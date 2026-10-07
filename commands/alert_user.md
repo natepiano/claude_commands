@@ -8,6 +8,8 @@ Send one alert:
 
 On the Mac, add `--machine natedev`; the keys exist only on natedev. Never read `~/.config/pushover/env`.
 
+News a terminal already shows, sent only when the user types in no terminal for N minutes (natedev): `python3 ~/.claude/scripts/message/escalate.py hold <key> --summary "<title>" --text "<news>" [--minutes 15]`, then `close <key>` once it stops being true.
+
 | Need | When |
 |---|---|
 | `blocked` (repeats until acknowledged) | Work has stopped and only the user can restart it: a login, a passphrase (`github-warmup`), a sudo step, a physical action. |
