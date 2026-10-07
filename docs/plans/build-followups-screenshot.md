@@ -90,7 +90,7 @@ None.
 
 **Ruled out:** classifying a shell command by searching its whole text (it counted rg/cat/echo mentions and dropped real shots); treating heredoc bodies as text (a body fed to python/bash/sh runs).
 
-### Phase 2 — Screenshot scripts run in later calls count as screenshots · status: todo
+### Phase 2 — Screenshot scripts run in later calls count as screenshots · status: done
 
 #### Work Order
 
