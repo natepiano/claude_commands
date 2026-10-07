@@ -267,7 +267,7 @@ A unit's `then` in the dailies input is a JSON list of one-line items, one per u
 
 **Ruled out:** a renderer-side rewrite of a chained string into a list; the refusal makes the showrunner fix the input, and a silent rewrite would hide the defect.
 
-### Phase 7 — A unit director's model and effort come from agents.conf · status: todo
+### Phase 7 — A unit director's model and effort come from agents.conf · status: done
 
 #### Work Order
 
@@ -292,9 +292,9 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 - **Resolution in `scripts/production/add_unit.py`.** `director_agent(request) -> DirectorAgent` (`NamedTuple`: `model: str`, `effort: DefaultEffort | Effort(value)`) runs `bash -c 'source "$1" && agents_resolve production.director && printf "%s\n%s\n%s\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"' _ <agents_config.sh>`, with `agents_config.sh` taken from this script's own checkout (`Path(__file__).resolve().parents[1] / "agents" / "agents_config.sh"`), and `AGENTS_CONFIG_FILE` left to the caller's environment (default `~/.claude/config/agents.conf`). It is called from `preflight`, so `--check` refuses too and promotion never stops a session it then cannot launch:
   - a nonzero resolver exit is exit 2 with the resolver's first `ERROR:` line;
   - a family other than `claude` (a hand-written `production=codex` beside a hand-written `[production.codex]`) is exit 2 with `unit directors launch only on claude; production.director resolves to <family> (<model>)`;
-  - nothing is written, stopped or started on either refusal.
+  - nothing in the production doc, the repository or tmux is written, stopped or started on either refusal (the resolver's routine Codex catalog refresh may run, as on every resolver call).
 - **Every launch path passes it.** `launch_session` builds `claude --model <model> [--effort <effort>] [--resume <id>] --remote-control …`, `--effort` only for `Effort(value)` (an empty effort uses the CLI default, as `agents_claude_args` does). That covers a plan launch, a brief launch and a standby launch (`produce.md` <LaunchUnits/> and `/showrunner:add_unit`) and a resume launch (`promote_unit.md` step 6). The commit, the Units row and the log line do not change.
-- **The showrunner's own Resume.** `commands/showrunner/produce.md` <LaunchUnits/> **Resume** becomes `claude --resume <session-id> $(bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve production.director && agents_claude_args') --remote-control <session> -n <session>`; on a resolver error, stop and tell the user its line. `commands/showrunner/add_unit.md` and `promote_unit.md` each say in one line that the launch takes its model and effort from `/agent production.director`. `commands/agent.md` documents a one-family function: kept by every-function switches, refused when switched alone.
+- **The showrunner's own Resume.** `commands/showrunner/produce.md` <LaunchUnits/> **Resume** gets its flags first from `bash -c` sourcing `agents_config.sh`, running `agents_resolve production.director`, refusing a family other than `claude` with the same line as `add_unit.py`, then `agents_claude_args`; only then `claude --resume <session-id> <flags> --remote-control <session> -n <session>`. On a nonzero exit, stop and tell the user its line, and never run `claude --resume` without the flags. `commands/showrunner/add_unit.md` and `promote_unit.md` each say in one line that the launch takes its model and effort from `/agent production.director`. `commands/agent.md` documents a one-family function: kept by every-function switches, refused when switched alone.
 
 **Files:**
 - `config/agents.conf` — `production=claude`, `[production.claude]`, the comments.
@@ -318,7 +318,40 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 - From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_add_unit.py'` and `bash scripts/agents/test_agents_config.sh` green; basedpyright 0 errors and 0 warnings on `scripts/production/add_unit.py` and `test_add_unit.py`.
 - Live (natedev, once the merge reaches `~/.claude` main): `/agent production` shows `director` at `opus` `xhigh`; the next unit director launched shows `--model opus --effort xhigh` in its `ps` command line.
 
-### Phase 8 — Dailies input builder · status: todo
+### Phase 8 — Stall watch treats a unit waiting on someone else as waiting · status: todo
+
+#### Work Order
+
+Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-showrunner`, branch `build-followups-enh-showrunner`. State every time in PDT.
+
+**Source:** the showrunner (natedev), 2026-10-06 ~19:1x PDT. At 19:0x PDT the stall watch bumped mul_add, whose last line was "— gate: the user runs the Mac Claude go-live and controls at a Mac terminal". `stall_watch.py` resets a unit's stretch only for a last line that starts `done:` or `blocked:`, so a unit waiting on the user under `gate:` or `decision:` is bumped and reported as stalled every stretch.
+
+**Goal:** the stall watch treats a unit whose last turn-end line is `— gate:` or `— decision:` as waiting, exactly as it treats `done:` and `blocked:`: no bump, no notice to the showrunner, and a fresh stretch. `— holding:` stays a stall candidate.
+
+**Spec:**
+- **Read first, in full:** `scripts/production/stall_watch.py` (`TURN_END`, the last-line test in the unit loop, `Stretch`, `read_stretch`, `work_running`, and the standby and finished-run skips) and `scripts/production/test_stall_watch.py` (`test_blocked_turn_end_waits_for_a_new_unblocked_status`, `test_holding_turn_end_still_bumps_idle_unit`, `test_done_turn_end_is_never_stalled`).
+- **The rule.** A turn-end line is a wait when its kind is `done`, `blocked`, `gate` or `decision`: in each the unit has handed the next move to someone else or has finished. `holding` is the one kind that says the unit itself is waiting on work it has running, so with nothing running it is the stall the watch exists to catch. A unit waiting on the user is already reported to the user (`unit_status.sh` prints `STILL WAITING on you`); the watch adds no second report.
+- **One list of kinds.** `TURN_END` already names all five kinds. Build it and the wait test from the same two names in the module, the waiting kinds and `holding`, so the pattern and the test cannot drift apart again. The test reads the kind of the last line the way `TURN_END` does, with or without the leading `— `, and replaces `last.lstrip("— ").startswith(("done:", "blocked:"))`. A pane with no turn-end line on screen (`none on screen`) takes the stall path as today.
+- **The reset is the existing one.** A waiting last line writes the fresh stretch and skips the unit, as `done:` and `blocked:` do today; the stretch restarts at the next status that is not a wait, so a unit that answers the gate and then says `— holding:` is judged from that line.
+
+**Files:**
+- `scripts/production/stall_watch.py` — the waiting kinds and the last-line test.
+- `scripts/production/test_stall_watch.py` — its tests.
+
+**Seats:** 1 writer + 1 tester.
+- `impl` — `stall_watch.py`; post `done` without waiting for the test seat.
+- `test` — from the Spec alone, in `test_stall_watch.py`, modelled on `test_blocked_turn_end_waits_for_a_new_unblocked_status`: the mul_add line verbatim, `— gate: the user runs the Mac Claude go-live and controls at a Mac terminal`, and a `— decision: …` line each get no bump and no notice at the start and after the stall interval, and a later `— holding: …` line starts the stall from that line; a `gate:` and a `decision:` line without the leading `— ` behave the same; a `— holding: …` line with nothing running is still bumped (the existing test, left as it is); the `done:` and `blocked:` tests stay green unchanged. Each new test fails on the tree before this phase. Owns the final suite run.
+
+**Constraints from prior phases:**
+- Phases 4 and 5 (as built): the watch skips a standby unit and a finished run (a Units row whose Plan cell says `run done`) before any bump or notice, and `done:` and `blocked:` reset the stretch; keep all of them.
+- `stall_watch.py` and `test_stall_watch.py` are in this unit's **Owns** row (hub files, gate G1 cleared): neither is an `--also` path. Merge `build-followups` into the branch at the phase start.
+- Tests never start a real `claude`, `tmux`, `systemd-run` or `ssh`, never write `~/.claude/config/`, `~/.local/state/` or a real production doc, and never push anywhere but a temporary bare repository.
+
+**Acceptance gate:**
+- From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_stall_watch.py'` green; basedpyright 0 errors and 0 warnings on `scripts/production/stall_watch.py` and `test_stall_watch.py`.
+- Live (natedev, once the merge reaches `~/.claude` main): a unit whose last line is `— gate:` or `— decision:` gets no bump across a stall stretch.
+
+### Phase 9 — Dailies input builder · status: todo
 
 #### Work Order
 
@@ -326,11 +359,11 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 
 **Source:** Phase 5's script-or-judgment audit (its As-built table): the rows "Build dailies input from `unit_status.sh`", "Restart the update clock after a user-run dailies", "Gather time, LOG, merge state and review watch", "Detect stale or past ETA and request a new one" and "Build-hold markers and holder files". The audit's owner phase for each is this one.
 
-**Goal:** one command, `scripts/production/dailies_input.py`, writes the mechanical half of `dailies_input.json` and merges the showrunner's judgment fields over it, so `commands/showrunner/dailies.md`'s Status check and Gather become one call: the showrunner supplies only what needs judgment (project, goal, phase, `started`, held reason, update, waiting_on_it, needed, then, ETA numbers, held or testing merges), and the command refuses the input it cannot complete, naming each missing field. It first extracts the merge-branch reader that Phases 9 and 11 also use.
+**Goal:** one command, `scripts/production/dailies_input.py`, writes the mechanical half of `dailies_input.json` and merges the showrunner's judgment fields over it, so `commands/showrunner/dailies.md`'s Status check and Gather become one call: the showrunner supplies only what needs judgment (project, goal, phase, `started`, held reason, update, waiting_on_it, needed, then, ETA numbers, held or testing merges), and the command refuses the input it cannot complete, naming each missing field. It first extracts the merge-branch reader that Phases 10 and 12 also use.
 
 **Spec:**
 - **Read first, in full:** `commands/showrunner/dailies.md` (Status check and clock, Gather, Input), `scripts/production/unit_status.sh`, `scripts/production/dailies_render.py` (the unit field set, `InputError`, the input parser its command line calls) and `scripts/production/merge_checkpoint.py` (`merge_history`, `code_merged`). The command is the mechanical lines of those steps in the order the text gives them; the judgment lines stay in the text.
-- **The merge-branch reader, in `merge_checkpoint.py`.** `merge_history(request)` answers for one unit's last checkpoint only. Extract the parse of the merge subjects on `MERGE_BRANCH` (`Merge <unit> phase <N> (<short>) into <merge branch>`, a shrink merge told from a code merge) into one typed reader over a checkout and a merge branch, with three queries: the last merge of any unit, a unit's last merge, and the count of code merges (a shrink merge never counts, a code checkpoint's first merge does). `merge_history` and `code_merged` call it and keep their behavior, so the existing `test_merge_checkpoint.py` cases stay green unchanged; new cases pin the three queries on a temporary repository. Phases 9 and 11 import the reader; none of the three copies the rule.
+- **The merge-branch reader, in `merge_checkpoint.py`.** `merge_history(request)` answers for one unit's last checkpoint only. Extract the parse of the merge subjects on `MERGE_BRANCH` (`Merge <unit> phase <N> (<short>) into <merge branch>`, a shrink merge told from a code merge) into one typed reader over a checkout and a merge branch, with three queries: the last merge of any unit, a unit's last merge, and the count of code merges (a shrink merge never counts, a code checkpoint's first merge does). `merge_history` and `code_merged` call it and keep their behavior, so the existing `test_merge_checkpoint.py` cases stay green unchanged; new cases pin the three queries on a temporary repository. Phases 10 and 12 import the reader; none of the three copies the rule.
 - **Command.** `dailies_input.py --production <doc> --status <file> --judgment <file> --state-dir <dir> --out <file> [--length simple|page|elaborate] [--holders <dir>] [--notifier <path>] [--user-run]`. It reads `ZONE`, `LOG`, `MERGE_BRANCH`, `CHECKOUT`, the **Updates** instance name and each unit's session through `add_unit.py`'s `read_production`, `production_field`, `cell_value` and `unit_rows`, as `merge_checkpoint.py` does. It prints `<step>: ok|failed — <one line>` per step and exits 0, or 2 when it refuses; a refusal writes nothing to `--out`.
 - **Status.** `--status` is the output of `unit_status.sh <scratch>/unit_status <zone> --showrunner <name>`, saved to a file by the one line `dailies.md` names. A `== <unit>` line opens a unit's block, for a unit in the Units table (any other name is refused, naming it); before the first one only the `at <time> / <time> UTC` line may stand. The structural lines, each copied into the tests from `unit_status.sh`: `SESSION GONE`, `CLAUDE NOT RUNNING`, `TICKS FAILING (…)`, `FORM WAITING on you in <unit>: …`, `BLOCK in <unit>, open <age>: …`, `STILL WAITING on you, <unit>: …`, and the `=== DECISION for you from <unit> ===` … `=== end <unit> ===` block. Every other line in a block is the unit's activity text (the script prints up to five free lines per unit: its latest step, a spinner, a decision, blocked or gate line, and its ETA line), kept as `Activity(text)` and never refused. States, never strings: `SessionGone | ClaudeNotRunning | Running`, and the flags `FormWaiting(text) | Decision(text) | StillWaiting(text) | Block(age, text) | TicksFailing(text)`. It prints `flags first:` lines for what dailies must put first (session gone, Claude not running, form waiting, a decision, a usage limit named in the activity text) and sets `needs_user` true for a form, decision or still-waiting flag the judgment file left unset.
 - **Fields it fills.** `length`, `zone`, `unit`, `label` (the renderer's default when absent), `next_run`, each unit's `build_hold` marker, the review-watch topic and the merge-branch topic. `build_hold`: `true` for a unit under a holder file in `--holders` (default `~/.local/state/build-hold/`), a holder's own unit never marked; a marker with no holder file, or holder files with no marked unit, is refused as the renderer refuses it. Review watch: it runs `review_regime.py watch`, shows its line as the `Review watch` topic until it prints `acknowledged`, and exit 3 sets `needs_user`. Merge branch: the last merge from the merge-branch reader and whether `MERGE_BRANCH` is pushed; held or testing comes from the judgment file. `next_run`: the `next_due` of `<notifier> status <UPDATES>`; under `--user-run` it is the `next_due` the clock restart prints (below).
@@ -360,7 +393,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 - From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_dailies_input.py'`, `-p 'test_merge_checkpoint.py'` and `-p 'test_dailies_render*.py'` green; basedpyright 0 errors and 0 warnings on `scripts/production/dailies_input.py`, `test_dailies_input.py` and `merge_checkpoint.py`.
 - Live (natedev, once the merge reaches `~/.claude` main): the next dailies runs `dailies_input.py` and `dailies_render.py` and prints the same report the written-by-hand input gave.
 
-### Phase 9 — Production open and wrap · status: todo
+### Phase 10 — Production open and wrap · status: todo
 
 #### Work Order
 
@@ -371,10 +404,10 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 **Goal:** one command, `scripts/production/production_lifecycle.py`, runs a production's fixed git and document steps at its start and its end, so `commands/showrunner/produce.md`'s <LoadProduction/>, <OpenMergeBranch/>, <PromoteMain/> and <Wrap/> keep only the judgment: whether a unit's close-out needs the owner's approval, and the person's live smoke verdict.
 
 **Spec:**
-- **Read `commands/showrunner/produce.md` <LoadProduction/>, <OpenMergeBranch/>, <PromoteMain/> and <Wrap/> in full first,** and `scripts/production/merge_checkpoint.py`'s merge-branch reader (built in Phase 8). Each subcommand is the mechanical lines of one of them, in the order the text gives them; the judgment lines stay in the text.
+- **Read `commands/showrunner/produce.md` <LoadProduction/>, <OpenMergeBranch/>, <PromoteMain/> and <Wrap/> in full first,** and `scripts/production/merge_checkpoint.py`'s merge-branch reader (built in Phase 9). Each subcommand is the mechanical lines of one of them, in the order the text gives them; the judgment lines stay in the text.
 - **A production without CI.** Every subcommand takes `--no-ci`, which the showrunner passes when the production doc's **Production rules** say CI does not apply (this production's do: no CI, no smoke launch, no Mac run, no `validate_and_push.sh`). With it, the CI, smoke-launch and Mac-run steps of `promote-main` and `wrap` each print `<step>: ok — skipped: no CI` and the rest runs, the promote of main by the doc's **Promote:** field included. `produce.md` keeps that one judgment line beside each call.
 - **Subcommands**, each taking `--production <doc>` and printing `<step>: ok|held|failed — <one line>`, the first `held` or `failed` stopping the run, exit 0 or 2:
-  - `load` — `CHECKOUT` is on `MERGE_BRANCH`, or clean on the commit the branch will start from, else the message `Run /showrunner:produce in a checkout on <merge branch>.`; on `resume` or a running doc, the last `### STATE` block of `LOG`, `LAST_MERGED` from Phase 8's merge-branch reader (imported, not copied), and each unit's session through `tmux has-session`.
+  - `load` — `CHECKOUT` is on `MERGE_BRANCH`, or clean on the commit the branch will start from, else the message `Run /showrunner:produce in a checkout on <merge branch>.`; on `resume` or a running doc, the last `### STATE` block of `LOG`, `LAST_MERGED` from Phase 9's merge-branch reader (imported, not copied), and each unit's session through `tmux has-session`.
   - `open` — only for status `planned`: creates `MERGE_BRANCH`, sets the doc `running` and its `**Showrunner session:**` line, commits `production(<name>): plans for <n> units`, pushes with upstream, adds `LOG` to the checkout's `info/exclude` and creates it with its heading. A re-run resumes at the first step not done.
   - `promote-main` — the preflight and git steps of <PromoteMain/>, stopping at the live smoke verdict, which stays with the person.
   - `wrap` — the clean and merged checks, the worktree retire, the notifier removal and the doc's status change of <Wrap/>, then the final wrap report rendered from the git, CI and close-out records; a unit whose close-out needs an approval is `held`, naming it.
@@ -391,14 +424,14 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 
 **Constraints from prior phases:**
 - Phase 5 (as built): the reader, the named states and the step-line form are `merge_checkpoint.py`'s; reuse its functions by import.
-- Phase 8 (as built): the merge-branch reader (last merge of any unit, a unit's last merge, the code-merge count) lives in `merge_checkpoint.py`; import it, never copy the merge-subject rule. Phase 8 also adds `dailies_input.py`; this phase does not touch it.
+- Phase 9 (as built): the merge-branch reader (last merge of any unit, a unit's last merge, the code-merge count) lives in `merge_checkpoint.py`; import it, never copy the merge-subject rule. Phase 9 also adds `dailies_input.py`; this phase does not touch it.
 - Tests never start a real `claude`, `tmux`, `systemd-run` or `ssh`, never write `~/.claude/config/`, `~/.local/state/` or a real production doc, and never push anywhere but a temporary bare repository.
 - Both new files are outside this unit's **Owns**: the checkpoint notice names each as `also touches <path>`.
 
 **Acceptance gate:**
 - From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_production_lifecycle.py'` green; basedpyright 0 errors and 0 warnings on `scripts/production/production_lifecycle.py` and its test.
 
-### Phase 10 — Update registration · status: todo
+### Phase 11 — Update registration · status: todo
 
 #### Work Order
 
@@ -428,14 +461,14 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 
 **Constraints from prior phases:**
 - Phase 5 (as built): the reader, the named states and the step-line form are `merge_checkpoint.py`'s; reuse them by import. `stall_watch.py` reads the notifier conf's `CHECK=` path and the Units rows' Plan cell; do not change what it reads.
-- Phases 8 and 9 add their own commands; this phase does not touch them.
+- Phases 9 and 10 add their own commands; this phase does not touch them.
 - Tests never start a real `claude`, `tmux`, `systemd-run` or `ssh`, never write `~/.claude/config/`, `~/.local/state/` or a real production doc, and never push anywhere but a temporary bare repository.
 - Both new files are outside this unit's **Owns**: the checkpoint notice names each as `also touches <path>`.
 
 **Acceptance gate:**
 - From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_update_registration.py'` green; basedpyright 0 errors and 0 warnings on `scripts/production/update_registration.py` and its test.
 
-### Phase 11 — CI points and review watch · status: todo
+### Phase 12 — CI points and review watch · status: todo
 
 #### Work Order
 
@@ -446,11 +479,11 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 **Goal:** one command, `scripts/production/ci_points.py`, counts code merges, starts and collects a CI point, runs the review watch once and drafts the gate-clear and gate-lift notices, so `commands/showrunner/produce.md` <CIPoint/>, <ClearGate/> and <Direct/> keep only the choice of repair owner, the routing of arrivals and the order of a queue.
 
 **Spec:**
-- **Read `commands/showrunner/produce.md` <CIPoint/>, <ClearGate/>, <Direct/> and <MergeCheckpoint/> step 6 in full first,** and `scripts/production/merge_checkpoint.py`'s merge-branch reader (built in Phase 8). Each subcommand is the mechanical lines of one of them, in the order the text gives them.
+- **Read `commands/showrunner/produce.md` <CIPoint/>, <ClearGate/>, <Direct/> and <MergeCheckpoint/> step 6 in full first,** and `scripts/production/merge_checkpoint.py`'s merge-branch reader (built in Phase 9). Each subcommand is the mechanical lines of one of them, in the order the text gives them.
 - **A production without CI.** `due`, `ci start` and `ci collect` take `--no-ci`, which the showrunner passes when the production doc's **Production rules** say CI does not apply (this production's do). With it each prints `<step>: ok — skipped: no CI` and does nothing else; `produce.md` keeps that one judgment line beside each call.
 - **No `queue` command.** The audit row "Route arrivals and serialize the checkpoint queue" is a judgment row, not a script: an arrival is a message in the showrunner's own session, not a file a script can read, and the one fact worth a lock, one merge at a time, is already `merge_checkpoint.py`'s step lines. This phase's As-built records the row as judgment, with this reason.
 - **Subcommands**, each with `--production <doc>`, printing `<step>: ok|failed — <one line>`, exit 0 or 2:
-  - `due` — the count of code merges on `MERGE_BRANCH` from Phase 8's merge-branch reader (imported, not copied), and whether a CI point is due on every fifth.
+  - `due` — the count of code merges on `MERGE_BRANCH` from Phase 9's merge-branch reader (imported, not copied), and whether a CI point is due on every fifth.
   - `ci start` and `ci collect` — the commands and polling of <CIPoint/> as one transaction, the validation and CI result printed as one line each.
   - `watch` — runs `review_regime.py watch`, prints its report line, and on the first exit 3 only, logs it and prints a notify line; later exit 3 results are not repeated.
   - `notice clear|lift <gate id>` — drafts the `send <unit>:` line for a gate that cleared or lifted, in the form the Gates table and <ClearGate/> give.
@@ -467,15 +500,15 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 
 **Constraints from prior phases:**
 - Phase 5 (as built): the reader, the named states and the step-line form are `merge_checkpoint.py`'s; reuse them by import. The merge command's step 9 already records `review_regime.py add`; this phase only reads.
-- Phase 8 (as built): the merge-branch reader (the merge-subject rule and the code-merge count) lives in `merge_checkpoint.py`; import it, never copy the rule.
-- Phases 8 to 10 add their own commands; this phase does not touch them.
+- Phase 9 (as built): the merge-branch reader (the merge-subject rule and the code-merge count) lives in `merge_checkpoint.py`; import it, never copy the rule.
+- Phases 9 to 11 add their own commands; this phase does not touch them.
 - Tests never start a real `claude`, `tmux`, `systemd-run` or `ssh`, never write `~/.claude/config/`, `~/.local/state/` or a real production doc, and never push anywhere but a temporary bare repository.
 - Both new files are outside this unit's **Owns**: the checkpoint notice names each as `also touches <path>`.
 
 **Acceptance gate:**
 - From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_ci_points.py'` green; basedpyright 0 errors and 0 warnings on `scripts/production/ci_points.py` and its test.
 
-### Phase 12 — Waiting, cross-unit search and alerts · status: todo
+### Phase 13 — Waiting, cross-unit search and alerts · status: todo
 
 #### Work Order
 
@@ -493,7 +526,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
   - `search <old name> <new name>` — every site in the other units' branches and worktrees that names a renamed public item, with the path and line.
   - `quota` — the fixed fanout of a quota alert to each unit and the held-item lifecycle; the account action stays the user's.
   - `agenda` — raises an item once its wait passes eight hours, deduplicated by first open; the options stay the showrunner's.
-  - `eta-request <unit>` — once per phase, prints `request /unit:eta: <unit>` for a unit with no measured ETA and records it in `--state-dir`; Phase 8's builder prints the same line and shares this record.
+  - `eta-request <unit>` — once per phase, prints `request /unit:eta: <unit>` for a unit with no measured ETA and records it in `--state-dir`; Phase 9's builder prints the same line and shares this record.
 - **Named states**, never a string or `None` across the reader boundary: `WaitOpen(<since>) | WaitCleared`, `EtaRequested | EtaNotYetRequested`, `NotBlocked | StillBlocked(<last lines>)`.
 - **The doc.** `produce.md` names each subcommand where it names the step and drops the text it replaces.
 
@@ -507,7 +540,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 
 **Constraints from prior phases:**
 - Phase 5 (as built): the reader, the named states and the step-line form are `merge_checkpoint.py`'s; reuse them by import.
-- Phase 8 (as built): `dailies_input.py` keeps the once-per-phase ETA request record in `--state-dir`; this phase reads and writes the same record in the same form, and never forks it.
+- Phase 9 (as built): `dailies_input.py` keeps the once-per-phase ETA request record in `--state-dir`; this phase reads and writes the same record in the same form, and never forks it.
 - Tests never start a real `claude`, `tmux`, `systemd-run` or `ssh`, never write `~/.claude/config/`, `~/.local/state/` or a real production doc, and never push anywhere but a temporary bare repository.
 - Both new files are outside this unit's **Owns**: the checkpoint notice names each as `also touches <path>`.
 

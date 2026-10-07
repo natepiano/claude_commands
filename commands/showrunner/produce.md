@@ -221,8 +221,8 @@ confirm the block remains and no compaction is running. Type `/compact` with
 `tmux send-keys -l`, then send `Enter` separately.
 
 **Resume.** To bring back a unit director whose session ended, use
-   `claude --resume <session-id> --remote-control <session> -n <session>`, which
-   keeps its link and its place in the list.
+   `claude --resume <session-id> <flags> --remote-control <session> -n <session>`, which keeps its link and its place in the list.
+   Get `<flags>` first, from `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve production.director || exit 1; [[ "$AGENT_FAMILY" == claude ]] || { echo "unit directors launch only on claude; production.director resolves to $AGENT_FAMILY ($AGENT_MODEL)" >&2; exit 1; }; agents_claude_args'`, which prints `--model <model> [--effort <effort>]`. If it exits nonzero, stop and tell the user its line; never run `claude --resume` without the flags.
 </LaunchUnits>
 
 ---

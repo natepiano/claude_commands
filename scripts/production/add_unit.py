@@ -51,6 +51,19 @@ class ResumedSession(NamedTuple):
     cwd: Path
 
 
+class DefaultEffort(NamedTuple):
+    pass
+
+
+class Effort(NamedTuple):
+    value: str
+
+
+class DirectorAgent(NamedTuple):
+    model: str
+    effort: DefaultEffort | Effort
+
+
 class OmittedCell(NamedTuple):
     pass
 
@@ -70,6 +83,11 @@ class ExistingUnitRow(NamedTuple):
     session: str
     port: str
     owns: str
+
+
+class ReadyToLaunch(NamedTuple):
+    row: NoUnitRow | ExistingUnitRow
+    director: DirectorAgent
 
 
 class UnitLaunch(NamedTuple):
@@ -303,7 +321,27 @@ def tmux_live(tmux: str, name: str) -> bool:
     return result.returncode == 0
 
 
-def preflight(request: UnitLaunch) -> NoUnitRow | ExistingUnitRow:
+def director_agent(request: UnitLaunch) -> DirectorAgent:
+    """Resolve the unit director in this script's checkout before any writes."""
+    resolver = Path(__file__).resolve().parents[1] / "agents" / "agents_config.sh"
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1" && agents_resolve production.director && printf "%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"',
+         "_", str(resolver)], cwd=request.production.checkout,
+        text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        error = next((line for line in result.stderr.splitlines() if line.startswith("ERROR:")),
+                     result.stderr.splitlines()[0] if result.stderr else "ERROR: cannot resolve production.director.")
+        raise Refusal(error)
+    values = result.stdout.splitlines()
+    if len(values) != 3 or not values[0] or not values[1]:
+        raise Refusal("ERROR: production.director resolver returned invalid output.")
+    family, model, effort = values
+    if family != "claude":
+        raise Refusal(f"unit directors launch only on claude; production.director resolves to {family} ({model})")
+    return DirectorAgent(model, Effort(effort) if effort else DefaultEffort())
+
+
+def preflight(request: UnitLaunch) -> ReadyToLaunch:
     production = request.production
     branch = git(production, "branch", "--show-current").stdout.strip()
     if branch != production.merge_branch:
@@ -336,7 +374,7 @@ def preflight(request: UnitLaunch) -> NoUnitRow | ExistingUnitRow:
         if (not any(line.startswith("> **Production:") for line in content.splitlines())
                 or len(saved_words) != 2 or saved_words[1] != request.plan.words + "\n"):
             raise Refusal(f"stub plan {request.plan.stub} already exists with different content")
-    return existing
+    return ReadyToLaunch(existing, director_agent(request))
 
 
 def write_stub(request: UnitLaunch) -> None:
@@ -424,10 +462,12 @@ def prompt_for(request: UnitLaunch) -> str:
             f"approval before you run /unit:delegate {plan}.")
 
 
-def launch_session(request: UnitLaunch, tmux: str) -> None:
+def launch_session(request: UnitLaunch, tmux: str, director: DirectorAgent) -> None:
     if tmux_live(tmux, request.name):
         return
-    argv = ["claude"]
+    argv = ["claude", "--model", director.model]
+    if isinstance(director.effort, Effort):
+        argv.extend(["--effort", director.effort.value])
     if isinstance(request.session, ResumedSession):
         argv.extend(["--resume", request.session.session_id])
     argv.extend(["--remote-control", request.name, "-n", request.name,
@@ -528,17 +568,17 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     try:
         request = launch_request(args)
-        existing = preflight(request)
+        ready = preflight(request)
         if cast(bool, args.check):
             return 0
         tmux = tmux_binary()
-        if tmux_live(tmux, request.name) and isinstance(existing, NoUnitRow):
+        if tmux_live(tmux, request.name) and isinstance(ready.row, NoUnitRow):
             raise Refusal(f"tmux session {request.name} is already live")
         write_stub(request)
-        append_row(request, existing)
+        append_row(request, ready.row)
         commit_and_push(request)
         ensure_worktree(request)
-        launch_session(request, tmux)
+        launch_session(request, tmux, ready.director)
         wait_for_remote_control(request, tmux)
         record(request)
         print(f"{request.unit} started: tmux attach -t {request.name}")
