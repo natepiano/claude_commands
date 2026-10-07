@@ -207,6 +207,7 @@ class ToolValue(TypedDict):
 class WindowResolutionValue(TypedDict):
     physical_width: int
     physical_height: int
+    scale_factor_override: float | None
     scale_factor: float
 
 
@@ -1208,7 +1209,10 @@ def ensure_window(session: Session, size: str) -> None:
     if len(rows) != 1:
         raise Failure(f"expected one primary window, found {len(rows)}")
     window = cast(WindowValue, rows[0].get("components", {})[WINDOW])
-    scale = window["resolution"]["scale_factor"]
+    resolution = window["resolution"]
+    scale = resolution["scale_factor_override"]
+    if scale is None:
+        scale = resolution["scale_factor"]
     width = round(int(match.group(1)) * scale)
     height = round(int(match.group(2)) * scale)
     if session.read_camera().size == (width, height):
@@ -2212,7 +2216,10 @@ def add_shot_flags(parser: argparse.ArgumentParser) -> None:
 
 def add_run_flags(parser: argparse.ArgumentParser, port_required: bool = True) -> None:
     _ = parser.add_argument("--port", type=int, required=port_required, default=0)
-    _ = parser.add_argument("--window", help="logical window size, such as 1440x900")
+    _ = parser.add_argument(
+        "--window",
+        help="logical window size, such as 1280x720 (the PNG is 2560x1440 at Hana's 2x scale)",
+    )
     _ = parser.add_argument("--settle", type=int, help="extra frames to wait after the camera stops")
     _ = parser.add_argument("--out", help="directory, or one .png path")
     _ = parser.add_argument("--views-file")

@@ -311,3 +311,37 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 **Gotchas:** the no-news scan's 30 s bound is sensitive to per-episode work over all events; per-episode linear event scans or deep-copied episode records push it past the bound, so lookups stay indexed and records compact.
 
 **Ruled out:** a rebuild-timelines command — the scan rebuilds timelines itself.
+
+### Phase 8 — `--window 1280x720` gives a 1280x720 window on any display · status: done
+
+#### Work Order
+
+**Source:** the showrunner, 2026-10-07, reported by startup-polish (hana production): on natedev, `--window 1280x720` on a Hana whose window carries `scale_factor_override` 2.0 gave a 640x360 logical window, so shots came out half size. The unit director reproduced it the same day on port 15797 (trunk build): override 2.0 over a base scale of 1.0 left the window at 1280x720 physical, 640x360 logical, and the PNG was 1280x720. Setting 2560x1440 physical by hand gave 1280x720 logical, and the camera reported scale 2.0.
+
+**Goal:** `--window WxH` and a stored view's `window` give a window of W×H logical pixels at whatever scale Hana runs, so a shot asked for at 1280x720 shows Hana's 1280x720 layout.
+
+**Spec:**
+- `ensure_window` (`scripts/hana_shot/hana_shot.py:1202`) uses the window's effective scale: `resolution.scale_factor_override` when it is set, else `resolution.scale_factor`, as Bevy's `WindowResolution::scale_factor()` does. Today it reads only `scale_factor`, the OS value.
+- `WindowResolutionValue` (`:207`) gains `scale_factor_override: float | None`; BRP sends `null` when no override is set.
+- The physical target stays round(logical × scale). The early return and the wait still compare the camera's physical size with that target.
+- The `--window` help (`:2215`) and `commands/hana_shot.md` item 3 say the size is logical and the PNG is that size times Hana's scale: 2560x1440 for 1280x720 at 2x.
+- Nothing else changes: the timings record, crops and padding keep their current units.
+- Tests drive the existing BRP fake: its primary-window query answers a `Window` with a resolution, it records `world.mutate_components`, and its camera's `physical_size` follows the mutated physical size. Three cases, each asking for 1280x720:
+  - base 1.0 with override 2.0 writes 2560x1440;
+  - base 2.0 with override 1.0 writes nothing, since the window is already 1280x720 physical;
+  - base 2.0 with no override writes 2560x1440.
+  The first two fail on today's code.
+- After the showrunner merges the checkpoint, the unit director appends a product change to `~/.local/state/screenshot-analysis/changes.json` (summary "Scale-aware --window", effective at the merge, hosts natedev and mac).
+
+**Files:**
+- `scripts/hana_shot/hana_shot.py` — effective scale in `ensure_window`, the resolution type, the `--window` help
+- `commands/hana_shot.md` — item 3 says the size is logical
+- `scripts/hana_shot/test_hana_shot.py` — the fake's window and the three scale cases
+
+**Seats:** 1 writer + 1 tester
+- `impl`: `scripts/hana_shot/hana_shot.py`, `commands/hana_shot.md`
+- `test`: `scripts/hana_shot/test_hana_shot.py`
+
+**Constraints from prior phases:** each `shot` call still appends its one timings line (Phase 3); its `window` field keeps the camera's physical size. The hana showrunner may land urgent fixes to `scripts/hana_shot/` on `~/.claude` main, so merge first.
+
+**Acceptance gate:** the `scripts/hana_shot` tests pass, and `basedpyright` reports 0/0/0 on both changed `.py` files. Live, on port 15797: a Hana with override 2.0 shot with `--window 1280x720` gives a 2560x1440 PNG, and its window reads 1280x720 logical; with no override the PNG is 1280x720, as today.
