@@ -13,8 +13,9 @@ from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
-from compare import compare
+from compare import compare, markdown as compare_markdown
 from phases import markdown as phases_markdown, phases
+import report as study_report
 from turns import Compaction, Dropped, Turn, director_turns, load_roster, read_session, resolve_session_files, session_ids
 
 PDT = ZoneInfo("America/Los_Angeles")
@@ -51,11 +52,12 @@ def drop_sum(values: list[Dropped]) -> dict[str, int]:
     )}
 
 
-def extract(roster: Path, projects_dir: Path, registry_dir: Path, state_dir: Path) -> dict[str, object]:
+def extract(roster: Path, projects_dir: Path, registry_dir: Path, state_dir: Path, verbose: bool = True) -> dict[str, object]:
     all_turns: list[Turn] = []
     all_compactions: list[Compaction] = []
     summaries: list[dict[str, object]] = []
-    print("name | requests | model / effort | first Sonnet PDT | switched by PDT | difference min | drops")
+    if verbose:
+        print("name | requests | model / effort | first Sonnet PDT | switched by PDT | difference min | drops")
     for entry in load_roster(roster):
         files = resolve_session_files(entry, projects_dir, registry_dir)
         ids = session_ids(entry, registry_dir)
@@ -95,7 +97,8 @@ def extract(roster: Path, projects_dir: Path, registry_dir: Path, state_dir: Pat
         breakdown = ", ".join(f"{model}:{count}" for model, count in sorted(models.items()))
         effort_breakdown = ", ".join(f"{effort}:{count}" for effort, count in sorted(efforts.items()))
         drop_text = ", ".join(f"{key}:{value}" for key, value in dropped.items())
-        print(f"{entry.name} | {len(turns)} | {breakdown}; {effort_breakdown} | {first_pdt or '-'} | {switch or '-'} | {difference if difference is not None else '-'} | {drop_text}")
+        if verbose:
+            print(f"{entry.name} | {len(turns)} | {breakdown}; {effort_breakdown} | {first_pdt or '-'} | {switch or '-'} | {difference if difference is not None else '-'} | {drop_text}")
     result: dict[str, object] = {
         "extracted": datetime.now(timezone.utc).isoformat(),
         "sessions": summaries,
@@ -121,6 +124,24 @@ def main() -> None:
     _ = phases_parser.add_argument("--runs-dir", type=Path, default=Path.home() / ".local/state/plan-delegate/runs")
     _ = phases_parser.add_argument("--registry-dir", type=Path, default=Path.home() / ".claude/sessions")
     _ = phases_parser.add_argument("--roster", type=Path, default=DEFAULT_ROSTER)
+    report_parser = subcommands.add_parser("report", help="render director numbers and the default recommendation")
+    mode = report_parser.add_mutually_exclusive_group()
+    _ = mode.add_argument("--interim", action="store_true")
+    _ = mode.add_argument("--final", action="store_true")
+    _ = report_parser.add_argument("--message", action="store_true")
+    _ = report_parser.add_argument("--no-extract", action="store_true")
+    _ = report_parser.add_argument("--state-dir", type=Path, default=Path(os.environ.get("MODEL_STUDY_STATE", DEFAULT_STATE)))
+    _ = report_parser.add_argument("--projects-dir", type=Path, default=Path.home() / ".claude/projects")
+    _ = report_parser.add_argument("--registry-dir", type=Path, default=Path.home() / ".claude/sessions")
+    _ = report_parser.add_argument("--runs-dir", type=Path, default=Path.home() / ".local/state/plan-delegate/runs")
+    _ = report_parser.add_argument("--roster", type=Path, default=DEFAULT_ROSTER)
+    _ = report_parser.add_argument("--now", type=datetime.fromisoformat)
+    ready_parser = subcommands.add_parser("ready", help="check the Sonnet sample gate")
+    _ = ready_parser.add_argument("--state-dir", type=Path, default=Path(os.environ.get("MODEL_STUDY_STATE", DEFAULT_STATE)))
+    _ = ready_parser.add_argument("--projects-dir", type=Path, default=Path.home() / ".claude/projects")
+    _ = ready_parser.add_argument("--registry-dir", type=Path, default=Path.home() / ".claude/sessions")
+    _ = ready_parser.add_argument("--roster", type=Path, default=DEFAULT_ROSTER)
+    _ = ready_parser.add_argument("--now", type=datetime.fromisoformat)
     args = cast(dict[str, object], vars(parser.parse_args()))
     if args.get("command") == "extract":
         roster = args["roster"]
@@ -135,7 +156,7 @@ def main() -> None:
     elif args.get("command") == "compare":
         state_dir = args["state_dir"]
         assert isinstance(state_dir, Path)
-        _ = compare(state_dir)
+        print(compare_markdown(compare(state_dir)))
     elif args.get("command") == "phases":
         state_dir = args["state_dir"]
         runs_dir = args["runs_dir"]
@@ -146,6 +167,50 @@ def main() -> None:
         assert isinstance(registry_dir, Path)
         assert isinstance(roster, Path)
         print(phases_markdown(phases(state_dir, runs_dir, roster, registry_dir)))
+    elif args.get("command") == "report":
+        roster = args["roster"]
+        projects_dir = args["projects_dir"]
+        registry_dir = args["registry_dir"]
+        runs_dir = args["runs_dir"]
+        state_dir = args["state_dir"]
+        assert isinstance(roster, Path)
+        assert isinstance(projects_dir, Path)
+        assert isinstance(registry_dir, Path)
+        assert isinstance(runs_dir, Path)
+        assert isinstance(state_dir, Path)
+        if args["no_extract"] is True:
+            extracted = cast(study_report.ExtractReport, json.loads((state_dir / "extract.json").read_text()))
+        else:
+            extracted = cast(study_report.ExtractReport, cast(object, extract(roster, projects_dir, registry_dir, state_dir, verbose=False)))
+        comparison = compare(state_dir)
+        phase_data = phases(state_dir, runs_dir, roster, registry_dir)
+        now = args["now"]
+        assert now is None or isinstance(now, datetime)
+        moment = now or datetime.now(PDT)
+        final = args["final"] is True
+        path = state_dir / "report.md"
+        atomic_text(path, study_report.render(comparison, phase_data, extracted, moment, final))
+        if args["message"] is True:
+            print(study_report.message(comparison, phase_data, extracted, moment, final, path), end="")
+        else:
+            print(path)
+    elif args.get("command") == "ready":
+        roster = args["roster"]
+        projects_dir = args["projects_dir"]
+        registry_dir = args["registry_dir"]
+        state_dir = args["state_dir"]
+        assert isinstance(roster, Path)
+        assert isinstance(projects_dir, Path)
+        assert isinstance(registry_dir, Path)
+        assert isinstance(state_dir, Path)
+        _ = extract(roster, projects_dir, registry_dir, state_dir, verbose=False)
+        comparison = compare(state_dir)
+        now = args["now"]
+        assert now is None or isinstance(now, datetime)
+        gate, lines = study_report.ready(comparison, now)
+        print("\n".join(lines))
+        if not gate:
+            raise SystemExit(3)
 
 
 if __name__ == "__main__":

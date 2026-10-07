@@ -162,7 +162,7 @@ def who() -> dict[str, str | None]:
     return {
         "seat": env.get("PLAN_DELEGATE_TEAM_ROLE") or None,
         "delegate_session": Path(board.rstrip("/")).name if board else None,
-        "session": env.get("CLAUDE_CODE_SESSION_ID") or env.get("CODEX_THREAD_ID") or None,
+        "session": env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID") or None,
     }
 
 
