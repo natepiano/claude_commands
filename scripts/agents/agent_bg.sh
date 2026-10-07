@@ -320,8 +320,28 @@ refresh_log
 # reads the summary never finds nothing at all.
 if [[ ! -s "${SUMMARY_FILE}" ]]; then
   if [[ -s "${LOG_FILE}" ]]; then
-    tail -c 4000 "${LOG_FILE}" > "${SUMMARY_FILE}" 2>/dev/null || true
-  else
+    if ! "$PY" - "${LOG_FILE}" "${SUMMARY_FILE}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+log = Path(sys.argv[1]).read_bytes().decode("utf-8", errors="replace")
+terminal_sequences = (
+    r"\x1b\].*?(?:\x07|\x1b\\|\Z)"
+    r"|\x1b\[[0-?]*[ -/]*[@-~]"
+    r"|\x1b[ -/]*[0-~]"
+)
+plain = re.sub(terminal_sequences, "", log, flags=re.DOTALL)
+plain = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", plain)
+tail = plain[-4000:]
+if tail.strip():
+    Path(sys.argv[2]).write_text(tail, encoding="utf-8")
+PY
+    then
+      : > "${SUMMARY_FILE}"
+    fi
+  fi
+  if [[ ! -s "${SUMMARY_FILE}" ]]; then
     printf 'The background agent %s produced no summary.\n' "${MESH_NAME}" > "${SUMMARY_FILE}"
   fi
 fi

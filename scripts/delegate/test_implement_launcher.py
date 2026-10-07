@@ -132,17 +132,33 @@ import pathlib
 import sys
 
 root = pathlib.Path(os.environ['STUB_CLAUDE_ROOT'])
-if sys.argv[1:3] == ['agents', '--json']:
+if sys.argv[1] == '--bg':
+    (root / 'launch_args.json').write_text(json.dumps(sys.argv[1:]))
+    (root / 'seat_state').write_text('busy')
+    own_summary = root / 'own_summary.bin'
+    if own_summary.exists():
+        pathlib.Path(os.environ['STUB_SUMMARY']).write_bytes(own_summary.read_bytes())
+    name = sys.argv[sys.argv.index('--name') + 1]
+    print(f'backgrounded · abc12345 · {name}')
+elif sys.argv[1:3] == ['agents', '--json']:
     unreadable = root / 'unreadable_listing_once'
     if unreadable.exists():
         unreadable.unlink()
         print('not JSON')
         sys.exit(0)
     status = (root / 'seat_state').read_text().strip()
-    print(json.dumps([{'id': 'abc12345', 'name': 'fixture-impl', 'status': status}]
+    if status == 'busy':
+        (root / 'seat_state').write_text('idle')
+    launch_args = root / 'launch_args.json'
+    name = 'fixture-impl'
+    if launch_args.exists():
+        arguments = json.loads(launch_args.read_text())
+        name = arguments[arguments.index('--name') + 1]
+    print(json.dumps([{'id': 'abc12345', 'name': name, 'status': status}]
                      if status != 'gone' else []))
 elif sys.argv[1] == 'logs':
-    print('stub Claude log')
+    pane = root / 'pane.bin'
+    sys.stdout.buffer.write(pane.read_bytes() if pane.exists() else b'stub Claude log\\n')
 else:
     sys.exit(2)
 """
@@ -487,12 +503,131 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
                 ))
             ) from error
 
+    def claude_launch(
+        self, session_dir: Path, registry_row: str, *, inherited_effort: str = ""
+    ) -> subprocess.CompletedProcess[str]:
+        registry = self.root / ".claude" / "config" / "agents.conf"
+        _ = registry.write_text(
+            CLAUDE_REGISTRY.replace("impl=opus:high", f"impl={registry_row}")
+            .replace(
+                "opus=low,medium,high,xhigh,max",
+                "opus=low,medium,high,xhigh,max\nsonnet=low,medium,high,xhigh,max",
+            ),
+            encoding="utf-8",
+        )
+        stub = self.root / "claude"
+        _ = stub.write_text(STUB_CLAUDE, encoding="utf-8")
+        stub.chmod(0o755)
+        environment = self.environment()
+        environment["CLAUDE_BIN"] = str(stub)
+        environment["STUB_CLAUDE_ROOT"] = str(self.root)
+        environment["STUB_SUMMARY"] = str(session_dir / "impl_summary_impl.txt")
+        if inherited_effort:
+            environment["AGENT_BG_EFFORT"] = inherited_effort
+        else:
+            _ = environment.pop("AGENT_BG_EFFORT", None)
+        return subprocess.run(
+            ["bash", str(self.implement_script), str(session_dir), str(self.working_dir),
+             str(self.prompt_file), "impl", "the retry path", "impl",
+             "writing the retry path", "0", "impl"],
+            check=False, capture_output=True, text=True, env=environment, timeout=30,
+        )
+
     def open_passes(self, session_dir: Path) -> dict[str, OpenPass]:
         stored = cast(
             "ProgressState",
             json.loads((session_dir / "progress_history_state.json").read_text(encoding="utf-8")),
         )
         return stored["pass"]
+
+    def test_new_claude_seat_uses_registry_effort(self) -> None:
+        for row, expected_effort in (("sonnet:low", "low"), ("sonnet", "")):
+            with self.subTest(row=row):
+                session_dir = self.start_phase(f"effort-{row.replace(':', '-')}")
+                result = self.claude_launch(
+                    session_dir, row, inherited_effort="xhigh"
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                arguments = cast("list[str]", json.loads(
+                    (self.root / "launch_args.json").read_text(encoding="utf-8")
+                ))
+                self.assertEqual(arguments[arguments.index("--model") + 1], "sonnet")
+                if expected_effort:
+                    self.assertEqual(
+                        arguments[arguments.index("--effort") + 1], expected_effort
+                    )
+                else:
+                    self.assertNotIn("--effort", arguments)
+                self.assertEqual(
+                    (session_dir / "impl_bg_id_impl").read_text(encoding="utf-8"),
+                    "abc12345\n",
+                )
+                self.assertIn(
+                    "abc12345\t", (session_dir / "seats").read_text(encoding="utf-8")
+                )
+
+    def test_claude_pane_fallback_strips_controls_before_character_cut(self) -> None:
+        session_dir = self.start_phase("pane-cleanup")
+        raw = (
+            "é" * 4050 + "\x1b]0;Title\x07\x1b]1;Other\x1b\\"
+            + "\x1b[31mVisible\r text\b\x1b[2K\x1b[0m\x1b7\nNext line\n"
+        )
+        _ = (self.root / "pane.bin").write_bytes(raw.encode("utf-8"))
+
+        result = self.claude_launch(session_dir, "sonnet:low")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = (session_dir / "impl_summary_impl.txt").read_text(encoding="utf-8")
+        expected = ("é" * 4050 + "Visible text\nNext line\n")[-4000:]
+        self.assertEqual(summary, expected)
+        self.assertEqual(len(summary), 4000)
+        self.assertNotIn("\x1b", summary)
+        self.assertNotIn("\r", summary)
+        self.assertEqual((session_dir / "impl_agent_impl.log").read_bytes(), raw.encode("utf-8"))
+
+    def test_claude_pane_fallback_keeps_newline_and_tab_after_a_stray_escape(self) -> None:
+        session_dir = self.start_phase("pane-stray-escape")
+        _ = (self.root / "pane.bin").write_bytes(
+            "Before\x1b\nMiddle\x1b\tTail\x1b(Bend\n".encode("utf-8")
+        )
+
+        result = self.claude_launch(session_dir, "sonnet:low")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (session_dir / "impl_summary_impl.txt").read_text(encoding="utf-8"),
+            "Before\nMiddle\tTailend\n",
+        )
+
+    def test_claude_control_only_pane_uses_no_summary_line(self) -> None:
+        session_dir = self.start_phase("pane-controls-only")
+        _ = (self.root / "pane.bin").write_bytes(
+            b"\x1b[31m\x1b]0;Title\x07\x1b]1;Other\x1b\\\x1b7\r\b\x07"
+        )
+
+        result = self.claude_launch(session_dir, "sonnet:low")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = (session_dir / "impl_summary_impl.txt").read_text(encoding="utf-8")
+        arguments = cast("list[str]", json.loads(
+            (self.root / "launch_args.json").read_text(encoding="utf-8")
+        ))
+        name = arguments[arguments.index("--name") + 1]
+        self.assertEqual(
+            summary, f"The background agent {name} produced no summary.\n",
+        )
+
+    def test_claude_written_summary_is_preserved_byte_for_byte(self) -> None:
+        session_dir = self.start_phase("own-summary")
+        original = b"Seat summary\r\n\x1b[31mcolour\x1b[0m\n"
+        _ = (self.root / "own_summary.bin").write_bytes(original)
+        _ = (self.root / "pane.bin").write_bytes(b"Other pane output\n")
+
+        result = self.claude_launch(session_dir, "sonnet:low")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session_dir / "impl_summary_impl.txt").read_bytes(), original)
 
     def test_a_dispatch_with_no_pass_kind_is_refused(self) -> None:
         # What the incident actually looked like on the wire: a seat launched
