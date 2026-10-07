@@ -161,24 +161,15 @@ The pause is safe to register: it cannot delay a prompt, cannot stay on for ever
 
 ### Phase 3 — The broadcast skips a session record it cannot read  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `broadcast.py` reaches every live session when a registry file cannot be read, as it did before Phase 2 gave `read_session` a named answer for that case.
-
-**Spec:**
-- `scripts/production/broadcast.py`, `live_sessions()` (line 64): since Phase 2 `sessions.read_session` returns `SessionRecord | UnreadableSessionRecord` where it returned `SessionRecord | None`, so the line's `record is None` no longer catches an unreadable record and `record["name"]` raises `TypeError` on one. Import `UnreadableSessionRecord` beside the three names line 30 imports, and skip a record with `isinstance(record, UnreadableSessionRecord)` where the line tested `record is None`. Nothing else changes.
-- `scripts/production/test_broadcast.py`: one test, `test_a_registry_file_that_cannot_be_read_is_skipped`. A registry file that is not JSON and one that parses but lacks fields sit beside the four live records; `--all` exits 0 and prints the same five lines as `test_all_reaches_every_role_at_once_and_never_the_sender`. It fails without the repair.
+`scripts/production/broadcast.py` `live_sessions()` skips a registry file that `sessions.read_session` reports as `UnreadableSessionRecord`, so a broadcast reaches every live session when a registry file is not JSON or lacks a field.
 
 **Files:**
 - `scripts/production/broadcast.py` — the skip.
-- `scripts/production/test_broadcast.py` — the test.
+- `scripts/production/test_broadcast.py` — `test_a_registry_file_that_cannot_be_read_is_skipped`.
 
-**Seats:** 1 writer. The unit director makes this one edit directly: the defect names its one correct edit.
-- `impl` — `scripts/production/broadcast.py`, `scripts/production/test_broadcast.py`.
-
-**Constraints from prior phases:** Phase 2 changed `scripts/message/sessions.py`: `read_session(path) -> SessionRecord | UnreadableSessionRecord`, with `UnreadableSessionRecord.FOUND` for a file that cannot be read, is not JSON, or lacks a field. `scripts/production/broadcast.py` and `scripts/production/codex_winddown.py` are the only importers of `sessions` under `scripts/`; `codex_winddown.py` imports `SessionRecord` alone and needs no change. The showrunner's merge check found this on 2026-10-07: Phase 2's type check ran on the changed files only, and `broadcast.py` arrived by a merge. Neither file belongs to a live unit's row: the checkpoint notice names them as `also touches`.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/production -p 'test_*.py'` green, and the same for `scripts/message` and `scripts/hooks`; `basedpyright scripts/production`, `basedpyright scripts/message` and `basedpyright scripts/hooks`, each on the whole directory, end `0 errors, 0 warnings, 0 notes`.
+**Gotchas:** `broadcast.py` and `codex_winddown.py` are the only importers of `sessions` under `scripts/`; `codex_winddown.py` imports `SessionRecord` alone.
 
 ### Phase 4 — `/showrunner:rename_unit <old> <new>` renames a unit's session everywhere the showrunner reads it  · status: todo
 
