@@ -141,8 +141,8 @@ echo "at $(TZ=$ZONE date '+%H:%M %Z') / $(date -u +%H:%M) UTC"
 processes=$(ps -eo pid=,ppid=,args=)
 for u in $units; do
   echo "== $u"
-  if ! $TM has-session -t "$u" 2>/dev/null; then echo 'SESSION GONE'; continue; fi
-  pane_pid=$($TM display-message -p -t "$u" '#{pane_pid}')
+  if ! $TM has-session -t "=$u" 2>/dev/null; then echo 'SESSION GONE'; continue; fi
+  pane_pid=$($TM display-message -p -t "=$u:" '#{pane_pid}')
   pid=$(pane_claude_pid "$pane_pid")
   [[ -z $pid ]] && echo 'CLAUDE NOT RUNNING'
   if [[ -n $pid ]]; then
@@ -157,7 +157,7 @@ for u in $units; do
       fi
     fi
   fi
-  p=$($TM capture-pane -p -J -S -400 -t "$u")
+  p=$($TM capture-pane -p -J -S -400 -t "=$u:")
   waiting_on_user "$u" "$p"
   pane=$(print -r -- "$p" | tail -150)
   print -r -- "$pane" | grep -E '^● ' | grep -vE 'says:|^● (Bash|Read|Write|Edit|Skill|Update|Search)\(' | tail -2 | cut -c1-220

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,7 +25,7 @@ with (state / "calls").open("a") as output:
     output.write(name + " " + " ".join(sys.argv[1:])
                  + (" cwd=" + os.getcwd() if name == "cargo-berth" else "") + "\\n")
 if name == "tmux" and sys.argv[1:2] == ["has-session"]:
-    session = sys.argv[-1]
+    session = sys.argv[-1].removeprefix("=")
     raise SystemExit(0 if (state / ("live-" + session)).exists() else 1)
 if name == "ssh":
     print("rc=" + (state / "mac-rc").read_text().strip() if (state / "mac-rc").exists() else "rc=0")
@@ -238,6 +239,25 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn(beta_merge[:7], result.stdout)
         self.assertIn("alpha", (self.state / "calls").read_text())
         self.assertIn("beta", (self.state / "calls").read_text())
+
+    def test_load_reads_a_gone_unit_as_gone_while_a_session_its_name_prefixes_lives(self) -> None:
+        binary = shutil.which("tmux")
+        if binary is None:
+            self.skipTest("tmux is required to check its session matching")
+        self.running()
+        server_dir = self.root / "tmux"
+        server_dir.mkdir()
+        self.env["TMUX_TMPDIR"] = str(server_dir)
+        _ = self.env.pop("TMUX", None)
+        self.write(self.root / "bin" / "tmux", f'#!/bin/sh\nexec {binary} "$@"\n')
+        self.addCleanup(subprocess.run, [binary, "kill-server"], env=self.env, capture_output=True, check=False)
+        for name in ("alphabet", "beta"):
+            _ = subprocess.run([binary, "-f", "/dev/null", "new-session", "-d", "-s", name, "sleep 60"],
+                               env=self.env, check=True)
+        result = self.run_lifecycle("load", "--no-ci", "--resume")
+        self.assert_step(result, "ok")
+        self.assertIn("alpha-unit: alpha gone", result.stdout)
+        self.assertIn("beta-unit: beta live", result.stdout)
 
     def test_open_holds_when_production_is_wrapped(self) -> None:
         self.running()
