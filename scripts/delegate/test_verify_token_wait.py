@@ -72,6 +72,20 @@ PY
         state=$(ps -p "$old" -o stat= 2>/dev/null || true)
         case "$state" in ''|Z*) : ;; *) exit 98 ;; esac
     fi
+    if [ "${TEST_CORRUPT_OWNER:-0}" = 1 ]; then
+        python3 - "$TEST_OWNED_RECORD" "$TEST_STEP_GROUP" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+record = Path(sys.argv[1])
+Path(sys.argv[2]).write_text(str(json.loads(record.read_text())["group"]))
+record.write_text("invalid ownership record")
+PY
+    fi
+    if [ -n "${TEST_CARGO_STATUS:-}" ]; then
+        exit "$TEST_CARGO_STATUS"
+    fi
     exit 0
 fi
 exit 97
@@ -184,6 +198,34 @@ esac
         result = self.verify(environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((self.root / "owned-confirmed").exists())
+
+    def test_failed_release_reports_reason_and_fails_successful_step(self) -> None:
+        board = self.root / "board"
+        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                       "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_CORRUPT_OWNER": "1",
+                       "TEST_OWNED_RECORD": str(board / "locks" / "cargo.d" / "owned"),
+                       "TEST_STEP_GROUP": str(self.root / "step-group")}
+        result = self.verify(environment)
+        group = int((self.root / "step-group").read_text())
+        self.started_groups.add(group)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("board.sh: invalid step ownership record", result.stderr)
+        self.assertTrue((board / "locks" / "cargo.d").exists())
+        self.assertEqual(self.live_group_processes(group), [])
+
+    def test_failed_release_preserves_step_failure(self) -> None:
+        board = self.root / "board"
+        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                       "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_CORRUPT_OWNER": "1",
+                       "TEST_CARGO_STATUS": "42",
+                       "TEST_OWNED_RECORD": str(board / "locks" / "cargo.d" / "owned"),
+                       "TEST_STEP_GROUP": str(self.root / "step-group")}
+        result = self.verify(environment)
+        group = int((self.root / "step-group").read_text())
+        self.started_groups.add(group)
+        self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
+        self.assertIn("board.sh: invalid step ownership record", result.stderr)
+        self.assertEqual(self.live_group_processes(group), [])
 
     def test_waiting_for_peer_call_records_token_seconds(self) -> None:
         board = self.root / "board"
@@ -306,7 +348,7 @@ esac
                        "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                  env=environment, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, start_new_session=True)
+                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
         self.started_groups.add(first.pid)
         try:
             deadline = time.monotonic() + 15
@@ -333,9 +375,24 @@ esac
             self.assertIn(cargo_pid, self.live_group_processes(step_group),
                           "reclaim ended the live holder's cargo")
 
+            reclaimed_release = subprocess.run(
+                ["bash", str(BOARD), "release", str(board), "first", "cargo", "--pid", str(first.pid)],
+                capture_output=True, text=True, check=False, timeout=10)
+            self.assertEqual(reclaimed_release.returncode, 3, reclaimed_release.stderr)
+            self.assertIn("first does not hold cargo (holder is second)", reclaimed_release.stderr)
+            wrong_process_release = subprocess.run(
+                ["bash", str(BOARD), "release", str(board), "first", "cargo", "--pid", "1"],
+                capture_output=True, text=True, check=False, timeout=10)
+            self.assertEqual(wrong_process_release.returncode, 1, wrong_process_release.stderr)
+            unowned_release = subprocess.run(
+                ["bash", str(BOARD), "release", str(board), "third", "cargo"],
+                capture_output=True, text=True, check=False, timeout=10)
+            self.assertEqual(unowned_release.returncode, 1, unowned_release.stderr)
+
             _ = (self.root / "release").touch()
-            _ = first.wait(timeout=20)
-            self.assertEqual(first.returncode, 0)
+            _, first_error = first.communicate(timeout=20)
+            self.assertEqual(first.returncode, 0, first_error)
+            self.assertIn("first does not hold cargo (holder is second)", first_error)
             released = subprocess.run(["bash", str(BOARD), "release", str(board), "second",
                                        "cargo"], capture_output=True, text=True, check=False,
                                       timeout=10)
@@ -345,6 +402,75 @@ esac
             if first.poll() is None:
                 self.end_group(first.pid)
             _ = first.wait(timeout=5)
+            if first.stderr is not None:
+                first.stderr.close()
+
+    def test_same_slot_reclaim_preserves_new_step_and_old_result(self) -> None:
+        board = self.root / "board"
+        lock = board / "locks" / "cargo.d"
+        first_release = self.root / "first-release"
+        second_release = self.root / "second-release"
+        first_running = self.root / "first-running"
+        second_running = self.root / "second-running"
+        first_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                             "PLAN_DELEGATE_TEAM_ROLE": "holder", "TEST_BLOCK": "1",
+                             "TEST_RELEASE": str(first_release),
+                             "TEST_RUNNING": str(first_running),
+                             "TEST_CARGO_PID": str(self.root / "first-cargo-pid")}
+        second_environment = {**first_environment, "TEST_RELEASE": str(second_release),
+                              "TEST_RUNNING": str(second_running),
+                              "TEST_CARGO_PID": str(self.root / "second-cargo-pid")}
+        first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+                                 env=first_environment, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
+        self.started_groups.add(first.pid)
+        second: subprocess.Popen[str] | None = None
+        try:
+            deadline = time.monotonic() + 15
+            while not first_running.exists() and time.monotonic() < deadline:
+                self.assertIsNone(first.poll(), "first verify exited before cargo")
+                time.sleep(0.05)
+            self.assertTrue(first_running.exists(), "first cargo did not start")
+            _ = (lock / "expires").write_text("0")
+            second = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+                                      env=second_environment, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.PIPE, text=True, start_new_session=True)
+            self.started_groups.add(second.pid)
+            while not second_running.exists() and time.monotonic() < deadline:
+                self.assertIsNone(second.poll(), "second verify exited before cargo")
+                time.sleep(0.05)
+            self.assertTrue(second_running.exists(), "second cargo did not start")
+            self.assertEqual((lock / "holder_pid").read_text(), str(second.pid))
+            second_record = cast(dict[str, object], json.loads((lock / "owned").read_text()))
+            second_group = cast(int, second_record["group"])
+            self.started_groups.add(second_group)
+            second_cargo_pid = int((self.root / "second-cargo-pid").read_text())
+
+            first_release.touch()
+            _, first_error = first.communicate(timeout=20)
+            self.assertEqual(first.returncode, 0, first_error)
+            self.assertEqual((lock / "holder_pid").read_text(), str(second.pid))
+            self.assertIsNone(second.poll(), "old release ended the new verify")
+            self.assertIn(second_cargo_pid, self.live_group_processes(second_group),
+                          "old release ended the new cargo step")
+
+            second_release.touch()
+            _, second_error = second.communicate(timeout=20)
+            self.assertEqual(second.returncode, 0, second_error)
+        finally:
+            first_release.touch()
+            second_release.touch()
+            if first.poll() is None:
+                self.end_group(first.pid)
+            _ = first.wait(timeout=5)
+            if first.stderr is not None:
+                first.stderr.close()
+            if second is not None:
+                if second.poll() is None:
+                    self.end_group(second.pid)
+                _ = second.wait(timeout=5)
+                if second.stderr is not None:
+                    second.stderr.close()
 
     def assert_interrupted_holder_stops_step_before_release(self, interruption: signal.Signals) -> None:
         board = self.root / "board"
