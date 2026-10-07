@@ -11,3 +11,14 @@ Otherwise:
 1. Run `~/.claude/scripts/buildlog/buildlog schema` once: tables, columns, views, example queries.
 2. Write SQL and run `~/.claude/scripts/buildlog/buildlog query "<SQL>"` (read-only; single quotes inside). Add `--json` only when you need exact values to compute from.
 3. Answer the question in a few lines, with the numbers. Per kind of step, split by caller unless asked otherwise. Mac rows arrive with natedev's hourly sync.
+
+## Owner session
+
+In the build-report session, point the schedule at the running session and check its status:
+
+```sh
+zsh ~/.claude/scripts/message/notifier.sh new report-builds --to "session:$CLAUDE_CODE_SESSION_ID" --every 240 --from report-builds --command 'Scheduled report (builds, every 4 hours): run /builds with no argument and show its output unchanged. Do nothing else for this message.'
+zsh ~/.claude/scripts/message/notifier.sh status report-builds
+```
+
+Repeated `new` retargets the report without moving its clock. The owner reruns it after a session restart because the session id changes.
