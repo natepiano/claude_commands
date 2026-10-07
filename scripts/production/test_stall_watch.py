@@ -229,7 +229,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(self.tick(START + 301).returncode, 0)
         self.assertEqual(len(self.sent()), 2)
 
-    def test_stalled_unit_is_bumped_and_told_once_until_latest_turn_end_changes(self) -> None:
+    def test_stalled_unit_waits_at_gate_then_bumps_after_holding_returns(self) -> None:
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.sent(), [])
         self.assertEqual(self.tick(START + 300).returncode, 0)
@@ -252,6 +252,30 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.panes["unit-one"]["pane"] = "— gate: ready for next step\n"
         self.assertEqual(self.tick(START + 662).returncode, 0)
         self.assertEqual(self.tick(START + 962).returncode, 0)
+        self.assertEqual(len(self.sent()), 2)
+        self.panes["unit-one"]["pane"] += "— holding: ready for next task\n"
+        self.assertEqual(self.tick(START + 963).returncode, 0)
+        self.assertEqual(len(self.sent()), 2)
+        self.assertEqual(self.tick(START + 1263).returncode, 0)
+        second = self.sent()[2:]
+        self.assertEqual(len(second), 2)
+        self.assertNotEqual({item["key"] for item in first}, {item["key"] for item in second})
+
+    def test_stalled_unit_is_bumped_and_told_once_until_latest_turn_end_changes(self) -> None:
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        self.assertEqual(self.tick(START + 300).returncode, 0)
+        first = self.sent()
+        self.assertEqual(len(first), 2)
+        self.assertEqual(self.tick(START + 360).returncode, 0)
+        self.assertEqual(len(self.sent()), 2)
+        self.panes["unit-one"]["pane"] = "reply text\n— holding: waiting on a decision\n"
+        self.assertEqual(self.tick(START + 361).returncode, 0)
+        self.assertEqual(self.tick(START + 661).returncode, 0)
+        self.assertEqual(len(self.sent()), 2)
+        self.panes["unit-one"]["pane"] = "— holding: ready for next step\n"
+        self.assertEqual(self.tick(START + 662).returncode, 0)
+        self.assertEqual(self.tick(START + 962).returncode, 0)
         second = self.sent()[2:]
         self.assertEqual(len(second), 2)
         self.assertNotEqual({item["key"] for item in first}, {item["key"] for item in second})
@@ -272,6 +296,50 @@ raise SystemExit(1 if record['to'] in fail else 0)
                 self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
                                  {"bump", "tell"})
                 self.send_log.unlink()
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+
+    def test_gate_turn_end_waits_until_a_later_holding_status_stalls(self) -> None:
+        self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
+        for status in ("— gate: the user runs the Mac Claude go-live and controls at a Mac terminal\n",
+                       "gate: the user runs the Mac Claude go-live and controls at a Mac terminal\n"):
+            with self.subTest(status=status):
+                self.panes["unit-one"]["pane"] = status
+                self.assertEqual(self.tick(START).returncode, 0)
+                self.assertEqual(self.sent(), [])
+                self.assertEqual(self.tick(START + 600).returncode, 0)
+                self.assertEqual(self.sent(), [])
+                self.panes["unit-one"]["pane"] = status + "— holding: ready for next task\n"
+                self.assertEqual(self.tick(START + 601).returncode, 0)
+                self.assertEqual(self.sent(), [])
+                self.assertEqual(self.tick(START + 1200).returncode, 0)
+                self.assertEqual(self.sent(), [])
+                self.assertEqual(self.tick(START + 1201).returncode, 0)
+                self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
+                                 {"bump", "tell"})
+                self.send_log.unlink(missing_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+
+    def test_decision_turn_end_waits_until_a_later_holding_status_stalls(self) -> None:
+        self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
+        for status in ("— decision: the user chooses whether to proceed\n",
+                       "decision: the user chooses whether to proceed\n"):
+            with self.subTest(status=status):
+                self.panes["unit-one"]["pane"] = status
+                self.assertEqual(self.tick(START).returncode, 0)
+                self.assertEqual(self.sent(), [])
+                self.assertEqual(self.tick(START + 600).returncode, 0)
+                self.assertEqual(self.sent(), [])
+                self.panes["unit-one"]["pane"] = status + "— holding: ready for next task\n"
+                self.assertEqual(self.tick(START + 601).returncode, 0)
+                self.assertEqual(self.sent(), [])
+                self.assertEqual(self.tick(START + 1200).returncode, 0)
+                self.assertEqual(self.sent(), [])
+                self.assertEqual(self.tick(START + 1201).returncode, 0)
+                self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
+                                 {"bump", "tell"})
+                self.send_log.unlink(missing_ok=True)
                 for path in self.state.glob("*.json"):
                     path.unlink()
 

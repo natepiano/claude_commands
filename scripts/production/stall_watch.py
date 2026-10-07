@@ -26,7 +26,9 @@ SESSIONS = Path(os.environ.get("STALL_WATCH_SESSIONS") or Path(__file__).resolve
 SEND = Path(os.environ.get("STALL_WATCH_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
 TMUX = os.environ.get("STALL_WATCH_TMUX") or "tmux"
 PS = os.environ.get("STALL_WATCH_PS") or "ps"
-TURN_END = re.compile(r"^\s*(?:— )?(?:holding|gate|decision|blocked|done):.*$", re.MULTILINE)
+WAITING_KINDS = ("done", "blocked", "gate", "decision")
+HOLDING_KIND = "holding"
+TURN_END = re.compile(rf"^\s*(?:— )?(?P<kind>{'|'.join((*WAITING_KINDS, HOLDING_KIND))}):.*$", re.MULTILINE)
 WORK = {"zsh", "bash", "sh", "implement.sh", "review.sh", "verify.sh"}
 
 
@@ -291,9 +293,9 @@ def tick(now: float) -> None:
             session_id, socket = identity
             path = stretch_path(configured["session"], name)
             stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
-            turns = TURN_END.findall(pane)
-            last = cast(str, turns[-1]).strip() if turns else "none on screen"
-            if last.lstrip("— ").startswith(("done:", "blocked:")):
+            turns = list(TURN_END.finditer(pane))
+            last = turns[-1].group(0).strip() if turns else "none on screen"
+            if turns and turns[-1].group("kind") in WAITING_KINDS:
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)

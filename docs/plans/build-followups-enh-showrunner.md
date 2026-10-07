@@ -289,7 +289,7 @@ A unit's `then` in the dailies input is a JSON list of one-line items, one per u
 
 **Ruled out:** a one-line substitution for the Resume flags, since a failed substitution runs `claude --resume` with no flags and skips the family check; a `[production.codex]` set or a Codex director, since unit directors launch only on Claude.
 
-### Phase 8 — Stall watch treats a unit waiting on someone else as waiting · status: todo
+### Phase 8 — Stall watch treats a unit waiting on someone else as waiting · status: done
 
 #### Work Order
 
@@ -301,7 +301,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 
 **Spec:**
 - **Read first, in full:** `scripts/production/stall_watch.py` (`TURN_END`, the last-line test in the unit loop, `Stretch`, `read_stretch`, `work_running`, and the standby and finished-run skips) and `scripts/production/test_stall_watch.py` (`test_blocked_turn_end_waits_for_a_new_unblocked_status`, `test_holding_turn_end_still_bumps_idle_unit`, `test_done_turn_end_is_never_stalled`).
-- **The rule.** A turn-end line is a wait when its kind is `done`, `blocked`, `gate` or `decision`: in each the unit has handed the next move to someone else or has finished. `holding` is the one kind that says the unit itself is waiting on work it has running, so with nothing running it is the stall the watch exists to catch. A unit waiting on the user is already reported to the user (`unit_status.sh` prints `STILL WAITING on you`); the watch adds no second report.
+- **The rule.** A turn-end line is a wait when its kind is `done`, `blocked`, `gate` or `decision`: in each the unit has handed the next move to someone else or has finished. `holding` is the one kind that says the unit itself is waiting on work it has running, so with nothing running it is the stall the watch exists to catch. A unit waiting on the user under `decision:` or `blocked:` is already reported to the user (`unit_status.sh` prints `STILL WAITING on you`); the watch adds no second report. A `gate:` wait is not flagged by `unit_status.sh`: it shows only as the unit's activity line, and this phase leaves that script as it is.
 - **One list of kinds.** `TURN_END` already names all five kinds. Build it and the wait test from the same two names in the module, the waiting kinds and `holding`, so the pattern and the test cannot drift apart again. The test reads the kind of the last line the way `TURN_END` does, with or without the leading `— `, and replaces `last.lstrip("— ").startswith(("done:", "blocked:"))`. A pane with no turn-end line on screen (`none on screen`) takes the stall path as today.
 - **The reset is the existing one.** A waiting last line writes the fresh stretch and skips the unit, as `done:` and `blocked:` do today; the stretch restarts at the next status that is not a wait, so a unit that answers the gate and then says `— holding:` is judged from that line.
 
