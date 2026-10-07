@@ -53,9 +53,19 @@ class PromptSource(Enum):
 
 
 @dataclass(frozen=True)
-class Talking:
+class Replying:
     user_wrote_at: int
-    answered_at: int | None
+
+
+@dataclass(frozen=True)
+class Quiet:
+    user_wrote_at: int
+    reply_ended_at: int
+
+
+@dataclass(frozen=True)
+class QuestionPending:
+    due_at: int
 
 
 @dataclass(frozen=True)
@@ -73,7 +83,7 @@ class Returned:
     returned_at: int
 
 
-PausePhase = Talking | Asked | KeptOff | Returned
+PausePhase = Replying | Quiet | QuestionPending | Asked | KeptOff | Returned
 
 
 @dataclass(frozen=True)
@@ -104,9 +114,21 @@ PauseResult = Paused | NothingToPause
 
 
 @dataclass(frozen=True)
-class HookReply:
-    system_message: str | None
+class ShownToUser:
+    system_message: str
     context: str
+
+
+@dataclass(frozen=True)
+class ContextOnly:
+    context: str
+
+
+class NoReply(Enum):
+    NOTHING = "no reply"
+
+
+HookReply = ShownToUser | ContextOnly | NoReply
 
 
 @dataclass(frozen=True)
@@ -145,6 +167,13 @@ class NotRunning(Enum):
 
 
 SessionLookup = Running | NotRunning
+
+
+@dataclass(frozen=True)
+class QuestionDelivery:
+    session_id: str
+    socket: str
+    due_at: int
 
 
 def state_root() -> Path:
@@ -193,7 +222,7 @@ def first_error_line(message: str) -> str:
 
 def run_notifier(*arguments: str) -> str:
     result = subprocess.run([*notifier_command(), *arguments], capture_output=True, text=True,
-                            check=False, timeout=10)
+                            check=False, timeout=5)
     if result.returncode != 0:
         message = first_error_line(result.stderr) or first_error_line(result.stdout)
         raise RuntimeError(message or f"notifier {' '.join(arguments)} exited {result.returncode}")
@@ -279,9 +308,13 @@ def session_reports(session_id: str) -> list[Report]:
 
 
 def _phase_json(phase: PausePhase) -> dict[str, object]:
-    if isinstance(phase, Talking):
-        return {"kind": "talking", "user_wrote_at": phase.user_wrote_at,
-                "answered_at": phase.answered_at}
+    if isinstance(phase, Replying):
+        return {"kind": "replying", "user_wrote_at": phase.user_wrote_at}
+    if isinstance(phase, Quiet):
+        return {"kind": "quiet", "user_wrote_at": phase.user_wrote_at,
+                "reply_ended_at": phase.reply_ended_at}
+    if isinstance(phase, QuestionPending):
+        return {"kind": "question_pending", "due_at": phase.due_at}
     if isinstance(phase, Asked):
         return {"kind": "asked", "asked_at": phase.asked_at}
     if isinstance(phase, KeptOff):
@@ -299,10 +332,6 @@ def _integer(value: object, field: str) -> int:
     return value
 
 
-def _optional_integer(value: object, field: str) -> int | None:
-    return None if value is None else _integer(value, field)
-
-
 def _string_tuple(value: object, field: str) -> tuple[str, ...]:
     if not isinstance(value, list):
         raise ValueError(f"invalid {field}")
@@ -317,9 +346,13 @@ def _phase_from_json(value: object) -> PausePhase:
         raise ValueError("invalid phase")
     fields = cast(dict[str, object], value)
     kind = fields.get("kind")
-    if kind == "talking":
-        return Talking(_integer(fields.get("user_wrote_at"), "user_wrote_at"),
-                       _optional_integer(fields.get("answered_at"), "answered_at"))
+    if kind == "replying":
+        return Replying(_integer(fields.get("user_wrote_at"), "user_wrote_at"))
+    if kind == "quiet":
+        return Quiet(_integer(fields.get("user_wrote_at"), "user_wrote_at"),
+                     _integer(fields.get("reply_ended_at"), "reply_ended_at"))
+    if kind == "question_pending":
+        return QuestionPending(_integer(fields.get("due_at"), "due_at"))
     if kind == "asked":
         return Asked(_integer(fields.get("asked_at"), "asked_at"))
     if kind == "kept_off":
@@ -411,9 +444,20 @@ def _watcher_conf() -> Path:
     return notifier_root() / WATCHER / "conf"
 
 
+def _watcher_state() -> Path:
+    return notifier_root() / WATCHER / "state"
+
+
 def ensure_watcher() -> None:
-    if _watcher_conf().exists():
+    conf_exists = _watcher_conf().exists()
+    state_exists = _watcher_state().exists()
+    if conf_exists and state_exists:
+        if _key_values(_watcher_state()).get("ENABLED") == "1":
+            return
+        _ = run_notifier("resume", WATCHER)
         return
+    if conf_exists or state_exists:
+        _ = run_notifier("remove", WATCHER)
     home = Path.home()
     command = f"{home}/.claude/scripts/lib/py {home}/.claude/scripts/hooks/conversation_pause.py tick"
     _ = run_notifier("new", WATCHER, "--every", "1", "--run", command)
@@ -423,34 +467,71 @@ def _pause_locked(session_id: str, now: int) -> PauseResult:
     import showrunner_footer
 
     current = _record(session_id)
+    reports = session_reports(session_id)
+    footer_slugs = tuple(dict.fromkeys(
+        report.name.removeprefix("showrunner-")
+        for report in reports if report.name.startswith("showrunner-")
+    ))
+    footers_on = {
+        slug for slug in footer_slugs
+        if showrunner_footer.footer_state(slug) is showrunner_footer.FooterState.ON
+    }
+    if (isinstance(current, NoPauseRecord)
+            and not any(report.enabled for report in reports) and not footers_on):
+        return NothingToPause()
+    ensure_watcher()
+
     record = (current if isinstance(current, PauseRecord)
-              else PauseRecord(session_id, (), (), Talking(now, None)))
-    record = replace(record, phase=Talking(now, None))
+              else PauseRecord(session_id, (), (), Replying(now)))
+    record = replace(record, phase=Replying(now))
     new_instances: list[str] = []
     new_footers: list[str] = []
-    reports = session_reports(session_id)
+    failed: list[str] = []
     for report in reports:
-        if report.enabled and report.name not in record.instances:
+        if not report.enabled:
+            continue
+        newly_recorded = report.name not in record.instances
+        if newly_recorded:
             record = replace(record, instances=(*record.instances, report.name))
             write_record(record)
+        try:
             _ = run_notifier("stop", report.name)
-            new_instances.append(report.name)
-    for report in reports:
-        if not report.name.startswith("showrunner-"):
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            record = replace(record, instances=tuple(
+                name for name in record.instances if name != report.name
+            ))
+            write_record(record)
+            failed.append(report.name)
             continue
-        slug = report.name.removeprefix("showrunner-")
-        if (slug not in record.footers
-                and showrunner_footer.footer_state(slug) is showrunner_footer.FooterState.ON):
+        if newly_recorded:
+            new_instances.append(report.name)
+    for slug in footer_slugs:
+        if slug not in footers_on:
+            continue
+        newly_recorded = slug not in record.footers
+        if newly_recorded:
             record = replace(record, footers=(*record.footers, slug))
             write_record(record)
+        try:
             showrunner_footer.set_footer_state(slug, showrunner_footer.FooterState.OFF)
+        except OSError:
+            record = replace(record, footers=tuple(
+                name for name in record.footers if name != slug
+            ))
+            write_record(record)
+            failed.append(f"footer {slug}")
+            continue
+        if newly_recorded:
             new_footers.append(slug)
     if not record.instances and not record.footers:
         record_path(session_id).unlink(missing_ok=True)
-        return NothingToPause()
-    write_record(record)
-    ensure_watcher()
-    return Paused(user_words(new_instances, new_footers))
+        result: PauseResult = NothingToPause()
+    else:
+        write_record(record)
+        result = Paused(user_words(new_instances, new_footers))
+    if failed:
+        raise RuntimeError(f"failed to pause: {', '.join(failed)}")
+    return result
 
 
 def pause(session_id: str, now: int) -> PauseResult:
@@ -462,13 +543,34 @@ def _resume_items(record: PauseRecord) -> tuple[str, ...]:
     import showrunner_footer
 
     resumed_instances: list[str] = []
+    failed_instances: list[str] = []
+    resumed_footers: list[str] = []
+    failed_footers: list[str] = []
     for name in record.instances:
-        if (notifier_root() / name).is_dir():
+        if not (notifier_root() / name).is_dir():
+            continue
+        try:
             _ = run_notifier("resume", name)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            failed_instances.append(name)
+        else:
             resumed_instances.append(name)
     for slug in record.footers:
-        showrunner_footer.set_footer_state(slug, showrunner_footer.FooterState.ON)
-    return user_words(resumed_instances, record.footers)
+        try:
+            showrunner_footer.set_footer_state(slug, showrunner_footer.FooterState.ON)
+        except OSError:
+            failed_footers.append(slug)
+        else:
+            resumed_footers.append(slug)
+    if failed_instances or failed_footers:
+        write_record(replace(
+            record,
+            instances=tuple(failed_instances),
+            footers=tuple(failed_footers),
+        ))
+        failed = [*failed_instances, *(f"footer {slug}" for slug in failed_footers)]
+        raise RuntimeError(f"failed to resume: {', '.join(failed)}")
+    return user_words(resumed_instances, resumed_footers)
 
 
 def _resume_locked(session_id: str) -> tuple[str, ...]:
@@ -488,9 +590,11 @@ def resume(session_id: str) -> tuple[str, ...]:
 def mark_answered(session_id: str, now: int) -> None:
     with record_lock():
         current = _record(session_id)
-        if (isinstance(current, PauseRecord) and isinstance(current.phase, Talking)
-                and current.phase.answered_at is None):
-            write_record(replace(current, phase=replace(current.phase, answered_at=now)))
+        if isinstance(current, PauseRecord) and isinstance(current.phase, Replying):
+            write_record(replace(
+                current,
+                phase=Quiet(current.phase.user_wrote_at, now),
+            ))
 
 
 def answer(prompt: str) -> PromptAnswer:
@@ -506,11 +610,11 @@ def _with_list(sentence: str, words: tuple[str, ...]) -> str:
     return f"{sentence}: {', '.join(words)}." if words else f"{sentence}."
 
 
-def _pause_reply(result: PauseResult) -> HookReply | None:
+def _pause_reply(result: PauseResult) -> HookReply:
     if not isinstance(result, Paused) or not result.newly:
-        return None
+        return NoReply.NOTHING
     names = ", ".join(result.newly)
-    return HookReply(
+    return ShownToUser(
         f"Automatic updates paused while we talk: {names}.",
         "Automatic updates for this session are paused while the user talks to you: "
         +
@@ -527,14 +631,14 @@ def _keep_context() -> str:
     )
 
 
-def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int) -> HookReply | None:
+def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int) -> HookReply:
     response = answer(prompt) if source is PromptSource.TYPED else NotAnAnswer()
     with record_lock():
         current = _record(session_id)
         if isinstance(current, PauseRecord) and isinstance(current.phase, Asked):
             if isinstance(response, Yes):
                 words = _resume_locked(session_id)
-                return HookReply(
+                return ShownToUser(
                     _with_list("Automatic updates are back on", words),
                     'The user answered yes to "Return to automatic updates?". '
                     + _with_list("They are back on", words)
@@ -542,12 +646,11 @@ def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int
                 )
             if isinstance(response, No):
                 write_record(replace(current, phase=KeptOff()))
-                return HookReply("Automatic updates stay off.", _keep_context())
+                return ShownToUser("Automatic updates stay off.", _keep_context())
             _ = _pause_locked(session_id, now)
             if source is not PromptSource.TYPED:
-                return None
-            return HookReply(
-                None,
+                return NoReply.NOTHING
+            return ContextOnly(
                 'You asked the user "Return to automatic updates? (yes / no)" and they wrote something '
                 + "else. If their message answers that question, run "
                 +
@@ -558,14 +661,19 @@ def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int
             late_answer = now - current.phase.returned_at < TOMBSTONE_SECONDS
             if late_answer and isinstance(response, Yes):
                 record_path(session_id).unlink(missing_ok=True)
-                return HookReply(None, "Automatic updates already returned on their own. Tell the user that in one line.")
+                return ContextOnly(
+                    "Automatic updates already returned on their own. Tell the user that in one line."
+                )
             if late_answer and isinstance(response, No):
                 result = _pause_locked(session_id, now)
                 refreshed = _record(session_id)
                 if isinstance(refreshed, PauseRecord):
                     write_record(replace(refreshed, phase=KeptOff()))
                 words = result.newly if isinstance(result, Paused) else ()
-                return HookReply(_with_list("Automatic updates are off again", words), _keep_context())
+                return ShownToUser(
+                    _with_list("Automatic updates are off again", words),
+                    _keep_context(),
+                )
             record_path(session_id).unlink(missing_ok=True)
             return _pause_reply(_pause_locked(session_id, now))
         return _pause_reply(_pause_locked(session_id, now))
@@ -592,19 +700,22 @@ def _session_lookup(session_id: str) -> SessionLookup:
     return NotRunning.GONE if result.returncode in {0, 1} else NotRunning.UNKNOWN
 
 
-def _send_question(session_id: str, socket: str) -> None:
+def _send_question(delivery: QuestionDelivery) -> bool:
     try:
         result = subprocess.run(
-            [*send_command(), "--to", f"uds:{socket}", "--from", WATCHER,
-             "--key", f"conversation-pause-{session_id}", "--text", QUESTION],
+            [*send_command(), "--to", f"uds:{delivery.socket}", "--from", WATCHER,
+             "--key", f"conversation-pause-{delivery.session_id}", "--text", QUESTION],
             capture_output=True, text=True, check=False, timeout=90,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        print(f"conversation-pause: send for {session_id}: {error}", file=sys.stderr)
-        return
-    if result.returncode != 0:
-        message = first_error_line(result.stderr) or first_error_line(result.stdout) or str(result.returncode)
-        print(f"conversation-pause: send for {session_id}: {message}", file=sys.stderr)
+        print(f"conversation-pause: send for {delivery.session_id}: {error}", file=sys.stderr)
+        return False
+    first_output = first_error_line(result.stdout)
+    if result.returncode == 0 and first_output.startswith("SENT:"):
+        return True
+    message = first_error_line(result.stderr) or first_output or str(result.returncode)
+    print(f"conversation-pause: send for {delivery.session_id}: {message}", file=sys.stderr)
+    return False
 
 
 def _return_after_timeout(record: PauseRecord, now: int) -> tuple[str, ...]:
@@ -613,59 +724,95 @@ def _return_after_timeout(record: PauseRecord, now: int) -> tuple[str, ...]:
     return words
 
 
-def _question_due(phase: Talking, now: int) -> bool:
-    if phase.answered_at is not None:
-        return now - phase.answered_at >= QUIET_SECONDS
-    return now - phase.user_wrote_at >= UNANSWERED_SECONDS
+def _review_slugs(record: PauseRecord) -> frozenset[str]:
+    slugs = set(record.footers)
+    slugs.update(
+        name.removeprefix("showrunner-")
+        for name in record.instances if name.startswith("showrunner-")
+    )
+    return frozenset(slugs)
 
 
-def _advance(path: Path, now: int, questions: list[tuple[str, str]], actions: list[str]) -> bool:
-    """Move one record on; True while it still needs the watcher."""
-    record = read_record(path)
-    session = _session_lookup(record.session_id)
-    if session is NotRunning.UNKNOWN:
-        return True
+def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup, review_open: bool,
+             questions: list[QuestionDelivery], actions: list[str]) -> None:
     if session is NotRunning.GONE:
         words = _resume_items(record)
         path.unlink(missing_ok=True)
         actions.append(f"session ended: {record.session_id}: {', '.join(words)}")
-        return False
+        return
+    if review_open:
+        return
     phase = record.phase
-    if isinstance(phase, Talking):
-        if _question_due(phase, now):
-            write_record(replace(record, phase=Asked(now)))
-            questions.append((record.session_id, session.socket))
+    if isinstance(phase, Replying):
+        if now - phase.user_wrote_at >= UNANSWERED_SECONDS:
+            phase = QuestionPending(now)
+            record = replace(record, phase=phase)
+            write_record(record)
             actions.append(f"question due: {record.session_id}")
-        return True
+    elif isinstance(phase, Quiet):
+        if now - phase.reply_ended_at >= QUIET_SECONDS:
+            phase = QuestionPending(now)
+            record = replace(record, phase=phase)
+            write_record(record)
+            actions.append(f"question due: {record.session_id}")
+    if isinstance(phase, QuestionPending):
+        if now - phase.due_at >= ANSWER_SECONDS:
+            words = _return_after_timeout(record, now)
+            actions.append(f"automatic updates on: {record.session_id}: {', '.join(words)}")
+        elif isinstance(session, Running):
+            questions.append(QuestionDelivery(record.session_id, session.socket, phase.due_at))
+        return
     if isinstance(phase, Asked):
         if now - phase.asked_at < ANSWER_SECONDS:
-            return True
+            return
         words = _return_after_timeout(record, now)
         actions.append(f"automatic updates on: {record.session_id}: {', '.join(words)}")
-        return False
+        return
     if isinstance(phase, Returned) and now - phase.returned_at >= TOMBSTONE_SECONDS:
         path.unlink(missing_ok=True)
         actions.append(f"late-answer window ended: {record.session_id}")
-    return False
 
 
 def tick(now: int) -> tuple[str, ...]:
-    questions: list[tuple[str, str]] = []
+    import showrunner_footer
+
+    paths = sorted(state_root().glob("*.json"))
+    lookups = [(path, _session_lookup(path.stem)) for path in paths]
+    questions: list[QuestionDelivery] = []
     actions: list[str] = []
-    active = False
     with record_lock():
-        for path in sorted(state_root().glob("*.json")):
+        for path, session in lookups:
             try:
-                active = _advance(path, now, questions, actions) or active
+                record = read_record(path)
+                review_open = any(
+                    showrunner_footer.review_pause_path(slug).exists()
+                    for slug in _review_slugs(record)
+                )
+                _advance(path, record, now, session, review_open, questions, actions)
+            except FileNotFoundError:
+                continue
             except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
-                active = True
                 print(f"conversation-pause: {path.name}: {first_error_line(str(error))}",
                       file=sys.stderr)
-        if not active and _watcher_conf().exists():
+        if not any(state_root().glob("*.json")) and _watcher_conf().exists():
             _ = run_notifier("remove", WATCHER)
             actions.append("watcher removed")
-    for session_id, socket in questions:
-        _send_question(session_id, socket)
+    for delivery in questions:
+        with record_lock():
+            current = _record(delivery.session_id)
+            if (not isinstance(current, PauseRecord)
+                    or not isinstance(current.phase, QuestionPending)
+                    or current.phase.due_at != delivery.due_at):
+                continue
+        if not _send_question(delivery):
+            continue
+        delivered_at = now_epoch()
+        with record_lock():
+            current = _record(delivery.session_id)
+            if (isinstance(current, PauseRecord)
+                    and isinstance(current.phase, QuestionPending)
+                    and current.phase.due_at == delivery.due_at):
+                write_record(replace(current, phase=Asked(delivered_at)))
     return tuple(actions)
 
 

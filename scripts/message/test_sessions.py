@@ -70,14 +70,45 @@ class SessionLookupTests(unittest.TestCase):
         self.assertEqual(self.run_cli("socket", "same").stdout.strip(), str(other_path))
         self.assertEqual(self.run_cli("socket", "session:same-id").stdout.strip(), str(other_path))
 
-    def test_dead_pid_missing_socket_and_malformed_records_are_skipped(self) -> None:
+    def test_dead_pid_and_missing_socket_return_absent(self) -> None:
         self.record("dead.json", pid=2**29 + os.getpid())
         self.record("missing-socket.json", socket_path=self.root / "absent.sock")
-        _ = (self.sessions / "broken.json").write_text("{")
-        _ = (self.sessions / "missing-keys.json").write_text('{"name":"agent"}')
         for args in (("socket", "agent"), ("id", "agent")):
             result = self.run_cli(*args)
-            self.assertEqual((result.returncode, result.stdout), (1, ""))
+            self.assertEqual(
+                (result.returncode, result.stdout, result.stderr), (1, "", "")
+            )
+
+    def test_empty_readable_registry_returns_absent(self) -> None:
+        result = self.run_cli("socket", "session:missing")
+        self.assertEqual(
+            (result.returncode, result.stdout, result.stderr), (1, "", "")
+        )
+
+    def test_missing_registry_returns_unknown(self) -> None:
+        self.sessions.rmdir()
+        result = self.run_cli("socket", "session:missing")
+        self.assertEqual((result.returncode, result.stdout), (3, ""))
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+
+    def test_registry_that_cannot_be_listed_returns_unknown(self) -> None:
+        self.sessions.chmod(0)
+        self.addCleanup(self.sessions.chmod, 0o700)
+        try:
+            _ = list(self.sessions.iterdir())
+        except PermissionError:
+            pass
+        else:
+            self.skipTest("current user can list a mode-zero directory")
+        result = self.run_cli("socket", "session:missing")
+        self.assertEqual((result.returncode, result.stdout), (3, ""))
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+
+    def test_corrupt_registry_record_returns_unknown(self) -> None:
+        _ = (self.sessions / "broken.json").write_text("{")
+        result = self.run_cli("socket", "session:session-1")
+        self.assertEqual((result.returncode, result.stdout), (3, ""))
+        self.assertEqual(len(result.stderr.splitlines()), 1)
 
     def test_oversized_pid_does_not_hide_live_matching_session(self) -> None:
         self.record("oversized.json", pid=10**100, name="agent", updated=20)

@@ -27,7 +27,7 @@ from live_units import live_units
 
 MESSAGE = Path(__file__).resolve().parent.parent / "message"
 sys.path.insert(0, str(MESSAGE))
-from sessions import SessionRecord, live_session, read_session  # noqa: E402
+from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
 
 SEND = Path(os.environ.get("BROADCAST_SEND") or MESSAGE / "send.py")
 PS = shlex.split(os.environ.get("BROADCAST_PS") or "ps -eo pid=,ppid=,comm=,args=")
@@ -61,7 +61,7 @@ def live_sessions() -> dict[str, SessionRecord]:
     newest: dict[str, SessionRecord] = {}
     for path in showrunners.SESSIONS_DIR.glob("*.json"):
         record = read_session(path)
-        if record is None or not record["name"] or not live_session(record):
+        if isinstance(record, UnreadableSessionRecord) or not record["name"] or not live_session(record):
             continue
         if record["name"] not in newest or record["updatedAt"] > newest[record["name"]]["updatedAt"]:
             newest[record["name"]] = record

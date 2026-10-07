@@ -42,7 +42,7 @@ def notifier(action: str, slug: str) -> str:
 
 
 def record_path(slug: str) -> Path:
-    return showrunner_footer.state_root() / "review-paused" / f"{slug}.json"
+    return showrunner_footer.review_pause_path(slug)
 
 
 def read_record(path: Path) -> ReviewPauseRecord:
