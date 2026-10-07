@@ -145,7 +145,7 @@ class TopLevelTests(unittest.TestCase):
         other = self.add("ordinary", tmux="ordinary:@3.%3")
         _ = self.add("trunk", tmux="unit-trunk:@0.%0")
         sessions = top_level.forwarded_sessions(
-            self.folder, lambda target: target.startswith("unit-")
+            self.folder, lambda target: target.rpartition(".")[2] == "%0"
         )
         self.assertEqual(
             [(session.name, session.session_id) for session in sessions],
@@ -154,6 +154,16 @@ class TopLevelTests(unittest.TestCase):
         self.assertEqual(
             [session.address for session in sessions if isinstance(session, top_level.AddressableSession)],
             [f"uds:{other}", f"uds:{address}"],
+        )
+
+    def test_stale_tmux_session_name_uses_live_pane_to_identify_unit(self) -> None:
+        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                ["tmux"], 0, f"{top_level.UNIT_MARK}=build-followups\n", "")) as run:
+            self.assertTrue(top_level.is_unit("old-name:@3.%7"))
+        run.assert_called_once_with(
+            ["tmux", "show-environment", "-t", "%7", top_level.UNIT_MARK],
+            capture_output=True,
+            text=True,
         )
 
     def test_ended_and_reused_pids_are_left_out(self) -> None:
@@ -193,7 +203,7 @@ class TopLevelTests(unittest.TestCase):
         _ = subprocess.run([binary, "-f", "/dev/null", "new-session", "-d", "-s", "unit-trunk", "sleep 60"],
                            check=True)
         _ = subprocess.run([binary, "set-environment", "-t", "=unit-trunk", top_level.UNIT_MARK, "1"], check=True)
-        self.assertTrue(top_level.is_unit("unit-trunk:@0.%0"))
+        self.assertTrue(top_level.is_unit("stale-name:@0.%0"))
         self.assertFalse(top_level.is_unit("unit:@1.%1"))
 
 if __name__ == "__main__":

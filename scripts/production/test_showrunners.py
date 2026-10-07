@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
+from unittest import mock
 
 import showrunners
 
@@ -229,6 +230,34 @@ raise SystemExit(1)
         self.assertEqual(self.entries(), [{"session": "new director", "zone": "America/Los_Angeles",
                                            "units": ["new hook"]}])
         self.assertTrue((self.config.parent / "showrunners.lock").exists())
+
+    def test_failed_stall_rename_keeps_registry_and_retry_completes(self) -> None:
+        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "hook")
+        original = self.config.read_bytes()
+        failed = subprocess.CompletedProcess(["stall_watch.py"], 1, "", "injected failure")
+        succeeded = subprocess.CompletedProcess(["stall_watch.py"], 0, "", "")
+        with mock.patch.object(showrunners, "CONFIG", self.config), \
+                mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier), \
+                mock.patch.object(subprocess, "run", return_value=failed):
+            with self.assertRaisesRegex(ValueError, "stall state rename failed"):
+                showrunners.change("rename", "hook", "", [], "new-hook")
+        self.assertEqual(self.config.read_bytes(), original)
+        with mock.patch.object(showrunners, "CONFIG", self.config), \
+                mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier), \
+                mock.patch.object(subprocess, "run", return_value=succeeded):
+            showrunners.change("rename", "hook", "", [], "new-hook")
+        self.assertEqual(self.entries()[0]["units"], ["new-hook"])
+
+    def test_second_registry_rename_changes_nothing(self) -> None:
+        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "hook")
+        _ = self.successful("rename", "hook", "new-hook")
+        renamed = self.config.read_bytes()
+        with mock.patch.object(showrunners, "CONFIG", self.config), \
+                mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier), \
+                mock.patch.object(subprocess, "run") as run:
+            showrunners.change("rename", "hook", "", [], "new-hook")
+        self.assertEqual(self.config.read_bytes(), renamed)
+        run.assert_not_called()
 
     def test_rename_updates_old_form_unit_lists_in_every_prompt(self) -> None:
         _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "tool-based-ui-trunk")

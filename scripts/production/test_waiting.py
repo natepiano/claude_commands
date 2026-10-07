@@ -278,9 +278,15 @@ class WaitingTests(unittest.TestCase):
         producer_log = self.root / "launch-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         request = add_unit.UnitLaunch(
-            production._replace(log=producer_log), session, ALPHA, "alpha-branch", self.alpha,
-            add_unit.PlanGiven(self.root / "alpha-plan.md"), add_unit.OmittedCell(),
-            add_unit.OmittedCell(), add_unit.NewSession(), 1.0,
+            production=production._replace(log=producer_log),
+            identity=add_unit.UnitIdentity(ALPHA, session),
+            branch="alpha-branch",
+            worktree=self.alpha,
+            plan=add_unit.PlanGiven(self.root / "alpha-plan.md"),
+            port=add_unit.OmittedCell(),
+            owns=add_unit.OmittedCell(),
+            session=add_unit.NewSession(),
+            timeout=1.0,
         )
         with (mock.patch.object(add_unit, "registry_has_unit", return_value=True),
               mock.patch.object(add_unit, "update_old_prompt"), redirect_stdout(io.StringIO())):
