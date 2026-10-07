@@ -145,6 +145,35 @@ class NotifierTests(unittest.TestCase):
         self.assertEqual(self.conf()["EVERY"], "3")
         self.assertEqual(self.run_cli("interval", "example", "0").returncode, 2)
 
+    def test_resume_keeps_an_upcoming_due_time_and_enabled_state(self) -> None:
+        _ = self.new()
+        due = self.state()["NEXT_DUE"]
+        _ = self.successful("stop", "example")
+        output = self.successful("resume", "example", now=MINUTE + 60)
+        self.assertTrue(output.startswith(f"next_due={due} ("), output)
+        self.assertEqual(self.state()["ENABLED"], "1")
+        self.assertEqual(self.state()["NEXT_DUE"], due)
+
+        before = self.state()
+        output = self.successful("resume", "example", now=MINUTE + 90)
+        self.assertTrue(output.startswith(f"next_due={due} ("), output)
+        self.assertEqual(self.state(), before)
+
+    def test_resume_keeps_a_past_due_time_then_tick_sends_once(self) -> None:
+        _ = self.new()
+        due = self.state()["NEXT_DUE"]
+        _ = self.successful("stop", "example")
+        output = self.successful("resume", "example", now=MINUTE + 180)
+        self.assertTrue(output.startswith(f"next_due={due} ("), output)
+        self.assertEqual(self.state()["ENABLED"], "1")
+        self.assertEqual(self.state()["NEXT_DUE"], due)
+
+        _ = self.successful("tick", now=MINUTE + 180)
+        self.assertEqual(len(self.lines()), 1)
+        self.assertEqual(self.state()["LAST_SENT"], str(MINUTE + 180))
+        _ = self.successful("tick", now=MINUTE + 180)
+        self.assertEqual(len(self.lines()), 1)
+
     def test_aligned_schedule_lands_on_the_clock(self) -> None:
         def at(zone: str, hour: int, minute: int) -> int:
             return int(datetime(2026, 10, 5, hour, minute, 30, tzinfo=ZoneInfo(zone)).timestamp())

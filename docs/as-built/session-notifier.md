@@ -81,6 +81,7 @@ The slot is claimed before the check runs, so a concurrent tick or `fire` cannot
 | --- | --- |
 | `new <instance> --every <min> (--run <cmd> \| --to <target> (--command <text> \| --prompt-file <path>)) [--from <sender>] [--check <cmd>] [--hold] [--timeout <s>]` | `--run` makes a run-only instance that sends nothing; it takes none of `--to`, `--from`, `--check`, `--command`, `--prompt-file`, `--hold` (usage error, exit 2), and `status` shows its command in place of a target. Fresh instance: writes `conf` and `state`, enabled, prints `next_due`. Existing instance: rewrites `conf` only, prints nothing, so the clock and `ENABLED` stay as they were. Refuses (2) an empty command or prompt file, both or neither, `--every` or `--timeout` not a whole number above 0, a relative prompt path. |
 | `start <instance>` | `ENABLED=1`, schedules from now, prints `next_due`. |
+| `resume <instance>` | `ENABLED=1`, keeps `NEXT_DUE` unchanged, and prints `next_due`. A missed slot runs on the next tick; a future slot runs at its existing time. |
 | `stop <instance>` | `ENABLED=0`; `NEXT_DUE` stays. |
 | `restart <instance>` | `LAST_RESTART=now`, schedules from now, prints `next_due`. Leaves `ENABLED` alone. |
 | `interval <instance> <min>` | Sets `EVERY`, then does what `restart` does. Bad minutes exit 2 before the instance lookup. |
@@ -91,7 +92,7 @@ The slot is claimed before the check runs, so a concurrent tick or `fire` cannot
 | `health <instance>` | Exit 1 with `failing: no instance`, `failing: no tick since <time\|never>` (`.last_tick` missing or older than 120 s), or `failing: last two sends exit a, b` (the last two `exit` lines both nonzero). Otherwise exit 0 with `ok`, or `ok: stopped` for a stopped instance. |
 | `tick` | The job's verb. Always exits 0. |
 
-`restart`, `start`, `interval`, `fire` and a fresh `new` print exactly one line `next_due=<epoch> (<YYYY-MM-DD HH:MM TZ>)`, in local time.
+`restart`, `start`, `resume`, `interval`, `fire` and a fresh `new` print exactly one line `next_due=<epoch> (<YYYY-MM-DD HH:MM TZ>)`, in local time.
 
 ### The check contract
 
@@ -162,7 +163,7 @@ For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <
 - A slot is claimed (`NEXT_DUE` advanced) before the check or send runs.
 - Every schedule write sets `NEXT_DUE = now - now % 60 + EVERY * 60`.
 - `new` on an existing instance rewrites `conf` and leaves `state` alone.
-- `restart`, `start`, `interval`, `fire` and a fresh `new` print exactly one `next_due=<epoch> (<local time>)` line; `progress_history.py` and `prepare_session.sh` parse it.
+- `restart`, `start`, `resume`, `interval`, `fire` and a fresh `new` print exactly one `next_due=<epoch> (<local time>)` line; `progress_history.py` and `prepare_session.sh` parse it.
 - CLI exit codes: 0 done, 1 no such instance or `health` failing, 2 usage error or refused.
 - Check contract: 0 sends, 2 removes the instance, other nonzero skips, and the check finishes within `TIMEOUT`. `delegate_run.py check` stays a quick file read and never treats an old run as gone.
 - Message instances are named `showrunner-<slug>` and `delegate-<run id>`, run id = basename of `SESSION_DIR`; the send key is `notifier-<instance>`. Run-only instances (`stall-watch`, `tmux-names`) send nothing.

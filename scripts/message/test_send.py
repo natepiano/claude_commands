@@ -137,9 +137,41 @@ class SendTests(unittest.TestCase):
         with mock.patch.object(send, "run", return_value=(255, "", "ssh: connect to host mac: timed out")):
             self.assertEqual(self.send("--machine", "mac", "--text", "hi").outcome, "failed")
 
+    def test_the_user_is_reached_with_a_title_and_a_need_and_never_queued(self) -> None:
+        commands: list[list[str]] = []
+
+        def channel(command: list[str], stdin: str, timeout: float) -> tuple[int | None, str, str]:
+            del stdin, timeout
+            commands.append(command)
+            return (0, "", "") if len(commands) == 1 else (1, "", "refused")
+
+        told = ["--to", "user", "--from", "test", "--summary", "natedev: disk", "--need", "blocked", "--text", "full"]
+        with mock.patch.object(send, "run", channel):
+            self.assertEqual(send.send(send.parse(told)), send.Result("sent", "to the user"))
+            self.assertEqual(send.send(send.parse(told)).outcome, "failed")
+        self.assertEqual(commands[0][2:], ["--priority", "2", "natedev: disk", "full"])
+        self.assertEqual(self.relayed, [])
+        self.assertEqual(send.pending("user"), "")
+        self.assertEqual([entry["to"] for entry in self.log()], ["user", "user"])
+
+    def test_a_remote_send_to_the_user_carries_its_need(self) -> None:
+        commands: list[list[str]] = []
+
+        def remote_run(command: list[str], stdin: str, timeout: float) -> tuple[int | None, str, str]:
+            del stdin, timeout
+            commands.append(command)
+            return 0, "SENT: to the user\n", ""
+
+        with mock.patch.object(send, "run", remote_run):
+            result = send.send(send.parse(["--to", "user", "--summary", "mac: login", "--need", "decision",
+                                           "--machine", "natedev", "--text", "hi"]))
+        self.assertEqual(result, send.Result("sent", "on natedev: to the user"))
+        self.assertIn("--need decision", commands[0][-1])
+
     def test_usage_errors_exit_2(self) -> None:
         for argv in (["--to", "x", "--repeat-minutes", "5", "--text", "t"], ["--to", "x", "--codex", "--text", "t"],
-                     ["--to", "x", "--text", "  "], ["ack"]):
+                     ["--to", "x", "--text", "  "], ["ack"], ["--to", "user", "--text", "t"],
+                     ["--to", "x", "--need", "decision", "--text", "t"]):
             with self.assertRaises(SystemExit) as raised, mock.patch("sys.stderr"):
                 _ = send.main(argv)
             self.assertEqual(raised.exception.code, 2, argv)
