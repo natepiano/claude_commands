@@ -36,6 +36,7 @@ def unit(held: bool) -> dict[str, object]:
 
 class DailiesHoldTests(unittest.TestCase):
     folder: Path = Path()
+    mac_state: Path = Path()
     scratch: Path = Path()
 
     @override
@@ -46,11 +47,39 @@ class DailiesHoldTests(unittest.TestCase):
         (self.scratch / ".local/state/agent-notes").mkdir(parents=True)
         self.folder = self.scratch / "holders"
         self.folder.mkdir()
+        self.mac_state = self.scratch / "mac-test"
+        self.mac_state.mkdir()
         _ = (self.scratch / "meminfo").write_text("MemAvailable: 67108864 kB\n")
 
     def write_holder(self, name: str, since: str, purpose: str, release: str = "unknown") -> Path:
         path = self.folder / name
         _ = path.write_text(json.dumps({"holder": name, "since": since, "for": purpose, "release_eta": release}) + "\n")
+        return path
+
+    def write_mac_block(
+        self,
+        state: str = "active",
+        *,
+        ci: str = "off_by_this_block",
+        reason: str = "renderer work",
+    ) -> Path:
+        record: dict[str, object] = {
+            "version": 2,
+            "holder": "alice",
+            "for": reason,
+            "since": "2026-10-04T16:50:00+00:00",
+            "expires": "2026-10-05T18:30:00+00:00",
+            "session": None,
+            "showrunner": None,
+            "state": state,
+            "ci": ci,
+        }
+        if state == "pending":
+            record["waiting_on"] = {"kind": "ci_job"}
+        else:
+            record["free_message"] = {"kind": "not_needed"}
+        path = self.mac_state / "block.json"
+        _ = path.write_text(json.dumps(record) + "\n")
         return path
 
     def write_cycle(self, states: list[tuple[str, str]], *, outcomes: dict[str, str] | None = None) -> None:
@@ -95,6 +124,7 @@ class DailiesHoldTests(unittest.TestCase):
                 "BUILD_HOLD_DIR": str(self.folder),
                 "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
                 "BUILDLOG_MEMINFO": str(self.scratch / "meminfo"),
+                "MAC_TEST_STATE_DIR": str(self.mac_state),
             },
         )
 
@@ -128,6 +158,78 @@ class DailiesHoldTests(unittest.TestCase):
         footer = self.assert_ok(self.footer())
         self.assertEqual([line for line in report if "build hold" in line], [])
         self.assertEqual([line for line in footer if "build hold" in line], [])
+        self.assertEqual([line for line in report if "Mac block" in line], [])
+        self.assertEqual([line for line in footer if "Mac block" in line], [])
+
+    def test_active_and_pending_mac_blocks_appear_in_report_and_footer(self) -> None:
+        expected = {
+            "active": "* Mac block: alice since 09:50 PDT, for renderer work - lifts Mon 11:30 PDT",
+            "pending": "* Mac block pending: alice since 09:50 PDT, for renderer work - lifts Mon 11:30 PDT",
+        }
+        for state, line in expected.items():
+            with self.subTest(state=state):
+                _ = self.write_mac_block(state)
+                self.assertIn(line, self.assert_ok(self.report(False)))
+                self.assertIn(line, self.assert_ok(self.footer()))
+
+    def test_uncertain_switch_adds_warning_to_active_and_pending_blocks(self) -> None:
+        for state in ("active", "pending"):
+            for ci in ("still_on", "off_unconfirmed"):
+                with self.subTest(state=state, ci=ci):
+                    _ = self.write_mac_block(state, ci=ci)
+                    mac_line = next(
+                        line for line in self.assert_ok(self.footer())
+                        if line.startswith("* Mac block")
+                    )
+                    self.assertTrue(mac_line.endswith(" - CI can still use the Mac"))
+
+    def test_mac_block_follows_hold_release_lines_and_precedes_agents(self) -> None:
+        _ = self.write_holder("seat", "2026-10-04T10:56:00-07:00", "the focused test")
+        self.write_cycle([("first", "DeliveryQueued")])
+        _ = self.write_mac_block()
+        lines = self.assert_ok(self.footer())
+        hold_index = next(index for index, line in enumerate(lines) if line.startswith("* build hold:"))
+        release_index = lines.index("  * session 1 [first]: DeliveryQueued")
+        mac_index = next(index for index, line in enumerate(lines) if line.startswith("* Mac block:"))
+        agent_index = lines.index("* none active")
+        self.assertLess(hold_index, release_index)
+        self.assertLess(release_index, mac_index)
+        self.assertLess(mac_index, agent_index)
+        self.assertEqual(lines[-1], "* next dailies: 11:30 PDT - nothing needed")
+
+    def test_mac_block_reason_with_plumbing_is_refused_with_recovery(self) -> None:
+        _ = self.write_mac_block(reason="the tester handoff")
+        suffix = "; have alice run /mac_test block again with other words"
+        self.assert_refused(self.report(False), "tester", suffix)
+        self.assert_refused(self.footer(), "tester", suffix)
+
+    def test_unreadable_mac_block_is_reported_without_refusing_footer(self) -> None:
+        path = self.mac_state / "block.json"
+        cases: list[tuple[str, str]] = [
+            ("malformed JSON", "{"),
+            ("missing key", ""),
+            ("timestamp without zone", ""),
+        ]
+        for name, content in cases:
+            with self.subTest(case=name):
+                if name == "malformed JSON":
+                    _ = path.write_text(content)
+                else:
+                    _ = self.write_mac_block()
+                    record = cast(dict[str, object], json.loads(path.read_text()))
+                    if name == "missing key":
+                        del record["holder"]
+                    else:
+                        record["expires"] = "2026-10-05T18:30:00"
+                    _ = path.write_text(json.dumps(record))
+                for lines in (
+                    self.assert_ok(self.report(False)),
+                    self.assert_ok(self.footer()),
+                ):
+                    self.assertIn(
+                        f"* Mac block: its state file cannot be read ({path})",
+                        lines,
+                    )
 
     def test_release_directory_alone_is_not_a_holder(self) -> None:
         self.write_cycle([("first", "DeliveryQueued")])

@@ -37,7 +37,13 @@ class RunRecord(TypedDict):
     since: str
 
 
-CiSwitch = Literal["off_by_this_block", "off_before", "not_configured", "still_on"]
+CiSwitch = Literal[
+    "off_by_this_block",
+    "off_before",
+    "not_configured",
+    "still_on",
+    "off_unconfirmed",
+]
 
 
 class NoRun:
@@ -172,6 +178,27 @@ class GhFailure:
 
 
 GhResult = GhAnswer | GhFailure
+
+
+@dataclass(frozen=True)
+class CiSwitchReadFailed:
+    """The current CI switch value could not be read."""
+
+    line: str
+
+
+@dataclass(frozen=True)
+class CiSwitchWriteUnconfirmed:
+    """The request to turn off the CI switch had no confirmed result."""
+
+    line: str
+
+
+CiSwitchOffResult = (
+    Literal["off_before", "off_by_this_block"]
+    | CiSwitchReadFailed
+    | CiSwitchWriteUnconfirmed
+)
 
 
 class CiIdle:
@@ -408,7 +435,13 @@ def decoded_showrunner(showrunner: object, path: Path) -> Showrunner:
 
 
 def decoded_ci(value: object, path: Path) -> CiSwitch:
-    if value not in ("off_by_this_block", "off_before", "not_configured", "still_on"):
+    if value not in (
+        "off_by_this_block",
+        "off_before",
+        "not_configured",
+        "still_on",
+        "off_unconfirmed",
+    ):
         raise ValueError(f"{path} has an invalid block record")
     return value
 
@@ -796,7 +829,7 @@ def ci_activity(config: MacTestConfig) -> CiActivity:
     return CI_IDLE
 
 
-def switch_ci_off(config: MacTestConfig) -> CiSwitch | GhFailure:
+def switch_ci_off(config: MacTestConfig) -> CiSwitchOffResult:
     current = run_gh(
         config,
         "variable",
@@ -806,7 +839,7 @@ def switch_ci_off(config: MacTestConfig) -> CiSwitch | GhFailure:
         config.ci_repo,
     )
     if isinstance(current, GhFailure):
-        return current
+        return CiSwitchReadFailed(current.line)
     if current.stdout.strip() != "true":
         return "off_before"
     changed = run_gh(
@@ -820,7 +853,7 @@ def switch_ci_off(config: MacTestConfig) -> CiSwitch | GhFailure:
         config.ci_repo,
     )
     if isinstance(changed, GhFailure):
-        return changed
+        return CiSwitchWriteUnconfirmed(changed.line)
     return "off_by_this_block"
 
 
@@ -835,6 +868,15 @@ def switch_ci_back(config: MacTestConfig) -> GhResult:
         "--repo",
         config.ci_repo,
     )
+
+
+def ci_needs_restore(ci: CiSwitch) -> bool:
+    # An unanswered write may have worked. Restoring can also undo a later manual switch-off.
+    return ci in ("off_by_this_block", "off_unconfirmed")
+
+
+def ci_may_still_be_on(ci: CiSwitch) -> bool:
+    return ci in ("still_on", "off_unconfirmed")
 
 
 def replace_ci(
@@ -959,7 +1001,7 @@ def expiry_text(block: PendingMacBlock | ActiveMacBlock, skipped: str) -> str:
         f"Message from mac-test: the Mac block by {block.holder} ({block.reason}) "
         + f"reached its time limit at {block_time(block.expires)} and lifted by itself."
     )
-    if block.ci == "off_by_this_block":
+    if ci_needs_restore(block.ci):
         text += " CI may use the Mac again."
     if skipped:
         text += f"\n{skipped}"
@@ -990,7 +1032,7 @@ def expire_block(
 ) -> SettleOutcome:
     if not config.ci_repo:
         block = replace_ci(block, "not_configured")
-    elif block.ci == "off_by_this_block":
+    elif ci_needs_restore(block.ci):
         restored = switch_ci_back(config)
         if isinstance(restored, GhFailure):
             text = (
@@ -1159,17 +1201,28 @@ def full_settle(
 
     ci_problem: Problem = NO_PROBLEM
     waiting_problem: Problem = NO_PROBLEM
-    if block.ci == "still_on":
+    if ci_may_still_be_on(block.ci):
         if not config.ci_repo:
             block = replace_ci(block, "not_configured")
             with locked(paths.lock):
                 write_block(paths.block, block)
         else:
+            prior_ci = block.ci
             switched = switch_ci_off(config)
-            if isinstance(switched, GhFailure):
+            if isinstance(switched, CiSwitchReadFailed):
                 ci_problem = ProblemLine(switched.line)
+            elif isinstance(switched, CiSwitchWriteUnconfirmed):
+                ci_problem = ProblemLine(switched.line)
+                block = replace_ci(block, "off_unconfirmed")
+                with locked(paths.lock):
+                    write_block(paths.block, block)
             else:
-                block = replace_ci(block, switched)
+                settled_ci: CiSwitch = (
+                    "off_by_this_block"
+                    if prior_ci == "off_unconfirmed" and switched == "off_before"
+                    else switched
+                )
+                block = replace_ci(block, settled_ci)
                 with locked(paths.lock):
                     write_block(paths.block, block)
 
@@ -1426,7 +1479,7 @@ def command_block(
         if isinstance(outcome.block, NoMacBlock):
             return 0
         print(block_state_line(outcome.block, outcome.waiting_problem))
-        if outcome.block.ci == "still_on":
+        if ci_may_still_be_on(outcome.block.ci):
             line = (
                 outcome.ci_problem.line
                 if isinstance(outcome.ci_problem, ProblemLine)
@@ -1439,7 +1492,7 @@ def command_block(
             f"It lifts by itself at {block_time(outcome.block.expires)} "
             + "unless you run block again."
         )
-        return 2 if outcome.block.ci == "still_on" else 0
+        return 2 if ci_may_still_be_on(outcome.block.ci) else 0
 
 
 def command_unblock(
@@ -1458,7 +1511,7 @@ def command_unblock(
             return 1
         if not config.ci_repo:
             block = replace_ci(block, "not_configured")
-        elif block.ci == "off_by_this_block":
+        elif ci_needs_restore(block.ci):
             restored = switch_ci_back(config)
             if isinstance(restored, GhFailure):
                 print(
@@ -1468,7 +1521,7 @@ def command_unblock(
                 return 2
         with locked(paths.lock):
             paths.block.unlink(missing_ok=True)
-        if block.ci == "off_by_this_block":
+        if ci_needs_restore(block.ci):
             print("Mac unblocked; CI may use the Mac again.")
         elif block.ci == "off_before":
             print("Mac unblocked; CI's Mac switch was already off and stays off.")

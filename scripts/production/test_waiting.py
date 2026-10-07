@@ -335,7 +335,10 @@ class WaitingTests(unittest.TestCase):
         }
         holders = self.root / "producer-holders"
         holders.mkdir(exist_ok=True)
-        with mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": str(holders)}):
+        with mock.patch.dict(os.environ, {
+            "BUILD_HOLD_DIR": str(holders),
+            "MAC_TEST_STATE_DIR": str(self.root / "mac-test"),
+        }):
             report = dailies_render.parse_report(fields, "default")
         resolved = dailies_render.resolve_eta_moments(report, {}, moment)
         return dailies_render.log_line(report, resolved, moment, moment.tzname() or "PDT")
@@ -361,7 +364,10 @@ class WaitingTests(unittest.TestCase):
         }
         holders = self.root / "producer-holders"
         holders.mkdir(exist_ok=True)
-        with mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": str(holders)}):
+        with mock.patch.dict(os.environ, {
+            "BUILD_HOLD_DIR": str(holders),
+            "MAC_TEST_STATE_DIR": str(self.root / "mac-test"),
+        }):
             report = dailies_render.parse_report(fields, "default")
         previous = {ALPHA: dailies_render.LastUnitReport(
             phase,

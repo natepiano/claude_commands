@@ -74,6 +74,7 @@ class RegistrationTests(unittest.TestCase):
         self.env = {**os.environ, "HOME": str(self.home), "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
                     "REGISTRATION_TEST_STATE": str(self.state), "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
+                    "MAC_TEST_STATE_DIR": str(self.state / "mac-test"),
                     "CLAUDE_CODE_SESSION_ID": "current-session-id"}
         _ = self.git("init", "-b", "production", str(self.checkout), cwd=self.root)
         _ = self.git("config", "user.name", "Registration Test")
@@ -117,9 +118,9 @@ class RegistrationTests(unittest.TestCase):
         return path
 
     def copied_command(self) -> Path:
-        tree = self.root / "command-copy"
+        tree = Path(tempfile.mkdtemp(prefix="command-copy-", dir=self.root))
         _ = shutil.copytree(SCRIPT.parent, tree / "scripts/production")
-        for name in ("build_hold", "whoami"):
+        for name in ("build_hold", "lint", "mac_test", "whoami"):
             _ = shutil.copytree(SCRIPT.parent.parent / name, tree / "scripts" / name)
         hooks = tree / "scripts/hooks"
         hooks.mkdir(parents=True)
