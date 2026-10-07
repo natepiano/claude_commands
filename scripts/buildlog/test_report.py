@@ -69,6 +69,12 @@ class ReportTests(unittest.TestCase):
         self.assertEqual([row[0] for row in rows], ["Build-folder turn", "Memory admission", "CI queue"])
         return {row[0]: row[1:] for row in rows}
 
+    def rebuilds_lines(self, day: str = "2026-10-02") -> list[str]:
+        lines = self.render(day).splitlines()
+        start = lines.index("### Rebuilds")
+        end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("### ")), len(lines))
+        return lines[start:end]
+
     def test_waiting_section_shows_each_tail_and_top_three(self) -> None:
         at = "2026-10-02T12:00:00Z"
         calls = [
@@ -112,6 +118,113 @@ class ReportTests(unittest.TestCase):
         rows = self.waiting_rows()
         self.assertEqual(rows, {name: ["none", "", "", "", ""] for name in
                                 ("Build-folder turn", "Memory admission", "CI queue")})
+
+    def test_rebuild_bins_include_edges_and_exclude_unmeasured_steps(self) -> None:
+        at = "2026-10-02T12:00:00Z"
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            step("none-over", started_at=at, duration_s=5.0, finished_s=10.0, crates_compiled=0),
+            step("none-zero", started_at=at, duration_s=15.0, finished_s=0.0, crates_compiled=0),
+            step("edited-low", started_at=at, duration_s=10.0, finished_s=5.0, crates_compiled=1),
+            step("edited-high", started_at=at, duration_s=30.0, finished_s=15.0, crates_compiled=3),
+            step("cascade-low", started_at=at, duration_s=20.0, finished_s=10.0, crates_compiled=4),
+            step("cascade-high", started_at=at, duration_s=40.0, finished_s=20.0, crates_compiled=49),
+            step("cold", started_at=at, duration_s=90.0, finished_s=40.0, crates_compiled=50),
+            step("sweep", started_at=at, step="sweep", duration_s=1000.0, finished_s=1000.0, crates_compiled=100),
+            step("unknown-count", started_at=at, duration_s=1000.0, finished_s=1000.0, crates_compiled=None),
+            step(
+                "other-day",
+                started_at="2026-10-01T12:00:00Z",
+                duration_s=1000.0,
+                finished_s=1000.0,
+                crates_compiled=100,
+            ),
+        )
+
+        all_lines = self.render().splitlines()
+        waiting = all_lines.index("### Waiting")
+        next_heading = next(line for line in all_lines[waiting + 1:] if line.startswith("### "))
+        self.assertEqual(next_heading, "### Rebuilds")
+        section = self.rebuilds_lines()
+        self.assertEqual(section[2], "| Rebuild | Steps | Compile | Other | Total | Share of compile | Share of time |")
+        self.assertIn("| none | 2 | 10.0 s | 15.0 s | 20.0 s | 10% | 10% |", section)
+        self.assertIn("| edited crate (1–3 crates) | 2 | 20.0 s | 20.0 s | 40.0 s | 20% | 19% |", section)
+        self.assertIn("| cascade (4–49 crates) | 2 | 30.0 s | 30.0 s | 1.0 min | 30% | 29% |", section)
+        self.assertIn("| cold (50+ crates) | 1 | 40.0 s | 50.0 s | 1.5 min | 40% | 43% |", section)
+        self.assertFalse(any(line.startswith("nextest:") for line in section))
+        self.assertNotIn("Edited-crate rebuilds by package (nextest):", section)
+        self.assertIn(
+            "Source: steps with a known crate count; compile is cargo's own \"Finished … in\" time, other is the rest of the step.",
+            section,
+        )
+
+    def test_nextest_rebuilds_show_packages_top_five_and_empty_cold_bin(self) -> None:
+        package_steps = [
+            ("hana-short", "package(hana)", 10.0, 1),
+            ("hana-complex", "package(hana) & (test(a) | test(b))", 30.0, 3),
+            ("unknown", None, 35.0, 2),
+            ("alpha", "package(alpha)", 20.0, 1),
+            ("beta", "package(beta)", 20.0, 2),
+            ("gamma", "package(gamma)", 15.0, 3),
+            ("delta", "package(delta)", 10.0, 1),
+            ("epsilon", "package(epsilon)", 5.0, 2),
+        ]
+        records = [
+            step(
+                record_id,
+                step="nextest",
+                argv=["cargo", "nextest", "run", "-E", expression] if expression else ["cargo", "nextest", "run"],
+                duration_s=finished * 2,
+                finished_s=finished,
+                crates_compiled=crates,
+            )
+            for record_id, expression, finished, crates in package_steps
+        ]
+        records.append(
+            step(
+                "cascade-package",
+                step="nextest",
+                argv=["cargo", "nextest", "run", "-E", "package(zeta)"],
+                duration_s=200.0,
+                finished_s=100.0,
+                crates_compiled=4,
+            )
+        )
+        self.write(self.root / "natedev" / "2026-10.jsonl", *records)
+
+        section = self.rebuilds_lines()
+        self.assertIn("| cold (50+ crates) | 0 | — | — | — | — | — |", section)
+        self.assertEqual(section[2], "nextest: 4.1 min compiling, 4.1 min running tests (50% compiling).")
+        self.assertEqual(section[3], "")
+        self.assertEqual(section[4], "| Rebuild | Steps | Compile | Other | Total | Share of compile | Share of time |")
+        title = section.index("Edited-crate rebuilds by package (nextest):")
+        package_table = [line for line in section[title + 1:] if line.startswith("|")]
+        self.assertEqual(package_table[0], "| Package | Steps | p50 | p95 | Compile |")
+        self.assertEqual(package_table[2:], [
+            "| hana | 2 | 10.0 s | 30.0 s | 40.0 s |",
+            "| (unknown) | 1 | 35.0 s | 35.0 s | 35.0 s |",
+            "| alpha | 1 | 20.0 s | 20.0 s | 20.0 s |",
+            "| beta | 1 | 20.0 s | 20.0 s | 20.0 s |",
+            "| gamma | 1 | 15.0 s | 15.0 s | 15.0 s |",
+        ])
+        self.assertFalse(any("delta" in line or "epsilon" in line or "zeta" in line for line in package_table))
+
+    def test_each_rebuild_table_is_followed_immediately_by_its_source_and_a_blank_line(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            step("edited", step="nextest", argv=["package(hana)"], duration_s=20.0, finished_s=10.0, crates_compiled=1),
+        )
+
+        section = self.rebuilds_lines()
+        table_ends = [
+            index
+            for index, line in enumerate(section[:-1])
+            if line.startswith("|") and not section[index + 1].startswith("|")
+        ]
+        self.assertEqual(len(table_ends), 2)
+        for table_end in table_ends:
+            self.assertTrue(section[table_end + 1].startswith("Source:"))
+            self.assertTrue(table_end + 2 == len(section) or section[table_end + 2] == "")
 
     def write_release(self, trial: rust_release.TrialOutcome, pin: str | None = "1.99.0") -> None:
         state: rust_release.ReleaseState = {
