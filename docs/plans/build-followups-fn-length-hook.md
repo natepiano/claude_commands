@@ -328,6 +328,48 @@ Moved to enh-showrunner (2026-10-06 14:2x PDT) with the phase above; the showrun
 
 **Ruled out:** naming `/unit:report off|on` in `commands/unit/delegate.md`'s `<ProgressContract/>`, which still names `notifier.sh stop|start`: the file is enh-showrunner's, and the showrunner clears any such line.
 
+### Phase 9 — A Claude seat runs at the effort its registry row names, and a summary filled from a seat's pane is plain text · status: done
+
+#### Work Order
+
+Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`, branch `build-followups-stalls`. State every time in PDT.
+
+**Source:** the showrunner (natedev), 2026-10-06 17:3x PDT, from the live probe of `implement.sh --to`: "(1) when a seat leaves `impl_summary_<slot>.txt` empty, the launcher's pane fallback strips terminal codes; (2) a Claude seat registered `sonnet:low` showed `thinking with xhigh effort` in its pane: find whether it really runs at xhigh or the pane line misleads, and if it really runs xhigh, make the launch apply the registry's effort, with a test. It matters for quota." The third probe finding (a seat makes its own worktree because a guard blocks edits in a main checkout) is expected and out of scope.
+
+**Finding for (2), settled from the code before this phase:** the pane line is true. `scripts/delegate/implement.sh` resolves the registry row into `AGENT_EFFORT` and hands it to both Codex launchers (`--effort "${AGENT_EFFORT:-}"`) but calls `agent_bg.sh` for a Claude seat (line 428 at 15dfe0b) without `AGENT_BG_EFFORT`, which is how `agent_bg.sh` learns to add `--effort <level>` to `claude --bg`. The seat therefore inherits `~/.claude/settings.json`: `modelSettings` → `claude-sonnet-5-5` → `effortLevel: xhigh`, which is the effort the pane showed. `scripts/ask_a_friend/launch_friend.sh` already passes `AGENT_BG_EFFORT`, so it is correct and stays untouched.
+
+**Goal:** a Claude seat the launcher starts runs at the effort its registry row names, so a `sonnet:low` row costs low-effort quota. And a summary the launcher fills from a seat's pane holds readable text, never raw terminal control codes.
+
+**Spec:**
+- **Effort reaches a new Claude seat.** In `scripts/delegate/implement.sh`, the `agent_bg.sh` call for a new Claude seat sets `AGENT_BG_EFFORT="${AGENT_EFFORT:-}"` beside the existing `AGENT_BG_LEDGER`. `agent_bg.sh` then adds `--effort <level>` to `claude --bg`, next to `--model`, as it already does when the variable is set. A registry row with no effort leaves `AGENT_EFFORT` empty, so no `--effort` is added and the seat keeps the user's default, as today. The assignment is explicit, so an `AGENT_BG_EFFORT` left in the caller's environment cannot override the registry. The `--attach` follow-up call changes nothing: that seat already exists and keeps the effort it started with.
+- **The pane fallback strips terminal codes.** In `scripts/agents/agent_bg.sh`, when the seat leaves its summary file empty, the fallback fills it from the seat's pane log (`tail -c 4000 "${LOG_FILE}"` at line 323 at 15dfe0b). Before taking the last 4000 characters it strips from the whole log: CSI sequences (`ESC [ … final byte`), OSC sequences (`ESC ] …` up to BEL or `ESC \`), any other two-character `ESC` sequence, and every remaining control character except newline and tab (carriage returns and backspaces go). It strips first and cuts after, so the cut never lands inside a sequence, and it cuts by characters, not bytes, so no multibyte character is split. When nothing readable is left after stripping, the summary holds the existing `The background agent <name> produced no summary.` line instead of a file of blanks. The pane log file itself (`LOG_FILE`) is not rewritten: only the summary is cleaned. A summary the seat wrote itself is never touched.
+- Use the script's existing interpreter (`"$PY"`), as its other embedded snippets do; add no new script file.
+
+**Files:**
+- `scripts/delegate/implement.sh` — the effort variable on the new-Claude-seat call.
+- `scripts/agents/agent_bg.sh` — the stripping fallback.
+- `scripts/delegate/test_implement_launcher.py` — both behaviours, through the real `implement.sh` and the real `agent_bg.sh` copied into its script tree.
+
+**Seats:** 1 writer + 1 tester.
+- `impl` — `scripts/delegate/implement.sh`, `scripts/agents/agent_bg.sh`.
+- `test` — `scripts/delegate/test_implement_launcher.py`, from the Spec alone; owns the final suite run. The file's script tree already copies the real `agent_bg.sh` and stubs `claude`; extend the stub so a `--bg` launch records its arguments and prints a banner (`backgrounded · <id> · <name>`), `agents --json` reports the seat busy then idle, and `logs` prints text the case chooses. No test starts a real `claude`. Cases:
+  - a new Claude seat whose registry row is `sonnet:low` is launched with `--effort low` and `--model sonnet`; a row that names no effort (if the registry accepts one) is launched with no `--effort`; an `AGENT_BG_EFFORT=xhigh` in the caller's environment does not change either result;
+  - a seat that leaves its summary empty, with a pane log full of colour codes, a title-setting OSC sequence, carriage returns and a cursor-movement sequence, ends with a summary that holds the readable text, contains no `ESC` byte and no carriage return, and is cut to the last 4000 characters;
+  - a pane log of nothing but control codes ends with the `produced no summary` line;
+  - a seat that writes its own summary keeps it byte for byte.
+
+**Constraints from prior phases:**
+- `impl_status_<slot>` is written last, after the pass and landed records (Phase 8); the new call changes only the environment of the `agent_bg.sh` launch, not the order.
+- Tests never start a real `codex` or `claude` and never touch the real notifier state, the real `~/.claude`, or a real session.
+- Another unit owns `commands/unit/delegate.md`, `produce.md`, `promote_unit.md`, `showrunners.py`, `stall_watch.py`, `dailies_render.py` and the mul_add hook files; none is edited here.
+
+**Acceptance gate:**
+- From the worktree root, `python3 -m unittest discover -s scripts/delegate -p 'test_implement_launcher.py'` is green.
+- basedpyright reports 0 errors and 0 warnings on the test file.
+- `bash -n scripts/delegate/implement.sh` and `bash -n scripts/agents/agent_bg.sh` pass.
+- Red run (unit director, scratch copy): the new tests fail against 15dfe0b's `implement.sh` and `agent_bg.sh`.
+- Live (showrunner or user, after the merge reaches `~/.claude` main; the unit director's own probe launch was refused by the permission classifier on 2026-10-06): one Claude seat registered `sonnet:low` and launched through `implement.sh` shows `low effort` in its pane, not `xhigh`.
+
 ### Moved: re-measure after both hooks are live (was Phase 8)
 
 Moved to mul_add-unit as its Phase 6 by the showrunner (natedev), 2026-10-06 14:3x PDT: that phase measures too_many_lines and suboptimal_flops over one fixed window with controls on both machines, after both fn-length hooks are live, so a second re-measure here would count the same lint twice. Phase 1's As-built keeps the baseline it reads.
