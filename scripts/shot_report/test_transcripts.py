@@ -12,8 +12,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict, cast
 
-from scripts.shot_report.episodes import split_episodes
-from scripts.shot_report.transcripts import RememberedScript, ToolCall, _classify, _remember, scan_calls  # pyright: ignore[reportPrivateUsage]
+from scripts.shot_report.episodes import NoObservablePath, NoneCited, OneCitedShot, SeveralCitedShots, split_episodes
+from scripts.shot_report.transcripts import ExactOrderedCaptureAttempts, RememberedScript, ToolCall, _classify, _remember, scan_calls  # pyright: ignore[reportPrivateUsage]
 
 
 class ShellCases(TypedDict):
@@ -85,6 +85,22 @@ def _claude_tools(path: Path, tools: list[tuple[str, dict[str, object], bool]], 
                          "cwd": cwd, "sessionId": path.stem, "message": {"content": [part]}, "type": kind})
     path.parent.mkdir(parents=True, exist_ok=True)
     _ = path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def _fixture_rows(path: Path, rows: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def _claude_part(seconds: int, session: str, row_type: str, part: dict[str, object]) -> dict[str, object]:
+    return {"timestamp": (START + timedelta(seconds=seconds)).isoformat(), "type": row_type,
+            "cwd": "/fictional/studio", "sessionId": session,
+            "message": {"role": "assistant" if row_type == "assistant" else "user", "content": [part]}}
+
+
+def _codex_part(seconds: int, part: dict[str, object]) -> dict[str, object]:
+    return {"timestamp": (START + timedelta(seconds=seconds)).isoformat(),
+            "type": "response_item", "payload": part}
 
 
 class TranscriptTest(unittest.TestCase):
@@ -558,6 +574,7 @@ class TranscriptTest(unittest.TestCase):
                     "--state-dir", str(state_dir),
                     "--claude-root", str(CLASSIFY / "claude" / "projects"),
                     "--codex-root", str(CLASSIFY / "codex" / "sessions"),
+                    "--timings-path", str(state_dir / "fixture-timings.jsonl"),
                 ],
                 capture_output=True, text=True, check=False,
             )
@@ -757,6 +774,357 @@ class TranscriptTest(unittest.TestCase):
             calls = scan_calls(root / "claude", root / "codex")
             missing = next(call for call in calls if Path(call.transcript_path).stem == "missing")
             self.assertEqual(missing.project, "studio-feature")
+
+    def test_later_claude_citations_link_to_result_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "claude" / "kept.jsonl"
+            path.parent.mkdir()
+            rows: list[dict[str, object]] = []
+
+            def add(seconds: int, row_type: str, content: list[dict[str, object]], subtype: str = "") -> None:
+                row: dict[str, object] = {
+                    "timestamp": (START + timedelta(seconds=seconds)).isoformat(),
+                    "cwd": "/fictional/studio", "sessionId": "kept", "type": row_type,
+                    "message": {"role": "assistant" if row_type == "assistant" else "user", "content": content},
+                }
+                if subtype:
+                    row["subtype"] = subtype
+                rows.append(row)
+
+            def shot(seconds: int, name: str, result: str) -> None:
+                add(seconds, "assistant", [{"type": "tool_use", "id": name,
+                                             "name": "mcp__brp__brp_extras_screenshot", "input": {}}])
+                add(seconds + 5, "user", [{"type": "tool_result", "tool_use_id": name, "content": result}])
+
+            shot(0, "a", "saved /tmp/a.png")
+            shot(30, "b", "saved /tmp/b.png")
+            add(40, "assistant", [{"type": "text", "text": "Using /tmp/b.png"}])
+            add(50, "assistant", [{"type": "tool_use", "id": "write", "name": "Write",
+                                    "input": {"file_path": "/tmp/report.md", "content": "See /tmp/a.png"}}])
+            add(55, "user", [{"type": "tool_result", "tool_use_id": "write", "content": "saved"}])
+            shot(1200, "c", "saved /tmp/c.png")
+            add(1210, "user", [{"type": "text", "text": "What about /tmp/c.png?"}])
+            add(1220, "assistant", [{"type": "tool_use", "id": "failed-write", "name": "Write",
+                                      "input": {"file_path": "/tmp/report.md", "content": "See /tmp/c.png"}}])
+            add(1225, "user", [{"type": "tool_result", "tool_use_id": "failed-write",
+                                "content": "permission denied", "is_error": True}])
+            add(1230, "assistant", [{"type": "tool_use", "id": "copy", "name": "Bash",
+                                      "input": {"command": "cat /tmp/c.png > /tmp/copy.png"}}])
+            add(1235, "user", [{"type": "tool_result", "tool_use_id": "copy", "content": "done"}])
+            shot(2400, "d", "capture complete")
+            add(2410, "assistant", [{"type": "text", "text": "Using /tmp/d.png"}])
+            shot(3600, "e", "saved /tmp/e.png")
+            add(3610, "system", [{"type": "text", "text": "checkpoint /tmp/e.png"}], "checkpoint")
+            shot(4800, "f", "saved /tmp/f-first.png and /tmp/f-second.png")
+            add(4810, "assistant", [{"type": "text", "text": "Using /tmp/f-first.png and /tmp/f-second.png"}])
+            shot(6000, "g", "saved /tmp/g.png")
+            shot(6030, "h", "saved /tmp/h.png")
+            add(6040, "assistant", [{"type": "text", "text": "Using /tmp/h.png"}])
+            shot(7200, "j", "saved /tmp/reused.png")
+            shot(7230, "k", "saved /tmp/reused.png")
+            add(7240, "assistant", [{"type": "text", "text": "Using /tmp/reused.png"}])
+            shot(8400, "l", "saved /tmp/shell.png")
+            add(8410, "assistant", [{"type": "tool_use", "id": "shell-write", "name": "Bash",
+                                      "input": {"command": "echo 'See /tmp/shell.png' > /tmp/report.md"}}])
+            add(8415, "user", [{"type": "tool_result", "tool_use_id": "shell-write", "content": "done"}])
+            _ = path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            calls = scan_calls(root / "claude", root / "codex")
+            episodes = split_episodes(calls, 300)
+        self.assertEqual([call.image_paths for call in calls], [
+            ("/tmp/a.png",), ("/tmp/b.png",), ("/tmp/c.png",), (), ("/tmp/e.png",),
+            ("/tmp/f-first.png", "/tmp/f-second.png"),
+            ("/tmp/g.png",), ("/tmp/h.png",),
+            ("/tmp/reused.png",), ("/tmp/reused.png",),
+            ("/tmp/shell.png",),
+        ])
+        self.assertEqual([call.cited_image_paths for call in calls], [
+            ("/tmp/a.png",), ("/tmp/b.png",), (), (), ("/tmp/e.png",),
+            ("/tmp/f-first.png", "/tmp/f-second.png"),
+            (), ("/tmp/h.png",),
+            (), ("/tmp/reused.png",),
+            ("/tmp/shell.png",),
+        ])
+        self.assertEqual([episode.kept_shot for episode in episodes], [
+            SeveralCitedShots(0, 2), NoneCited(), NoObservablePath(), OneCitedShot(0),
+            SeveralCitedShots(0, 2),
+            OneCitedShot(1),
+            OneCitedShot(1),
+            OneCitedShot(0),
+        ])
+
+    def test_codex_script_run_path_is_cited_by_later_message(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "codex" / "kept.jsonl"
+            path.parent.mkdir()
+            rows: list[dict[str, object]] = [{
+                "timestamp": START.isoformat(), "type": "session_meta",
+                "payload": {"id": "kept-codex", "cwd": "/fictional/studio"},
+            }]
+            patch = "*** Begin Patch\n*** Add File: /fictional/studio/shot.py\n+rpc('brp_extras/screenshot', {})\n*** End Patch"
+            for seconds, kind, call_id, value in (
+                (0, "function_call", "write", {"name": "functions.apply_patch", "arguments": json.dumps({"input": patch})}),
+                (5, "function_call_output", "write", {"output": "Success"}),
+                (30, "function_call", "run", {"name": "functions.exec_command", "arguments": json.dumps({"cmd": "python3 shot.py"})}),
+                (35, "function_call_output", "run", {"output": "saved /tmp/script.png"}),
+            ):
+                rows.append({"timestamp": (START + timedelta(seconds=seconds)).isoformat(),
+                             "type": "response_item", "payload": {"type": kind, "call_id": call_id, **value}})
+            rows.append({"timestamp": (START + timedelta(seconds=40)).isoformat(), "type": "response_item",
+                         "payload": {"type": "message", "role": "assistant",
+                                     "content": [{"type": "output_text", "text": "![shot](/tmp/script.png)"}]}})
+            _ = path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            calls = scan_calls(root / "claude", root / "codex")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].script_path, "/fictional/studio/shot.py")
+        self.assertEqual(calls[0].image_paths, ("/tmp/script.png",))
+        self.assertEqual(calls[0].cited_image_paths, ("/tmp/script.png",))
+
+    def test_codex_patch_cites_added_text_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "codex" / "patch-citation.jsonl"
+            path.parent.mkdir()
+            rows: list[dict[str, object]] = [{
+                "timestamp": START.isoformat(), "type": "session_meta",
+                "payload": {"id": "patch-citation", "cwd": "/fictional/studio"},
+            }]
+            for index, image in enumerate(("/tmp/a.png", "/tmp/b.png")):
+                start = START + timedelta(seconds=index * 30)
+                rows.extend((
+                    {"timestamp": start.isoformat(), "type": "response_item", "payload": {
+                        "type": "function_call", "name": "functions.exec_command", "call_id": str(index),
+                        "arguments": json.dumps({"cmd": "python3 hana_shot.py shot --view demo"}),
+                    }},
+                    {"timestamp": (start + timedelta(seconds=5)).isoformat(), "type": "response_item", "payload": {
+                        "type": "function_call_output", "call_id": str(index), "output": f"saved {image}",
+                    }},
+                ))
+            rejected = "*** Begin Patch\n*** Update File: /tmp/report.md\n@@\n+See /tmp/a.png\n*** End Patch"
+            rows.extend((
+                {"timestamp": (START + timedelta(seconds=37)).isoformat(), "type": "response_item", "payload": {
+                    "type": "function_call", "name": "functions.apply_patch", "call_id": "rejected",
+                    "arguments": json.dumps({"input": rejected}),
+                }},
+                {"timestamp": (START + timedelta(seconds=38)).isoformat(), "type": "response_item", "payload": {
+                    "type": "function_call_output", "call_id": "rejected", "output": "Failed to find expected lines",
+                }},
+            ))
+            patch = "*** Begin Patch\n*** Update File: /tmp/a.png\n@@\n+See /tmp/b.png\n*** End Patch"
+            rows.extend((
+                {"timestamp": (START + timedelta(seconds=40)).isoformat(), "type": "response_item", "payload": {
+                    "type": "function_call", "name": "functions.apply_patch", "call_id": "patch",
+                    "arguments": json.dumps({"input": patch}),
+                }},
+                {"timestamp": (START + timedelta(seconds=45)).isoformat(), "type": "response_item", "payload": {
+                    "type": "function_call_output", "call_id": "patch", "output": "Success",
+                }},
+            ))
+            _ = path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            calls = scan_calls(root / "claude", root / "codex")
+            episodes = split_episodes(calls, 300)
+        self.assertEqual([call.cited_image_paths for call in calls], [(), ("/tmp/b.png",)])
+        self.assertEqual([episode.kept_shot for episode in episodes], [OneCitedShot(1)])
+
+    def test_timing_attempts_include_failed_views_before_a_kept_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "claude" / "timed.jsonl"
+            path.parent.mkdir()
+            rows: list[dict[str, object]] = [
+                {"timestamp": START.isoformat(), "type": "assistant", "cwd": "/fictional/studio",
+                 "sessionId": "timed", "message": {"role": "assistant", "content": [{
+                     "type": "tool_use", "id": "all", "name": "Bash",
+                     "input": {"command": "python3 hana_shot.py shot --view all"},
+                 }]}},
+                {"timestamp": (START + timedelta(seconds=20)).isoformat(), "type": "user", "cwd": "/fictional/studio",
+                 "sessionId": "timed", "message": {"role": "user", "content": [{
+                     "type": "tool_result", "tool_use_id": "all", "content": "one view failed; one saved",
+                 }]}},
+                {"timestamp": (START + timedelta(seconds=30)).isoformat(), "type": "assistant", "cwd": "/fictional/studio",
+                 "sessionId": "timed", "message": {"role": "assistant", "content": [{
+                     "type": "text", "text": "Using /tmp/kept.png",
+                 }]}},
+            ]
+            _ = path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            timing_path = root / "timings.jsonl"
+            record: dict[str, object] = {
+                "time": (START + timedelta(seconds=15)).isoformat(), "status": "failure", "exit_code": 1,
+                "failure_reason": "black_capture", "session": {"state": "present", "value": "timed"},
+                "attempts": [
+                    {"status": "failure", "label": "front", "view": "front", "image_paths": [],
+                     "failure_reason": "black_capture"},
+                    {"status": "success", "label": "side", "view": "side", "image_paths": ["/tmp/kept.png"]},
+                ],
+            }
+            old = {"time": START.replace(tzinfo=None).isoformat(), "label": "old", "total_ms": 10}
+            for status, session in (("failure", {"state": "present", "value": "timed"}),
+                                    ("success", {"state": "absent"})):
+                with self.subTest(status=status):
+                    record["status"] = status
+                    record["exit_code"] = 1 if status == "failure" else 0
+                    record["session"] = session
+                    _ = timing_path.write_text(json.dumps(old) + "\n{bad json\n" + json.dumps(record) + "\n",
+                                               encoding="utf-8")
+                    calls = scan_calls(root / "claude", root / "codex", timing_path)
+                    episodes = split_episodes(calls, 300)
+                    self.assertEqual(len(calls), 1)
+                    self.assertIsInstance(calls[0].attempt_evidence, ExactOrderedCaptureAttempts)
+                    self.assertEqual(calls[0].image_paths, ("/tmp/kept.png",))
+                    self.assertEqual(calls[0].cited_image_paths, ("/tmp/kept.png",))
+                    self.assertEqual([episode.kept_shot for episode in episodes], [OneCitedShot(1)])
+
+    def test_rollout_filename_and_timing_use_full_thread_id(self) -> None:
+        thread_id = "01a11402-04d7-7440-890c-cceb61ba833b"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "codex" / "2026" / "10" / "06" / f"rollout-2026-10-06T21-37-19-{thread_id}.jsonl"
+            _fixture_rows(path, [
+                _codex_part(0, {"type": "function_call", "name": "exec_command", "call_id": "shot",
+                                "arguments": json.dumps({"cmd": "python3 hana_shot.py shot --view front"})}),
+                _codex_part(20, {"type": "function_call_output", "call_id": "shot", "output": "saved /tmp/front.png"}),
+                _codex_part(25, {"type": "message", "role": "assistant",
+                                 "content": [{"type": "output_text", "text": "Using /tmp/front.png"}]}),
+            ])
+            timing_path = root / "timings.jsonl"
+            _ = timing_path.write_text(json.dumps({
+                "time": (START + timedelta(seconds=15)).isoformat(), "status": "success", "exit_code": 0,
+                "session": {"state": "present", "value": thread_id}, "attempts": [
+                    {"status": "failure", "label": "first", "view": "first", "image_paths": [],
+                     "failure_reason": "black_capture"},
+                    {"status": "success", "label": "front", "view": "front", "image_paths": ["/tmp/front.png"]},
+                ],
+            }) + "\n", encoding="utf-8")
+            calls = scan_calls(root / "claude", root / "codex", timing_path)
+            episodes = split_episodes(calls, 300)
+        self.assertEqual([call.session_id for call in calls], [thread_id])
+        self.assertEqual([episode.kept_shot for episode in episodes], [OneCitedShot(1)])
+
+    def test_send_message_input_cites_shots_from_message_and_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows: list[dict[str, object]] = []
+            for index, name in enumerate(("front", "side", "string")):
+                seconds = index * 30
+                rows.extend((
+                    _claude_part(seconds, "notice", "assistant", {"type": "tool_use", "id": name,
+                        "name": "mcp__brp__brp_extras_screenshot", "input": {}}),
+                    _claude_part(seconds + 5, "notice", "user", {"type": "tool_result", "tool_use_id": name,
+                        "content": f"saved /tmp/{name}.png"}),
+                ))
+            rows.extend((
+                _claude_part(100, "notice", "assistant", {"type": "tool_use", "id": "notice-object",
+                    "name": "SendMessage", "input": {"message": {"text": "Use /tmp/front.png"},
+                                                       "summary": "See /tmp/side.png"}}),
+                _claude_part(110, "notice", "assistant", {"type": "tool_use", "id": "notice-string",
+                    "name": "SendMessage", "input": {"message": "Use /tmp/string.png"}}),
+            ))
+            _fixture_rows(root / "claude" / "notice.jsonl", rows)
+            calls = scan_calls(root / "claude", root / "codex")
+        self.assertEqual([call.cited_image_paths for call in calls], [
+            ("/tmp/front.png",), ("/tmp/side.png",), ("/tmp/string.png",),
+        ])
+
+    def test_mesh_message_cites_shot_without_read_only_command_citation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            claude_rows: list[dict[str, object]] = []
+            codex_rows: list[dict[str, object]] = []
+            for index, label in enumerate(("skip", "kept")):
+                seconds = index * 30
+                claude_rows.extend((
+                    _claude_part(seconds, "claude-mesh", "assistant", {"type": "tool_use", "id": label,
+                        "name": "mcp__brp__brp_extras_screenshot", "input": {}}),
+                    _claude_part(seconds + 5, "claude-mesh", "user", {"type": "tool_result",
+                        "tool_use_id": label, "content": f"saved /tmp/claude-{label}.png"}),
+                ))
+                codex_rows.extend((
+                    _codex_part(seconds, {"type": "function_call", "name": "exec_command", "call_id": label,
+                        "arguments": json.dumps({"cmd": "python3 hana_shot.py shot --view front"})}),
+                    _codex_part(seconds + 5, {"type": "function_call_output", "call_id": label,
+                        "output": f"saved /tmp/codex-{label}.png"}),
+                ))
+            claude_rows.extend((
+                _claude_part(70, "claude-mesh", "assistant", {"type": "tool_use", "id": "read",
+                    "name": "Bash", "input": {"command": "ls /tmp/claude-skip.png"}}),
+                _claude_part(80, "claude-mesh", "assistant", {"type": "tool_use", "id": "send",
+                    "name": "Bash", "input": {"command": "python3 codex_mesh.py send --message 'Use /tmp/claude-kept.png'"}}),
+            ))
+            codex_rows.extend((
+                _codex_part(70, {"type": "function_call", "name": "exec_command", "call_id": "copy",
+                    "arguments": json.dumps({"cmd": "cp /tmp/codex-skip.png /tmp/copy.png"})}),
+                _codex_part(80, {"type": "function_call", "name": "exec_command", "call_id": "send",
+                    "arguments": json.dumps({"cmd": "python3 codex_mesh.py send --message 'Use /tmp/codex-kept.png'"})}),
+            ))
+            _fixture_rows(root / "claude" / "mesh.jsonl", claude_rows)
+            _fixture_rows(root / "codex" / "mesh.jsonl", codex_rows)
+            calls = scan_calls(root / "claude", root / "codex")
+        cited = {(call.agent, path): call.cited_image_paths for call in calls for path in call.image_paths}
+        self.assertEqual(cited[("Claude", "/tmp/claude-skip.png")], ())
+        self.assertEqual(cited[("Claude", "/tmp/claude-kept.png")], ("/tmp/claude-kept.png",))
+        self.assertEqual(cited[("Codex", "/tmp/codex-skip.png")], ())
+        self.assertEqual(cited[("Codex", "/tmp/codex-kept.png")], ("/tmp/codex-kept.png",))
+
+    def test_two_invocations_in_one_tool_call_keep_attempt_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _fixture_rows(root / "claude" / "two-shots.jsonl", [
+                _claude_part(0, "two-shots", "assistant", {"type": "tool_use", "id": "shots", "name": "Bash",
+                    "input": {"command": "python3 hana_shot.py shot --view first; python3 hana_shot.py shot --view second"}}),
+                _claude_part(20, "two-shots", "user", {"type": "tool_result", "tool_use_id": "shots",
+                    "content": "saved /tmp/first.png and /tmp/second.png"}),
+                _claude_part(30, "two-shots", "assistant", {"type": "text", "text": "Using /tmp/second.png"}),
+            ])
+            records = [
+                {"time": (START + timedelta(seconds=seconds)).isoformat(), "status": "success", "exit_code": 0,
+                 "session": {"state": "present", "value": "two-shots"}, "attempts": [{
+                     "status": "success", "label": name, "view": name, "image_paths": [f"/tmp/{name}.png"],
+                 }]}
+                for seconds, name in ((5, "first"), (15, "second"))
+            ]
+            timing_path = root / "timings.jsonl"
+            _ = timing_path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+            calls = scan_calls(root / "claude", root / "codex", timing_path)
+            episodes = split_episodes(calls, 300)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([episode.kept_shot for episode in episodes], [OneCitedShot(1)])
+        evidence = calls[0].attempt_evidence
+        assert isinstance(evidence, ExactOrderedCaptureAttempts)
+        self.assertEqual(len(evidence.captures), 2)
+
+    def test_recorded_path_with_spaces_needs_whole_path_boundary(self) -> None:
+        path_with_spaces = "/tmp/My Shots/front.png"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records: list[dict[str, object]] = []
+            for session, text_value in (("exact", f"Using ({path_with_spaces})"),
+                                        ("longer", "/tmp/other/My Shots/front.png and /tmp/My Shots/front.png.bak")):
+                _fixture_rows(root / "claude" / f"{session}.jsonl", [
+                    _claude_part(0, session, "assistant", {"type": "tool_use", "id": "shot", "name": "Bash",
+                        "input": {"command": "python3 hana_shot.py shot --view front"}}),
+                    _claude_part(10, session, "user", {"type": "tool_result", "tool_use_id": "shot",
+                        "content": "saved"}),
+                    _claude_part(20, session, "assistant", {"type": "text", "text": text_value}),
+                ])
+                records.append({"time": (START + timedelta(seconds=5)).isoformat(), "status": "success",
+                    "exit_code": 0, "session": {"state": "present", "value": session},
+                    "attempts": [{"status": "success", "label": "front", "view": "front",
+                                  "image_paths": [path_with_spaces]}]})
+            timing_path = root / "timings.jsonl"
+            _ = timing_path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+            calls = scan_calls(root / "claude", root / "codex", timing_path)
+        by_session = {call.session_id: call.cited_image_paths for call in calls}
+        self.assertEqual(by_session["exact"], (path_with_spaces,))
+        self.assertEqual(by_session["longer"], ())
+
+    def test_attempt_evidence_names_state_count_guarantee(self) -> None:
+        from scripts.shot_report.transcripts import AttemptCountInferredFromImages, ExactOrderedCaptureAttempts, SuccessfulCapture
+
+        call = ToolCall(START, START, "fixture", "fixture.jsonl", "Claude", "studio", "shot", "hana_shot")
+        self.assertIsInstance(call.attempt_evidence, AttemptCountInferredFromImages)
+        capture = SuccessfulCapture(("/tmp/one.png",))
+        self.assertEqual(ExactOrderedCaptureAttempts((capture,)).captures, (capture,))
 
 
 if __name__ == "__main__":

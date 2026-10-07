@@ -13,13 +13,17 @@ from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
-from episodes import Episode, SURVEY_SOURCES, read_episodes, split_episodes, write_episodes  # pyright: ignore[reportImplicitRelativeImport]
+from episodes import (  # pyright: ignore[reportImplicitRelativeImport]
+    Episode, LegacyEvidenceUnavailable, NoObservablePath, NoneCited, OneCitedShot,
+    SeveralCitedShots, SURVEY_SOURCES, read_episodes, split_episodes, write_episodes,
+)
 from transcripts import scan_calls, survey_counts  # pyright: ignore[reportImplicitRelativeImport]
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
 STATE_DIR = Path.home() / ".local/state/screenshot-analysis"
 CLAUDE_ROOT = Path.home() / ".claude/projects"
 CODEX_ROOT = Path.home() / ".codex/sessions"
+TIMINGS_PATH = Path.home() / ".cache/hana-shot/timings.jsonl"
 
 
 def _window_stamp(value: str) -> datetime:
@@ -99,6 +103,31 @@ def _image_rows(episodes: Iterable[Episode]) -> list[str]:
     return _aligned_table(headers, rows)
 
 
+def _kept_rows(episodes: Iterable[Episode]) -> list[str]:
+    groups: dict[tuple[int, str, str, str], list[Episode]] = defaultdict(list)
+    for episode in episodes:
+        groups[(episode.split, episode.method, episode.agent, episode.project)].append(episode)
+    headers = ["split_s", "method", "agent", "project", "n_episodes", "cited", "several_cited",
+               "none_cited", "no_observable_path", "legacy_unassessed", "n_first_kept",
+               "median_attempts_before", "p90_attempts_before"]
+    rows: list[list[str]] = []
+    for (split, method, agent, project), group in sorted(groups.items()):
+        before = [float(episode.kept_shot.attempts_before_first_kept_shot) for episode in group
+                  if isinstance(episode.kept_shot, (OneCitedShot, SeveralCitedShots))]
+        rows.append([
+            str(split), method, agent, project, str(len(group)),
+            str(sum(isinstance(episode.kept_shot, OneCitedShot) for episode in group)),
+            str(sum(isinstance(episode.kept_shot, SeveralCitedShots) for episode in group)),
+            str(sum(isinstance(episode.kept_shot, NoneCited) for episode in group)),
+            str(sum(isinstance(episode.kept_shot, NoObservablePath) for episode in group)),
+            str(sum(isinstance(episode.kept_shot, LegacyEvidenceUnavailable) for episode in group)),
+            str(len(before)),
+            f"{statistics.median(before):.1f}" if before else "—",
+            f"{_percentile(before, .90):.1f}" if before else "—",
+        ])
+    return _aligned_table(headers, rows)
+
+
 def _by_hand_sessions(episodes: Iterable[Episode]) -> list[str]:
     latest: dict[tuple[str, str, str], datetime] = {}
     for episode in episodes:
@@ -126,6 +155,8 @@ def report(state_dir: Path, since: str = "", until: str = "", project: str = "")
     end_label = end.astimezone(PACIFIC).isoformat() if end else "latest saved"
     lines = [f"Window: {start_label} to {end_label} PDT (America/Los_Angeles); n counts episodes; duration in hours and minutes"]
     lines.extend(_report_rows(selected))
+    lines.append("Kept-shot evidence by split; each state counts episodes; attempt statistics use n_first_kept")
+    lines.extend(_kept_rows(selected))
     lines.append("Minutes per image, 5-min split; n_images counts images")
     lines.extend(_image_rows(selected))
     hana = [episode for episode in selected if episode.split == 300 and episode.method == "/hana_shot"]
@@ -164,9 +195,9 @@ def survey(state_dir: Path) -> str:
     return "\n".join(lines)
 
 
-def scan(state_dir: Path, claude_root: Path, codex_root: Path) -> str:
+def scan(state_dir: Path, claude_root: Path, codex_root: Path, timings_path: Path | None = None) -> str:
     started = time.monotonic()
-    calls = scan_calls(claude_root, codex_root)
+    calls = scan_calls(claude_root, codex_root, timings_path)
     counts = survey_counts(calls)
     counted = {"mcp_brp", "bash_brp", "hana_shot"}
     counted.update(source for source in SURVEY_SOURCES if counts.get(source, (0, 0, 0))[0] > 10)
@@ -196,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = scan_parser.add_argument("--state-dir", type=Path, default=STATE_DIR)
     _ = scan_parser.add_argument("--claude-root", type=Path, default=CLAUDE_ROOT)
     _ = scan_parser.add_argument("--codex-root", type=Path, default=CODEX_ROOT)
+    _ = scan_parser.add_argument("--timings-path", type=Path, default=TIMINGS_PATH)
     report_parser = commands.add_parser("report")
     _ = report_parser.add_argument("--state-dir", type=Path, default=STATE_DIR)
     _ = report_parser.add_argument("--since", default="")
@@ -207,7 +239,8 @@ def main(argv: list[str] | None = None) -> int:
     action = cast(str, args.action)
     state_dir = cast(Path, args.state_dir)
     if action == "scan":
-        print(scan(state_dir, cast(Path, args.claude_root), cast(Path, args.codex_root)))
+        print(scan(state_dir, cast(Path, args.claude_root), cast(Path, args.codex_root),
+                   cast(Path, args.timings_path)))
     elif action == "report":
         print(report(state_dir, cast(str, args.since), cast(str, args.until), cast(str, args.project)))
     else:
