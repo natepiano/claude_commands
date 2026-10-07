@@ -174,7 +174,7 @@ The user's measure, relayed by the showrunner (natedev) 2026-10-06: "it's a lot 
 - A pooled compaction row in `compare.json` — derived from the switched directors' rows instead.
 - Every earlier Opus request as the control's earlier side — measures drift, not the switch.
 
-### Phase 3 — The phase table counts turns and repair rounds for the same work · status: todo
+### Phase 3 — The phase table counts turns and repair rounds for the same work · status: done
 
 #### Work Order
 
