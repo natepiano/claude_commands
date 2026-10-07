@@ -471,7 +471,7 @@ def atomic_json(path: Path, result: ComparisonReport) -> None:
 
 
 def compare(state_dir: Path) -> ComparisonReport:
-    """Print comparison tables and atomically write all their data to compare.json."""
+    """Atomically write comparison data without printing its tables."""
     turns = load_turns(state_dir / "turns.jsonl")
     compactions = load_compactions(state_dir / "compactions.jsonl")
     names = director_names(turns)
@@ -523,5 +523,4 @@ def compare(state_dir: Path) -> ComparisonReport:
         "directors": directors, "pooled": pooled, "control": control, "compactions": compaction_rows,
     }
     atomic_json(state_dir / "compare.json", result)
-    print(markdown(result))
     return result
