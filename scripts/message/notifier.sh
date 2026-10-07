@@ -15,7 +15,7 @@ SESSIONS_DIR=${NOTIFIER_SESSIONS_DIR:-$HOME/.claude/sessions}
 NOW=${NOTIFIER_NOW_EPOCH:-$EPOCHSECONDS}
 
 die() { print -u2 -r -- "notifier.sh: $*"; exit 2 }
-usage() { die 'usage: notifier.sh new <instance> --every <min> (--run <cmd> | --to <target> (--command <text> | --prompt-file <path>)) [--from <sender>] [--check <cmd>] [--hold] [--aligned] [--timeout <s>]; start|stop|status|fire|restart|remove|health <instance>; interval <instance> <min>; align <instance> on|off; status|tick' }
+usage() { die 'usage: notifier.sh new <instance> --every <min> (--run <cmd> | --to <target> (--command <text> | --prompt-file <path>)) [--from <sender>] [--check <cmd>] [--hold] [--aligned] [--timeout <s>]; start|resume|stop|status|fire|restart|remove|health <instance>; interval <instance> <min>; align <instance> on|off; status|tick' }
 
 [[ $NOW == <0-> ]] || die "invalid clock: $NOW"
 
@@ -177,6 +177,7 @@ cmd_state() {
   read_state
   case $action in
     start) state[ENABLED]=1; schedule; next_line ;;
+    resume) state[ENABLED]=1; write_state; next_line ;;
     stop) state[ENABLED]=0; write_state ;;
     restart) state[LAST_RESTART]=$NOW; schedule; next_line ;;
     interval)
@@ -461,7 +462,7 @@ action=$1
 shift
 case $action in
   new) cmd_new "$@" ;;
-  start|stop|restart)
+  start|resume|stop|restart)
     (( $# == 1 )) || usage
     cmd_state "$action" "$1" ;;
   interval)
