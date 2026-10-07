@@ -42,6 +42,7 @@ class ReleaseEntry(TypedDict, total=False):
     wait_started_at: str
     wait_ended_at: str
     outcome: str
+    answered_at: str
 
 
 class HoldCycle(TypedDict):
@@ -109,6 +110,11 @@ class MemoryGateReturned:
 
 
 @dataclass(frozen=True)
+class NothingToBuild:
+    answered_at: datetime
+
+
+@dataclass(frozen=True)
 class NoAdmissionAck:
     released_at: datetime
 
@@ -120,7 +126,7 @@ class NoRegistration:
 
 ReleaseState = (AwaitingRelease | RecipientGone | DeliveryFailed | DeliveryQueued |
                 ReleasedAwaitingAdmission | WaitingForMemory | MemoryGateReturned |
-                NoAdmissionAck | NoRegistration)
+                NothingToBuild | NoAdmissionAck | NoRegistration)
 
 
 def read_release_state(entry: Mapping[str, object]) -> ReleaseState:
@@ -137,6 +143,7 @@ def read_release_state(entry: Mapping[str, object]) -> ReleaseState:
         "ReleasedAwaitingAdmission": {"released_at"},
         "WaitingForMemory": {"released_at", "wait_started_at"},
         "MemoryGateReturned": {"wait_ended_at", "outcome"},
+        "NothingToBuild": {"answered_at"},
         "NoAdmissionAck": {"released_at"},
         "NoRegistration": set(),
     }
@@ -170,6 +177,8 @@ def read_release_state(entry: Mapping[str, object]) -> ReleaseState:
             if outcome not in {"Granted", "TimedOut", "MeminfoUnavailable"}:
                 raise ValueError(f"invalid gate outcome for {session_id}")
             return MemoryGateReturned(instant("wait_ended_at"), cast(GateOutcome, outcome))
+        case "NothingToBuild":
+            return NothingToBuild(instant("answered_at"))
         case "NoAdmissionAck":
             return NoAdmissionAck(instant("released_at"))
         case "NoRegistration":
@@ -179,7 +188,7 @@ def read_release_state(entry: Mapping[str, object]) -> ReleaseState:
 
 
 def store_release_state(entry: ReleaseEntry, state: ReleaseState) -> None:
-    for field in ("attempted_at", "released_at", "wait_started_at", "wait_ended_at", "outcome"):
+    for field in ("attempted_at", "released_at", "wait_started_at", "wait_ended_at", "outcome", "answered_at"):
         _ = entry.pop(field, None)
     entry["state"] = type(state).__name__
     if isinstance(state, (DeliveryFailed, DeliveryQueued)):
@@ -192,6 +201,8 @@ def store_release_state(entry: ReleaseEntry, state: ReleaseState) -> None:
     elif isinstance(state, MemoryGateReturned):
         entry["wait_ended_at"] = state.wait_ended_at.isoformat()
         entry["outcome"] = state.outcome
+    elif isinstance(state, NothingToBuild):
+        entry["answered_at"] = state.answered_at.isoformat()
 
 
 @dataclass(frozen=True)
@@ -599,6 +610,28 @@ def mark_gate(session_id: str, state: str, outcome: str = "") -> str:
         return "mark ignored"
 
 
+def answer_nothing_to_build(session_id: str) -> str:
+    """A released session's answer when it has no build or BRP launch to start, so the next is released."""
+    if not session_id:
+        return "NoSessionId"
+    if not has_holder_file(holder_directory()):
+        return "no build hold"
+    with release_lock():
+        if isinstance(read_holders(holder_directory()), NoHolders):
+            return "no build hold"
+        cycle = read_cycle_for_change()
+        if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
+            return "no hold cycle"
+        entry = next((entry for entry in cycle["entries"] if entry["session_id"] == session_id), None)
+        if entry is None:
+            return "nothing-to-build ignored: this session is not registered"
+        if not isinstance(read_release_state(entry), (ReleasedAwaitingAdmission, DeliveryQueued)):
+            return f"nothing-to-build ignored: {entry_text(entry)}"
+        store_release_state(entry, NothingToBuild(datetime.now().astimezone()))
+        save_cycle(cycle)
+        return f"{entry_text(entry)}; the release moves on to the next session"
+
+
 def socket_for(session_id: str) -> str | None:
     script = Path(__file__).resolve().parent.parent / "message" / "sessions.py"
     result = subprocess.run([sys.executable, str(script), "socket", f"session:{session_id}"], capture_output=True, text=True)
@@ -607,7 +640,9 @@ def socket_for(session_id: str) -> str | None:
 
 def send_release(entry: ReleaseEntry, socket: str) -> int:
     script = Path(__file__).resolve().parent.parent / "message" / "send.py"
-    notice = f"/build_hold: your hold has been released. Start your next build or BRP launch now; its memory gate records admission. Session {entry['session_id']}."
+    notice = ("/build_hold: your hold has been released. Start your next build or BRP launch now; its memory gate records admission. "
+              "With nothing to build, run python3 ~/.claude/scripts/build_hold/build_hold.py nothing-to-build now, so the next session is released. "
+              f"Session {entry['session_id']}.")
     result = subprocess.run([sys.executable, str(script), "--to", f"uds:{socket}", "--text", notice], capture_output=True, text=True)
     return result.returncode
 
@@ -795,6 +830,7 @@ def main(arguments: list[str]) -> int:
     _ = release.add_argument("--holder")
     _ = release.add_argument("--resume", action="store_true")
     _ = commands.add_parser("wait")
+    _ = commands.add_parser("nothing-to-build")
     mark = commands.add_parser("mark")
     _ = mark.add_argument("--state", required=True, choices=["WaitingForMemory", "MemoryGateReturned"])
     _ = mark.add_argument("--outcome", choices=["Granted", "TimedOut", "MeminfoUnavailable"], default="")
@@ -832,6 +868,8 @@ def main(arguments: list[str]) -> int:
             print(release_cycle(holder_directory(), name))
         elif action == "wait":
             print(register_wait(os.environ.get("CLAUDE_CODE_SESSION_ID", "")))
+        elif action == "nothing-to-build":
+            print(answer_nothing_to_build(os.environ.get("CLAUDE_CODE_SESSION_ID", "")))
         elif action == "mark":
             print(mark_gate(cast(str, options.session_id) or os.environ.get("CLAUDE_CODE_SESSION_ID", ""), cast(str, options.state), cast(str, options.outcome)))
         elif action == "record-recipient":
