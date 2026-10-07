@@ -107,14 +107,14 @@ The user's measure, relayed by the showrunner (natedev) 2026-10-06: "it's a lot 
 - `director_turns(reads)` sorts one director's session reads by `started` and recomputes `switch_turn` over the combined sequence. `model_study.py` holds `extract(roster, projects_dir, registry_dir, state_dir)`, `atomic_text` and the parser with the `extract` subcommand; the three outputs are written whole through a temporary file.
 
 **Files:**
-- `scripts/model_study/turns.py` — `RosterEntry`, `Turn`, `Compaction`, `Dropped`, `SessionRead`, `load_roster`, `registered_ids`, `session_ids`, `resolve_session_files`, `director_boundary`, `prompt_kind`, `read_session`, `director_turns`.
+- `scripts/model_study/turns.py` — `RosterEntry`, `Turn`, `Compaction`, `Dropped`, `SessionRead`, `load_roster`, `registered_ids`, `session_ids`, `director_boundary`, `prompt_kind`, `read_session`, `director_turns`.
 - `scripts/model_study/model_study.py` — the command line and `extract`; later subcommands extend its parser.
 - `scripts/model_study/roster.json` — the twelve directors (`screenshot`, `widget`, `hook`, `enh-showrunner`, `cache-evict`, `mul_add`, `build-report`, `model-study`, `startup`, `fps`, `trunk`, `organon`); production `hana` for `widget`, `startup`, `fps`, `trunk`, `organon`, else `build-followups`.
 - `scripts/model_study/test_turns.py` — ten tests against synthetic transcripts (usage and timing, kinds, director start, compactions, drops, registry, privacy, combined `switch_turn`, synthetic dropping, final-block stop reason).
 - `pyrightconfig.json` — one `executionEnvironments` entry `{"root": "scripts/model_study", "extraPaths": ["scripts/model_study"]}`.
 
 **Binds later work:**
-- Roster entry: `{"name", "session_ids", "switched_by_pdt", "production", "director_from_pdt"}`; `load_roster(path) -> list[RosterEntry]` (frozen dataclass). `session_ids(entry, registry_dir)` adds the `sessionId` that `<registry-dir>/*.json` (objects with `name`, `sessionId`) names for the entry now, because a restarted director keeps its name and gets a new id. `resolve_session_files(entry, projects_dir, registry_dir) -> list[Path]` finds `<projects-dir>/*/<id>.jsonl` and never reads `<id>/subagents/`; an id with no file is listed under `missing_ids`, not an error.
+- Roster entry: `{"name", "session_ids", "switched_by_pdt", "production", "director_from_pdt"}`; `load_roster(path) -> list[RosterEntry]` (frozen dataclass). `session_ids(entry, registry_dir)` adds the `sessionId` that `<registry-dir>/*.json` (objects with `name`, `sessionId`) names for the entry now, because a restarted director keeps its name and gets a new id. `extract` finds each id's transcript with `<projects-dir>/*/<id>.jsonl` and never reads `<id>/subagents/`; an id with no file is a gone session kept from the saved state, not an error.
 - `Turn` (frozen; `to_json()` is the `turns.jsonl` row): `session` (the file's id), `name`, `request_id`, `started`, `ended` (ISO UTC), `seconds` (float or null), `model`, `effort` (`perTurnEffort`, `unknown` when absent), `speed` (`usage.speed`, `unknown` when absent), `stop`, `kind`, `input`, `output`, `thinking`, `cache_read`, `write_5m`, `write_1h`, `context` (input + cache_read + write_5m + write_1h), `switch_turn`, `after_compact` (1 to 10 for the first ten requests after each `compact_boundary`, else 0). `Compaction` (to `compactions.jsonl`): `session`, `name`, `at` (ISO UTC), `trigger`, `pre_tokens`, `post_tokens`, `duration_ms` (null when absent), `model` (that of the last request before it).
 - `Dropped` and the `dropped` object of each `extract.json` session carry six keys: `before_director`, `sidechain`, `no_trigger`, `negative`, `over_limit`, `synthetic`; a limits listing names all six. `turns.jsonl` rows are real API requests only, never `<synthetic>`.
 - `switch_turn` is true for the director's first request overall and the first request after any change of `model`, combined per director by `director_turns`; carried rows and live rows must be recomputed together, so a live row that follows carried rows on the same model is not a switch.
@@ -232,7 +232,7 @@ The user's measure, relayed by the showrunner (natedev) 2026-10-06: "it's a lot 
 
 **Ruled out:** a length cap on `report.md` (only the message is capped); filtering `phases.json` rows by effort or speed; named variants for unavailable measurements in place of `None` and JSON null.
 
-### Phase 5 — The study can be re-run as the sample grows · status: todo
+### Phase 5 — The study can be re-run as the sample grows · status: done
 
 #### Work Order
 
