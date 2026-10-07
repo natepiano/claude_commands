@@ -213,6 +213,218 @@ class MulAddHookTests(unittest.TestCase):
                 self.assertTrue(scope.enabled)
                 self.assertEqual(len(findings), 1)
 
+    def test_if_else_initializer_is_a_plain_binding(self) -> None:
+        _ = self.rs_file.write_text(
+            "fn f(c: bool) -> f32 {\n" +
+            "    let w = if c { 1.0 } else { 2.0 };\n" +
+            "    w * 0.5 + 1.0\n" +
+            "}\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual([finding.rewrite for finding in findings], ["w.mul_add(0.5, 1.0)"])
+
+    def test_else_if_initializer_is_a_plain_binding(self) -> None:
+        _ = self.rs_file.write_text(
+            "fn f(c: bool, d: bool, a: f32, b: f32, e: f32) -> f32 {\n" +
+            "    let w = if c { a } else if d { b } else { e };\n" +
+            "    w * 0.5 + 1.0\n" +
+            "}\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual([finding.rewrite for finding in findings], ["w.mul_add(0.5, 1.0)"])
+
+    def test_if_else_initializer_does_not_make_tuple_pattern_let_else(self) -> None:
+        _ = self.rs_file.write_text(
+            "fn f(c: bool) -> f32 {\n" +
+            "    let (w, _) = if c { (1.0, 0) } else { (2.0, 0) };\n" +
+            "    w * 0.5 + 1.0\n" +
+            "}\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual([finding.rewrite for finding in findings], ["w.mul_add(0.5, 1.0)"])
+
+    def test_let_else_pattern_binding_stays_excluded(self) -> None:
+        _ = self.rs_file.write_text(
+            "fn f(opt: Option<f32>) -> f32 {\n" +
+            "    let Some(v) = opt else { return 0.0 };\n" +
+            "    v * 0.5 + 1.0\n" +
+            "}\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual(findings, [])
+
+    def test_nested_if_else_does_not_hide_outer_let_else(self) -> None:
+        _ = self.rs_file.write_text(
+            "fn choose(value: i32) -> Option<f32> { Some(value as f32) }\n" +
+            "fn f(c: bool) -> f32 {\n" +
+            "    let Some(v) = choose(if c { 1 } else { 2 }) else { return 0.0 };\n" +
+            "    v * 0.5 + 1.0\n" +
+            "}\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual(findings, [])
+
+    def test_if_else_vector_initializer_stays_excluded(self) -> None:
+        _ = self.rs_file.write_text(
+            "fn f(c: bool) -> Vec2 {\n" +
+            "    let w = if c { Vec2::ONE } else { Vec2::ZERO };\n" +
+            "    w * 0.5 + 1.0\n" +
+            "}\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual(findings, [])
+
+    def test_ambiguous_field_name_does_not_prove_integer_product(self) -> None:
+        _ = self.rs_file.write_text(
+            "struct F { n: f32 }\n" +
+            "struct I { n: i32 }\n" +
+            "fn f(i: I) -> i32 { i.n * i.n + 1 }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual(findings, [])
+
+    def test_ambiguous_field_name_with_float_literal_still_rewrites(self) -> None:
+        _ = self.rs_file.write_text(
+            "struct F { n: f32 }\n" +
+            "struct I { n: i32 }\n" +
+            "fn f(f: F, c: f32) -> f32 { f.n * 0.5 + c }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual([finding.rewrite for finding in findings], ["f.n.mul_add(0.5, c)"])
+
+    def test_file_float_const_proves_product(self) -> None:
+        _ = self.rs_file.write_text(
+            "const K: f32 = 2.0;\n" +
+            "fn f(x: f32, c: f32) -> f32 { c + x * K }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual([finding.rewrite for finding in findings], ["x.mul_add(K, c)"])
+
+    def test_function_local_float_const_proves_only_its_function(self) -> None:
+        _ = self.rs_file.write_text(
+            "fn f(x: f32, c: f32) -> f32 { const K: f32 = 2.0; c + x * K }\n" +
+            "fn g(x: f32) -> f32 { x * K + x }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual([finding.rewrite for finding in findings], ["x.mul_add(K, c)"])
+
+    def test_sibling_function_float_const_does_not_prove_product(self) -> None:
+        _ = self.rs_file.write_text(
+            "fn g() -> f32 { const K: f32 = 1.0; K }\n" +
+            "fn f(x: f32) -> f32 { x * K + x }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual(findings, [])
+
+    def test_nested_nonfloat_const_does_not_hide_file_float_const(self) -> None:
+        _ = self.rs_file.write_text(
+            "const K: f32 = 2.0;\n" +
+            "fn g() -> u32 { const K: u32 = 1; K }\n" +
+            "fn f(x: f32, c: f32) -> f32 { c + x * K }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual([finding.rewrite for finding in findings], ["x.mul_add(K, c)"])
+
+    def test_nonfloat_module_const_before_float_names_no_scalar(self) -> None:
+        _ = self.rs_file.write_text(
+            "mod b { pub const N: u32 = 1; pub fn f() -> u32 { N * N + 1 } }\n" +
+            "mod a { pub const N: f32 = 1.0; }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual(findings, [])
+
+    def test_nonfloat_module_const_after_float_names_no_scalar(self) -> None:
+        _ = self.rs_file.write_text(
+            "mod a { pub const N: f32 = 1.0; }\n" +
+            "mod b { pub const N: u32 = 1; pub fn f() -> u32 { N * N + 1 } }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual(findings, [])
+
+    def test_duplicate_float_module_consts_still_prove_product(self) -> None:
+        _ = self.rs_file.write_text(
+            "mod a { pub const N: f32 = 1.0; }\n" +
+            "mod b { pub const N: f32 = 2.0; }\n" +
+            "fn f(x: f32, c: f32) -> f32 { c + x * N }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual([finding.rewrite for finding in findings], ["x.mul_add(N, c)"])
+
+    def test_plain_local_shadows_file_float_const(self) -> None:
+        _ = self.rs_file.write_text(
+            "const K: f32 = 2.0;\n" +
+            "fn f() -> i32 { let K = 2; K * K + 1 }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual(findings, [])
+
+    def test_plain_local_shadows_module_float_const(self) -> None:
+        _ = self.rs_file.write_text(
+            "mod m { pub const K: f32 = 2.0; }\n" +
+            "fn f() -> i32 { let K = 2; K * K + 1 }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual(findings, [])
+
+    def test_file_vector_const_does_not_prove_product(self) -> None:
+        _ = self.rs_file.write_text(
+            "const K: Vec2 = Vec2::ONE;\n" +
+            "fn f(x: f32, c: Vec2) -> Vec2 { c + x * K }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual(findings, [])
+
+    def test_file_float_static_proves_product(self) -> None:
+        _ = self.rs_file.write_text(
+            "static K: f64 = 2.0;\n" +
+            "fn f(x: f64, c: f64) -> f64 { c + x * K }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual([finding.rewrite for finding in findings], ["x.mul_add(K, c)"])
+
+    def test_local_annotation_overrides_file_float_const(self) -> None:
+        _ = self.rs_file.write_text(
+            "const K: f32 = 2.0;\n" +
+            "fn f(x: f32, c: Vec2) -> Vec2 {\n" +
+            "    let K: Vec2 = Vec2::ONE;\n" +
+            "    c + x * K\n" +
+            "}\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual(findings, [])
+
+    def test_last_float_field_in_chain_proves_literal_product(self) -> None:
+        _ = self.rs_file.write_text(
+            "struct S { h: f32 }\n" +
+            "fn f(s: Outer, c: f32) -> f32 { c - s.inner.h * 0.5 }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual([finding.rewrite for finding in findings], ["(-s.inner.h).mul_add(0.5, c)"])
+
+    def test_float_fields_prove_product_without_literal(self) -> None:
+        _ = self.rs_file.write_text(
+            "struct S { a: f32, b: f32 }\n" +
+            "fn f(s: S, c: f32) -> f32 { s.a * s.b + c }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual([finding.rewrite for finding in findings], ["s.a.mul_add(s.b, c)"])
+
+    def test_last_float_field_in_addend_is_accepted(self) -> None:
+        _ = self.rs_file.write_text(
+            "struct S { h: f32 }\n" +
+            "fn f(s: Outer, x: f32) -> f32 { x * 0.5 + s.inner.h }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual([finding.rewrite for finding in findings], ["x.mul_add(0.5, s.inner.h)"])
+
+    def test_vector_field_does_not_prove_literal_product(self) -> None:
+        _ = self.rs_file.write_text(
+            "struct S { v: Vec2 }\n" +
+            "fn f(s: S, c: Vec2) -> Vec2 { s.v * 0.5 + c }\n"
+        )
+        _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+        self.assertEqual(findings, [])
+
     def test_integer_product_does_not_block(self) -> None:
         _ = self.rs_file.write_text("fn sample(i: i32, j: i32) { let _ = i * 2 + j; }\n")
         self.assert_passes()
