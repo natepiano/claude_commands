@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -18,12 +19,12 @@ from typing import BinaryIO, ClassVar, NotRequired, TypedDict, cast, override
 from unittest import mock
 
 from scripts.shot_report import shot_report as report_module
-from scripts.shot_report.changes import Change, append_change, read_changes, write_changes
+from scripts.shot_report.changes import MeasurementChange, ProductChange, append_change, read_changes, write_changes
 from scripts.shot_report.episodes import (
     LegacyEvidenceUnavailable, NoObservablePath, NoneCited, OneCitedShot,
     SeveralCitedShots, read_episodes, write_episodes,
 )
-from scripts.shot_report.transcripts import ExactOrderedCaptureAttempts, SuccessfulCapture
+from scripts.shot_report.transcripts import AvailableTimingSource, ExactAttemptCountFromOrderedCaptures
 
 
 class EpisodeRecord(TypedDict):
@@ -47,6 +48,16 @@ class EpisodeRecord(TypedDict):
 HERE = Path(__file__).resolve().parent
 FIXTURES = HERE / "fixtures"
 COMMAND = HERE / "shot_report.py"
+
+
+def _chunk_bytes(row: dict[str, object]) -> bytes:
+    encoded = base64.b64decode(str(row["data"]), validate=True)
+    return zlib.decompress(encoded) if row.get("encoding") == "zlib+base64" else encoded
+
+
+def _chunk_record(key: str, content: bytes) -> dict[str, object]:
+    return {"kind": "chunk", "key": key, "encoding": "zlib+base64",
+            "data": base64.b64encode(zlib.compress(content)).decode("ascii")}
 
 
 class ShotReportTest(unittest.TestCase):
@@ -193,7 +204,7 @@ class ShotReportTest(unittest.TestCase):
             state_dir = Path(directory)
             write_episodes(state_dir / "episodes.jsonl",
                            [replace(baseline, kept_shot=state,
-                                    attempt_count_evidence=(ExactOrderedCaptureAttempts((SuccessfulCapture(("shot.png",)),))
+                                    attempt_count_evidence=(ExactAttemptCountFromOrderedCaptures()
                                                             if index == 0 else baseline.attempt_count_evidence))
                             for index, state in enumerate(evidence)])
             with (state_dir / "episodes.jsonl").open("a", encoding="utf-8") as target:
@@ -202,7 +213,7 @@ class ShotReportTest(unittest.TestCase):
                                  '"method":"by hand","source":[]}\n')
             self.assertEqual(len(read_episodes(state_dir / "episodes.jsonl")), 5)
             self.assertIsInstance(read_episodes(state_dir / "episodes.jsonl")[0].attempt_count_evidence,
-                                  ExactOrderedCaptureAttempts)
+                                  ExactAttemptCountFromOrderedCaptures)
             result = subprocess.run([sys.executable, str(COMMAND), "report", "--state-dir", str(state_dir)],
                                     cwd=HERE, capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -317,12 +328,32 @@ class ShotReportTest(unittest.TestCase):
             self.assertIn("b01a299", {change.commit for change in changes})
             self.assertIn("dab07788", {change.commit for change in changes})
             recording = next(change for change in changes if change.commit == "e6c96fb")
-            self.assertTrue(recording.measurement_change)
-            added = Change("claude", "approved123", "Faster crop", datetime.fromisoformat("2026-10-08T00:00:00+00:00"),
-                           ("natedev",))
+            self.assertIsInstance(recording, MeasurementChange)
+            added = ProductChange("claude", "approved123", "Faster crop", datetime.fromisoformat("2026-10-08T00:00:00+00:00"),
+                                  ("natedev",))
             append_change(path, added)
             append_change(path, added)
             self.assertEqual(sum(change.commit == "approved123" for change in read_changes(path)), 1)
+
+    def test_legacy_changes_load_as_named_variants_and_save_without_bool(self) -> None:
+        stamp = "2026-10-08T00:00:00+00:00"
+        legacy: list[dict[str, object]] = [
+            {"repository": "claude", "commit": "product", "summary": "Crop", "effective_at": stamp,
+             "host_coverage": ["natedev"]},
+            {"repository": "claude", "commit": "measurement", "summary": "Count failures", "effective_at": stamp,
+             "host_coverage": ["natedev"], "measurement_change": True},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "changes.json"
+            _ = path.write_text(json.dumps(legacy), encoding="utf-8")
+            loaded = read_changes(path)
+            self.assertEqual([(change.commit, type(change)) for change in loaded],
+                             [("measurement", MeasurementChange), ("product", ProductChange)])
+            write_changes(path, loaded)
+            saved = cast(list[dict[str, object]], json.loads(path.read_text(encoding="utf-8")))
+            self.assertEqual({row["kind"] for row in saved}, {"product", "measurement"})
+            self.assertTrue(all("measurement_change" not in row for row in saved))
+            self.assertEqual(read_changes(path), loaded)
 
     def test_hourly_guard_skips_same_utc_hour_and_resumes_next_hour(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -355,8 +386,8 @@ class ShotReportTest(unittest.TestCase):
             ]
             write_episodes(state_dir / "episodes.jsonl", records)
             write_changes(state_dir / "changes.json", [
-                Change("claude", "rollout", "Introduce /hana_shot", change_time, ("natedev", "mac")),
-                Change("claude", "recording", "Log calls", change_time + timedelta(hours=1), ("natedev",), True),
+                ProductChange("claude", "rollout", "Introduce /hana_shot", change_time, ("natedev", "mac")),
+                MeasurementChange("claude", "recording", "Log calls", change_time + timedelta(hours=1), ("natedev",)),
             ])
             report_module._save_object(state_dir / "scan_status.json", {  # pyright: ignore[reportPrivateUsage]
                 "last_success": "2026-10-02T00:00:00+00:00",
@@ -419,9 +450,9 @@ class ShotReportTest(unittest.TestCase):
                         start=rollout + timedelta(minutes=25), end=rollout + timedelta(minutes=26)),
             ])
             write_changes(state_dir / "changes.json", [
-                Change("claude", "rollout", "Introduce /hana_shot", rollout, ("natedev",)),
-                Change("claude", "mac-only", "Mac display", rollout + timedelta(minutes=10), ("mac",)),
-                Change("bevy_brp", "crop", "Crop in extras", rollout + timedelta(minutes=20), ("natedev",)),
+                ProductChange("claude", "rollout", "Introduce /hana_shot", rollout, ("natedev",)),
+                ProductChange("claude", "mac-only", "Mac display", rollout + timedelta(minutes=10), ("mac",)),
+                ProductChange("bevy_brp", "crop", "Crop in extras", rollout + timedelta(minutes=20), ("natedev",)),
             ])
             report_module._save_object(state_dir / "scan_status.json", {  # pyright: ignore[reportPrivateUsage]
                 "host_last_success": {"natedev": "2026-10-02T00:00:00+00:00"},
@@ -459,7 +490,7 @@ class ShotReportTest(unittest.TestCase):
                              {"codex/candidate.jsonl"})
             prior: dict[str, object] = {}
             for key, row in files.items():
-                received = sum(len(base64.b64decode(str(chunk["data"]))) for chunk in first
+                received = sum(len(_chunk_bytes(chunk)) for chunk in first
                                if chunk.get("kind") == "chunk" and chunk.get("key") == key)
                 prior[key] = {"size": row["size"], "inode": row["inode"], "mtime": row["mtime"],
                               "matched": row["matched"], "cursor": int(str(row["start"])) + received}
@@ -472,7 +503,7 @@ class ShotReportTest(unittest.TestCase):
                            and row.get("key") == "codex/ordinary.jsonl")
             self.assertIs(changed["matched"], True)
             self.assertEqual(changed["start"], 0)
-            sent = b"".join(base64.b64decode(str(row["data"])) for row in third
+            sent = b"".join(_chunk_bytes(row) for row in third
                             if row.get("kind") == "chunk" and row.get("key") == "codex/ordinary.jsonl")
             self.assertEqual(sent, ordinary.read_bytes())
 
@@ -489,6 +520,30 @@ class ShotReportTest(unittest.TestCase):
         self.assertFalse(any(record.get("kind") == "file" for record in records))
         self.assertEqual(records[-1], {"kind": "end", "finished": False})
 
+    def test_mac_ssh_timeout_keeps_fifteen_seconds_beyond_reader_budget(self) -> None:
+        budget = report_module.MAC_READ_BUDGET_SECONDS
+        timeout = report_module.MAC_SSH_TIMEOUT_SECONDS
+        self.assertGreaterEqual(timeout - budget, 15)
+        self.assertEqual(timeout - budget, report_module.MAC_SSH_TIMEOUT_MARGIN_SECONDS)
+
+    def test_default_mac_reader_uses_shared_budget(self) -> None:
+        reader = report_module._mac_reader_source()  # pyright: ignore[reportPrivateUsage]
+        self.assertIn(f"deadline = time.monotonic() + {report_module.MAC_READ_BUDGET_SECONDS}", reader)
+        self.assertNotIn("__BUDGET_SECONDS__", reader)
+
+    def test_mac_chunk_decoder_round_trips_each_encoding_and_rejects_unknown(self) -> None:
+        content = b'{"cmd":"hana_shot.py shot"}\n' + bytes(range(256)) * 8
+        for encoding, payload in (("base64", content), ("zlib+base64", zlib.compress(content))):
+            with self.subTest(encoding=encoding):
+                row: dict[str, object] = {"encoding": encoding,
+                                          "data": base64.b64encode(payload).decode("ascii")}
+                self.assertEqual(report_module._chunk_source_bytes(row), content)  # pyright: ignore[reportPrivateUsage]
+                if encoding == "base64":
+                    _ = row.pop("encoding")
+                    self.assertEqual(report_module._chunk_source_bytes(row), content)  # pyright: ignore[reportPrivateUsage]
+        with self.assertRaisesRegex(ValueError, "encoding"):
+            _ = report_module._chunk_source_bytes({"encoding": "unknown", "data": "YQ=="})  # pyright: ignore[reportPrivateUsage]
+
     def test_mac_reader_uses_scan_filter_constants(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / ".codex/sessions"
@@ -502,6 +557,137 @@ class ShotReportTest(unittest.TestCase):
         records = [cast(dict[str, object], json.loads(line)) for line in result.stdout.splitlines()]
         self.assertTrue(any(record.get("kind") == "chunk" and record.get("key") == "codex/custom.jsonl"
                             for record in records))
+
+    def test_mac_reader_chunks_round_trip_and_count_source_bytes(self) -> None:
+        content = b'{"cmd":"hana_shot.py shot"}\n' + b'x' * (2 * 65536 + 17)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / ".codex/sessions/capture.jsonl"
+            source.parent.mkdir(parents=True)
+            _ = source.write_bytes(content)
+            clock = "import time\ntime.monotonic = lambda: 0\n"
+            result = subprocess.run([sys.executable, "-c", clock + report_module._mac_reader_source()],  # pyright: ignore[reportPrivateUsage]
+                                    input="{}", capture_output=True, text=True, timeout=10, check=False,
+                                    env={**os.environ, "HOME": directory})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [cast(dict[str, object], json.loads(line)) for line in result.stdout.splitlines()]
+        chunks = [row for row in rows if row.get("kind") == "chunk"]
+        self.assertTrue(chunks)
+        self.assertTrue(all(row.get("encoding") == "zlib+base64" for row in chunks))
+        source_chunks = [_chunk_bytes(row) for row in chunks]
+        self.assertTrue(all(chunk for chunk in source_chunks))
+        self.assertEqual(sum(map(len, source_chunks)), len(content))
+        self.assertEqual(b"".join(source_chunks), content)
+
+    def test_mac_reader_resumes_legacy_manifest_then_restarts_same_size_rewrite(self) -> None:
+        first_content = b'{"cmd":"hana_shot.py shot"}\n' + b'a' * (65536 + 23)
+        rewritten = b'{"cmd":"hana_shot.py shot"}\n' + b'b' * (65536 + 23)
+        key = "codex/2026/10/06/capture.jsonl"
+        real_run = subprocess.run
+        sent_priors: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "remote"
+            source = home / ".codex/sessions/2026/10/06/capture.jsonl"
+            source.parent.mkdir(parents=True)
+            _ = source.write_bytes(first_content)
+            state_dir = Path(directory) / "state"
+            mirror = state_dir / "mac-source" / key
+            mirror.parent.mkdir(parents=True)
+            cursor = 31000
+            _ = mirror.write_bytes(first_content[:cursor])
+            stat = source.stat()
+            report_module._save_object(state_dir / "mac_manifest.json", {  # pyright: ignore[reportPrivateUsage]
+                key: {"size": stat.st_size, "inode": stat.st_ino, "mtime": stat.st_mtime_ns,
+                      "matched": True, "cursor": cursor},
+            })
+
+            def local_ssh(args: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+                self.assertEqual(args[0], "ssh")
+                sent_priors.append(cast(dict[str, object], json.loads(cast(bytes, options["input"]))))
+                command = shlex.shlex(args[-1], posix=True, punctuation_chars=";")
+                command.whitespace_split = True
+                reader = list(command)[2]
+                clock = "import time\ntime.monotonic = lambda: 0\n"
+                result = real_run([sys.executable, "-c", clock + reader],
+                                  input=cast(bytes, options["input"]), stdout=cast(BinaryIO, options["stdout"]),
+                                  stderr=subprocess.PIPE, timeout=10, check=False,
+                                  env={**os.environ, "HOME": str(home)})
+                return subprocess.CompletedProcess(args, result.returncode,
+                                                   stderr=f"rc={result.returncode}\n".encode() + result.stderr)
+
+            with mock.patch.object(subprocess, "run", side_effect=local_ssh):
+                resumed = report_module._mac_evidence(state_dir)  # pyright: ignore[reportPrivateUsage]
+                unchanged = report_module._mac_evidence(state_dir)  # pyright: ignore[reportPrivateUsage]
+            self.assertIsInstance(resumed, report_module.MacEvidenceAvailable)
+            self.assertIsInstance(unchanged, report_module.MacEvidenceAvailable)
+            assert isinstance(resumed, report_module.MacEvidenceAvailable)
+            assert isinstance(unchanged, report_module.MacEvidenceAvailable)
+            self.assertEqual(cast(dict[str, object], sent_priors[0][key])["cursor"], cursor)
+            self.assertEqual(resumed.bytes_read, len(first_content) - cursor)
+            self.assertEqual(unchanged.bytes_read, 0)
+            self.assertEqual(mirror.read_bytes(), first_content)
+
+            _ = source.write_bytes(rewritten)
+            changed_ns = stat.st_mtime_ns + 2_000_000_000
+            os.utime(source, ns=(changed_ns, changed_ns))
+            with mock.patch.object(subprocess, "run", side_effect=local_ssh):
+                replaced = report_module._mac_evidence(state_dir)  # pyright: ignore[reportPrivateUsage]
+            self.assertIsInstance(replaced, report_module.MacEvidenceAvailable)
+            assert isinstance(replaced, report_module.MacEvidenceAvailable)
+            self.assertEqual(replaced.bytes_read, len(rewritten))
+            self.assertEqual(mirror.read_bytes(), rewritten)
+            manifest = report_module._read_object(state_dir / "mac_manifest.json")  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(cast(dict[str, object], manifest[key])["cursor"], len(rewritten))
+
+    def test_previous_reader_manifest_resumes_without_duplicate_calls(self) -> None:
+        content = (FIXTURES / "codex/sessions/2026/10/01/rollout-control.jsonl").read_bytes()
+        key = "codex/2026/10/01/rollout-control.jsonl"
+        real_run = subprocess.run
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "remote"
+            source = home / ".codex/sessions/2026/10/01/rollout-control.jsonl"
+            source.parent.mkdir(parents=True)
+            _ = source.write_bytes(content)
+            state_dir = Path(directory) / "state"
+            mirror = state_dir / "mac-source" / key
+            mirror.parent.mkdir(parents=True)
+            cursor = len(content) // 2
+            _ = mirror.write_bytes(content[:cursor])
+            stat = source.stat()
+            report_module._save_object(state_dir / "mac_manifest.json", {  # pyright: ignore[reportPrivateUsage]
+                key: {"size": stat.st_size, "inode": stat.st_ino, "mtime": stat.st_mtime_ns,
+                      "matched": True, "cursor": cursor},
+            })
+
+            def local_ssh(args: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+                command = shlex.shlex(args[-1], posix=True, punctuation_chars=";")
+                command.whitespace_split = True
+                reader = list(command)[2]
+                clock = "import time\ntime.monotonic = lambda: 0\n"
+                result = real_run([sys.executable, "-c", clock + reader],
+                                  input=cast(bytes, options["input"]), stdout=cast(BinaryIO, options["stdout"]),
+                                  stderr=subprocess.PIPE, timeout=10, check=False,
+                                  env={**os.environ, "HOME": str(home)})
+                return subprocess.CompletedProcess(args, result.returncode,
+                                                   stderr=f"rc={result.returncode}\n".encode() + result.stderr)
+
+            with mock.patch.object(subprocess, "run", side_effect=local_ssh):
+                first = report_module._mac_evidence(state_dir)  # pyright: ignore[reportPrivateUsage]
+                second = report_module._mac_evidence(state_dir)  # pyright: ignore[reportPrivateUsage]
+            assert isinstance(first, report_module.MacEvidenceAvailable)
+            assert isinstance(second, report_module.MacEvidenceAvailable)
+            self.assertEqual((first.bytes_read, second.bytes_read), (len(content) - cursor, 0))
+            self.assertEqual(mirror.read_bytes(), content)
+            manifest = report_module._read_object(state_dir / "mac_manifest.json")  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(cast(dict[str, object], manifest[key])["cursor"], len(content))
+            with mock.patch.object(report_module, "_mac_evidence", return_value=first):
+                _ = report_module.scan(state_dir, state_dir / "local-claude", state_dir / "local-codex",
+                                       include_mac=True)
+            episodes = read_episodes(state_dir / "episodes.jsonl")
+            self.assertTrue(episodes)
+            with mock.patch.object(report_module, "_mac_evidence", return_value=second):
+                _ = report_module.scan(state_dir, state_dir / "local-claude", state_dir / "local-codex",
+                                       include_mac=True)
+            self.assertEqual(read_episodes(state_dir / "episodes.jsonl"), episodes)
 
     def test_mac_reader_resumes_unchanged_file_after_each_budget(self) -> None:
         content = (b'{"cmd":"hana_shot.py shot"}\n' + b'{"message":"' +
@@ -520,8 +706,9 @@ class ShotReportTest(unittest.TestCase):
                 command = shlex.shlex(args[-1], posix=True, punctuation_chars=";")
                 command.whitespace_split = True
                 reader = list(command)[2]
+                tick = report_module.MAC_READ_BUDGET_SECONDS // 2 + 1
                 clock = ("import time\n"
-                         "ticks = iter(range(40, 4000, 40))\n"
+                         f"ticks = iter(range({tick}, {tick * 100}, {tick}))\n"
                          "time.monotonic = lambda: next(ticks)\n")
                 result = real_run([sys.executable, "-c", clock + reader],
                                   input=cast(bytes, options["input"]), stdout=cast(BinaryIO, options["stdout"]),
@@ -545,7 +732,7 @@ class ShotReportTest(unittest.TestCase):
                     line = report_module.scan(state_dir, state_dir / "local-claude",
                                               state_dir / "local-codex", include_mac=True)
                 if isinstance(evidence.progress, report_module.MacReadFinished):
-                    self.assertIn("Mac: read 0 source bytes; finished", line)
+                    self.assertIn(f"Mac: finished; read {evidence.bytes_read} source bytes", line)
                     self.assertEqual(report_module._host_coverage(state_dir)["mac"].at,  # pyright: ignore[reportPrivateUsage]
                                      evidence.started_at)
                     break
@@ -574,7 +761,7 @@ class ShotReportTest(unittest.TestCase):
             nonlocal reachable
             commands.append(args)
             self.assertIn("rc=$?", args[-1])
-            self.assertEqual(options["timeout"], 120)
+            self.assertEqual(options["timeout"], report_module.MAC_SSH_TIMEOUT_SECONDS)
             if not reachable:
                 reachable = True
                 return subprocess.CompletedProcess(args, 255, stderr=b"unreachable")
@@ -591,8 +778,7 @@ class ShotReportTest(unittest.TestCase):
                 _ = output.write((json.dumps({"kind": "file", "key": key, **meta,
                                               "matched": True, "start": start}) + "\n").encode())
                 if start < len(content):
-                    _ = output.write((json.dumps({"kind": "chunk", "key": key,
-                                                  "data": base64.b64encode(content[start:]).decode()}) + "\n").encode())
+                    _ = output.write((json.dumps(_chunk_record(key, content[start:])) + "\n").encode())
             _ = output.write(b'{"kind":"end","finished":true}\n')
             return subprocess.CompletedProcess(args, 0, stderr=b"rc=0\n")
 
@@ -676,7 +862,7 @@ class ShotReportTest(unittest.TestCase):
                 {"kind": "claude_coverage", "included": False},
                 {"kind": "file", "key": key, "size": len(payload), "inode": 17, "mtime": 1,
                  "matched": True, "start": start},
-                {"kind": "chunk", "key": key, "data": base64.b64encode(part).decode()},
+                _chunk_record(key, part),
                 {"kind": "end", "finished": calls > 1},
             ]
             for row in rows:
@@ -718,8 +904,7 @@ class ShotReportTest(unittest.TestCase):
                 {"kind": "claude_coverage", "included": False},
                 {"kind": "file", "key": "codex/growing.jsonl", "size": len(content) - 4,
                  "inode": 3, "mtime": 1, "matched": True, "start": 0},
-                {"kind": "chunk", "key": "codex/growing.jsonl",
-                 "data": base64.b64encode(content).decode()},
+                _chunk_record("codex/growing.jsonl", content),
                 {"kind": "end", "finished": True},
             ]
             for row in rows:
@@ -740,7 +925,7 @@ class ShotReportTest(unittest.TestCase):
             output = cast(BinaryIO, options["stdout"])
             _ = output.write(b'{"kind":"file","key":"codex/partial.jsonl","size":20,' +
                              b'"inode":3,"mtime":1,"matched":true,"start":0}\n')
-            raise subprocess.TimeoutExpired(args, 120)
+            raise subprocess.TimeoutExpired(args, report_module.MAC_SSH_TIMEOUT_SECONDS)
 
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
@@ -768,6 +953,115 @@ class ShotReportTest(unittest.TestCase):
             self.assertEqual(coverage["mac"].at, mac_start)
             self.assertEqual(report_module._read_object(state_dir / "scan_status.json")["last_success"],  # pyright: ignore[reportPrivateUsage]
                              completed.isoformat())
+
+    def test_legacy_mac_coverage_excludes_claude_even_when_old_status_says_included(self) -> None:
+        baseline = next(episode for episode in read_episodes(self.state_dir / "episodes.jsonl") if episode.split == 300)
+        change_time = datetime.fromisoformat("2026-10-01T00:30:00+00:00")
+        covered_at = change_time + timedelta(hours=1)
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            report_module._save_object(state_dir / "scan_status.json", {  # pyright: ignore[reportPrivateUsage]
+                "host_last_success": {"mac": covered_at.isoformat(), "natedev": covered_at.isoformat()},
+                "mac_claude": "included",
+            })
+            write_episodes(state_dir / "episodes.jsonl", [
+                replace(baseline, source_host="mac", method="by hand",
+                        start=change_time - timedelta(minutes=10), end=change_time - timedelta(minutes=9)),
+                replace(baseline, source_host="mac", method="/hana_shot",
+                        start=change_time + timedelta(minutes=10), end=change_time + timedelta(minutes=11)),
+            ])
+            write_changes(state_dir / "changes.json", [
+                ProductChange("claude", "legacy-mac", "Mac crop", change_time, ("mac",)),
+            ])
+            output = report_module.report(state_dir)
+        mac_coverage = next(line for line in output.splitlines()
+                            if line.startswith("mac evidence covered through "))
+        local_coverage = next(line for line in output.splitlines()
+                              if line.startswith("natedev evidence covered through "))
+        self.assertIn("sources: Codex transcripts, timings", mac_coverage)
+        self.assertNotIn("Claude transcripts", mac_coverage)
+        self.assertIn("sources: Claude transcripts, Codex transcripts, timings", local_coverage)
+        mac_rows = [line for line in output.splitlines() if "legacy-mac" in line and "host=mac" in line]
+        self.assertTrue(mac_rows)
+        self.assertTrue(all("incomplete:mac" in line for line in mac_rows), mac_rows)
+
+    def test_local_coverage_names_timings_only_when_timing_source_is_available(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            claude_root = FIXTURES / "claude" / "projects"
+            codex_root = FIXTURES / "codex" / "sessions"
+            _ = report_module.scan(state_dir, claude_root, codex_root)
+            without = report_module._read_object(state_dir / "scan_status.json")  # pyright: ignore[reportPrivateUsage]
+            without_hosts = cast(dict[str, object], without["host_coverage"])
+            without_local = cast(dict[str, object], without_hosts["natedev"])
+            self.assertEqual(set(cast(list[str], without_local["sources"])), {"claude", "codex"})
+
+            timings = state_dir / "timings.jsonl"
+            _ = timings.write_text("", encoding="utf-8")
+            _ = report_module.scan(state_dir, claude_root, codex_root,
+                                   AvailableTimingSource(timings, "natedev"))
+            with_timing = report_module._read_object(state_dir / "scan_status.json")  # pyright: ignore[reportPrivateUsage]
+            with_hosts = cast(dict[str, object], with_timing["host_coverage"])
+            local = cast(dict[str, object], with_hosts["natedev"])
+            self.assertEqual(set(cast(list[str], local["sources"])), {"claude", "codex", "timings"})
+
+    def test_mac_finished_without_claude_transcripts_never_labels_window_complete(self) -> None:
+        baseline = next(episode for episode in read_episodes(self.state_dir / "episodes.jsonl") if episode.split == 300)
+        change_time = datetime.fromisoformat("2026-10-01T00:30:00+00:00")
+        mac_start = change_time + timedelta(hours=2)
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            mirror = state_dir / "mac-source"
+            mac = report_module.MacEvidenceAvailable(mirror / "claude-unavailable", mirror / "codex",
+                                                     mirror / "timings/timings.jsonl", 0, False,
+                                                     mac_start, report_module.MacReadFinished())
+            with mock.patch.object(report_module, "_mac_evidence", return_value=mac):
+                _ = report_module.scan(state_dir, state_dir / "local-claude", state_dir / "local-codex",
+                                       include_mac=True)
+            covered = report_module._host_coverage(state_dir)["mac"]  # pyright: ignore[reportPrivateUsage]
+            self.assertIsInstance(covered, report_module.CoveredHostSourcesThrough)
+            self.assertEqual(covered.sources, frozenset(("codex", "timings")))
+            write_episodes(state_dir / "episodes.jsonl", [
+                replace(baseline, source_host="mac", method="by hand",
+                        start=change_time - timedelta(minutes=10), end=change_time - timedelta(minutes=9)),
+                replace(baseline, source_host="mac", method="/hana_shot",
+                        start=change_time + timedelta(minutes=10), end=change_time + timedelta(minutes=11)),
+            ])
+            write_changes(state_dir / "changes.json", [
+                ProductChange("claude", "mac-crop", "Crop on Mac", change_time, ("mac",)),
+            ])
+            output = report_module.report(state_dir)
+        mac_rows = [line for line in output.splitlines() if "mac-crop" in line and "host=mac" in line]
+        self.assertTrue(mac_rows)
+        self.assertTrue(all("incomplete:mac" in line for line in mac_rows), mac_rows)
+        self.assertIn("Mac Claude transcripts: out", output)
+        self.assertIn("Codex transcripts", output)
+        self.assertIn("timings", output)
+
+    def test_report_shows_saved_mac_read_state_beside_last_coverage(self) -> None:
+        mac_start = datetime.fromisoformat("2026-10-06T20:00:00+00:00")
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            mirror = state_dir / "mac-source"
+            states: list[tuple[str, report_module.MacEvidence]] = [
+                ("finished", report_module.MacEvidenceAvailable(
+                    mirror / "claude-unavailable", mirror / "codex", mirror / "timings/timings.jsonl",
+                    0, False, mac_start, report_module.MacReadFinished())),
+                ("catching up", report_module.MacEvidenceAvailable(
+                    mirror / "claude-unavailable", mirror / "codex", mirror / "timings/timings.jsonl",
+                    0, False, mac_start + timedelta(minutes=1), report_module.MacReadCatchingUp())),
+                ("unavailable", report_module.MacEvidenceUnavailable("asleep")),
+            ]
+            for expected, evidence in states:
+                with self.subTest(state=expected), mock.patch.object(report_module, "_mac_evidence", return_value=evidence):
+                    _ = report_module.scan(state_dir, state_dir / "local-claude",
+                                           state_dir / "local-codex", include_mac=True)
+                    status = report_module._read_object(state_dir / "scan_status.json")  # pyright: ignore[reportPrivateUsage]
+                    self.assertEqual(str(status["mac_read_state"]).replace("_", " "), expected)
+                    mac_line = next(line for line in report_module.report(state_dir).splitlines()
+                                    if line.startswith("Mac:"))
+                    self.assertIn(expected, mac_line)
+                    self.assertIn(report_module._pacific(mac_start), mac_line)  # pyright: ignore[reportPrivateUsage]
 
     def test_change_with_missing_required_key_is_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

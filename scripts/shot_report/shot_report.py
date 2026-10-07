@@ -13,6 +13,7 @@ import statistics
 import subprocess
 import tempfile
 import time
+import zlib
 from collections.abc import Iterable
 from collections import defaultdict
 from dataclasses import dataclass
@@ -22,22 +23,23 @@ from typing import BinaryIO, cast
 from zoneinfo import ZoneInfo
 
 if __package__:
-    from .changes import Change, read_changes
+    from .changes import Change, MeasurementChange, ProductChange, read_changes
     from .episodes import (Episode, LegacyEvidenceUnavailable, NoObservablePath, NoneCited,
                            OneCitedShot, SeveralCitedShots, SURVEY_SOURCES, read_episodes,
                            split_episodes, write_episodes)
-    from .transcripts import (AttemptCountInferredFromImages, AvailableTimingSource,
-                              CODEX_PREFILTER, PREFILTER, RELATED_WRITE, ExactOrderedCaptureAttempts, PersistentScanCache,
+    from .transcripts import (AttemptCountInferredFromImages, ExactAttemptCountFromOrderedCaptures,
+                              AvailableTimingSource,
+                              CODEX_PREFILTER, PREFILTER, RELATED_WRITE, PersistentScanCache,
                               UnavailableTimingSource, scan_calls, survey_counts)
 else:
-    from changes import Change, read_changes  # pyright: ignore[reportImplicitRelativeImport]
+    from changes import Change, MeasurementChange, ProductChange, read_changes  # pyright: ignore[reportImplicitRelativeImport]
     from episodes import (  # pyright: ignore[reportImplicitRelativeImport]
         Episode, LegacyEvidenceUnavailable, NoObservablePath, NoneCited, OneCitedShot,
         SeveralCitedShots, SURVEY_SOURCES, read_episodes, split_episodes, write_episodes,
     )
     from transcripts import (  # pyright: ignore[reportImplicitRelativeImport]
-        AttemptCountInferredFromImages, AvailableTimingSource, CODEX_PREFILTER, PREFILTER, RELATED_WRITE,
-        ExactOrderedCaptureAttempts,
+        AttemptCountInferredFromImages, ExactAttemptCountFromOrderedCaptures,
+        AvailableTimingSource, CODEX_PREFILTER, PREFILTER, RELATED_WRITE,
         PersistentScanCache, UnavailableTimingSource, scan_calls, survey_counts,
     )
 
@@ -51,11 +53,14 @@ FAILURE_REASONS = (
     "timeout", "already_in_progress", "black_capture", "empty_crop", "no_app",
     "invalid_request", "no_target", "invalid_png", "copy_failed", "brp_error", "shot_failed",
 )
+MAC_READ_BUDGET_SECONDS = 300
+MAC_SSH_TIMEOUT_MARGIN_SECONDS = 30
+MAC_SSH_TIMEOUT_SECONDS = MAC_READ_BUDGET_SECONDS + MAC_SSH_TIMEOUT_MARGIN_SECONDS
 
 # Remote Python receives prior file identities and returns only candidate bytes
 # not yet received. Filter literals are filled from transcripts.py below.
 MAC_READER = r'''
-import base64, itertools, json, pathlib, re, sys, time
+import base64, itertools, json, pathlib, re, sys, time, zlib
 prior = json.load(sys.stdin)
 deadline = time.monotonic() + __BUDGET_SECONDS__
 claude_hints = tuple(term.encode() for term in __CLAUDE_HINTS__)
@@ -90,7 +95,9 @@ def transfer(path, key, source):
         matched = False
         start = 0
     elif (old.get('matched') and old.get('inode') == stat.st_ino
-          and stat.st_size >= old.get('cursor', 0)):
+          and stat.st_size >= old.get('cursor', 0)
+          and (old.get('mtime') == stat.st_mtime_ns
+               or stat.st_size > old.get('size', stat.st_size))):
         matched = True
         start = old.get('cursor', 0)
     else:
@@ -104,7 +111,8 @@ def transfer(path, key, source):
         with path.open('rb') as stream:
             stream.seek(start)
             while data := stream.read(65536):
-                print(json.dumps({'kind': 'chunk', 'key': key, 'data': base64.b64encode(data).decode('ascii')}))
+                print(json.dumps({'kind': 'chunk', 'key': key, 'encoding': 'zlib+base64',
+                                  'data': base64.b64encode(zlib.compress(data, 6)).decode('ascii')}))
                 if time.monotonic() >= deadline:
                     return False
     return True
@@ -133,7 +141,7 @@ print(json.dumps({'kind': 'end', 'finished': finished}))
 '''
 
 
-def _mac_reader_source(budget_seconds: int = 80) -> str:
+def _mac_reader_source(budget_seconds: int = MAC_READ_BUDGET_SECONDS) -> str:
     return (MAC_READER.replace("__BUDGET_SECONDS__", str(budget_seconds))
             .replace("__CLAUDE_HINTS__", repr(PREFILTER))
             .replace("__CODEX_HINTS__", repr(CODEX_PREFILTER))
@@ -150,7 +158,13 @@ class MacReadCatchingUp:
     pass
 
 
+@dataclass(frozen=True)
+class MacReadUnavailable:
+    pass
+
+
 MacReadProgress = MacReadFinished | MacReadCatchingUp
+MacReadState = MacReadProgress | MacReadUnavailable
 
 
 @dataclass(frozen=True)
@@ -183,8 +197,9 @@ class InProgressMacFileTransfer:
 
 
 @dataclass(frozen=True)
-class HostCoveredThrough:
+class CoveredHostSourcesThrough:
     at: datetime
+    sources: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -192,7 +207,18 @@ class HostNeverCovered:
     pass
 
 
-HostCoverage = HostCoveredThrough | HostNeverCovered
+HostCoverage = CoveredHostSourcesThrough | HostNeverCovered
+MEASURED_SOURCES = frozenset(("claude", "codex", "timings"))
+
+
+def _chunk_source_bytes(item: dict[str, object]) -> bytes:
+    encoded = base64.b64decode(str(item["data"]), validate=True)
+    encoding = item.get("encoding", "base64")
+    if encoding == "base64":
+        return encoded
+    if encoding == "zlib+base64":
+        return zlib.decompress(encoded)
+    raise ValueError("invalid Mac chunk encoding")
 
 
 def _mac_evidence(state_dir: Path) -> MacEvidence:
@@ -218,7 +244,7 @@ def _mac_evidence(state_dir: Path) -> MacEvidence:
                 result = subprocess.run(
                     ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mac", command],
                     input=json.dumps(prior).encode(), stdout=output, stderr=subprocess.PIPE,
-                    timeout=120, check=False,
+                    timeout=MAC_SSH_TIMEOUT_SECONDS, check=False,
                 )
             except (OSError, subprocess.TimeoutExpired) as error:
                 return MacEvidenceUnavailable(str(error))
@@ -254,7 +280,7 @@ def _mac_evidence(state_dir: Path) -> MacEvidence:
                     key = str(item["key"])
                     if key not in announced or not announced[key].matched:
                         raise ValueError("Mac chunk without file")
-                    announced[key].received += len(base64.b64decode(str(item["data"]), validate=True))
+                    announced[key].received += len(_chunk_source_bytes(item))
                 elif item.get("kind") == "end" and isinstance(item.get("finished"), bool):
                     progress = MacReadFinished() if item["finished"] else MacReadCatchingUp()
                 else:
@@ -287,7 +313,7 @@ def _mac_evidence(state_dir: Path) -> MacEvidence:
                             _ = stream.seek(start)
                             _ = stream.truncate()
                         open_files[key] = stream
-                    _ = open_files[key].write(base64.b64decode(str(item["data"])))
+                    _ = open_files[key].write(_chunk_source_bytes(item))
         finally:
             for stream in open_files.values():
                 stream.close()
@@ -298,7 +324,7 @@ def _mac_evidence(state_dir: Path) -> MacEvidence:
         return MacEvidenceAvailable(mirror / ("claude" if included else "claude-unavailable"),
                                     mirror / "codex", mirror / "timings/timings.jsonl",
                                     bytes_read, included, started_at, progress)
-    except (ValueError, KeyError, OSError, binascii.Error) as error:
+    except (ValueError, KeyError, OSError, binascii.Error, zlib.error) as error:
         return MacEvidenceUnavailable(str(error))
     finally:
         _ = output_path.unlink(missing_ok=True)
@@ -416,13 +442,13 @@ def _kept_rows(episodes: Iterable[Episode]) -> list[str]:
     for (split, method, agent, project), group in sorted(groups.items()):
         exact = [float(episode.kept_shot.attempts_before_first_kept_shot) for episode in group
                  if isinstance(episode.kept_shot, (OneCitedShot, SeveralCitedShots))
-                 and isinstance(episode.attempt_count_evidence, ExactOrderedCaptureAttempts)]
+                 and isinstance(episode.attempt_count_evidence, ExactAttemptCountFromOrderedCaptures)]
         inferred = [float(episode.kept_shot.attempts_before_first_kept_shot) for episode in group
                     if isinstance(episode.kept_shot, (OneCitedShot, SeveralCitedShots))
                     and isinstance(episode.attempt_count_evidence, AttemptCountInferredFromImages)]
         rows.append([
             str(split), method, agent, project, str(len(group)),
-            str(sum(isinstance(episode.attempt_count_evidence, ExactOrderedCaptureAttempts) for episode in group)),
+            str(sum(isinstance(episode.attempt_count_evidence, ExactAttemptCountFromOrderedCaptures) for episode in group)),
             str(sum(isinstance(episode.attempt_count_evidence, AttemptCountInferredFromImages) for episode in group)),
             str(sum(isinstance(episode.kept_shot, OneCitedShot) for episode in group)),
             str(sum(isinstance(episode.kept_shot, SeveralCitedShots) for episode in group)),
@@ -478,27 +504,48 @@ def _window_stats(episodes: list[Episode]) -> str:
             f"p90_min={_percentile(minutes, .90):.1f}{small}")
 
 
-def _host_coverage(state_dir: Path) -> dict[str, HostCoveredThrough]:
-    raw = _read_object(state_dir / "scan_status.json").get("host_last_success")
-    if not isinstance(raw, dict):
-        return {}
-    result: dict[str, HostCoveredThrough] = {}
-    for host, stamp in cast(dict[object, object], raw).items():
-        if isinstance(host, str) and isinstance(stamp, str):
-            try:
-                result[host] = HostCoveredThrough(datetime.fromisoformat(stamp.replace("Z", "+00:00")))
-            except ValueError:
+def _host_coverage(state_dir: Path) -> dict[str, CoveredHostSourcesThrough]:
+    status = _read_object(state_dir / "scan_status.json")
+    raw = status.get("host_coverage")
+    result: dict[str, CoveredHostSourcesThrough] = {}
+    if isinstance(raw, dict):
+        for host, value in cast(dict[object, object], raw).items():
+            if not isinstance(host, str) or not isinstance(value, dict):
                 continue
+            row = cast(dict[str, object], value)
+            stamp, sources = row.get("at"), row.get("sources")
+            if isinstance(stamp, str) and isinstance(sources, list) and all(
+                isinstance(source, str) and source in MEASURED_SOURCES for source in cast(list[object], sources)
+            ):
+                try:
+                    result[host] = CoveredHostSourcesThrough(
+                        datetime.fromisoformat(stamp.replace("Z", "+00:00")),
+                        frozenset(cast(list[str], sources)),
+                    )
+                except ValueError:
+                    continue
+    legacy = status.get("host_last_success")
+    if isinstance(legacy, dict):
+        for host, stamp in cast(dict[object, object], legacy).items():
+            if isinstance(host, str) and isinstance(stamp, str) and host not in result:
+                try:
+                    sources = (MEASURED_SOURCES if host == "natedev"
+                               else frozenset(("codex", "timings")))
+                    result[host] = CoveredHostSourcesThrough(
+                        datetime.fromisoformat(stamp.replace("Z", "+00:00")), sources,
+                    )
+                except ValueError:
+                    continue
     return result
 
 
-def _coverage_incomplete(host: str, end: datetime, coverage: dict[str, HostCoveredThrough]) -> bool:
+def _coverage_incomplete(host: str, end: datetime, coverage: dict[str, CoveredHostSourcesThrough]) -> bool:
     state: HostCoverage = coverage.get(host, HostNeverCovered())
-    return isinstance(state, HostNeverCovered) or state.at < end
+    return isinstance(state, HostNeverCovered) or state.at < end or not MEASURED_SOURCES <= state.sources
 
 
 def _change_rows(episodes: list[Episode], changes: list[Change], state_dir: Path) -> list[str]:
-    products = sorted((change for change in changes if not change.measurement_change),
+    products = sorted((change for change in changes if isinstance(change, ProductChange)),
                       key=lambda change: (change.effective_at, change.repository, change.commit))
     coverage = _host_coverage(state_dir)
     lines = ["By change, product changes only; each host window ends at its next product change",
@@ -530,7 +577,7 @@ def _change_rows(episodes: list[Episode], changes: list[Change], state_dir: Path
                         lines.append(f"{change.repository} {change.commit} {method} {split}s {side} host={host} " +
                                      f"[{window}] {_window_stats(group)}; {label}")
     for change in changes:
-        if change.measurement_change:
+        if isinstance(change, MeasurementChange):
             lines.append(f"Measurement change {change.repository} {change.commit}: {change.summary}; " +
                          "excluded from speed comparisons")
     return lines
@@ -629,8 +676,18 @@ def report(state_dir: Path, since: str = "", until: str = "", project: str = "")
         lines.append(f"Last successful scan: {_pacific(datetime.fromisoformat(last_scan.replace('Z', '+00:00')))}")
     else:
         lines.append("Last successful scan: never")
-    for host, coverage in sorted(_host_coverage(state_dir).items()):
-        lines.append(f"{host} evidence covered through {_pacific(coverage.at)}")
+    coverage = _host_coverage(state_dir)
+    for host, covered in sorted(coverage.items()):
+        names = [name for source, name in (("claude", "Claude transcripts"),
+                                          ("codex", "Codex transcripts"),
+                                          ("timings", "timings")) if source in covered.sources]
+        lines.append(f"{host} evidence covered through {_pacific(covered.at)}; sources: {', '.join(names)}")
+    state = status.get("mac_read_state", "unavailable")
+    if state not in ("finished", "catching up", "unavailable"):
+        state = "unavailable"
+    mac_covered = coverage.get("mac")
+    covered_label = _pacific(mac_covered.at) if mac_covered is not None else "never"
+    lines.append(f"Mac: {state}; evidence covered through {covered_label}")
     lines.append(f"Mac Claude transcripts: {status.get('mac_claude', 'out')}")
     lines.extend(_report_rows(selected))
     lines.append("Kept-shot evidence by split; attempt medians and p90 separate exact ordered captures from counts inferred from images, each with n")
@@ -732,12 +789,24 @@ def scan(state_dir: Path, claude_root: Path, codex_root: Path,
             _ = output.write(json.dumps(record, sort_keys=True) + "\n")
     now = _utc_now().isoformat()
     raw_hosts = previous_status.get("host_last_success")
-    hosts = cast(dict[str, object], raw_hosts) if isinstance(raw_hosts, dict) else {}
+    hosts = dict(cast(dict[str, object], raw_hosts)) if isinstance(raw_hosts, dict) else {}
     hosts["natedev"] = local_read_started.isoformat()
+    raw_coverage = previous_status.get("host_coverage")
+    covered_sources = dict(cast(dict[str, object], raw_coverage)) if isinstance(raw_coverage, dict) else {}
+    local_sources = (MEASURED_SOURCES if isinstance(timing_source, AvailableTimingSource)
+                     else MEASURED_SOURCES - {"timings"})
+    covered_sources["natedev"] = {"at": local_read_started.isoformat(), "sources": sorted(local_sources)}
     if isinstance(mac_result, MacEvidenceAvailable) and isinstance(mac_result.progress, MacReadFinished):
         hosts["mac"] = mac_result.started_at.isoformat()
+        mac_sources = MEASURED_SOURCES if mac_result.claude_included else frozenset(("codex", "timings"))
+        covered_sources["mac"] = {"at": mac_result.started_at.isoformat(), "sources": sorted(mac_sources)}
+    mac_state: MacReadState = (mac_result.progress if isinstance(mac_result, MacEvidenceAvailable)
+                               else MacReadUnavailable())
+    mac_state_name = ("finished" if isinstance(mac_state, MacReadFinished)
+                      else "catching up" if isinstance(mac_state, MacReadCatchingUp) else "unavailable")
     scan_status: dict[str, object] = {
-        "last_success": now, "host_last_success": hosts, "mac_claude": (
+        "last_success": now, "host_last_success": hosts, "host_coverage": covered_sources,
+        "mac_read_state": mac_state_name, "mac_claude": (
             ("included" if mac_result.claude_included else "out") if isinstance(mac_result, MacEvidenceAvailable)
             else previous_status.get("mac_claude", "out")
         ),
@@ -745,8 +814,7 @@ def scan(state_dir: Path, claude_root: Path, codex_root: Path,
     if isinstance(previous_status.get("last_hour_utc"), str):
         scan_status["last_hour_utc"] = previous_status["last_hour_utc"]
     _save_object(state_dir / "scan_status.json", scan_status)
-    mac_line = (f"Mac: read {mac_result.bytes_read} source bytes; " +
-                ("finished" if isinstance(mac_result.progress, MacReadFinished) else "catching up") +
+    mac_line = (f"Mac: {mac_state_name}; read {mac_result.bytes_read} source bytes" +
                 f"; Claude transcripts {'included' if mac_result.claude_included else 'out'}"
                 if isinstance(mac_result, MacEvidenceAvailable)
                 else f"Mac: unavailable ({mac_result.reason}); read 0 source bytes; saved evidence retained")

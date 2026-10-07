@@ -86,6 +86,11 @@ class AttemptCountInferredFromImages:
 
 
 @dataclass(frozen=True)
+class ExactAttemptCountFromOrderedCaptures:
+    pass
+
+
+@dataclass(frozen=True)
 class ExactOrderedCaptureAttempts:
     captures: tuple[CaptureAttempt, ...]
 

@@ -215,51 +215,41 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 **Ruled out:** a cache that replays matched transcript lines (9.2 GB, failed the speed gate); a project filter on change rows (a change's repository is where the tool lives, not where affected episodes ran).
 
-### Phase 5 — The Mac's transcripts catch up in hours, and two report types say what they hold · status: todo
+### Phase 5 — The Mac's transcripts catch up in hours, and two report types say what they hold · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** the Mac's first catch-up finishes within a few hourly runs, the report says exactly what the Mac read covers and whether it is still catching up, and the two report types that hold less than their names claim say what they hold.
+- The Mac read is prefiltered at the source, keeps a cursor per file, and resumes without re-reading received bytes. Each read sends `zlib`-compressed, `base64`-encoded 64 KiB chunks, and byte accounting stays in source bytes. Coverage advances only on a finished read, stamped with the read-start time; an outage keeps the mirror and the coverage. Mac Claude transcripts are out above 100 files or 100 MB. A file rewritten in place at the same size is read again from byte 0.
+- `scripts/shot_report/shot_report.py` holds `MAC_READ_BUDGET_SECONDS = 300` and `MAC_SSH_TIMEOUT_MARGIN_SECONDS = 30`; `MAC_SSH_TIMEOUT_SECONDS = 330` is derived from that pair, never a second literal. The ssh stream is the limit of a read: the reader's hint scan took 2.9 s of an 80 s read and the receiver 0.25 s.
+- The hourly job's bound is `SCREENSHOT_HOURLY_TIMEOUT_SECONDS = 900` in `scripts/buildlog/cli.py`; `scripts/buildlog/test_sync.py` asserts it is at least `MAC_SSH_TIMEOUT_SECONDS + 300`.
+- Host coverage is `CoveredHostSourcesThrough(at, sources)` or `HostNeverCovered`; the measured sources are claude, codex and timings. A legacy status file without `host_coverage` gives the Mac Codex and timings only; natedev lists timings only when the timing source is available. The Mac read state is `MacReadFinished`, `MacReadCatchingUp` or `MacReadUnavailable`, saved in the scan status and printed as `Mac: finished|catching up|unavailable` with the covered-through time and the included sources. A by-change window over the Mac is labeled `incomplete:mac`.
+- `ExactAttemptCountFromOrderedCaptures` is the exact attempt-count provenance, distinct from the inferred type; both survive save and reload. `changes.py` holds `ProductChange` and `MeasurementChange` under the union `Change`; a measurement change is listed separately and never counted as a speed gain. No `ExactOrderedCaptureAttempts(())` marker or `measurement_change` bool remains. A by-change window is bounded by the neighbouring product change of any repository on an overlapping host.
 
-**Spec:**
-- Measure first where an 80 s Mac read goes: the hint scans of files not yet judged, the chunk loop, and the receiving side's validation. Report the split, with its run count, before changing anything. Fix whichever part dominates; compression and the budget below are the expected fixes, not the only ones.
-- Send each chunk compressed (`zlib` before `base64`) and decode it in `_mac_evidence`'s validation. The byte accounting stays in source bytes, so the report's "read N source bytes" keeps its meaning.
-- Raise the per-run budget only as far as the 120 s ssh bound allows with margin, and only when the measured split shows the budget, not throughput, ends a run.
-- A manifest and a mirror written by the earlier reader stay valid: a run that finds them resumes without re-reading received bytes. A file rewritten in place at the same size is detected by its changed modification time and read again from byte 0, instead of keeping a stale mirror.
-- Keep every behavior of the earlier phase: per-file resume cursors, an outage that keeps the mirror and the coverage, coverage that advances only on a finished read stamped with the read-start time, and the Mac Claude 100-file / 100 MB cap.
-- Host coverage names the sources it covers. A finished read of the Mac's Codex transcripts and timings, with its Claude transcripts left out, is recorded as that, and a by-change window never reads `complete` for a host whose included sources are fewer than the window's measured sources. Name the coverage type for that guarantee, and test the label the report prints.
-- The saved scan status and `/shot_report` show the current Mac read state (finished, catching up, or unavailable) beside the last covered time, with a report test for each outcome.
-- Exact attempt counts get their own provenance type: `Episode` no longer uses `ExactOrderedCaptureAttempts(())` as a bare exactness marker. Saving and reloading episodes keeps exact and inferred counts apart, and an old `episodes.jsonl` still loads.
-- The change ledger's product change and measurement change are two named variants, not a `Change` with `measurement_change: bool`. An existing `changes.json` still reads and seeds the same rows.
+**Measured:** on the real Mac, default-root scans in a scratch state directory under natedev load 60-150: the Mac read finished at scan 5 (gate: within 8). Source MB per scan: 681, 456, 649, 690, 1271 (about 3.75 GB). Scan walls 377, 334, 329, 324, 222 s. The scan after it read 0 Mac source bytes and took 4.6 s. Before the change: about 100 MB per 80 s run and not finished after 14 runs; an earlier 105 s budget took 12 runs (208, 263, 198, 352, 390, 194, 168, 191, 329, 565, 840 MB, then 48 MB). Parsed-state cache about 12 MB (plus 0.5 MB for the Mac). Suites: shot_report 117, hana_shot 31, buildlog 257, basedpyright 0 errors 0 warnings. The hourly job itself was not run against the real Mac; the acceptance loop called `scan` directly, and the 900 s bound is held by the test.
 
 **Files:**
-- `scripts/shot_report/shot_report.py` — the Mac reader source, the chunk encoding, the receive validation, the coverage label, the read-state line and the ledger consumers
-- `scripts/shot_report/changes.py` — the two change variants
-- `scripts/shot_report/episodes.py`, `scripts/shot_report/transcripts.py` — the exact-count provenance type
-- `scripts/shot_report/test_shot_report.py`, `scripts/shot_report/test_transcripts.py` — tests beside each change
-- `commands/shot_report.md` — the Mac read-state line and the coverage wording
+- `scripts/shot_report/shot_report.py` — Mac reader, read budget and ssh constants, coverage by source, read state, report lines
+- `scripts/shot_report/changes.py` — `ProductChange` / `MeasurementChange`
+- `scripts/shot_report/episodes.py` — exact attempt-count type
+- `scripts/shot_report/transcripts.py` — prefiltered resumable mirror, per-file cursors, same-size rewrite re-read
+- `scripts/shot_report/test_shot_report.py`, `scripts/shot_report/test_transcripts.py` — tests, including the real generated reader under a temp HOME with a deterministic clock
+- `scripts/buildlog/cli.py`, `scripts/buildlog/test_sync.py` — the hourly bound and its test
+- `commands/shot_report.md` — first run starts `hourly` once in the background, no polling; states the Mac read state and coverage
 
-**Seats:** 1 writer + 1 tester — the type changes reach `shot_report.py`, so the writer owns every source file and the tester writes the tests against the agreed types.
-- `impl` — `scripts/shot_report/shot_report.py`, `changes.py`, `episodes.py`, `transcripts.py`, `commands/shot_report.md`
-- `test` — `scripts/shot_report/test_shot_report.py`, `scripts/shot_report/test_transcripts.py`, and every fixture under `scripts/shot_report/fixtures/`; it opens against the Spec's behaviors and takes the type names from `impl`'s board post
+**Binds later work:**
+- Mac candidates are priced from Codex transcripts and timings only, because Mac Claude transcripts are out; the first Mac catch-up takes about five scans.
+- The saved scan status and the report text are what a proposal cites for the Mac read state and coverage.
+- An approved proposal appends a `ProductChange` to `changes.json`; a `MeasurementChange` is listed separately and never counted as a speed gain.
+- The hourly bound stays at least 300 s above `MAC_SSH_TIMEOUT_SECONDS`; the test fails when a raised read budget leaves the job bound behind.
 
-**Constraints from prior phases:**
-- `MAC_READER` in `shot_report.py` walks `~/.codex/sessions` in sorted order, keeps a cursor per file, prints one JSON line per file and one base64 line per 65,536-byte read, and stops at an 80 s budget. `_mac_evidence` runs it over ssh with a 120 s timeout, validates the whole transfer, then commits a valid partial batch. Its resume branch trusts a matched file's inode and cursor whatever its modification time says.
-- The reader leaves the Mac's Claude transcripts out when they pass 100 files or 100 MB (today 61 files, 112 MB), yet a finished read records host coverage through `HostCoveredThrough` and a by-change window can read `complete`. `MacReadFinished` and `MacReadCatchingUp` exist for one scan's result and are printed on the scan line only.
-- Measured 2026-10-06/07 on the real Mac: the Codex corpus is 1,856 files and 5.82 GB; the files the scan's own hints select are 213 files and 3,746,615,468 bytes (June 810 MB, July 1,616 MB, August 1,314 MB, September 5 MB). Fourteen consecutive default-root scans received 47–172 MB each, 1.4 GB in all, and were still catching up; that projects to about 37 hourly runs for the first catch-up.
-- Link: `ssh mac "head -c 50000000 <file>"` took 9.1 s (5.5 MB/s); the same 50 MB through `gzip -1` sent 22.9 MB in 3.5 s. The reader uses about a quarter of the link, so compression alone may not be the whole fix.
-- The local baselines hold on every run: Claude MCP 519 episodes / 47.65 h and full by hand 584 / 53.73 h at the 5-minute split, Sep 9 PDT to 2026-10-06T16:35Z; a local run with nothing new takes 0.5–0.7 s.
-- `Episode` saves `attempt_count_evidence_state` and builds exact counts with `ExactOrderedCaptureAttempts(())` at `episodes.py:145`; `Change` in `changes.py` carries `measurement_change: bool`, and `changes.json` is read and seeded by `changes.py`.
-- Tests run the real generated reader under a temporary HOME with a deterministic clock (`test_mac_reader_resumes_unchanged_file_after_each_budget`); no test touches the real Mac or the real transcripts.
-- Saved run output stays under a few GB: read each real run, then delete it, including the scratch state directory and the Mac mirror.
+**Gotchas:**
+- A scan with an empty corpus rereads rg.
+- `bytes_read` counts discovery once.
+- The acceptance loop calls `scan` directly and cannot see the hourly job's time bound.
 
-**Acceptance gate:**
-- On the real Mac, repeated default-root scans in a scratch state directory reach "Mac: finished" within 8 runs; the same measurement before the change (about 100 MB per run, not finished after 14) is quoted beside it.
-- A run after that reads no Mac content bytes, and the whole scan finishes in under 30 s.
-- A mirror and manifest written by the earlier reader resume without duplicating a byte or a call, and a same-size in-place rewrite is read again.
-- The report prints the Mac read state for each of finished, catching up and unavailable, and a by-change window over a Mac whose Claude transcripts are out does not read `complete`.
-- Exact and inferred attempt counts survive a save and reload as distinct types, and no `ExactOrderedCaptureAttempts(())` marker or `measurement_change` bool remains.
-- The shot_report, hana_shot and buildlog suites pass and basedpyright reports 0 errors and 0 warnings.
+**Ruled out:**
+- A project filter on change rows: every project counts, so a change is assessed against all of them.
+- Raising the read budget without measuring: the split of one 80 s read (hint scans 2.9 s, chunk loop 77.1 s, receiver 0.25 s) shows the ssh stream, not the reader or receiver, ends a run.
 
 ### Phase 6 — Proposals: the next change, ranked by measured minutes saved · status: todo (standing)
 
@@ -293,6 +283,6 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 **Seats:** none — the unit director ranks and proposes from the report; no code is written until a proposal becomes its own phase.
 
-**Constraints from prior phases:** Failure logging, Codex transcript scanning and kept-shot detection are delivered, so `analysis.md` → Next improvements entry 2, entry 3 and the failure-logging half of entry 1 are not proposed again; the question of what fills long `/hana_shot` episodes stays seeded. The hourly phase supplies source-host coverage and says whether each attempt count is exact or inferred from images. Price weekly agent minutes from an observed eligible weekly count, keep per-shot milliseconds distinct from episode minutes, and leave a candidate unpriced when its evidence cannot support that calculation.
+**Constraints from prior phases:** Failure logging, Codex transcript scanning and kept-shot detection are delivered, so `analysis.md` → Next improvements entry 2, entry 3 and the failure-logging half of entry 1 are not proposed again; the question of what fills long `/hana_shot` episodes stays seeded. The hourly phase supplies source-host coverage and says whether each attempt count is exact or inferred from images. The Mac catch-up delivers Codex transcripts and timings and finishes in about five hourly runs; Mac Claude transcripts stay out above 100 files or 100 MB, so every Mac estimate names that limit. A `changes.json` entry is either a product change, which is a speed candidate, or a measurement change, which the report lists separately and never counts as a speed gain; an approved proposal appends a product change carrying its effective time and affected hosts. Price weekly agent minutes from an observed eligible weekly count, keep per-shot milliseconds distinct from episode minutes, and leave a candidate unpriced when its evidence cannot support that calculation.
 
 **Acceptance gate:** each proposal cites a report less than 24 h old, the covered window and n for every number, both splits when it uses episode time, exact or inferred attempt evidence when it uses kept shots, and the calculation of expected agent-minutes saved per week. A candidate without those inputs is labeled unpriced and ranks below every priced one.
