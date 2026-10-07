@@ -305,46 +305,28 @@ Moved to enh-showrunner (2026-10-06 14:2x PDT) with the phase above; the showrun
 
 ### Phase 8 — `/unit:report off` and `on` stop and start a unit's progress updates, and the launcher reports done only after recording it · status: done
 
-#### Work Order
+#### As-built
 
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`, branch `build-followups-stalls`. State every time in PDT.
-
-**Source:** the user, 2026-10-06 17:0x PDT, relayed by the showrunner (natedev): "`/unit:report off` stops this session's delegate-<run id> notifier, and `/unit:report on` starts it again. The run id is resolved from /tmp/claude/delegate/active/$CLAUDE_CODE_SESSION_ID, so the user can do it from the unit's own session without looking up the run id." Today the only way is `notifier.sh stop|start delegate-<run id>`.
-
-**Goal:** from a unit's own session, `/unit:report off` stops its progress updates and `/unit:report on` starts them again, with no run id to look up. And the launcher's final status never runs ahead of what it records: `impl_status_<slot>` reads `implemented` only once the pass and the repair round are recorded.
-
-**Spec:**
-- **`scripts/delegate/unit_notifier.sh <claude_session_id> [on|off]`.** The script already resolves the run id: the marker `${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}/<session id>` names the session directory, and its basename is the run id. With no mode it creates the instance exactly as today (`prepare_session.sh` calls it that way). With `off` it runs `notifier.sh stop delegate-<run id>`; with `on`, `notifier.sh start delegate-<run id>`. Both share today's marker reading, so the lookup stays in one place.
-- **Output.** On success it prints one line: `progress updates off: delegate-<run id>`, or `progress updates on: delegate-<run id>` followed by the next tick time that `notifier.sh start` prints. A missing or empty marker exits 1 with today's message and changes nothing. A `notifier.sh` failure (for example, no such instance) passes its message and exit status through. Any other mode word, or more than two arguments, prints the usage and exits 2.
-- **`commands/unit/report.md`.** Usage becomes `/unit:report [on|off]`, with an `argument-hint`. With `off` or `on`, the command runs `zsh ~/.claude/scripts/delegate/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID" off|on`, relays its line, and composes no report. A failure is relayed as printed: exit 1 covers both a session with no active run and a run whose notifier instance is missing, and the message says which. A Codex unit has no notifier: say the switch is unavailable there, as `commands/unit/interval.md` does. `/unit:report` with no argument is unchanged.
-- **The launcher writes its final status last** (the showrunner, 2026-10-06 17:2x PDT, folding in a defect from before Phase 7). Today `scripts/delegate/implement.sh` writes `implemented` (line 511 at 4770e26) before `finish-pass` (line 513) and, under `PLAN_DELEGATE_RESOLVES_ROUND=1`, `findings.py landed` (line 528). A unit director reading the status between them reviews a round still in flight. The success path writes `implemented` only after both succeed; a failure in either still writes `error`, posts `blocked` and exits 1. The worker-error path writes `error` after its `finish-pass` and `abandon --edits-landed`, so neither final status comes before its records. Until then the file keeps reading `implementing`.
-- `commands/unit/delegate.md` → `<ProgressContract/>` names `notifier.sh stop|start` for stopping updates. If it needs a line naming `/unit:report off|on`, the unit director sends that line to the showrunner, which clears it with enh-showrunner (owner). Seats never edit `delegate.md`.
+- `scripts/delegate/unit_notifier.sh <claude_session_id> [on|off]` reads the marker `${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}/<session id>`, which names the session directory; its basename is the run id. With no mode it creates the `delegate-<run id>` instance. `off` runs `notifier.sh stop delegate-<run id>` and `on` runs `notifier.sh start delegate-<run id>`; all three modes share the one marker lookup.
+- On success it prints one line: `progress updates off: delegate-<run id>`, or `progress updates on: delegate-<run id>` followed by the next tick time `notifier.sh start` prints. A missing or empty marker exits 1 with its message and changes nothing; a `notifier.sh` failure (for example, no such instance) passes its message and exit status through; another mode word, or more than two arguments, prints the usage and exits 2.
+- `/unit:report [on|off]` (with an `argument-hint`): `off` or `on` runs `zsh ~/.claude/scripts/delegate/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID" off|on`, relays its line and composes no report; a failure is relayed as printed. A Codex unit has no notifier, so the command says the switch is unavailable there, as `commands/unit/interval.md` does. With no argument the command is unchanged.
+- `scripts/delegate/implement.sh` writes `impl_status_<slot>` as `implemented` only after `finish-pass` and, under `PLAN_DELEGATE_RESOLVES_ROUND=1`, `findings.py landed` succeed; a failure in either writes `error`, posts `blocked` and exits 1. The worker-error path writes `error` after its `finish-pass` and `abandon --edits-landed`. Until the final write the file reads `implementing`.
 
 **Files:**
-- `scripts/delegate/unit_notifier.sh` — the `on|off` mode.
-- `commands/unit/report.md` — the arguments.
-- `scripts/delegate/test_delegate_check.py` — the mode's cases, beside today's `unit_notifier` tests.
-- `scripts/delegate/implement.sh` — the final status written after the records.
-- `scripts/delegate/test_implement_launcher.py` — the order.
+- `scripts/delegate/unit_notifier.sh` — instance creation and the `on|off` switch.
+- `commands/unit/report.md` — `[on|off]` usage and the switch paragraph before the contract.
+- `scripts/delegate/implement.sh` — final status written after the pass and landed records.
+- `scripts/delegate/test_delegate_check.py` — off/on round trip on an instance `unit_notifier.sh` created, missing and empty marker, bad arguments, missing-instance passthrough.
+- `scripts/delegate/test_implement_launcher.py` — stub `finish-pass`, `findings.py landed` and `abandon` record the status file when they run and pin both orders.
 
-**Seats:** 1 writer + 1 tester.
-- `impl` — `scripts/delegate/unit_notifier.sh`, `commands/unit/report.md`, `scripts/delegate/implement.sh`.
-- `test` — `scripts/delegate/test_delegate_check.py`, `scripts/delegate/test_implement_launcher.py`, from the Spec alone; owns the final suite run:
-  - `off` then `on` round trip on an instance that `unit_notifier.sh` created: the instance reads disabled, then enabled, and each run prints its one line;
-  - `off` with no marker exits 1 and leaves the notifier state directory untouched;
-  - a bad mode word exits 2;
-  - `on` for a run whose instance was never created passes notifier's failure through, with a non-zero exit;
-  - with stub `finish-pass` and `findings.py landed` that record the status file's contents when they run, both see `implementing`, and the file ends `implemented`; a failing `landed` leaves `error`; the worker-error path's `finish-pass` and `abandon` also see `implementing`.
+**Binds later work:** `prepare_session.sh` calls `unit_notifier.sh` with the session id alone to create the instance, and that call stays unchanged (`test_unit_notifier_creates_held_instance_with_rounded_interval`). Unit directors and `launch_implementation.md` read `impl_status_<slot>`, so any new record step in `implement.sh` goes before the final status write. Tests run the real `notifier.sh` against temporary `NOTIFIER_STATE_DIR`, `PLAN_DELEGATE_ACTIVE_DIR`, `PLAN_DELEGATE_CONFIG` and `NOTIFIER_NOW_EPOCH`, as `test_delegate_check.py`'s `environment()` does, and never touch the real notifier state or send to a real session.
 
-**Constraints from prior phases:**
-- Tests run the real `notifier.sh` against a temporary `NOTIFIER_STATE_DIR`, `PLAN_DELEGATE_ACTIVE_DIR`, `PLAN_DELEGATE_CONFIG` and `NOTIFIER_NOW_EPOCH`, as `test_delegate_check.py`'s `environment()` does. They never touch the real notifier state or send to a real session.
-- `prepare_session.sh` calls `unit_notifier.sh` with one argument, and that call keeps working unchanged (today's `test_unit_notifier_creates_held_instance_with_rounded_interval`).
+**Gotchas:**
+- `unit_notifier.sh` exit 1 covers both a session with no active run and a run whose notifier instance is missing; only the message says which, so `/unit:report` relays it as printed.
+- `off` persists in the notifier instance until `on` or `end_session.sh`.
+- The switch is checked live by running `/unit:report off`, reading `notifier.sh status delegate-<run id>` as disabled, then `/unit:report on`.
 
-**Acceptance gate:**
-- From the worktree root, `python3 -m unittest discover -s scripts/delegate -p 'test_delegate_check.py'` and `python3 -m unittest discover -s scripts/delegate -p 'test_implement_launcher.py'` are green.
-- basedpyright reports 0 errors and 0 warnings on both test files.
-- `zsh -n scripts/delegate/unit_notifier.sh` and `bash -n scripts/delegate/implement.sh` pass.
-- Live (unit director, after the merge reaches `~/.claude` main): in this unit's session, `/unit:report off`, then `notifier.sh status delegate-<run id>` reads disabled; then `/unit:report on` re-enables it.
+**Ruled out:** naming `/unit:report off|on` in `commands/unit/delegate.md`'s `<ProgressContract/>`, which still names `notifier.sh stop|start`: the file is enh-showrunner's, and the showrunner clears any such line.
 
 ### Moved: re-measure after both hooks are live (was Phase 8)
 
