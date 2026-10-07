@@ -347,6 +347,42 @@ Moved to enh-showrunner (2026-10-06 14:2x PDT) with the phase above; the showrun
 - An unterminated OSC sequence discards the rest of the pane log; accepted because a seat-written summary never reaches the fallback.
 - Live check still owed after the change reaches `~/.claude` main: a Claude seat registered `sonnet:low` and launched through `implement.sh` shows `low effort` in its pane, not `xhigh`. A bare `claude --bg` probe from an automated run is refused by the permission classifier, so a person runs it.
 
+### Phase 10 — The token-wait test no longer depends on the wall clock · status: done
+
+#### Work Order
+
+Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`, branch `build-followups-stalls`. State every time in PDT.
+
+**Source:** the showrunner (natedev), 2026-10-06 18:0x PDT: "scripts/delegate/test_verify_token_wait.py test_waiting_for_peer_call_records_token_seconds failed once in the full delegate suite under load (line 269: waits[0] 1 != 0) and passed 3 of 3 alone; it came with Phase 7. Make it independent of wall-clock timing before the run closes."
+
+**Finding, from the test before this phase:** the test starts a verify call that holds the cargo token (`TEST_BLOCK=1`, signalled by a `running` file), starts a second call, then `time.sleep(4)`, touches `release`, and asserts the two recorded `token_wait_s` values sorted are exactly `0` and at least `3`. Both bounds rest on the clock: a first call whose acquire straddles a whole-second tick, or a loaded machine, records `1`, and a second call that has not yet begun waiting when `release` is touched records `0`. The writer confirms the mechanism in `scripts/delegate/board.sh` and `scripts/delegate/verify.sh` (where `token_wait_s` is computed and how often a waiter polls) before changing the test.
+
+**Goal:** `test_waiting_for_peer_call_records_token_seconds` passes on a loaded machine and on a quiet one, every run, because each assertion compares a recorded wait with something the test observed, never with a constant of seconds.
+
+**Spec:**
+- Replace the fixed `time.sleep(4)` with a wait on an observable fact that the second call is blocked on the token (a board record, a log line, or a marker the stub `cargo` or the board writes), polled with a generous deadline and a failure message that names what it waited for. If no such fact exists today, the writer adds the smallest one to the test's own stub or environment first; `board.sh` and `verify.sh` change only when the production code genuinely needs to expose a waiting marker, and then the change is minimal and covered by this test.
+- Measure, with `time.monotonic()` in the test, the moments that bound each wait: the first call's start and the instant its `running` file appears; the instant the second call is seen blocked and the instant `release` is touched. Assert from those: the first call's `token_wait_s` is at most the whole seconds between its start and its `running` file, plus one for a tick of the whole-second clock; the second call's `token_wait_s` is at least the whole seconds between being seen blocked and `release`, minus one for the same tick. The assertions never name `0`, `3` or `4`.
+- Keep what the test proves: two verify calls record two `token_wait_s` values, and the call that waited for a peer records a longer wait than the call that did not. Keep the process-group cleanup (`started_groups`, `end_group`) exactly as it is.
+- The other tests in the file are unchanged.
+
+**Files:**
+- `scripts/delegate/test_verify_token_wait.py` — the test and any helper it needs.
+- `scripts/delegate/board.sh`, `scripts/delegate/verify.sh` — only if the production code must expose a waiting marker (see Spec).
+
+**Seats:** 1 writer.
+- `impl` — `scripts/delegate/test_verify_token_wait.py`, and `board.sh`/`verify.sh` only as the Spec allows; owns the final runs.
+
+**Constraints from prior phases:**
+- Tests never start a real `cargo`, `codex` or `claude`, and never touch the real board, the real `~/.claude` or a real session.
+- `release` and reclaim stay fail-closed (`board.sh release` refuses a pid that is not the holder's); no change here weakens them.
+- Another unit owns `commands/unit/delegate.md`, `produce.md`, `promote_unit.md`, `showrunners.py`, `stall_watch.py`, `dailies_render.py` and the mul_add hook files; none is edited here.
+
+**Acceptance gate:**
+- From the worktree root, `python3 -m unittest discover -s scripts/delegate -p 'test_verify_token_wait.py'` is green, and the one test passes five runs in a row alone and once under load (the writer runs the whole `scripts/delegate` suite once, which is the same load the flake came from).
+- basedpyright reports 0 errors and 0 warnings on the test file.
+- `bash -n scripts/delegate/board.sh` and `bash -n scripts/delegate/verify.sh` pass when either changed.
+- Red run (unit director, scratch copy): with a `time.sleep` long enough to keep the second call from starting to wait (or the whole-second tick forced), the previous test fails and the new test still passes.
+
 ### Moved: re-measure after both hooks are live (was Phase 8)
 
 Moved to mul_add-unit as its Phase 6 by the showrunner (natedev), 2026-10-06 14:3x PDT: that phase measures too_many_lines and suboptimal_flops over one fixed window with controls on both machines, after both fn-length hooks are live, so a second re-measure here would count the same lint twice. Phase 1's As-built keeps the baseline it reads.
