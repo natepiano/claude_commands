@@ -481,6 +481,8 @@ def eta_moment(text: str, line_moment: datetime) -> EtaOnLog | NoEtaOnLog:
     if weekday is not None:
         target = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun").index(weekday.group(1))
         days = (target - line_moment.weekday()) % 7
+        if days > 3:
+            days -= 7
         moment = line_moment.replace(hour=int(weekday.group(2)), minute=int(weekday.group(3)),
                                      second=0, microsecond=0) + timedelta(days=days)
         return EtaOnLog(moment)

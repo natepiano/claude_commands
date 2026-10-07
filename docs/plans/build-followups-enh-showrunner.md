@@ -476,7 +476,7 @@ One locked state helper, `waiting.update_state(path, change)` (`fcntl.flock` on 
 **Ruled out:**
 - A separate follow-up phase for the waiting-surface contract cases: they are test-only, and the status and dailies fixes phase already edits `test_waiting.py`.
 
-### Phase 14 — Status and dailies fixes · status: todo
+### Phase 14 — Status and dailies fixes · status: done
 
 #### Work Order
 

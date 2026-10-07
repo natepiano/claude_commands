@@ -24,6 +24,7 @@ import add_unit
 import dailies_render
 import merge_checkpoint
 import update_registration
+import waiting
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 import quota_alert
@@ -329,7 +330,40 @@ class WaitingTests(unittest.TestCase):
         holders.mkdir(exist_ok=True)
         with mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": str(holders)}):
             report = dailies_render.parse_report(fields, "default")
-        return dailies_render.log_line(report, moment, moment.tzname() or "PDT")
+        resolved = dailies_render.resolve_eta_moments(report, {}, moment)
+        return dailies_render.log_line(report, resolved, moment, moment.tzname() or "PDT")
+
+    def producer_held_eta_line(self, moment: datetime, phase: str, eta: datetime) -> str:
+        eta_text = eta.strftime("%H:%M")
+        fields: dict[str, object] = {
+            "length": "simple",
+            "zone": "America/Los_Angeles",
+            "units": [{
+                "unit": ALPHA,
+                "label": "alpha",
+                "project": "panels that stay readable",
+                "phase": phase,
+                "started": (moment - timedelta(hours=5)).replace(
+                    tzinfo=None).isoformat(timespec="minutes"),
+                "held": "the panel review is paused",
+                "update": "checking the panel labels",
+                "eta": {"time": eta_text, "percent": 60},
+                "then": ["nothing queued"],
+            }],
+            "topics": [],
+        }
+        holders = self.root / "producer-holders"
+        holders.mkdir(exist_ok=True)
+        with mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": str(holders)}):
+            report = dailies_render.parse_report(fields, "default")
+        previous = {ALPHA: dailies_render.LastUnitReport(
+            phase,
+            dailies_render.LastReportedEta(eta_text, eta),
+            "the panel review is paused",
+            eta,
+        )}
+        resolved = dailies_render.resolve_eta_moments(report, previous, moment)
+        return dailies_render.log_line(report, resolved, moment, moment.tzname() or "PDT")
 
     def quota_note(self, name: str, tool: str = "codex") -> QuotaNote:
         return QuotaNote(self.root / f"{name}.md", tool, {
@@ -733,6 +767,46 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f"{ALPHA}|{PHASE_IDENTITY}", result.stdout)
 
+    def test_held_unchanged_eta_from_yesterday_stays_out_of_the_agenda(self) -> None:
+        zone = ZoneInfo("America/Los_Angeles")
+        start = datetime(2026, 10, 6, 18, 50, tzinfo=zone)
+        first_report = datetime(2026, 10, 6, 19, 30, tzinfo=zone)
+        eta = datetime(2026, 10, 6, 19, 35, tzinfo=zone)
+        now = datetime(2026, 10, 7, 0, 10, tzinfo=zone)
+        held_report = self.producer_held_eta_line(now, PHASE, eta)
+        lines = (
+            "# Production log — example",
+            self.producer_launch_line(start),
+            self.producer_eta_line(first_report, PHASE, eta),
+            held_report,
+            self.producer_state_block(now, {ALPHA: PHASE}),
+            "",
+        )
+        self.assertIn(f"{ALPHA} {PHASE_IDENTITY} Tue 19:35 PDT", held_report)
+        self.write(self.log, "\n".join(lines))
+
+        class AgendaClock:
+            @staticmethod
+            def now(requested_zone: ZoneInfo) -> datetime:
+                return now.astimezone(requested_zone)
+
+        output = io.StringIO()
+        with mock.patch.object(waiting, "datetime", AgendaClock), redirect_stdout(output):
+            waiting.agenda(add_unit.read_production(self.doc), self.state)
+        self.assertIn("agenda: ok — 0 new items", output.getvalue())
+        self.assertFalse((self.state / "agenda_seen.json").exists())
+
+    def test_future_weekday_eta_from_renderer_resolves_after_the_log_line(self) -> None:
+        zone = ZoneInfo("America/Los_Angeles")
+        report_at = datetime(2026, 10, 6, 8, 0, tzinfo=zone)
+        eta = datetime(2026, 10, 8, 9, 0, tzinfo=zone)
+        line = self.producer_eta_line(report_at, PHASE, eta)
+        prefix = f"{ALPHA} {PHASE_IDENTITY} "
+        eta_text = line.split("dailies ETAs: ", 1)[1].removeprefix(prefix)
+
+        self.assertTrue(eta_text.startswith("Thu 09:00 PDT"), line)
+        self.assertEqual(waiting.eta_moment(eta_text, report_at), waiting.EtaOnLog(eta))
+
     def test_log_timeline_spans_two_midnights_for_waits_and_first_phase(self) -> None:
         now = datetime.now(ZoneInfo("America/Los_Angeles"))
         moments = [now - timedelta(hours=hours) for hours in (50, 40, 26, 14, 2)]
@@ -779,6 +853,21 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
         self.assertEqual(json.loads(seen_path.read_text()), {})
 
+    def test_quota_prints_each_held_alert_with_percent_left_and_reset_time(self) -> None:
+        first_note, second_note = self.quota_note("codex 1"), self.quota_note("codex 2")
+        first = self.run_waiting("quota", "--notice", self.quota_message(first_note),
+                                 "--state-dir", str(self.state))
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        second = self.run_waiting("quota", "--notice", self.quota_message(second_note),
+                                  "--state-dir", str(self.state))
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        held = [line for line in second.stdout.splitlines() if line.startswith("held: ")]
+        self.assertEqual(len(held), 2, second.stdout)
+        for account in ("codex 1", "codex 2"):
+            line = next(item for item in held if account in item)
+            self.assertIn("4%", line)
+            self.assertIn("resets 2026-10-12 09:00 PDT", line)
+
     def test_quota_queues_one_unit_collects_failure_and_saves_held_alert(self) -> None:
         self.add_gamma()
         send = self.bin_path / "send.py"
@@ -822,6 +911,21 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         unmeasured = produce.split("**Unmeasured ETAs.**", 1)[1].split("- **Waiting on block.**", 1)[0]
         self.assertNotIn("Ask again only if", unmeasured)
         self.assertIn("the command will not repeat the request", unmeasured)
+
+    def test_quota_alert_and_agenda_contracts_keep_every_user_surface(self) -> None:
+        root = SCRIPT.parents[2]
+        produce = (root / "commands/showrunner/produce.md").read_text(encoding="utf-8")
+        dailies = (root / "commands/showrunner/dailies.md").read_text(encoding="utf-8")
+        quota = produce.split("<QuotaAlert>", 1)[1].split("</QuotaAlert>", 1)[0]
+        agenda = produce.split("<Agenda>", 1)[1].split("</Agenda>", 1)[0]
+        agenda_words = " ".join(agenda.split())
+        open_topics = dailies.split("5. **Open topics.**", 1)[1].split("6. **Review watch.**", 1)[0]
+
+        self.assertIn("listed first in every Waiting on block", " ".join(quota.split()))
+        self.assertIn("held quota alerts", open_topics)
+        self.assertIn("`- HH:MM <zone>: agenda: <item>`", agenda_words)
+        self.assertEqual(agenda_words.count("`For discussion with you`"), 1)
+        self.assertIn("`- HH:MM <zone>: agenda closed: <item>: <what was decided>`", agenda_words)
 
 
 if __name__ == "__main__":

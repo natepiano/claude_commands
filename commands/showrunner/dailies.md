@@ -55,9 +55,11 @@ Read the current state, not memory, and check what you state the way
    The input builder keeps the ETA's first-seen time and prints
    `request /unit:eta: <unit>` once per phase when that ETA is over an hour
    old or past. Send that request this turn. It writes `set HH:MM` for a stale
-   ETA and `none measured - requested` for a passed one. Supply the phase,
-   started time, current update, and ETA numbers from the unit's plan and
-   reports. Text after `❯` may be a prompt suggestion, not the user's draft:
+   ETA and `none measured - requested` for a passed one. A held unit's ETA
+   that has not changed since the builder first saw it is never requested and
+   stays as stated. Supply the phase, started time, current update, and ETA
+   numbers from the unit's plan and reports. Text after `❯` may be a prompt
+   suggestion, not the user's draft:
    `capture-pane -e` shows a suggestion dimmed (`ESC[2m`).
 4. **Merge branch.** The input builder reads the last merge and whether the
    branch is pushed. Supply anything held or testing in the judgment file.
