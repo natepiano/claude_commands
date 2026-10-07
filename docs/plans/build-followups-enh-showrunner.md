@@ -291,36 +291,27 @@ A unit's `then` in the dailies input is a JSON list of one-line items, one per u
 
 ### Phase 8 — Stall watch treats a unit waiting on someone else as waiting · status: done
 
-#### Work Order
+#### As-built
 
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-showrunner`, branch `build-followups-enh-showrunner`. State every time in PDT.
-
-**Source:** the showrunner (natedev), 2026-10-06 ~19:1x PDT. At 19:0x PDT the stall watch bumped mul_add, whose last line was "— gate: the user runs the Mac Claude go-live and controls at a Mac terminal". `stall_watch.py` resets a unit's stretch only for a last line that starts `done:` or `blocked:`, so a unit waiting on the user under `gate:` or `decision:` is bumped and reported as stalled every stretch.
-
-**Goal:** the stall watch treats a unit whose last turn-end line is `— gate:` or `— decision:` as waiting, exactly as it treats `done:` and `blocked:`: no bump, no notice to the showrunner, and a fresh stretch. `— holding:` stays a stall candidate.
-
-**Spec:**
-- **Read first, in full:** `scripts/production/stall_watch.py` (`TURN_END`, the last-line test in the unit loop, `Stretch`, `read_stretch`, `work_running`, and the standby and finished-run skips) and `scripts/production/test_stall_watch.py` (`test_blocked_turn_end_waits_for_a_new_unblocked_status`, `test_holding_turn_end_still_bumps_idle_unit`, `test_done_turn_end_is_never_stalled`).
-- **The rule.** A turn-end line is a wait when its kind is `done`, `blocked`, `gate` or `decision`: in each the unit has handed the next move to someone else or has finished. `holding` is the one kind that says the unit itself is waiting on work it has running, so with nothing running it is the stall the watch exists to catch. A unit waiting on the user under `decision:` or `blocked:` is already reported to the user (`unit_status.sh` prints `STILL WAITING on you`); the watch adds no second report. A `gate:` wait is not flagged by `unit_status.sh`: it shows only as the unit's activity line, and this phase leaves that script as it is.
-- **One list of kinds.** `TURN_END` already names all five kinds. Build it and the wait test from the same two names in the module, the waiting kinds and `holding`, so the pattern and the test cannot drift apart again. The test reads the kind of the last line the way `TURN_END` does, with or without the leading `— `, and replaces `last.lstrip("— ").startswith(("done:", "blocked:"))`. A pane with no turn-end line on screen (`none on screen`) takes the stall path as today.
-- **The reset is the existing one.** A waiting last line writes the fresh stretch and skips the unit, as `done:` and `blocked:` do today; the stretch restarts at the next status that is not a wait, so a unit that answers the gate and then says `— holding:` is judged from that line.
+- The stall watch reads the kind of a unit pane's last turn-end line, with or without the leading `— `. `done`, `blocked`, `gate` and `decision` are waits: the unit has finished or handed the next move to someone else, so the watch sends no bump, sends no notice to the showrunner, and writes a fresh stretch.
+- `holding` is the one kind that stays a stall candidate: it says the unit is waiting on work it has running, so with nothing running it is the stall the watch exists to catch. A pane with no turn-end line on screen takes the stall path as before.
+- `WAITING_KINDS` and `HOLDING_KIND` name the kinds. The turn-end pattern is built from them with a named `kind` group, and the last match's kind picks the branch, so the pattern and the wait test cannot drift apart.
+- The stretch restarts at the next status that is not a wait. A unit that answers a gate and then shows `— holding:` is judged stalled only after a full interval from the first screen that shows that line.
+- The standby skip and the finished-run skip (a Units row whose Plan cell says `run done`) still run before any bump or notice.
+- The verbatim `— gate: the user runs the Mac Claude go-live and controls at a Mac terminal` line, a bare `gate:` line, and prefixed and bare `decision:` lines are each silent at the start and after the stall interval, then bumped and reported once after a later `— holding:` line. The changed-reported-status test stays, with a `holding:` last line.
 
 **Files:**
-- `scripts/production/stall_watch.py` — the waiting kinds and the last-line test.
-- `scripts/production/test_stall_watch.py` — its tests.
+- `scripts/production/stall_watch.py` — the waiting kinds, the turn-end pattern and the wait branch in the unit loop.
+- `scripts/production/test_stall_watch.py` — the stall-watch tests, 29 in all.
+- `docs/as-built/build-followups-fn-length-hook.md` — its stall-watch sentence names the four waiting kinds.
 
-**Seats:** 1 writer + 1 tester.
-- `impl` — `stall_watch.py`; post `done` without waiting for the test seat.
-- `test` — from the Spec alone, in `test_stall_watch.py`, modelled on `test_blocked_turn_end_waits_for_a_new_unblocked_status`: the mul_add line verbatim, `— gate: the user runs the Mac Claude go-live and controls at a Mac terminal`, and a `— decision: …` line each get no bump and no notice at the start and after the stall interval, and a later `— holding: …` line starts the stall from that line; a `gate:` and a `decision:` line without the leading `— ` behave the same; a `— holding: …` line with nothing running is still bumped (the existing test, left as it is); the `done:` and `blocked:` tests stay green unchanged. Each new test fails on the tree before this phase. Owns the final suite run.
+**Binds later work:** `scripts/production/unit_status.sh` is unchanged: it treats a `gate:` line as activity text, and anything that reads a unit's status takes it the same way.
 
-**Constraints from prior phases:**
-- Phases 4 and 5 (as built): the watch skips a standby unit and a finished run (a Units row whose Plan cell says `run done`) before any bump or notice, and `done:` and `blocked:` reset the stretch; keep all of them.
-- `stall_watch.py` and `test_stall_watch.py` are in this unit's **Owns** row (hub files, gate G1 cleared): neither is an `--also` path. Merge `build-followups` into the branch at the phase start.
-- Tests never start a real `claude`, `tmux`, `systemd-run` or `ssh`, never write `~/.claude/config/`, `~/.local/state/` or a real production doc, and never push anywhere but a temporary bare repository.
+**Gotchas:**
+- `unit_status.sh` prints `STILL WAITING on you` only for `decision:` and `blocked:` last lines. A `gate:` wait shows only as the unit's activity line, so a unit stopped at a gate is silent in the stall watch and not flagged to the user by the status script.
+- Sandboxed seats have no writable temporary directory and cannot run this suite; run it from the main tree.
 
-**Acceptance gate:**
-- From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_stall_watch.py'` green; basedpyright 0 errors and 0 warnings on `scripts/production/stall_watch.py` and `test_stall_watch.py`.
-- Live (natedev, once the merge reaches `~/.claude` main): a unit whose last line is `— gate:` or `— decision:` gets no bump across a stall stretch.
+**Ruled out:** teaching `unit_status.sh` to flag `gate:` in this change, since that is a script outside the phase's files and changes what the dailies show.
 
 ### Phase 9 — Dailies input builder · status: todo
 
