@@ -62,6 +62,13 @@
       ]
     },
     {
+      "root": "scripts/mac_test",
+      "extraPaths": [
+        "scripts/mac_test",
+        "scripts/lint"
+      ]
+    },
+    {
       "root": "scripts/lint",
       "extraPaths": [
         "scripts/lint"

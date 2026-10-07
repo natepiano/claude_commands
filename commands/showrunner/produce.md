@@ -529,9 +529,10 @@ Promote the exact sha pushed by <CIPoint/> after these checks:
 3. The GitHub CI run concluded `success`. In
    `gh run view <run-id> --json jobs`, every job concluded `success` or
    `skipped`, and `Test Suite` (Linux) concluded `success`.
-   `macOS: Compile and Test` skipped because its runner is offline passes;
-   add `macOS skipped (runner offline)` to the log line. A macOS job that ran
-   and failed blocks. User rule 2026-10-02.
+   `macOS: Compile and Test` skipped because its runner is offline or the Mac
+   is blocked passes. Add `macOS skipped (runner offline)` or `macOS skipped
+   (Mac blocked)` to the log line. A macOS job that ran and failed blocks. User
+   rule 2026-10-02.
 4. Run `python3 ~/.claude/scripts/production/production_lifecycle.py
    promote-main --production PRODUCTION_DOC --ci-green <sha>
    --smoke-passed <sha>`. The command checks that main is not dirty, pushes
