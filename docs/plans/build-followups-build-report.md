@@ -44,28 +44,17 @@ The user (2026-10-07, after the build analysis): "yes do all of this - understan
 
 ### Phase 2 — The build-folder wait separates a seat's own queue from waiting on another seat  · status: done
 
-#### Work Order
+#### As-built
 
-**Worktree:** `/home/natepiano/worktrees/claude-build-followups-build-report`, branch `build-followups-build-report`.
-
-**Goal:** the Waiting table replaces its one `Build-folder turn` row with two: `Build-folder turn, behind another seat` and `Build-folder turn, behind its own call`, so the first measures real blocking.
-
-**Spec:**
-- The cargo token is held per delegate session (`verify.sh` acquires it on the session's board), so a call's token wait can only be caused by calls with the same non-null `delegate_session`.
-- For each call on the day with `token_wait_s > 0`: its wait interval is `[started_at + wait_s - token_wait_s, started_at + wait_s]`. Each other call of the same `delegate_session` with an `ended_at` holds the token over `[started_at + wait_s, ended_at]` (holders may start the day before; fetch calls whose `ended_at` falls on the day or later). Overlap seconds with holders of the same `seat` count as own; overlap with any other seat counts as another seat. Any part of the wait no holder covers counts as another seat, so no wait is hidden. Cap the two parts at the call's `token_wait_s`.
-- A call with no `delegate_session` puts its whole wait in the another-seat row.
-- Each row goes through the existing `wait_row()` with that call's part as the duration (worktree as owner and name, as now); `Waited` counts calls with a positive part in that row. The other-seat row comes first.
-- Add the Waiting table's one line, directly under it (the report's style: one `Source:` line under each table, nothing else): `Source: verify.sh calls, memory-gated steps and CI jobs; a seat's own calls run one at a time, so waiting behind its own call adds no delay, behind another seat does.`
-- Keep functions under the function-length hook.
+- The `### Waiting` table opens with two rows, always present: `Build-folder turn, behind another seat`, then `Build-folder turn, behind its own call`. Each goes through `wait_row()` with the call's part as the duration and the worktree as owner and name; `Waited` counts calls with a positive part in that row. The one line under the table: `Source: verify.sh calls, memory-gated steps and CI jobs; a seat's own calls run one at a time, so waiting behind its own call adds no delay, behind another seat does.`
+- `build_folder_waits(connection, day)` returns `(another_waits, own_waits)`, two `ReportedWait` lists (`tuple[float, str, str, str]`: duration, owner, name, started_at). It reads the day's `tool = 'verify.sh'` calls and the token holders, the verify.sh calls with a `delegate_session` and an `ended_at` on the day or later. `token_holders()` turns each into `TokenHolder(call_id, delegate_session, seat, starts_at, ends_at)` over `[started_at + wait_s, ended_at]`, and holders are grouped by session so each call scans only its own session's.
+- The cargo token is held per delegate session, so only calls of the same `delegate_session` can cause a token wait. `attribute_token_wait()` runs only for a positive `token_wait_s` on a call with a session; a call with no `delegate_session` puts its whole wait in the another-seat row.
+- `attribute_token_wait(call_id, delegate_session, seat, starts_at, wait_s, token_wait_s, holders) -> TokenWaitAttribution(behind_another_seat_s, behind_own_call_s)` takes the wait interval `[started_at + wait_s - token_wait_s, started_at + wait_s]` and splits it at the boundaries of the overlapping same-session holders other than the call itself. A segment is own only when every holder covering it has the call's seat; every other segment, uncovered included, is another seat. Own is capped at `token_wait_s`, and another seat is the remainder.
 
 **Files:**
-- `scripts/buildlog/report.py` — `waiting_section()` and a new attribution helper.
-- `scripts/buildlog/test_report.py` — tests for the split; update the existing Waiting tests to the two row labels.
+- `scripts/buildlog/report.py` — `ReportedWait`, the `TokenHolder` and `TokenWaitAttribution` dataclasses, `call_time`, `token_holders`, `attribute_token_wait`, `build_folder_waits`, and the two rows and `Source:` line in `waiting_section`.
+- `scripts/buildlog/test_report.py` — tests for the split (own seat, another seat, both, uncovered remainder, no session, another session's holder, a holder from the previous day), the port-lint exclusion, and the Waiting `Source:` line.
 
-**Seats:** `1 writer + 1 tester` — one module and its test file.
-- `impl` — `scripts/buildlog/report.py`.
-- `test` — `scripts/buildlog/test_report.py`, from this Spec alone: a wait fully behind the same seat, fully behind another seat, split across both, with an uncovered remainder, a call with no delegate session, a holder from another session ignored, a holder that started the previous day, and both rows present when nothing waited.
+**Gotchas:** the `calls` table also holds port-lint calls, so every query over the call population, counted calls and holders alike, filters `tool = 'verify.sh'`. A NULL seat is coalesced to `(unknown seat)`; session calls with no seat never wait but can hold the token, and a seat waiting behind one counts as another seat. Holders are fetched by `ended_at`, not `started_at`, so a holder that began the previous day is found.
 
-**Constraints from prior phases:** Phase 1 put `### Rebuilds` directly after `### Waiting`; leave its order alone. Every report table is followed by exactly one `Source:` line and nothing else. The `scripts/buildlog/buildlog` shim loads the main checkout, so worktree checks call `python3 scripts/buildlog/cli.py`. In this worktree basedpyright prints a missing-`.venv` note and exits 3; the gate is its `0 errors, 0 warnings` line.
-
-**Acceptance gate:** the Test command green and the Lint command at `0 errors, 0 warnings`. On `TZ=America/Los_Angeles python3 scripts/buildlog/cli.py report 2026-10-06`, the own-call row holds most of the day's build-folder wait (the 2026-10-05/06 analysis found about three quarters).
+**Ruled out:** counting uncovered wait as own, since that would hide waits with no recorded holder.
