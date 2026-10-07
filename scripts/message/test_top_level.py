@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -179,6 +180,21 @@ class TopLevelTests(unittest.TestCase):
         self.assertEqual(lines, [])
         self.assertEqual(recorded, [])
 
+
+    def test_a_gone_session_is_not_taken_for_a_unit_whose_name_it_prefixes(self) -> None:
+        binary = shutil.which("tmux")
+        if binary is None:
+            self.skipTest("tmux is required to check its session matching")
+        server_dir = self.folder / "tmux"
+        server_dir.mkdir()
+        self.enterContext(mock.patch.dict(os.environ, {"TMUX_TMPDIR": str(server_dir)}))
+        _ = os.environ.pop("TMUX", None)
+        self.addCleanup(subprocess.run, [binary, "kill-server"], capture_output=True, check=False)
+        _ = subprocess.run([binary, "-f", "/dev/null", "new-session", "-d", "-s", "unit-trunk", "sleep 60"],
+                           check=True)
+        _ = subprocess.run([binary, "set-environment", "-t", "=unit-trunk", top_level.UNIT_MARK, "1"], check=True)
+        self.assertTrue(top_level.is_unit("unit-trunk:@0.%0"))
+        self.assertFalse(top_level.is_unit("unit:@1.%1"))
 
 if __name__ == "__main__":
     _ = unittest.main()
