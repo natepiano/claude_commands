@@ -24,6 +24,24 @@ import sync
 from test_index import STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
 
 
+def local_clock(at: str) -> str:
+    return datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone().strftime("%H:%M %Z")
+
+
+def token_holder(record_id: str, acquired_at: str, released_at: str, seat: str, delegate_session: str) -> Record:
+    started_at = "2026-10-01T12:00:00Z"
+    started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    acquired = datetime.fromisoformat(acquired_at.replace("Z", "+00:00"))
+    return call(
+        record_id,
+        started_at=started_at,
+        ended_at=released_at,
+        wait_s=int((acquired - started).total_seconds()),
+        seat=seat,
+        delegate_session=delegate_session,
+    )
+
+
 class ReportTests(unittest.TestCase):
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     records: list[Record]  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -60,13 +78,26 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(lines[2], "### Waiting")
         start = lines.index("### Waiting")
         end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("### "))
-        table = [line for line in lines[start:end] if line.startswith("|")]
+        table_indexes = [i for i in range(start, end) if lines[i].startswith("|")]
+        table = [lines[i] for i in table_indexes]
         self.assertEqual(
             [cell.strip() for cell in table[0].strip("|").split("|")],
             ["Wait", "Longest", "Over 5 min", "Waited", "Total", "Worst"],
         )
+        self.assertEqual(
+            lines[table_indexes[-1] + 1],
+            "Source: verify.sh calls, memory-gated steps and CI jobs; a seat's own calls run one at a time, so waiting behind its own call adds no delay, behind another seat does.",
+        )
         rows = [[cell.strip() for cell in line.strip("|").split("|")] for line in table[2:]]
-        self.assertEqual([row[0] for row in rows], ["Build-folder turn", "Memory admission", "CI queue"])
+        self.assertEqual(
+            [row[0] for row in rows],
+            [
+                "Build-folder turn, behind another seat",
+                "Build-folder turn, behind its own call",
+                "Memory admission",
+                "CI queue",
+            ],
+        )
         return {row[0]: row[1:] for row in rows}
 
     def rebuilds_lines(self, day: str = "2026-10-02") -> list[str]:
@@ -101,9 +132,12 @@ class ReportTests(unittest.TestCase):
 
         rows = self.waiting_rows()
         zone = datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone().strftime("%H:%M %Z")
-        self.assertEqual(rows["Build-folder turn"], [
+        self.assertEqual(rows["Build-folder turn, behind another seat"], [
             f"10.0 min (alpha, {zone})", "3", "4 of 5 calls", "0.5 seat-hours",
             "alpha 16.0 min, beta 7.0 min, gamma 4.0 min",
+        ])
+        self.assertEqual(rows["Build-folder turn, behind its own call"], [
+            "none", "0", "0 of 5 calls", "0.0 seat-hours", "",
         ])
         self.assertEqual(rows["Memory admission"], [
             f"15.0 min (alpha impl, {zone})", "3", "3 of 4 steps", "0.5 seat-hours",
@@ -117,7 +151,112 @@ class ReportTests(unittest.TestCase):
     def test_waiting_rows_remain_visible_when_no_wait_was_recorded(self) -> None:
         rows = self.waiting_rows()
         self.assertEqual(rows, {name: ["none", "", "", "", ""] for name in
-                                ("Build-folder turn", "Memory admission", "CI queue")})
+                                ("Build-folder turn, behind another seat", "Build-folder turn, behind its own call",
+                                 "Memory admission", "CI queue")})
+
+    def test_build_folder_wait_fully_behind_own_call_from_previous_day(self) -> None:
+        at = "2026-10-02T12:00:00Z"
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("waiter", started_at=at, ended_at="2026-10-02T12:11:00Z",
+                 wait_s=600, token_wait_s=600, worktree="/r/alpha", seat="impl", delegate_session="delegate-a"),
+            token_holder("holder", "2026-10-02T12:00:00Z", "2026-10-02T12:10:00Z", "impl", "delegate-a"),
+        )
+
+        rows = self.waiting_rows()
+        self.assertEqual(rows["Build-folder turn, behind its own call"][0], f"10.0 min (alpha, {local_clock(at)})")
+        self.assertEqual(
+            rows["Build-folder turn, behind its own call"][2:],
+            ["1 of 1 calls", "0.2 seat-hours", "alpha 10.0 min"],
+        )
+        self.assertEqual(rows["Build-folder turn, behind another seat"][2], "0 of 1 calls")
+
+    def test_build_folder_wait_fully_behind_another_seat(self) -> None:
+        at = "2026-10-02T13:00:00Z"
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("waiter", started_at=at, ended_at="2026-10-02T13:08:00Z",
+                 wait_s=420, token_wait_s=420, worktree="/r/beta", seat="impl", delegate_session="delegate-a"),
+            token_holder("holder", "2026-10-02T13:00:00Z", "2026-10-02T13:07:00Z", "test", "delegate-a"),
+        )
+
+        rows = self.waiting_rows()
+        self.assertEqual(rows["Build-folder turn, behind another seat"][0], f"7.0 min (beta, {local_clock(at)})")
+        self.assertEqual(
+            rows["Build-folder turn, behind another seat"][2:],
+            ["1 of 1 calls", "0.1 seat-hours", "beta 7.0 min"],
+        )
+        self.assertEqual(rows["Build-folder turn, behind its own call"][2], "0 of 1 calls")
+
+    def test_build_folder_wait_splits_across_own_call_and_another_seat(self) -> None:
+        at = "2026-10-02T14:00:00Z"
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("waiter", started_at=at, ended_at="2026-10-02T14:11:00Z",
+                 wait_s=600, token_wait_s=600, worktree="/r/gamma", seat="impl", delegate_session="delegate-a"),
+            token_holder("own", "2026-10-02T14:00:00Z", "2026-10-02T14:04:00Z", "impl", "delegate-a"),
+            token_holder("other", "2026-10-02T14:04:00Z", "2026-10-02T14:10:00Z", "test", "delegate-a"),
+        )
+
+        rows = self.waiting_rows()
+        self.assertEqual(rows["Build-folder turn, behind another seat"][0], f"6.0 min (gamma, {local_clock(at)})")
+        self.assertEqual(rows["Build-folder turn, behind its own call"][0], f"4.0 min (gamma, {local_clock(at)})")
+        self.assertEqual(rows["Build-folder turn, behind another seat"][2], "1 of 1 calls")
+        self.assertEqual(rows["Build-folder turn, behind its own call"][2], "1 of 1 calls")
+
+    def test_uncovered_build_folder_wait_counts_as_behind_another_seat(self) -> None:
+        at = "2026-10-02T15:00:00Z"
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("waiter", started_at=at, ended_at="2026-10-02T15:11:00Z",
+                 wait_s=600, token_wait_s=600, worktree="/r/delta", seat="impl", delegate_session="delegate-a"),
+            token_holder("own", "2026-10-02T15:00:00Z", "2026-10-02T15:02:00Z", "impl", "delegate-a"),
+            token_holder("other", "2026-10-02T15:02:00Z", "2026-10-02T15:05:00Z", "test", "delegate-a"),
+        )
+
+        rows = self.waiting_rows()
+        self.assertEqual(rows["Build-folder turn, behind another seat"][0], f"8.0 min (delta, {local_clock(at)})")
+        self.assertEqual(rows["Build-folder turn, behind its own call"][0], f"2.0 min (delta, {local_clock(at)})")
+
+    def test_build_folder_wait_without_delegate_session_counts_as_another_seat(self) -> None:
+        at = "2026-10-02T16:00:00Z"
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("waiter", started_at=at, ended_at="2026-10-02T16:06:00Z",
+                 wait_s=300, token_wait_s=300, worktree="/r/epsilon", seat="impl"),
+        )
+
+        rows = self.waiting_rows()
+        self.assertEqual(rows["Build-folder turn, behind another seat"][0], f"5.0 min (epsilon, {local_clock(at)})")
+        self.assertEqual(rows["Build-folder turn, behind its own call"][2], "0 of 1 calls")
+
+    def test_port_lint_calls_neither_count_as_build_folder_calls_nor_hold_the_folder(self) -> None:
+        at = "2026-10-02T18:00:00Z"
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("waiter", started_at=at, ended_at="2026-10-02T18:06:00Z",
+                 wait_s=300, token_wait_s=300, worktree="/r/eta", seat="impl", delegate_session="delegate-a"),
+            call("lint", tool="port-lint", started_at=at, ended_at="2026-10-02T18:05:00Z",
+                 worktree="/r/eta", seat="impl", delegate_session="delegate-a"),
+        )
+
+        rows = self.waiting_rows()
+        self.assertEqual(rows["Build-folder turn, behind another seat"][0], f"5.0 min (eta, {local_clock(at)})")
+        self.assertEqual(rows["Build-folder turn, behind another seat"][2], "1 of 1 calls")
+        self.assertEqual(rows["Build-folder turn, behind its own call"][2], "0 of 1 calls")
+
+    def test_holder_from_another_delegate_session_is_ignored(self) -> None:
+        at = "2026-10-02T17:00:00Z"
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("waiter", started_at=at, ended_at="2026-10-02T17:06:00Z",
+                 wait_s=300, token_wait_s=300, worktree="/r/zeta", seat="impl", delegate_session="delegate-a"),
+            token_holder("unrelated", "2026-10-02T17:00:00Z", "2026-10-02T17:05:00Z", "impl", "delegate-b"),
+        )
+
+        rows = self.waiting_rows()
+        self.assertEqual(rows["Build-folder turn, behind another seat"][0], f"5.0 min (zeta, {local_clock(at)})")
+        self.assertEqual(rows["Build-folder turn, behind its own call"][2], "0 of 1 calls")
 
     def test_rebuild_bins_include_edges_and_exclude_unmeasured_steps(self) -> None:
         at = "2026-10-02T12:00:00Z"

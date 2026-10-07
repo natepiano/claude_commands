@@ -58,6 +58,7 @@ REBUILD_LABELS = (NO_REBUILD_LABEL, EDITED_CRATE_LABEL, CASCADE_LABEL, COLD_BUIL
 PACKAGE_PATTERN = re.compile(r"package\(([^)&|\s]+)\)")
 
 Row = tuple[object, ...]
+ReportedWait = tuple[float, str, str, str]
 
 
 def seconds(value: object) -> str:
@@ -173,6 +174,21 @@ class PackageRebuilds:
             self.compile_samples.append(step.compile_s)
 
 
+@dataclass(frozen=True)
+class TokenHolder:
+    call_id: str
+    delegate_session: str
+    seat: str
+    starts_at: datetime
+    ends_at: datetime
+
+
+@dataclass(frozen=True)
+class TokenWaitAttribution:
+    behind_another_seat_s: float
+    behind_own_call_s: float
+
+
 EXTRA: dict[str, list[Column]] = {
     "check": [AverageColumn("Build", "avg(finished_s)", seconds, "finished_s"), Column("Warnings", "sum(warnings)", count)],
     "clippy": [
@@ -222,7 +238,7 @@ def caller_label(caller: object, host: object, hosts: int) -> str:
     return f"{label} ({host})" if hosts > 1 else label
 
 
-def wait_row(label: str, waits: list[tuple[float, str, str, str]], unit: str) -> list[str]:
+def wait_row(label: str, waits: list[ReportedWait], unit: str) -> list[str]:
     """Summarize measured waits, keeping parallel seats as separate time."""
     if not waits:
         return [label, "none", "", "", "", ""]
@@ -246,13 +262,82 @@ def wait_seconds(value: object) -> float:
     return float(value) if isinstance(value, int | float) else 0.0
 
 
-def waiting_section(connection: sqlite3.Connection, day: str) -> list[str]:
+def call_time(value: object) -> datetime:
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def token_holders(rows: list[Row]) -> list[TokenHolder]:
+    holders: list[TokenHolder] = []
+    for call_id, started_at, wait_s, ended_at, seat, delegate_session in rows:
+        starts_at = call_time(started_at) + timedelta(seconds=wait_seconds(wait_s))
+        ends_at = call_time(ended_at)
+        if starts_at < ends_at:
+            holders.append(TokenHolder(str(call_id), str(delegate_session), str(seat), starts_at, ends_at))
+    return holders
+
+
+def attribute_token_wait(
+    call_id: str,
+    delegate_session: str,
+    seat: str,
+    starts_at: datetime,
+    wait_s: float,
+    token_wait_s: float,
+    holders: Sequence[TokenHolder],
+) -> TokenWaitAttribution:
+    wait_ends_at = starts_at + timedelta(seconds=wait_s)
+    wait_starts_at = wait_ends_at - timedelta(seconds=token_wait_s)
+    overlapping = [
+        holder for holder in holders
+        if holder.call_id != call_id and holder.delegate_session == delegate_session
+        and holder.starts_at < wait_ends_at and holder.ends_at > wait_starts_at
+    ]
+    boundaries = sorted({wait_starts_at, wait_ends_at, *(point for holder in overlapping for point in (holder.starts_at, holder.ends_at))})
+    own_s = 0.0
+    for left, right in zip(boundaries, boundaries[1:]):
+        if left < wait_starts_at or right > wait_ends_at:
+            continue
+        covering = [holder for holder in overlapping if holder.starts_at < right and holder.ends_at > left]
+        if covering and all(holder.seat == seat for holder in covering):
+            own_s += (right - left).total_seconds()
+    own_s = min(token_wait_s, own_s)
+    return TokenWaitAttribution(token_wait_s - own_s, own_s)
+
+
+def build_folder_waits(connection: sqlite3.Connection, day: str) -> tuple[list[ReportedWait], list[ReportedWait]]:
     calls = fetch(
         connection,
-        "SELECT token_wait_s, coalesce(worktree_name, '(unknown worktree)'), started_at FROM calls"
-        + " WHERE date(started_at, 'localtime') = ?",
+        "SELECT id, token_wait_s, coalesce(worktree_name, '(unknown worktree)'), started_at,"
+        + " coalesce(wait_s, 0), coalesce(seat, '(unknown seat)'), delegate_session FROM calls"
+        + " WHERE tool = 'verify.sh' AND date(started_at, 'localtime') = ?",
         day,
     )
+    holder_rows = fetch(
+        connection,
+        "SELECT id, started_at, coalesce(wait_s, 0), ended_at, coalesce(seat, '(unknown seat)'), delegate_session"
+        + " FROM calls WHERE tool = 'verify.sh' AND ended_at IS NOT NULL AND delegate_session IS NOT NULL"
+        + " AND date(ended_at, 'localtime') >= ?",
+        day,
+    )
+    holders_by_session: dict[str, list[TokenHolder]] = {}
+    for holder in token_holders(holder_rows):
+        holders_by_session.setdefault(holder.delegate_session, []).append(holder)
+    another_waits: list[ReportedWait] = []
+    own_waits: list[ReportedWait] = []
+    for call_id, duration, tree, started_at, wait_s, seat, delegate_session in calls:
+        token_wait_s = wait_seconds(duration)
+        attribution = TokenWaitAttribution(token_wait_s, 0.0) if token_wait_s <= 0 or not isinstance(delegate_session, str) else attribute_token_wait(
+            str(call_id), delegate_session, str(seat), call_time(started_at), wait_seconds(wait_s), token_wait_s,
+            holders_by_session.get(delegate_session, []),
+        )
+        identity = (str(tree), str(tree), str(started_at))
+        another_waits.append((attribution.behind_another_seat_s, *identity))
+        own_waits.append((attribution.behind_own_call_s, *identity))
+    return another_waits, own_waits
+
+
+def waiting_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    another_waits, own_waits = build_folder_waits(connection, day)
     steps = fetch(
         connection,
         "SELECT mem_wait_s, coalesce(worktree_name, '(unknown worktree)'), seat, started_at FROM steps"
@@ -267,7 +352,8 @@ def waiting_section(connection: sqlite3.Connection, day: str) -> list[str]:
         day,
     )
     rows = [
-        wait_row("Build-folder turn", [(wait_seconds(duration), str(tree), str(tree), str(at)) for duration, tree, at in calls], "calls"),
+        wait_row("Build-folder turn, behind another seat", another_waits, "calls"),
+        wait_row("Build-folder turn, behind its own call", own_waits, "calls"),
         wait_row(
             "Memory admission",
             [(wait_seconds(duration), str(tree), f"{tree} {seat}" if seat else str(tree), str(at)) for duration, tree, seat, at in steps],
@@ -275,7 +361,8 @@ def waiting_section(connection: sqlite3.Connection, day: str) -> list[str]:
         ),
         wait_row("CI queue", [(wait_seconds(duration), f"{workflow} / {name}", f"{workflow} / {name}", str(at)) for duration, workflow, name, at in jobs], "jobs"),
     ]
-    return ["### Waiting", "", *table(["Wait", "Longest", "Over 5 min", "Waited", "Total", "Worst"], rows), ""]
+    source = "Source: verify.sh calls, memory-gated steps and CI jobs; a seat's own calls run one at a time, so waiting behind its own call adds no delay, behind another seat does."
+    return ["### Waiting", "", *table(["Wait", "Longest", "Over 5 min", "Waited", "Total", "Worst"], rows), source, ""]
 
 
 def rebuild_bin(crates_compiled: int) -> str:
