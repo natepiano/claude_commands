@@ -267,7 +267,7 @@ The user's measure, relayed by the showrunner (natedev) 2026-10-06: "it's a lot 
 
 **Ruled out:** named domain-state variants in place of None and JSON null across `turns.py` and `compare.py` (file format, no behavior change).
 
-### Phase 6 — The final report goes to the showrunner with its recommendation · status: todo
+### Phase 6 — The final report goes to the showrunner with its recommendation · status: done
 
 #### Work Order
 
