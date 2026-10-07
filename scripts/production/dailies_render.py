@@ -477,10 +477,13 @@ def parse_upcoming_work(fields: JsonMap, where: str) -> UpcomingWork | NoUpcomin
     if value is None:
         return NoUpcomingWork()
     if isinstance(value, str):
-        return UpcomingWork((text(fields, "then", where),))
+        raise InputError(f'{where}.then: must be a list of one-line items, one per upcoming phase: ["Phase 3: …", "Phase 4: …"]')
     if not isinstance(value, list) or not value:
         raise InputError(f"{where}.then: expected a non-empty list of one-line text")
     items = tuple(text({"then": item}, "then", where) for item in cast(list[object], value))
+    for index, item in enumerate(items):
+        if re.search(r", then |; then| then Phase|\bPhase \d+:.*\bPhase \d+:", item, re.IGNORECASE):
+            raise InputError(f"{where}.then[{index}]: one item names more than one phase; split it into list items: {item}")
     return UpcomingWork(items)
 
 
