@@ -147,13 +147,17 @@ class DailiesInputTests(unittest.TestCase):
             })
         _ = self.judgment.write_text(json.dumps({"units": units, "topics": []}) + "\n", encoding="utf-8")
 
-    def run_builder(self, *extra: str) -> subprocess.CompletedProcess[str]:
+    def run_builder(self, *extra: str, include_render_state: bool = True) -> subprocess.CompletedProcess[str]:
+        state_args = (
+            ("--render-state", str(self.root / "render-state.json"))
+            if include_render_state and "--render-state" not in extra else ()
+        )
         return subprocess.run(
             [sys.executable, str(SCRIPT), "--production", str(self.doc),
              "--status", str(self.status), "--judgment", str(self.judgment),
              "--state-dir", str(self.state), "--out", str(self.output),
              "--holders", str(self.holders), "--notifier", str(self.notifier),
-             "--at", AT, *extra],
+             "--at", AT, *state_args, *extra],
             cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False,
         )
 
@@ -206,6 +210,15 @@ class DailiesInputTests(unittest.TestCase):
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("label", self.unit())
+
+    def test_render_state_is_required_before_notifier_or_output(self) -> None:
+        _ = self.output.write_text("sentinel\n", encoding="utf-8")
+        result = self.run_builder(include_render_state=False)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("usage:", result.stderr)
+        self.assertIn("--render-state", result.stderr)
+        self.assertEqual(self.notifier_events(), [])
+        self.assertEqual(self.output.read_text(encoding="utf-8"), "sentinel\n")
 
     def test_long_session_without_judgment_label_is_refused(self) -> None:
         self.rename_unit("enh-showrunner-unit")
@@ -368,6 +381,13 @@ class DailiesInputTests(unittest.TestCase):
         self.assertIn("unit_status.txt", dailies)
         self.assertIn("/showrunner:dailies simple", dailies)
 
+    def test_dailies_command_surfaces_builder_step_failure_to_user(self) -> None:
+        command = SCRIPT.parents[2] / "commands/showrunner/dailies.md"
+        instructions = command.read_text(encoding="utf-8")
+        self.assertIn(
+            "When the builder prints `<step>: failed — <reason>`, give that exact line to " +
+            "the user as the failure message.", " ".join(instructions.split()))
+
     def test_user_run_opens_log_before_restarting_notifier(self) -> None:
         (self.checkout / "production.log").mkdir()
         result = self.run_builder("--user-run")
@@ -528,7 +548,7 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(next_phase.returncode, 0, next_phase.stdout + next_phase.stderr)
         self.assertIn(f"request /unit:eta: {ALPHA}", next_phase.stdout)
 
-    def test_refused_judgment_preserves_first_seen_and_request(self) -> None:
+    def test_refused_judgment_defers_eta_record_and_request_until_accepted(self) -> None:
         self.status_lines(f"== {ALPHA}", "ETA 16:50")
         fields = cast(dict[str, object], json.loads(self.judgment.read_text(encoding="utf-8")))
         units = cast(list[dict[str, object]], fields["units"])
@@ -536,16 +556,17 @@ class DailiesInputTests(unittest.TestCase):
         _ = self.judgment.write_text(json.dumps(fields), encoding="utf-8")
         refused = self.run_builder()
         self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
-        self.assertIn(f"request /unit:eta: {ALPHA}", refused.stdout)
-        seen = cast(dict[str, dict[str, object]], json.loads((self.state / "eta_seen.json").read_text()))
-        record = seen[f"{ALPHA}|Phase 2 of 3: panel labels stay clear"]
-        self.assertEqual(record["first_seen"], AT)
-        self.assertIs(record["requested"], True)
+        self.assertNotIn(f"request /unit:eta: {ALPHA}", refused.stdout)
+        self.assertFalse((self.state / "eta_seen.json").exists())
         units[0]["project"] = "panels that stay readable"
         _ = self.judgment.write_text(json.dumps(fields), encoding="utf-8")
         retried = self.run_builder()
         self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
-        self.assertNotIn("request /unit:eta:", retried.stdout)
+        self.assertIn(f"request /unit:eta: {ALPHA}", retried.stdout)
+        seen = cast(dict[str, dict[str, object]], json.loads((self.state / "eta_seen.json").read_text()))
+        record = seen[f"{ALPHA}|Phase 2 of 3: panel labels stay clear"]
+        self.assertEqual(record["first_seen"], AT)
+        self.assertIs(record["requested"], True)
 
     def test_invalid_at_is_named_as_input_failure(self) -> None:
         message = self.assert_refused_without_output("--at", "not-a-clock", mention="--at")
@@ -573,6 +594,39 @@ class DailiesInputTests(unittest.TestCase):
         message = self.assert_refused_without_output("--user-run", mention="units[0].then[0]: one item names more than one phase")
         self.assertIn(str(self.judgment), message)
         self.assertEqual(self.notifier_events(), [])
+
+    def test_moved_eta_without_reason_preserves_clock_output_and_eta_record(self) -> None:
+        baseline = self.run_builder()
+        self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
+        seen_path = self.state / "eta_seen.json"
+        seen = cast(dict[str, dict[str, object]], json.loads(seen_path.read_text(encoding="utf-8")))
+        key = f"{ALPHA}|Phase 2 of 3: panel labels stay clear"
+        seen[key]["first_seen"] = "2026-10-06T14:00"
+        seen[key]["requested"] = False
+        _ = seen_path.write_text(json.dumps(seen, separators=(",", ":")) + "\n", encoding="utf-8")
+        before_seen = seen_path.read_bytes()
+        _ = self.output.write_text("sentinel\n", encoding="utf-8")
+        render_state = self.root / "render-state.json"
+        old = {"phase": "Phase 2 of 3: panel labels stay clear", "eta": "2026-10-06T20:00:00",
+               "held": None, "first": "2026-10-06T20:00:00"}
+        _ = render_state.write_text(json.dumps({ALPHA: old}), encoding="utf-8")
+        self.events.unlink()
+
+        refused = self.run_builder("--user-run", "--render-state", str(render_state))
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn("judgment: failed", refused.stdout)
+        self.assertIn("units[0].eta.why", refused.stdout)
+        self.assertEqual(self.notifier_events(), [])
+        self.assertEqual(self.output.read_text(encoding="utf-8"), "sentinel\n")
+        self.assertEqual(seen_path.read_bytes(), before_seen)
+        self.assertNotIn("request /unit:eta:", refused.stdout)
+
+        self.judgment_file(alpha={"eta": {"percent": 60, "why": "the unit found another panel repair"}})
+        accepted = self.run_builder("--user-run", "--render-state", str(render_state))
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+        self.assertEqual(self.notifier_events(), [["restart", "showrunner-example"]])
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["why"],
+                         "the unit found another panel repair")
 
 
 if __name__ == "__main__":

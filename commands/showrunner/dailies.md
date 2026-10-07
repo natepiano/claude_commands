@@ -85,12 +85,15 @@ judgment JSON described below. Run the input builder, then the renderer on its
 output, and paste the renderer's output word for word as the whole report.
 Never edit the output: to change a line, change the input and run it again.
 When the renderer refuses the input (exit 2), fix what it names and run again.
+When the builder prints `<step>: failed — <reason>`, give that exact line to
+the user as the failure message. Correct the named input before reporting.
 
 ```sh
 python3 ~/.claude/scripts/production/dailies_input.py \
   --production <PRODUCTION_DOC> --status <scratchpad>/unit_status.txt \
   --judgment <scratchpad>/dailies_judgment.json --state-dir <scratchpad>/dailies_input_state \
   --out <scratchpad>/dailies_input.json --length <simple|page|elaborate> \
+  --render-state <scratchpad>/dailies_state.json \
   --notifier <NOTIFIER> [--user-run]
 python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_input.json \
   --state <scratchpad>/dailies_state.json --log <LOG> --outstanding <OUTSTANDING>

@@ -31,6 +31,13 @@ State:
 - `UPDATES` — `showrunner-<slug>`, where `<slug>` is the production doc's file
   name less `-production.md`.
 - `PROMPT_FILE` — `~/.local/state/showrunner/<slug>/prompt.txt`.
+- `SHOWRUNNER_STATE` — `<SCRATCH>/showrunner_state.json`, one JSON object with
+  optional `units` rows (`{"unit": "<unit session name>", "phase": "<text>",
+  "wait": "<text>"}`), `merges_held` (a list of text), and `open_for_user`
+  (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`).
+- `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<slug>.json`, written
+  by `update_registration.py footer --state` when `SHOWRUNNER_STATE` includes
+  `open_for_user`. Omitting that key leaves the durable list unchanged.
 
 `<DecisionEconomy/>` is defined by this import:
 
@@ -40,14 +47,16 @@ State:
 
 <Throughout>
 - **Time.** Before writing any time, run
-  `TZ=<ZONE> date '+%H:%M %Z'`. Give every time in `ZONE` only, never UTC (user,
-  2026-10-02). Unit directors state times in `ZONE` (user, 2026-10-04); convert any that arrive in another zone.
-- **Log.** Write one line per event in `LOG`: `- HH:MM <zone>: <event>`. Every
-  ten events, and before a compaction, add a `### STATE <time>` block. It gives:
-  - each unit's phase, last merged checkpoint and what it waits on;
-  - merges accepted but held;
-  - items open for the user.
-
+  `python3 ~/.claude/scripts/production/update_registration.py time <ISO or HH:MM>
+  --production PRODUCTION_DOC`. For the current time, pass `"$(date -Iseconds)"`.
+  Use its `HH:MM <zone>` output. Give every time in `ZONE` only, never UTC
+  (user, 2026-10-02).
+- **Log.** Run `python3 ~/.claude/scripts/production/update_registration.py
+  log "<event>" --production PRODUCTION_DOC` for each event. Add
+  `--state SHOWRUNNER_STATE` once that file exists, and `--before-compaction`
+  before a compaction. The command writes
+  the event line and each tenth `### STATE` block, including unit phase, last
+  merged checkpoint, waits, accepted but held merges and items open for the user.
   After a compaction, the production doc plus `LOG` is the whole state.
 - **Unit worktrees.** Never `cd` into one; use `git -C`. Never commit, reset or
   edit files there.
@@ -94,42 +103,27 @@ State:
   turn. Ask once per phase; ask again only if it answered without a time. Until
   it answers, report that ETA as `none measured - requested`.
 - **Waiting on block.** When footers are on, after the footer leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. The user's items come first. Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. The footer hook checks the shape and item order. User, 2026-10-06.
-- **Footer.** When footers are on, paste the output of
-  `python3 ~/.claude/scripts/production/dailies_render.py --footer --zone <ZONE>`,
-  word for word before the Waiting on block. It starts with a blank line and `---`, then
-  `HH:MM <zone> update:` and a blank line. Its `* ` bullets list each build
-  hold, each agent in the dailies report's words, then
-  `next dailies: HH:MM <zone>` or `no dailies scheduled`. A later day's
-  schedule includes its weekday. The last bullet ends ` - nothing needed`
-  when it applies. Put outstanding items in the Waiting on block, user's
-  first. Pass:
-  - `--next-run <HH:MM[+N]>`: `next_due` from `NOTIFIER status UPDATES` in
-    `ZONE`, with `+N` when it falls N days later, never from memory (user,
-    2026-10-02); leave it out when no schedule runs.
-  - Build holds come from the holder files in `~/.local/state/build-hold/`:
-    one line per active holder, including after a partial release. In a dailies
-    input, mark `units[i].build_hold: true` when you told that unit director to
-    stop builds. The renderer refuses a marker with no holder file, or active
-    holder files with no marked unit.
-  - `--nothing-needed`: when no subject needs a follow-up nobody has started.
-  - `--outstanding <OUTSTANDING>`, always, on the footer and on every dailies
-    render. `OUTSTANDING` is `~/.local/state/showrunner/outstanding/<slug>.json`:
-    `[{"since": "YYYY-MM-DDTHH:MM", "text": "..."}]`, one entry per thing the
-    user must do or decide, each with enough context to recall it without my
-    memory (what, where, why). Add an entry the moment it arises; remove it only
-    when the user addresses it and tells you. An entry the user defers gets
-    `"after": "YYYY-MM-DDTHH:MM"` (local) and stays hidden until then. User, 2026-10-05.
+- **Footer.** Run `python3 ~/.claude/scripts/production/update_registration.py
+  footer --production PRODUCTION_DOC` for the footer, adding
+  `--state SHOWRUNNER_STATE` once that file exists. Paste the rendered footer
+  word for word before the Waiting on block.
+  Pass `--nothing-needed` when no subject needs a follow-up nobody has started.
+  When the user-facing open list changes, set `open_for_user` in
+  `SHOWRUNNER_STATE` to the complete new list, starting from `OUTSTANDING`'s
+  current items; `[]` clears it.
+  When the footer switch is off, the command says `footers off`; omit both the
+  footer and the Waiting on block. The command reads the switch, the notifier's
+  next due time, and open-for-the-user items from `OUTSTANDING`. Keep each
+  item specific enough to recall what, where and why without memory. Remove
+  an item only when the user addresses it and tells you; defer an item with
+  `after` when the user asks. Build holds still come from holder files in
+  `~/.local/state/build-hold/`, and a dailies input marks each held unit.
 
   `scripts/hooks/stop-showrunner-footer.py` checks each reply in the session
-  targeted by `UPDATES` (<StartUpdates/> step 3). It uses the production doc's
-  running status and `ZONE`, notifier `next_due`, and `OUTSTANDING`. When the
-  footer's last bullet ends ` - nothing needed`, it passes `--nothing-needed`.
-  When the footer's update minute is at most five minutes old, it renders
-  with `--at` for that minute and its zone occurrence. When footers are on, a
-  missing or outdated footer or Waiting on block blocks the reply with the
-  exact footer lines and Waiting on shape. End the reply with those lines and
-  the Waiting on block.
-  The hook passes a reply after any Stop-hook block and passes on errors.
+  targeted by `UPDATES`. When footers are on, a missing or outdated footer or
+  Waiting on block blocks the reply with the exact footer lines and Waiting on
+  shape. End the reply with those lines and the Waiting on block. The hook
+  passes a reply after any Stop-hook block and passes on errors.
 
   `/showrunner:footer off` and `/showrunner:footer on` pause and resume the
   footer for this showrunner. Run them when the user says "footers off" or
@@ -227,26 +221,17 @@ The instance belongs to the production and keeps running when this session
 exits. On resume, retarget it. Remove it at <Wrap/>; its check removes it after
 the doc says `wrapped`. Each production has its own instance and log.
 
-Run these steps at the start and on every resume:
+At the start and on every resume, take this session's current name from the
+first line of ListAgents and run:
 
-1. **Register.** Set the doc's `**Showrunner session:**` line to this session's
-   name, from the first line of ListAgents. If the line changed, commit the doc
-   as `production(<name>): showrunner session <session name>`.
-2. **Prompt.** Fill the prompt below from the production doc and write it to
-   `PROMPT_FILE`.
-3. **Register instance.** Run `NOTIFIER new UPDATES --to
-   session:$CLAUDE_CODE_SESSION_ID --every <N from the doc's **Updates:** line>
-   --prompt-file PROMPT_FILE --from showrunner-timer-<slug> --check "zsh
-   $HOME/.claude/scripts/production/production_check.sh <absolute doc path>"`,
-   plus `--aligned` when that line says on the hour. A repeated `new` retargets
-   without moving the clock.
-   Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py add <this session's name> --zone <zone> --unit <each unit's tmux session>`, using the name from ListAgents.
-4. **Stall watch.** If `NOTIFIER status stall-watch` reports no instance, run
-   `NOTIFIER new stall-watch --every 1 --run "$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/stall_watch.py"`.
-5. **Tmux names.** If `NOTIFIER status tmux-names` reports no instance, run
-   `NOTIFIER new tmux-names --every 1 --run "$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/tmux_names.py"`.
-6. **Status.** Run `NOTIFIER status UPDATES` for the next tick and fire log.
-   The declared job runs the ticks.
+`python3 ~/.claude/scripts/production/update_registration.py register
+--production PRODUCTION_DOC --session <this session's name>`
+
+The command sets and commits a changed showrunner session line, retires the old
+registry name, registers the current name and unit sessions, writes `PROMPT_FILE`,
+retargets `UPDATES` with `NOTIFIER new` without moving its clock, creates
+stall-watch and tmux-names only when absent, and prints `next_due`. Use the
+reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
 
 The prompt:
 
@@ -255,6 +240,8 @@ The prompt:
 > It checks every unit director: its session and Claude are running, anything waiting
 > on the user, and its latest step and ETA. Run `/showrunner:dailies simple`
 > for every unit and open topic; its input builder reads the saved status file.
+> Pass `--render-state <SCRATCH>/dailies_state.json` to the builder; the renderer
+> uses that same file as `--state`.
 > Follow each `flags first:` line: a SESSION GONE, CLAUDE NOT RUNNING, FORM
 > WAITING, usage-limit or DECISION subject goes first, with `needed:` saying what
 > the user must do. Do no other work in this turn, except `/unit:eta` requests,
