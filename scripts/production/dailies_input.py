@@ -17,6 +17,7 @@ from add_unit import Refusal, cell_value, read_production, unit_rows
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_render import InputError, StateRefused, as_list, as_map, check_render_state, local_now, parse_report, parse_time
 from merge_checkpoint import NoMerge, git, merge_branch_history
+from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 from build_hold import ActiveHolders, read_holders
@@ -183,10 +184,9 @@ def eta_state(block: StatusBlock, phase: str, seen: JsonMap, now: datetime) -> E
         return EtaNone()
     key = f"{block.session}|{phase}"
     prior = seen.get(key)
-    requested = False
+    requested = isinstance(eta_requested(seen, key), EtaRequested)
     if isinstance(prior, dict):
         record = cast(JsonMap, prior)
-        requested = bool(record.get("requested", False))
         text = record.get("text")
         first = record.get("first_seen")
         if text == line and isinstance(first, str):
@@ -205,12 +205,14 @@ def eta_state(block: StatusBlock, phase: str, seen: JsonMap, now: datetime) -> E
     return EtaFresh(line)
 
 
-def eta_value(state: EtaState, supplied: object) -> JsonMap:
+def eta_value(state: EtaState, supplied: object, requested: bool = False) -> JsonMap:
     fields = as_map(supplied, "judgment.eta") if supplied is not None else {}
     result = dict(fields)
     if isinstance(state, EtaPassed):
         return {"none": "none measured - requested"}
     if isinstance(state, EtaNone):
+        if requested:
+            return {"none": "none measured - requested"}
         none = fields.get("none")
         return {"none": none if isinstance(none, str) else "no ETA stated yet"}
     found = re.search(r"\b(\d{1,2}:\d{2}(?:\+\d+)?)\b", state.text)
@@ -301,7 +303,8 @@ def run(args: argparse.Namespace) -> int:
     holders = read_holders(holders_path)
     holder_names: set[str] = {holder.name for holder in holders.holders} if isinstance(holders, ActiveHolders) else set()
     units_out: list[JsonMap] = []
-    eta_requests: list[str] = []
+    eta_touched: dict[str, None] = {}
+    eta_request_candidates: dict[str, str] = {}
     missing: list[str] = []
     blocks_by_session = {block.session: block for block in blocks}
     for index, unit in enumerate(units):
@@ -316,13 +319,17 @@ def run(args: argparse.Namespace) -> int:
         if "needs_user" not in result and any(isinstance(flag, (FormWaiting, Decision, StillWaiting)) for flag in block.flags):
             result["needs_user"] = True
         phase = fields.get("phase")
-        state = eta_state(block, phase if isinstance(phase, str) else "", seen, now)
-        result["eta"] = eta_value(state, fields.get("eta"))
+        phase_text = phase if isinstance(phase, str) else ""
+        key = f"{unit.session}|{phase_text}"
+        state = eta_state(block, phase_text, seen, now)
+        if not isinstance(state, EtaNone):
+            eta_touched[key] = None
+        requested = isinstance(eta_requested(seen, key), EtaRequested)
+        result["eta"] = eta_value(state, fields.get("eta"), requested)
         if isinstance(state, (EtaStale, EtaPassed)):
-            key = f"{unit.session}|{phase}"
             record = seen.get(key)
-            if isinstance(record, dict) and not cast(JsonMap, record).get("requested"):
-                eta_requests.append(unit.session)
+            if isinstance(record, dict) and isinstance(eta_requested(seen, key), EtaNotYetRequested):
+                eta_request_candidates[key] = unit.session
                 cast(JsonMap, record)["requested"] = True
         for key in ("project", "phase", "started", "held", "update"):
             if key not in result or (key != "held" and result[key] is None):
@@ -387,8 +394,22 @@ def run(args: argparse.Namespace) -> int:
     report("clock", "ok", str(result["next_run"]))
     validate_report(result, holders_path, judgment_path)
     report("judgment", "ok", f"{len(units_out)} units accepted")
-    state_dir.mkdir(parents=True, exist_ok=True)
-    _ = seen_path.write_text(json.dumps(seen, indent=2) + "\n", encoding="utf-8")
+    def merge_eta_records(fresh: JsonMap) -> tuple[str, ...]:
+        requests: list[str] = []
+        for key in eta_touched:
+            computed = seen.get(key)
+            if not isinstance(computed, dict):
+                continue
+            fresh_state = eta_requested(fresh, key)
+            fields = cast(JsonMap, computed).copy()
+            fields["requested"] = (isinstance(fresh_state, EtaRequested)
+                                   or isinstance(eta_requested(seen, key), EtaRequested))
+            fresh[key] = fields
+            if key in eta_request_candidates and isinstance(fresh_state, EtaNotYetRequested):
+                requests.append(eta_request_candidates[key])
+        return tuple(requests)
+
+    eta_requests = update_state(seen_path, merge_eta_records)
     for session in eta_requests:
         print(f"request /unit:eta: {session}")
     out.parent.mkdir(parents=True, exist_ok=True)

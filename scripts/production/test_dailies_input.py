@@ -21,6 +21,7 @@ from dailies_input import (Activity, Block, ClaudeNotRunning, Decision, FormWait
 SCRIPT = Path(__file__).with_name("dailies_input.py")
 RENDERER = SCRIPT.with_name("dailies_render.py")
 CI_POINTS = SCRIPT.with_name("ci_points.py")
+WAITING = SCRIPT.with_name("waiting.py")
 STAMP = "at 10:00 PDT / 17:00 UTC"
 AT = "2026-10-06T17:00"
 ALPHA = "alpha-unit"
@@ -56,6 +57,30 @@ if sys.argv[1:2] == ["report"]:
     print("| phases merged | 12 |")
     raise SystemExit(0)
 raise SystemExit(99)
+'''
+RACE_WATCH_STUB = '''#!__PYTHON__
+import os
+import subprocess
+import sys
+
+if sys.argv[1:2] != ["watch"]:
+    raise SystemExit(99)
+request = subprocess.run([
+    sys.executable,
+    os.environ["DAILIES_RACE_WAITING"],
+    "eta-request",
+    os.environ["DAILIES_RACE_UNIT"],
+    "--phase",
+    os.environ["DAILIES_RACE_PHASE"],
+    "--production",
+    os.environ["DAILIES_RACE_PRODUCTION"],
+    "--state-dir",
+    os.environ["DAILIES_RACE_STATE"],
+], capture_output=True, text=True, check=False)
+if request.returncode:
+    print(request.stdout + request.stderr, file=sys.stderr)
+    raise SystemExit(request.returncode)
+print("review threshold not reached")
 '''
 
 
@@ -216,6 +241,12 @@ class DailiesInputTests(unittest.TestCase):
 
     def run_merge_watch(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(CI_POINTS), "watch", "--production", str(self.doc),
+                               "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
+                              capture_output=True, text=True, check=False, timeout=25)
+
+    def run_eta_request(self, phase: str = "Phase 2 of 3: panel labels stay clear") -> subprocess.CompletedProcess[str]:
+        return subprocess.run([sys.executable, str(WAITING), "eta-request", ALPHA,
+                               "--phase", phase, "--production", str(self.doc),
                                "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
                               capture_output=True, text=True, check=False, timeout=25)
 
@@ -600,6 +631,68 @@ class DailiesInputTests(unittest.TestCase):
         self.judgment_file(alpha={"eta": {"time": "18:30", "percent": 60}})
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.unit()["eta"], {"none": "no ETA stated yet"})
+
+    def test_eta_request_first_makes_no_eta_report_requested_without_repeating_request(self) -> None:
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        requested = self.run_eta_request()
+        self.assertEqual(requested.returncode, 0, requested.stdout + requested.stderr)
+        self.assertEqual(requested.stdout.count(f"request /unit:eta: {ALPHA}"), 1)
+        seen_path = self.state / "eta_seen.json"
+        seen = cast(dict[str, dict[str, object]], json.loads(seen_path.read_text(encoding="utf-8")))
+        self.assertEqual(seen[f"{ALPHA}|Phase 2 of 3: panel labels stay clear"], {"requested": True})
+        report = self.run_builder()
+        self.assertEqual(report.returncode, 0, report.stdout + report.stderr)
+        self.assertEqual(self.unit()["eta"], {"none": "none measured - requested"})
+        self.assertNotIn("request /unit:eta:", report.stdout)
+        later = self.run_eta_request()
+        self.assertEqual(later.returncode, 0, later.stdout + later.stderr)
+        self.assertNotIn("request /unit:eta:", later.stdout)
+
+    def test_request_recorded_during_review_watch_survives_builder_write_without_duplicate(self) -> None:
+        beta_phase = "Phase 1 of 2: button labels stay clear"
+        self.production_doc(beta=True)
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 23:40",
+                          f"== {BETA}", "● Checking button labels", "ETA 16:40")
+        self.judgment_file(beta=True)
+        review = self.root / "race-review.py"
+        _ = review.write_text(RACE_WATCH_STUB.replace("__PYTHON__", sys.executable), encoding="utf-8")
+        review.chmod(0o755)
+        self.env.update({
+            "DAILIES_REVIEW_REGIME": str(review),
+            "CI_POINTS_REVIEW_REGIME": str(review),
+            "DAILIES_RACE_WAITING": str(WAITING),
+            "DAILIES_RACE_UNIT": BETA,
+            "DAILIES_RACE_PHASE": beta_phase,
+            "DAILIES_RACE_PRODUCTION": str(self.doc),
+            "DAILIES_RACE_STATE": str(self.state),
+        })
+
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn(f"request /unit:eta: {BETA}", result.stdout)
+        seen = cast(dict[str, dict[str, object]], json.loads((self.state / "eta_seen.json").read_text()))
+        record = seen[f"{BETA}|{beta_phase}"]
+        self.assertIs(record["requested"], True)
+        self.assertEqual(record["text"], "ETA 16:40")
+
+    def test_no_eta_report_first_allows_later_request_once_for_phase(self) -> None:
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        first = self.run_builder()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(self.unit()["eta"], {"none": "no ETA stated yet"})
+        self.assertNotIn("request /unit:eta:", first.stdout)
+        requested = self.run_eta_request()
+        self.assertEqual(requested.returncode, 0, requested.stdout + requested.stderr)
+        self.assertEqual(requested.stdout.count(f"request /unit:eta: {ALPHA}"), 1)
+        second = self.run_builder()
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(self.unit()["eta"], {"none": "none measured - requested"})
+        self.assertNotIn("request /unit:eta:", second.stdout)
+        next_phase = "Phase 3 of 3: panel edges align"
+        self.judgment_file(alpha={"phase": next_phase, "then": ["nothing queued"]})
+        new_phase = self.run_builder()
+        self.assertEqual(new_phase.returncode, 0, new_phase.stdout + new_phase.stderr)
         self.assertEqual(self.unit()["eta"], {"none": "no ETA stated yet"})
 
     def test_changed_passed_eta_requests_once_per_phase(self) -> None:

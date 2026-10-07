@@ -447,7 +447,7 @@ A unit's `then` in the dailies input is a JSON list of one-line items, one per u
 - Routing the review-alert `LOG` line through `update_registration.py log`: it adds a stray `log: ok` line and couples two commands.
 - Writing `review_watch.json` before the alert (at-most-once): a lost alert is the worse failure.
 
-### Phase 13 — Waiting, cross-unit search and alerts · status: todo
+### Phase 13 — Waiting, cross-unit search and alerts · status: done
 
 #### Work Order
 
@@ -490,3 +490,34 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 
 **Acceptance gate:**
 - From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_waiting.py'` green; `python3 -m unittest discover -s scripts/production -p 'test_dailies_input.py'` green; basedpyright 0 errors and 0 warnings on `scripts/production/waiting.py`, `scripts/production/dailies_input.py` and their tests.
+
+### Phase 14 — Status and dailies fixes · status: todo
+
+#### Work Order
+
+Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-showrunner`, branch `build-followups-enh-showrunner`. State every time in PDT.
+
+**Source:** two add-ons found while building Phases 8 and 12, which the user placed in this plan as `current` on 2026-10-06: the dailies status does not flag a unit stopped at a gate, and a held unit's unchanged ETA is read as tomorrow.
+
+**Goal:** a unit stopped at `gate:` shows as waiting on the user in the dailies status, and a held unit's unchanged ETA keeps its moment at any later clock time, so neither hides a wait nor stops the dailies.
+
+**Spec:**
+- **Read `scripts/production/unit_status.sh` (`waiting_on_user`), `scripts/production/test_unit_status.py`, `scripts/production/dailies_render.py` (`parse_time` and every caller that resolves an ETA text) and `scripts/production/test_dailies_render.py` in full first.**
+- **Gate waits.** `waiting_on_user` treats a last turn-end line of `— gate: …` like `decision:`: it prints the `STILL WAITING on you, <unit>:` line the same way, and a later `holding:` line clears it. A `gate:` line that names the showrunner or another unit is the showrunner's wait, as `decision:` and `blocked:` already are. Nothing else in the script changes.
+- **Unchanged ETA.** `parse_time` reads a bare `HH:MM` more than two hours before now as tomorrow (the rule of 2026-09-29), so a held phase's unchanged `19:35` is refused as `moved +1440 minutes` from 21:36 PDT on. An ETA text equal to the previous report's text for the same phase keeps the previous report's moment, at any later clock time and across 21:00 PDT (midnight in the east); a changed text still resolves by the two-hour rule; `HH:MM+0` is no longer needed. The previous report's moment is the reader's named state, never a bare `None`.
+
+**Files:**
+- `scripts/production/unit_status.sh` — `waiting_on_user` (outside this unit's **Owns**); `scripts/production/test_unit_status.py` — the new gate cases.
+- `scripts/production/dailies_render.py` — `parse_time` and the callers that resolve an ETA text (outside this unit's **Owns**; its owner is stalls-unit); `scripts/production/test_dailies_render.py` — the unchanged-ETA cases.
+
+**Seats:** 1 writer + 1 tester.
+- `impl` — `unit_status.sh` and `dailies_render.py`; post `done` without waiting for the test seat.
+- `test` — from the Spec alone, in `test_unit_status.py` and `test_dailies_render.py`: a unit whose last turn-end line is `— gate: …` prints the wait line, a later `holding:` line clears it, a gate naming the showrunner prints none; an unchanged ETA text keeps the previous moment at 21:36 PDT and at 23:50 PDT while a changed text still resolves by the two-hour rule. Owns the final suite run.
+
+**Constraints from prior phases:**
+- Phase 8 (as built): the dailies status reads `unit_status.sh`'s output lines; the `STILL WAITING on you, <session>:` form is the one `dailies_input.py` matches, so it does not change.
+- Tests never start a real `claude`, `tmux`, `systemd-run` or `ssh`, never write `~/.claude/config/`, `~/.local/state/` or a real production doc, and never push anywhere but a temporary bare repository.
+- Every file here is outside this unit's **Owns**: the checkpoint notice names each as `also touches <path> (owner <unit>)`, tested against the owner's tip after a trial merge on a clean tree.
+
+**Acceptance gate:**
+- From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_unit_status.py'` green; `python3 -m unittest discover -s scripts/production -p 'test_dailies_render*.py'` green; `python3 -m unittest discover -s scripts/production -p 'test_dailies_input.py'` green; basedpyright 0 errors and 0 warnings on `scripts/production/dailies_render.py`, `scripts/production/test_dailies_render.py` and `scripts/production/test_unit_status.py`.

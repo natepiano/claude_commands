@@ -27,7 +27,7 @@ State:
 - `SCRATCH` — this session's scratchpad directory.
 - `DAILIES_STATE_DIR` — `<SCRATCH>/dailies_input_state`, the dailies builder's
   `--state-dir` (`commands/showrunner/dailies.md` passes this path) and the
-  `--state-dir` for every `ci_points.py` call.
+  `--state-dir` for every `ci_points.py` and stateful `waiting.py` call.
 - `LAST_MERGED[unit]` — the unit's last merged checkpoint. Read it from the
   merge commit subjects on `MERGE_BRANCH`, never from memory.
 - `NOTIFIER` — `zsh ~/.claude/scripts/message/notifier.sh`.
@@ -100,11 +100,15 @@ State:
 - **Helpers.** Stop each named helper agent once its report is read.
 - **An auto-mode denial** is never retried or worked around. Tell the user what
   was denied and let them add a permission rule.
-- **Unmeasured ETAs.** Whenever a unit's phase ETA reads "none measured" or its
-  unit director has stated none — in an update tick, a dailies report or its
-  own message — send the unit director `From the showrunner: run /unit:eta (or read ~/.claude/commands/unit/eta.md if it is not in your skill list)` by SendMessage, in that same
-  turn. Ask once per phase; ask again only if it answered without a time. Until
-  it answers, report that ETA as `none measured - requested`.
+- **Unmeasured ETAs.** When a unit has no measured phase ETA, run `python3
+  ~/.claude/scripts/production/waiting.py eta-request <unit> --phase <phase>
+  --production PRODUCTION_DOC --state-dir DAILIES_STATE_DIR` in that turn.
+  Send its `request /unit:eta:` line to the unit director with `From the
+  showrunner: run /unit:eta (or read ~/.claude/commands/unit/eta.md if it is
+  not in your skill list)`. The shared record asks once per phase; if the
+  director answered without a time, message it yourself, because
+  the command will not repeat the request. Report `none measured - requested`
+  until it answers.
 - **Waiting on block.** When footers are on, after the footer leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. The user's items come first. Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. The footer hook checks the shape and item order. User, 2026-10-06.
 - **Footer.** Run `python3 ~/.claude/scripts/production/update_registration.py
   footer --production PRODUCTION_DOC` for the footer, adding
@@ -578,10 +582,13 @@ it needs. Every other wait is yours to clear, and fast.
    - **Preference:** "to avoid conflicts", "to build on their version". Never a
      block; tell the unit director to continue.
 
-   Before accepting a code block, have the waiting unit director test it: in a scratch
-   worktree, merge `MERGE_BRANCH` without the other unit's work and run its
-   tests. Green means it is not blocked: tell it to continue, or lift the gate
-   (<ClearGate/>).
+   Before accepting a code block, run `python3 ~/.claude/scripts/production/waiting.py scratch-test
+   <waiting unit> --tests "<command>" --production PRODUCTION_DOC
+   --state-dir DAILIES_STATE_DIR`. It tests a detached scratch checkout with
+   `MERGE_BRANCH`, without the other unit's unmerged work. Green means it is
+   not blocked: tell it to continue, or lift the gate (<ClearGate/>) using the
+   printed log path. A red test needs your classification; a merge conflict
+   is not a red test.
 2. **The unit waited on lands what is needed now.** Send its unit director:
 
    `From the showrunner: <waiting unit> waits on your <what>. Checkpoint at your next green point; if only part is needed, checkpoint that part first.`
@@ -644,7 +651,9 @@ it needs. Every other wait is yours to clear, and fast.
    - `- HH:MM <zone>: block: <waiting unit> on <unit> (<code | files>: <what>), clears ~HH:MM`
    - `- HH:MM <zone>: block cleared: <waiting unit> on <unit>`
 
-   At 30 minutes past its clear time, or one hour open without movement, act
+   At each tick, run `python3 ~/.claude/scripts/production/waiting.py waits
+   --production PRODUCTION_DOC` for berth overlaps, open waits and their ages.
+   At 30 minutes past a wait's clear time, or one hour open without movement, act
    under rules 2 and 3 in that turn, an update tick included, and log the call.
    A longer wait needs a logged reason. In the dailies, the waiting unit's
    `update` names the wait with its start and clear times.
@@ -728,6 +737,10 @@ checks that wait on the user's travel.
 A phase that runs past 8 hours is talked over with the user (user,
 2026-10-04). It never blocks the unit.
 
+At each tick, run `python3 ~/.claude/scripts/production/waiting.py agenda
+--production PRODUCTION_DOC --state-dir DAILIES_STATE_DIR`. Its new items are
+deduplicated per unit and phase; supply the cause, options and your pick.
+
 - **When.** In the tick or turn that first sees a phase 8 hours past its
   start, or an ETA more than 8 hours after its start, add it.
 - **The item.** The unit and phase, hours so far, ETA and repair rounds; what
@@ -770,9 +783,9 @@ land a phase sooner. Each design check covers every view of the change at once
 
 <CrossUnitChange>
 1. **Renamed or removed public items.** Search every other unit for uses of
-   the old name:
-   - its branch, with `git -C CHECKOUT grep -n <old> <branch>`;
-   - its worktree, with grep under the source directories.
+   the old name with `python3 ~/.claude/scripts/production/waiting.py search
+   <old name> <new name> --production PRODUCTION_DOC`. It lists branch and
+   worktree sites with paths and lines.
 
    Message the unit director of each unit that has uses. Give the exact sites
    and the replacement, and ask it to merge the merge branch and fix them before
@@ -804,7 +817,10 @@ section adds only what the showrunner role needs.
 This session is on the quota alert list because <StartUpdates/> adds it.
 
 **Unit directors act through you.** They are not on the list, so each notice
-reaches them only as your relay (<Throughout/>):
+reaches them only as your relay (<Throughout/>). Run `python3
+~/.claude/scripts/production/waiting.py quota --production PRODUCTION_DOC
+--state-dir DAILIES_STATE_DIR --notice "<full notice>"`. It relays
+to every unit director and prints one `send <unit>:` receipt each:
 - `Quota alert:` — tell every unit director to start no new delegate work on
   that tool; running seats finish and the unit director does the rest itself. Hold the alert as one
   item per account, listed first in every Waiting on block with the percent left
