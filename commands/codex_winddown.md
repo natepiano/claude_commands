@@ -1,9 +1,17 @@
 ---
-description: Wind Codex agents down on every showrunner and count the ones still running, sort them into stop-now and finish, or give the all clear. Args - `start`, `triage`, `clear`, or none for the count now.
-argument-hint: "[start|triage|clear]"
+description: Wind Codex agents down on every showrunner and count the ones still running, sort them into stop-now and finish, or give the all clear. Args - `start`, `triage`, `clear`, `help`, or none for the count now.
+argument-hint: "[start|triage|clear|help]"
 ---
 
-`$ARGUMENTS` is `start`, `triage`, `clear`, or empty. Run the line and show its output unchanged. With any other argument, name the choices and stop. Run `start`, `triage` or `clear` only on the user's word.
+`$ARGUMENTS` is `start`, `triage`, `clear`, `help`, or empty. Run the line and show its output unchanged. Run `start`, `triage` or `clear` only on the user's word. With `help` or any other argument, show this block word for word and stop:
+
+```
+/codex_winddown          the count now for the whole machine; changes nothing
+/codex_winddown start    every showrunner winds its Codex agents down and counts them every 2 minutes
+/codex_winddown triage   every showrunner sorts its running agents: stop now, onto a resume list, or finish
+/codex_winddown clear    your all clear: the counts stop and Codex agents may launch again
+/codex_winddown help     this list
+```
 
 1. Empty: `python3 ~/.claude/scripts/production/codex_winddown.py status`. It prints whether a wind-down is on and every session's running Codex agents on this machine, and changes nothing.
 2. `start`: `python3 ~/.claude/scripts/production/codex_winddown.py start --from <your session name>`. Every showrunner on this machine is told to let its running Codex agents finish and launch no new one, and prints `<session> - <count> - <projected finish>` for its unit directors, in alphabetical order, every 2 minutes. The count asks each unit director with a running agent for the finish; until it answers the line reads `asked, answer owed`. When no Codex agent is left on the machine, the user gets one phone notification.
