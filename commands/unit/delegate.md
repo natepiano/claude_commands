@@ -931,10 +931,11 @@ and the wall-clock line, produced by <ProgressReport/> steps 3 and 5 with the
 current pass or activity. This is unconditional: the numbered items say what
 happened, and the tables say how far into the phase and the plan it happened,
 which is the half the user cannot reconstruct. Emit it after any launch,
-printed below the sections above exactly as the recorder emits it. Should the
-recorder answer that no window is open, the
-launcher has not recorded its pass yet: try once more, then continue without the
-tables rather than stalling the turn.
+printed below the sections above exactly as the recorder emits it. With the
+phase active and no pass or activity open, the recorder prints the same tables
+from the phase's last recorded values under an `as of` line: paste them like any
+tick. `No active phase to report` is the only refusal, because no phase is
+active; then continue without the tables rather than stalling the turn.
 </DelegationResultFormat>
 
 <FixDispatch>

@@ -238,11 +238,10 @@ open: `finish-pass --status canceled --orphaned-launcher` closes it, and only
 that status, and only while a pass is open.
 
 `progress` writes the event and prints two tables under a line naming the
-worktree, the branch, and — when the plan's headings can be counted — the
-position of the phase in flight, `phase N of M`. That position is the finished
-count plus one, off the same headings the project percentage derives from, so
-the line and the table can never disagree; a plan that cannot be counted keeps
-the short worktree-and-branch form. The first table holds the clocks: a project
+worktree, and the branch when it differs. The line carries no position: how
+far through the plan the run is belongs to the first table's Phases column,
+and a plan with deferred earlier phases or retired ids puts the active phase
+at an ordinal that matches neither number. The first table holds the clocks: a project
 row and a phase row carrying the reported percentage, elapsed, ETA, unchanged,
 — when the plan's headings can be counted — how many phases are done, and last
 the best and worst arrival the percentage still allows.
@@ -424,6 +423,25 @@ rate whatever the measured error says — a spread wider than the percentage
 itself would otherwise push the pessimistic end to 1% and quote an arrival
 ninety-nine times the elapsed clock. Both cells are blank wherever the ETA is.
 
+An active phase with no pass or activity open — reviews closed, repair writers
+not started — still gets every section. `progress` reads the phase's last
+`progress_reported` event and prints the clocks table from it: that call's
+percentages, unchanged clocks, and calibration spread, with elapsed and ETA
+measured at the event's timestamp and each arrival's day named from now. The
+`Phases` cell counts the plan as it stands. A `*Percentages and clocks as of <time>,
+the last progress report.*` line above the table names that moment, dated only
+when it falls on another day. A phase never reported reads as of its start: 0
+for the phase, and the project at the plan's phase count held below 100, or the
+last reported project percent when the plan cannot be counted. The round table
+is the phase's windows as they stand, and a phase with none yet draws one
+`no stage yet` row. In place of the activity sentence goes `No pass or activity
+is open.` and the warning that the records say nothing about whether a worker
+is still running. The percent options are neither required nor checked. The
+call appends no event and opens no window; like every `progress` call it
+restarts the notifier clock, and it writes state only to resolve a missing
+project clock.
+Only a missing or finished phase is refused, with `No active phase to report`.
+
 `timeline` renders the stage table alone, for one phase or for every phase of
 the run, and needs no open window. It answers the questions asked after the
 fact — how many fix passes a phase took, how long each review ran — without
@@ -438,7 +456,7 @@ front of them is current and how long until the next one. The next tick comes
 from the Claude unit's `delegate-<run id>` notifier instance: every `progress`
 call runs `notifier.sh restart` on it as its first act, before it reads state,
 and a rendered report names the `next_due` that restart prints. A refused call
-(no open window, a failed percent check, a missing override reason or
+(no active phase, a failed percent check, a missing override reason or
 `--cap-stage`) keeps its message and exit status but still restarts the clock,
 so the next tick lands one interval after the call. With no instance, or a
 restart that fails, the recorder falls
