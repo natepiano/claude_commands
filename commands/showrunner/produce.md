@@ -25,6 +25,9 @@ State:
   doc.
 - `CHECKOUT` — this session's checkout, which must be on `MERGE_BRANCH`.
 - `SCRATCH` — this session's scratchpad directory.
+- `DAILIES_STATE_DIR` — `<SCRATCH>/dailies_input_state`, the dailies builder's
+  `--state-dir` (`commands/showrunner/dailies.md` passes this path) and the
+  `--state-dir` for every `ci_points.py` call.
 - `LAST_MERGED[unit]` — the unit's last merged checkpoint. Read it from the
   merge commit subjects on `MERGE_BRANCH`, never from memory.
 - `NOTIFIER` — `zsh ~/.claude/scripts/message/notifier.sh`.
@@ -312,6 +315,7 @@ told to split. User, 2026-10-04.
 
 Merge one checkpoint at a time. A notice that arrives while a merge is testing
 waits its turn. When every unit's final checkpoints are merged, go to <Wrap/>.
+Routing arrivals and ordering that queue are the showrunner's calls.
 </Direct>
 
 ---
@@ -390,15 +394,16 @@ notice to the unit director before any merge command runs:
 
 6. **After the push.** Run <ClearGate/> for a code checkpoint's first merge;
    run <CrossUnitChange/> when public items were renamed or removed or files
-   restructured; after every fifth code merge since the last CI point, run
-   <CIPoint/>. Run `review_regime.py watch` after a code checkpoint and handle
-   its first exit 3 as below; a shrink adds no review-ledger row or CI count.
-   The first time the watch exits 3, run `report --since 2026-09-28`, push at
-   once (`~/.claude/scripts/notify/pushover.py --priority 1 "Hana: review watch"
-   "<one line; the table is in this session>"`), log it, and give the user the
-   table. While it exits 3, the dailies `Review watch` topic needs the user,
-   and every build report (`/builds`, every 4 hours) carries it and pushes
-   again. Run `review_regime.py ack` only on the user's own acknowledgment.
+   restructured. Run `python3 ~/.claude/scripts/production/ci_points.py due
+   --production PRODUCTION_DOC --state-dir DAILIES_STATE_DIR` after each code
+   merge; when it says due, run <CIPoint/>. Run `python3
+   ~/.claude/scripts/production/ci_points.py watch --production PRODUCTION_DOC
+   --state-dir DAILIES_STATE_DIR` after each code checkpoint. Give the user its
+   table on the first alert. A shrink adds no review-ledger row or CI count. While the
+   watch exits 3, the dailies `Review watch` topic needs the user, and every
+   build report (`/builds`, every 4 hours) carries it and pushes again. Run
+   `review_regime.py ack` only on the user's own acknowledgment. Pass `--no-ci`
+   to `due` when the production rules say CI does not apply.
 </MergeCheckpoint>
 
 ---
@@ -473,26 +478,22 @@ or helper working a camera out by hand gets pointed at it.
 ---
 
 <CIPoint>
-Validation needs a clean tree, so merge nothing while it runs. Before this
-push, check for an older queued or running CI run on the merge branch. Add
-`--cancel-prior` when this push supersedes it and no CI point is watching its
-result or diagnosing a red run. With `dangerouslyDisableSandbox: true`, run in
-the background:
-
-```sh
-bash ~/.claude/scripts/validate_and_push/validate_and_push.sh \
-  --to "<merge branch>" \
-  --fix-commit "ci(<name>): validation fixes after <unit> phase <N>"
-```
-
-Then watch its run with
-`gh run watch <run-id> --repo <repo> --exit-status`, also in the background.
-Red CI goes to the unit director whose unit owns the failing files. It fixes the failure as
-its next checkpoint, and you merge that as usual. Log each point and its
-result.
-
-When validation passes, start <PromoteMain/>'s smoke launch before the next
-merge. When the watch reports green, finish <PromoteMain/>.
+Merge nothing during validation. Before the push, check for an older queued or
+running CI run on `MERGE_BRANCH`; add `--cancel-prior` when this push supersedes
+it and no CI point is watching its result or diagnosing a red run. With
+`dangerouslyDisableSandbox: true`, run
+`python3 ~/.claude/scripts/production/ci_points.py ci start --production
+PRODUCTION_DOC --state-dir DAILIES_STATE_DIR [--cancel-prior]` in the background.
+It validates, pushes, and records the CI run. When validation passes, start
+<PromoteMain/>'s smoke launch before the next merge. Then run `python3
+~/.claude/scripts/production/ci_points.py ci collect --production
+PRODUCTION_DOC --state-dir DAILIES_STATE_DIR` in the background. Its last line is
+`--ci-green <tip>` only after the current tip's required jobs pass. When its
+last line is `--ci-green <tip>`, finish <PromoteMain/> with it. Give a failed
+collect line to the dailies judgment file as a topic with
+`needs_user: true`; send red CI to the unit director that owns the failing
+files for a small fix checkpoint. Log each point and its result. Pass
+`--no-ci` to both calls when the production rules say CI does not apply.
 
 **Mac run.** After every green CI on the merge branch, run its sha on the Mac
 in the background: `zsh ~/.claude/scripts/production/mac_run.sh <CHECKOUT> <sha> 60`.
@@ -550,17 +551,15 @@ Log `- HH:MM <zone>: main promoted to <short sha> (<n> commits)`, or
 ---
 
 <ClearGate>
-When a merged checkpoint is what a gate waits on, SendMessage the waiting unit
-director:
+When a merged checkpoint clears a gate, run `python3
+~/.claude/scripts/production/ci_points.py notice clear G<k> --production
+PRODUCTION_DOC` and SendMessage its `send <unit>:` line. The unit director
+checks the merge in git before continuing.
 
-`From the showrunner: G<k> clear — <unit> phase <M> is on <merge branch> as <merge hash>. Merge <merge branch> and continue.`
-
-The unit director checks this in git itself before it continues.
-
-When a gate's test under <Dependencies/> rule 1 passes without the gating
-checkpoint, lift the gate instead:
-
-`From the showrunner: G<k> lifted — your tests pass without <unit> phase <M> (<log path>). Continue.`
+When a gate's test under <Dependencies/> rule 1 passes without that checkpoint,
+run `python3 ~/.claude/scripts/production/ci_points.py notice lift G<k>
+--production PRODUCTION_DOC --log <test log path>` and SendMessage its
+`send <unit>:` line.
 </ClearGate>
 
 ---
@@ -825,7 +824,8 @@ When every unit's final-gate and as-built checkpoints are merged:
 
 1. Run a final <CIPoint/> and all <PromoteMain/> checks on its exact sha:
    local validation, smoke launch and GitHub CI verdict, then the promotion
-   call. Pass `--ci-green <sha> --smoke-passed <sha>` when CI applies, or
+   call. Pass `ci collect`'s `--ci-green <sha>` and the smoke launch's
+   `--smoke-passed <sha>` when CI applies, or
    `--no-ci` under the production's no-CI rule.
 2. Work through the production doc's **Close-out** items in order:
    - an item the **Production rules** pre-approve runs as written;

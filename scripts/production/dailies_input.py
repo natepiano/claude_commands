@@ -14,6 +14,7 @@ from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo
 
 from add_unit import Refusal, cell_value, read_production, unit_rows
+from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_render import InputError, StateRefused, as_list, as_map, check_render_state, local_now, parse_report, parse_time
 from merge_checkpoint import NoMerge, git, merge_branch_history
 
@@ -332,17 +333,19 @@ def run(args: argparse.Namespace) -> int:
     if bool(holder_names) != any(bool(unit.get("build_hold")) for unit in units_out):
         raise DailiesFailure("build hold", "units.build_hold: holder files and unit markers disagree")
     report("build hold", "ok", f"{len(holder_names)} active holders checked")
-    review_script = Path(os.environ.get("DAILIES_REVIEW_REGIME", str(Path(__file__).with_name("review_regime.py"))))
-    review = command(review_script, "watch")
-    if review.returncode not in (0, 3):
-        raise DailiesFailure("review watch", review.stderr.strip() or review.stdout.strip())
+    try:
+        review = review_watch(production, state_dir)
+    except PointFailure as error:
+        raise DailiesFailure("review watch", error.detail) from error
     topics = as_list(judgment.get("topics"), f"{judgment_path}.topics")
     topics_out = [as_map(topic, f"{judgment_path}.topics[{index}]") for index, topic in enumerate(topics)]
-    review_line = review.stdout.strip()
+    review_line = review.line
     if review_line and not review_line.startswith("acknowledged"):
         topics_out.append({"title": "Review watch", "update": review_line, "eta": "no ETA stated yet",
-                           "needs_user": review.returncode == 3})
+                           "needs_user": isinstance(review, (WatchFirstAlert, WatchRepeat))})
     report("review watch", "ok", review_line or "no open review watch")
+    if isinstance(review, WatchFirstAlert):
+        print(review.table)
     history = merge_branch_history(production.checkout, production.merge_branch)
     last = history.last_merge()
     local = git(production.checkout, "rev-parse", production.merge_branch)

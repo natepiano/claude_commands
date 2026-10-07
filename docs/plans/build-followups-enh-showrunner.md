@@ -414,7 +414,7 @@ A unit's `then` in the dailies input is a JSON list of one-line items, one per u
 
 **Ruled out:** a footer scan for an invented `needed` key (`--nothing-needed` replaced it).
 
-### Phase 12 — CI points and review watch · status: todo
+### Phase 12 — CI points and review watch · status: done
 
 #### Work Order
 

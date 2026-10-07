@@ -20,6 +20,7 @@ from dailies_input import (Activity, Block, ClaudeNotRunning, Decision, FormWait
 
 SCRIPT = Path(__file__).with_name("dailies_input.py")
 RENDERER = SCRIPT.with_name("dailies_render.py")
+CI_POINTS = SCRIPT.with_name("ci_points.py")
 STAMP = "at 10:00 PDT / 17:00 UTC"
 AT = "2026-10-06T17:00"
 ALPHA = "alpha-unit"
@@ -36,6 +37,25 @@ with record.open("a", encoding="utf-8") as output:
 if Path(os.environ["DAILIES_TEST_FAIL"]).exists():
     raise SystemExit(1)
 print(os.environ.get("DAILIES_TEST_NEXT_DUE", "next_due=1791334500 (2026-10-06 17:55 PDT)"))
+'''
+WATCH_STUB = '''#!__PYTHON__
+import json
+import os
+from pathlib import Path
+import sys
+
+events = Path(os.environ["DAILIES_WATCH_EVENTS"])
+with events.open("a", encoding="utf-8") as output:
+    output.write(json.dumps([Path(sys.argv[0]).name, *sys.argv[1:]]) + "\\n")
+if Path(sys.argv[0]).name == "pushover.py":
+    raise SystemExit(0)
+if sys.argv[1:2] == ["watch"]:
+    print("12 of 12 phases: report ready, waiting for your acknowledgment")
+    raise SystemExit(3)
+if sys.argv[1:2] == ["report"]:
+    print("| phases merged | 12 |")
+    raise SystemExit(0)
+raise SystemExit(99)
 '''
 
 
@@ -171,6 +191,33 @@ class DailiesInputTests(unittest.TestCase):
         if not self.events.exists():
             return []
         return [cast(list[str], json.loads(line)) for line in self.events.read_text(encoding="utf-8").splitlines()]
+
+    def watch_stubs(self) -> Path:
+        bin_path = self.root / "bin"
+        bin_path.mkdir()
+        events = self.root / "watch-events.jsonl"
+        for name in ("review_regime.py", "pushover.py"):
+            stub = bin_path / name
+            _ = stub.write_text(WATCH_STUB.replace("__PYTHON__", sys.executable), encoding="utf-8")
+            stub.chmod(0o755)
+        push = self.home / ".claude/scripts/notify/pushover.py"
+        push.parent.mkdir(parents=True, exist_ok=True)
+        _ = push.write_text(WATCH_STUB.replace("__PYTHON__", sys.executable), encoding="utf-8")
+        push.chmod(0o755)
+        self.env["DAILIES_WATCH_EVENTS"] = str(events)
+        self.env["DAILIES_REVIEW_REGIME"] = str(bin_path / "review_regime.py")
+        self.env["CI_POINTS_REVIEW_REGIME"] = str(bin_path / "review_regime.py")
+        self.env["PATH"] = str(bin_path) + os.pathsep + os.environ.get("PATH", "")
+        return events
+
+    def watch_events(self, events: Path) -> list[list[str]]:
+        return ([cast(list[str], json.loads(line)) for line in events.read_text().splitlines()]
+                if events.exists() else [])
+
+    def run_merge_watch(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([sys.executable, str(CI_POINTS), "watch", "--production", str(self.doc),
+                               "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
+                              capture_output=True, text=True, check=False, timeout=25)
 
     def rename_unit(self, name: str) -> None:
         for path in (self.doc, self.status, self.judgment):
@@ -440,16 +487,37 @@ class DailiesInputTests(unittest.TestCase):
         topics = cast(list[dict[str, object]], self.report()["topics"])
         self.assertFalse(any(item["title"] == "Review watch" for item in topics))
 
-    def test_review_watch_exit_three_marks_topic_for_user(self) -> None:
-        review = self.root / "review_regime.py"
-        _ = review.write_text("print('12 of 12 phases: report ready, waiting for your acknowledgment')\n"
-                              + "raise SystemExit(3)\n", encoding="utf-8")
-        self.env["DAILIES_REVIEW_REGIME"] = str(review)
+    def test_dailies_first_review_alert_marks_topic_and_merge_watch_repeats(self) -> None:
+        events = self.watch_stubs()
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("| phases merged | 12 |", result.stdout)
         topics = cast(list[dict[str, object]], self.report()["topics"])
         watch = next(item for item in topics if item["title"] == "Review watch")
         self.assertTrue(watch["needs_user"])
+        self.assertIn("12 of 12 phases", str(watch["update"]))
+        later = self.run_merge_watch()
+        self.assertEqual(later.returncode, 0, later.stdout + later.stderr)
+        self.assertNotIn("| phases merged |", later.stdout)
+        calls = self.watch_events(events)
+        self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
+        self.assertEqual(sum(row[0] == "pushover.py" for row in calls), 1)
+        self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
+
+    def test_merge_first_review_alert_is_not_repeated_by_dailies(self) -> None:
+        events = self.watch_stubs()
+        first = self.run_merge_watch()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertIn("| phases merged |", first.stdout)
+        later = self.run_builder()
+        self.assertEqual(later.returncode, 0, later.stdout + later.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        watch = next(item for item in topics if item["title"] == "Review watch")
+        self.assertTrue(watch["needs_user"])
+        calls = self.watch_events(events)
+        self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
+        self.assertEqual(sum(row[0] == "pushover.py" for row in calls), 1)
+        self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
 
     def test_judgment_held_and_testing_keep_merge_topic_even_when_pushed(self) -> None:
         fields = cast(dict[str, object], json.loads(self.judgment.read_text(encoding="utf-8")))
