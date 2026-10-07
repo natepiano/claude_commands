@@ -9,15 +9,20 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import monotonic
 from typing import TypedDict, cast
 
-from scripts.shot_report.episodes import NoObservablePath, NoneCited, OneCitedShot, SeveralCitedShots, read_episodes, split_episodes, write_episodes
+from scripts.shot_report.episodes import (
+    EpisodeTimeline, NoObservablePath, NoneCited, OneCitedShot, SeveralCitedShots,
+    TimelineUnavailable, read_episodes, split_episodes, write_episodes,
+)
 from scripts.shot_report.transcripts import (
     AttemptCountInferredFromImages, AvailableTimingSource, ExactAttemptCountFromOrderedCaptures, ExactOrderedCaptureAttempts,
-    PersistentScanCache, RememberedScript, SuccessfulCapture, ToolCall, scan_calls,
+    FailedCapture, HanaShotDurationUnavailable, MeasuredHanaShotDuration, NamedCaptureView, PersistentScanCache,
+    RememberedScript, SelectedCaptureTarget, SuccessfulCapture, ToolCall, TranscriptScan, TranscriptToolEvent, scan_calls,
 )
 from scripts.shot_report.transcripts import _classify, _remember  # pyright: ignore[reportPrivateUsage]
 from scripts.shot_report.transcripts import CachedScanEvidence
@@ -41,6 +46,7 @@ EXECUTION_CASES = cast(dict[str, list[str]], json.loads(
 ))
 START = datetime(2026, 10, 1, tzinfo=timezone.utc)
 CLASSIFY = Path(__file__).parent / "fixtures" / "classify"
+TIMELINE = Path(__file__).parent / "fixtures" / "timeline"
 
 
 def _claude_case(path: Path, calls: list[tuple[str, str, object]], cwd: str = "/fictional/studio") -> None:
@@ -111,6 +117,33 @@ def _codex_part(seconds: int, part: dict[str, object]) -> dict[str, object]:
 
 
 class TranscriptTest(unittest.TestCase):
+    def test_split_episodes_scales_by_transcript_instead_of_all_tool_events(self) -> None:
+        calls: list[ToolCall] = []
+        events: list[TranscriptToolEvent] = []
+        for transcript_number in range(2_000):
+            session = f"session-{transcript_number}"
+            transcript_path = f"transcript-{transcript_number}.jsonl"
+            for event_number in range(200):
+                start = START + timedelta(seconds=event_number * 2)
+                events.append(TranscriptToolEvent(
+                    start, start + timedelta(seconds=1), session, transcript_path,
+                    "Claude", "Read", "file_reads_searches_and_edits", False,
+                    tool_use_id=f"event-{event_number}",
+                ))
+            if transcript_number < 300:
+                start = START + timedelta(seconds=200)
+                calls.append(ToolCall(
+                    start, start + timedelta(seconds=1), session, transcript_path,
+                    "Claude", "studio", "shot", "mcp_brp", tool_use_id="event-100",
+                ))
+
+        started = monotonic()
+        episodes = split_episodes(calls, 300, tool_events=events)
+        elapsed = monotonic() - started
+
+        self.assertEqual(len(episodes), 300)
+        self.assertLess(elapsed, 5.0, f"split_episodes took {elapsed:.3f}s")
+
     def test_episode_attempt_count_provenance_round_trips_and_reads_legacy_state(self) -> None:
         path = "/fictional/shots/front.png"
         exact_call = ToolCall(
@@ -133,10 +166,172 @@ class TranscriptTest(unittest.TestCase):
                              ["ExactAttemptCountFromOrderedCaptures", "AttemptCountInferredFromImages"])
             rows[0]["attempt_count_evidence_state"] = "ExactOrderedCaptureAttempts"
             _ = rows[1].pop("attempt_count_evidence_state")
+            _ = rows[0].pop("timeline")
+            _ = rows[1].pop("timeline")
             _ = saved.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
             legacy = read_episodes(saved)
             self.assertIsInstance(legacy[0].attempt_count_evidence, ExactAttemptCountFromOrderedCaptures)
             self.assertIsInstance(legacy[1].attempt_count_evidence, AttemptCountInferredFromImages)
+            self.assertTrue(all(isinstance(episode.timeline, TimelineUnavailable) for episode in legacy))
+
+    def test_write_episodes_is_byte_identical_to_the_pre_repair_format_with_and_without_a_timeline(self) -> None:
+        call = ToolCall(
+            START, START + timedelta(seconds=5), "format", "format.jsonl", "Claude", "studio",
+            "shot", "mcp_brp", tool_use_id="shot",
+        )
+        with_timeline = split_episodes([call], 300)[0]
+        episodes = [with_timeline, replace(with_timeline, session_id="legacy", timeline=TimelineUnavailable())]
+        expected_lines: list[str] = []
+        for episode in episodes:
+            record = asdict(episode)
+            record["source"] = sorted(episode.source)
+            record["start"] = episode.start.isoformat()
+            record["end"] = episode.end.isoformat()
+            if isinstance(episode.timeline, EpisodeTimeline):
+                record["timeline"] = [
+                    {"start": gap.start.isoformat(), "end": gap.end.isoformat(), "category": gap.category}
+                    for gap in episode.timeline.gaps
+                ]
+            else:
+                del record["timeline"]
+            del record["kept_shot"]
+            del record["attempt_count_evidence"]
+            record["kept_shot_state"] = "no_observable_path"
+            record["attempt_count_evidence_state"] = "AttemptCountInferredFromImages"
+            expected_lines.append(json.dumps(record, sort_keys=True) + "\n")
+        with tempfile.TemporaryDirectory() as directory:
+            saved = Path(directory) / "episodes.jsonl"
+            write_episodes(saved, episodes)
+            actual = saved.read_text(encoding="utf-8")
+        self.assertEqual(actual, "".join(expected_lines))
+
+    def test_parsed_tool_events_store_the_category_from_name_and_command_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _claude_case(root / "claude" / "categories.jsonl", [
+                ("Bash", "cargo build", "built"),
+                ("mcp__brp__world_query", "", "{}"),
+                ("Read", "", "contents"),
+                ("Bash", "echo ready", "ready"),
+            ])
+            scan = scan_calls(root / "claude", root / "codex")
+        self.assertEqual([event.category for event in scan.tool_events], [
+            "builds_and_app_launches",
+            "other_brp",
+            "file_reads_searches_and_edits",
+            "other_tool_calls",
+        ])
+
+    def test_timeline_fixture_extracts_all_tools_and_attributes_exact_minutes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scan = scan_calls(
+                TIMELINE / "claude", Path(directory) / "codex",
+                AvailableTimingSource(TIMELINE / "timings.jsonl", "local"),
+            )
+        self.assertEqual([event.name for event in scan.tool_events], [
+            "Bash", "Bash", "mcp__brp__world_get_components", "Bash", "Read", "WebSearch", "Bash", "Bash",
+        ])
+        self.assertEqual([event.failed for event in scan.tool_events],
+                         [True, False, False, False, False, False, False, False])
+        self.assertEqual([event.unfinished for event in scan.tool_events],
+                         [False, False, False, False, False, False, True, False])
+        measured = [call.hana_shot_duration for call in scan if call.source == "hana_shot"]
+        self.assertEqual(measured, [
+            HanaShotDurationUnavailable(), MeasuredHanaShotDuration(30000.0),
+            MeasuredHanaShotDuration(30000.0),
+        ])
+        expected = {
+            "hana_shot": 1.0,
+            "retry": 1.0,
+            "other_brp": 0.5,
+            "builds_and_app_launches": 0.5,
+            "file_reads_searches_and_edits": 0.5,
+            "other_tool_calls": 0.5,
+            "agent_time": 3.0,
+            "unattributed": 1.0,
+        }
+        for split in (300, 900):
+            episodes = split_episodes(scan, split, tool_events=scan.tool_events)
+            self.assertEqual(len(episodes), 1)
+            timeline = episodes[0].timeline
+            self.assertIsInstance(timeline, EpisodeTimeline)
+            assert isinstance(timeline, EpisodeTimeline)
+            minutes = {
+                category: sum(gap.minutes for gap in timeline.gaps if gap.category == category)
+                for category in expected
+            }
+            self.assertEqual(minutes, expected)
+            self.assertEqual(sum(minutes.values()), episodes[0].minutes)
+
+    def test_unfinished_tool_call_gap_is_unattributed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scan = scan_calls(TIMELINE / "claude", Path(directory) / "codex")
+        unfinished = [event for event in scan.tool_events if event.unfinished]
+        self.assertEqual([(event.tool_use_id, event.start, event.end) for event in unfinished], [(
+            "unfinished", START + timedelta(minutes=6, seconds=30),
+            START + timedelta(minutes=6, seconds=30),
+        )])
+        episode = split_episodes(scan, 900, tool_events=scan.tool_events)[0]
+        timeline = episode.timeline
+        self.assertIsInstance(timeline, EpisodeTimeline)
+        assert isinstance(timeline, EpisodeTimeline)
+        self.assertIn((
+            START + timedelta(minutes=6, seconds=30), START + timedelta(minutes=7, seconds=30),
+            "unattributed",
+        ), [(gap.start, gap.end, gap.category) for gap in timeline.gaps])
+
+    def test_episode_without_saved_timeline_is_unavailable(self) -> None:
+        call = ToolCall(
+            START, START + timedelta(seconds=5), "legacy", "legacy.jsonl", "Claude", "studio",
+            "shot", "hana_shot",
+        )
+        episode = split_episodes([call], 300)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            saved = Path(directory) / "episodes.jsonl"
+            write_episodes(saved, [episode])
+            record = cast(dict[str, object], json.loads(saved.read_text(encoding="utf-8")))
+            _ = record.pop("timeline")
+            _ = saved.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            loaded = read_episodes(saved)
+        self.assertIsInstance(loaded[0].timeline, TimelineUnavailable)
+
+    def test_tool_use_ids_join_calls_that_share_transcript_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "claude" / "same-row.jsonl"
+            _fixture_rows(path, [
+                {"timestamp": START.isoformat(), "type": "assistant", "cwd": "/fictional/studio",
+                 "sessionId": "same-row", "message": {"role": "assistant", "content": [
+                     {"type": "tool_use", "id": "brp", "name": "mcp__brp__world_get_components",
+                      "input": {"entity": 1}},
+                     {"type": "tool_use", "id": "shot", "name": "Bash",
+                      "input": {"command": "python3 hana_shot.py shot --view front"}},
+                 ]}},
+                {"timestamp": (START + timedelta(seconds=30)).isoformat(), "type": "user",
+                 "cwd": "/fictional/studio", "sessionId": "same-row",
+                 "message": {"role": "user", "content": [
+                     {"type": "tool_result", "tool_use_id": "brp", "content": "{}"},
+                     {"type": "tool_result", "tool_use_id": "shot", "content": "saved /tmp/front.png"},
+                 ]}},
+            ])
+            scan = scan_calls(root / "claude", root / "codex")
+        self.assertEqual([call.tool_use_id for call in scan], ["brp", "shot"])
+        self.assertEqual([event.tool_use_id for event in scan.tool_events], ["brp", "shot"])
+        episode = split_episodes(scan, 300, tool_events=scan.tool_events)[0]
+        timeline = episode.timeline
+        self.assertIsInstance(timeline, EpisodeTimeline)
+        assert isinstance(timeline, EpisodeTimeline)
+        self.assertEqual([(gap.minutes, gap.category) for gap in timeline.gaps], [(0.5, "other_brp")])
+
+    def test_transcript_scan_copies_tool_events_from_any_iterable(self) -> None:
+        event = TranscriptToolEvent(
+            START, START, "session", "transcript.jsonl", "Claude", "Read",
+            "file_reads_searches_and_edits", False,
+            tool_use_id="read",
+        )
+        scan = TranscriptScan([], 0, 0, tool_events=(item for item in (event,)))
+        self.assertEqual(scan.tool_events, [event])
+        self.assertEqual(TranscriptScan([], 0, 0).tool_events, [])
 
     def test_related_codex_write_can_make_cached_file_a_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1235,6 +1430,99 @@ class TranscriptTest(unittest.TestCase):
                     self.assertEqual(calls[0].image_paths, ("/tmp/kept.png",))
                     self.assertEqual(calls[0].cited_image_paths, ("/tmp/kept.png",))
                     self.assertEqual([episode.kept_shot for episode in episodes], [OneCitedShot(1)])
+
+    def test_each_failed_or_uncited_attempt_identity_can_trigger_and_clear_a_retry(self) -> None:
+        captures = (
+            FailedCapture((), "black_capture", NamedCaptureView("front"), SelectedCaptureTarget("enemy")),
+            SuccessfulCapture(("/tmp/side.png",), NamedCaptureView("side"), SelectedCaptureTarget("player")),
+            SuccessfulCapture(("/tmp/top.png",), NamedCaptureView("top"), SelectedCaptureTarget("tower")),
+        )
+        attempts = (
+            (captures, ("/tmp/side.png",)),
+            ((SuccessfulCapture(("/tmp/front.png",), NamedCaptureView("front"),
+                                SelectedCaptureTarget("other")),), ("/tmp/front.png",)),
+            ((SuccessfulCapture(("/tmp/enemy.png",), NamedCaptureView("rear"),
+                                SelectedCaptureTarget("enemy")),), ("/tmp/enemy.png",)),
+            ((SuccessfulCapture(("/tmp/tower.png",), NamedCaptureView("overhead"),
+                                SelectedCaptureTarget("tower")),), ("/tmp/tower.png",)),
+            ((SuccessfulCapture(("/tmp/final.png",), NamedCaptureView("front"),
+                                SelectedCaptureTarget("other")),), ("/tmp/final.png",)),
+        )
+        calls: list[ToolCall] = []
+        events: list[TranscriptToolEvent] = []
+        for index, (ordered_attempts, cited_paths) in enumerate(attempts):
+            start = START + timedelta(seconds=index * 20)
+            end = start + timedelta(seconds=10)
+            use_id = f"shot-{index}"
+            paths = tuple(path for attempt in ordered_attempts for path in attempt.image_paths)
+            calls.append(ToolCall(
+                start, end, "retry-identities", "retry-identities.jsonl", "Claude", "studio",
+                "shot", "hana_shot", image_count=len(paths), image_paths=paths,
+                cited_image_paths=cited_paths, attempt_evidence=ExactOrderedCaptureAttempts(ordered_attempts),
+                tool_use_id=use_id,
+            ))
+            events.append(TranscriptToolEvent(
+                start, end, "retry-identities", "retry-identities.jsonl", "Claude", "Bash",
+                "other_tool_calls", False,
+                tool_use_id=use_id,
+            ))
+        episode = split_episodes(calls, 300, tool_events=events)[0]
+        timeline = episode.timeline
+        self.assertIsInstance(timeline, EpisodeTimeline)
+        assert isinstance(timeline, EpisodeTimeline)
+        category_at_call = {gap.start: gap.category for gap in timeline.gaps if gap.start in {call.start for call in calls}}
+        self.assertEqual([category_at_call[call.start] for call in calls], [
+            "hana_shot", "retry", "retry", "retry", "hana_shot",
+        ])
+
+    def test_hana_shot_duration_sums_only_single_attempt_success_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for session in ("summed", "multi", "failed"):
+                _fixture_rows(root / "claude" / f"{session}.jsonl", [
+                    _claude_part(0, session, "assistant", {"type": "tool_use", "id": "shot", "name": "Bash",
+                        "input": {"command": "python3 hana_shot.py shot --view all"}}),
+                    _claude_part(20, session, "user", {"type": "tool_result", "tool_use_id": "shot",
+                        "content": f"saved /tmp/{session}.png"}),
+                ])
+            records: list[dict[str, object]] = [
+                {"time": (START + timedelta(seconds=5)).isoformat(), "status": "success", "exit_code": 0,
+                 "total_ms": 1000, "session": {"state": "present", "value": "summed"},
+                 "attempts": [{"status": "success", "label": "first", "view": "first",
+                               "image_paths": ["/tmp/first.png"]}]},
+                {"time": (START + timedelta(seconds=15)).isoformat(), "status": "success", "exit_code": 0,
+                 "total_ms": 2000, "session": {"state": "present", "value": "summed"},
+                 "attempts": [{"status": "success", "label": "second", "view": "second",
+                               "image_paths": ["/tmp/summed.png"]}]},
+                {"time": (START + timedelta(seconds=10)).isoformat(), "status": "success", "exit_code": 0,
+                 "total_ms": 5000, "session": {"state": "present", "value": "multi"},
+                 "attempts": [
+                     {"status": "failure", "label": "first", "view": "first", "image_paths": [],
+                      "failure_reason": "black_capture"},
+                     {"status": "success", "label": "second", "view": "second",
+                      "image_paths": ["/tmp/multi.png"]},
+                 ]},
+                {"time": (START + timedelta(seconds=10)).isoformat(), "status": "failure", "exit_code": 1,
+                 "failure_reason": "black_capture", "session": {"state": "present", "value": "failed"},
+                 "attempts": [{"status": "failure", "label": "only", "view": "only", "image_paths": [],
+                               "failure_reason": "black_capture"}]},
+            ]
+            timing_path = root / "timings.jsonl"
+            _ = timing_path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+            scan = scan_calls(root / "claude", root / "codex", timing_path)
+        durations = {call.session_id: call.hana_shot_duration for call in scan}
+        self.assertEqual(durations, {
+            "summed": MeasuredHanaShotDuration(3000.0),
+            "multi": HanaShotDurationUnavailable(),
+            "failed": HanaShotDurationUnavailable(),
+        })
+        for session in ("multi", "failed"):
+            calls = [call for call in scan if call.session_id == session]
+            events = [event for event in scan.tool_events if event.session_id == session]
+            timeline = split_episodes(calls, 300, tool_events=events)[0].timeline
+            self.assertIsInstance(timeline, EpisodeTimeline)
+            assert isinstance(timeline, EpisodeTimeline)
+            self.assertEqual([(gap.minutes, gap.category) for gap in timeline.gaps], [(1 / 3, "hana_shot")])
 
     def test_rollout_filename_and_timing_use_full_thread_id(self) -> None:
         thread_id = "01a11402-04d7-7440-890c-cceb61ba833b"

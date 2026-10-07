@@ -21,8 +21,8 @@ from unittest import mock
 from scripts.shot_report import shot_report as report_module
 from scripts.shot_report.changes import MeasurementChange, ProductChange, append_change, read_changes, write_changes
 from scripts.shot_report.episodes import (
-    LegacyEvidenceUnavailable, NoObservablePath, NoneCited, OneCitedShot,
-    SeveralCitedShots, read_episodes, write_episodes,
+    GAP_CATEGORIES, EpisodeTimeline, LegacyEvidenceUnavailable, NoObservablePath, NoneCited,
+    OneCitedShot, SeveralCitedShots, TimelineUnavailable, read_episodes, write_episodes,
 )
 from scripts.shot_report.transcripts import AvailableTimingSource, ExactAttemptCountFromOrderedCaptures
 
@@ -58,6 +58,72 @@ def _chunk_bytes(row: dict[str, object]) -> bytes:
 def _chunk_record(key: str, content: bytes) -> dict[str, object]:
     return {"kind": "chunk", "key": key, "encoding": "zlib+base64",
             "data": base64.b64encode(zlib.compress(content)).decode("ascii")}
+
+
+def _timeline_part(stamp: datetime, session: str, row_type: str,
+                   part: dict[str, object]) -> dict[str, object]:
+    return {
+        "timestamp": stamp.isoformat(), "type": row_type, "cwd": "/fictional/studio",
+        "sessionId": session, "message": {
+            "role": "assistant" if row_type == "assistant" else "user", "content": [part],
+        },
+    }
+
+
+def _write_duration_fixture(path: Path, start: datetime, duration_minutes: float) -> None:
+    session = path.stem
+    duration_seconds = round(duration_minutes * 60)
+    rows = [
+        _timeline_part(start, session, "assistant", {
+            "type": "tool_use", "id": "first-shot", "name": "Bash",
+            "input": {"command": "python3 hana_shot.py shot --view first"},
+        }),
+        _timeline_part(start + timedelta(seconds=30), session, "user", {
+            "type": "tool_result", "tool_use_id": "first-shot", "content": "saved /tmp/first.png",
+        }),
+    ]
+    for seconds in range(240, duration_seconds - 30, 240):
+        use_id = f"bridge-{seconds}"
+        rows.extend((
+            _timeline_part(start + timedelta(seconds=seconds), session, "assistant", {
+                "type": "tool_use", "id": use_id, "name": "mcp__brp__world_get_components",
+                "input": {"entity": 1},
+            }),
+            _timeline_part(start + timedelta(seconds=seconds + 6), session, "user", {
+                "type": "tool_result", "tool_use_id": use_id, "content": "{}",
+            }),
+        ))
+    rows.extend((
+        _timeline_part(start + timedelta(seconds=duration_seconds - 30), session, "assistant", {
+            "type": "tool_use", "id": "last-shot", "name": "Bash",
+            "input": {"command": "python3 hana_shot.py shot --view last"},
+        }),
+        _timeline_part(start + timedelta(seconds=duration_seconds), session, "user", {
+            "type": "tool_result", "tool_use_id": "last-shot", "content": "saved /tmp/last.png",
+        }),
+    ))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def _long_episode_rows(output: str) -> list[dict[str, str]]:
+    section = output.split("What fills long /hana_shot episodes", 1)[1]
+    lines = section.splitlines()
+    header = next(line for line in lines if line.startswith("host"))
+    columns = re.split(r"\s{2,}", header.strip())
+    expected_columns = [
+        "host", "split_s", "threshold", "category", "long_min", "long_share", "median_long_min",
+        "long_n", "short_min", "short_share", "median_short_min", "short_n",
+    ]
+    if columns != expected_columns:
+        raise AssertionError(f"unexpected long-episode columns: {columns}")
+    return [
+        dict(zip(columns, cells, strict=True))
+        for line in lines[lines.index(header) + 1:]
+        if len(cells := re.split(r"\s{2,}", line.strip())) == len(columns)
+        and cells[1] in {"300", "900"}
+        and cells[2] in {"p75_5m", "10m+"}
+    ]
 
 
 class ShotReportTest(unittest.TestCase):
@@ -311,6 +377,152 @@ class ShotReportTest(unittest.TestCase):
             if line.startswith("/hana_shot") and "Claude" in line
         )
         self.assertEqual(image_row[-4:], ["1.5", "1.5", "3", "2"])
+
+    def test_known_gap_fixture_attributes_every_minute_and_names_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            scan = subprocess.run([
+                sys.executable, str(COMMAND), "scan",
+                "--claude-root", str(FIXTURES / "timeline" / "claude"),
+                "--codex-root", str(state_dir / "codex"),
+                "--timings-path", str(FIXTURES / "timeline" / "timings.jsonl"),
+                "--state-dir", str(state_dir),
+            ], cwd=HERE, capture_output=True, text=True, check=False)
+            self.assertEqual(scan.returncode, 0, scan.stderr)
+            report = subprocess.run([
+                sys.executable, str(COMMAND), "report", "--state-dir", str(state_dir),
+                "--since", "2026-09-30", "--until", "2026-10-02",
+            ], cwd=HERE, capture_output=True, text=True, check=False)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        self.assertIn("Window:", report.stdout)
+        self.assertIn("natedev evidence covered through", report.stdout)
+        self.assertIn("sources: Claude transcripts, Codex transcripts, timings", report.stdout)
+        self.assertIn("Mac Claude transcripts: out", report.stdout)
+        section_summary = report.stdout.split("What fills long /hana_shot episodes", 1)[1].splitlines()[1]
+        self.assertIn("Window:", section_summary)
+        self.assertIn("thresholds from 5-min split", section_summary)
+        self.assertIn("host coverage: natedev through", section_summary)
+        self.assertIn("Mac Claude transcripts: out", section_summary)
+        rows = _long_episode_rows(report.stdout)
+        self.assertEqual(list(dict.fromkeys(row["host"] for row in rows)), ["all", "natedev"])
+        for host in ("all", "natedev"):
+            for split in ("300", "900"):
+                for threshold in ("p75_5m", "10m+"):
+                    categories = {
+                        row["category"] for row in rows
+                        if row["host"] == host and row["split_s"] == split
+                        and row["threshold"] == threshold
+                    }
+                    self.assertEqual(categories, set(GAP_CATEGORIES))
+
+    def test_long_episode_rows_include_all_and_each_host_and_longest_list_names_host(self) -> None:
+        durations = (4, 5, 6, 7, 8, 9, 9.5, 10, 11, 12, 13, 14, 20)
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            claude_root = state_dir / "claude"
+            for index, duration in enumerate(durations):
+                _write_duration_fixture(
+                    claude_root / f"duration-{duration:g}.jsonl",
+                    datetime.fromisoformat("2026-10-01T00:00:00+00:00") + timedelta(days=index),
+                    duration,
+                )
+            scan = subprocess.run([
+                sys.executable, str(COMMAND), "scan",
+                "--claude-root", str(claude_root), "--codex-root", str(state_dir / "codex"),
+                "--timings-path", str(state_dir / "missing-timings.jsonl"),
+                "--state-dir", str(state_dir),
+            ], cwd=HERE, capture_output=True, text=True, check=False)
+            self.assertEqual(scan.returncode, 0, scan.stderr)
+            episodes = read_episodes(state_dir / "episodes.jsonl")
+            write_episodes(state_dir / "episodes.jsonl", [
+                replace(episode, source_host=("mac" if episode.session_id.endswith(("10", "12", "14", "20"))
+                                              else "natedev"))
+                for episode in episodes
+            ])
+            status = report_module._read_object(state_dir / "scan_status.json")  # pyright: ignore[reportPrivateUsage]
+            status["mac_claude"] = "out"
+            report_module._save_object(state_dir / "scan_status.json", status)  # pyright: ignore[reportPrivateUsage]
+            report = subprocess.run([
+                sys.executable, str(COMMAND), "report", "--state-dir", str(state_dir),
+            ], cwd=HERE, capture_output=True, text=True, check=False)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        rows = _long_episode_rows(report.stdout)
+        self.assertEqual(list(dict.fromkeys(row["host"] for row in rows)),
+                         ["all", "natedev", "mac (Claude out)"])
+        for host in ("all", "natedev", "mac (Claude out)"):
+            self.assertEqual(len([row for row in rows if row["host"] == host]), 32)
+        for split in ("300", "900"):
+            p75 = next(row for row in rows if row["host"] == "all" and row["split_s"] == split
+                       and row["threshold"] == "p75_5m" and row["category"] == "hana_shot")
+            ten_minutes = next(row for row in rows if row["host"] == "all" and row["split_s"] == split
+                               and row["threshold"] == "10m+" and row["category"] == "hana_shot")
+            self.assertEqual((p75["long_n"], p75["short_n"]), ("4", "6"))
+            self.assertEqual((ten_minutes["long_n"], ten_minutes["short_n"]), ("6", "6"))
+            self.assertEqual(
+                (p75["long_min"], p75["long_share"], p75["median_long_min"]),
+                ("4.0", "6.8%", "1.0"),
+            )
+            self.assertEqual(
+                (ten_minutes["long_min"], ten_minutes["long_share"], ten_minutes["median_long_min"]),
+                ("6.0", "7.5%", "1.0"),
+            )
+            for row in (p75, ten_minutes):
+                self.assertEqual(
+                    (row["short_min"], row["short_share"], row["median_short_min"]),
+                    ("6.0", "15.4%", "1.0"),
+                )
+
+        longest = report.stdout.split("10 longest /hana_shot episodes, 5-min split", 1)[1]
+        header = next(line for line in longest.splitlines() if line.startswith("host agent project session_id"))
+        self.assertEqual(header.split(), [
+            "host", "agent", "project", "session_id", "start", "duration_min",
+            "largest_category", "largest_min", "second_category", "second_min",
+        ])
+        episode_rows = [
+            re.split(r"\s{2,}", line.strip())
+            for line in longest.splitlines()[longest.splitlines().index(header) + 1:]
+            if "duration-" in line
+        ]
+        self.assertEqual(len(episode_rows), 10)
+        self.assertEqual([float(row[5]) for row in episode_rows], sorted(
+            (duration for duration in durations if duration >= 7), reverse=True,
+        ))
+        self.assertEqual({row[0] for row in episode_rows}, {"natedev", "mac (Claude out)"})
+        self.assertTrue(all(row[6] == "agent_time" and row[8] == "hana_shot" for row in episode_rows))
+
+    def test_long_episode_section_excludes_records_without_episode_timeline_and_counts_them(self) -> None:
+        baseline = next(
+            episode for episode in read_episodes(self.state_dir / "episodes.jsonl")
+            if episode.split == 300 and episode.method == "/hana_shot"
+        )
+        available = replace(baseline, source_host="natedev", timeline=EpisodeTimeline(()))
+        unavailable = replace(
+            available, session_id="saved-before-timelines",
+            timeline=TimelineUnavailable(),
+        )
+        with_excluded = report_module.long_episode_report_rows(
+            [available, unavailable], "all available", "latest saved", {}, "out",
+        )
+        output = "\n".join(with_excluded)
+        self.assertIn("/hana_shot episodes left out for lacking a timeline: n=1", with_excluded[1])
+        self.assertNotIn("saved-before-timelines", output)
+        self.assertEqual({row["long_n"] for row in _long_episode_rows(output)
+                          if row["host"] == "all" and row["split_s"] == "300"
+                          and row["threshold"] == "p75_5m"}, {"1"})
+
+        without_excluded = report_module.long_episode_report_rows(
+            [available], "all available", "latest saved", {}, "out",
+        )
+        self.assertNotIn("left out for lacking a timeline", without_excluded[1])
+
+    def test_cli_has_no_rebuild_timelines_command_or_helper(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(COMMAND), "--help"], cwd=HERE,
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("rebuild-timelines", result.stdout)
+        self.assertFalse(hasattr(report_module, "rebuild_saved_timelines"))
 
     def test_survey_shows_call_session_and_project_counts(self) -> None:
         result = self.run_command("survey")
