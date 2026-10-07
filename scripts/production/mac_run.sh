@@ -71,8 +71,24 @@ on_mac "cd $clone && ~/.cargo/bin/cargo build -q -p hana" || { print "build fail
 
 # perl's alarm stops hana after the hold; 142 (SIGALRM) means it stayed up.
 # Run outside cargo, so Bevy needs the asset root that `cargo run` would give it.
-on_mac "cd $clone && BEVY_ASSET_ROOT=\$HOME/$clone/crates/hana BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $hold ./target/debug/hana > $log 2>&1"
-run_exit=$?
+# Started over ssh, hana gets no camera access and its cameras stay dark, so it
+# starts from Terminal, which holds the grant. `open` returns at once, so the
+# .command writes hana's exit status to a file. User, 2026-10-07.
+launch=/tmp/mac_run_hana.command
+status_file=/tmp/mac_run_hana.status
+ssh $host "rm -f $status_file; cat > $launch; chmod +x $launch" <<EOF
+#!/bin/zsh
+cd ~/$clone
+BEVY_ASSET_ROOT=\$HOME/$clone/crates/hana BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $hold \$HOME/$clone/target/debug/hana > $log 2>&1
+echo \$? > $status_file
+exit 0
+EOF
+ssh $host "open -a Terminal $launch"
+run_exit=$(ssh $host "for i in {1..$(( hold + 60 ))}; do [ -f $status_file ] && break; sleep 1; done; cat $status_file 2>/dev/null; rm -f $launch $status_file")
+if [[ $run_exit != <-> ]]; then
+  ssh $host "pkill -f '[h]ana_catalyst_mac/target/debug/hana'"
+  run_exit=255
+fi
 if (( run_exit == 142 )); then
   print "hana stayed up ${hold}s"
   result=0
@@ -96,7 +112,7 @@ for entry in $examples; do
   # Run the built binary, as for hana: the Mac's cargo is a wrapper script that
   # waits on its child, so an alarm on `cargo run` never reaches the example.
   # The pkill catches a survivor; the bracket keeps it from matching its shell.
-  on_mac "cd $clone && BEVY_ASSET_ROOT=\$HOME/$clone/crates/$parts[1] BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $example_hold ./target/debug/examples/$parts[2] > $example_log 2>&1"
+  on_mac "cd $clone && BEVY_ASSET_ROOT=\$HOME/$clone/crates/$parts[1] BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $example_hold \$HOME/$clone/target/debug/examples/$parts[2] > $example_log 2>&1"
   example_exit=$?
   ssh $host "pkill -f '[h]ana_catalyst_mac/target/debug/examples/$parts[2]'"
   if (( example_exit == 142 )); then

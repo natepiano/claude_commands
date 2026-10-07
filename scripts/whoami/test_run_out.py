@@ -1,110 +1,103 @@
-"""Run-out detection, replay, and the lean the footer learns from them."""
+"""The readings log and the weighted pace the dailies footer extends to 100% used."""
 
 import json
+import math
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import override
 
-import run_out
-from run_out import Reading, episodes, latest_drop, lean, ratios, read_run_outs, record_run_outs, trailing_rate
+from run_out import HALF_LIFE, MAX_GAP, MIN_SPAN, Reading, read_readings, weighted_rate
 
 START = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
 
 
-def climb(used: list[float], *, minutes: int = 60, start: datetime = START) -> list[Reading]:
-    return [Reading(start + timedelta(minutes=minutes * index), percent) for index, percent in enumerate(used)]
+STEP = 600
+
+
+def climb(used: list[float], *, start: datetime = START) -> list[Reading]:
+    """One reading every ten minutes."""
+    return [Reading(start + timedelta(seconds=STEP * index), percent) for index, percent in enumerate(used)]
+
+
+def step(steps: float) -> float:
+    return START.timestamp() + STEP * steps
 
 
 class RunOutTests(unittest.TestCase):
-    root: Path = Path()
+    def test_readings_are_per_account_in_time_order_and_bad_lines_are_skipped(self) -> None:
+        path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "readings.jsonl"
+        records: list[dict[str, object]] = [
+            {"account": "claude 1", "at": (START + timedelta(hours=1)).isoformat(), "remaining": 70},
+            {"account": "claude 1", "at": START.isoformat(), "remaining": 80},
+            {"account": "codex 2", "at": START.isoformat(), "remaining": 55.5},
+            {"account": "codex 2", "at": "2026-10-05T13:00:00", "remaining": 10},
+            {"account": "codex 2", "at": START.isoformat(), "remaining": True},
+            {"account": "codex 2", "at": START.isoformat(), "remaining": math.nan},
+        ]
+        _ = path.write_text("{bad json}\n[]\n" + "".join(json.dumps(record) + "\n" for record in records))
+        self.assertEqual(read_readings(path), {
+            "claude 1": [Reading(START, 20), Reading(START + timedelta(hours=1), 30)],
+            "codex 2": [Reading(START, 44.5)],
+        })
+        self.assertEqual(read_readings(path.with_name("missing.jsonl")), {})
 
-    @override
-    def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+    def test_a_rise_twelve_hours_old_counts_half(self) -> None:
+        self.assertEqual(HALF_LIFE, timedelta(hours=12))
+        # Two hours at 1 point a step, then the same two hours 12 h later at 3 a step; the drop between them is a refill.
+        old = climb([float(index) for index in range(13)])
+        new = climb([5.0 + 3 * index for index in range(13)], start=START + HALF_LIFE)
+        self.assertAlmostEqual(weighted_rate(old + new, new[-1].at.timestamp()) or 0, (0.5 * 1 + 3) / (1.5 * STEP))
 
-    def write_readings(self, account: str, readings: list[Reading]) -> Path:
-        path = self.root / "readings.jsonl"
-        with path.open("a", encoding="utf-8") as output:
-            for reading in readings:
-                _ = output.write(json.dumps({"account": account, "at": reading.at.isoformat(), "remaining": 100 - reading.used_percent}) + "\n")
-        return path
+    def test_quiet_recent_stretch_lengthens_time_left(self) -> None:
+        rise = [5.0 * index for index in range(9)]
+        busy_then_quiet = climb(rise + [40.0] * 8)
+        quiet_then_busy = climb([0.0] * 8 + rise)
+        plain = 40 / (16 * STEP)
+        quiet = weighted_rate(busy_then_quiet, step(16)) or 0
+        busy = weighted_rate(quiet_then_busy, step(16)) or 0
+        self.assertLess(quiet, plain)
+        self.assertGreater(busy, plain)
+        self.assertGreater(60 / quiet, 60 / busy)
+        # Each further quiet stretch lowers the pace, so the run-out moves later.
+        paces = [weighted_rate(busy_then_quiet[:index + 1], step(index)) or 0 for index in range(8, 17)]
+        self.assertEqual(paces, sorted(paces, reverse=True))
+        self.assertEqual(len(set(paces)), len(paces))
 
-    def write_run_outs(self, *ratio_lists: list[float]) -> Path:
-        path = self.root / "run_outs.jsonl"
-        _ = path.write_text("".join(
-            json.dumps({"account": "claude 1", "ended": (START + timedelta(days=index)).isoformat(), "ratios": values}) + "\n"
-            for index, values in enumerate(ratio_lists)
-        ))
-        return path
+    def test_refill_starts_a_new_stretch_and_the_one_before_still_counts(self) -> None:
+        # An hour at 2 points a step, a refill, then an hour at 1 a step; each old rise is 7 steps older than its new one.
+        readings = climb([50, 52, 54, 56, 58, 60, 62, 0, 1, 2, 3, 4, 5, 6])
+        weight = math.pow(0.5, 7 * STEP / HALF_LIFE.total_seconds())
+        self.assertAlmostEqual(weighted_rate(readings, step(13)) or 0, (2 * weight + 1) / ((weight + 1) * STEP))
 
-    def test_trailing_rate_needs_an_hour(self) -> None:
-        readings = climb([10, 20], minutes=30)
-        self.assertIsNone(trailing_rate(readings, START.timestamp(), (START + timedelta(hours=1)).timestamp()))
-        readings = climb([10, 20])
-        self.assertAlmostEqual(trailing_rate(readings, START.timestamp(), (START + timedelta(hours=1)).timestamp()) or 0, 10 / 3600)
+    def test_time_at_full_is_skipped(self) -> None:
+        readings = climb([88, 90, 92, 94, 96, 98, 100, 100, 100, 100, 0, 2, 4, 6, 8, 10, 12])
+        self.assertAlmostEqual(weighted_rate(readings, step(16)) or 0, 2 / STEP)
 
-    def test_latest_drop_finds_refill_then_redeemed_reset(self) -> None:
-        readings = climb([42, 99, 0, 19, 5, 20])
-        self.assertEqual(latest_drop(readings, readings[3].at.timestamp()), readings[2].at.timestamp())
-        self.assertEqual(latest_drop(readings, readings[-1].at.timestamp()), readings[4].at.timestamp())
+    def test_time_logged_out_is_not_quiet_time(self) -> None:
+        before = climb([float(index) for index in range(8)])
+        after = climb([7.0 + index for index in range(8)], start=START + timedelta(days=2))
+        self.assertAlmostEqual(weighted_rate(before + after, after[-1].at.timestamp()) or 0, 1 / STEP)
+        # A reading `MAX_GAP` after the last still counts as quiet time; one second later it does not.
+        last = before[-1].at
+        counted = weighted_rate(before + [Reading(last + MAX_GAP, 7)], (last + MAX_GAP).timestamp()) or 0
+        skipped = weighted_rate(before + [Reading(last + MAX_GAP + timedelta(seconds=1), 7)], (last + MAX_GAP).timestamp() + 1) or 0
+        self.assertLess(counted, 1 / STEP)
+        self.assertAlmostEqual(skipped, 1 / STEP)
 
-    def test_latest_drop_ignores_readings_after_end(self) -> None:
-        readings = climb([42, 99, 0, 19, 5])
-        self.assertEqual(latest_drop(readings, readings[3].at.timestamp()), readings[2].at.timestamp())
-        self.assertIsNone(latest_drop(readings, readings[1].at.timestamp()))
+    def test_readings_after_end_are_ignored(self) -> None:
+        self.assertAlmostEqual(weighted_rate(climb([0, 1, 2, 3, 4, 5, 6, 7, 50]), step(7)) or 0, 1 / STEP)
 
-    def test_latest_drop_is_none_without_a_drop(self) -> None:
-        self.assertIsNone(latest_drop([], START.timestamp()))
-        self.assertIsNone(latest_drop(climb([0, 20, 20, 99]), (START + timedelta(hours=3)).timestamp()))
-
-    def test_run_out_at_empty_and_reset_when_nearly_out_count(self) -> None:
-        emptied = climb([80, 90, 100, 100])
-        reset_low = climb([90, 96, 96, 0, 10], start=START + timedelta(hours=4))
-        reset_high = climb([40, 50, 0], start=START + timedelta(hours=9))
-        still_going = climb([60, 70], start=START + timedelta(hours=12))
-        found = episodes(emptied + reset_low + reset_high + still_going)
-        self.assertEqual([reached for _, reached in found], [emptied[2], reset_low[1]])
-        self.assertEqual(found[0][0], emptied[:3])
-        self.assertEqual(found[1][0], reset_low[:2])
-
-    def test_steady_pace_scores_one_and_a_late_burst_scores_under_one(self) -> None:
-        steady = climb([70, 80, 90, 100])
-        span, reached = episodes(steady)[0]
-        self.assertEqual([round(ratio, 3) for ratio in ratios(span, reached)], [1.0, 1.0])
-        burst = climb([70, 75, 80, 100])
-        span, reached = episodes(burst)[0]
-        self.assertEqual([round(ratio, 3) for ratio in ratios(span, reached)], [0.25, 0.4])
-
-    def test_each_run_out_is_recorded_once(self) -> None:
-        readings = self.write_readings("claude 1", climb([70, 75, 80, 100]))
-        run_outs = self.root / "run_outs.jsonl"
-        self.assertEqual(record_run_outs(readings, run_outs),
-                         ["claude 1: run-out at 2026-10-05T15:00:00+00:00 recorded; footer lean now 0.29"])
-        _ = self.write_readings("claude 1", climb([100, 0], start=START + timedelta(hours=4)))
-        self.assertEqual(record_run_outs(readings, run_outs), [])
-        self.assertEqual(read_run_outs(run_outs), [
-            {"account": "claude 1", "ended": "2026-10-05T15:00:00+00:00", "ratios": [0.25, 0.4]},
-        ])
-
-    def test_lean_is_one_until_learned_then_the_lower_quartile(self) -> None:
-        self.assertEqual(lean(self.root / "missing.jsonl"), 1.0)
-        self.assertEqual(lean(self.write_run_outs([0.8])), 0.8)
-        self.assertAlmostEqual(lean(self.write_run_outs([0.5, 0.7], [0.8, 0.9, 1.0])), 0.7)
-
-    def test_lean_follows_only_the_latest_run_outs(self) -> None:
-        path = self.write_run_outs(*([[0.1]] * 3 + [[0.9]] * run_out.KEPT))
-        self.assertAlmostEqual(lean(path), 0.9)
-
-    def test_bad_lines_and_repeated_run_outs_are_skipped(self) -> None:
-        path = self.write_run_outs([0.5])
-        _ = path.write_text("{bad json}\n[]\n" + path.read_text() * 2
-                            + json.dumps({"account": "codex 2", "ended": START.isoformat(), "ratios": [True, "x", -1, 0.6]}) + "\n")
-        self.assertEqual(read_run_outs(path), [
-            {"account": "claude 1", "ended": START.isoformat(), "ratios": [0.5]},
-            {"account": "codex 2", "ended": START.isoformat(), "ratios": [0.6]},
-        ])
+    def test_no_pace_until_the_readings_cover_an_hour(self) -> None:
+        self.assertEqual(MIN_SPAN, timedelta(hours=1))
+        self.assertIsNone(weighted_rate([], step(0)))
+        self.assertIsNone(weighted_rate(climb([40]), step(0)))
+        self.assertIsNone(weighted_rate(climb([90, 20]), step(1)))
+        self.assertIsNone(weighted_rate(climb([100.0] * 9), step(8)))
+        # Six ten-minute steps weigh a little under an hour; the seventh carries it over.
+        self.assertIsNone(weighted_rate(climb([0, 3, 6, 9, 12, 15, 18]), step(6)))
+        self.assertAlmostEqual(weighted_rate(climb([0, 3, 6, 9, 12, 15, 18, 21]), step(7)) or 0, 3 / STEP)
+        self.assertEqual(weighted_rate(climb([40.0] * 8), step(7)), 0)
 
 
 if __name__ == "__main__":

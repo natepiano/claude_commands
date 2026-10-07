@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import signal
 import struct
 import subprocess
 import sys
@@ -128,6 +129,10 @@ class Fake:
         self.window_physical_size: tuple[int, int] = (1280, 720)
         self.window_scale_factor: float = 1.0
         self.window_scale_factor_override: float | None = None
+        self.window_level: str = "Normal"
+        self.refuse_window_level_raise_once: bool = False
+        self.refuse_window_level_restore: bool = False
+        self.screenshot_started: threading.Event = threading.Event()
         self.release: threading.Event = threading.Event()
         self.lock: threading.Lock = threading.Lock()
 
@@ -145,6 +150,14 @@ class Fake:
                     self.window_physical_size = (cast(int, params["value"]), height)
                 elif params.get("path") == ".resolution.physical_height":
                     self.window_physical_size = (width, cast(int, params["value"]))
+                elif params.get("path") == ".window_level":
+                    level = cast(str, params["value"])
+                    if self.refuse_window_level_raise_once and level == "AlwaysOnTop":
+                        self.refuse_window_level_raise_once = False
+                        return {"error": {"code": -32603, "message": "raise refused once"}}
+                    if self.refuse_window_level_restore and level != "AlwaysOnTop":
+                        return {"error": {"code": -32603, "message": "restore refused"}}
+                    self.window_level = level
             if method == "brp_extras/get_diagnostics":
                 self.frame += 1
                 return {"result": {"frame_time_ms": {"current": 8.0}, "frame_count": float(self.frame)}}
@@ -165,7 +178,8 @@ class Fake:
                 return {"result": [NAME]}
             return {"error": {"code": -23402, "message": f"entity {entity} not found"}}
         if method == "brp_extras/screenshot":
-            if self.screenshot == "hang":
+            self.screenshot_started.set()
+            if self.screenshot in ("hang", "hold"):
                 _ = self.release.wait(15)
                 return {"result": None}
             if self.screenshot == "busy-always" or (self.screenshot == "busy-once" and screenshots == 1):
@@ -202,7 +216,7 @@ def query(fake: Fake, params: dict[str, object]) -> list[dict[str, object]]:
             "physical_height": height,
             "scale_factor_override": fake.window_scale_factor_override,
             "scale_factor": fake.window_scale_factor,
-        }}}}]
+        }, "window_level": fake.window_level}}}]
     if SWITCH_SLIDER in with_types:
         return [
             {"entity": entity, "components": {path: {"id": tool_id, "definition": definition}}, "has": {AABB: False}}
@@ -259,7 +273,7 @@ class HanaShotTest(unittest.TestCase):
     def timing_lines(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for line in self.timings.read_text().splitlines()]
 
-    def run_script(self, *args: str, session_variables: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def script_environment(self, session_variables: dict[str, str] | None = None) -> dict[str, str]:
         environment = {
             **os.environ,
             "XDG_CACHE_HOME": str(self.scratch / "cache"),
@@ -271,10 +285,33 @@ class HanaShotTest(unittest.TestCase):
             _ = environment.pop(name, None)
         if session_variables is not None:
             environment.update(session_variables)
+        return environment
+
+    def run_python(
+        self, program: Path, *args: str, session_variables: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(SCRIPT), *args],
-            cwd=self.scratch, env=environment, capture_output=True, text=True, timeout=60, check=False,
+            [sys.executable, str(program), *args],
+            cwd=self.scratch, env=self.script_environment(session_variables), capture_output=True, text=True,
+            timeout=60, check=False,
         )
+
+    def run_script(self, *args: str, session_variables: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        return self.run_python(SCRIPT, *args, session_variables=session_variables)
+
+    def start_python(self, program: Path, *args: str) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            [sys.executable, str(program), *args],
+            cwd=self.scratch, env=self.script_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+    def start_script(self, *args: str) -> subprocess.Popen[str]:
+        return self.start_python(SCRIPT, *args)
+
+    def stop_script(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is None:
+            process.kill()
+        _ = process.communicate()
 
     def shot(self, *args: str) -> subprocess.CompletedProcess[str]:
         return self.run_script("shot", "--port", str(self.port), "--out", str(self.scratch / "shot.png"), *args)
@@ -650,6 +687,37 @@ class RemoteTests(HanaShotTest):
             return []
         return [cast(list[str], json.loads(line)) for line in self.ssh_log.read_text().splitlines()]
 
+    def hana_shot_driver(self, name: str, setup: str) -> Path:
+        driver = self.scratch / name
+        _ = driver.write_text("\n".join([
+            "import os",
+            "import signal",
+            "import sys",
+            f"sys.path.insert(0, {str(SCRIPT.parent.resolve())!r})",
+            "import hana_shot",
+            "",
+            setup,
+            "",
+            "raise SystemExit(hana_shot.main(sys.argv[1:]))",
+            "",
+        ]))
+        return driver
+
+    def interrupt_held_remote_mac_shot(self, signal_number: int, program: Path = SCRIPT) -> tuple[int, str]:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        self.fake.window_level = "AlwaysOnBottom"
+        self.fake.screenshot = "hold"
+        process = self.start_python(
+            program,
+            "shot", "--port", str(self.port), "--out", str(self.scratch / "shot.png"),
+            "--mode", "home", "--remote", REMOTE_HOST,
+        )
+        self.addCleanup(self.stop_script, process)
+        self.assertTrue(self.fake.screenshot_started.wait(10), "the screenshot call never reached the fake")
+        process.send_signal(signal_number)
+        _, stderr = process.communicate(timeout=60)
+        return cast(int, process.returncode), stderr
+
     def test_remote_shot_copies_the_png_back_and_removes_it_there(self) -> None:
         remote = self.fake_remote(copies=True)
         result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
@@ -690,7 +758,9 @@ class RemoteTests(HanaShotTest):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.fake.methods("world.mutate_components"), [
             {"entity": WINDOW_ENTITY, "component": WINDOW, "path": ".window_level", "value": "AlwaysOnTop"},
+            {"entity": WINDOW_ENTITY, "component": WINDOW, "path": ".window_level", "value": "Normal"},
         ])
+        self.assertEqual(self.fake.window_level, "Normal")
         calls = self.ssh_calls()
         uname, awake, copy = calls[:3]
         self.assertEqual(uname, ["ssh", REMOTE_HOST, "uname", "-s"])
@@ -698,6 +768,170 @@ class RemoteTests(HanaShotTest):
         self.assertTrue(awake[2].startswith("caffeinate -u "), awake)
         self.assertEqual(copy[0], "scp", "the display is awake before the shot")
         self.assertIn(["ended"], calls, "the keep-awake ends before the run exits")
+
+    def test_remote_mac_shot_restores_an_always_on_bottom_window(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        self.fake.window_level = "AlwaysOnBottom"
+
+        result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
+            "AlwaysOnTop", "AlwaysOnBottom",
+        ])
+        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
+        self.assertIn(["ended"], self.ssh_calls())
+
+    def test_remote_mac_shot_repairs_an_already_always_on_top_window_to_normal(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        self.fake.window_level = "AlwaysOnTop"
+
+        result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
+            "AlwaysOnTop", "Normal",
+        ])
+        self.assertEqual(self.fake.window_level, "Normal")
+        self.assertIn(["ended"], self.ssh_calls())
+
+    def test_failed_remote_mac_shot_restores_the_window_and_ends_keep_awake(self) -> None:
+        _ = self.fake_remote(copies=False, system="Darwin")
+        self.fake.window_level = "AlwaysOnBottom"
+
+        result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
+            "AlwaysOnTop", "AlwaysOnBottom",
+        ])
+        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
+        self.assertIn(["ended"], self.ssh_calls())
+
+    def test_signal_during_close_does_not_interrupt_window_restore(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        self.fake.window_level = "AlwaysOnBottom"
+        driver = self.hana_shot_driver("signal_during_restore.py", """\
+real_mutate = hana_shot.Brp.mutate
+def signal_during_restore(brp, entity, component, path, value, *args, **kwargs):
+    if path == ".window_level" and value != "AlwaysOnTop":
+        os.kill(os.getpid(), signal.SIGTERM)
+    return real_mutate(brp, entity, component, path, value, *args, **kwargs)
+hana_shot.Brp.mutate = signal_during_restore
+""")
+
+        result = self.run_python(
+            driver,
+            "shot", "--port", str(self.port), "--out", str(self.scratch / "shot.png"),
+            "--mode", "home", "--remote", REMOTE_HOST,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
+            "AlwaysOnTop", "AlwaysOnBottom",
+        ])
+        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
+        self.assertIn(["ended"], self.ssh_calls())
+        [line] = self.timing_lines()
+        self.assertEqual(line["exit_code"], 0)
+
+    def test_second_signal_during_unwinding_keeps_the_first_exit_and_closes_the_session(self) -> None:
+        driver = self.hana_shot_driver("second_signal_during_close.py", """\
+real_close = hana_shot.Session.close
+def signal_before_close(session):
+    os.kill(os.getpid(), signal.SIGHUP)
+    return real_close(session)
+hana_shot.Session.close = signal_before_close
+""")
+
+        return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGTERM, driver)
+
+        self.assertEqual(return_code, 128 + signal.SIGTERM, stderr)
+        self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
+            "AlwaysOnTop", "AlwaysOnBottom",
+        ])
+        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
+        self.assertIn(["ended"], self.ssh_calls())
+        [line] = self.timing_lines()
+        self.assertEqual(line["exit_code"], 128 + signal.SIGTERM)
+
+    def test_sigint_restores_the_remote_mac_window_and_records_the_signal_exit(self) -> None:
+        return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGINT)
+
+        self.assertEqual(return_code, 128 + signal.SIGINT, stderr)
+        self.assertNotIn("KeyboardInterrupt", stderr)
+        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
+        self.assertIn(["ended"], self.ssh_calls())
+        [line] = self.timing_lines()
+        self.assertEqual((line["invocation_kind"], line["exit_code"]), ("shot", 128 + signal.SIGINT))
+
+    def test_sigterm_restores_the_remote_mac_window_and_records_the_signal_exit(self) -> None:
+        return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGTERM)
+
+        self.assertEqual(return_code, 128 + signal.SIGTERM, stderr)
+        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
+        self.assertIn(["ended"], self.ssh_calls())
+        [line] = self.timing_lines()
+        self.assertEqual((line["invocation_kind"], line["exit_code"]), ("shot", 128 + signal.SIGTERM))
+
+    def test_sighup_restores_the_remote_mac_window_and_records_the_signal_exit(self) -> None:
+        return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGHUP)
+
+        self.assertEqual(return_code, 128 + signal.SIGHUP, stderr)
+        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
+        self.assertIn(["ended"], self.ssh_calls())
+        [line] = self.timing_lines()
+        self.assertEqual((line["invocation_kind"], line["exit_code"]), ("shot", 128 + signal.SIGHUP))
+
+    def test_views_check_retries_window_preparation_after_a_refused_raise(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        self.fake.window_level = "AlwaysOnBottom"
+        self.fake.refuse_window_level_raise_once = True
+        _ = (self.scratch / "views.toml").write_text(
+            '[views.first]\nmode = "home"\n[views.second]\nmode = "home"\n',
+        )
+        fake_magick = self.scratch / "bin" / "magick"
+        _ = fake_magick.write_text("#!/bin/sh\necho 0.5\n")
+        fake_magick.chmod(0o755)
+
+        result = self.views(
+            "check", "--port", str(self.port), "--out", str(self.scratch / "check"),
+            "--remote", REMOTE_HOST,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("FAIL first:", result.stderr)
+        self.assertIn("raise refused once", result.stderr)
+        self.assertIn("PASS second", result.stdout)
+        self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
+            "AlwaysOnTop", "AlwaysOnBottom", "AlwaysOnTop", "AlwaysOnBottom",
+        ])
+        self.assertEqual(len(self.fake.methods("brp_extras/screenshot")), 1)
+        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
+        calls = self.ssh_calls()
+        awake = next(index for index, call in enumerate(calls) if call[:2] == ["ssh", REMOTE_HOST]
+                     and len(call) > 2 and call[2].startswith("caffeinate -u "))
+        copy = next(index for index, call in enumerate(calls) if call[:1] == ["scp"])
+        self.assertLess(awake, copy, "the second shot starts only after keep-awake is running")
+        self.assertIn(["ended"], calls)
+
+    def test_refused_window_restore_reports_once_without_changing_a_success_exit(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        self.fake.refuse_window_level_restore = True
+
+        result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+
+        self.assertEqual(result.returncode, 0)
+        restore_errors = [
+            line for line in result.stderr.splitlines()
+            if line.startswith("hana_shot: could not put the window level back")
+        ]
+        self.assertEqual(restore_errors, [
+            "hana_shot: could not put the window level back to Normal: "
+            + "world.mutate_components failed (-32603): restore refused",
+        ])
+        self.assertEqual(self.fake.window_level, "AlwaysOnTop")
+        self.assertIn(["ended"], self.ssh_calls())
 
     def test_remote_host_that_gives_no_system_fails_before_any_shot(self) -> None:
         _ = self.fake_remote(copies=True, system="")
