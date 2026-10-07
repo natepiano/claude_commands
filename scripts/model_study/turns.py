@@ -117,10 +117,11 @@ class SessionRead:
 
 
 def director_turns(reads: list[SessionRead]) -> list[Turn]:
-    turns = sorted(
-        (turn for read in reads for turn in read.turns),
-        key=lambda turn: turn.started,
-    )
+    return recompute_switch_turns([turn for read in reads for turn in read.turns])
+
+
+def recompute_switch_turns(rows: list[Turn]) -> list[Turn]:
+    turns = sorted(rows, key=lambda turn: turn.started)
     previous_model: str | None = None
     combined: list[Turn] = []
     for turn in turns:
@@ -154,13 +155,6 @@ def registered_ids(name: str, registry_dir: Path) -> list[str]:
 
 def session_ids(entry: RosterEntry, registry_dir: Path) -> list[str]:
     return list(dict.fromkeys([*entry.session_ids, *registered_ids(entry.name, registry_dir)]))
-
-
-def resolve_session_files(entry: RosterEntry, projects_dir: Path, registry_dir: Path) -> list[Path]:
-    paths: list[Path] = []
-    for session_id in session_ids(entry, registry_dir):
-        paths.extend(sorted(projects_dir.glob(f"*/{session_id}.jsonl")))
-    return paths
 
 
 def user_content(record: Record) -> object:
