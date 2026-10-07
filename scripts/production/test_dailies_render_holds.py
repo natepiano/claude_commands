@@ -41,7 +41,7 @@ class DailiesHoldTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        # HOME puts the renderer's AGENTS_DIR, READINGS_LOG and RUN_OUTS_LOG under this test directory.
+        # HOME puts the renderer's AGENTS_DIR and READINGS_LOG under this test directory.
         (self.scratch / "rust/hanadocs/agents").mkdir(parents=True)
         (self.scratch / ".local/state/agent-notes").mkdir(parents=True)
         self.folder = self.scratch / "holders"
