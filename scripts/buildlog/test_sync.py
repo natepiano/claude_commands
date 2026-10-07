@@ -182,14 +182,32 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(cli.main(["sync", "pause", "Mac hold"]), 0)
         with (
             mock.patch.object(ci, "ci", return_value=0) as poll,
+            mock.patch.object(cli, "screenshot_hourly", return_value=0) as screenshots,
             mock.patch.object(rust_release, "check_release", return_value=0) as release,
             mock.patch.object(index, "update", return_value=0),
         ):
             self.assertEqual(cli.hourly(), 0)
 
         poll.assert_called_once_with()
+        screenshots.assert_called_once_with()
         release.assert_called_once_with()
         self.assertEqual(self.commands, [])
+
+    def test_screenshot_hourly_invokes_report_hourly_once(self) -> None:
+        commands: list[tuple[list[str], bool, int]] = []
+
+        def fake_run(args: list[str], *, check: bool, timeout: int) -> subprocess.CompletedProcess[str]:
+            commands.append((args, check, timeout))
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            self.assertEqual(cli.screenshot_hourly(), 0)
+        self.assertEqual(len(commands), 1)
+        command, check, timeout = commands[0]
+        self.assertEqual(command[-1], "hourly")
+        self.assertTrue(command[-2].endswith("scripts/shot_report/shot_report.py"))
+        self.assertFalse(check)
+        self.assertEqual(timeout, 300)
 
     def test_resume_removes_pause_and_next_sync_contacts_peer(self) -> None:
         self.assertEqual(cli.main(["sync", "pause", "Mac hold"]), 0)

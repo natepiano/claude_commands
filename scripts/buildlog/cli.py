@@ -15,7 +15,7 @@
   buildlog sample                   record machine memory and stall counters once
   buildlog snapshot                 record slice and zram counters now
   buildlog memory START END         report memory between offset-bearing instants
-  buildlog hourly                   sync, ci, then Rust release check
+  buildlog hourly                   sync, ci, screenshot scan, then Rust release check
   buildlog backfill-verify [LEDGER] copy verify.sh's old events.jsonl ledger in, once
 
 Records live in ~/.local/state/buildlog (BUILDLOG_DIR moves it); see store.py.
@@ -26,9 +26,11 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 from datetime import date
+from pathlib import Path
 from typing import cast
 
 import ci
@@ -188,9 +190,15 @@ def day_report(args: list[str]) -> int:
     return 0
 
 
+def screenshot_hourly() -> int:
+    command = Path(__file__).resolve().parents[1] / "shot_report" / "shot_report.py"
+    return subprocess.run([sys.executable, str(command), "hourly"], check=False, timeout=300).returncode
+
+
 def hourly() -> int:
     status = 0
-    for name, job in (("sync", sync.sync), ("ci", ci.ci), ("rust release", rust_release.check_release)):
+    for name, job in (("sync", sync.sync), ("ci", ci.ci),
+                      ("screenshot", screenshot_hourly), ("rust release", rust_release.check_release)):
         try:
             status |= job()
         except Exception as error:  # noqa: BLE001 -- one job's failure must not cost the other its run
