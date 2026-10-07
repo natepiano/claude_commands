@@ -10,6 +10,12 @@
   ],
   "executionEnvironments": [
     {
+      "root": "scripts/model_study",
+      "extraPaths": [
+        "scripts/model_study"
+      ]
+    },
+    {
       "root": "scripts/hooks",
       "extraPaths": [
         "scripts/hooks"
