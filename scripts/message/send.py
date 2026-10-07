@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send one message to a Claude session, or a Codex seat, by name: the one way scripts do it.
+"""Send one message to a Claude session, a Codex seat, or the user: the one way scripts do it.
 
 Agents holding the SendMessage tool call it directly; scripts call this. The rules
 every message follows are /message (~/.claude/commands/message.md).
@@ -7,6 +7,7 @@ every message follows are /message (~/.claude/commands/message.md).
   send.py --to NAME [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
           [--machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
+  send.py --to user --summary TITLE [--need note|decision|blocked] ...   the user
   send.py ack KEY       later sends with KEY are skipped
   send.py reopen KEY    forget KEY: acknowledgement and repeat window
   send.py pending NAME  print and clear NAME's queue
@@ -22,6 +23,11 @@ the last stream per recipient stays in STATE/relay/<to>.jsonl.
 `--codex` queues the text on a codex_mesh.py thread instead, and `--machine`
 runs this script on HOST over ssh, where ~/.claude is this repo.
 
+`--to user` reaches the user wherever they are; `--summary` is the title. `--need`
+says what they must do: `note` nothing, `decision` decide while work goes on,
+`blocked` act before work can go on, repeated until they acknowledge it. How
+it reaches them is `user()`'s business: no caller names the channel.
+
 `--key` names a message. With `--repeat-minutes`, a send with the same key to the
 same recipient inside the window is skipped; `ack` skips every later send with
 the key until `reopen`. The window counts from the last attempt, delivered or
@@ -34,7 +40,7 @@ message text as one JSON line in STATE/log.jsonl:
   QUEUED: why    a Claude recipient not reached; kept in          exit 1
                  STATE/queue/<to>.jsonl, the latest per key
   FAILED: why    not delivered and not kept: a Codex seat, which  exit 3
-                 no queue reader reaches, or ssh to HOST
+                 no queue reader reaches, the user, or ssh to HOST
 Usage errors, an unreadable --file and an empty message exit 2. STATE is $XDG_STATE_HOME/message, or ~/.local/state/message.
 """
 
@@ -60,6 +66,8 @@ STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state
 CLAUDE = Path.home() / ".local" / "bin" / "claude"
 SESSIONS = Path.home() / ".claude" / "sessions"
 CODEX_MESH = Path(__file__).resolve().parent.parent / "agents" / "codex_mesh.py"
+USER = "user"
+USER_CHANNEL = Path(__file__).resolve().parent.parent / "notify" / "pushover.py"
 # On the remote host: its own interpreter shim and copy of this script.
 REMOTE = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send.py"'
 MODEL = "sonnet"
@@ -69,6 +77,8 @@ TIMEOUT = 40
 KILL_GRACE = 10
 
 Outcome = Literal["sent", "skipped", "queued", "failed"]
+Need = Literal["note", "decision", "blocked"]
+CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "1", "blocked": "2"}
 EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3}
 
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
@@ -109,6 +119,7 @@ class Options(NamedTuple):
     codex: bool
     session_dir: str | None
     timeout: float
+    need: Need
     text: str | None
     file: str | None
 
@@ -412,12 +423,24 @@ def codex(message: Message, session_dir: str, timeout: float) -> Result:
     return Result("failed", f"codex_mesh.py send: {why}")
 
 
+def user(message: Message, need: Need, timeout: float) -> Result:
+    """Reach the user. The channel is this function's business alone."""
+    command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], message.summary, message.text]
+    code, out, err = run(command, "", timeout)
+    if code == 0:
+        return Result("sent", "to the user")
+    why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
+    return Result("failed", f"the user was not reached: {why}")
+
+
 def remote(message: Message, host: str, options: Options) -> Result:
     """Run this script on host; its own log and queue record the attempt there."""
     forwarded = ["--to", message.to, "--from", message.sender, "--summary", message.summary,
                  "--timeout", f"{options.timeout:g}"]
     if message.key is not None:
         forwarded += ["--key", message.key]
+    if message.to == USER:
+        forwarded += ["--need", options.need]
     if options.session_dir is not None:
         forwarded += ["--codex", "--session-dir", options.session_dir]
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"{REMOTE} {shlex.join(forwarded)}"]
@@ -459,11 +482,14 @@ def optional_float(value: object) -> float | None:
 
 
 def parse(argv: list[str]) -> Options:
-    parser = argparse.ArgumentParser(prog="send.py", description="Send one message to a Claude session or Codex seat.",
+    parser = argparse.ArgumentParser(prog="send.py",
+                                     description="Send one message to a Claude session, a Codex seat or the user.",
                                      epilog="Also: send.py ack KEY | reopen KEY | pending NAME")
-    _ = parser.add_argument("--to", required=True, help="the recipient's name as ListAgents prints it")
+    _ = parser.add_argument("--to", required=True, help="the recipient's name as ListAgents prints it, or `user`")
     _ = parser.add_argument("--from", dest="sender", help="the sender name the recipient sees")
-    _ = parser.add_argument("--summary", help="SendMessage's short label; default the first line")
+    _ = parser.add_argument("--summary", help="SendMessage's short label, default the first line; the title to `user`")
+    _ = parser.add_argument("--need", choices=list(CHANNEL_PRIORITY), default="note",
+                            help="to `user`: what they must do (default note: nothing)")
     _ = parser.add_argument("--key", help="names the message for --repeat-minutes, ack and the queue")
     _ = parser.add_argument("--repeat-minutes", type=float, help="skip a send with --key inside this window")
     _ = parser.add_argument("--machine", help="deliver from this ssh host instead (mac)")
@@ -479,7 +505,11 @@ def parse(argv: list[str]) -> Options:
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
                       machine=optional_str(get["machine"]), codex=get["codex"] is True,
                       session_dir=optional_str(get["session_dir"]), timeout=optional_float(get["timeout"]) or TIMEOUT,
-                      text=optional_str(get["text"]), file=optional_str(get["file"]))
+                      need=cast(Need, get["need"]), text=optional_str(get["text"]), file=optional_str(get["file"]))
+    if options.to == USER and (options.summary is None or options.codex):
+        parser.error("--to user needs --summary, its title, and takes no --codex")
+    if options.to != USER and options.need != "note":
+        parser.error("--need goes with --to user")
     if options.codex != (options.session_dir is not None):
         parser.error("--codex and --session-dir go together")
     if options.repeat_minutes is not None and options.key is None:
@@ -519,6 +549,8 @@ def send(options: Options) -> Result:
         result = Result("skipped", skip)
     elif options.machine is not None:
         result = remote(message, options.machine, options)
+    elif message.to == USER:
+        result = user(message, options.need, options.timeout)
     elif options.session_dir is not None:
         result = codex(message, options.session_dir, options.timeout)
     else:

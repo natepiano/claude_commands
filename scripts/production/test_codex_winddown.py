@@ -11,8 +11,9 @@ import unittest
 from pathlib import Path
 from typing import override
 
+import broadcast
 import codex_winddown
-from codex_winddown import Process
+from broadcast import Process
 
 SCRIPT = Path(__file__).with_name("codex_winddown.py")
 MESH = "/run/current-system/sw/bin/python3 /home/u/.claude/scripts/delegate/../agents/codex_mesh.py"
@@ -27,16 +28,16 @@ with open(os.environ["LOG"], "a") as log:
 
 class CountTests(unittest.TestCase):
     def test_a_mesh_turn_and_a_plain_exec_are_agents(self) -> None:
-        self.assertTrue(codex_winddown.is_codex_agent(Process(1, 0, "python3", f"{MESH} start --name a")))
-        self.assertTrue(codex_winddown.is_codex_agent(Process(1, 0, "python3", f"{MESH} follow --to a")))
-        self.assertTrue(codex_winddown.is_codex_agent(Process(1, 0, "codex", "codex exec --json")))
+        self.assertTrue(broadcast.is_codex_agent(Process(1, 0, "python3", f"{MESH} start --name a")))
+        self.assertTrue(broadcast.is_codex_agent(Process(1, 0, "python3", f"{MESH} follow --to a")))
+        self.assertTrue(broadcast.is_codex_agent(Process(1, 0, "codex", "codex exec --json")))
 
     def test_servers_wrappers_and_claude_seats_are_not_agents(self) -> None:
         for command, arguments in (("codex", "codex app-server --listen ws://127.0.0.1:1"),
                                    ("zsh", f"zsh -c {MESH} start --name a"),
                                    ("python3", f"{MESH} can-follow --session-dir d"),
                                    ("bash", "bash /home/u/.claude/scripts/agents/agent_bg.sh a")):
-            self.assertFalse(codex_winddown.is_codex_agent(Process(1, 0, command, arguments)), arguments)
+            self.assertFalse(broadcast.is_codex_agent(Process(1, 0, command, arguments)), arguments)
 
     def test_an_agent_belongs_to_its_nearest_named_session(self) -> None:
         table = {10: Process(10, 1, "claude", "claude"), 20: Process(20, 10, "claude", "claude"),
@@ -83,23 +84,23 @@ class MessageTests(unittest.TestCase):
             "always": [], "showrunners": [{"session": "hana", "zone": "America/Los_Angeles", "units": ["trunk"]},
                                           {"session": "gone", "zone": "America/Los_Angeles", "units": []}],
         }), encoding="utf-8")
-        listener = socket.socket(socket.AF_UNIX)
-        self.addCleanup(listener.close)
-        listener.bind(str(self.root / "hana.sock"))
-        _ = (self.root / "sessions/1.json").write_text(json.dumps({
-            "pid": os.getpid(), "sessionId": "abc", "name": "hana", "updatedAt": 1,
-            "messagingSocketPath": str(self.root / "hana.sock"),
-        }), encoding="utf-8")
+        for name, pid in (("hana", os.getpid()), ("trunk", os.getppid())):
+            listener = socket.socket(socket.AF_UNIX)
+            self.addCleanup(listener.close)
+            listener.bind(str(self.root / f"{name}.sock"))
+            _ = (self.root / f"sessions/{pid}.json").write_text(json.dumps({
+                "pid": pid, "sessionId": f"id-{name}", "name": name, "updatedAt": 1,
+                "messagingSocketPath": str(self.root / f"{name}.sock"),
+            }), encoding="utf-8")
         _ = (self.root / "notifier.sh").write_text(NOTIFIER_STUB, encoding="utf-8")
         _ = (self.root / "send.py").write_text(SEND_STUB, encoding="utf-8")
         self.environment = {
             **os.environ, "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json"),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"), "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
-            "CODEX_WINDDOWN_NOTIFIER": str(self.root / "notifier.sh"), "CODEX_WINDDOWN_SEND": str(self.root / "send.py"),
+            "CODEX_WINDDOWN_NOTIFIER": str(self.root / "notifier.sh"), "BROADCAST_SEND": str(self.root / "send.py"),
             "CODEX_WINDDOWN_STATE": str(self.root / "prompts"), "LOG": str(self.root / "log"),
-            "CODEX_WINDDOWN_PUSH": str(self.root / "push.py"), "CODEX_WINDDOWN_PS": f"cat {self.root / 'ps'}",
+            "BROADCAST_PS": f"cat {self.root / 'ps'}",
         }
-        _ = (self.root / "push.py").write_text(SEND_STUB.replace('"send "', '"push "'), encoding="utf-8")
         self.set_processes()
 
     def set_processes(self, *lines: str) -> None:
@@ -109,14 +110,18 @@ class MessageTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=self.environment, capture_output=True,
                               text=True, check=False)
 
-    def test_start_tells_each_live_showrunner_and_starts_its_count(self) -> None:
+    def test_start_tells_each_role_its_version_and_starts_each_showrunners_count(self) -> None:
         done = self.run_script("start", "--from", "natedev")
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stdout.splitlines(), ["hana: told to wind down", "gone: no live session, skipped",
-                                                    "hana: counting every 2 minutes"])
+        self.assertEqual(done.stdout.splitlines(), ["hana - showrunner - sent", "gone - showrunner - no live session",
+                                                    "trunk - unit director - sent", "hana: counting every 2 minutes"])
         log = (self.root / "log").read_text(encoding="utf-8")
-        self.assertIn("send --to hana --from natedev --text Codex wind-down, from the user", log)
-        self.assertIn("notifier new codex-count-hana --every 2 --to session:abc", log)
+        for session in ("hana", "trunk"):
+            self.assertIn(f"send --to {session} --from natedev --text Codex wind-down, from the user", log)
+        self.assertEqual(log.count('a "Codex count" message arrives'), 1)
+        self.assertEqual(log.count("You are encouraged to continue work on your own"), 1)
+        self.assertEqual(log.count("was sent this directly, and no other agent."), 2)
+        self.assertIn("notifier new codex-count-hana --every 2 --to session:id-hana", log)
         prompt = (self.root / "prompts/codex-count-hana.txt").read_text(encoding="utf-8")
         self.assertIn(f"{SCRIPT} count hana`", prompt)
 
@@ -124,18 +129,20 @@ class MessageTests(unittest.TestCase):
         _ = self.run_script("start", "--from", "natedev")
         done = self.run_script("clear", "--from", "natedev")
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stdout.splitlines(), ["hana: count stopped", "hana: told the all clear",
-                                                    "gone: no live session, skipped",
-                                                    "hana: 0 of 0 unit directors told",
-                                                    "gone: 0 of 0 unit directors told"])
+        self.assertEqual(done.stdout.splitlines(), ["hana: count stopped", "hana - showrunner - sent",
+                                                    "gone - showrunner - no live session",
+                                                    "trunk - unit director - sent"])
         self.assertEqual(list((self.root / "notifier").iterdir()), [])
-        self.assertIn("--text All clear, from the user", (self.root / "log").read_text(encoding="utf-8"))
+        log = (self.root / "log").read_text(encoding="utf-8")
+        self.assertIn("send --to hana --from natedev --text All clear, from the user", log)
+        self.assertIn("Start using Codex again", log)
 
     def test_triage_needs_a_wind_down_and_carries_the_users_words(self) -> None:
         self.assertEqual(self.run_script("triage", "--from", "natedev").returncode, 1)
         _ = self.run_script("start", "--from", "natedev")
         done = self.run_script("triage", "--from", "natedev")
-        self.assertEqual(done.stdout.splitlines(), ["hana: told to sort its agents", "gone: no live session, skipped"])
+        self.assertEqual(done.stdout.splitlines(), ["hana - showrunner - sent", "gone - showrunner - no live session",
+                                                    "trunk - unit director - sent"])
         self.assertIn("which ones can be stopped now and added to a resume list",
                       (self.root / "log").read_text(encoding="utf-8"))
 
@@ -158,22 +165,23 @@ class MessageTests(unittest.TestCase):
         self.assertEqual(log.count("send --to trunk --from hana --text Codex wind-down, from hana: your Codex agents"), 1)
         self.assertIn("launch Claude agents for short time frames", log)
 
-    def test_the_user_is_pushed_once_when_a_wind_down_reaches_no_agents(self) -> None:
+    def test_the_user_is_told_once_when_a_wind_down_reaches_no_agents(self) -> None:
         agent = (f"{os.getpid()} 1 claude claude", f"40 {os.getpid()} python3 {MESH} start --name a")
         self.set_processes(*agent)
         _ = self.run_script("start", "--from", "natedev")
         self.assertIn("hana - 1 - ETA Unmeasured", self.run_script("count", "hana").stdout)
-        self.assertNotIn("push ", (self.root / "log").read_text(encoding="utf-8"))
+        self.assertNotIn("--to user", (self.root / "log").read_text(encoding="utf-8"))
         self.set_processes()
         for _ in range(2):
             _ = self.run_script("count", "hana")
         log = (self.root / "log").read_text(encoding="utf-8")
-        self.assertEqual(log.count("push --priority 1 Codex wind-down No Codex agent is running on"), 1)
+        self.assertEqual(log.count("send --to user --from codex-winddown --summary Codex wind-down --need decision"
+                                   + " --text No Codex agent is running on"), 1)
         self.set_processes(*agent)
         _ = self.run_script("count", "hana")
         self.set_processes()
         _ = self.run_script("count", "hana")
-        self.assertEqual((self.root / "log").read_text(encoding="utf-8").count("push "), 2)
+        self.assertEqual((self.root / "log").read_text(encoding="utf-8").count("--to user"), 2)
 
     def test_status_says_whether_a_wind_down_is_on(self) -> None:
         self.assertIn("Wind-down: off", self.run_script("status").stdout)

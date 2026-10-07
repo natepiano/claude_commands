@@ -21,20 +21,15 @@ from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Final, Literal, NamedTuple, cast
+from typing import Final, Literal, cast
 from zoneinfo import ZoneInfo
 
+import broadcast
 import showrunners
 from live_units import live_units
+from sessions import SessionRecord
 
-MESSAGE = Path(__file__).resolve().parent.parent / "message"
-sys.path.insert(0, str(MESSAGE))
-from sessions import SessionRecord, live_session, read_session  # noqa: E402
-
-NOTIFIER = Path(os.environ.get("CODEX_WINDDOWN_NOTIFIER") or MESSAGE / "notifier.sh")
-SEND = Path(os.environ.get("CODEX_WINDDOWN_SEND") or MESSAGE / "send.py")
-PUSH = Path(os.environ.get("CODEX_WINDDOWN_PUSH") or MESSAGE.parent / "notify/pushover.py")
-PS = shlex.split(os.environ.get("CODEX_WINDDOWN_PS") or "ps -eo pid=,ppid=,comm=,args=")
+NOTIFIER = Path(os.environ.get("CODEX_WINDDOWN_NOTIFIER") or broadcast.MESSAGE / "notifier.sh")
 STATE = Path(os.environ.get("CODEX_WINDDOWN_STATE") or Path.home() / ".local/state/codex-winddown")
 PROJECTIONS = "projections.json"
 QUIET = "quiet"
@@ -52,8 +47,14 @@ Projection = float | Literal["unmeasured"] | None
 WIND_DOWN = (
     "Codex wind-down, from the user (/codex_winddown start in {sender}, {time}): let every running"
     " Codex agent finish and launch no new one until the user gives the all clear. Unit directors are"
-    " encouraged to continue work on their own. Pass this to your unit directors. Every {minutes} minutes a \"Codex count\" message arrives; do what it says and"
-    " nothing else in that turn. Protocol: ~/.claude/commands/codex_winddown.md."
+    " encouraged to continue work on their own. Every {minutes} minutes a \"Codex count\" message"
+    " arrives; do what it says and nothing else in that turn. Protocol:"
+    " ~/.claude/commands/codex_winddown.md."
+)
+UNIT_WIND_DOWN = (
+    "Codex wind-down, from the user (/codex_winddown start in {sender}, {time}): let every running"
+    " Codex agent finish and launch no new one until the user gives the all clear. You are encouraged"
+    " to continue work on your own, or to launch Claude agents for short time frames."
 )
 TICK = (
     "Codex count (every {minutes} minutes until the user's all clear). Run `python3 {script} count"
@@ -73,13 +74,13 @@ AT_ZERO = (
 TRIAGE = (
     "Codex wind-down, from the user (/codex_winddown triage in {sender}, {time}): \"you need to tell"
     " all of the other seats to figure out which ones can be stopped now and added to a resume list vs"
-    " which really should finish right now\". Pass this to every unit director with a running Codex"
-    " agent: stop each one that can stop, keep what it wrote, and put it on a resume list (the seat,"
-    " its work order, what is left); let the rest finish."
+    " which really should finish right now\". Sort the Codex agents running under you: stop each one"
+    " that can stop, keep what it wrote, and put it on a resume list (the seat, its work order, what is"
+    " left); let the rest finish. With none running, there is nothing to do."
 )
 ALL_CLEAR = (
     "All clear, from the user (/codex_winddown clear in {sender}, {time}): we are back with Codex. The"
-    " wind-down is over and the Codex count has stopped. Your unit directors are told directly."
+    " wind-down is over and the Codex count has stopped."
 )
 UNIT_CLEAR = (
     "All clear, from the user (/codex_winddown clear in {sender}, {time}): we are back with Codex. Start"
@@ -88,49 +89,9 @@ UNIT_CLEAR = (
 )
 
 
-class Process(NamedTuple):
-    pid: int
-    parent: int
-    command: str
-    arguments: str
-
-
-def processes() -> dict[int, Process]:
-    listing = subprocess.run(PS, capture_output=True, text=True, check=True)
-    table: dict[int, Process] = {}
-    for line in listing.stdout.splitlines():
-        fields = line.split(None, 3)
-        if len(fields) >= 3:
-            table[int(fields[0])] = Process(int(fields[0]), int(fields[1]), fields[2],
-                                            fields[3] if len(fields) > 3 else "")
-    return table
-
-
-def is_codex_agent(process: Process) -> bool:
-    words = process.arguments.split()
-    if process.command == "codex":
-        return words[1:2] == ["exec"]
-    if not process.command.startswith("python"):
-        return False
-    mesh = next((index for index, word in enumerate(words) if word.endswith("/codex_mesh.py")), None)
-    return mesh is not None and words[mesh + 1:mesh + 2] in (["start"], ["follow"])
-
-
-def live_sessions() -> dict[str, SessionRecord]:
-    """Each live named session, the newest record winning a shared name."""
-    newest: dict[str, SessionRecord] = {}
-    for path in showrunners.SESSIONS_DIR.glob("*.json"):
-        record = read_session(path)
-        if record is None or not record["name"] or not live_session(record):
-            continue
-        if record["name"] not in newest or record["updatedAt"] > newest[record["name"]]["updatedAt"]:
-            newest[record["name"]] = record
-    return newest
-
-
-def owner(process: Process, table: Mapping[int, Process], names: Mapping[int, str]) -> str:
+def owner(process: broadcast.Process, table: Mapping[int, broadcast.Process], names: Mapping[int, str]) -> str:
     seen: set[int] = set()
-    current: Process | None = process
+    current: broadcast.Process | None = process
     while current is not None and current.pid not in seen:
         if current.pid in names:
             return names[current.pid]
@@ -139,12 +100,14 @@ def owner(process: Process, table: Mapping[int, Process], names: Mapping[int, st
     return NO_SESSION
 
 
-def agent_counts(table: Mapping[int, Process], names: Mapping[int, str]) -> Counter[str]:
-    return Counter(owner(process, table, names) for process in table.values() if is_codex_agent(process))
+def agent_counts(table: Mapping[int, broadcast.Process], names: Mapping[int, str]) -> Counter[str]:
+    return Counter(owner(process, table, names) for process in table.values()
+                   if broadcast.is_codex_agent(process))
 
 
 def current_counts() -> Counter[str]:
-    return agent_counts(processes(), {record["pid"]: name for name, record in live_sessions().items()})
+    names = {record["pid"]: name for name, record in broadcast.live_sessions().items()}
+    return agent_counts(broadcast.processes(), names)
 
 
 def listed(session: str, units: list[str], counts: Mapping[str, int]) -> dict[str, int]:
@@ -206,20 +169,14 @@ def clock(zone: str) -> str:
     return datetime.now(ZoneInfo(zone)).strftime("%H:%M %Z")
 
 
-def send(session: str, sender: str, text: str) -> bool:
-    done = subprocess.run([sys.executable, str(SEND), "--to", session, "--from", sender, "--text", text],
-                          capture_output=True, text=True, check=False)
-    return done.returncode == 0
-
-
 def needs_asking(unit: str, held: Mapping[str, Projection], now: float) -> bool:
     answer = held.get(unit, 0.0)
     return isinstance(answer, float) and answer <= now
 
 
 def ask(showrunner: str, unit: str, agents: int) -> bool:
-    return send(unit, showrunner, ASK.format(showrunner=showrunner, agents=agents, script=Path(__file__).resolve(),
-                                             unit=shlex.quote(unit)))
+    return not broadcast.send(unit, showrunner, ASK.format(showrunner=showrunner, agents=agents,
+                                                           script=Path(__file__).resolve(), unit=shlex.quote(unit)))
 
 
 def refresh(showrunner: str, units: list[str], rows: Mapping[str, int], now: float) -> dict[str, Projection]:
@@ -234,12 +191,12 @@ def refresh(showrunner: str, units: list[str], rows: Mapping[str, int], now: flo
         saved.update(dict.fromkeys(asked))
         current = dict(saved)
     for unit in finished:
-        _ = send(unit, showrunner, AT_ZERO.format(showrunner=showrunner))
+        _ = broadcast.send(unit, showrunner, AT_ZERO.format(showrunner=showrunner))
     return current
 
 
 def announce_quiet(running: int) -> None:
-    """Push the user once when a wind-down has no Codex agent left on the machine; a later agent re-arms it."""
+    """Tell the user once when a wind-down has no Codex agent left on the machine; a later agent re-arms it."""
     if running or not instances():
         (STATE / QUIET).unlink(missing_ok=True)
         return
@@ -249,8 +206,7 @@ def announce_quiet(running: int) -> None:
     except FileExistsError:
         return
     text = f"No Codex agent is running on {socket.gethostname()}. Reset when ready, then /codex_winddown clear."
-    _ = subprocess.run([sys.executable, str(PUSH), "--priority", "1", "Codex wind-down", text],
-                       capture_output=True, text=True, check=False)
+    _ = broadcast.send("user", "codex-winddown", text, "--summary", "Codex wind-down", "--need", "decision")
 
 
 def count(session: str) -> int:
@@ -296,29 +252,13 @@ def instance_name(session: str) -> str:
     return INSTANCE + re.sub(r"[^A-Za-z0-9._-]", "-", session)
 
 
-def tell_showrunners(sender: str, message: str, told: str) -> bool:
-    """Send every live showrunner the message and report each; true when all of them have it."""
-    live, every = live_sessions(), True
-    for runner in showrunners.load_settings()["showrunners"]:
-        if runner["session"] not in live:
-            print(f"{runner['session']}: no live session, skipped")
-            continue
-        sent = send(runner["session"], sender,
-                    message.format(sender=sender, time=clock(runner["zone"]), minutes=EVERY_MINUTES))
-        every = every and sent
-        print(f"{runner['session']}: {told if sent else 'NOT told'}")
-    return every
-
-
-def tell_units(sender: str) -> bool:
-    """Send every live unit director the all clear and report each showrunner; true when all have it."""
-    live, every = live_sessions(), True
-    for runner in showrunners.load_settings()["showrunners"]:
-        units = [unit for unit in live_units(runner["session"]) if unit in live]
-        told = [send(unit, sender, UNIT_CLEAR.format(sender=sender, time=clock(runner["zone"]))) for unit in units]
-        every = every and all(told)
-        print(f"{runner['session']}: {sum(told)} of {len(units)} unit directors told")
-    return every
+def announce(sender: str, showrunner: str, unit: str) -> bool:
+    """Send every showrunner and unit director its version at once and print each delivery."""
+    zones = {runner["session"]: runner["zone"] for runner in showrunners.load_settings()["showrunners"]}
+    named = {"sender": sender, "time": clock(zones.get(sender) or next(iter(zones.values()), "UTC")),
+             "minutes": EVERY_MINUTES}
+    return broadcast.report(broadcast.broadcast(sender, {"showrunner": showrunner.format(**named),
+                                                          "unit director": unit.format(**named)}))
 
 
 def start_count(record: SessionRecord) -> bool:
@@ -335,8 +275,8 @@ def start(sender: str) -> int:
     STATE.mkdir(parents=True, exist_ok=True)
     for name in (PROJECTIONS, QUIET):
         (STATE / name).unlink(missing_ok=True)
-    every = tell_showrunners(sender, WIND_DOWN, "told to wind down")
-    live = live_sessions()
+    every = announce(sender, WIND_DOWN, UNIT_WIND_DOWN)
+    live = broadcast.live_sessions()
     for runner in showrunners.load_settings()["showrunners"]:
         if runner["session"] in live:
             counting = start_count(live[runner["session"]])
@@ -350,7 +290,7 @@ def triage(sender: str) -> int:
     if not instances():
         print("No wind-down is on. Run /codex_winddown start first.", file=sys.stderr)
         return 1
-    return 0 if tell_showrunners(sender, TRIAGE, "told to sort its agents") else 1
+    return 0 if announce(sender, TRIAGE, TRIAGE) else 1
 
 
 def clear(sender: str) -> int:
@@ -362,8 +302,7 @@ def clear(sender: str) -> int:
         print(f"{name.removeprefix(INSTANCE)}: {'count stopped' if done.returncode == 0 else 'count NOT stopped'}")
     for name in (PROJECTIONS, QUIET):
         (STATE / name).unlink(missing_ok=True)
-    told = [tell_showrunners(sender, ALL_CLEAR, "told the all clear"), tell_units(sender)]
-    return 0 if every and all(told) else 1
+    return 0 if announce(sender, ALL_CLEAR, UNIT_CLEAR) and every else 1
 
 
 def main(arguments: list[str]) -> int:
