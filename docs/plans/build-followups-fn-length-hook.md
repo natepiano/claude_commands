@@ -273,91 +273,78 @@ Moved to enh-showrunner (2026-10-06 14:2x PDT) with the phase above; the showrun
 
 ### Phase 7 — The launcher carries follow-up work to a seat that is still open, and a failed review pause can be retried · status: done
 
+#### As-built
+
+- `implement.sh --to <seat>` (ahead of the usual positional arguments; the prompt file is the message) sends follow-up work to a seat still open in the phase. It skips `seat_name.sh` and addresses the full seat name from `mesh_roster.json` (Codex) or the `seats` ledger (Claude). It exits 2 with a message, before any record, when the seat is unknown, `mesh=none`, busy (roster `running` or `waiting_capacity`, `impl_status_<slot>` reads `implementing`, `claude agents` reads busy or gone), or its slot, family or configuration differs from the durable launch record (slot, family, model, full Claude session id or Codex thread id).
+- Past those checks the launcher runs the new-seat path: truncates `impl_summary_<slot>.txt`, writes `impl_status_<slot>` (`implementing`, then `implemented` or `error`), calls `start-pass` and `finish-pass`, runs `findings.py landed` or `abandon --edits-landed` under `PLAN_DELEGATE_RESOLVES_ROUND=1`, and posts a register line (`role=<kind>`, `follow-up to <seat>`) and the `launcher:` `done` or `blocked` post. `done` posts only after the pass and landed state are recorded; a failed ledger write posts `blocked`. A fixed trailer on the message tells the seat to write `impl_summary_<slot>.txt` last, then post `done`. The launcher's exit wakes the unit director, as a new seat's does.
+- One claim per seat. Codex: `codex_mesh.py can-follow --session-dir <dir> --to <seat> --claim-pid <pid>` checks the seat is followable and takes the roster claim under lock with the launcher pid before any status or pass write; a second concurrent follow-up exits 2 with nothing recorded. `codex_mesh.py follow --session-dir <dir> --to <seat> --message-file <path> [--claim-pid <pid>]` then requires that claim (a changed claim exits 1); without `--claim-pid` it refuses and claims on its own pid. A claim whose launcher is dead is released and its status set to `error`; `release-follow` releases an unstarted claim.
+- `follow` accepts a roster entry that is followable (`done`, or `failed` only when `thread/read` shows no live turn). It starts or reuses the app-server, calls `thread/resume`, starts one turn on the same thread, and streams it through `_stream_turn`, the loop `start` also uses; it waits on the started turn id, so an earlier `done` cannot end the wait. A resume that fails, or a live turn found after resume, exits 1 with the reason. The roster record is a named state (followable, active with its turn id, starting with the launcher pid, waiting for capacity), and the live-server check returns `LiveServer` or `ServerRestartRequired` rather than `int | None`.
+- Claude: `agent_bg.sh --attach` sends through `send.py` (`QUEUED` is an error), counts the seat's finished assistant turns in its transcript (`~/.claude/projects/*/<session id>.jsonl`) before sending, and waits until the count grows and the seat is idle; a turn shorter than the 15 s poll counts.
+- Docs: a finished Codex seat is reached only through `implement.sh --to`; a repair whose files sit with an open seat may go to that seat the same way; a message to a seat without the launcher is for questions only. <DispatchContract/> item 6 and <FixDispatch/>'s third outcome name the follow-up beside a new seat.
+- `review_pause.py` writes its pause record first, with one state per action (`dailies`, `footers`): `untouched`, `attempted`, `done`, `skipped`. `reconcile_attempted(instance, slug, path, record)`, shared by `pause`, `status` and `resume`, turns an `attempted` action into `done` when its effect is observable (dailies stopped, footers off); a failed notifier stop leaves it `attempted`, so a retry redoes only what did not happen, and `resume` undoes only the `done` actions (`parts`).
+- `board.sh release <session_dir> <agent> <resource> --pid <pid>` refuses a pid that is not the holder's: exit 3 when the caller was reclaimed (listed in `reclaimed_holders`), else exit 1, with the reason on stderr. `verify.sh`'s `release_token` always passes `--pid $$`; 0 and 3 count as released (the reclaiming holder owns the token), any other status fails the run.
+- `scripts/whoami/agent_accounts.py` reads `rateLimitResetCredits` through a key on the `CodexRateLimits` TypedDict and casts the reset-credit summary once in `reset_credits`; basedpyright reports 0 errors and 0 warnings with no ignore.
+
+**Files:**
+- `scripts/delegate/implement.sh` — launcher; the `--to` follow-up path.
+- `scripts/agents/codex_mesh.py` — `can-follow`, `follow`, `release-follow`, roster claims and named states, `_stream_turn`.
+- `scripts/agents/agent_bg.sh` — `--attach` to an open Claude seat.
+- `scripts/production/review_pause.py` — pause, status and resume records with per-action states.
+- `scripts/delegate/board.sh`, `scripts/delegate/verify.sh` — token release by holder pid; a failed release fails the run.
+- `scripts/whoami/agent_accounts.py` — typed rate-limit reads.
+- `commands/unit/delegate.md`, `docs/delegate/write_prompt_contract.md` — follow-up rules, read by every unit director.
+- `scripts/delegate/test_implement_launcher.py`, `scripts/agents/test_codex_mesh.py`, `scripts/production/test_review_pause.py`, `scripts/delegate/test_verify_token_wait.py`, `scripts/delegate/test_board_reclaim.py` — `--to`, `follow` on `StubAppServer`, pause retry, release that fails closed.
+
+**Binds later work:** the follow-up path shares the launcher's success path, so edits to `implement.sh`'s final status order must keep the follow-up claim, status and refusal behaviour; `codex_mesh.py`'s roster states are read by `can-follow`, `follow` and the launcher alike.
+
+**Gotchas:**
+- A follow-up claim must exist before any status record, or a refusal leaves a stale record.
+- A peer turn can overtake a followed turn after `thread/resume`: `follow` exits 1, `impl_status` reads `error`, and the roster stays active while the peer runs, then is restored; a failure of the followed turn survives the peer turn.
+- Legacy `false` pause actions read as skipped.
+- `board.sh release` exit 3 is benign for `verify.sh`; exit 1 is a real failure.
+
+### Phase 8 — `/unit:report off` and `on` stop and start a unit's progress updates, and the launcher reports done only after recording it · status: todo
+
 #### Work Order
 
 Work only in worktree `/home/natepiano/worktrees/claude-build-followups-stalls`, branch `build-followups-stalls`. State every time in PDT.
 
-**Source:** the user, 2026-10-06 13:1x PDT, through the showrunner (natedev): "the launcher (implement.sh) carries follow-up work to a seat that is still open. The unit director gives it the open seat and a message. The launcher sends it, records the pass (and the repair round's landed state, when it resolves one), waits for the seat's done, posts done, and exits, which wakes the unit director, just as it does for a new seat. Messages without the launcher stay for questions only." Placed after the Codex phase by the showrunner; renumbered Phase 9 when the add-unit and merge-checkpoint phases took 7 and 8 (2026-10-06 14:1x PDT), and Phase 7 when those two moved to enh-showrunner (2026-10-06 14:2x PDT). Measured: on 2026-10-06 this unit redirected an open Codex seat twice by message (Phase 5), and neither message recorded a pass or woke the unit director.
-
-**Goal:** one `implement.sh --to <seat>` call sends follow-up work to a seat still open in the phase. The run records it as that slot's pass and resolves the repair round. The launcher's exit wakes the unit director, just as a new seat's does, for Codex and Claude seats alike.
-
-**Spec:**
-- **`implement.sh --to <seat>`** takes today's positional arguments, with the prompt file as the message. It skips `seat_name.sh` and addresses `<seat>`, the full name from `mesh_roster.json` (Codex) or the `seats` ledger (Claude), whichever holds it. Before any record, it exits 2 with a message when the seat is in neither, is `mesh=none`, or is busy: roster `running` or `waiting_capacity`, its slot's `impl_status_<slot>` reads `implementing`, or `claude agents` reads it busy or `gone`.
-- Otherwise it runs today's path unchanged:
-  - it truncates `impl_summary_<slot>.txt` and writes `impl_status_<slot>` (`implementing`, then `implemented` or `error`);
-  - it calls `start-pass` and `finish-pass` as the launcher;
-  - under `PLAN_DELEGATE_RESOLVES_ROUND=1`, it runs `findings.py landed` or `abandon --edits-landed`;
-  - it posts a register line carrying `role=<kind>` and `follow-up to <seat>`, and the `launcher:` `done` or `blocked` post.
-
-  It appends a fixed trailer to the message: write `impl_summary_<slot>.txt` as your last act, then post `done`.
-- **Codex:** a new `codex_mesh.py follow --session-dir <dir> --to <seat> --message-file <path>`.
-  - It refuses unless the roster entry reads `done` or `failed`. A `failed` entry is followable only after `thread/read` shows no live turn, the check `start` already makes before reusing one (`codex_mesh.py` near line 835); a live turn is refused.
-  - It sets the entry to `running`, calls `thread/resume`, starts one turn on that thread, and streams it. The streaming loop is the one `start` uses, pulled out of `_attach_and_run` into one function both verbs call. It ends with the same roster states.
-  - It waits on the turn id it started, so an earlier `done` cannot end the wait.
-  - When the recorded app-server is gone, it starts one and resumes the thread from its rollout. A resume that fails exits 1 with the server's error.
-- **Claude:** it sends through `send.py` (a `QUEUED` result is an error), then waits with a turn-completion check that cannot miss a turn shorter than the 15 s poll: a transcript turn count, not busy-then-idle.
-- **Docs:**
-  - `docs/delegate/write_prompt_contract.md` <PhaseMesh/>: a finished Codex seat is reached only through `implement.sh --to`.
-  - `commands/unit/delegate.md` <FixDispatch/>: a repair whose files sit with an open seat may go to that seat through `implement.sh --to`.
-  - Both docs: a message to a seat without the launcher is for questions only.
-  - <DispatchContract/> item 6 and <FixDispatch/>'s third outcome name the follow-up as well as a new seat.
-
-- **One claim per seat.** `implement.sh --to` takes the seat in one locked step that checks the full seat name, slot and family and marks it busy before any status or pass write; a second follow-up to the same seat, started at the same moment, exits 2 with nothing recorded. The seat's identity is the durable record made at its launch (slot, family, model, and the full Claude session id or Codex thread id), not the `seats` ledger's short id or metadata `implement.sh` rewrites each run; a wrong slot or changed configuration exits 2. The claim names the launcher's pid and the turn it started; a claim whose launcher is dead is released and its status set to `error`. The launcher posts `done` only after the pass and, for a repair, `findings.py landed` are recorded; a failed ledger write is `blocked`. `codex_mesh.py`'s roster record gives the seat a named state (followable: done or failed; active, with its turn id) instead of a free-form `status` string and an empty `turn_id`.
-- **When a Claude seat's turn is done.** The launcher reads the seat's transcript (`~/.claude/projects/*/<session id>.jsonl`, the id from `~/.claude/sessions/<pid>.json`), counts its finished assistant turns before sending, and waits until the count grows and the seat is idle; `scripts/agents/agent_bg.sh` gains that attach path beside its launch path. A turn shorter than the poll interval still counts.
-- **`scripts/whoami/agent_accounts.py` passes basedpyright** (the showrunner, 2026-10-06 13:5x PDT; the defects date from 2026-09-24 and are not this plan's work): lines 419–448 cast `CodexRateLimits` to `dict[str, object]` (`reportInvalidCast`) and read its fields as unknowns (8 warnings). Read them through the TypedDict's own keys, so the file reports 0 errors and 0 warnings with no new ignore and the same values.
-- **A failed review pause can be retried** (moved from Phase 6 by the unit director under the hard landing, 2026-10-06 14:5x PDT; Phase 6's closure review found it). `scripts/production/review_pause.py` writes its pause record first, so resume knows what to undo, then stops the notifier. When that stop fails, the record stays, and every retry returns the status early (line 75) without stopping the dailies or turning the footers off. The record names each action that completed (dailies stopped, footers off, per production), never the intent, so a retry redoes only what did not happen and resume undoes only what did.
-- **A failed token release reaches the seat** (architect review after Phase 6). Since Phase 6, `board.sh release` fails closed when the step group cannot be shown stopped, but `verify.sh` calls release with its error suppressed and `|| true` (line 804), so the seat sees success while the token stays locked. A failed release prints board.sh's reason and makes verify exit non-zero; a failed acquire is reported once, never retried blindly.
-- **Named states, not flags** (type design). `codex_mesh.py`'s roster record is one of followable (done or failed, no live turn), active (with its turn id) or waiting for capacity; the pause record is the set of completed actions; the live-server check returns a named live or restart outcome instead of `int | None`.
-
-**Files:**
-- `scripts/delegate/implement.sh` — `--to`.
-- `scripts/agents/codex_mesh.py` — `follow` and the shared turn loop.
-- `scripts/agents/agent_bg.sh` — attach to an open Claude seat.
-- `scripts/whoami/agent_accounts.py` — basedpyright clean.
-- `scripts/production/review_pause.py` — a failed pause leaves nothing that stops a retry.
-- `scripts/production/test_review_pause.py` — a failed stop, then a retry.
-- `scripts/delegate/verify.sh` — a failed release fails the run.
-- `scripts/delegate/test_verify_token_wait.py` — a release that fails closed.
-- `commands/unit/delegate.md`, `docs/delegate/write_prompt_contract.md` — the rules above.
-- `scripts/delegate/test_implement_launcher.py` — `--to` cases (copy `findings.py` into its temporary tree so round resolution is covered).
-- `scripts/agents/test_codex_mesh.py` — `follow` cases on `StubAppServer`.
-
-**Seats:** 2 writers + 1 tester.
-- `impl` — `scripts/delegate/implement.sh`, `scripts/agents/codex_mesh.py`, `scripts/agents/agent_bg.sh`, `commands/unit/delegate.md`, `docs/delegate/write_prompt_contract.md`; post `done` without waiting for the test seat.
-- `impl2` — `scripts/production/review_pause.py`, `scripts/production/test_review_pause.py`, `scripts/whoami/agent_accounts.py`, `scripts/delegate/verify.sh`, `scripts/delegate/test_verify_token_wait.py`; writes its own tests.
-- `test` — `scripts/delegate/test_implement_launcher.py`, `scripts/agents/test_codex_mesh.py`, from the Spec alone; owns the final suite run:
-  - a `failed` roster entry whose thread still has a live turn is refused;
-  - a Claude follow-up on a stubbed session, transcript and `send.py`: a turn shorter than the poll counts, a `QUEUED` send is an error, a seat gone after delivery is `error`;
-  - a wrong slot or changed configuration exits 2; a launcher killed before and after turn start leaves a claim the next call recovers; a failed ledger write posts `blocked`;
-  - `follow` on a `done` seat runs one turn on the same thread (`thread/resume`, then one `turn/start`), and the roster ends `done`;
-  - `follow` on a `running` seat exits 2 and sends nothing;
-  - an earlier turn's completion does not end `follow`'s wait;
-  - `--to` records one pass for the slot and resolves the round `landed`; a worker error records `abandon --edits-landed` and the `blocked` post;
-  - an unknown seat, or a busy one, exits 2 before any pass or status write.
-
-**Constraints from prior phases:**
-- Phase 5 (as built): the stall watcher counts `implement.sh` as running work, so a follow-up launcher keeps its unit from being bumped.
-- `commands/unit/delegate.md` and `docs/delegate/write_prompt_contract.md` are read by every unit director; name them in the checkpoint notice as `also touches` per production_format item 9.
-- Tests never start a real `codex` or `claude`, never write `~/.claude/sessions`, and run in temporary session directories.
-
-**Acceptance gate:**
-- From the worktree root, `python3 -m unittest discover -s scripts/delegate -p 'test_implement_launcher.py'` and `python3 -m unittest discover -s scripts/agents -p 'test_codex_mesh.py'` and `python3 -m unittest discover -s scripts/production -p 'test_review_pause.py'` and `python3 -m unittest discover -s scripts/delegate -p 'test_verify_token_wait.py'` green (pause tests cover a failure before and after the stop takes effect, and a later production failing in the same call); basedpyright 0 errors and 0 warnings on the changed `.py` files; `bash -n` on the changed shell scripts.
-- Live (unit director, after the merge reaches `~/.claude` main): in a scratch session directory and scratch worktree, a one-seat Codex dispatch writes a file. Then `implement.sh --to` that seat asks for a second line. The pass shows in the progress table, `impl_status` reads `implemented`, and the launcher's exit wakes the unit director. Repeat with a scratch Claude seat. Delete the scratch worktree after.
-
-### Phase 8 — `/unit:report off` and `on` stop and start a unit's progress updates · status: todo
-
 **Source:** the user, 2026-10-06 17:0x PDT, relayed by the showrunner (natedev): "`/unit:report off` stops this session's delegate-<run id> notifier, and `/unit:report on` starts it again. The run id is resolved from /tmp/claude/delegate/active/$CLAUDE_CODE_SESSION_ID, so the user can do it from the unit's own session without looking up the run id." Today the only way is `notifier.sh stop|start delegate-<run id>`.
 
-**Goal:** from a unit's own session, `/unit:report off` stops its progress updates and `/unit:report on` starts them again, with no run id to look up.
+**Goal:** from a unit's own session, `/unit:report off` stops its progress updates and `/unit:report on` starts them again, with no run id to look up. And the launcher's final status never runs ahead of what it records: `impl_status_<slot>` reads `implemented` only once the pass and the repair round are recorded.
 
 **Spec:**
-- `/unit:report off` runs `zsh ~/.claude/scripts/message/notifier.sh stop delegate-<run id>`, and `/unit:report on` runs `… start delegate-<run id>`, where the run id is the basename of the session directory that `/tmp/claude/delegate/active/$CLAUDE_CODE_SESSION_ID` names. It reports the notifier's result in one line. With no active run for the session, it says so in one line and changes nothing. `/unit:report` with no argument is unchanged.
-- The resolution lives in one script, so the command text carries no path logic; its tests stub `notifier.sh` and the active-run file through a temporary directory.
-- `commands/unit/delegate.md` → `<ProgressContract/>` names `notifier.sh stop|start` for stopping updates; if it needs a line naming `/unit:report off|on`, that line goes to the showrunner, which clears it with enh-showrunner (owner).
+- **`scripts/delegate/unit_notifier.sh <claude_session_id> [on|off]`.** The script already resolves the run id: the marker `${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}/<session id>` names the session directory, and its basename is the run id. With no mode it creates the instance exactly as today (`prepare_session.sh` calls it that way). With `off` it runs `notifier.sh stop delegate-<run id>`; with `on`, `notifier.sh start delegate-<run id>`. Both share today's marker reading, so the lookup stays in one place.
+- **Output.** On success it prints one line: `progress updates off: delegate-<run id>`, or `progress updates on: delegate-<run id>` followed by the next tick time that `notifier.sh start` prints. A missing or empty marker exits 1 with today's message and changes nothing. A `notifier.sh` failure (for example, no such instance) passes its message and exit status through. Any other mode word, or more than two arguments, prints the usage and exits 2.
+- **`commands/unit/report.md`.** Usage becomes `/unit:report [on|off]`, with an `argument-hint`. With `off` or `on`, the command runs `zsh ~/.claude/scripts/delegate/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID" off|on`, relays its line, and composes no report. Exit 1 means no active run for this session: say so in one line. A Codex unit has no notifier: say the switch is unavailable there, as `commands/unit/interval.md` does. `/unit:report` with no argument is unchanged.
+- **The launcher writes its final status last** (the showrunner, 2026-10-06 17:2x PDT, folding in a defect from before Phase 7). Today `scripts/delegate/implement.sh` writes `implemented` (line 511 at 4770e26) before `finish-pass` (line 513) and, under `PLAN_DELEGATE_RESOLVES_ROUND=1`, `findings.py landed` (line 528). A unit director reading the status between them reviews a round still in flight. The success path writes `implemented` only after both succeed; a failure in either still writes `error`, posts `blocked` and exits 1. The worker-error path writes `error` after its `finish-pass` and `abandon --edits-landed`, so neither final status comes before its records. Until then the file keeps reading `implementing`.
+- `commands/unit/delegate.md` → `<ProgressContract/>` names `notifier.sh stop|start` for stopping updates. If it needs a line naming `/unit:report off|on`, the unit director sends that line to the showrunner, which clears it with enh-showrunner (owner). Seats never edit `delegate.md`.
 
-**Files:** `commands/unit/report.md`; the resolving script and its test under `scripts/delegate/`.
+**Files:**
+- `scripts/delegate/unit_notifier.sh` — the `on|off` mode.
+- `commands/unit/report.md` — the arguments.
+- `scripts/delegate/test_delegate_check.py` — the mode's cases, beside today's `unit_notifier` tests.
+- `scripts/delegate/implement.sh` — the final status written after the records.
+- `scripts/delegate/test_implement_launcher.py` — the order.
 
 **Seats:** 1 writer + 1 tester.
+- `impl` — `scripts/delegate/unit_notifier.sh`, `commands/unit/report.md`, `scripts/delegate/implement.sh`.
+- `test` — `scripts/delegate/test_delegate_check.py`, `scripts/delegate/test_implement_launcher.py`, from the Spec alone; owns the final suite run:
+  - `off` then `on` round trip on an instance that `unit_notifier.sh` created: the instance reads disabled, then enabled, and each run prints its one line;
+  - `off` with no marker exits 1 and leaves the notifier state directory untouched;
+  - a bad mode word exits 2;
+  - `on` for a run whose instance was never created passes notifier's failure through, with a non-zero exit;
+  - with stub `finish-pass` and `findings.py landed` that record the status file's contents when they run, both see `implementing`, and the file ends `implemented`; a failing `landed` leaves `error`; the worker-error path's `finish-pass` and `abandon` also see `implementing`.
+
+**Constraints from prior phases:**
+- Tests run the real `notifier.sh` against a temporary `NOTIFIER_STATE_DIR`, `PLAN_DELEGATE_ACTIVE_DIR`, `PLAN_DELEGATE_CONFIG` and `NOTIFIER_NOW_EPOCH`, as `test_delegate_check.py`'s `environment()` does. They never touch the real notifier state or send to a real session.
+- `prepare_session.sh` calls `unit_notifier.sh` with one argument, and that call keeps working unchanged (today's `test_unit_notifier_creates_held_instance_with_rounded_interval`).
+
+**Acceptance gate:**
+- From the worktree root, `python3 -m unittest discover -s scripts/delegate -p 'test_delegate_check.py'` and `python3 -m unittest discover -s scripts/delegate -p 'test_implement_launcher.py'` are green.
+- basedpyright reports 0 errors and 0 warnings on both test files.
+- `zsh -n scripts/delegate/unit_notifier.sh` and `bash -n scripts/delegate/implement.sh` pass.
+- Live (unit director, after the merge reaches `~/.claude` main): in this unit's session, `/unit:report off`, then `notifier.sh status delegate-<run id>` reads disabled; then `/unit:report on` re-enables it.
 
 ### Moved: re-measure after both hooks are live (was Phase 8)
 
