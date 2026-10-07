@@ -313,7 +313,7 @@ A unit's `then` in the dailies input is a JSON list of one-line items, one per u
 
 **Ruled out:** teaching `unit_status.sh` to flag `gate:` in this change, since that is a script outside the phase's files and changes what the dailies show.
 
-### Phase 9 — Dailies input builder · status: todo
+### Phase 9 — Dailies input builder · status: done
 
 #### Work Order
 
@@ -423,6 +423,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 
 **Constraints from prior phases:**
 - Phase 5 (as built): the reader, the named states and the step-line form are `merge_checkpoint.py`'s; reuse them by import. `stall_watch.py` reads the notifier conf's `CHECK=` path and the Units rows' Plan cell; do not change what it reads.
+- Phase 9 (as built): `produce.md`'s scheduled-update prompt already writes `unit_status.sh`'s full output to `<SCRATCH>/unit_status.txt` and runs `/showrunner:dailies simple`, which reads that file through `dailies_input.py`. The template this command expands keeps both; do not rewrite them.
 - Phases 9 and 10 add their own commands; this phase does not touch them.
 - Tests never start a real `claude`, `tmux`, `systemd-run` or `ssh`, never write `~/.claude/config/`, `~/.local/state/` or a real production doc, and never push anywhere but a temporary bare repository.
 - Both new files are outside this unit's **Owns**: the checkpoint notice names each as `also touches <path>`.

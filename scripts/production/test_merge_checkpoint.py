@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -11,6 +12,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import NamedTuple, cast, final, override
+
+from merge_checkpoint import (CodeCheckpoint, LastMerged, NoMerge, ShrinkCommit,
+                              merge_branch_history, merge_history, request_from)
 
 
 SCRIPT = Path(__file__).with_name("merge_checkpoint.py")
@@ -769,6 +773,102 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertIn("scope: held", staged.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), before)
         self.assertEqual(self.git("diff", "--cached", "--name-only"), "unrelated.txt")
+
+    def test_merge_branch_reader_reports_no_merge_before_checkpoints(self) -> None:
+        history = merge_branch_history(self.checkout, "production")
+        self.assertIsInstance(history.last_merge(), NoMerge)
+        self.assertIsInstance(history.last_for_unit("alpha-unit"), NoMerge)
+        self.assertIsInstance(history.last_code_for_unit("alpha-unit"), NoMerge)
+        self.assertEqual(history.code_merge_count(), 0)
+        self.assertFalse(history.has_code_merge("alpha-unit", "2"))
+
+    def test_merge_reader_keeps_subject_from_earlier_branch_name(self) -> None:
+        code = self.checkpoint()
+        _ = self.git("merge", "--no-ff", "-m",
+                     f"Merge alpha-unit phase 2 ({code[:7]}) into old-name", "alpha-branch")
+        history = merge_branch_history(self.checkout, "production")
+        entry = history.last_code_for_unit("alpha-unit")
+        self.assertNotIsInstance(entry, NoMerge)
+        if isinstance(entry, NoMerge):
+            self.fail("merge under earlier branch name was not read")
+        self.assertEqual((entry.unit, entry.phase, entry.short), ("alpha-unit", "2", code[:7]))
+        self.assertIsInstance(entry.kind, CodeCheckpoint)
+        self.assertTrue(history.has_code_merge("alpha-unit", "2"))
+
+    def test_merge_history_uses_code_checkpoint_after_shrink(self) -> None:
+        code = self.checkpoint()
+        _ = self.git("merge", "--no-ff", "-m",
+                     f"Merge alpha-unit phase 2 ({code[:7]}) into production", "alpha-branch")
+        code_merge = self.git("rev-parse", "HEAD")
+        shrink = self.checkpoint("docs/plans/alpha.md", "short as built\n", subject="shrink")
+        _ = self.git("merge", "--no-ff", "-m",
+                     f"Merge alpha-unit phase 2 shrink ({shrink[:7]}) into production", "alpha-branch")
+        shrink_merge = self.git("rev-parse", "HEAD")
+        history = merge_branch_history(self.checkout, "production")
+        last_any = history.last_for_unit("alpha-unit")
+        last_code = history.last_code_for_unit("alpha-unit")
+        self.assertNotIsInstance(last_any, NoMerge)
+        self.assertNotIsInstance(last_code, NoMerge)
+        if isinstance(last_any, NoMerge) or isinstance(last_code, NoMerge):
+            self.fail("checkpoint history was not read")
+        self.assertEqual(last_any.merge_hash, shrink_merge)
+        self.assertIsInstance(last_any.kind, ShrinkCommit)
+        self.assertEqual(last_code.merge_hash, code_merge)
+        self.assertIsInstance(last_code.kind, CodeCheckpoint)
+        request = request_from(argparse.Namespace(
+            production=str(self.doc), unit="alpha-unit", phase="2", hash=code,
+            also=[], shrink=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS,
+            cancel_prior=False, started=STARTED, regime="after", holds=0,
+            merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
+        ))
+        latest = merge_history(request)
+        self.assertIsInstance(latest, LastMerged)
+        if isinstance(latest, LastMerged):
+            self.assertEqual(latest.hash, code)
+
+    def test_merge_branch_reader_queries_last_any_last_unit_and_code_count(self) -> None:
+        alpha_code = self.checkpoint(content="alpha phase two\n")
+        _ = self.git("merge", "--no-ff", "-m",
+                     f"Merge alpha-unit phase 2 ({alpha_code[:7]}) into production", "alpha-branch")
+        alpha_merge = self.git("rev-parse", "HEAD")
+        self.write(self.other, "src/beta.txt", "beta phase one\n")
+        _ = self.git("add", "src/beta.txt", cwd=self.other)
+        _ = self.git("commit", "-m", "beta phase one", cwd=self.other)
+        beta_code = self.git("rev-parse", "HEAD", cwd=self.other)
+        _ = self.git("merge", "--no-ff", "-m",
+                     f"Merge beta-unit phase 1 ({beta_code[:7]}) into production", "beta-branch")
+        beta_merge = self.git("rev-parse", "HEAD")
+        shrink = self.checkpoint("docs/plans/alpha.md", "short as built\n", subject="shrink")
+        _ = self.git("merge", "--no-ff", "-m",
+                     f"Merge alpha-unit phase 2 shrink ({shrink[:7]}) into production", "alpha-branch")
+        shrink_merge = self.git("rev-parse", "HEAD")
+
+        history = merge_branch_history(self.checkout, "production")
+        latest = history.last_merge()
+        self.assertNotIsInstance(latest, NoMerge)
+        if isinstance(latest, NoMerge):
+            self.fail("shrink merge was not read")
+        self.assertEqual((latest.unit, latest.phase, latest.short, latest.merge_hash),
+                         ("alpha-unit", "2", shrink[:7], shrink_merge))
+        self.assertIsInstance(latest.kind, ShrinkCommit)
+        alpha = history.last_for_unit("alpha-unit")
+        self.assertEqual(alpha, latest)
+        alpha_code = history.last_code_for_unit("alpha-unit")
+        self.assertNotIsInstance(alpha_code, NoMerge)
+        if isinstance(alpha_code, NoMerge):
+            self.fail("alpha code merge was not read")
+        self.assertEqual(alpha_code.merge_hash, alpha_merge)
+        beta = history.last_for_unit("beta-unit")
+        self.assertNotIsInstance(beta, NoMerge)
+        if isinstance(beta, NoMerge):
+            self.fail("beta merge was not read")
+        self.assertEqual((beta.unit, beta.merge_hash), ("beta-unit", beta_merge))
+        self.assertIsInstance(beta.kind, CodeCheckpoint)
+        self.assertEqual(history.code_merge_count(), 2)
+        self.assertTrue(history.has_code_merge("alpha-unit", "2"))
+        self.assertTrue(history.has_code_merge("beta-unit", "1"))
+        self.assertFalse(history.has_code_merge("alpha-unit", "3"))
+        self.assertEqual(history.entries[-1].merge_hash, alpha_merge)
 
 
 if __name__ == "__main__":

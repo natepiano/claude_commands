@@ -66,6 +66,40 @@ class LastMerged(NamedTuple):
     hash: str
 
 
+class NoMerge(NamedTuple):
+    pass
+
+
+class MergeEntry(NamedTuple):
+    unit: str
+    phase: str
+    short: str
+    merge_branch: str
+    merge_hash: str
+    kind: CodeCheckpoint | ShrinkCommit
+
+
+class MergeBranchHistory(NamedTuple):
+    entries: tuple[MergeEntry, ...]
+
+    def last_merge(self) -> MergeEntry | NoMerge:
+        return self.entries[0] if self.entries else NoMerge()
+
+    def last_for_unit(self, unit: str) -> MergeEntry | NoMerge:
+        return next((entry for entry in self.entries if entry.unit == unit), NoMerge())
+
+    def last_code_for_unit(self, unit: str) -> MergeEntry | NoMerge:
+        return next((entry for entry in self.entries
+                     if entry.unit == unit and isinstance(entry.kind, CodeCheckpoint)), NoMerge())
+
+    def code_merge_count(self) -> int:
+        return sum(isinstance(entry.kind, CodeCheckpoint) for entry in self.entries)
+
+    def has_code_merge(self, unit: str, phase: str) -> bool:
+        return any(entry.unit == unit and entry.phase == phase and isinstance(entry.kind, CodeCheckpoint)
+                   for entry in self.entries)
+
+
 class CodeCheckpoint(NamedTuple):
     pass
 
@@ -253,25 +287,34 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
                         cast(str | None, args.excluded) or "")
 
 
-def merge_history(request: MergeRequest) -> FirstMerge | LastMerged:
-    output = good(git(request.production.checkout, "log", request.production.merge_branch,
-                      "--format=%H%x00%s"), "ancestry")
-    pattern = re.compile(rf"^Merge {re.escape(request.unit.name)} phase [^ ]+ \(([0-9a-f]+)\)")
+def merge_branch_history(checkout: Path, merge_branch: str) -> MergeBranchHistory:
+    """Read checkpoint merge subjects on a branch, newest first."""
+    output = good(git(checkout, "log", merge_branch, "--format=%H%x00%s"), "ancestry")
+    pattern = re.compile(r"^Merge (.+?) phase (\S+?)( shrink)? \(([0-9a-f]+)\)")
+    entries: list[MergeEntry] = []
     for row in output.splitlines():
-        _, _, subject = row.partition("\x00")
-        match = pattern.match(subject)
-        if match:
-            checkpoint = good(git(request.production.checkout, "rev-parse", match.group(1) + "^{commit}"),
-                              "ancestry")
-            return LastMerged(checkpoint)
-    return FirstMerge()
+        merge_hash, separator, subject = row.partition("\x00")
+        match = pattern.match(subject) if separator else None
+        if match is None:
+            continue
+        unit, phase, shrink, short = match.groups()
+        entries.append(MergeEntry(unit, phase, short, merge_branch, merge_hash,
+                                  ShrinkCommit() if shrink else CodeCheckpoint()))
+    return MergeBranchHistory(tuple(entries))
+
+
+def merge_history(request: MergeRequest) -> FirstMerge | LastMerged:
+    latest = merge_branch_history(request.production.checkout, request.production.merge_branch).last_code_for_unit(
+        request.unit.name)
+    if isinstance(latest, NoMerge):
+        return FirstMerge()
+    checkpoint = good(git(request.production.checkout, "rev-parse", latest.short + "^{commit}"), "ancestry")
+    return LastMerged(checkpoint)
 
 
 def code_merged(request: MergeRequest) -> bool:
-    output = good(git(request.production.checkout, "log", request.production.merge_branch,
-                      "--format=%s"), "ancestry")
-    return any(line.startswith(f"Merge {request.unit.name} phase {request.phase} (")
-               for line in output.splitlines())
+    history = merge_branch_history(request.production.checkout, request.production.merge_branch)
+    return history.has_code_merge(request.unit.name, request.phase)
 
 
 def ancestry(request: MergeRequest) -> bool:

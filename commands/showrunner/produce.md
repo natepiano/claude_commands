@@ -260,12 +260,12 @@ Run these steps at the start and on every resume:
 The prompt:
 
 > Scheduled update (every <N> minutes, every unit in full; the user is in
-> <zone>). Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> --showrunner <this session's name> | cut -c1-400`.
+> <zone>). Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> --showrunner <this session's name> > <SCRATCH>/unit_status.txt`.
 > It checks every unit director: its session and Claude are running, anything waiting
-> on the user, and its latest step and ETA. Then give the user
-> `/showrunner:dailies simple` for every unit and open topic. If the script
-> shows SESSION GONE, CLAUDE NOT RUNNING, FORM WAITING, a usage limit, or a
-> DECISION for the user, that subject goes first, with `needed:` saying what
+> on the user, and its latest step and ETA. Run `/showrunner:dailies simple`
+> for every unit and open topic; its input builder reads the saved status file.
+> Follow each `flags first:` line: a SESSION GONE, CLAUDE NOT RUNNING, FORM
+> WAITING, usage-limit or DECISION subject goes first, with `needed:` saying what
 > the user must do. Do no other work in this turn, except `/unit:eta` requests,
 > merging a unit's checkpoint on a fresh design-check pass, acting on a BLOCK
 > past its limit (`/showrunner:produce` → Dependencies, rule 4), and compacting
