@@ -1,6 +1,6 @@
 # cache-evict: the disk floor takes from the least used build cache first
 
-> **Status: IMPLEMENTATION PLAN — phased, delegate-ready; approved by the showrunner 2026-10-06 (Phase 2 `--forecast` dropped, the re-measure renumbered Phase 2).** Below its free-space floor, the disk floor sweep removes only the shortfall, but today it spreads that across every idle target by compile age, so each active unit loses part of its working set. This plan makes it take from the least recently used target first, records each target's last build so a test rerun counts as use, names in the journal whose cache went, and re-measures a day later.
+> **Status: IMPLEMENTATION PLAN — phased, delegate-ready; approved by the showrunner 2026-10-06 (Phase 2 `--forecast` dropped, the re-measure renumbered Phase 2); the showrunner added the memory gate as Phase 2 at 16:33 PDT, so the re-measure is Phase 3.** Below its free-space floor, the disk floor sweep removes only the shortfall, but today it spreads that across every idle target by compile age, so each active unit loses part of its working set. This plan makes it take from the least recently used target first, records each target's last build so a test rerun counts as use, names in the journal whose cache went, then makes the build memory gate hold a step until the memory it will need is free, and re-measures the floor a day later.
 
 > **Production: build-followups** — unit `cache-evict-unit`; production doc `docs/plans/build-followups-production.md`
 
@@ -37,19 +37,20 @@ i.e. figuring out the safest buld cache to delete in such situations so we don't
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. This plan changes the disk floor's eviction order in `scripts/lint/sweep.py` (Phase 1) and re-measures a day after it is live (Phase 2). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-cache-evict` on branch `build-followups-cache-evict` (unit `cache-evict-unit` of production `build-followups`). Name both in every Work Order.
+- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. This plan changes the disk floor's eviction order in `scripts/lint/sweep.py` (Phase 1), makes the build memory gate (`scripts/lint/memory_gate.sh`) admit a step only when its expected peak fits (Phase 2), and re-measures the floor a day after Phase 1 is live (Phase 3). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-cache-evict` on branch `build-followups-cache-evict` (unit `cache-evict-unit` of production `build-followups`). Name both in every Work Order.
 - **Project started:** 2026-10-06T22:31:00+00:00
 - **Stack:** Python 3.13, standard library only.
 - **Layout:**
   - `scripts/lint/sweep.py` — budget sweep, doc-index prune, disk floor, floor alerts; header docstring holds the policy and its measurements
   - `scripts/lint/test_sweep.py` — its tests; `FloorTests` (helpers `base()`, `hold()`, `cargo_target()`, `unit()`) covers the floor
+  - `scripts/lint/memory_gate.sh` — `buildlog_wait_for_memory`, sourced by `scripts/lint/invoke.sh` (`run_once`) and the BRP launch hook `scripts/hooks/pre-tool-use-brp-launch-gate.sh`; its rule is documented in `docs/as-built/build-memory-admission.md` "The memory gate"
   - `config/lint.conf` — `sweep_free_floor_gib.natedev` (300 GiB since the user lowered it from 500 on 2026-10-06) and its comment
   - outside the repository: `~/.local/state/lint-sweep/` (floor lock, `floor.json`), `journalctl --user -u disk-floor.service` (EDT), `~/.local/state/buildlog/index.sqlite` (UTC; read only, `?mode=ro`)
 - **Key files:** `scripts/lint/sweep.py` (`Group`, `group_roots`, `scan_roots`, `choose`, `shrink`, `hold_floor`, `sweep_workspace`, `main`, header paragraphs "The disk floor" and "Last use"); `scripts/lint/invoke.sh:229–248` (`sweep_after_step`), `:355–369` (`invoke_sweep`); `scripts/buildlog/parse.py:49–52` (the lines it counts); `docs/as-built/build-memory-admission.md` "Disk-floor alerts" (as-built to amend at run end).
 - **Test lanes:** `scripts/lint/` — `test_*.py` beside the scripts.
 - **Build:** none.
-- **Test:** `python3 -m unittest discover -s scripts/lint -p 'test_sweep.py'` from the worktree root. Merge tests (production): `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'`.
-- **Lint:** `basedpyright scripts/lint/sweep.py scripts/lint/test_sweep.py` passes when its output ends `0 errors, 0 warnings, 0 notes` (it exits 3 in every checkout; the status says nothing).
+- **Test:** `python3 -m unittest discover -s scripts/lint -p 'test_*.py'` from the worktree root. Merge tests (production): `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'`.
+- **Lint:** `basedpyright` on each changed Python file under `scripts/lint/` passes when its output ends `0 errors, 0 warnings, 0 notes` (it exits 3 in every checkout; the status says nothing).
 - **Style:** none — not Rust.
 - **Invariants:**
   - Never remove output from a target whose cargo locks a build holds; the floor keeps taking every idle target's locks for its whole scan and removal, as now.
@@ -67,7 +68,7 @@ i.e. figuring out the safest buld cache to delete in such situations so we don't
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
-| G1 | Phase 2 | 24 h after Phase 1 reaches `~/.claude` main (T_live, its As-built) | the clock |
+| G1 | Phase 3 | 24 h after Phase 1 reaches `~/.claude` main (T_live, its As-built) | the clock |
 
 ## Phases
 
@@ -99,7 +100,53 @@ i.e. figuring out the safest buld cache to delete in such situations so we don't
 
 **Ruled out:** a `--forecast` mode (the re-measure reads the journal instead); moving the stamp ahead of `invoke.sh`'s rate limit (the lag only reorders targets used within the same 5 minutes).
 
-### Phase 2 — Re-measure a day after the target order went live · status: todo
+### Phase 2 — The memory gate holds a build until the memory it will need is free · status: done
+
+#### Work Order
+
+Work only in worktree `/home/natepiano/worktrees/claude-build-followups-cache-evict`, branch `build-followups-cache-evict`. State every time in PDT.
+
+**Source (showrunner, 2026-10-06 16:33 PDT):** earlyoom killed 5 builds between 15:31 and 16:29 PDT, the user's important test among them: hana builds in the tool-based-ui demo, widget (x2) and frame-time worktrees, and the sccache server at 16:09. `scripts/lint/memory_gate.sh` starts a build whenever `MemAvailable` is at least 12 GiB and reserves nothing, so several hana nextest steps each see 12 GiB free, all start, and each grows to 7–25 GB. Admit a step only when `MemAvailable`, less the growth still expected from steps already running, covers this step's expected peak; expected peaks from build-log history (repo + step, a high percentile of `peak_mem_bytes`), with a fallback when there is no history. Keep the 15-min limit, make the wait visible in the step's output, and replay today's kill windows.
+
+**Measured (unit director, 16:40 PDT):** at the kills (UTC 22:31:12, 23:02:27, 23:09:36, 23:09:54, 23:29:21) 9, 7, 7, 6 and 2 steps were running, nearly all `hana` `nextest` from `verify.sh`, each peaking at 7–23 GiB (`steps.peak_mem_bytes`); every one had started with `mem_wait_s` 0–31. Over the build log's history on natedev, `hana nextest` (5,366 runs) peaks p50 10.2 GiB, p90 20.3, p95 24.6; `hana clippy` p90 7.6, `hana mend` 8.0, `hana check` 3.1, `cargo-liner nextest` 6.5. `MemTotal` is 60.5 GiB; earlyoom sends SIGTERM at 5% available. `peak_mem_bytes` is the scope's `memory.peak`, page cache included, which `MemAvailable` already counts as free: in the 105 `hana nextest` runs with no other `builds.slice` step beside them, the slice's `builds_anon_bytes` (60 s samples) peaked at a median 31% of the step's `peak_mem_bytes`, p90 61%, max 105%; `hana clippy` p90 65% (17 runs), `hana mend` 58% (22). A live `widget-enhancements` mend scope at 16:55 PDT held 1.0 GiB anon and 3.6 GiB file. So `need` and running steps' use are process memory (`anon`), not `memory.peak`.
+
+**Goal:** a build step starts only when the memory it is expected to reach fits beside the growth still expected from the steps already running, so a burst of large test steps runs in turn instead of together and earlyoom stops killing them.
+
+**Spec:**
+- **The rule.** All sizes are process memory: `memory.stat` `anon`, which page reclaim cannot take back. For a step that compiles (`buildlog_step_compiles`, unchanged):
+  - `need` — its expected anon peak, the first of these that applies, each the 90th percentile (`nearest_rank` rule: sorted index `(90*n+99)//100-1`) over this host and the same repo and step in the last 14 days, with at least 5 values:
+    1. the anon peaks the gate measured itself (`admission/anon_peaks.jsonl`, below);
+    2. the build log's `peak_mem_bytes` × `ANON_SHARE` = 0.65, the measured p90 anon share above (state the measurement beside the constant);
+    3. otherwise the fallback, 12 GiB.
+
+    Repo and step are derived exactly as the build log derives them: `parse.step_name(argv)` and the folder name of `record.git_facts(record.git_directory(argv, cwd))["repo_path"]` (imports from `scripts/buildlog/`, read only). The index is `store.root() / "index.sqlite"`, opened `?mode=ro`; a missing or unreadable index or history file, or no repo, skips that source.
+  - `promised` — the sum, over live reservations, of `max(0, need_i - anon_i)`, where `anon_i` is the `anon` line of `memory.stat` in that step's scope cgroup; 0 when the step has no scope or the cgroup is gone, so an unscoped step counts its whole `need`.
+  - `reserve` — earlyoom's line: 5% of `MemTotal`, or 0 when the meminfo has no `MemTotal` line.
+  - Admit when `MemAvailable >= need + promised + reserve`. With no live reservation, admit at `MemAvailable >= min(need + reserve, 12 GiB)`: a step alone never waits for more than today's gate asked, since no running step will free anything.
+- **Measuring a step.** `BUILDLOG_SCOPE_SH` (`invoke.sh`) writes its scope's cgroup directory to `"$0.cgroup"` as its first action after the marker, and reuses that path for the `memory.peak` read at its end; `record.py` never reads the sidecar. While an admitted, scoped step runs, `run_once` keeps one background sampler that reads the scope's `memory.stat` `anon` every second with shell builtins and keeps the maximum beside the reservation. On release the sampler stops, and a step that has a measured maximum appends one line to `admission/anon_peaks.jsonl`: host, repo, step, worktree, the anon peak in bytes, the step's exit status and its end time (UTC ISO). Release deletes the reservation, the maximum and the `.cgroup` sidecar.
+- **The ledger.** One file per admitted step under `store.root() / "admission"` (so every test that moves `BUILDLOG_DIR` or `HOME` gets its own), holding the step's pid, that pid's start time (`/proc/<pid>/stat` field 22), `need`, repo, step, worktree, admission time and the scope sidecar's path once known. The check, the pruning and the write happen under one exclusive `fcntl.flock` on `admission/lock`, so two gates cannot both admit against the same free memory. A reservation whose pid is gone, or whose pid's start time differs, is deleted when read. A step admitted at the 15-min limit writes its reservation too.
+- **Who holds it.** `buildlog_wait_for_memory [ARGV...]` takes the step's argv; the pid recorded is the calling shell's `$BASHPID`, passed explicitly. It sets `BUILDLOG_MEM_OUTCOME` and `BUILDLOG_MEM_WAIT_S` as now, plus `BUILDLOG_MEM_RESERVATION` (the reservation's path, empty when none). `buildlog_release_memory` deletes that file and clears the variable; `run_once` calls it once the step returns, on every path (terminal, piped, sandbox failure). Called with no argv (the BRP launch hook, unchanged), the gate uses the fallback `need` and writes no reservation: the launch's build runs outside the hook's process.
+- **The split.** A new `scripts/lint/memory_admit.py` owns `need`, the ledger and the decision; `memory_gate.sh` keeps the poll loop, the 5 s interval and 900 s limit (`BUILDLOG_MEM_POLL_S`, `BUILDLOG_MEM_WAIT_LIMIT_S`), the build-hold marks and the outcome names (`Granted`, `TimedOut`, `MeminfoUnavailable`). The decision is one pure function over plain values (`MemAvailable`, `MemTotal` or none, `need`, and each live reservation's `need` and `anon`) returning a tagged admit or hold that carries the threshold, `promised` and `reserve`; the replay calls the same function. Python runs through `"$HOME/.claude/scripts/lib/py"`, as `record.py` does. A step admitted at once costs one Python start; name that cost in the header comment.
+- **The output** (stderr, which `verify.sh` folds into the step's log):
+  - On the first hold, one line, keeping today's prefix and clause so existing readers still match: `waiting for memory since HH:MM PDT: the machine has X.X GiB free; a build starts at Y.Y (<repo> <step> needs N.N GiB, <the 90th percentile of K measured runs | 0.65 of the 90th percentile peak of K runs | no history, so the fallback>; P.P GiB still promised to M running steps: <repo> <step> in <worktree>, …; R.R GiB kept for earlyoom)`. Omit the promised clause when M is 0 and the earlyoom clause when R is 0.
+  - Every 60 s while held: `still waiting for memory (N min): the machine has X.X GiB free; a build starts at Y.Y`. Never repeat the `waiting for memory since ` prefix.
+  - On admission after a hold: `memory free after N min S s: starting`.
+  - At the limit, today's line unchanged: `memory wait limit reached after 15 min; starting anyway`.
+- **Tests** (`scripts/lint/test_memory_admit.py`, fake meminfo, fake build-log index, fake cgroup tree, temporary ledger; never the real ones): the decision for alone, beside running steps, with a running step's `anon` counted, and with no `MemTotal`; `need` from measured peaks, falling to the build log at 4 measured values and using it at 5, the share applied, a stale row outside 14 days, another repo or host, and no index or history file; the sampler's maximum reaching `anon_peaks.jsonl` on release, and nothing appended for an unscoped step; the scope string writing the `.cgroup` sidecar (`test_invoke_scope.py`); two concurrent admissions against memory for one admit only one; a dead or reused pid's reservation is ignored and deleted; a step admitted at the limit holds a reservation; release deletes it; the gate's lines in order with no repeated prefix; no reservation without argv. The existing gate tests in `scripts/buildlog/test_record.py`, `scripts/build_hold/test_build_hold.py` and `scripts/delegate/test_verify_*.py` keep passing unchanged.
+- **The replay** (a scratch script under the session folder, never committed, calling the pure decision): for every step that compiled and arrived (`started_at - mem_wait_s`) in the 15 minutes before each of 22:31:12, 23:02:27, 23:09:36 and 23:29:21 UTC, in arrival order, re-deciding each held step at every later sample: `need` = tier 2 above, from rows that started before 2026-10-06 22:00 UTC (no measured anon peaks exist yet); `MemAvailable` = `MemTotal` − `mem_used_bytes` of the nearest `samples` row at or before the moment decided; `promised` = the admitted, still-running steps' `need` minus that sample's `builds_anon_bytes`, floored at 0. A held step stays out of the running set until admitted, then runs for its actual duration from that moment; the 15-min limit admits it regardless. Report per window, in PDT: arrival, worktree, repo and step, `need`, free, promised, admitted or held, the wait it would have had, and its actual peak and exit status; then the steps held, their total and longest wait (the cost), and which of the steps earlyoom actually killed would have been held. The free memory replayed is what the machine actually had, including steps the gate would have held, so the waits are an upper estimate; state that and each other approximation beside the table.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — new: expected peak, ledger, decision, the CLI the gate calls.
+- `scripts/lint/memory_gate.sh` — the loop calls it; the output lines; `BUILDLOG_MEM_RESERVATION`; `buildlog_release_memory`; the header states the rule.
+- `scripts/lint/invoke.sh` — `BUILDLOG_SCOPE_SH` writes the `.cgroup` sidecar; `run_once` passes the step's argv to the gate, runs the sampler, and releases the reservation on every path.
+- `scripts/lint/test_invoke_scope.py` — the sidecar holds the scope's cgroup directory.
+- `scripts/lint/test_memory_admit.py` — new: the tests above.
+
+**Seats:** 1 writer — `impl` writes the code and tests, then runs the replay and reports its table.
+
+**Acceptance gate:** `test_memory_admit.py`, `test_sweep.py`, `test_invoke_scope.py`, and the `scripts/buildlog`, `scripts/build_hold` and `scripts/delegate` suites named above pass; basedpyright reports `0 errors, 0 warnings, 0 notes` for `memory_admit.py` and `test_memory_admit.py`; the replay table reports, per kill window, which steps the gate would have held.
+
+### Phase 3 — Re-measure a day after the target order went live · status: todo
 
 #### Work Order
 
@@ -114,6 +161,7 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-cache-ev
 - From `journalctl --user -u disk-floor.service` (EDT) for B and W: timer sweeps that removed output, GiB taken, orphan GiB (the `orphaned files` line) apart, and the hours from each sweep back to the newest unit it took (median, min, max), from the `last used <oldest> to <newest>` removal line. In W that line spans oldest to newest unit; in B it named the last unit chosen, which under the old order was the newest by whole days, so label B's figure as that. Flag a sweep with a `could not remove` line as incomplete. Printed GiB are rounded.
 - From W's per-target lines (timer removals): GiB taken from targets whose last use was under 1 h, 1–6 h and over 6 h before the sweep, and the five targets that lost the most. The per-target lines of a complete sweep sum to its removal and orphan lines within rounding.
 - From the build log (`~/.local/state/buildlog/index.sqlite`, `?mode=ro`; schema in `scripts/buildlog/index.py`): `sum(sweep_freed_bytes)` of `step='sweep'` on natedev for B and W, reported as its own daily total beside the timer's.
+- Phase 2's memory gate reaches `~/.claude` main inside W; name that time beside the verdict, since holding builds in turn can change how fast targets grow.
 - Verdict, no threshold: the share of W's timer GiB taken from targets used under 1 h before the sweep, and GiB a day in W against B, compared within each floor segment (500 or 300 GiB). If the floor removed nothing in W, say so: zero GiB, no top five, no age share, the lowest free space W reached, and that the live order stays unobserved beyond Phase 1's read-only check.
 
 **Files:**
