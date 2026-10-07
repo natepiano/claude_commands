@@ -97,7 +97,7 @@ def png(width: int, height: int, brightness: int = 128) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
 
 
-def camera_components() -> dict[str, object]:
+def camera_components(physical_size: tuple[int, int] = (1280, 720), scale_factor: float = 1.0) -> dict[str, object]:
     angles = {"yaw": 0.0, "pitch": 0.3}
     return {
         "hana_lagrange::orbit_cam::OrbitCam": {
@@ -111,7 +111,7 @@ def camera_components() -> dict[str, object]:
             "viewport": None,
             "computed": {
                 "clip_from_view": [1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 0, -1.0, 0, 0, 0.1, 0],
-                "target_info": {"physical_size": [1280, 720], "scale_factor": 1.0},
+                "target_info": {"physical_size": list(physical_size), "scale_factor": scale_factor},
             },
         },
     }
@@ -125,6 +125,9 @@ class Fake:
         self.frame: int = 0
         self.screenshot: str = "ok"
         self.remote: Path | None = None
+        self.window_physical_size: tuple[int, int] = (1280, 720)
+        self.window_scale_factor: float = 1.0
+        self.window_scale_factor_override: float | None = None
         self.release: threading.Event = threading.Event()
         self.lock: threading.Lock = threading.Lock()
 
@@ -136,15 +139,24 @@ class Fake:
         with self.lock:
             self.calls.append({"method": method, "params": params})
             screenshots = sum(1 for call in self.calls if call["method"] == "brp_extras/screenshot")
+            if method == "world.mutate_components" and params.get("component") == WINDOW:
+                width, height = self.window_physical_size
+                if params.get("path") == ".resolution.physical_width":
+                    self.window_physical_size = (cast(int, params["value"]), height)
+                elif params.get("path") == ".resolution.physical_height":
+                    self.window_physical_size = (width, cast(int, params["value"]))
             if method == "brp_extras/get_diagnostics":
                 self.frame += 1
                 return {"result": {"frame_time_ms": {"current": 8.0}, "frame_count": float(self.frame)}}
         if method == "world.query":
-            return {"result": query(params)}
+            return {"result": query(self, params)}
         if method == "world.get_resources":
             return {"result": {"value": {"home": {"animation_duration_milliseconds": 2000}}}}
         if method == "world.get_components":
-            return {"result": {"components": camera_components(), "errors": {}}}
+            return {"result": {"components": camera_components(
+                self.window_physical_size,
+                self.window_scale_factor_override or self.window_scale_factor,
+            ), "errors": {}}}
         if method == "world.list_components":
             entity = params.get("entity")
             if entity is None:
@@ -175,13 +187,22 @@ class Fake:
         return {"result": None}
 
 
-def query(params: dict[str, object]) -> list[dict[str, object]]:
+def query(fake: Fake, params: dict[str, object]) -> list[dict[str, object]]:
     with_types = cast(dict[str, list[str]], params.get("filter") or {}).get("with", [])
     data = cast(dict[str, list[str]], params.get("data") or {})
     if EDITOR_CAMERA in with_types:
-        return [{"entity": CAMERA_ENTITY, "components": camera_components()}]
+        return [{"entity": CAMERA_ENTITY, "components": camera_components(
+            fake.window_physical_size,
+            fake.window_scale_factor_override or fake.window_scale_factor,
+        )}]
     if PRIMARY_WINDOW in with_types:
-        return [{"entity": WINDOW_ENTITY, "components": {}}]
+        width, height = fake.window_physical_size
+        return [{"entity": WINDOW_ENTITY, "components": {WINDOW: {"resolution": {
+            "physical_width": width,
+            "physical_height": height,
+            "scale_factor_override": fake.window_scale_factor_override,
+            "scale_factor": fake.window_scale_factor,
+        }}}}]
     if SWITCH_SLIDER in with_types:
         return [
             {"entity": entity, "components": {path: {"id": tool_id, "definition": definition}}, "has": {AABB: False}}
@@ -420,6 +441,42 @@ class ShotTests(HanaShotTest):
         self.assertEqual((attempt["status"], attempt["label"], attempt["view"]), ("success", "home", None))
         self.assertEqual(attempt["image_paths"], [str(self.scratch / "shot.png")])
         self.assertEqual([path.name for path in self.scratch.glob(".shot-*")], [])
+
+    def test_window_uses_override_scale_when_it_is_higher_than_base_scale(self) -> None:
+        self.fake.window_scale_factor = 1.0
+        self.fake.window_scale_factor_override = 2.0
+
+        result = self.shot("--mode", "home", "--window", "1280x720")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertCountEqual(self.fake.methods("world.mutate_components"), [
+            {"entity": WINDOW_ENTITY, "component": WINDOW,
+             "path": ".resolution.physical_width", "value": 2560},
+            {"entity": WINDOW_ENTITY, "component": WINDOW,
+             "path": ".resolution.physical_height", "value": 1440},
+        ])
+
+    def test_window_uses_override_scale_when_it_is_lower_than_base_scale(self) -> None:
+        self.fake.window_scale_factor = 2.0
+        self.fake.window_scale_factor_override = 1.0
+
+        result = self.shot("--mode", "home", "--window", "1280x720")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fake.methods("world.mutate_components"), [])
+
+    def test_window_uses_base_scale_when_override_is_absent(self) -> None:
+        self.fake.window_scale_factor = 2.0
+
+        result = self.shot("--mode", "home", "--window", "1280x720")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertCountEqual(self.fake.methods("world.mutate_components"), [
+            {"entity": WINDOW_ENTITY, "component": WINDOW,
+             "path": ".resolution.physical_width", "value": 2560},
+            {"entity": WINDOW_ENTITY, "component": WINDOW,
+             "path": ".resolution.physical_height", "value": 1440},
+        ])
 
     def test_session_evidence_uses_codex_thread_before_claude_code_session(self) -> None:
         cases: tuple[tuple[dict[str, str], dict[str, str]], ...] = (
