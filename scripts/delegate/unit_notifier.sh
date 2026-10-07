@@ -6,7 +6,11 @@ setopt no_unset pipe_fail extended_glob
 SCRIPT=${0:A}
 REPO=${SCRIPT:h:h:h}
 
-(( $# == 1 )) || { print -u2 -r -- 'usage: unit_notifier.sh <claude_session_id>'; exit 2; }
+(( $# == 1 || $# == 2 )) || { print -u2 -r -- 'usage: unit_notifier.sh <claude_session_id> [on|off]'; exit 2; }
+if (( $# == 2 )) && [[ $2 != on && $2 != off ]]; then
+  print -u2 -r -- 'usage: unit_notifier.sh <claude_session_id> [on|off]'
+  exit 2
+fi
 session_id=$1
 marker=${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}/$session_id
 if [[ ! -f $marker ]]; then
@@ -19,6 +23,17 @@ if [[ -z $session_dir ]]; then
   exit 1
 fi
 run_id=${session_dir:t}
+
+if (( $# == 2 )); then
+  if [[ $2 == off ]]; then
+    zsh "$REPO/scripts/message/notifier.sh" stop "delegate-$run_id" || exit $?
+    print -r -- "progress updates off: delegate-$run_id"
+  else
+    next_due=$(zsh "$REPO/scripts/message/notifier.sh" start "delegate-$run_id") || exit $?
+    print -r -- "progress updates on: delegate-$run_id $next_due"
+  fi
+  exit 0
+fi
 
 # The leading digits, as progress_timer.sh reads them, so a trailing comment
 # leaves the interval alone.
