@@ -39,7 +39,7 @@ The user, via natedev, 2026-10-06 13:1x PDT: "create a long running unit directo
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. This plan builds the screenshot episode report (Phase 1), counts screenshot scripts run in later calls (Phase 2), records every `/hana_shot` call with failures and the kept shot (Phase 3), runs the report hourly with each change's effect (Phase 4), then proposes improvements (Phase 5). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-screenshot` on branch `build-followups-screenshot` (unit `screenshot-unit` of production `build-followups`).
+- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. This plan builds the screenshot episode report (Phase 1), counts screenshot scripts run in later calls (Phase 2), records every `/hana_shot` call with failures and the kept shot (Phase 3), runs the report hourly with each change's effect (Phase 4), brings the Mac's transcripts up to date in a few hourly runs and fixes two report types (Phase 5), then proposes improvements (Phase 6). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-screenshot` on branch `build-followups-screenshot` (unit `screenshot-unit` of production `build-followups`).
 - **Project started:** 2026-10-06T20:30:00+00:00
 - **Stack:** Python 3.13, standard library only.
 - **Layout:**
@@ -55,7 +55,7 @@ The user, via natedev, 2026-10-06 13:1x PDT: "create a long running unit directo
 - **Lint:** `basedpyright <each changed .py file>` passes when its output ends `0 errors, 0 warnings, 0 notes`. It exits 3 in every checkout, so the exit status says nothing.
 - **Invariants:**
   - Tests never read the real `~/.claude/projects`, `~/.codex` or `~/.cache/hana-shot`; they use fixtures.
-  - The scan only reads transcripts. It never writes or moves one.
+  - The scan reads transcripts and timing logs read-only. It never writes or moves either source.
   - The hourly scan reads only new bytes since its cache, and stays under 30 s on a run with nothing new.
   - Each number in a report states its window, its split and its count. Medians and p90 come with n.
   - Python is typed throughout, with no `Any` and no file-level type ignores.
@@ -90,112 +90,168 @@ None.
 
 **Ruled out:** classifying a shell command by searching its whole text (it counted rg/cat/echo mentions and dropped real shots); treating heredoc bodies as text (a body fed to python/bash/sh runs).
 
-### Phase 2 — Screenshot scripts run in later calls count as screenshots · status: todo
+### Phase 2 — Screenshot scripts run in later calls count as screenshots · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a screenshot taken by a script the agent wrote earlier counts. Today a script written in one call (the Write tool, or a `cat >`/`tee` heredoc) and run in a later call is invisible: the later call holds only the script's path, so the report undercounts by-hand time in the projects that script their shots.
+- `transcripts.py` remembers scripts per transcript as `RememberedScript` (`content`, `classification_state`, `source`, `screenshot_calls`, `selected_content`). Sources: Claude `Write`, `Edit` of a remembered file, Codex `apply_patch` add/update/delete, `cat >`/`cat >>`/`tee` heredocs, and shell removals. Each script is tracked by normalized path and current content, so an append, replacement or deletion changes what a later run counts. Python content classifies through `_code_result` and shell content through `_shell_classification`, the same executing forms that classify a live call; there is no second classifier. Both readers read Write, Edit, `apply_patch` and path-only shell runs before their row filters; the Claude reader skips a `tool_result` line only when none of its `tool_use_id`s is pending.
+- A later shell call links to a remembered script through `python3`/`bash`/`sh`/`zsh <path>`, `./path`, `source`/`. path`, wrappers such as `timeout`, `os.exec*` and `subprocess.run`, by full path or by name relative to the call's directory (including `cd`). A remembered file that runs another remembered screenshot file is itself a screenshot file.
+- A run counts as a screenshot only when its arguments select the screenshot branch of a script that dispatches on arguments (argparse options and aliases, shell `$N` tests, `case`, sourced functions in command position); `selected_content` holds that branch. Any other run is a related call. `/hana_shot` calls are classified from their command line and never pass through script memory.
+- Image count of a scripted shot: the distinct `.png` paths in the result; with none, the screenshot calls the selected content makes (loops, `range()`, called functions, functions passed by reference, decorators), at least 1. One shell command running several scripts counts each.
+- `ToolCall` carries `script_path`, `script_paths` and `project_attribution`, which replaces `project_is_fallback: bool`. `ProjectAttribution` has five values: repository, scratchpad, last_path, removed_worktree, scratchpad_target_missing. A cwd under `/tmp/claude-<uid>/<encoded project dir>/<session>/scratchpad/…` belongs to the repository its encoded directory names (worktrees folded); a worktree deleted after the session folds into the live repository whose name it carries. The fold runs at the end of `scan_calls` over every call.
+- `scan_calls` reads transcripts in a `ProcessPoolExecutor` (up to 4 workers, one transcript per task, input sorted largest first) and returns `TranscriptScan` (a list of `ToolCall` with `candidate_file_count` and `bytes_read`); `shot_report.py scan` prints both. The scan only reads transcripts.
 
-**Spec:**
-- Within one transcript, remember each file a call writes whose content takes a screenshot or makes a related BRP call by Phase 1's executing forms: a Claude `Write` (and `Edit` of a file already remembered), a Codex `apply_patch` add or update, and a `cat >`/`cat >>`/`tee` heredoc in a shell command.
-- A later shell call that runs a remembered file — `python3 <path>`, `bash`/`sh`/`zsh <path>`, `./<path>`, `source`/`. <path>`, a wrapper such as `timeout 580 <path>`, by full path or by name relative to the call's directory — is a shot call (or a related call) with the file's source. A remembered file that runs another remembered screenshot file is itself a screenshot file.
-- A scripted shot call's image count is the distinct `.png` paths in its result; with none, the number of screenshot calls in the file, at least 1. Apply the same rule to a single shell command that takes several shots (a loop, a heredoc), which counts one image today.
-- In the Claude reader, a `tool_result` line is skipped only when none of its `tool_use_id`s is pending, not just the first.
-- A cwd under a Claude scratchpad (`/tmp/claude-<uid>/<encoded project dir>/<session>/scratchpad/…`) belongs to the project its encoded directory names (`-home-natepiano-rust-widget-enhancements` → that repository, worktrees folded), not to a project called `scratchpad`. Phase 1's real report shows 8 such episodes, 1.04 h.
-- The full scan took 48 s in the repair seat and 98 s in the unit director's default run on 2026-10-06; find what varies and hold it at 60 s or less.
-- Probe of the real transcripts on 2026-10-06 (loose match): 87 scripts written with a screenshot call, up to 487 later runs of them. State the measured counts in the As-built.
-- Both readers filter rows before classifying (Claude skips tool uses without a screenshot hint; Codex skips calls the classifier does not recognise). Read Write, Edit, `apply_patch` and path-only shell runs before those filters, or a later run that holds only a path never reaches the linker.
-- Track each remembered script by normalized path and its current content: an append, replacement or deletion updates it, so a run counts only the calls the file holds at that moment. Classify Python content with `_code_result` and shell content with `_shell_classification`.
-- Project attribution is a named state — resolved repository, decoded from a scratchpad path, or last-path fallback — replacing `ToolCall.project_is_fallback: bool`.
-- A heredoc script written and run in the same shell call already counts (Phase 1); the new tests cover runs in a later call.
-
-**Files:**
-- `scripts/shot_report/transcripts.py` — remembered script files per transcript; script-run detection; image counts for scripted shots
-- `scripts/shot_report/test_transcripts.py` and `scripts/shot_report/fixtures/classify/` — tests and samples
-
-**Seats:** 1 writer + 1 tester — the test lane is `scripts/shot_report/`, and the Spec names each write and run form.
-- `impl` — `transcripts.py`; runs the real-data probe and one scan
-- `test` — `test_transcripts.py` and `fixtures/classify/`: a Write then a later run, a `cat >` heredoc then a later `./` run, a script sourcing another screenshot script, a written script never run, a loop taking three shots, and a two-result line
-
-**Constraints from prior phases:** Phase 1's executing forms in `_shell_classification` decide whether a file's content takes a screenshot; reuse them, never a second classifier. Tests never read real transcripts. The full scan stays at 60 s or less.
-
-**Acceptance gate:**
-- Tests green; basedpyright 0/0.
-- On real data, the probe prints scripts remembered, later runs counted, and the by-hand change at the 5-min split; a sample of 20 counted runs read by hand are all runs of a screenshot script.
-- The seed's Claude MCP subset still gives 519 episodes / 47.65 h.
-- A full scan takes 60 s or less warm on natedev, printing the candidate-file count and bytes read; the As-built names the measured cause of the 48 s vs 98 s difference.
-- Tests cover `episodes.jsonl` and `survey.json` after scripted runs are counted, and a script whose screenshot call was removed before a later run.
-
-### Phase 3 — Every `/hana_shot` call is recorded, failures and the shot the agent kept included · status: todo
-
-#### Work Order
-
-**Goal:** failures and attempts-to-usable-shot become measurable. Today only successful shots are logged, and an episode assumes its last shot was kept.
-
-**Spec:**
-- Define two records: an invocation (one `hana_shot.py shot` run, `--view all` included) and a shot attempt (one view's capture), with partial failures; `views check` logs only after its black-image and empty-crop checks. Successful, failed and old-format records are named variants, and session and kept-shot evidence are named states, not bare `str | None` fields.
-- Store each attempt's image paths so a later path citation in the transcript links to one attempt; the report shows cited, several cited, none cited, and no observable path.
-- `hana_shot.py` writes one `timings.jsonl` line per call, success or not, carrying:
-  - the exit code;
-  - a reason for every failure exit, with one fixed slug per cause it can name: timeout, already in progress, black capture, empty crop, no app, and the like;
-  - the session ID when one is in the environment.
-- `stats` counts failures by reason.
-- In the episode scan, a shot is kept when its path appears later in the same transcript in an outgoing message, a checkpoint notice or a file the agent wrote. An episode then reports attempts before the first kept shot.
-- Old lines without the new fields still parse.
+**Measured** (2026-10-06 unless noted):
+- Seed Claude MCP subset: 519 episodes / 47.65 h, unchanged.
+- By hand at the 300 s split, 2026-09-09 to the `/hana_shot` rollout: 584 episodes / 53.73 h (the figure before scripted runs counted was 568 / 51.89 h).
+- Real default scan, 18:09 PDT: 26,124 calls, 3,038 candidate files, 13.83 GB read, 39.6 s wall / 85.2 s user / 69.7 s sys, under load average 23/37/61.
+- Same-load A/B/B/A: before the repair rounds 27.7 s wall / 69.6 s user; final 31.4 s wall / 76.6 s user (+13% wall, +10% CPU).
+- Seat probe: 80 shot/bash_brp + 4 spectacle + 339 related scripts remembered; 140 later shot runs linked; 491 scratchpad calls all map to hana (26 by-hand episodes at the 300 s split before the rollout).- The 48 s vs 98 s scan difference came from transcript traversal (page cache and machine load), not the state-file location. Keeping ordinary source and prose files out of the script-name filter cut the traversal.
+- 69 tests; basedpyright 0 errors, 0 warnings, 0 notes. Tests never read the real `~/.claude/projects`, `~/.codex` or `~/.cache/hana-shot`.
 
 **Files:**
-- `scripts/shot_report/shot_report.py` and `commands/shot_report.md` — the kept-shot columns in the report
-- `scripts/hana_shot/hana_shot.py` — one `timings.jsonl` line per call with exit code, failure reason and session ID; `stats` counts failures by reason
-- `scripts/hana_shot/test_hana_shot.py` — a fake BRP server for each failure path
-- `commands/hana_shot.md` — the record's fields and the failure reasons
-- `scripts/shot_report/episodes.py`, `scripts/shot_report/transcripts.py` — kept-shot detection and attempts before the first kept shot
-- `scripts/shot_report/test_shot_report.py` and `scripts/shot_report/fixtures/` — kept-shot fixtures
+- `scripts/shot_report/transcripts.py` — script memory, run linking, branch selection, image counts, attribution, worker-pool scan
+- `scripts/shot_report/shot_report.py` — scan summary line (candidate files, bytes read)
+- `scripts/shot_report/test_transcripts.py`, `scripts/shot_report/fixtures/classify/{claude,codex}/` — the 69 tests and the write-and-run samples
 
-**Seats:** 2 writers — the call record and the kept-shot scan touch disjoint files, each with tests beside it.
-- `impl` — `scripts/hana_shot/hana_shot.py`, `test_hana_shot.py`, `commands/hana_shot.md`
-- `test` opens as impl — `scripts/shot_report/episodes.py`, `transcripts.py`, `test_shot_report.py`, `fixtures/`
+**Binds later work:**
+- Remembered script content and removals decide how a later run counts, so a transcript is not independent of its earlier bytes. The remembered-script memory lives for one transcript's read; the incremental scan persists it beside the cursor and reruns the repository fold over cached and new calls. Acceptance for that: a script written before the cursor and run after it counts once across two consecutive incremental runs.
+- Kept-shot detection reads a scripted shot's image paths from the later run's result; `ToolCall.script_path` names the script it ran. A `/hana_shot` call skips script memory.
+- One transcript is the pool's unit of work. The full scan runs 30–40 s, so a 30 s no-news bound needs the incremental cache; its before/after table starts from the numbers above.
+- `RememberedScript` and `project_attribution` are implementation-only: the episode record carries `project` alone.
 
-**Acceptance gate:**
-- Tests green, with a fake BRP server for each failure path.
-- After promotion, the unit reads the first real lines from other sessions' calls and quotes one success and, if any occurred, one failure in the As-built.
+**Gotchas:**
+- A script's classification depends on its current content and the run's arguments; one file can be a shot in one call and a related call in another.
+- The 60 s scan bound holds only while ordinary source and prose files stay out of the script-name filter; wall time also swings with page cache and machine load.
+- Six known limits, each a script shape none of 20 hand-read real runs showed, left uncounted until a real transcript shows one:
+  1. `os.execle`/`os.execlpe` with a non-literal env expression is not followed.
+  2. A zero-iteration loop (`range(0)`, an empty list) still reports one image.
+  3. An omitted argparse option falls back to the first argument.
+  4. `async def` and class methods are not followed by call counting (image count stays at least 1).
+  5. `rm x; bash -c ./x` does not see the outer `rm`.
+  6. A decorated function also called directly counts its body twice when the result has no `.png` path.
 
-### Phase 4 — The report runs every hour and shows what each change did · status: todo
+**Ruled out:**
+- Counting any run of a file that holds a screenshot call: it made every helper subcommand (`brp.py query`) a shot.
+- A second classifier for script content.
+- The state-file location as the cause of the scan-time difference.
 
-#### Work Order
+### Phase 3 — Every `/hana_shot` call is recorded, failures and the shot the agent kept included · status: done
 
-**Goal:** the regime runs without anyone asking, and every `/hana_shot` change gets a before and after.
+#### As-built
 
-**Spec:**
-- An hourly run inside the hour is skipped; the next hour updates. Keep pending results, remembered scripts and open 5- and 15-minute episodes across runs, so a transcript appended across the boundary neither loses nor doubles calls.
-- The Mac is a delayed source, as `scripts/buildlog/sync.py` treats it: name the remote command, its timeout, a per-host cursor, and the report's coverage state; test unreachable then reachable.
-- `changes.json` stores each change's repository, host coverage and effective time; the by-change table shows each method's count and window at both splits, and marks a side below 20 episodes.
-- The report shows the last successful scan time, and exposes `/hana_shot` failure reasons and per-mode timing counts with their windows, so Phase 5 can price candidates.
-- Times state the zone and the actual offset (PDT or PST), with a winter-window test.
-- `buildlog hourly` calls the scan. It is incremental and runs once per hour even when the job runs more often.
-- A change list in `~/.local/state/screenshot-analysis/changes.json` holds, for each change, its time, its commit and one line on what it changed. Seed it with the commits in What exists today and the hana-side changes in `analysis.md`. Phase 5 builds append to it.
-- `/shot_report` adds a by-change table: episodes, median and p90 between consecutive changes. It flags a window with fewer than 20 episodes as too small to judge.
-- It also adds a weekly trend line for by-hand vs `/hana_shot` agent-hours.
-- The Mac:
-  - Codex transcripts are read over `ssh mac`; print `rc=$?` in the command.
-  - Claude transcripts are counted only if a cheap path exists. Otherwise the report states that they are out.
+- `scripts/hana_shot/hana_shot.py` appends one JSON line per `shot` call and per `views check` call to `~/.cache/hana-shot/timings.jsonl` when the call ends. Fields: `status` (success or failure), `exit_code`, `failure_reason` (a `FailureReason` string enum of 11 slugs: timeout, already_in_progress, black_capture, empty_crop, no_app, invalid_request, no_target, invalid_png, copy_failed, brp_error, shot_failed), `session` (state `present` with a value, or `absent`) and an ordered `attempts` list.
+- Each successful attempt carries its own per-view timing fields (`SuccessfulAttempt` extends `TimingRecord`), so a multi-view call keeps one set per view. The legacy top-level timing fields stay on success lines; lines without `status` read as legacy successes. A failed attempt lists an image path only when the file's `mtime_ns` is at or after that attempt's start, so a stale `--out` file is never claimed.
+- A failure to write the record prints one warning on stderr and leaves the call's exit code and stdout unchanged. `hana_shot.py stats` counts successes and failures by reason, and counts each successful view once.
+- The session value is `CODEX_THREAD_ID` first, then `CLAUDE_CODE_SESSION_ID`, otherwise absent. A Codex seat inherits the director's `CLAUDE_CODE_SESSION_ID`, so the Codex variable has to come first. A Codex episode's session id is the full five-group thread id from the rollout file name; a Claude main transcript's file stem and row `sessionId` equal `CLAUDE_CODE_SESSION_ID`.
+- `scan_calls(claude_root, codex_root, timings_path)` in `scripts/shot_report/transcripts.py` reads transcripts as before and also reads the timing log (`scan --timings-path PATH`, default `~/.cache/hana-shot/timings.jsonl`). It reads transcripts and the log read-only and never writes or moves either. Transcript output omits the failed views of `--view all`, so exact attempt counts come from the timing records.
+- After the worker pool finishes, `_recorded_calls` runs once over all calls and links records to calls by session id plus time (within 10 s): a present-session record goes to the call whose end is nearest; an absent-session record links only when exactly one call overlaps; one call may take several records, in time order. Calls that ran in a deleted worktree are folded into their repository first.
+- Each episode carries a kept-shot state (`OneCitedShot`, `SeveralCitedShots`, `NoneCited`, `NoObservablePath`, `LegacyEvidenceUnavailable`) and the saved fields `kept_shot_state`, `attempts_before_first_kept_shot` and `cited_attempt_count`. The attempt count is `ExactOrderedCaptureAttempts` when ordered timing records supply it and `AttemptCountInferredFromImages` (an estimate) otherwise.
+- A citation is a recorded image path, whole and at a path boundary, in assistant text, in a `SendMessage` input (message, summary or object form), in a `codex_mesh.py --message` argument (only lines containing `.png`), in a checkpoint row, or in a file the agent wrote; paths with spaces link. Checkpoint notices leave a transcript as a `SendMessage` call or a `codex_mesh.py` argument, not as assistant text.
+- Scan cost, real default roots, 2026-10-06, natedev: 26,136 calls from 3,050-3,053 candidate files, 13.88 GB read, 1,208 episodes saved at the 300 s and 900 s splits. The earlier baselines still hold: the seed's Claude MCP subset 519 episodes / 47.65 h and the full by-hand set 584 / 53.73 h (5-minute split, 2026-09-09 to the rollout cut). Same machine, alternating the two trees in a balanced order (two runs each, load average 36 to 254): this code averaged 43.3 s wall / 96.2 s user against 74.3 s / 118.0 s for the code before the change. Quiet-machine references: 39.6 s wall / 85.2 s user before the change, and 41.7 s wall / 98.3 s user for an earlier version of this tree (load 27 to 60). The change adds no measurable scan cost.
+- Evidence on real calls: `~/.cache/hana-shot/timings.jsonl` holds five new-format lines from other sessions' calls (2026-10-06 19:23-19:25 PDT). All five are `status: success`, `exit_code: 0`, `session.state: present`, one attempt each (three `fit`, two `pose`, crop `none`, 0.6 s to 2.1 s total); all 202 earlier lines are legacy successes, and no failure line exists yet. The first, abbreviated, session and image path elided:
+
+```json
+{"time": "2026-10-07T02:23:41.080+00:00", "host": "natedev", "port": 15711, "mode": "fit", "crop": "none", "window": "1280x720", "total_ms": 726.7, "status": "success", "exit_code": 0, "session": {"state": "present", "value": "<session id>"}, "attempts": [{"mode": "fit", "total_ms": 726.7, "status": "success", "image_paths": ["<one .png path>"]}]}
+```
 
 **Files:**
-- `scripts/buildlog/cli.py` — the one `hourly` call to the scan, beside `rust_release.check_release`
-- `scripts/shot_report/shot_report.py`, `scripts/shot_report/episodes.py`, `scripts/shot_report/transcripts.py` — the incremental scan cache, the once-per-hour guard, the Mac read, the by-change table and the weekly trend
-- `scripts/shot_report/changes.py` — reads and seeds `changes.json`
-- `scripts/shot_report/test_shot_report.py` and `scripts/shot_report/fixtures/` — tests
-- `commands/shot_report.md` — the new tables
+- `scripts/hana_shot/hana_shot.py` — the invocation record, failure slugs, session evidence, `stats`
+- `scripts/hana_shot/test_hana_shot.py` — a fake BRP server for each failure path, session precedence, the fresh-image rule, the write-failure test
+- `commands/hana_shot.md` — record fields, failure reasons, session precedence, stats counting
+- `scripts/shot_report/transcripts.py` — the timing join `_recorded_calls`, citation extraction, `_kept_calls`, the evidence types
+- `scripts/shot_report/episodes.py` — kept-shot states and the saved counts
+- `scripts/shot_report/shot_report.py`, `commands/shot_report.md` — the kept-shot table and the `--timings-path` option
+- `scripts/shot_report/test_transcripts.py`, `test_shot_report.py` — join, citation and report tests
 
-**Seats:** 1 writer + 1 tester — the test lane is `scripts/shot_report/`.
-- `impl` — `scripts/buildlog/cli.py`, `shot_report.py`, `episodes.py`, `transcripts.py`, `changes.py`, `commands/shot_report.md`
-- `test` — `test_shot_report.py`, `fixtures/` and `scripts/buildlog/test_sync.py` (the hourly call): two consecutive incremental runs with no duplicates, the once-per-hour guard, the by-change table with a small-window flag, the weekly trend
+**Binds later work:**
+- The incremental scan keeps each transcript's remembered scripts, pending uses and results and citation positions beside its byte offset, because a script's content decides how a later run counts.
+- The timing join and the kept-path match run over all calls, so a cached scan reruns them over cached plus new evidence without taking one record twice; the repository-name fold reruns the same way.
+- A timing record is appended when a call ends and its transcript result lands moments later, so a record can arrive one run before its call; unlinked records stay pending until their call is cached.
+- The saved episode keeps exact-vs-inferred provenance for the attempt count; `episodes.jsonl` is rewritten whole by each scan and does not save it.
+- The session variable order and the full Codex thread id are what link records to calls.
+- The report shows the kept-shot table only; the record already carries the 11 failure reasons and per-view timing (mode, crop, phase times) that failure-reason and per-mode tables read.
+- The 60 s bound for a full scan is a quiet-machine bound.
 
-**Acceptance gate:**
-- Two consecutive hourly runs add new episodes and leave no duplicates.
-- A run with nothing new finishes in under 30 s.
-- The by-change table shows the rollout's before and after at both splits.
+**Gotchas:**
+- A failed attempt's image path is judged by file `mtime_ns` against the attempt's start clock; a coarse kernel mtime can lag by a few milliseconds while a capture takes tens of milliseconds.
+- An absent-session record links only when exactly one call overlaps within 10 s, so two absent-session records near two calls are skipped as ambiguous.
+- `views check` runs write timing records and are not shot episodes.
+- Citation matching substring-tests each citation against the latest shot paths, with no measurable cost.
 
-### Phase 5 — Proposals: the next change, ranked by measured minutes saved · status: todo (standing)
+**Ruled out:** classifying `views check` runs as shots (they record a stored-view check, not an agent's framing attempts); a second classifier next to the existing one.
+
+### Phase 4 — The report runs every hour and shows what each change did · status: done
+
+#### As-built
+
+`buildlog hourly` runs the screenshot scan once per UTC hour under `hourly.lock`; a second run in the same hour prints `Screenshot scan skipped: already ran this UTC hour at <time> (<zone offset>)`. The scan cache is `PersistentScanCache` (`format_version` 3; a version change forces one cold rebuild) in `~/.local/state/screenshot-analysis/scan-cache.pickle`. It stores parsed state, not matched lines: per transcript at its byte cursor, the resumable Claude and Codex parser progress (pending uses and results, remembered scripts, session metadata, citation positions), raw calls, citations, unlinked timing records and open 5- and 15-minute episodes. `scan_calls(claude_root, codex_root, timings_path)` and the cache states keep their signatures. Discovery uses cached file identity, and the scan line states the bytes read. Every run reruns the timing join, kept-path match and repository fold over cached and new evidence; timing records are keyed `TimingRecordId(source_host, source_path, byte_offset)`, so a repeated join never duplicates an attempt and a record read before its call stays pending.
+
+- `Episode` saves and reloads whether the attempts-before-first-kept-shot count is exact (`ExactOrderedCaptureAttempts`) or inferred from images (`AttemptCountInferredFromImages`). The recorder's in-flight record is `InProgressCaptureInvocation`. Invocation records carry an invocation kind (`shot`, `views_check`, `unknown` for old lines) and a source host, kept apart from the `host` a timing record carries for the machine running Hana; `views check` stays outside shot episodes.
+- `changes.py` types the ledger `changes.json`: repository, commit, one-line description, effective time, host coverage and a measurement-change marker.
+- `/shot_report` shows the by-change table (per method: window, episode count, median and p90 at 300 s and 900 s; under 20 episodes is flagged too small, missing host coverage marks the window incomplete; the heading names zone and offset per boundary), the weekly by-hand vs `/hana_shot` agent-hours trend, the last successful scan time, and `/hana_shot` evidence with windows: success, failure and legacy-success counts, each of the 11 failure reasons, per-mode and per-crop counts and phase-time medians over successful attempts. Invocation records aggregate on their own, so a failure with no transcript result stays visible.
+- Mac Codex transcripts and the Mac `timings.jsonl` are delayed inputs read over `ssh mac` (the command prints `rc=$?`), one cursor per source host, mirrored in `mac-source/` with `mac_manifest.json`. The read is budgeted (about 80 s inside the 120 s ssh timeout), prefiltered at the source with the scan's own candidate hints, per-file and resumable. Coverage advances only on a finished read, stamped with the read start time; an outage keeps the mirror and its history. Mac Claude transcripts are out above 100 files / 100 MB (61 files / 112 MB measured).
+
+Rules: by-change windows end at the next product change in any repository that reaches an overlapping host; every project counts (no project filter on change rows).
+
+Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-06T16:35Z:
+- First hourly run, cold state: 26,297 calls from 3,091 candidate files, 20,624,840,574 transcript and timing bytes read, 1,232 episodes saved at 300 s and 900 s in 124.6 s. Mac line: read 132,126,372 source bytes; catching up; Claude transcripts out. Both baselines reproduce: Claude MCP n=519 total_h=47.65, full by hand n=584 total_h=53.73.
+- A second run in the same UTC hour is skipped in 0.5 s. The cache file is 12,253,845 bytes (about 12 MB, parsed state).
+- A default-root scan with nothing new locally: 89,423,794 bytes read, 84,992,205 (about 85 MB) of them the Mac, in 86.5 s, almost all of it the Mac read budget. A local-only no-news run takes 0.5 to 0.7 s.
+- The Mac holds 213 of 1,856 Codex files as candidates (3.75 GB) and one 80 s read copies about 100 MB, so its first catch-up is still running after 14 scans and takes about 37 hourly runs. The reader moves about a quarter of what the link carries: 50 MB raw over ssh took 9.1 s (5.5 MB/s), and `gzip -1` made the same 50 MB 22.9 MB.
+
+**Files:**
+- `scripts/shot_report/transcripts.py` — scan cache, parsed state, candidate hints, timing join
+- `scripts/shot_report/shot_report.py` — report, Mac reader and receiver, coverage, by-change windows
+- `scripts/shot_report/changes.py` — typed change ledger; `scripts/shot_report/episodes.py` — episodes with attempt-count provenance
+- `scripts/hana_shot/hana_shot.py` — invocation kind on every call; `scripts/buildlog/cli.py` — the hourly job
+- `commands/shot_report.md`, `commands/hana_shot.md` — report and recorder wording
+- `test_shot_report.py`, `test_transcripts.py`, `scripts/hana_shot/test_hana_shot.py`, `scripts/buildlog/test_sync.py`, `scripts/shot_report/fixtures/` — tests; the Mac reader test runs the generated reader under a temporary `HOME` with a deterministic clock
+
+**Binds later work:** the Mac catch-up and report-types work ("The Mac's transcripts catch up in hours, and two report types say what they hold") owns the catch-up speed (the Mac line reads finished within 8 runs), coverage by included source, the saved per-outcome read state, the mtime-aware resume, the exact-count provenance type and the two change variants. The by-change table and any priced proposal lack Mac data until then. Until it lands: Mac coverage excludes Mac Claude transcripts yet reads as covered; the Mac read state (finished or catching up) is printed on the scan line only, not saved or shown by `/shot_report`; a same-size in-place rewrite of a Mac file leaves a stale mirror; `Episode` carries a placeholder `ExactOrderedCaptureAttempts(())` payload and `Change.measurement_change` is a bare boolean. The Proposals phase states Mac coverage beside every ranked minute count, prices a host-specific candidate only from an eligible weekly count with its coverage (host-combined weekly counts cannot), and appends each approved product change to `changes.json`.
+
+**Gotchas:**
+- A transcript cached as a non-candidate is parsed whole from byte 0 when it first matches a hint, or it loses its session context.
+
+**Ruled out:** a cache that replays matched transcript lines (9.2 GB, failed the speed gate); a project filter on change rows (a change's repository is where the tool lives, not where affected episodes ran).
+
+### Phase 5 — The Mac's transcripts catch up in hours, and two report types say what they hold · status: done
+
+#### As-built
+
+- The Mac read is prefiltered at the source, keeps a cursor per file, and resumes without re-reading received bytes. Each read sends `zlib`-compressed, `base64`-encoded 64 KiB chunks, and byte accounting stays in source bytes. Coverage advances only on a finished read, stamped with the read-start time; an outage keeps the mirror and the coverage. Mac Claude transcripts are out above 100 files or 100 MB. A file rewritten in place at the same size is read again from byte 0.
+- `scripts/shot_report/shot_report.py` holds `MAC_READ_BUDGET_SECONDS = 300` and `MAC_SSH_TIMEOUT_MARGIN_SECONDS = 30`; `MAC_SSH_TIMEOUT_SECONDS = 330` is derived from that pair, never a second literal. The ssh stream is the limit of a read: the reader's hint scan took 2.9 s of an 80 s read and the receiver 0.25 s.
+- The hourly job's bound is `SCREENSHOT_HOURLY_TIMEOUT_SECONDS = 900` in `scripts/buildlog/cli.py`; `scripts/buildlog/test_sync.py` asserts it is at least `MAC_SSH_TIMEOUT_SECONDS + 300`.
+- Host coverage is `CoveredHostSourcesThrough(at, sources)` or `HostNeverCovered`; the measured sources are claude, codex and timings. A legacy status file without `host_coverage` gives the Mac Codex and timings only; natedev lists timings only when the timing source is available. The Mac read state is `MacReadFinished`, `MacReadCatchingUp` or `MacReadUnavailable`, saved in the scan status and printed as `Mac: finished|catching up|unavailable` with the covered-through time and the included sources. A by-change window over the Mac is labeled `incomplete:mac`.
+- `ExactAttemptCountFromOrderedCaptures` is the exact attempt-count provenance, distinct from the inferred type; both survive save and reload. `changes.py` holds `ProductChange` and `MeasurementChange` under the union `Change`; a measurement change is listed separately and never counted as a speed gain. No `ExactOrderedCaptureAttempts(())` marker or `measurement_change` bool remains. A by-change window is bounded by the neighbouring product change of any repository on an overlapping host.
+
+**Measured:** on the real Mac, default-root scans in a scratch state directory under natedev load 60-150: the Mac read finished at scan 5 (gate: within 8). Source MB per scan: 681, 456, 649, 690, 1271 (about 3.75 GB). Scan walls 377, 334, 329, 324, 222 s. The scan after it read 0 Mac source bytes and took 4.6 s. Before the change: about 100 MB per 80 s run and not finished after 14 runs; an earlier 105 s budget took 12 runs (208, 263, 198, 352, 390, 194, 168, 191, 329, 565, 840 MB, then 48 MB). Parsed-state cache about 12 MB (plus 0.5 MB for the Mac). Suites: shot_report 117, hana_shot 31, buildlog 257, basedpyright 0 errors 0 warnings. The hourly job itself was not run against the real Mac; the acceptance loop called `scan` directly, and the 900 s bound is held by the test.
+
+**Files:**
+- `scripts/shot_report/shot_report.py` — Mac reader, read budget and ssh constants, coverage by source, read state, report lines
+- `scripts/shot_report/changes.py` — `ProductChange` / `MeasurementChange`
+- `scripts/shot_report/episodes.py` — exact attempt-count type
+- `scripts/shot_report/transcripts.py` — prefiltered resumable mirror, per-file cursors, same-size rewrite re-read
+- `scripts/shot_report/test_shot_report.py`, `scripts/shot_report/test_transcripts.py` — tests, including the real generated reader under a temp HOME with a deterministic clock
+- `scripts/buildlog/cli.py`, `scripts/buildlog/test_sync.py` — the hourly bound and its test
+- `commands/shot_report.md` — first run starts `hourly` once in the background, no polling; states the Mac read state and coverage
+
+**Binds later work:**
+- Mac candidates are priced from Codex transcripts and timings only, because Mac Claude transcripts are out; the first Mac catch-up takes about five scans.
+- The saved scan status and the report text are what a proposal cites for the Mac read state and coverage.
+- An approved proposal appends a `ProductChange` to `changes.json`; a `MeasurementChange` is listed separately and never counted as a speed gain.
+- The hourly bound stays at least 300 s above `MAC_SSH_TIMEOUT_SECONDS`; the test fails when a raised read budget leaves the job bound behind.
+
+**Gotchas:**
+- A scan with an empty corpus rereads rg.
+- `bytes_read` counts discovery once.
+- The acceptance loop calls `scan` directly and cannot see the hourly job's time bound.
+
+**Ruled out:**
+- A project filter on change rows: every project counts, so a change is assessed against all of them.
+- Raising the read budget without measuring: the split of one 80 s read (hint scans 2.9 s, chunk loop 77.1 s, receiver 0.25 s) shows the ssh stream, not the reader or receiver, ends a run.
+
+### Phase 6 — Proposals: the next change, ranked by measured minutes saved · status: todo (standing)
 
 #### Work Order
 
@@ -218,10 +274,15 @@ None.
 - An approved proposal becomes the next numbered phase, appended to this plan. Its As-built names the change list entry that measures it.
 - A declined one is recorded here with the user's reason. The next proposal goes only when natedev asks.
 - After each approved phase merges, re-rank with fresh data before proposing again.
+- Price a candidate only from its eligible weekly count. The weekly trend and the mode and crop tables combine hosts, so read the saved `episodes.jsonl` and `invocations.jsonl` in `~/.local/state/screenshot-analysis/` by name, or add host-specific report rows, and show each candidate's eligible weekly count and its host coverage. A candidate whose eligible count is unavailable stays unpriced, and when none can be priced the proposal says so.
+- Carry the Mac's source limits into every estimate that uses Mac data: say which Mac sources are in (Codex transcripts and timings) and which are out (Claude transcripts), and whether the Mac read is still catching up.
+- Each approved phase appends its product change to `changes.json` with its effective time and affected hosts before the by-change table is used to assess it.
 
 **Files:**
 - `docs/plans/build-followups-screenshot.md` — each approved proposal as a new phase, each declined one with the user's reason
 
 **Seats:** none — the unit director ranks and proposes from the report; no code is written until a proposal becomes its own phase.
 
-**Acceptance gate:** each proposal cites report numbers from a report less than 24 h old, each number with its window.
+**Constraints from prior phases:** Failure logging, Codex transcript scanning and kept-shot detection are delivered, so `analysis.md` → Next improvements entry 2, entry 3 and the failure-logging half of entry 1 are not proposed again; the question of what fills long `/hana_shot` episodes stays seeded. The hourly phase supplies source-host coverage and says whether each attempt count is exact or inferred from images. The Mac catch-up delivers Codex transcripts and timings and finishes in about five hourly runs; Mac Claude transcripts stay out above 100 files or 100 MB, so every Mac estimate names that limit. A `changes.json` entry is either a product change, which is a speed candidate, or a measurement change, which the report lists separately and never counts as a speed gain; an approved proposal appends a product change carrying its effective time and affected hosts. Price weekly agent minutes from an observed eligible weekly count, keep per-shot milliseconds distinct from episode minutes, and leave a candidate unpriced when its evidence cannot support that calculation.
+
+**Acceptance gate:** each proposal cites a report less than 24 h old, the covered window and n for every number, both splits when it uses episode time, exact or inferred attempt evidence when it uses kept shots, and the calculation of expected agent-minutes saved per week. A candidate without those inputs is labeled unpriced and ranks below every priced one.

@@ -786,10 +786,11 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(state["LAST_RESTART"], str(report_at))
         self.assertEqual(state["NEXT_DUE"], str(report_at + 15 * 60))
 
-    def test_closed_window_restarts_unit_notifier(self) -> None:
+    def test_a_finished_phase_is_refused_and_restarts_unit_notifier(self) -> None:
+        """With no active phase there is nothing to report, and the clock still moves."""
         started_at = 20_000
         report_at = started_at + 100
-        session_dir = self.start_run("refused-window", started_at)
+        session_dir = self.start_run("refused-phase", started_at)
         self.start_phase_and_pass(session_dir, started_at)
         _ = self.run_command(
             "finish-phase",
@@ -835,7 +836,8 @@ class ProgressHistoryTests(unittest.TestCase):
                 at=report_at,
             )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("No open window to report", result.stderr)
+        self.assertIn("No active phase to report: phase completed.", result.stderr)
+        self.assertIn("say nothing about whether the workers are alive", result.stderr)
         state = dict(
             line.split("=", 1)
             for line in (state_dir / f"delegate-{session_dir.name}" / "state")
@@ -844,6 +846,231 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         self.assertEqual(state["LAST_RESTART"], str(report_at))
         self.assertEqual(state["NEXT_DUE"], str(report_at + 15 * 60))
+
+    def close_the_only_pass(self, session_dir: Path, at: int) -> None:
+        """Finish the pass `start_phase_and_pass` opened: reviews closed, no writer yet."""
+        _ = self.run_command(
+            "finish-pass", "--session-dir", str(session_dir), "--status", "completed", at=at
+        )
+
+    def test_a_phase_between_windows_reports_its_last_recorded_tables(self) -> None:
+        """No window open is a moment inside the phase, not the end of the report."""
+        started_at = 20_000
+        session_dir = self.start_run("between-windows", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.run_progress(session_dir, at=started_at + 100)
+        self.close_the_only_pass(session_dir, at=started_at + 200)
+        state_dir = self.root / "notifier"
+        environment = os.environ.copy()
+        environment["NOTIFIER_STATE_DIR"] = str(state_dir)
+        environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
+        environment["TZ"] = "UTC"
+        _ = subprocess.run(
+            [
+                "zsh",
+                str(SCRIPT.parents[1] / "message" / "notifier.sh"),
+                "new",
+                f"delegate-{session_dir.name}",
+                "--to",
+                "session:test-claude-session",
+                "--every",
+                "15",
+                "--command",
+                "/unit:report",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        report_at = started_at + 400
+        with patch.dict(
+            os.environ,
+            {"NOTIFIER_STATE_DIR": str(state_dir), "NOTIFIER_NOW_EPOCH": str(report_at)},
+        ):
+            # Percents the tick passes are neither required nor checked: the
+            # report shows what was recorded, not what this call claims.
+            report = self.run_command(
+                "progress",
+                "--session-dir",
+                str(session_dir),
+                "--phase-raw-percent",
+                "55",
+                "--activity",
+                "waiting on the repair writers",
+                at=report_at,
+            )
+        lines = report.splitlines()
+        self.assertEqual(
+            lines[:3],
+            [
+                "**bevy_hana_rubric - feature/rubric**",
+                "",
+                "*Percentages and clocks as of 05:35:00, the last progress report.*",
+            ],
+        )
+        summary = self.table_rows(report, SUMMARY_HEADER)
+        # The rows the 05:35:00 report printed: its percents and its clocks.
+        self.assertEqual(
+            [row[:3] for row in summary[:2]],
+            [["Project", "40", "00:01:40"], ["Phase 3", "30", "00:01:40"]],
+        )
+        rounds = self.table_rows(
+            report, ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"]
+        )
+        self.assertEqual(
+            [(row[0], row[3], row[5]) for row in rounds],
+            [("Fix 2", "fix 3m done", "done")],
+        )
+        warning = lines[-2]
+        self.assertTrue(warning.startswith("No pass or activity is open. "))
+        self.assertIn("say nothing about whether the workers are alive", warning)
+        self.assertGreater(lines.index(warning), lines.index(next(
+            line for line in lines if line.startswith("| Fix 2 ")
+        )))
+        self.assertEqual(lines[-1], "**now 1970-01-01 05:40:00 - next report 05:55:00**")
+        restart = dict(
+            line.split("=", 1)
+            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        self.assertEqual(restart["LAST_RESTART"], str(report_at))
+
+    def test_a_phase_never_reported_still_prints_both_tables(self) -> None:
+        """Before the first report the clocks read as of the phase start."""
+        started_at = 20_000
+        session_dir = self.start_run("never-reported", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        self.close_the_only_pass(session_dir, at=started_at + 200)
+        report = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--activity",
+            "waiting on the repair writers",
+            at=started_at + 400,
+        )
+        self.assertIn(
+            "*Percentages and clocks as of 05:33:20, the phase start, before any "
+            + "progress report.*",
+            report,
+        )
+        self.assertEqual(
+            [row[:3] for row in self.table_rows(report, SUMMARY_HEADER)[:2]],
+            [["Project", "0", "00:00:00"], ["Phase 3", "0", "00:00:00"]],
+        )
+        self.assertEqual(
+            [
+                row[0]
+                for row in self.table_rows(
+                    report, ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"]
+                )
+            ],
+            ["Fix 2"],
+        )
+
+    def test_a_phase_with_no_window_yet_draws_a_row_saying_so(self) -> None:
+        started_at = 20_000
+        session_dir = self.start_run("no-window-yet", started_at)
+        self.start_phase(session_dir, started_at)
+        report = self.run_command(
+            "progress", "--session-dir", str(session_dir), "--activity", "starting", at=started_at + 60
+        )
+        self.assertEqual(
+            self.table_rows(report, ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"]),
+            [["-", "-", "-", "-", "-", "no stage yet"]],
+        )
+
+    def test_a_report_between_windows_records_nothing(self) -> None:
+        """No event, no window: pass counts and convergence never see the call."""
+        started_at = 20_000
+        session_dir = self.start_run("records-nothing", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.run_progress(session_dir, at=started_at + 100)
+        self.close_the_only_pass(session_dir, at=started_at + 200)
+        history = self.history_dir / "runs" / "records-nothing.jsonl"
+        state_path = session_dir / "progress_history_state.json"
+        events_before = history.read_text(encoding="utf-8")
+        state_before = state_path.read_text(encoding="utf-8")
+        _ = self.run_progress(session_dir, at=started_at + 400)
+        self.assertEqual(history.read_text(encoding="utf-8"), events_before)
+        self.assertEqual(state_path.read_text(encoding="utf-8"), state_before)
+        self.assertEqual(
+            {str(record["status"]) for record in self.pass_slots(session_dir).values()},
+            {"completed"},
+        )
+
+    def report_phase_percent(self, session_dir: Path, percent: int, at: int) -> None:
+        _ = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "40",
+            "--project-percent",
+            "40",
+            "--phase-raw-percent",
+            str(percent),
+            "--phase-percent",
+            str(percent),
+            "--cap-stage",
+            "implementation",
+            "--activity",
+            "implementing",
+            at=at,
+        )
+
+    def test_a_report_between_windows_names_the_eta_day_from_now(self) -> None:
+        """Recorded 23:30 on the 3rd, read at 03:00 on the 4th: 00:40 is today."""
+        recorded_at = 2 * 86_400 + 23 * 3_600 + 1_800
+        session_dir = self.start_run("past-midnight", recorded_at - 1_800)
+        self.start_phase_and_pass(session_dir, recorded_at - 1_800)
+        self.report_phase_percent(session_dir, 30, at=recorded_at)
+        self.close_the_only_pass(session_dir, at=recorded_at + 60)
+        report = self.run_progress(session_dir, at=3 * 86_400 + 3 * 3_600)
+        self.assertIn("as of 1970-01-03 23:30:00, the last progress report", report)
+        phase_row = self.table_rows(report, SUMMARY_HEADER)[1]
+        self.assertEqual(phase_row[:4], ["Phase 3", "30", "00:30:00", "today 00:40"])
+        self.assertTrue(phase_row[5].startswith("today "))
+        self.assertTrue(phase_row[6].startswith("today "))
+
+    def test_a_report_between_windows_reads_the_latest_report_of_the_phase(self) -> None:
+        started_at = 20_000
+        session_dir = self.start_run("latest-report", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        self.report_phase_percent(session_dir, 20, at=started_at + 100)
+        self.report_phase_percent(session_dir, 50, at=started_at + 150)
+        self.close_the_only_pass(session_dir, at=started_at + 200)
+        report = self.run_progress(session_dir, at=started_at + 400)
+        self.assertIn("as of 05:35:50, the last progress report", report)
+        self.assertEqual(self.table_rows(report, SUMMARY_HEADER)[1][:2], ["Phase 3", "50"])
+
+    def test_a_report_between_windows_ignores_an_earlier_phase(self) -> None:
+        started_at = 20_000
+        session_dir = self.start_run("earlier-phase", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        self.report_phase_percent(session_dir, 30, at=started_at + 100)
+        self.close_the_only_pass(session_dir, at=started_at + 200)
+        _ = self.run_command(
+            "finish-phase", "--session-dir", str(session_dir), "--status", "completed",
+            at=started_at + 300,
+        )
+        _ = self.run_command(
+            "start-phase", "--session-dir", str(session_dir), "--phase-id", "4",
+            "--phase-title", "Next phase", at=started_at + 400,
+        )
+        report = self.run_progress(session_dir, at=started_at + 500)
+        self.assertIn("the phase start, before any progress report", report)
+        self.assertEqual(self.table_rows(report, SUMMARY_HEADER)[1][:2], ["Phase 4", "0"])
+
+    def test_a_run_with_no_phase_is_refused(self) -> None:
+        session_dir = self.start_run("no-phase", 20_000)
+        result = self.run_failing_command(
+            "progress", "--session-dir", str(session_dir), "--activity", "idle", at=20_100
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No active phase to report: phase missing.", result.stderr)
 
     def run_progress(self, session_dir: Path, at: int) -> str:
         return self.run_command(

@@ -38,7 +38,7 @@ below), and the ones `/agent` edits (`agents_set_service_tier`).
 
 Vocabulary: a **family** is a CLI vendor (`codex` | `claude`); an **agent** is a model within a family (`gpt-5.6-sol`, `opus`); a **function** is a consumer; a **task** is `<function>.<subtask>` — exactly two segments.
 
-Every function carries *both* family sets, fully specified at all times, so a family switch is a one-line edit and never a row edit. The functions and their complete sub-task sets:
+Every function carries *both* family sets, fully specified at all times, so a family switch is a one-line edit and never a row edit, except a function whose rows name exactly one family: it is pinned to that family (`production` has only `[production.claude]`, for unit directors). Every-function switches keep a pinned function and print `# kept <function> on <family>: its only set`; switching it alone to the other family is refused. The functions and their complete sub-task sets:
 
 | Function | Sub-tasks |
 | --- | --- |
@@ -154,8 +154,9 @@ so no `--ws-auth` token.
 
 `start` connects, calls `thread/start` then `turn/start`, writes the delegate's
 entry into `<session_dir>/mesh_roster.json`
-(`{name: {thread_id, turn_id, status, launcher_pid?}}`, `launcher_pid` only on a
-`waiting_capacity` entry; every read-modify-write under `fcntl.LOCK_EX`, because
+(`{name: {thread_id, turn_id, status, launcher_pid?}}`, `launcher_pid` on a
+`waiting_capacity` entry and on a follow-up's `starting` and `running` entries,
+which also carry `previous_status`; every read-modify-write under `fcntl.LOCK_EX`, because
 the delegates register concurrently), and **blocks until its last turn ends**,
 translating the notification stream into the log file (`agent:`, `exec:`,
 `edit:`, `thinking`) that `heartbeat_watch.sh` narrates. On a `turn/completed`
@@ -256,7 +257,7 @@ A thin dispatcher over the resolver:
 | `config/README.md` | The `## agents.conf` section: three-layer schema, `/agent` as the editor, sync behavior. |
 | `scripts/agents/agents_config.sh` | Resolver + editors + freshness-gated sync trigger. |
 | `scripts/agents/agent_exec.sh` | Family dispatch launcher, dry-run hook. |
-| `scripts/agents/codex_mesh.py` | Addressable codex launcher: the default for codex `/unit:delegate` seats and the path for `/ask_a_friend`'s codex friend (`start --resident`). One app-server per session, one thread per delegate, `send`/`steer`/`end`/`list`/`stop`, and a capacity backoff that resumes the same thread. |
+| `scripts/agents/codex_mesh.py` | Addressable codex launcher: the default for codex `/unit:delegate` seats and the path for `/ask_a_friend`'s codex friend (`start --resident`). One app-server per session, one thread per delegate, `send`/`steer`/`end`/`list`/`stop`, `follow`/`can-follow`/`release-follow` (a new turn on a finished seat's thread, for `implement.sh --to`), and a capacity backoff that resumes the same thread. |
 | `scripts/agents/agent_admin.sh` | `/agent` backend. |
 | `scripts/agents/sync_codex_catalog.sh` + `.plist` | `[codex.agents]` materialization, staleness warnings. |
 | `scripts/agents/heartbeat.sh`, `heartbeat_watch.sh` | Liveness log helpers used by the delegate wrappers (role header block, 60 s beats with an activity digest decoded from the agent log). |
@@ -281,7 +282,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 ## Invariants
 
 - The registry is the only home for family/agent/effort. Consumers resolve through `agents_resolve` or `agent_exec` and never re-derive flag vocabulary — `agents_codex_args` / `agents_claude_args` own it.
-- Every function keeps **both** family sets fully specified, so switching families is a one-row edit; `agents_set_assignment` (and `agents_set_all_assignments`, across every function at once) refuses a switch if any row of the target set fails validation, and leaves the file untouched.
+- Every function keeps **both** family sets fully specified, so switching families is a one-row edit (a one-family function is pinned and kept by every-function switches); `agents_set_assignment` (and `agents_set_all_assignments`, across every function at once) refuses a switch if any row of the target set fails validation, and leaves the file untouched.
 - Agent names stay disjoint between `[codex.agents]` and `[claude.agents]` — `agents_set_row` infers the family from the agent and refuses a name listed by both instead of picking a family for it.
 - Task names are exactly two segments. Empty effort means "omit the flag"; `agent:` with nothing after the colon is invalid; a catalog row with an empty effort list is valid and admits only bare pairs.
 - Only `agents_set_assignment`, `agents_set_all_assignments`, and `agents_set_model` change which family is live. `agents_set_row` writes a row (live or dormant) and `agents_set_service_tier` writes a tier (live or dormant); neither flips liveness. The one exception is a `caller` function: its live family is whichever agent is asking, it is written by hand in the file, and neither switch touches it.
@@ -308,7 +309,8 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   exists to provide.
 - A codex delegate's launcher ends with its last turn, and `send` then refuses it
   though the thread persists. Unlike a claude delegate, whose
-  background session stays resumable, a finished codex peer cannot be messaged —
+  background session stays resumable, a finished codex peer cannot be messaged;
+  only the unit director's `implement.sh --to <seat>` (`codex_mesh.py follow`) gives it new work —
   `<PhaseMesh/>` in `commands/unit/delegate.md` states this, and the register
   line's `reach=` field is what tells a peer which of the two it is addressing.
 - The fix pipeline runs unattended every 10 minutes on both machines from the `nate.jobs.style-fix` job in `/etc/nixos/modules/common/style-fix.nix` (`intervalSeconds = 600`, no idle gate; see `fix-pipeline.md`). `agents_config.sh`, `agent_assignments.sh`, the three stage scripts, and `fix_report_parse.py` must never be left broken, and the resolver must keep working under `/bin/bash` (3.2).
@@ -345,8 +347,8 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - **`codex queue --thread` exits 0 for a thread with no live session.** The
   acknowledgement says nothing about delivery — do not use it as a reachability
   test.
-- **A finished codex delegate is gone.** Its thread persists, but `send` refuses
-  it once `start` returns, unlike a claude background session, which a message resumes from its transcript. The
+- **A finished codex delegate takes no messages.** Its thread persists, but `send` refuses
+  it once `start` returns (`implement.sh --to` reaches it through `follow`), unlike a claude background session, which a message resumes from its transcript. The
   exception is a thread started `--resident` (ask_a_friend's friend): it stays
   `running` across turns, prints each reply as it lands, and ends only on
   `codex_mesh.py end`. `send`

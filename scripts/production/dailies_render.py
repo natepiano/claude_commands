@@ -51,7 +51,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
@@ -477,10 +477,13 @@ def parse_upcoming_work(fields: JsonMap, where: str) -> UpcomingWork | NoUpcomin
     if value is None:
         return NoUpcomingWork()
     if isinstance(value, str):
-        return UpcomingWork((text(fields, "then", where),))
+        raise InputError(f'{where}.then: must be a list of one-line items, one per upcoming phase: ["Phase 3: …", "Phase 4: …"]')
     if not isinstance(value, list) or not value:
         raise InputError(f"{where}.then: expected a non-empty list of one-line text")
     items = tuple(text({"then": item}, "then", where) for item in cast(list[object], value))
+    for index, item in enumerate(items):
+        if re.search(r", then |; then| then Phase|\bPhase \d+:.*\bPhase \d+:", item, re.IGNORECASE):
+            raise InputError(f"{where}.then[{index}]: one item names more than one phase; split it into list items: {item}")
     return UpcomingWork(items)
 
 
@@ -905,6 +908,29 @@ def check_changes(report: Report, previous: dict[str, Previous], now: datetime) 
                 f"units[{index}].eta.why: the ETA moved {minutes:+d} minutes since the last report; "
                 + "say why in a few words (rendered after 'because'), from the unit director's own reports"
             )
+
+
+class StateClear(NamedTuple):
+    pass
+
+
+class StateRefused(NamedTuple):
+    field: str
+    why: str
+
+
+def check_render_state(value: object, state_path: Path, at: str | None = None) -> StateClear | StateRefused:
+    """Check a candidate against renderer state before its builder changes the clock."""
+    try:
+        report = parse_report(value, "default")
+        previous = load_state(state_path)
+        now, _ = local_now(report.zone, "input.zone", at)
+        check_changes(report, previous, now)
+    except (InputError, OSError, ValueError, json.JSONDecodeError) as error:
+        detail = str(error)
+        field, separator, why = detail.partition(": ")
+        return StateRefused(field if separator else "input", why if separator else detail)
+    return StateClear()
 
 
 def range_clock(moment: datetime, now: datetime) -> str:

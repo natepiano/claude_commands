@@ -71,6 +71,10 @@ class Call(TypedDict):
 
 
 class TimingLine(TypedDict):
+    status: str
+    exit_code: int
+    session: dict[str, str]
+    attempts: list[dict[str, object]]
     port: int
     mode: str
     crop: str
@@ -83,11 +87,12 @@ class TimingLine(TypedDict):
     total_ms: float
 
 
-def png(width: int, height: int) -> bytes:
+def png(width: int, height: int, brightness: int = 128) -> bytes:
     def chunk(kind: bytes, data: bytes) -> bytes:
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
 
-    rows = b"".join(b"\x00" + b"\x80\x80\x80" * width for _ in range(height))
+    pixel = bytes([brightness]) * 3
+    rows = b"".join(b"\x00" + pixel * width for _ in range(height))
     header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
 
@@ -153,10 +158,19 @@ class Fake:
                 return {"result": None}
             if self.screenshot == "busy-always" or (self.screenshot == "busy-once" and screenshots == 1):
                 return {"error": {"code": -32603, "message": "Screenshot already in progress"}}
+            if self.screenshot == "error":
+                return {"error": {"code": -32603, "message": "camera rejected capture"}}
             path = Path(cast(str, params["path"]))
             if self.remote is not None:
                 path = self.remote / path.name
-            _ = path.write_bytes(png(*SHOT_SIZE))
+            if self.screenshot == "invalid":
+                _ = path.write_bytes(b"not png")
+            elif self.screenshot == "black":
+                _ = path.write_bytes(png(*SHOT_SIZE, brightness=0))
+            elif self.screenshot == "tiny":
+                _ = path.write_bytes(png(1, 1))
+            else:
+                _ = path.write_bytes(png(*SHOT_SIZE))
             return {"result": {"path": params["path"], "status": "ok"}}
         return {"result": None}
 
@@ -221,7 +235,10 @@ class HanaShotTest(unittest.TestCase):
     def timings(self) -> Path:
         return self.scratch / "cache" / "hana-shot" / "timings.jsonl"
 
-    def run_script(self, *args: str) -> subprocess.CompletedProcess[str]:
+    def timing_lines(self) -> list[dict[str, object]]:
+        return [cast(dict[str, object], json.loads(line)) for line in self.timings.read_text().splitlines()]
+
+    def run_script(self, *args: str, session_variables: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         environment = {
             **os.environ,
             "XDG_CACHE_HOME": str(self.scratch / "cache"),
@@ -229,6 +246,10 @@ class HanaShotTest(unittest.TestCase):
             # RemoteTests puts its fake scp and ssh here.
             "PATH": f"{self.scratch / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
         }
+        for name in ("CLAUDE_SESSION_ID", "CODEX_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+            _ = environment.pop(name, None)
+        if session_variables is not None:
+            environment.update(session_variables)
         return subprocess.run(
             [sys.executable, str(SCRIPT), *args],
             cwd=self.scratch, env=environment, capture_output=True, text=True, timeout=60, check=False,
@@ -300,6 +321,39 @@ class SelectorTests(HanaShotTest):
 
 
 class ViewsTests(HanaShotTest):
+    def test_empty_registry_records_a_refused_invocation(self) -> None:
+        _ = (self.scratch / "views.toml").write_text("")
+        shot = self.run_script(
+            "shot", "--port", str(self.port), "--view", "all", "--views-file", str(self.scratch / "views.toml"),
+        )
+        check = self.views("check", "--port", str(self.port))
+        self.assertEqual((shot.returncode, check.returncode), (2, 2))
+        self.assertEqual([line["failure_reason"] for line in self.timing_lines()], ["invalid_request"] * 2)
+        self.assertEqual([line["invocation_kind"] for line in self.timing_lines()], ["shot", "views_check"])
+
+    def test_check_records_black_and_empty_crops_after_validation(self) -> None:
+        _ = (self.scratch / "views.toml").write_text('[views.front]\nmode = "home"\n')
+        fake_magick = self.scratch / "bin" / "magick"
+        fake_magick.parent.mkdir()
+        _ = fake_magick.write_text("#!/bin/sh\necho 0\n")
+        fake_magick.chmod(0o755)
+        self.fake.screenshot = "black"
+        black = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"))
+        self.assertEqual(black.returncode, 1, black.stderr)
+        self.assertEqual(self.timing_lines()[0]["failure_reason"], "black_capture")
+
+        _ = fake_magick.write_text("#!/bin/sh\necho 0.5\n")
+        self.fake.screenshot = "tiny"
+        empty = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"))
+        self.assertEqual(empty.returncode, 1, empty.stderr)
+        self.assertEqual(self.timing_lines()[1]["failure_reason"], "empty_crop")
+
+        self.fake.screenshot = "ok"
+        passed = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"))
+        self.assertEqual(passed.returncode, 0, passed.stderr)
+        self.assertEqual(self.timing_lines()[2]["status"], "success")
+        self.assertEqual([line["invocation_kind"] for line in self.timing_lines()], ["views_check"] * 3)
+
     def test_add_list_show_and_replace(self) -> None:
         added = self.views(
             "add", "log-back", "--target", "name:Log", "--yaw", "3.14159", "--margin", "0.2",
@@ -360,7 +414,30 @@ class ShotTests(HanaShotTest):
             (self.port, "home", "none", "1280x720", *SHOT_SIZE),
         )
         self.assertGreaterEqual(line["total_ms"], line["capture_ms"])
+        self.assertEqual((line["status"], line["exit_code"]), ("success", 0))
+        self.assertEqual(line["session"], {"state": "absent"})
+        [attempt] = line["attempts"]
+        self.assertEqual((attempt["status"], attempt["label"], attempt["view"]), ("success", "home", None))
+        self.assertEqual(attempt["image_paths"], [str(self.scratch / "shot.png")])
         self.assertEqual([path.name for path in self.scratch.glob(".shot-*")], [])
+
+    def test_session_evidence_uses_codex_thread_before_claude_code_session(self) -> None:
+        cases: tuple[tuple[dict[str, str], dict[str, str]], ...] = (
+            ({"CLAUDE_CODE_SESSION_ID": "claude"}, {"state": "present", "value": "claude"}),
+            ({"CODEX_THREAD_ID": "codex"}, {"state": "present", "value": "codex"}),
+            ({"CLAUDE_CODE_SESSION_ID": "claude", "CODEX_THREAD_ID": "codex"},
+             {"state": "present", "value": "codex"}),
+            ({}, {"state": "absent"}),
+            ({"CLAUDE_SESSION_ID": "old-claude", "CODEX_SESSION_ID": "old-codex"}, {"state": "absent"}),
+        )
+        for variables, expected in cases:
+            with self.subTest(variables=variables):
+                result = self.run_script(
+                    "shot", "--port", str(self.port), "--out", str(self.scratch / "shot.png"),
+                    "--mode", "home", session_variables=variables,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.timing_lines()[-1]["session"], expected)
 
     def test_timed_out_screenshot_is_never_resent(self) -> None:
         self.fake.screenshot = "hang"
@@ -369,7 +446,9 @@ class ShotTests(HanaShotTest):
         self.assertIn("without resending", result.stderr)
         self.assertEqual(len(self.fake.methods("brp_extras/screenshot")), 1)
         self.assertFalse((self.scratch / "shot.png").exists())
-        self.assertFalse(self.timings.exists())
+        [line] = self.timing_lines()
+        self.assertEqual((line["exit_code"], line["failure_reason"]), (3, "timeout"))
+        self.assertEqual(cast(list[dict[str, object]], line["attempts"])[0]["image_paths"], [])
 
     def test_busy_screenshot_is_resent_once(self) -> None:
         self.fake.screenshot = "busy-once"
@@ -384,6 +463,108 @@ class ShotTests(HanaShotTest):
         result = self.shot("--mode", "home")
         self.assertEqual(result.returncode, 1)
         self.assertIn("already in progress", result.stderr)
+        self.assertEqual(self.timing_lines()[0]["failure_reason"], "already_in_progress")
+
+    def test_failed_capture_causes_have_one_record_each(self) -> None:
+        for mode, reason in (("error", "brp_error"), ("invalid", "invalid_png")):
+            with self.subTest(mode=mode):
+                self.fake.screenshot = mode
+                result = self.shot("--mode", "home")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                line = self.timing_lines()[-1]
+                self.assertEqual((line["status"], line["failure_reason"]), ("failure", reason))
+
+    def test_missing_target_and_invalid_request_are_recorded(self) -> None:
+        missing = self.shot("--target", "name:Absent")
+        refused = self.shot("--mode", "pose")
+        self.assertEqual((missing.returncode, refused.returncode), (1, 2))
+        self.assertEqual([line["failure_reason"] for line in self.timing_lines()], ["no_target", "invalid_request"])
+
+    def test_parser_error_is_recorded(self) -> None:
+        result = self.run_script("shot", "--port", str(self.port), "--mode")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        [line] = self.timing_lines()
+        self.assertEqual((line["port"], line["failure_reason"], line["exit_code"]),
+                         (self.port, "invalid_request", 2))
+
+    def test_multi_view_failure_keeps_earlier_attempt(self) -> None:
+        views = self.scratch / "views.toml"
+        _ = views.write_text('[views.first]\nmode = "home"\n[views.second]\ntarget = "name:Absent"\n')
+        result = self.run_script("shot", "--port", str(self.port), "--view", "all", "--views-file", str(views))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        [line] = self.timing_lines()
+        self.assertEqual(line["failure_reason"], "no_target")
+        attempts = cast(list[dict[str, object]], line["attempts"])
+        self.assertEqual([attempt["status"] for attempt in attempts], ["success", "failure"])
+        self.assertEqual(len(cast(list[str], attempts[0]["image_paths"])), 1)
+        self.assertEqual(attempts[0]["mode"], "home")
+        stats = self.run_script("stats")
+        self.assertIn("1 shots since", stats.stdout)
+        self.assertIn("failure no_target: 1", stats.stdout)
+
+    def test_stats_counts_each_view_and_legacy_shot_once(self) -> None:
+        views = self.scratch / "views.toml"
+        _ = views.write_text('[views.first]\nmode = "home"\n[views.second]\ntarget = "name:Log"\nmode = "hana-frame"\n')
+        shot = self.run_script("shot", "--port", str(self.port), "--view", "all", "--views-file", str(views))
+        self.assertEqual(shot.returncode, 0, shot.stderr)
+        [line] = self.timing_lines()
+        attempts = cast(list[dict[str, object]], line["attempts"])
+        self.assertEqual([attempt["mode"] for attempt in attempts], ["home", "hana-frame"])
+        self.assertTrue(all("total_ms" in attempt for attempt in attempts))
+        legacy = {key: value for key, value in line.items() if key not in ("status", "exit_code", "session", "attempts")}
+        with self.timings.open("a") as handle:
+            _ = handle.write(json.dumps(legacy) + "\n")
+        stats = self.run_script("stats")
+        self.assertEqual(stats.returncode, 0, stats.stderr)
+        rows = {row.split()[0]: row.split() for row in stats.stdout.splitlines()[2:]}
+        self.assertEqual(rows["all"][1], "3")
+        self.assertEqual(rows["home/none"][1], "1")
+        self.assertEqual(rows["hana-frame/none"][1], "2")
+
+    def test_failed_attempt_paths_require_a_new_file(self) -> None:
+        output = self.scratch / "shot.png"
+        _ = output.write_bytes(png(*SHOT_SIZE))
+        old = 1_600_000_000_000_000_000
+        os.utime(output, ns=(old, old))
+        self.fake.screenshot = "error"
+        failed = self.shot("--mode", "home")
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        first_attempts = cast(list[dict[str, object]], self.timing_lines()[0]["attempts"])
+        self.assertEqual(first_attempts[0]["image_paths"], [])
+
+        _ = (self.scratch / "views.toml").write_text('[views.front]\nmode = "home"\n')
+        fake_magick = self.scratch / "bin" / "magick"
+        fake_magick.parent.mkdir()
+        _ = fake_magick.write_text("#!/bin/sh\necho 0\n")
+        fake_magick.chmod(0o755)
+        self.fake.screenshot = "black"
+        black = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"))
+        self.assertEqual(black.returncode, 1, black.stderr)
+        second_attempts = cast(list[dict[str, object]], self.timing_lines()[1]["attempts"])
+        self.assertEqual(second_attempts[0]["image_paths"], [str(self.scratch / "check" / "front.png")])
+
+    def test_timing_write_failure_keeps_call_outcome(self) -> None:
+        _ = (self.scratch / "cache").write_text("occupied")
+        success = self.shot("--mode", "home")
+        self.assertEqual(success.returncode, 0, success.stderr)
+        self.assertEqual(success.stdout.strip(), str(self.scratch / "shot.png"))
+        self.assertEqual(sum("could not write timing record" in line for line in success.stderr.splitlines()), 1)
+        self.assertIn("Not a directory", success.stderr)
+        self.assertNotIn("Traceback", success.stderr)
+
+        self.fake.screenshot = "error"
+        failure = self.shot("--mode", "home")
+        self.assertEqual(failure.returncode, 1, failure.stderr)
+        self.assertEqual(failure.stdout, "")
+        self.assertIn("camera rejected capture", failure.stderr)
+        self.assertEqual(sum("could not write timing record" in line for line in failure.stderr.splitlines()), 1)
+        self.assertIn("Not a directory", failure.stderr)
+        self.assertNotIn("Traceback", failure.stderr)
+
+    def test_no_app_is_recorded(self) -> None:
+        result = self.run_script("shot", "--port", "65001", "--mode", "home")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.timing_lines()[0]["failure_reason"], "no_app")
 
 
 class RemoteTests(HanaShotTest):
@@ -444,7 +625,7 @@ class RemoteTests(HanaShotTest):
         )
         self.assertEqual(len(list(remote.iterdir())), 1)
         self.assertFalse((self.scratch / "shot.png").exists())
-        self.assertFalse(self.timings.exists())
+        self.assertEqual(self.timing_lines()[0]["failure_reason"], "copy_failed")
 
     def test_remote_mac_shot_raises_the_window_and_holds_the_display_awake_for_the_run(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
@@ -489,6 +670,21 @@ class PoseTests(HanaShotTest):
 
 
 class StatsTests(HanaShotTest):
+    def test_failures_by_reason_and_bad_lines_are_skipped(self) -> None:
+        self.timings.parent.mkdir(parents=True)
+        _ = self.timings.write_text(
+            '\n'.join([
+                '{"time":"2026-10-03T10:00:00+00:00","status":"failure","exit_code":3,"failure_reason":"timeout"}',
+                '{"time":"2026-10-03T11:00:00+00:00","status":"failure","exit_code":1,"failure_reason":"no_app"}',
+                '{"time":"2026-10-03T12:00:00+00:00","status":"failure","exit_code":3,"failure_reason":"timeout"}',
+                '{bad}',
+            ]) + '\n'
+        )
+        result = self.run_script("stats")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("failure no_app: 1", result.stdout)
+        self.assertIn("failure timeout: 2", result.stdout)
+
     def write_timings(self, *rows: tuple[str, str, str, float]) -> None:
         self.timings.parent.mkdir(parents=True)
         records = [

@@ -1,10 +1,11 @@
 ---
 description: Show what this unit's delegate run and its agents are doing right now.
+argument-hint: "[on|off]"
 ---
 
 # Delegate — status report
 
-**Usage:** `/unit:report`
+**Usage:** `/unit:report [on|off]`
 
 Type this when a run has gone quiet, when an update arrived without its tables,
 or any time you want to know what the agents are doing right now. It runs inside
@@ -18,16 +19,25 @@ It defines `<ProgressReport/>` — the content of an update. `<ProgressContract/
 owed. Never compose a report from memory of an earlier read: the byte-for-byte
 copy rule and the ordinary-English closing sentences are the parts that decay.
 
+With `on` or `off`, run
+`zsh ~/.claude/scripts/delegate/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID" on|off`
+using the requested word. Relay its output and stop without composing a report.
+A Codex unit has no notifier; say this switch is unavailable there. If the
+command fails, relay its message as printed: exit 1 covers both a session with
+no active run and a run whose notifier instance is missing, and the message
+says which. Reject other arguments.
+
 Everything below is the contract.
 
 ---
 
 <ProgressReport>
 1. Check launcher state first. For Codex, `exit_code` alone marks terminal
-   completion; a returned `session_id` without it remains active. If no dispatch,
-   background verification or open activity remains active, emit no stale
-   report and process completion. Ticks arriving
-   during a report, or several together, get one report.
+   completion; a returned `session_id` without it remains active. When no
+   dispatch, background verification or open activity remains active, process
+   completion; its result closes with the tables from step 5. A closed pass
+   alone is not completion (step 5). Ticks arriving during a report, or several
+   together, get one report.
 2. Read the current Work Order and verification list, the latest relevant
    heartbeat lines, `board.sh read "${SESSION_DIR}" --since <cursor>`,
    `git status --short`, and `git diff --stat` in `${WORKING_DIR}`. Keep the
@@ -66,19 +76,25 @@ Everything below is the contract.
 
    `python3 ~/.claude/scripts/delegate/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_RAW_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --cap-stage "<stage>" --activity "<current activity>" [--phase-override-reason "<specific evidence>"]`
 
-   **`No open window to report` does not mean the dispatch finished.** A pass
-   can be recorded closed while its worker is still running — a live run has
-   shown two seats carrying a closed pass while both were posting to the board —
-   so treating it as completion would route a healthy round through
-   <FixDispatch/>'s abandon path and lose the work. Establish which it is from
-   the seats themselves: `impl_status_<slot>`, board posts since the last
-   cursor, and whether the launcher has exited. Alive means say so in prose and
-   keep the run going; genuinely terminal means step 1's completion handling.
-   Never open an activity to make the tables render — that records unit-director
-   work that never happened.
+   **Between windows the tables still print.** With the phase active and no
+   pass or activity open — reviews closed, repair writers not started — the
+   recorder prints both tables from the phase's last recorded values, under an
+   `as of` line, and a `No pass or activity is open.` line under them. Paste it
+   like any other tick; there is no report without tables, and "No progress
+   table this time" is never written. A closed pass does not mean the dispatch
+   finished: a live run has shown two seats carrying a closed pass while both
+   were posting to the board, and treating that as completion routes a healthy
+   round through <FixDispatch/>'s abandon path.
+   Check the seats: `impl_status_<slot>`, board posts since the last cursor,
+   and whether the launcher has exited. Alive means say so in prose and keep the
+   run going; terminal means step 1's completion handling. Never open an
+   activity to make the tables render — that records unit-director work that
+   never happened. `No active phase to report` is the one refusal between
+   windows: no phase is active.
 
    Include the override reason only when rejecting an applicable calibrated
-   value. **Copy its Markdown output byte-for-byte** — the scope line,
+   value. **Copy its Markdown output byte-for-byte** — the scope line, the
+   `as of` line and the `No pass or activity is open.` line when present,
    both tables with every row and cell, the `Earlier:` line above the round
    table when there is one, the `- **Verification**` gate block under the
    table when there is one (already condensed, one line per gate command),

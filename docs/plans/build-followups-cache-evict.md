@@ -1,6 +1,6 @@
 # cache-evict: the disk floor takes from the least used build cache first
 
-> **Status: IMPLEMENTATION PLAN — phased, delegate-ready; approved by the showrunner 2026-10-06 (Phase 2 `--forecast` dropped, the re-measure renumbered Phase 2).** Below its free-space floor, the disk floor sweep removes only the shortfall, but today it spreads that across every idle target by compile age, so each active unit loses part of its working set. This plan makes it take from the least recently used target first, records each target's last build so a test rerun counts as use, names in the journal whose cache went, and re-measures a day later.
+> **Status: IMPLEMENTATION PLAN — phased, delegate-ready; approved by the showrunner 2026-10-06 (Phase 2 `--forecast` dropped, the re-measure renumbered Phase 2); the showrunner added the memory gate as Phase 2 at 16:33 PDT, so the re-measure was Phase 3; the showrunner's merge check then found the gate's concurrent-check test racing, so a follow-up Phase 3 fixes it and the re-measure is Phase 4.** Below its free-space floor, the disk floor sweep removes only the shortfall, but today it spreads that across every idle target by compile age, so each active unit loses part of its working set. This plan makes it take from the least recently used target first, records each target's last build so a test rerun counts as use, names in the journal whose cache went, then makes the build memory gate hold a step until the memory it will need is free, and re-measures the floor a day later.
 
 > **Production: build-followups** — unit `cache-evict-unit`; production doc `docs/plans/build-followups-production.md`
 
@@ -37,19 +37,20 @@ i.e. figuring out the safest buld cache to delete in such situations so we don't
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. This plan changes the disk floor's eviction order in `scripts/lint/sweep.py` (Phase 1) and re-measures a day after it is live (Phase 2). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-cache-evict` on branch `build-followups-cache-evict` (unit `cache-evict-unit` of production `build-followups`). Name both in every Work Order.
+- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. This plan changes the disk floor's eviction order in `scripts/lint/sweep.py` (Phase 1), makes the build memory gate (`scripts/lint/memory_gate.sh`) admit a step only when its expected peak fits (Phase 2), fixes the gate's concurrent-check test (Phase 3), and re-measures the floor a day after Phase 1 is live (Phase 4). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-cache-evict` on branch `build-followups-cache-evict` (unit `cache-evict-unit` of production `build-followups`). Name both in every Work Order.
 - **Project started:** 2026-10-06T22:31:00+00:00
 - **Stack:** Python 3.13, standard library only.
 - **Layout:**
   - `scripts/lint/sweep.py` — budget sweep, doc-index prune, disk floor, floor alerts; header docstring holds the policy and its measurements
   - `scripts/lint/test_sweep.py` — its tests; `FloorTests` (helpers `base()`, `hold()`, `cargo_target()`, `unit()`) covers the floor
+  - `scripts/lint/memory_gate.sh` — `buildlog_wait_for_memory`, sourced by `scripts/lint/invoke.sh` (`run_once`) and the BRP launch hook `scripts/hooks/pre-tool-use-brp-launch-gate.sh`; its rule is documented in `docs/as-built/build-memory-admission.md` "The memory gate"
   - `config/lint.conf` — `sweep_free_floor_gib.natedev` (300 GiB since the user lowered it from 500 on 2026-10-06) and its comment
   - outside the repository: `~/.local/state/lint-sweep/` (floor lock, `floor.json`), `journalctl --user -u disk-floor.service` (EDT), `~/.local/state/buildlog/index.sqlite` (UTC; read only, `?mode=ro`)
 - **Key files:** `scripts/lint/sweep.py` (`Group`, `group_roots`, `scan_roots`, `choose`, `shrink`, `hold_floor`, `sweep_workspace`, `main`, header paragraphs "The disk floor" and "Last use"); `scripts/lint/invoke.sh:229–248` (`sweep_after_step`), `:355–369` (`invoke_sweep`); `scripts/buildlog/parse.py:49–52` (the lines it counts); `docs/as-built/build-memory-admission.md` "Disk-floor alerts" (as-built to amend at run end).
 - **Test lanes:** `scripts/lint/` — `test_*.py` beside the scripts.
 - **Build:** none.
-- **Test:** `python3 -m unittest discover -s scripts/lint -p 'test_sweep.py'` from the worktree root. Merge tests (production): `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'`.
-- **Lint:** `basedpyright scripts/lint/sweep.py scripts/lint/test_sweep.py` passes when its output ends `0 errors, 0 warnings, 0 notes` (it exits 3 in every checkout; the status says nothing).
+- **Test:** `python3 -m unittest discover -s scripts/lint -p 'test_*.py'` from the worktree root. Merge tests (production): `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'`.
+- **Lint:** `basedpyright` on each changed Python file under `scripts/lint/` passes when its output ends `0 errors, 0 warnings, 0 notes` (it exits 3 in every checkout; the status says nothing).
 - **Style:** none — not Rust.
 - **Invariants:**
   - Never remove output from a target whose cargo locks a build holds; the floor keeps taking every idle target's locks for its whole scan and removal, as now.
@@ -67,7 +68,7 @@ i.e. figuring out the safest buld cache to delete in such situations so we don't
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
-| G1 | Phase 2 | 24 h after Phase 1 reaches `~/.claude` main (T_live, its As-built) | the clock |
+| G1 | Phase 4 | 24 h after Phase 1 reaches `~/.claude` main (T_live, its As-built) | the clock |
 
 ## Phases
 
@@ -99,7 +100,48 @@ i.e. figuring out the safest buld cache to delete in such situations so we don't
 
 **Ruled out:** a `--forecast` mode (the re-measure reads the journal instead); moving the stamp ahead of `invoke.sh`'s rate limit (the lag only reorders targets used within the same 5 minutes).
 
-### Phase 2 — Re-measure a day after the target order went live · status: todo
+### Phase 2 — The memory gate holds a build until the memory it will need is free · status: done
+
+#### As-built
+
+A step that compiles starts only when its expected process memory fits beside the growth still promised to steps already running; the gate exists to stop earlyoom killing parallel hana nextest builds. All sizes are process memory (`memory.stat` `anon`), not `memory.peak`.
+
+- **Rule.** Admit when `MemAvailable >= need + promised + reserve`; alone (no live reservation) admit at `min(need + reserve, 12 GiB)`. `reserve` is 5% of `MemTotal` (0 without a `MemTotal` line). `promised` is the sum over live reservations of `max(0, need_i - anon_i)`, with `anon_i` from the scope cgroup `memory.stat` and 0 when the scope or cgroup is gone, so an unscoped step counts its whole `need`.
+- **`need`.** The first tier that applies, each a p90 by `(90*n+99)//100-1` over this host, repo and step in 14 days with at least 5 values: measured anon peaks (`admission/anon_peaks.jsonl`), then build-log `peak_mem_bytes` x `ANON_SHARE` 0.65 (measured p90 anon share 61-65%), then the 12 GiB fallback. Repo and step come from `parse.step_name` and `record.git_facts` (imports from `scripts/buildlog`, read only); a missing index, history file or repo skips that tier.
+- **`memory_admit.py`.** Pure `decide(available, total, need, running)`, `expected_peak`, `check` returning a frozen `CheckResult` whose `reservation` is `Reserved(path)` or `NotReserved(held|launch|untracked)`, and `release`. `StepProfile` (repo, step, worktree, peak) is resolved once per wait and passed back on later polls through CLI fields; the CLI prints 15 `|`-separated fields. Python runs through `"$HOME/.claude/scripts/lib/py"`; a step admitted at once costs one Python start.
+- **Ledger.** One `*.reservation` JSON file per admitted step under `store.root()/"admission"` (pid, pid start time from `/proc/<pid>/stat` field 22, need, repo, step, worktree, admitted_at, sidecar path). Check, prune and write happen under one exclusive `fcntl.flock` on `admission/lock`; a reservation whose pid is gone or reused is deleted when read. A step admitted at the limit writes its reservation too. `MemAvailable` is read inside the lock after the anon reads.
+- **`memory_gate.sh`.** `buildlog_wait_for_memory [ARGV...]` polls every `BUILDLOG_MEM_POLL_S` (5) up to `BUILDLOG_MEM_WAIT_LIMIT_S` (900) and sets `BUILDLOG_MEM_OUTCOME` (`Granted`, `TimedOut`, `MeminfoUnavailable`), `BUILDLOG_MEM_WAIT_S` and `BUILDLOG_MEM_RESERVATION`. A decision is made first, so only a step still held at the limit times out; with limit 0 a step starts at once. `buildlog_release_memory` deletes the reservation. A no-argv call (the BRP launch hook) uses the fallback `need`, writes no reservation, and grants from the shell's own read of a FIFO meminfo at or above 12 GiB.
+- **Stderr lines.** First hold: `waiting for memory since HH:MM PDT: ...` naming need, its source, the promised GiB and the running steps. Every 60 s: `still waiting for memory (N min): ...`. On admission: `memory free after N min S s: starting`. At the limit: `memory wait limit reached after 15 min; starting anyway`. Gate failure: `memory gate failed (<last line of the Python output>); starting anyway` (the first line is the traceback header). Untracked admission: `memory gate could not track this step; starting without a reservation`.
+- **`invoke.sh`.** `BUILDLOG_SCOPE_SH` writes the scope's cgroup directory to `"$BUILDLOG_PEAK.cgroup"`. `run_once` passes the step argv to the gate and runs one `buildlog_sample_anon` sampler (reads `anon` every second, exits when its parent is gone) that keeps the step's anon maximum in the `.max` file beside the reservation. `buildlog_finish_memory` stops the sampler, releases the reservation (appending the maximum to `anon_peaks.jsonl`: host, repo, step, worktree, anon peak, exit status, UTC end time; nothing for an unscoped step) and removes the sidecar on every path.
+- **Measured.** First check 431 ms, cached poll 102 ms, release 97 ms (hana nextest, 5,397 index rows). Replay of the four kill windows with tier-2 `need` (upper estimates, since the free memory replayed includes steps the gate would have held): held/arrived 54/76, 54/80, 27/46, 33/55 steps; longest wait 900 s in each.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — new: `need`, ledger, `decide`, `check`, `release` and the CLI the gate calls.
+- `scripts/lint/memory_gate.sh` — poll loop, cached profile, output lines, `BUILDLOG_MEM_RESERVATION`, `buildlog_release_memory`.
+- `scripts/lint/invoke.sh` — scope sidecar, anon sampler, release on every path.
+- `scripts/lint/test_memory_admit.py` — new: 25 tests over fake meminfo, index, cgroup tree and ledger.
+- `scripts/lint/test_invoke_scope.py` — sidecar and sampler tests.
+
+**Binds later work:** the work titled "Re-measure a day after the target order went live" names when this gate reached `~/.claude` main (its checkpoint is found by `git log --grep='^checkpoint(build-followups-cache-evict): phase 2 '`); holding builds in turn can change how fast targets grow. `scripts/buildlog/` stays read only.
+
+**Gotchas:** at the 15 min limit a held step starts anyway, so a sustained overload can still burst. Tier 2 is 0.65 x the build-log p90, conservative until 5 measured runs exist per repo and step. Reading `MemAvailable` before the anon reads, or outside the lock, admits on stale numbers.
+
+### Phase 3 — The memory gate's concurrent-check test no longer races · status: done
+
+#### As-built
+
+`LedgerTests.check(available, *, force, sidecar)` in `scripts/lint/test_memory_admit.py` keeps its signature and every caller, and calls two helpers: `write_meminfo(available)`, the one write of the fake `meminfo`, then `admit(*, force, sidecar)`, the `gate.check` call returning `(decision, path)`. `test_two_concurrent_checks_admit_one` calls `write_meminfo(12 * GIB)` once before it starts its two threads and each thread calls only `admit()`, so no thread truncates the file another is reading.
+
+`ShellTests.test_unreadable_meminfo_starts_the_step` sources `memory_gate.sh` and runs `buildlog_wait_for_memory /bin/true` against an empty meminfo and against one holding `MemTotal:` but no `MemAvailable:`. Each run exits 0, prints `MeminfoUnavailable`, and leaves `BUILDLOG_MEM_RESERVATION` empty. It and `test_python_failure_is_reported_and_step_starts` run under `set -e`, as `invoke.sh` does, so a gate that returned non-zero would fail them; all three cases fail against a copy of the gate that returns 1. `memory_admit.py` and `memory_gate.sh` are unchanged: the gate fails open, so a meminfo it cannot read never stops or delays a step.
+
+**Files:**
+- `scripts/lint/test_memory_admit.py` — the helper split, the concurrent test, the fail-open test.
+
+**Gotchas:** a shell test that proves "the step starts" runs the gate under `set -e`; a bare trailing `printf` hides a non-zero return from the gate.
+
+**Ruled out:** failing a build on a meminfo the gate cannot read; the gate must never stop or delay a step.
+
+### Phase 4 — Re-measure a day after the target order went live · status: todo
 
 #### Work Order
 
@@ -110,10 +152,11 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-cache-ev
 **Goal:** show whether the floor now takes from the least used targets, and what it costs per day, against the 2026-10-06 numbers.
 
 **Spec:** every step reads; nothing outside the As-built is written.
-- T_live: the commit time of the first `~/.claude` main commit that contains the Phase 1 checkpoint (`git log --format=%H -1 --grep='^checkpoint(build-followups-cache-evict): phase 1 ' build-followups-cache-evict`): `git -C ~/.claude log --ancestry-path --reverse --format='%h %cI' <checkpoint>..main | head -1`. Window W: T_live to T_live + 24 h; baseline B: the 24 h before T_live. The user lowered the floor from 500 to 300 GiB on 2026-10-06; `sweep_free_floor_gib.natedev=300` was live on `build-followups` and `~/.claude` main by 15:47 PDT, and this branch merged `build-followups` after the Phase 1 checkpoint. Name the floor in force beside every figure, split B or W at the moment the floor changed when it falls inside one, and take the change's time from `git log -S'sweep_free_floor_gib.natedev=300' build-followups -- config/lint.conf` and the time it reached `~/.claude` main.
+- T_live: the time `~/.claude` main's tip first contained the Phase 1 checkpoint (`git log --format=%H -1 --grep='^checkpoint(build-followups-cache-evict): phase 1 ' build-followups-cache-evict`): read main's reflog oldest first, `git -C ~/.claude reflog show --date=iso-strict --format='%h %gd' main | tac`, and take the time of the first tip for which `git -C ~/.claude merge-base --is-ancestor <checkpoint> <tip>` succeeds. It was 2026-10-06 16:33:18 PDT (tip `d321850`), the showrunner's G1 clock; a commit time is not it, since the oldest `--ancestry-path` commit is this unit's own merge at 16:21 PDT. Window W: T_live to T_live + 24 h; baseline B: the 24 h before T_live. The user lowered the floor from 500 to 300 GiB on 2026-10-06; `sweep_free_floor_gib.natedev=300` was live on `build-followups` and `~/.claude` main by 15:47 PDT, and this branch merged `build-followups` after the Phase 1 checkpoint. Name the floor in force beside every figure, split B or W at the moment the floor changed when it falls inside one, and take the change's time from `git log -S'sweep_free_floor_gib.natedev=300' build-followups -- config/lint.conf` and the time it reached `~/.claude` main.
 - From `journalctl --user -u disk-floor.service` (EDT) for B and W: timer sweeps that removed output, GiB taken, orphan GiB (the `orphaned files` line) apart, and the hours from each sweep back to the newest unit it took (median, min, max), from the `last used <oldest> to <newest>` removal line. In W that line spans oldest to newest unit; in B it named the last unit chosen, which under the old order was the newest by whole days, so label B's figure as that. Flag a sweep with a `could not remove` line as incomplete. Printed GiB are rounded.
 - From W's per-target lines (timer removals): GiB taken from targets whose last use was under 1 h, 1–6 h and over 6 h before the sweep, and the five targets that lost the most. The per-target lines of a complete sweep sum to its removal and orphan lines within rounding.
 - From the build log (`~/.local/state/buildlog/index.sqlite`, `?mode=ro`; schema in `scripts/buildlog/index.py`): `sum(sweep_freed_bytes)` of `step='sweep'` on natedev for B and W, reported as its own daily total beside the timer's.
+- Phase 2's memory gate reaches `~/.claude` main after T_live (its checkpoint: `git log --format=%H -1 --grep='^checkpoint(build-followups-cache-evict): phase 2 ' build-followups-cache-evict`; its time on main as for T_live); name that time and where it falls in W beside the verdict, since holding builds in turn can change how fast targets grow.
 - Verdict, no threshold: the share of W's timer GiB taken from targets used under 1 h before the sweep, and GiB a day in W against B, compared within each floor segment (500 or 300 GiB). If the floor removed nothing in W, say so: zero GiB, no top five, no age share, the lowest free space W reached, and that the live order stays unobserved beyond Phase 1's read-only check.
 
 **Files:**

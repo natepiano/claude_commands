@@ -29,18 +29,20 @@ While `/showrunner:produce` runs scheduled updates through `UPDATES`, a
 dailies the user runs takes the next tick's place. N is the
 production doc's **Updates** interval. Two steps do that:
 
-1. **Check every unit.** Before Gather, run the status script that the
-   scheduled-update prompt names. It checks every unit director, each time: that its
-   session and Claude are running, any form or decision waiting on the user,
-   and its latest step and ETA. Put anything it flags first (SESSION GONE,
-   CLAUDE NOT RUNNING, FORM WAITING, a usage limit, a DECISION), as a scheduled
-   tick does.
-2. **Reset the clock.** After the report, run `NOTIFIER restart UPDATES`:
-   at 19:21 with N = 15, the next tick is 19:36. An aligned timer keeps the
-   clock: at 19:21 with N = 60, 20:00; at 19:45, 21:00. Log the `next_due` it prints.
+1. **Check every unit.** Save the status script's complete output before Gather:
+   `zsh ~/.claude/scripts/production/unit_status.sh <scratchpad>/unit_status <ZONE> --showrunner <this session's name> > <scratchpad>/unit_status.txt`.
+   The input builder reads that file and prints `flags first:` for SESSION GONE,
+   CLAUDE NOT RUNNING, FORM WAITING, a usage limit, and a DECISION. Put these
+   first in the report.
+2. **Reset the clock.** Pass `--user-run` to the input builder for a dailies
+   the user invoked. It validates the full input before it runs `NOTIFIER restart
+   UPDATES`, takes the new `next_due` for the report, and logs that line. At
+   19:21 with N = 15, the next tick is 19:36. An aligned timer keeps the
+   clock: at 19:21 with N = 60, 20:00; at 19:45, 21:00.
 
-A scheduled tick skips both steps. It has run the script already, and its clock
-is already right.
+A scheduled tick's prompt saves `<SCRATCH>/unit_status.txt`, then runs
+`/showrunner:dailies simple`. Pass that file to the builder without
+`--user-run`; its clock is already right.
 
 ## Gather
 
@@ -49,23 +51,22 @@ Read the current state, not memory, and check what you state the way
 
 1. **Time.** `TZ=<ZONE> date '+%H:%M %Z'`. `ZONE` only, never UTC (user, 2026-10-02).
 2. **Log.** The latest `### STATE` block in `LOG` and every event after it.
-3. **Each unit.** Capture its unit director's pane
-   (`tmux capture-pane -p -t <session> -S -60`): the phase, what it is doing now, its latest phase ETA, and any `— decision:`,
-   `— blocked:` or form waiting. Text after `❯` may be a prompt suggestion, not
-   the user's draft: `capture-pane -e` shows a suggestion dimmed (`ESC[2m`).
-   Note when the ETA was stated. One stated over an hour ago gets `/unit:eta`
-   this turn, and its `detail` reads `set HH:MM` until a new one arrives. User,
-   2026-10-04. An ETA already past is not shown as the ETA: send `/unit:eta`
-   and report `none measured - requested` until the new one comes. User,
-   2026-10-04 ("why does widget gantt lane say 17:26 ... when you ran this at 17:39?").
-4. **Merge branch.** Its last merge, whether it is pushed, and anything held or
-   testing.
+3. **Each unit.** Use the saved status output for its latest activity and ETA.
+   The input builder keeps the ETA's first-seen time and prints
+   `request /unit:eta: <unit>` once per phase when that ETA is over an hour
+   old or past. Send that request this turn. It writes `set HH:MM` for a stale
+   ETA and `none measured - requested` for a passed one. Supply the phase,
+   started time, current update, and ETA numbers from the unit's plan and
+   reports. Text after `❯` may be a prompt suggestion, not the user's draft:
+   `capture-pane -e` shows a suggestion dimmed (`ESC[2m`).
+4. **Merge branch.** The input builder reads the last merge and whether the
+   branch is pushed. Supply anything held or testing in the judgment file.
 5. **Open topics.** Everything in `LOG` not yet closed: held quota alerts, CI,
    defects routed between units, gates, and items waiting on the user.
-6. **Review watch.** `python3 ~/.claude/scripts/production/review_regime.py watch`.
-   Until it prints `acknowledged`, its line is the `Review watch` topic every
-   report; exit 3 sets `needs_user` (`/showrunner:produce` →
-   <MergeCheckpoint/> step 11). User, 2026-10-04.
+6. **Review watch.** The input builder runs `review_regime.py watch` and adds
+   its line as a topic until it prints `acknowledged`; exit 3 sets
+   `needs_user` (`/showrunner:produce` → <MergeCheckpoint/> step 6).
+   User, 2026-10-04.
 
 ## Subjects
 
@@ -79,12 +80,21 @@ ETA, earliest first, then units with no ETA, then the other topics.
 
 ## Output
 
-The report comes from a fixed template, never written by hand. Write the input
-JSON, run the renderer, and paste its output word for word as the whole report.
+The report comes from a fixed template, never written by hand. Write only the
+judgment JSON described below. Run the input builder, then the renderer on its
+output, and paste the renderer's output word for word as the whole report.
 Never edit the output: to change a line, change the input and run it again.
 When the renderer refuses the input (exit 2), fix what it names and run again.
+When the builder prints `<step>: failed — <reason>`, give that exact line to
+the user as the failure message. Correct the named input before reporting.
 
 ```sh
+python3 ~/.claude/scripts/production/dailies_input.py \
+  --production <PRODUCTION_DOC> --status <scratchpad>/unit_status.txt \
+  --judgment <scratchpad>/dailies_judgment.json --state-dir <scratchpad>/dailies_input_state \
+  --out <scratchpad>/dailies_input.json --length <simple|page|elaborate> \
+  --render-state <scratchpad>/dailies_state.json \
+  --notifier <NOTIFIER> [--user-run]
 python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_input.json \
   --state <scratchpad>/dailies_state.json --log <LOG> --outstanding <OUTSTANDING>
 ```
@@ -97,6 +107,20 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
   compare. Write no such line by hand.
 
 ### Input
+
+The judgment file has `units` and optional `topics` and `merge`. Each unit
+has its `unit` session name and only the fields requiring judgment: `project`,
+`goal` when measured, `phase`, `started`, `held`, `held_examples` when useful,
+`update`, `waiting_on_it`, `needed`, `needs_user` when you know the answer,
+`then`, `label` (up to eight characters; needed when the session name without
+`-unit` is longer), and ETA numbers (`percent`, `earliest`, `latest`, `first`, `fixes`,
+`why`) in `eta`. The builder takes the ETA time from status. Write `merge.held`
+or `merge.testing` when relevant. It fills `length`, `zone`, `unit`,
+`next_run`, build holds, review watch and merge branch. A refusal names what
+needs correction and leaves the output file untouched; fix the judgment file
+and run it again.
+
+The builder's output, which the renderer consumes:
 
 ```json
 {
@@ -149,12 +173,13 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 | `waiting_on_it` | Only for a topic that lands with this unit's phase, and who waits. |
 | `needed` | Only when the subject needs a follow-up nobody has started, from you (the user), the showrunner or another unit director. Say who. |
 | `needs_user` | `true` when the subject waits on you. It then goes first. |
-| `then` | A non-empty list of one-line items, one per upcoming phase or follow-up; lead with its phase number when it has one. A range with one shared purpose is one item: `76–79: edge cases in selection, jack panels, the palette and Log, saved scenes and reset`. Required on a follow-up and on a plan's last phase. On a follow-up, an item must name the plan phase the unit returns to (`the plan at Phase <N>`), or say `plan done`; the renderer refuses anything else. Read the plan doc's `todo` phases to write it. |
+| `then` | A non-empty list only: each one-line item names one upcoming phase or follow-up; never chain two in one item. Lead with its phase number when it has one. A range with one shared purpose is one item: `76–79: edge cases in selection, jack panels, the palette and Log, saved scenes and reset`. Required on a follow-up and on a plan's last phase. On a follow-up, an item must name the plan phase the unit returns to (`the plan at Phase <N>`), or say `plan done`; the renderer refuses anything else. Read the plan doc's `todo` phases to write it. |
 | topic `title`, `update`, `eta` | The topic's name, what it is doing now, and when it lands, as text. |
 
-**`then`** lists what the unit does after this, in order. Give each upcoming
-phase or follow-up its own item; group a phase range only when it has one shared
-purpose. `simple` shows only the first item. `page` and `elaborate` show each
+**`then`** is always a list of one-line items in order. Give each upcoming
+phase or follow-up its own item; never chain two in one item. Group a phase
+range only when it has one shared purpose. For example: `"then": ["Phase 3: panel labels stay legible", "Phase 4: panel edges align"]`.
+`simple` shows only the first item. `page` and `elaborate` show each
 item as a sub-bullet under `- then:`; a single item stays on the `- then:` line.
 
 - On work inserted ahead of its plan (a follow-up, or a phase added mid-run)
@@ -162,9 +187,9 @@ item as a sub-bullet under `- then:`; a single item stays on the `- then:` line.
   then name the plan phase it goes back to, by number and what it does:
   `["40: precompose redesign and dimming", "the plan at Phase 41: new tools
   placed by the arrangement engine"]`.
-- On its plan's last phase with more work queued: name it and its source: `the
-  hana_organon plan (docs/hana/hana-organon-design.md), six phases, once this
-  phase is merged`. With nothing queued, `nothing queued`.
+- On its plan's last phase with more work queued: name it and its source:
+  `["the hana_organon plan (docs/hana/hana-organon-design.md), six phases, once this phase is merged"]`.
+  With nothing queued, `["nothing queued"]`.
 
 Read the plans and design docs for this, not the unit's queue alone. A unit
 director's own handoff may list only the work in front of it.

@@ -215,8 +215,9 @@ Applies to every implementation, test, fix, and review launcher.
    independently; process the first without waiting for the other.
 5. Codex: apply <CodexDispatchWait/>. Never end the turn while the launcher is
    active; its terminal result drives the next workflow step.
-6. A launcher killed at its time limit leaves its Codex seat running with no
-   one watching. Arm a Monitor on `${SESSION_DIR}/board.log` until that seat
+6. A new-seat or follow-up launcher killed at its time limit leaves its Codex
+   seat running with no one watching. Arm a Monitor on
+   `${SESSION_DIR}/board.log` until that seat
    posts its own `done`, not a `launcher:` line. Once it has, and its last lint
    and test passed after its last edit, end it with `codex_mesh.py end
    --session-dir "${SESSION_DIR}" --to <seat>` (never `stop`, which ends every
@@ -529,10 +530,9 @@ report: when work finishes, report its result and current progress header even
 if a tick arrived recently.
 
 A user-requested status check emits <ProgressReport/> immediately. If the user
-stops updates, run
-`zsh ~/.claude/scripts/message/notifier.sh stop delegate-<run id>` for Claude;
-Codex keeps polling without reports. Resume Claude updates with `start` on the
-same instance. Change one unit's interval with `/unit:interval <min>`.
+stops updates, use `/unit:report off` for Claude; Codex keeps polling without
+reports. Resume Claude updates with `/unit:report on`. Change one unit's
+interval with `/unit:interval <min>`.
 </ProgressContract>
 
 <AuthorizationContract>
@@ -931,10 +931,11 @@ and the wall-clock line, produced by <ProgressReport/> steps 3 and 5 with the
 current pass or activity. This is unconditional: the numbered items say what
 happened, and the tables say how far into the phase and the plan it happened,
 which is the half the user cannot reconstruct. Emit it after any launch,
-printed below the sections above exactly as the recorder emits it. Should the
-recorder answer that no window is open, the
-launcher has not recorded its pass yet: try once more, then continue without the
-tables rather than stalling the turn.
+printed below the sections above exactly as the recorder emits it. With the
+phase active and no pass or activity open, the recorder prints the same tables
+from the phase's last recorded values under an `as of` line: paste them like any
+tick. `No active phase to report` is the only refusal, because no phase is
+active; then continue without the tables rather than stalling the turn.
 </DelegationResultFormat>
 
 <FixDispatch>
@@ -958,6 +959,11 @@ finding id only in its summary; an id in code outlives the review that defined
 it. <ClosureReview/> is the cold read, so no seat is spent
 on one here. A seat's file set is its findings' files plus their test targets;
 its prompt names every other seat's files as read only.
+
+When a repair's files belong to a seat still open, dispatch it with
+`implement.sh --to <full-seat-name>` before the usual positional arguments.
+The prompt file is the follow-up message. Messages without the launcher are
+for questions only.
 
 Run `findings.py dispatch --covers <all batch ids>` before launching, then:
 
@@ -1012,7 +1018,7 @@ On completion, `implemented` continues as above; `error` applies
 <DelegateLaunchFailure/>, and then, if the error survives it,
 <RetainDelegatedPhaseReservation/>, reports the fix log, records an error
 outcome, clears the session marker, and stops. Both outcomes resolve the round
-in the ledger through the launcher. Any third outcome — the dispatch stopped,
+in the ledger through the launcher. Any third outcome — a new-seat or follow-up dispatch stopped,
 killed, or gone without `impl_status` reaching either — is the unit director's to
 resolve with `findings.py abandon` per <FindingsLedger/>, then apply
 <RetainDelegatedPhaseReservation/> before reviewing, re-dispatching, or
