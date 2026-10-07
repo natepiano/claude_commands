@@ -47,8 +47,22 @@ class CountTests(unittest.TestCase):
 
     def test_the_list_is_every_unit_in_alphabetical_order(self) -> None:
         rows = codex_winddown.listed("hana", ["trunk", "Organon", "startup"], {"trunk": 1, "Organon": 2})
-        self.assertEqual(codex_winddown.render("Codex agents, 13:31 PDT", rows),
-                         "Codex agents, 13:31 PDT\n\n```\nOrganon - 2\nstartup - 0\ntrunk - 1\n```")
+        held: dict[str, codex_winddown.Projection] = {"Organon": 1300.0}
+        self.assertEqual(codex_winddown.render("Codex agents, 13:31 PDT", rows, held, 1000.0),
+                         "Codex agents, 13:31 PDT\n\n```\nOrganon - 2 - likely finishes in 5 minutes\n"
+                         + "startup - 0\ntrunk - 1 - ETA Unmeasured\n```")
+
+    def test_a_projection_reads_owed_unmeasured_or_minutes(self) -> None:
+        held: dict[str, codex_winddown.Projection] = {"owed": None, "blind": "unmeasured", "soon": 1001.0,
+                                                      "late": 999.0}
+        self.assertEqual([codex_winddown.projected(unit, held, 1000.0) for unit in ("owed", "blind", "soon", "late")],
+                         ["asked, answer owed", "ETA Unmeasured", "likely finishes in 1 minute", "ETA Unmeasured"])
+
+    def test_a_unit_is_asked_once_and_again_when_its_time_has_passed(self) -> None:
+        held: dict[str, codex_winddown.Projection] = {"owed": None, "blind": "unmeasured", "soon": 1001.0,
+                                                      "late": 999.0}
+        self.assertEqual([unit for unit in ("new", "owed", "blind", "soon", "late")
+                          if codex_winddown.needs_asking(unit, held, 1000.0)], ["new", "late"])
 
     def test_a_showrunner_lists_itself_only_with_agents_or_without_units(self) -> None:
         self.assertEqual(codex_winddown.listed("hana", ["trunk"], {"hana": 1}), {"trunk": 0, "hana": 1})
@@ -92,8 +106,8 @@ class MessageTests(unittest.TestCase):
     def test_start_tells_each_live_showrunner_and_starts_its_count(self) -> None:
         done = self.run_script("start", "--from", "natedev")
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stdout.splitlines(), ["hana: told, counting every 2 minutes",
-                                                    "gone: no live session, skipped"])
+        self.assertEqual(done.stdout.splitlines(), ["hana: told to wind down", "gone: no live session, skipped",
+                                                    "hana: counting every 2 minutes"])
         log = (self.root / "log").read_text(encoding="utf-8")
         self.assertIn("send --to hana --from natedev --text Codex wind-down, from the user", log)
         self.assertIn("notifier new codex-count-hana --every 2 --to session:abc", log)
@@ -104,9 +118,37 @@ class MessageTests(unittest.TestCase):
         _ = self.run_script("start", "--from", "natedev")
         done = self.run_script("clear", "--from", "natedev")
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stdout.splitlines(), ["hana: count stopped", "hana: told the all clear"])
+        self.assertEqual(done.stdout.splitlines(), ["hana: count stopped", "hana: told the all clear",
+                                                    "gone: no live session, skipped"])
         self.assertEqual(list((self.root / "notifier").iterdir()), [])
         self.assertIn("--text All clear, from the user", (self.root / "log").read_text(encoding="utf-8"))
+
+    def test_triage_needs_a_wind_down_and_carries_the_users_words(self) -> None:
+        self.assertEqual(self.run_script("triage", "--from", "natedev").returncode, 1)
+        _ = self.run_script("start", "--from", "natedev")
+        done = self.run_script("triage", "--from", "natedev")
+        self.assertEqual(done.stdout.splitlines(), ["hana: told to sort its agents", "gone: no live session, skipped"])
+        self.assertIn("which ones can be stopped now and added to a resume list",
+                      (self.root / "log").read_text(encoding="utf-8"))
+
+    def test_a_unit_records_its_answer_and_start_forgets_it(self) -> None:
+        self.assertEqual(self.run_script("eta", "trunk", "5").stdout, "trunk: recorded\n")
+        self.assertEqual(self.run_script("eta", "organon", "unmeasured").returncode, 0)
+        self.assertEqual(self.run_script("eta", "trunk", "soon").returncode, 2)
+        saved = (self.root / "prompts/projections.json").read_text(encoding="utf-8")
+        self.assertIn('"organon": "unmeasured"', saved)
+        self.assertIn('"trunk": ', saved)
+        _ = self.run_script("start", "--from", "natedev")
+        self.assertFalse((self.root / "prompts/projections.json").exists())
+
+    def test_a_unit_that_reaches_no_agents_is_told_at_once_and_only_once(self) -> None:
+        (self.root / "prompts").mkdir()
+        _ = (self.root / "prompts/projections.json").write_text('{"trunk": null}', encoding="utf-8")
+        for _ in range(2):
+            self.assertIn("trunk - 0\n", self.run_script("count", "hana").stdout)
+        log = (self.root / "log").read_text(encoding="utf-8")
+        self.assertEqual(log.count("send --to trunk --from hana --text Codex wind-down, from hana: your Codex agents"), 1)
+        self.assertIn("launch Claude agents for short time frames", log)
 
     def test_status_says_whether_a_wind_down_is_on(self) -> None:
         self.assertIn("Wind-down: off", self.run_script("status").stdout)
