@@ -515,6 +515,68 @@ def save_cycle(cycle: HoldCycle) -> None:
     os.replace(temporary, path)
 
 
+def _renamed_holder_text(path: Path, new: str) -> str:
+    try:
+        raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ValueError(f"cannot rename build hold holder {path}: {error}") from error
+    if not isinstance(raw, dict):
+        raise ValueError(f"cannot rename build hold holder {path}: expected object")
+    fields = cast(dict[str, object], raw)
+    fields["holder"] = new
+    return json.dumps(fields, ensure_ascii=False) + "\n"
+
+
+def _rename_cycle_holder(cycle: HoldCycle, old: str, new: str) -> bool:
+    changed = False
+    old_hold = cycle["holders"].pop(old, None)
+    if old_hold is not None:
+        changed = True
+        if new not in cycle["holders"]:
+            cycle["holders"][new] = old_hold
+    for session_id, recipient in cycle["recipients"].items():
+        if recipient == old:
+            cycle["recipients"][session_id] = new
+            changed = True
+    for entry in cycle["entries"]:
+        if entry["name"] == old:
+            entry["name"] = new
+            changed = True
+    return changed
+
+
+def rename_holder(old: str, new: str) -> list[str]:
+    """Move one build holder and its active-cycle references to a new name."""
+    directory = holder_directory()
+    old_path = holder_path(directory, old)
+    new_path = holder_path(directory, new)
+    with release_lock():
+        if not old_path.exists():
+            return []
+        if old_path != new_path and new_path.exists():
+            raise ValueError(f"build hold holders exist for both {old!r} and {new!r}")
+
+        holder_text = _renamed_holder_text(old_path, new)
+        cycle = read_cycle()
+        cycle_changed = cycle is not None and _rename_cycle_holder(cycle, old, new)
+        if cycle is not None and cycle_changed:
+            save_cycle(cycle)
+
+        temporary = old_path.with_name(f".{old_path.name}.rename-{uuid.uuid4().hex}")
+        try:
+            _ = temporary.write_text(holder_text, encoding="utf-8")
+            os.replace(temporary, old_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        if old_path != new_path:
+            os.replace(old_path, new_path)
+
+    changed = ["build hold holder"]
+    if cycle_changed:
+        changed.append("build hold cycle")
+    return changed
+
+
 def open_cycle(now: datetime) -> HoldCycle:
     cycle: HoldCycle = {"id": uuid.uuid4().hex, "opened_at": now.isoformat(), "holders": {}, "recipients": {}, "entries": [], "release_started_at": ""}
     save_cycle(cycle)

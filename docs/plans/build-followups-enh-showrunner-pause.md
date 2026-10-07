@@ -40,7 +40,7 @@ Each is the unit director's own call unless it names the user or the showrunner.
 - **`no` keeps the updates off** until the user asks for them, or until their next conversation in that session goes quiet and the question comes round again.
 - **Turning a report back on must not move its schedule.** `notifier.sh start` schedules a whole interval from now, which would push a four-hour build report four hours past every conversation. The notifier gains a `resume` verb; a defect is fixed where it lives.
 - **The whole working pause is one phase** (the user made it the priority, 2026-10-07): one round of writing and review. An independent review of that phase then found seven defects in it, so a repair phase follows it and registration follows the repair. The unit rename (`/showrunner:rename_unit`) runs before the registration, which waits on the user (unit director, 2026-10-07 15:25 PDT; it was the last phase until then); its Work Order is added while the pause is being built.
-- **Registration is last and waits for the user.** Both hooks run only once `settings.json` lists them. The showrunner relayed the request; the unit director asks the user directly before that edit.
+- **Registration comes after the yes/no protection (Phase 5), and the user approved it.** Both hooks run only once `settings.json` lists them. The showrunner relayed the request, so the unit director asked the user directly; the user typed "yes i want the auto pause" in the unit director's session on 2026-10-07 about 15:45 PDT. The live `~/.claude` checkout still holds an uncommitted change to `settings.json` that is not this unit's; the showrunner settles it before it promotes the file.
 - **The pause waits while a review is open.** `/adhoc_review` typed into a showrunner's session reaches the pause first, so the pause holds the dailies and footer and the review finds them already off. While that review is open the pause neither asks its question nor returns the updates; its clock runs on from the last reply once the review ends. Each of the two features still restores only what it turned off itself.
 - **A typed message waits at most five seconds on the pause.** Past that the hook gives up for that one message and the next message finishes the pause. A message arriving late costs the user more than one report slipping through.
 - **A question that cannot reach the session still ends the pause.** The user's five minutes to answer start when the question arrives; when it never arrives, the updates return five minutes after it fell due, the same wait as an unanswered question.
@@ -85,7 +85,7 @@ Each is the unit director's own call unless it names the user or the showrunner.
 - **Port:** none.
 - **Test lanes:** `scripts/hooks/`, `scripts/message/` and `scripts/production/` (tests sit beside the scripts as `test_*.py`).
 - **Test:** `python3 -m unittest discover -s scripts/hooks -p 'test_*.py'`, from the worktree root; the same form with `-s scripts/message` or `-s scripts/production`. While iterating, one file: `-p '<test_file>.py'`.
-- **Lint:** `basedpyright <each changed .py file>` passes when its output ends `0 errors, 0 warnings, 0 notes`. It exits 3 in every checkout, so the exit status says nothing.
+- **Lint:** `basedpyright <directory>` on each whole directory a change can reach (`scripts/production`, `scripts/message`, `scripts/hooks`, `scripts/build_hold`, `scripts/mac_test`), never on the changed files alone: an importer elsewhere breaks unseen. It passes when its output ends `0 errors, 0 warnings, 0 notes`. It exits 3 in every checkout, so the exit status says nothing.
 - **Invariants:**
   - Tests never start a real `claude`, `tmux`, `systemd-run` or `ssh`, never write `~/.claude/config/` or `~/.local/state/`, and never push anywhere (source: `docs/as-built/showrunner-automation.md`). Every state root and every outside command has an environment override, and tests set all of them.
   - Other units run scripts from the live `~/.claude` checkout while this plan edits the worktree's copies. An existing notifier verb keeps its behavior and its output (source: this plan's author; other units parse `next_due`).
@@ -171,7 +171,7 @@ The pause is safe to register: it cannot delay a prompt, cannot stay on for ever
 
 **Gotchas:** `broadcast.py` and `codex_winddown.py` are the only importers of `sessions` under `scripts/`; `codex_winddown.py` imports `SessionRecord` alone.
 
-### Phase 4 — `/showrunner:rename_unit <old> <new>` renames a unit's session everywhere the showrunner reads it  · status: todo
+### Phase 4 — `/showrunner:rename_unit <old> <new>` renames a unit's session everywhere the showrunner reads it  · status: done
 
 #### Work Order
 
@@ -264,28 +264,41 @@ State stores:
 - `impl` — orchestration: `commands/showrunner/rename_unit.md`, `scripts/production/rename_unit.py`, `scripts/production/test_rename_unit.py`, `scripts/production/tmux_names.py`, `scripts/production/test_tmux_names.py`, `scripts/production/showrunners.py`, `scripts/production/stall_watch.py`, `scripts/production/test_showrunners.py`, `scripts/production/add_unit.py`, `scripts/production/test_add_unit.py`, `scripts/message/top_level.py`, `scripts/message/test_top_level.py`; hub: `scripts/production/rename_unit.py` (the only caller of both writers' functions).
 - `test` — opens as impl; the state stores: `scripts/production/rename_state.py`, `scripts/production/test_rename_state.py`, `scripts/message/send.py`, `scripts/message/test_send.py`, `scripts/build_hold/build_hold.py`, `scripts/build_hold/test_build_hold.py`. Item F fixes the three signatures the other writer calls.
 
-**Constraints from prior phases:** Phase 1 touches none of these files. Phase 2 changed `scripts/production/stall_watch.py` and `scripts/production/test_stall_watch.py`: `socket_for_target` returns `_SessionSocket | _NoLiveSession | _SessionLookupUnavailable`, and `tick` never reports a showrunner whose session name is in the registry as missing, and judges nobody missing in a minute when a lookup could not answer; `rename_state` is unchanged. `scripts/message/sessions.py socket` exits 3 when it cannot answer and 1 when no live session has the name. Phase 3 touches only `scripts/production/broadcast.py` and its test. This phase runs before the registration (Phase 5), which waits on the user. Once Phase 5 registers the pause, typing `/showrunner:rename_unit` pauses the showrunner's dailies and footer, and the `/rename <new>` this command types into the unit's pane pauses that unit's status reports; both pauses are keyed by session id, so they survive the new name untouched and return as any pause does. No pause record is moved. `scripts/production/tmux_names.py`, `scripts/message/send.py`, `scripts/message/top_level.py`, `scripts/build_hold/build_hold.py` and their tests belong to no live unit's row: the checkpoint notice names them as `also touches`.
+**Constraints from prior phases:** Phase 1 touches none of these files. Phase 2 changed `scripts/production/stall_watch.py` and `scripts/production/test_stall_watch.py`: `socket_for_target` returns `_SessionSocket | _NoLiveSession | _SessionLookupUnavailable`, and `tick` never reports a showrunner whose session name is in the registry as missing, and judges nobody missing in a minute when a lookup could not answer; `rename_state` is unchanged. `scripts/message/sessions.py socket` exits 3 when it cannot answer and 1 when no live session has the name. Phase 3 touches only `scripts/production/broadcast.py` and its test. This phase runs before the registration (Phase 6). Once Phase 6 registers the pause, typing `/showrunner:rename_unit` pauses the showrunner's dailies and footer, and the `/rename <new>` this command types into the unit's pane pauses that unit's status reports; both pauses are keyed by session id, so they survive the new name untouched and return as any pause does. No pause record is moved. `scripts/production/tmux_names.py`, `scripts/message/send.py`, `scripts/message/top_level.py`, `scripts/build_hold/build_hold.py` and their tests belong to no live unit's row: the checkpoint notice names them as `also touches`.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/production -p 'test_*.py'` green; `python3 -m unittest discover -s scripts/message -p 'test_*.py'` green; `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'` green; `basedpyright` on each changed `.py` file ends `0 errors, 0 warnings, 0 notes`. Live check by the showrunner after it promotes the command: rename a throwaway unit and read the row, `tmux ls` and the next dailies.
+**Acceptance gate:** `python3 -m unittest discover -s scripts/production -p 'test_*.py'` green; `python3 -m unittest discover -s scripts/message -p 'test_*.py'` green; `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'` green; `basedpyright` on each whole directory `scripts/production`, `scripts/message`, `scripts/hooks`, `scripts/build_hold` and `scripts/mac_test` ends `0 errors, 0 warnings, 0 notes`. Live check by the showrunner after it promotes the command: rename a throwaway unit and read the row, `tmux ls` and the next dailies.
 
-### Phase 5 — The two hooks are registered, and the commands say what they do  · status: todo
+### Phase 5 — A bare yes or no meant for another question is left to the session  · status: todo
 
 #### Work Order
 
-**Pending decision: register the two hooks in `settings.json`**
+**Goal:** While the pause's return question is open, a bare `yes` or `no` the user types in answer to a newer question from the session is no longer taken as the answer to the return question. The user, 2026-10-07 about 16:00 PDT: "yes that's fine if you protect this - but make sure to test it with a scratch session you run first". This phase runs before the registration so the hooks every session gets are the protected ones (the unit director's ordering).
 
-Actual problem:
-The pause runs only once `settings.json` lists `user-prompt-submit-conversation-pause.py` under `UserPromptSubmit` and `stop-conversation-pause.py` under `Stop`. `settings.json` is the user's configuration, and the request reached this unit through the showrunner, so the unit director asks the user directly. Asked in the unit director's session 2026-10-07 about 12:45 PDT and again about 15:06 PDT; not yet answered.
+**Spec:**
+- `scripts/hooks/conversation_pause.py`: once the question has been put to the user, the pause counts the session's replies that end after it (the Stop hook sees each). The reply that carries the question is the first. While only that reply has ended, a bare `yes` or `no` is the answer, as today. Once a later reply has ended, a bare `yes` or `no` is ordinary typing: it goes to the session untouched, the question stays open, and it still times out into the return after `ANSWER_SECONDS`.
+- The count lives in the pause record's `asked` state as a named field, never a bare optional; a record written before this change reads as "only the question's reply has ended".
+- The session can still answer for the user through `RESUME_COMMAND` and `KEEP_COMMAND` when the user's sentence means yes or no about the updates; that path is unchanged.
+- `status` says when a newer reply has taken the bare answer away, in one clause.
+- `scripts/hooks/test_conversation_pause.py`: the question asked, its reply ended, `yes` returns the updates; the question asked, a second reply ended, `yes` reaches the session, the record stays `asked`, and the timeout still returns the updates; the same for `no`; an old record without the field behaves as before.
+- The unit director reads `message_arrived`, `answer`, `mark_answered` and the Stop hook at this phase's start and tightens this Spec before dispatch.
 
-What exists now:
-- `settings.json` registers no `UserPromptSubmit` hook; its `Stop` list holds three hooks.
-- The live `~/.claude` checkout holds an uncommitted change to `settings.json` that is not this unit's, so the showrunner cannot promote this file until that is settled.
+**Files:**
+- `scripts/hooks/conversation_pause.py` — the count and the rule.
+- `scripts/hooks/stop-conversation-pause.py` — counts a reply that ends after the question, where the change needs it.
+- `scripts/hooks/user-prompt-submit-conversation-pause.py` — only where the rule needs it.
+- `scripts/hooks/test_conversation_pause.py` — the cases above.
 
-What should change:
-- Add the two hook entries below, and one permission entry so a session can run the pause's own `resume`, `keep` and `status` commands without a permission prompt.
+**Seats:** 1 writer + 1 tester.
+- `impl` — `scripts/hooks/conversation_pause.py`, `scripts/hooks/stop-conversation-pause.py`, `scripts/hooks/user-prompt-submit-conversation-pause.py`.
+- `test` — `scripts/hooks/test_conversation_pause.py`.
 
-Recommendation:
-Register both. Phase 2's repairs passed their review on 2026-10-07. The feature the user asked for does nothing until they are.
+**Constraints from prior phases:** Phase 2 named the states (`replying`, `quiet`, `question_pending`, `asked`, `kept_off`, `returned`) and made each hook give up after five seconds; neither may hold up a prompt. Phase 1 built the three scripts. The hooks are not registered yet (Phase 6), so nothing live runs this code. Tests never start a real `claude` or `tmux` and never write `~/.local/state/`.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/hooks -p 'test_*.py'` green; `basedpyright scripts/hooks` ends `0 errors, 0 warnings, 0 notes`. Then, before the checkpoint, the user's live check, run by the unit director in a scratch Claude session it starts itself: the two hooks registered for that session alone (a scratch settings file, the pause's state under a temporary directory, short timings), never in `settings.json`. In it: the question arrives, the session asks a question of its own, a typed `yes` reaches the session and the updates stay paused; in a second round a typed `yes` straight after the question returns the updates. The checkpoint notice states what the scratch session showed.
+
+### Phase 6 — The two hooks are registered, and the commands say what they do  · status: todo
+
+#### Work Order
 
 **Goal:** Every session runs the two hooks, and the showrunner and unit director commands say what happens when the user writes.
 
@@ -305,6 +318,110 @@ Register both. Phase 2's repairs passed their review on 2026-10-07. The feature 
 - `impl` — `settings.json`, `scripts/hooks/test_conversation_pause.py`.
 - `test` — opens as impl: `commands/showrunner/produce.md`, `commands/unit/delegate.md`.
 
-**Constraints from prior phases:** Phase 3 (the broadcast repair) and Phase 4 (the rename command) touch none of this phase's files. Since Phase 2 the prompt hook also calls `escalate.typed()` (`scripts/message/escalate.py`) for every typed prompt, so registering it starts that record too. Phase 2 repaired the pause and renamed its states (`replying`, `quiet`, `question_pending`, `asked`, `kept_off`, `returned`: what `status` prints); each hook gives up after five seconds, so neither needs a `timeout` in its registration. Phase 1 built `scripts/hooks/user-prompt-submit-conversation-pause.py`, `scripts/hooks/stop-conversation-pause.py` and `scripts/hooks/conversation_pause.py` (commands `status`, `resume`, `keep`, `tick`). The question the session is asked to put is `Return to automatic updates? (yes / no) They return on their own in 5 minutes.`, sent from `conversation-pause`. The session is handed two command lines to run through Bash, `RESUME_COMMAND` and `KEEP_COMMAND` (`"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/conversation_pause.py" resume` and `… keep`); each reads `CLAUDE_CODE_SESSION_ID`. Timings: the question five minutes after a reply ends (`QUIET_SECONDS`), thirty minutes after the user's message when no reply ended (`UNANSWERED_SECONDS`), the return five minutes after an unanswered question (`ANSWER_SECONDS`), a late yes or no for five minutes after that (`TOMBSTONE_SECONDS`).
+**Constraints from prior phases:** Phase 3 (the broadcast repair) and Phase 4 (the rename command) touch none of this phase's files. Phase 5 changed `scripts/hooks/conversation_pause.py` and `scripts/hooks/test_conversation_pause.py` so a bare `yes` or `no` is left to the session once the session has written since the question; the registration test goes beside that phase's tests, and the hooks registered here are the protected ones. Since Phase 2 the prompt hook also calls `escalate.typed()` (`scripts/message/escalate.py`) for every typed prompt, so registering it starts that record too. Phase 2 repaired the pause and renamed its states (`replying`, `quiet`, `question_pending`, `asked`, `kept_off`, `returned`: what `status` prints); each hook gives up after five seconds, so neither needs a `timeout` in its registration. Phase 1 built `scripts/hooks/user-prompt-submit-conversation-pause.py`, `scripts/hooks/stop-conversation-pause.py` and `scripts/hooks/conversation_pause.py` (commands `status`, `resume`, `keep`, `tick`). The question the session is asked to put is `Return to automatic updates? (yes / no) They return on their own in 5 minutes.`, sent from `conversation-pause`. The session is handed two command lines to run through Bash, `RESUME_COMMAND` and `KEEP_COMMAND` (`"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/conversation_pause.py" resume` and `… keep`); each reads `CLAUDE_CODE_SESSION_ID`. Timings: the question five minutes after a reply ends (`QUIET_SECONDS`), thirty minutes after the user's message when no reply ended (`UNANSWERED_SECONDS`), the return five minutes after an unanswered question (`ANSWER_SECONDS`), a late yes or no for five minutes after that (`TOMBSTONE_SECONDS`).
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/hooks -p 'test_*.py'` green; `python3 -c "import json; json.load(open('settings.json'))"` exits 0; `bash scripts/agents/test_agents_config.sh` green. Live check by the unit director after the showrunner promotes it: a typed message in a session with a running report shows the pause notice, five quiet minutes later the question arrives, a typed `yes` brings the reports back, and a sentence that means yes makes the session run the resume command with no permission prompt; a second round answered `no` leaves them off, `status` says so, and the `conversation-pause` notifier instance is gone once no record is left.
+
+### Phase 7 — A progress report shows the closing work of a unit's last piece of work  · status: todo
+
+#### Work Order
+
+**Goal:** A `/unit:report` that arrives while a unit runs its closing steps (the shrink of its last phase, the final gate) prints both progress tables, with a row for the step that is running. Today it prints `No active phase to report`, so the user gets a report without tables at the point where they want to know how close the unit is to done. Added by the user, 2026-10-07 about 15:55 PDT: "add it to the end of your current work orders and do it then".
+
+**Spec:**
+- `scripts/delegate/progress_history.py`, the `progress` command: the recorder already keeps a row for an activity opened after its phase closed, and `timeline` already lists it (checked in a scratch run, 2026-10-07). While such an activity is open and no phase is active, `progress` prints the scope table and the round table for the phase that closed last, from that phase's last recorded values, with the open activity as the running row. It prints them in the form it uses between windows: the `as of` line, both tables, the wall clock line.
+- With no phase active and no activity open, `progress` still answers `No active phase to report`, as today.
+- With a phase active, nothing changes: every existing `progress` output stays byte for byte the same.
+- `calibrate` is accepted in the same state, or `progress` needs no calibration there; the writer picks the one that leaves `commands/unit/report.md` step 5 runnable as written, and says which in its summary.
+- `scripts/delegate/test_progress_history.py`: a run whose last phase is finished, then an activity opened (`start-activity --label shrink`): `progress` exits 0 and prints both tables with the activity's row running; after `finish-activity`, `progress` answers `No active phase to report`; a run with a phase active prints what it printed before this change.
+
+**Files:**
+- `scripts/delegate/progress_history.py` — `progress` while an activity is open on a closed phase.
+- `scripts/delegate/test_progress_history.py` — the three cases.
+
+**Seats:** 1 writer + 1 tester.
+- `impl` — `scripts/delegate/progress_history.py`.
+- `test` — `scripts/delegate/test_progress_history.py`.
+
+**Constraints from prior phases:** No earlier phase of this plan touches `scripts/delegate/`. The two files belong to no live unit's row: the checkpoint notice names them as `also touches`. Other units run `progress_history.py` from the live `~/.claude` checkout on every status report, so every existing command keeps its output; tests point `--session-dir` at a temporary directory and never read a real run's state.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/delegate -p 'test_*.py'` green; `basedpyright scripts/delegate` reports no more problems than the count the unit director measures on this phase's starting commit, and none in the two files' changed lines.
+
+### Phase 8 — The registry records each unit director's status, and the stall watch reads it there  · status: todo
+
+#### Work Order
+
+**Goal:** Each unit director's current status (running, run finished, standing by) is recorded in the registry the showrunners already have, `config/showrunners.json`, and the stall watch reads a finished run from that record, never from words in a production doc. A live unit whose Plan cell mentions `run done` inside a description is still watched. Added by the user, 2026-10-07 about 16:00 PDT: "current is fine", then, on how a finished run is told: "have a configuration file for unit directors (don't we already have one going for showrunners? maybe we could add it to that) that shows the current status of unit directors", "probably that's better".
+
+**Spec:**
+- `scripts/production/showrunners.py`: each unit entry in the registry carries a status, a named type with one value per state the scripts tell apart today (running, run finished, standing by; the writer reads `stall_watch.py` and `add_unit.py` for the full set). A registry written before this change reads as running. One `change` verb sets a unit's status, safe to run twice.
+- `scripts/production/stall_watch.py` `finished_run_units`: a unit is finished when the registry says so. The `re.search(r"\brun done\b", cells[2])` over the Plan cell goes; `plan_cell_is_retired` stays for retired rows unless the registry status covers it too.
+- The instructions name the one command a unit director runs when its run ends, and nothing asks it to write a phrase: `docs/production_format.md` (<ProductionUnit/>) and `docs/delegate/final_gate_commit.md`, one sentence each. `add_unit.py` writes `running` when it launches or adopts a unit.
+- Tests: a Plan cell that mentions `run done` leaves the unit watched; a unit the registry marks finished is skipped; an old registry file without the field reads every unit as running; setting the status twice changes nothing the second time.
+- The unit director researches the registry's present layout and its readers at this phase's start and tightens this Spec before dispatch.
+
+**Files:**
+- `scripts/production/showrunners.py`, `scripts/production/test_showrunners.py` — the status and its verb.
+- `scripts/production/stall_watch.py`, `scripts/production/test_stall_watch.py` — the reader.
+- `scripts/production/add_unit.py`, `scripts/production/test_add_unit.py` — the status at launch.
+- `docs/production_format.md`, `docs/delegate/final_gate_commit.md` — the command a unit director runs.
+
+**Seats:** 2 writers, each writing the tests for its own files.
+- `impl` — `scripts/production/showrunners.py`, `scripts/production/test_showrunners.py`, `scripts/production/add_unit.py`, `scripts/production/test_add_unit.py`.
+- `test` — opens as impl: `scripts/production/stall_watch.py`, `scripts/production/test_stall_watch.py`, `docs/production_format.md`, `docs/delegate/final_gate_commit.md`.
+
+**Constraints from prior phases:** Phase 2 changed `scripts/production/stall_watch.py` and its test. Phase 4 changes `showrunners.py`, `add_unit.py` and `stall_watch.py` for the rename (`UnitIdentity`, repeat-safe `change("rename", …)`); build on what it leaves. The two docs are instructions every unit director reads from the live checkout: add the sentences, change nothing else. Tests never write `~/.claude/config/`.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/production -p 'test_*.py'` green; `basedpyright` on each whole directory `scripts/production`, `scripts/message`, `scripts/hooks`, `scripts/build_hold` and `scripts/mac_test` ends `0 errors, 0 warnings, 0 notes`.
+
+### Phase 9 — Showrunners and unit directors are told they may always correct an out-of-date as-built doc  · status: todo
+
+#### Work Order
+
+**Goal:** No showrunner or unit director asks before correcting an as-built doc that no longer matches the code, whichever unit owns the doc. The user, 2026-10-07 about 16:10 PDT: "you never have to ask about correcting out of date as-built's - add a note to follow up and fix the instructions taht guide showrunners and that guides unit directors that they should always be free to correct as-built documentation".
+
+**Spec:**
+- `docs/production_format.md`, <ProductionUnit/> item 9 (files you do not own): one sentence. Correcting an as-built doc under `docs/as-built/` that contradicts the code is always allowed, in any unit's doc, without asking the user, the showrunner or the owner; the checkpoint notice still names the file as `also touches`.
+- `commands/showrunner/produce.md`, in its rules: the same rule for the showrunner, and that it never holds a merge because a unit corrected another unit's as-built doc.
+- `docs/delegate/final_gate_commit.md`, where the as-built pass is defined: the same rule for the as-built pass.
+- Each sentence cites the user and the date. Nothing else in the three files changes.
+
+**Files:**
+- `docs/production_format.md` — the rule for unit directors.
+- `commands/showrunner/produce.md` — the rule for showrunners.
+- `docs/delegate/final_gate_commit.md` — the rule in the as-built pass.
+
+**Seats:** 1 writer. The unit director makes these edits directly: three sentences of instruction text, no code.
+- `impl` — `docs/production_format.md`, `commands/showrunner/produce.md`, `docs/delegate/final_gate_commit.md`.
+
+**Constraints from prior phases:** Phase 6 adds a paragraph to `commands/showrunner/produce.md`; Phase 8 adds a sentence to `docs/production_format.md` and to `docs/delegate/final_gate_commit.md`. Add beside them, change none of them. Every unit reads these three files from the live checkout.
+
+**Acceptance gate:** each of the three files states the rule once; `git diff --stat` for the phase names only those three files and the plan doc.
+
+### Phase 10 — Every phone alert goes through the one command that reaches the user  · status: todo
+
+#### Work Order
+
+**Goal:** Nothing sends a phone alert directly. Every script and command that reaches the user's phone does it through `send.py --to user`, so the urgency levels and anything else that command does apply everywhere. The user, 2026-10-07 about 15:55 PDT: "they should all be updated to use the one path to communicate with me". Asked first by the showrunner (natedev) the same day.
+
+**Spec:**
+- `scripts/message/send.py --to user --summary TITLE [--need note|decision|blocked] --text MESSAGE` is the one way (main `49573a8`); need maps to priority: note 0, decision 1, blocked 2. Each caller below stops calling `scripts/notify/pushover.py` and calls it, keeping its title, its message and its urgency (priority 0 → `note`, 1 → `decision`, 2 → `blocked`), and keeping what it does today when the send fails.
+- `scripts/production/ci_points.py` (near line 234), `scripts/buildlog/rust_release.py` (near line 157), `scripts/lint/sweep.py` (near line 1052): the call and its test, each test proving the command line the script runs, with a stub in place of `send.py`.
+- `commands/showrunner/produce.md` (the section near line 710 that tells the showrunner to run `pushover.py`) and `commands/builds.md`: the instruction names `send.py --to user`, as `commands/alert_user.md` already does, the Mac's `--machine natedev` included where the command can run on the Mac.
+- A caller that can run on the Mac passes `--machine natedev`: the keys exist only on natedev.
+- `scripts/notify/pushover.py` stays: `send.py` calls it.
+- The unit director reads each call site and `send.py`'s user path at this phase's start and tightens this Spec before dispatch.
+
+**Files:**
+- `scripts/production/ci_points.py`, `scripts/production/test_ci_points.py`
+- `scripts/buildlog/rust_release.py`, `scripts/buildlog/test_rust_release.py`
+- `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`
+- `commands/showrunner/produce.md`, `commands/builds.md`
+
+**Seats:** 2 writers, each writing the tests for its own files.
+- `impl` — `scripts/production/ci_points.py`, `scripts/production/test_ci_points.py`, `commands/showrunner/produce.md`, `commands/builds.md`.
+- `test` — opens as impl: `scripts/buildlog/rust_release.py`, `scripts/buildlog/test_rust_release.py`, `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`.
+
+**Constraints from prior phases:** Phases 6 and 9 each add text to `commands/showrunner/produce.md`; change only the phone-alert instruction there. None of these files is in this unit's row: the checkpoint notice names each as `also touches`, with its owner where the production doc gives one. Tests never send a real alert and never read `~/.config/pushover/env`.
+
+**Acceptance gate:** `python3 -m unittest discover -s <dir> -p 'test_*.py'` green for `scripts/production`, `scripts/buildlog`, `scripts/lint` and `scripts/message`; `basedpyright scripts/production` ends `0 errors, 0 warnings, 0 notes`, and `basedpyright` on `scripts/buildlog` and `scripts/lint` reports no more problems than the unit director measures on this phase's starting commit; `grep -rn "pushover.py" scripts commands` names only `scripts/notify/`, `scripts/message/` and `commands/alert_user.md`.

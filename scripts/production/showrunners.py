@@ -336,6 +336,10 @@ def change(action: str, session: str, zone: str, units: list[str], new_name: str
             if len(missing) == len(units):
                 return
         elif action == "rename":
+            if not any(runner["session"] == session
+                       or any(unit.name == session for unit in runner["units"])
+                       for runner in settings["showrunners"]):
+                return
             for runner in settings["showrunners"]:
                 old_runner = runner["session"]
                 if old_runner == session:
