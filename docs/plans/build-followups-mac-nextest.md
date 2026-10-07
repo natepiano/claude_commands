@@ -9,6 +9,7 @@
 ## Delegation Context
 
 - **Project:** `~/.claude` config repo: scripts and commands every Claude Code and Codex session on natedev and the Mac runs. This plan sends `verify.sh test` runs to the Mac when it is idle.
+- **Project started:** 2026-10-07T18:50:28.798+00:00
 - **Stack:** Python 3 standard library only (`unittest`, `argparse`, `fcntl`, `subprocess`, `shlex`, `tomllib`), checked by basedpyright; bash (`scripts/delegate/verify.sh`, `scripts/lint/invoke.sh`); zsh (`scripts/production/mac_run.sh`); `ssh` and `rsync` to host `mac` (Tailscale SSH).
 - **Layout:** `scripts/mac_test/` (new: state CLI, offload runner, audit, tests) · `scripts/delegate/` (`verify.sh` and its `test_verify_*.py`) · `scripts/production/mac_run.sh` · `scripts/buildlog/` (`record.py`, `index.py`, `report.py`, tests) · `config/` · `commands/`.
 - **Key files:**
@@ -38,11 +39,12 @@
   - Python: basedpyright zero errors and zero warnings, no file-level ignores, no `Any` (a `TypedDict` for each JSON shape).
   - `settings.json` is not edited.
   - `config/mac_test.conf` ships with `offload=off`; only the last phase turns it on.
+  - Nothing of this feature writes to or runs on the Mac until the showrunner says the Ian Hubert demo there is over (natedev's call, 2026-10-07): no mirror, copy, test run or measurement. A read-only look is allowed. Every phase before the live check is built and tested on natedev only.
   - Mac facts, read 2026-10-07: `hostname -s` is `Mac`, 12 cores, 64 GiB memory, 187 GiB free, bash 5.3 and `~/.cargo/bin/cargo` on the non-login ssh `PATH`, `/usr/bin/rsync` is Apple's (plain options only).
 
 ## Phases
 
-### Phase 1 — The Mac's lock, block and "Mac is free" message  · status: todo
+### Phase 1 — The Mac's lock, block and "Mac is free" message  · status: done
 
 #### Work Order
 
@@ -79,7 +81,108 @@ The message, sent once when a pending block turns active: first line `Message fr
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/mac_test -p 'test_*.py'` ends `OK`, and `basedpyright scripts/mac_test` ends `0 errors, 0 warnings, 0 notes`. Tests prove: a claim under a block exits 10; a second claim exits 11 and `--wait` gets it once the first releases; a block placed during a run is pending, and the release sends exactly one message and turns it active; a run whose process was killed is settled by the next `status`, which sends the message; another holder cannot unblock; with `sessions.py` answering 1 the message goes to the holder's name.
 
-### Phase 2 — The offload runner: probe, copy the tree, run on the Mac  · status: todo
+### Phase 2 — A block stops CI's Mac job, expires, and names what it skipped  · status: todo
+
+#### Work Order
+
+**Goal:** A block on the Mac also keeps CI's Mac job from starting, lifts by itself when its holder forgets it, and says on the way out which commits went without a macOS check.
+
+**Spec:**
+The hana workflow runs its one macOS job, `macOS: Compile and Test`, only while the repository variable `MACOS_CI` is `true`; any other value skips that job and the run stays green, as when the Mac is away. The block uses that switch. Everything here calls `gh` (found on `PATH`) from natedev; nothing touches the Mac.
+
+New file `config/mac_test.conf`, each key commented in plain words, read with `config_values()` imported from `scripts/lint/sweep.py` (the import form of `scripts/buildlog/disk.py:15-16`). `MAC_TEST_CONFIG` overrides the path; the default is `~/.claude/config/mac_test.conf`. Every test sets `MAC_TEST_CONFIG` to a scratch file, the first phase's tests included, so no test reads the live config:
+```
+ci_repo=natepiano/hana
+ci_variable=MACOS_CI
+ci_workflow=ci.yml
+ci_job=macOS: Compile and Test
+block_hours=4
+block_max_hours=48
+block_warn_minutes=15
+```
+An empty or missing `ci_repo` turns the CI switch, the busy check and the skipped list off; expiry still applies.
+
+**The lock is never held across a slow call.** State is read and written under the flock; every `gh` call and every message send runs with the lock released. A command decides under the lock, calls outside it, takes the lock again, reads the block again, and applies its change only when the block is still the same one (same `since`). This replaces the first phase's sending of the "Mac is free" message under the lock. `claim` settles only what needs no `gh` call (a dead run) and never calls `gh`; it answers 10 on any block anyway. Every other command settles in full.
+
+`block.json` gains `"expires": "<ISO-8601 UTC>"`, `"showrunner": str | null` and `"ci_before": str | null` (null when the switch is off or `gh` failed). `read_block(path)` stays a plain read with no lock, no settle and no message, and `state_paths()` stays importable: the footer imports both in the next phase.
+
+- **CI is busy** when some run of `ci_workflow` with status `queued` or `in_progress` has a job named `ci_job` whose status is `queued` or `in_progress`. Read it with `gh run list --repo <ci_repo> --workflow <ci_workflow> --status <status> --json databaseId` for both statuses (a run reads `queued` while its Mac job is `in_progress`), then `gh run view <id> --repo <ci_repo> --json jobs` for each id.
+- `block --holder NAME --for TEXT [--hours N] [--showrunner NAME]`: N defaults to `block_hours`; above `block_max_hours` print `a block lasts at most <block_max_hours> hours` and exit 2. A new block reads the variable with `gh variable get <ci_variable> --repo <ci_repo>`, stores it as `ci_before`, and sets it with `gh variable set <ci_variable> --body false --repo <ci_repo>`. It is `pending` while a run is live or CI is busy; when CI is the cause its first line reads `Block pending for <holder>: CI's Mac job is running. Nothing new starts there, and you get a message when it ends.` Every `block` ends with the line `It lifts by itself at <day HH:MM zone> unless you run block again.` (`%a %H:%M %Z`, local zone). The same holder again renews: reason, expiry and showrunner are replaced; `since`, `state` and `ci_before` are kept, and no variable call is made.
+- **Expiry.** A block whose `expires` has passed lifts by itself in a full settle: the variable is restored as `unblock` does, `block.json` is removed, and one message goes to the holder (the first phase's delivery rule) and, when the block names one, to the showrunner by name: `Message from mac-test: the Mac block by <holder> (<for>) reached its time limit at <day HH:MM zone> and lifted by itself. CI's Mac job is on again.` followed by the skipped list below. `block_warn_minutes` before `expires`, one message to the holder: `Message from mac-test: your Mac block (<for>) lifts by itself at <day HH:MM zone>. Run block again to keep it.`, sent with `--key mac-block-warn-<expires> --repeat-minutes 1440` so it goes once.
+- `watch`: every 60 s (`MAC_TEST_WATCH_INTERVAL_S` for tests) run a full settle; exit when no block is left. One watcher at a time, held by a flock on `watch.lock`. Any command that finds a block and that lock free starts one, detached (`start_new_session=True`, output to `watch.log` in the state directory).
+- A full settle turns a pending block active only when no run is live and CI is not busy, then sends the "Mac is free" message; `<what>` is `CI's Mac job` when CI was the last thing running. A failing busy check leaves the block pending.
+- `unblock`: when `ci_before` is `true`, set the variable back to `true`, remove the block and print `Mac unblocked; CI's Mac job is on again.` Any other stored value is left alone: `Mac unblocked; CI's Mac job was already off and stays off.` Then print the skipped list. When the variable cannot be set back, the block stays: print `Mac still blocked: CI's Mac job could not be turned back on (<gh's last line>). Run github-warmup, then unblock again.` and exit 2. The same failure at expiry keeps the block, tries again at every settle, and sends that text to the holder and the showrunner with `--key mac-block-stuck-<since> --repeat-minutes 60`.
+- **The skipped list**, built after the variable is restored and outside the lock: runs of `ci_workflow` created at or after the block's `since` (`gh run list --repo <ci_repo> --workflow <ci_workflow> --created '>=<since>' --limit 200 --json databaseId,headBranch,headSha`, newest first), keeping each whose `ci_job` job has conclusion `skipped` (`gh run view <id> --repo <ci_repo> --json jobs`). It prints
+  ```
+  CI runs that skipped the macOS job under this block:
+    <branch>: <n> runs, newest <first 9 characters of the sha>
+  Run CI again on each branch's newest commit to make up its macOS check: gh workflow run <ci_workflow> --repo <ci_repo> --ref <branch>
+  ```
+  with one branch line per branch, sorted by name, or the single line `No CI run skipped the macOS job under this block.` A failing `gh` here prints `Could not list the CI runs that skipped the macOS job: <gh's last line>` and changes no exit code.
+- `status`: the block line becomes `blocked by <holder> since <day HH:MM zone>, lifts <day HH:MM zone>: <for>` or `block pending for <holder>, lifts <day HH:MM zone>: <for>`, and one line is added: `CI's Mac job: on`, `CI's Mac job: off (this block)`, `CI's Mac job: off (set elsewhere)` or `CI's Mac job: running now`.
+- A failing `gh` on `block` (a cold credential agent is the usual cause) never loses the block: it is written with `ci_before` null, and `block` prints `Mac blocked for our own tests and builds, but CI's Mac job is still on: <gh's last line>. Run github-warmup, then block again.` and exits 2.
+
+`commands/mac_test.md`: `block <why> [hours N]`; a unit director adds `--showrunner <its showrunner's session name>`. It says what a block does to CI (new CI runs skip the Mac job and stay green, a Mac job already running finishes first, runs started under a block get no macOS check), that a block lifts by itself and how to keep it, and that `unblock` lists the commits to run CI on again. `commands/showrunner/produce.md`, the promote rule (529-534): a skipped `macOS: Compile and Test` also passes when the Mac is blocked; the log line reads `macOS skipped (Mac blocked)`. `config/README.md` gains a `## mac_test.conf` entry. `pyrightconfig.json` gains `{"root": "scripts/mac_test", "extraPaths": ["scripts/mac_test", "scripts/lint"]}`.
+
+**Files:**
+- `scripts/mac_test/mac_test.py` — the CI switch, the busy check, expiry, the skipped list, `watch`.
+- `scripts/mac_test/test_mac_test.py` — tests for them.
+- `config/mac_test.conf` — new, with the keys above.
+- `config/README.md` — the new entry.
+- `pyrightconfig.json` — the new environment entry.
+- `commands/mac_test.md` — hours, CI, expiry, the skipped list.
+- `commands/showrunner/produce.md` — one clause in the promote rule.
+
+**Seats:** `1 writer + 1 tester` — the command, its config and docs are one writer's; the tests come from this Spec.
+- `impl` — `scripts/mac_test/mac_test.py`, `config/mac_test.conf`, `config/README.md`, `commands/mac_test.md`, `commands/showrunner/produce.md`; hub: `pyrightconfig.json`
+- `test` — `scripts/mac_test/test_mac_test.py`: a stand-in `gh` on `PATH` that logs its argv and answers from a fixture file (the variable's value, the run lists, each run's jobs, a failure knob), and the first phase's stand-in `send` and `sessions` files.
+
+**Constraints from prior phases:** `scripts/mac_test/mac_test.py` has `claim`, `release`, `block`, `unblock`, `status` and one `settle()`, with state under `MAC_TEST_STATE_DIR` and the "Mac is free" message sent through `MAC_TEST_SEND` and `MAC_TEST_SESSIONS`. Its tests drive it as a subprocess and pin the first phase's output lines; the lines this phase changes are changed in those tests too.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/mac_test -p 'test_*.py'` ends `OK`; `basedpyright scripts/mac_test` ends `0 errors, 0 warnings, 0 notes`. Tests prove: `block` stores the old value and sets the variable to `false`; `unblock` restores it only when it was `true`, and keeps the block with exit 2 when `gh` fails; a block placed while CI is busy is pending, and the watcher turns it active and sends exactly one message once CI is idle; a block past its `expires` lifts at the next settle, restores the variable and messages the holder and the named showrunner; the warning goes once; a renewal keeps `since` and moves `expires`; the skipped list's three forms; a failing `gh` on `block` exits 2 with the block written; `claim` makes no `gh` call; each `status` line; an empty `ci_repo` makes no `gh` call at all; a slow stand-in `send` does not delay a `claim` made meanwhile.
+
+### Phase 3 — A Mac block shows in the footer and the dailies  · status: todo
+
+#### Work Order
+
+**Goal:** A pending or active Mac block shows in every showrunner reply footer and dailies report, beside the build holds, so a block that turns off the macOS check is never out of sight.
+
+**Spec:**
+One renderer serves every place a build hold shows. `footer()` in `scripts/production/dailies_render.py:1213-1235` builds the footer for the dailies report (`render`, 1373), for `update_registration.py footer` (through `footer_main`, 1400-1412) and for the Stop hook (`scripts/hooks/showrunner_footer.py:193-210` runs `dailies_render.py --footer` and compares line for line). A build hold's line comes from `hold_line` (1088-1092). The Mac block joins it there:
+
+- Read the block without side effects: add `scripts/mac_test` to `sys.path` beside the `build_hold` insert (57), `from mac_test import read_block, state_paths`, and call `read_block(state_paths().block)`. Never run `mac_test.py status` here: it takes the lock, settles and can send a message, and the Stop hook gives the whole render 10 s.
+- New `mac_block_line(block, zone) -> str`, times in the footer's `zone` as `hold_line` does them:
+  - active: `Mac block: <holder> since <HH:MM zone>, for <for> - lifts <day HH:MM zone>`
+  - pending: `Mac block pending: <holder> since <HH:MM zone>, for <for> - lifts <day HH:MM zone>`
+  (`%H:%M %Z` and `%a %H:%M %Z`.)
+- In `footer()` the Mac block item follows the build-hold items and their nested release lines and comes before the agent lines. The schedule line stays the last bullet: the Stop hook's `stamp()` reads it there.
+- `footer()` takes the block state as a parameter; `footer_main` and `parse_report` (879) each read it once, and `Report` carries it beside `build_hold` (227).
+- The block's reason passes `check_plumbing` like a build-hold purpose (`read_dailies_hold`, 689-698); a match raises `InputError` ending `; have <holder> run /mac_test block again with other words`.
+- An unreadable block file (`ValueError` or `OSError` from the read) never refuses the footer: the item reads `Mac block: its state file cannot be read (<path>)`.
+- No unit row mark and no input key: `parse_report` and `parse_unit` reject unknown keys, and a Mac block holds no unit. `update_registration.py`, `dailies_input.py` and both hook files need no change.
+
+Tests point every run at a scratch state directory with `MAC_TEST_STATE_DIR`, so a block live on this machine never leaks into a test:
+- `scripts/production/test_dailies_render_holds.py` — add `MAC_TEST_STATE_DIR` to `run_script`'s env (86-99) and new cases: the active line, the pending line, the order (build hold, Mac block, agents, schedule last), no block and no line, a plumbing word refused with the hint, the unreadable-file line.
+- Set `MAC_TEST_STATE_DIR` in `test_dailies_render.py` (`run()` 82-97 and `StatePreflightTests.setUp` 769-772), `test_dailies_render_agents.py` (`setUp` 34-59), `test_dailies_input.py` (the env at 126), `test_update_registration.py` (the env at 74-77; `copied_command` at 119-130 also copies `scripts/mac_test`) and `scripts/hooks/test_stop_showrunner_footer.py` (`setUp` 90-117).
+
+`pyrightconfig.json`: the `scripts/production` entry (75-82) gains `scripts/mac_test` in `extraPaths`. Docs: `commands/showrunner/produce.md` — the hold sentence (126-127) also names the Mac block and its state directory, and the example footer (144-160) gains a Mac block line; `commands/showrunner/dailies.md` — 171, 249 and 250-252 name the Mac block line; the `dailies_render.py` docstring (35-36).
+
+**Files:**
+- `scripts/production/dailies_render.py` — read the block, `mac_block_line`, the footer item.
+- `scripts/production/test_dailies_render_holds.py` — the new cases.
+- `scripts/production/test_dailies_render.py`, `scripts/production/test_dailies_render_agents.py`, `scripts/production/test_dailies_input.py`, `scripts/production/test_update_registration.py`, `scripts/hooks/test_stop_showrunner_footer.py` — the scratch state directory.
+- `pyrightconfig.json` — one path.
+- `commands/showrunner/produce.md`, `commands/showrunner/dailies.md` — the Mac block line.
+
+**Seats:** `1 writer + 1 tester` — the renderer and its docs are one writer's; the tests come from this Spec.
+- `impl` — `scripts/production/dailies_render.py`, `commands/showrunner/produce.md`, `commands/showrunner/dailies.md`; hub: `pyrightconfig.json`
+- `test` — `scripts/production/test_dailies_render_holds.py`, `scripts/production/test_dailies_render.py`, `scripts/production/test_dailies_render_agents.py`, `scripts/production/test_dailies_input.py`, `scripts/production/test_update_registration.py`, `scripts/hooks/test_stop_showrunner_footer.py`
+
+**Constraints from prior phases:** `scripts/mac_test/mac_test.py` exports `state_paths()` and a plain `read_block(path)` that returns the block record (`holder`, `session`, `showrunner`, `for`, `since`, `expires`, `state`, `ci_before`) or its no-block value and raises `ValueError` on a malformed file. `MAC_TEST_STATE_DIR` moves the state directory.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/production -p 'test_dailies_*.py'` ends `OK`; `python3 -m unittest discover -s scripts/production -p 'test_update_registration.py'` ends `OK`; `python3 -m unittest discover -s scripts/hooks -p 'test_stop_showrunner_footer.py'` ends `OK`; `basedpyright scripts/production` ends `0 errors, 0 warnings, 0 notes`.
+
+### Phase 4 — The offload runner: probe, copy the tree, run on the Mac  · status: todo
 
 #### Work Order
 
@@ -91,7 +194,7 @@ New `scripts/mac_test/offload.py`:
 
 Exit codes: `0` passed on the Mac; `75` not run there (declined or lost; the run must happen locally); any other value is the Mac run's own exit status. With `--result`, write three lines: `mac=<passed|failed|lost|declined>`, `reason=<word or empty>`, `seconds=<float>`. A decline prints one line `mac_test: staying on natedev (<reason>)`.
 
-Config: `MAC_TEST_CONFIG`, default `~/.claude/config/mac_test.conf`, read with `config_values()` imported from `scripts/lint/sweep.py` (the import form of `scripts/buildlog/disk.py:15-16`). New file `config/mac_test.conf`, each key commented in plain words:
+Config: `MAC_TEST_CONFIG`, default `~/.claude/config/mac_test.conf`, read with `config_values()` imported from `scripts/lint/sweep.py` (the import form of `scripts/buildlog/disk.py:15-16`). `config/mac_test.conf` gains these keys, each commented in plain words:
 ```
 offload=off
 host=mac
@@ -118,24 +221,23 @@ Steps, in order; each failure is a decline with the reason shown:
    When `mac_skip.<repo>` is not empty, the value after `-E` becomes `(<given>) & not (<mac_skip>)`. Stream the remote stdout and stderr line by line as they arrive; hold back the last `mac_exit=<n>` line. No such line → `lost`, exit 75. `mac_exit=0` → exit 0. Otherwise print `mac_test: this ran on the Mac (macOS). A failure that looks unrelated to your change may be a macOS difference; rerun with --local to run it on natedev.` and exit `<n>`.
 7. On SIGTERM or SIGINT: stop the ssh child, try once for at most 10 s to end what it started (`ssh <host> "pkill -f <mirror>"`), release, and exit 128 plus the signal number.
 
-`config/README.md` gains a `## mac_test.conf` entry. `pyrightconfig.json` gains `{"root": "scripts/mac_test", "extraPaths": ["scripts/mac_test", "scripts/lint"]}`.
+The `## mac_test.conf` entry in `config/README.md` gains the new keys.
 
 **Files:**
 - `scripts/mac_test/offload.py` — new: the runner.
 - `scripts/mac_test/test_offload.py` — new: its tests.
-- `config/mac_test.conf` — new.
-- `config/README.md` — the new entry.
-- `pyrightconfig.json` — the new environment entry.
+- `config/mac_test.conf` — the offload keys.
+- `config/README.md` — the entry's new keys.
 
 **Seats:** `1 writer + 1 tester` — the runner and its config are one writer's; the tests come from this Spec.
-- `impl` — `scripts/mac_test/offload.py`, `config/mac_test.conf`, `config/README.md`; hub: `pyrightconfig.json` (the tester's imports resolve through it)
+- `impl` — `scripts/mac_test/offload.py`, `config/mac_test.conf`, `config/README.md`
 - `test` — `scripts/mac_test/test_offload.py`: one stand-in script installed as `ssh` and `rsync` on `PATH` (the form in `scripts/production/test_merge_checkpoint.py:44-58`), logging argv, with knobs for each probe line, `mac_exit=<n>`, ssh's own 255, a slow answer and a missing last line.
 
-**Constraints from prior phases:** `scripts/mac_test/mac_test.py` exists with `claim` (0 claimed, 10 blocked, 11 busy) and `release`, state under `MAC_TEST_STATE_DIR`.
+**Constraints from prior phases:** `scripts/mac_test/mac_test.py` exists with `claim` (0 claimed, 10 blocked, 11 busy) and `release`, state under `MAC_TEST_STATE_DIR`. `config/mac_test.conf` exists with the `ci_*` keys, read through `MAC_TEST_CONFIG` with `config_values()`; `pyrightconfig.json` already lists `scripts/mac_test` with `scripts/lint` on its path.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/mac_test -p 'test_*.py'` ends `OK`; `basedpyright scripts/mac_test` ends `0 errors, 0 warnings, 0 notes`. Tests prove: each decline reason, with exit 75 and the result file; a second call inside the back-off makes no ssh call; the rsync argv and the exclude file; the remote command carries the call id, the budget and the exact nextest words, with a filter such as `package(hana) & (test(a) | test(b))` surviving quoting; `mac_skip` wraps the filter; output order is kept and the `mac_exit` line is not shown; exit 0, a failing status and a lost connection; the claim is released on every path, a signal included.
 
-### Phase 3 — `verify.sh test` tries the Mac first  · status: todo
+### Phase 5 — `verify.sh test` tries the Mac first  · status: todo
 
 #### Work Order
 
@@ -150,13 +252,13 @@ Steps, in order; each failure is a decline with the reason shown:
   - Exit 0 on a `--filter` run: print `verify.sh: PASS on the Mac (macOS). A filtered run is feedback, so nothing ran on natedev.`, write the call record, exit 0. No pass record.
   - Exit 0 otherwise: print `verify.sh: passed on the Mac (macOS); now confirming on natedev, which is the gate.` and continue into the local path.
   - Any other status: write the call record with that status and exit with it. No token, no local run, no pass or fail record.
-- `note_event` (561-580) passes `BUILDLOG_MAC`, `BUILDLOG_MAC_REASON` and `BUILDLOG_MAC_S` to `record.py call` beside `BUILDLOG_TOKEN_WAIT_S` (577), read from the result file. `--local` records `declined` with reason `local_flag`. `record.py` ignores them until Phase 5.
+- `note_event` (561-580) passes `BUILDLOG_MAC`, `BUILDLOG_MAC_REASON` and `BUILDLOG_MAC_S` to `record.py call` beside `BUILDLOG_TOKEN_WAIT_S` (577), read from the result file. `--local` records `declined` with reason `local_flag`. `record.py` ignores them until the build-log phase lands.
 - An interrupt while the runner is active reaches the runner, which releases its claim.
 - No other verb calls the runner; `final` stays on natedev.
 
-`scripts/production/mac_run.sh`: after the reach probe (line 45), `python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what "mac run ${sha[1,9]}" --wait 600`. Exit 10 or 11: print the line it gave and exit 3, which the showrunner's rule already reads as "skip". Release on every exit path. Update the header's exit list.
+`scripts/production/mac_run.sh`: after the reach probe (line 45), `python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what "mac run ${sha[1,9]}" --wait 600`. Exit 10 or 11: print the line it gave (`blocked by <holder>: <for>` or `busy: <what> since <HH:MM>`) and exit 9, a new code that means the Mac is blocked or busy with a test. Exit 3 keeps meaning only that the Mac is unreachable, which hana's showrunner reads as an outage (natedev, 2026-10-07). Release on every exit path. Update the header's exit list.
 
-`commands/showrunner/produce.md`, the Mac run rule (503-509): add that exit 3 also means the Mac is blocked or busy with a test. `commands/unit/delegate.md`, the `<VerificationContract/>` table: add the row `a Mac failure that looks unrelated to the change, run on natedev` → `bash ~/.claude/scripts/delegate/verify.sh test <package> --local`.
+`commands/showrunner/produce.md`, the Mac run rule (503-509): add that exit 9 means the Mac is blocked or busy with a test, so the run is skipped and it is no outage. `commands/unit/delegate.md`, the `<VerificationContract/>` table: add the row `a Mac failure that looks unrelated to the change, run on natedev` → `bash ~/.claude/scripts/delegate/verify.sh test <package> --local`.
 
 **Files:**
 - `scripts/delegate/verify.sh` — `--local`, the composed argv, the Mac step, the call record fields.
@@ -169,11 +271,11 @@ Steps, in order; each failure is a decline with the reason shown:
 - `impl` — `scripts/delegate/verify.sh`, `scripts/production/mac_run.sh`, `commands/showrunner/produce.md`, `commands/unit/delegate.md`
 - `test` — `scripts/delegate/test_verify_mac_offload.py`: the fixture of `test_verify_token_wait.py` (its stand-in `cargo` extended to answer `nextest --version` and `nextest run`), with `VERIFY_MAC_RUNNER` pointing at a stand-in runner that logs its argv, writes the result file and exits as told.
 
-**Constraints from prior phases:** `scripts/mac_test/offload.py run` exits 0 (Mac pass), 75 (run locally) or the Mac run's status, and writes `mac=`, `reason=`, `seconds=` lines to `--result`. `scripts/mac_test/mac_test.py claim --wait` exits 0, 10 or 11. `config/mac_test.conf` ships `offload=off`, so nothing reaches the Mac yet.
+**Constraints from prior phases:** `scripts/mac_test/offload.py run` exits 0 (Mac pass), 75 (run locally) or the Mac run's status, and writes `mac=`, `reason=`, `seconds=` lines to `--result`. `scripts/mac_test/mac_test.py claim --wait` exits 0, 10 (prints `blocked by <holder>: <for>`) or 11 (prints `busy: <what> since <HH:MM>`). `config/mac_test.conf` ships `offload=off`, so nothing reaches the Mac yet.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/delegate -p 'test_verify_*.py'` ends `OK` with `test_verify_untested_examples.py` unchanged; `basedpyright scripts/delegate` ends `0 errors, 0 warnings, 0 notes`; `bash -n scripts/delegate/verify.sh` and `zsh -n scripts/production/mac_run.sh` pass. Tests prove: the runner gets the same words the local run would; exit 75 runs locally with the token as before; a Mac failure exits with that status, runs no local cargo and writes no pass record; a Mac pass on a full run then runs locally and only that run writes the pass record; a Mac pass on a `--filter` run ends there; `--local` never calls the runner and a recorded pass answers both forms; `check`, `lint` and `final` never call it; the call record carries the three fields.
 
-### Phase 4 — Which packages are pointless on the Mac  · status: todo
+### Phase 6 — Which packages are pointless on the Mac  · status: todo
 
 #### Work Order
 
@@ -201,7 +303,7 @@ Output is a markdown table: `Package | Gated sites (src) | Gated sites (tests) |
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/mac_test -p 'test_*.py'` ends `OK`; `basedpyright scripts/mac_test` ends `0 errors, 0 warnings, 0 notes`.
 
-### Phase 5 — The build log and the report show what the Mac took  · status: todo
+### Phase 7 — The build log and the report show what the Mac took  · status: todo
 
 #### Work Order
 
@@ -229,14 +331,16 @@ Output is a markdown table: `Package | Gated sites (src) | Gated sites (tests) |
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` ends `OK`; `basedpyright scripts/buildlog` ends `0 errors, 0 warnings, 0 notes`.
 
-### Phase 6 — Live on the Mac, then switched on  · status: todo
+### Phase 8 — Live on the Mac, then switched on  · status: todo
 
 #### Work Order
+
+**Blocked by:** the showrunner's word that the Ian Hubert demo on the Mac is over (natedev, 2026-10-07). Until then nothing of this feature writes to or runs on the Mac; reached earlier, the run holds here.
 
 **Goal:** A real hana test run goes to the Mac and comes back right in every case, the limits are set from measured numbers, and the feature is switched on.
 
 **Spec:**
-natedev lifted its hold on the Mac on 2026-10-07 at 11:55 PDT; this phase may run there. Work in a scratch clone of hana (`git clone --local /home/natepiano/rust/hana <scratch>` at the tip of `init/catalyst`), never in another unit's worktree, with `MAC_TEST_CONFIG` pointing at a scratch copy of the config with `offload=on`. Keep saved output small and delete the clone at the end. Run the checks in order, fix each defect where it lives with a regression test, and record every number in the report back:
+This is the first phase that writes to or runs on the Mac. Work in a scratch clone of hana (`git clone --local /home/natepiano/rust/hana <scratch>` at the tip of `init/catalyst`), never in another unit's worktree, with `MAC_TEST_CONFIG` pointing at a scratch copy of the config with `offload=on`. Keep saved output small and delete the clone at the end. Run the checks in order, fix each defect where it lives with a regression test, and record every number in the report back:
 1. Each probe line parses on the Mac; a block makes the call stay local.
 2. The first and second tree copy: times, and that `target`, `.git` and `.direnv` are absent from the mirror and the Mac's rsync accepts the options.
 3. `verify.sh test hana --filter <one test>`: the Mac's cold build time, then its rebuild time after touching `crates/hana/src/tool/surface.rs`, against natedev's.
