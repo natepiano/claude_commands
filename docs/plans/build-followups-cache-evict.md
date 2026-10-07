@@ -128,29 +128,18 @@ A step that compiles starts only when its expected process memory fits beside th
 
 ### Phase 3 — The memory gate's concurrent-check test no longer races · status: done
 
-#### Work Order
+#### As-built
 
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-cache-evict`, branch `build-followups-cache-evict`. State every time in PDT.
+`LedgerTests.check(available, *, force, sidecar)` in `scripts/lint/test_memory_admit.py` keeps its signature and every caller, and calls two helpers: `write_meminfo(available)`, the one write of the fake `meminfo`, then `admit(*, force, sidecar)`, the `gate.check` call returning `(decision, path)`. `test_two_concurrent_checks_admit_one` calls `write_meminfo(12 * GIB)` once before it starts its two threads and each thread calls only `admit()`, so no thread truncates the file another is reading.
 
-**Source (showrunner, 2026-10-06):** the Phase 2 checkpoint was not merged because `test_memory_admit.LedgerTests.test_two_concurrent_checks_admit_one` failed 2 of 5 runs on the merge branch with `ValueError: MemAvailable missing from <tmp>/meminfo`, raised by `read_meminfo` (`memory_admit.py:201`) from `check` (`:254`). It also fails here, 2 of 30 runs.
-
-**Cause (measured here):** `LedgerTests.check` (`test_memory_admit.py`) rewrites the shared fake `meminfo` with `write_text` (truncate, then write) at the start of every call, and the test's two threads call it together, so one thread's `read_meminfo` can read the file the other has just truncated. `/proc/meminfo` is read in one piece and never reads short, so the gate is not at fault.
-
-**Goal:** the concurrent-admission test passes on every run, and a meminfo the gate cannot read never stops or delays a build step, with that decision pinned by a test.
-
-**Spec:**
-- `LedgerTests.check(available, *, force, sidecar)` keeps its signature and every other caller. Split it into `write_meminfo(available)` (the one `write_text`) and `admit(*, force, sidecar)` (the `patch.object` block and the `gate.check` call returning `(decision, path)`); `check` calls the first, then the second. `test_two_concurrent_checks_admit_one` calls `write_meminfo(12 * GIB)` once before it starts its threads, and `arrive()` calls only `admit()`, so no thread writes the file while another reads it.
-- A new test `test_unreadable_meminfo_starts_the_step`, beside `test_python_failure_is_reported_and_step_starts` and written the same way (`bash -c`, `source` the gate, `buildlog_wait_for_memory /bin/true`, `BUILDLOG_MEMINFO`), runs it twice: once with an empty meminfo and once with a meminfo holding `MemTotal:` but no `MemAvailable:` line. Each run exits 0, prints `MeminfoUnavailable`, and leaves `BUILDLOG_MEM_RESERVATION` empty. This pins the decision that the gate fails open: a meminfo it cannot read never fails or holds a step.
-- `memory_admit.py` and `memory_gate.sh` do not change: a missing `MemAvailable` already makes the shell leave its loop with `MeminfoUnavailable` and start the step, and a Python read failure already prints `memory gate failed (<last line of the Python output>); starting anyway` and starts it.
+`ShellTests.test_unreadable_meminfo_starts_the_step` sources `memory_gate.sh` and runs `buildlog_wait_for_memory /bin/true` against an empty meminfo and against one holding `MemTotal:` but no `MemAvailable:`. Each run exits 0, prints `MeminfoUnavailable`, and leaves `BUILDLOG_MEM_RESERVATION` empty. It and `test_python_failure_is_reported_and_step_starts` run under `set -e`, as `invoke.sh` does, so a gate that returned non-zero would fail them; all three cases fail against a copy of the gate that returns 1. `memory_admit.py` and `memory_gate.sh` are unchanged: the gate fails open, so a meminfo it cannot read never stops or delays a step.
 
 **Files:**
-- `scripts/lint/test_memory_admit.py` — the split helper, the concurrent test, the new test.
+- `scripts/lint/test_memory_admit.py` — the helper split, the concurrent test, the fail-open test.
 
-**Seats:** 1 writer — `impl` owns `scripts/lint/test_memory_admit.py`; no hub file.
+**Gotchas:** a shell test that proves "the step starts" runs the gate under `set -e`; a bare trailing `printf` hides a non-zero return from the gate.
 
-**Constraints from prior phases:** the gate's behavior, messages and outcomes are as Phase 2's As-built states; this phase adds tests only. Tests use temporary directories and fake meminfo files, never the real ledger, build log or `/proc/meminfo`.
-
-**Acceptance gate:** from `scripts/lint`, `for i in $(seq 1 20); do python3 -m unittest -q test_memory_admit.LedgerTests.test_two_concurrent_checks_admit_one || exit 1; done` passes; `python3 -m unittest discover -s scripts/lint -p 'test_*.py'` from the worktree root passes; `basedpyright` on `scripts/lint/test_memory_admit.py` ends `0 errors, 0 warnings, 0 notes`.
+**Ruled out:** failing a build on a meminfo the gate cannot read; the gate must never stop or delay a step.
 
 ### Phase 4 — Re-measure a day after the target order went live · status: todo
 
