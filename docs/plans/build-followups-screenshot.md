@@ -136,7 +136,7 @@ None.
 - A second classifier for script content.
 - The state-file location as the cause of the scan-time difference.
 
-### Phase 3 — Every `/hana_shot` call is recorded, failures and the shot the agent kept included · status: todo
+### Phase 3 — Every `/hana_shot` call is recorded, failures and the shot the agent kept included · status: done
 
 #### Work Order
 

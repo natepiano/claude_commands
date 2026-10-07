@@ -11,7 +11,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, cast
 
-from transcripts import ToolCall  # pyright: ignore[reportImplicitRelativeImport]
+if __package__:
+    from .transcripts import ExactOrderedCaptureAttempts, ToolCall
+else:
+    from transcripts import ExactOrderedCaptureAttempts, ToolCall  # pyright: ignore[reportImplicitRelativeImport]
 
 Method = Literal["by hand", "/hana_shot"]
 ScreenshotSource = Literal[
@@ -20,6 +23,35 @@ ScreenshotSource = Literal[
 ScreenshotSources = frozenset[ScreenshotSource]
 SURVEY_SOURCES = {"grim", "spectacle", "screencapture", "import", "browser"}
 DEFAULT_SOURCES = frozenset({"mcp_brp", "bash_brp", "hana_shot", *SURVEY_SOURCES})
+
+
+@dataclass(frozen=True)
+class OneCitedShot:
+    attempts_before_first_kept_shot: int
+
+
+@dataclass(frozen=True)
+class SeveralCitedShots:
+    attempts_before_first_kept_shot: int
+    cited_attempt_count: int
+
+
+@dataclass(frozen=True)
+class NoneCited:
+    pass
+
+
+@dataclass(frozen=True)
+class NoObservablePath:
+    pass
+
+
+@dataclass(frozen=True)
+class LegacyEvidenceUnavailable:
+    pass
+
+
+KeptShotEvidence = OneCitedShot | SeveralCitedShots | NoneCited | NoObservablePath | LegacyEvidenceUnavailable
 
 
 @dataclass(frozen=True)
@@ -37,6 +69,7 @@ class Episode:
     other_call_count: int
     transcript_path: str
     session_id: str
+    kept_shot: KeptShotEvidence
 
     @property
     def minutes(self) -> float:
@@ -83,6 +116,19 @@ def _episode(calls: list[ToolCall], gap_seconds: int) -> Episode | None:
     first = calls[0]
     method: Method = "/hana_shot" if any(call.source == "hana_shot" for call in shots) else "by hand"
     sources = cast(ScreenshotSources, frozenset(call.source for call in shots))
+    cited_shots = [call for call in shots if call.cited_image_paths]
+    if cited_shots:
+        first_kept = cited_shots[0]
+        before = sum(len(_capture_paths(call)) for call in shots[:shots.index(first_kept)])
+        kept_indices = _cited_attempt_indices(first_kept)
+        before += min(kept_indices) if kept_indices else 0
+        cited_attempt_count = sum(len(_cited_attempt_indices(call)) for call in cited_shots)
+        evidence: KeptShotEvidence = (OneCitedShot(before) if cited_attempt_count == 1
+                                     else SeveralCitedShots(before, cited_attempt_count))
+    elif any(call.image_paths for call in shots):
+        evidence = NoneCited()
+    else:
+        evidence = NoObservablePath()
     return Episode(
         split=gap_seconds, agent=first.agent, project=first.project, method=method,
         source=sources, start=first.start, end=max(call.end for call in shots),
@@ -90,7 +136,23 @@ def _episode(calls: list[ToolCall], gap_seconds: int) -> Episode | None:
         hana_shot_call_count=sum(call.source == "hana_shot" for call in shots),
         other_call_count=sum(call.kind == "other" for call in calls),
         transcript_path=first.transcript_path, session_id=first.session_id,
+        kept_shot=evidence,
     )
+
+
+def _capture_paths(call: ToolCall) -> tuple[tuple[str, ...], ...]:
+    if isinstance(call.attempt_evidence, ExactOrderedCaptureAttempts):
+        return tuple(attempt.image_paths for attempt in call.attempt_evidence.captures)
+    paths = tuple((path,) for path in call.image_paths)
+    if paths:
+        return paths + tuple(() for _ in range(max(0, call.image_count - len(paths))))
+    return tuple(() for _ in range(max(1, call.image_count)))
+
+
+def _cited_attempt_indices(call: ToolCall) -> set[int]:
+    attempts = _capture_paths(call)
+    return {max((index for index, paths in enumerate(attempts) if path in paths), default=0)
+            for path in call.cited_image_paths}
 
 
 def write_episodes(path: Path, episodes: Iterable[Episode]) -> None:
@@ -104,6 +166,12 @@ def write_episodes(path: Path, episodes: Iterable[Episode]) -> None:
                 record["source"] = sorted(episode.source)
                 record["start"] = episode.start.isoformat()
                 record["end"] = episode.end.isoformat()
+                record.pop("kept_shot")
+                record["kept_shot_state"] = _evidence_name(episode.kept_shot)
+                if isinstance(episode.kept_shot, (OneCitedShot, SeveralCitedShots)):
+                    record["attempts_before_first_kept_shot"] = episode.kept_shot.attempts_before_first_kept_shot
+                if isinstance(episode.kept_shot, SeveralCitedShots):
+                    record["cited_attempt_count"] = episode.kept_shot.cited_attempt_count
                 _ = target.write(json.dumps(record, sort_keys=True) + "\n")
         os.replace(temp_name, path)
     finally:
@@ -117,7 +185,10 @@ def read_episodes(path: Path) -> list[Episode]:
     episodes: list[Episode] = []
     with path.open(encoding="utf-8") as source:
         for line in source:
-            raw = cast(object, json.loads(line))
+            try:
+                raw = cast(object, json.loads(line))
+            except json.JSONDecodeError:
+                continue
             if not isinstance(raw, dict):
                 continue
             record = cast(dict[str, object], raw)
@@ -138,20 +209,51 @@ def read_episodes(path: Path) -> list[Episode]:
             if not all(isinstance(name, str) and name in DEFAULT_SOURCES for name in source_names):
                 continue
             sources = cast(ScreenshotSources, frozenset(source_names))
-            screenshot_count = int(str(record["screenshot_count"]))
-            episodes.append(Episode(
-                split=int(str(record["split"])), agent=str(record["agent"]),
-                project=str(record["project"]), method=method,
-                source=sources,
-                start=datetime.fromisoformat(start.replace("Z", "+00:00")),
-                end=datetime.fromisoformat(end.replace("Z", "+00:00")),
-                screenshot_count=screenshot_count,
-                image_count=int(str(record.get("image_count", screenshot_count))),
-                hana_shot_call_count=int(str(record.get(
-                    "hana_shot_call_count", screenshot_count if "hana_shot" in sources else 0,
-                ))),
-                other_call_count=int(str(record["other_call_count"])),
-                transcript_path=str(record["transcript_path"]),
-                session_id=str(record["session_id"]),
-            ))
+            try:
+                screenshot_count = int(str(record["screenshot_count"]))
+                evidence = _read_evidence(record)
+                episodes.append(Episode(
+                    split=int(str(record["split"])), agent=str(record["agent"]),
+                    project=str(record["project"]), method=method,
+                    source=sources,
+                    start=datetime.fromisoformat(start.replace("Z", "+00:00")),
+                    end=datetime.fromisoformat(end.replace("Z", "+00:00")),
+                    screenshot_count=screenshot_count,
+                    image_count=int(str(record.get("image_count", screenshot_count))),
+                    hana_shot_call_count=int(str(record.get(
+                        "hana_shot_call_count", screenshot_count if "hana_shot" in sources else 0,
+                    ))),
+                    other_call_count=int(str(record["other_call_count"])),
+                    transcript_path=str(record["transcript_path"]),
+                    session_id=str(record["session_id"]),
+                    kept_shot=evidence,
+                ))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
     return episodes
+
+
+def _evidence_name(evidence: KeptShotEvidence) -> str:
+    if isinstance(evidence, OneCitedShot):
+        return "cited"
+    if isinstance(evidence, SeveralCitedShots):
+        return "several_cited"
+    if isinstance(evidence, NoneCited):
+        return "none_cited"
+    if isinstance(evidence, NoObservablePath):
+        return "no_observable_path"
+    return "legacy_unassessed"
+
+
+def _read_evidence(record: dict[str, object]) -> KeptShotEvidence:
+    state = record.get("kept_shot_state")
+    if state == "cited":
+        return OneCitedShot(int(str(record["attempts_before_first_kept_shot"])))
+    if state == "several_cited":
+        return SeveralCitedShots(int(str(record["attempts_before_first_kept_shot"])),
+                                 int(str(record["cited_attempt_count"])))
+    if state == "none_cited":
+        return NoneCited()
+    if state == "no_observable_path":
+        return NoObservablePath()
+    return LegacyEvidenceUnavailable()
