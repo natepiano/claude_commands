@@ -30,7 +30,8 @@
     {
       "root": "scripts/whoami",
       "extraPaths": [
-        "scripts/whoami"
+        "scripts/whoami",
+        "scripts/message"
       ]
     },
     {
@@ -61,6 +62,13 @@
       ]
     },
     {
+      "root": "scripts/mac_test",
+      "extraPaths": [
+        "scripts/mac_test",
+        "scripts/lint"
+      ]
+    },
+    {
       "root": "scripts/lint",
       "extraPaths": [
         "scripts/lint"
@@ -77,6 +85,7 @@
       "extraPaths": [
         "scripts/production",
         "scripts/build_hold",
+        "scripts/message",
         "scripts/whoami"
       ]
     },

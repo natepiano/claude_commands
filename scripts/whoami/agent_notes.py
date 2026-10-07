@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from pathlib import Path
 from typing import cast
 
 import codex_pacer
+import five_hour
 from agent_accounts import EASTERN, Report, live_reports
 from quota_alert import AgentNote, alert, current_session, refresh
 from run_out import READINGS_LOG
@@ -219,6 +221,11 @@ def update() -> list[str]:
     messages: list[str] = []
     for account in reports:
         messages += apply(notes, account, checked_at)
+    try:
+        messages += five_hour.watch(reports)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        # The 5-hour watch must never cost the notes or the weekly alerts.
+        messages.append(f"5-hour watch did not run: {error!r}")
     return messages
 
 
