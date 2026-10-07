@@ -124,6 +124,35 @@ def stretch_path(slug: str, unit: str) -> Path:
     return STATE_DIR / f"{name}.json"
 
 
+def finished_run_units(runner: showrunners.RunningShowrunner) -> set[str]:
+    """Read the production doc named by this notifier's check command."""
+    try:
+        conf = (showrunners.NOTIFIER_STATE_DIR / f"showrunner-{runner.slug}" / "conf").read_text(encoding="utf-8")
+        check = next(line.partition("=")[2] for line in conf.splitlines() if line.startswith("CHECK="))
+        command = shlex.split(check)
+        check_index = next(index for index, token in enumerate(command)
+                           if Path(token).name == "production_check.sh")
+        doc = Path(command[check_index + 1])
+        if not doc.is_absolute():
+            return set()
+        lines = doc.read_text(encoding="utf-8").splitlines()
+    except (OSError, ValueError, IndexError, StopIteration):
+        return set()
+
+    finished: set[str] = set()
+    in_units = False
+    for line in lines:
+        if line.strip() == "## Units":
+            in_units = True
+        elif in_units and line.startswith("## "):
+            break
+        elif in_units:
+            cells = line.split("|")
+            if len(cells) >= 4 and not cells[0].strip() and re.search(r"\brun done\b", cells[2]):
+                finished.add(cells[1].strip())
+    return finished
+
+
 def rename_state(old: str, new: str, runner_before: str, runner_after: str,
                  units: list[str]) -> None:
     """Move saved stretches while the registry rename is locked."""
@@ -200,7 +229,12 @@ def tick(now: float) -> None:
     settings = showrunners.load_settings()
     rows = processes()
     pending: list[Delivery] = []
-    missing = showrunners.missing_showrunners(settings)
+    running = showrunners.running_showrunners()
+    sockets = {configured["session"]: socket_for_target(configured["session"])
+               for configured in settings["showrunners"]}
+    configured_sockets = set(sockets.values())
+    missing = [runner for runner in running if runner.socket not in configured_sockets]
+    runners_by_socket = {runner.socket: runner for runner in running}
     missing_slugs = {runner.slug for runner in missing}
     for path in STATE_DIR.glob("missing-*.json"):
         if path.stem.removeprefix("missing-") not in missing_slugs:
@@ -225,16 +259,19 @@ def tick(now: float) -> None:
             pending.append(delivery(path, "missing", faults_socket,
                                     f"stall-watch:missing:{runner.slug}:{int(stretch['since'])}", message))
     for configured in settings["showrunners"]:
-        showrunner_socket = socket_for_target(configured["session"])
+        showrunner_socket = sockets[configured["session"]]
         if showrunner_socket is None:
             continue
+        runner = runners_by_socket.get(showrunner_socket)
+        finished: set[str] = finished_run_units(runner) if runner is not None else set()
         try:
             zone = ZoneInfo(configured["zone"])
         except (KeyError, ValueError):
             print(f"stall-watch: invalid zone for {configured['session']}: {configured['zone']}", file=sys.stderr)
             continue
         for unit in configured["units"]:
-            if isinstance(unit, showrunners.StandbyUnit):
+            if isinstance(unit, showrunners.StandbyUnit) or unit.name in finished:
+                stretch_path(configured["session"], unit.name).unlink(missing_ok=True)
                 continue
             name = unit.name
             if subprocess.run([TMUX, "has-session", "-t", f"={name}"], capture_output=True, check=False).returncode != 0:
@@ -256,7 +293,7 @@ def tick(now: float) -> None:
             stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
             turns = TURN_END.findall(pane)
             last = cast(str, turns[-1]).strip() if turns else "none on screen"
-            if last.lstrip("— ").startswith("done:"):
+            if last.lstrip("— ").startswith(("done:", "blocked:")):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)

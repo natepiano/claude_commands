@@ -135,7 +135,7 @@ A unit's `then` in the dailies input is a JSON list of one-line items, one per u
 
 **Ruled out:** rewriting a pre-filled Units row to the script's own form.
 
-### Phase 5 — One command merges a checkpoint, and every other showrunner step gets a script-or-not verdict · status: todo
+### Phase 5 — One command merges a checkpoint, and every other showrunner step gets a script-or-not verdict · status: done
 
 #### Work Order
 
@@ -143,11 +143,12 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 
 **Source:** the user, 2026-10-06 14:1x PDT, through the showrunner (natedev): "right - everything that can be scripted should be scripted so the showrunner has the least amount of things to remember". The script, its steps and the audit are the showrunner's packaging of that ask, placed in this plan as its merge-checkpoint phase.
 
-**Goal:** `merge_checkpoint.py --production <doc> <unit> <phase> <hash> [--also <path>…] [--shrink]`, with the record arguments below, runs `produce.md` <MergeCheckpoint/>'s mechanical steps in one run, prints one result line per step and the message to send the unit, and on red leaves the merge branch as it was; <MergeCheckpoint/> keeps only the judgment steps and the call. The As-built lists every other step in `produce.md` and `commands/showrunner/dailies.md` the showrunner must remember, each with a script-or-not verdict, and each clear one becomes a follow-up phase.
+**Goal:** `merge_checkpoint.py --production <doc> <unit> <phase> <hash> [--also <path>…] [--shrink] [--delivers "<line>"] [--cancel-prior]`, with the record arguments below, runs `produce.md` <MergeCheckpoint/>'s mechanical steps in one run, prints one result line per step and the message to send the unit, and on red leaves the merge branch as it was; <MergeCheckpoint/> keeps only the judgment steps and the call. The As-built lists every other step in `produce.md` and `commands/showrunner/dailies.md` the showrunner must remember, each with a script-or-not verdict, and each clear one becomes a follow-up phase.
 
 **Spec:**
 - **Reads** from the production doc what <MergeCheckpoint/> reads: `MERGE_BRANCH`, `CHECKOUT`, `LOG`, `ZONE`, the unit's Units row (branch, Owns), the hub-file rows, **Merge tests**, and the production rules that decide the push. `LAST_MERGED[unit]` comes from the merge subjects on `MERGE_BRANCH` (`Merge <unit> phase <N> (<short>) into <merge branch>`), never from an argument. Two optional doc fields make the push explicit: **Push:** `validate_and_push` (the default, <MergeCheckpoint/> step 10) or `git`; **Promote:** `<checkout>[, mac <path>]` (after a push, fast-forward that checkout's `main` and pull on the Mac). This production's doc carries `**Push:** git` and `**Promote:** ~/.claude, mac ~/.claude` (the showrunner, 2026-10-06). **Known flakes:** names packages whose red-then-green-alone run counts green.
 - **Named states at the reader boundary:** the push is `ValidateAndPush | GitPush`, the promotion `NoPromotion | PromoteTo(<checkouts>, <mac path or none as its own state>)`, the unit's history `FirstMerge | LastMerged(<hash>)`, the kind `CodeCheckpoint | ShrinkCommit`. `production_field` raises on a missing field, so an optional field is read by a reader that returns its absent state; no `str | None` passes the boundary.
+- **Arguments for the merge:** `--delivers "<one line of what the phase delivers>"` (required for a code checkpoint; it is the merge message's body, as <MergeCheckpoint/> step 7 wrote it) and `--cancel-prior` (`validate_and_push` only: passed through as step 10's conditional).
 - **Arguments for the record:** `--review-trial "<the notice's line>"` (required for a code checkpoint) gives `--ux-findings`, `--code-findings`, `--review-minutes`, `--ux-check-minutes` and `--ux-repair-minutes`; `--started <ISO>` (required); `--regime after|trial` (default `after`; `trial` when the unit's broad review ran the `craft` lens); `--holds` and `--merge-defects` (default 0, the showrunner counts them from `LOG`); `--excluded "<why>"` passed through (`"no merge design check"` for a phase no merge design check judged). `--merged` is the merge commit's time.
 - **Steps,** each printing `<step>: ok|held|failed — <one line>`; the first `held` or `failed` stops the run:
   1. ancestry (`cat-file -e`; `merge-base --is-ancestor LAST_MERGED <hash>`, skipped on a unit's first merge; a hash already on `MERGE_BRANCH`, a re-run after a failed promote, skips steps 2–7 and resumes at the first step-8 destination not yet reached) and on-origin (`fetch origin <branch>`, `--is-ancestor <hash> origin/<branch>`; failing prints the message asking the unit to push);
@@ -166,17 +167,20 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 - The last line printed is `send <unit>: <message>`: the merged line with the next step, or the hold or failure and what the unit does.
 - `commands/showrunner/produce.md` <MergeCheckpoint/>: steps 1–3 and 7–10 and the record step become the call, run in the background; steps 4–6 (other units, new public items, design check), <ClearGate/>, <CrossUnitChange/>, <CIPoint/> and `review_regime.py watch` stay the showrunner's, read from the script's lines.
 - **Stall watch** (the showrunner, 2026-10-06 16:5x PDT, routing it to this unit as `stall_watch.py`'s owner): the rule is idle 10+ minutes, nothing running, no external block. `stall_watch.py` sends no bump and no showrunner notice while the last turn-end line on a unit's pane is `— blocked: …`; it treats that line as it treats `done:`, a fresh stretch, so the idle clock starts at the next status that is not a block. Seen 16:23 PDT (cache-evict, `— blocked: waiting on the showrunner: G1 …`) and 16:4x PDT (mul_add, `— blocked: the 96-hour measurement window …`).
+- **Finished runs** (the showrunner, 2026-10-06 18:0x PDT, relayed by natedev): `stall_watch.py` bumped build-report at 18:0x PDT ("idle since 17:47, nothing running") although its run is done: its Units row's Plan cell reads `run done; as-built …` and it waits only for its 4-hourly `/builds` tick. `stall_watch.py` skips a unit whose Units row says its run is done, as it skips a standby unit: no bump and no showrunner notice, and no stretch kept. It reads that state where the production already records it, the Plan cell's `run done`, not from a flag the showrunner must remember to set. A test pins it: a unit idle past the stall minutes whose row says `run done` gets no bump and no notice, and the same unit with a live plan is still bumped.
 - **Footers off** (the user's footer rule, relayed by the showrunner 2026-10-06 16:5x PDT): turning footers off drops the Waiting on block as well. `commands/showrunner/produce.md` still gives the old rule in two places, line 96 ("or after the reply when footers are off, leave two empty lines, write `Waiting on:`…") and lines 133–136 ("reports off, end each reply with the Waiting on block alone"); both say that off drops the Waiting on block too. hook-unit's footer commit (`showrunner_footer.py`, its test and `footer.md`) lands about 17:25 PDT; read it before editing so the wording matches.
+- **Stopping progress updates** (the showrunner, 2026-10-06 17:3x PDT, relayed by natedev): `commands/unit/delegate.md` <ProgressContract/> still says to stop a Claude unit's updates with `zsh ~/.claude/scripts/message/notifier.sh stop delegate-<run id>` and to resume them with `start` on the same instance. hook-unit's Phase 8 (`d184445`, on `build-followups`) added `/unit:report off|on`, which runs `unit_notifier.sh "$CLAUDE_CODE_SESSION_ID" on|off`; the paragraph names `/unit:report off` to stop and `/unit:report on` to resume instead, Codex keeping its sentence. One paragraph, no other change in the file; hook-unit's Phase 7 also edits `delegate.md`, so this phase names it in the checkpoint notice as `also touches commands/unit/delegate.md`.
 - **The audit:** every other step in `produce.md` and `commands/showrunner/dailies.md` the showrunner must remember — building the dailies input from `unit_status.sh`, the idle check, promotion and the Mac pull included — one row each: the step, where it lives, `script` or `judgment`, and why. Written into this phase's As-built; each `script` row the unit director turns into a follow-up phase with its own Work Order.
 
 **Files:**
 - `scripts/production/merge_checkpoint.py` — new.
 - `scripts/production/test_merge_checkpoint.py` — new.
 - `commands/showrunner/produce.md` — <MergeCheckpoint/> calls the script.
-- `scripts/production/stall_watch.py` — no bump while the last status is `— blocked:`; `scripts/production/test_stall_watch.py`.
+- `scripts/production/stall_watch.py` — no bump while the last status is `— blocked:`, and none for a unit whose run is done; `scripts/production/test_stall_watch.py`.
+- `commands/unit/delegate.md` — <ProgressContract/> names `/unit:report off|on` (also touches; owner hook-unit).
 
 **Seats:** 1 writer + 1 tester.
-- `impl` — `scripts/production/merge_checkpoint.py`, `commands/showrunner/produce.md`, `scripts/production/stall_watch.py`; post `done` without waiting for the test seat.
+- `impl` — `scripts/production/merge_checkpoint.py`, `commands/showrunner/produce.md`, `scripts/production/stall_watch.py`, `commands/unit/delegate.md`; post `done` without waiting for the test seat.
 - `test` — `scripts/production/test_merge_checkpoint.py` from the Spec alone, with real `git` in temporary repositories and a temporary bare `origin`, stubs on `PATH` for `verify.sh`, `validate_and_push.sh`, `review_regime.py` and `ssh` recording argv: each step's `held` and `failed` cases with no merge left behind; a red package reset and a known flake continuing; the green `git` path merging diverged `origin/main`, pushing, promoting a second temporary checkout by fast-forward and reading the Mac's `rc=`; a promote refused by an uncommitted file fails without undoing the push; the record call's argv and the LOG line; the `into:` lines, with a gate the merge clears and with none, and one per **Promote** checkout; the record call's full real argv; a promote that fails after the push prints the `into:` lines reached, and a re-run resumes at that promote; the promote fast-forwards to the pushed tip after a diverged `origin/main` merge; `--shrink` with the plan doc and the next-items file merges, and is `held` when another path is staged or the phase's code checkpoint has not merged. Also `scripts/production/test_stall_watch.py`: a unit idle past the stall minutes whose last status is `— blocked: waiting on the showrunner: G1 …` gets no bump and no notice; the same for `— blocked: the 96-hour measurement window …`; a unit whose last status is `— holding: …` with nothing running is still bumped. Owns the final suite run. Then the audit table, in its summary.
 
 **Constraints from prior phases:**
@@ -191,3 +195,85 @@ Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-show
 **Acceptance gate:**
 - From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_merge_checkpoint.py'` and `-p 'test_stall_watch.py'` green; basedpyright 0 errors and 0 warnings on the changed `.py` files.
 - Live (natedev, once the merge reaches `~/.claude` main): the next checkpoint any unit sends is merged with the script; its lines match what the showrunner would have done by hand, and the As-built carries the audit table.
+
+### Phase 6 — Dailies `then` is a list of single items, never a string or a chain · status: todo
+
+#### Work Order
+
+Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-showrunner`, branch `build-followups-enh-showrunner`. State every time in PDT.
+
+**Source:** the user, 2026-10-06 ~18:2x PDT, through the showrunner (natedev): "wasn't enh-showrunner supposed to fix dailies not to output laundry lists of then: future phases in simple mode?" Phase 2 left `parse_upcoming_work` accepting a plain string, so a showrunner that packs several phases into one string ("A, then B, then C") gets the whole list in `simple`.
+
+**Goal:** a unit's `then` in the dailies input is a non-empty list of one-line items, each naming at most one upcoming phase or follow-up; `dailies_render.py` refuses the plain-string form with a message that names the list form, and refuses an item that chains more than one, so `simple` always prints one phase.
+
+**Spec:**
+- **List only.** `parse_upcoming_work` (`scripts/production/dailies_render.py`) takes a non-empty list of one-line text. A string is refused as `units[N].then: must be a list of one-line items, one per upcoming phase: ["Phase 3: …", "Phase 4: …"]`; the existing non-list, empty-list, empty-item and non-text-item refusals stay.
+- **One item, one phase.** An item that contains `, then `, `; then` or ` then Phase` (any case) is refused as `units[N].then[I]: one item names more than one phase; split it into list items`, naming the item. A range with one shared purpose stays one item (`76–79: …`), and the word `then` elsewhere in an item is allowed.
+- **The doc.** `commands/showrunner/dailies.md`'s `then` row and its example say list only, one phase or follow-up per item, never chained with `then`; no wording allows a string.
+
+**Files:**
+- `scripts/production/dailies_render.py` — `parse_upcoming_work`, the chain check.
+- `scripts/production/test_dailies_render.py` — the string and chain refusals; the legacy-string case is replaced by the refusal.
+- `commands/showrunner/dailies.md` — the `then` row, the section and its example.
+
+**Seats:** 1 writer + 1 tester.
+- `impl` — `dailies_render.py` and `dailies.md`; post `done` without waiting for the test seat.
+- `test` — from the Spec alone, in `test_dailies_render.py`: a string `then` is refused at `simple`, `page` and `elaborate` with the list form named; an item chained by each of `, then `, `; then` and ` then Phase` is refused and names the item; a one-item list, a multi-item list and a `76–79: …` range item still render as before. Replace the case that reads a string as one item.
+
+**Constraints from prior phases:**
+- Phase 2 (as built): `then` is a JSON list read by `parse_upcoming_work` into `UpcomingWork(items)` or `NoUpcomingWork()`; each item passes `check_words` and `check_then_order`; `simple` prints the first item only. Keep all of it; this phase only narrows what is accepted.
+- Phase 5 (as built) changes one step reference in `dailies.md`; this phase edits the `then` row and example. Runs after Phase 5.
+- Tests never start a real `claude`, `tmux`, `systemd-run` or `ssh`, never write `~/.claude/config/`, `~/.local/state/` or a real production doc, and never push anywhere but a temporary bare repository.
+
+**Acceptance gate:**
+- From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_dailies_render.py'` green; basedpyright 0 errors and 0 warnings on `scripts/production/dailies_render.py` and `test_dailies_render.py`.
+
+### Phase 7 — A unit director's model and effort come from agents.conf · status: todo
+
+#### Work Order
+
+Work only in worktree `/home/natepiano/worktrees/claude-build-followups-enh-showrunner`, branch `build-followups-enh-showrunner`. State every time in PDT.
+
+**Source:** the user, 2026-10-06 ~16:5x PDT, through the showrunner (natedev): "the director's model and effort come from agents.conf". Today no unit director launch passes `--model` or `--effort`, so every one runs at the Claude Code default.
+
+**Goal:** every unit director launch passes the `--model` and `--effort` that `agents_resolve production.director` gives; `[production.claude]` `director=opus:xhigh` keeps today's behavior; `/agent production.director sonnet:xhigh` changes it; a Codex assignment is refused with a clear line before anything is stopped or started.
+
+**Spec:**
+- **Registry.** `config/agents.conf` gains `production=claude` under `[assignments]` and a section, with a comment saying unit directors launch only on Claude and the showrunner is whatever session runs `/showrunner:produce` (nothing launches it):
+  ```
+  # ── production (unit directors, launched by add_unit.py) ──
+  [production.claude]
+  director=opus:xhigh
+  ```
+  There is no `[production.codex]`. The header's **Consumers** list gains `production unit directors (add_unit.py)`.
+- **One-family functions in `scripts/agents/agents_config.sh`.** A function whose row sets name exactly one family (here `production`, set only for claude) is pinned to that family:
+  - `agents_set_all_assignments <family>` and `agents_set_model <agent>` (no function named) leave a pinned function's assignment and rows as they are, like a `caller` function, instead of rejecting the whole switch over its missing set. `agent_admin.sh` prints `# kept production on claude: its only set` after its `# switched …` line, one line per kept function.
+  - A switch aimed at the pinned function itself is refused, with the file untouched: `agents_set_assignment production codex`, `agents_set_model <codex agent> production`, and `agents_set_row production.director <codex agent>[:<effort>]` each print `ERROR: 'production' runs only on claude: [production.claude] is its only set.` and return 1.
+  - Every function configured today has both sets, so none of them changes behavior.
+- **Resolution in `scripts/production/add_unit.py`.** `director_agent(request) -> DirectorAgent` (`NamedTuple`: `model: str`, `effort: DefaultEffort | Effort(value)`) runs `bash -c 'source "$1" && agents_resolve production.director && printf "%s\n%s\n%s\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"' _ <agents_config.sh>`, with `agents_config.sh` taken from this script's own checkout (`Path(__file__).resolve().parents[1] / "agents" / "agents_config.sh"`), and `AGENTS_CONFIG_FILE` left to the caller's environment (default `~/.claude/config/agents.conf`). It is called from `preflight`, so `--check` refuses too and promotion never stops a session it then cannot launch:
+  - a nonzero resolver exit is exit 2 with the resolver's first `ERROR:` line;
+  - a family other than `claude` (a hand-written `production=codex` beside a hand-written `[production.codex]`) is exit 2 with `unit directors launch only on claude; production.director resolves to <family> (<model>)`;
+  - nothing is written, stopped or started on either refusal.
+- **Every launch path passes it.** `launch_session` builds `claude --model <model> [--effort <effort>] [--resume <id>] --remote-control …`, `--effort` only for `Effort(value)` (an empty effort uses the CLI default, as `agents_claude_args` does). That covers a plan launch, a brief launch and a standby launch (`produce.md` <LaunchUnits/> and `/showrunner:add_unit`) and a resume launch (`promote_unit.md` step 6). The commit, the Units row and the log line do not change.
+- **The showrunner's own Resume.** `commands/showrunner/produce.md` <LaunchUnits/> **Resume** becomes `claude --resume <session-id> $(bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve production.director && agents_claude_args') --remote-control <session> -n <session>`; on a resolver error, stop and tell the user its line. `commands/showrunner/add_unit.md` and `promote_unit.md` each say in one line that the launch takes its model and effort from `/agent production.director`. `commands/agent.md` documents a one-family function: kept by every-function switches, refused when switched alone.
+
+**Files:**
+- `config/agents.conf` — `production=claude`, `[production.claude]`, the comments.
+- `scripts/agents/agents_config.sh` — pinned one-family functions; `scripts/agents/agent_admin.sh` — the `# kept …` lines; `scripts/agents/test_agents_config.sh`.
+- `scripts/production/add_unit.py` — `DirectorAgent`, `director_agent`, `preflight` and `launch_session`; `scripts/production/test_add_unit.py`.
+- `commands/showrunner/produce.md` — **Resume**; `commands/showrunner/add_unit.md`, `commands/showrunner/promote_unit.md`, `commands/agent.md` — one line each.
+
+**Seats:** 1 writer + 1 tester.
+- `impl` — every file above except the two test files; post `done` without waiting for the test seat.
+- `test` — from the Spec alone. `scripts/production/test_add_unit.py`: each test writes its own `agents.conf` in the temporary root and sets `AGENTS_CONFIG_FILE`, `CODEX_CONFIG_FILE`, `CODEX_MODELS_CACHE_FILE` and `CODEX_CATALOG_SYNC_STATE_FILE` to temporary paths (the state file newest, so no catalog sync runs), as `scripts/agents/test_agents_config.sh` does; then, from the recorded `systemd-run` argv, a plan launch, a brief launch, a standby launch and a resume launch each run `claude --model opus --effort xhigh`; a `sonnet:xhigh` row gives `--model sonnet --effort xhigh`; an `opus` row with no effort gives `--model opus` and no `--effort`; a hand-written codex assignment is exit 2 with its one line and nothing launched, written or committed, with and without `--check`; a missing `[production.claude]` is exit 2 with the resolver's line. `scripts/agents/test_agents_config.sh`: `/agent codex` and `/agent <codex agent>` keep `production` on claude, print the `# kept …` line and still switch every other function; `/agent production codex`, `/agent <codex agent>` for `production` and `/agent production.director <codex agent>:xhigh` are refused with the file byte-identical; `/agent production.director sonnet:xhigh` writes the row and `agents_resolve production.director` then gives `sonnet` and `xhigh`. Owns the final suite run.
+
+**Constraints from prior phases:**
+- Phase 4 (as built): `add_unit.py --check` runs `launch_request` and `preflight` only, exit 0 or 2, nothing written or started; promotion runs it before it stops the session, so resolution sits in `preflight`. The launch states are `PlanGiven | BriefGiven | Standby` and the session `ResumedSession` or a new one; keep them, and add the director's model and effort beside them, not as a new launch state.
+- Phase 5 edits `produce.md` <MergeCheckpoint/> and the footer lines; this phase edits only <LaunchUnits/> **Resume**. Runs after Phase 5.
+- `agents_config.sh` is bash only and refuses to be sourced into zsh; call it through `bash -c`, never `zsh`.
+- Tests never start a real `claude`, `tmux`, `systemd-run` or `ssh`, never write `~/.claude/config/`, `~/.local/state/` or a real production doc, and never push anywhere but a temporary bare repository.
+- `config/agents.conf`, `scripts/agents/agents_config.sh`, `agent_admin.sh`, `test_agents_config.sh` and `commands/agent.md` are outside this unit's **Owns**: the checkpoint notice names each as `also touches <path>`.
+
+**Acceptance gate:**
+- From the worktree root, `python3 -m unittest discover -s scripts/production -p 'test_add_unit.py'` and `bash scripts/agents/test_agents_config.sh` green; basedpyright 0 errors and 0 warnings on `scripts/production/add_unit.py` and `test_add_unit.py`.
+- Live (natedev, once the merge reaches `~/.claude` main): `/agent production` shows `director` at `opus` `xhigh`; the next unit director launched shows `--model opus --effort xhigh` in its `ps` command line.

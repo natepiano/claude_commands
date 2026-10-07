@@ -529,10 +529,9 @@ report: when work finishes, report its result and current progress header even
 if a tick arrived recently.
 
 A user-requested status check emits <ProgressReport/> immediately. If the user
-stops updates, run
-`zsh ~/.claude/scripts/message/notifier.sh stop delegate-<run id>` for Claude;
-Codex keeps polling without reports. Resume Claude updates with `start` on the
-same instance. Change one unit's interval with `/unit:interval <min>`.
+stops updates, use `/unit:report off` for Claude; Codex keeps polling without
+reports. Resume Claude updates with `/unit:report on`. Change one unit's
+interval with `/unit:interval <min>`.
 </ProgressContract>
 
 <AuthorizationContract>

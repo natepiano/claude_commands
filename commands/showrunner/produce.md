@@ -93,7 +93,7 @@ State:
   own message — send the unit director `From the showrunner: run /unit:eta (or read ~/.claude/commands/unit/eta.md if it is not in your skill list)` by SendMessage, in that same
   turn. Ask once per phase; ask again only if it answered without a time. Until
   it answers, report that ETA as `none measured - requested`.
-- **Waiting on block.** After the footer, or after the reply when footers are off, leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. The user's items come first. Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. The footer hook checks the shape and item order. User, 2026-10-06.
+- **Waiting on block.** When footers are on, after the footer leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. The user's items come first. Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. The footer hook checks the shape and item order. User, 2026-10-06.
 - **Footer.** When footers are on, paste the output of
   `python3 ~/.claude/scripts/production/dailies_render.py --footer --zone <ZONE>`,
   word for word before the Waiting on block. It starts with a blank line and `---`, then
@@ -125,15 +125,16 @@ State:
   running status and `ZONE`, notifier `next_due`, and `OUTSTANDING`. When the
   footer's last bullet ends ` - nothing needed`, it passes `--nothing-needed`.
   When the footer's update minute is at most five minutes old, it renders
-  with `--at` for that minute and its zone occurrence. A missing or outdated
-  footer or Waiting on block blocks the reply with the exact footer lines and
-  Waiting on shape. End the reply with those lines and the Waiting on block.
+  with `--at` for that minute and its zone occurrence. When footers are on, a
+  missing or outdated footer or Waiting on block blocks the reply with the
+  exact footer lines and Waiting on shape. End the reply with those lines and
+  the Waiting on block.
   The hook passes a reply after any Stop-hook block and passes on errors.
 
   `/showrunner:footer off` and `/showrunner:footer on` pause and resume the
   footer for this showrunner. Run them when the user says "footers off" or
   "footers on" as well as when they type the command. While `/showrunner:footer`
-  reports off, end each reply with the Waiting on block alone. Run
+  reports off, omit both the footer and the Waiting on block. Run
   `/showrunner:footer` after every compaction and session resume: its switch
   survives both. An `/adhoc_review` in this session pauses current dailies and
   footers, then asks whether to turn back on what it paused at the end
@@ -338,32 +339,14 @@ waits its turn. When every unit's final checkpoints are merged, go to <Wrap/>.
 ---
 
 <MergeCheckpoint>
-Input: the unit, phase, hash and shots from its notice.
+Input: the unit, phase, hash, shots, and `review trial:` line from its notice.
+Take the phase start time from the unit's previous merge time in `LOG`, or
+from its launch line in `LOG` for the first phase.
 
-1. **Ancestry.** `git -C CHECKOUT cat-file -e <hash>^{commit}` must succeed.
-   `git -C CHECKOUT merge-base --is-ancestor <LAST_MERGED[unit]> <hash>` must
-   succeed, so nothing merged before is dropped. A unit's first merge has no
-   `LAST_MERGED` and skips this check.
+The showrunner first judges the following points. A held judgment returns the
+notice to the unit director before any merge command runs:
 
-   The hash must also be on origin: after `git -C CHECKOUT fetch origin
-   <branch>`, `git -C CHECKOUT merge-base --is-ancestor <hash> origin/<branch>`
-   succeeds. If it fails, tell the unit director to push its branch. The merge
-   does not wait.
-2. **Scope.** `git -C CHECKOUT diff --name-only <merge branch>...<hash>` lists
-   the unit's changes. Every path must be:
-   - in the unit's **Owns**;
-   - one of its hub files;
-   - or named in the notice as `also touches`.
-
-   For anything else, ask the unit director why, and hold the merge until it
-   answers.
-3. **Conflicts.**
-   `git -C CHECKOUT merge-tree --write-tree --name-only <merge branch> <hash>`
-   exits 1 on a conflict. On a conflict:
-   - the unit director merges the merge branch, resolves the conflict on its
-     side, and sends a new hash;
-   - do not merge the old one.
-4. **Other units.** For each other unit, compare this change's paths with:
+1. **Other units.** For each other unit, compare this change's paths with:
    - its branch, `git -C CHECKOUT diff --name-only <merge branch>...<its branch>`;
    - its uncommitted edits, `git -C <its worktree> status --short`.
 
@@ -376,10 +359,10 @@ Input: the unit, phase, hash and shots from its notice.
    line lacks `tested against <owner tip>` or a fix owner the owner agreed to
    goes back (`production_format.md` → <ProductionUnit/> item 9). User,
    2026-10-06.
-5. **New public items.** Each new `pub` item in the diff needs a user in
+2. **New public items.** Each new `pub` item in the diff needs a user in
    production code. One with no consumer goes back to the unit director as a
    finding.
-6. **Design check.** A change users can see, in the app or in any example,
+3. **Design check.** A change users can see, in the app or in any example,
    needs shots and the unit's own verdict on them: the notice's `design check:`
    line (`production_format.md` → <ProductionUnit/> item 3). The unit runs the
    check before sending; you do not repeat it.
@@ -397,85 +380,47 @@ Input: the unit, phase, hash and shots from its notice.
    rule and the fix, and do not merge. Never ask the user whether a visible
    defect matters. User rule 2026-10-01 (nightly review): the unit judges its
    own shots before it moves on, so holds are not found after it has.
-7. **Merge.** Write the message to `<SCRATCH>/merge_<short hash>.msg`:
+4. **Run the checkpoint.** In the background, run
+   `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/merge_checkpoint.py --production
+   <PRODUCTION_DOC> <unit> <phase> <hash> --started <ISO>
+   --review-trial "<the complete review trial: line>"
+   --delivers "<one line of what the phase delivers>"`.
+   Add one `--also <path>` per approved outside path, one `--trailer <line>`
+   per attribution line this session requires, `--regime trial` if the broad
+   review used the craft lens, `--holds <K>` (this phase's held checkpoints)
+   and `--merge-defects <D>` (the defect rows its merge design checks found in
+   its own work, moved ones included and rows the check calls older left out),
+   both counted from `LOG`, and `--excluded "no merge design check"` for a
+   phase no merge design check judged (`report` and `watch` leave it out). The
+   default regime is `after`; both counts default to zero. Give `--scratch
+   <SCRATCH>` to keep its merge message and test log there. For a phase shrink
+   notice, add `--shrink`; omit `--review-trial` and `--delivers`. Add
+   `--cancel-prior` only with `Push: validate_and_push` when this push supersedes
+   an older queued or running CI run on the merge branch and no CI point is
+   watching its result or diagnosing a red run. The script checks ancestry,
+   origin, scope and conflicts, reports overlaps with other units, merges,
+   tests, reruns red packages, pushes, promotes, and records the result. Its
+   first `held` or `failed` line stops the run. Send its final `send <unit>:`
+   message to the unit director.
 
-   ```
-   Merge <unit> phase <N> (<short hash>) into <merge branch>
+5. **Report where it landed.** Include every `into:` line from the script in
+   the user update. Each names the checkout, why it received the merge and
+   what gate it unblocks. If the showrunner then merges the merge branch into
+   a unit worktree, add an `into:` line for that worktree with the same why
+   and unblocks fields. A failed promote still reports each place already
+   reached. A rerun of the same hash resumes promotion.
 
-   <one line: what the phase delivers>
-
-   <the attribution lines this session's commits require>
-   ```
-
-   Then run `git -C CHECKOUT merge --no-ff -q -F <msg file> <hash>`.
-8. **Test.** In the background, test each package that owns a changed file (its
-   nearest `Cargo.toml`), plus the doc's **Merge tests**, one after another:
-
-   ```sh
-   log=<SCRATCH>/merge_<short hash>_test.log; : > $log
-   for p in <packages>; do
-     bash ~/.claude/scripts/delegate/verify.sh test $p >> $log 2>&1
-     print -r -- "${p}_EXIT=$?" >> $log
-   done
-   ```
-
-   Then add a step for each changed example (`crates/<pkg>/examples/<name>.rs`
-   or `crates/<pkg>/examples/<name>/`): `verify.sh example <pkg> <name>`, with
-   its own `_EXIT` line. Tests and the quick push never run clippy on an example,
-   and CI's Clippy job does (`--all-targets`). On 2026-10-03, examples' Phase 1
-   turned the merge branch red this way.
-
-   When the notification arrives, read the `_EXIT` lines once.
-9. **Red.** Rerun each red package once, alone.
-   - Green alone, and memory names it as a known load-sensitive flake: log it
-     and continue.
-   - Otherwise, confirm that `HEAD` is this unpushed merge and undo it with
-     `git -C CHECKOUT reset --keep HEAD~1`. Send the unit director the failing
-     tests and the log path.
-10. **Green.** Push through CI's mend, rustfmt and taplo checks, which the tests
-    above do not cover. Before this push, check for an older queued or running
-    CI run on the merge branch. Add `--cancel-prior` when this push supersedes
-    it and no CI point is watching its result or diagnosing a red run. With
-    `dangerouslyDisableSandbox: true`, run in the background:
-
-    ```sh
-    bash ~/.claude/scripts/validate_and_push/validate_and_push.sh --quick \
-      --to "<merge branch>" \
-      --fix-commit "ci(<name>): format fixes after <unit> phase <N>"
-    ```
-
-    It commits what those tools fix as that one commit, fails on a mend warning
-    they cannot fix, and pushes. Never force-push. Leave the CI run it reports
-    to <CIPoint/>. On a failure nothing was pushed: undo the merge and any fix
-    commit with `git -C CHECKOUT reset --keep origin/<merge branch>` (if the
-    failed step's own edits block it, `git -C CHECKOUT restore .` first), and
-    send the unit director the failing step and the log. Log a push:
-    `- HH:MM <zone>: <unit> phase <N> (<hash>) merged as <merge hash>; <packages> green; pushed`.
-11. **After the push:**
-    - run <ClearGate/> for any gate this checkpoint clears;
-    - run <CrossUnitChange/> when the change renamed or removed public items,
-      or restructured files;
-    - after every fifth merge since the last CI point, run <CIPoint/>.
-    - record the phase in the review ledger:
-      `python3 ~/.claude/scripts/production/review_regime.py add --unit <unit> --phase <N> --regime after --started <ISO> --merged <ISO> --holds <K> --merge-defects <D> --ux-findings <N> --code-findings <N> --review-minutes <M> --ux-check-minutes <U> --ux-repair-minutes <R>`.
-      `holds` counts this phase's held checkpoints and `merge-defects` the
-      defect rows its merge design checks found in its own work, moved ones
-      included and rows the check calls older left out, both from `LOG`. A
-      phase no merge design check judged adds `--excluded "no merge design
-      check"`, and `report` and `watch` leave it out. The last three come
-      from the unit's `review trial:` checkpoint line. A phase whose broad
-      review ran the `craft` lens is `--regime trial`. The 12-phase report
-      says whether the screenshot check's minutes (check plus its repairs) buy
-      fewer holds and merge defects (user, 2026-10-04).
-    - then run `review_regime.py watch` (user decision 2026-10-04: watch 12
-      phases without the code reviewer; since 2026-10-05 only phases with no
-      `excluded` reason count). The first time it exits 3, run
-      `report --since 2026-09-28`, push at once
-      (`~/.claude/scripts/notify/pushover.py --priority 1 "Hana: review watch" "<one line; the table is in this session>"`),
-      log it, and give the user the table. While it exits 3, the dailies
-      `Review watch` topic needs the user, and every build report (`/builds`,
-      every 4 hours) carries it and pushes again. Run `review_regime.py ack`
-      only on the user's own acknowledgment.
+6. **After the push.** Run <ClearGate/> for a code checkpoint's first merge;
+   run <CrossUnitChange/> when public items were renamed or removed or files
+   restructured; after every fifth code merge since the last CI point, run
+   <CIPoint/>. Run `review_regime.py watch` after a code checkpoint and handle
+   its first exit 3 as below; a shrink adds no review-ledger row or CI count.
+   The first time the watch exits 3, run `report --since 2026-09-28`, push at
+   once (`~/.claude/scripts/notify/pushover.py --priority 1 "Hana: review watch"
+   "<one line; the table is in this session>"`), log it, and give the user the
+   table. While it exits 3, the dailies `Review watch` topic needs the user,
+   and every build report (`/builds`, every 4 hours) carries it and pushes
+   again. Run `review_regime.py ack` only on the user's own acknowledgment.
 </MergeCheckpoint>
 
 ---
@@ -512,7 +457,7 @@ Screenshots and the guide never load into the showrunner's own context: never
 Read a shot, not even to look before a merge or before the user sees it. The
 2026-10-01 nightly review counted 116 shots (227k tokens) loaded there in 2.6
 days. Units run this check themselves before each checkpoint notice
-(<MergeCheckpoint/> step 6). Run it here only when a notice's verdict is
+(<MergeCheckpoint/> step 3). Run it here only when a notice's verdict is
 missing or stale: spawn a fresh helper agent with this prompt:
 
 > Read `~/.claude/commands/ux_eval.md` and follow it for these shots:
@@ -940,7 +885,7 @@ When every unit's final-gate and as-built checkpoints are merged:
 - Only the showrunner pushes the merge branch and main, never with force.
   Units push only their own branch.
 - Merge only from a checkpoint notice. Never merge a visible change before a
-  fresh design-check pass on its shots (<MergeCheckpoint/> step 6).
+  fresh design-check pass on its shots (<MergeCheckpoint/> step 3).
 - **Check intent before ruling.** Before ruling that a design-check finding
   must change something deliberate-looking, read the repository's
   `docs/design-decisions.md`, the plan and the as-built docs; if intent stays
