@@ -1,0 +1,2 @@
+{"type":"assistant","timestamp":"2026-10-01T00:00:00.000Z","cwd":"/fictional/studio","sessionId":"write-only","message":{"role":"assistant","content":[{"type":"tool_use","id":"write-only-0","name":"Write","input":{"file_path":"/fictional/studio/unused.py","content":"rpc('brp_extras/screenshot', {})\n"}}]}}
+{"type":"user","timestamp":"2026-10-01T00:00:05.000Z","cwd":"/fictional/studio","sessionId":"write-only","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"write-only-0","content":"ok"}]}}

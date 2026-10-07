@@ -183,7 +183,7 @@ def scan(state_dir: Path, claude_root: Path, codex_root: Path) -> str:
     write_episodes(state_dir / "episodes.jsonl", episodes)
     _ = (state_dir / "survey.json").write_text(json.dumps(counts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return "\n".join((
-        f"Scanned {len(calls)} calls; saved {len(episodes)} episodes at 300 s and 900 s in {time.monotonic()-started:.1f} s.",
+        f"Scanned {len(calls)} calls from {calls.candidate_file_count} candidate files; read {calls.bytes_read} bytes; saved {len(episodes)} episodes at 300 s and 900 s in {time.monotonic()-started:.1f} s.",
         f"Claude MCP baseline Sep 9 PDT to 2026-10-06T16:35Z, 300 s: n={len(baseline)} total_h={sum(episode.minutes for episode in baseline)/60:.2f}",
         f"Full by hand Sep 9 PDT to 2026-10-06T16:35Z, 300 s: n={len(full)} total_h={sum(episode.minutes for episode in full)/60:.2f}",
     ))
