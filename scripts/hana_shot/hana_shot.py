@@ -25,6 +25,7 @@ import sys
 import tempfile
 import time
 import tomllib
+from types import FrameType
 from typing import IO, Literal, NamedTuple, NotRequired, TypedDict, cast
 
 
@@ -99,6 +100,75 @@ class Failure(Exception):
 
 class CaptureTimeout(Exception):
     """A screenshot that never answered; exit 3, and never resend it."""
+
+
+class ExitSignal(BaseException):
+    """A catchable process signal that should unwind the active shot."""
+
+    def __init__(self, number: int) -> None:
+        super().__init__(number)
+        self.number: int = number
+
+
+@dataclass(frozen=True)
+class ExitSignalsEnabled:
+    """The first exit signal may unwind the active operation."""
+
+
+@dataclass(frozen=True)
+class ExitSignalsDeferred:
+    """Cleanup must finish before an exit signal unwinds the operation."""
+
+
+@dataclass(frozen=True)
+class DeferredExitSignal:
+    """The first exit signal received while cleanup was protected."""
+
+    number: int
+
+
+@dataclass(frozen=True)
+class ExitSignalsLatched:
+    """An unwind or final cleanup has begun; later exit signals do nothing."""
+
+
+class ExitSignalLatch:
+    """Make the first exit signal unwind once, after any cleanup in progress."""
+
+    def __init__(self) -> None:
+        self.state: ExitSignalsEnabled | ExitSignalsDeferred | DeferredExitSignal | ExitSignalsLatched
+        self.state = ExitSignalsEnabled()
+
+    def reset(self) -> None:
+        self.state = ExitSignalsEnabled()
+
+    def latch(self) -> None:
+        self.state = ExitSignalsLatched()
+
+    def interrupt(self, number: int) -> None:
+        if isinstance(self.state, ExitSignalsEnabled):
+            self.state = ExitSignalsLatched()
+            raise ExitSignal(number)
+        if isinstance(self.state, ExitSignalsDeferred):
+            self.state = DeferredExitSignal(number)
+
+    @contextmanager
+    def defer_during_cleanup(self) -> Generator[None, None, None]:
+        deferring = isinstance(self.state, ExitSignalsEnabled)
+        if deferring:
+            self.state = ExitSignalsDeferred()
+        try:
+            yield
+        finally:
+            if deferring and isinstance(self.state, ExitSignalsDeferred):
+                self.state = ExitSignalsEnabled()
+            elif deferring and isinstance(self.state, DeferredExitSignal):
+                deferred = self.state
+                self.state = ExitSignalsLatched()
+                raise ExitSignal(deferred.number)
+
+
+EXIT_SIGNAL_LATCH = ExitSignalLatch()
 
 
 class BrpCallError(Failure):
@@ -214,6 +284,24 @@ class WindowResolutionValue(TypedDict):
 class WindowValue(TypedDict):
     resolution: WindowResolutionValue
     window_level: str
+
+
+@dataclass(frozen=True)
+class WindowLevelPending:
+    """The session has not yet prepared the macOS window for capture."""
+
+
+@dataclass(frozen=True)
+class WindowLeftAlone:
+    """The session found no unique primary window to raise."""
+
+
+@dataclass(frozen=True)
+class WindowRaised:
+    """A window this session must restore when it closes."""
+
+    entity: int
+    restore_level: str
 
 
 class RectValue(TypedDict):
@@ -576,7 +664,7 @@ class Session:
         self.rect_support: bool | None = None
         self.last_move: tuple[object, ...] | None = None
         self.last_state: CameraState | None = None
-        self.window_level_set: bool = False
+        self.window_level: WindowLevelPending | WindowLeftAlone | WindowRaised = WindowLevelPending()
 
     def start(self) -> CameraState:
         system = None if self.remote is None else POOL.submit(remote_system, self.remote)
@@ -595,14 +683,32 @@ class Session:
         return camera_state(rows[0]["components"])
 
     def close(self) -> None:
-        """End the remote keep-awake: with its stdin closed, the remote shell kills caffeinate."""
+        """Latch exit signals, restore the window, then end the keep-awake."""
+        EXIT_SIGNAL_LATCH.latch()
+        self.restore_window_and_end_keep_awake()
+
+    def restore_window_and_end_keep_awake(self) -> None:
+        """Undo window preparation without changing the active outcome."""
+        window_level = self.window_level
+        if isinstance(window_level, WindowRaised):
+            try:
+                self.brp.mutate(window_level.entity, WINDOW, ".window_level", window_level.restore_level)
+            except Failure as exc:
+                print(
+                    f"hana_shot: could not put the window level back to {window_level.restore_level}: {exc}",
+                    file=sys.stderr,
+                )
+        self.window_level = WindowLevelPending()
         if self.keep_awake is None:
             return
+        keep_awake_process = self.keep_awake
         try:
-            _ = self.keep_awake.communicate(timeout=CALL_TIMEOUT)
+            if self.remote is None:
+                keep_awake_process.terminate()
+            _ = keep_awake_process.communicate(timeout=CALL_TIMEOUT)
         except subprocess.TimeoutExpired:
-            self.keep_awake.kill()
-            _ = self.keep_awake.wait()
+            keep_awake_process.kill()
+            _ = keep_awake_process.wait()
         self.keep_awake = None
 
     def read_camera(self) -> CameraState:
@@ -1230,19 +1336,35 @@ def ensure_window(session: Session, size: str) -> None:
 
 def keep_visible(session: Session) -> None:
     """macOS draws nothing for a hidden window: raise it above others and wake the display."""
-    if session.window_level_set:
+    if not isinstance(session.window_level, WindowLevelPending):
         return
-    rows = session.brp.query({"data": {}, "filter": {"with": [PRIMARY_WINDOW]}})
+    rows = session.brp.query({"data": {"components": [WINDOW]}, "filter": {"with": [PRIMARY_WINDOW]}})
+    prepared_window: WindowLeftAlone | WindowRaised = WindowLeftAlone()
     if len(rows) == 1:
-        session.brp.mutate(rows[0]["entity"], WINDOW, ".window_level", "AlwaysOnTop")
-    if session.remote is not None:
-        session.keep_awake = keep_awake(session.remote)
-    else:
-        caffeinate = shutil.which("caffeinate")
-        if caffeinate is not None:
-            _ = subprocess.Popen([caffeinate, "-u", "-t", "30"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    session.window_level_set = True
-    session.wait_frames(2)
+        raw_window = rows[0].get("components", {}).get(WINDOW)
+        window = cast(WindowValue, cast(object, raw_window)) if isinstance(raw_window, dict) else None
+        level = window.get("window_level") if window is not None else None
+        restore_level = level if isinstance(level, str) and level != "AlwaysOnTop" else "Normal"
+        entity = rows[0]["entity"]
+        prepared_window = WindowRaised(entity, restore_level)
+        session.window_level = prepared_window
+    try:
+        if isinstance(prepared_window, WindowRaised):
+            session.brp.mutate(prepared_window.entity, WINDOW, ".window_level", "AlwaysOnTop")
+        if session.remote is not None:
+            session.keep_awake = keep_awake(session.remote)
+        else:
+            caffeinate = shutil.which("caffeinate")
+            if caffeinate is not None:
+                session.keep_awake = subprocess.Popen(
+                    [caffeinate, "-u", "-t", "30"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+        session.wait_frames(2)
+        session.window_level = prepared_window
+    except BaseException:
+        with EXIT_SIGNAL_LATCH.defer_during_cleanup():
+            session.restore_window_and_end_keep_awake()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -2273,6 +2395,10 @@ def arguments(argv: list[str]) -> Arguments:
     return parser.parse_args(argv, namespace=Arguments())
 
 
+def exit_for_signal(number: int, _frame: FrameType | None) -> None:
+    EXIT_SIGNAL_LATCH.interrupt(number)
+
+
 def main(argv: list[str]) -> int:
     try:
         args = arguments(argv)
@@ -2299,6 +2425,10 @@ def main(argv: list[str]) -> int:
     }
     invocation = (InProgressCaptureInvocation(kind="shot" if args.command == "shot" else "views_check")
                   if args.command == "shot" or args.command == "views" and args.action == "check" else None)
+    EXIT_SIGNAL_LATCH.reset()
+    _ = signal.signal(signal.SIGINT, exit_for_signal)
+    _ = signal.signal(signal.SIGTERM, exit_for_signal)
+    _ = signal.signal(signal.SIGHUP, exit_for_signal)
     exit_code = 1
     try:
         if args.command == "views" and args.action in ("check", "add") and args.from_current or (
@@ -2328,6 +2458,8 @@ def main(argv: list[str]) -> int:
         exit_code = 1
         if invocation is not None and not invocation.failures:
             invocation.failures.append(failure_reason(exc))
+    except ExitSignal as exc:
+        exit_code = 128 + exc.number
     finally:
         if invocation is not None:
             write_invocation(invocation, args.port, args.remote, exit_code)
