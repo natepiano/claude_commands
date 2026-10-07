@@ -288,7 +288,7 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 **Seats:** none — the unit director ranks and proposes from the report; no code is written until a proposal becomes its own phase.
 
-**Constraints from prior phases:** Failure logging, Codex transcript scanning and kept-shot detection are delivered, so `analysis.md` → Next improvements entry 2, entry 3 and the failure-logging half of entry 1 are not proposed again; what fills long `/hana_shot` episodes is answered by the report's "What fills long /hana_shot episodes" section: agent thinking holds 61–67% of long minutes, other BRP calls 7–12%, file work 8–11%, retries 3–5% and shot calls 2–3%, so it is not proposed again. Its first window was under one day; re-rank from that section after a full week of `/hana_shot` data. The hourly phase supplies source-host coverage and says whether each attempt count is exact or inferred from images. The Mac catch-up delivers Codex transcripts and timings and finished in five hourly runs (`scan_status.json` → `mac_read_state`; check it before each estimate); Mac Claude transcripts stay out above 100 files or 100 MB, so every Mac estimate names that limit. A `changes.json` entry is either a product change, which is a speed candidate, or a measurement change, which the report lists separately and never counts as a speed gain; an approved proposal appends a product change carrying its effective time and affected hosts. Scale-aware `--window` (Phase 8, d1efe4c) is in `changes.json` as a product change on natedev and the Mac, effective 2026-10-07 08:04 PDT; it is not proposed again. Price weekly agent minutes from an observed eligible weekly count, keep per-shot milliseconds distinct from episode minutes, and leave a candidate unpriced when its evidence cannot support that calculation.
+**Constraints from prior phases:** Failure logging, Codex transcript scanning and kept-shot detection are delivered, so `analysis.md` → Next improvements entry 2, entry 3 and the failure-logging half of entry 1 are not proposed again; what fills long `/hana_shot` episodes is answered by the report's "What fills long /hana_shot episodes" section: agent thinking holds 61–67% of long minutes, other BRP calls 7–12%, file work 8–11%, retries 3–5% and shot calls 2–3%, so it is not proposed again. Its first window was under one day; re-rank from that section after a full week of `/hana_shot` data. The hourly phase supplies source-host coverage and says whether each attempt count is exact or inferred from images. The Mac catch-up delivers Codex transcripts and timings and finished in five hourly runs (`scan_status.json` → `mac_read_state`; check it before each estimate); Mac Claude transcripts stay out above 100 files or 100 MB, so every Mac estimate names that limit. A `changes.json` entry is either a product change, which is a speed candidate, or a measurement change, which the report lists separately and never counts as a speed gain; an approved proposal appends a product change carrying its effective time and affected hosts. Scale-aware `--window` (Phase 8, d1efe4c) is in `changes.json` as a product change on natedev and the Mac, effective 2026-10-07 08:04 PDT; it is not proposed again. The window-level restore (Phase 9) is in `changes.json` as a product change on natedev and the Mac, effective 2026-10-07 10:08 PDT; it is not proposed again. Since that change, a `/hana_shot` run ended by Ctrl-C, SIGTERM or SIGHUP writes its invocation record with `status: failure`, `exit_code` 130, 143 or 129 and `failure_reason: shot_failed`; before it, SIGTERM and SIGHUP left no record. When a candidate is priced from failures in `invocations.jsonl`, count records with those exit codes apart from failed shots. Price weekly agent minutes from an observed eligible weekly count, keep per-shot milliseconds distinct from episode minutes, and leave a candidate unpriced when its evidence cannot support that calculation.
 
 **Acceptance gate:** each proposal cites a report less than 24 h old whose scan covers every host it uses through a time at or after G1 (`scan_status.json` → `last_success` and `host_coverage`), the covered window and n for every number, both splits when it uses episode time, exact or inferred attempt evidence when it uses kept shots, and the calculation of expected agent-minutes saved per week. A candidate without those inputs is labeled unpriced and ranks below every priced one.
 
@@ -338,38 +338,28 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 ### Phase 9 — `/hana_shot` leaves no Mac window always on top · status: done
 
-#### Work Order
+#### As-built
 
-**Source:** the showrunner, 2026-10-07: `keep_visible` (`scripts/hana_shot/hana_shot.py:1231`) sets the Hana window to AlwaysOnTop on every macOS run, and nothing sets it back. That day a Hana window on the Mac stayed in front of everything while the user was away; `/hana_shot` ran there 29 times, last at 08:12 PDT, from tool-based-ui-demo and startup-polish. Hana sets no window level itself: `~/rust/hana` has no `WindowLevel` or `window_level`.
-
-**Goal:** when `/hana_shot` exits, by success, failure, Ctrl-C, SIGTERM or SIGHUP, every window it raised has the level it had before the run, so no Mac window stays always on top.
-
-**Spec:**
-- `keep_visible` (`:1231`) queries the primary window's `Window` component and reads its `window_level` before it writes AlwaysOnTop. It still does its work once per session, as today.
-- The level to put back is the one read, except that a level reading AlwaysOnTop goes back to Normal: Hana sets no level itself, so an AlwaysOnTop level is one an earlier run left behind. A level that cannot be read also goes back to Normal.
-- `Session.window_level_set: bool` (`:579`) becomes a type that says whether this run raised the window and, when it did, the window entity and the level to put back, such as `WindowLeftAlone | WindowRaised(entity, restore_level)`. It is not a bare optional.
-- `Session.close()` (`:597`) puts the level back first, then ends the keep-awake. The restore call uses `CALL_TIMEOUT`. A restore that fails (a BRP error, or Hana gone) prints one stderr line, `hana_shot: could not put the window level back to <level>: <reason>`. The keep-awake still ends, and the run keeps its own exit code and exception.
-- Every command that shoots opens its `Session` with `closing(...)` (`:1856`, `:2137`). Success, `Failure`, `Refused`, `CaptureTimeout` and Ctrl-C therefore already pass through `close()`. `main` (`:2276`) also turns SIGTERM and SIGHUP into an exit that unwinds through `close()` and its own `finally`, so the invocation record is still written; the exit code is 128 + the signal number. SIGKILL cannot be caught; the next run's AlwaysOnTop-to-Normal rule repairs the level it leaves.
-- A local macOS run (no `--remote`, Hana on this Mac) takes the same path.
-- `commands/hana_shot.md` items 8 and 9 say the level goes back to what it was when the run ends.
-- Tests drive the existing BRP fake. Its primary window answers a `window_level` (Normal unless a test sets another), and a `.window_level` mutate changes it. Every case is a remote Mac shot that checks the fake's final level and that the keep-awake ended:
-  - success from Normal: the mutates are AlwaysOnTop then Normal, and the level ends Normal;
-  - success from AlwaysOnBottom: it ends AlwaysOnBottom;
-  - success from AlwaysOnTop: it ends Normal;
-  - a failed run (the remote copy leaves no file, exit 1): it ends at the level it started with;
-  - SIGINT, and separately SIGTERM, sent while the fake holds the screenshot call: it ends at the level it started with, and the invocation record is written;
-  - a restore the fake refuses: one stderr line, and the run's exit code is unchanged.
-  The success, failure and signal cases fail on today's code. `test_remote_mac_shot_raises_the_window_and_holds_the_display_awake_for_the_run` changes to expect the restore.
+- `Session.window_level` is `WindowLevelPending | WindowLeftAlone | WindowRaised(entity, restore_level)`; nothing outside the tool reads it. `keep_visible` reads the primary window's `window_level` before it writes AlwaysOnTop and records `WindowRaised`. A level read as AlwaysOnTop, or one that cannot be read, restores to Normal: Hana sets no level itself, so AlwaysOnTop is one an earlier run left behind.
+- `Session.restore_window_and_end_keep_awake()` puts the level back, then ends the keep-awake. `Session.close()` and a failed preparation both call it. The restore uses `Brp.call`'s default `CALL_TIMEOUT`. A restore that fails prints one stderr line, `hana_shot: could not put the window level back to <level>: <reason>`; the keep-awake still ends and the run keeps its exit code.
+- Preparation counts as done only after the raise, the keep-awake start and the frame wait all succeed, because a session marked prepared early stops `views check` from preparing later views. On a failure or a signal it undoes itself and the state returns to `WindowLevelPending`, so the next view prepares again.
+- `ExitSignalLatch`: the first SIGINT, SIGTERM or SIGHUP raises `ExitSignal` (a `BaseException`) once, and `main` exits with 128 + the signal number (130, 143, 129), with no traceback and with the timings line and the invocation record written. Later signals, and any that arrive once `Session.close()` has begun, do not interrupt. A signal during a failed preparation's rollback is delivered after the rollback. The latch states are `ExitSignalsEnabled`, `ExitSignalsDeferred`, `DeferredExitSignal` and `ExitSignalsLatched`.
+- A local macOS run takes the same cleanup path: it keeps its `caffeinate` handle and terminates it at cleanup.
 
 **Files:**
-- `scripts/hana_shot/hana_shot.py` — read the level, the raised-window type, the restore in `close()`, SIGTERM and SIGHUP in `main`
-- `commands/hana_shot.md` — items 8 and 9 say the level goes back
-- `scripts/hana_shot/test_hana_shot.py` — the fake's window level and the exit-path cases
+- `scripts/hana_shot/hana_shot.py` — the level read, the session window state, the shared cleanup, the signal latch and handlers
+- `commands/hana_shot.md` — items 6, 8 and 9 state the restore, the stale-level repair and the signal exit codes
+- `scripts/hana_shot/test_hana_shot.py` — the BRP fake's window level, a one-shot raise refusal, a held screenshot, generated driver subprocesses that wrap `Brp.mutate` and `Session.close`; exit-path cases for success from Normal, AlwaysOnBottom and AlwaysOnTop, a failed remote copy, SIGINT, SIGTERM, SIGHUP, a signal during cleanup, a second signal during the unwinding, `views check` retrying preparation, a refused restore
 
-**Seats:** 1 writer + 1 tester
-- `impl`: `scripts/hana_shot/hana_shot.py`, `commands/hana_shot.md`
-- `test`: `scripts/hana_shot/test_hana_shot.py`
+**Binds later work:** **Proposals: the next change, ranked by measured minutes saved** reads invocation records, where a run ended by a stop signal is a failure with exit code 130, 143 or 129 and `failure_reason: shot_failed`. `changes.json` carries this change as a product change for natedev and the Mac, effective 2026-10-07 10:08 PDT.
 
-**Constraints from prior phases:** each `shot` call still appends its one timings line and invocation record (Phase 3), on every exit path, signals included. `ensure_window` reads the `Window` component through `WindowValue`, whose `window_level` is a string (Phase 8).
+**Gotchas:**
+- A signal handler that raises can fire inside cleanup, so `closing(...)` alone does not protect the restore; the latch engages before cleanup starts.
+- SIGKILL cannot be caught; the next run's AlwaysOnTop-to-Normal rule repairs the level it leaves.
+- The local macOS branch cannot run on Linux; no test exercises it, only a live Mac run.
 
-**Acceptance gate:** the `scripts/hana_shot` tests pass, and `basedpyright` reports 0/0/0 on both changed `.py` files. Live, on the Mac, after the merge: the tool-based-ui unit's next Mac shot reads `window_level` once `/hana_shot` exits, and it reads the level from before the run (Normal for Hana). The showrunner arranges that check; no Mac Hana is cleared for this unit's port.
+**Ruled out:**
+- `SIG_IGN` during cleanup — child processes inherit an ignored disposition; a latch the handler checks does not leak.
+- A `timeout` parameter on `Brp.mutate` — it only repeated `Brp.call`'s default.
+- Leaving Ctrl-C on the `KeyboardInterrupt` path — one path for all three signals gives one rule and one exit-code scheme.
+
