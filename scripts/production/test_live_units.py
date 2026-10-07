@@ -57,7 +57,7 @@ class LiveUnitsTests(unittest.TestCase):
             "## Units",
             "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
             "| --- | --- | --- | --- | --- | --- | --- |",
-            f"| old-unit | (run done; retired by the user) follow-up | /tmp/old | old | `{retired_session}` (resumed elsewhere) | — | — |",
+            f"| old-unit | (retired by the user; run done) follow-up | /tmp/old | old | `{retired_session}` (resumed elsewhere) | — | — |",
         )), encoding="utf-8")
         return doc
 

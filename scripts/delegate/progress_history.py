@@ -1043,8 +1043,9 @@ def _close_active_activity(
 def _start_activity(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    phase = _object_dict(state.get("phase"))
-    if phase is None or _string(phase.get("status")) != "active":
+    if _string(state.get("status")) != "active":
+        raise SystemExit("Cannot start an activity: the run is finished")
+    if _object_dict(state.get("phase")) is None:
         raise SystemExit("Start a phase before starting an activity")
     now = _now_epoch()
     _close_active_activity(session_dir, state, "interrupted", "", now)
@@ -1175,6 +1176,8 @@ def _start_phase(args: argparse.Namespace) -> None:
         raise SystemExit(
             f"Phase {_string(active.get('id'))} is still active; finish it before starting another"
         )
+    _close_active_activity(session_dir, state, "interrupted", "", now)
+    state = _read_state(session_dir)
     phase: dict[str, object] = {
         "instance_id": str(uuid.uuid4()),
         "id": _arg_string(args, "phase_id", "ad hoc"),
@@ -4075,6 +4078,9 @@ def _progress(args: argparse.Namespace) -> None:
 def _finish_phase(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
+    phase = _object_dict(state.get("phase"))
+    if phase is None or _string(phase.get("status")) != "active":
+        return
     now = _now_epoch()
     _close_open_passes(session_dir, state, "interrupted", now)
     state = _read_state(session_dir)
@@ -4082,9 +4088,6 @@ def _finish_phase(args: argparse.Namespace) -> None:
     state = _read_state(session_dir)
     if _clear_armed_review(session_dir, state, "phase ended", now):
         state = _read_state(session_dir)
-    phase = _object_dict(state.get("phase"))
-    if phase is None or _string(phase.get("status")) != "active":
-        return
     event = _event(state, "phase_finished", now)
     event["status"] = _arg_string(args, "status")
     event["phase_elapsed_seconds"] = max(
@@ -4110,6 +4113,8 @@ def _finish_run(args: argparse.Namespace) -> None:
         state = _read_state(session_dir)
     if _string(state.get("status")) != "active":
         return
+    _close_active_activity(session_dir, state, "interrupted", "", now)
+    state = _read_state(session_dir)
     event = _event(state, "run_finished", now)
     event["status"] = run_status
     event["run_elapsed_seconds"] = max(
@@ -4135,7 +4140,7 @@ def _finding_lenses(event: dict[str, object]) -> set[str]:
 
 
 def _review_trial(args: argparse.Namespace) -> None:
-    """Print one line: what the phase's UX and craft lenses found, and review time.
+    """Print one line: the phase's UX and code findings, and review time.
 
     It feeds the unit's checkpoint notice line, which the showrunner records with
     review_regime.py. The phase is the one in state, active or just closed by
@@ -4170,7 +4175,7 @@ def _review_trial(args: argparse.Namespace) -> None:
             if "ux" in lenses:
                 ux_findings += 1
                 ux_finding_ids.add(_string(event.get("finding_id")))
-            if "craft" in lenses:
+            if not lenses or lenses - {"ux"}:
                 code_findings += 1
         elif event_type == "finding_batch_dispatched":
             dispatched.append(event)
