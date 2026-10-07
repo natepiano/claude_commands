@@ -39,6 +39,12 @@
 
 set -euo pipefail
 
+ATTACH=0
+if [[ "${1:-}" == "--attach" ]]; then
+  ATTACH=1
+  shift
+fi
+
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.10.
@@ -83,6 +89,109 @@ fi
 if [[ ! "${MESH_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]; then
   echo "agent_bg.sh: invalid mesh name '${MESH_NAME}'." >&2
   exit 2
+fi
+
+if [[ "${ATTACH}" == "1" ]]; then
+  BG_ID="$(cat "${ID_FILE}" 2>/dev/null || true)"
+  [[ -n "${BG_ID}" ]] || { echo "agent_bg.sh: missing seat id" >&2; exit 2; }
+  transcript_count() {
+    BG_ID="${BG_ID}" MESH_NAME="${MESH_NAME}" "$PY" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+sessions = Path(os.environ.get("NOTIFIER_SESSIONS_DIR", str(Path.home() / ".claude/sessions")))
+projects = Path(os.environ.get("CLAUDE_PROJECTS_DIR", str(Path.home() / ".claude/projects")))
+session_id = ""
+for path in sessions.glob("*.json"):
+    try:
+        row = json.loads(path.read_text())
+    except (OSError, ValueError):
+        continue
+    if row.get("name") == os.environ["MESH_NAME"] and (
+        row.get("id") == os.environ["BG_ID"]
+        or str(row.get("sessionId", "")).startswith(os.environ["BG_ID"])
+    ):
+        session_id = str(row.get("sessionId", ""))
+        break
+if not session_id:
+    print(-1)
+    raise SystemExit
+matches = list(projects.glob(f"*/{session_id}.jsonl"))
+count = 0
+if matches:
+    try:
+        for line in matches[0].read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("type") == "assistant" and row.get("message", {}).get("stop_reason") in ("end_turn", "stop_sequence"):
+                count += 1
+    except OSError:
+        pass
+print(count)
+PY
+  }
+  before="$(transcript_count)"
+  [[ "${before}" != "-1" ]] || { echo "agent_bg.sh: session transcript identity unavailable" >&2; exit 2; }
+  SEND_SCRIPT="${AGENT_BG_SEND_SCRIPT:-$(dirname "${BASH_SOURCE[0]}")/../message/send.py}"
+  delivery="$("$PY" "${SEND_SCRIPT}" --to "${MESH_NAME}" --from "launcher" --file "${PROMPT_FILE}")" || {
+    echo "agent_bg.sh: follow-up was not delivered to ${MESH_NAME}" >&2
+    exit 1
+  }
+  if [[ "${delivery}" == QUEUED* || "${delivery}" == FAILED* ]]; then
+    echo "agent_bg.sh: ${delivery}" >&2
+    exit 1
+  fi
+  # The transcript index identifies this turn even if it finishes before the
+  # first poll. Keep it with the launcher's claim for killed-launch recovery.
+  if [[ -n "${PLAN_DELEGATE_BOARD_DIR:-}" && -n "${PLAN_DELEGATE_TEAM_ROLE:-}" ]]; then
+    FOLLOW_TURN_INDEX="$((before + 1))" "$PY" - <<'PY'
+import fcntl
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ["PLAN_DELEGATE_BOARD_DIR"])
+slot = os.environ["PLAN_DELEGATE_TEAM_ROLE"]
+with (root / "impl_seat_claim.lock").open("a+") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    path = root / f"impl_claim_{slot}.json"
+    try:
+        claim = json.loads(path.read_text())
+    except (OSError, ValueError):
+        raise SystemExit
+    if claim.get("pid") == int(os.environ.get("FOLLOW_LAUNCHER_PID", "0")):
+        claim["turn_id"] = f"claude-turn-{os.environ['FOLLOW_TURN_INDEX']}"
+        path.write_text(json.dumps(claim))
+PY
+  fi
+  while true; do
+    status="$("${CLAUDE_BIN}" agents --json 2>/dev/null | BG_ID="${BG_ID}" "$PY" -c '
+import json, os, sys
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    print("unreadable")
+else:
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        print("unreadable")
+    else:
+        row = next((row for row in rows if row.get("id") == os.environ["BG_ID"]), None)
+        print(row.get("status", "unreadable") if row else "gone")
+' || true)"
+    if [[ "${status}" == "gone" ]]; then
+      echo "agent_bg.sh: ${MESH_NAME} vanished after delivery" >&2
+      exit 1
+    fi
+    after="$(transcript_count)"
+    if [[ "${after}" =~ ^[0-9]+$ && "${after}" -gt "${before}" && "${status}" == "idle" ]]; then
+      "${CLAUDE_BIN}" logs "${BG_ID}" > "${LOG_FILE}" 2>/dev/null || true
+      exit 0
+    fi
+    sleep "${POLL_SECS}"
+  done
 fi
 
 # `claude --bg` runs the session in a spare process of one long-lived per-user
@@ -211,8 +320,28 @@ refresh_log
 # reads the summary never finds nothing at all.
 if [[ ! -s "${SUMMARY_FILE}" ]]; then
   if [[ -s "${LOG_FILE}" ]]; then
-    tail -c 4000 "${LOG_FILE}" > "${SUMMARY_FILE}" 2>/dev/null || true
-  else
+    if ! "$PY" - "${LOG_FILE}" "${SUMMARY_FILE}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+log = Path(sys.argv[1]).read_bytes().decode("utf-8", errors="replace")
+terminal_sequences = (
+    r"\x1b\].*?(?:\x07|\x1b\\|\Z)"
+    r"|\x1b\[[0-?]*[ -/]*[@-~]"
+    r"|\x1b[ -/]*[0-~]"
+)
+plain = re.sub(terminal_sequences, "", log, flags=re.DOTALL)
+plain = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", plain)
+tail = plain[-4000:]
+if tail.strip():
+    Path(sys.argv[2]).write_text(tail, encoding="utf-8")
+PY
+    then
+      : > "${SUMMARY_FILE}"
+    fi
+  fi
+  if [[ ! -s "${SUMMARY_FILE}" ]]; then
     printf 'The background agent %s produced no summary.\n' "${MESH_NAME}" > "${SUMMARY_FILE}"
   fi
 fi

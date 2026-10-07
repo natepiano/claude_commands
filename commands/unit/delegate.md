@@ -66,7 +66,7 @@ it:
 | --- | --- | --- |
 | <ProgressReport/> | `commands/unit/report.md` | `/unit:report` |
 | <VerbosePostPhaseReport/>, <CombinedWindowReport/>, <RemainingWorkOutlook/> | `commands/unit/phase_report.md` | `/unit:phase_report` |
-| <CheckpointCommit/>, <PushCheckpoint/> | `commands/unit/checkpoint.md` | `/unit:checkpoint` |
+| <CheckpointCommit/>, <ShrinkCommit/>, <PushCheckpoint/> | `commands/unit/checkpoint.md` | `/unit:checkpoint` |
 | <ConsiderNextItems/>, <ReviewPendingAddOns/> | `commands/unit/add_ons.md` | `/unit:add_ons` |
 | <ResolveStyleDiffBase/>, <RunProjectStyleReview/> | `commands/unit/style_review.md` | `/unit:style_review` |
 | <PeriodicCI/>, <CICleanup/> | `commands/unit/ci.md` | `/unit:ci` |
@@ -76,6 +76,7 @@ it:
 | <LaunchImplementation/> | `docs/delegate/launch_implementation.md` | — |
 | <DualReview/>, <TeamReview/>, <ReviewPromptContract/>, <BroadReviewPrompt/>, <ClosureReview/> | `docs/delegate/dual_review.md` | — |
 | <RunPhaseReview/>, <RunPhaseShrink/> | `docs/delegate/run_phase_review.md` | — |
+| <PhaseEnd/> | `docs/delegate/phase_end.md` | — |
 | <FinalGateCommit/>, <RunAsBuilt/>, <AsBuiltCommit/> | `docs/delegate/final_gate_commit.md` | — |
 | <ProductionUnit/> | `docs/production_format.md` | — |
 
@@ -94,11 +95,13 @@ A call site's arguments are what that file calls `$ARGUMENTS`.
 - The unit director does not write implementation code unless the user explicitly
   asks. Exceptions: agreed doc-only/trivial post-review fixes and the single
   inline cleanup in <RunProjectStyleReview/>.
-- `single` never commits. Loop and verbose modes create exactly one
-  <CheckpointCommit/> per completed phase, plus the one <FinalGateCommit/> that
-  closes verification and the one <AsBuiltCommit/> that carries the run's
-  documentation. <PeriodicCI/> may add `ci(<plan-slug>): …` commits for
-  validation fixes and CI repairs. No other commit is allowed.
+- `single` never commits. Loop and verbose modes create one
+  <CheckpointCommit/> and one <ShrinkCommit/> per completed phase, plus the one
+  <FinalGateCommit/> that closes verification and the one <AsBuiltCommit/> that
+  carries the run's documentation. <PeriodicCI/> may add `ci(<plan-slug>): …`
+  commits for validation fixes and CI repairs. No other commit is allowed.
+  Only <ShrinkCommit/> runs while seats edit, and it commits only the plan doc
+  and an approved `${NEXT_ITEMS_PATH}` change.
 - Every commit the run makes is pushed by <PushCheckpoint/>, fast-forward only,
   to the working branch's own name on origin, never to the default branch.
   <PeriodicCI/> runs CI on it every fifth checkpoint of a plan with five or more
@@ -119,7 +122,7 @@ throughout. It changes four things in this command:
 - it adds one commit kind to <CoreContract/>: merging the production's merge
   branch into this branch;
 - it replaces <PeriodicCI/> and <CICleanup/>, because the showrunner runs CI;
-- it sends a checkpoint notice after <RecordPhaseCompletion/>;
+- it sends checkpoint and shrink notices at <PhaseEnd/>'s points;
 - it adds a landing rule to the repair rounds in <FixDispatch/>.
 </ProductionUnit>
 
@@ -190,8 +193,10 @@ under that directory. This avoids half-applied durable-state writes.
   `tty: true` and a short initial yield; retain its returned `session_id`. Do not
   shell-background the launcher: it waits for its worker and remains attached.
 - Saved run output (traces, captures, logs) stays under a few GB: read each run
-  and delete it before the next. A disk-floor sweeper keeps 500 GiB free on `/`
-  by deleting every unit's build caches. Ask natedev for room before a run that
+  and delete it before the next. A disk-floor sweeper keeps 300 GiB free on `/`
+  by deleting only the shortfall, least recently used build output first, never
+  from a target a build holds; build trial merges in your own worktree as usual.
+  Ask natedev for room before a run that
   must keep more. Put this rule in every seat and helper prompt that saves
   output. User, 2026-10-04: 300 GB of traces cost 235 GiB of caches.
 </ToolingContract>
@@ -202,14 +207,17 @@ Applies to every implementation, test, fix, and review launcher.
 1. Launch under <ToolingContract/> and save `${DISPATCH_HANDLE}`.
 2. Tell the user in one line what is running and what happens on completion.
 3. Perform only synchronous work assigned by the call site: the main half of
-   <DualReview/>. Do not inspect launcher output as a substitute for that review.
-4. Claude: end the turn under <TurnEndGate/>, naming what is running in the
-   `— holding: waiting on <what is running>` line, never its handle. Task and notifier messages resume
-   the workflow independently; process the first without waiting for the other.
+   <DualReview/> or the shrink assigned by <PhaseEnd/>. Do not inspect launcher
+   output as a substitute for that review.
+4. Claude: after assigned synchronous work, end the turn under <TurnEndGate/>,
+   naming what is running in the `— holding: waiting on <what is running>`
+   line, never its handle. Task and notifier messages resume the workflow
+   independently; process the first without waiting for the other.
 5. Codex: apply <CodexDispatchWait/>. Never end the turn while the launcher is
    active; its terminal result drives the next workflow step.
-6. A launcher killed at its time limit leaves its Codex seat running with no
-   one watching. Arm a Monitor on `${SESSION_DIR}/board.log` until that seat
+6. A new-seat or follow-up launcher killed at its time limit leaves its Codex
+   seat running with no one watching. Arm a Monitor on
+   `${SESSION_DIR}/board.log` until that seat
    posts its own `done`, not a `launcher:` line. Once it has, and its last lint
    and test passed after its last edit, end it with `codex_mesh.py end
    --session-dir "${SESSION_DIR}" --to <seat>` (never `stop`, which ends every
@@ -298,7 +306,7 @@ the turn and resumes from a task or notifier message; Codex applies
   progress updates, any live `DISPATCH_HANDLE`, any live
   `REVIEW_DISPATCH_HANDLE` with `EARLY_REVIEW` and `REVIEW_PASS`,
   `STYLE_REVIEW_DONE`, `STYLE_DIFF_BASE`, `NEXT_ITEMS_PATH`, whichever tagged
-  `DelegatedPhaseReservationState` is live, and any
+  `DelegatedPhaseReservationState` is live, any pending <PhaseEnd/> work, and any
   unresolved next-item approval, and any overlap sent to the showrunner and not
   yet answered: its holder ids, paths and answer choices. Exclude the
   handoff from review intent-to-add and commits.
@@ -595,9 +603,8 @@ Apply <CoreContract/>, <TurnEndGate/>, <CompactionContract/>,
 <ProductionUnit/> when the plan header names a production.
 
 The numbered steps below carry no turn boundaries. Consecutive steps run in one
-turn unless <TurnEndGate/> authorizes a stop between them. Steps 11 through 16
-in particular are one continuous sequence from phase review through completion
-recording, with no report emitted between them.
+turn unless <TurnEndGate/> authorizes a stop between them. Steps 1–10 apply to
+all modes. Step 11 ends `single`; step 12 applies to loop and verbose.
 
 1. <PrepareSession/>
 2. <ComposeWorkOrder/>
@@ -613,15 +620,16 @@ recording, with no report emitted between them.
    later change reached the app or the screen
 10. <RunProjectStyleReview/> — `single` only; loop and verbose run the run's one
     style review from <FinalGate/> after the whole plan is green
-11. <RunPhaseReview/>
-12. <RunPhaseShrink/>
-13. <ConsiderNextItems/>
-14. <CheckpointCommit/>
-15. <PhaseCleanup/>
-16. <RecordPhaseCompletion/>
-17. <VerbosePostPhaseReport/> and applicable <VerbosePostPhaseGate/>
-18. <NextPhase/> or <RunSummary/>
+11. `single`: <RunPhaseReview/>, <RunPhaseShrink/>, <ConsiderNextItems/>,
+    <PhaseCleanup/> in full, then <RecordPhaseCompletion/> and end. It never
+    commits or enters the remaining steps.
+12. Loop and verbose: <PhaseEnd/>.
 </ExecutionSteps>
+
+<PhaseEnd>
+Read `~/.claude/docs/delegate/phase_end.md` in full when a loop or verbose
+phase's gates pass. Follow its order through the next turn boundary.
+</PhaseEnd>
 
 <PrepareSession>
 Run `bash ~/.claude/scripts/delegate/prepare_session.sh` under
@@ -952,6 +960,11 @@ it. <ClosureReview/> is the cold read, so no seat is spent
 on one here. A seat's file set is its findings' files plus their test targets;
 its prompt names every other seat's files as read only.
 
+When a repair's files belong to a seat still open, dispatch it with
+`implement.sh --to <full-seat-name>` before the usual positional arguments.
+The prompt file is the follow-up message. Messages without the launcher are
+for questions only.
+
 Run `findings.py dispatch --covers <all batch ids>` before launching, then:
 
 ```sh
@@ -1005,7 +1018,7 @@ On completion, `implemented` continues as above; `error` applies
 <DelegateLaunchFailure/>, and then, if the error survives it,
 <RetainDelegatedPhaseReservation/>, reports the fix log, records an error
 outcome, clears the session marker, and stops. Both outcomes resolve the round
-in the ledger through the launcher. Any third outcome — the dispatch stopped,
+in the ledger through the launcher. Any third outcome — a new-seat or follow-up dispatch stopped,
 killed, or gone without `impl_status` reaching either — is the unit director's to
 resolve with `findings.py abandon` per <FindingsLedger/>, then apply
 <RetainDelegatedPhaseReservation/> before reviewing, re-dispatching, or
@@ -1113,12 +1126,13 @@ instructions name; with none, skip and say so in one line.
    `findings.py open --severity blocker --lens ux --caught-by delegate --title <defect> --file <shot path> --detail "<rule>: <fix>"`
    Then obey `findings.py gate` exactly as <Synthesize/> step 5 does, the same
    repair round under <FixDispatch/>, except that `converged` continues to
-   <RunPhaseReview/>.
+   <PhaseEnd/> in loop or verbose, or <RunPhaseReview/> in `single`.
 5. Re-entered after a `ux` repair that changed the screen, this step replaces
    1–4: re-shoot and re-judge only the rows raised — a fresh helper, under its
    own `UX review` activity, given just those rows and their shots — and record
    each with `findings.py verdict`. A `still_open` row returns to step 4's
-   gate. Then continue to <RunPhaseReview/>.
+   gate. Then continue to <PhaseEnd/> in loop or verbose, or
+   <RunPhaseReview/> in `single`.
 6. **The notice's verdict.** In a production unit, the checkpoint notice's
    `design check:` line (<ProductionUnit/> item 3) is one fresh helper's
    verdict on exactly the shots the notice sends, from a build of the
@@ -1142,14 +1156,15 @@ same file as `/unit:style_review`.
 </RunProjectStyleReview>
 
 <RunPhaseReview>
-Read `~/.claude/docs/delegate/run_phase_review.md` in full after smoke and
-<UXReview/>, once per phase. It also defines <RunPhaseShrink/>, which follows
-it before the checkpoint.
+Read `~/.claude/docs/delegate/run_phase_review.md` in full once per phase.
+In loop and verbose, apply it at <PhaseEnd/>'s point. In `single`, use
+<ExecutionSteps/> step 11. The file also defines <RunPhaseShrink/>.
 </RunPhaseReview>
 
 <ConsiderNextItems>
-Read `~/.claude/commands/unit/add_ons.md` in full and apply it after
-shrink, at each phase boundary. Phased plans only; the unit director performs the
+Read `~/.claude/commands/unit/add_ons.md` in full and apply it at
+<PhaseEnd/>'s point in loop or verbose; in `single`, use <ExecutionSteps/> step
+11. Phased plans only; the unit director performs the
 assessment and never launches another agent for it. It writes `apply`
 corrections, accumulates every add-on in `${NEXT_ITEMS_PENDING}`, and asks
 nothing. Never work from memory of an earlier read — `Class` obedience and the
@@ -1167,7 +1182,8 @@ reaches the plan or `${NEXT_ITEMS_PATH}`. The user can invoke the same file as
 
 <CheckpointCommit>
 Read `~/.claude/commands/unit/checkpoint.md` in full and apply it once
-per completed phase. Loop and verbose only; `single` never commits.
+per completed loop or verbose phase at <PhaseEnd/>'s point. `single` never
+commits.
 
 This is durable state with no cheap undo, so read the whole contract before
 acting on any part of it, and read the reservation record from disk. A value
@@ -1181,28 +1197,34 @@ retry. <PushCheckpoint/> runs only after that release; a failed push never
 fails the checkpoint.
 </CheckpointCommit>
 
+<ShrinkCommit>
+Read `~/.claude/commands/unit/checkpoint.md` in full and apply it at
+<PhaseEnd/>'s point in loop and verbose. It commits the plan doc and an approved
+`${NEXT_ITEMS_PATH}` change, then runs <PushCheckpoint/>. It owns no
+reservation and calls no release. When a next phase is running, its first
+plan-doc edit acquires that phase's reservation in an enrolled repository.
+</ShrinkCommit>
+
 <PhaseCleanup>
-After <RunPhaseShrink/> and a successful checkpoint when one applies, run:
-
-`bash ~/.claude/scripts/delegate/clear_phase_review.sh "${SESSION_DIR}" <phase-id>`
-`python3 ~/.claude/scripts/delegate/remove_seats.py --session-dir "${SESSION_DIR}"`
-
-The first removes only this phase's review prose; structured progress history
-remains. Do not clear before shrink succeeds or while a checkpoint can still
-fail. The second removes this run's claude seats, which nothing messages after
-the phase, and any seat a dead run left alive; a failure there is one line in
-the report, never a stop.
-
-Then end everything else this phase started: TaskStop each Claude Agent
-helper, end finished launchers, and shut down every Hana or
-example app it launched. Never touch what another session started. Mid-phase,
+In `single`, run both halves under <ExecutionSteps/> step 11.
+At <PhaseEnd/>'s worker cleanup point, run
+`python3 ~/.claude/scripts/delegate/remove_seats.py --session-dir "${SESSION_DIR}"`.
+It removes the completed phase's claude seats and any seat a dead run left
+alive; a failure is one line in the report, never a stop. TaskStop each Claude
+Agent helper, end finished launchers, and shut down every Hana or example app
+this phase launched. Never touch what another session started. Mid-phase,
 stop each helper once its result is read and each app once no step uses it.
+
+At <PhaseEnd/>'s review-prose cleanup point, run
+`bash ~/.claude/scripts/delegate/clear_phase_review.sh "${SESSION_DIR}" <phase-id>`.
+It removes only the completed phase's review prose; structured progress
+history remains.
 User, 2026-10-03.
 </PhaseCleanup>
 
 <RecordPhaseCompletion>
-After smoke, UX review, phase review, shrink, next-item consideration, cleanup,
-and checkpoint when applicable, run `progress_history.py finish-phase
+In loop and verbose, run at <PhaseEnd/>'s point; in `single`, follow
+<ExecutionSteps/> step 11. Call `progress_history.py finish-phase
 --session-dir "${SESSION_DIR}" --status completed`.
 
 After a loop/verbose phase with `RepositoryNotEnrolled` or
@@ -1245,20 +1267,23 @@ answer from the completed report and preserve the gate.
 </VerbosePostPhaseGate>
 
 <NextPhase>
-If no todo phase remains, run <FinalGate/>, then <RunAsBuilt/>, then the final
-<PeriodicCI/> point and <CICleanup/>, then <RunSummary/>. Otherwise reset `REVIEW_PASS=0` and smoke to `not_run`.
-Style state is per-run, not per-phase: never reset it or delete its marker
-here, and never re-resolve `STYLE_DIFF_BASE`.
+At <PhaseEnd/>'s next boundary, choose the next phase or close the plan. If no
+todo phase remains, run <FinalGate/>, <RunAsBuilt/>, the final <PeriodicCI/>
+point and <CICleanup/>, then <RunSummary/>.
 
-- Every mode but `single`: first run <PeriodicCI/> when a CI point is due, and
-  repair a red CI result before dispatching.
-- Loop: announce next phase and return to <ComposeWorkOrder/>.
-- Verbose/no window: announce its briefing and return to <ComposeWorkOrder/>.
-- `next N`: decrement after completion; clear at zero, otherwise continue.
-- `through X`: clear after X, otherwise continue.
+For `next N`, decrement after completion and clear at zero. For `through X`,
+clear after X. In verbose mode outside an active window, use <PhaseEnd/>'s
+report and gate.
 
-Every return rechecks Pending decisions. When a window closes, prepare the next
-briefing but do not dispatch it.
+For loop or an active auto window, reset `REVIEW_PASS=0` and smoke to
+`not_run`. Style state is per-run: never reset it or delete its marker here,
+and never re-resolve `STYLE_DIFF_BASE`. Run <PeriodicCI/> when a CI point is
+due, after the shrink commit per <PhaseEnd/>, and repair a red result before
+dispatching. Announce the next phase, run
+<ComposeWorkOrder/>, <VerbosePrePhaseGate/> when required,
+<CoordinateDelegatedPhaseReservation/>, and <LaunchImplementation/>. Its
+`start-phase` runs before dispatch.
+Every return rechecks Pending decisions.
 </NextPhase>
 
 <FinalGate>

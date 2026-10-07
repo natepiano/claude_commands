@@ -13,7 +13,7 @@
 #   board.sh post    <session_dir> <agent> <kind> <message...>
 #   board.sh read    <session_dir> [--since N] [--from AGENT] [--kind KIND]
 #   board.sh acquire <session_dir> <agent> <resource> [--pid PID] [--hold SECONDS] [--wait SECONDS]
-#   board.sh release <session_dir> <agent> <resource>
+#   board.sh release <session_dir> <agent> <resource> [--pid PID]
 #   board.sh renew   <session_dir> <agent> <resource> [--hold SECONDS]
 #   board.sh role    <session_dir> <slot> <role> [note...]
 #   board.sh roles   <session_dir>
@@ -220,6 +220,73 @@ write_lock_meta() {
   fi
 }
 
+cleanup_owned_group() {
+  local dir="$1"
+  [[ -f "$dir/owned" ]] || return 0
+  python3 - "$dir/owned" <<'PY'
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+record = Path(sys.argv[1])
+
+def identity(pid: int) -> str | None:
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
+        # A zombie leader still owns its PID, so its start time is safe to
+        # check while live children remain in the group.
+        return fields[19]
+    except (OSError, IndexError):
+        try:
+            return subprocess.check_output(['ps', '-p', str(pid), '-o', 'lstart='],
+                                           text=True, stderr=subprocess.DEVNULL).strip()
+        except subprocess.CalledProcessError:
+            return None
+
+def live_group(group: int) -> bool:
+    try:
+        lines = subprocess.check_output(['ps', '-A', '-o', 'pgid=', '-o', 'stat='],
+                                        text=True).splitlines()
+        return any(int(parts[0]) == group and not parts[1].startswith('Z')
+                   for line in lines if (parts := line.split()) and len(parts) > 1)
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        # Reclaim and release must fail closed if the group cannot be inspected.
+        raise RuntimeError('cannot inspect step process group')
+
+try:
+    saved = json.loads(record.read_text())
+    group = int(saved['group'])
+    start = str(saved['start'])
+except (OSError, ValueError, KeyError, TypeError):
+    print('board.sh: invalid step ownership record', file=sys.stderr)
+    sys.exit(1)
+
+if identity(group) != start:
+    if live_group(group):
+        print('board.sh: step group leader identity changed', file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+
+try:
+    os.killpg(group, signal.SIGKILL)
+except ProcessLookupError:
+    pass
+
+deadline = time.monotonic() + 2
+while live_group(group) and time.monotonic() < deadline:
+    time.sleep(0.05)
+if live_group(group):
+    print('board.sh: step group still has running processes', file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 cmd_acquire() {
   local session_dir="${1:?acquire needs <session_dir>}"
   local agent="${2:?acquire needs <agent>}"
@@ -257,12 +324,25 @@ cmd_acquire() {
     # since another waiter may have replaced it after the first check.
     if lock_stale_reason "$dir" >/dev/null; then
       if lock_guard "$guard"; then
-        local reason previous
+        local reason previous previous_pid reclaimed_holders
         if reason="$(lock_stale_reason "$dir")"; then
           previous="$(lock_holder "$dir")"
+          previous_pid="$(cat "$dir/holder_pid" 2>/dev/null || true)"
+          reclaimed_holders="$(cat "$dir/reclaimed_holders" 2>/dev/null || true)"
+          if [[ "$reason" == pid\ * ]] && ! cleanup_owned_group "$dir"; then
+            exec 9>&-
+            return 1
+          fi
           rm -rf "$dir"
           if mkdir "$dir" 2>/dev/null; then
             write_lock_meta "$dir" "$agent" "$hold" "$holder_pid"
+            if [[ "$reason" == expired && "$previous" != unknown
+                  && "$previous_pid" =~ ^[1-9][0-9]*$ ]]; then
+              printf '%s\n%s\t%s\n' "$reclaimed_holders" "$previous" "$previous_pid" \
+                > "$dir/reclaimed_holders"
+            elif [[ -n "$reclaimed_holders" ]]; then
+              printf '%s\n' "$reclaimed_holders" > "$dir/reclaimed_holders"
+            fi
             exec 9>&-
             if [[ "$reason" == pid\ * ]]; then
               cmd_post "$session_dir" "$agent" claim \
@@ -291,10 +371,17 @@ cmd_release() {
   local session_dir="${1:?release needs <session_dir>}"
   local agent="${2:?release needs <agent>}"
   local resource="${3:?release needs <resource>}"
+  shift 3
+  local release_pid=""
+  if (( $# > 0 )); then
+    [[ $# -eq 2 && "$1" == --pid && "$2" =~ ^[1-9][0-9]*$ ]] \
+      || die "release accepts only --pid followed by a positive integer"
+    release_pid="$2"
+  fi
   local dir; dir="$(lock_dir "$session_dir" "$resource")"
   local guard="${session_dir}/locks/${resource}.guard"
   local attempt lock_status guarded=0
-  if [[ -d "$dir" ]] && command -v python3 >/dev/null 2>&1; then
+  if [[ -d "$dir" ]]; then
     for ((attempt=0; attempt<200; attempt++)); do
       if lock_guard "$guard"; then
         guarded=1
@@ -311,12 +398,36 @@ cmd_release() {
     printf 'not held %s\n' "$resource"
     return 0
   fi
-  local holder; holder="$(lock_holder "$dir")"
+  if (( guarded == 0 )); then
+    printf 'board.sh: cannot guard %s release\n' "$resource" >&2
+    return 1
+  fi
+  local holder holder_pid
+  holder="$(lock_holder "$dir")"
+  holder_pid="$(cat "$dir/holder_pid" 2>/dev/null || true)"
   # Releasing a token another agent now holds would hand a third agent a lock
   # while the real holder is still working behind it.
-  if [[ "$holder" != "$agent" && "$holder" != "unknown" ]]; then
+  if [[ "$holder" != "$agent" && "$holder" != "unknown" ]] \
+      || [[ -n "$release_pid" && "$release_pid" != "$holder_pid" ]]; then
+    local reclaimed=0
+    if [[ -n "$release_pid" && -f "$dir/reclaimed_holders" ]] \
+        && grep -Fxq -- "$(printf '%s\t%s' "$agent" "$release_pid")" "$dir/reclaimed_holders"; then
+      reclaimed=1
+    fi
     (( guarded == 0 )) || exec 9>&-
-    printf 'board.sh: %s does not hold %s (holder is %s)\n' "$agent" "$resource" "$holder" >&2
+    if [[ "$holder" == "$agent" && -n "$release_pid" && "$release_pid" != "$holder_pid" ]]; then
+      printf 'board.sh: %s pid %s does not hold %s (holder pid is %s)\n' \
+        "$agent" "$release_pid" "$resource" "$holder_pid" >&2
+    else
+      printf 'board.sh: %s does not hold %s (holder is %s)\n' "$agent" "$resource" "$holder" >&2
+    fi
+    if (( reclaimed == 1 )); then
+      return 3
+    fi
+    return 1
+  fi
+  if ! cleanup_owned_group "$dir"; then
+    exec 9>&-
     return 1
   fi
   rm -rf "$dir"

@@ -5,8 +5,9 @@ description: After implementing a phase, keep review prose temporary, update rem
 Use this after implementing a phase of a multi-phase plan. Review prose is
 ephemeral: write it only under `${SESSION_DIR}`, use it to update remaining Work
 Orders and prepare as-built input, then let `/unit:delegate` delete it after the
-phase checkpoint. The forward review also checks the plan's sibling
-`{plan-name}-next.md` when present. Never append review prose to either file.
+shrink. The forward review also checks the plan's sibling `{plan-name}-next.md`
+when present. Never append review prose to either file.
+Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 
 **Read `~/.claude/docs/type_design.md` first and follow it.** Apply its type-name
 and `Option<T>` rules to the temporary retrospective, remaining-phase review, and all
@@ -42,10 +43,10 @@ If the conversation does not make the phase obvious, ask the user one clarifying
 
 ## Step 3: Record a temporary retrospective and mark the phase complete
 
-1. Mark the phase complete in the plan's existing convention. For a
-   delegate-ready plan, set `status: done` and keep its `#### Work Order` only
-   until `/plan:shrink` replaces this phase before checkpoint. Do not edit any
-   earlier `done` phase.
+1. Mark the phase complete in the plan's existing convention. In loop/verbose,
+   the code checkpoint already set `status: done`; keep its `#### Work Order`
+   until `/plan:shrink`. In `single` or standalone, set `status: done` here.
+   Do not edit any earlier `done` phase.
 2. Write `${SESSION_DIR}/phase_review_retrospective_<phase>.md` using:
 
    ```text
@@ -92,8 +93,10 @@ recovery condition, diagnostic, or externally observable lifecycle, record:
 Put each disposition under `State and consequence audit` in the retrospective.
 Treat an unowned required consequence as an implication for remaining phases or
 a necessary next-item candidate. Treat a missing surface required by the
-completed Work Order as a current-phase defect; under `/unit:delegate`, return
-it to `<Synthesize/>` before shrink.
+completed Work Order as a current-phase defect. In loop/verbose, insert a
+follow-up phase next per `/plan:to_phased_plan` <PhaseNumbering/> and run it
+next. In `single`, return the defect to <Synthesize/>. Standalone, fix it before
+Step 6.
 </StateAndConsequenceAudit>
 
 ## Step 3.5: Sweep process comments out of the implementation diff
@@ -116,6 +119,8 @@ Scope this sweep narrowly:
 - If a comment contains both process history and a durable constraint, rewrite it to keep only the durable code constraint.
 
 If any comments were removed or rewritten, include that in the final update's `Learned and applied` row.
+In loop/verbose, leave those source-comment edits in the tree for the next
+phase's checkpoint commit.
 
 ## Step 4: Dispatch an architect review of the remaining phases
 
@@ -256,9 +261,10 @@ file, or the current plan, until the user places it through
 `apply` — a wrong record edit is one line to revert.
 
 **A defect in what this phase just shipped is never an `add`.** It is a
-current-phase defect: under `/unit:delegate` return it to <Synthesize/>, and
-standalone fix it before Step 6. A Work Order's **Files** list is the scope the
-plan predicted, not a limit on what this phase may repair.
+current-phase defect: in loop/verbose, insert a follow-up phase next per
+`/plan:to_phased_plan` <PhaseNumbering/> and run it next; in `single`, return it
+to <Synthesize/>; standalone, fix it before Step 6. A Work Order's **Files**
+list is the scope the plan predicted, not a limit on what this phase may repair.
 
 Under `/unit:delegate`, stop there; <ConsiderNextItems/> writes the `apply` ones
 and accumulates the rest for <ReviewPendingAddOns/> at the run's next
@@ -520,7 +526,7 @@ Style rules for the final update:
   file without approval; `/unit:delegate` accumulates them for its next
   interactive point.
 - Never write retrospective, finding, reviewer, pass, or approval prose into the
-  plan. Review text exists only under `${SESSION_DIR}` until the phase checkpoint.
+  plan. Review text exists only under `${SESSION_DIR}` until shrink cleanup.
 - Never edit an earlier `done` phase. A finding about past work becomes an
   `As-built` fact for the current phase, a forward Work Order change, or a new
   pending decision.

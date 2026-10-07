@@ -80,7 +80,9 @@ def descendants(root: int, rows: list[Process]) -> list[Process]:
 
 
 def claude_pid(pane_pid: int, rows: list[Process]) -> int | None:
-    return next((row.pid for row in descendants(pane_pid, rows)
+    pane = next((row for row in rows if row.pid == pane_pid), None)
+    candidates = ([pane] if pane is not None else []) + descendants(pane_pid, rows)
+    return next((row.pid for row in candidates
                  if row.command == "claude" or row.command.startswith("claude ")), None)
 
 
@@ -120,6 +122,18 @@ def unit_socket(pid: int) -> tuple[str, str] | None:
 def stretch_path(slug: str, unit: str) -> Path:
     name = hashlib.sha256(f"{slug}\0{unit}".encode()).hexdigest()
     return STATE_DIR / f"{name}.json"
+
+
+def rename_state(old: str, new: str, runner_before: str, runner_after: str,
+                 units: list[str]) -> None:
+    """Move saved stretches while the registry rename is locked."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    for unit in units:
+        previous_unit = old if unit == new else unit
+        source = stretch_path(runner_before, previous_unit)
+        destination = stretch_path(runner_after, unit)
+        if source != destination and source.exists():
+            os.replace(source, destination)
 
 
 def read_stretch(path: Path, pane_hash: str, now: float) -> Stretch:
@@ -220,13 +234,16 @@ def tick(now: float) -> None:
             print(f"stall-watch: invalid zone for {configured['session']}: {configured['zone']}", file=sys.stderr)
             continue
         for unit in configured["units"]:
-            if subprocess.run([TMUX, "has-session", "-t", f"={unit}"], capture_output=True, check=False).returncode != 0:
+            if isinstance(unit, showrunners.StandbyUnit):
+                continue
+            name = unit.name
+            if subprocess.run([TMUX, "has-session", "-t", f"={name}"], capture_output=True, check=False).returncode != 0:
                 continue
             try:
-                pane_pid = int(command_output([TMUX, "display-message", "-p", "-t", f"={unit}:", "#{pane_pid}"]))
-                pane = command_output([TMUX, "capture-pane", "-p", "-J", "-S", "-400", "-t", f"={unit}:"])
+                pane_pid = int(command_output([TMUX, "display-message", "-p", "-t", f"={name}:", "#{pane_pid}"]))
+                pane = command_output([TMUX, "capture-pane", "-p", "-J", "-S", "-400", "-t", f"={name}:"])
             except (OSError, ValueError) as error:
-                print(f"stall-watch: {unit}: {error}", file=sys.stderr)
+                print(f"stall-watch: {name}: {error}", file=sys.stderr)
                 continue
             pid = claude_pid(pane_pid, rows)
             if pid is None:
@@ -235,7 +252,7 @@ def tick(now: float) -> None:
             if identity is None:
                 continue
             session_id, socket = identity
-            path = stretch_path(configured["session"], unit)
+            path = stretch_path(configured["session"], name)
             stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
             turns = TURN_END.findall(pane)
             last = cast(str, turns[-1]).strip() if turns else "none on screen"
@@ -255,7 +272,7 @@ def tick(now: float) -> None:
             if now - since < settings["stall_minutes"] * 60 or running_work:
                 continue
             since_text = datetime.fromtimestamp(since, zone).strftime("%H:%M %Z")
-            key = f"stall-watch:{unit}:{int(since)}"
+            key = f"stall-watch:{name}:{int(since)}"
             if not stretch["reported_status"]:
                 stretch["reported_status"] = last
                 save_stretch(path, stretch)
@@ -264,7 +281,7 @@ def tick(now: float) -> None:
                         "Continue your run; if you are waiting on someone, say on whom in one line.")
                 pending.append(delivery(path, "bump", socket, f"{key}:bump", text))
             if not stretch["tell_sent"] and showrunner_socket:
-                text = f"{unit} idle since {since_text}, nothing running; bumped. Last status: {last}"
+                text = f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}"
                 pending.append(delivery(path, "tell", showrunner_socket, f"{key}:tell", text))
     send_all(pending)
 
@@ -282,6 +299,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 6 and sys.argv[1] == "rename-state":
+        rename_state(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:])
+        raise SystemExit(0)
     try:
         raise SystemExit(main())
     except (OSError, ValueError, KeyError) as error:

@@ -25,6 +25,7 @@ class UnitStatusTests(unittest.TestCase):
     def run_status(
         self, marker: str | None, health_text: str, health_exit: int, *,
         processes: str = "100 1 tmux pane\n200 100 zsh\n12345 200 claude --remote-control stalls\n",
+        showrunner: str | None = None,
     ) -> tuple[str, str | None]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -85,11 +86,20 @@ esac
                     "TEST_PROCESS_FILE": str(process_file),
                 }
             )
+            config = root / "config" / "showrunners.json"
+            config.parent.mkdir()
+            _ = config.write_text('{"threshold_percent":2,"repeat_minutes":30,"stall_minutes":5,'
+                                  + '"faults_to":"natedev","always":[],"showrunners":'
+                                  + '[{"session":"director","zone":"America/Los_Angeles",'
+                                  + '"units":["hook"]}]}')
+            _ = shutil.copy2(SCRIPT.with_name("showrunners.py"), script.with_name("showrunners.py"))
+            environment["SHOWRUNNERS_CONFIG"] = str(config)
             zsh = shutil.which("zsh")
             if zsh is None:
                 raise RuntimeError("zsh is required for unit status tests")
             result = subprocess.run(
-                [zsh, str(script), str(root / "status"), "America/Los_Angeles", "hook"],
+                [zsh, str(script), str(root / "status"), "America/Los_Angeles",
+                 *( ["--showrunner", showrunner] if showrunner else ["hook"] )],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -97,6 +107,10 @@ esac
             )
             calls = call_log.read_text(encoding="utf-8") if call_log.exists() else None
             return result.stdout, calls
+
+    def test_showrunner_form_reads_current_unit_names_from_config(self) -> None:
+        output, _ = self.run_status(None, "ok", 0, showrunner="director")
+        self.assertIn("== hook", output)
 
     def test_idle_run_reports_failed_tick_health(self) -> None:
         output, calls = self.run_status("/tmp/test-run\n", "failing: no instance", 1)

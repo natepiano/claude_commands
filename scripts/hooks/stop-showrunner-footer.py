@@ -53,7 +53,11 @@ def main() -> None:
         return
     import showrunner_footer
 
-    reason = showrunner_footer.block_reason(instances, reply)
+    states: dict[str, showrunner_footer.FooterState] = {}
+    for instance in instances:
+        slug = os.path.basename(instance).removeprefix("showrunner-")
+        states[slug] = showrunner_footer.footer_state(slug)
+    reason = showrunner_footer.block_reason(instances, reply, states)
     if reason is not None:
         print(json.dumps({"decision": "block", "reason": reason}))
 

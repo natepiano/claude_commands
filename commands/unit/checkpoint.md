@@ -17,8 +17,9 @@ remembered from conversation, from the harness session mapping, or re-derived
 from current `HEAD` is not proof and will silently accept the wrong checkpoint.
 
 `/unit:delegate` reads this file once per completed phase in loop and verbose
-mode. It defines `<CheckpointCommit/>` and `<PushCheckpoint/>` in full. `single`
-never commits.
+mode. It defines `<CheckpointCommit/>`, `<ShrinkCommit/>`, and
+`<PushCheckpoint/>` in full. `single` never commits.
+Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 
 Everything below is the contract.
 
@@ -30,8 +31,11 @@ Loop/verbose only:
 1. Require smoke pass, `not applicable`, or `deferred`. Style is not a phase
    gate: <RunProjectStyleReview/> runs once at <FinalGate/>, over every
    checkpoint this one joins.
-2. Confirm status contains only this phase, its plan doc, and an approved change
-   to `${NEXT_ITEMS_PATH}` when present.
+2. Confirm status contains only this phase, source-comment edits left by the
+   previous phase's plan review, its plan doc, and an approved change to
+   `${NEXT_ITEMS_PATH}` when present. The current phase may still have its Work
+   Order. Refuse the checkpoint if any earlier `done` phase still has a Work
+   Order; its shrink must be repaired first.
 3. Run `verify.sh fmt <package>` for every touched package; include resulting
    formatting changes.
 4. Mark the phase `status: done`. Never put its commit hash in the plan.
@@ -163,19 +167,46 @@ Loop/verbose only:
    <RetainDelegatedPhaseReservation/>. The checkpoint commit exists, but the
    phase does not complete until a later invocation confirms either the normal
    first-attempt reply or the matching already-journalled checkpoint above.
-8. Run <PushCheckpoint/>, then report `Checkpoint <short hash> — phase N:
-   <title>.` with its push note, if any. This report follows successful release
-   when the phase was active.
+8. Run <PushCheckpoint/>. Outside a production, report
+   `Checkpoint <short hash> — phase N: <title>.` with its push note, if any.
+   This report follows successful release when the phase was active.
 9. In a production unit, run
    `python3 ~/.claude/scripts/delegate/progress_history.py review-trial --session-dir "${SESSION_DIR}"`
-   before <RecordPhaseCompletion/> closes the phase (it also works after), and
-   keep its line for the checkpoint notice (<ProductionUnit/> item 3).
+   and keep its line for <ProductionUnit/> item 3's checkpoint notice.
 </CheckpointCommit>
+
+<ShrinkCommit>
+Loop/verbose only, after <RunPhaseShrink/> passes its structural check. The
+next phase's seats may be editing, but they never stage files.
+
+1. Stage only `${PLAN_DOC}` and an approved, changed `${NEXT_ITEMS_PATH}`.
+   Inspect the staged path set. Refuse the commit if it contains any other
+   path; leave the seats running and repair the staged set before retrying.
+2. Commit only the staged paths, once:
+
+   ```
+   shrink(<plan-slug>): phase N — <title>
+
+   Claude-Session: <session url>
+   ```
+
+3. Run <PushCheckpoint/>. In a production, give the hash and push note, if any,
+   to the caller for <ProductionUnit/> item 3's shrink notice. Outside a
+   production, report the shrink hash and push note, if any.
+
+This commit owns no reservation. Do not release a reservation here. In an
+enrolled repository, the shrink's first plan-doc write uses the Edit tool, so
+the edit hook claims the plan doc for the running phase's reservation
+(<PhaseEnd/> step 7). A failed structural check blocks this commit
+only. Repair the shrink before the next checkpoint; that checkpoint refuses
+while an earlier `done` phase still has a Work Order.
+</ShrinkCommit>
 
 <PushCheckpoint>
 Puts each commit on origin, so the work survives this machine. Runs after a
-successful release in <CheckpointCommit/>, and after <FinalGateCommit/> and
-<AsBuiltCommit/>. Run each git command with `dangerouslyDisableSandbox: true`.
+successful release in <CheckpointCommit/>, and after <ShrinkCommit/>,
+<FinalGateCommit/>, and <AsBuiltCommit/>. Run each git command with
+`dangerouslyDisableSandbox: true`.
 
 1. **Branch.** The current branch, under its own name. On the default branch
    (`gh repo view --json defaultBranchRef -q .defaultBranchRef.name`), push to

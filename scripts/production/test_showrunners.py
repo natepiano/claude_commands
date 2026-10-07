@@ -86,7 +86,8 @@ raise SystemExit(1)
     def environment(self) -> dict[str, str]:
         return {**os.environ, "SHOWRUNNERS_CONFIG": str(self.config),
                 "NOTIFIER_STATE_DIR": str(self.notifier), "NOTIFIER_SESSIONS_DIR": str(self.sessions),
-                "SHOWRUNNERS_SESSIONS": str(self.sessions_script)}
+                "SHOWRUNNERS_SESSIONS": str(self.sessions_script),
+                "STALL_WATCH_STATE_DIR": str(self.root / "stall-state")}
 
     def cli(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *args], env=self.environment(),
@@ -124,6 +125,27 @@ raise SystemExit(1)
         _ = self.successful("remove", "director")
         _ = self.successful("remove", "director")
         self.assertEqual(self.entries(), [])
+
+    def test_standby_add_list_and_ready_preserve_unit_membership(self) -> None:
+        _ = self.successful("add", "director", "--zone", "America/Los_Angeles",
+                            "--unit", "alpha", "--standby")
+        self.assertEqual(self.entries()[0]["units"], ["alpha"])
+        self.assertEqual(self.entries()[0]["standby"], ["alpha"])
+        self.assertIn("alpha:standby", self.successful("list"))
+        _ = self.successful("ready", "director", "--unit", "alpha")
+        self.assertEqual(self.entries()[0]["units"], ["alpha"])
+        self.assertEqual(self.entries()[0].get("standby", []), [])
+        self.assertNotIn("alpha:standby", self.successful("list"))
+
+    def test_ready_non_standby_unit_says_so_without_changing_config(self) -> None:
+        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "alpha")
+        before = self.config.read_bytes()
+        result = self.cli("ready", "director", "--unit", "alpha")
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(len((result.stdout + result.stderr).strip().splitlines()), 1)
+        self.assertIn("alpha", result.stdout + result.stderr)
+        self.assertIn("not on standby", result.stdout + result.stderr)
 
     def test_concurrent_adds_both_land(self) -> None:
         first = subprocess.Popen([sys.executable, str(SCRIPT), "add", "first", "--zone", "America/Los_Angeles",
@@ -174,6 +196,51 @@ raise SystemExit(1)
                                                    "units": []}])
                 self.assertIn(f"skipping {name}: {reason}", imported.stderr)
                 shutil.rmtree(self.notifier / name)
+
+    def test_rename_changes_unit_and_showrunner_session_under_lock(self) -> None:
+        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "hook")
+        _ = self.successful("rename", "hook", "new hook")
+        _ = self.successful("rename", "director", "new director")
+        self.assertEqual(self.entries(), [{"session": "new director", "zone": "America/Los_Angeles",
+                                           "units": ["new hook"]}])
+        self.assertTrue((self.config.parent / "showrunners.lock").exists())
+
+    def test_rename_updates_old_form_unit_lists_in_every_prompt(self) -> None:
+        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "tool-based-ui-trunk")
+        _ = self.successful("add", "other", "--zone", "America/Los_Angeles", "--unit", "tool-based-ui-trunk")
+        for slug in ("showrunner-first", "showrunner-second"):
+            self.instance(slug, units=("tool-based-ui-trunk", "tool-based-ui-trunk-extra"))
+            prompt = self.notifier / slug / "prompt"
+            _ = prompt.write_text(prompt.read_text() + "Keep tool-based-ui-trunk in this note.\n")
+        _ = self.successful("rename", "tool-based-ui-trunk", "trunk")
+        for slug in ("showrunner-first", "showrunner-second"):
+            prompt = (self.notifier / slug / "prompt").read_text()
+            self.assertIn("America/Los_Angeles trunk tool-based-ui-trunk-extra |", prompt)
+            self.assertIn("Keep tool-based-ui-trunk in this note.", prompt)
+        self.assertEqual([entry["units"] for entry in self.entries()], [["trunk"], ["trunk"]])
+
+    def test_rename_updates_new_form_showrunner_argument(self) -> None:
+        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "hook")
+        self.instance("showrunner-live")
+        prompt = self.notifier / "showrunner-live" / "prompt"
+        _ = prompt.write_text("Run `zsh ~/.claude/scripts/production/unit_status.sh "
+                              + "/tmp/status America/Los_Angeles --showrunner director | cut -c1-400`.\n"
+                              + "Keep director in this note.\n")
+        _ = self.successful("rename", "director", "new-director")
+        self.assertEqual(self.entries()[0]["session"], "new-director")
+        self.assertIn("--showrunner new-director |", prompt.read_text())
+        self.assertIn("Keep director in this note.", prompt.read_text())
+
+    def test_import_new_prompt_updates_zone_without_adding_names_as_units(self) -> None:
+        _ = self.successful("add", "director", "--zone", "America/New_York", "--unit", "existing")
+        self.record("director", "live-id")
+        self.instance("showrunner-live")
+        prompt = self.notifier / "showrunner-live" / "prompt"
+        _ = prompt.write_text("Run `zsh ~/.claude/scripts/production/unit_status.sh "
+                              + "/tmp/run/unit_status America/Los_Angeles --showrunner director | cut -c1-400`.\n")
+        _ = self.successful("import")
+        self.assertEqual(self.entries(), [{"session": "director", "zone": "America/Los_Angeles",
+                                           "units": ["existing"]}])
 
     def test_import_prefers_live_pid_record_over_stale_record_for_same_session(self) -> None:
         self.record("old name", "live-id", running=False, pid=999999)

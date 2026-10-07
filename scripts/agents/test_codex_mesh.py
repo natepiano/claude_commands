@@ -229,6 +229,8 @@ class MeshCommandTests(unittest.TestCase):
         params = cast("dict[str, object]", request.get("params", {}))
         if method == "thread/start":
             return [_reply(request, {"thread": {"id": self.next_thread_id}})]
+        if method == "thread/resume":
+            return [_reply(request, {"thread": {"id": params["threadId"]}})]
         if method == "turn/start":
             self.error_threads.discard(cast("str", params.get("threadId", THREAD_ID)))
             self.turn_starts += 1
@@ -243,6 +245,40 @@ class MeshCommandTests(unittest.TestCase):
                 self.error_threads.add(THREAD_ID)
             if outcome == "disconnect":
                 return [_reply(request, {"turn": {"id": turn_id}})]
+            if outcome == "earlier_completed":
+                return [
+                    _reply(request, {"turn": {"id": turn_id}}),
+                    _notice("turn/completed", {
+                        "threadId": THREAD_ID, "turn": {"id": "earlier-turn"}
+                    }),
+                    _notice("turn/completed", {
+                        "threadId": THREAD_ID, "turn": {"id": turn_id}
+                    }),
+                ]
+            if outcome == "earlier_only":
+                return [
+                    _reply(request, {"turn": {"id": turn_id}}),
+                    _notice("turn/completed", {
+                        "threadId": THREAD_ID, "turn": {"id": "earlier-turn"}
+                    }),
+                ]
+            if outcome == "completed_without_id":
+                return [
+                    _reply(request, {"turn": {"id": turn_id}}),
+                    _notice("turn/completed", {"threadId": THREAD_ID, "turn": {}}),
+                ]
+            if outcome == "completed_then_peer":
+                self.live_turn = "peer-turn"
+                self.announce_live_completion = True
+                return [
+                    _reply(request, {"turn": {"id": turn_id}}),
+                    _notice("turn/completed", {
+                        "threadId": THREAD_ID, "turn": {"id": turn_id}
+                    }),
+                    _notice("turn/started", {
+                        "threadId": THREAD_ID, "turn": {"id": "peer-turn"}
+                    }),
+                ]
             if outcome == "capacity":
                 finished = _notice(
                     "turn/failed",
@@ -422,6 +458,209 @@ class MeshCommandTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()) as errors:
             result = codex_mesh.command_start(self.start_args())
         return result, errors.getvalue()
+
+    def run_follow(self, message: str = "Repair the open finding") -> tuple[int, str]:
+        message_file = self.session_dir / "follow-up.txt"
+        _ = message_file.write_text(message, encoding="utf-8")
+        args = self.start_args()
+        args.to = "seat"
+        args.message_file = str(message_file)
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            result = codex_mesh.command_follow(args)
+        return result, errors.getvalue()
+
+    def test_follow_reuses_a_done_thread_and_records_its_new_turn(self) -> None:
+        code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+        code, errors = self.run_follow()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        resumes = self.methods("thread/resume")
+        self.assertEqual(len(resumes), 1)
+        self.assertEqual(
+            cast("dict[str, object]", resumes[0]["params"])["threadId"], THREAD_ID
+        )
+        starts = self.methods("turn/start")
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(
+            cast("dict[str, object]", starts[1]["params"])["threadId"], THREAD_ID
+        )
+        self.assertIn("Repair the open finding", str(starts[1]["params"]))
+        self.assertEqual(self.seat_record()["status"], "done")
+
+    def test_follow_refuses_a_running_seat_before_sending(self) -> None:
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "seat": {"thread_id": THREAD_ID, "turn_id": "live-turn", "status": "running"}
+        }), encoding="utf-8")
+        code, errors = self.run_follow()
+        self.assertEqual(code, 2, errors)
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertEqual(self.methods("turn/start"), [])
+
+    def test_follow_refuses_failed_seat_with_live_turn(self) -> None:
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "seat": {"thread_id": THREAD_ID, "turn_id": "", "status": "failed"}
+        }), encoding="utf-8")
+        self.live_turn = "peer-turn"
+        code, errors = self.run_follow()
+        self.assertEqual(code, 2, errors)
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertEqual(self.methods("turn/start"), [])
+
+    def test_follow_accepts_failed_seat_only_after_idle_read(self) -> None:
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "seat": {"thread_id": THREAD_ID, "turn_id": "", "status": "failed"}
+        }), encoding="utf-8")
+
+        code, errors = self.run_follow()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertTrue(self.methods("thread/read"))
+        self.assertEqual(len(self.methods("thread/resume")), 1)
+        self.assertEqual(len(self.methods("turn/start")), 1)
+        self.assertEqual(self.seat_record()["status"], "done")
+
+    def test_earlier_completion_cannot_finish_follow_turn(self) -> None:
+        code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+        self.outcomes = ["earlier_completed"]
+        code, errors = self.run_follow()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(len(self.methods("turn/start")), 2)
+        self.assertEqual(self.seat_record()["status"], "done")
+
+    def test_earlier_completion_alone_does_not_finish_follow_turn(self) -> None:
+        code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+        self.outcomes = ["earlier_only"]
+        self.start_args_timeout = 0.1
+
+        code, errors = self.run_follow()
+
+        self.assertNotEqual(code, 0, errors)
+        self.assertEqual(len(self.methods("turn/start")), 2)
+
+    def test_follow_failure_without_turn_id_finishes_as_failed(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        self.outcomes = ["failed"]
+        self.start_args_timeout = 0.1
+
+        code, errors = self.run_follow()
+
+        self.assertEqual(code, 1)
+        self.assertIn("ordinary failure", errors)
+        self.assertNotIn("no turn/completed", errors)
+
+    def test_follow_completion_without_turn_id_finishes_as_done(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        self.outcomes = ["completed_without_id"]
+        self.start_args_timeout = 0.1
+
+        code, errors = self.run_follow()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["status"], "done")
+
+    def test_follow_watches_peer_turn_queued_during_its_turn(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        self.outcomes = ["completed_then_peer"]
+
+        code, errors = self.run_follow()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.live_turn, "")
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.seat_record()["status"], "done")
+
+    def test_failed_followed_turn_remains_failed_after_peer_completes(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        self.outcomes = ["failed_with_queued"]
+
+        code, errors = self.run_follow()
+
+        self.assertEqual(code, 1, errors)
+        self.assertIn("ordinary failure", errors)
+        self.assertEqual(self.live_turn, "")
+        self.assertEqual(self.seat_record()["status"], "failed")
+
+    def test_claimed_follow_refuses_another_launcher_before_start(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        args = self.start_args()
+        args.to = "seat"
+        args.claim_pid = os.getpid()
+
+        self.assertEqual(codex_mesh.command_can_follow(args), 0)
+        self.assertEqual(self.seat_record()["status"], "starting")
+        self.assertEqual(codex_mesh.command_can_follow(args), 2)
+        self.assertEqual(len(self.methods("turn/start")), 1)
+
+    def test_live_turn_after_resume_restores_preclaim_roster_when_peer_finishes(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        args = self.start_args()
+        args.to = "seat"
+        args.claim_pid = os.getpid()
+        self.assertEqual(codex_mesh.command_can_follow(args), 0)
+        self.live_turn = "peer-turn"
+        self.announce_live_completion = True
+        args.message_file = str(self.session_dir / "follow-up.txt")
+        _ = Path(args.message_file).write_text("Follow up", encoding="utf-8")
+
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            code = codex_mesh.command_follow(args)
+
+        self.assertEqual(code, 1, errors.getvalue())
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertEqual(self.live_turn, "")
+
+    def test_claim_changed_after_dispatch_fails_without_overwriting_peer(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        args = self.start_args()
+        args.to = "seat"
+        args.claim_pid = os.getpid()
+        self.assertEqual(codex_mesh.command_can_follow(args), 0)
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "seat": {"thread_id": THREAD_ID, "turn_id": "peer-turn", "status": "running"}
+        }), encoding="utf-8")
+
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            code = codex_mesh.command_follow(args)
+
+        self.assertEqual(code, 1, errors.getvalue())
+        self.assertEqual(self.seat_record()["status"], "running")
+        self.assertEqual(len(self.methods("turn/start")), 1)
+
+    def test_follow_recovers_dead_launcher_only_after_thread_is_idle(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "seat": {"thread_id": THREAD_ID, "turn_id": "turn-1",
+                     "status": "running", "launcher_pid": 99999999}
+        }), encoding="utf-8")
+        self.live_turn = "still-running"
+        refused, _errors = self.run_follow()
+        self.assertEqual(refused, 2)
+        self.live_turn = ""
+
+        code, errors = self.run_follow()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["status"], "done")
+
+    def test_running_roster_without_turn_id_has_no_active_state(self) -> None:
+        state = codex_mesh._roster_thread({  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "running", "turn_id": ""
+        })
+
+        self.assertIsInstance(state, codex_mesh.InvalidThread)
+
+    def test_follow_refuses_running_roster_without_turn_id(self) -> None:
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "seat": {"thread_id": THREAD_ID, "status": "running"}
+        }), encoding="utf-8")
+
+        code, errors = self.run_follow()
+
+        self.assertEqual(code, 2, errors)
+        self.assertEqual(self.methods("turn/start"), [])
 
     def test_capacity_resumes_its_thread_without_repeating_the_prompt(self) -> None:
         self.outcomes = ["capacity", "completed"]

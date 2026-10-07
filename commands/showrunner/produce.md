@@ -93,8 +93,8 @@ State:
   own message — send the unit director `From the showrunner: run /unit:eta (or read ~/.claude/commands/unit/eta.md if it is not in your skill list)` by SendMessage, in that same
   turn. Ask once per phase; ask again only if it answered without a time. Until
   it answers, report that ETA as `none measured - requested`.
-- **Waiting on block.** After the footer, leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. The user's items come first. Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. User, 2026-10-06.
-- **Footer.** Paste the output of
+- **Waiting on block.** After the footer, or after the reply when footers are off, leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. The user's items come first. Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. The footer hook checks the shape and item order. User, 2026-10-06.
+- **Footer.** When footers are on, paste the output of
   `python3 ~/.claude/scripts/production/dailies_render.py --footer --zone <ZONE>`,
   word for word before the Waiting on block. It starts with a blank line and `---`, then
   `HH:MM <zone> update:` and a blank line. Its `* ` bullets list each build
@@ -129,6 +129,15 @@ State:
   footer or Waiting on block blocks the reply with the exact footer lines and
   Waiting on shape. End the reply with those lines and the Waiting on block.
   The hook passes a reply after any Stop-hook block and passes on errors.
+
+  `/showrunner:footer off` and `/showrunner:footer on` pause and resume the
+  footer for this showrunner. Run them when the user says "footers off" or
+  "footers on" as well as when they type the command. While `/showrunner:footer`
+  reports off, end each reply with the Waiting on block alone. Run
+  `/showrunner:footer` after every compaction and session resume: its switch
+  survives both. An `/adhoc_review` in this session pauses current dailies and
+  footers, then asks whether to turn back on what it paused at the end
+  (`commands/adhoc_review.md` Steps 2 and 5). The dailies keep their own switch.
 
   Example with a hold and an active agent (user, 2026-10-04):
 
@@ -200,38 +209,19 @@ Only when the doc's status is `planned`:
 ---
 
 <LaunchUnits>
-For each unit without a live unit director:
+For each unit without a live unit director, run
+`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>`.
+`<name>` is the Units row's Unit value without `-unit`; the existing row is adopted.
+Use `--standby` for a unit waiting for an assignment. Tell the user one line
+per unit director: its session name and `tmux attach -t <session>`.
 
-1. **Worktree.** If it is absent, run
-   `git -C CHECKOUT worktree add <worktree> -b <branch> <merge branch>`, then
-   `git -C CHECKOUT push -u origin <branch>`. When the
-   repository has `.claude/config/berth.toml`, also set
-   `git -C CHECKOUT config branch.<branch>.cargoBerthTarget <merge branch>`, so
-   cargo-berth measures the unit against the merge branch.
-2. **Session.** Always use detached tmux. The unit director then outlives this
-   session, runs while the screen is locked, and the showrunner can type into
-   it. When a unit director is blocked on a full context, type `/compact` into it with
-   `send-keys -l`, then `Enter`. First capture the pane to check the block is
-   still showing and no compaction is already running, since the user may have
-   typed it already.
-   - tmux is `command -v tmux`, or else
-     `$(nix build --no-link --print-out-paths 'nixpkgs#tmux^out')/bin/tmux`.
-   - Start it through `systemd-run --user --scope --unit=<session>`, so it lives
-     outside this session's scope.
-   - Remove every `CLAUDE_*` variable from its environment. An inherited
-     `CLAUDE_CODE_CHILD_SESSION` turns off transcript saving.
-   - `SHOWRUNNER_UNIT` marks it as yours: `/notify_top_level` messages reach
-     you, not it. Pass on what applies to it.
-   - Launch:
-     `tmux new-session -d -s <session> -c <worktree> -e SHOWRUNNER_UNIT=<slug> zsh -ic "ENABLE_TOOL_SEARCH=true command claude --remote-control <session> -n <session> --settings '{\"disableAgentView\": true}' '/unit:delegate <unit plan>'; exec zsh"`
-3. **Check.** Log the launch only after the pane shows `/remote-control is
-   active`. The mobile session list lags by minutes; trust the pane.
-   Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py add <this session's name> --zone <zone> --unit <session>`.
-4. **Resume.** To bring back a unit director whose session ended, use
+When a unit director is blocked on a full context, first capture its pane to
+confirm the block remains and no compaction is running. Type `/compact` with
+`tmux send-keys -l`, then send `Enter` separately.
+
+**Resume.** To bring back a unit director whose session ended, use
    `claude --resume <session-id> --remote-control <session> -n <session>`, which
    keeps its link and its place in the list.
-
-Tell the user one line per unit director: its session name, and `tmux attach -t <session>`.
 </LaunchUnits>
 
 ---
@@ -261,13 +251,15 @@ Run these steps at the start and on every resume:
    Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py add <this session's name> --zone <zone> --unit <each unit's tmux session>`, using the name from ListAgents.
 4. **Stall watch.** If `NOTIFIER status stall-watch` reports no instance, run
    `NOTIFIER new stall-watch --every 1 --run "$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/stall_watch.py"`.
-5. **Status.** Run `NOTIFIER status UPDATES` for the next tick and fire log.
+5. **Tmux names.** If `NOTIFIER status tmux-names` reports no instance, run
+   `NOTIFIER new tmux-names --every 1 --run "$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/tmux_names.py"`.
+6. **Status.** Run `NOTIFIER status UPDATES` for the next tick and fire log.
    The declared job runs the ticks.
 
 The prompt:
 
 > Scheduled update (every <N> minutes, every unit in full; the user is in
-> <zone>). Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> <sessions…> | cut -c1-400`.
+> <zone>). Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> --showrunner <this session's name> | cut -c1-400`.
 > It checks every unit director: its session and Claude are running, anything waiting
 > on the user, and its latest step and ETA. Then give the user
 > `/showrunner:dailies simple` for every unit and open topic. If the script

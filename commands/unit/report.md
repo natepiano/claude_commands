@@ -1,10 +1,11 @@
 ---
 description: Show what this unit's delegate run and its agents are doing right now.
+argument-hint: "[on|off]"
 ---
 
 # Delegate — status report
 
-**Usage:** `/unit:report`
+**Usage:** `/unit:report [on|off]`
 
 Type this when a run has gone quiet, when an update arrived without its tables,
 or any time you want to know what the agents are doing right now. It runs inside
@@ -17,6 +18,14 @@ It defines `<ProgressReport/>` — the content of an update. `<ProgressContract/
 `~/.claude/commands/unit/delegate.md` keeps the timing rules that say when one is
 owed. Never compose a report from memory of an earlier read: the byte-for-byte
 copy rule and the ordinary-English closing sentences are the parts that decay.
+
+With `on` or `off`, run
+`zsh ~/.claude/scripts/delegate/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID" on|off`
+using the requested word. Relay its output and stop without composing a report.
+A Codex unit has no notifier; say this switch is unavailable there. If the
+command fails, relay its message as printed: exit 1 covers both a session with
+no active run and a run whose notifier instance is missing, and the message
+says which. Reject other arguments.
 
 Everything below is the contract.
 

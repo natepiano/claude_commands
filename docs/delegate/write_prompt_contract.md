@@ -224,9 +224,9 @@ mid-run, without waiting for a phase to end.
   its turn ends, until <PhaseCleanup/>, and a message resumes it from its
   transcript. So the tester may ask the implementer a question after the
   implementer has reported done, and get an answer rather than silence. **A
-  finished codex peer is not**, and `send` says so rather than pretending: it
-  refuses any target whose roster status is not `running`. Ask a codex peer
-  while it is still working, or read its summary file instead.
+  finished codex peer refuses `send`; ask while it works or read its summary.
+  Only the unit director sends follow-up work, through `implement.sh --to
+  <seat>`. A message without the launcher is for questions only.
 - **A codex member has no route to the unit director.** It reaches its peer with
   the calls above and reaches the unit director only through the board, which the
   unit director reads at every progress tick. Anything that cannot wait for the

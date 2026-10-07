@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import os
 import shutil
 import subprocess
@@ -19,6 +20,7 @@ import showrunner_footer
 
 
 HOOK = Path(__file__).with_name("stop-showrunner-footer.py")
+SWITCH = HOOK.with_name("showrunner_footer.py")
 DAILIES = HOOK.parent.parent / "production" / "dailies_render.py"
 SETTINGS = HOOK.parent.parent.parent / "settings.json"
 ZONE = "America/Los_Angeles"
@@ -52,13 +54,17 @@ class FooterLibraryTests(unittest.TestCase):
     def test_next_run_text_handles_no_schedule_and_next_local_day(self) -> None:
         zone = ZoneInfo(ZONE)
         minute = datetime(2026, 10, 6, 23, 50, tzinfo=zone)
-        self.assertIsNone(showrunner_footer.next_run_text(None, minute, zone))
         self.assertEqual(showrunner_footer.next_run_text(
             int(datetime(2026, 10, 6, 23, 55, tzinfo=zone).timestamp()), minute, zone,
         ), "23:55")
         self.assertEqual(showrunner_footer.next_run_text(
             int(datetime(2026, 10, 7, 0, 5, tzinfo=zone).timestamp()), minute, zone,
         ), "00:05+1")
+
+    def test_block_reason_requires_named_footer_states(self) -> None:
+        parameter = inspect.signature(showrunner_footer.block_reason).parameters["states"]
+        default = cast(object, parameter.default)
+        self.assertIs(default, inspect.Parameter.empty)
 
     def test_read_production_skips_wrapped_doc(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -106,6 +112,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.write_state()
         self.environment = {
             **os.environ, "HOME": str(self.root), "NOTIFIER_STATE_DIR": str(self.notifier),
+            "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner-state"),
             "BUILD_HOLD_DIR": str(holds),
         }
 
@@ -139,6 +146,18 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
     def run_hook(self, reply: str = "Done.", **fields: object) -> subprocess.CompletedProcess[str]:
         payload: dict[str, object] = {"session_id": SESSION, "last_assistant_message": reply, **fields}
         return self.run_raw(json.dumps(payload))
+
+    def run_switch(self, action: str, session: str = SESSION) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([sys.executable, str(SWITCH), action], capture_output=True,
+                              text=True, check=False, env={**self.environment,
+                                                           "CLAUDE_CODE_SESSION_ID": session}, timeout=10)
+
+    def reason(self, reply: str) -> str:
+        result = self.run_hook(reply)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = cast(dict[str, str], json.loads(result.stdout))
+        self.assertEqual(decision["decision"], "block")
+        return decision["reason"]
 
     def assert_passes(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -233,7 +252,10 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
                 return datetime.fromtimestamp(pst_minute.timestamp(), tz) if tz else pst_minute.replace(tzinfo=None)
 
         with patch.dict(os.environ, self.environment), patch.object(showrunner_footer, "datetime", FixedClock):
-            self.assertIsNone(showrunner_footer.block_reason([str(self.instance)], "Done.\n" + footer + WAITING_BLOCK))
+            self.assertIsNone(showrunner_footer.block_reason(
+                [str(self.instance)], "Done.\n" + footer + WAITING_BLOCK,
+                {"demo": showrunner_footer.FooterState.ON},
+            ))
 
     def test_false_nothing_needed_claim_blocks_and_reason_drops_suffix(self) -> None:
         _ = self.outstanding.write_text(json.dumps([{"since": "2026-10-06T08:00", "text": "choose the path"}]))
@@ -294,6 +316,138 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.assertEqual(commands[-1],
                          '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/stop-showrunner-footer.py"')
         self.assertIn("stop-assistant-prose-banned-words.py", commands[-2])
+
+    def test_switch_off_allows_any_reply_and_on_requires_footer_and_waiting(self) -> None:
+        self.assertEqual(self.run_switch("status").stdout, "demo footers on\n")
+        self.assertEqual(self.run_switch("off").returncode, 0)
+        self.assertEqual(self.run_switch("off").returncode, 0)
+        self.assert_passes(self.run_hook("Done."))
+        self.assert_passes(self.run_hook("Done." + WAITING_BLOCK))
+        self.assert_passes(self.run_hook("Done.\n\nWaiting on:\n* malformed"))
+        self.assert_passes(self.run_hook("Done.\n" + self.footer() + WAITING_BLOCK))
+        self.assertEqual(self.run_switch("status").stdout, "demo footers off\n")
+        self.assertEqual(self.run_switch("on").returncode, 0)
+        self.assertIn("footer", self.reason("Done." + WAITING_BLOCK))
+        _ = self.assert_blocked_with_current_footer("Done.\n" + self.footer())
+        self.assert_passes(self.run_hook("Done.\n" + self.footer() + WAITING_BLOCK))
+
+    def test_switch_survives_new_target_and_is_per_production(self) -> None:
+        self.assertEqual(self.run_switch("off").returncode, 0)
+        other = self.notifier / "showrunner-other"
+        other.mkdir()
+        _ = (other / "conf").write_text(f"TARGET=session:another\nCHECK=zsh /x/check.sh {self.doc}\n")
+        _ = (other / "state").write_text((self.instance / "state").read_text())
+        _ = (self.instance / "conf").write_text(
+            f"TARGET=session:new-target\nCHECK=zsh /x/check.sh {self.doc}\n")
+        self.assert_passes(self.run_hook("Done." + WAITING_BLOCK, session_id="new-target"))
+        self.assertIn("footer", self.reason_for_session("another", "Done." + WAITING_BLOCK))
+        self.assertEqual(self.run_switch("status", "new-target").stdout, "demo footers off\n")
+        self.assertEqual(self.run_switch("status", "another").stdout, "other footers on\n")
+        missing = self.run_switch("status", "not-targeted")
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("no production targets this session", missing.stderr + missing.stdout)
+
+    def reason_for_session(self, session: str, reply: str) -> str:
+        result = self.run_hook(reply, session_id=session)
+        decision = cast(dict[str, str], json.loads(result.stdout))
+        return decision["reason"]
+
+    def test_two_productions_in_one_session_require_each_enabled_footer(self) -> None:
+        other = self.notifier / "showrunner-other"
+        other.mkdir()
+        _ = (other / "conf").write_text(f"TARGET=session:{SESSION}\nCHECK=zsh /x/check.sh {self.doc}\n")
+        _ = (other / "state").write_text("ENABLED=0\n")
+        self.assertEqual(self.run_switch("status").stdout, "demo footers on\nother footers on\n")
+        self.assertIn("footer", self.reason("Done.\n" + self.footer() + WAITING_BLOCK))
+        other_footer = subprocess.run(
+            [sys.executable, str(DAILIES), "--footer", "--zone", ZONE,
+             "--outstanding", str(self.root / ".local/state/showrunner/outstanding/other.json"),
+             "--nothing-needed"],
+            capture_output=True, text=True, check=False, env=self.environment, timeout=10,
+        )
+        self.assertEqual(other_footer.returncode, 0, other_footer.stderr)
+        self.assert_passes(self.run_hook("Done.\n" + self.footer() + "\n"
+                                         + other_footer.stdout.rstrip("\n") + WAITING_BLOCK))
+        self.assertEqual(self.run_switch("off").returncode, 0)
+        self.assertEqual(self.run_switch("on").returncode, 0)
+        # Set one switch directly to represent a separately paused production.
+        switch = self.root / "showrunner-state/footers-off/other"
+        switch.parent.mkdir(parents=True, exist_ok=True)
+        switch.touch()
+        self.assertIn("footer", self.reason("Done." + WAITING_BLOCK))
+        self.assert_passes(self.run_hook("Done.\n" + self.footer() + WAITING_BLOCK))
+
+    def test_two_production_footers_pass_in_reverse_instance_order(self) -> None:
+        other = self.notifier / "showrunner-other"
+        other.mkdir()
+        _ = (other / "conf").write_text(f"TARGET=session:{SESSION}\nCHECK=zsh /x/check.sh {self.doc}\n")
+        _ = (other / "state").write_text("ENABLED=0\n")
+        other_footer = subprocess.run(
+            [sys.executable, str(DAILIES), "--footer", "--zone", ZONE,
+             "--outstanding", str(self.root / ".local/state/showrunner/outstanding/other.json"),
+             "--nothing-needed"],
+            capture_output=True, text=True, check=False, env=self.environment, timeout=10,
+        )
+        self.assertEqual(other_footer.returncode, 0, other_footer.stderr)
+        reply = "Done.\n" + other_footer.stdout.rstrip("\n") + "\n" + self.footer() + WAITING_BLOCK
+        self.assert_passes(self.run_hook(reply))
+
+    def test_one_enabled_production_still_requires_waiting_block(self) -> None:
+        other = self.notifier / "showrunner-other"
+        other.mkdir()
+        _ = (other / "conf").write_text(f"TARGET=session:{SESSION}\nCHECK=zsh /x/check.sh {self.doc}\n")
+        _ = (other / "state").write_text("ENABLED=0\n")
+        switch = self.root / "showrunner-state/footers-off/other"
+        switch.parent.mkdir(parents=True, exist_ok=True)
+        switch.touch()
+        footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
+        _ = self.assert_blocked_with_current_footer("Done.\n" + footer)
+        self.assert_passes(self.run_hook("Done.\n" + footer + WAITING_BLOCK))
+
+    def test_two_productions_cannot_share_one_footer_span(self) -> None:
+        other = self.notifier / "showrunner-other"
+        other.mkdir()
+        _ = (other / "conf").write_text(f"TARGET=session:{SESSION}\nCHECK=zsh /x/check.sh {self.doc}\n")
+        _ = (other / "state").write_text((self.instance / "state").read_text())
+        self.assertIn("footer", self.reason("Done.\n" + self.footer() + WAITING_BLOCK))
+
+    def test_waiting_items_follow_eta_first_rules(self) -> None:
+        footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
+        tomorrow = (datetime.now(ZoneInfo(ZONE)) + timedelta(days=1)).strftime("%a")
+        valid = [
+            "* you: choose the path", "* 19:45 (18:20–23:55) - startup Phase 16",
+            "* 23:30 - later", "* 00:15+1 - overnight",
+            f"* {tomorrow} 09:00 - tomorrow", "* no ETA measured - awaiting estimate",
+        ]
+        def reply(items: list[str]) -> str:
+            return "Done.\n" + footer + "\n\n\nWaiting on:\n\n" + "\n".join(items)
+        self.assert_passes(self.run_hook(reply(valid)))
+        cases = [
+            (["* startup Phase 16 ETA 19:45"], "ETA"),
+            (["* startup 19:45 (18:20–23:55)"], "ETA"),
+            (["* 19:45 PDT - startup"], "zone"),
+            (["* 21:00 - later", "* 19:45 - earlier"], "order"),
+            (["* 19:45 - startup", "* you: choose"], "user"),
+            (["* no ETA measured - one", "* 19:45 - two"], "order"),
+            (["* 23:30 - today", "* 00:15 - earlier today"], "order"),
+        ]
+        for items, rule in cases:
+            with self.subTest(items=items):
+                reason = self.reason(reply(items))
+                self.assertIn(rule.lower(), reason.lower())
+                self.assertIn("19:45 (18:20–23:55) - startup Phase 16", reason)
+                self.assertIn("no ETA measured - <item>", reason)
+
+    def test_no_eta_items_and_malformed_leading_eta_cannot_hide_times(self) -> None:
+        footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
+        for item in (
+            "no ETA measured - startup 19:45 (18:20–23:55)",
+            "no ETA measured - startup ETA 19:45",
+            "19:45 PDT (18:20–23:55) - item",
+        ):
+            with self.subTest(item=item):
+                reason = self.reason("Done.\n" + footer + "\n\n\nWaiting on:\n\n* " + item)
+                self.assertIn("ETA", reason)
 
 
 if __name__ == "__main__":
