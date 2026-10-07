@@ -606,6 +606,24 @@ class MacTestCommandTests(unittest.TestCase):
         self.assertEqual(self.logged_arguments("send"), [])
         self.assertFalse((self.state_directory / "run.json").exists())
 
+    def test_claim_reports_damaged_block_state(self) -> None:
+        self.state_directory.mkdir()
+        block_path = self.state_directory / "block.json"
+        _ = block_path.write_text("damaged\n", encoding="utf-8")
+
+        result = self.command(
+            "claim",
+            "--pid",
+            str(os.getpid()),
+            "--what",
+            "alpha tests",
+            "--worktree",
+            str(self.root / "alpha"),
+        )
+
+        self.assert_command(result, 12, f"state unreadable: {block_path}\n")
+        self.assertFalse((self.state_directory / "run.json").exists())
+
     def test_block_records_state_and_turns_the_switch_off(self) -> None:
         environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "session-123"}
         result = self.command(
