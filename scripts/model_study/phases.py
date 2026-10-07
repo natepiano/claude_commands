@@ -212,9 +212,17 @@ def atomic_json(path: Path, report: PhaseReport) -> None:
 def phases(state_dir: Path, runs_dir: Path = DEFAULT_RUNS, roster: Path = DEFAULT_ROSTER, registry_dir: Path = DEFAULT_REGISTRY) -> PhaseReport:
     """Write phase measurements without printing transcript or run paths."""
     entries = load_roster(roster)
+    extract_path = state_dir / "extract.json"
+    saved_states: dict[str, dict[str, object]] = {}
+    if extract_path.exists():
+        extraction = cast(dict[str, object], json.loads(extract_path.read_text()))
+        saved_states = cast(dict[str, dict[str, object]], extraction.get("session_states", {}))
     by_session: dict[str, tuple[str, list[str]]] = {}
     for entry in entries:
-        ids = session_ids(entry, registry_dir)
+        ids = list(dict.fromkeys([
+            *(session_id for session_id, state in saved_states.items() if state.get("director") == entry.name),
+            *session_ids(entry, registry_dir),
+        ]))
         for session_id in ids:
             by_session[session_id] = (entry.name, ids)
     switched = [entry.name for entry in entries if entry.switched_by_pdt is not None]

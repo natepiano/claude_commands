@@ -56,6 +56,31 @@ def bootstrap_diff(
     return stat(b) - stat(a), percentile(differences, 2.5), percentile(differences, 97.5)
 
 
+def bootstrap_net(
+    opus: Sequence[float | int],
+    sonnet: Sequence[float | int],
+    control_before: Sequence[float | int],
+    control_after: Sequence[float | int],
+    stat: Callable[[Sequence[float | int]], float],
+    resamples: int = 2000,
+    seed: int = 1,
+) -> tuple[float, float, float]:
+    """Return the switched change minus the concurrent control change."""
+    if not opus or not sonnet or not control_before or not control_after or resamples < 1:
+        raise ValueError("bootstrap needs four nonempty samples and resamples > 0")
+    generator = random.Random(seed)
+    nets: list[float] = []
+    for _ in range(resamples):
+        sampled_opus = generator.choices(opus, k=len(opus))
+        sampled_sonnet = generator.choices(sonnet, k=len(sonnet))
+        sampled_before = generator.choices(control_before, k=len(control_before))
+        sampled_after = generator.choices(control_after, k=len(control_after))
+        nets.append((stat(sampled_sonnet) - stat(sampled_opus))
+                    - (stat(sampled_after) - stat(sampled_before)))
+    value = (stat(sonnet) - stat(opus)) - (stat(control_after) - stat(control_before))
+    return value, percentile(nets, 2.5), percentile(nets, 97.5)
+
+
 def request_cost(turn: Turn) -> float:
     """Price one standard-speed request in USD; thinking is included in output."""
     price = PRICES.get(turn.model)

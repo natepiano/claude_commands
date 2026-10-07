@@ -6,7 +6,7 @@ import statistics
 import unittest
 from dataclasses import replace
 
-from stats import PRICES, bootstrap_diff, label_difference, percentile, request_cost
+from stats import PRICES, bootstrap_diff, bootstrap_net, label_difference, percentile, request_cost
 from turns import Turn
 
 
@@ -59,6 +59,32 @@ class StatisticTests(unittest.TestCase):
         self.assertGreaterEqual(upper, 10)
         self.assertGreater(lower, 0)
 
+    def test_bootstrap_net_subtracts_the_control_shift(self) -> None:
+        baseline = [40] * 40
+        sonnet = [30] * 40
+        same_shift = bootstrap_net(baseline, sonnet, [25] * 40, [15] * 40,
+                                   statistics.median, resamples=100, seed=19)
+        self.assertEqual(same_shift, (0, 0, 0))
+        self.assertLessEqual(same_shift[1], 0)
+        self.assertGreaterEqual(same_shift[2], 0)
+        flat = bootstrap_net(baseline, sonnet, [25] * 40, [25] * 40,
+                             statistics.median, resamples=100, seed=19)
+        self.assertEqual(flat, (-10, -10, -10))
+        self.assertEqual(flat, bootstrap_net(baseline, sonnet, [25] * 40, [25] * 40,
+                                             statistics.median, resamples=100, seed=19))
+
+    def test_bootstrap_net_rejects_empty_samples_and_zero_resamples(self) -> None:
+        samples = ([1], [2], [3], [4])
+        for index in range(4):
+            arguments = list(samples)
+            arguments[index] = []
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                _ = bootstrap_net(arguments[0], arguments[1], arguments[2],
+                                  arguments[3], statistics.median)
+        with self.assertRaises(ValueError):
+            _ = bootstrap_net(samples[0], samples[1], samples[2], samples[3],
+                              statistics.median, resamples=0)
+
     def test_each_price_column_and_thinking_subset(self) -> None:
         expected = {
             "claude-opus-5-5": (4, 20, 0.20, 5, 8),
@@ -85,4 +111,3 @@ class StatisticTests(unittest.TestCase):
         self.assertEqual(label_difference(0, 1, 30, 30, "cost"), "no measurable difference")
         self.assertEqual(label_difference(-3, -1, 29, 30, "seconds"), "too few")
         self.assertEqual(label_difference(-3, -1, 30, 29, "seconds"), "too few")
-

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo
 
-from stats import PRICES, bootstrap_diff, label_difference, percentile, request_cost
+from stats import PRICES, bootstrap_diff, bootstrap_net, label_difference, percentile, request_cost
 from turns import Compaction, Turn
 
 OPUS = "claude-opus-5-5"
@@ -87,6 +87,15 @@ class ControlDirector(TypedDict):
 class ConcurrentControl(TypedDict):
     at_pdt: str | None
     directors: list[ControlDirector]
+    pooled: PooledControl
+
+
+class PooledControl(TypedDict):
+    before_n: int
+    after_n: int
+    before_median: float | None
+    after_median: float | None
+    change_seconds: float | None
 
 
 class CompactionComparison(TypedDict):
@@ -335,30 +344,60 @@ def compaction_result(name: str, arm: str, turns: Sequence[Turn], compactions: S
     }
 
 
-def control_results(directors: Sequence[DirectorComparison], arms: dict[str, dict[str, list[Turn]]], first_times: dict[str, datetime]) -> ConcurrentControl:
+def control_results_and_samples(directors: Sequence[DirectorComparison], arms: dict[str, dict[str, list[Turn]]], first_times: dict[str, datetime]) -> tuple[ConcurrentControl, list[float], list[float]]:
     switched_times = sorted(first_times[row["name"]].timestamp() for row in directors if row["status"] == "switched")
     if not switched_times:
-        return {"at_pdt": None, "directors": []}
+        return {"at_pdt": None, "directors": [], "pooled": {
+            "before_n": 0, "after_n": 0, "before_median": None, "after_median": None, "change_seconds": None,
+        }}, [], []
     boundary = datetime.fromtimestamp(statistics.median(switched_times), tz=PDT)
     controls: list[ControlDirector] = []
+    pooled_before: list[float] = []
+    pooled_after: list[float] = []
     for row in directors:
-        if row["status"] != "control candidate":
+        if row["status"] != "control candidate" or row["name"] in first_times:
             continue
         name = row["name"]
         opus = arms[name]["opus"]
         before_window = [turn for turn in opus if datetime.fromisoformat(turn.started) < boundary][-BASELINE_REQUESTS:]
         before = class_turns(before_window, "continuation")
         after = class_turns([turn for turn in opus if datetime.fromisoformat(turn.started) >= boundary], "continuation")
-        if len(before) < 30 or len(after) < 30:
-            continue
         before_seconds = [turn.seconds for turn in before if turn.seconds is not None]
         after_seconds = [turn.seconds for turn in after if turn.seconds is not None]
+        if len(before_seconds) < 30 or len(after_seconds) < 30:
+            continue
+        pooled_before.extend(before_seconds)
+        pooled_after.extend(after_seconds)
         controls.append({
-            "name": name, "before_n": len(before), "after_n": len(after),
+            "name": name, "before_n": len(before_seconds), "after_n": len(after_seconds),
             "before_median": median(before_seconds), "after_median": median(after_seconds),
             "difference": difference(before_seconds, after_seconds, "seconds"),
         })
-    return {"at_pdt": pdt_time(boundary), "directors": controls}
+    before_median = median(pooled_before)
+    after_median = median(pooled_after)
+    pooled: PooledControl = {
+        "before_n": len(pooled_before), "after_n": len(pooled_after),
+        "before_median": before_median, "after_median": after_median,
+        "change_seconds": after_median - before_median if before_median is not None and after_median is not None else None,
+    }
+    return {"at_pdt": pdt_time(boundary), "directors": controls, "pooled": pooled}, pooled_before, pooled_after
+
+
+def control_results(directors: Sequence[DirectorComparison], arms: dict[str, dict[str, list[Turn]]], first_times: dict[str, datetime]) -> ConcurrentControl:
+    return control_results_and_samples(directors, arms, first_times)[0]
+
+
+def net_seconds(opus: Sequence[Turn], sonnet: Sequence[Turn], control_before: Sequence[float], control_after: Sequence[float]) -> DifferenceEstimate:
+    before = [turn.seconds for turn in class_turns(opus, "continuation") if turn.seconds is not None]
+    after = [turn.seconds for turn in class_turns(sonnet, "continuation") if turn.seconds is not None]
+    if not control_before or not control_after:
+        return {"value": None, "low": None, "high": None, "label": "no control", "opus_n": len(before), "sonnet_n": len(after)}
+    if not before or not after:
+        return {"value": None, "low": None, "high": None, "label": "too few", "opus_n": len(before), "sonnet_n": len(after)}
+    value, low, high = bootstrap_net(before, after, control_before, control_after, lambda values: percentile(values, 50))
+    return {"value": value, "low": low, "high": high,
+            "label": label_difference(low, high, len(before), len(after), "seconds"),
+            "opus_n": len(before), "sonnet_n": len(after)}
 
 
 def formatted(value: object, digits: int = 2) -> str:
@@ -471,7 +510,7 @@ def atomic_json(path: Path, result: ComparisonReport) -> None:
 
 
 def compare(state_dir: Path) -> ComparisonReport:
-    """Print comparison tables and atomically write all their data to compare.json."""
+    """Atomically write comparison data without printing its tables."""
     turns = load_turns(state_dir / "turns.jsonl")
     compactions = load_compactions(state_dir / "compactions.jsonl")
     names = director_names(turns)
@@ -493,6 +532,8 @@ def compare(state_dir: Path) -> ComparisonReport:
     directors.sort(key=lambda row: order[row["status"]])
     switched = [row for row in directors if row["status"] == "switched"]
     pooled: DirectorComparison | None = None
+    pooled_baseline: list[Turn] = []
+    pooled_sonnet: list[Turn] = []
     if switched:
         pooled_opus = [turn for row in switched for turn in arms[row["name"]]["opus"]]
         pooled_sonnet = [turn for row in switched for turn in arms[row["name"]]["sonnet"]]
@@ -507,7 +548,17 @@ def compare(state_dir: Path) -> ComparisonReport:
         pooled_classes = pooled["classes"]
         pooled_classes["opus"] = {class_name: class_statistics(pooled_baseline, class_name) for class_name in CLASSES}
         pooled["differences"] = arm_differences(pooled_baseline, pooled_sonnet)
-    control = control_results(directors, arms, first_times)
+    control, control_before, control_after = control_results_and_samples(directors, arms, first_times)
+    for row in switched:
+        name = row["name"]
+        opus = [turn for turn in arms[name]["opus"] if datetime.fromisoformat(turn.started) < first_times[name]][-BASELINE_REQUESTS:]
+        differences = row["differences"]
+        assert differences is not None
+        differences["net_seconds"] = net_seconds(opus, arms[name]["sonnet"], control_before, control_after)
+    if pooled is not None:
+        differences = pooled["differences"]
+        assert differences is not None
+        differences["net_seconds"] = net_seconds(pooled_baseline, pooled_sonnet, control_before, control_after)
     compaction_rows: list[CompactionComparison] = []
     for row in directors:
         name = row["name"]
@@ -523,5 +574,4 @@ def compare(state_dir: Path) -> ComparisonReport:
         "directors": directors, "pooled": pooled, "control": control, "compactions": compaction_rows,
     }
     atomic_json(state_dir / "compare.json", result)
-    print(markdown(result))
     return result

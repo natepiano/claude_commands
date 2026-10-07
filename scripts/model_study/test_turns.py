@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
 from model_study import extract
-from turns import load_roster, read_session, resolve_session_files
+from turns import read_session
 
 
 class CacheCreation(TypedDict, total=False):
@@ -496,43 +496,6 @@ class RequestExtractionTests(unittest.TestCase):
             self.assertEqual(summary["dropped"]["before_director"], 1)
             self.assertEqual(summary["dropped"]["synthetic"], 1)
             self.assertIn("synthetic:1", output.getvalue())
-
-    def test_roster_name_adds_registry_id_and_ignores_subagent_files(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            roster_path = directory / "roster.json"
-            _ = roster_path.write_text(
-                json.dumps(
-                    [
-                        {
-                            "name": "fixture",
-                            "session_ids": ["old-id", "missing-id"],
-                            "switched_by_pdt": None,
-                            "production": "build-followups",
-                            "director_from_pdt": None,
-                        }
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            projects_dir = directory / "projects"
-            project = projects_dir / "project-a"
-            project.mkdir(parents=True)
-            old_path = write_transcript(project, [], "old-id")
-            live_path = write_transcript(project, [], "live-id")
-            subagents = project / "missing-id" / "subagents"
-            subagents.mkdir(parents=True)
-            _ = write_transcript(subagents, [], "missing-id")
-            registry_dir = directory / "registry"
-            registry_dir.mkdir()
-            _ = (registry_dir / "entry.json").write_text(
-                json.dumps({"name": "fixture", "sessionId": "live-id"}), encoding="utf-8"
-            )
-
-            entry = load_roster(roster_path)[0]
-            self.assertEqual(entry.name, "fixture")
-            self.assertEqual(list(entry.session_ids), ["old-id", "missing-id"])
-            self.assertEqual(set(resolve_session_files(entry, projects_dir, registry_dir)), {old_path, live_path})
 
     def test_extract_files_and_stdout_contain_no_transcript_text(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

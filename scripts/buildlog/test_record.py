@@ -459,6 +459,17 @@ class RecordTests(unittest.TestCase):
                 self.assertEqual(self.step(0, tty, "", "", SWEEP, extra)["caller"], expected)
         self.assertEqual(self.records()[4]["session"], "thread-9")
 
+    def test_session_prefers_codex_thread_id(self) -> None:
+        cases: list[tuple[dict[str, str], str | None]] = [
+            ({"CODEX_THREAD_ID": "thread-9", "CLAUDE_CODE_SESSION_ID": "session-1"}, "thread-9"),
+            ({"CLAUDE_CODE_SESSION_ID": "session-1"}, "session-1"),
+            ({}, None),
+        ]
+        for environment, expected in cases:
+            with self.subTest(environment=environment):
+                record = self.step(0, "0", "", "", SWEEP, environment)
+                self.assertEqual(record["session"], expected)
+
     def test_linked_worktree_and_detached_head(self) -> None:
         feature = self.base / "feature"
         _ = self.git("worktree", "add", "-q", "-b", "feature", str(feature), cwd=self.repo)
