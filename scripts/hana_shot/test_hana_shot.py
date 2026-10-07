@@ -329,6 +329,7 @@ class ViewsTests(HanaShotTest):
         check = self.views("check", "--port", str(self.port))
         self.assertEqual((shot.returncode, check.returncode), (2, 2))
         self.assertEqual([line["failure_reason"] for line in self.timing_lines()], ["invalid_request"] * 2)
+        self.assertEqual([line["invocation_kind"] for line in self.timing_lines()], ["shot", "views_check"])
 
     def test_check_records_black_and_empty_crops_after_validation(self) -> None:
         _ = (self.scratch / "views.toml").write_text('[views.front]\nmode = "home"\n')
@@ -351,6 +352,7 @@ class ViewsTests(HanaShotTest):
         passed = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"))
         self.assertEqual(passed.returncode, 0, passed.stderr)
         self.assertEqual(self.timing_lines()[2]["status"], "success")
+        self.assertEqual([line["invocation_kind"] for line in self.timing_lines()], ["views_check"] * 3)
 
     def test_add_list_show_and_replace(self) -> None:
         added = self.views(

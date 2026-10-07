@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 import re
 import subprocess
 import sys
@@ -12,8 +13,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict, cast
 
-from scripts.shot_report.episodes import NoObservablePath, NoneCited, OneCitedShot, SeveralCitedShots, split_episodes
-from scripts.shot_report.transcripts import ExactOrderedCaptureAttempts, RememberedScript, ToolCall, _classify, _remember, scan_calls  # pyright: ignore[reportPrivateUsage]
+from scripts.shot_report.episodes import NoObservablePath, NoneCited, OneCitedShot, SeveralCitedShots, read_episodes, split_episodes, write_episodes
+from scripts.shot_report.transcripts import (
+    AvailableTimingSource, ExactOrderedCaptureAttempts,
+    PersistentScanCache, RememberedScript, ToolCall, scan_calls,
+)
+from scripts.shot_report.transcripts import _classify, _remember  # pyright: ignore[reportPrivateUsage]
+from scripts.shot_report.transcripts import CachedScanEvidence
 
 
 class ShellCases(TypedDict):
@@ -104,6 +110,233 @@ def _codex_part(seconds: int, part: dict[str, object]) -> dict[str, object]:
 
 
 class TranscriptTest(unittest.TestCase):
+    def test_related_codex_write_can_make_cached_file_a_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "codex" / "related.jsonl"
+            path.parent.mkdir()
+            meta = {"timestamp": START.isoformat(), "type": "session_meta",
+                    "payload": {"id": "related", "cwd": "/fictional/studio"}}
+            _ = path.write_text(json.dumps(meta) + "\n")
+            cache = PersistentScanCache(root / "scan.pickle")
+            first = scan_calls(root / "claude", root / "codex", cache=cache)
+            self.assertEqual(first.candidate_file_count, 0)
+            patch = "*** Begin Patch\n*** Add File: /fictional/studio/worker.py\n+rpc('world.query')\n*** End Patch"
+            written = _codex_part(10, {"type": "function_call", "name": "functions.apply_patch",
+                                       "call_id": "write", "arguments": patch})
+            with path.open("a") as target:
+                _ = target.write(json.dumps(written) + "\n")
+            cached = scan_calls(root / "claude", root / "codex", cache=cache)
+            complete = scan_calls(root / "claude", root / "codex")
+            self.assertEqual((cached.candidate_file_count, cached.bytes_read), (1, path.stat().st_size))
+            self.assertEqual(cached.candidate_file_count, complete.candidate_file_count)
+            self.assertEqual(cached, complete)
+
+    def test_first_screenshot_replays_earlier_session_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "widget"
+            repo.mkdir()
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            encoded = re.sub(r"[^A-Za-z0-9]", "-", str(repo))
+            scratchpad = str(root / "claude-live" / encoded / "scratchpad")
+            claude_rows = [
+                {"timestamp": START.isoformat(), "type": "system", "cwd": str(repo), "sessionId": "claude-main",
+                 "message": {"content": "session opened"}},
+                _claude_part(1, "claude-main", "assistant", {"type": "tool_use", "id": "plain",
+                            "name": "Bash", "input": {"command": "echo browser"}}),
+                _claude_part(2, "claude-main", "user", {"type": "tool_result", "tool_use_id": "plain",
+                            "content": "done"}),
+                _claude_part(10, "claude-main", "assistant", {"type": "tool_use", "id": "shot",
+                            "name": "Bash", "input": {"command": "python3 hana_shot.py shot --view front"}}),
+                _claude_part(15, "claude-main", "user", {"type": "tool_result", "tool_use_id": "shot",
+                            "content": "saved /tmp/front.png"}),
+            ]
+            for row in claude_rows[1:3]:
+                row["cwd"] = str(repo)
+            for row in claude_rows[3:]:
+                row["cwd"] = scratchpad
+            thread_id = "01a11402-04d7-7440-890c-cceb61ba833b"
+            codex_rows = [
+                {"timestamp": START.isoformat(), "type": "event_msg", "payload": {"type": "turn_context"}},
+                {"timestamp": START.isoformat(), "type": "session_meta",
+                 "payload": {"id": thread_id, "cwd": str(repo)}},
+                _codex_part(1, {"type": "function_call", "name": "exec_command", "call_id": "plain",
+                                "arguments": json.dumps({"cmd": "pwd"})}),
+                _codex_part(2, {"type": "function_call_output", "call_id": "plain", "output": "done"}),
+                _codex_part(10, {"type": "function_call", "name": "exec_command", "call_id": "shot",
+                                 "arguments": json.dumps({"cmd": "python3 hana_shot.py shot --view front"})}),
+                _codex_part(15, {"type": "function_call_output", "call_id": "shot",
+                                 "output": "saved /tmp/front.png"}),
+            ]
+            for agent, rows, cuts in (("claude", claude_rows, (1, 3, 4, 5)),
+                                      ("codex", codex_rows, (1, 4, 5, 6))):
+                with self.subTest(agent=agent):
+                    scan_root = root / f"{agent}-scan"
+                    path = scan_root / agent / f"{agent}-session.jsonl"
+                    path.parent.mkdir(parents=True)
+                    cache = PersistentScanCache(scan_root / "cache.pickle")
+                    lines = [json.dumps(row) + "\n" for row in rows]
+                    previous = 0
+                    for stage, cut in enumerate(cuts):
+                        with path.open("a") as target:
+                            _ = target.write("".join(lines[previous:cut]))
+                        previous = cut
+                        cached = scan_calls(scan_root / "claude", scan_root / "codex", cache=cache)
+                        complete = scan_calls(scan_root / "claude", scan_root / "codex")
+                        cached_fields = [(call.project, call.project_attribution, call.cwd,
+                                          call.session_id, call.kind, call.image_paths) for call in cached]
+                        complete_fields = [(call.project, call.project_attribution, call.cwd,
+                                            call.session_id, call.kind, call.image_paths) for call in complete]
+                        self.assertEqual(cached_fields, complete_fields)
+                        self.assertEqual(cached.candidate_file_count, complete.candidate_file_count)
+                        self.assertEqual(cached.candidate_file_count, int(stage >= 2))
+                        if stage == 2:
+                            self.assertEqual(cached.bytes_read, path.stat().st_size)
+                    final_cached = scan_calls(scan_root / "claude", scan_root / "codex", cache=cache)
+                    self.assertEqual((len(final_cached), final_cached.bytes_read), (1, 0))
+                    self.assertEqual((final_cached[0].project, final_cached[0].image_paths),
+                                     ("widget", ("/tmp/front.png",)))
+                    self.assertEqual(final_cached[0].project_attribution,
+                                     "scratchpad" if agent == "claude" else "repository")
+
+    def test_cached_state_omits_transcript_lines_and_image_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "claude" / "large.jsonl"
+            payload = "A" * 2_000_000
+            _claude_case(transcript, [("Bash", "python3 hana_shot.py shot", "saved /tmp/view.png " + payload)])
+            cache = PersistentScanCache(root / "scan.pickle")
+            first = scan_calls(root / "claude", root / "codex", cache=cache)
+            self.assertEqual(len(first), 1)
+            self.assertEqual(first.bytes_read, transcript.stat().st_size)
+            self.assertLess(cache.path.stat().st_size, 100_000)
+            self.assertNotIn(payload[:100].encode(), cache.path.read_bytes())
+            self.assertEqual(scan_calls(root / "claude", root / "codex", cache=cache).bytes_read, 0)
+
+    def test_cache_version_and_damage_trigger_cold_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "claude" / "version.jsonl"
+            _claude_case(transcript, [("Bash", "python3 hana_shot.py shot", "saved /tmp/view.png")])
+            cache = PersistentScanCache(root / "scan.pickle")
+            self.assertEqual(len(scan_calls(root / "claude", root / "codex", cache=cache)), 1)
+            state = cast(CachedScanEvidence, pickle.loads(cache.path.read_bytes()))
+            state.format_version -= 1
+            _ = cache.path.write_bytes(pickle.dumps(state))
+            rebuilt = scan_calls(root / "claude", root / "codex", cache=cache)
+            self.assertEqual((len(rebuilt), rebuilt.bytes_read), (1, transcript.stat().st_size))
+            _ = cache.path.write_bytes(b"\x80\x04invalid")
+            repaired = scan_calls(root / "claude", root / "codex", cache=cache)
+            self.assertEqual((len(repaired), repaired.bytes_read), (1, transcript.stat().st_size))
+
+    def test_uncached_nonlocal_timing_matches_nonlocal_call(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _claude_case(root / "claude" / "remote.jsonl", [
+                ("Bash", "python3 hana_shot.py shot --view front", "saved /tmp/front.png"),
+            ])
+            timings = root / "timings.jsonl"
+            _ = timings.write_text(json.dumps({
+                "time": (START + timedelta(seconds=3)).isoformat(), "status": "success", "exit_code": 0,
+                "session": {"state": "present", "value": "remote"}, "attempts": [
+                    {"status": "success", "image_paths": ["/tmp/front.png"]},
+                ],
+            }) + "\n")
+            calls = scan_calls(root / "claude", root / "codex", AvailableTimingSource(timings, "mac"),
+                               source_host="mac")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0].source_host, "mac")
+            self.assertIsInstance(calls[0].attempt_evidence, ExactOrderedCaptureAttempts)
+            self.assertEqual(calls.invocations[0].identity.source_host, "mac")
+
+    def test_cached_partial_json_line_completes_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "claude" / "partial.jsonl"
+            path.parent.mkdir()
+            cache = PersistentScanCache(root / "scan.pickle")
+            use = _claude_part(0, "partial", "assistant", {"type": "tool_use", "id": "shot",
+                              "name": "Bash", "input": {"command": "python3 hana_shot.py shot"}})
+            result = _claude_part(5, "partial", "user", {"type": "tool_result", "tool_use_id": "shot",
+                                 "content": "saved /tmp/view.png"})
+            encoded = json.dumps(use) + "\n"
+            _ = path.write_text(encoded[:len(encoded) // 2])
+            self.assertEqual(len(scan_calls(root / "claude", root / "codex", cache=cache)), 0)
+            self.assertEqual(scan_calls(root / "claude", root / "codex", cache=cache).bytes_read, 0)
+            with path.open("a") as target:
+                _ = target.write(encoded[len(encoded) // 2:] + json.dumps(result) + "\n")
+            calls = scan_calls(root / "claude", root / "codex", cache=cache)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(scan_calls(root / "claude", root / "codex", cache=cache).bytes_read, 0)
+
+    def test_cached_script_write_and_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "claude" / "script.jsonl"
+            _claude_tools(path, [
+                ("Write", {"file_path": "shot.sh", "content": "grim /tmp/view.png"}, False),
+                ("Bash", {"command": "bash shot.sh"}, False),
+                ("Bash", {"command": "rm shot.sh"}, False),
+                ("Bash", {"command": "bash shot.sh"}, False),
+            ], "/fictional/studio")
+            rows = path.read_text().splitlines(keepends=True)
+            cache = PersistentScanCache(root / "scan.pickle")
+            _ = path.write_text("".join(rows[:2]))
+            first = scan_calls(root / "claude", root / "codex", cache=cache)
+            self.assertEqual(len(first), 0)
+            for end, expected in ((4, 1), (6, 1), (8, 1)):
+                with path.open("a") as target:
+                    _ = target.write("".join(rows[end - 2:end]))
+                incremental = scan_calls(root / "claude", root / "codex", cache=cache)
+                full = scan_calls(root / "claude", root / "codex")
+                self.assertEqual(len(incremental), expected)
+                self.assertEqual(incremental, full)
+            self.assertEqual(scan_calls(root / "claude", root / "codex", cache=cache).bytes_read, 0)
+
+    def test_cached_use_result_timing_and_later_citation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "claude" / "session.jsonl"
+            path.parent.mkdir()
+            cache = PersistentScanCache(root / "state" / "scan.pickle")
+            timings = root / "timings.jsonl"
+            use = {"timestamp": START.isoformat(), "cwd": "/fictional/studio", "sessionId": "session",
+                   "type": "assistant", "message": {"content": [{"type": "tool_use", "id": "one", "name": "Bash",
+                   "input": {"command": "python3 hana_shot.py shot --view front"}}]}}
+            result = {"timestamp": (START + timedelta(seconds=20)).isoformat(), "cwd": "/fictional/studio",
+                      "sessionId": "session", "type": "user", "message": {"content": [{"type": "tool_result",
+                      "tool_use_id": "one", "content": "saved /tmp/kept.png"}]}}
+            citation = {"timestamp": (START + timedelta(seconds=25)).isoformat(), "cwd": "/fictional/studio",
+                        "sessionId": "session", "type": "assistant", "message": {"content": [{"type": "text",
+                        "text": "Using /tmp/kept.png"}]}}
+            _ = path.write_text(json.dumps(use) + "\n")
+            first = scan_calls(root / "claude", root / "codex", cache=cache)
+            self.assertEqual((len(first), first.bytes_read > 0), (0, True))
+            timing: dict[str, object] = {"time": (START + timedelta(seconds=15)).isoformat(), "status": "success", "exit_code": 0,
+                      "invocation_kind": "shot", "session": {"state": "present", "value": "session"},
+                      "attempts": [{"status": "failure", "failure_reason": "black_capture", "image_paths": []},
+                                   {"status": "success", "image_paths": ["/tmp/kept.png"]}]}
+            _ = timings.write_text(json.dumps(timing) + "\n")
+            second = scan_calls(root / "claude", root / "codex", AvailableTimingSource(timings, "local"), cache)
+            self.assertEqual((len(second), len(second.invocations)), (0, 1))
+            with path.open("a") as target:
+                _ = target.write(json.dumps(result) + "\n")
+            third = scan_calls(root / "claude", root / "codex", AvailableTimingSource(timings, "local"), cache)
+            self.assertEqual((len(third), len(third[0].attempt_evidence.captures)
+                              if isinstance(third[0].attempt_evidence, ExactOrderedCaptureAttempts) else -1), (1, 2))
+            with path.open("a") as target:
+                _ = target.write(json.dumps(citation) + "\n")
+            fourth = scan_calls(root / "claude", root / "codex", AvailableTimingSource(timings, "local"), cache)
+            episodes = split_episodes(fourth, 300)
+            self.assertEqual([episode.kept_shot for episode in episodes], [OneCitedShot(1)])
+            self.assertIsInstance(episodes[0].attempt_count_evidence, ExactOrderedCaptureAttempts)
+            saved = root / "episodes.jsonl"
+            write_episodes(saved, episodes)
+            self.assertIsInstance(read_episodes(saved)[0].attempt_count_evidence, ExactOrderedCaptureAttempts)
+            quiet = scan_calls(root / "claude", root / "codex", AvailableTimingSource(timings, "local"), cache)
+            self.assertEqual((len(quiet), quiet.bytes_read), (1, 0))
+
     def _script_calls(self, session: str) -> list[ToolCall]:
         calls = scan_calls(CLASSIFY / "claude" / "projects", CLASSIFY / "codex" / "sessions")
         return [call for call in calls if call.session_id == session]
