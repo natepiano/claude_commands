@@ -84,7 +84,7 @@ The user, via natedev, 2026-10-07 (relayed in the showrunner's words):
 
 **Ruled out:** hiding a live unit's wait on a retired unit, which would hide a stuck unit; skipping retired rows in `merge_checkpoint.py`, `ci_points.py` and `production_lifecycle.py`, which read every row because a retired unit sends no checkpoint and the wrap already passes a unit whose branch is gone.
 
-### Phase 2 — The recorder keeps a row for closing work and counts every code finding  · status: todo
+### Phase 2 — The recorder keeps a row for closing work and counts every code finding  · status: done
 
 #### Work Order
 
@@ -114,7 +114,7 @@ Part C, the retired marker (`scripts/production/add_unit.py`, `docs/production_f
 
 - Today `RETIRED = re.compile(r"\bretired\b")` is searched anywhere in a Units row's Plan cell. This unit's own row said `follow-up: retired units drop out of the status`, so the status output, the dailies, the waits and the stall watch all skipped a live unit.
 - New rule: a row is retired only when its Plan cell begins with the word `retired`, alone or straight after one opening parenthesis: `retired by the user 2026-10-07 …` or `(retired by the user 2026-10-07, worktree removed) …`. Leading spaces are ignored. The word is lower case and whole (`retiredness` does not count). The word anywhere later in the cell means nothing, and that includes later inside a leading parenthesis: `(run done; retired by the user)` is a live row.
-- One place holds the rule: one name in `add_unit.py` that answers "is this Plan cell retired", used by `live_unit_rows`, `retired_sessions` and `retired_units`. No other file tests the word.
+- One place holds the rule: one name in `add_unit.py` that answers "is this Plan cell retired", used by `live_unit_rows`, `retired_sessions` and `retired_units`, and by `finished_run_units` in `scripts/production/stall_watch.py`, which today imports the pattern and searches the Plan cell itself. No other file tests the word.
 - `docs/production_format.md`, the retired paragraph: say the Plan cell begins with `retired`, alone or inside an opening parenthesis, give the example `(retired by the user 2026-10-07, worktree removed)`, and say the word anywhere else in the cell changes nothing. Drop the sentence that a live unit's Plan cell never uses the word.
 - Tests (`scripts/production/test_add_unit.py`): a Units table built from rows of the real production doc `docs/plans/build-followups-production.md` (copy the rows into the test; read the doc, never write it, and do not open it from the test): the stalls-unit row with its Plan cell opening `(retired by the user 2026-10-07; run done, worktree removed)`, this unit's row with the Plan cell that tripped the old rule (`… (follow-up: retired units drop out of the status and a simple dailies groups idle units; …`), and one more live row. `retired_units` is exactly `{"stalls-unit"}`, `retired_sessions` is exactly that row's session, and `live_unit_rows` keeps the other two. Also: `retired` first, `(retired` first, the word mid-cell, `(run done; retired by the user)`, `retiredness`, and `Retired`, each with its expected answer (the last four are live).
 - Two fixtures written under the old rule mark a row with `(run done; retired by the user)`: `scripts/production/test_live_units.py` (line 60) and `scripts/production/test_dailies_input.py` (line 296). Change each to open with `(retired by the user; run done)` and change nothing else in those files.
@@ -135,13 +135,15 @@ Tests (`scripts/delegate/test_progress_history.py`), each driving the script as 
 - `scripts/production/test_add_unit.py`
 - `scripts/production/test_live_units.py`
 - `scripts/production/test_dailies_input.py`
+- `scripts/production/stall_watch.py`
+- `scripts/production/test_stall_watch.py`
 
 **Seats:** 1 writer + 1 tester. Both defects sit in one file, so one seat writes the code and the other the tests.
 - `impl` — `scripts/delegate/progress_history.py` (parts A and B) and `scripts/production/review_regime.py` (the words).
 - `test` — `scripts/delegate/test_progress_history.py`: the cases listed under Tests, written from this Work Order while the writer works, then run against the writer's code.
 
-Part C arrived after those two seats launched and shares no file with them. It runs beside them in a third seat, `fix2`, opening as a writer: `scripts/production/add_unit.py`, `docs/production_format.md`, `scripts/production/test_add_unit.py`, `scripts/production/test_live_units.py`, `scripts/production/test_dailies_input.py`.
+Part C arrived after those two seats launched and shares no file with them. It runs beside them in a third seat, `fix2`, opening as a writer: `scripts/production/add_unit.py`, `docs/production_format.md`, `scripts/production/test_add_unit.py`, `scripts/production/test_live_units.py`, `scripts/production/test_dailies_input.py`, and `scripts/production/stall_watch.py` with `scripts/production/test_stall_watch.py`.
 
-**Constraints from prior phases:** Parts A and B share no file with phase 1. Part C repairs phase 1's marker: `live_unit_rows`, `retired_sessions` and `retired_units` in `add_unit.py` are its three readers, and every other script reaches the marker through them. Other units run this recorder from `~/.claude/scripts/delegate/` while this phase edits the worktree's copy, so nothing here may change an event's existing fields, the state file's existing keys, or any line `progress` prints: only `start-activity`'s refusal rule and `review-trial`'s code number change. Tests write only under a temporary session directory.
+**Constraints from prior phases:** Parts A and B share no file with phase 1. Part C repairs phase 1's marker: `live_unit_rows`, `retired_sessions` and `retired_units` in `add_unit.py` are its three readers in that file; `finished_run_units` in `stall_watch.py` reads the marker too, and every other script reaches it through those three. Other units run this recorder from `~/.claude/scripts/delegate/` while this phase edits the worktree's copy, so nothing here may change an event's existing fields, the state file's existing keys, or any line `progress` prints: only `start-activity`'s refusal rule and `review-trial`'s code number change. Tests write only under a temporary session directory.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/delegate -p 'test_progress_history.py'` green; `python3 -m unittest discover -s scripts/production -p 'test_merge_checkpoint.py'` green (it parses the review line); `python3 -m unittest discover -s scripts/production -p 'test_*.py'` green; `basedpyright` on each changed `.py` file ends `0 errors, 0 warnings, 0 notes`. Live check by the unit director: in a scratch session directory, `start-run`, `start-phase`, `finish-phase`, then `start-activity --label shrink` and `finish-activity` both exit 0.

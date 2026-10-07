@@ -847,6 +847,242 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(state["LAST_RESTART"], str(report_at))
         self.assertEqual(state["NEXT_DUE"], str(report_at + 15 * 60))
 
+    def test_an_activity_after_a_closed_phase_keeps_the_phase_record(self) -> None:
+        started_at = 21_000
+        session_dir = self.start_run("closed-phase-activity", started_at)
+        self.start_phase(session_dir, started_at + 10)
+        _ = self.run_command(
+            "finish-phase",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            at=started_at + 100,
+        )
+        phase_before = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        phase_instance_id = cast(str, phase_before["instance_id"])
+
+        _ = self.run_command(
+            "start-activity",
+            "--session-dir",
+            str(session_dir),
+            "--label",
+            "Shrink",
+            "--activity",
+            "recording the as-built phase",
+            at=started_at + 110,
+        )
+        _ = self.run_command(
+            "finish-activity",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            "--result",
+            "pass",
+            at=started_at + 140,
+        )
+
+        phase_after = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        self.assertEqual(phase_after, phase_before)
+        self.assertEqual(phase_after["status"], "completed")
+        self.assertEqual(phase_after["finished_at"], float(started_at + 100))
+        phase_finished_events = [
+            event
+            for event in self.read_events("closed-phase-activity")
+            if event.get("event_type") == "phase_finished"
+        ]
+        self.assertEqual(len(phase_finished_events), 1)
+        self.assertEqual(phase_finished_events[0].get("phase_elapsed_seconds"), 90)
+        activity_events = [
+            event
+            for event in self.read_events("closed-phase-activity")
+            if event.get("event_type") in {"activity_started", "activity_finished"}
+        ]
+        self.assertEqual(
+            [event.get("event_type") for event in activity_events],
+            ["activity_started", "activity_finished"],
+        )
+        self.assertEqual(
+            {event.get("phase_instance_id") for event in activity_events},
+            {phase_instance_id},
+        )
+        self.assertEqual(activity_events[-1].get("status"), "completed")
+        self.assertEqual(activity_events[-1].get("activity_result"), "pass")
+        self.assertEqual(activity_events[-1].get("activity_elapsed_seconds"), 30)
+
+    def test_repeating_finish_phase_keeps_a_closed_phase_activity_open(self) -> None:
+        started_at = 21_500
+        session_dir = self.start_run("repeated-phase-finish", started_at)
+        self.start_phase(session_dir, started_at + 10)
+        _ = self.run_command(
+            "finish-phase",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            at=started_at + 100,
+        )
+        phase_before = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        _ = self.run_command(
+            "start-activity",
+            "--session-dir",
+            str(session_dir),
+            "--label",
+            "Shrink",
+            "--activity",
+            "recording the as-built phase",
+            at=started_at + 110,
+        )
+        _ = self.run_command(
+            "finish-phase",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            at=started_at + 120,
+        )
+        phase_after = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        self.assertEqual(phase_after["status"], phase_before["status"])
+        self.assertEqual(phase_after["finished_at"], phase_before["finished_at"])
+        _ = self.run_command(
+            "finish-activity",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            "--result",
+            "pass",
+            at=started_at + 150,
+        )
+
+        events = self.read_events("repeated-phase-finish")
+        phase_finished_events = [
+            event for event in events if event.get("event_type") == "phase_finished"
+        ]
+        self.assertEqual(len(phase_finished_events), 1)
+        activity_finished_events = [
+            event for event in events if event.get("event_type") == "activity_finished"
+        ]
+        self.assertEqual(len(activity_finished_events), 1)
+        self.assertEqual(activity_finished_events[0].get("status"), "completed")
+        self.assertEqual(activity_finished_events[0].get("activity_result"), "pass")
+        self.assertEqual(
+            activity_finished_events[0].get("activity_elapsed_seconds"), 40
+        )
+
+    def test_start_activity_distinguishes_missing_phase_from_finished_run(self) -> None:
+        started_at = 22_000
+        no_phase = self.start_run("activity-without-phase", started_at)
+        refused = self.run_failing_command(
+            "start-activity",
+            "--session-dir",
+            str(no_phase),
+            "--label",
+            "Verification",
+            "--activity",
+            "running checks",
+            at=started_at + 10,
+        )
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("Start a phase before starting an activity", refused.stderr)
+
+        finished = self.start_run("activity-after-run", started_at + 100)
+        self.start_phase(finished, started_at + 110)
+        _ = self.run_command(
+            "finish-phase",
+            "--session-dir",
+            str(finished),
+            "--status",
+            "completed",
+            at=started_at + 120,
+        )
+        _ = self.run_command(
+            "finish-run",
+            "--session-dir",
+            str(finished),
+            "--status",
+            "completed",
+            at=started_at + 130,
+        )
+        refused = self.run_failing_command(
+            "start-activity",
+            "--session-dir",
+            str(finished),
+            "--label",
+            "Verification",
+            "--activity",
+            "running checks",
+            at=started_at + 140,
+        )
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("run is finished", refused.stderr.lower())
+
+    def test_a_closed_phase_activity_is_interrupted_by_the_next_phase_or_run_end(
+        self,
+    ) -> None:
+        for index, ending in enumerate(("next phase", "run end")):
+            with self.subTest(ending=ending):
+                started_at = 23_000 + index * 1_000
+                name = f"closed-activity-{index}"
+                session_dir = self.start_run(name, started_at)
+                self.start_phase(session_dir, started_at + 10)
+                phase = cast(dict[str, object], self.read_state(session_dir)["phase"])
+                phase_instance_id = cast(str, phase["instance_id"])
+                _ = self.run_command(
+                    "finish-phase",
+                    "--session-dir",
+                    str(session_dir),
+                    "--status",
+                    "completed",
+                    at=started_at + 100,
+                )
+                _ = self.run_command(
+                    "start-activity",
+                    "--session-dir",
+                    str(session_dir),
+                    "--label",
+                    "Shrink",
+                    "--activity",
+                    "recording the completed phase",
+                    at=started_at + 110,
+                )
+                if ending == "next phase":
+                    _ = self.run_command(
+                        "start-phase",
+                        "--session-dir",
+                        str(session_dir),
+                        "--phase-id",
+                        "4",
+                        "--phase-title",
+                        "Final checks",
+                        at=started_at + 140,
+                    )
+                else:
+                    _ = self.run_command(
+                        "finish-run",
+                        "--session-dir",
+                        str(session_dir),
+                        "--status",
+                        "completed",
+                        at=started_at + 140,
+                    )
+
+                finished_events = [
+                    event
+                    for event in self.read_events(name)
+                    if event.get("event_type") == "activity_finished"
+                ]
+                self.assertEqual(len(finished_events), 1)
+                self.assertEqual(
+                    finished_events[0].get("phase_instance_id"), phase_instance_id
+                )
+                self.assertEqual(finished_events[0].get("status"), "interrupted")
+                self.assertEqual(finished_events[0].get("activity_result"), "")
+                self.assertEqual(
+                    finished_events[0].get("activity_elapsed_seconds"), 30
+                )
+
     def close_the_only_pass(self, session_dir: Path, at: int) -> None:
         """Finish the pass `start_phase_and_pass` opened: reviews closed, no writer yet."""
         _ = self.run_command(
@@ -2425,6 +2661,13 @@ class ProgressHistoryTests(unittest.TestCase):
             events.append(cast(dict[str, object], parsed))
         return events
 
+    def read_state(self, session_dir: Path) -> dict[str, object]:
+        state_text = (session_dir / "progress_history_state.json").read_text(
+            encoding="utf-8"
+        )
+        parsed: object = json.loads(state_text)  # pyright: ignore[reportAny]
+        return cast(dict[str, object], parsed)
+
     def table_rows(self, rendered: str, header: list[str]) -> list[list[str]]:
         rows = [
             [cell.strip() for cell in line.removeprefix("| ").removesuffix(" |").split(" | ")]
@@ -2722,7 +2965,7 @@ class ProgressHistoryTests(unittest.TestCase):
 
         # 3050 s is 50.8 minutes, which rounds to 51 rather than truncating to 50.
         expected = (
-            "review trial: ux 1 findings, code 2 findings, review-seat minutes 51, "
+            "review trial: ux 1 findings, code 4 findings, review-seat minutes 51, "
             + "ux check minutes 6, ux repair minutes 0"
         )
         self.assertEqual(
@@ -2737,6 +2980,68 @@ class ProgressHistoryTests(unittest.TestCase):
             self.run_command("review-trial", "--session-dir", str(session_dir), at=base + 5_700),
             expected,
         )
+
+    def test_review_trial_counts_each_code_finding_once(self) -> None:
+        self.write_full_config()
+        started_at = 71_000
+        session_dir = self.start_run("code-findings", started_at)
+        self.start_phase(session_dir, started_at + 10)
+
+        def assert_trial_counts(ux_findings: int, code_findings: int, at: int) -> None:
+            self.assertEqual(
+                self.run_command(
+                    "review-trial", "--session-dir", str(session_dir), at=at
+                ),
+                f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
+                + "review-seat minutes 0, ux check minutes 0, ux repair minutes 0",
+            )
+
+        for index, lens in enumerate(("adversary,contract", "contract", "contract")):
+            _ = self.run_findings(
+                session_dir,
+                "open",
+                "--severity",
+                "minor",
+                "--title",
+                f"code finding {index}",
+                "--caught-by",
+                "delegate",
+                "--lens",
+                lens,
+                at=started_at + 20 + index,
+            )
+        _ = self.run_findings(
+            session_dir,
+            "open",
+            "--severity",
+            "minor",
+            "--title",
+            "unit director finding",
+            "--caught-by",
+            "delegate",
+            at=started_at + 30,
+        )
+        assert_trial_counts(0, 4, started_at + 40)
+
+        for offset, lens, ux_findings, code_findings in (
+            (50, "ux", 1, 4),
+            (51, "ux,craft", 2, 5),
+            (52, "both", 2, 6),
+        ):
+            _ = self.run_findings(
+                session_dir,
+                "open",
+                "--severity",
+                "minor",
+                "--title",
+                f"finding from {lens}",
+                "--caught-by",
+                "delegate",
+                "--lens",
+                lens,
+                at=started_at + offset,
+            )
+            assert_trial_counts(ux_findings, code_findings, started_at + offset + 1)
 
     def test_review_trial_reports_the_screenshot_check_and_its_repair_minutes(self) -> None:
         """The check's own minutes, and only the fix rounds that covered a ux finding."""
@@ -2776,7 +3081,7 @@ class ProgressHistoryTests(unittest.TestCase):
         # 150 s rounds to 3 minutes, not 2.
         self.assertEqual(
             self.run_command("review-trial", "--session-dir", str(session_dir), at=base + 6_000),
-            "review trial: ux 1 findings, code 0 findings, review-seat minutes 3, "
+            "review trial: ux 1 findings, code 1 findings, review-seat minutes 3, "
             + "ux check minutes 3, ux repair minutes 20",
         )
 

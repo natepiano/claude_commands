@@ -293,7 +293,7 @@ class DailiesInputTests(unittest.TestCase):
                 self.assertEqual(rendered.returncode, 0, rendered.stderr)
 
     def test_retired_unit_needs_no_status_or_judgment_entry(self) -> None:
-        retired_row = (f"| `{BETA}` | (run done; retired by the user) | `{self.root / 'beta'}` | "
+        retired_row = (f"| `{BETA}` | (retired by the user; run done) | `{self.root / 'beta'}` | "
                        f"`beta` | `{BETA}` | — | — |")
         content = self.doc.read_text(encoding="utf-8")
         _ = self.doc.write_text(content.replace("\n\n## Gates", f"\n{retired_row}\n\n## Gates"),

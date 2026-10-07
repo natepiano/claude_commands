@@ -18,7 +18,7 @@ from typing import NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 import showrunners
-from add_unit import RETIRED, cell_value
+from add_unit import cell_value, plan_cell_is_retired
 
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
@@ -148,7 +148,7 @@ def finished_run_units(runner: showrunners.RunningShowrunner) -> set[str]:
             cells = line.split("|")
             if (len(cells) >= 4 and not cells[0].strip()
                     and (re.search(r"\brun done\b", cells[2]) is not None
-                         or RETIRED.search(cells[2]) is not None)):
+                         or plan_cell_is_retired(cells[2]))):
                 finished.add(cells[1].strip())
                 if len(cells) >= 6:
                     finished.add(cell_value(cells[5]))
