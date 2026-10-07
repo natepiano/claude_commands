@@ -291,28 +291,22 @@ Real-code check, `objdump -d -C --no-show-raw-insn` counted per function, on two
 
 ### Phase 7 — Codex seats' build rows carry the seat's own thread id · status: done
 
-#### Work Order
+#### As-built
 
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`, branch `build-followups-mul-add`. State every time in PDT.
-
-**Goal:** a delegated Codex seat's buildlog rows record the seat's own `CODEX_THREAD_ID` as `session`, not its director's `CLAUDE_CODE_SESSION_ID` (showrunner, 2026-10-06 19:0x PDT: screenshot-unit read the app-server's environment, and a Codex seat inherits its director's Claude session id).
-
-**Constraints from prior phases:**
-- `scripts/buildlog/record.py` and `scripts/buildlog/test_record.py` are not this unit's (the Units row gives `scripts/buildlog/` to `followups-unit`): this phase edits them on the showrunner's word only, touching the one expression below and the one test, and the checkpoint notice names both as `also touches <path> (owner followups-unit), tested against <owner tip>`.
-- Python is typed throughout with no `Any` and no file-level type ignores; tests never write the real `~/.local/state/buildlog`.
-
-**Spec:**
-- In `who()` (`scripts/buildlog/record.py`, the `"session"` entry, line 165), read `CODEX_THREAD_ID` first and `CLAUDE_CODE_SESSION_ID` second, still `None` when neither is set: `env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID") or None`. Change nothing else in the file: `caller` (`CLAUDECODE` or `CODEX_THREAD_ID` reads `agent`) stays, and no existing row is rewritten.
-- In `scripts/buildlog/test_record.py` add one test, named for the behavior (`test_session_prefers_codex_thread_id`), that records with an environment holding both `CODEX_THREAD_ID` and `CLAUDE_CODE_SESSION_ID` and asserts the stored `session` is the thread id. It also asserts an environment with only `CLAUDE_CODE_SESSION_ID` stores that one, and one with neither stores `None`. `test_caller_precedence` and `test_call_record_fields` keep passing unchanged: the first holds only `CODEX_THREAD_ID`, the second only `CLAUDE_CODE_SESSION_ID`.
-- Before finishing, search `scripts/` for readers of a record's `session` field (`grep -rn '"session"\|session' scripts/buildlog scripts/delegate`) and report any that assumes the Claude id wins; change none of them.
+- `who()` in `scripts/buildlog/record.py` stores `env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID") or None` as `session`. A Codex seat inherits its director's Claude session id, so the thread id comes first and a Codex seat's rows carry the seat's own id. A Claude seat's rows are unchanged, an environment with neither id stores `None`, `caller` is unchanged, and no recorded row is rewritten.
+- `test_session_prefers_codex_thread_id` in `scripts/buildlog/test_record.py` records under an environment holding both ids (stores the thread id), only the Claude id (stores it) and neither (stores `None`).
+- `report.py` groups on `coalesce(delegate_session, session)` and `loop.py` groups failed calls by seat and session; neither assumes the Claude id wins. `scripts/agents/agents_config.sh` (`_agents_caller_family`) already lets Codex win when both ids are present.
+- Measured at ship: the buildlog suite, 255 tests, passes; basedpyright reports 0 errors and 0 warnings on both files.
 
 **Files:**
-- `scripts/buildlog/record.py` — the `session` precedence in `who()`
-- `scripts/buildlog/test_record.py` — the both-ids test
+- `scripts/buildlog/record.py` — the session precedence in `who()` (the follow-ups unit's file, edited at the showrunner's word)
+- `scripts/buildlog/test_record.py` — the three-case test
 
-**Seats:** 1 writer — `impl` owns both files; the change is one expression and one test.
+**Binds later work:**
+- Rows a Codex seat recorded before this change merged name the director's Claude session; rows after it name the seat's thread. It is live on natedev from 2026-10-06 19:24:53 PDT and on the Mac from its next pull of `~/.claude`. The re-measure states which rows of its window came after, and does not compare a Codex seat's `loop.py` gaps across that line.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/buildlog -p 'test_record.py'` exits 0 and runs the new test; `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` exits 0; `basedpyright scripts/buildlog/record.py scripts/buildlog/test_record.py` ends `0 errors, 0 warnings, 0 notes`.
+**Ruled out:**
+- Rewriting rows already recorded — the change fixes the precedence only.
 
 ### Phase 8 — Re-measure: long functions and multiply-adds out of hana's clippy failures · status: todo
 
