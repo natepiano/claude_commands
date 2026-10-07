@@ -90,41 +90,51 @@ None.
 
 **Ruled out:** classifying a shell command by searching its whole text (it counted rg/cat/echo mentions and dropped real shots); treating heredoc bodies as text (a body fed to python/bash/sh runs).
 
-### Phase 2 — Screenshot scripts run in later calls count as screenshots · status: todo
+### Phase 2 — Screenshot scripts run in later calls count as screenshots · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a screenshot taken by a script the agent wrote earlier counts. Today a script written in one call (the Write tool, or a `cat >`/`tee` heredoc) and run in a later call is invisible: the later call holds only the script's path, so the report undercounts by-hand time in the projects that script their shots.
+- `transcripts.py` remembers scripts per transcript as `RememberedScript` (`content`, `classification_state`, `source`, `screenshot_calls`, `selected_content`). Sources: Claude `Write`, `Edit` of a remembered file, Codex `apply_patch` add/update/delete, `cat >`/`cat >>`/`tee` heredocs, and shell removals. Each script is tracked by normalized path and current content, so an append, replacement or deletion changes what a later run counts. Python content classifies through `_code_result` and shell content through `_shell_classification`, the same executing forms that classify a live call; there is no second classifier. Both readers read Write, Edit, `apply_patch` and path-only shell runs before their row filters; the Claude reader skips a `tool_result` line only when none of its `tool_use_id`s is pending.
+- A later shell call links to a remembered script through `python3`/`bash`/`sh`/`zsh <path>`, `./path`, `source`/`. path`, wrappers such as `timeout`, `os.exec*` and `subprocess.run`, by full path or by name relative to the call's directory (including `cd`). A remembered file that runs another remembered screenshot file is itself a screenshot file.
+- A run counts as a screenshot only when its arguments select the screenshot branch of a script that dispatches on arguments (argparse options and aliases, shell `$N` tests, `case`, sourced functions in command position); `selected_content` holds that branch. Any other run is a related call. `/hana_shot` calls are classified from their command line and never pass through script memory.
+- Image count of a scripted shot: the distinct `.png` paths in the result; with none, the screenshot calls the selected content makes (loops, `range()`, called functions, functions passed by reference, decorators), at least 1. One shell command running several scripts counts each.
+- `ToolCall` carries `script_path`, `script_paths` and `project_attribution`, which replaces `project_is_fallback: bool`. `ProjectAttribution` has five values: repository, scratchpad, last_path, removed_worktree, scratchpad_target_missing. A cwd under `/tmp/claude-<uid>/<encoded project dir>/<session>/scratchpad/…` belongs to the repository its encoded directory names (worktrees folded); a worktree deleted after the session folds into the live repository whose name it carries. The fold runs at the end of `scan_calls` over every call.
+- `scan_calls` reads transcripts in a `ProcessPoolExecutor` (up to 4 workers, one transcript per task, input sorted largest first) and returns `TranscriptScan` (a list of `ToolCall` with `candidate_file_count` and `bytes_read`); `shot_report.py scan` prints both. The scan only reads transcripts.
 
-**Spec:**
-- Within one transcript, remember each file a call writes whose content takes a screenshot or makes a related BRP call by Phase 1's executing forms: a Claude `Write` (and `Edit` of a file already remembered), a Codex `apply_patch` add or update, and a `cat >`/`cat >>`/`tee` heredoc in a shell command.
-- A later shell call that runs a remembered file — `python3 <path>`, `bash`/`sh`/`zsh <path>`, `./<path>`, `source`/`. <path>`, a wrapper such as `timeout 580 <path>`, by full path or by name relative to the call's directory — is a shot call (or a related call) with the file's source. A remembered file that runs another remembered screenshot file is itself a screenshot file.
-- A scripted shot call's image count is the distinct `.png` paths in its result; with none, the number of screenshot calls in the file, at least 1. Apply the same rule to a single shell command that takes several shots (a loop, a heredoc), which counts one image today.
-- In the Claude reader, a `tool_result` line is skipped only when none of its `tool_use_id`s is pending, not just the first.
-- A cwd under a Claude scratchpad (`/tmp/claude-<uid>/<encoded project dir>/<session>/scratchpad/…`) belongs to the project its encoded directory names (`-home-natepiano-rust-widget-enhancements` → that repository, worktrees folded), not to a project called `scratchpad`. Phase 1's real report shows 8 such episodes, 1.04 h.
-- The full scan took 48 s in the repair seat and 98 s in the unit director's default run on 2026-10-06; find what varies and hold it at 60 s or less.
-- Probe of the real transcripts on 2026-10-06 (loose match): 87 scripts written with a screenshot call, up to 487 later runs of them. State the measured counts in the As-built.
-- Both readers filter rows before classifying (Claude skips tool uses without a screenshot hint; Codex skips calls the classifier does not recognise). Read Write, Edit, `apply_patch` and path-only shell runs before those filters, or a later run that holds only a path never reaches the linker.
-- Track each remembered script by normalized path and its current content: an append, replacement or deletion updates it, so a run counts only the calls the file holds at that moment. Classify Python content with `_code_result` and shell content with `_shell_classification`.
-- Project attribution is a named state — resolved repository, decoded from a scratchpad path, or last-path fallback — replacing `ToolCall.project_is_fallback: bool`.
-- A heredoc script written and run in the same shell call already counts (Phase 1); the new tests cover runs in a later call.
+**Measured** (2026-10-06 unless noted):
+- Seed Claude MCP subset: 519 episodes / 47.65 h, unchanged.
+- By hand at the 300 s split, 2026-09-09 to the `/hana_shot` rollout: 584 episodes / 53.73 h (the figure before scripted runs counted was 568 / 51.89 h).
+- Real default scan, 18:09 PDT: 26,124 calls, 3,038 candidate files, 13.83 GB read, 39.6 s wall / 85.2 s user / 69.7 s sys, under load average 23/37/61.
+- Same-load A/B/B/A: before the repair rounds 27.7 s wall / 69.6 s user; final 31.4 s wall / 76.6 s user (+13% wall, +10% CPU).
+- Seat probe: 80 shot/bash_brp + 4 spectacle + 339 related scripts remembered; 140 later shot runs linked; 491 scratchpad calls all map to hana (26 by-hand episodes at the 300 s split before the rollout).- The 48 s vs 98 s scan difference came from transcript traversal (page cache and machine load), not the state-file location. Keeping ordinary source and prose files out of the script-name filter cut the traversal.
+- 69 tests; basedpyright 0 errors, 0 warnings, 0 notes. Tests never read the real `~/.claude/projects`, `~/.codex` or `~/.cache/hana-shot`.
 
 **Files:**
-- `scripts/shot_report/transcripts.py` — remembered script files per transcript; script-run detection; image counts for scripted shots
-- `scripts/shot_report/test_transcripts.py` and `scripts/shot_report/fixtures/classify/` — tests and samples
+- `scripts/shot_report/transcripts.py` — script memory, run linking, branch selection, image counts, attribution, worker-pool scan
+- `scripts/shot_report/shot_report.py` — scan summary line (candidate files, bytes read)
+- `scripts/shot_report/test_transcripts.py`, `scripts/shot_report/fixtures/classify/{claude,codex}/` — the 69 tests and the write-and-run samples
 
-**Seats:** 1 writer + 1 tester — the test lane is `scripts/shot_report/`, and the Spec names each write and run form.
-- `impl` — `transcripts.py`; runs the real-data probe and one scan
-- `test` — `test_transcripts.py` and `fixtures/classify/`: a Write then a later run, a `cat >` heredoc then a later `./` run, a script sourcing another screenshot script, a written script never run, a loop taking three shots, and a two-result line
+**Binds later work:**
+- Remembered script content and removals decide how a later run counts, so a transcript is not independent of its earlier bytes. The remembered-script memory lives for one transcript's read; the incremental scan persists it beside the cursor and reruns the repository fold over cached and new calls. Acceptance for that: a script written before the cursor and run after it counts once across two consecutive incremental runs.
+- Kept-shot detection reads a scripted shot's image paths from the later run's result; `ToolCall.script_path` names the script it ran. A `/hana_shot` call skips script memory.
+- One transcript is the pool's unit of work. The full scan runs 30–40 s, so a 30 s no-news bound needs the incremental cache; its before/after table starts from the numbers above.
+- `RememberedScript` and `project_attribution` are implementation-only: the episode record carries `project` alone.
 
-**Constraints from prior phases:** Phase 1's executing forms in `_shell_classification` decide whether a file's content takes a screenshot; reuse them, never a second classifier. Tests never read real transcripts. The full scan stays at 60 s or less.
+**Gotchas:**
+- A script's classification depends on its current content and the run's arguments; one file can be a shot in one call and a related call in another.
+- The 60 s scan bound holds only while ordinary source and prose files stay out of the script-name filter; wall time also swings with page cache and machine load.
+- Six known limits, each a script shape none of 20 hand-read real runs showed, left uncounted until a real transcript shows one:
+  1. `os.execle`/`os.execlpe` with a non-literal env expression is not followed.
+  2. A zero-iteration loop (`range(0)`, an empty list) still reports one image.
+  3. An omitted argparse option falls back to the first argument.
+  4. `async def` and class methods are not followed by call counting (image count stays at least 1).
+  5. `rm x; bash -c ./x` does not see the outer `rm`.
+  6. A decorated function also called directly counts its body twice when the result has no `.png` path.
 
-**Acceptance gate:**
-- Tests green; basedpyright 0/0.
-- On real data, the probe prints scripts remembered, later runs counted, and the by-hand change at the 5-min split; a sample of 20 counted runs read by hand are all runs of a screenshot script.
-- The seed's Claude MCP subset still gives 519 episodes / 47.65 h.
-- A full scan takes 60 s or less warm on natedev, printing the candidate-file count and bytes read; the As-built names the measured cause of the 48 s vs 98 s difference.
-- Tests cover `episodes.jsonl` and `survey.json` after scripted runs are counted, and a script whose screenshot call was removed before a later run.
+**Ruled out:**
+- Counting any run of a file that holds a screenshot call: it made every helper subcommand (`brp.py query`) a shot.
+- A second classifier for script content.
+- The state-file location as the cause of the scan-time difference.
 
 ### Phase 3 — Every `/hana_shot` call is recorded, failures and the shot the agent kept included · status: todo
 
@@ -154,6 +164,8 @@ None.
 **Seats:** 2 writers — the call record and the kept-shot scan touch disjoint files, each with tests beside it.
 - `impl` — `scripts/hana_shot/hana_shot.py`, `test_hana_shot.py`, `commands/hana_shot.md`
 - `test` opens as impl — `scripts/shot_report/episodes.py`, `transcripts.py`, `test_shot_report.py`, `fixtures/`
+
+**Constraints from prior phases:** A scripted shot (Phase 2) is a `ToolCall` of the later run: its image paths come from that run's result, and `ToolCall.script_path` and `script_paths` name the scripts it ran, so a kept-shot citation links to the run, never to the call that wrote the script. A run of a script counts as a shot only when its arguments select the screenshot branch. `/hana_shot` calls are classified from their command line and never pass through script memory. `scan_calls` returns a `TranscriptScan` and reads transcripts in a worker pool, one transcript per task, so kept-shot detection works on one transcript's calls or runs after the pool. Script write-and-run samples are in `scripts/shot_report/fixtures/classify/`.
 
 **Acceptance gate:**
 - Tests green, with a fake BRP server for each failure path.
@@ -190,8 +202,11 @@ None.
 - `impl` — `scripts/buildlog/cli.py`, `shot_report.py`, `episodes.py`, `transcripts.py`, `changes.py`, `commands/shot_report.md`
 - `test` — `test_shot_report.py`, `fixtures/` and `scripts/buildlog/test_sync.py` (the hourly call): two consecutive incremental runs with no duplicates, the once-per-hour guard, the by-change table with a small-window flag, the weekly trend
 
+**Constraints from prior phases:** `scan_calls` reads each transcript in full, in a worker pool of up to four processes, one transcript per task. A transcript's remembered scripts (`RememberedScript`, keyed by normalized path, holding the current content) live only inside that read, and a script's content and its removals decide how a later run counts: a run counts as a shot only when its arguments select the screenshot branch of the content at that moment. An incremental scan therefore stores each transcript's remembered scripts beside its byte offset, so a script written before the cursor still counts a run after it, and a removal before the cursor still stops one. After the workers finish, `scan_calls` folds calls from deleted worktrees into live repository names across all transcripts, so that fold reruns over the cached and the new calls together. A full scan takes 30–40 s on natedev (39.6 s under load average 23), so the 30 s bound for a run with nothing new needs the cache. Reference numbers at the 5-minute split, 2026-09-09 to the rollout cut: 584 episodes / 53.73 h by hand, and the seed's Claude MCP subset 519 / 47.65 h; Phase 1's 568 / 51.89 h predates script-run counting.
+
 **Acceptance gate:**
 - Two consecutive hourly runs add new episodes and leave no duplicates.
+- A script written before the cache cursor and run after it counts the run, and one removed before the cursor does not.
 - A run with nothing new finishes in under 30 s.
 - The by-change table shows the rollout's before and after at both splits.
 

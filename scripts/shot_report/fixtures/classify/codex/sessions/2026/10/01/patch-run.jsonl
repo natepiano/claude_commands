@@ -1,0 +1,5 @@
+{"timestamp":"2026-10-01T00:00:00.000Z","type":"session_meta","payload":{"id":"patch-run","cwd":"/fictional/studio"}}
+{"timestamp":"2026-10-01T00:00:00.000Z","type":"response_item","payload":{"type":"function_call","name":"functions.apply_patch","call_id":"patch-0","arguments":"{\"input\":\"*** Begin Patch\\n*** Add File: /fictional/studio/patch.py\\n+rpc('brp_extras/screenshot', {})\\n*** End Patch\"}"}}
+{"timestamp":"2026-10-01T00:00:05.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"patch-0","output":"Success"}}
+{"timestamp":"2026-10-01T00:00:30.000Z","type":"response_item","payload":{"type":"function_call","name":"functions.exec_command","call_id":"patch-1","arguments":"{\"cmd\":\"python3 /fictional/studio/patch.py\"}"}}
+{"timestamp":"2026-10-01T00:00:35.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"patch-1","output":"done"}}
