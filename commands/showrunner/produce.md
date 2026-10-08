@@ -142,20 +142,6 @@ State:
   footers, then asks whether to turn back on what it paused at the end
   (`commands/adhoc_review.md` Steps 2 and 5). The dailies keep their own switch.
 
-  When the user types a message here, the dailies and footer pause on their own.
-  Later, a `conversation-pause:` message asks you to put this question to the
-  user word for word: `Return to automatic updates? (yes / no) They return on
-  their own in 5 minutes.` Never answer it for them. Their typed yes or no is
-  handled without you while the reply that put the question is your latest.
-  Once you have replied again, a bare yes or no reaches you as the answer to
-  whatever you asked last, and the pause's question stays open until it times
-  out. The question comes five minutes after your reply ends, or thirty minutes
-  after their message when the reply was interrupted. Unanswered for five
-  minutes, the updates return on their own. While an `/adhoc_review` is open
-  here, the question waits for the review to end.
-  `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/conversation_pause.py" status`
-  says what is paused.
-
   Example with a hold and an active agent (user, 2026-10-04):
 
   ```text
