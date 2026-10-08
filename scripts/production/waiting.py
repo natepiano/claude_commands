@@ -565,9 +565,13 @@ def quota(production: Production, notice: str, state_dir: Path) -> None:
             raise WaitingFailure("quota", "expected a quota alert account line")
         account, tool = named_account.group(1), named_account.group(2)
         change: HoldQuotaAlert | ClearQuotaAlerts | RestoreQuotaAlerts = HoldQuotaAlert(account, line)
-        action = (f"delegation continues on Claude; rerun {tool} work in flight"
-                  if "Every function that ran on" in notice
-                  else f"start no new delegate work on {tool}; running seats finish")
+        if "Every function that ran on" in notice:
+            action = f"delegation continues on Claude; rerun {tool} work in flight"
+        elif "nothing was switched to Claude" in notice:
+            action = (f"keep delegating on {tool}: its weekly allowance is used up and credits may be carrying the "
+                      + f"work; tell the showrunner at once if {tool} refuses work for quota")
+        else:
+            action = f"start no new delegate work on {tool}; running seats finish"
     elif kind == "Quota alert acknowledged:":
         named = re.search(r"the user silenced (.+?) (?:in session|outside any session)", line)
         accounts = [item.strip() for item in named.group(1).split(",")] if named else [line.removeprefix(kind).strip()]

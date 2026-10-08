@@ -840,8 +840,13 @@ reaches them only as your relay (<Throughout/>). Run `python3
 ~/.claude/scripts/production/waiting.py quota --production PRODUCTION_DOC
 --state-dir DAILIES_STATE_DIR --notice "<full notice>"`. It relays
 to every unit director and prints one `send <unit>:` receipt each:
-- `Quota alert:` — tell every unit director to start no new delegate work on
-  that tool; running seats finish and the unit director does the rest itself. Hold the alert as one
+- `Quota alert:` — the command picks the instruction from the notice. A Codex
+  notice that says nothing was switched: unit directors keep delegating on Codex,
+  whose account may keep working on its credits, and tell you at once if Codex
+  refuses work for quota; bring a refusal to the user. A notice that says every
+  function moved: delegation continues on Claude. A Claude notice, or a Codex one
+  whose switch failed: start no new delegate work on that tool; running seats
+  finish and the unit director does the rest itself. Hold the alert as one
   item per account, listed first in every Waiting on block with the percent left
   and the reset time, until it is acknowledged or restored.
 - `Quota alert acknowledged:` — drop the held item. Paused work stays paused.

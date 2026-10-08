@@ -905,6 +905,18 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
             self.assertIn("4%", line)
             self.assertIn("resets 2026-10-12 09:00 PDT", line)
 
+    def test_quota_tells_units_to_keep_delegating_on_codex_and_to_stop_on_claude(self) -> None:
+        codex = self.run_waiting("quota", "--notice", self.quota_message(self.quota_note("codex 1")),
+                                 "--state-dir", str(self.state))
+        self.assertEqual(codex.returncode, 0, codex.stdout + codex.stderr)
+        self.assertIn(f"send {ALPHA}: From the showrunner: keep delegating on Codex:", codex.stdout)
+        self.assertIn("tell the showrunner at once if Codex refuses work for quota", codex.stdout)
+        self.assertNotIn("start no new", codex.stdout)
+        claude = self.run_waiting("quota", "--notice", self.quota_message(self.quota_note("claude 2", "claude")),
+                                  "--state-dir", str(self.state))
+        self.assertEqual(claude.returncode, 0, claude.stdout + claude.stderr)
+        self.assertIn(f"send {ALPHA}: From the showrunner: start no new delegate work on Claude;", claude.stdout)
+
     def test_quota_queues_one_unit_collects_failure_and_saves_held_alert(self) -> None:
         self.add_gamma()
         send = self.bin_path / "send.py"
