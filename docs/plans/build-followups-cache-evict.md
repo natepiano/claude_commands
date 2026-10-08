@@ -65,73 +65,23 @@ What the showrunner asked for, in behaviour:
 
 ### Phase 1 — Follow-up 1: scratch target folders come under the disk floor  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** A folder cargo built into counts as a build cache for the floor and for the disk measurement even without `.rustc_info.json`, and below the floor an idle target under `/tmp` loses output before any managed target.
-
-**Spec:**
-
-Worktree `/home/natepiano/worktrees/claude-build-followups-cache-evict`, branch `build-followups-cache-evict`.
-
-1. **One rule for a cargo target** — `scripts/lint/sweep.py`, beside `RUSTC_INFO`:
-
-   ```python
-   CACHE_TAG = "CACHEDIR.TAG"
-   CARGO_TAG_LINE = "# This file is a cache directory tag created by cargo."
-
-   def is_cargo_target(directory: str) -> bool:
-       """Whether cargo built into directory."""
-   ```
-
-   - True when `<directory>/.rustc_info.json` is a file, exactly as `target_dirs` tests today.
-   - Otherwise True only when both hold: `<directory>/CACHEDIR.TAG` is a file with `CARGO_TAG_LINE` as one of its lines, and `build_trees(directory)` is not empty. Read at most the first 512 bytes of the tag; a tag that cannot be read or decoded is not cargo's.
-   - Why both: cargo writes the identical tag into `$CARGO_HOME/registry` and `$CARGO_HOME/git`, which hold no build tree, and other tools write `CACHEDIR.TAG` with their own comment line. A folder the floor takes for a target has its unowned files removed as orphans, so a wrong yes deletes data.
-   - Cost, named: one more `stat` for each directory the walk visits that has no `.rustc_info.json`; the tag is read and `build_trees` runs only where a tag exists.
-   - `target_dirs()` calls `is_cargo_target(directory)` in place of its `os.path.isfile(... RUSTC_INFO)` test. Nothing else in it changes.
-
-2. **Scratch targets go first** — `scripts/lint/sweep.py`:
-
-   ```python
-   # Targets under these roots are scratch builds: below the floor they lose output before any other target.
-   SCRATCH_ROOTS = ("/tmp",)
-
-   def is_scratch_target(root: str, scratch_roots: Sequence[str]) -> bool:
-       """Whether the target directory root lies under one of scratch_roots."""
-   ```
-
-   - Compare real paths, so a symlinked root is judged by where it points; a root equal to a scratch root counts as under it.
-   - `hold_floor(floor, dry_run, roots=FLOOR_ROOTS, lock=FLOOR_LOCK, scratch_roots=SCRATCH_ROOTS)` gains the last parameter so tests can name their own scratch root.
-   - Its removal order becomes: scratch before managed, then the target's last use, then `unit_age`, as one `RemovalOrder` key: `(0.0 if scratch else 1.0, target_uses[target], *unit_age(group, ordered_at))`. Decide each idle target's scratch flag once, before sorting.
-   - A target a build holds stays in `busy` and is untouched, as now. The printed lines do not change: `the floor took <GiB> from <target>, last used <when>` already names a scratch target by its path.
-   - The workspace budget sweep (`sweep()`) is not touched.
-
-3. **The header docstring** — `scripts/lint/sweep.py`, paragraph "The disk floor". Replace the sentence that begins "Targets under FLOOR_ROOTS (those holding .rustc_info.json)" so the paragraph says, in this order: a target is a directory under `FLOOR_ROOTS` holding `.rustc_info.json`, or cargo's `CACHEDIR.TAG` beside a build tree (a folder cargo creates carries the tag from its first moment, and `.rustc_info.json` may come only when the first build ends, or never; cargo's registry carries the same tag and has no build tree); a folder made before a build with `CARGO_CACHE_RUSTC_INFO=0` has neither and stays unseen; orphaned files go first from every idle target, as before; then idle targets under `SCRATCH_ROOTS` lose output; then the least recently used target, then by build-unit use within each target. Add one dated line of evidence: on 2026-10-08 the tag rule found 76 targets where `.rustc_info.json` alone found 41. Keep the rest of the paragraph byte for byte.
-
-4. **The disk measurement** — `scripts/buildlog/disk.py:128`: `if sweep.is_cargo_target(directory): continue`. No other change in that file.
-
-5. **Tests.** Each is named for the behaviour it pins.
-   - `scripts/lint/test_sweep.py`, with a helper that builds a target holding cargo's tag and a `debug/.fingerprint` build tree and no `.rustc_info.json`:
-     - `target_dirs` finds such a target;
-     - `target_dirs` does not find a directory with cargo's tag and no build tree (the shape of cargo's registry), and its files survive a floor run;
-     - `target_dirs` does not find a directory whose `CACHEDIR.TAG` has the `Signature:` line and another tool's comment, even with a `debug/.fingerprint` beside it;
-     - below the floor, a scratch target used a minute ago loses output before a managed target idle for hours, and with a shortfall smaller than the scratch target the managed target loses nothing;
-     - a scratch target whose cargo lock is held is left alone and the managed target loses output;
-     - a tag-only target below the floor loses output and its path appears in a `the floor took` line;
-     - among managed targets the existing order still holds (the existing test `test_below_the_floor_the_least_recently_used_target_goes` passes unchanged, with the helper `hold()` passing a scratch root that holds none of its targets if the temporary directory lies under `/tmp`).
-   - `scripts/buildlog/test_disk.py`:
-     - a tag-only target is left out of `outside_build_caches`, as the `.rustc_info.json` target is at line 198;
-     - a directory with another tool's `CACHEDIR.TAG` is still counted.
+- `sweep.is_cargo_target(directory)` decides what a cargo target is: a directory holding `.rustc_info.json`, or cargo's `CACHEDIR.TAG` (matched on the line `# This file is a cache directory tag created by cargo.`) beside a build tree. `target_dirs()` and `scripts/buildlog/disk.py`'s `outside_directory_bytes()` both call it, so the floor and the disk measurement agree on what is build output.
+- `SCRATCH_ROOTS = ("/tmp",)` and `sweep.is_scratch_target(root, scratch_roots)` mark scratch targets. Below the floor, `hold_floor()` takes output from idle scratch targets before any other target, then by the target's last use, then by build-unit use. `hold_floor()` takes `scratch_roots` as a parameter for tests.
+- A target whose cargo locks a build holds is never touched, scratch or not.
+- On natedev (2026-10-08) the rule finds 76 targets where `.rustc_info.json` alone found 41. All 35 added are scratch folders under `/tmp`; 31 are finished builds carrying only the tag.
 
 **Files:**
-- `scripts/lint/sweep.py` — `CACHE_TAG`, `CARGO_TAG_LINE`, `SCRATCH_ROOTS`, `is_cargo_target`, `is_scratch_target`; `target_dirs` and `hold_floor` use them; header paragraph
-- `scripts/buildlog/disk.py` — line 128 calls `sweep.is_cargo_target`
-- `scripts/lint/test_sweep.py` — the floor and target-finding tests above
-- `scripts/buildlog/test_disk.py` — the two measurement tests above
+- `scripts/lint/sweep.py` — the target rule, the scratch rule, the floor's order
+- `scripts/buildlog/disk.py` — the disk measurement, using the same target rule
+- `scripts/lint/test_sweep.py` — tests: a tag beside a build tree is found, a tag alone and another tool's tag are not, scratch goes first, a held scratch target is left
+- `scripts/buildlog/test_disk.py` — tests: a tag target is excluded from outside-cache growth, another tool's tag is counted
 
-**Seats:** 1 writer + 1 tester — the code and its tests are separate files.
-- `impl` — `scripts/lint/sweep.py`, `scripts/buildlog/disk.py`; no hub file
-- `test` — `scripts/lint/test_sweep.py`, `scripts/buildlog/test_disk.py`, written from the Spec's signatures and constants
+**Gotchas:**
+- Into a folder cargo creates, `CACHEDIR.TAG` and `debug/` appear at once; `.rustc_info.json` comes when the first build ends, or never. Into a folder that already exists, cargo writes `.rustc_info.json` early and no tag.
+- A folder made before a build that runs with `CARGO_CACHE_RUSTC_INFO=0` carries neither marker and stays unseen. Nothing on natedev sets that variable.
+- `~/.cargo/registry` and `~/.cargo/git` carry the same tag text; the build tree beside the tag is what tells a target from them.
+- Orphaned files, which no build unit owns, go first from every idle target, ahead of the scratch-first order.
 
-**Constraints from prior phases:** none in this plan. From the earlier run, now in `docs/as-built/build-memory-admission.md` "Disk floor: what it removes": `choose()` and `shrink()` take the order as a `RemovalOrder` argument, and `hold_floor()` passes a lambda built from `target_uses` and `unit_age`; a target's last use is the newer of its `.lint-sweep-used` stamp and its units' last uses.
-
-**Acceptance gate:** both test commands in Delegation Context green, with the new tests present and passing; `basedpyright scripts/lint/sweep.py scripts/lint/test_sweep.py scripts/buildlog/disk.py scripts/buildlog/test_disk.py` ending `0 errors, 0 warnings, 0 notes`. The unit director then lists the targets the floor finds on this machine before and after the change, without taking a lock or removing anything, and reads every folder the new rule adds.
+**Ruled out:** a structural rule (a child folder holding `.fingerprint` and a cargo lock) — one listing per walked folder for a case nothing here produces; a floor hook inside scratch builds — the 2-minute timer covers them at about 2 GiB a minute against 300 GiB of headroom; scratch units ahead of orphaned files — an orphan costs nobody a rebuild.
