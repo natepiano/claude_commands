@@ -285,6 +285,17 @@ def cargo_target(base: Path, name: str, digest: str, used: float) -> tuple[Path,
     return tree, output
 
 
+def cargo_tag_target(base: Path, name: str, digest: str, used: float) -> tuple[Path, Path]:
+    """A target with cargo's cache tag and a build tree, but no rustc-info file."""
+    root = base / name / "target"
+    tree = root / "debug"
+    output = unit(tree, "deps", name, digest, used)
+    _ = (root / sweep.CACHE_TAG).write_text(
+        f"Signature: 8a477f597d28d172789f06886806bc55\n{sweep.CARGO_TAG_LINE}\n"
+    )
+    return tree, output
+
+
 class FloorTests(SweepCase):
     def base(self) -> Path:
         base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
@@ -306,7 +317,13 @@ class FloorTests(SweepCase):
     def hold(self, base: Path, floor: int, free: list[int], dry_run: bool = False) -> tuple[int, str]:
         output = io.StringIO()
         with mock.patch.object(sweep, "free_bytes", side_effect=free), redirect_stdout(output):
-            status = sweep.hold_floor(floor, dry_run, [str(base)], str(base / "floor.lock"))
+            status = sweep.hold_floor(
+                floor,
+                dry_run,
+                [str(base)],
+                str(base / "floor.lock"),
+                [str(base / "scratch")],
+            )
         return status, output.getvalue()
 
     def prior(self, free: int, caches: int, age: int = 60, alert_at: float | None = None,
@@ -853,6 +870,82 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         _ = write(base / "uv" / "CACHEDIR.TAG")
         self.assertEqual(sweep.target_dirs([str(base)]), [str(base / "repo" / "target")])
 
+    def test_target_dirs_finds_cargo_tag_beside_a_build_tree(self) -> None:
+        base = self.base()
+        _, _ = cargo_tag_target(base, "repo", APP, time.time())
+
+        self.assertEqual(sweep.target_dirs([str(base)]), [str(base / "repo" / "target")])
+
+    def test_target_dirs_ignores_cargo_tag_without_a_build_tree_and_floor_preserves_it(self) -> None:
+        base = self.base()
+        registry = base / "registry"
+        registry.mkdir()
+        tag = registry / sweep.CACHE_TAG
+        _ = tag.write_text(f"Signature: cargo\n{sweep.CARGO_TAG_LINE}\n")
+        registry_file = write(registry / "index")
+        _, removable = cargo_target(base, "removable", APP, time.time() - DAY)
+
+        self.assertNotIn(str(registry), sweep.target_dirs([str(base)]))
+        status, _ = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])
+
+        self.assertEqual(status, 0)
+        self.assertTrue(tag.exists())
+        self.assertTrue(registry_file.exists())
+        self.assertFalse(removable.exists())
+
+    def test_target_dirs_ignores_another_tools_cache_tag_beside_a_build_tree(self) -> None:
+        base = self.base()
+        root = base / "other" / "target"
+        _ = unit(root / "debug", "deps", "other", APP, time.time())
+        _ = (root / sweep.CACHE_TAG).write_text(
+            "Signature: 8a477f597d28d172789f06886806bc55\n"
+            + "# This file is a cache directory tag created by another tool.\n"
+        )
+
+        self.assertNotIn(str(root), sweep.target_dirs([str(base)]))
+
+    def test_below_the_floor_a_recent_scratch_target_goes_before_an_old_managed_target(self) -> None:
+        base = self.base()
+        now = time.time()
+        _, managed = cargo_target(base, "managed", APP, now - 3 * 3600)
+        _, scratch = cargo_target(base / "scratch", "recent", DEMO, now - 60)
+
+        status, output = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])
+
+        self.assertEqual(status, 0)
+        self.assertFalse(scratch.exists())
+        self.assertTrue(managed.exists())
+        self.assertIn(f"from {base / 'scratch' / 'recent' / 'target'}", output)
+        self.assertNotIn(f"from {base / 'managed' / 'target'}", output)
+
+    def test_below_the_floor_a_held_scratch_target_is_left_for_a_managed_target(self) -> None:
+        base = self.base()
+        scratch_tree, scratch = cargo_target(base / "scratch", "held", APP, time.time())
+        lock = os.open(scratch_tree / sweep.LOCK_NAMES[0], os.O_RDONLY | os.O_CREAT)
+        self.addCleanup(os.close, lock)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _, managed = cargo_target(base, "managed", DEMO, time.time() - DAY)
+
+        status, output = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])
+
+        self.assertEqual(status, 0)
+        self.assertTrue(scratch.exists())
+        self.assertFalse(managed.exists())
+        self.assertIn("1 left alone while a build holds them", output)
+        self.assertIn(f"from {base / 'managed' / 'target'}", output)
+
+    def test_below_the_floor_a_tag_only_target_loses_output_and_is_named(self) -> None:
+        base = self.base()
+        _, output_file = cargo_tag_target(base, "tagged", APP, time.time() - DAY)
+        root = base / "tagged" / "target"
+
+        status, output = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])
+
+        self.assertEqual(status, 0)
+        self.assertFalse(output_file.exists())
+        self.assertIn("the floor took ", output)
+        self.assertIn(f"from {root},", output)
+
     def test_below_the_floor_the_least_recently_used_target_goes(self) -> None:
         base = self.base()
         now = time.time()
@@ -867,7 +960,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         self.assertFalse(idle.exists())
         self.assertTrue(recent.exists())
         self.assertIn("removed 1 build units", output)
-        self.assertIn(f"the floor took ", output)
+        self.assertIn("the floor took ", output)
         self.assertIn(f" from {base / 'idle' / 'target'}, last used {sweep.when(now - 3600)}", output)
         self.assertEqual(sum("removed" in line for line in output.splitlines()), 1)
 
