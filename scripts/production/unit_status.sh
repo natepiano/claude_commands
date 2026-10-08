@@ -1,7 +1,8 @@
 #!/usr/bin/env zsh
 # Unit status for /showrunner:produce's update schedule.
-# Usage: unit_status.sh <state-dir> <user-zone> <session>...
-#    or: unit_status.sh <state-dir> <user-zone> --showrunner <session> (skips retired units)
+# Usage: unit_status.sh <state-dir> <user-zone> --showrunner <session>
+# The units are the live rows of the showrunner's production doc. Each is found by the mark on
+# its tmux session, so a block is headed by the unit id, which no rename changes.
 # Each call checks every unit director: that its session and Claude are running, tick
 # health for every unit with an active run, any form or decision waiting on the user,
 # and its latest step, gate and ETA.
@@ -9,21 +10,22 @@
 # No pipefail: each test reads grep's own status, and an early `grep -q` exit
 # would fail the `tail` before it with SIGPIPE.
 
-if (( $# < 3 )); then
-  print -u2 'usage: unit_status.sh <state-dir> <user-zone> <session>...'
+if (( $# != 4 )) || [[ $3 != --showrunner ]]; then
+  print -u2 'usage: unit_status.sh <state-dir> <user-zone> --showrunner <session>'
   exit 2
 fi
 DIR=$1
 ZONE=$2
-shift 2
-units=("$@")
-if [[ $1 == --showrunner ]]; then
-  [[ $# == 2 ]] || { print -u2 'usage: --showrunner <session>'; exit 2; }
-  showrunner=$2
-  REPO=${0:A:h:h:h}
-  unit_lines=$("$REPO/scripts/lib/py" "$REPO/scripts/production/live_units.py" "$showrunner") || exit 1
-  [[ -n $unit_lines ]] && units=("${(@f)unit_lines}") || units=()
-fi
+REPO=${0:A:h:h:h}
+# One line per unit: its id, its pane now, whether Claude runs there, its session name now.
+unit_lines=$("$REPO/scripts/lib/py" "$REPO/scripts/production/live_units.py" "$4") || exit 1
+[[ -n $unit_lines ]] && units=("${(@f)unit_lines}") || units=()
+# What a gate line may call a peer: its unit id, or its session name now.
+names=()
+for line in $units; do
+  fields=("${(@ps:\t:)line}")
+  names+=($fields[1] $fields[4])
+done
 # `^out` alone: `nixpkgs#tmux` without it also prints the man output's path.
 TM=$(command -v tmux) || TM=$(nix build --no-link --print-out-paths 'nixpkgs#tmux^out')/bin/tmux
 REPO=${0:A:h:h:h}
@@ -76,7 +78,7 @@ waiting_on_user() {
   fi
   gate_text=${last#*:}
   actor_text=${gate_text#*:}
-  for o in $units; do
+  for o in $names; do
     [[ $o != $u && " $actor_text " == *[^[:alnum:]_-]"$o"[^[:alnum:]_-]* ]] && peer=1
   done
   # A wait on the showrunner or another unit is the showrunner's to clear, not the user's.
@@ -130,10 +132,13 @@ pane_claude_pid() {
 
 echo "at $(TZ=$ZONE date '+%H:%M %Z') / $(date -u +%H:%M) UTC"
 processes=$(ps -eo pid=,ppid=,args=)
-for u in $units; do
+for line in $units; do
+  fields=("${(@ps:\t:)line}")
+  u=$fields[1]
+  target=$fields[2]
   echo "== $u"
-  if ! $TM has-session -t "=$u" 2>/dev/null; then echo 'SESSION GONE'; continue; fi
-  pane_pid=$($TM display-message -p -t "=$u:" '#{pane_pid}')
+  if [[ -z $target ]]; then echo 'SESSION GONE'; continue; fi
+  pane_pid=$($TM display-message -p -t "$target" '#{pane_pid}')
   pid=$(pane_claude_pid "$pane_pid")
   [[ -z $pid ]] && echo 'CLAUDE NOT RUNNING'
   if [[ -n $pid ]]; then
@@ -150,7 +155,7 @@ for u in $units; do
       fi
     fi
   fi
-  p=$($TM capture-pane -p -J -S -400 -t "=$u:")
+  p=$($TM capture-pane -p -J -S -400 -t "$target")
   waiting_on_user "$u" "$p"
   pane=$(print -r -- "$p" | tail -150)
   print -r -- "$pane" | grep -E '^● ' | grep -vE 'says:|^● (Bash|Read|Write|Edit|Skill|Update|Search)\(' | tail -2 | cut -c1-220

@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo
 
-from add_unit import Refusal, cell_value, live_unit_rows, read_production, unit_rows
+import unit_lookup
+from add_unit import Refusal, cell_value, live_unit_table, read_production, unit_table
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_render import InputError, StateRefused, as_list, as_map, check_render_state, local_now, parse_report, parse_time
 from merge_checkpoint import NoMerge, git, merge_branch_history
@@ -95,6 +96,8 @@ EtaState = EtaFresh | EtaStale | EtaPassed | EtaNone
 
 class UnitRow(NamedTuple):
     name: str
+    # The unit's session name at this moment, read from its live session; empty when none runs.
+    # It addresses the unit and is never a key: every record is kept under the unit's name.
     session: str
 
 
@@ -109,22 +112,27 @@ def report(step: str, state: str, detail: str) -> None:
     print(f"{step}: {state} — {detail.replace(chr(10), '; ')}", flush=True)
 
 
-def units_from_doc(lines: list[str]) -> tuple[UnitRow, ...]:
-    _, rows = unit_rows(lines)
-    live_rows = live_unit_rows(lines)
-    if rows and not live_rows:
+def units_from_doc(lines: list[str], slug: str) -> tuple[UnitRow, ...]:
+    live_rows = live_unit_table(lines, slug)
+    if unit_table(lines) and not live_rows:
         raise DailiesFailure("production", "no live units: every Units row is retired")
+    try:
+        marked = unit_lookup.marked_units(slug)
+    except OSError as error:
+        raise DailiesFailure("production", f"the unit sessions could not be looked up: {error}") from error
     units: list[UnitRow] = []
-    for row in live_rows:
-        cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
-        if len(cells) < 5:
-            raise DailiesFailure("production", f"invalid Units row: {row}")
-        units.append(UnitRow(cell_value(cells[0]), cell_value(cells[4])))
+    for cells in live_rows:
+        name = cell_value(cells.get("Unit", ""))
+        if not name:
+            raise DailiesFailure("production", f"invalid Units row: {cells}")
+        found = marked.get(name)
+        claude = found.claude if found is not None else None
+        units.append(UnitRow(name, claude.name if isinstance(claude, unit_lookup.LiveClaude) else ""))
     return tuple(units)
 
 
 def status_blocks(path: Path, units: tuple[UnitRow, ...]) -> tuple[StatusBlock, ...]:
-    names = {unit.session for unit in units}
+    names = {unit.name for unit in units}
     blocks: list[StatusBlock] = []
     session = ""
     state: SessionState = Running()
@@ -304,7 +312,7 @@ def run(args: argparse.Namespace) -> int:
     production = read_production(production_path)
     now, _ = local_now(str(production.zone), "--zone", at)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
-    units = units_from_doc(lines)
+    units = units_from_doc(lines, production.slug)
     instance = f"showrunner-{production.slug}"
     blocks = status_blocks(status_path, units)
     report("status", "ok", f"{len(blocks)} units read")
@@ -344,10 +352,10 @@ def run(args: argparse.Namespace) -> int:
     missing: list[str] = []
     blocks_by_session = {block.session: block for block in blocks}
     for index, unit in enumerate(units):
-        block = blocks_by_session[unit.session]
-        fields = by_session.get(unit.session, by_session.get(unit.name, {}))
+        block = blocks_by_session[unit.name]
+        fields = by_session.get(unit.name, {})
         result = dict(fields)
-        result["unit"] = unit.session
+        result["unit"] = unit.name
         if "build_hold" in result:
             raise DailiesFailure("build hold", f"{judgment_path}.units[{index}].build_hold: supplied by holder files")
         if holder_names and unit.session not in holder_names and unit.name not in holder_names:
@@ -356,7 +364,7 @@ def run(args: argparse.Namespace) -> int:
             result["needs_user"] = True
         phase = fields.get("phase")
         phase_text = phase if isinstance(phase, str) else ""
-        key = f"{unit.session}|{phase_text}"
+        key = f"{unit.name}|{phase_text}"
         held = fields.get("held")
         state = eta_state(block, phase_text, seen, now, ZoneInfo(str(production.zone)),
                           held=isinstance(held, str) and bool(held.strip()))
@@ -367,7 +375,7 @@ def run(args: argparse.Namespace) -> int:
         if isinstance(state, (EtaStale, EtaPassed)):
             record = seen.get(key)
             if isinstance(record, dict) and isinstance(eta_requested(seen, key), EtaNotYetRequested):
-                eta_request_candidates[key] = unit.session
+                eta_request_candidates[key] = unit.name
                 cast(JsonMap, record)["requested"] = True
         for key in ("project", "phase", "started", "held", "update"):
             if key not in result or (key != "held" and result[key] is None):

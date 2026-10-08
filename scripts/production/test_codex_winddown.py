@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import override
 
@@ -79,10 +80,22 @@ class MessageTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for name in ("notifier", "sessions"):
             (self.root / name).mkdir()
+        # hana's one unit: a row of its production doc, and a tmux session marked as that unit.
+        doc = self.root / "show-production.md"
+        _ = doc.write_text("\n".join(("## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
+                                      "| --- | --- | --- | --- | --- | --- |",
+                                      "| trunk-unit | docs/plan.md | /tmp/no-worktree-of-trunk | trunk | — | — |")),
+                           encoding="utf-8")
+        _ = (self.root / "tmux.json").write_text(json.dumps({"$1": {
+            "label": "any-label", "panes": ["%1"],
+            "env": {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "trunk-unit"}}}), encoding="utf-8")
+        self.enterContext(mock.patch.dict(os.environ, {
+            "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
+            "FAKE_TMUX_STATE": str(self.root / "tmux.json")}))
         _ = (self.root / "showrunners.json").write_text(json.dumps({
             "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "hana",
-            "always": [], "showrunners": [{"session": "hana", "zone": "America/Los_Angeles", "units": ["trunk"]},
-                                          {"session": "gone", "zone": "America/Los_Angeles", "units": []}],
+            "always": [], "showrunners": [{"session": "hana", "zone": "America/Los_Angeles", "doc": str(doc)},
+                                          {"session": "gone", "zone": "America/Los_Angeles", "doc": ""}],
         }), encoding="utf-8")
         for name, pid in (("hana", os.getpid()), ("trunk", os.getppid())):
             listener = socket.socket(socket.AF_UNIX)
@@ -90,6 +103,7 @@ class MessageTests(unittest.TestCase):
             listener.bind(str(self.root / f"{name}.sock"))
             _ = (self.root / f"sessions/{pid}.json").write_text(json.dumps({
                 "pid": pid, "sessionId": f"id-{name}", "name": name, "updatedAt": 1,
+                "tmux": "name-at-start:@1.%1" if name == "trunk" else "",
                 "messagingSocketPath": str(self.root / f"{name}.sock"),
             }), encoding="utf-8")
         _ = (self.root / "notifier.sh").write_text(NOTIFIER_STUB, encoding="utf-8")

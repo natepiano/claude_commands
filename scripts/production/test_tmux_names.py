@@ -138,38 +138,14 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
     def entries(self) -> list[dict[str, object]]:
         return cast(list[dict[str, object]], json.loads(self.config.read_text())["showrunners"])
 
-    def test_unit_rename_changes_tmux_and_config_in_one_tick(self) -> None:
+    def test_unit_rename_changes_the_tmux_label_and_leaves_the_registry_alone(self) -> None:
+        before = self.config.read_bytes()
         self.session("new", "%1")
         result = self.tick()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.names(), {"new": ["%1"]})
-        self.assertEqual(self.entries()[0]["units"], [registered("new")])
-
-    def test_unit_renames_keep_all_three_registry_statuses(self) -> None:
-        statuses = ("running", "run-finished", "standing-by")
-        old_names = [f"old-{status}" for status in statuses]
-        _ = self.config.write_text(json.dumps({
-            "threshold_percent": 2,
-            "repeat_minutes": 30,
-            "stall_minutes": 5,
-            "faults_to": "natedev",
-            "always": [],
-            "showrunners": [{
-                "session": "director",
-                "zone": "America/Los_Angeles",
-                "units": [registered(name, status) for name, status in zip(old_names, statuses)],
-            }],
-        }))
-        _ = self.tmux.write_text(json.dumps({name: [f"%{index}"]
-                                             for index, name in enumerate(old_names, start=1)}))
-        for index, status in enumerate(statuses, start=1):
-            self.session(f"new-{status}", f"%{index}")
-
-        result = self.tick()
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.entries()[0]["units"],
-                         [registered(f"new-{status}", status) for status in statuses])
+        # The registry holds no unit names, so a unit's rename leaves it as it was.
+        self.assertEqual(self.config.read_bytes(), before)
 
     def test_showrunner_rename_changes_config_session(self) -> None:
         _ = self.tmux.write_text(json.dumps({"director": ["%1"]}))
@@ -197,30 +173,15 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.names(), {"new": ["%1"]})
 
-    def test_registry_failure_leaves_tmux_old_and_next_tick_finishes(self) -> None:
-        self.session("new", "%1")
-        with mock.patch.dict(os.environ, self.environment, clear=True), \
-                mock.patch.object(tmux_names, "TMUX", "tmux"), \
-                mock.patch.object(showrunners, "CONFIG", self.config), \
-                mock.patch.object(showrunners, "change", side_effect=ValueError("injected failure")):
-            outcome = tmux_names.rename_session("%1", "old", "new")
-        self.assertIsInstance(outcome, tmux_names.RenameIncomplete)
-        self.assertEqual(self.names(), {"old": ["%1"]})
-        self.assertEqual(self.tick().returncode, 0)
-        self.assertEqual(self.names(), {"new": ["%1"]})
-        self.assertEqual(self.entries()[0]["units"], [registered("new")])
-
-    def test_tmux_failure_after_registry_change_is_finished_next_tick(self) -> None:
+    def test_tmux_failure_is_finished_next_tick(self) -> None:
         self.session("new", "%1")
         _ = (self.root / "rename-failure").touch()
         first = self.tick()
         self.assertIn("tmux session still names", first.stderr)
         self.assertEqual(self.names(), {"old": ["%1"]})
-        self.assertEqual(self.entries()[0]["units"], [registered("new")])
         (self.root / "rename-failure").unlink()
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.names(), {"new": ["%1"]})
-        self.assertEqual(self.entries()[0]["units"], [registered("new")])
 
     def test_rename_session_does_not_change_another_pane_session(self) -> None:
         _ = self.tmux.write_text(json.dumps({"old": ["%1"], "other": ["%2"]}))

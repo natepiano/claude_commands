@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
-from unittest import mock
 
 import rename_state
-import send
 
 
 class RenameStateTests(unittest.TestCase):
@@ -23,12 +20,6 @@ class RenameStateTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.scratch = self.root / "scratch"
         self.scratch.mkdir()
-        self.enterContext(mock.patch.dict(os.environ, {
-            "XDG_STATE_HOME": str(self.root / "xdg"),
-            "BUILD_HOLD_DIR": str(self.root / "holders"),
-            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-        }))
-        _ = self.enterContext(mock.patch.object(send, "STATE", self.root / "xdg" / "message"))
 
     def write_json(self, relative: str, value: object) -> Path:
         path = self.scratch / relative
@@ -60,7 +51,7 @@ class RenameStateTests(unittest.TestCase):
         })
         paths = [eta, decisions, blocks, showrunner, judgment, rendered]
 
-        changed = rename_state.rename_all("old", "new", self.scratch)
+        changed = rename_state.rename_scratch("old", "new", self.scratch)
 
         self.assertEqual(changed, [
             "dailies_input_state/eta_seen.json",
@@ -86,23 +77,23 @@ class RenameStateTests(unittest.TestCase):
         self.assertEqual(set(rendered_fields), {"new", "other"})
 
         after_first = {path: path.read_bytes() for path in paths}
-        self.assertEqual(rename_state.rename_all("old", "new", self.scratch), [])
+        self.assertEqual(rename_state.rename_scratch("old", "new", self.scratch), [])
         self.assertEqual({path: path.read_bytes() for path in paths}, after_first)
 
     def test_missing_file_and_missing_directory_are_skipped(self) -> None:
-        self.assertEqual(rename_state.rename_all("old", "new", self.scratch), [])
-        self.assertEqual(rename_state.rename_all("old", "new", self.root / "absent"), [])
+        self.assertEqual(rename_state.rename_scratch("old", "new", self.scratch), [])
+        self.assertEqual(rename_state.rename_scratch("old", "new", self.root / "absent"), [])
 
     def test_blocks_open_keeps_existing_new_row_when_old_row_differs(self) -> None:
         blocks = self.scratch / "unit_status" / "blocks_open"
         blocks.parent.mkdir()
         _ = blocks.write_text("old\told block\t10:00\nnew\tkept block\t10:05\nother\tother block\t10:10\n")
 
-        self.assertIn("unit_status/blocks_open", rename_state.rename_all("old", "new", self.scratch))
+        self.assertIn("unit_status/blocks_open", rename_state.rename_scratch("old", "new", self.scratch))
 
         self.assertEqual(blocks.read_text(), "new\tkept block\t10:05\nother\tother block\t10:10\n")
         after_first = blocks.read_bytes()
-        self.assertEqual(rename_state.rename_all("old", "new", self.scratch), [])
+        self.assertEqual(rename_state.rename_scratch("old", "new", self.scratch), [])
         self.assertEqual(blocks.read_bytes(), after_first)
 
     def test_unparsable_json_is_refused_by_file_name(self) -> None:
@@ -110,20 +101,7 @@ class RenameStateTests(unittest.TestCase):
         path.parent.mkdir(parents=True)
         _ = path.write_text("{not json\n")
         with self.assertRaisesRegex(rename_state.RenameRefused, "eta_seen.json"):
-            _ = rename_state.rename_all("old", "new", self.scratch)
-
-    def test_build_holder_collision_becomes_rename_refusal(self) -> None:
-        holders = self.root / "holders"
-        holders.mkdir()
-        for name in ("old", "new"):
-            _ = (holders / name).write_text(json.dumps({
-                "holder": name,
-                "since": "2026-10-07T10:00:00+00:00",
-                "for": "rename work",
-                "release_eta": "unknown",
-            }) + "\n")
-        with self.assertRaisesRegex(rename_state.RenameRefused, "both 'old' and 'new'"):
-            _ = rename_state.rename_all("old", "new", self.scratch)
+            _ = rename_state.rename_scratch("old", "new", self.scratch)
 
 
 if __name__ == "__main__":

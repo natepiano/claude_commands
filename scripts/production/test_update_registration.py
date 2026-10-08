@@ -75,6 +75,8 @@ class RegistrationTests(unittest.TestCase):
                     "REGISTRATION_TEST_STATE": str(self.state), "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
                     "MAC_TEST_STATE_DIR": str(self.state / "mac-test"),
+                    # No test here may ask a real tmux which unit sessions exist.
+                    "UNIT_LOOKUP_TMUX": str(self.root / "no-tmux"),
                     "CLAUDE_CODE_SESSION_ID": "current-session-id"}
         _ = self.git("init", "-b", "production", str(self.checkout), cwd=self.root)
         _ = self.git("config", "user.name", "Registration Test")
@@ -89,9 +91,9 @@ class RegistrationTests(unittest.TestCase):
             "- **Merge branch:** `production`", f"- **Showrunner checkout:** `{self.checkout}`",
             "- **Showrunner session:** first-showrunner", "- **Log:** `production.log`",
             "- **User zone:** America/Los_Angeles", "- **Updates:** every 15 minutes", "",
-            "## Units", "", "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-            f"| `alpha-unit` | `docs/alpha.md` | `{alpha}` | `alpha` | `alpha-session` | — | — |",
+            "## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |",
+            "| --- | --- | --- | --- | --- | --- |",
+            f"| `alpha-unit` | `docs/alpha.md` | `{alpha}` | `alpha` | — | — |",
             "", "## Gates", "",
         )), encoding="utf-8")
         _ = self.git("add", ".")
@@ -124,7 +126,7 @@ class RegistrationTests(unittest.TestCase):
     def copied_command(self) -> Path:
         tree = Path(tempfile.mkdtemp(prefix="command-copy-", dir=self.root))
         _ = shutil.copytree(SCRIPT.parent, tree / "scripts/production")
-        for name in ("build_hold", "lint", "mac_test", "whoami"):
+        for name in ("build_hold", "lint", "mac_test", "message", "whoami"):
             _ = shutil.copytree(SCRIPT.parent.parent / name, tree / "scripts" / name)
         hooks = tree / "scripts/hooks"
         hooks.mkdir(parents=True)
@@ -138,32 +140,18 @@ class RegistrationTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(script), *args, "--production", str(self.doc)],
                               cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False)
 
-    def test_a_unit_with_no_session_and_no_worktree_leaves_the_registry(self) -> None:
+    def test_register_records_where_the_doc_is_and_keeps_an_old_unit_list_for_adopt(self) -> None:
+        # A registry written before the change still lists units; adopt reads run states from the list.
+        _ = self.config.write_text(json.dumps({
+            "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "natedev",
+            "always": ["natedev"], "showrunners": [{
+                "session": "first-showrunner", "zone": "America/New_York",
+                "units": [{"session": "a-name-since-changed", "status": "running"}]}]}), encoding="utf-8")
         first = self.run_command("register", "--session", "first-showrunner")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        # tmux knows only `kept-session`, and neither added unit has a worktree of its own.
-        tmux = self.root / "bin" / "tmux"
-        _ = tmux.write_text("#!/bin/sh\n[ \"$1\" = has-session ] || exit 99\n"
-                            + "[ \"$3\" = '=kept-session' ] && exit 0\nexit 1\n", encoding="utf-8")
-        tmux.chmod(0o755)
-        rows = ("| `gone-unit` | `docs/gone.md` | `/nonexistent/gone` | `gone` | `gone-session` | — | — |\n"
-                + "| `kept-unit` | `docs/kept.md` | `/nonexistent/kept` | `kept` | `kept-session` | — | — |\n")
-        content = self.doc.read_text(encoding="utf-8")
-        _ = self.doc.write_text(content.replace("\n\n## Gates", f"\n{rows}\n## Gates"), encoding="utf-8")
-        _ = self.git("commit", "-am", "two more units")
-        # The removed unit was registered while it was still there.
-        added = subprocess.run([sys.executable, str(SCRIPT.with_name("showrunners.py")), "add", "first-showrunner",
-                                "--zone", "America/Los_Angeles", "--unit", "gone-session"],
-                               env=self.env, capture_output=True, text=True, check=False)
-        self.assertEqual(added.returncode, 0, added.stderr)
-        self.assertIn("gone-session", self.config.read_text(encoding="utf-8"))
-
-        again = self.run_command("register", "--session", "first-showrunner")
-
-        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
-        self.assertEqual(self.registry()[0]["units"],
-                         [{"session": "alpha-session", "status": "running"},
-                          {"session": "kept-session", "status": "running"}])
+        self.assertEqual(self.registry(), [{"session": "first-showrunner", "zone": "America/Los_Angeles",
+                                            "doc": str(self.doc),
+                                            "units": [{"session": "a-name-since-changed", "status": "running"}]}])
 
     def test_start_and_resume_retarget_only_updates_and_retire_old_session(self) -> None:
         first = self.run_command("register", "--session", "first-showrunner")
@@ -171,8 +159,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertIn("register: ok", first.stdout)
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
         self.assertEqual(self.registry()[0]["session"], "first-showrunner")
-        self.assertEqual(self.registry()[0]["units"],
-                         [{"session": "alpha-session", "status": "running"}])
+        self.assertEqual(self.registry()[0]["doc"], str(self.doc))
         initial_calls = self.notifier_calls()
         self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", "showrunner-example"]]), 1)
         updates = next(call for call in initial_calls if call[:2] == ["new", "showrunner-example"])
@@ -188,8 +175,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(self.git("log", "-1", "--format=%s"),
                          "production(example): showrunner session resumed-showrunner")
         self.assertEqual([entry["session"] for entry in self.registry()], ["resumed-showrunner"])
-        self.assertEqual(self.registry()[0]["units"],
-                         [{"session": "alpha-session", "status": "running"}])
+        self.assertEqual(self.registry()[0]["doc"], str(self.doc))
         registry_bytes = self.config.read_bytes()
         doc_bytes = self.doc.read_bytes()
         repeated = self.run_command("register", "--session", "resumed-showrunner", env=new_env)
@@ -306,13 +292,13 @@ class RegistrationTests(unittest.TestCase):
         self.assertIn("alpha-unit: not stated; last merged none; waits on not stated", log)
         self.assertIn("beta-unit: not stated; last merged none; waits on not stated", log)
 
-    def test_state_block_matches_session_and_merge_history_and_reads_outstanding(self) -> None:
+    def test_state_block_matches_unit_and_merge_history_and_reads_outstanding(self) -> None:
         _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit phase 2 (abc1234)")
         outstanding = self.outstanding()
         _ = outstanding.write_text(json.dumps([{"since": "2026-10-04T10:00", "text": "review colors"}]) + "\n",
                                    encoding="utf-8")
         state = self.root / "judgment.json"
-        _ = state.write_text(json.dumps({"units": [{"unit": "alpha-session", "phase": "Phase 2 of 3: panels",
+        _ = state.write_text(json.dumps({"units": [{"unit": "alpha-unit", "phase": "Phase 2 of 3: panels",
                                                     "wait": "review"}],
                                            "merges_held": ["alpha phase 2"],
                                            "open_for_user": ["stale state item"]}), encoding="utf-8")

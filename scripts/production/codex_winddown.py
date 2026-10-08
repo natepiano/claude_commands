@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 
 import broadcast
 import showrunners
-from live_units import live_units
+from live_units import live_unit_names
 from sessions import SessionRecord
 
 NOTIFIER = Path(os.environ.get("CODEX_WINDDOWN_NOTIFIER") or broadcast.MESSAGE / "notifier.sh")
@@ -215,7 +215,7 @@ def count(session: str) -> int:
     if runner is None:
         print(f"showrunner absent from config: {session}", file=sys.stderr)
         return 1
-    units, counts = live_units(session), current_counts()
+    units, counts = live_unit_names(session), current_counts()
     rows = listed(session, units, counts)
     held = refresh(session, units, rows, time.time())
     announce_quiet(counts.total())
@@ -241,7 +241,7 @@ def status() -> int:
     counts = current_counts()
     rows: dict[str, int] = {name: number for name, number in counts.items() if number}
     for runner in showrunners.load_settings()["showrunners"]:
-        rows.update(listed(runner["session"], live_units(runner["session"]), counts))
+        rows.update(listed(runner["session"], live_unit_names(runner["session"]), counts))
     counting = ", ".join(name.removeprefix(INSTANCE) for name in instances())
     print(f"Wind-down: {'on for ' + counting if counting else 'off'}")
     print(render("Codex agents on this machine", rows, read_projections(), time.time()))

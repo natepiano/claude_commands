@@ -15,7 +15,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, NamedTuple, TypeVar, cast
 
-from add_unit import Production, Refusal, cell_value, live_unit_rows, read_production, retired_units
+import unit_lookup
+from add_unit import Production, Refusal, cell_value, live_unit_table, read_production, retired_units
 from merge_checkpoint import MergeEntry, NoMerge, Stop, git, merge_branch_history, report as merge_report
 
 JsonMap = dict[str, object]
@@ -135,6 +136,8 @@ class BerthNotConfigured(NamedTuple):
 
 class Unit(NamedTuple):
     name: str
+    # The unit's session name at this moment, read from its live session; empty when none runs.
+    # It addresses the unit and is never a key: every record is kept under the unit's name.
     session: str
     branch: str
     worktree: Path
@@ -155,18 +158,26 @@ def report(step: str, state: str, message: str) -> None:
 
 
 def units_from_doc(production: Production) -> tuple[Unit, ...]:
+    lines = production.doc.read_text(encoding="utf-8").splitlines()
+    try:
+        marked = unit_lookup.marked_units(production.slug)
+    except OSError as error:
+        raise WaitingFailure("production", f"the unit sessions could not be looked up: {error}") from error
     units: list[Unit] = []
-    for row in live_unit_rows(production.doc.read_text(encoding="utf-8").splitlines()):
-        cells = [cell_value(cell.strip()) for cell in row.strip("|").split("|")]
-        if len(cells) < 5:
-            raise WaitingFailure("production", f"invalid Units row: {row}")
-        units.append(Unit(cells[0], cells[4], cells[3], Path(cells[2]).expanduser()))
+    for cells in live_unit_table(lines, production.slug):
+        row = {heading: cell_value(cell) for heading, cell in cells.items()}
+        if not all(row.get(heading) for heading in ("Unit", "Worktree", "Branch")):
+            raise WaitingFailure("production", f"invalid Units row: {cells}")
+        found = marked.get(row["Unit"])
+        claude = found.claude if found is not None else None
+        units.append(Unit(row["Unit"], claude.name if isinstance(claude, unit_lookup.LiveClaude) else "",
+                          row["Branch"], Path(row["Worktree"]).expanduser()))
     return tuple(units)
 
 
 def named_unit(production: Production, name: str) -> Unit:
     for unit in units_from_doc(production):
-        if name in (unit.name, unit.session):
+        if name and name in (unit.name, unit.session):
             return unit
     raise WaitingFailure("production", f"unknown unit {name}")
 
@@ -225,7 +236,7 @@ def eta_requested(seen: JsonMap, key: str) -> EtaRequested | EtaNotYetRequested:
 def eta_request(production: Production, name: str, phase: str, state_dir: Path) -> None:
     unit = named_unit(production, name)
     path = state_dir / "eta_seen.json"
-    key = f"{unit.session}|{phase}"
+    key = f"{unit.name}|{phase}"
 
     def request(seen: JsonMap) -> EtaRequested | EtaNotYetRequested:
         state = eta_requested(seen, key)
@@ -235,7 +246,7 @@ def eta_request(production: Production, name: str, phase: str, state_dir: Path) 
 
     state = update_state(path, request)
     if isinstance(state, EtaNotYetRequested):
-        print(f"request /unit:eta: {unit.session}")
+        print(f"request /unit:eta: {unit.name}")
     report("eta-request", "ok", "already requested" if isinstance(state, EtaRequested) else "requested")
 
 
@@ -404,7 +415,7 @@ def waits(production: Production) -> None:
     board = run_command("waits", ["cargo-berth", "board", "--json"])
     overlaps = berth_board(board)
     now = datetime.now(production.zone)
-    retired = retired_units(production.doc.read_text(encoding="utf-8").splitlines())
+    retired = retired_units(production.doc.read_text(encoding="utf-8").splitlines(), production.slug)
     active: dict[str, WaitOpen | WaitCleared] = {}
     clears: dict[str, str] = {}
     for event in log_events(production, now):
@@ -468,8 +479,8 @@ def phase_start(events: tuple[LogEvent, ...], unit: Unit,
         pattern = re.compile(rf"(?:^|: ){re.escape(unit.name)} phase {re.escape(prior_phase)} "
                              + r"\([^)]+\) merged as [^;]+;")
     else:
-        pattern = re.compile(rf": added {re.escape(unit.name)} \([^)]+\), tmux "
-                             + rf"{re.escape(unit.session)}, worktree ")
+        # A line written before session names left the log also says `tmux <name>,`.
+        pattern = re.compile(rf": added {re.escape(unit.name)} \([^)]+\),(?: tmux [^,]+,)? worktree ")
     for event in reversed(events):
         if pattern.search(event.line):
             return PhaseStart(event.moment)
@@ -498,7 +509,7 @@ def eta_moment(text: str, line_moment: datetime) -> EtaOnLog | NoEtaOnLog:
 
 def phase_eta(events: tuple[LogEvent, ...], unit: Unit, phase: str,
               start: PhaseStart) -> EtaOnLog | NoEtaOnLog:
-    labels = tuple(dict.fromkeys((unit.session, unit.name)))
+    labels = tuple(label for label in dict.fromkeys((unit.session, unit.name)) if label)
     for event in reversed(events):
         if event.moment < start.moment or "dailies ETAs:" not in event.line:
             continue
@@ -588,6 +599,9 @@ def quota(production: Production, notice: str, state_dir: Path) -> None:
     sender = shutil.which("send.py") or str(Path(__file__).resolve().parent.parent / "message/send.py")
     failures: list[str] = []
     for unit in units_from_doc(production):
+        if not unit.session:
+            failures.append(f"{unit.name}: no Claude is running in its session, so it was not told")
+            continue
         try:
             delivered = subprocess.run([sys.executable, sender, "--to", unit.session,
                                         "--from", production.showrunner_session,

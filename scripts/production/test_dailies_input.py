@@ -125,7 +125,12 @@ class DailiesInputTests(unittest.TestCase):
         self.notifier.chmod(0o755)
         self.env = {**os.environ, "HOME": str(self.home), "BUILD_HOLD_DIR": str(self.holders),
                     "MAC_TEST_STATE_DIR": str(self.root / "mac-test"),
-                    "DAILIES_TEST_EVENTS": str(self.events), "DAILIES_TEST_FAIL": str(self.notifier_failure)}
+                    "DAILIES_TEST_EVENTS": str(self.events), "DAILIES_TEST_FAIL": str(self.notifier_failure),
+                    # Unit sessions are looked up in this stand-in; with no state file it has no sessions.
+                    "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
+                    "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
+                    "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")}
+        (self.root / "sessions").mkdir()
         _ = subprocess.run(["git", "init", "-b", "production", str(self.checkout)],
                            check=True, capture_output=True, text=True)
         _ = self.git("config", "user.name", "Dailies Test")
@@ -159,12 +164,12 @@ class DailiesInputTests(unittest.TestCase):
             "- **User zone:** America/Los_Angeles",
             "- **Updates:** every 15 minutes", "",
             "## Units", "",
-            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-            f"| `{ALPHA}` | `docs/alpha.md` | `{self.root / 'alpha'}` | `alpha` | `{ALPHA}` | — | — |",
+            "| Unit | Plan | Worktree | Branch | Port | Owns |",
+            "| --- | --- | --- | --- | --- | --- |",
+            f"| `{ALPHA}` | `docs/alpha.md` | `{self.root / 'alpha'}` | `alpha` | — | — |",
         ]
         if beta:
-            rows.append(f"| `{BETA}` | `docs/beta.md` | `{self.root / 'beta'}` | `beta` | `{BETA}` | — | — |")
+            rows.append(f"| `{BETA}` | `docs/beta.md` | `{self.root / 'beta'}` | `beta` | — | — |")
         rows.extend(["", "## Gates", ""])
         _ = self.doc.write_text("\n".join(rows), encoding="utf-8")
 
