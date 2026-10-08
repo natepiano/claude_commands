@@ -2,7 +2,7 @@
 
 ## What it is
 
-The session notifier sends a message to a live Claude session on a schedule: the scheduled-update prompt (a `/showrunner:dailies simple` report) to a showrunner, and `/unit:report` ticks to a `/unit:direct` unit director. Each schedule is a named **instance** stored on disk. One declared 15 s job runs `notifier.sh tick` on both machines and sends every instance that is due. Before each send, the instance's own check command decides whether to send, skip or remove the instance. No agent arms or re-arms a timer. The schedule lives outside the session, so it keeps going through ended turns, compaction and restarts, and it works the same on Linux (natedev) and the Mac.
+The session notifier sends a message to a live Claude session on a schedule: the scheduled-update prompt (a `/showrunner:dailies gantt` report) to a showrunner, and `/unit:report` ticks to a `/unit:direct` unit director. Each schedule is a named **instance** stored on disk. One declared 15 s job runs `notifier.sh tick` on both machines and sends every instance that is due. Before each send, the instance's own check command decides whether to send, skip or remove the instance. No agent arms or re-arms a timer. The schedule lives outside the session, so it keeps going through ended turns, compaction and restarts, and it works the same on Linux (natedev) and the Mac.
 
 ## How it works
 
