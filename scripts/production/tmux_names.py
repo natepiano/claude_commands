@@ -205,9 +205,6 @@ def tick() -> None:
 def main() -> int:
     try:
         tick()
-        # Its own process: rename_unit imports this module.
-        _ = subprocess.run([sys.executable, str(Path(__file__).with_name("rename_unit.py")), "--follow"],
-                           check=False)
     except (OSError, ValueError) as error:
         print(f"tmux-names: {error}", file=sys.stderr)
         return 1

@@ -175,15 +175,6 @@ def _fields(path: Path) -> dict[str, str]:
     return dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines() if "=" in line)
 
 
-def target_session(instance: Path) -> str | None:
-    """Read the id of the Claude session an update instance prompts, when its target is one."""
-    try:
-        kind, _, session_id = _fields(instance / "conf").get("TARGET", "").partition(":")
-    except (OSError, UnicodeError):
-        return None
-    return session_id if kind == "session" and session_id else None
-
-
 def checked_doc(instance: Path) -> CheckedDoc | NoCheckedDoc:
     """Read the production doc passed to an update instance's production check."""
     try:

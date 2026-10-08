@@ -188,10 +188,10 @@ def _rename_scratch(old: str, new: str, scratch: Path) -> list[str]:
     return changed
 
 
-def rename_all(old: str, new: str, scratch: Path | None) -> list[str]:
-    """Move every store entry from the old unit name to the new one. No scratch means none to move."""
+def rename_all(old: str, new: str, scratch: Path) -> list[str]:
+    """Move every store entry from the old unit name to the new one."""
     try:
-        changed = _rename_scratch(old, new, scratch) if scratch is not None else []
+        changed = _rename_scratch(old, new, scratch)
         changed.extend(send.rename_recipient(old, new))
         changed.extend(build_hold.rename_holder(old, new))
     except RenameRefused:
