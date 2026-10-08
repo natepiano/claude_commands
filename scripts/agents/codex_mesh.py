@@ -64,6 +64,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TextIO, TypedDict, cast, final
 
 SERVER_FILE = "mesh_server.json"
+SERVER_LOG = "mesh_server.log"
 ROSTER_FILE = "mesh_roster.json"
 # Servers dropped by _retire_server, kept so `stop` can still reap them. A
 # retired server is abandoned rather than signalled: it may still be finishing a
@@ -800,7 +801,7 @@ def ensure_server(session_dir: str) -> tuple[int, bool]:
             return port, False
 
         chosen = _free_port()
-        log_path = _session_path(session_dir, "mesh_server.log")
+        log_path = _session_path(session_dir, SERVER_LOG)
         with log_path.open("ab") as log_handle:
             process = subprocess.Popen(
                 ["codex", "app-server", "--listen", f"ws://127.0.0.1:{chosen}"],
@@ -1879,6 +1880,207 @@ def _reap(pid: int) -> bool:
     return True
 
 
+# Where the run-active markers live.
+SWEEP_ROOT = Path("/tmp/claude/delegate")
+# How long a server and its run folder must have sat untouched before the sweep calls it unused.
+SWEEP_IDLE_SECS = 1800.0
+# Files in a run folder whose change means the run is still working.
+SWEEP_ACTIVITY_FILES = ("heartbeat.log", "board.log", ROSTER_FILE, SERVER_LOG)
+SERVER_COMMAND = "codex app-server --listen ws://127.0.0.1:"
+
+
+@dataclass(frozen=True)
+class ServerInUse:
+    reason: str
+
+
+@dataclass(frozen=True)
+class ServerUnused:
+    reason: str
+
+
+@dataclass(frozen=True)
+class ServerUnknown:
+    """Nothing proves it idle, so it is left alone like one in use."""
+
+    reason: str
+
+
+SweepVerdict = ServerInUse | ServerUnused | ServerUnknown
+
+
+@dataclass(frozen=True)
+class ServerFacts:
+    """What the sweep gathered about one running app-server without talking to it."""
+
+    pid: int
+    port: int
+    age_secs: float
+    clients: int
+    # The run folder that started it; None when its log handle names none.
+    session_dir: Path | None
+    folder_exists: bool
+    marked_active: bool
+    # Seats in the run folder's roster whose launcher process is alive.
+    live_launchers: tuple[str, ...]
+    # Seconds since the run folder's newest activity file changed; None when it has none.
+    quiet_secs: float | None
+
+
+def _sweep_verdict(facts: ServerFacts, busy_threads: Callable[[], tuple[str, ...]]) -> SweepVerdict:
+    """Whether anything still needs this app-server. Every doubt counts as in use, and the server
+    is asked about its conversations last, so none can be called unused without that answer."""
+    if facts.clients:
+        return ServerInUse(f"{facts.clients} client connection(s) on its port")
+    if facts.session_dir is None:
+        return ServerUnknown("its log names no run folder, so this launcher did not start it")
+    if facts.live_launchers:
+        # A resident seat waits between turns with nothing on the socket.
+        return ServerInUse("a seat's launcher is still running: " + ", ".join(facts.live_launchers))
+    if facts.marked_active:
+        return ServerInUse("its run has an active marker")
+    if facts.age_secs < SWEEP_IDLE_SECS:
+        return ServerInUse(f"started {facts.age_secs / 60:.0f} min ago")
+    if facts.quiet_secs is not None and facts.quiet_secs < SWEEP_IDLE_SECS:
+        return ServerInUse(f"its run folder changed {facts.quiet_secs / 60:.0f} min ago")
+    if busy := busy_threads():
+        return ServerInUse("a conversation is not idle: " + "; ".join(busy))
+    if not facts.folder_exists:
+        folder = "its run folder was deleted"
+    else:
+        folder = "no activity file" if facts.quiet_secs is None else f"quiet for {facts.quiet_secs / 3600:.1f} h"
+    return ServerUnused(f"no client, no launcher, no active marker, no conversation mid-turn, {folder}")
+
+
+def _running_servers() -> list[tuple[int, int, float]]:
+    """(pid, port, age in seconds) of every app-server listening on loopback."""
+    listed = subprocess.run(["ps", "-eo", "pid=,etimes=,args="], capture_output=True, text=True, check=True)
+    servers: list[tuple[int, int, float]] = []
+    for line in listed.stdout.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) < 3:
+            continue
+        _head, found, port = fields[2].partition(SERVER_COMMAND)
+        if found and port.isdigit() and fields[0].isdigit() and fields[1].isdigit():
+            servers.append((int(fields[0]), int(port), float(fields[1])))
+    return servers
+
+
+def _client_counts() -> dict[int, int]:
+    """Established connections per local port. A server's clients land on its own port."""
+    listed = subprocess.run(["ss", "-Htn", "state", "established"], capture_output=True, text=True, check=True)
+    counts: dict[int, int] = {}
+    for line in listed.stdout.splitlines():
+        fields = line.split()
+        port = fields[2].rpartition(":")[2] if len(fields) >= 4 else ""
+        if port.isdigit():
+            counts[int(port)] = counts.get(int(port), 0) + 1
+    return counts
+
+
+def _server_folder(pid: int) -> Path | None:
+    """The run folder that started this server: `ensure_server` points its stderr at that folder's
+    log, and the handle outlives a rewritten record or a deleted folder. None when it names no such log."""
+    try:
+        target = os.readlink(f"/proc/{pid}/fd/2")
+    except OSError:
+        return None
+    log = Path(target.removesuffix(" (deleted)"))
+    return log.parent if log.name == SERVER_LOG else None
+
+
+def _marked_active(root: Path, folder: Path) -> bool:
+    """Whether a run-active marker names `folder`. A marker that cannot be read counts as naming it."""
+    active = root / "active"
+    for marker in sorted(active.iterdir()) if active.is_dir() else []:
+        try:
+            lines = marker.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return True
+        if lines and lines[0].strip() and Path(lines[0].strip()).resolve() == folder.resolve():
+            return True
+    return False
+
+
+def _quiet_secs(folder: Path, now: float) -> float | None:
+    changed = [(folder / name).stat().st_mtime for name in SWEEP_ACTIVITY_FILES if (folder / name).exists()]
+    return now - max(changed) if changed else None
+
+
+def _live_launchers(folder: Path) -> tuple[str, ...]:
+    roster = _read_json_object(folder / ROSTER_FILE)
+    return tuple(
+        name
+        for name, entry in sorted(roster.items())
+        for pid in [_as_dict(entry).get("launcher_pid")]
+        if isinstance(pid, int) and _pid_alive(pid)
+    )
+
+
+def _roster_threads(folder: Path) -> dict[str, str]:
+    """Thread id to seat name for every conversation the run folder's roster lists."""
+    roster = _read_json_object(folder / ROSTER_FILE)
+    named = {_as_str(_as_dict(entry).get("thread_id")): name for name, entry in sorted(roster.items())}
+    return {thread_id: name for thread_id, name in named.items() if thread_id}
+
+
+def _busy_threads(port: int, seats: dict[str, str]) -> tuple[str, ...]:
+    """Conversations on this server that are not idle, or why they could not be read.
+
+    The server lists what it has loaded, so a turn left running by a launcher killed at its time
+    limit is seen with no client connected and no roster. `seats` adds the roster's conversations
+    and names them."""
+    try:
+        client = Client(port, f"sweep-{os.getpid()}")
+    except (ConnectionError, OSError, SystemExit) as exc:
+        return (f"the server could not be asked ({str(exc) or exc.__class__.__name__})",)
+    try:
+        listed = client.call("thread/loaded/list", {})
+        result = _as_dict(listed.get("result"))
+        loaded = result.get("data")
+        if listed.get("error") or not isinstance(loaded, list) or result.get("nextCursor"):
+            return ("its loaded conversations could not be listed in full",)
+        thread_ids = {*seats, *(_as_str(thread_id) for thread_id in cast("list[object]", loaded))} - {""}
+        busy: list[str] = []
+        for thread_id in sorted(thread_ids):
+            state = _read_live_turn(client, thread_id)
+            if not isinstance(state, ThreadIdle):
+                busy.append(f"{seats.get(thread_id, thread_id)}: {state.__class__.__name__}")
+        return tuple(busy)
+    except (ConnectionError, OSError, SystemExit) as exc:
+        return (f"the server stopped answering ({str(exc) or exc.__class__.__name__})",)
+    finally:
+        client.close()
+
+
+def command_sweep(args: argparse.Namespace) -> int:
+    """Print every running app-server with whether anything still needs it. Stops nothing."""
+    root = Path(_as_str(_attr(args, "root")) or SWEEP_ROOT)
+    try:
+        servers, clients = _running_servers(), _client_counts()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"codex_mesh: sweep: cannot list servers or connections ({exc}); nothing judged", file=sys.stderr)
+        return 1
+    now = time.time()
+    unused = 0
+    for pid, port, age in sorted(servers):
+        folder = _server_folder(pid)
+        exists = folder is not None and folder.is_dir()
+        facts = ServerFacts(
+            pid, port, age, clients.get(port, 0), folder, exists,
+            marked_active=folder is not None and _marked_active(root, folder),
+            live_launchers=_live_launchers(folder) if folder is not None and exists else (),
+            quiet_secs=_quiet_secs(folder, now) if folder is not None and exists else None,
+        )
+        seats = _roster_threads(folder) if folder is not None and exists else {}
+        verdict = _sweep_verdict(facts, lambda port=port, seats=seats: _busy_threads(port, seats))
+        unused += isinstance(verdict, ServerUnused)
+        label = {ServerInUse: "in use", ServerUnused: "unused", ServerUnknown: "unknown"}[type(verdict)]
+        print(f"{pid}\t{port}\t{label}\t{verdict.reason}\t{folder or '-'}")
+    print(f"{len(servers)} app-server(s), {unused} unused; report only, nothing was stopped")
+    return 0
+
+
 def command_serve(args: argparse.Namespace) -> int:
     port, _fresh = ensure_server(_as_str(_attr(args, "session_dir")))
     print(port)
@@ -1967,6 +2169,10 @@ def main(argv: list[str] | None = None) -> int:
     stop = subparsers.add_parser("stop", help="stop the session app-server")
     _ = stop.add_argument("--session-dir", required=True)
     stop.set_defaults(handler=command_stop)
+
+    sweep = subparsers.add_parser("sweep", help="report app-servers nothing is using; stops nothing")
+    _ = sweep.add_argument("--root", default="")
+    sweep.set_defaults(handler=command_sweep)
 
     roster = subparsers.add_parser("list", help="print the delegate roster")
     _ = roster.add_argument("--session-dir", required=True)
