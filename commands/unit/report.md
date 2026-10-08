@@ -89,8 +89,11 @@ Everything below is the contract.
    and whether the launcher has exited. Alive means say so in prose and keep the
    run going; terminal means step 1's completion handling. Never open an
    activity to make the tables render — that records unit-director work that
-   never happened. `No active phase to report` is the one refusal between
-   windows: no phase is active.
+   never happened. When the last phase is closed but an activity is still
+   open, `progress` prints both tables from that phase's last recorded values
+   with the activity as the running row: copy them like any other tick. `No
+   active phase to report` remains only when no phase is active and no
+   activity is open.
 
    Include the override reason only when rejecting an applicable calibrated
    value. **Copy its Markdown output byte-for-byte** — the scope line, the

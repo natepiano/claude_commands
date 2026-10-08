@@ -872,6 +872,11 @@ When every unit's final-gate and as-built checkpoints are merged:
   Units push only their own branch.
 - Merge only from a checkpoint notice. Never merge a visible change before a
   fresh design-check pass on its shots (<MergeCheckpoint/> step 3).
+- **An out-of-date as-built doc may always be corrected.** You and every unit
+  may correct an as-built doc under `docs/as-built/` that contradicts the
+  code, in any unit's doc, without asking the user or the owner. Never hold a
+  merge because a unit corrected another unit's as-built doc. User,
+  2026-10-07.
 - **Check intent before ruling.** Before ruling that a design-check finding
   must change something deliberate-looking, read the repository's
   `docs/design-decisions.md`, the plan and the as-built docs; if intent stays

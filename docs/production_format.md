@@ -269,6 +269,10 @@ Only after <RunAsBuilt/> and, where it applies, <AsBuiltCommit/> are complete, r
    work can fix goes to the owner before the notice: what breaks and who fixes
    it, named on the line. The owner never absorbs your break in a repair
    round. User, 2026-10-06.
+   Correcting an as-built doc under `docs/as-built/` that contradicts the
+   code is always allowed, in any unit's doc, without asking the user, the
+   showrunner or the owner; the checkpoint notice still names the file as
+   `also touches`. User, 2026-10-07.
 10. **Turn-end lines.** A wait the showrunner can clear names it:
     `— blocked: waiting on the showrunner: <what>`. A wait on another unit is
     one of these: `— blocked: waiting on the showrunner: <unit> <what>`. A wait
