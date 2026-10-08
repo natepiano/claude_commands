@@ -100,6 +100,8 @@ class UnitRow(NamedTuple):
     # The unit's session name at this moment, read from its live session; empty when none runs.
     # It addresses the unit and is never a key: every record is kept under the unit's name.
     session: str
+    # Read from the records of the unit's /unit:delegate runs.
+    run: unit_lookup.UnitState
 
 
 class DailiesFailure(Exception):
@@ -128,7 +130,11 @@ def units_from_doc(lines: list[str], slug: str) -> tuple[UnitRow, ...]:
             raise DailiesFailure("production", f"invalid Units row: {cells}")
         found = marked.get(name)
         claude = found.claude if found is not None else None
-        units.append(UnitRow(name, claude.name if isinstance(claude, unit_lookup.LiveClaude) else ""))
+        try:
+            run = unit_lookup.run_state(Path(cell_value(cells.get("Worktree", ""))))
+        except OSError as error:
+            raise DailiesFailure("production", f"the run records of {name} could not be read: {error}") from error
+        units.append(UnitRow(name, claude.name if isinstance(claude, unit_lookup.LiveClaude) else "", run))
     return tuple(units)
 
 
@@ -321,6 +327,16 @@ def run(args: argparse.Namespace) -> int:
     instance = f"showrunner-{production.slug}"
     blocks = status_blocks(status_path, units)
     report("status", "ok", f"{len(blocks)} units read")
+    # A unit whose run is finished has nothing to report: it needs no judgment entry and is left out,
+    # unless it shows a form or a decision, which the user still has to see.
+    asking = {block.session for block in blocks
+              if any(isinstance(flag, (FormWaiting, Decision)) for flag in block.flags)}
+    finished = [unit.name for unit in units
+                if unit.run is unit_lookup.UnitState.RUN_FINISHED and unit.name not in asking]
+    if finished:
+        units = tuple(unit for unit in units if unit.name not in finished)
+        blocks = tuple(block for block in blocks if block.session not in finished)
+        report("status", "ok", f"left out, run finished and nothing waiting on the user: {', '.join(finished)}")
     for block in blocks:
         first: list[str] = []
         if isinstance(block.state, SessionGone):

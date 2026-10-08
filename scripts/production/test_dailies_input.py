@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from dailies_input import (Activity, Block, ClaudeNotRunning, Decision, FormWaiting,
                            Running, SessionGone, StillWaiting, TicksFailing, UnitRow,
                            status_blocks)
+from unit_lookup import UnitState
 
 
 SCRIPT = Path(__file__).with_name("dailies_input.py")
@@ -275,7 +276,7 @@ class DailiesInputTests(unittest.TestCase):
     def parsed_block(self) -> tuple[Running | SessionGone | ClaudeNotRunning,
                                     tuple[FormWaiting | Decision | StillWaiting | Block | TicksFailing, ...],
                                     tuple[Activity, ...]]:
-        block = status_blocks(self.status, (UnitRow(ALPHA, ALPHA),))[0]
+        block = status_blocks(self.status, (UnitRow(ALPHA, ALPHA, UnitState.RUNNING),))[0]
         return block.state, block.flags, block.activity
 
     def assert_refused_without_output(self, *extra: str, mention: str) -> str:
@@ -285,6 +286,39 @@ class DailiesInputTests(unittest.TestCase):
         self.assertIn(mention, result.stdout + result.stderr)
         self.assertEqual(self.output.read_text(encoding="utf-8"), "sentinel\n")
         return result.stdout + result.stderr
+
+    def finished_run(self, worktree: Path) -> None:
+        """Record a /unit:delegate run in `worktree` that has finished, as the recorder would."""
+        runs = self.root / "history/runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        events: list[dict[str, object]] = [
+            {"event_type": "run_started", "working_dir": str(worktree.resolve()), "run_started_at": 1.0},
+            {"event_type": "run_finished"}]
+        _ = (runs / f"{worktree.name}.jsonl").write_text(
+            "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        self.env["PLAN_DELEGATE_HISTORY_DIR"] = str(self.root / "history")
+
+    def test_a_unit_whose_run_is_finished_needs_no_entry_and_is_left_out(self) -> None:
+        self.production_doc(beta=True)
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels", f"== {BETA}", "● Standing by")
+        self.judgment_file()
+        self.finished_run(self.root / "beta")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        units = cast(list[dict[str, object]], self.report()["units"])
+        self.assertEqual([unit["unit"] for unit in units], [ALPHA])
+        self.assertIn(f"left out, run finished and nothing waiting on the user: {BETA}", result.stdout)
+
+    def test_a_finished_unit_that_shows_a_form_keeps_its_place_and_needs_its_entry(self) -> None:
+        self.production_doc(beta=True)
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels",
+                          f"== {BETA}", f"FORM WAITING on you in {BETA}: a question form is on its screen")
+        self.judgment_file()
+        self.finished_run(self.root / "beta")
+        refused = self.run_builder()
+        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        self.assertIn("units[1].project: required", refused.stdout + refused.stderr)
+        self.assertNotIn("left out", refused.stdout)
 
     def test_each_length_produces_input_the_renderer_accepts(self) -> None:
         for length in ("gantt", "simple", "page", "elaborate"):
