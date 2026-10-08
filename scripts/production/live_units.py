@@ -38,33 +38,35 @@ def production_units(doc: Path) -> list[LiveUnit]:
     return [LiveUnit(unit, marked.get(unit)) for unit in units if unit]
 
 
-def live_units(session: str) -> list[LiveUnit]:
-    settings = showrunners.load_settings()
-    runner = next((item for item in settings["showrunners"] if item["session"] == session), None)
-    if runner is None:
-        raise ValueError(f"showrunner absent from config: {session}")
+def units_of(runner: showrunners.Showrunner) -> list[LiveUnit]:
+    """The showrunner's units. A showrunner whose update timer names no doc has none to list."""
     return production_units(Path(runner["doc"])) if runner["doc"] else []
 
 
-def live_unit_names(session: str) -> list[str]:
+def live_unit_names(runner: showrunners.Showrunner) -> list[str]:
     """The session names, as they are now, of the showrunner's units that have a live Claude.
 
     A tmux that cannot say which sessions exist leaves the list empty and says why.
     """
     try:
-        return [unit.name for unit in live_units(session) if unit.name]
+        return [unit.name for unit in units_of(runner) if unit.name]
     except OSError as error:
-        print(f"live_units: the units of {session} could not be listed: {error}", file=sys.stderr)
+        print(f"live_units: the units of {runner['slug']} could not be listed: {error}", file=sys.stderr)
         return []
 
 
 def main(arguments: list[str]) -> int:
     """Print one line per unit: unit id, pane, whether Claude runs (live, stopped, unknown, gone), name."""
-    if len(arguments) != 1:
-        print("usage: live_units.py <showrunner session>", file=sys.stderr)
-        return 2
     try:
-        units = live_units(arguments[0])
+        match arguments:
+            case ["--production", doc]:
+                units = production_units(Path(doc))
+            # An update prompt written before a production was named by its doc names the showrunner.
+            case [showrunner] if not showrunner.startswith("-"):
+                units = units_of(showrunners.named(showrunner))
+            case _:
+                print("usage: live_units.py --production <production doc>", file=sys.stderr)
+                return 2
     except (OSError, ValueError) as error:
         print(error, file=sys.stderr)
         return 1

@@ -10,7 +10,7 @@ every message follows are /message (~/.claude/commands/message.md).
   send.py --to user --summary TITLE [--need note|decision|blocked] ...   the user
   send.py ack KEY       later sends with KEY are skipped
   send.py reopen KEY    forget KEY: acknowledgement and repeat window
-  send.py pending NAME  print and clear NAME's queue
+  send.py pending [NAME]  print and clear what is kept for this session, or for NAME's
 
 Delivery. The session-to-session channel is a tool, not a command, so a Claude
 recipient is reached through a headless `claude -p` relay whose one job is a
@@ -38,7 +38,10 @@ message text as one JSON line in STATE/log.jsonl:
   SENT: how                                                       exit 0
   SKIPPED: why   acknowledged, or inside the repeat window        exit 0
   QUEUED: why    a Claude recipient not reached; kept in          exit 1
-                 STATE/queue/<to>.jsonl, the latest per key
+                 STATE/queue/, the latest per key, under the
+                 recipient's Claude session id, so a rename loses
+                 nothing; under the name as given when no live
+                 session answers to it, which the outcome says
   FAILED: why    not delivered and not kept: a Codex seat, which  exit 3
                  no queue reader reaches, the user, or ssh to HOST
 Usage errors, an unreadable --file and an empty message exit 2. STATE is $XDG_STATE_HOME/message, or ~/.local/state/message.
@@ -61,6 +64,9 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sessions  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message"
 CLAUDE = Path.home() / ".local" / "bin" / "claude"
@@ -191,8 +197,22 @@ def key_states() -> Generator[KeyStates]:
             write_atomic(path, json.dumps(states, indent=2, sort_keys=True) + "\n")
 
 
-def queue_path(to: str) -> Path:
-    return STATE / "queue" / f"{file_name(to)}.jsonl"
+def queue_path(key: str) -> Path:
+    return STATE / "queue" / f"{file_name(key)}.jsonl"
+
+
+def session_key(session: sessions.SessionRecord) -> str:
+    return f"session-{session['sessionId']}"
+
+
+def queue_for(to: str) -> Path:
+    """Where a message that did not reach `to` is kept.
+
+    Under the Claude session id of the live session `to` means, so the session finds it whatever it
+    is called later. Under `to` itself when no live session answers to it: there is no id to look up.
+    """
+    session = sessions.addressed(to, sessions.live_sessions())
+    return queue_path(session_key(session) if session is not None else to)
 
 
 def read_queue(path: Path) -> list[Queued]:
@@ -205,7 +225,7 @@ def read_queue(path: Path) -> list[Queued]:
 
 def enqueue(message: Message, reason: str, at: datetime) -> None:
     """Keep a message that did not arrive; a later one with the same key replaces it."""
-    path = queue_path(message.to)
+    path = queue_for(message.to)
     entry: Queued = {"time": at.isoformat(), "from": message.sender, "to": message.to, "key": message.key,
                      "summary": message.summary, "text": message.text, "reason": reason}
     with locked():
@@ -264,11 +284,30 @@ def reopen(key: str) -> str:
     return f"{key}: reopened; its next send goes out"
 
 
-def pending(to: str) -> str:
-    path = queue_path(to)
+def pending(to: str | None) -> str:
+    """Print and clear what is kept for a session: the one `to` means, or the caller's own.
+
+    It is found by session id. What was kept under a name is found too: the name `to`, the session's
+    name now, and each name it once had that no live session has now.
+    """
+    records = sessions.live_sessions()
+    if to is None:
+        own = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        session = next((record for record in records if own and record["sessionId"] == own), None)
+        if session is None:
+            raise ValueError("pending without a name runs inside a live Claude session")
+    else:
+        session = sessions.addressed(to, records)
+    keys = [] if to is None else [to]
+    if session is not None:
+        taken = {record["name"] for record in records if record["sessionId"] != session["sessionId"]}
+        keys = [session_key(session), session["name"], f"uds:{session['messagingSocketPath']}",
+                *(name for name in session["formerNames"] if name not in taken), *keys]
+    paths = list(dict.fromkeys(queue_path(key) for key in keys if key))
     with locked():
-        entries = read_queue(path)
-        path.unlink(missing_ok=True)
+        entries = sorted((entry for path in paths for entry in read_queue(path)), key=lambda entry: entry["time"])
+        for path in paths:
+            path.unlink(missing_ok=True)
     return "\n\n".join(f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:\n"
                        + entry["text"].rstrip() for index, entry in enumerate(entries, 1))
 
@@ -484,7 +523,7 @@ def optional_float(value: object) -> float | None:
 def parse(argv: list[str]) -> Options:
     parser = argparse.ArgumentParser(prog="send.py",
                                      description="Send one message to a Claude session, a Codex seat or the user.",
-                                     epilog="Also: send.py ack KEY | reopen KEY | pending NAME")
+                                     epilog="Also: send.py ack KEY | reopen KEY | pending [NAME]")
     _ = parser.add_argument("--to", required=True, help="the recipient's name as ListAgents prints it, or `user`")
     _ = parser.add_argument("--from", dest="sender", help="the sender name the recipient sees")
     _ = parser.add_argument("--summary", help="SendMessage's short label, default the first line; the title to `user`")
@@ -557,6 +596,9 @@ def send(options: Options) -> Result:
         result = relay(message, options.timeout)
         if result.outcome == "queued":
             enqueue(message, result.detail, started)
+            if sessions.addressed(message.to, sessions.live_sessions()) is None:
+                result = Result("queued", f"{result.detail}; no live session answers to {message.to},"
+                                + " so it is kept under that name")
     log(message, result, started)
     return result
 
@@ -567,11 +609,15 @@ def main(argv: list[str]) -> int:
             print(acknowledge(key))
         case ["reopen", key]:
             print(reopen(key))
-        case ["pending", name]:
-            if text := pending(name):
+        case ["pending", *named] if len(named) <= 1:
+            try:
+                text = pending(named[0] if named else None)
+            except ValueError as error:
+                usage_error(str(error))
+            if text:
                 print(text)
         case ["ack" | "reopen" | "pending", *_]:
-            usage_error(f"usage: send.py {argv[0]} {'NAME' if argv[0] == 'pending' else 'KEY'}")
+            usage_error(f"usage: send.py {argv[0]} {'[NAME]' if argv[0] == 'pending' else 'KEY'}")
         case _:
             result = send(parse(argv))
             print(f"{result.outcome.upper()}: {result.detail}")

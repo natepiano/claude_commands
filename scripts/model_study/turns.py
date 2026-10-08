@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 
 OVER_LIMIT_SECONDS = 1800
 PDT = ZoneInfo("America/Los_Angeles")
+# Newest first; transcripts from before the rename hold the old name.
+DIRECTOR_COMMANDS = ("/unit:direct", "/unit:delegate")
 
 type Record = dict[str, object]
 
@@ -166,12 +168,14 @@ def director_boundary(records: list[Record], director_from: str | None, first_re
         at = datetime.fromisoformat(director_from).replace(tzinfo=PDT)
         return at, at.isoformat(), False
     for record in records:
-        if record.get("type") == "user" and isinstance(user_content(record), str) and "<command-name>/unit:delegate</command-name>" in cast(str, user_content(record)):
+        content = user_content(record)
+        if record.get("type") == "user" and isinstance(content, str) and any(f"<command-name>{name}</command-name>" in content for name in DIRECTOR_COMMANDS):
             at = timestamp(record)
             if at is not None:
                 return at, at.isoformat(), False
     for record in records:
-        if record.get("type") == "user" and record.get("turnOrigin") in ("human", "peer") and isinstance(user_content(record), str) and "/unit:delegate" in cast(str, user_content(record)):
+        content = user_content(record)
+        if record.get("type") == "user" and record.get("turnOrigin") in ("human", "peer") and isinstance(content, str) and any(name in content for name in DIRECTOR_COMMANDS):
             at = timestamp(record)
             if at is not None:
                 return at, at.isoformat(), False

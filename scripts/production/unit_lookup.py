@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """Find a production's units by the marks on their tmux sessions.
 
-A unit's tmux session carries three marks in its environment: the production slug, the unit id
-and the unit's run state. Nothing else records which session is which unit. A unit's current name,
-pane and socket are read here, from tmux and the live session records, each time they are needed,
-so a rename or a relaunch leaves nothing to bring in step.
+A unit's tmux session carries two marks in its environment: the production slug and the unit id.
+Nothing else records which session is which unit. A unit's current name, pane and socket are read
+here, from tmux and the live session records, each time they are needed, so a rename or a relaunch
+leaves nothing to bring in step. Its run state is stored nowhere either: it is read from the
+records /unit:delegate keeps of its runs.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 MESSAGE = Path(__file__).resolve().parent.parent / "message"
 sys.path.insert(0, str(MESSAGE))
@@ -22,10 +24,8 @@ from sessions import UnreadableSessionRecord, live_session, read_session  # noqa
 
 PRODUCTION_MARK = "SHOWRUNNER_UNIT"
 UNIT_MARK = "SHOWRUNNER_UNIT_ID"
-STATE_MARK = "SHOWRUNNER_UNIT_STATE"
 USAGE = ("usage: unit_lookup.py list <production slug> | pane <production slug> <unit>"
-         + " | mark <production slug> <unit> <tmux session>"
-         + " | state <production slug> <unit> <running|run-finished|standing-by>")
+         + " | mark <production slug> <unit> <tmux session>")
 
 
 class UnitState(Enum):
@@ -56,12 +56,57 @@ Claude = LiveClaude | ClaudeNotRunning | ClaudeUnknown
 
 class MarkedUnit(NamedTuple):
     unit: str
-    state: UnitState
     # The first pane of the marked tmux session, as tmux addresses it ("%41").
     pane: str
     # The tmux session's label now. It is a display name: nothing finds a pane by it.
     label: str
     claude: Claude
+
+
+def runs_dir() -> Path:
+    """Where /unit:delegate keeps one record per run. Read at each call, as the recorder reads it."""
+    root = os.environ.get("PLAN_DELEGATE_HISTORY_DIR")
+    return (Path(root).expanduser() if root else Path.home() / ".local/state/plan-delegate") / "runs"
+
+
+def _events(path: Path) -> list[dict[str, object]]:
+    """A run record's events. A line caught half-written is left out; the next read has it."""
+    events: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            event = cast(object, json.loads(line))
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            events.append(cast(dict[str, object], event))
+    return events
+
+
+def run_state(worktree: Path) -> UnitState:
+    """A unit's run state, read from the newest record of a /unit:delegate run in its worktree.
+
+    No record means the unit has started no run, so it is standing by. Raises OSError when the
+    records cannot be read, which says nothing about the unit.
+    """
+    directory = runs_dir()
+    if not directory.exists():
+        return UnitState.STANDING_BY
+    wanted = str(worktree.expanduser().resolve())
+    newest: tuple[float, list[dict[str, object]]] | None = None
+    for path in directory.iterdir():
+        if path.suffix != ".jsonl":
+            continue
+        events = _events(path)
+        first = events[0] if events else {}
+        if first.get("event_type") != "run_started" or first.get("working_dir") != wanted:
+            continue
+        started = first.get("run_started_at")
+        at = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else 0.0
+        if newest is None or at > newest[0]:
+            newest = (at, events)
+    if newest is None:
+        return UnitState.STANDING_BY
+    return UnitState.RUN_FINISHED if newest[1][-1].get("event_type") == "run_finished" else UnitState.RUNNING
 
 
 def sessions_dir() -> Path:
@@ -108,7 +153,7 @@ def _marks(session: str) -> dict[str, str]:
     if shown.returncode != 0:
         return {}
     pairs = (line.split("=", 1) for line in shown.stdout.splitlines() if "=" in line)
-    return {name: value for name, value in pairs if name in (PRODUCTION_MARK, UNIT_MARK, STATE_MARK)}
+    return {name: value for name, value in pairs if name in (PRODUCTION_MARK, UNIT_MARK)}
 
 
 def _claudes() -> tuple[dict[str, LiveClaude], str]:
@@ -150,11 +195,7 @@ def marked_units(slug: str) -> dict[str, MarkedUnit]:
             raise OSError(f"tmux sessions {units[unit].label} and {label} both carry the mark of {unit}")
         live = [claudes[pane] for pane in panes if pane in claudes]
         claude: Claude = (live[0] if live else ClaudeUnknown(unread) if unread else ClaudeNotRunning())
-        try:
-            state = UnitState(marks.get(STATE_MARK, UnitState.RUNNING.value))
-        except ValueError as error:
-            raise OSError(f"{label} carries an unknown state mark: {marks[STATE_MARK]}") from error
-        units[unit] = MarkedUnit(unit, state, panes[0], label, claude)
+        units[unit] = MarkedUnit(unit, panes[0], label, claude)
     return units
 
 
@@ -164,15 +205,6 @@ def mark(target: str, slug: str, unit: str) -> None:
         done = _tmux("set-environment", "-t", target, name, value)
         if done.returncode != 0:
             raise OSError(f"tmux could not mark {target}: {done.stderr.strip() or f'exit {done.returncode}'}")
-
-
-def set_state(target: str, state: UnitState) -> None:
-    """Record a unit's run state on the tmux session `target` names or holds as a pane."""
-    if UNIT_MARK not in _marks(target):
-        raise OSError(f"{target} is not a marked unit session")
-    done = _tmux("set-environment", "-t", target, STATE_MARK, state.value)
-    if done.returncode != 0:
-        raise OSError(f"tmux could not mark {target}: {done.stderr.strip() or f'exit {done.returncode}'}")
 
 
 def main(arguments: list[str]) -> int:
@@ -186,7 +218,7 @@ def main(arguments: list[str]) -> int:
                             else ("", "", ""))
                     running = ("live" if isinstance(claude, LiveClaude)
                                else "unknown" if isinstance(claude, ClaudeUnknown) else "stopped")
-                    print("\t".join((unit.unit, unit.state.value, unit.pane, unit.label, running, *told)))
+                    print("\t".join((unit.unit, unit.pane, unit.label, running, *told)))
             case ["pane", slug, name]:
                 found = marked_units(slug).get(name)
                 if found is None:
@@ -194,12 +226,6 @@ def main(arguments: list[str]) -> int:
                 print(found.pane)
             case ["mark", slug, name, target]:
                 mark(target, slug, name)
-            # The showrunner's way to set a unit's run state; a unit sets its own from its pane.
-            case ["state", slug, name, state] if state in [one.value for one in UnitState]:
-                found = marked_units(slug).get(name)
-                if found is None:
-                    return 1
-                set_state(found.pane, UnitState(state))
             case _:
                 print(USAGE, file=sys.stderr)
                 return 2

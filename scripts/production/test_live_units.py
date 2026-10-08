@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from typing import override
 
+import fake_showrunner
 import fake_tmux
 from fake_tmux import FakeSession
 
@@ -26,7 +27,7 @@ def marked(label: str, pane: str, unit: str, slug: str = "show") -> FakeSession:
 
 class LiveUnitsTests(unittest.TestCase):
     root: Path = Path()
-    config: Path = Path()
+    timers: Path = Path()
     doc: Path = Path()
     state: Path = Path()
     records: Path = Path()
@@ -35,22 +36,14 @@ class LiveUnitsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.config = self.root / "showrunners.json"
+        self.timers = self.root / "notifier"
         self.doc = self.root / "show-production.md"
         self.state = self.root / "tmux.json"
         self.records = self.root / "sessions"
         self.records.mkdir()
-        self.environment = {**os.environ, "SHOWRUNNERS_CONFIG": str(self.config),
+        self.environment = {**os.environ, "NOTIFIER_STATE_DIR": str(self.timers),
                             "NOTIFIER_SESSIONS_DIR": str(self.records),
                             "UNIT_LOOKUP_TMUX": FAKE, "FAKE_TMUX_STATE": str(self.state)}
-        self.register("director", str(self.doc))
-
-    def register(self, session: str, doc: str) -> None:
-        _ = self.config.write_text(json.dumps({
-            "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5,
-            "faults_to": "natedev", "always": ["natedev"],
-            "showrunners": [{"session": session, "zone": "America/Los_Angeles", "doc": doc}],
-        }), encoding="utf-8")
 
     def write_doc(self, header: tuple[str, str], *rows: str) -> None:
         _ = self.doc.write_text("\n".join(("# Production", "## Units", *header, *rows)), encoding="utf-8")
@@ -65,9 +58,9 @@ class LiveUnitsTests(unittest.TestCase):
             "pid": os.getpid(), "sessionId": f"id-{name}", "name": name,
             "messagingSocketPath": str(path), "updatedAt": 1, "tmux": f"label-at-start:@1.{pane}"}))
 
-    def run_script(self, session: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), session], env=self.environment,
-                              capture_output=True, text=True, check=False)
+    def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([sys.executable, str(SCRIPT), *(arguments or ("--production", str(self.doc)))],
+                              env=self.environment, capture_output=True, text=True, check=False)
 
     def test_each_live_row_is_listed_in_doc_order_with_its_session_as_it_is_now(self) -> None:
         self.write_doc(
@@ -82,7 +75,7 @@ class LiveUnitsTests(unittest.TestCase):
                                      "$3": marked("done-label", "%6", "done-unit"),
                                      "$4": marked("other-show", "%7", "gone-unit", slug="other")})
         self.claude("renamed-since-launch", "%4")
-        result = self.run_script("director")
+        result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
         # `gone-unit` has neither a worktree nor a session of this production, so it is retired.
         self.assertEqual(result.stdout.splitlines(), ["alpha-unit\t%4\tlive\trenamed-since-launch",
@@ -93,27 +86,34 @@ class LiveUnitsTests(unittest.TestCase):
                        "| alpha-unit | docs/plans/alpha.md | /tmp/no-such-worktree-alpha | alpha | `stale-name` | — | — |")
         fake_tmux.write(self.state, {"$1": marked("current-name", "%4", "alpha-unit")})
         self.claude("current-name", "%4")
-        result = self.run_script("director")
+        result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["alpha-unit\t%4\tlive\tcurrent-name"])
 
-    def test_a_showrunner_with_no_registered_doc_has_no_units(self) -> None:
-        self.register("director", "")
-        result = self.run_script("director")
-        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+    def test_a_prompt_written_before_the_change_still_names_the_showrunner(self) -> None:
+        self.write_doc(HEADER, "| alpha-unit | docs/plans/alpha.md | /tmp/no-such-worktree-alpha | alpha | — | — |")
+        fake_tmux.write(self.state, {"$1": marked("alpha-label", "%4", "alpha-unit")})
+        _ = fake_showrunner.write_timer(self.timers, "show", "director-id", "America/Los_Angeles", self.doc)
+        self.addCleanup(fake_showrunner.write_session(self.records, "director", "director-id").close)
+        for showrunner in ("director", "show"):
+            with self.subTest(showrunner=showrunner):
+                result = self.run_script(showrunner)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), ["alpha-unit\t%4\tstopped\t"])
 
     def test_a_tmux_that_cannot_say_is_an_error_not_an_empty_list(self) -> None:
         self.write_doc(HEADER, "| alpha-unit | docs/plans/alpha.md | /tmp/no-such-worktree-alpha | alpha | — | — |")
         self.environment["UNIT_LOOKUP_TMUX"] = str(self.root / "no-such-tmux")
-        result = self.run_script("director")
+        result = self.run_script()
         self.assertEqual((result.returncode, result.stdout), (1, ""), result.stderr)
         self.assertIn("no-such-tmux", result.stderr)
 
-    def test_absent_showrunner_exits_one(self) -> None:
+    def test_a_showrunner_no_timer_names_exits_one(self) -> None:
         result = self.run_script("missing")
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr.strip(), "showrunner absent from config: missing")
+        self.assertEqual((result.returncode, result.stdout), (1, ""))
+        self.assertIn("no showrunner with an update timer is called missing", result.stderr)
+        self.assertEqual(self.run_script().returncode, 1)
+        self.assertEqual(self.run_script("--production").returncode, 2)
 
 
 if __name__ == "__main__":

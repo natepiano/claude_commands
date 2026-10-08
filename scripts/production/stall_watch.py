@@ -8,12 +8,10 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 import time
 from datetime import datetime
-from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
@@ -55,16 +53,7 @@ class Delivery(NamedTuple):
     command: list[str]
 
 
-class _SessionSocket(NamedTuple):
-    path: str
 
-
-class _NoLiveSession(Enum):
-    RESULT = "no live session"
-
-
-class _SessionLookupUnavailable(Enum):
-    RESULT = "session lookup unavailable"
 
 
 def command_output(command: list[str]) -> str:
@@ -141,22 +130,6 @@ def save_stretch(path: Path, stretch: Stretch) -> None:
     os.replace(temporary, path)
 
 
-def socket_for_target(target: str) -> _SessionSocket | _NoLiveSession | _SessionLookupUnavailable:
-    try:
-        result = subprocess.run(
-            [sys.executable, str(SESSIONS), "socket", target],
-            capture_output=True, text=True, check=False,
-        )
-    except OSError:
-        return _SessionLookupUnavailable.RESULT
-    socket = result.stdout.strip()
-    if result.returncode == 0:
-        return _SessionSocket(socket) if socket else _NoLiveSession.RESULT
-    if result.returncode == 1:
-        return _NoLiveSession.RESULT
-    return _SessionLookupUnavailable.RESULT
-
-
 def delivery(path: Path, kind: str, socket: str, key: str, text: str) -> Delivery:
     return Delivery(path, kind, [sys.executable, str(SEND), "--to", f"uds:{socket}", "--from", "stall-watch",
                                  "--key", key, "--text", text])
@@ -195,64 +168,34 @@ def tick(now: float) -> None:
     settings = showrunners.load_settings()
     rows = processes()
     pending: list[Delivery] = []
-    running = showrunners.running_showrunners()
-    sockets = {configured["session"]: socket_for_target(configured["session"])
-               for configured in settings["showrunners"]}
-    configured_names = set(sockets)
-    lookup_unavailable = any(isinstance(result, _SessionLookupUnavailable)
-                             for result in sockets.values())
-    configured_sockets = {result.path for result in sockets.values()
-                          if isinstance(result, _SessionSocket)}
-    missing = ([] if lookup_unavailable else
-               [runner for runner in running
-                if runner.session not in configured_names and runner.socket not in configured_sockets])
-    if not lookup_unavailable:
-        missing_slugs = {runner.slug for runner in missing}
-        for path in STATE_DIR.glob("missing-*.json"):
-            if path.stem.removeprefix("missing-") not in missing_slugs:
-                path.unlink()
-    faults_lookup = socket_for_target(settings["faults_to"])
-    faults_socket = faults_lookup.path if isinstance(faults_lookup, _SessionSocket) else ""
-    for runner in missing:
-        path = STATE_DIR / f"missing-{runner.slug}.json"
-        stretch = read_stretch(path, runner.socket, now)
-        save_stretch(path, stretch)
-        if not stretch["tell_sent"] and faults_socket:
-            if isinstance(runner.prompt, showrunners.PromptZone) and isinstance(runner.doc, showrunners.CheckedDoc):
-                args = shlex.join(["add", runner.session, "--zone", runner.prompt.zone, "--doc", str(runner.doc.path)])
-                prompt_note = ""
-            else:
-                args = f"add {shlex.quote(runner.session)} --zone <zone> --doc <production doc>"
-                reason = (runner.prompt.reason if isinstance(runner.prompt, showrunners.UnreadablePrompt)
-                          else runner.doc.reason if isinstance(runner.doc, showrunners.NoCheckedDoc) else "")
-                prompt_note = f" Its zone or its doc is not given because {reason}."
-            add = "$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py " + args
-            message = (f"stall-watch: showrunner {runner.slug} (session {runner.session}) is running but "
-                       "missing from config/showrunners.json, so its units are not watched. "
-                       f"It should run: {add}.{prompt_note}")
-            pending.append(delivery(path, "missing", faults_socket,
-                                    f"stall-watch:missing:{runner.slug}:{int(stretch['since'])}", message))
-    for configured in settings["showrunners"]:
-        showrunner_lookup = sockets[configured["session"]]
-        if not isinstance(showrunner_lookup, _SessionSocket):
+    for configured in showrunners.registered_showrunners():
+        # A showrunner that is not running has no one to tell: its units are not watched.
+        showrunner_socket = configured["socket"]
+        if not showrunner_socket:
             continue
-        showrunner_socket = showrunner_lookup.path
         try:
             zone = ZoneInfo(configured["zone"])
         except (KeyError, ValueError):
-            print(f"stall-watch: invalid zone for {configured['session']}: {configured['zone']}", file=sys.stderr)
+            print(f"stall-watch: invalid zone for {configured['slug']}: {configured['zone']}", file=sys.stderr)
             continue
         # The units are the doc's live rows; each is found by the mark on its tmux session.
         try:
             slug = showrunners.production_slug(configured["doc"])
             lines = Path(configured["doc"]).read_text(encoding="utf-8").splitlines()
-            live = {add_unit.cell_value(cells.get("Unit", "")) for cells in add_unit.live_unit_table(lines, slug)}
+            live = {add_unit.cell_value(cells.get("Unit", "")): add_unit.cell_value(cells.get("Worktree", ""))
+                    for cells in add_unit.live_unit_table(lines, slug)}
             marked = unit_lookup.marked_units(slug)
         except (OSError, UnicodeError, ValueError, add_unit.Refusal) as error:
-            print(f"stall-watch: {configured['session']}: its units are not watched: {error}", file=sys.stderr)
+            print(f"stall-watch: {configured['slug']}: its units are not watched: {error}", file=sys.stderr)
             continue
         for name, unit in marked.items():
-            if unit.state is not unit_lookup.UnitState.RUNNING or name not in live:
+            # A unit is watched while the newest /unit:delegate run in its worktree is unfinished.
+            try:
+                running = name in live and unit_lookup.run_state(Path(live[name])) is unit_lookup.UnitState.RUNNING
+            except (OSError, UnicodeError) as error:
+                print(f"stall-watch: {name}: its run state is unknown: {error}", file=sys.stderr)
+                continue
+            if not running:
                 stretch_path(slug, name).unlink(missing_ok=True)
                 continue
             claude = unit.claude

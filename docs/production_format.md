@@ -64,9 +64,6 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Repository:** <main checkout path>
 - **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
 - **Showrunner checkout:** <path, on the merge branch>
-- **Showrunner session:** <the showrunner's SendMessage name, as ListAgents prints it> —
-  `/showrunner:produce` writes it at start and on every resume; the update timer
-  sends each tick to it
 - **Log:** <repo-relative path> — git-excluded; one line per event
 - **User zone:** <IANA zone> — every time the showrunner reports is in this zone plus UTC
 - **Updates:** every <N> minutes (default 15); each update reports every unit in full;
@@ -76,6 +73,10 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
 - **UX guide:** <path to the project's UX rules, e.g. `~/rust/hanadocs/ux`>; omit when
   nothing users see changes
+
+The showrunner's session name is not in the doc: a name can change, so it is
+looked up when needed. `~/.claude/scripts/lib/py
+~/.claude/scripts/production/showrunners.py name <slug>` prints it as it is now.
 
 ## Units
 
@@ -139,8 +140,8 @@ Applies to a `/unit:delegate` run whose plan header carries a
 run and after every compaction. Your row in its **Units** table gives your name,
 branch, port and the files you own.
 
-At <PrepareSession/>, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/showrunners.py" status --state running` from the unit director's own pane; a session stays live after its run ends and can start another run without a new launch, so this sets a finished unit back to running for the stall watch and changes nothing when it is already running. The state is a mark on the unit's own tmux session, so the call names no session.
-Only after <RunAsBuilt/> and, where it applies, <AsBuiltCommit/> are complete, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/showrunners.py" status --state run-finished` from the unit director's own pane before <RunSummary/>; a run that stopped, failed, or waits on a decision does not mark itself finished, and nothing asks for `run done` text in the Plan cell.
+A unit's run state is written down nowhere and the unit sets nothing. Each reader takes it, when it needs it, from the records `/unit:delegate` keeps of the runs in the unit's worktree: no run yet is standing by, a newest run with no finish is running, a newest run that finished is run-finished. A session stays live after its run ends, and its next run reads as running from that run's first record.
+A run that stopped, failed, or waits on a decision has no finish in its record, so it does not read as finished, and nothing asks for `run done` text in the Plan cell.
 
 1. **Your port.** Every app launch for smoke tests and shots uses your port,
    never the user's default port or another unit's.

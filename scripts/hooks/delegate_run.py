@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Whether a /unit:delegate run is currently active in a given Claude session.
+"""Whether a /unit:direct run is currently active in a given Claude session.
 
 `prepare_session.sh` drops a marker file named for `CLAUDE_CODE_SESSION_ID`
 (verified identical to the `session_id` in every hook payload) holding the

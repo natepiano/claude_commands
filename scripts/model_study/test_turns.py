@@ -273,6 +273,31 @@ class RequestExtractionTests(unittest.TestCase):
                     ["after"],
                 ),
                 (
+                    "command, new name",
+                    [
+                        user("2026-10-06T23:00:00Z", "setup", origin="human"),
+                        assistant("2026-10-06T23:00:01Z", "before"),
+                        user(
+                            "2026-10-06T23:00:10Z",
+                            "<command-name>/unit:direct</command-name>",
+                        ),
+                        assistant("2026-10-06T23:00:11Z", "after"),
+                    ],
+                    None,
+                    ["after"],
+                ),
+                (
+                    "human, new name",
+                    [
+                        user("2026-10-06T23:00:00Z", "setup", origin="human"),
+                        assistant("2026-10-06T23:00:01Z", "before"),
+                        user("2026-10-06T23:00:10Z", "run /unit:direct", origin="human"),
+                        assistant("2026-10-06T23:00:11Z", "after"),
+                    ],
+                    None,
+                    ["after"],
+                ),
+                (
                     "roster",
                     [
                         user("2026-10-06T23:00:00Z", "setup", origin="human"),

@@ -60,8 +60,11 @@ if __package__ in (None, ""):
 
 from ..production.showrunners import (
     CONFIG as CONFIG,
+    Showrunner as Showrunner,
     ShowrunnerSettings as ShowrunnerSettings,
     load_settings_from as load_settings_from,
+    registered_showrunners as registered_showrunners,
+    socket_for as socket_for,
 )
 
 
@@ -141,9 +144,33 @@ def load_config() -> Config:
     return load_settings_from(CONFIG)
 
 
+def showrunners_now() -> list[Showrunner]:
+    """Every showrunner with an update timer. None when the session records cannot say who runs."""
+    try:
+        return registered_showrunners()
+    except OSError as error:
+        print(f"quota-alert: showrunners unknown: {error}", file=sys.stderr)
+        return []
+
+
+def not_live(names: list[str]) -> list[str]:
+    """Those of `names` that no live session is called now. A lookup that cannot say leaves a name out."""
+    missed: list[str] = []
+    for name in names:
+        try:
+            if socket_for(name) is None:
+                missed.append(name)
+        except OSError:
+            continue
+    return missed
+
+
 def recipients(config: Config, here: str | None = None) -> list[str]:
-    """Keep configured names even when their sessions are currently offline."""
-    names = [*config["always"], *(runner["session"] for runner in config["showrunners"])]
+    """The configured names, offline or not, then each running showrunner by its name now.
+
+    A showrunner that is not running has no name to send to; it hears the next repeat after it resumes.
+    """
+    names = [*config["always"], *(runner["session"] for runner in showrunners_now() if runner["session"])]
     return list(dict.fromkeys(name for name in names if name != here))
 
 
@@ -375,6 +402,8 @@ def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: Swi
         f"Protocol: {PROTOCOL}. Read from {note.path}, checked {note.get('weekly_usage_checked_at')}. Sent by "
         + f"{Path(__file__)} to the sessions in {CONFIG}.",
     ]
+    lines += [f"{missed}, which {CONFIG} names to always get this alert, is not a live session and has not seen it."
+              for missed in not_live(config["always"])]
     return "\n".join(lines)
 
 

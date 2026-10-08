@@ -11,6 +11,8 @@ import unittest
 from pathlib import Path
 from typing import override
 
+import fake_showrunner
+
 SCRIPT = Path(__file__).with_name("broadcast.py")
 # Each send waits for TOGETHER sends to have started, so sends run one after another fail.
 SEND_STUB = """import os, sys, time
@@ -51,9 +53,15 @@ class BroadcastTests(unittest.TestCase):
             for index, unit in enumerate(("trunk-unit", "gone-unit"), start=1)}), encoding="utf-8")
         _ = (self.root / "showrunners.json").write_text(json.dumps({
             "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "hana",
-            "always": [], "showrunners": [{"session": "hana", "zone": "America/Los_Angeles", "doc": str(doc)},
-                                          {"session": "natedev", "zone": "America/Los_Angeles", "doc": ""}],
+            "always": [],
         }), encoding="utf-8")
+        # A second showrunner whose production has no units.
+        other = self.root / "other-production.md"
+        _ = other.write_text("\n".join(("## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
+                                        "| --- | --- | --- | --- | --- | --- |")), encoding="utf-8")
+        # A showrunner is recorded by its update timer, addressed to its Claude session id.
+        _ = fake_showrunner.write_timer(self.root / "notifier", "show", "id-hana", "America/Los_Angeles", doc)
+        _ = fake_showrunner.write_timer(self.root / "notifier", "zz-other", "id-natedev", "America/Los_Angeles", other)
         for name, pid in (("hana", os.getpid()), ("trunk", os.getppid()), ("natedev", 1), ("ups", 2)):
             listener = socket.socket(socket.AF_UNIX)
             self.addCleanup(listener.close)

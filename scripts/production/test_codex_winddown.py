@@ -14,6 +14,7 @@ from typing import override
 
 import broadcast
 import codex_winddown
+import fake_showrunner
 from broadcast import Process
 
 SCRIPT = Path(__file__).with_name("codex_winddown.py")
@@ -94,9 +95,15 @@ class MessageTests(unittest.TestCase):
             "FAKE_TMUX_STATE": str(self.root / "tmux.json")}))
         _ = (self.root / "showrunners.json").write_text(json.dumps({
             "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "hana",
-            "always": [], "showrunners": [{"session": "hana", "zone": "America/Los_Angeles", "doc": str(doc)},
-                                          {"session": "gone", "zone": "America/Los_Angeles", "doc": ""}],
+            "always": [],
         }), encoding="utf-8")
+        # A second showrunner whose production has no units.
+        other = self.root / "other-production.md"
+        _ = other.write_text("\n".join(("## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
+                                        "| --- | --- | --- | --- | --- | --- |")), encoding="utf-8")
+        # A showrunner is recorded by its update timer; the one of `zz-gone` has no running session.
+        _ = fake_showrunner.write_timer(self.root / "notifier", "show", "id-hana", "America/Los_Angeles", doc)
+        _ = fake_showrunner.write_timer(self.root / "notifier", "zz-gone", "id-gone", "America/Los_Angeles", other)
         for name, pid in (("hana", os.getpid()), ("trunk", os.getppid())):
             listener = socket.socket(socket.AF_UNIX)
             self.addCleanup(listener.close)
@@ -127,7 +134,7 @@ class MessageTests(unittest.TestCase):
     def test_start_tells_each_role_its_version_and_starts_each_showrunners_count(self) -> None:
         done = self.run_script("start", "--from", "natedev")
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stdout.splitlines(), ["hana - showrunner - sent", "gone - showrunner - no live session",
+        self.assertEqual(done.stdout.splitlines(), ["hana - showrunner - sent", "zz-gone - showrunner - no live session",
                                                     "trunk - unit director - sent", "hana: counting every 2 minutes"])
         log = (self.root / "log").read_text(encoding="utf-8")
         for session in ("hana", "trunk"):
@@ -144,9 +151,11 @@ class MessageTests(unittest.TestCase):
         done = self.run_script("clear", "--from", "natedev")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout.splitlines(), ["hana: count stopped", "hana - showrunner - sent",
-                                                    "gone - showrunner - no live session",
+                                                    "zz-gone - showrunner - no live session",
                                                     "trunk - unit director - sent"])
-        self.assertEqual(list((self.root / "notifier").iterdir()), [])
+        # Only the showrunners' own update timers are left: every count is gone.
+        self.assertEqual(sorted(path.name for path in (self.root / "notifier").iterdir()),
+                         ["showrunner-show", "showrunner-zz-gone"])
         log = (self.root / "log").read_text(encoding="utf-8")
         self.assertIn("send --to hana --from natedev --text All clear, from the user", log)
         self.assertIn("Start using Codex again", log)
@@ -155,7 +164,7 @@ class MessageTests(unittest.TestCase):
         self.assertEqual(self.run_script("triage", "--from", "natedev").returncode, 1)
         _ = self.run_script("start", "--from", "natedev")
         done = self.run_script("triage", "--from", "natedev")
-        self.assertEqual(done.stdout.splitlines(), ["hana - showrunner - sent", "gone - showrunner - no live session",
+        self.assertEqual(done.stdout.splitlines(), ["hana - showrunner - sent", "zz-gone - showrunner - no live session",
                                                     "trunk - unit director - sent"])
         self.assertIn("which ones can be stopped now and added to a resume list",
                       (self.root / "log").read_text(encoding="utf-8"))

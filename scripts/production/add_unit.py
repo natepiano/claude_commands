@@ -23,7 +23,6 @@ class Production(NamedTuple):
     slug: str
     merge_branch: str
     checkout: Path
-    showrunner_session: str
     log: Path
     zone: ZoneInfo
 
@@ -164,7 +163,6 @@ def read_production(path: Path) -> Production:
         lines = doc.read_text(encoding="utf-8").splitlines()
         merge_branch = production_field(lines, "Merge branch")
         checkout = Path(production_field(lines, "Showrunner checkout")).expanduser().resolve()
-        showrunner_session = production_field(lines, "Showrunner session")
         log = Path(production_field(lines, "Log"))
         zone = ZoneInfo(production_field(lines, "User zone"))
         slug = doc.name.removesuffix("-production.md")
@@ -174,7 +172,7 @@ def read_production(path: Path) -> Production:
             raise Refusal("production Log must be relative to Showrunner checkout")
         if "## Units" not in lines:
             raise Refusal("production doc lacks Units table")
-        return Production(doc, slug, merge_branch, checkout, showrunner_session, checkout / log, zone)
+        return Production(doc, slug, merge_branch, checkout, checkout / log, zone)
     except (OSError, UnicodeError, KeyError, ValueError) as error:
         raise Refusal(f"cannot read production doc: {error}") from error
 
@@ -572,20 +570,24 @@ def ensure_worktree(request: UnitLaunch) -> None:
 def prompt_for(request: UnitLaunch) -> str:
     production = request.production
     doc = str(production.doc)
+    # The showrunner's name is written nowhere: a unit looks it up, since a rename changes it.
+    showrunner = ("the showrunner, whose session name `~/.claude/scripts/lib/py "
+                  f"~/.claude/scripts/production/showrunners.py name {production.slug}` prints (look it up "
+                  "before each message: the name can change)")
     if isinstance(request.plan, Standby):
-        return (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under the "
-                f"showrunner {production.showrunner_session}, on standby. Work only in your worktree "
+        return (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under "
+                f"{showrunner}, on standby. Work only in your worktree "
                 f"{request.worktree}, branch {request.branch}. Do nothing until the showrunner sends you work.")
     plan = request.plan_path.as_posix()
     if isinstance(request.session, ResumedSession):
         plan = str(request.worktree / request.plan_path)
-        return (f"You are now {request.identity.unit} in production {production.slug} (doc {doc}), under the "
-                f"showrunner {production.showrunner_session}. Work only in your worktree {request.worktree}, "
+        return (f"You are now {request.identity.unit} in production {production.slug} (doc {doc}), under "
+                f"{showrunner}. Work only in your worktree {request.worktree}, "
                 f"branch {request.branch}, and name it in every Work Order. Run /unit:delegate {plan}.")
     if isinstance(request.plan, PlanGiven):
         return f"/unit:delegate {plan}"
-    return (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under the "
-            f"showrunner {production.showrunner_session}. Work only in your worktree {request.worktree}, "
+    return (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under "
+            f"{showrunner}. Work only in your worktree {request.worktree}, "
             f"branch {request.branch}, and name it in every Work Order. Your plan {plan} holds only the "
             f"user's words. Write the full phased plan there, send it to the showrunner, and wait for its "
             f"approval before you run /unit:delegate {plan}.")
@@ -596,9 +598,7 @@ def launch_session(request: UnitLaunch, tmux: str, director: DirectorAgent) -> N
 
     The marks are what finds the unit afterwards; its name is only what it is called at launch.
     """
-    state = unit_lookup.UnitState.STANDING_BY if isinstance(request.plan, Standby) else unit_lookup.UnitState.RUNNING
-    marks = {unit_lookup.PRODUCTION_MARK: request.production.slug, unit_lookup.UNIT_MARK: request.identity.unit,
-             unit_lookup.STATE_MARK: state.value}
+    marks = {unit_lookup.PRODUCTION_MARK: request.production.slug, unit_lookup.UNIT_MARK: request.identity.unit}
     argv = ["claude", "--model", director.model]
     if isinstance(director.effort, Effort):
         argv.extend(["--effort", director.effort.value])
@@ -642,10 +642,6 @@ def wait_for_remote_control(request: UnitLaunch, tmux: str) -> unit_lookup.Marke
 
 def record(request: UnitLaunch) -> None:
     production = request.production
-    script = Path(__file__).resolve().parent / "showrunners.py"
-    _ = subprocess.run([sys.executable, str(script), "add", production.showrunner_session,
-                        "--zone", production.zone.key, "--doc", str(production.doc)],
-                       text=True, capture_output=True, check=True)
     log_line = f"added {request.identity.unit} ({request.mode_name}), worktree {request.worktree}"
     if production.log.exists() and any(log_line in line for line in production.log.read_text(encoding="utf-8").splitlines()):
         return

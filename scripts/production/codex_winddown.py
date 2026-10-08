@@ -210,12 +210,12 @@ def announce_quiet(running: int) -> None:
 
 
 def count(session: str) -> int:
-    runner = next((item for item in showrunners.load_settings()["showrunners"] if item["session"] == session),
-                  None)
-    if runner is None:
-        print(f"showrunner absent from config: {session}", file=sys.stderr)
+    try:
+        runner = showrunners.named(session)
+    except ValueError as error:
+        print(error, file=sys.stderr)
         return 1
-    units, counts = live_unit_names(session), current_counts()
+    units, counts = live_unit_names(runner), current_counts()
     rows = listed(session, units, counts)
     held = refresh(session, units, rows, time.time())
     announce_quiet(counts.total())
@@ -240,8 +240,8 @@ def instances() -> list[str]:
 def status() -> int:
     counts = current_counts()
     rows: dict[str, int] = {name: number for name, number in counts.items() if number}
-    for runner in showrunners.load_settings()["showrunners"]:
-        rows.update(listed(runner["session"], live_unit_names(runner["session"]), counts))
+    for runner in showrunners.registered_showrunners():
+        rows.update(listed(runner["session"] or runner["slug"], live_unit_names(runner), counts))
     counting = ", ".join(name.removeprefix(INSTANCE) for name in instances())
     print(f"Wind-down: {'on for ' + counting if counting else 'off'}")
     print(render("Codex agents on this machine", rows, read_projections(), time.time()))
@@ -254,7 +254,7 @@ def instance_name(session: str) -> str:
 
 def announce(sender: str, showrunner: str, unit: str) -> bool:
     """Send every showrunner and unit director its version at once and print each delivery."""
-    zones = {runner["session"]: runner["zone"] for runner in showrunners.load_settings()["showrunners"]}
+    zones = {runner["session"]: runner["zone"] for runner in showrunners.registered_showrunners()}
     named = {"sender": sender, "time": clock(zones.get(sender) or next(iter(zones.values()), "UTC")),
              "minutes": EVERY_MINUTES}
     return broadcast.report(broadcast.broadcast(sender, {"showrunner": showrunner.format(**named),
@@ -277,7 +277,7 @@ def start(sender: str) -> int:
         (STATE / name).unlink(missing_ok=True)
     every = announce(sender, WIND_DOWN, UNIT_WIND_DOWN)
     live = broadcast.live_sessions()
-    for runner in showrunners.load_settings()["showrunners"]:
+    for runner in showrunners.registered_showrunners():
         if runner["session"] in live:
             counting = start_count(live[runner["session"]])
             every = every and counting
