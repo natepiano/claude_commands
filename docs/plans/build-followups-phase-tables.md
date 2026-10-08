@@ -1,6 +1,6 @@
 # phase-tables
 
-> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** Each production unit keeps one Markdown note in the vault with its current phase, its ETA and a table of every phase's start and finish; the dailies chart reads the same record.
+> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** Each production unit keeps one Markdown note in the vault with its current phase, its ETA and a table of every phase's start and finish; the dailies chart takes each unit's start and ETA from the same events.
 
 > **Production: build-followups** — unit `phase-tables-unit`; production doc `docs/plans/build-followups-production.md`
 
@@ -11,17 +11,17 @@
 - **Stack:** Python 3.10+ (stdlib only, `unittest`), zsh, Markdown command files. basedpyright must report 0 errors and 0 warnings; no file-level ignores; no `Any`.
 - **Layout:** `scripts/delegate/` (the progress recorder and this plan's script), `scripts/production/` (showrunner scripts), `commands/unit/`, `commands/showrunner/`, `docs/`.
 - **Key files:**
-  - `scripts/delegate/progress_history.py` — the recorder. Session state in `<session-dir>/progress_history_state.json`; durable events in `~/.local/state/plan-delegate/runs/<run-id>.jsonl` (`_history_root()`, env override). Plan headings: `PHASE_HEADING_PATTERN`, `PHASE_STATUS_PATTERN`, `PHASE_TITLE_PATTERN`, `_count_plan_phases` (line 538). ETA maths: `_eta_seconds` (1910), `_eta_band_cells` (3408), `_percent_spread` (3445), `_recorded_report` (3776). Transitions: `_start_phase` (1169), `_progress` (3883), `_finish_phase` (4121), `_finish_run` (4147). Run lookup: `_run_started_event` (703). Event append: `_append_event` (370). Clock: `_now_epoch` (honours `PLAN_DELEGATE_NOW_EPOCH`).
+  - `scripts/delegate/progress_history.py` — the recorder. Session state in `<session-dir>/progress_history_state.json`; durable events in `~/.local/state/plan-delegate/runs/<run-id>.jsonl` (`_history_root()`, env override). Plan headings: `PHASE_HEADING_PATTERN`, `PHASE_STATUS_PATTERN`, `PHASE_TITLE_PATTERN`, `_count_plan_phases`, `plan_phases`. ETA maths: `_eta_seconds`, `eta_band_seconds` (3496), `percent_spread` (3510), `_recorded_report`. Transitions: `_start_phase` (1223), `_progress` (3948), `_finish_phase` (4186), `_finish_run` (4212). Run lookup: `_run_started_event` (732), `plan_runs` (744). Event append: `_append_event` (378). Clock: `now_epoch` (honours `PLAN_DELEGATE_NOW_EPOCH`).
   - `scripts/delegate/test_progress_history.py` — its tests; they run the recorder in temp dirs.
   - `scripts/delegate/findings.py` — precedent for a second script reading `progress_history_state.json`.
-  - `scripts/production/add_unit.py` — `read_production(path) -> Production` (`slug`, `showrunner_session`, `zone`), `production_field`, `cell_value`, the Units table readers.
+  - `scripts/production/add_unit.py` — `read_production(path) -> Production` (`slug`, `zone`; the showrunner's session name is not in the doc: `current_name(slug)` in `scripts/production/showrunners.py` looks it up, and answers empty while the showrunner is not running), `production_field`, `cell_value`, the Units table readers (`live_unit_table`). `scripts/production/merge_checkpoint.py` — `parse_units` (each unit's `plan` and `worktree`). `scripts/production/unit_lookup.py` — a unit's live session name.
   - `scripts/whoami/agent_notes.py` — precedent for a script writing vault notes: temp file, keep mode, `os.replace` (`set_fields`, line 81).
   - `commands/unit/report.md` — `<ProgressReport/>`, read at every tick. `commands/unit/eta.md`, `commands/unit/eta_breakdown.md` — where a unit states an ETA.
-  - `scripts/production/dailies_input.py` — the dailies input builder (`eta_state` 213, `eta_value` 244, `run` 292). `commands/showrunner/dailies.md` — its input contract.
+  - `scripts/production/dailies_input.py` — the dailies input builder (`eta_state` 221, `eta_value` 252, `run` 300). `commands/showrunner/dailies.md` — its input contract.
   - `docs/as-built/plan-delegate-progress-history.md` — the recorder's as-built.
 - **Test lanes:** `scripts/delegate/` and `scripts/production/` — tests sit beside the code as `test_<module>.py` (`unittest`).
 - **Build:** none (Python).
-- **Test:** `python3 -m unittest discover -s scripts/delegate -p 'test_phase_table.py'` and `python3 -m unittest discover -s scripts/delegate -p 'test_progress_history.py'`; Phase 5 adds `python3 -m unittest discover -s scripts/production -p 'test_dailies_input.py'`.
+- **Test:** `python3 -m unittest discover -s scripts/delegate -p 'test_phase_table.py'` and `python3 -m unittest discover -s scripts/delegate -p 'test_progress_history.py'`; Phase 4 adds `python3 -m unittest discover -s scripts/production -p 'test_dailies_input.py'`.
 - **Lint:** `basedpyright <each changed .py>` — pass is its `0 errors, 0 warnings` line (it exits 3: pyrightconfig names a `.venv` no checkout has).
 - **Invariants:**
   - The table writer never costs a report: no failure in it changes the recorder's output or exit status (user: agents must not re-read or re-write the note, and a report must not break).
@@ -31,190 +31,158 @@
   - Every time shown is in the production doc's **User zone**.
   - Forbidden-words hooks apply to code, comments and prose.
   - Do not edit `commands/unit/delegate.md` or `scripts/delegate/verify.sh`: build-report-unit's unmerged branch changes both (the showrunner, 2026-10-08). If a phase cannot avoid one, tell the showrunner before editing.
-  - Gate G2 is registered in the production doc; the showrunner says when it clears. Nothing is built for the Mac until the user answers (the showrunner, 2026-10-08).
+  - Gate G2 cleared on 2026-10-08 and the merge branch is merged into this branch (`d4d9a27`). Nothing is built for the Mac until the user answers (the showrunner, 2026-10-08).
+  - Only two things are stored: the note, and a stated ETA as one event in the recorder's run file. Everything a script can find again is rebuilt from the recorder's events when asked (the user, 2026-10-08: "only the least necessary things written down to files - anything that is quickly discoverable by a script should be done that way").
 
 ## Phases
 
 ### Phase 1 — The phase table, built from the run's records  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `phase_table.py show --session-dir <dir>` prints a unit's current phase and a table of every phase's start and finish, for any live delegate run, with no agent input.
-
-**Spec:**
-
-New `scripts/delegate/phase_table.py`, importing `progress_history` as a module. It reads; it appends no event.
-
-1. In `progress_history.py`, add public functions and leave callers' behaviour unchanged:
-   - `plan_phases(plan_path: Path) -> list[PlanPhase]`, `PlanPhase(TypedDict)`: `id: str`, `title: str`, `done: bool`, in document order. Same classification as `_count_plan_phases` (a heading with no status marker is done; `### Phase 12 Review` is skipped; a duplicate id is skipped). `title` is the heading text after the dash, with any `· status: …` marker and trailing commit annotation in parentheses removed. `_count_plan_phases` now counts over `plan_phases` so the two cannot disagree.
-   - `eta_band_seconds(percent: int, elapsed: int, spread: float) -> tuple[int, int, int] | None` — `(eta, low, high)` seconds remaining; `_eta_band_cells` formats from it.
-   - `plan_runs(plan_path: Path) -> list[Path]` — every run file under `_history_root()/runs` whose `run_started` event names this plan (resolve the event's `plan_doc` against its `working_dir` with `_plan_path`), oldest first.
-2. `build(session_dir: Path) -> PhaseRecord` in `phase_table.py`:
-   - Read the state file; plan path = `_plan_path(working_dir, project_plan_doc or plan_doc)`. No plan: raise `NoPlan`.
-   - Per plan phase id, from `phase_started` / `phase_finished` events across `plan_runs`: `start` = earliest `phase_started`; `finish` = the `phase_finished` whose status is `completed`; `seconds` = the sum of `phase_elapsed_seconds` over that id's finished instances. A done phase with no events keeps `start`, `finish`, `seconds` as `None`.
-   - Current phase = the state's `phase` when its status is `active`. `percent` and the projection come from that phase's last `progress_reported` event (`phase_percent`, the event time, the elapsed at that time, `_percent_spread` of its calibration): `eta`, `earliest`, `latest` = event time + `eta_band_seconds`. No report yet, or percent 0: all three `None`.
-   - Prediction for each todo phase after the current one: `typical` = median `seconds` of this plan's completed phases; with none completed, the current phase's projected total (start to `eta`); with neither, no prediction. `gap` = median seconds from a completed phase's finish to the next phase's start within one run, 0 with no sample. Chain: start = previous finish + `gap`, finish = start + `typical`. `plan_finish` = the last phase's finish.
-   - `PhaseRecord` and its rows are `TypedDict`s; every time is an aware `datetime` internally.
-3. `render(record: PhaseRecord, zone: ZoneInfo) -> str` — Markdown, exactly:
-
-   ```
-   **Phase 3 of 6 — <title>**
-
-   | | |
-   | --- | --- |
-   | Started | 10-08 09:12 |
-   | Done | 60% |
-   | ETA | 10-08 10:40 (10:25 to 11:05) |
-   | Plan finish | 10-08 15:10, predicted |
-   | Updated | 10-08 09:55 PDT |
-
-   | Phase | What it delivers | Status | Start | Finish |
-   | --- | --- | --- | --- | --- |
-   | 6 | <title> | predicted | 10-08 13:40 | 10-08 15:10 |
-   | 3 | <title> | running, 60% | 10-08 09:12 | 10-08 10:40 |
-   | 2 | <title> | done in 0:55 | 10-08 08:10 | 10-08 09:05 |
-   ```
-
-   Rows are in descending plan order, so the oldest phase is last. Every time is `MM-DD HH:MM` in `zone`; the zone abbreviation appears once, on `Updated`. An unknown cell is `—`. With no active phase the heading is `**No phase running — <done> of <total> done**` and the ETA row is omitted. `Updated` is `_now_epoch()`.
-4. CLI: `phase_table.py show --session-dir <dir> [--zone <IANA>] [--json]`. Zone defaults to the machine's. `--json` prints the record: ISO-8601 times with offset, keys `plan`, `updated`, `plan_finish`, `current` (`phase`, `of`, `title`, `started`, `percent`, `eta` as `{time, earliest, latest, source: "projected"}` or `null`) and `phases` (`phase`, `title`, `status` ∈ `done|running|todo`, `start`, `finish`, `seconds`). Exit 1 with one line when the session has no state or no plan.
+- `scripts/delegate/phase_table.py` reads the recorder's events and writes none. `build(session_dir: Path) -> PhaseRecord` raises `NoState` or `NoPlan`; `render(record: PhaseRecord, zone: ZoneInfo) -> str` returns Markdown; `show(session_dir: Path, zone: ZoneInfo, json_output: bool = False) -> str` returns either form. CLI: `phase_table.py show --session-dir <dir> [--zone <IANA>] [--json]`, zone defaulting to the machine's, exit 1 with one line on stderr.
+- `PhaseRecord` is a NamedTuple of named states, never optional fields: `plan: Path`, `updated: datetime`, `current: RunningPhase | NoPhaseRunning`, `phases: list[DonePhase | RunningPhase | TodoPhase]`, `plan_finish: FinishedAt | PredictedFinish | UnknownFinish`. Done times are `Completed | NotRecorded`, todo times `Predicted | NotPredicted`, running progress `Reported | NotReported`, a report's ETA `ProjectedEta | NoEta`, a recorded instance's finish `InstanceFinished | InstanceStillRunning`. Times are aware `datetime`s; `None` appears only in the JSON.
+- Recorded work attaches to a plan phase by recorded title (casefold, backticks removed, whitespace collapsed), then by id, across every run of the plan; a done row takes its times from the title family of its last completed instance, and a todo row never shows recorded times. The running phase is the state's `phase` while `active`; its ETA is its last `progress_reported` event's time plus `eta_band_seconds`, absent with no report or percent 0. Later todo phases chain from that ETA: start = previous finish + gap, finish = start + typical, with typical the median seconds of the plan's completed phases (else the running phase's projected total) and gap the median from a completed finish to the next start in the same run (0 with no sample).
+- `render` gives a heading (`**Phase 3 of 6 — <title>**`, or `**No phase running — <done> of <total> done**`), a summary table (`Started`, `Done`, `ETA`, `Plan finish`, `Updated`; no `ETA` row when no phase runs) and a phase table (`Phase`, `What it delivers`, `Status`, `Start`, `Finish`) in descending plan order. Times are `MM-DD HH:MM` in `zone`, the zone abbreviation appears once on `Updated`, and an unknown cell is `—`. `--json` prints `_json_record(record, zone)`: `plan`, `updated`, `plan_finish`, `current` (its `eta` is `{time, earliest, latest, source: "projected"}` or `null`) and `phases`, with ISO-8601 offset times.
+- `progress_history.py` public readers: `plan_phases(plan_path: Path) -> list[PlanPhase]` (`PlanPhase` TypedDict: `id: str`, `title: str`, `done: bool`; document order; one classification shared with `_count_plan_phases`; a title drops its status marker and a trailing commit annotation and keeps a descriptive parenthetical), `plan_runs(plan_path: Path) -> list[Path]` (oldest first; a run matches by its own `run_started.plan_doc` only), `eta_band_seconds(percent: int, elapsed: int, spread: float) -> tuple[int, int, int] | None` (`(eta, low, high)` seconds remaining; `_eta_band_cells` formats from it), and `now_epoch`, `resolve_plan_path`, `percent_spread`.
 
 **Files:**
-- `scripts/delegate/phase_table.py` — new: `build`, `render`, `show`.
-- `scripts/delegate/test_phase_table.py` — new.
-- `scripts/delegate/progress_history.py` — `plan_phases`, `eta_band_seconds`, `plan_runs`; `_count_plan_phases` and `_eta_band_cells` built on them.
-- `scripts/delegate/test_progress_history.py` — cases for the three new functions.
+- `scripts/delegate/phase_table.py` — builds, renders and prints one unit's phase table.
+- `scripts/delegate/test_phase_table.py` — its tests.
+- `scripts/delegate/progress_history.py` — the public readers; what the recorder writes is unchanged.
+- `scripts/delegate/test_progress_history.py` — the recorder's tests, with cases for the readers.
 
-**Seats:** 1 writer + 1 tester — the Spec fixes the record and the Markdown, so tests are written from it.
-- `impl` — `scripts/delegate/phase_table.py`, `scripts/delegate/progress_history.py`
-- `test` — `scripts/delegate/test_phase_table.py` and the new cases in `scripts/delegate/test_progress_history.py`: fixtures are a temp history root, a plan file with all three heading forms, and event lines; they cover a phase run twice across two runs, a done phase with no events, prediction with and without a completed phase, the no-active-phase form, and the exact Markdown.
+**Binds later work:** `_json_record` is the only JSON shape and nothing stores it. `NoState` and `NoPlan` carry the user-facing reason; the vault-note phase's `refresh` reports each as `phase table not written: <reason>`. Todo rows are `NotPredicted` and an unfinished plan's finish is `UnknownFinish` (both dashes) unless the running phase has a `ProjectedEta`; the vault-note phase adds a prediction start for the no-report and no-running-phase cases. An active phase with no plan heading shows in the heading line only, with no row; the dailies phase leaves such a unit on its existing path.
 
-**Constraints from prior phases:** none.
+**Gotchas:** The reader takes a shared lock on each run file and the recorder appends under an exclusive lock on the same file, so a read started while the recorder holds its lock blocks; `plan_runs` reads each run's first line with no lock. `_start_phase` writes session state before it appends `phase_started`: the events, not the state file, say what happened. A phase left open by a session that died is indistinguishable in the events from live work. Recorded history reuses phase numbers and rewords headings: of 219 recorded phase starts, 177 match a plan heading by id and title, 29 by id only, 1 by title only, 12 not at all (ad hoc and follow-up ids).
 
-**Acceptance gate:** both Test commands green; `basedpyright scripts/delegate/phase_table.py scripts/delegate/test_phase_table.py scripts/delegate/progress_history.py` reports `0 errors, 0 warnings`; `phase_table.py show --session-dir "${SESSION_DIR}" --zone America/Los_Angeles` on this run prints this plan's five phases with Phase 1 running.
+**Ruled out:** a stored JSON record per unit (store only what no script can find again); grouping events by phase id alone (history reuses phase numbers); seat slots renamed to subsystem names (the plan format fixes `impl` and `test`).
 
-### Phase 2 — The note is written to the vault at every report  · status: todo
+### Phase 2 — The note is written to the vault at every report, named for the unit's session  · status: done
 
 #### Work Order
 
-**Goal:** Every production unit's note appears in the vault and stays current: the recorder rewrites it at each phase start, progress report, phase finish and run finish, and a note left under an old name is removed.
+**Goal:** Every production unit's note appears in the vault and stays current: the recorder rewrites it at each phase start, progress report, phase finish and run finish, it is named for the unit's session as it is now, and a note left under an old name is removed. Nothing but the note is stored; the table is rebuilt from the recorder's events each time it is asked for.
 
 **Spec:**
 
-1. `phase_table.py refresh --session-dir <dir>`:
+1. Names first. Both seats build on them, and by themselves they change no behaviour, no rendered word and no JSON key.
+   - Recorder: `eta_band_seconds(percent, elapsed, spread) -> EtaBand | EtaProjectionUnavailable`. `EtaBand(NamedTuple)` has `remaining`, `earliest`, `latest` in seconds: the three numbers the tuple held, in that order. `EtaProjectionUnavailable(NamedTuple)` has no fields. Every caller in `progress_history.py` and `phase_table.py` matches on the type; no `None` return remains.
+   - Table: each state name says its subject. `Reported`→`ReportedPhaseProgress`, `NotReported`→`PhaseProgressNotReported`, `Completed`→`CompletedPhaseTiming`, `NotRecorded`→`PhaseTimingNotRecorded`, `Predicted`→`PredictedPhaseTiming`, `NotPredicted`→`PhaseTimingNotPredicted`, `NoEta`→`EtaUnavailable`, `InstanceStillRunning`→`PhaseInstanceWithoutFinish`, `RunningPhase`→`OpenPhase`, `NoPhaseRunning`→`NoOpenPhase`.
+2. `build_plan(plan_path: Path) -> PhaseRecord` becomes the one builder, and the events are its authority:
+   - The open phase is the newest phase instance that has a `phase_started` and no `phase_finished` in the plan's newest run (`plan_runs` returns oldest first), unless that run has a `run_finished` event. A `phase_finished` of any status (`completed`, `stopped`, `error`) closes its instance. An unfinished instance in an older run is not open.
+   - Open means started and not finished in the events. It does not prove the unit's session is alive: a session that died leaves its phase open. `OpenPhase`'s doc comment says so, and callers decide liveness (the note is written by the running recorder; the dailies builder has its own unit state).
+   - The session state file is not read for the phase. `_start_phase` writes state before it appends `phase_started`, so a phase present in state with no start event does not exist for the table.
+   - `build(session_dir)` reads the state file for the plan path only (`project_plan_doc`, else `plan_doc`, as now) and returns `build_plan` of it. `NoState` remains for a missing or unreadable state file. `NoPlan` is raised only when the plan file cannot be read, and its message names the path. A plan with no recorded run, or with no open phase, is a normal record with `NoOpenPhase`.
+   - The open row's `started` is the earliest start among the open instance and the earlier instances of that plan phase that carry its recorded title.
+   - An open phase whose id and title match no plan phase stays as now: the current-phase heading shows it and no table row is marked running.
+   - Upcoming phases are predicted whenever a typical duration is known (the median of completed rows, else the open phase's projected total, as now). The first prediction starts from the open phase's ETA when it has one; else from the later of now and the open phase's start plus the typical duration; else, with no open phase, from now. With no typical duration, rows stay `PhaseTimingNotPredicted` and the plan finish `UnknownFinish`.
+   - One named state carries the open phase through the builder: no placeholder `datetime`, no loose per-field locals.
+3. `phase_table.py refresh --session-dir <dir>`:
    - Read the plan's `> **Production: <name>** — unit `<unit>`; production doc `<path>`` line (format: `docs/delegate_plan_format.md`). No such line: exit 0 silently; a run outside a production writes nothing (author's scope call: the user's layout is `showrunners/<showrunner>/`).
-   - Resolve the production doc against the plan's Git root; `read_production` gives `slug`, `showrunner_session`, `zone`.
-   - Build the record and write it as JSON (the `--json` shape, plus `production`, `unit`, `zone`) to `<record root>/<slug>/<unit>.json`. Record root: `PHASE_TABLE_RECORDS`, default `_history_root()/phase-tables`. This file is the one record the dailies chart and the note both come from.
-   - Vault root: `PHASE_TABLE_VAULT`, default `~/rust/hanadocs/showrunners`. When its parent (`~/rust/hanadocs`) does not exist, write the JSON only.
-   - Note path: `<vault root>/<showrunner_session>/<file name>.md`. In this phase `file name` is the unit id.
-   - Note content: frontmatter, then `# <file name>`, then `render(record, zone)`. Frontmatter keys, in this order: `phase_table: true`, `production`, `unit`, `showrunner`, `phase` (`"3 of 6"`), `percent`, `eta`, `plan_finish`, `updated` (ISO minutes in the User zone, or `null`).
-   - Write through a temp file in the same directory and `os.replace`; create directories as needed; mode `0o644`.
-   - Before the first write on a machine, when the vault is a Git checkout and its `.git/info/exclude` has no `showrunners/` line, append that line. Never edit the vault's `.gitignore` (the showrunner's call, 2026-10-08: it changes no shared file and needs no commit there).
+   - Resolve the production doc against the plan's Git root; `read_production` (`scripts/production/add_unit.py`) gives `slug` and `zone`; `showrunners.current_name(slug)` (`scripts/production/showrunners.py`) gives the showrunner's session name. Its `Refusal` is a reason for the failure line below.
+   - Vault root: `PHASE_TABLE_VAULT`, default `~/rust/hanadocs/showrunners`. When its parent (`~/rust/hanadocs`) does not exist, exit 0 and write nothing.
+   - Note path: `<vault root>/<the showrunner's session name>/<file name>.md`; while the lookup answers empty, the folder this unit's newest note is already in, and a one-line refusal when it has none. `file name` is `unit_lookup.marked_units(slug)[unit].claude.name` when that is a `LiveClaude` with a non-empty name; in every other case (no marked tmux session, `ClaudeNotRunning`, `ClaudeUnknown`, `OSError`) the unit id. In the name, `/` and NUL become `-` and a leading `.` is dropped. Nothing stores the name; the removal rule below deletes the note written under the previous one. Read `unit_lookup.py`; change nothing in it.
+   - Imports: `phase_table.py` already puts the repository root on `sys.path` and imports `from scripts.delegate import progress_history`. Import the production readers the same way (`from scripts.production import unit_lookup`, `from scripts.production.add_unit import Refusal, read_production`) and put `scripts/production` on `sys.path` first, because `add_unit.py` imports its siblings by bare name. The form must type-check under the repository's `pyrightconfig.json` with no ignore and must run from any working directory.
+   - Note content: frontmatter, then `# <file name>`, then `render(record, zone)`. Frontmatter is exactly three keys, in this order: `phase_table: true`, `production`, `unit`. They are how a later refresh recognises this unit's own notes; every other fact is in the body.
+   - Write through a temp file in the same directory and `os.replace`; create directories as needed; mode `0o644`. Before replacing, the target must be absent or carry this unit's three ownership keys; otherwise write nothing, print the reason to stderr and exit 1. A hand-written note is never overwritten, and two names that become one path cannot take each other's note.
+   - Before the first write on a machine, when the vault root sits inside a Git checkout (by default `~/rust/hanadocs`) and that checkout's `info/exclude` has no `showrunners/` line, append that line. Find the file through the containing checkout, never under `showrunners/`. Never edit the vault's `.gitignore` (the showrunner's call, 2026-10-08: it changes no shared file and needs no commit there).
    - Then remove every other `*.md` under `<vault root>/*/` whose frontmatter has `phase_table: true` and this `production` and `unit`, and remove a showrunner directory left empty. Never touch a file without `phase_table: true`.
-2. `phase_table.py show` gains `--production <slug> --unit <id>`: print that unit's JSON record, exit 1 when there is none.
-3. Recorder hook: `_refresh_phase_table(session_dir)` in `progress_history.py`, called as the last act of `_start_phase`, `_progress` (every path that printed a report), `_finish_phase` and `_finish_run`. It returns at once unless the state's plan file contains `> **Production:`. Otherwise it runs `[sys.executable, <phase_table.py>, "refresh", "--session-dir", …]` with a 10 s timeout, stdout discarded. On non-zero exit, timeout or `OSError` it prints one line to stderr, `phase table not written: <reason>`, and the recorder's own stdout and exit status are unchanged.
-4. `commands/unit/report.md`, step 5: one paragraph — the `progress` call also rewrites this unit's phase note and record; nothing is written by hand; when the user asks for the phase table, paste `phase_table.py show --session-dir "${SESSION_DIR}" --zone <User zone>`.
-5. `docs/as-built/plan-delegate-progress-history.md`: add the hook to the description of the four commands.
+   - `NoState`, `NoPlan` or a `Refusal`: print the reason to stderr and exit 1. `show` does the same for the first two.
+4. No phase-table record file is written and no record directory exists (the user's rule, 2026-10-08: "only the least necessary things written down to files - anything that is quickly discoverable by a script should be done that way"). `show --json` stays as the on-request form.
+5. Recorder hook: `_refresh_phase_table(session_dir)` in `progress_history.py`, called as the last act of `_start_phase`, `_progress` (every path that printed a report), `_finish_phase` and `_finish_run`. It returns at once unless the state's plan file contains `> **Production:`. Otherwise it runs `[sys.executable, <phase_table.py beside it>, "refresh", "--session-dir", …]` with a 10 s timeout, stdout discarded. On non-zero exit, timeout or `OSError` it prints one line to stderr, `phase table not written: <reason>`, and the recorder's own stdout and exit status are unchanged. `refresh` never calls the recorder's CLI and never takes its session lock: the recorder holds that lock for the whole command the hook runs in.
+6. `commands/unit/report.md`, step 5: one paragraph — the `progress` call also rewrites this unit's phase note; nothing is written by hand; when the user asks for the phase table, paste `phase_table.py show --session-dir "${SESSION_DIR}" --zone <User zone>`.
+7. `docs/as-built/plan-delegate-progress-history.md`: add the hook to the description of the four commands, and `eta_band_seconds`'s two results.
 
 **Files:**
-- `scripts/delegate/phase_table.py` — `refresh`, stale-note removal, `show --production --unit`.
-- `scripts/delegate/test_phase_table.py` — refresh cases.
-- `scripts/delegate/progress_history.py` — `_refresh_phase_table` and its four call sites.
-- `scripts/delegate/test_progress_history.py` — hook cases.
+- `scripts/delegate/phase_table.py` — the renamed states, `build_plan`, the prediction start, `refresh`, the note's name, stale-note removal.
+- `scripts/delegate/test_phase_table.py` — builder and refresh cases.
+- `scripts/delegate/progress_history.py` — `EtaBand | EtaProjectionUnavailable`, `_refresh_phase_table` and its four call sites.
+- `scripts/delegate/test_progress_history.py` — band and hook cases.
 - `commands/unit/report.md` — the step 5 paragraph.
-- `docs/as-built/plan-delegate-progress-history.md` — the hook.
+- `docs/as-built/plan-delegate-progress-history.md` — the hook and the band's results.
 
-**Seats:** 1 writer + 1 tester — the note's bytes and the removal rule are fixed by the Spec.
-- `impl` — `scripts/delegate/phase_table.py`, `scripts/delegate/progress_history.py`, `commands/unit/report.md`, `docs/as-built/plan-delegate-progress-history.md`
-- `test` — `scripts/delegate/test_phase_table.py`, `scripts/delegate/test_progress_history.py`: with `PHASE_TABLE_VAULT` and `PHASE_TABLE_RECORDS` in a temp dir — the note's exact bytes; a second refresh after the showrunner's name changes moves the note and removes the empty directory; a hand-written note in the same folder survives; a plan with no Production line writes nothing; a failing `refresh` leaves `progress` output and exit status byte-identical.
+**Seats:** 2 writers — the table and the recorder each keep their tests beside them; they meet only at `eta_band_seconds`'s result and the `refresh` command line, and the Spec fixes both.
+- `impl` — `scripts/delegate/phase_table.py`, `scripts/delegate/test_phase_table.py`. Builder cases: a stopped phase is not open; a finished run has no open phase; a phase left unfinished in an older run is not open once a newer run exists; a phase in the state file with no `phase_started` event is not open; a run whose first line cannot be parsed is skipped; an open phase outside the plan shows in the heading only; with no report yet, predictions start from the start plus the typical duration, or from now when that has passed; with no open phase they start from now; with no typical duration nothing is predicted. Refresh cases, with `PHASE_TABLE_VAULT` in a temp dir and the lookup's own test stand-ins (the override `tmux_binary()` reads, and `NOTIFIER_SESSIONS_DIR`): the note's exact bytes; the live session's name is the file name, else the unit id; a renamed session moves the note; a changed showrunner name moves it and removes the empty directory; a hand-written note in the same folder survives; a hand-written file at the target path is left unchanged with exit 1; another unit's note at the target is left unchanged with exit 1; a plan with no Production line writes nothing; nothing but the note is created under the vault root or the recorder's history root; the exclude line is added once, in the containing checkout; `show` and `refresh` print the reason and exit 1 for a missing state file and an unreadable plan; `phase_table.py show --help` exits 0 from a working directory outside the repository.
+- `test` — opens as impl: `scripts/delegate/progress_history.py`, `scripts/delegate/test_progress_history.py`, `commands/unit/report.md`, `docs/as-built/plan-delegate-progress-history.md`. Cases: both results of `eta_band_seconds`; a failing `refresh` leaves the stdout and exit status of `start-phase`, `progress`, `finish-phase` and `finish-run` byte-identical and prints the one stderr line; a timeout prints it too; a plan with no Production line starts no subprocess; and, once the table seat's `refresh` is in the tree (ask on the board), one `progress` call on a production plan writes the note well inside the timeout.
 
-**Constraints from prior phases:** Phase 1 built `build`, `render`, `show`, and the public `plan_phases`, `eta_band_seconds`, `plan_runs`. The record's JSON shape is Phase 1's `--json`.
+**Constraints from prior phases:** Phase 1 built `build`, `render`, `show`, `_json_record`, and the recorder's public `plan_phases`, `plan_runs` (a run matches by its own `plan_doc`), `eta_band_seconds`, `now_epoch`, `resolve_plan_path`, `percent_spread`. The record is the `PhaseRecord` NamedTuple of named states; under their phase 1 names they are `DonePhase | RunningPhase | TodoPhase`, `Completed | NotRecorded`, `Predicted | NotPredicted`, `Reported | NotReported`, `ProjectedEta | NoEta`, `FinishedAt | PredictedFinish | UnknownFinish`, `RunningPhase | NoPhaseRunning`. Past work is attached to a plan phase by recorded title, then id (`_phase_instances`, `_instances_by_phase`); keep that rule. The table reader takes a shared lock on each run file while it reads its events; `plan_runs` reads each run's first line with no lock. The recorder holds its exclusive lock on a run file only inside `_append_event`, and its session lock for the whole command. `scripts/production/unit_lookup.py` is in this branch as merged (`216bc9a`): `marked_units(slug) -> dict[str, MarkedUnit]`; `MarkedUnit.claude` is `LiveClaude` (`name`, `session_id`), `ClaudeNotRunning` or `ClaudeUnknown`. For an unchanged input, `show`'s Markdown and `--json` bytes change only where a prediction now replaces a dash.
 
-**Acceptance gate:** both Test commands green; basedpyright clean on the changed files; after one `/unit:report` in this run, `~/rust/hanadocs/showrunners/natedev/phase-tables-unit.md` exists with this plan's table and `phase_table.py show --production build-followups --unit phase-tables-unit` prints its record.
+**Acceptance gate:** both Test commands green; basedpyright clean on the changed files; after one `/unit:report` in this run, the note exists under `~/rust/hanadocs/showrunners/natedev/`, named for this unit's live session (`phase-tables-unit.md` when its tmux session is not marked), with this plan's table; no phase-table record file exists under the recorder's state directory.
 
 ### Phase 3 — A stated ETA is recorded  · status: todo
 
 #### Work Order
 
-**Goal:** When a unit states an ETA with `/unit:eta` or `/unit:eta_breakdown`, the note and the record carry that time, its range and its basis until it passes.
+**Goal:** When a unit states an ETA with `/unit:eta` or `/unit:eta_breakdown`, the note carries that time, its range and its basis until it passes.
 
 **Spec:**
 
-1. Recorder subcommand `progress_history.py eta --session-dir <dir> --time <YYYY-MM-DDTHH:MM> [--earliest <…> --latest <…>] --basis <text>`. Times are local to the process `TZ` (units run the recorder under the User zone, `<ProductionUnit/>` item 11). It requires an active phase, appends an `eta_stated` event (`eta_at`, `eta_earliest_at`, `eta_latest_at` as epochs, `basis`) through `_append_event`, calls `_refresh_phase_table`, and prints `ETA recorded: <HH:MM zone>`. A time in the past, `--earliest` after `--time`, or `--latest` before it is refused with exit 2. One of `--earliest` / `--latest` without the other is refused.
-2. `build`: the current phase's ETA is the last `eta_stated` of this phase instance while its `eta_at` is later than now — `source: "stated"`, plus `stated_at` and `basis`. Otherwise the projection, `source: "projected"`. `eta.first` = the phase instance's first `eta_stated` time, else `null`.
-3. `render`: the ETA row gains a second row under it, `| ETA from | stated 09:50: <basis> |` or `| ETA from | projected from 60% done |`.
+1. Recorder subcommand `progress_history.py eta --session-dir <dir> --time <YYYY-MM-DDTHH:MM> [--earliest <…> --latest <…>] --basis <text>`. Times are local to the process `TZ` (units run the recorder under the User zone, `<ProductionUnit/>` item 11). It requires an active phase, appends an `eta_stated` event (`eta_at`, `basis`, and with a range `eta_earliest_at` and `eta_latest_at`; all times as epochs) through `_append_event`, calls `_refresh_phase_table`, and prints `ETA recorded: <HH:MM zone>`. With no range the event carries neither range key. A time in the past, `--earliest` after `--time`, or `--latest` before it is refused with exit 2. One of `--earliest` / `--latest` without the other is refused. This event is the only stored copy of a stated ETA: no script can find one again, so it is the one thing this plan stores beside the note.
+2. Table states:
+   - The ETA moves from `ReportedPhaseProgress`, which keeps `percent` only, to `OpenPhase.eta: StatedEta | ProjectedEta | EtaUnavailable`, because a stated ETA exists with no progress report.
+   - `StatedEta(time, range: EtaRange | NoEtaRange, stated_at, basis)`; `EtaRange(earliest, latest)`. Never optional fields on `ProjectedEta`.
+   - `ProjectedEta` gains `as_of`: the time of the progress report it was projected from.
+   - `OpenPhase.first_stated: FirstStatedEtaTarget | EtaNeverStated`. `FirstStatedEtaTarget(time)` is the `eta_at` of the instance's first `eta_stated` event: the time first promised, not when it was said. It stays after a stated ETA passes and the projection returns.
+   - The open phase's ETA is its instance's last `eta_stated` while that `eta_at` is later than now; otherwise the projection; otherwise `EtaUnavailable`. The builder's prediction start takes the ETA from either source.
+   - `--json`: `current.eta` is `{time, earliest, latest, source, stated_at, basis, as_of, first}` with `source` `"stated"` or `"projected"`; a key with no value is `null`.
+3. `render`: with no range the ETA row shows the time alone, with no parentheses. A second row follows it: `| ETA from | stated 09:50: <basis> |` or `| ETA from | projected from 60% done |`.
 4. `commands/unit/eta.md`: before sending the answer, run the `eta` command with the time, range and basis being sent; the answer line is unchanged. `commands/unit/eta_breakdown.md`: when the breakdown moves the ETA, run the same command with the bullets' last end time.
 5. `docs/as-built/plan-delegate-progress-history.md`: the `eta` command and the `eta_stated` event.
 
 **Files:**
 - `scripts/delegate/progress_history.py` — the `eta` subcommand.
-- `scripts/delegate/phase_table.py` — stated ETA in `build`, the `ETA from` row.
-- `scripts/delegate/test_progress_history.py`, `scripts/delegate/test_phase_table.py` — cases.
+- `scripts/delegate/test_progress_history.py` — its cases.
+- `scripts/delegate/phase_table.py` — the ETA states, the stated ETA in the builder, the `ETA from` row.
+- `scripts/delegate/test_phase_table.py` — their cases.
 - `commands/unit/eta.md`, `commands/unit/eta_breakdown.md` — the recorder call.
 - `docs/as-built/plan-delegate-progress-history.md` — the command and event.
 
-**Seats:** 1 writer + 1 tester.
-- `impl` — `scripts/delegate/progress_history.py`, `scripts/delegate/phase_table.py`, `commands/unit/eta.md`, `commands/unit/eta_breakdown.md`, `docs/as-built/plan-delegate-progress-history.md`
-- `test` — the two test files: each refusal; a stated ETA wins over a later progress report; a passed one yields to the projection; a new phase starts with none; `first` holds across a restatement.
+**Seats:** 2 writers — the recorder writes the event and the table reads it; the event's shape in Spec 1 is all they share.
+- `impl` — `scripts/delegate/progress_history.py`, `scripts/delegate/test_progress_history.py`, `commands/unit/eta.md`, `commands/unit/eta_breakdown.md`, `docs/as-built/plan-delegate-progress-history.md`. Cases: each refusal; no active phase; an exact ETA's event has no range keys and a ranged one has both; the note is rewritten.
+- `test` — opens as impl: `scripts/delegate/phase_table.py`, `scripts/delegate/test_phase_table.py`, with `eta_stated` events written straight into the test's run files. Cases: a stated ETA wins over a later progress report; a passed one yields to the projection and `first` stays; a new phase starts with none; `first` holds across a restatement; exact and ranged rows; a stated ETA with no progress report; predictions start from a stated ETA.
 
-**Constraints from prior phases:** Phase 2's `_refresh_phase_table` and the record JSON; Phase 1's `current.eta` object, which gains `stated_at`, `basis`, `first`.
+**Constraints from prior phases:** Phase 2's `_refresh_phase_table`, `build_plan` and state names (`OpenPhase`, `ReportedPhaseProgress`, `EtaUnavailable`), and the `--json` form's `current.eta` object. No phase-table record file exists. The recorder holds its session lock for the whole `eta` command, as for every other.
 
-**Acceptance gate:** both Test commands green; basedpyright clean on the changed files; in this run, `eta --time <a time 30 min ahead> --basis "check"` changes the note's ETA rows and the record's `current.eta.source` to `stated`.
+**Acceptance gate:** both Test commands green; basedpyright clean on the changed files; in this run, under `TZ=America/Los_Angeles`, `eta --time <a time 30 min ahead> --basis "check"` changes the note's ETA rows and `show --json`'s `current.eta.source` to `stated`.
 
-### Phase 4 — The note is named for the unit's session as it is now  · status: todo
-
-**Blocked by:** G2 — enh-showrunner-unit's lookup checkpoint (`scripts/production/unit_lookup.py`) merged into `build-followups`.
+### Phase 4 — The dailies take each unit's start and ETA from its run's records  · status: todo
 
 #### Work Order
 
-**Goal:** A unit's note is `showrunners/<showrunner>/<its session name now>.md`; after a rename the next report writes the new name and removes the old note.
+**Goal:** The dailies chart takes each unit's phase start and ETA from the same events as the unit's note, so no ETA line has to be on the captured screen or typed into the status file; a retired unit's note is removed.
 
 **Spec:**
 
-1. In `refresh`, `file name` = `unit_lookup.marked_units(slug)[unit].claude.name` when that is a `LiveClaude` with a non-empty name; in every other case (no marked tmux session, Claude not running, records unreadable, `OSError`) the unit id. Import `unit_lookup` from `scripts/production` by path, as `live_units.py` does. Read it; change nothing in it.
-2. A name is made safe for a file: `/` and NUL become `-`; a leading `.` is dropped.
-3. Nothing stores the name. Phase 2's removal rule already deletes the note written under the previous name, since it matches on frontmatter `production` and `unit`.
-4. Frontmatter gains `session: <name>` after `unit`; the record JSON does not.
+1. `phase_table.py show --production-doc <doc> --json`, a new form (`show` takes exactly one of `--session-dir` and `--production-doc`): one JSON object keyed by unit id, with one entry per live Units row. A unit's plan is its Plan cell resolved against its Worktree cell when relative, carried as a named `ProductionUnitPlan(unit, plan)`: `plan_runs` matches a run by its absolute plan path, and a unit's plan lives in the unit's worktree, not the showrunner's checkout. Use the Units readers in `scripts/production` (`merge_checkpoint.parse_units` for Plan and Worktree, `add_unit.live_unit_table` for which rows are live). An entry is the unit's `--json` record, or `{"unavailable": "<reason>"}` when its plan cannot be read. A unit with no recorded run has a record with no open phase. Times are in the doc's User zone.
+2. `dailies_input.py` runs that command once per build (the file's `command` helper) and parses the answer into one named state per unit: `RecordBackedPhase(number, started, eta)` when the record has an open phase whose id is all digits and belongs to the plan, else `NoRecordedOpenPhase`. A failed or unparsable call is reported as `phase tables: failed — <reason>`, every unit takes today's path, and the build does not stop.
+3. Per unit the record is used as one bundle or not at all:
+   - The judgment's `phase` stays required and stays the showrunner's words (`dailies.md`: `Phase <N> of <M>: <what it changes>`, the oldest phase not yet merged).
+   - When the judgment's phase number equals the record's open phase number, `started` and the ETA come from the record. A value the judgment gives for any of those fields wins.
+   - In every other case the unit takes today's path unchanged, pane ETA lines included: a held checkpoint heads the unit while its next phase is open, a `follow-up` phase, a suffixed id such as `12a`, an open phase outside the plan, no open phase, an unavailable record.
+4. A record-backed ETA enters the existing ETA states (`EtaFresh | EtaStale | EtaPassed | EtaNone`) through one new function beside `eta_state`, never by composing pane text:
+   - Its age counts from `stated_at` for a stated ETA and from `as_of` for a projected one. Older than one hour: `EtaStale` with that time as `first_seen` (`detail: set HH:MM`). A time already passed: `EtaPassed`. No ETA in the record: `EtaNone`. With `held` given and the ETA unchanged since the builder first saw it: `EtaFresh`, never requested.
+   - It keeps the same `eta_seen.json` record under the same `<unit>|<phase text>` key (`text`, `first_seen`, `requested`), so `eta_requested`, the once-per-phase `request /unit:eta: <unit>` line and `merge_eta_records` work unchanged.
+   - It fills `eta.time`, `eta.earliest`, `eta.latest` (`HH:MM`, `+1` for tomorrow), `eta.percent`, and `eta.first` (`YYYY-MM-DDTHH:MM`). The renderer requires `percent` with `time`: with no reported percent in the record and none in the judgment, the ETA is not taken from the record and takes today's path.
+   - `eta.why`: when the judgment gives none, a stated ETA supplies its `basis`. `eta.fixes` stays the judgment's. Read `check_render_state` in `dailies_render.py` before writing this: the built input must pass it on a first build, an unchanged one and one where the time moved by 15 minutes or more.
+   - The pane's ETA lines are not read for a record-backed unit, so its status capture needs no `Phase ETA:` line (the showrunner's requirement, 2026-10-08: the capture seldom holds a unit's ETA answer, and hana wrote each unit's line into the status file by hand).
+5. `phase_table.py prune --production-doc <doc>`: remove every `phase_table: true` note under `<vault root>/*/` whose `production` is this doc's slug and whose `unit` is not a live row of its Units table, and remove a directory left empty. `dailies_input.py` runs it once per build; a failure is reported as `phase tables: failed — <reason>` and does not stop the build.
+6. `commands/showrunner/dailies.md`: Gather step 3 and the Input table's `started` and `eta` rows say that a unit with a recorded open phase gets both from its run's records, that a judgment value wins, and that no `Phase ETA:` line is needed in the status capture.
 
 **Files:**
-- `scripts/delegate/phase_table.py` — the name lookup.
-- `scripts/delegate/test_phase_table.py` — cases using the lookup's own test stand-in (`UNIT_LOOKUP_TMUX`, `NOTIFIER_SESSIONS_DIR`).
-
-**Seats:** 1 writer + 1 tester.
-- `impl` — `scripts/delegate/phase_table.py`
-- `test` — `scripts/delegate/test_phase_table.py`: a live name is used; a rename between two refreshes leaves one note; each fallback case uses the unit id.
-
-**Constraints from prior phases:** Phase 2's `refresh` and removal rule. Re-read `unit_lookup.py` as merged: this Work Order was written from its pre-checkpoint form (`marked_units(slug) -> dict[str, MarkedUnit]`, `MarkedUnit.claude: LiveClaude | ClaudeNotRunning | ClaudeUnknown`).
-
-**Acceptance gate:** Test commands green; basedpyright clean; this unit's note is `showrunners/natedev/phase-tables.md` and `phase-tables-unit.md` is gone.
-
-### Phase 5 — The dailies read each unit's phase, start and ETA from the record  · status: todo
-
-**Blocked by:** G2 — as Phase 4; this phase edits `scripts/production/dailies_input.py`, which that checkpoint changes.
-
-#### Work Order
-
-**Goal:** The dailies chart and each unit's note show the same phase, start and ETA, and the showrunner no longer types them; a retired unit's note is removed.
-
-**Spec:**
-
-1. `dailies_input.py`, per unit: read the record with `phase_table.read_record(slug, unit) -> PhaseRecord | None` (new, the reader behind `show --production --unit`). When it has a running phase and the judgment gives no `phase`, fill `phase` as `Phase <N> of <M>: <title>` and `started` as `YYYY-MM-DDTHH:MM` in the zone. When it has an ETA, fill `eta.time`, `eta.earliest`, `eta.latest`, `eta.percent` and `eta.first` in the renderer's forms (`HH:MM`, `+1` for tomorrow), and take the ETA's age from `stated_at` (a projected ETA is as old as the record's `updated`); the pane's ETA lines are then not read for that unit. A judgment value for any of these fields wins and is kept. A unit with no record, or no running phase, keeps today's path unchanged.
-2. `phase_table.py prune --production-doc <doc>`: remove every `phase_table: true` note under `<vault root>/<showrunner_session>/` whose `production`/`unit` pair is not a live row of the doc's Units table, and its JSON record. `dailies_input.py` runs it once per build; a failure is reported as `phase tables: failed — <reason>` and does not stop the build.
-3. `commands/showrunner/dailies.md`: Gather step 3 and the Input section say which fields the record supplies and that the judgment file overrides them.
-
-**Files:**
-- `scripts/production/dailies_input.py` — the record read, the prune call.
+- `scripts/delegate/phase_table.py` — `show --production-doc`, `ProductionUnitPlan`, `prune`.
+- `scripts/delegate/test_phase_table.py` — their cases.
+- `scripts/production/dailies_input.py` — the one call, the bundle rule, the record-backed ETA state, the prune call.
 - `scripts/production/test_dailies_input.py` — cases.
-- `scripts/delegate/phase_table.py` — `read_record`, `prune`.
-- `scripts/delegate/test_phase_table.py` — prune cases.
-- `commands/showrunner/dailies.md` — the two passages.
+- `commands/showrunner/dailies.md` — the passages.
 
-**Seats:** 2 writers — the split is by directory.
-- `impl` — `scripts/production/dailies_input.py`, `scripts/production/test_dailies_input.py`, `commands/showrunner/dailies.md`
-- `test` — opens as impl: `scripts/delegate/phase_table.py`, `scripts/delegate/test_phase_table.py`
+**Seats:** 2 writers — the split is by directory; the two meet only at the `--json` shape, which phases 1 to 3 fix.
+- `impl` — `scripts/production/dailies_input.py`, `scripts/production/test_dailies_input.py`, `commands/showrunner/dailies.md`. Cases, each over consecutive builds with a stand-in for the command's JSON: first sight; unchanged; moved by 15 minutes with and without a judgment `why`; stale after an hour with one request line; passed; stated, projected and no ETA; a status capture with no ETA text at all; a held checkpoint heading the unit while its next phase is open; a judgment value wins; no percent; a failed call.
+- `test` — opens as impl: `scripts/delegate/phase_table.py`, `scripts/delegate/test_phase_table.py`. Cases: a plan resolved against the unit's worktree with the showrunner's checkout elsewhere; an unreadable plan gives `unavailable` for that unit only; retired rows are left out; prune across every showrunner directory; hand-written notes survive.
 
-**Constraints from prior phases:** the record JSON (Phases 1–3) and `PHASE_TABLE_RECORDS` / `PHASE_TABLE_VAULT`. `dailies_input.py` and `test_dailies_input.py` are enh-showrunner-unit's files: name them in the checkpoint notice as `also touches`, and trial-merge that unit's tip first (`<ProductionUnit/>` item 9). Line refs in Key files predate its checkpoint; re-read the file as merged.
+**Constraints from prior phases:** `build_plan`, the `PhaseRecord` states and the `--json` shape (Phases 1–3, `current.eta` with `source`, `stated_at`, `as_of`, `basis`, `first`), `PHASE_TABLE_VAULT`, and the note's three ownership keys. No phase-table record file is read or written; the builder asks each time. `dailies_input.py` and `test_dailies_input.py` are enh-showrunner-unit's files, in this branch as merged at `216bc9a`: name them in the checkpoint notice as `also touches`, and trial-merge that unit's tip first (`<ProductionUnit/>` item 9). Re-read the file before composing; Key files' line refs are from that merge.
 
-**Acceptance gate:** all three Test commands green; basedpyright clean on the changed files; a dailies built with no `phase`, `started` or `eta` for this unit in the judgment file renders this unit's row from the record.
+**Acceptance gate:** all three Test commands green; basedpyright clean on the changed files; a dailies input built for this production from a status capture with no ETA line for this unit carries this unit's `started` and `eta.time` from its run's records.
 
 ## Source
 

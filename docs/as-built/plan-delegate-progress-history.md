@@ -228,6 +228,13 @@ progress_history.py phase-count --plan-doc <path> [--phase-percent <N>]
 progress_history.py aggregate [--percent <N>]
 ```
 
+For production plans, `start-phase`, every `progress` report, `finish-phase`,
+and `finish-run` end by asking `phase_table.py refresh` to rewrite the unit's
+vault note from the event stream. The refresh has a ten-second limit and is
+best-effort: a refusal, timeout, or launch error writes one diagnostic to
+stderr without changing the recorder command's output or status. Plans without
+a `> **Production:` line skip the subprocess entirely.
+
 `implement.sh` and `review.sh` own pass lifecycle: they set
 `PLAN_DELEGATE_PASS_OWNER=launcher` on their own `start-pass` / `finish-pass`
 calls, per invocation so the agent subprocess never inherits it. The recorder
@@ -407,6 +414,11 @@ extend or nothing left to extend it over. Because the projection reads the same
 capped number the row displays, it never contradicts the percentage beside it,
 and it inherits that number's accuracy: derived phase counts for the project,
 the reporter's estimate for the phase.
+
+`eta_band_seconds` names both outcomes. `EtaBand` carries the projected
+`remaining`, `earliest`, and `latest` seconds in that order;
+`EtaProjectionUnavailable` says the displayed percentage and elapsed time do
+not support a projection.
 
 `ETA low` and `ETA high` close the row with the two arrivals that same
 percentage still allows, each followed by its own distance from the ETA as
