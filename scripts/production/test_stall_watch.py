@@ -111,8 +111,6 @@ if len(matches) != 1:
 data = panes[matches[0]]
 if args[0] == 'show-environment':
     print(f"SHOWRUNNER_UNIT={data['slug']}\\nSHOWRUNNER_UNIT_ID={matches[0]}")
-    if data['state']:
-        print(f"SHOWRUNNER_UNIT_STATE={data['state']}")
 else:
     print(data['pane'])
 """)
@@ -135,6 +133,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
             "PATH": f"{self.bin}:{os.environ.get('PATH', '')}",
             "SHOWRUNNERS_CONFIG": str(self.config),
             "NOTIFIER_STATE_DIR": str(self.notifier),
+            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
             "NOTIFIER_SESSIONS_DIR": str(self.sessions),
             "SHOWRUNNERS_SESSIONS": str(self.sessions_script),
             "STALL_WATCH_STATE_DIR": str(self.state),
@@ -165,12 +164,13 @@ raise SystemExit(1 if record['to'] in fail else 0)
             rows = [f"| {unit} | {self.plans.get(unit, '`docs/plan.md`')} | /tmp/no-worktree-of-{unit} | {unit} | — | — |"
                     for unit in units]
             _ = (self.root / f"{session}-production.md").write_text("\n".join((
+                "- **User zone:** America/Los_Angeles", "",
                 "## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |",
                 "| --- | --- | --- | --- | --- | --- |", *rows, "")))
 
     def configure_registered(self, runners: dict[str, list[tuple[str, str]]],
                              *, stall_minutes: int = 5) -> None:
-        """As `configure`, and each unit's tmux session carries the state mark given."""
+        """As `configure`, and each unit's run records say the state given."""
         for units in runners.values():
             self.states.update(dict(units))
         self.configure({session: [unit for unit, _ in units] for session, units in runners.items()},
@@ -231,7 +231,20 @@ raise SystemExit(1 if record['to'] in fail else 0)
     def tick(self, at: int, *, delay: int = 0) -> subprocess.CompletedProcess[str]:
         _ = self.ps_file.write_text("\n".join(self.process_rows) + "\n")
         _ = self.tmux_file.write_text(json.dumps({
-            name: {**pane, "state": self.states.get(name, "")} for name, pane in self.panes.items()}))
+            name: dict(pane) for name, pane in self.panes.items()}))
+        # A unit's run state is read from the record of the newest /unit:delegate run in its worktree.
+        runs = self.root / "history/runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        for record in runs.iterdir():
+            record.unlink()
+        for name in self.panes:
+            state = self.states.get(name, "") or "running"
+            if state == "standing-by":
+                continue
+            events = [{"event_type": "run_started", "run_started_at": 1.0,
+                       "working_dir": str(Path(f"/tmp/no-worktree-of-{name}").resolve())},
+                      *([{"event_type": "run_finished"}] if state == "run-finished" else [])]
+            _ = (runs / f"{name}.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
         return subprocess.run(
             [sys.executable, str(SCRIPT)],
             env={**self.environment, "STALL_WATCH_NOW_EPOCH": str(at), "STALL_TEST_SEND_DELAY": str(delay)},

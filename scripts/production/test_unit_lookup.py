@@ -38,7 +38,8 @@ class UnitLookupTests(unittest.TestCase):
         self.records = self.root / "sessions"
         self.records.mkdir()
         self.environment = {**os.environ, "FAKE_TMUX_STATE": str(self.state), "UNIT_LOOKUP_TMUX": FAKE,
-                            "NOTIFIER_SESSIONS_DIR": str(self.records)}
+                            "NOTIFIER_SESSIONS_DIR": str(self.records),
+                            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history")}
         self.enterContext(mock.patch.dict(os.environ, self.environment))
 
     def claude(self, name: str, pane: str, *, updated: int = 1, session_id: str = "") -> None:
@@ -64,7 +65,7 @@ class UnitLookupTests(unittest.TestCase):
         found = unit_lookup.marked_units("show")
         self.assertEqual(list(found), ["trunk-unit"])
         unit = found["trunk-unit"]
-        self.assertEqual((unit.pane, unit.label, unit.state), ("%4", "renamed-since-launch", UnitState.RUNNING))
+        self.assertEqual((unit.pane, unit.label), ("%4", "renamed-since-launch"))
         assert isinstance(unit.claude, LiveClaude)
         self.assertEqual((unit.claude.name, unit.claude.session_id), ("renamed-since-launch", "id-renamed-since-launch"))
 
@@ -77,9 +78,9 @@ class UnitLookupTests(unittest.TestCase):
         self.assertEqual((claude.name, claude.session_id), ("after", "new-id"))
 
     def test_a_marked_session_with_no_claude_is_still_the_units_pane(self) -> None:
-        fake_tmux.write(self.state, {"$1": marked("trunk", "%4", "trunk-unit", SHOWRUNNER_UNIT_STATE="run-finished")})
+        fake_tmux.write(self.state, {"$1": marked("trunk", "%4", "trunk-unit")})
         unit = unit_lookup.marked_units("show")["trunk-unit"]
-        self.assertEqual((unit.pane, unit.state), ("%4", UnitState.RUN_FINISHED))
+        self.assertEqual(unit.pane, "%4")
         self.assertIsInstance(unit.claude, ClaudeNotRunning)
 
     def test_an_unreadable_record_leaves_a_unit_without_a_match_unknown_not_stopped(self) -> None:
@@ -108,30 +109,53 @@ class UnitLookupTests(unittest.TestCase):
         self.assertEqual((found.returncode, found.stdout), (0, "%4\n"))
         self.assertEqual(self.run_script("pane", "show", "fps-unit").returncode, 1)
         listed = self.run_script("list", "show")
-        self.assertEqual(listed.stdout.split("\t")[:5], ["trunk-unit", "running", "%4", "trunk", "live"])
+        self.assertEqual(listed.stdout.split("\t")[:4], ["trunk-unit", "%4", "trunk", "live"])
         self.state.unlink()
         _ = self.state.write_text("not json")
         self.assertEqual(self.run_script("pane", "show", "trunk-unit").returncode, 3)
         self.assertEqual(self.run_script("list").returncode, 2)
 
-    def test_a_session_is_marked_once_and_its_state_follows(self) -> None:
+    def test_a_session_is_marked_once_and_marking_it_again_changes_nothing(self) -> None:
         fake_tmux.write(self.state, {"$1": FakeSession(label="old-name", panes=["%4"], env={})})
-        with self.assertRaisesRegex(OSError, "not a marked unit session"):
-            unit_lookup.set_state("%4", UnitState.RUN_FINISHED)
         self.assertEqual(self.run_script("mark", "show", "trunk-unit", "old-name").returncode, 0)
         self.assertEqual(self.run_script("mark", "show", "trunk-unit", "old-name").returncode, 0)
         self.assertEqual(self.run_script("mark", "show", "trunk-unit", "absent").returncode, 3)
-        unit_lookup.set_state("%4", UnitState.RUN_FINISHED)
-        self.assertEqual(unit_lookup.marked_units("show")["trunk-unit"].state, UnitState.RUN_FINISHED)
+        self.assertEqual(list(unit_lookup.marked_units("show")), ["trunk-unit"])
+        # A state is not something to set: the command that set one is gone.
+        self.assertEqual(self.run_script("state", "show", "trunk-unit", "run-finished").returncode, 2)
 
-    def test_the_showrunner_sets_a_units_state_by_unit_id_from_outside_its_pane(self) -> None:
-        fake_tmux.write(self.state, {"$1": marked("any-label", "%4", "trunk-unit")})
-        self.assertEqual(self.run_script("state", "show", "trunk-unit", "run-finished").returncode, 0)
-        self.assertEqual(unit_lookup.marked_units("show")["trunk-unit"].state, UnitState.RUN_FINISHED)
-        self.assertEqual(self.run_script("state", "show", "trunk-unit", "running").returncode, 0)
-        self.assertEqual(unit_lookup.marked_units("show")["trunk-unit"].state, UnitState.RUNNING)
-        self.assertEqual(self.run_script("state", "show", "fps-unit", "run-finished").returncode, 1)
-        self.assertEqual(self.run_script("state", "show", "trunk-unit", "asleep").returncode, 2)
+    def record(self, name: str, worktree: Path, started: float, *later: str) -> Path:
+        """Write the record of a /unit:delegate run in `worktree`, as the recorder would."""
+        runs = self.root / "history/runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        events = [{"event_type": "run_started", "working_dir": str(worktree.resolve()), "run_started_at": started},
+                  *({"event_type": kind} for kind in later)]
+        path = runs / f"{name}.jsonl"
+        _ = path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        return path
+
+    def test_a_units_run_state_is_read_from_the_newest_run_record_of_its_worktree(self) -> None:
+        worktree = self.root / "trunk"
+        worktree.mkdir()
+        # No run was ever started here: the unit is standing by, whatever other worktrees ran.
+        self.assertIs(unit_lookup.run_state(worktree), UnitState.STANDING_BY)
+        _ = self.record("elsewhere", self.root / "elsewhere", 9.0, "phase_started")
+        self.assertIs(unit_lookup.run_state(worktree), UnitState.STANDING_BY)
+        _ = self.record("first", worktree, 1.0, "phase_started", "run_finished")
+        self.assertIs(unit_lookup.run_state(worktree), UnitState.RUN_FINISHED)
+        second = self.record("second", worktree, 2.0, "phase_started")
+        self.assertIs(unit_lookup.run_state(worktree), UnitState.RUNNING)
+        # A last line caught half-written is not yet an event.
+        with second.open("a", encoding="utf-8") as handle:
+            _ = handle.write('{"event_type": "run_fin')
+        self.assertIs(unit_lookup.run_state(worktree), UnitState.RUNNING)
+        _ = self.record("second", worktree, 2.0, "phase_started", "run_finished")
+        self.assertIs(unit_lookup.run_state(worktree), UnitState.RUN_FINISHED)
+
+    def test_run_records_that_cannot_be_read_are_an_error_not_a_state(self) -> None:
+        (self.root / "history/runs/unreadable.jsonl").mkdir(parents=True)
+        with self.assertRaises(OSError):
+            _ = unit_lookup.run_state(self.root / "trunk")
 
 
 if __name__ == "__main__":

@@ -283,8 +283,7 @@ class AddUnitTests(unittest.TestCase):
         self.assertFalse((worktree / "docs/plans/build-followups-alpha.md").exists())
         # Adding a unit registers nothing: the showrunner's update timer already names the doc.
         self.assertFalse(self.config.exists())
-        self.assertEqual(self.marks("alpha"), {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "alpha-unit",
-                                               "SHOWRUNNER_UNIT_STATE": "standing-by"})
+        self.assertEqual(self.marks("alpha"), {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
         tmux = next(record for record in self.events("tmux")
                     if cast(list[str], record["args"])[:1] == ["new-session"])
         command = cast(list[str], tmux["args"])[-1]
@@ -345,9 +344,9 @@ class AddUnitTests(unittest.TestCase):
         tmux = next(record for record in self.events("tmux")
                     if cast(list[str], record["args"])[:1] == ["new-session"])
         args = cast(list[str], tmux["args"])
-        self.assertEqual(args[:13], ["new-session", "-d", "-s", "alpha", "-c", str(worktree),
+        self.assertEqual(args[:11], ["new-session", "-d", "-s", "alpha", "-c", str(worktree),
                                      "-e", "SHOWRUNNER_UNIT=build-followups", "-e", "SHOWRUNNER_UNIT_ID=alpha-unit",
-                                     "-e", "SHOWRUNNER_UNIT_STATE=running", "zsh"])
+                                     "zsh"])
         self.assertIn("claude --model opus --effort xhigh --remote-control alpha -n alpha", args[-1])
         self.assert_director_flags("opus", "xhigh")
         self.assertIn("'/unit:delegate docs/plans/given.md'", args[-1])
@@ -758,7 +757,7 @@ class RetiredRowTests(unittest.TestCase):
         return f"| `{unit}-unit` | {plan} | `{worktree}` | `branch` | `{unit}` (resumed elsewhere) | — | — |"
 
     def session(self, unit: str) -> unit_lookup.MarkedUnit:
-        return unit_lookup.MarkedUnit(unit, unit_lookup.UnitState.RUNNING, "%1", "any-label", unit_lookup.ClaudeNotRunning())
+        return unit_lookup.MarkedUnit(unit, "%1", "any-label", unit_lookup.ClaudeNotRunning())
 
     def retired(self, worktree: Path, *, gone: bool, plan: str = "`docs/plan.md`") -> tuple[bool, int]:
         """Whether the row is retired, and how many times tmux was asked."""

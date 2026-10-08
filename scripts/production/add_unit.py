@@ -598,9 +598,7 @@ def launch_session(request: UnitLaunch, tmux: str, director: DirectorAgent) -> N
 
     The marks are what finds the unit afterwards; its name is only what it is called at launch.
     """
-    state = unit_lookup.UnitState.STANDING_BY if isinstance(request.plan, Standby) else unit_lookup.UnitState.RUNNING
-    marks = {unit_lookup.PRODUCTION_MARK: request.production.slug, unit_lookup.UNIT_MARK: request.identity.unit,
-             unit_lookup.STATE_MARK: state.value}
+    marks = {unit_lookup.PRODUCTION_MARK: request.production.slug, unit_lookup.UNIT_MARK: request.identity.unit}
     argv = ["claude", "--model", director.model]
     if isinstance(director.effort, Effort):
         argv.extend(["--effort", director.effort.value])

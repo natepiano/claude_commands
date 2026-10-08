@@ -182,13 +182,20 @@ def tick(now: float) -> None:
         try:
             slug = showrunners.production_slug(configured["doc"])
             lines = Path(configured["doc"]).read_text(encoding="utf-8").splitlines()
-            live = {add_unit.cell_value(cells.get("Unit", "")) for cells in add_unit.live_unit_table(lines, slug)}
+            live = {add_unit.cell_value(cells.get("Unit", "")): add_unit.cell_value(cells.get("Worktree", ""))
+                    for cells in add_unit.live_unit_table(lines, slug)}
             marked = unit_lookup.marked_units(slug)
         except (OSError, UnicodeError, ValueError, add_unit.Refusal) as error:
             print(f"stall-watch: {configured['slug']}: its units are not watched: {error}", file=sys.stderr)
             continue
         for name, unit in marked.items():
-            if unit.state is not unit_lookup.UnitState.RUNNING or name not in live:
+            # A unit is watched while the newest /unit:delegate run in its worktree is unfinished.
+            try:
+                running = name in live and unit_lookup.run_state(Path(live[name])) is unit_lookup.UnitState.RUNNING
+            except (OSError, UnicodeError) as error:
+                print(f"stall-watch: {name}: its run state is unknown: {error}", file=sys.stderr)
+                continue
+            if not running:
                 stretch_path(slug, name).unlink(missing_ok=True)
                 continue
             claude = unit.claude
