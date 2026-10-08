@@ -58,6 +58,11 @@ the user, so it needs no gate here. It changes no code and commits nothing itsel
 <RunSummary/>. A refusal there is reported, not repaired, and leaves nothing to
 commit.
 
+Correcting an as-built doc under `docs/as-built/` that contradicts the code is
+always allowed in this pass, in any unit's doc, without asking the user, the
+showrunner or the owner; a production unit's notice names the file as
+`also touches`. User, 2026-10-07.
+
 Only after <RunAsBuilt/> and, where it applies, <AsBuiltCommit/> are complete, a production unit runs `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/showrunners.py" status "<showrunner session>" --unit "<this row's Session cell>" --state run-finished` before <RunSummary/>; a run that stopped, failed, or waits on a decision does not mark itself finished, and nothing asks for `run done` text in the Plan cell.
 </RunAsBuilt>
 
