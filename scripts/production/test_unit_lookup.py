@@ -125,7 +125,7 @@ class UnitLookupTests(unittest.TestCase):
         self.assertEqual(self.run_script("state", "show", "trunk-unit", "run-finished").returncode, 2)
 
     def record(self, name: str, worktree: Path, started: float, *later: str) -> Path:
-        """Write the record of a /unit:delegate run in `worktree`, as the recorder would."""
+        """Write the record of a /unit:direct run in `worktree`, as the recorder would."""
         runs = self.root / "history/runs"
         runs.mkdir(parents=True, exist_ok=True)
         events = [{"event_type": "run_started", "working_dir": str(worktree.resolve()), "run_started_at": started},

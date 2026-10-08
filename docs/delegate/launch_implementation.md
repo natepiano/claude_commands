@@ -1,6 +1,6 @@
 # Launch implementation
 
-Read at the point of use from `/unit:delegate`. Defines `<LaunchImplementation/>`
+Read at the point of use from `/unit:direct`. Defines `<LaunchImplementation/>`
 in full.
 
 **Read when:** before a phase's first dispatch, and again when that dispatch

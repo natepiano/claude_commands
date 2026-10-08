@@ -2,7 +2,7 @@
 
 ## What it is
 
-The session notifier sends a message to a live Claude session on a schedule: the scheduled-update prompt (a `/showrunner:dailies simple` report) to a showrunner, and `/unit:report` ticks to a `/unit:delegate` unit director. Each schedule is a named **instance** stored on disk. One declared 15 s job runs `notifier.sh tick` on both machines and sends every instance that is due. Before each send, the instance's own check command decides whether to send, skip or remove the instance. No agent arms or re-arms a timer. The schedule lives outside the session, so it keeps going through ended turns, compaction and restarts, and it works the same on Linux (natedev) and the Mac.
+The session notifier sends a message to a live Claude session on a schedule: the scheduled-update prompt (a `/showrunner:dailies simple` report) to a showrunner, and `/unit:report` ticks to a `/unit:direct` unit director. Each schedule is a named **instance** stored on disk. One declared 15 s job runs `notifier.sh tick` on both machines and sends every instance that is due. Before each send, the instance's own check command decides whether to send, skip or remove the instance. No agent arms or re-arms a timer. The schedule lives outside the session, so it keeps going through ended turns, compaction and restarts, and it works the same on Linux (natedev) and the Mac.
 
 ## How it works
 
@@ -24,7 +24,7 @@ The session notifier sends a message to a live Claude session on a schedule: the
 | `scripts/production/dailies_input.py` | `--user-run` restarts the showrunner instance for a dailies the user runs. |
 | `scripts/production/production_lifecycle.py` | `wrap` removes the showrunner instance. |
 | `commands/showrunner/{produce,dailies,interval}.md` | Call those commands; `/showrunner:interval` retimes the showrunner instance. |
-| `commands/unit/delegate.md` `<ProgressContract>`, `commands/unit/report.md`, `commands/unit/interval.md` | How a unit treats its ticks, and `/unit:interval`. |
+| `commands/unit/direct.md` `<ProgressContract>`, `commands/unit/report.md`, `commands/unit/interval.md` | How a unit treats its ticks, and `/unit:interval`. |
 | `config/delegate.conf` | `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS`, the unit interval. |
 | `/etc/nixos/modules/common/session-notifier.nix` | The 15 s job. |
 | `scripts/message/test_notifier.py`, `test_sessions.py`, `scripts/delegate/test_delegate_check.py` | CLI tests, run through the `NOTIFIER_*` variables. |
@@ -130,7 +130,7 @@ N comes from the doc's `**Updates:** every N minutes` line, 15 when absent; `on 
 
 ### The unit instance
 
-Each Claude delegate run gets `delegate-<run id>`, where the run id is the basename of `SESSION_DIR` (`/tmp/claude/delegate/<uuid>`). `prepare_session.sh`, when `CLAUDE_CODE_SESSION_ID` is set, writes the marker under the fixed `/tmp/claude/delegate/active`, then runs `PLAN_DELEGATE_ACTIVE_DIR=/tmp/claude/delegate/active zsh unit_notifier.sh <id>`. On success it prints the `next_due=` line; on failure it prints `notifier instance not created: <output>` and goes on. `Session ready at <dir>` is always its last line.
+Each Claude `/unit:direct` run gets `delegate-<run id>`, where the run id is the basename of `SESSION_DIR` (`/tmp/claude/delegate/<uuid>`). `prepare_session.sh`, when `CLAUDE_CODE_SESSION_ID` is set, writes the marker under the fixed `/tmp/claude/delegate/active`, then runs `PLAN_DELEGATE_ACTIVE_DIR=/tmp/claude/delegate/active zsh unit_notifier.sh <id>`. On success it prints the `next_due=` line; on failure it prints `notifier instance not created: <output>` and goes on. `Session ready at <dir>` is always its last line.
 
 `unit_notifier.sh <claude_session_id> [on|off]` reads `SESSION_DIR` from the marker (exit 1 when missing or empty, 2 on a usage error). With `off` it runs `notifier.sh stop delegate-<run id>` and prints `progress updates off: delegate-<run id>`; with `on`, `notifier.sh start`, printing `progress updates on: delegate-<run id> <next_due line>`; a `notifier.sh` failure passes its message and status through. With no mode it `exec`s:
 
@@ -196,7 +196,7 @@ For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <
 
 - **The schedule lives outside the session.** An agent that must arm a timer before ending every turn misses one sooner or later. A file-backed instance ticked by a job keeps the schedule through turn ends, compaction and restarts, and the showrunner and the units use one mechanism.
 - **One job ticks every instance.** A timer per instance would need systemd on Linux and launchd on the Mac from inside the script. One declared 15 s job keeps timers out of `notifier.sh`, and the script identical on each machine; its one launcher call only detaches a run-only job after the tick has decided it is due. `AccuracySec` is 1 s because systemd's default of 1 minute would spread a 15 s tick across a minute.
-- **The check decides, not the notifier.** `notifier.sh` knows nothing about productions or delegate runs. Each owner supplies a command, and exit 2 lets an instance remove itself when its owner is gone, so a crashed run or a missed wrap stops sending on its own.
+- **The check decides, not the notifier.** `notifier.sh` knows nothing about productions or `/unit:direct` runs. Each owner supplies a command, and exit 2 lets an instance remove itself when its owner is gone, so a crashed run or a missed wrap stops sending on its own.
 - **Unit ticks only while work runs.** An idle unit, waiting on the user or between steps, has nothing new to report, and every report costs generation time. A unit parked overnight keeps its instance, so updates resume with the work.
 - **Hold for units.** A unit in a long turn cannot read ticks; without the hold they would stack and each produce a report. The socket-change release covers a restarted session, which lost its waiting tick; the two-interval release keeps a lost tick from silencing the unit for good.
 - **Each report restarts the clock.** The next tick comes one interval after the latest report from any source, the report's clock line names the real next tick, and the restart releases the hold.

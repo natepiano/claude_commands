@@ -1,17 +1,17 @@
 ---
-description: Review the add-ons a delegate run has collected for later.
+description: Review the add-ons a /unit:direct run has collected for later.
 ---
 
-# Delegate — next items
+# Direct — next items
 
 **Usage:** `/unit:add_ons`
 
-Type this to review the add-ons a delegate run has accumulated: it walks
+Type this to review the add-ons a `/unit:direct` run has accumulated: it walks
 `${NEXT_ITEMS_PENDING}` through <ReviewPendingAddOns/> now. It runs inside the
-current session and already knows the plan and its phases. If no delegate run is
+current session and already knows the plan and its phases. If no `/unit:direct` run is
 active, say so in one line and stop.
 
-`/unit:delegate` reads this file at each phase boundary and at every interactive
+`/unit:direct` reads this file at each phase boundary and at every interactive
 point. It defines <ConsiderNextItems/> and <ReviewPendingAddOns/> in full. Never
 work from memory of an earlier read: silence in automatic mode and the
 one-line reporting rule are the parts that drift.

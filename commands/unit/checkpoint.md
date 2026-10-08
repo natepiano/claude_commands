@@ -1,14 +1,14 @@
 ---
-description: Commit and push a finished delegate phase and release its reservation, when the run did not.
+description: Commit and push a finished /unit:direct phase and release its reservation, when the run did not.
 ---
 
-# Delegate — checkpoint
+# Direct — checkpoint
 
 **Usage:** `/unit:checkpoint`
 
 Type this when a phase finished and was never committed, or when a run stopped
 between the commit and the reservation release. It runs inside the current
-session and already knows the phase, the plan doc, and the mode. If no delegate
+session and already knows the phase, the plan doc, and the mode. If no `/unit:direct`
 run is active, say so in one line and stop.
 
 This is durable state with no cheap undo. Read the whole contract before acting
@@ -16,7 +16,7 @@ on any part of it, and read the reservation record from disk — a value
 remembered from conversation, from the harness session mapping, or re-derived
 from current `HEAD` is not proof and will silently accept the wrong checkpoint.
 
-`/unit:delegate` reads this file once per completed phase in loop and verbose
+`/unit:direct` reads this file once per completed phase in loop and verbose
 mode. It defines `<CheckpointCommit/>`, `<ShrinkCommit/>`, and
 `<PushCheckpoint/>` in full. `single` never commits.
 Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
@@ -50,7 +50,7 @@ Loop/verbose only:
    | `CheckpointCommittedAwaitingReleaseConfirmation` | Valid only as a resumed state: route directly to step 7, re-entering neither drift nor checkpoint creation. |
 
    Run each cargo-berth command in this checkpoint as written, under
-   `/unit:delegate` <BerthDecisions/>:
+   `/unit:direct` <BerthDecisions/>:
 
    ```sh
    cargo-berth drift --full --json

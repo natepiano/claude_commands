@@ -583,14 +583,14 @@ def prompt_for(request: UnitLaunch) -> str:
         plan = str(request.worktree / request.plan_path)
         return (f"You are now {request.identity.unit} in production {production.slug} (doc {doc}), under "
                 f"{showrunner}. Work only in your worktree {request.worktree}, "
-                f"branch {request.branch}, and name it in every Work Order. Run /unit:delegate {plan}.")
+                f"branch {request.branch}, and name it in every Work Order. Run /unit:direct {plan}.")
     if isinstance(request.plan, PlanGiven):
-        return f"/unit:delegate {plan}"
+        return f"/unit:direct {plan}"
     return (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under "
             f"{showrunner}. Work only in your worktree {request.worktree}, "
             f"branch {request.branch}, and name it in every Work Order. Your plan {plan} holds only the "
             f"user's words. Write the full phased plan there, send it to the showrunner, and wait for its "
-            f"approval before you run /unit:delegate {plan}.")
+            f"approval before you run /unit:direct {plan}.")
 
 
 def launch_session(request: UnitLaunch, tmux: str, director: DirectorAgent) -> None:

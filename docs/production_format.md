@@ -1,6 +1,6 @@
 # Production format
 
-The shared contract for a **production**: several `/unit:delegate` runs building
+The shared contract for a **production**: several `/unit:direct` runs building
 one deliverable in parallel, coordinated by one session. The commands sit in one
 folder per role under `~/.claude/commands/`. These read or write this format and
 must not drift from it:
@@ -12,7 +12,7 @@ must not drift from it:
 - `/showrunner:produce` — runs the production from the showrunner session.
 - `/showrunner:dailies` — reports the production to the executive producer.
 - `/showrunner:interval` — changes how often the scheduled updates come.
-- `/unit:delegate` — a unit's run; it applies <ProductionUnit/> below.
+- `/unit:direct` — a unit's run; it applies <ProductionUnit/> below.
 
 ---
 
@@ -27,10 +27,10 @@ must not drift from it:
 - **Showrunner** — the session running `/showrunner:produce`. It merges, tests, pushes,
   makes the visual choices, clears waits between units, relays the user's words
   and reports on a schedule. It writes no implementation code.
-- **Unit** — one `/unit:delegate` run on one unit plan, in its own worktree and
+- **Unit** — one `/unit:direct` run on one unit plan, in its own worktree and
   branch. A unit is named `<area>-unit`, e.g. `widget-unit`. Its plan, worktree,
   branch, phases, checkpoints and ETA are the unit's.
-- **Unit director** — the Claude session that runs a unit: the `/unit:delegate`
+- **Unit director** — the Claude session that runs a unit: the `/unit:direct`
   session the showrunner launches in tmux. It receives messages, decides, writes
   Work Orders, dispatches seats, runs gates, checkpoints and reports. It writes
   no implementation code.
@@ -135,12 +135,12 @@ Each gated phase carries its gate directly under the phase heading:
 ---
 
 <ProductionUnit>
-Applies to a `/unit:delegate` run whose plan header carries a
+Applies to a `/unit:direct` run whose plan header carries a
 `> **Production:**` line. Read the production doc it names at the start of the
 run and after every compaction. Your row in its **Units** table gives your name,
 branch, port and the files you own.
 
-A unit's run state is written down nowhere and the unit sets nothing. Each reader takes it, when it needs it, from the records `/unit:delegate` keeps of the runs in the unit's worktree: no run yet is standing by, a newest run with no finish is running, a newest run that finished is run-finished. A session stays live after its run ends, and its next run reads as running from that run's first record.
+A unit's run state is written down nowhere and the unit sets nothing. Each reader takes it, when it needs it, from the records `/unit:direct` keeps of the runs in the unit's worktree: no run yet is standing by, a newest run with no finish is running, a newest run that finished is run-finished. A session stays live after its run ends, and its next run reads as running from that run's first record.
 A run that stopped, failed, or waits on a decision has no finish in its record, so it does not read as finished, and nothing asks for `run done` text in the Plan cell.
 
 1. **Your port.** Every app launch for smoke tests and shots uses your port,
@@ -192,7 +192,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    round.
 
    Such a notice carries the third line: the verdict of the design check
-   (`/unit:delegate` → <UXReview/>) that a fresh helper gave on exactly the
+   (`/unit:direct` → <UXReview/>) that a fresh helper gave on exactly the
    shots this notice sends, taken from a build of `<hash>`. A verdict on other
    shots, or on a build from before a later change to what users see, is
    stale: re-shoot and re-judge before sending. Send the notice on a `pass`,
@@ -269,7 +269,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
 9. **Files you do not own.** Edit another unit's files or hub files only through
    cargo-berth's normal flow. An incursion resolves itself. The showrunner picks
    each overlap answer, and no berth decision waits on the user
-   (`/unit:delegate` <BerthDecisions/>). Name each such file in your checkpoint
+   (`/unit:direct` <BerthDecisions/>). Name each such file in your checkpoint
    notice as `also touches <path> (owner <unit>), tested against <owner tip>`.
    Before the notice, on a clean tree, trial-merge the owner's current tip in
    your own worktree (`git merge --no-commit --no-ff <owner tip>`), run the
@@ -310,7 +310,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     the error it names, wherever it is in the workspace, then lint once.
     Never re-run lint on a tree that has not changed. A Work Order runs lint
     once after the seat's edits, never once per crate; per crate is right
-    only for test (`/unit:delegate`). Fix a file you do not
+    only for test (`/unit:direct`). Fix a file you do not
     own through item 9, and name it in your checkpoint notice. Tell your seats
     this in every Work Order that runs lint.
 14. **When others wait on you** (user, 2026-09-29). When your checkpoint turns
