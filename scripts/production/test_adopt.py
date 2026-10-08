@@ -100,10 +100,9 @@ class AdoptTests(unittest.TestCase):
         result = self.run_adopt()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.marks(), {
-            "alpha": {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "alpha-unit",
-                      "SHOWRUNNER_UNIT_STATE": "running"},
-            "beta-renamed": {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "beta-unit",
-                             "SHOWRUNNER_UNIT_STATE": "run-finished"},
+            # The old registry held a run state per unit; none is carried over, as none is stored.
+            "alpha": {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "alpha-unit"},
+            "beta-renamed": {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "beta-unit"},
             "someone-else": {}})
         table = [line for line in self.doc.read_text(encoding="utf-8").splitlines() if line.startswith("|")]
         self.assertEqual(table[:2], ["| Unit | Plan | Worktree | Branch | Port | Owns |",
@@ -115,14 +114,15 @@ class AdoptTests(unittest.TestCase):
                          "alpha-unit|which colour\nbeta-unit|which size\n")
         self.assertEqual(self.commits(), ["production(show): unit sessions are looked up, not written down", "base"])
 
-    def test_a_unit_marked_by_hand_before_the_run_still_gets_its_run_state(self) -> None:
+    def test_a_unit_marked_by_hand_before_the_run_is_left_as_it_is(self) -> None:
         sessions = fake_tmux.read(self.tmux)
         sessions["$2"]["env"].update({"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "beta-unit"})
         fake_tmux.write(self.tmux, sessions)
         result = self.run_adopt()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.marks()["beta-renamed"]["SHOWRUNNER_UNIT_STATE"], "run-finished")
-        self.assertEqual(self.marks()["alpha"]["SHOWRUNNER_UNIT_STATE"], "running")
+        self.assertIn("adopt: beta-unit was already marked", result.stdout)
+        self.assertEqual(self.marks()["beta-renamed"], {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "beta-unit"})
+        self.assertEqual(self.marks()["alpha"], {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
 
     def test_a_second_run_changes_nothing(self) -> None:
         self.assertEqual(self.run_adopt().returncode, 0)

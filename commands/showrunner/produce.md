@@ -262,7 +262,8 @@ reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
 The prompt:
 
 > Scheduled update (every <N> minutes, every unit checked; the user is in
-> <zone>). Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> --production <production doc> > <SCRATCH>/unit_status.txt`.
+> <zone>). `<SCRATCH>` below stands for your own scratchpad directory: put its
+> path in place of it before you run a command. Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> --production <production doc> > <SCRATCH>/unit_status.txt`.
 > It checks every unit director: its session and Claude are running, anything waiting
 > on the user, and its latest step and ETA. Run `/showrunner:dailies simple`
 > for every unit and open topic; its input builder reads the saved status file.
