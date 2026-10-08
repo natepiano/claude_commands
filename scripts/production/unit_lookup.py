@@ -24,7 +24,8 @@ PRODUCTION_MARK = "SHOWRUNNER_UNIT"
 UNIT_MARK = "SHOWRUNNER_UNIT_ID"
 STATE_MARK = "SHOWRUNNER_UNIT_STATE"
 USAGE = ("usage: unit_lookup.py list <production slug> | pane <production slug> <unit>"
-         + " | mark <production slug> <unit> <tmux session>")
+         + " | mark <production slug> <unit> <tmux session>"
+         + " | state <production slug> <unit> <running|run-finished|standing-by>")
 
 
 class UnitState(Enum):
@@ -193,6 +194,12 @@ def main(arguments: list[str]) -> int:
                 print(found.pane)
             case ["mark", slug, name, target]:
                 mark(target, slug, name)
+            # The showrunner's way to set a unit's run state; a unit sets its own from its pane.
+            case ["state", slug, name, state] if state in [one.value for one in UnitState]:
+                found = marked_units(slug).get(name)
+                if found is None:
+                    return 1
+                set_state(found.pane, UnitState(state))
             case _:
                 print(USAGE, file=sys.stderr)
                 return 2
