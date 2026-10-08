@@ -373,10 +373,11 @@ def parse_time(text: str, now: datetime) -> datetime:
 
 
 def parse_range_end(text: str, now: datetime, eta: datetime, *, earliest: bool) -> datetime:
-    """A range end, on the day that keeps it on its side of the ETA: earliest at or before, latest at or after."""
-    moment = parse_time(text, now)
+    """A range end, on the ETA's day or the one next to it that keeps it on its side: earliest at or before, latest at or after. `+N` counts days from the report."""
     if "+" in text:
-        return moment
+        return parse_time(text, now)
+    hour_text, minute_text = text.split(":")
+    moment = eta.replace(hour=int(hour_text), minute=int(minute_text), second=0, microsecond=0)
     if earliest and moment > eta:
         return moment - timedelta(days=1)
     if not earliest and moment < eta:
@@ -994,20 +995,21 @@ def same_phase(previous: str, current: str) -> bool:
 
 
 def resolve_eta_moment(unit: Unit, previous: Previous, now: datetime) -> ResolvedEta:
-    """Resolve this report's ETA once, preserving an unchanged same-phase moment."""
+    """Resolve this report's ETA once: from the moment it was stated, else preserving an unchanged same-phase moment."""
     eta = unit.eta
     if isinstance(eta, NoEta):
         return NoResolvedEtaMoment()
+    # A time that names no day is read on the day it was stated. That comes before the last report's
+    # moment: the same clock stated again a day later is a new time. `+N` counts days from the report,
+    # as the builder writes it.
+    if eta.stated is not None and "+" not in eta.time:
+        stated = eta.stated if eta.stated.tzinfo is not None else eta.stated.replace(tzinfo=now.tzinfo)
+        return ResolvedEtaMoment(parse_time(eta.time, stated))
     if (isinstance(previous, LastUnitReport)
             and same_phase(previous.phase, unit.phase)
             and isinstance(previous.eta, LastReportedEta)
             and previous.eta.text == eta.time):
         return ResolvedEtaMoment(previous.eta.moment)
-    # A time that names no day is read on the day it was stated. `+N` counts days from the report, as the
-    # builder writes it.
-    if eta.stated is not None and "+" not in eta.time:
-        stated = eta.stated if eta.stated.tzinfo is not None else eta.stated.replace(tzinfo=now.tzinfo)
-        return ResolvedEtaMoment(parse_time(eta.time, stated))
     return ResolvedEtaMoment(parse_time(eta.time, now))
 
 
