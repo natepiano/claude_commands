@@ -12,12 +12,19 @@ from pathlib import Path
 
 
 def write_timer(notifier_dir: Path, slug: str, session_id: str, zone: str, doc: Path | str) -> Path:
-    """Write the update timer of the production `slug`, addressed to `session_id`."""
+    """Write the update timer of the production `slug`, addressed to `session_id`.
+
+    The zone is the doc's own User zone line, so the doc is given one unless `zone` is empty.
+    """
     instance = notifier_dir / f"showrunner-{slug}"
     instance.mkdir(parents=True, exist_ok=True)
     prompt = instance / "prompt.txt"
     _ = prompt.write_text(f"Run `zsh unit_status.sh /scratch/unit_status {zone} --production {doc}`.\n",
                           encoding="utf-8")
+    path = Path(doc)
+    held = path.read_text(encoding="utf-8") if path.is_file() else ""
+    if zone and "- **User zone:** " not in held:
+        _ = path.write_text(f"- **User zone:** {zone}\n{held}", encoding="utf-8")
     _ = (instance / "conf").write_text(
         f"TARGET=session:{session_id}\nPROMPT_FILE={prompt}\nCHECK=zsh /scripts/production_check.sh {doc}\n",
         encoding="utf-8")

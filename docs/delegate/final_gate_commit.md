@@ -63,7 +63,7 @@ always allowed in this pass, in any unit's doc, without asking the user, the
 showrunner or the owner; a production unit's notice names the file as
 `also touches`. User, 2026-10-07.
 
-Only after <RunAsBuilt/> and, where it applies, <AsBuiltCommit/> are complete, a production unit runs `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/showrunners.py" status --state run-finished` from its own pane before <RunSummary/>; a run that stopped, failed, or waits on a decision does not mark itself finished, and nothing asks for `run done` text in the Plan cell.
+A production unit sets no run state: the showrunner's tools read it from this run's record, which reads as finished once the run's finish is recorded. A run that stopped, failed, or waits on a decision does not read as finished, and nothing asks for `run done` text in the Plan cell.
 </RunAsBuilt>
 
 <AsBuiltCommit>

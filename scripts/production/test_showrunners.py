@@ -95,6 +95,8 @@ raise SystemExit(1)
             fields.append(f"PROMPT_FILE={prompt}")
         if doc is not None:
             fields.append("CHECK=" + shlex.join(["zsh", "/opt/tools/production_check.sh", str(doc)]))
+            # The zone is read from the production doc's own line.
+            _ = Path(doc).write_text(f"- **User zone:** {zone}\n", encoding="utf-8")
         _ = (directory / "conf").write_text("\n".join(fields) + "\n")
 
     def environment(self, pane: str = "") -> dict[str, str]:
@@ -113,18 +115,12 @@ raise SystemExit(1)
         self.assertEqual(result.returncode, 0, (args, result.stdout, result.stderr))
         return result.stdout
 
-    def unit_session(self, unit: str, pane: str, state: str = "") -> None:
+    def unit_session(self, unit: str, pane: str) -> None:
         """Give the production `show` one tmux session marked as `unit`."""
         marks = {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": unit}
-        if state:
-            marks["SHOWRUNNER_UNIT_STATE"] = state
         sessions = fake_tmux.read(self.tmux) if self.tmux.exists() else {}
         sessions[f"${len(sessions) + 1}"] = FakeSession(label=f"label-of-{unit}", panes=[pane], env=marks)
         fake_tmux.write(self.tmux, sessions)
-
-    def state_marks(self) -> dict[str, str]:
-        return {session["env"]["SHOWRUNNER_UNIT_ID"]: session["env"].get("SHOWRUNNER_UNIT_STATE", "")
-                for session in fake_tmux.read(self.tmux).values() if "SHOWRUNNER_UNIT_ID" in session["env"]}
 
     def test_checked_doc_reads_absolute_path_after_check_script(self) -> None:
         directory = self.notifier / "showrunner-check"
@@ -154,7 +150,7 @@ raise SystemExit(1)
         self.instance("stall-watch", doc=self.doc)
         pid = self.record("first-name", "live-id")
         self.assertEqual(self.successful("list").splitlines(), [
-            f"other\t<not running>\t{LOS_ANGELES}\t<no doc in its check>",
+            # A timer whose check names no production doc is not a showrunner's: it is left out.
             f"show\tfirst-name\t{LOS_ANGELES}\t{self.doc}"])
         self.assertEqual(self.successful("name", "show"), "first-name\n")
         # A rename is written in one place, the session's own record, and every reader sees it.
@@ -185,8 +181,14 @@ raise SystemExit(1)
 
     def test_a_timer_that_is_not_a_complete_showrunners_is_left_out_with_the_reason(self) -> None:
         self.instance("showrunner-no-target", include_target=False)
-        self.instance("showrunner-no-prompt", include_prompt=False)
-        self.instance("showrunner-unnamed", target="session:unnamed-id")
+        self.instance("showrunner-no-doc")
+        self.instance("showrunner-unnamed", target="session:unnamed-id", doc=self.root / "unnamed-production.md")
+        # The zone is the doc's own line: a doc without one, or with one that names no zone, is no showrunner's.
+        self.instance("showrunner-no-zone", doc=self.root / "no-zone-production.md")
+        _ = (self.root / "no-zone-production.md").write_text("# Production\n", encoding="utf-8")
+        self.instance("showrunner-bad-zone", doc=self.root / "bad-zone-production.md", zone="Nowhere/Never")
+        self.instance("showrunner-lost-doc", doc=self.root / "lost-production.md")
+        (self.root / "lost-production.md").unlink()
         self.instance("showrunner-show", doc=self.doc)
         _ = self.record("director", "live-id")
         # A session that answers on its socket and has no live named process cannot be named.
@@ -195,7 +197,10 @@ raise SystemExit(1)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [f"show\tdirector\t{LOS_ANGELES}\t{self.doc}"])
         self.assertIn("skipping showrunner-no-target", result.stderr)
-        self.assertIn("skipping showrunner-no-prompt: PROMPT_FILE is missing", result.stderr)
+        self.assertIn("skipping showrunner-no-doc: CHECK is missing", result.stderr)
+        self.assertIn("skipping showrunner-no-zone: production doc lacks User zone", result.stderr)
+        self.assertIn("skipping showrunner-bad-zone: production doc has an invalid User zone", result.stderr)
+        self.assertIn("skipping showrunner-lost-doc: production doc could not be read", result.stderr)
         self.assertIn("skipping showrunner-unnamed: session unnamed-id has no live named process", result.stderr)
 
     def test_the_name_comes_from_the_live_process_not_a_stale_record_of_the_same_session(self) -> None:
@@ -204,54 +209,16 @@ raise SystemExit(1)
         _ = self.record("director", "live-id")
         self.assertEqual(self.successful("name", "show"), "director\n")
 
-    def test_ready_marks_a_standing_by_unit_running_by_the_showrunners_name_or_its_production(self) -> None:
-        self.instance("showrunner-show", doc=self.doc)
-        _ = self.record("director", "live-id")
-        self.unit_session("alpha", "%4", "standing-by")
-        self.unit_session("beta", "%5", "standing-by")
-        self.unit_session("gamma", "%6", "standing-by")
-        _ = self.successful("ready", "director", "--unit", "alpha")
-        _ = self.successful("ready", "show", "--unit", "beta")
-        self.assertEqual(self.state_marks(), {"alpha": "running", "beta": "running", "gamma": "standing-by"})
-        self.assertFalse(self.config.exists())
-
-    def test_ready_non_standby_unit_says_so_without_changing_its_mark(self) -> None:
-        self.instance("showrunner-show", doc=self.doc)
-        self.unit_session("alpha", "%4", "run-finished")
-        result = self.cli("ready", "show", "--unit", "alpha", "--unit", "no-session")
-        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertEqual(result.stdout.splitlines(), ["alpha is not on standby", "no-session is not on standby"])
-        self.assertEqual(self.state_marks(), {"alpha": "run-finished"})
-
-    def test_ready_refuses_an_unknown_showrunner_and_one_whose_timer_checks_no_doc(self) -> None:
-        self.instance("showrunner-show")
-        for showrunner, reason in (("show", "not a production doc: none registered"),
-                                   ("absent", "no showrunner with an update timer is called absent")):
-            with self.subTest(showrunner=showrunner):
-                result = self.cli("ready", showrunner, "--unit", "alpha")
-                self.assertEqual(result.returncode, 1)
-                self.assertIn(reason, result.stderr)
-
-    def test_status_marks_the_tmux_session_the_unit_calls_from(self) -> None:
+    def test_the_old_ready_and_status_commands_do_nothing_and_succeed(self) -> None:
+        # Sessions started before a unit's run state was read from its run records still call them.
         self.unit_session("alpha", "%4")
-        self.unit_session("beta", "%5")
-        _ = self.successful("status", "--state", "run-finished", pane="%4")
-        _ = self.successful("status", "--state", "run-finished", pane="%4")
-        self.assertEqual(self.state_marks(), {"alpha": "run-finished", "beta": ""})
-        # A unit that started before the change still names the showrunner and itself; both are unused.
-        _ = self.successful("status", "director", "--unit", "any-name", "--state", "running", pane="%4")
-        self.assertEqual(self.state_marks(), {"alpha": "running", "beta": ""})
-        self.assertFalse(self.config.exists())
-
-    def test_status_refuses_a_caller_that_is_not_in_a_marked_unit_session(self) -> None:
-        sessions = {"$1": FakeSession(label="not-a-unit", panes=["%9"], env={})}
-        fake_tmux.write(self.tmux, sessions)
-        for pane, reason in (("", "this is not one"), ("%9", "is not a marked unit session")):
-            with self.subTest(pane=pane):
-                result = self.cli("status", "--state", "run-finished", pane=pane)
-                self.assertEqual(result.returncode, 1)
-                self.assertIn(reason, result.stderr)
-        self.assertEqual(fake_tmux.read(self.tmux), sessions)
+        before = self.tmux.read_bytes()
+        for arguments in (("ready", "director", "--unit", "alpha"), ("ready", "no-such-showrunner", "--unit", "x"),
+                          ("status", "--state", "run-finished"),
+                          ("status", "director", "--unit", "any-name", "--state", "running")):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(self.successful(*arguments, pane="%4"), "")
+        self.assertEqual(self.tmux.read_bytes(), before)
 
     def test_settings_ignore_a_showrunner_list_stored_before_showrunners_were_looked_up(self) -> None:
         document = {**showrunners.defaults(), "showrunners": [{

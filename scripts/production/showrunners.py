@@ -13,10 +13,6 @@ from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
 
-# The alert tools load this file as part of a package, where its own directory is not on the path.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import unit_lookup  # noqa: E402
-
 CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or Path(__file__).resolve().parents[2] / "config/showrunners.json")
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
@@ -32,9 +28,9 @@ class Showrunner(TypedDict):
     socket: str
     # The production's slug, which names the showrunner whatever its session is called.
     slug: str
+    # The user's zone, read from the production doc.
     zone: str
-    # The production doc, whose Units table says which units the showrunner has. Empty until the
-    # showrunner registers; its units are then unknown, not none.
+    # The production doc, whose Units table says which units the showrunner has.
     doc: str
 
 
@@ -44,14 +40,6 @@ class ShowrunnerSettings(TypedDict):
     stall_minutes: float
     faults_to: str
     always: list[str]
-
-
-class PromptZone(NamedTuple):
-    zone: str
-
-
-class UnreadablePrompt(NamedTuple):
-    reason: str
 
 
 class CheckedDoc(NamedTuple):
@@ -153,26 +141,22 @@ def _session_name(session_id: str) -> str:
     raise ValueError(f"session {session_id} has no live named process")
 
 
-def _prompt_zone(fields: dict[str, str]) -> PromptZone | UnreadablePrompt:
-    value = fields.get("PROMPT_FILE")
-    if not value:
-        return UnreadablePrompt("PROMPT_FILE is missing")
-    prompt_file = Path(value)
-    if not prompt_file.is_absolute():
-        return UnreadablePrompt("PROMPT_FILE is not absolute")
+def _doc_zone(doc: Path) -> str:
+    """The user's zone, from the production doc's own User zone line."""
+    prefix = "- **User zone:** "
     try:
-        prompt = prompt_file.read_text(encoding="utf-8")
+        lines = doc.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as error:
-        return UnreadablePrompt(f"prompt could not be read: {error}")
-    match = re.search(r"unit_status\.sh\s+\S+\s+([^\s|`]+)", prompt)
-    if match is None:
-        return UnreadablePrompt("unit_status.sh command is missing its zone")
-    zone = match.group(1)
+        raise ValueError(f"production doc could not be read: {error}") from error
+    found = next((re.search(r"[A-Za-z][\w+-]*(?:/[\w+-]+)*", line[len(prefix):]) for line in lines
+                  if line.startswith(prefix)), None)
+    if found is None:
+        raise ValueError("production doc lacks User zone")
     try:
-        _ = ZoneInfo(zone)
+        _ = ZoneInfo(found.group(0))
     except (KeyError, ValueError) as error:
-        return UnreadablePrompt(f"prompt has an invalid zone: {error}")
-    return PromptZone(zone)
+        raise ValueError(f"production doc has an invalid User zone: {error}") from error
+    return found.group(0)
 
 
 def _registered(instance: Path) -> Showrunner:
@@ -180,14 +164,14 @@ def _registered(instance: Path) -> Showrunner:
     target = fields["TARGET"]
     if not target.startswith("session:") or not target[8:]:
         raise ValueError("invalid TARGET")
-    prompt = _prompt_zone(fields)
-    if isinstance(prompt, UnreadablePrompt):
-        raise ValueError(prompt.reason)
     doc = checked_doc(instance)
+    if isinstance(doc, NoCheckedDoc):
+        raise ValueError(doc.reason)
+    zone = _doc_zone(doc.path)
     socket = socket_for(target)
     name = _session_name(target[8:]) if socket is not None else ""
-    return Showrunner(session=name, socket=socket or "", slug=instance.name.removeprefix("showrunner-"), zone=prompt.zone,
-                      doc=str(doc.path) if isinstance(doc, CheckedDoc) else "")
+    return Showrunner(session=name, socket=socket or "", slug=instance.name.removeprefix("showrunner-"), zone=zone,
+                      doc=str(doc.path))
 
 
 def registered_showrunners(state_dir: Path | None = None) -> list[Showrunner]:
@@ -230,41 +214,20 @@ def named(showrunner: str) -> Showrunner:
     raise ValueError(f"no showrunner with an update timer is called {showrunner} or runs that production")
 
 
-def ready(session: str, units: list[str]) -> None:
-    """Mark each standing-by unit as running. Its state is a mark on its own tmux session."""
-    runner = named(session)
-    marked = unit_lookup.marked_units(production_slug(runner["doc"]))
-    for unit in units:
-        found = marked.get(unit)
-        if found is None or found.state is not unit_lookup.UnitState.STANDING_BY:
-            print(f"{unit} is not on standby")
-            continue
-        unit_lookup.set_state(found.pane, unit_lookup.UnitState.RUNNING)
-
-
-def set_own_state(state: str) -> None:
-    """Record the calling unit's run state on the tmux session it runs in."""
-    pane = os.environ.get("TMUX_PANE", "")
-    if not pane:
-        raise ValueError("status is set by a unit from its own tmux pane; this is not one")
-    unit_lookup.set_state(pane, unit_lookup.UnitState(state))
-
-
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="action", required=True)
+    # Does nothing: a unit's run state is read from its run records. Delete once no session started before that is left.
     making_ready = commands.add_parser("ready")
-    _ = making_ready.add_argument("session")
-    _ = making_ready.add_argument("--unit", action="append", required=True)
+    _ = making_ready.add_argument("session", nargs="?")
+    _ = making_ready.add_argument("--unit", action="append")
     naming = commands.add_parser("name")
     _ = naming.add_argument("slug")
+    # Does nothing: a unit's run state is read from its run records. Delete once no session started before that is left.
     setting_status = commands.add_parser("status")
-    # A unit that started before its state became a mark on its own tmux session still names the
-    # showrunner and itself here. Both are accepted and unused: the pane says which unit calls.
     _ = setting_status.add_argument("session", nargs="?")
     _ = setting_status.add_argument("--unit")
-    _ = setting_status.add_argument("--state", required=True,
-                                    choices=("running", "run-finished", "standing-by"))
+    _ = setting_status.add_argument("--state")
     _ = commands.add_parser("list")
     args = parser.parse_args(argv)
     action = cast(str, args.action)
@@ -272,16 +235,12 @@ def main(argv: list[str]) -> int:
         if action == "list":
             for runner in registered_showrunners():
                 print(f"{runner['slug']}\t{runner['session'] or '<not running>'}\t{runner['zone']}"
-                      + f"\t{runner['doc'] or '<no doc in its check>'}")
+                      + f"\t{runner['doc']}")
         elif action == "name":
             name = current_name(cast(str, args.slug))
             if not name:
                 raise ValueError(f"the showrunner of {cast(str, args.slug)} is not running")
             print(name)
-        elif action == "status":
-            set_own_state(cast(str, args.state))
-        elif action == "ready":
-            ready(cast(str, args.session), cast(list[str], args.unit))
     except (OSError, ValueError, KeyError) as error:
         print(f"showrunners: {error}", file=sys.stderr)
         return 1
