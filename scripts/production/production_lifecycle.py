@@ -165,7 +165,7 @@ def doc_path_in_checkout(production: Production, path: Path) -> str:
         raise LifecycleStop("open", "failed", f"{path} is outside {production.checkout}") from error
 
 
-def open_production(production: Production, lines: list[str], session: str) -> None:
+def open_production(production: Production, lines: list[str]) -> None:
     status = doc_status(lines)
     if isinstance(status, ProductionWrapped):
         raise LifecycleStop("open", "held", "production is already wrapped")
@@ -179,16 +179,9 @@ def open_production(production: Production, lines: list[str], session: str) -> N
     if isinstance(status, ProductionPlanned):
         updated = [line.replace("**Status: PRODUCTION — planned.**", "**Status: PRODUCTION — running.**")
                    for line in updated]
-    if isinstance(status, ProductionPlanned):
-        for index, line in enumerate(updated):
-            if line.startswith("- **Showrunner session:**"):
-                updated[index] = f"- **Showrunner session:** {session}"
-                break
-        else:
-            raise LifecycleStop("doc", "failed", "production doc lacks Showrunner session")
     if updated != lines:
         _ = production.doc.write_text("\n".join(updated) + "\n", encoding="utf-8")
-    report("doc", "ok", f"running; showrunner {production.showrunner_session if isinstance(status, ProductionRunning) else session}")
+    report("doc", "ok", "running")
     rows = units(updated, production)
     paths = [doc_path_in_checkout(production, production.doc)]
     paths.extend(doc_path_in_checkout(production, unit.plan) for unit in rows)
@@ -391,12 +384,9 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             elif remote.returncode != 2:
                 raise LifecycleStop("retire", "failed", remote.stderr.strip() or f"ls-remote exited {remote.returncode}")
         notifier = Path.home() / ".claude/scripts/message/notifier.sh"
-        showrunners = Path.home() / ".claude/scripts/production/showrunners.py"
-        py = Path.home() / ".claude/scripts/lib/py"
+        # The update timer is the one record of the showrunner, so removing it unregisters it.
         _ = command("notifier", production.checkout, str(notifier), "remove", f"showrunner-{production.slug}")
-        _ = command("showrunner", production.checkout, str(py), str(showrunners), "remove",
-                    production.showrunner_session)
-        report("notifier", "ok", "update instance and showrunner registration removed")
+        report("notifier", "ok", "update timer removed")
         updated = [line.replace("**Status: PRODUCTION — running.**", "**Status: PRODUCTION — wrapped.**")
                    for line in lines]
         _ = production.doc.write_text("\n".join(updated) + "\n", encoding="utf-8")
@@ -445,6 +435,7 @@ def main() -> int:
     _ = parser.add_argument("--production", required=True, type=Path)
     _ = parser.add_argument("--no-ci", action="store_true")
     _ = parser.add_argument("--resume", action="store_true")
+    # Accepted and unused: a showrunner started before its name was looked up still passes it.
     _ = parser.add_argument("--session")
     _ = parser.add_argument("--ci-green")
     _ = parser.add_argument("--smoke-passed")
@@ -459,15 +450,12 @@ def main() -> int:
             raise LifecycleStop("input", "failed", "--no-ci excludes the verdict flags")
         ci_green = CommitVerdict(ci_sha) if ci_sha is not None else VerdictMissing()
         smoke_passed = CommitVerdict(smoke_sha) if smoke_sha is not None else VerdictMissing()
-        session = cast(str | None, args.session)
-        if action == "open" and not session:
-            raise LifecycleStop("input", "failed", "open needs --session")
         production = read_production(cast(Path, args.production))
         lines = doc_lines(production)
         if action == "load":
             load(production, lines, cast(bool, args.resume))
         elif action == "open":
-            open_production(production, lines, cast(str, session))
+            open_production(production, lines)
         elif action == "promote-main":
             _ = promote_main(production, lines, no_ci, ci_green, smoke_passed)
         else:

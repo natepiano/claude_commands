@@ -13,13 +13,14 @@ import five_hour
 from agent_accounts import CodexRateLimits, Quota, Report
 
 import escalate  # five_hour puts scripts/message on the path
-from quota_alert import Config
+import quota_alert
+from quota_alert import Config, Showrunner
 
 RESETS = datetime(2026, 10, 7, 21, 20, tzinfo=timezone.utc)
 CONFIG = cast(Config, cast(object, {
     "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "hana", "always": ["natedev"],
-    "showrunners": [{"session": "hana", "zone": "America/Los_Angeles", "units": []}],
 }))
+SHOWRUNNERS = [Showrunner(session="hana", socket="/hana.sock", slug="show", zone="America/Los_Angeles", doc="")]
 
 
 def report(tool: str, used: float | None) -> Report:
@@ -45,7 +46,11 @@ class WatchTests(unittest.TestCase):
         def schedule() -> None:
             return None
 
+        def showrunners() -> list[Showrunner]:
+            return SHOWRUNNERS
+
         for module, name, stand_in in ((five_hour, "relay", relay), (five_hour, "load_config", config),
+                                       (quota_alert, "registered_showrunners", showrunners),
                                        (escalate, "schedule", schedule), (escalate, "STATE", self.state)):
             _ = self.enterContext(patch.object(module, name, stand_in))
 

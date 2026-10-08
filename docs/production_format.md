@@ -64,9 +64,6 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Repository:** <main checkout path>
 - **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
 - **Showrunner checkout:** <path, on the merge branch>
-- **Showrunner session:** <the showrunner's SendMessage name, as ListAgents prints it> —
-  `/showrunner:produce` writes it at start and on every resume; the update timer
-  sends each tick to it
 - **Log:** <repo-relative path> — git-excluded; one line per event
 - **User zone:** <IANA zone> — every time the showrunner reports is in this zone plus UTC
 - **Updates:** every <N> minutes (default 15); each update reports every unit in full;
@@ -76,6 +73,10 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
 - **UX guide:** <path to the project's UX rules, e.g. `~/rust/hanadocs/ux`>; omit when
   nothing users see changes
+
+The showrunner's session name is not in the doc: a name can change, so it is
+looked up when needed. `~/.claude/scripts/lib/py
+~/.claude/scripts/production/showrunners.py name <slug>` prints it as it is now.
 
 ## Units
 

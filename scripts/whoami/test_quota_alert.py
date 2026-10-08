@@ -10,7 +10,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast, override
+from typing import override
 from unittest import mock
 
 import quota_alert
@@ -52,6 +52,12 @@ sonnet=low,medium,high
 REAL_RECIPIENTS = quota_alert.recipients
 
 
+def running(*names: str) -> list[quota_alert.Showrunner]:
+    """Running showrunners called `names`, as their update timers and session records would give them."""
+    return [quota_alert.Showrunner(session=name, socket=f"/{name}.sock", slug=name.replace(" ", "-"),
+                                   zone="America/Los_Angeles", doc="") for name in names]
+
+
 def configured_recipients(config: quota_alert.Config, here: str | None = None) -> list[str]:
     del config
     return [name for name in ("natedev", "boss of bosses") if name != here]
@@ -73,12 +79,7 @@ class QuotaAlertTests(unittest.TestCase):
         self.root = Path(directory.name)
         config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({"threshold_percent": 1, "repeat_minutes": 30,
-                                          "stall_minutes": 5, "faults_to": "natedev", "always": ["natedev"],
-                                          "showrunners": [
-                                              {"session": "natedev", "zone": "America/Los_Angeles", "units": []},
-                                              {"session": "boss of bosses", "zone": "America/Los_Angeles",
-                                               "units": []},
-                                          ]}))
+                                          "stall_minutes": 5, "faults_to": "natedev", "always": ["natedev"]}))
         registry = self.root / "agents.conf"
         _ = registry.write_text(REGISTRY)
         for name, value in (("CONFIG", config), ("STATE", self.root / "state.json"), ("relay", self.relay),
@@ -146,8 +147,8 @@ class QuotaAlertTests(unittest.TestCase):
 
         self.assertEqual(config["threshold_percent"], 7)
         self.assertEqual(config["always"], ["always-there"])
-        # A unit list left in the file is not read: a unit's run state is a mark on its own session.
-        self.assertEqual(config["showrunners"][0]["session"], "named-director")
+        # A list of showrunners left in the file is not read: they are found by their update timers.
+        self.assertNotIn("showrunners", config)
 
     def test_repeats_to_every_recipient_until_acknowledged(self) -> None:
         notes: Notes = [self.note("codex 1.md", "active", "1")]
@@ -198,12 +199,8 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertEqual(quota_alert.alert(notes, self.now + timedelta(hours=1)), [])
 
     def test_always_then_showrunners_receive_alert_restored_and_echo_once_by_name(self) -> None:
-        config = quota_alert.CONFIG
-        content = cast(dict[str, object], json.loads(config.read_text()))
-        runners = cast(list[dict[str, object]], content["showrunners"])
-        runners.append({"session": "new director", "zone": "America/Los_Angeles", "units": []})
-        _ = config.write_text(json.dumps(content))
-        with mock.patch.object(quota_alert, "recipients", REAL_RECIPIENTS):
+        with mock.patch.object(quota_alert, "recipients", REAL_RECIPIENTS), mock.patch.object(
+                quota_alert, "registered_showrunners", lambda: running("natedev", "boss of bosses", "new director")):
             low_note = self.note("claude 2.md", "active", "0")
             expected = ["natedev", "boss of bosses", "new director"]
             self.assertEqual(quota_alert.recipients(quota_alert.load_config()), expected)
@@ -216,13 +213,9 @@ class QuotaAlertTests(unittest.TestCase):
             _ = quota_alert.tell_others("user action", "natedev")
             self.assertCountEqual([recipient for recipient, _ in self.sent], ["boss of bosses", "new director"])
 
-    def test_always_recipient_survives_removal_of_its_showrunner_entry(self) -> None:
-        config = quota_alert.CONFIG
-        content = cast(dict[str, object], json.loads(config.read_text()))
-        runners = cast(list[dict[str, object]], content["showrunners"])
-        content["showrunners"] = [runner for runner in runners if runner["session"] != "natedev"]
-        _ = config.write_text(json.dumps(content))
-        with mock.patch.object(quota_alert, "recipients", REAL_RECIPIENTS):
+    def test_an_always_recipient_is_told_when_it_runs_no_production(self) -> None:
+        with mock.patch.object(quota_alert, "recipients", REAL_RECIPIENTS), mock.patch.object(
+                quota_alert, "registered_showrunners", lambda: running("boss of bosses")):
             self.assertEqual(quota_alert.recipients(quota_alert.load_config()), ["natedev", "boss of bosses"])
             _ = quota_alert.alert([self.note("claude 2.md", "active", "0")], self.now)
             self.assertCountEqual([recipient for recipient, _ in self.sent], ["natedev", "boss of bosses"])

@@ -90,20 +90,9 @@ def live_sessions() -> list[ClaudeSession] | TmuxServerUnavailable:
     return found
 
 
-def _registry_holds(settings: showrunners.ShowrunnerSettings, name: str) -> bool:
-    return any(runner["session"] == name for runner in settings["showrunners"])
-
-
 def _rename_session(pane: str, old: str, new: str, panes: dict[str, str]) -> SessionRenamed | RenameIncomplete:
+    """Bring the tmux label in step with the session's name. The label is display only: nothing else follows a rename."""
     changed: list[str] = []
-    try:
-        settings = showrunners.load_settings() if showrunners.CONFIG.exists() else showrunners.defaults()
-        if _registry_holds(settings, old):
-            showrunners.change("rename", old, "", "", new)
-            changed.append("showrunner registry")
-    except (OSError, ValueError) as error:
-        return RenameIncomplete(f"the showrunner registry still names {old}: {error}")
-
     current = panes.get(pane)
     if current == new:
         return SessionRenamed(tuple(changed))

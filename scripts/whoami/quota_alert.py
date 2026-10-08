@@ -60,8 +60,10 @@ if __package__ in (None, ""):
 
 from ..production.showrunners import (
     CONFIG as CONFIG,
+    Showrunner as Showrunner,
     ShowrunnerSettings as ShowrunnerSettings,
     load_settings_from as load_settings_from,
+    registered_showrunners as registered_showrunners,
 )
 
 
@@ -141,9 +143,21 @@ def load_config() -> Config:
     return load_settings_from(CONFIG)
 
 
+def showrunners_now() -> list[Showrunner]:
+    """Every showrunner with an update timer. None when the session records cannot say who runs."""
+    try:
+        return registered_showrunners()
+    except OSError as error:
+        print(f"quota-alert: showrunners unknown: {error}", file=sys.stderr)
+        return []
+
+
 def recipients(config: Config, here: str | None = None) -> list[str]:
-    """Keep configured names even when their sessions are currently offline."""
-    names = [*config["always"], *(runner["session"] for runner in config["showrunners"])]
+    """The configured names, offline or not, then each running showrunner by its name now.
+
+    A showrunner that is not running has no name to send to; it hears the next repeat after it resumes.
+    """
+    names = [*config["always"], *(runner["session"] for runner in showrunners_now() if runner["session"])]
     return list(dict.fromkeys(name for name in names if name != here))
 
 
