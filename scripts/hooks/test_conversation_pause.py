@@ -20,6 +20,7 @@ import conversation_pause
 LIBRARY = Path(__file__).with_name("conversation_pause.py")
 PROMPT_HOOK = Path(__file__).with_name("user-prompt-submit-conversation-pause.py")
 STOP_HOOK = Path(__file__).with_name("stop-conversation-pause.py")
+SETTINGS = LIBRARY.parent.parent.parent / "settings.json"
 SESSION = "session-1"
 NOW = 10_000
 QUESTION = (
@@ -51,6 +52,45 @@ NO_CONTEXT = (
 )
 
 
+class ConversationPauseRegistrationTests(unittest.TestCase):
+    def test_settings_registers_hooks_and_permission_once(self) -> None:
+        settings = cast(dict[str, object], json.loads(SETTINGS.read_text()))
+        hooks = cast(dict[str, list[dict[str, object]]], settings["hooks"])
+
+        def registered_commands(groups: list[dict[str, object]]) -> list[str]:
+            commands: list[str] = []
+            for group in groups:
+                registered = cast(list[dict[str, object]], group["hooks"])
+                commands.extend(
+                    command
+                    for hook in registered
+                    if isinstance(command := hook.get("command"), str)
+                )
+            return commands
+
+        prompt_command = (
+            '"$HOME/.claude/scripts/lib/py" '
+            '"$HOME/.claude/scripts/hooks/user-prompt-submit-conversation-pause.py"'
+        )
+        self.assertEqual(
+            registered_commands(hooks["UserPromptSubmit"]).count(prompt_command), 1
+        )
+
+        stop_command = (
+            '"$HOME/.claude/scripts/lib/py" '
+            '"$HOME/.claude/scripts/hooks/stop-conversation-pause.py"'
+        )
+        self.assertEqual(registered_commands(hooks["Stop"]).count(stop_command), 1)
+
+        resume_prefix = conversation_pause.RESUME_COMMAND.rsplit(" ", 1)[0]
+        self.assertEqual(
+            conversation_pause.KEEP_COMMAND.rsplit(" ", 1)[0], resume_prefix
+        )
+        permissions = cast(dict[str, object], settings["permissions"])
+        allow = cast(list[str], permissions["allow"])
+        self.assertEqual(allow.count(f"Bash({resume_prefix} *)"), 1)
+
+
 def cross_session(sender: str, text: str) -> str:
     return (
         f'<cross-session-message from="uds:/tmp/source.sock" from-name="{sender}" '
@@ -71,6 +111,15 @@ def asked_read(asked_at: int, replies_ended: int) -> dict[str, object]:
         "kind": "asked",
         "asked_at": asked_at,
         "reading": {"kind": "read", "replies_ended": replies_ended},
+    }
+
+
+def scheduled_wakeup(prompt: str) -> dict[str, object]:
+    return {
+        "id": "scheduled-1",
+        "schedule": "0 * * * *",
+        "recurring": True,
+        "prompt": prompt,
     }
 
 
@@ -262,6 +311,14 @@ print("SENT: delivered")
             json.loads((self.pause_root / f"{session_id}.json").read_text()),
         )
 
+    def scheduled_prompts_path(self, session_id: str = SESSION) -> Path:
+        return self.pause_root / "scheduled-prompts" / f"{session_id}.json"
+
+    def scheduled_prompts(self, session_id: str = SESSION) -> list[str]:
+        return cast(
+            list[str], json.loads(self.scheduled_prompts_path(session_id).read_text())
+        )
+
     def calls(self, path: Path) -> list[list[str]]:
         if not path.exists():
             return []
@@ -401,6 +458,12 @@ print("SENT: delivered")
         def unexpected_sender_read() -> frozenset[str]:
             self.fail("sender files were read for a non-cross-session prompt")
 
+        def unexpected_scheduled_prompt_read() -> tuple[str, ...]:
+            self.fail("scheduled prompts were read for a notice or cross-session prompt")
+
+        def no_scheduled_prompts() -> tuple[str, ...]:
+            return ()
+
         typed = (
             "hello",
             "   hello",
@@ -408,38 +471,56 @@ print("SENT: delivered")
             "/unit:report",
             "/compact",
             "From the user (via the showrunner): go on",
+            '<agent-message from="a1">done</agent-message>',
+            '<pasted_content id="1">code</pasted_content> why?',
+            "<div> why",
         )
         for prompt in typed:
             with self.subTest(prompt=prompt):
                 self.assertIs(
-                    conversation_pause.prompt_source(prompt, unexpected_sender_read),
+                    conversation_pause.prompt_source(
+                        prompt, unexpected_sender_read, no_scheduled_prompts
+                    ),
                     conversation_pause.PromptSource.TYPED,
                 )
         self.assertIs(
-            conversation_pause.prompt_source(cross_session("natedev", "go"), frozenset),
+            conversation_pause.prompt_source(
+                cross_session("natedev", "go"),
+                frozenset,
+                unexpected_scheduled_prompt_read,
+            ),
             conversation_pause.PromptSource.PEER,
         )
         for sender in ("stall-watch", "mac-test", "disk_floor"):
             with self.subTest(sender=sender):
                 self.assertIs(
-                    conversation_pause.prompt_source(cross_session(sender, "go"), frozenset),
+                    conversation_pause.prompt_source(
+                        cross_session(sender, "go"),
+                        frozenset,
+                        unexpected_scheduled_prompt_read,
+                    ),
                     conversation_pause.PromptSource.SCHEDULED,
                 )
         self.assertIs(
             conversation_pause.prompt_source(
                 cross_session("delegate-abc", "go"),
                 lambda: frozenset({"delegate-abc"}),
+                unexpected_scheduled_prompt_read,
             ),
             conversation_pause.PromptSource.SCHEDULED,
         )
         for prompt in (
             "<task-notification>done</task-notification>",
-            '<agent-message from="a1">done</agent-message>',
+            "<system-reminder>remember</system-reminder>",
             "",
         ):
             with self.subTest(prompt=prompt):
                 self.assertIs(
-                    conversation_pause.prompt_source(prompt, unexpected_sender_read),
+                    conversation_pause.prompt_source(
+                        prompt,
+                        unexpected_sender_read,
+                        unexpected_scheduled_prompt_read,
+                    ),
                     conversation_pause.PromptSource.NOTICE,
                 )
 
@@ -693,6 +774,93 @@ print("SENT: delivered")
         result = self.run_prompt(cross_session("natedev", "continue"))
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
+
+    def test_pasted_content_prompt_pauses_reports(self) -> None:
+        instance = self.create_instance("delegate-abc")
+        prompt = (
+            '<pasted_content id="one">display: flex</pasted_content id="one">\n'
+            "why does this not center?"
+        )
+
+        reply = self.parsed_reply(self.run_prompt(prompt))
+
+        self.assertEqual(
+            reply["systemMessage"],
+            "Automatic updates paused while we talk: status reports.",
+        )
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+
+    def test_arbitrary_tag_opened_prompt_pauses_reports(self) -> None:
+        instance = self.create_instance("delegate-abc")
+
+        reply = self.parsed_reply(self.run_prompt("<div> why"))
+
+        self.assertEqual(
+            reply["systemMessage"],
+            "Automatic updates paused while we talk: status reports.",
+        )
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+
+    def test_task_notification_and_system_reminder_do_not_pause_reports(self) -> None:
+        instance = self.create_instance("delegate-abc")
+        for prompt in (
+            "<task-notification>done</task-notification>",
+            "<system-reminder>remember</system-reminder>",
+        ):
+            with self.subTest(prompt=prompt):
+                result = self.run_prompt(prompt)
+                self.assertEqual(
+                    (result.returncode, result.stdout, result.stderr), (0, "", "")
+                )
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
+        self.assertFalse((self.escalate_root / "typed").exists())
+
+    def test_recorded_scheduled_prompt_does_not_pause_but_different_prompt_does(self) -> None:
+        instance = self.create_instance("delegate-abc")
+        recorded = self.run_stop(
+            extra={"session_crons": [scheduled_wakeup("  recurring status  ")]}
+        )
+        self.assertEqual(
+            (recorded.returncode, recorded.stdout, recorded.stderr), (0, "", "")
+        )
+
+        scheduled = self.run_prompt("recurring status")
+
+        self.assertEqual(
+            (scheduled.returncode, scheduled.stdout, scheduled.stderr), (0, "", "")
+        )
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertFalse((self.escalate_root / "typed").exists())
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
+
+        typed = self.parsed_reply(self.run_prompt("a different thought"))
+        self.assertEqual(
+            typed["systemMessage"],
+            "Automatic updates paused while we talk: status reports.",
+        )
+        self.assertTrue((self.escalate_root / "typed").exists())
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+
+    def test_clipped_scheduled_prompt_matches_by_prefix(self) -> None:
+        instance = self.create_instance("delegate-abc")
+        recorded = self.run_stop(extra={
+            "session_crons": [
+                scheduled_wakeup("summarize this long plan… [+240 chars]")
+            ]
+        })
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+
+        scheduled = self.run_prompt(
+            "summarize this long plan and include the unresolved decisions"
+        )
+
+        self.assertEqual(
+            (scheduled.returncode, scheduled.stdout, scheduled.stderr), (0, "", "")
+        )
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertFalse((self.escalate_root / "typed").exists())
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
 
     def test_scheduled_notice_agent_and_typed_slash_prompts(self) -> None:
@@ -957,6 +1125,87 @@ print("SENT: delivered")
         agent = self.run_stop(extra={"agent_id": "a1"})
         self.assertEqual((agent.returncode, agent.stdout, agent.stderr), (0, "", ""))
         self.assertEqual(self.record(), before)
+
+    def test_stop_hook_records_scheduled_prompts_without_pause_record(self) -> None:
+        result = self.run_stop(extra={
+            "session_crons": [
+                scheduled_wakeup("first scheduled prompt"),
+                scheduled_wakeup("second scheduled prompt"),
+            ]
+        })
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual(
+            self.scheduled_prompts(),
+            ["first scheduled prompt", "second scheduled prompt"],
+        )
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
+
+    def test_stop_hook_active_event_still_records_scheduled_prompts(self) -> None:
+        result = self.run_stop(extra={
+            "stop_hook_active": True,
+            "session_crons": [scheduled_wakeup("scheduled while stop hook is active")],
+        })
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual(
+            self.scheduled_prompts(), ["scheduled while stop hook is active"]
+        )
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
+
+    def test_stop_hook_empty_scheduled_list_removes_recorded_prompts(self) -> None:
+        created = self.run_stop(extra={
+            "session_crons": [scheduled_wakeup("scheduled prompt")]
+        })
+        self.assertEqual(created.returncode, 0, created.stderr)
+        path = self.scheduled_prompts_path()
+        self.assertTrue(path.exists())
+
+        removed = self.run_stop(extra={"session_crons": []})
+
+        self.assertEqual((removed.returncode, removed.stdout, removed.stderr), (0, "", ""))
+        self.assertFalse(path.exists())
+
+    def test_stop_payload_without_scheduled_list_leaves_recorded_prompts(self) -> None:
+        created = self.run_stop(extra={
+            "session_crons": [scheduled_wakeup("scheduled prompt")]
+        })
+        self.assertEqual(created.returncode, 0, created.stderr)
+
+        unchanged = self.run_stop()
+
+        self.assertEqual(
+            (unchanged.returncode, unchanged.stdout, unchanged.stderr), (0, "", "")
+        )
+        self.assertEqual(self.scheduled_prompts(), ["scheduled prompt"])
+
+    def test_tick_and_status_ignore_scheduled_prompt_files(self) -> None:
+        recorded = self.run_stop(extra={
+            "session_crons": [scheduled_wakeup("scheduled prompt")]
+        })
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+
+        status = self.run_cli("status")
+        tick = self.run_cli("tick")
+
+        self.assertEqual((status.returncode, status.stdout, status.stderr), (0, "not paused\n", ""))
+        self.assertEqual((tick.returncode, tick.stdout, tick.stderr), (0, "", ""))
+        self.assertEqual(self.calls(self.sessions_log), [])
+        self.assertTrue(self.scheduled_prompts_path().exists())
+
+    def test_tick_removes_scheduled_prompts_older_than_eight_days(self) -> None:
+        recorded = self.run_stop(extra={
+            "session_crons": [scheduled_wakeup("expired scheduled prompt")]
+        })
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        path = self.scheduled_prompts_path()
+        expired_at = NOW - conversation_pause.SCHEDULED_PROMPT_RETENTION_SECONDS - 1
+        os.utime(path, (expired_at, expired_at))
+
+        tick = self.run_cli("tick", now=NOW)
+
+        self.assertEqual((tick.returncode, tick.stdout, tick.stderr), (0, "", ""))
+        self.assertFalse(path.exists())
 
     def test_stop_hook_active_event_does_not_count_reply_twice(self) -> None:
         instance = self.create_instance("delegate-abc", enabled=False)

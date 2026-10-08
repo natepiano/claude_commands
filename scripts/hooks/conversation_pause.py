@@ -23,6 +23,7 @@ QUIET_SECONDS = 300
 ANSWER_SECONDS = 300
 UNANSWERED_SECONDS = 1800
 TOMBSTONE_SECONDS = 300
+SCHEDULED_PROMPT_RETENTION_SECONDS = 8 * 24 * 60 * 60
 WATCHER = "conversation-pause"
 JOB_SENDERS = frozenset({WATCHER, "stall-watch", "tmux-names", "quota_alert", "mac-test",
                          "disk_floor"})
@@ -40,9 +41,13 @@ KEEP_COMMAND = (
     '"$HOME/.claude/scripts/lib/py" '
     '"$HOME/.claude/scripts/hooks/conversation_pause.py" keep'
 )
-TAG_WRAPPER = re.compile(r"^<[A-Za-z][A-Za-z0-9-]*[\s>]")
+NOTICE_TAG = re.compile(r"^<(?:task-notification|system-reminder)(?:\s|>)")
 CROSS_SESSION_TAG = re.compile(r"^<cross-session-message\b[^>]*>")
 FROM_NAME = re.compile(r'\bfrom-name="([^"]*)"')
+CLIPPED_PROMPT_MARKER = re.compile(r"… \[\+\d+ chars\]")
+
+type ScheduledSenderLookup = Callable[[], frozenset[str]]
+type ScheduledPromptLookup = Callable[[], tuple[str, ...]]
 
 
 class PromptSource(Enum):
@@ -203,6 +208,10 @@ def record_path(session_id: str) -> Path:
     return state_root() / f"{session_id}.json"
 
 
+def scheduled_prompts_path(session_id: str) -> Path:
+    return state_root() / "scheduled-prompts" / f"{session_id}.json"
+
+
 def now_epoch() -> int:
     override = os.environ.get("CONVERSATION_PAUSE_NOW_EPOCH")
     return int(override) if override is not None else int(time.time())
@@ -270,6 +279,63 @@ def scheduled_senders() -> frozenset[str]:
     return frozenset(senders)
 
 
+def record_scheduled_prompts(session_id: str, prompts: tuple[str, ...]) -> None:
+    destination = scheduled_prompts_path(session_id)
+    if not prompts:
+        destination.unlink(missing_ok=True)
+        return
+    root = destination.parent
+    root.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=root,
+            prefix=".scheduled-prompts-",
+            delete=False,
+            encoding="utf-8",
+        ) as temporary:
+            json.dump(list(prompts), temporary)
+            _ = temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_path = Path(temporary.name)
+        os.replace(temporary_path, destination)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def read_scheduled_prompts(session_id: str) -> tuple[str, ...]:
+    try:
+        raw = cast(object, json.loads(
+            scheduled_prompts_path(session_id).read_text(encoding="utf-8")
+        ))
+    except (OSError, UnicodeError, ValueError):
+        return ()
+    if not isinstance(raw, list):
+        return ()
+    items = cast(list[object], raw)
+    if not all(isinstance(item, str) for item in items):
+        return ()
+    return tuple(cast(list[str], items))
+
+
+def _is_recorded_scheduled_prompt(prompt: str, recorded: tuple[str, ...]) -> bool:
+    prompt = prompt.strip()
+    for scheduled in recorded:
+        scheduled = scheduled.strip()
+        if prompt == scheduled:
+            return True
+        marker = CLIPPED_PROMPT_MARKER.search(scheduled)
+        if marker is not None:
+            prefix = scheduled[:marker.start()]
+            if prefix and prompt.startswith(prefix):
+                return True
+    return False
+
+
 def is_return_question(prompt: str) -> bool:
     text = prompt.lstrip()
     if CROSS_SESSION_TAG.match(text) is None:
@@ -279,7 +345,11 @@ def is_return_question(prompt: str) -> bool:
     return match is not None and match.group(1) == WATCHER
 
 
-def prompt_source(prompt: str, senders: Callable[[], frozenset[str]]) -> PromptSource:
+def prompt_source(
+    prompt: str,
+    senders: ScheduledSenderLookup,
+    scheduled_prompts: ScheduledPromptLookup,
+) -> PromptSource:
     text = prompt.lstrip()
     if not text:
         return PromptSource.NOTICE
@@ -289,10 +359,12 @@ def prompt_source(prompt: str, senders: Callable[[], frozenset[str]]) -> PromptS
         name = match.group(1) if match is not None else ""
         return (PromptSource.SCHEDULED if name in JOB_SENDERS or name in senders()
                 else PromptSource.PEER)
-    if (TAG_WRAPPER.match(text) is not None
+    if (NOTICE_TAG.match(text) is not None
             or text.startswith("Another Claude session sent a message")
             or text.startswith("[SYSTEM NOTIFICATION")):
         return PromptSource.NOTICE
+    if _is_recorded_scheduled_prompt(text, scheduled_prompts()):
+        return PromptSource.SCHEDULED
     return PromptSource.TYPED
 
 
@@ -863,6 +935,18 @@ def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup, 
 
 def tick(now: int) -> tuple[str, ...]:
     import showrunner_footer
+
+    scheduled_root = state_root() / "scheduled-prompts"
+    try:
+        scheduled_paths = list(scheduled_root.glob("*.json"))
+    except OSError:
+        scheduled_paths = []
+    for path in scheduled_paths:
+        try:
+            if now - path.stat().st_mtime > SCHEDULED_PROMPT_RETENTION_SECONDS:
+                path.unlink(missing_ok=True)
+        except OSError:
+            continue
 
     paths = sorted(state_root().glob("*.json"))
     lookups = [(path, _session_lookup(path.stem)) for path in paths]
