@@ -34,21 +34,51 @@ class ProjectedEta(NamedTuple):
     time: datetime
     earliest: datetime
     latest: datetime
+    as_of: datetime
+
+
+class EtaRange(NamedTuple):
+    """The earliest and latest targets stated with an ETA."""
+
+    earliest: datetime
+    latest: datetime
+
+
+class NoEtaRange(NamedTuple):
+    """A stated ETA was an exact target without a range."""
+
+
+class StatedEta(NamedTuple):
+    """The latest target explicitly stated for a running phase."""
+
+    time: datetime
+    range: EtaRange | NoEtaRange
+    stated_at: datetime
+    basis: str
 
 
 class EtaUnavailable(NamedTuple):
-    """A report is absent or cannot produce a projected finish."""
+    """No current stated or projected finish can be shown."""
 
 
 class ReportedPhaseProgress(NamedTuple):
     """The last progress report written for a running phase."""
 
     percent: int
-    eta: ProjectedEta | EtaUnavailable
 
 
 class PhaseProgressNotReported(NamedTuple):
     """A running phase has no valid progress report."""
+
+
+class FirstStatedEtaTarget(NamedTuple):
+    """The target promised by a phase instance's first stated ETA."""
+
+    time: datetime
+
+
+class EtaNeverStated(NamedTuple):
+    """A phase instance has never had a stated ETA."""
 
 
 class CompletedPhaseTiming(NamedTuple):
@@ -92,6 +122,8 @@ class OpenPhase(NamedTuple):
     title: str
     started: datetime
     progress: ReportedPhaseProgress | PhaseProgressNotReported
+    eta: StatedEta | ProjectedEta | EtaUnavailable
+    first_stated: FirstStatedEtaTarget | EtaNeverStated
 
 
 class TodoPhase(NamedTuple):
@@ -160,6 +192,40 @@ class OpenPhaseInstance(NamedTuple):
 
     phase: PhaseInstance
     progress: ReportedPhaseProgress | PhaseProgressNotReported
+    eta: StatedEta | ProjectedEta | EtaUnavailable
+    first_stated: FirstStatedEtaTarget | EtaNeverStated
+
+
+class ProgressReportTimeNotRecorded(NamedTuple):
+    """A progress event has no usable report time."""
+
+
+class ProgressElapsedTimeNotRecorded(NamedTuple):
+    """A progress event has no recorded elapsed duration."""
+
+
+class LastPhaseProgressEvent(NamedTuple):
+    """The latest valid progress event for one phase instance."""
+
+    percent: int
+    reported_at: datetime | ProgressReportTimeNotRecorded
+    elapsed: int | ProgressElapsedTimeNotRecorded
+    spread: float
+
+
+class PhaseProgressEventNotRecorded(NamedTuple):
+    """A phase instance has no valid progress event."""
+
+
+class LatestStatedEtaEvent(NamedTuple):
+    """The latest stated ETA and the first target for one phase instance."""
+
+    eta: StatedEta
+    first: FirstStatedEtaTarget
+
+
+class NoStatedEtaEvent(NamedTuple):
+    """A phase instance has no valid stated ETA event."""
 
 
 class TypicalDuration(NamedTuple):
@@ -374,11 +440,26 @@ def _newest_open_instance(
         )
     for instance in reversed(started):
         if instance.instance_id not in closed:
+            progress_event = _last_progress(runs, instance.instance_id)
+            stated_event = _latest_stated_eta(runs, instance.instance_id)
+            projection = _reported_eta(progress_event, instance.start)
+            if isinstance(stated_event, LatestStatedEtaEvent):
+                first_stated: FirstStatedEtaTarget | EtaNeverStated = (
+                    stated_event.first
+                )
+                eta: StatedEta | ProjectedEta | EtaUnavailable
+                if stated_event.eta.time.timestamp() > progress_history.now_epoch():
+                    eta = stated_event.eta
+                else:
+                    eta = projection
+            else:
+                first_stated = EtaNeverStated()
+                eta = projection
             return OpenPhaseInstance(
                 phase=instance,
-                progress=_reported_eta(
-                    _last_progress(runs, instance.instance_id), instance.start
-                ),
+                progress=_reported_progress(progress_event),
+                eta=eta,
+                first_stated=first_stated,
             )
     return NoOpenPhase()
 
@@ -429,52 +510,111 @@ def _gap_samples(runs: list[list[dict[str, object]]]) -> list[int]:
 
 def _last_progress(
     runs: list[list[dict[str, object]]], instance_id: str
-) -> dict[str, object] | None:
-    last: dict[str, object] | None = None
+) -> LastPhaseProgressEvent | PhaseProgressEventNotRecorded:
+    last_event: dict[str, object] | None = None
     for events in runs:
         for event in events:
             if (
                 _text(event.get("event_type")) == "progress_reported"
                 and _text(event.get("phase_instance_id")) == instance_id
             ):
-                last = event
-    return last
+                last_event = event
+    if last_event is None:
+        return PhaseProgressEventNotRecorded()
+    percent_value = last_event.get("phase_percent")
+    if isinstance(percent_value, bool) or not isinstance(percent_value, int):
+        return PhaseProgressEventNotRecorded()
+    reported_at = _moment(last_event.get("timestamp_epoch"))
+    elapsed = _duration(last_event.get("phase_elapsed_seconds"))
+    calibration = _object_dict(last_event.get("phase_calibration"))
+    if calibration is None:
+        calibration = _object_dict(last_event.get("calibration"))
+    return LastPhaseProgressEvent(
+        percent=percent_value,
+        reported_at=(
+            reported_at
+            if reported_at is not None
+            else ProgressReportTimeNotRecorded()
+        ),
+        elapsed=(
+            elapsed if elapsed is not None else ProgressElapsedTimeNotRecorded()
+        ),
+        spread=progress_history.percent_spread(calibration),
+    )
+
+
+def _reported_progress(
+    report: LastPhaseProgressEvent | PhaseProgressEventNotRecorded,
+) -> ReportedPhaseProgress | PhaseProgressNotReported:
+    if isinstance(report, PhaseProgressEventNotRecorded):
+        return PhaseProgressNotReported()
+    return ReportedPhaseProgress(percent=report.percent)
 
 
 def _reported_eta(
-    report: dict[str, object] | None, started: datetime
-) -> ReportedPhaseProgress | PhaseProgressNotReported:
-    if report is None:
-        return PhaseProgressNotReported()
-    percent_value = report.get("phase_percent")
-    if isinstance(percent_value, bool) or not isinstance(percent_value, int):
-        return PhaseProgressNotReported()
-    percent = percent_value
-    as_of_epoch = _epoch(report.get("timestamp_epoch"))
-    if as_of_epoch is None:
-        return ReportedPhaseProgress(percent=percent, eta=EtaUnavailable())
-    elapsed = _duration(report.get("phase_elapsed_seconds"))
-    if elapsed is None:
-        elapsed = max(0, int(as_of_epoch - started.timestamp()))
-    calibration = _object_dict(report.get("phase_calibration"))
-    if calibration is None:
-        calibration = _object_dict(report.get("calibration"))
+    report: LastPhaseProgressEvent | PhaseProgressEventNotRecorded,
+    started: datetime,
+) -> ProjectedEta | EtaUnavailable:
+    if isinstance(report, PhaseProgressEventNotRecorded) or isinstance(
+        report.reported_at, ProgressReportTimeNotRecorded
+    ):
+        return EtaUnavailable()
+    as_of = report.reported_at
+    elapsed = report.elapsed
+    if isinstance(elapsed, ProgressElapsedTimeNotRecorded):
+        elapsed_seconds = max(0, int((as_of - started).total_seconds()))
+    else:
+        elapsed_seconds = elapsed
     band = progress_history.eta_band_seconds(
-        percent,
-        elapsed,
-        progress_history.percent_spread(calibration),
+        report.percent,
+        elapsed_seconds,
+        report.spread,
     )
     if isinstance(band, progress_history.EtaProjectionUnavailable):
-        return ReportedPhaseProgress(percent=percent, eta=EtaUnavailable())
-    as_of = datetime.fromtimestamp(as_of_epoch, UTC)
-    return ReportedPhaseProgress(
-        percent=percent,
-        eta=ProjectedEta(
-            time=as_of + timedelta(seconds=band.remaining),
-            earliest=as_of + timedelta(seconds=band.earliest),
-            latest=as_of + timedelta(seconds=band.latest),
-        ),
+        return EtaUnavailable()
+    return ProjectedEta(
+        time=as_of + timedelta(seconds=band.remaining),
+        earliest=as_of + timedelta(seconds=band.earliest),
+        latest=as_of + timedelta(seconds=band.latest),
+        as_of=as_of,
     )
+
+
+def _latest_stated_eta(
+    runs: list[list[dict[str, object]]], instance_id: str
+) -> LatestStatedEtaEvent | NoStatedEtaEvent:
+    first: FirstStatedEtaTarget | EtaNeverStated = EtaNeverStated()
+    latest: StatedEta | NoStatedEtaEvent = NoStatedEtaEvent()
+    for events in runs:
+        for event in events:
+            if (
+                _text(event.get("event_type")) != "eta_stated"
+                or _text(event.get("phase_instance_id")) != instance_id
+            ):
+                continue
+            time = _moment(event.get("eta_at"))
+            stated_at = _moment(event.get("timestamp_epoch"))
+            if time is None or stated_at is None:
+                continue
+            earliest = _moment(event.get("eta_earliest_at"))
+            latest_range = _moment(event.get("eta_latest_at"))
+            eta_range: EtaRange | NoEtaRange
+            if earliest is not None and latest_range is not None:
+                eta_range = EtaRange(earliest=earliest, latest=latest_range)
+            else:
+                eta_range = NoEtaRange()
+            stated = StatedEta(
+                time=time,
+                range=eta_range,
+                stated_at=stated_at,
+                basis=_text(event.get("basis")),
+            )
+            if isinstance(first, EtaNeverStated):
+                first = FirstStatedEtaTarget(time=stated.time)
+            latest = stated
+    if isinstance(latest, NoStatedEtaEvent) or isinstance(first, EtaNeverStated):
+        return NoStatedEtaEvent()
+    return LatestStatedEtaEvent(eta=latest, first=first)
 
 
 def _done_phase(
@@ -531,11 +671,10 @@ def _plan_finish(
             return FinishedAt(max(finishes))
         return UnknownFinish()
     projections = [
-        phase.progress.eta.time
+        phase.eta.time
         for phase in phases
         if isinstance(phase, OpenPhase)
-        and isinstance(phase.progress, ReportedPhaseProgress)
-        and isinstance(phase.progress.eta, ProjectedEta)
+        and isinstance(phase.eta, StatedEta | ProjectedEta)
     ]
     projections.extend(
         phase.times.finish
@@ -592,6 +731,8 @@ def build_plan(plan_path: Path) -> PhaseRecord:
                 title=phase["title"],
                 started=earliest,
                 progress=open_instance.progress,
+                eta=open_instance.eta,
+                first_stated=open_instance.first_stated,
             )
             rows.append(current)
         elif phase["done"]:
@@ -613,6 +754,8 @@ def build_plan(plan_path: Path) -> PhaseRecord:
             title=open_instance.phase.title or "Untitled phase",
             started=open_instance.phase.start,
             progress=open_instance.progress,
+            eta=open_instance.eta,
+            first_stated=open_instance.first_stated,
         )
 
     durations = [
@@ -625,10 +768,10 @@ def build_plan(plan_path: Path) -> PhaseRecord:
     if durations:
         typical = TypicalDuration(int(statistics.median(durations)))
     elif isinstance(current, OpenPhase) and isinstance(
-        current.progress, ReportedPhaseProgress
-    ) and isinstance(current.progress.eta, ProjectedEta):
+        current.eta, StatedEta | ProjectedEta
+    ):
         typical = TypicalDuration(
-            max(0, int((current.progress.eta.time - current.started).total_seconds()))
+            max(0, int((current.eta.time - current.started).total_seconds()))
         )
     else:
         typical = UnknownDuration()
@@ -639,10 +782,8 @@ def build_plan(plan_path: Path) -> PhaseRecord:
         gap_before_first = False
         if isinstance(current, OpenPhase):
             gap_before_first = True
-            if isinstance(current.progress, ReportedPhaseProgress) and isinstance(
-                current.progress.eta, ProjectedEta
-            ):
-                previous_finish = current.progress.eta.time
+            if isinstance(current.eta, StatedEta | ProjectedEta):
+                previous_finish = current.eta.time
             else:
                 previous_finish = max(
                     now,
@@ -697,6 +838,10 @@ def _time(moment: datetime, zone: ZoneInfo) -> str:
     return moment.astimezone(zone).strftime("%H:%M")
 
 
+def _cell_text(text: str) -> str:
+    return " ".join(text.split()).replace("|", "\\|")
+
+
 def _elapsed(seconds: int) -> str:
     hours, remainder = divmod(seconds, 3600)
     return f"{hours}:{remainder // 60:02d}"
@@ -727,10 +872,8 @@ def _row_clocks(
         return "—", "—"
     if isinstance(row, OpenPhase):
         finish = "—"
-        if isinstance(row.progress, ReportedPhaseProgress) and isinstance(
-            row.progress.eta, ProjectedEta
-        ):
-            finish = _clock(row.progress.eta.time, zone)
+        if isinstance(row.eta, StatedEta | ProjectedEta):
+            finish = _clock(row.eta.time, zone)
         return _clock(row.started, zone), finish
     if isinstance(row.times, PredictedPhaseTiming):
         return _clock(row.times.start, zone), _clock(row.times.finish, zone)
@@ -762,15 +905,28 @@ def render(record: PhaseRecord, zone: ZoneInfo) -> str:
     ]
     if isinstance(current, OpenPhase):
         eta_cell = "—"
-        if isinstance(current.progress, ReportedPhaseProgress) and isinstance(
-            current.progress.eta, ProjectedEta
-        ):
-            eta = current.progress.eta
+        eta_from = "—"
+        if isinstance(current.eta, ProjectedEta):
+            eta = current.eta
             eta_cell = (
                 f"{_clock(eta.time, zone)} "
                 + f"({_time(eta.earliest, zone)} to {_time(eta.latest, zone)})"
             )
+            if isinstance(current.progress, ReportedPhaseProgress):
+                eta_from = f"projected from {current.progress.percent}% done"
+        elif isinstance(current.eta, StatedEta):
+            eta = current.eta
+            eta_cell = _clock(eta.time, zone)
+            if isinstance(eta.range, EtaRange):
+                eta_cell += (
+                    f" ({_time(eta.range.earliest, zone)} "
+                    + f"to {_time(eta.range.latest, zone)})"
+                )
+            eta_from = (
+                f"stated {_time(eta.stated_at, zone)}: {_cell_text(eta.basis)}"
+            )
         summary.append(f"| ETA | {eta_cell} |")
+        summary.append(f"| ETA from | {eta_from} |")
     plan_finish = "—"
     if isinstance(record.plan_finish, FinishedAt):
         plan_finish = _clock(record.plan_finish.at, zone)
@@ -816,10 +972,8 @@ def _json_phase(
     elif isinstance(row, OpenPhase):
         status = "running"
         start = _iso(row.started, zone)
-        if isinstance(row.progress, ReportedPhaseProgress) and isinstance(
-            row.progress.eta, ProjectedEta
-        ):
-            finish = _iso(row.progress.eta.time, zone)
+        if isinstance(row.eta, StatedEta | ProjectedEta):
+            finish = _iso(row.eta.time, zone)
     else:
         status = "todo"
         if isinstance(row.times, PredictedPhaseTiming):
@@ -843,15 +997,37 @@ def _json_record(record: PhaseRecord, zone: ZoneInfo) -> dict[str, object]:
         percent: int | None = None
         if isinstance(current.progress, ReportedPhaseProgress):
             percent = current.progress.percent
-        if isinstance(current.progress, ReportedPhaseProgress) and isinstance(
-            current.progress.eta, ProjectedEta
-        ):
-            eta = current.progress.eta
+        first: str | None = None
+        if isinstance(current.first_stated, FirstStatedEtaTarget):
+            first = _iso(current.first_stated.time, zone)
+        if isinstance(current.eta, ProjectedEta):
+            eta = current.eta
             eta_json = {
                 "time": _iso(eta.time, zone),
                 "earliest": _iso(eta.earliest, zone),
                 "latest": _iso(eta.latest, zone),
                 "source": "projected",
+                "stated_at": None,
+                "basis": None,
+                "as_of": _iso(eta.as_of, zone),
+                "first": first,
+            }
+        elif isinstance(current.eta, StatedEta):
+            eta = current.eta
+            earliest: str | None = None
+            latest: str | None = None
+            if isinstance(eta.range, EtaRange):
+                earliest = _iso(eta.range.earliest, zone)
+                latest = _iso(eta.range.latest, zone)
+            eta_json = {
+                "time": _iso(eta.time, zone),
+                "earliest": earliest,
+                "latest": latest,
+                "source": "stated",
+                "stated_at": _iso(eta.stated_at, zone),
+                "basis": eta.basis,
+                "as_of": None,
+                "first": first,
             }
         current_json = {
             "phase": current.phase,

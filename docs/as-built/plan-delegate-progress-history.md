@@ -21,6 +21,7 @@ Schema version 1 records these event types:
 - `pass_started` / `pass_finished`
 - `activity_started` / `activity_finished`
 - `progress_reported`
+- `eta_stated`
 - `finding_opened` / `finding_batch_dispatched` / `finding_verdict` /
   `finding_gate`, appended by `scripts/delegate/findings.py` to the same stream
 
@@ -37,6 +38,11 @@ percentages, decision source, override reason, each elapsed clock, and the
 calibration evidence used for that report. The phase decision also repeats the
 historical bias, suggested adjustment, and chosen adjustment so downstream
 analysis does not need to unpack the calibration snapshot.
+
+`eta_stated` records the active phase's promised arrival as epoch `eta_at` and
+its `basis`. A ranged statement also carries epoch `eta_earliest_at` and
+`eta_latest_at`; an exact statement carries neither range key. The event is the
+only recorder copy of a stated ETA. The live state does not duplicate it.
 
 ## Project clock
 
@@ -221,6 +227,7 @@ progress_history.py start-activity --session-dir <dir> --label <label> --activit
 progress_history.py finish-activity --session-dir <dir> [--status completed|error|canceled|interrupted] [--result <outcome>]
 progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
 progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>]
+progress_history.py eta --session-dir <dir> --time <YYYY-MM-DDTHH:MM> [--earliest <YYYY-MM-DDTHH:MM> --latest <YYYY-MM-DDTHH:MM>] --basis <text>
 progress_history.py finish-phase ...
 progress_history.py finish-run ...
 progress_history.py timeline --session-dir <dir> [--phase <id>]
@@ -228,12 +235,20 @@ progress_history.py phase-count --plan-doc <path> [--phase-percent <N>]
 progress_history.py aggregate [--percent <N>]
 ```
 
-For production plans, `start-phase`, every `progress` report, `finish-phase`,
-and `finish-run` end by asking `phase_table.py refresh` to rewrite the unit's
-vault note from the event stream. The refresh has a ten-second limit and is
-best-effort: a refusal, timeout, or launch error writes one diagnostic to
-stderr without changing the recorder command's output or status. Plans without
-a `> **Production:` line skip the subprocess entirely.
+For production plans, `start-phase`, every `progress` report, `eta`,
+`finish-phase`, and `finish-run` end by asking `phase_table.py refresh` to
+rewrite the unit's vault note from the event stream. The refresh has a
+ten-second limit and is best-effort: a refusal, timeout, or launch error writes
+one diagnostic to stderr without changing the recorder command's output or
+status. Plans without a `> **Production:` line skip the subprocess entirely.
+
+`eta` accepts local wall-clock timestamps in the process `TZ`, requires an
+active phase, and writes `ETA recorded: <HH:MM zone>` after the durable append.
+It rejects a past target, a time the local clock skips, a range that does not
+enclose the target, only one range endpoint, or a blank basis with status 2.
+A note-refresh failure does not change the appended event, success line, or
+exit status. `/unit:eta` and `/unit:eta_breakdown` run it under
+`TZ=<User zone>`.
 
 `implement.sh` and `review.sh` own pass lifecycle: they set
 `PLAN_DELEGATE_PASS_OWNER=launcher` on their own `start-pass` / `finish-pass`

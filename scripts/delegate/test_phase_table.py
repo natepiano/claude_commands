@@ -348,12 +348,14 @@ class PhaseTableTests(unittest.TestCase):
         self.assertIsInstance(progress, phase_table.ReportedPhaseProgress)
         assert isinstance(progress, phase_table.ReportedPhaseProgress)
         self.assertEqual(progress.percent, 50)
-        projection = progress.eta
+        projection = current.eta
         self.assertIsInstance(projection, phase_table.ProjectedEta)
         assert isinstance(projection, phase_table.ProjectedEta)
         self.assert_epoch(projection.time, 2_370)
         self.assert_epoch(projection.earliest, 2_350)
         self.assert_epoch(projection.latest, 2_400)
+        self.assert_epoch(projection.as_of, 2_310)
+        self.assertIsInstance(current.first_stated, phase_table.EtaNeverStated)
 
         archived = rows["1"]
         self.assertIsInstance(archived, phase_table.DonePhase)
@@ -431,6 +433,193 @@ class PhaseTableTests(unittest.TestCase):
         assert isinstance(record.plan_finish, phase_table.PredictedFinish)
         self.assert_epoch(record.plan_finish.at, 1_400)
 
+    def test_stated_eta_wins_over_a_later_progress_report(self) -> None:
+        self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
+        _ = self.write_run(
+            "current",
+            900,
+            self.phase_event("phase_started", "1", "one", 1_000),
+            self.phase_event(
+                "eta_stated",
+                "1",
+                "one",
+                1_050,
+                eta_at=1_500,
+                basis="three checks remain",
+            ),
+            self.phase_event(
+                "progress_reported",
+                "1",
+                "one",
+                1_100,
+                phase_percent=60,
+                phase_elapsed_seconds=100,
+                phase_calibration=None,
+            ),
+        )
+        self.write_state(None)
+
+        current = self.build(1_200).current
+
+        assert isinstance(current, phase_table.OpenPhase)
+        assert isinstance(current.progress, phase_table.ReportedPhaseProgress)
+        self.assertEqual(current.progress.percent, 60)
+        self.assertIsInstance(current.eta, phase_table.StatedEta)
+        assert isinstance(current.eta, phase_table.StatedEta)
+        self.assert_epoch(current.eta.time, 1_500)
+        self.assertIsInstance(current.eta.range, phase_table.NoEtaRange)
+        self.assert_epoch(current.eta.stated_at, 1_050)
+        self.assertEqual(current.eta.basis, "three checks remain")
+        assert isinstance(current.first_stated, phase_table.FirstStatedEtaTarget)
+        self.assert_epoch(current.first_stated.time, 1_500)
+
+    def test_passed_stated_eta_yields_to_projection_and_keeps_first(self) -> None:
+        self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
+        _ = self.write_run(
+            "current",
+            900,
+            self.phase_event("phase_started", "1", "one", 1_000),
+            self.phase_event(
+                "eta_stated",
+                "1",
+                "one",
+                1_050,
+                eta_at=1_150,
+                basis="initial target",
+            ),
+            self.phase_event(
+                "progress_reported",
+                "1",
+                "one",
+                1_100,
+                phase_percent=50,
+                phase_elapsed_seconds=100,
+                phase_calibration=None,
+            ),
+        )
+        self.write_state(None)
+
+        current = self.build(1_160).current
+
+        assert isinstance(current, phase_table.OpenPhase)
+        self.assertIsInstance(current.eta, phase_table.ProjectedEta)
+        assert isinstance(current.eta, phase_table.ProjectedEta)
+        self.assert_epoch(current.eta.time, 1_200)
+        assert isinstance(current.first_stated, phase_table.FirstStatedEtaTarget)
+        self.assert_epoch(current.first_stated.time, 1_150)
+
+    def test_first_stated_target_holds_across_restatement(self) -> None:
+        self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
+        _ = self.write_run(
+            "current",
+            900,
+            self.phase_event("phase_started", "1", "one", 1_000),
+            self.phase_event(
+                "eta_stated",
+                "1",
+                "one",
+                1_050,
+                eta_at=1_400,
+                basis="first target",
+            ),
+            self.phase_event(
+                "eta_stated",
+                "1",
+                "one",
+                1_100,
+                eta_at=1_600,
+                eta_earliest_at=1_500,
+                eta_latest_at=1_700,
+                basis="expanded verification",
+            ),
+        )
+        self.write_state(None)
+
+        current = self.build(1_200).current
+
+        assert isinstance(current, phase_table.OpenPhase)
+        assert isinstance(current.eta, phase_table.StatedEta)
+        self.assert_epoch(current.eta.time, 1_600)
+        assert isinstance(current.eta.range, phase_table.EtaRange)
+        self.assert_epoch(current.eta.range.earliest, 1_500)
+        self.assert_epoch(current.eta.range.latest, 1_700)
+        assert isinstance(current.first_stated, phase_table.FirstStatedEtaTarget)
+        self.assert_epoch(current.first_stated.time, 1_400)
+
+    def test_new_phase_does_not_inherit_the_previous_stated_eta(self) -> None:
+        self.write_plan(
+            plan_text(
+                "### Phase 1 — Earlier delivery  · status: done",
+                "",
+                "### Phase 2 — Current delivery  · status: todo",
+            )
+        )
+        _ = self.write_run(
+            "current",
+            800,
+            self.phase_event("phase_started", "1", "one", 900),
+            self.phase_event(
+                "eta_stated",
+                "1",
+                "one",
+                950,
+                eta_at=1_100,
+                basis="earlier phase",
+            ),
+            self.phase_event(
+                "phase_finished",
+                "1",
+                "one",
+                1_000,
+                status="completed",
+                phase_elapsed_seconds=100,
+            ),
+            self.phase_event("phase_started", "2", "two", 1_050),
+        )
+        self.write_state(None)
+
+        current = self.build(1_100).current
+
+        assert isinstance(current, phase_table.OpenPhase)
+        self.assertEqual(current.phase, "2")
+        self.assertIsInstance(current.eta, phase_table.EtaUnavailable)
+        self.assertIsInstance(current.first_stated, phase_table.EtaNeverStated)
+
+    def test_stated_eta_without_progress_drives_later_predictions(self) -> None:
+        self.write_plan(
+            plan_text(
+                "### Phase 1 — Current delivery  · status: todo",
+                "",
+                "### Phase 2 — Later delivery  · status: todo",
+            )
+        )
+        _ = self.write_run(
+            "current",
+            900,
+            self.phase_event("phase_started", "1", "one", 1_000),
+            self.phase_event(
+                "eta_stated",
+                "1",
+                "one",
+                1_050,
+                eta_at=1_300,
+                basis="remaining test matrix",
+            ),
+        )
+        self.write_state(None)
+
+        record = self.build(1_100)
+        current = record.current
+        later = record.phases[1]
+
+        assert isinstance(current, phase_table.OpenPhase)
+        self.assertIsInstance(current.progress, phase_table.PhaseProgressNotReported)
+        self.assertIsInstance(current.eta, phase_table.StatedEta)
+        assert isinstance(later, phase_table.TodoPhase)
+        assert isinstance(later.times, phase_table.PredictedPhaseTiming)
+        self.assert_epoch(later.times.start, 1_300)
+        self.assert_epoch(later.times.finish, 1_600)
+
     def test_prediction_is_unknown_without_history_or_a_current_report(self) -> None:
         self.write_plan(
             plan_text(
@@ -504,7 +693,7 @@ class PhaseTableTests(unittest.TestCase):
         self.assertIsInstance(current.progress, phase_table.ReportedPhaseProgress)
         assert isinstance(current.progress, phase_table.ReportedPhaseProgress)
         self.assertEqual(current.progress.percent, 0)
-        self.assertIsInstance(current.progress.eta, phase_table.EtaUnavailable)
+        self.assertIsInstance(current.eta, phase_table.EtaUnavailable)
         later = record.phases[1]
         self.assertIsInstance(later, phase_table.TodoPhase)
         assert isinstance(later, phase_table.TodoPhase)
@@ -1229,6 +1418,7 @@ class PhaseTableTests(unittest.TestCase):
                     "| Started | 10-08 09:12 |",
                     "| Done | 60% |",
                     "| ETA | 10-08 10:23 (10:13 to 10:38) |",
+                    "| ETA from | projected from 60% done |",
                     "| Plan finish | 10-08 11:25, predicted |",
                     "| Updated | 10-08 10:00 PDT |",
                     "",
@@ -1241,6 +1431,146 @@ class PhaseTableTests(unittest.TestCase):
                 )
             ),
         )
+
+    def test_render_exact_stated_eta_and_json_shape(self) -> None:
+        zone = ZoneInfo("America/Los_Angeles")
+
+        def epoch(hour: int, minute: int) -> int:
+            return int(datetime(2026, 10, 8, hour, minute, tzinfo=zone).timestamp())
+
+        self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
+        _ = self.write_run(
+            "current",
+            epoch(9, 0),
+            self.phase_event("phase_started", "1", "one", epoch(9, 10)),
+            self.phase_event(
+                "eta_stated",
+                "1",
+                "one",
+                epoch(9, 50),
+                eta_at=epoch(10, 30),
+                basis="two checks remain",
+            ),
+        )
+        self.write_state(None)
+
+        with patch.dict(
+            os.environ,
+            {
+                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
+                "PLAN_DELEGATE_NOW_EPOCH": str(epoch(10, 0)),
+            },
+        ):
+            rendered = phase_table.show(self.session_dir, zone)
+            parsed = cast(
+                "dict[str, object]",
+                json.loads(phase_table.show(self.session_dir, zone, json_output=True)),
+            )
+
+        self.assertIn("| ETA | 10-08 10:30 |", rendered)
+        self.assertIn("| ETA from | stated 09:50: two checks remain |", rendered)
+        current_json = cast("dict[str, object]", parsed["current"])
+        eta_json = cast("dict[str, object]", current_json["eta"])
+        self.assertEqual(
+            set(eta_json),
+            {
+                "time",
+                "earliest",
+                "latest",
+                "source",
+                "stated_at",
+                "basis",
+                "as_of",
+                "first",
+            },
+        )
+        self.assertEqual(eta_json["source"], "stated")
+        self.assertIsNone(eta_json["earliest"])
+        self.assertIsNone(eta_json["latest"])
+        self.assertIsNone(eta_json["as_of"])
+        self.assertEqual(eta_json["basis"], "two checks remain")
+        self.assertEqual(eta_json["time"], eta_json["first"])
+        self.assertTrue(cast(str, eta_json["stated_at"]).endswith("-07:00"))
+
+    def test_render_ranged_stated_eta(self) -> None:
+        zone = ZoneInfo("America/Los_Angeles")
+
+        def epoch(hour: int, minute: int) -> int:
+            return int(datetime(2026, 10, 8, hour, minute, tzinfo=zone).timestamp())
+
+        self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
+        _ = self.write_run(
+            "current",
+            epoch(9, 0),
+            self.phase_event("phase_started", "1", "one", epoch(9, 10)),
+            self.phase_event(
+                "eta_stated",
+                "1",
+                "one",
+                epoch(9, 50),
+                eta_at=epoch(10, 30),
+                eta_earliest_at=epoch(10, 15),
+                eta_latest_at=epoch(10, 45),
+                basis="integration range",
+            ),
+        )
+        self.write_state(None)
+
+        with patch.dict(
+            os.environ,
+            {
+                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
+                "PLAN_DELEGATE_NOW_EPOCH": str(epoch(10, 0)),
+            },
+        ):
+            rendered = phase_table.show(self.session_dir, zone)
+
+        self.assertIn("| ETA | 10-08 10:30 (10:15 to 10:45) |", rendered)
+        self.assertIn("| ETA from | stated 09:50: integration range |", rendered)
+
+    def test_render_keeps_a_stated_basis_inside_its_table_cell(self) -> None:
+        zone = ZoneInfo("America/Los_Angeles")
+        basis = "lint | full tests\nthen the live check"
+
+        def epoch(hour: int, minute: int) -> int:
+            return int(datetime(2026, 10, 8, hour, minute, tzinfo=zone).timestamp())
+
+        self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
+        _ = self.write_run(
+            "current",
+            epoch(9, 0),
+            self.phase_event("phase_started", "1", "one", epoch(9, 10)),
+            self.phase_event(
+                "eta_stated",
+                "1",
+                "one",
+                epoch(9, 50),
+                eta_at=epoch(10, 30),
+                basis=basis,
+            ),
+        )
+        self.write_state(None)
+
+        with patch.dict(
+            os.environ,
+            {
+                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
+                "PLAN_DELEGATE_NOW_EPOCH": str(epoch(10, 0)),
+            },
+        ):
+            rendered = phase_table.show(self.session_dir, zone)
+            parsed = cast(
+                "dict[str, object]",
+                json.loads(phase_table.show(self.session_dir, zone, json_output=True)),
+            )
+
+        self.assertIn(
+            "| ETA from | stated 09:50: lint \\| full tests then the live check |",
+            rendered,
+        )
+        current_json = cast("dict[str, object]", parsed["current"])
+        eta_json = cast("dict[str, object]", current_json["eta"])
+        self.assertEqual(eta_json["basis"], basis)
 
     def test_render_without_an_active_phase_omits_eta(self) -> None:
         self.write_plan(
@@ -1333,6 +1663,24 @@ class PhaseTableTests(unittest.TestCase):
         self.assertTrue(cast(str, parsed["updated"]).endswith("-07:00"))
         self.assertTrue(cast(str, current["started"]).endswith("-07:00"))
         self.assertTrue(cast(str, eta["time"]).endswith("-07:00"))
+        self.assertEqual(
+            set(eta),
+            {
+                "time",
+                "earliest",
+                "latest",
+                "source",
+                "stated_at",
+                "basis",
+                "as_of",
+                "first",
+            },
+        )
+        self.assertEqual(eta["source"], "projected")
+        self.assertIsNone(eta["stated_at"])
+        self.assertIsNone(eta["basis"])
+        self.assertTrue(cast(str, eta["as_of"]).endswith("-07:00"))
+        self.assertIsNone(eta["first"])
 
     def test_cli_reports_missing_state_or_plan_on_one_line(self) -> None:
         empty_session = self.root / "empty-session"
@@ -1405,6 +1753,7 @@ class PhaseTableTests(unittest.TestCase):
                     "| Started | 01-01 00:16 |",
                     "| Done | — |",
                     "| ETA | — |",
+                    "| ETA from | — |",
                     "| Plan finish | — |",
                     "| Updated | 01-01 00:20 UTC |",
                     "",
