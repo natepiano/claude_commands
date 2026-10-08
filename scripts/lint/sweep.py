@@ -55,12 +55,21 @@ The disk floor. Each budget fits the disk; together they do not (hana 96 GiB
 in each of 9 worktrees, 24 in 7 other repos, CI 160 x 2), and natedev's disk
 filled on 2026-10-03. When lint.conf sets sweep_free_floor_gib.<host> or
 sweep_free_floor_gib, the shortfall below that free-space floor sets how much
-build output goes. Targets under FLOOR_ROOTS (those holding .rustc_info.json)
-lose output least recently used target first, then by build-unit use within
-each target. A target's last use is the newer of its .lint-sweep-used stamp and
-its units' last uses. A target whose cargo locks a build holds is never
-touched. One sweep holds the floor at a time and keeps every idle target's
-cargo locks while scanning and removing, so a build starting there waits.
+build output goes. A target is a directory under FLOOR_ROOTS holding
+.rustc_info.json, or cargo's CACHEDIR.TAG beside a build tree: a folder cargo
+creates carries the tag from its first moment, and .rustc_info.json may come
+only when the first build ends, or never. Cargo's registry carries the same
+tag with no build tree. A folder made before a build with
+CARGO_CACHE_RUSTC_INFO=0 has neither and stays unseen. Orphaned files go first
+from every idle target, as before. Then idle targets under SCRATCH_ROOTS lose
+output, then the least recently used target, then by build-unit use within
+each target. On 2026-10-08 the tag rule found 76 targets where
+.rustc_info.json alone found 41: 31 finished scratch targets carried only the
+tag, and one in its first build had reached 22 GiB unseen. A target's last use
+is the newer of its .lint-sweep-used stamp and its units' last uses. A target
+whose cargo locks a build holds is never touched. One sweep holds the floor at
+a time and keeps every idle target's cargo locks while scanning and removing,
+so a build starting there waits.
 --floor-only skips the workspace sweep for disk-floor.nix's 2-minute timer.
 CI's targets are outside FLOOR_ROOTS, and its accounts cannot read lint.conf.
 By 15:23 PDT on 2026-10-06 that timer had taken 801 GiB, from units last
@@ -170,6 +179,8 @@ FLOOR_ONLY_FLAG = "--floor-only"
 USE_STAMP = ".lint-sweep-used"
 # Every cargo target directory on natedev was under one of these (2026-10-03).
 FLOOR_ROOTS = ("~/rust", "~/.local/state", "/tmp")
+# Targets under these roots are scratch builds: below the floor they lose output before any other target.
+SCRATCH_ROOTS = ("/tmp",)
 FLOOR_LOCK = os.path.join("~", ".local", "state", "lint-sweep", "floor.lock")
 FLOOR_STATE_ENV = "LINT_SWEEP_STATE_DIR"
 BUILDLOG_DIR_ENV = "BUILDLOG_DIR"
@@ -186,10 +197,14 @@ PACIFIC = ZoneInfo("America/Los_Angeles")
 # /tmp/claude-<uid>/<project>/<session>/scratchpad/ up to 7.
 FLOOR_SEARCH_DEPTH = 8
 FLOOR_SKIP = frozenset({".git", "node_modules"})
-# cargo writes this at a target directory's root on every build. Not
-# CACHEDIR.TAG: cargo writes that only when it creates the directory itself,
-# and mend's wrapper creates hana worktrees' first.
+# cargo writes this at a target directory's root: early in a build into a
+# folder that already exists; into a folder it creates, when the first build
+# ends or never (31 finished scratch targets had none on 2026-10-08). It
+# writes CACHEDIR.TAG at once, but only into a folder it creates (mend's
+# wrapper makes hana worktrees' first), so each marker covers the other's gap.
 RUSTC_INFO = ".rustc_info.json"
+CACHE_TAG = "CACHEDIR.TAG"
+CARGO_TAG_LINE = "# This file is a cache directory tag created by cargo."
 HASH_LENGTH = 16
 HEX_DIGITS = frozenset("0123456789abcdef")
 
@@ -363,6 +378,23 @@ def build_trees(root: str) -> list[str]:
                 continue
         frontier = next_frontier
     return trees
+
+
+def is_cargo_target(directory: str) -> bool:
+    """Whether cargo built into directory."""
+    if os.path.isfile(os.path.join(directory, RUSTC_INFO)):
+        return True
+    # Cost: one more stat per directory without rustc info; reads and tree
+    # searches happen only where that stat finds a tag.
+    tag = os.path.join(directory, CACHE_TAG)
+    if not os.path.isfile(tag):
+        return False
+    try:
+        with open(tag, "rb") as handle:
+            lines = handle.read(512).decode("utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return CARGO_TAG_LINE in lines and bool(build_trees(directory))
 
 
 def lock_trees(trees: list[str]) -> tuple[list[int], str | None]:
@@ -805,7 +837,7 @@ def target_dirs(roots: Sequence[str]) -> list[str]:
         frontier = [(os.path.expanduser(root), 0)]
         while frontier:
             directory, depth = frontier.pop()
-            if os.path.isfile(os.path.join(directory, RUSTC_INFO)):
+            if is_cargo_target(directory):
                 found.add(os.path.realpath(directory))
                 continue
             if depth < FLOOR_SEARCH_DEPTH:
@@ -815,6 +847,19 @@ def target_dirs(roots: Sequence[str]) -> list[str]:
                     if entry.name not in FLOOR_SKIP and entry.is_dir(follow_symlinks=False)
                 )
     return sorted(found)
+
+
+def is_scratch_target(root: str, scratch_roots: Sequence[str]) -> bool:
+    """Whether the target directory root lies under one of scratch_roots."""
+    target = os.path.realpath(root)
+    for scratch_root in scratch_roots:
+        scratch = os.path.realpath(os.path.expanduser(scratch_root))
+        try:
+            if os.path.commonpath((target, scratch)) == scratch:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def target_last_use(root: str, groups: list[Group]) -> float:
@@ -1073,7 +1118,13 @@ def send_floor_alert(message: str, channels: FloorAlertChannels) -> bool:
     return delivered
 
 
-def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = FLOOR_ROOTS, lock: str = FLOOR_LOCK) -> int:
+def hold_floor(
+    floor: int,
+    dry_run: bool,
+    roots: Sequence[str] = FLOOR_ROOTS,
+    lock: str = FLOOR_LOCK,
+    scratch_roots: Sequence[str] = SCRATCH_ROOTS,
+) -> int:
     """Below the floor, take the shortfall from the least used idle targets."""
     home = os.path.expanduser("~")
     free = free_bytes(home)
@@ -1108,6 +1159,7 @@ def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = FLOOR_ROOTS, lo
         for group in scan.groups:
             target_groups[tree_targets[group.build_tree]].append(group)
         target_uses = {root: target_last_use(root, groups) for root, groups in target_groups.items()}
+        scratch_targets = {root: is_scratch_target(root, scratch_roots) for root in idle}
         total = sum(scan.blocks.values())
         held_bytes = sum(directory_blocks(path) for path in busy)
         ci_bytes = sum(directory_blocks(path) for path in CI_TARGETS)
@@ -1124,7 +1176,11 @@ def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = FLOOR_ROOTS, lo
             total,
             budget,
             dry_run,
-            lambda group: (target_uses[tree_targets[group.build_tree]], *unit_age(group, ordered_at)),
+            lambda group: (
+                0.0 if scratch_targets[tree_targets[group.build_tree]] else 1.0,
+                target_uses[tree_targets[group.build_tree]],
+                *unit_age(group, ordered_at),
+            ),
         )
         taken: dict[str, int] = {}
         for group, freed in chosen:
