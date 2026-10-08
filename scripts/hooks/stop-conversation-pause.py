@@ -19,10 +19,18 @@ class HookBudgetSpent(Exception):
     pass
 
 
+class ScheduledWakeup(TypedDict):
+    id: str
+    schedule: str
+    recurring: bool
+    prompt: str
+
+
 class StopPayload(TypedDict, total=False):
     session_id: str
     agent_id: str
     stop_hook_active: bool
+    session_crons: list[ScheduledWakeup]
 
 
 def pause_record_path(session_id: str) -> Path:
@@ -31,12 +39,26 @@ def pause_record_path(session_id: str) -> Path:
     return root / f"{session_id}.json"
 
 
+def scheduled_prompts_path(session_id: str) -> Path:
+    return pause_record_path(session_id).parent / "scheduled-prompts" / f"{session_id}.json"
+
+
 def main() -> None:
     payload = cast(StopPayload, json.loads(sys.stdin.read()))
-    if "agent_id" in payload or payload.get("stop_hook_active", False):
+    if "agent_id" in payload:
         return
     session_id = payload.get("session_id", "")
-    if not session_id or not pause_record_path(session_id).exists():
+    if not session_id:
+        return
+    wakeups = payload.get("session_crons", [])
+    records_scheduled_prompts = "session_crons" in payload and (
+        bool(wakeups) or scheduled_prompts_path(session_id).exists()
+    )
+    marks_reply_ended = (
+        not payload.get("stop_hook_active", False)
+        and pause_record_path(session_id).exists()
+    )
+    if not records_scheduled_prompts and not marks_reply_ended:
         return
 
     budget = int(os.environ.get("CONVERSATION_PAUSE_HOOK_BUDGET", HOOK_BUDGET_SECONDS))
@@ -49,7 +71,15 @@ def main() -> None:
     try:
         import conversation_pause
 
-        conversation_pause.mark_reply_ended(session_id, conversation_pause.now_epoch())
+        if records_scheduled_prompts:
+            conversation_pause.record_scheduled_prompts(
+                session_id,
+                tuple(wakeup["prompt"] for wakeup in wakeups),
+            )
+        if marks_reply_ended:
+            conversation_pause.mark_reply_ended(
+                session_id, conversation_pause.now_epoch()
+            )
     finally:
         _ = signal.alarm(0)
 

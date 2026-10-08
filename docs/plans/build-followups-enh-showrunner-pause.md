@@ -225,23 +225,25 @@ The pause is safe to register: it cannot delay a prompt, cannot stay on for ever
 
 **Ruled out:** matching the question by its text (a model relays it); a bare count field on `asked` (the question can queue behind a running reply).
 
-### Phase 6 — The two hooks are registered, and the commands say what they do  · status: todo
+### Phase 6 — The two hooks are registered, and the commands say what they do  · status: done
 
 #### Work Order
 
 **Goal:** Every session runs the two hooks, and the showrunner and unit director commands say what happens when the user writes.
 
 **Spec:**
-- `settings.json`, in `hooks`: a new `"UserPromptSubmit"` list holding one group whose one hook is `{"type": "command", "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/user-prompt-submit-conversation-pause.py\""}`; and, appended to the existing `Stop` group's `hooks` list, `{"type": "command", "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-conversation-pause.py\""}`. In `permissions.allow`, one entry: `Bash("$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/conversation_pause.py" *)` (the quotes escaped as JSON requires); it matches the command lines the hook hands the session, `RESUME_COMMAND` and `KEEP_COMMAND` in `conversation_pause.py`, character for character. Nothing else in the file changes.
+- `settings.json`, in `hooks`: a new `"UserPromptSubmit"` list holding one group whose one hook is `{"type": "command", "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/user-prompt-submit-conversation-pause.py\""}`; and, in the existing `Stop` group's `hooks` list straight after `stop-delegate-continue.py` (`scripts/hooks/test_stop_showrunner_footer.py` keeps the banned-words and footer hooks last; the hooks of one group all run on the same event, so the position changes no behavior), `{"type": "command", "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-conversation-pause.py\""}`. In `permissions.allow`, one entry: `Bash("$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/conversation_pause.py" *)` (the quotes escaped as JSON requires); it matches the command lines the hook hands the session, `RESUME_COMMAND` and `KEEP_COMMAND` in `conversation_pause.py`, character for character. Nothing else in the file changes.
 - `commands/showrunner/produce.md`, beside the line `The dailies keep their own switch.`: a short paragraph. When the user types a message here, the dailies and the footer pause on their own; a `conversation-pause:` message later asks you to put one question to the user, word for word; never answer it for them; their typed yes or no is handled without you while the reply that put the question is your latest. Once you have replied again, a bare yes or no reaches you as the answer to whatever you asked last, and the pause's question stays open until it times out. The question comes five minutes after your reply ends, or thirty minutes after their message when the reply was interrupted; unanswered for five minutes, the updates return on their own. While an `/adhoc_review` is open here the question waits for the review to end. `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/conversation_pause.py" status` says what is paused.
 - `commands/unit/delegate.md`, in the progress contract beside `If the user stops updates, use /unit:report off`: one sentence saying a message the user types pauses the status reports on its own and the same `conversation-pause:` message follows.
+- Added by this phase's repair round, because registering the prompt hook for every session exposed it: a scheduled prompt (`CronCreate`, `/loop`, `ScheduleWakeup`) reaches `UserPromptSubmit` as its text alone, with no field naming its source. The Stop hook therefore records the session's `session_crons[].prompt` list at `<state>/scheduled-prompts/<session id>.json` (an empty list removes the file; a payload without the key leaves it), and `prompt_source` answers `SCHEDULED` for a prompt equal to a recorded one, or to the prefix of one clipped at 1000 characters. Only a prompt opening with `<task-notification` or `<system-reminder` is a notice by its tag, so a typed message that opens with a paste or any other tag pauses the reports. `tick` removes a scheduled-prompts file older than eight days. The Stop hook loads the pause module only when the session has a schedule, an old scheduled-prompts file to clear, or a pause record.
 - `scripts/hooks/test_conversation_pause.py`: one test that reads `settings.json` and finds both hook commands and the permission entry, each exactly once, and that the permission entry is exactly `f"Bash({RESUME_COMMAND.rsplit(' ', 1)[0]} *)"`, with `KEEP_COMMAND.rsplit(' ', 1)[0]` equal to the same prefix.
 
 **Files:**
 - `settings.json` — the two registrations and the permission entry.
 - `commands/showrunner/produce.md` — the paragraph.
 - `commands/unit/delegate.md` — the sentence.
-- `scripts/hooks/test_conversation_pause.py` — the registration test.
+- `scripts/hooks/test_conversation_pause.py` — the registration test and the scheduled-prompt and notice-tag tests.
+- `scripts/hooks/conversation_pause.py`, `scripts/hooks/stop-conversation-pause.py`, `scripts/hooks/user-prompt-submit-conversation-pause.py` — the scheduled-prompt record and the narrower notice rule.
 
 **Seats:** 2 writers, one for the registration and its test, one for the two command files. Nothing here has a test lane worth a seat of its own: the one test is three lines.
 - `impl` — `settings.json`, `scripts/hooks/test_conversation_pause.py`.

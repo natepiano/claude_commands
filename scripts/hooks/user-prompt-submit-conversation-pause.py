@@ -61,7 +61,11 @@ def main() -> None:
     try:
         import conversation_pause
 
-        source = conversation_pause.prompt_source(prompt, conversation_pause.scheduled_senders)
+        source = conversation_pause.prompt_source(
+            prompt,
+            conversation_pause.scheduled_senders,
+            lambda: conversation_pause.read_scheduled_prompts(session_id),
+        )
         if source is conversation_pause.PromptSource.TYPED:
             _record_typed_prompt()
         return_question = conversation_pause.is_return_question(prompt)
