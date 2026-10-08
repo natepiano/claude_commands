@@ -32,9 +32,14 @@ class LiveUnitsTests(unittest.TestCase):
             "SHOWRUNNERS_CONFIG": str(self.config),
             "NOTIFIER_STATE_DIR": str(self.notifier),
         }
-        self.write_config("director", ["alpha", "old", "standby"], ["standby"])
+        self.write_config("director", [
+            ("alpha", "running"),
+            ("old", "running"),
+            ("standby", "standing-by"),
+            ("finished", "run-finished"),
+        ])
 
-    def write_config(self, session: str, units: list[str], standby: list[str]) -> None:
+    def write_config(self, session: str, units: list[tuple[str, str]]) -> None:
         _ = self.config.write_text(json.dumps({
             "threshold_percent": 2,
             "repeat_minutes": 30,
@@ -44,8 +49,7 @@ class LiveUnitsTests(unittest.TestCase):
             "showrunners": [{
                 "session": session,
                 "zone": "America/Los_Angeles",
-                "units": units,
-                "standby": standby,
+                "units": [{"session": unit, "status": status} for unit, status in units],
             }],
         }), encoding="utf-8")
 
@@ -71,17 +75,17 @@ class LiveUnitsTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPT), session], env=self.environment,
                               capture_output=True, text=True, check=False)
 
-    def test_registry_order_and_standby_membership_survive_retirement_filter(self) -> None:
+    def test_registry_order_and_every_live_status_survive_retirement_filter(self) -> None:
         self.instance("current", self.production_doc("current", "director", "old"))
         result = self.run_script("director")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["alpha", "standby"])
+        self.assertEqual(result.stdout.splitlines(), ["alpha", "standby", "finished"])
 
     def test_doc_for_another_showrunner_retires_nothing(self) -> None:
         self.instance("other", self.production_doc("other", "other-director", "old"))
         result = self.run_script("director")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["alpha", "old", "standby"])
+        self.assertEqual(result.stdout.splitlines(), ["alpha", "old", "standby", "finished"])
 
     def test_no_checked_doc_keeps_every_configured_unit(self) -> None:
         directory = self.notifier / "showrunner-current"
@@ -89,7 +93,7 @@ class LiveUnitsTests(unittest.TestCase):
         _ = (directory / "conf").write_text("TARGET=session:abc\n", encoding="utf-8")
         result = self.run_script("director")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["alpha", "old", "standby"])
+        self.assertEqual(result.stdout.splitlines(), ["alpha", "old", "standby", "finished"])
 
     def test_absent_showrunner_exits_one(self) -> None:
         result = self.run_script("missing")

@@ -16,6 +16,11 @@ import tmux_names
 import showrunners
 
 SCRIPT = Path(__file__).with_name("tmux_names.py")
+TEST_TMUX_SOCKET = "/tmp/tmux-test/default"
+
+
+def registered(session: str, status: str = "running") -> dict[str, str]:
+    return {"session": session, "status": status}
 
 
 class TmuxNamesTests(unittest.TestCase):
@@ -52,7 +57,9 @@ try:
 except FileNotFoundError:
     raise SystemExit(1)
 args = sys.argv[1:]
-if args[0] == 'list-sessions':
+if args[0] == 'display-message':
+    print(os.environ['TEST_TMUX_SOCKET'])
+elif args[0] == 'list-sessions':
     for name in state:
         print(name)
 elif args[0] == 'list-panes':
@@ -87,7 +94,7 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         _ = self.config.write_text(json.dumps({"threshold_percent": 2, "repeat_minutes": 30,
                                            "stall_minutes": 5, "faults_to": "natedev", "always": [],
                                            "showrunners": [{"session": "director", "zone": "America/Los_Angeles",
-                                                            "units": ["old"]}]}))
+                                                            "units": [registered("old")]}]}))
         self.environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
                             "SHOWRUNNERS_CONFIG": str(self.config),
                             "SHOWRUNNERS_SESSIONS": str(sessions_script),
@@ -99,6 +106,7 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
                             "TMUX_NAMES_FAULT_STATE_DIR": str(self.root / "fault-state"),
                             "TEST_FAULTS": str(self.root / "faults"),
                             "TEST_TMUX_STATE": str(self.tmux),
+                            "TEST_TMUX_SOCKET": TEST_TMUX_SOCKET,
                             "TEST_TMUX_RENAME_FAILURE": str(self.root / "rename-failure")}
 
     def close_children(self) -> None:
@@ -106,14 +114,17 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
             child.terminate()
             _ = child.wait(timeout=3)
 
-    def session(self, name: str, pane: str, *, source: str = "user") -> None:
+    def session(self, name: str, pane: str, *, source: str = "user",
+                tmux_socket: str = TEST_TMUX_SOCKET) -> None:
         child = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.children.append(child)
         _ = (self.sessions / f"{child.pid}.json").write_text(json.dumps({
             "name": name, "nameSource": source, "sessionId": str(child.pid)}))
         directory = self.proc / str(child.pid)
         directory.mkdir()
-        _ = (directory / "environ").write_bytes(f"TMUX_PANE={pane}\0".encode())
+        _ = (directory / "environ").write_bytes(
+            f"TMUX={tmux_socket},{child.pid},0\0TMUX_PANE={pane}\0".encode()
+        )
 
     def tick(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT)], env=self.environment,
@@ -130,7 +141,33 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         result = self.tick()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.names(), {"new": ["%1"]})
-        self.assertEqual(self.entries()[0]["units"], ["new"])
+        self.assertEqual(self.entries()[0]["units"], [registered("new")])
+
+    def test_unit_renames_keep_all_three_registry_statuses(self) -> None:
+        statuses = ("running", "run-finished", "standing-by")
+        old_names = [f"old-{status}" for status in statuses]
+        _ = self.config.write_text(json.dumps({
+            "threshold_percent": 2,
+            "repeat_minutes": 30,
+            "stall_minutes": 5,
+            "faults_to": "natedev",
+            "always": [],
+            "showrunners": [{
+                "session": "director",
+                "zone": "America/Los_Angeles",
+                "units": [registered(name, status) for name, status in zip(old_names, statuses)],
+            }],
+        }))
+        _ = self.tmux.write_text(json.dumps({name: [f"%{index}"]
+                                             for index, name in enumerate(old_names, start=1)}))
+        for index, status in enumerate(statuses, start=1):
+            self.session(f"new-{status}", f"%{index}")
+
+        result = self.tick()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.entries()[0]["units"],
+                         [registered(f"new-{status}", status) for status in statuses])
 
     def test_showrunner_rename_changes_config_session(self) -> None:
         _ = self.tmux.write_text(json.dumps({"director": ["%1"]}))
@@ -150,7 +187,7 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
                 self.session("nixos-45", "%1", source=source)
                 self.assertEqual(self.tick().returncode, 0)
                 self.assertEqual(self.names(), {"old": ["%1"]})
-                self.assertEqual(self.entries()[0]["units"], ["old"])
+                self.assertEqual(self.entries()[0]["units"], [registered("old")])
 
     def test_rename_works_before_registry_has_been_created(self) -> None:
         self.config.unlink()
@@ -169,7 +206,7 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         self.assertEqual(self.names(), {"old": ["%1"]})
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.names(), {"new": ["%1"]})
-        self.assertEqual(self.entries()[0]["units"], ["new"])
+        self.assertEqual(self.entries()[0]["units"], [registered("new")])
 
     def test_tmux_failure_after_registry_change_is_finished_next_tick(self) -> None:
         self.session("new", "%1")
@@ -177,11 +214,11 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         first = self.tick()
         self.assertIn("tmux session still names", first.stderr)
         self.assertEqual(self.names(), {"old": ["%1"]})
-        self.assertEqual(self.entries()[0]["units"], ["new"])
+        self.assertEqual(self.entries()[0]["units"], [registered("new")])
         (self.root / "rename-failure").unlink()
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.names(), {"new": ["%1"]})
-        self.assertEqual(self.entries()[0]["units"], ["new"])
+        self.assertEqual(self.entries()[0]["units"], [registered("new")])
 
     def test_rename_session_does_not_change_another_pane_session(self) -> None:
         _ = self.tmux.write_text(json.dumps({"old": ["%1"], "other": ["%2"]}))
@@ -201,6 +238,38 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(len((self.root / "faults").read_text().splitlines()), 2)
+
+    def test_live_sessions_require_the_tmux_server_socket_to_match(self) -> None:
+        self.session("local", "%0")
+        self.session("stranger", "%0", tmux_socket="/tmp/tmux-test/other")
+        self.session("missing tmux", "%2")
+        without_tmux = self.children[-1]
+        _ = (self.proc / str(without_tmux.pid) / "environ").write_bytes(b"TMUX_PANE=%2\0")
+        with mock.patch.dict(os.environ, self.environment, clear=True), \
+                mock.patch.object(tmux_names, "SESSIONS_DIR", self.sessions), \
+                mock.patch.object(tmux_names, "PROC_DIR", self.proc), \
+                mock.patch.object(tmux_names, "TMUX", "tmux"):
+            sessions = tmux_names.live_sessions()
+        if isinstance(sessions, tmux_names.TmuxServerUnavailable):
+            self.fail(sessions.reason)
+        self.assertEqual([session.name for session in sessions], ["local"])
+
+    def test_tick_uses_only_claude_session_on_its_tmux_server(self) -> None:
+        _ = self.tmux.write_text(json.dumps({"old": ["%0"]}))
+        self.session("local", "%0")
+        self.session("stranger", "%0", tmux_socket="/tmp/tmux-test/other")
+        result = self.tick()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.names(), {"local": ["%0"]})
+        self.assertFalse((self.root / "faults").exists())
+
+    def test_tick_does_not_rename_for_session_on_another_tmux_server(self) -> None:
+        _ = self.tmux.write_text(json.dumps({"old": ["%0"]}))
+        self.session("stranger", "%0", tmux_socket="/tmp/tmux-test/other")
+        result = self.tick()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.names(), {"old": ["%0"]})
+        self.assertFalse((self.root / "faults").exists())
 
     def test_no_tmux_server_exits_zero(self) -> None:
         self.tmux.unlink()

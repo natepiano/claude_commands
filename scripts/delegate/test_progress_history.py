@@ -847,6 +847,179 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(state["LAST_RESTART"], str(report_at))
         self.assertEqual(state["NEXT_DUE"], str(report_at + 15 * 60))
 
+    def test_a_closed_phase_with_a_running_activity_reports_its_last_tables(
+        self,
+    ) -> None:
+        started_at = 20_000
+        session_dir = self.start_run("closed-phase-progress", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.run_progress(session_dir, at=started_at + 100)
+        self.close_the_only_pass(session_dir, at=started_at + 200)
+        _ = self.run_command(
+            "finish-phase",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            at=started_at + 300,
+        )
+        _ = self.run_command(
+            "start-activity",
+            "--session-dir",
+            str(session_dir),
+            "--label",
+            "shrink",
+            "--activity",
+            "recording the as-built phase",
+            at=started_at + 310,
+        )
+        calibration_text = self.run_command(
+            "calibrate",
+            "--session-dir",
+            str(session_dir),
+            "--candidate-percent",
+            "65",
+            at=started_at + 320,
+        )
+        parsed: object = json.loads(calibration_text)  # pyright: ignore[reportAny]
+        calibration = cast(dict[str, object], parsed)
+        self.assertEqual(calibration["candidate_percent"], 65)
+
+        history = self.history_dir / "runs" / "closed-phase-progress.jsonl"
+        state_path = session_dir / "progress_history_state.json"
+        events_before = history.read_text(encoding="utf-8")
+        state_before = state_path.read_text(encoding="utf-8")
+        report = self.run_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--project-raw-percent",
+            "99",
+            "--project-percent",
+            "99",
+            "--phase-raw-percent",
+            "99",
+            "--phase-percent",
+            "99",
+            "--cap-stage",
+            "complete",
+            "--activity",
+            "this report argument must be ignored",
+            at=started_at + 400,
+        )
+
+        self.assertEqual(
+            report.splitlines()[:3],
+            [
+                "**bevy_hana_rubric - feature/rubric**",
+                "",
+                "*Percentages and clocks as of 05:35:00, the last progress report.*",
+            ],
+        )
+        self.assertEqual(
+            [row[:3] for row in self.table_rows(report, SUMMARY_HEADER)[:2]],
+            [["Project", "40", "00:01:40"], ["Phase 3", "30", "00:01:40"]],
+        )
+        rounds = self.table_rows(
+            report,
+            ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"],
+        )
+        self.assertEqual([row[0] for row in rounds], ["Fix 2", "shrink"])
+        self.assertEqual(rounds[-1][-1], "running")
+        self.assertIn("recording the as-built phase", report)
+        self.assertNotIn("this report argument must be ignored", report)
+        self.assertNotIn("No pass or activity is open.", report)
+        self.assertEqual(
+            report.splitlines()[-1],
+            "**now 1970-01-01 05:40:00 - next report 05:43:00**",
+        )
+        self.assertEqual(history.read_text(encoding="utf-8"), events_before)
+        self.assertEqual(state_path.read_text(encoding="utf-8"), state_before)
+        progress_events = [
+            event
+            for event in self.read_events("closed-phase-progress")
+            if event.get("event_type") == "progress_reported"
+        ]
+        self.assertEqual(len(progress_events), 1)
+        state = self.read_state(session_dir)
+        self.assertEqual(state["pending_calibration"], calibration)
+
+    def test_a_closed_phase_with_a_finished_activity_has_no_active_report(
+        self,
+    ) -> None:
+        started_at = 21_000
+        session_dir = self.start_run("closed-finished-activity", started_at)
+        self.start_phase(session_dir, started_at + 10)
+        _ = self.run_command(
+            "finish-phase",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            at=started_at + 100,
+        )
+        _ = self.run_command(
+            "start-activity",
+            "--session-dir",
+            str(session_dir),
+            "--label",
+            "shrink",
+            "--activity",
+            "recording the as-built phase",
+            at=started_at + 110,
+        )
+        _ = self.run_command(
+            "finish-activity",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            "--result",
+            "pass",
+            at=started_at + 140,
+        )
+
+        result = self.run_failing_command(
+            "progress",
+            "--session-dir",
+            str(session_dir),
+            "--activity",
+            "reporting after shrink",
+            at=started_at + 150,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No active phase to report: phase completed.", result.stderr)
+
+    def test_an_active_phase_progress_report_keeps_its_exact_output(self) -> None:
+        started_at = 20_000
+        session_dir = self.start_run("active-phase-output", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+
+        report = self.run_progress(session_dir, at=started_at + 100)
+
+        self.assertEqual(
+            report,
+            "\n".join(
+                (
+                    "**bevy_hana_rubric - feature/rubric**",
+                    "",
+                    "| Scope   |   % |  Elapsed |         ETA | Unchanged |              ETA low |             ETA high |",
+                    "| ------- | --: | -------: | ----------: | --------- | -------------------: | -------------------: |",
+                    "| Project |  40 | 00:01:40 | today 05:37 |           | today 05:36 (-00:00) | today 05:38 (+00:01) |",
+                    "| Phase 3 |  30 | 00:01:40 | today 05:38 |           | today 05:37 (-00:01) | today 05:41 (+00:02) |",
+                    "",
+                    "**Phase 3: Retry handling**",
+                    "",
+                    "| Stage | Start    | Elapsed | Agent 1        | Agent 2 | Result  |",
+                    "| ----- | -------- | ------- | -------------- | ------- | ------- |",
+                    "| Fix 2 | 05:33:30 | 1m      | fix 1m running | -       | running |",
+                    "",
+                    "▸ **Fix 2 - implementing**",
+                    "**now 1970-01-01 05:35:00 - next report 05:38:00**",
+                )
+            ),
+        )
+
     def test_an_activity_after_a_closed_phase_keeps_the_phase_record(self) -> None:
         started_at = 21_000
         session_dir = self.start_run("closed-phase-activity", started_at)

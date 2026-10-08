@@ -23,6 +23,7 @@ QUIET_SECONDS = 300
 ANSWER_SECONDS = 300
 UNANSWERED_SECONDS = 1800
 TOMBSTONE_SECONDS = 300
+SCHEDULED_PROMPT_RETENTION_SECONDS = 8 * 24 * 60 * 60
 WATCHER = "conversation-pause"
 JOB_SENDERS = frozenset({WATCHER, "stall-watch", "tmux-names", "quota_alert", "mac-test",
                          "disk_floor"})
@@ -40,9 +41,13 @@ KEEP_COMMAND = (
     '"$HOME/.claude/scripts/lib/py" '
     '"$HOME/.claude/scripts/hooks/conversation_pause.py" keep'
 )
-TAG_WRAPPER = re.compile(r"^<[A-Za-z][A-Za-z0-9-]*[\s>]")
+NOTICE_TAG = re.compile(r"^<(?:task-notification|system-reminder)(?:\s|>)")
 CROSS_SESSION_TAG = re.compile(r"^<cross-session-message\b[^>]*>")
 FROM_NAME = re.compile(r'\bfrom-name="([^"]*)"')
+CLIPPED_PROMPT_MARKER = re.compile(r"… \[\+\d+ chars\]")
+
+type ScheduledSenderLookup = Callable[[], frozenset[str]]
+type ScheduledPromptLookup = Callable[[], tuple[str, ...]]
 
 
 class PromptSource(Enum):
@@ -69,8 +74,22 @@ class QuestionPending:
 
 
 @dataclass(frozen=True)
+class QuestionNotRead:
+    pass
+
+
+@dataclass(frozen=True)
+class QuestionRead:
+    replies_ended: int
+
+
+QuestionReading = QuestionNotRead | QuestionRead
+
+
+@dataclass(frozen=True)
 class Asked:
     asked_at: int
+    reading: QuestionReading
 
 
 @dataclass(frozen=True)
@@ -189,6 +208,10 @@ def record_path(session_id: str) -> Path:
     return state_root() / f"{session_id}.json"
 
 
+def scheduled_prompts_path(session_id: str) -> Path:
+    return state_root() / "scheduled-prompts" / f"{session_id}.json"
+
+
 def now_epoch() -> int:
     override = os.environ.get("CONVERSATION_PAUSE_NOW_EPOCH")
     return int(override) if override is not None else int(time.time())
@@ -256,7 +279,77 @@ def scheduled_senders() -> frozenset[str]:
     return frozenset(senders)
 
 
-def prompt_source(prompt: str, senders: Callable[[], frozenset[str]]) -> PromptSource:
+def record_scheduled_prompts(session_id: str, prompts: tuple[str, ...]) -> None:
+    destination = scheduled_prompts_path(session_id)
+    if not prompts:
+        destination.unlink(missing_ok=True)
+        return
+    root = destination.parent
+    root.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=root,
+            prefix=".scheduled-prompts-",
+            delete=False,
+            encoding="utf-8",
+        ) as temporary:
+            json.dump(list(prompts), temporary)
+            _ = temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_path = Path(temporary.name)
+        os.replace(temporary_path, destination)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def read_scheduled_prompts(session_id: str) -> tuple[str, ...]:
+    try:
+        raw = cast(object, json.loads(
+            scheduled_prompts_path(session_id).read_text(encoding="utf-8")
+        ))
+    except (OSError, UnicodeError, ValueError):
+        return ()
+    if not isinstance(raw, list):
+        return ()
+    items = cast(list[object], raw)
+    if not all(isinstance(item, str) for item in items):
+        return ()
+    return tuple(cast(list[str], items))
+
+
+def _is_recorded_scheduled_prompt(prompt: str, recorded: tuple[str, ...]) -> bool:
+    prompt = prompt.strip()
+    for scheduled in recorded:
+        scheduled = scheduled.strip()
+        if prompt == scheduled:
+            return True
+        marker = CLIPPED_PROMPT_MARKER.search(scheduled)
+        if marker is not None:
+            prefix = scheduled[:marker.start()]
+            if prefix and prompt.startswith(prefix):
+                return True
+    return False
+
+
+def is_return_question(prompt: str) -> bool:
+    text = prompt.lstrip()
+    if CROSS_SESSION_TAG.match(text) is None:
+        return False
+    opening_tag = text.partition(">")[0]
+    match = FROM_NAME.search(opening_tag)
+    return match is not None and match.group(1) == WATCHER
+
+
+def prompt_source(
+    prompt: str,
+    senders: ScheduledSenderLookup,
+    scheduled_prompts: ScheduledPromptLookup,
+) -> PromptSource:
     text = prompt.lstrip()
     if not text:
         return PromptSource.NOTICE
@@ -266,10 +359,12 @@ def prompt_source(prompt: str, senders: Callable[[], frozenset[str]]) -> PromptS
         name = match.group(1) if match is not None else ""
         return (PromptSource.SCHEDULED if name in JOB_SENDERS or name in senders()
                 else PromptSource.PEER)
-    if (TAG_WRAPPER.match(text) is not None
+    if (NOTICE_TAG.match(text) is not None
             or text.startswith("Another Claude session sent a message")
             or text.startswith("[SYSTEM NOTIFICATION")):
         return PromptSource.NOTICE
+    if _is_recorded_scheduled_prompt(text, scheduled_prompts()):
+        return PromptSource.SCHEDULED
     return PromptSource.TYPED
 
 
@@ -316,7 +411,16 @@ def _phase_json(phase: PausePhase) -> dict[str, object]:
     if isinstance(phase, QuestionPending):
         return {"kind": "question_pending", "due_at": phase.due_at}
     if isinstance(phase, Asked):
-        return {"kind": "asked", "asked_at": phase.asked_at}
+        reading: dict[str, object]
+        if isinstance(phase.reading, QuestionNotRead):
+            reading = {"kind": "not_read"}
+        else:
+            reading = {"kind": "read", "replies_ended": phase.reading.replies_ended}
+        return {
+            "kind": "asked",
+            "asked_at": phase.asked_at,
+            "reading": reading,
+        }
     if isinstance(phase, KeptOff):
         return {"kind": "kept_off"}
     return {"kind": "returned", "returned_at": phase.returned_at}
@@ -341,6 +445,18 @@ def _string_tuple(value: object, field: str) -> tuple[str, ...]:
     return tuple(cast(list[str], items))
 
 
+def _question_reading_from_json(value: object) -> QuestionReading:
+    if not isinstance(value, dict):
+        raise ValueError("invalid reading")
+    fields = cast(dict[str, object], value)
+    kind = fields.get("kind")
+    if kind == "not_read":
+        return QuestionNotRead()
+    if kind == "read":
+        return QuestionRead(_integer(fields.get("replies_ended"), "replies_ended"))
+    raise ValueError("invalid reading kind")
+
+
 def _phase_from_json(value: object) -> PausePhase:
     if not isinstance(value, dict):
         raise ValueError("invalid phase")
@@ -354,7 +470,16 @@ def _phase_from_json(value: object) -> PausePhase:
     if kind == "question_pending":
         return QuestionPending(_integer(fields.get("due_at"), "due_at"))
     if kind == "asked":
-        return Asked(_integer(fields.get("asked_at"), "asked_at"))
+        reading = (
+            _question_reading_from_json(fields.get("reading"))
+            if "reading" in fields
+            else QuestionRead(_integer(fields.get("replies_ended_since_question", 1),
+                                       "replies_ended_since_question"))
+        )
+        return Asked(
+            _integer(fields.get("asked_at"), "asked_at"),
+            reading,
+        )
     if kind == "kept_off":
         return KeptOff()
     if kind == "returned":
@@ -587,13 +712,27 @@ def resume(session_id: str) -> tuple[str, ...]:
         return _resume_locked(session_id)
 
 
-def mark_answered(session_id: str, now: int) -> None:
+def mark_reply_ended(session_id: str, now: int) -> None:
     with record_lock():
         current = _record(session_id)
-        if isinstance(current, PauseRecord) and isinstance(current.phase, Replying):
+        if not isinstance(current, PauseRecord):
+            return
+        phase = current.phase
+        if isinstance(phase, Replying):
             write_record(replace(
                 current,
-                phase=Quiet(current.phase.user_wrote_at, now),
+                phase=Quiet(phase.user_wrote_at, now),
+            ))
+        elif isinstance(phase, Asked) and isinstance(phase.reading, QuestionRead):
+            write_record(replace(
+                current,
+                phase=replace(
+                    phase,
+                    reading=replace(
+                        phase.reading,
+                        replies_ended=phase.reading.replies_ended + 1,
+                    ),
+                ),
             ))
 
 
@@ -633,9 +772,30 @@ def _keep_context() -> str:
 
 def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int) -> HookReply:
     response = answer(prompt) if source is PromptSource.TYPED else NotAnAnswer()
+    return_question = is_return_question(prompt)
     with record_lock():
         current = _record(session_id)
+        if return_question:
+            if isinstance(current, PauseRecord):
+                phase = current.phase
+                if isinstance(phase, QuestionPending):
+                    write_record(replace(
+                        current,
+                        phase=Asked(now, QuestionRead(0)),
+                    ))
+                elif (isinstance(phase, Asked)
+                      and isinstance(phase.reading, QuestionNotRead)):
+                    write_record(replace(
+                        current,
+                        phase=replace(phase, reading=QuestionRead(0)),
+                    ))
+            return NoReply.NOTHING
         if isinstance(current, PauseRecord) and isinstance(current.phase, Asked):
+            phase = current.phase
+            if (isinstance(phase.reading, QuestionRead)
+                    and phase.reading.replies_ended > 1
+                    and isinstance(response, (Yes, No))):
+                return NoReply.NOTHING
             if isinstance(response, Yes):
                 words = _resume_locked(session_id)
                 return ShownToUser(
@@ -776,6 +936,18 @@ def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup, 
 def tick(now: int) -> tuple[str, ...]:
     import showrunner_footer
 
+    scheduled_root = state_root() / "scheduled-prompts"
+    try:
+        scheduled_paths = list(scheduled_root.glob("*.json"))
+    except OSError:
+        scheduled_paths = []
+    for path in scheduled_paths:
+        try:
+            if now - path.stat().st_mtime > SCHEDULED_PROMPT_RETENTION_SECONDS:
+                path.unlink(missing_ok=True)
+        except OSError:
+            continue
+
     paths = sorted(state_root().glob("*.json"))
     lookups = [(path, _session_lookup(path.stem)) for path in paths]
     questions: list[QuestionDelivery] = []
@@ -812,7 +984,10 @@ def tick(now: int) -> tuple[str, ...]:
             if (isinstance(current, PauseRecord)
                     and isinstance(current.phase, QuestionPending)
                     and current.phase.due_at == delivery.due_at):
-                write_record(replace(current, phase=Asked(delivered_at)))
+                write_record(replace(
+                    current,
+                    phase=Asked(delivered_at, QuestionNotRead()),
+                ))
     return tuple(actions)
 
 
@@ -823,6 +998,10 @@ def _status(session_id: str) -> str:
             return "not paused"
         names = ", ".join(user_words(current.instances, current.footers))
         kind = _phase_kind(current.phase)
+        if (isinstance(current.phase, Asked)
+                and isinstance(current.phase.reading, QuestionRead)
+                and current.phase.reading.replies_ended > 1):
+            kind += "; a newer reply ended; bare yes/no belongs to the session"
         return f"paused: {names} ({kind})" if names else f"not paused ({kind})"
 
 

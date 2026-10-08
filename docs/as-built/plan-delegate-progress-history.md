@@ -440,7 +440,10 @@ is still running. The percent options are neither required nor checked. The
 call appends no event and opens no window; like every `progress` call it
 restarts the notifier clock, and it writes state only to resolve a missing
 project clock.
-Only a missing or finished phase is refused, with `No active phase to report`.
+A missing phase, or a closed phase with no open activity, is refused with
+`No active phase to report`. When the last phase is closed and an activity is
+still open, `progress` prints both tables from that phase's last recorded values
+and shows the activity as the running row.
 
 `timeline` renders the stage table alone, for one phase or for every phase of
 the run, and needs no open window. It answers the questions asked after the

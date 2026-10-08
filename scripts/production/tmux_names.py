@@ -27,6 +27,14 @@ class ClaudeSession(NamedTuple):
     user_named: bool
 
 
+class TmuxServerSocket(NamedTuple):
+    path: Path
+
+
+class TmuxServerUnavailable(NamedTuple):
+    reason: str
+
+
 class SessionRenamed(NamedTuple):
     descriptions: tuple[str, ...]
 
@@ -35,7 +43,25 @@ class RenameIncomplete(NamedTuple):
     reason: str
 
 
-def live_sessions() -> list[ClaudeSession]:
+def _tmux_server_socket() -> TmuxServerSocket | TmuxServerUnavailable:
+    try:
+        result = subprocess.run([TMUX, "display-message", "-p", "#{socket_path}"],
+                                capture_output=True, text=True, check=False)
+    except OSError as error:
+        return TmuxServerUnavailable(str(error))
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"tmux exited {result.returncode}"
+        return TmuxServerUnavailable(detail)
+    socket_path = result.stdout.strip()
+    if not socket_path:
+        return TmuxServerUnavailable("tmux returned no socket path")
+    return TmuxServerSocket(Path(socket_path))
+
+
+def live_sessions() -> list[ClaudeSession] | TmuxServerUnavailable:
+    server = _tmux_server_socket()
+    if isinstance(server, TmuxServerUnavailable):
+        return server
     found: list[ClaudeSession] = []
     for path in SESSIONS_DIR.glob("*.json"):
         try:
@@ -46,10 +72,18 @@ def live_sessions() -> list[ClaudeSession]:
             session_id = record.get("sessionId")
             if not isinstance(name, str) or not name or not isinstance(session_id, str) or not session_id:
                 continue
-            environ = (PROC_DIR / str(pid) / "environ").read_bytes()
-            pane = next((entry.removeprefix("TMUX_PANE=") for entry in environ.decode(errors="replace").split("\0")
-                         if entry.startswith("TMUX_PANE=")), "")
-            if pane:
+            environ = {
+                key: value
+                for entry in (PROC_DIR / str(pid) / "environ").read_bytes().decode(
+                    errors="replace"
+                ).split("\0")
+                for key, separator, value in [entry.partition("=")]
+                if separator
+            }
+            pane = environ.get("TMUX_PANE")
+            session_tmux = environ.get("TMUX")
+            if (pane and session_tmux
+                    and Path(session_tmux.split(",", 1)[0]) == server.path):
                 found.append(ClaudeSession(name, session_id, pane, record.get("nameSource") == "user"))
         except (OSError, ValueError, TypeError):
             continue
@@ -57,7 +91,7 @@ def live_sessions() -> list[ClaudeSession]:
 
 
 def _registry_holds(settings: showrunners.ShowrunnerSettings, name: str) -> bool:
-    return any(runner["session"] == name or any(unit.name == name for unit in runner["units"])
+    return any(runner["session"] == name or any(unit.session == name for unit in runner["units"])
                for runner in settings["showrunners"])
 
 
@@ -138,6 +172,8 @@ def tick() -> None:
     if not panes:
         return
     sessions = live_sessions()
+    if isinstance(sessions, TmuxServerUnavailable):
+        return
     by_tmux: dict[str, list[ClaudeSession]] = {}
     for session in sessions:
         old = panes.get(session.pane)

@@ -131,6 +131,9 @@ Applies to a `/unit:delegate` run whose plan header carries a
 run and after every compaction. Your row in its **Units** table gives your name,
 branch, port and the files you own.
 
+At <PrepareSession/>, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/showrunners.py" status "<showrunner session>" --unit "<this row's Session cell>" --state running`; a session stays live after its run ends and can start another run without a new launch, so this sets a finished entry back to running for the stall watch and rewrites nothing when it is already running.
+Only after <RunAsBuilt/> and, where it applies, <AsBuiltCommit/> are complete, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/showrunners.py" status "<showrunner session>" --unit "<this row's Session cell>" --state run-finished` before <RunSummary/>; a run that stopped, failed, or waits on a decision does not mark itself finished, and nothing asks for `run done` text in the Plan cell.
+
 1. **Your port.** Every app launch for smoke tests and shots uses your port,
    never the user's default port or another unit's.
 2. **Whose words.** Text typed into your session that begins
@@ -266,6 +269,10 @@ branch, port and the files you own.
    work can fix goes to the owner before the notice: what breaks and who fixes
    it, named on the line. The owner never absorbs your break in a repair
    round. User, 2026-10-06.
+   Correcting an as-built doc under `docs/as-built/` that contradicts the
+   code is always allowed, in any unit's doc, without asking the user, the
+   showrunner or the owner; the checkpoint notice still names the file as
+   `also touches`. User, 2026-10-07.
 10. **Turn-end lines.** A wait the showrunner can clear names it:
     `— blocked: waiting on the showrunner: <what>`. A wait on another unit is
     one of these: `— blocked: waiting on the showrunner: <unit> <what>`. A wait

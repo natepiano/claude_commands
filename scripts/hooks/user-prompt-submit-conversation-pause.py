@@ -61,16 +61,23 @@ def main() -> None:
     try:
         import conversation_pause
 
-        source = conversation_pause.prompt_source(prompt, conversation_pause.scheduled_senders)
+        source = conversation_pause.prompt_source(
+            prompt,
+            conversation_pause.scheduled_senders,
+            lambda: conversation_pause.read_scheduled_prompts(session_id),
+        )
         if source is conversation_pause.PromptSource.TYPED:
             _record_typed_prompt()
-        if source in {conversation_pause.PromptSource.SCHEDULED,
-                      conversation_pause.PromptSource.NOTICE}:
+        return_question = conversation_pause.is_return_question(prompt)
+        if (source in {conversation_pause.PromptSource.SCHEDULED,
+                       conversation_pause.PromptSource.NOTICE}
+                and not return_question):
             return
-        showrunner_session = (source is conversation_pause.PromptSource.PEER
-                              and conversation_pause.is_showrunner_session(session_id))
-        if not conversation_pause.pauses(source, showrunner_session):
-            return
+        if not return_question:
+            showrunner_session = (source is conversation_pause.PromptSource.PEER
+                                  and conversation_pause.is_showrunner_session(session_id))
+            if not conversation_pause.pauses(source, showrunner_session):
+                return
         reply = conversation_pause.message_arrived(
             session_id, source, prompt, conversation_pause.now_epoch())
         if reply is conversation_pause.NoReply.NOTHING:

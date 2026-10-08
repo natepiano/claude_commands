@@ -8,7 +8,9 @@ UTC so a saved reading is distinguishable from live usage. No credentials are
 saved. Other frontmatter and note bodies are preserved. Run as a script, it then
 hands the notes to quota_alert.py, which messages sessions when an account runs
 low, and to codex_pacer.py, which decides the `pace` tier from them; `refresh`
-(/quota_refresh) is the run after the user reports a usage reset.
+(/quota_refresh) is the run after the user reports a usage reset. `blocked` is
+codex_mesh.py reporting that Codex refused a launch for quota: it reads the notes
+as the timer left them and hands them to quota_alert.blocked().
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from typing import cast
 import codex_pacer
 import five_hour
 from agent_accounts import EASTERN, Report, live_reports
-from quota_alert import AgentNote, alert, current_session, refresh
+from quota_alert import AgentNote, alert, blocked, current_session, refresh
 from run_out import READINGS_LOG
 
 AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
@@ -183,6 +185,8 @@ def apply(notes: list[Note], account: Report, checked_at: datetime) -> list[str]
                 # Preserve the earliest known expiration, including its Eastern offset.
                 expirations = account.limit_reset_expirations
                 updates["limit_reset"] = expirations[0].astimezone(EASTERN).isoformat(timespec="seconds") if expirations else "null"
+            if account.credit_balance is not None:
+                updates["credit_balance"] = account.credit_balance
             updates["weekly_remaining_usage"] = "null" if remaining is None else f"{remaining:g}"
             if fresh is not None:
                 updates["resets"] = local_reset(fresh)
@@ -240,8 +244,12 @@ def mark_tier(plan: codex_pacer.Plan) -> None:
 
 
 def main() -> None:
+    if sys.argv[1:] == ["blocked"]:
+        for line in blocked(list(read_notes())):
+            print(line)
+        return
     if sys.argv[1:] not in ([], ["refresh"]):
-        sys.exit("usage: agent_notes.py [refresh]")
+        sys.exit("usage: agent_notes.py [refresh|blocked]")
     for line in update():
         print(line)
     notes: list[AgentNote] = list(read_notes())

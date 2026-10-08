@@ -142,6 +142,20 @@ State:
   footers, then asks whether to turn back on what it paused at the end
   (`commands/adhoc_review.md` Steps 2 and 5). The dailies keep their own switch.
 
+  When the user types a message here, the dailies and footer pause on their own.
+  Later, a `conversation-pause:` message asks you to put this question to the
+  user word for word: `Return to automatic updates? (yes / no) They return on
+  their own in 5 minutes.` Never answer it for them. Their typed yes or no is
+  handled without you while the reply that put the question is your latest.
+  Once you have replied again, a bare yes or no reaches you as the answer to
+  whatever you asked last, and the pause's question stays open until it times
+  out. The question comes five minutes after your reply ends, or thirty minutes
+  after their message when the reply was interrupted. Unanswered for five
+  minutes, the updates return on their own. While an `/adhoc_review` is open
+  here, the question waits for the review to end.
+  `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/conversation_pause.py" status`
+  says what is paused.
+
   Example with a hold and an active agent (user, 2026-10-04):
 
   ```text
@@ -692,7 +706,7 @@ it needs. Every other wait is yours to clear, and fast.
    3. **Otherwise, tell the user exactly what to do,** in one line they can act on from
       a phone: the session, the exact words to type or the exact allow rule
       to add, and why the check refused it, in a few words. Put it in
-      `needed:` and send it as a <Notify/> priority 2 alert.
+      `needed:` and send it as a <Notify/> `blocked` alert.
    4. **Rule 4's limit holds.** Read the pane again each hour, and repeat 1–3.
       A `needed:` line never repeats unchanged from tick to tick.
    5. **Prevent the next one.** When a routine action for the unit is refused
@@ -704,17 +718,17 @@ it needs. Every other wait is yours to clear, and fast.
 </Dependencies>
 
 <Notify>
-Phone alerts go through Pushover (user's pick, 2026-10-03), because the user
-often ignores ordinary push notifications:
+Phone alerts use the one message path, which reaches the phone through
+Pushover (user's pick, 2026-10-03), because the user often ignores ordinary
+push notifications:
 
-`~/.claude/scripts/notify/pushover.py [--priority 0|1|2] "Hana: <unit or topic>" "<message>"`
+`python3 ~/.claude/scripts/message/send.py --to user --need note|decision|blocked --summary "Hana: <unit or topic>" --text "<message>"`
 
-The message is the one action or fact, under 200 characters. Exit 0 means
-sent. On 1 (refused or unreachable) or 2 (bad usage or missing keys), fall back
-to PushNotification and say so in the log. Never read or print
-`~/.config/pushover/env`. Every send is logged in
-`~/.local/state/notify/pushover.jsonl`, one JSON line holding the time,
-priority, title, full message and outcome.
+On the Mac, add `--machine natedev`; the keys exist only on natedev. The
+message is the one action or fact, under 200 characters. Exit 0 means sent. On
+`FAILED` (exit 3), fall back to PushNotification and say so in the log. Never
+read or print `~/.config/pushover/env`. Every attempt is logged in
+`~/.local/state/message/log.jsonl`.
 
 **Push whenever work waits on the user.** When the production or any unit is
 blocked on something only the user can do (a rebuild, `github-warmup`, an
@@ -723,14 +737,14 @@ blocked, the exact action, and on which machine. One push per new block.
 Units tell you, and you push; the machine-config session (natedev, macbook)
 pushes for blocks it owns. Each block has one owner. User, 2026-10-04, after a
 rebuild waited 1.5 h with no push. A rebuild is pushed even when nothing waits
-on it, at priority 1: the user wants a text for every rebuild needed (user,
+on it, with `--need decision`: the user wants a text for every rebuild needed (user,
 2026-10-04).
 
-| Priority | When |
+| Need | When |
 | --- | --- |
-| 2: emergency, repeats every 5 min until the user taps Acknowledge | Work has stopped, and only the user can restart it: a block under <Dependencies/> rule 6, after steps 1–2, carrying the exact action; a cold gpg-agent stopping every push (the user runs `github-warmup`). Send once per block. |
-| 1: high | The user is needed, but nothing has stopped: a product decision only they can make while units have other work; main's CI red after <PromoteMain/>; a block still open an hour after they acknowledged it. That last one says what changed, never the same text again. |
-| 0: normal | A unit's whole plan finished and merged; before/after shots ready for the user's review. |
+| `blocked` (priority 2; repeats every 5 min until the user taps Acknowledge) | Work has stopped, and only the user can restart it: a block under <Dependencies/> rule 6, after steps 1–2, carrying the exact action; a cold gpg-agent stopping every push (the user runs `github-warmup`). Send once per block. |
+| `decision` (priority 1) | The user is needed, but nothing has stopped: a product decision only they can make while units have other work; main's CI red after <PromoteMain/>; a block still open an hour after they acknowledged it. That last one says what changed, never the same text again. |
+| `note` (priority 0) | A unit's whole plan finished and merged; before/after shots ready for the user's review. |
 
 Never sent: dailies, ETAs, routine merges, green CI, flakes rerun, and hardware
 checks that wait on the user's travel.
@@ -826,8 +840,13 @@ reaches them only as your relay (<Throughout/>). Run `python3
 ~/.claude/scripts/production/waiting.py quota --production PRODUCTION_DOC
 --state-dir DAILIES_STATE_DIR --notice "<full notice>"`. It relays
 to every unit director and prints one `send <unit>:` receipt each:
-- `Quota alert:` — tell every unit director to start no new delegate work on
-  that tool; running seats finish and the unit director does the rest itself. Hold the alert as one
+- `Quota alert:` — the command picks the instruction from the notice. A Codex
+  notice that says nothing was switched: unit directors keep delegating on Codex,
+  whose account may keep working on its credits, and tell you at once if Codex
+  refuses work for quota; bring a refusal to the user. A notice that says every
+  function moved: delegation continues on Claude. A Claude notice, or a Codex one
+  whose switch failed: start no new delegate work on that tool; running seats
+  finish and the unit director does the rest itself. Hold the alert as one
   item per account, listed first in every Waiting on block with the percent left
   and the reset time, until it is acknowledged or restored.
 - `Quota alert acknowledged:` — drop the held item. Paused work stays paused.
@@ -872,6 +891,11 @@ When every unit's final-gate and as-built checkpoints are merged:
   Units push only their own branch.
 - Merge only from a checkpoint notice. Never merge a visible change before a
   fresh design-check pass on its shots (<MergeCheckpoint/> step 3).
+- **An out-of-date as-built doc may always be corrected.** You and every unit
+  may correct an as-built doc under `docs/as-built/` that contradicts the
+  code, in any unit's doc, without asking the user or the owner. Never hold a
+  merge because a unit corrected another unit's as-built doc. User,
+  2026-10-07.
 - **Check intent before ruling.** Before ruling that a design-check finding
   must change something deliberate-looking, read the repository's
   `docs/design-decisions.md`, the plan and the as-built docs; if intent stays
