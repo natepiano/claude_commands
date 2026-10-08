@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import selectors
@@ -151,6 +152,11 @@ class AppServer:
 
     def close(self) -> None:
         self.selector.close()
+        for pipe in (self.process.stdin, self.process.stdout):
+            if pipe is not None:
+                # A request the server never read is still buffered, and closing fails on it.
+                with contextlib.suppress(OSError):
+                    pipe.close()
         if self.process.poll() is None:
             self.process.kill()
         try:
@@ -186,7 +192,11 @@ class AppServer:
         try:
             _ = self.process.stdin.write((json.dumps(request) + "\n").encode())
             self.process.stdin.flush()
-        except (BrokenPipeError, OSError) as error:
+        except BrokenPipeError as error:
+            # The server ended before it read the request. Whether the write or the read meets
+            # that first is a matter of timing, so both report it the same way.
+            raise HookError("app-server closed before replying") from error
+        except OSError as error:
             raise HookError(f"app-server write failed: {error}") from error
         while True:
             try:

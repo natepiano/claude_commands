@@ -125,7 +125,13 @@ def latest_transcript_activity(session_id: str) -> float:
 
 def unit_socket(pid: int) -> tuple[str, str] | None:
     try:
-        session_id = command_output([sys.executable, str(SESSIONS), "id", str(pid)])
+        found = subprocess.run([sys.executable, str(SESSIONS), "id", str(pid)],
+                               capture_output=True, text=True, check=False)
+        # Exit 1 is a Claude with no session record yet. Any other failure is the lookup failing.
+        if found.returncode not in (0, 1):
+            print(f"stall-watch: pid {pid}: {found.stderr.strip() or f'sessions.py exited {found.returncode}'}",
+                  file=sys.stderr)
+        session_id = found.stdout.strip() if found.returncode == 0 else ""
         record = cast(dict[str, object], json.loads((SESSIONS_DIR / f"{pid}.json").read_text(encoding="utf-8")))
         socket = record.get("messagingSocketPath")
         if session_id and isinstance(socket, str) and socket:

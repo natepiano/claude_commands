@@ -143,7 +143,11 @@ def fault(kind: str, old: str, new: str, settings: showrunners.ShowrunnerSetting
     marker = FAULT_STATE_DIR / key
     if marker.exists():
         return
-    socket = showrunners.socket_for(settings["faults_to"])
+    try:
+        socket = showrunners.socket_for(settings["faults_to"])
+    except OSError as error:
+        print(f"tmux-names: {error}", file=sys.stderr)
+        return
     if socket is None:
         return
     message = f"tmux-names: skipped {old} → {new}: {kind}"

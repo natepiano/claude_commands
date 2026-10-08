@@ -168,6 +168,17 @@ raise SystemExit(1)
         _ = self.successful("remove", "director")
         self.assertEqual(self.entries(), [])
 
+    def test_unreadable_session_records_are_an_error_not_a_stopped_showrunner(self) -> None:
+        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "alpha")
+        self.assertIn("director\tnot running", self.successful("list"))
+        _ = self.sessions_script.write_text(
+            "import sys\nprint('sessions: one or more registry files could not be read', file=sys.stderr)\n"
+            + "raise SystemExit(3)\n")
+        result = self.cli("list")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("not running", result.stdout)
+        self.assertIn("cannot tell whether director is running: sessions: one or more registry files", result.stderr)
+
     def test_standby_add_list_and_ready_preserve_unit_membership(self) -> None:
         _ = self.successful("add", "director", "--zone", "America/Los_Angeles",
                             "--unit", "alpha", "--standby")

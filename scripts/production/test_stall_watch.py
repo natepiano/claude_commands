@@ -63,6 +63,9 @@ errors = json.loads(os.environ.get('STALL_TEST_SESSION_ERRORS', '[]'))
 overrides = json.loads(os.environ.get('STALL_TEST_SESSION_OVERRIDES', '{}'))
 if command == 'socket' and target in errors:
     raise SystemExit(3)
+if command == 'id' and os.environ.get('STALL_TEST_ID_ERROR'):
+    print('sessions: one or more registry files could not be read', file=sys.stderr)
+    raise SystemExit(3)
 if command == 'socket' and target in overrides:
     print(overrides[target])
     raise SystemExit(0)
@@ -618,6 +621,15 @@ raise SystemExit(1 if record['to'] in fail else 0)
         _ = showrunner.write_text(json.dumps(record))
         _ = self.tick(START)
         _ = self.tick(START + 600)
+        self.assertEqual(self.sent(), [])
+
+    def test_unreadable_session_records_are_reported_and_the_unit_is_skipped(self) -> None:
+        self.production("showrunner", ("unit-one",))
+        pid, _ = self.unit("unit-one")
+        self.environment["STALL_TEST_ID_ERROR"] = "1"
+        result = self.tick(START)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"stall-watch: pid {pid}: sessions: one or more registry files could not be read", result.stderr)
         self.assertEqual(self.sent(), [])
 
     def test_unavailable_configured_lookup_preserves_missing_state_and_sends_nothing(self) -> None:

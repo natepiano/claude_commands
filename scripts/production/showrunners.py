@@ -166,8 +166,14 @@ def load_settings_from(path: Path) -> ShowrunnerSettings:
 
 
 def socket_for(target: str) -> str | None:
+    """The session's socket, or None when it is not running. Raises OSError when the session
+    records cannot be read, which says nothing about whether it runs."""
     result = subprocess.run([sys.executable, str(SESSIONS), "socket", target], capture_output=True,
                             text=True, check=False)
+    # Exit 1 is no such live session. Any other failure is the lookup itself failing.
+    if result.returncode not in (0, 1):
+        reason = result.stderr.strip() or f"sessions.py exited {result.returncode}"
+        raise OSError(f"cannot tell whether {target} is running: {reason}")
     return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
 
 

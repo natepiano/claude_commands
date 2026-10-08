@@ -137,7 +137,9 @@ for u in $units; do
   pid=$(pane_claude_pid "$pane_pid")
   [[ -z $pid ]] && echo 'CLAUDE NOT RUNNING'
   if [[ -n $pid ]]; then
-    session_id=$("$PY" "$SESSIONS" id "$pid" 2>/dev/null)
+    # No 2>/dev/null: the lookup is silent when the pid has no session and says why when the
+    # session records cannot be read.
+    session_id=$("$PY" "$SESSIONS" id "$pid")
     if [[ -n $session_id && -f $ACTIVE_DIR/$session_id ]]; then
       session_dir=$(< "$ACTIVE_DIR/$session_id")
       if [[ -n $session_dir ]]; then
