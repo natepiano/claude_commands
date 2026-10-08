@@ -153,7 +153,7 @@ class QuotaAlertTests(unittest.TestCase):
 
     def test_repeats_to_every_recipient_until_acknowledged(self) -> None:
         notes: Notes = [self.note("codex 1.md", "active", "1")]
-        self.assertEqual(len(quota_alert.alert(notes, self.now)), 3)  # the switch to claude, then two sends
+        self.assertEqual(len(quota_alert.alert(notes, self.now)), 2)  # two sends, and no switch to claude
         self.assertEqual(self.recipients(), ["boss of bosses", "natedev"])
         _ = quota_alert.alert(notes, self.now + timedelta(minutes=10))
         self.assertEqual(self.recipients(), [])
@@ -191,8 +191,7 @@ class QuotaAlertTests(unittest.TestCase):
         _ = self.recipients()
         notes: Notes = [self.note("codex 1.md", "active", "100"), self.note("claude 2.md", "active", "64")]
         log = quota_alert.alert(notes, self.now + timedelta(minutes=2))
-        self.assertEqual(log, ["switch to claude undone: moved back from Claude to Codex: delegate, fix",
-                               "quota restored codex 1 -> natedev: sent", "quota restored codex 1 -> boss of bosses: sent"])
+        self.assertEqual(log, ["quota restored codex 1 -> natedev: sent", "quota restored codex 1 -> boss of bosses: sent"])
         text = self.sent[0][1]
         self.assertTrue(text.startswith("Quota restored: delegation on Codex can resume; the codex 1 alert is closed."))
         self.assertIn("codex 1, the active Codex account, has 100% of its weekly usage left", text)
@@ -338,12 +337,31 @@ class QuotaAlertTests(unittest.TestCase):
     def assignments(self) -> dict[str, str]:
         return quota_alert.registry_assignments()
 
-    def test_codex_running_out_moves_every_codex_function_to_claude_once(self) -> None:
+    def refuse(self) -> str:
+        """Codex refused work for quota: switch within codex 1's open episode."""
+        note = self.note("codex 1.md", "active", "0")
+        with quota_alert.state_file() as state:
+            return quota_alert.switch_to_claude(state, note, self.now.isoformat(timespec="seconds"))
+
+    def test_codex_reaching_the_threshold_switches_nothing_and_says_to_keep_delegating(self) -> None:
+        log = quota_alert.alert([self.note("codex 1.md", "active", "0")], self.now)
+        self.assertEqual([line for line in log if "switch" in line], [])
+        self.assertEqual(self.assignments(),
+                         {"delegate": "codex", "cli": "claude", "fix": "codex", "ask_a_friend": "caller"})
+        text = self.sent[0][1]
+        self.assertIn("nothing was switched to Claude: keep delegating Codex work", text)
+        self.assertIn("if Codex refuses work for quota, bring that to them at once", text)
+        self.assertNotIn("start no new", text)
+        self.assertIsNone(quota_alert.notice(lambda: "natedev"))
+
+    def test_a_quota_refusal_moves_every_codex_function_to_claude_once(self) -> None:
         notes: Notes = [self.note("codex 1.md", "active", "0")]
-        log = quota_alert.alert(notes, self.now)
-        self.assertIn("switched to claude for codex 1: delegate, fix", log)
+        _ = quota_alert.alert(notes, self.now)
+        self.assertEqual(self.refuse(), "switched to claude for codex 1: delegate, fix")
         self.assertEqual(self.assignments(),
                          {"delegate": "claude", "cli": "claude", "fix": "claude", "ask_a_friend": "caller"})
+        self.sent.clear()
+        _ = quota_alert.alert(notes, self.now + timedelta(minutes=30))
         text = self.sent[0][1]
         stamp = self.now.isoformat(timespec="seconds")
         self.assertIn(f"Every function that ran on Codex (delegate, fix) was moved to Claude at {stamp}", text)
@@ -351,7 +369,7 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertNotIn("start no new", text)
         # The user puts fix back on codex mid-episode; the next run does not move it again.
         self.assertIsNone(quota_alert.edit_registry("agents_set_assignment", "fix", "codex"))
-        _ = quota_alert.alert(notes, self.now + timedelta(minutes=30))
+        _ = quota_alert.alert(notes, self.now + timedelta(minutes=60))
         self.assertEqual(self.assignments()["fix"], "codex")
 
     def test_claude_running_out_switches_nothing(self) -> None:
@@ -362,6 +380,7 @@ class QuotaAlertTests(unittest.TestCase):
 
     def test_recovery_moves_back_only_what_is_still_on_claude(self) -> None:
         _ = quota_alert.alert([self.note("codex 1.md", "active", "0")], self.now)
+        _ = self.refuse()
         self.assertIsNone(quota_alert.edit_registry("agents_set_assignment", "fix", "codex"))
         self.sent.clear()
         log = quota_alert.alert([self.note("codex 1.md", "active", "100")], self.now + timedelta(hours=1))
@@ -375,21 +394,25 @@ class QuotaAlertTests(unittest.TestCase):
         registry = quota_alert.REGISTRY
         _ = registry.write_text(REGISTRY.replace("impl=opus:high", "impl=opus:ultra"))
         notes: Notes = [self.note("codex 1.md", "active", "0")]
-        log = quota_alert.alert(notes, self.now)
-        self.assertTrue(log[0].startswith("switch to claude for codex 1 failed: ERROR: [delegate.impl] effort 'ultra'"))
+        _ = quota_alert.alert(notes, self.now)
+        self.assertTrue(self.refuse().startswith(
+            "switch to claude for codex 1 failed: ERROR: [delegate.impl] effort 'ultra'"))
         self.assertEqual(self.assignments()["delegate"], "codex")
+        self.sent.clear()
+        _ = quota_alert.alert(notes, self.now + timedelta(minutes=30))
         text = self.sent[0][1]
         self.assertIn("The automatic switch from Codex to Claude failed: ERROR: [delegate.impl] effort 'ultra'", text)
         self.assertIn("start no new Codex work", text)
-        # Once per episode: a registry fixed mid-episode is not switched by the next run.
+        # A registry fixed mid-episode is not switched by the next run.
         _ = registry.write_text(REGISTRY)
-        _ = quota_alert.alert(notes, self.now + timedelta(minutes=30))
+        _ = quota_alert.alert(notes, self.now + timedelta(minutes=60))
         self.assertEqual(self.assignments()["delegate"], "codex")
 
     def test_a_stopped_switch_leaves_the_registry_alone(self) -> None:
+        _ = quota_alert.alert([self.note("codex 1.md", "active", "0")], self.now)
         with mock.patch.object(quota_alert, "EDIT_TIMEOUT", 0.01):
-            log = quota_alert.alert([self.note("codex 1.md", "active", "0")], self.now)
-        self.assertEqual(log[0], "switch to claude for codex 1 failed: agents_set_all_assignments took longer "
+            line = self.refuse()
+        self.assertEqual(line, "switch to claude for codex 1 failed: agents_set_all_assignments took longer "
                          + "than 0.01 s and was stopped")
         # The editor's process group died with it: nothing it started lands later.
         time.sleep(2)
@@ -398,10 +421,11 @@ class QuotaAlertTests(unittest.TestCase):
 
     def test_another_low_codex_account_keeps_the_switch(self) -> None:
         _ = quota_alert.alert([self.note("codex 1.md", "active", "0")], self.now)
+        _ = self.refuse()
         self.sent.clear()
         log = quota_alert.alert([self.note("codex 1.md", "inactive", "0"), self.note("codex 2.md", "active", "1")],
                                 self.now + timedelta(minutes=2))
-        self.assertIn("switch to claude for codex 2: nothing was on codex", log)
+        self.assertEqual([line for line in log if "switch" in line], [])
         self.assertEqual(self.assignments()["delegate"], "claude")
         self.assertIn("Every function that ran on Codex (delegate, fix) was moved to Claude", self.sent[0][1])
         _ = quota_alert.alert([self.note("codex 1.md", "inactive", "0"), self.note("codex 2.md", "active", "90")],
@@ -410,6 +434,7 @@ class QuotaAlertTests(unittest.TestCase):
 
     def test_refresh_moves_back_and_says_so(self) -> None:
         _ = quota_alert.alert([self.note("codex 1.md", "active", "0")], self.now)
+        _ = self.refuse()
         self.sent.clear()
         lines = quota_alert.refresh([self.note("codex 1.md", "active", "100")], "natedev",
                                     self.now + timedelta(minutes=3))
@@ -421,6 +446,7 @@ class QuotaAlertTests(unittest.TestCase):
     def test_notice_shows_each_switch_once_and_only_in_the_owner_session(self) -> None:
         self.assertIsNone(quota_alert.notice(lambda: "natedev"))
         _ = quota_alert.alert([self.note("codex 1.md", "active", "0")], self.now)
+        _ = self.refuse()
         self.assertIsNone(quota_alert.notice(lambda: "boss of bosses"))
         text = quota_alert.notice(lambda: "natedev")
         assert text is not None
