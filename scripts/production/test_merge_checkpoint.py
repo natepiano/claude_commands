@@ -267,6 +267,23 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assert_stopped_before_merge(unpushed, "held", "origin")
         self.assertIn("push", unpushed.process.stdout)
 
+    def test_never_pushed_unit_branch_is_held_like_an_unpushed_checkpoint(self) -> None:
+        sha = self.checkpoint(push=False)
+        unpushed = self.run_checkpoint(sha)
+        _ = self.git("push", "origin", "--delete", "alpha-branch", cwd=self.unit)
+        never_pushed = self.run_checkpoint(sha)
+        self.assert_stopped_before_merge(never_pushed, "held", "ancestry: held — commit is not on origin")
+        self.assertIn("send alpha-unit: push your branch to origin and resend the checkpoint",
+                      never_pushed.process.stdout)
+        self.assertEqual(never_pushed.process.stdout, unpushed.process.stdout)
+
+    def test_unreachable_origin_still_fails_at_ancestry(self) -> None:
+        sha = self.checkpoint()
+        _ = self.git("remote", "set-url", "origin", str(self.root / "absent.git"))
+        result = self.run_checkpoint(sha)
+        self.assert_stopped_before_merge(result, "failed", "ancestry: failed")
+        self.assertIn("send alpha-unit: the showrunner will inspect the failed command", result.process.stdout)
+
     def test_scope_holds_unowned_path_and_allows_explicit_also(self) -> None:
         sha = self.checkpoint("outside.txt", "unowned\n")
         held = self.run_checkpoint(sha)

@@ -338,6 +338,19 @@ def code_merged(request: MergeRequest) -> bool:
     return history.has_code_merge(request.unit.name, request.phase)
 
 
+def on_origin(request: MergeRequest) -> bool:
+    """Fetch the unit branch and say whether it holds the checkpoint."""
+    checkout = request.production.checkout
+    fetched = git(checkout, "fetch", "origin", request.unit.branch)
+    # A branch not pushed yet holds no commit: ls-remote exits 2 when origin lacks the ref.
+    if fetched.returncode and git(checkout, "ls-remote", "--exit-code", "origin",
+                                  f"refs/heads/{request.unit.branch}").returncode == 2:
+        return False
+    _ = good(fetched, "ancestry")
+    return git(checkout, "merge-base", "--is-ancestor", request.commit,
+               f"origin/{request.unit.branch}").returncode == 0
+
+
 def ancestry(request: MergeRequest) -> bool:
     checkout = request.production.checkout
     if git(checkout, "cat-file", "-e", f"{request.commit}^{{commit}}").returncode:
@@ -350,8 +363,7 @@ def ancestry(request: MergeRequest) -> bool:
         if git(checkout, "merge-base", "--is-ancestor", request.commit, request.production.merge_branch).returncode:
             raise Stop("ancestry", "held", "checkpoint drops an earlier merge",
                        "merge the latest unit checkpoint and send a new hash")
-    _ = good(git(checkout, "fetch", "origin", request.unit.branch), "ancestry")
-    if git(checkout, "merge-base", "--is-ancestor", request.commit, f"origin/{request.unit.branch}").returncode:
+    if not on_origin(request):
         raise Stop("ancestry", "held", "commit is not on origin",
                    "push your branch to origin and resend the checkpoint")
     already = git(checkout, "merge-base", "--is-ancestor", request.commit,
