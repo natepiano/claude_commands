@@ -7,17 +7,25 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import statistics
+import subprocess
 import sys
+import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+PRODUCTION_SCRIPTS = REPOSITORY_ROOT / "scripts" / "production"
 if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 
 from scripts.delegate import progress_history
+from scripts.production import showrunners, unit_lookup
+from scripts.production.add_unit import Refusal, read_production
 
 
 class ProjectedEta(NamedTuple):
@@ -28,22 +36,22 @@ class ProjectedEta(NamedTuple):
     latest: datetime
 
 
-class NoEta(NamedTuple):
+class EtaUnavailable(NamedTuple):
     """A report is absent or cannot produce a projected finish."""
 
 
-class Reported(NamedTuple):
+class ReportedPhaseProgress(NamedTuple):
     """The last progress report written for a running phase."""
 
     percent: int
-    eta: ProjectedEta | NoEta
+    eta: ProjectedEta | EtaUnavailable
 
 
-class NotReported(NamedTuple):
+class PhaseProgressNotReported(NamedTuple):
     """A running phase has no valid progress report."""
 
 
-class Completed(NamedTuple):
+class CompletedPhaseTiming(NamedTuple):
     """Recorded timing for the completed instance family of a done phase."""
 
     start: datetime
@@ -51,18 +59,18 @@ class Completed(NamedTuple):
     seconds: int
 
 
-class NotRecorded(NamedTuple):
+class PhaseTimingNotRecorded(NamedTuple):
     """A done plan phase has no completed instance on record."""
 
 
-class Predicted(NamedTuple):
+class PredictedPhaseTiming(NamedTuple):
     """Projected timing for a future plan phase."""
 
     start: datetime
     finish: datetime
 
 
-class NotPredicted(NamedTuple):
+class PhaseTimingNotPredicted(NamedTuple):
     """A future plan phase cannot yet be projected."""
 
 
@@ -71,16 +79,19 @@ class DonePhase(NamedTuple):
 
     phase: str
     title: str
-    times: Completed | NotRecorded
+    times: CompletedPhaseTiming | PhaseTimingNotRecorded
 
 
-class RunningPhase(NamedTuple):
-    """The phase instance active in session state at read time."""
+class OpenPhase(NamedTuple):
+    """A phase started but not finished in the newest run's events.
+
+    This says nothing about whether the unit's session is still alive.
+    """
 
     phase: str
     title: str
     started: datetime
-    progress: Reported | NotReported
+    progress: ReportedPhaseProgress | PhaseProgressNotReported
 
 
 class TodoPhase(NamedTuple):
@@ -88,11 +99,11 @@ class TodoPhase(NamedTuple):
 
     phase: str
     title: str
-    times: Predicted | NotPredicted
+    times: PredictedPhaseTiming | PhaseTimingNotPredicted
 
 
-class NoPhaseRunning(NamedTuple):
-    """Session state has no active phase."""
+class NoOpenPhase(NamedTuple):
+    """The newest recorded run has no unfinished phase instance."""
 
 
 class FinishedAt(NamedTuple):
@@ -116,8 +127,8 @@ class PhaseRecord(NamedTuple):
 
     plan: Path
     updated: datetime
-    current: RunningPhase | NoPhaseRunning
-    phases: list[DonePhase | RunningPhase | TodoPhase]
+    current: OpenPhase | NoOpenPhase
+    phases: list[DonePhase | OpenPhase | TodoPhase]
     plan_finish: FinishedAt | PredictedFinish | UnknownFinish
 
 
@@ -130,7 +141,7 @@ class InstanceFinished(NamedTuple):
     written_at: int
 
 
-class InstanceStillRunning(NamedTuple):
+class PhaseInstanceWithoutFinish(NamedTuple):
     """No finish event was written for this phase instance."""
 
 
@@ -141,7 +152,14 @@ class PhaseInstance(NamedTuple):
     phase: str
     title: str
     start: datetime
-    finish: InstanceFinished | InstanceStillRunning
+    finish: InstanceFinished | PhaseInstanceWithoutFinish
+
+
+class OpenPhaseInstance(NamedTuple):
+    """The unfinished event-backed instance carried through the builder."""
+
+    phase: PhaseInstance
+    progress: ReportedPhaseProgress | PhaseProgressNotReported
 
 
 class TypicalDuration(NamedTuple):
@@ -162,6 +180,39 @@ class PlanPhasePosition(NamedTuple):
 
 class OutsidePlan(NamedTuple):
     """The active phase has no heading in the current plan."""
+
+
+class ProductionReference(NamedTuple):
+    """The production and unit named by a delegate plan."""
+
+    production: str
+    unit: str
+    document: str
+
+
+class PlanOutsideProduction(NamedTuple):
+    """The plan does not belong to a production."""
+
+
+class NoteOwnership(NamedTuple):
+    """The identity keys on a generated phase note."""
+
+    production: str
+    unit: str
+
+
+class NoteWithoutPhaseTableOwnership(NamedTuple):
+    """A note cannot be identified as this script's output."""
+
+
+class MostRecentOwnedPhaseNote(NamedTuple):
+    """The newest generated note found for one production unit."""
+
+    path: Path
+
+
+class NoOwnedPhaseNote(NamedTuple):
+    """The vault has no generated note for one production unit."""
 
 
 class NoState(Exception):
@@ -196,7 +247,7 @@ def _state(session_dir: Path) -> dict[str, object]:
     state_path = session_dir / progress_history.STATE_FILENAME
     try:
         text = state_path.read_text(encoding="utf-8")
-    except OSError as error:
+    except (OSError, UnicodeError) as error:
         raise NoState(f"No progress state in {session_dir}") from error
     state = _json_object(text)
     if state is None:
@@ -254,14 +305,14 @@ def _phase_instances(
             if started is None and event_type == "phase_started":
                 started = _moment(event.get("timestamp_epoch"))
             if existing is None:
-                if started is None:
+                if event_type != "phase_started" or started is None:
                     continue
                 instance = PhaseInstance(
                     instance_id=instance_id,
                     phase=_text(event.get("phase_id")),
                     title=_text(event.get("phase_title")),
                     start=started,
-                    finish=InstanceStillRunning(),
+                    finish=PhaseInstanceWithoutFinish(),
                 )
             else:
                 instance = PhaseInstance(
@@ -285,6 +336,51 @@ def _phase_instances(
                     )
             instances[instance_id] = instance
     return list(instances.values())
+
+
+def _newest_open_instance(
+    runs: list[list[dict[str, object]]],
+) -> OpenPhaseInstance | NoOpenPhase:
+    if not runs:
+        return NoOpenPhase()
+    events = runs[-1]
+    if any(_text(event.get("event_type")) == "run_finished" for event in events):
+        return NoOpenPhase()
+    started: list[PhaseInstance] = []
+    closed: set[str] = set()
+    for event in events:
+        event_type = _text(event.get("event_type"))
+        instance_id = _text(event.get("phase_instance_id"))
+        if not instance_id:
+            continue
+        if event_type == "phase_finished":
+            closed.add(instance_id)
+            continue
+        if event_type != "phase_started":
+            continue
+        start = _moment(event.get("phase_started_at")) or _moment(
+            event.get("timestamp_epoch")
+        )
+        if start is None:
+            continue
+        started.append(
+            PhaseInstance(
+                instance_id=instance_id,
+                phase=_text(event.get("phase_id")),
+                title=_text(event.get("phase_title")),
+                start=start,
+                finish=PhaseInstanceWithoutFinish(),
+            )
+        )
+    for instance in reversed(started):
+        if instance.instance_id not in closed:
+            return OpenPhaseInstance(
+                phase=instance,
+                progress=_reported_eta(
+                    _last_progress(runs, instance.instance_id), instance.start
+                ),
+            )
+    return NoOpenPhase()
 
 
 def _normalized_title(title: str) -> str:
@@ -347,16 +443,16 @@ def _last_progress(
 
 def _reported_eta(
     report: dict[str, object] | None, started: datetime
-) -> Reported | NotReported:
+) -> ReportedPhaseProgress | PhaseProgressNotReported:
     if report is None:
-        return NotReported()
+        return PhaseProgressNotReported()
     percent_value = report.get("phase_percent")
     if isinstance(percent_value, bool) or not isinstance(percent_value, int):
-        return NotReported()
+        return PhaseProgressNotReported()
     percent = percent_value
     as_of_epoch = _epoch(report.get("timestamp_epoch"))
     if as_of_epoch is None:
-        return Reported(percent=percent, eta=NoEta())
+        return ReportedPhaseProgress(percent=percent, eta=EtaUnavailable())
     elapsed = _duration(report.get("phase_elapsed_seconds"))
     if elapsed is None:
         elapsed = max(0, int(as_of_epoch - started.timestamp()))
@@ -368,16 +464,15 @@ def _reported_eta(
         elapsed,
         progress_history.percent_spread(calibration),
     )
-    if band is None:
-        return Reported(percent=percent, eta=NoEta())
-    eta, earliest, latest = band
+    if isinstance(band, progress_history.EtaProjectionUnavailable):
+        return ReportedPhaseProgress(percent=percent, eta=EtaUnavailable())
     as_of = datetime.fromtimestamp(as_of_epoch, UTC)
-    return Reported(
+    return ReportedPhaseProgress(
         percent=percent,
         eta=ProjectedEta(
-            time=as_of + timedelta(seconds=eta),
-            earliest=as_of + timedelta(seconds=earliest),
-            latest=as_of + timedelta(seconds=latest),
+            time=as_of + timedelta(seconds=band.remaining),
+            earliest=as_of + timedelta(seconds=band.earliest),
+            latest=as_of + timedelta(seconds=band.latest),
         ),
     )
 
@@ -392,7 +487,11 @@ def _done_phase(
         if isinstance(finish, InstanceFinished) and finish.status == "completed":
             completed.append((instance, finish))
     if not completed:
-        return DonePhase(phase=phase["id"], title=phase["title"], times=NotRecorded())
+        return DonePhase(
+            phase=phase["id"],
+            title=phase["title"],
+            times=PhaseTimingNotRecorded(),
+        )
     last, last_finish = max(completed, key=lambda pair: pair[1].written_at)
     title = _normalized_title(last.title)
     kept = [
@@ -408,7 +507,7 @@ def _done_phase(
     return DonePhase(
         phase=phase["id"],
         title=phase["title"],
-        times=Completed(
+        times=CompletedPhaseTiming(
             start=min(instance.start for instance in kept),
             finish=last_finish.at,
             seconds=seconds,
@@ -417,79 +516,68 @@ def _done_phase(
 
 
 def _plan_finish(
-    phases: list[DonePhase | RunningPhase | TodoPhase],
+    phases: list[DonePhase | OpenPhase | TodoPhase],
 ) -> FinishedAt | PredictedFinish | UnknownFinish:
     if not phases:
         return UnknownFinish()
-    last = phases[-1]
-    if isinstance(last, DonePhase) and isinstance(last.times, Completed):
-        return FinishedAt(last.times.finish)
-    if isinstance(last, RunningPhase):
-        if isinstance(last.progress, Reported) and isinstance(
-            last.progress.eta, ProjectedEta
-        ):
-            return PredictedFinish(last.progress.eta.time)
+    if all(isinstance(phase, DonePhase) for phase in phases):
+        finishes = [
+            phase.times.finish
+            for phase in phases
+            if isinstance(phase, DonePhase)
+            and isinstance(phase.times, CompletedPhaseTiming)
+        ]
+        if finishes:
+            return FinishedAt(max(finishes))
         return UnknownFinish()
-    if isinstance(last, TodoPhase) and isinstance(last.times, Predicted):
-        return PredictedFinish(last.times.finish)
+    projections = [
+        phase.progress.eta.time
+        for phase in phases
+        if isinstance(phase, OpenPhase)
+        and isinstance(phase.progress, ReportedPhaseProgress)
+        and isinstance(phase.progress.eta, ProjectedEta)
+    ]
+    projections.extend(
+        phase.times.finish
+        for phase in phases
+        if isinstance(phase, TodoPhase)
+        and isinstance(phase.times, PredictedPhaseTiming)
+    )
+    if projections:
+        return PredictedFinish(max(projections))
     return UnknownFinish()
 
 
-def build(session_dir: Path) -> PhaseRecord:
-    """Build a session's phase view without changing its state or history."""
-    state = _state(session_dir)
-    working_dir_text = _text(state.get("working_dir"))
-    plan_doc = _text(state.get("project_plan_doc")) or (
-        _text(state.get("plan_doc"))
-    )
-    if not plan_doc:
-        raise NoPlan(f"No plan recorded for {session_dir}")
-    working_dir = Path(working_dir_text) if working_dir_text else Path.cwd()
-    plan_path = progress_history.resolve_plan_path(working_dir, plan_doc)
+def build_plan(plan_path: Path) -> PhaseRecord:
+    """Build one plan's phase view entirely from its durable events."""
+    plan_path = plan_path.expanduser().resolve()
     try:
         phases = progress_history.plan_phases(plan_path)
-    except OSError as error:
+    except (OSError, UnicodeError) as error:
         raise NoPlan(f"Unable to read plan {plan_path}") from error
 
     run_events = [_events(path) for path in progress_history.plan_runs(plan_path)]
     instances = _phase_instances(run_events)
-    active = _object_dict(state.get("phase"))
-    if active is not None and _text(active.get("status")) != "active":
-        active = None
-    active_id = _text(active.get("id")) if active is not None else ""
-    current: RunningPhase | NoPhaseRunning = NoPhaseRunning()
+    open_instance = _newest_open_instance(run_events)
+    assigned = _instances_by_phase(phases, instances)
+    current: OpenPhase | NoOpenPhase = NoOpenPhase()
     current_position: PlanPhasePosition | OutsidePlan = OutsidePlan()
-    active_instance = ""
-    active_title = ""
-    active_started = datetime.min.replace(tzinfo=UTC)
-    active_progress: Reported | NotReported = NotReported()
-    if active is not None:
-        started = _moment(active.get("started_at"))
-        if started is None:
-            raise NoState(f"Active phase has no valid started_at in {session_dir}")
-        active_started = started
-        active_instance = _text(active.get("instance_id"))
-        active_title = _text(active.get("title"), "Untitled phase")
-        for index, phase in enumerate(phases):
-            if phase["id"] == active_id:
-                current_position = PlanPhasePosition(index)
-                active_title = phase["title"]
+    if isinstance(open_instance, OpenPhaseInstance):
+        for index, phase_instances in enumerate(assigned):
+            if any(
+                instance.instance_id == open_instance.phase.instance_id
+                for instance in phase_instances
+            ):
+                current_position = PlanPhasePosition(offset=index)
                 break
-        active_progress = _reported_eta(
-            _last_progress(run_events, active_instance), active_started
-        )
-
-    historical = [
-        instance for instance in instances if instance.instance_id != active_instance
-    ]
-    assigned = _instances_by_phase(phases, historical)
-    rows: list[DonePhase | RunningPhase | TodoPhase] = []
+    rows: list[DonePhase | OpenPhase | TodoPhase] = []
     for index, phase in enumerate(phases):
         if (
             isinstance(current_position, PlanPhasePosition)
             and index == current_position.offset
+            and isinstance(open_instance, OpenPhaseInstance)
         ):
-            recorded_title = _normalized_title(_text(active.get("title"))) if active else ""
+            recorded_title = _normalized_title(open_instance.phase.title)
             related = [
                 instance
                 for instance in assigned[index]
@@ -497,13 +585,13 @@ def build(session_dir: Path) -> PhaseRecord:
             ]
             earliest = min(
                 (instance.start for instance in related),
-                default=active_started,
+                default=open_instance.phase.start,
             )
-            current = RunningPhase(
-                phase=active_id,
-                title=active_title,
+            current = OpenPhase(
+                phase=phase["id"],
+                title=phase["title"],
                 started=earliest,
-                progress=active_progress,
+                progress=open_instance.progress,
             )
             rows.append(current)
         elif phase["done"]:
@@ -513,28 +601,31 @@ def build(session_dir: Path) -> PhaseRecord:
                 TodoPhase(
                     phase=phase["id"],
                     title=phase["title"],
-                    times=NotPredicted(),
+                    times=PhaseTimingNotPredicted(),
                 )
             )
 
-    if active is not None and isinstance(current_position, OutsidePlan):
-        current = RunningPhase(
-            phase=active_id,
-            title=active_title,
-            started=active_started,
-            progress=active_progress,
+    if isinstance(open_instance, OpenPhaseInstance) and isinstance(
+        current_position, OutsidePlan
+    ):
+        current = OpenPhase(
+            phase=open_instance.phase.phase,
+            title=open_instance.phase.title or "Untitled phase",
+            started=open_instance.phase.start,
+            progress=open_instance.progress,
         )
 
     durations = [
         row.times.seconds
         for row in rows
-        if isinstance(row, DonePhase) and isinstance(row.times, Completed)
+        if isinstance(row, DonePhase)
+        and isinstance(row.times, CompletedPhaseTiming)
     ]
     typical: TypicalDuration | UnknownDuration
     if durations:
         typical = TypicalDuration(int(statistics.median(durations)))
-    elif isinstance(current, RunningPhase) and isinstance(
-        current.progress, Reported
+    elif isinstance(current, OpenPhase) and isinstance(
+        current.progress, ReportedPhaseProgress
     ) and isinstance(current.progress.eta, ProjectedEta):
         typical = TypicalDuration(
             max(0, int((current.progress.eta.time - current.started).total_seconds()))
@@ -543,29 +634,38 @@ def build(session_dir: Path) -> PhaseRecord:
         typical = UnknownDuration()
     gap_samples = _gap_samples(run_events)
     gap = int(statistics.median(gap_samples)) if gap_samples else 0
-    if (
-        isinstance(current_position, PlanPhasePosition)
-        and isinstance(current, RunningPhase)
-        and isinstance(current.progress, Reported)
-        and isinstance(current.progress.eta, ProjectedEta)
-    ):
-        previous_finish = current.progress.eta.time
-        for index in range(current_position.offset + 1, len(rows)):
-            row = rows[index]
+    if isinstance(typical, TypicalDuration):
+        now = datetime.fromtimestamp(progress_history.now_epoch(), UTC)
+        gap_before_first = False
+        if isinstance(current, OpenPhase):
+            gap_before_first = True
+            if isinstance(current.progress, ReportedPhaseProgress) and isinstance(
+                current.progress.eta, ProjectedEta
+            ):
+                previous_finish = current.progress.eta.time
+            else:
+                previous_finish = max(
+                    now,
+                    current.started + timedelta(seconds=typical.seconds),
+                )
+        else:
+            previous_finish = now
+        for index, row in enumerate(rows):
             if isinstance(row, DonePhase):
-                if isinstance(row.times, Completed):
-                    previous_finish = row.times.finish
                 continue
-            if isinstance(row, RunningPhase) or isinstance(typical, UnknownDuration):
-                break
-            start = previous_finish + timedelta(seconds=gap)
+            if isinstance(row, OpenPhase):
+                continue
+            start = previous_finish
+            if gap_before_first:
+                start += timedelta(seconds=gap)
             finish = start + timedelta(seconds=typical.seconds)
             rows[index] = TodoPhase(
                 phase=row.phase,
                 title=row.title,
-                times=Predicted(start=start, finish=finish),
+                times=PredictedPhaseTiming(start=start, finish=finish),
             )
             previous_finish = finish
+            gap_before_first = True
 
     return PhaseRecord(
         plan=plan_path,
@@ -576,6 +676,17 @@ def build(session_dir: Path) -> PhaseRecord:
         phases=rows,
         plan_finish=_plan_finish(rows),
     )
+
+
+def build(session_dir: Path) -> PhaseRecord:
+    """Build a session's phase view without changing its state or history."""
+    state = _state(session_dir)
+    working_dir_text = _text(state.get("working_dir"))
+    plan_doc = _text(state.get("project_plan_doc")) or _text(state.get("plan_doc"))
+    if not plan_doc:
+        raise NoState(f"Progress state does not name a plan in {session_dir}")
+    working_dir = Path(working_dir_text) if working_dir_text else Path.cwd()
+    return build_plan(progress_history.resolve_plan_path(working_dir, plan_doc))
 
 
 def _clock(moment: datetime, zone: ZoneInfo) -> str:
@@ -591,33 +702,37 @@ def _elapsed(seconds: int) -> str:
     return f"{hours}:{remainder // 60:02d}"
 
 
-def _row_status(row: DonePhase | RunningPhase | TodoPhase) -> str:
+def _row_status(row: DonePhase | OpenPhase | TodoPhase) -> str:
     if isinstance(row, DonePhase):
-        if isinstance(row.times, Completed):
+        if isinstance(row.times, CompletedPhaseTiming):
             return f"done in {_elapsed(row.times.seconds)}"
         return "done"
-    if isinstance(row, RunningPhase):
-        if isinstance(row.progress, Reported):
+    if isinstance(row, OpenPhase):
+        if isinstance(row.progress, ReportedPhaseProgress):
             return f"running, {row.progress.percent}%"
         return "running"
-    return "predicted" if isinstance(row.times, Predicted) else "todo"
+    return (
+        "predicted"
+        if isinstance(row.times, PredictedPhaseTiming)
+        else "todo"
+    )
 
 
 def _row_clocks(
-    row: DonePhase | RunningPhase | TodoPhase, zone: ZoneInfo
+    row: DonePhase | OpenPhase | TodoPhase, zone: ZoneInfo
 ) -> tuple[str, str]:
     if isinstance(row, DonePhase):
-        if isinstance(row.times, Completed):
+        if isinstance(row.times, CompletedPhaseTiming):
             return _clock(row.times.start, zone), _clock(row.times.finish, zone)
         return "—", "—"
-    if isinstance(row, RunningPhase):
+    if isinstance(row, OpenPhase):
         finish = "—"
-        if isinstance(row.progress, Reported) and isinstance(
+        if isinstance(row.progress, ReportedPhaseProgress) and isinstance(
             row.progress.eta, ProjectedEta
         ):
             finish = _clock(row.progress.eta.time, zone)
         return _clock(row.started, zone), finish
-    if isinstance(row.times, Predicted):
+    if isinstance(row.times, PredictedPhaseTiming):
         return _clock(row.times.start, zone), _clock(row.times.finish, zone)
     return "—", "—"
 
@@ -625,7 +740,7 @@ def _row_clocks(
 def render(record: PhaseRecord, zone: ZoneInfo) -> str:
     """Render a phase record as the compact Markdown report."""
     current = record.current
-    if isinstance(current, NoPhaseRunning):
+    if isinstance(current, NoOpenPhase):
         done = sum(isinstance(row, DonePhase) for row in record.phases)
         heading = f"**No phase running — {done} of {len(record.phases)} done**"
     else:
@@ -635,9 +750,9 @@ def render(record: PhaseRecord, zone: ZoneInfo) -> str:
 
     started = "—"
     percent = "—"
-    if isinstance(current, RunningPhase):
+    if isinstance(current, OpenPhase):
         started = _clock(current.started, zone)
-        if isinstance(current.progress, Reported):
+        if isinstance(current.progress, ReportedPhaseProgress):
             percent = f"{current.progress.percent}%"
     summary = [
         "| | |",
@@ -645,9 +760,9 @@ def render(record: PhaseRecord, zone: ZoneInfo) -> str:
         f"| Started | {started} |",
         f"| Done | {percent} |",
     ]
-    if isinstance(current, RunningPhase):
+    if isinstance(current, OpenPhase):
         eta_cell = "—"
-        if isinstance(current.progress, Reported) and isinstance(
+        if isinstance(current.progress, ReportedPhaseProgress) and isinstance(
             current.progress.eta, ProjectedEta
         ):
             eta = current.progress.eta
@@ -687,27 +802,27 @@ def _iso(moment: datetime, zone: ZoneInfo) -> str:
 
 
 def _json_phase(
-    row: DonePhase | RunningPhase | TodoPhase, zone: ZoneInfo
+    row: DonePhase | OpenPhase | TodoPhase, zone: ZoneInfo
 ) -> dict[str, object]:
     start: str | None = None
     finish: str | None = None
     seconds: int | None = None
     if isinstance(row, DonePhase):
         status = "done"
-        if isinstance(row.times, Completed):
+        if isinstance(row.times, CompletedPhaseTiming):
             start = _iso(row.times.start, zone)
             finish = _iso(row.times.finish, zone)
             seconds = row.times.seconds
-    elif isinstance(row, RunningPhase):
+    elif isinstance(row, OpenPhase):
         status = "running"
         start = _iso(row.started, zone)
-        if isinstance(row.progress, Reported) and isinstance(
+        if isinstance(row.progress, ReportedPhaseProgress) and isinstance(
             row.progress.eta, ProjectedEta
         ):
             finish = _iso(row.progress.eta.time, zone)
     else:
         status = "todo"
-        if isinstance(row.times, Predicted):
+        if isinstance(row.times, PredictedPhaseTiming):
             start = _iso(row.times.start, zone)
             finish = _iso(row.times.finish, zone)
     return {
@@ -722,13 +837,13 @@ def _json_phase(
 
 def _json_record(record: PhaseRecord, zone: ZoneInfo) -> dict[str, object]:
     current_json: dict[str, object] | None = None
-    if isinstance(record.current, RunningPhase):
+    if isinstance(record.current, OpenPhase):
         current = record.current
         eta_json: dict[str, object] | None = None
         percent: int | None = None
-        if isinstance(current.progress, Reported):
+        if isinstance(current.progress, ReportedPhaseProgress):
             percent = current.progress.percent
-        if isinstance(current.progress, Reported) and isinstance(
+        if isinstance(current.progress, ReportedPhaseProgress) and isinstance(
             current.progress.eta, ProjectedEta
         ):
             eta = current.progress.eta
@@ -766,6 +881,263 @@ def show(session_dir: Path, zone: ZoneInfo, json_output: bool = False) -> str:
     return render(record, zone)
 
 
+PRODUCTION_PATTERN = re.compile(
+    r"^> \*\*Production: (?P<production>.+?)\*\* — unit `(?P<unit>[^`]+)`; "
+    + r"production doc `(?P<document>[^`]+)`$",
+    re.MULTILINE,
+)
+
+
+def _production_reference(plan_path: Path) -> ProductionReference | PlanOutsideProduction:
+    try:
+        text = plan_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise NoPlan(f"Unable to read plan {plan_path}") from error
+    match = PRODUCTION_PATTERN.search(text)
+    if match is None:
+        return PlanOutsideProduction()
+    return ProductionReference(
+        production=match.group("production"),
+        unit=match.group("unit"),
+        document=match.group("document"),
+    )
+
+
+def _git_output(directory: Path, *arguments: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(directory), *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Refusal(f"cannot inspect Git checkout: {error}") from error
+    if result.returncode != 0:
+        reason = result.stderr.strip() or f"git exited {result.returncode}"
+        raise Refusal(f"cannot inspect Git checkout: {reason}")
+    return result.stdout.strip()
+
+
+def _production_document(plan_path: Path, reference: ProductionReference) -> Path:
+    root = Path(_git_output(plan_path.parent, "rev-parse", "--show-toplevel"))
+    document = Path(reference.document).expanduser()
+    return document.resolve() if document.is_absolute() else (root / document).resolve()
+
+
+def _phase_note_name(production: str, unit: str) -> str:
+    name = unit
+    try:
+        marked = unit_lookup.marked_units(production).get(unit)
+        if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
+            if marked.claude.name:
+                name = marked.claude.name
+    except OSError:
+        pass
+    cleaned = name.replace("/", "-").replace("\0", "-").lstrip(".")
+    return cleaned or unit
+
+
+def _note_ownership(path: Path) -> NoteOwnership | NoteWithoutPhaseTableOwnership:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return NoteWithoutPhaseTableOwnership()
+    if not lines or lines[0] != "---":
+        return NoteWithoutPhaseTableOwnership()
+    fields: dict[str, str] = {}
+    closed = False
+    for line in lines[1:]:
+        if line == "---":
+            closed = True
+            break
+        key, separator, value = line.partition(":")
+        if separator:
+            fields[key.strip()] = value.strip()
+    if not closed or fields.get("phase_table") != "true":
+        return NoteWithoutPhaseTableOwnership()
+    production = fields.get("production", "")
+    unit = fields.get("unit", "")
+    if not production or not unit:
+        return NoteWithoutPhaseTableOwnership()
+    return NoteOwnership(production=production, unit=unit)
+
+
+def _most_recent_owned_note(
+    vault_root: Path, ownership: NoteOwnership
+) -> MostRecentOwnedPhaseNote | NoOwnedPhaseNote:
+    matches = [
+        path
+        for path in vault_root.glob("*/*.md")
+        if _note_ownership(path) == ownership
+    ]
+    if not matches:
+        return NoOwnedPhaseNote()
+    try:
+        newest = max(
+            matches,
+            key=lambda path: (path.stat().st_mtime_ns, path.as_posix()),
+        )
+    except OSError as error:
+        raise Refusal(f"cannot inspect phase notes in {vault_root}: {error}") from error
+    return MostRecentOwnedPhaseNote(path=newest)
+
+
+def _note_text(
+    name: str,
+    production: str,
+    unit: str,
+    record: PhaseRecord,
+    zone: ZoneInfo,
+) -> str:
+    return "\n".join(
+        (
+            "---",
+            "phase_table: true",
+            f"production: {production}",
+            f"unit: {unit}",
+            "---",
+            "",
+            f"# {name}",
+            "",
+            render(record, zone),
+            "",
+        )
+    )
+
+
+def _ensure_showrunners_excluded(vault_root: Path) -> None:
+    try:
+        checkout = Path(
+            _git_output(vault_root.parent, "rev-parse", "--show-toplevel")
+        ).resolve()
+    except Refusal:
+        return
+    try:
+        relative = vault_root.resolve().relative_to(checkout)
+    except ValueError:
+        return
+    if relative == Path():
+        return
+    exclude_line = f"{relative.as_posix()}/"
+    git_path = Path(
+        _git_output(checkout, "rev-parse", "--git-path", "info/exclude")
+    )
+    exclude = git_path if git_path.is_absolute() else checkout / git_path
+    try:
+        before = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if exclude_line in before.splitlines():
+            return
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with exclude.open("a", encoding="utf-8") as handle:
+            if before and not before.endswith("\n"):
+                _ = handle.write("\n")
+            _ = handle.write(f"{exclude_line}\n")
+    except OSError as error:
+        raise Refusal(f"cannot update {exclude}: {error}") from error
+
+
+def _write_note(target: Path, content: str, ownership: NoteOwnership) -> None:
+    target_existed = target.exists()
+    if target_existed and _note_ownership(target) != ownership:
+        raise Refusal(
+            "phase note target is not owned by "
+            + f"{ownership.production}/{ownership.unit}: {target}"
+        )
+    temporary: Path | None = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            delete=False,
+        ) as handle:
+            _ = handle.write(content)
+            os.fchmod(handle.fileno(), 0o644)
+            temporary = Path(handle.name)
+        if target_existed:
+            os.replace(temporary, target)
+        else:
+            try:
+                os.link(temporary, target)
+            except FileExistsError as error:
+                raise Refusal(
+                    f"phase note appeared before publication: {target}"
+                ) from error
+    except OSError as error:
+        raise Refusal(f"cannot write phase note {target}: {error}") from error
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _remove_stale_notes(
+    vault_root: Path, target: Path, ownership: NoteOwnership
+) -> None:
+    for candidate in vault_root.glob("*/*.md"):
+        if candidate == target or _note_ownership(candidate) != ownership:
+            continue
+        try:
+            candidate.unlink()
+            candidate.parent.rmdir()
+        except OSError as error:
+            if candidate.exists():
+                raise Refusal(
+                    f"cannot remove stale phase note {candidate}: {error}"
+                ) from error
+
+
+def refresh(session_dir: Path) -> None:
+    """Rewrite a production unit's generated phase note, when it has one."""
+    record = build(session_dir)
+    reference = _production_reference(record.plan)
+    if isinstance(reference, PlanOutsideProduction):
+        return
+    vault_root = Path(
+        os.environ.get("PHASE_TABLE_VAULT")
+        or Path.home() / "rust" / "hanadocs" / "showrunners"
+    ).expanduser()
+    if not vault_root.parent.exists():
+        return
+    production = read_production(_production_document(record.plan, reference))
+    ownership = NoteOwnership(production=production.slug, unit=reference.unit)
+    try:
+        showrunner = showrunners.current_name(production.slug)
+    except OSError as error:
+        raise Refusal(
+            f"cannot look up the showrunner of {production.slug}: {error}"
+        ) from error
+    if showrunner:
+        if showrunner in {".", ".."} or "/" in showrunner or "\0" in showrunner:
+            raise Refusal("production Showrunner session must be one directory name")
+        folder = vault_root / showrunner
+    else:
+        previous = _most_recent_owned_note(vault_root, ownership)
+        if isinstance(previous, NoOwnedPhaseNote):
+            raise Refusal(f"the showrunner of {production.slug} is not running")
+        folder = previous.path.parent
+    name = _phase_note_name(production.slug, reference.unit)
+    target = folder / f"{name}.md"
+    if target.exists() and _note_ownership(target) != ownership:
+        raise Refusal(
+            "phase note target is not owned by "
+            + f"{production.slug}/{reference.unit}: {target}"
+        )
+    _ensure_showrunners_excluded(vault_root)
+    _write_note(
+        target,
+        _note_text(name, production.slug, reference.unit, record, production.zone),
+        ownership,
+    )
+    _remove_stale_notes(vault_root, target, ownership)
+
+
 def _local_zone() -> ZoneInfo:
     configured = os.environ.get("TZ")
     if configured:
@@ -785,26 +1157,35 @@ def _local_zone() -> ZoneInfo:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Show a delegate run's plan phases.")
+    parser = argparse.ArgumentParser(
+        description="Show or refresh a delegate run's plan phases."
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     show_parser = commands.add_parser("show")
     _ = show_parser.add_argument("--session-dir", type=Path, required=True)
     _ = show_parser.add_argument("--zone", default="")
     _ = show_parser.add_argument("--json", action="store_true")
+    refresh_parser = commands.add_parser("refresh")
+    _ = refresh_parser.add_argument("--session-dir", type=Path, required=True)
     return parser
 
 
 def main() -> int:
     args = _build_parser().parse_args()
+    command_value: object = getattr(args, "command", "")
     session_value: object = getattr(args, "session_dir", Path())
     zone_value: object = getattr(args, "zone", "")
     json_value: object = getattr(args, "json", False)
+    command = command_value if isinstance(command_value, str) else ""
     session_dir = session_value if isinstance(session_value, Path) else Path()
     zone_name = zone_value if isinstance(zone_value, str) else ""
     try:
+        if command == "refresh":
+            refresh(session_dir.expanduser().resolve())
+            return 0
         zone = ZoneInfo(zone_name) if zone_name else _local_zone()
         output = show(session_dir.expanduser().resolve(), zone, json_value is True)
-    except (NoState, NoPlan, ZoneInfoNotFoundError) as error:
+    except (NoState, NoPlan, Refusal, ZoneInfoNotFoundError) as error:
         print(str(error), file=sys.stderr)
         return 1
     print(output)

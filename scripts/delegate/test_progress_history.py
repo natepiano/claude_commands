@@ -3,12 +3,16 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
+import io
 import json
 import os
 import subprocess
 import tempfile
 import unittest
+from collections.abc import Callable
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast, override
@@ -27,6 +31,27 @@ BOARD = Path(__file__).with_name("board.sh")
 # points apart drew four ETAs hours apart.
 SWING_REPORTS: tuple[tuple[int, int], ...] = ((86, 15), (82, 20), (78, 40), (84, 55))
 SUMMARY_HEADER = ["Scope", "%", "Elapsed", "ETA", "Unchanged", "ETA low", "ETA high"]
+
+
+def recorder_parser() -> argparse.ArgumentParser:
+    builder = vars(progress_history).get("_build_parser")
+    if not callable(builder):
+        raise AssertionError("progress recorder parser is unavailable")
+    return cast(Callable[[], argparse.ArgumentParser], builder)()
+
+
+def recorder_handler(name: str) -> Callable[[argparse.Namespace], None]:
+    handler = vars(progress_history).get(name)
+    if not callable(handler):
+        raise AssertionError(f"progress recorder handler is unavailable: {name}")
+    return cast(Callable[[argparse.Namespace], None], handler)
+
+
+def refresh_phase_table(session_dir: Path) -> None:
+    refresh = vars(progress_history).get("_refresh_phase_table")
+    if not callable(refresh):
+        raise AssertionError("progress recorder phase-table refresh is unavailable")
+    cast(Callable[[Path], None], refresh)(session_dir)
 
 
 class ProgressHistoryTests(unittest.TestCase):
@@ -136,6 +161,58 @@ class ProgressHistoryTests(unittest.TestCase):
             capture_output=True,
             text=True,
             env=environment,
+        )
+
+    def invoke_handler(
+        self,
+        handler: Callable[[argparse.Namespace], None],
+        arguments: argparse.Namespace,
+        at: int,
+        refresh_result: subprocess.CompletedProcess[str] | BaseException,
+    ) -> tuple[None, str, str]:
+        environment = os.environ.copy()
+        environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
+        environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
+        environment["PHASE_TABLE_VAULT"] = str(self.root / "vault")
+        environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
+        environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
+        environment["TZ"] = "UTC"
+        self.isolate_identity(environment)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        if isinstance(refresh_result, BaseException):
+            run_patch = patch(
+                "scripts.delegate.progress_history.subprocess.run",
+                side_effect=refresh_result,
+            )
+        else:
+            run_patch = patch(
+                "scripts.delegate.progress_history.subprocess.run",
+                return_value=refresh_result,
+            )
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch(
+                "scripts.delegate.progress_history.shutil.which",
+                return_value=None,
+            ),
+            run_patch,
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            returned = handler(arguments)
+        return returned, stdout.getvalue(), stderr.getvalue()
+
+    def add_production_marker(self, session_dir: Path) -> None:
+        state = self.read_state(session_dir)
+        plan_path = Path(cast(str, state["project_plan_doc"]))
+        plan_text = plan_path.read_text(encoding="utf-8")
+        _ = plan_path.write_text(
+            plan_text
+            + "> **Production: Example** — unit `unit-a`; "
+            + "production doc `docs/example-production.md`\n",
+            encoding="utf-8",
         )
 
     def start_run(self, name: str, started_at: int) -> Path:
@@ -4135,6 +4212,264 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         self.assertEqual(header.splitlines()[0], "**bevy_hana_rubric**")
 
+    def test_phase_table_failure_does_not_change_recorder_command_results(self) -> None:
+        parser = recorder_parser()
+        started_at = 40_000
+
+        def prepare(
+            command: str,
+            name: str,
+        ) -> tuple[Callable[[argparse.Namespace], None], argparse.Namespace]:
+            session_dir = self.start_run(name, started_at)
+            if command != "start-phase":
+                self.start_phase_and_pass(session_dir, started_at)
+            if command == "finish-run":
+                self.close_the_only_pass(session_dir, at=started_at + 20)
+                _ = self.run_command(
+                    "finish-phase",
+                    "--session-dir",
+                    str(session_dir),
+                    "--status",
+                    "completed",
+                    at=started_at + 30,
+                )
+            self.add_production_marker(session_dir)
+            if command == "start-phase":
+                arguments = parser.parse_args(
+                    [
+                        command,
+                        "--session-dir",
+                        str(session_dir),
+                        "--phase-id",
+                        "3",
+                        "--phase-title",
+                        "Retry handling",
+                    ]
+                )
+                return recorder_handler("_start_phase"), arguments
+            if command == "progress":
+                arguments = parser.parse_args(
+                    [
+                        command,
+                        "--session-dir",
+                        str(session_dir),
+                        "--raw-percent",
+                        "30",
+                        "--percent",
+                        "30",
+                        "--activity",
+                        "implementing",
+                    ]
+                )
+                return recorder_handler("_progress"), arguments
+            if command == "finish-phase":
+                arguments = parser.parse_args(
+                    [
+                        command,
+                        "--session-dir",
+                        str(session_dir),
+                        "--status",
+                        "completed",
+                    ]
+                )
+                return recorder_handler("_finish_phase"), arguments
+            arguments = parser.parse_args(
+                [
+                    command,
+                    "--session-dir",
+                    str(session_dir),
+                    "--status",
+                    "completed",
+                ]
+            )
+            return recorder_handler("_finish_run"), arguments
+
+        success = subprocess.CompletedProcess[str]([], 0, "", "")
+        refusal = subprocess.CompletedProcess[str](
+            [], 1, "", "target belongs to another unit\n"
+        )
+        for command in ("start-phase", "progress", "finish-phase", "finish-run"):
+            with self.subTest(command=command):
+                success_handler, success_arguments = prepare(
+                    command, f"refresh-success-{command}"
+                )
+                failure_handler, failure_arguments = prepare(
+                    command, f"refresh-failure-{command}"
+                )
+                successful = self.invoke_handler(
+                    success_handler,
+                    success_arguments,
+                    at=started_at + 100,
+                    refresh_result=success,
+                )
+                refused = self.invoke_handler(
+                    failure_handler,
+                    failure_arguments,
+                    at=started_at + 100,
+                    refresh_result=refusal,
+                )
+
+                self.assertEqual(refused[:2], successful[:2])
+                self.assertEqual(successful[2], "")
+                self.assertEqual(
+                    refused[2],
+                    "phase table not written: target belongs to another unit\n",
+                )
+
+    def test_phase_table_timeout_prints_one_line(self) -> None:
+        session_dir = self.start_run("refresh-timeout", 50_000)
+        self.add_production_marker(session_dir)
+        arguments = recorder_parser().parse_args(
+            [
+                "start-phase",
+                "--session-dir",
+                str(session_dir),
+                "--phase-id",
+                "3",
+                "--phase-title",
+                "Retry handling",
+            ]
+        )
+
+        returned, stdout, stderr = self.invoke_handler(
+            recorder_handler("_start_phase"),
+            arguments,
+            at=50_100,
+            refresh_result=subprocess.TimeoutExpired(["phase_table.py"], 10),
+        )
+
+        self.assertIsNone(returned)
+        self.assertEqual(stdout, "")
+        self.assertEqual(len(stderr.splitlines()), 1)
+        self.assertIn("phase table not written:", stderr)
+        self.assertIn("timed out after 10 seconds", stderr)
+
+    def test_plan_without_production_marker_starts_no_phase_table_process(self) -> None:
+        session_dir = self.start_run("refresh-not-a-production", 60_000)
+
+        with patch("scripts.delegate.progress_history.subprocess.run") as run:
+            refresh_phase_table(session_dir)
+
+        run.assert_not_called()
+
+    def test_invalid_utf8_plan_starts_no_phase_table_process_or_output(self) -> None:
+        session_dir = self.start_run("refresh-invalid-utf8", 65_000)
+        state = self.read_state(session_dir)
+        plan_path = Path(cast(str, state["project_plan_doc"]))
+        _ = plan_path.write_bytes(b"\xff")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "PHASE_TABLE_VAULT": str(self.root / "vault"),
+                    "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
+                },
+            ),
+            patch("scripts.delegate.progress_history.subprocess.run") as run,
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            refresh_phase_table(session_dir)
+
+        run.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_progress_refresh_writes_the_production_phase_note(self) -> None:
+        from scripts.production import fake_showrunner
+
+        started_at = 70_000
+        session_dir = self.start_run("refresh-end-to-end", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        state = self.read_state(session_dir)
+        plan_path = Path(cast(str, state["project_plan_doc"]))
+        plan_text = plan_path.read_text(encoding="utf-8")
+        _ = plan_path.write_text(
+            plan_text + "### Phase 3 — Retry handling  · status: todo\n\n",
+            encoding="utf-8",
+        )
+        self.add_production_marker(session_dir)
+        production_doc = self.working_dir / "docs" / "example-production.md"
+        _ = production_doc.write_text(
+            "\n".join(
+                (
+                    "# Example production",
+                    "",
+                    "- **Merge branch:** main",
+                    f"- **Showrunner checkout:** {self.working_dir}",
+                    "- **Log:** logs/showrunner.md",
+                    "- **User zone:** UTC",
+                    "",
+                    "## Units",
+                    "",
+                    "| Unit | Plan | Worktree | Branch | Port | Owns |",
+                    "| --- | --- | --- | --- | --- | --- |",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        notifier_dir = self.root / "notifier"
+        sessions_dir = self.root / "notifier-sessions"
+        _ = fake_showrunner.write_timer(
+            notifier_dir,
+            "example",
+            "example-showrunner-id",
+            "UTC",
+            production_doc,
+        )
+        held = fake_showrunner.write_session(
+            sessions_dir,
+            "example-showrunner",
+            "example-showrunner-id",
+        )
+        self.addCleanup(held.close)
+        vault_root = self.root / "vault" / "showrunners"
+        vault_root.parent.mkdir(parents=True)
+        history_paths_before = {
+            path.relative_to(self.history_dir) for path in self.history_dir.rglob("*")
+        }
+
+        with patch.dict(
+            os.environ,
+            {
+                "PHASE_TABLE_VAULT": str(vault_root),
+                "UNIT_LOOKUP_TMUX": "/bin/false",
+                "NOTIFIER_STATE_DIR": str(notifier_dir),
+                "NOTIFIER_SESSIONS_DIR": str(sessions_dir),
+            },
+        ):
+            report = self.run_progress(session_dir, at=started_at + 100)
+
+        note = vault_root / "example-showrunner" / "unit-a.md"
+        self.assertTrue(note.is_file())
+        self.assertEqual(
+            note.read_text(encoding="utf-8").splitlines()[:8],
+            [
+                "---",
+                "phase_table: true",
+                "production: example",
+                "unit: unit-a",
+                "---",
+                "",
+                "# unit-a",
+                "",
+            ],
+        )
+        self.assertIn("**Phase 3 of 1 — Retry handling**", note.read_text(encoding="utf-8"))
+        self.assertIn("| Phase 3 |", report)
+        self.assertEqual(
+            [path.relative_to(vault_root) for path in vault_root.rglob("*.md")],
+            [Path("example-showrunner/unit-a.md")],
+        )
+        self.assertEqual(
+            {path.relative_to(self.history_dir) for path in self.history_dir.rglob("*")},
+            history_paths_before,
+        )
+
 
 class PhaseCountTests(unittest.TestCase):
     """A plan's phase headings take three forms; all three must be counted.
@@ -4320,9 +4655,12 @@ class PublicPhaseHelperTests(unittest.TestCase):
     def test_eta_band_seconds_exposes_the_existing_projection_math(self) -> None:
         self.assertEqual(
             progress_history.eta_band_seconds(50, 100, 10.0),
-            (100, 66, 150),
+            progress_history.EtaBand(remaining=100, earliest=66, latest=150),
         )
-        self.assertIsNone(progress_history.eta_band_seconds(0, 100, 10.0))
+        self.assertIsInstance(
+            progress_history.eta_band_seconds(0, 100, 10.0),
+            progress_history.EtaProjectionUnavailable,
+        )
 
     def test_plan_runs_finds_matching_history_oldest_first(self) -> None:
         working_dir = self.root / "worktree"
