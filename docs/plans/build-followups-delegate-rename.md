@@ -43,116 +43,46 @@
 
 ### Phase 1 — `/unit:direct` runs the workflow and `/unit:delegate` forwards to it  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** Typing `/unit:direct <args>` runs the workflow, typing `/unit:delegate <args>` reaches the same workflow with the same arguments, a compacted run is sent to the new file, and the transcript reader finds a unit director under either name.
+`/unit:direct` is the unit director's workflow: `commands/unit/direct.md` holds it whole, and its description, title and usage line name the new command. `/unit:delegate` still works: `commands/unit/delegate.md` is a short regular file that tells its caller the command is now `/unit:direct`, and to read `~/.claude/commands/unit/direct.md` in full and run it from the top with the same arguments (`$ARGUMENTS`). A caller that reaches the old file by path, from a compaction hook or an older instruction, is sent to the same file.
 
-**Spec:**
+The SessionStart hook for a compacted run and the Stop hook name `/unit:direct` and send the run back to `~/.claude/commands/unit/direct.md`. The `Delegate session directory:` line and the hooks' file names are unchanged.
 
-1. `git mv commands/unit/delegate.md commands/unit/direct.md`, so history follows the workflow. In `direct.md` change three lines and nothing else:
-   - line 2: `description: Delegate phased work with review, …` → `description: Direct phased work with review, …` (the rest of the line unchanged);
-   - line 5: `# Delegate` → `# Direct`;
-   - line 15: `` `/unit:delegate [plan-doc-path] … `` → `` `/unit:direct [plan-doc-path] … ``.
-
-   Every other use of the word in the file falls under rule clause 4.
-
-2. Create `commands/unit/delegate.md` as a regular file with exactly this content:
-
-   ```markdown
-   ---
-   description: Old name of /unit:direct; forwards to it with the same arguments.
-   ---
-
-   # Renamed to `/unit:direct`
-
-   This command is now `/unit:direct`. Read `~/.claude/commands/unit/direct.md` in
-   full and run it from the top with the arguments this command was given,
-   unchanged: `$ARGUMENTS`
-
-   If you reached this file by path, from a compaction hook or an instruction
-   written before the rename, the workflow you want is that same file. Keep the run
-   you have and read it there.
-   ```
-
-   It forwards by a read of the file's path, not by the Skill tool: the same sentence then serves a typed command, a compacted run that re-reads the old path, and the Codex skill generated from this file.
-
-3. `scripts/hooks/session-start-delegate-resume.py`:
-   - line 2 docstring and line 39 (`CONTEXT`): `/unit:delegate` → `/unit:direct`;
-   - line 4: `` `delegate.md` `` → `` `direct.md` ``;
-   - line 14: `a delegate run` → `a /unit:direct run`;
-   - line 45: `~/.claude/commands/unit/delegate.md` → `~/.claude/commands/unit/direct.md`.
-
-   Line 55 (`Delegate session directory:`) stays.
-
-4. `scripts/hooks/stop-delegate-continue.py`:
-   - lines 2 and 15: `/unit:delegate` → `/unit:direct`;
-   - line 6: `` `delegate.md` `` → `` `direct.md` ``;
-   - line 53 (`REASON`): `Delegate run active,` → `/unit:direct run active,`;
-   - line 56: the path, as in item 3;
-   - line 73: `delegate runs` → `/unit:direct runs`.
-
-5. `scripts/hooks/delegate_run.py` line 2: `/unit:delegate` → `/unit:direct`. No other line.
-
-6. New `scripts/hooks/test_command_stub.py` (`unittest`, stdlib only, no `Any`), with `REPO = Path(__file__).resolve().parents[2]`. It reads files as text and imports no hook. Cases:
-   - the stub `commands/unit/delegate.md` is a regular file and not a symlink;
-   - the stub's text contains `~/.claude/commands/unit/direct.md`, `/unit:direct` and `$ARGUMENTS`, and has at most 20 lines;
-   - `commands/unit/direct.md` is a regular file, not a symlink, and its `**Usage:**` line begins `` **Usage:** `/unit:direct ``;
-   - for each of `session-start-delegate-resume.py` and `stop-delegate-continue.py`: `re.findall(r"~/\.claude/(commands/[\w/]+\.md)", text)` is non-empty, and every path it finds is `commands/unit/direct.md`.
-
-7. `scripts/model_study/turns.py` reads both names, since transcripts from before the rename hold the old one. Add at module level:
-
-   ```python
-   # Newest first; transcripts from before the rename hold the old name.
-   DIRECTOR_COMMANDS = ("/unit:direct", "/unit:delegate")
-   ```
-
-   In `director_boundary`, the first loop's test becomes `any(f"<command-name>{name}</command-name>" in content for name in DIRECTOR_COMMANDS)` and the second loop's `any(name in content for name in DIRECTOR_COMMANDS)`, where `content` is `cast(str, user_content(record))`. The order of the two loops and every other condition stay.
-8. `scripts/model_study/test_turns.py`: beside the `command` and `human` cases (lines 250–275), add the same two cases with `/unit:direct`. The existing cases stay.
-9. `docs/as-built/director-model-study.md` line 27 names both: `<command-name>/unit:direct</command-name>` or the older `<command-name>/unit:delegate</command-name>`, and a `human` or `peer` prompt containing either name.
-
-   Items 7 to 9 moved here from Phase 2 after this phase's review (the unit director, 2026-10-08): the reader must know the new name in the same checkpoint that makes the name live, or a session started with `/unit:direct` is measured whole.
+The model study finds where a unit director's work begins under either name: `DIRECTOR_COMMANDS = ("/unit:direct", "/unit:delegate")` in `scripts/model_study/turns.py`, and `director_boundary` accepts any of them in a `<command-name>` record or in a `human` or `peer` prompt.
 
 **Files:**
-- `commands/unit/direct.md` — the workflow, moved here; three lines changed
+- `commands/unit/direct.md` — the workflow
 - `commands/unit/delegate.md` — the forwarding stub
-- `scripts/hooks/session-start-delegate-resume.py` — the new name and path
-- `scripts/hooks/stop-delegate-continue.py` — the new name and path
-- `scripts/hooks/delegate_run.py` — docstring line 2
-- `scripts/hooks/test_command_stub.py` — new
-- `scripts/model_study/turns.py` — `DIRECTOR_COMMANDS`, `director_boundary`
-- `scripts/model_study/test_turns.py` — two new cases
-- `docs/as-built/director-model-study.md` — line 27
+- `scripts/hooks/session-start-delegate-resume.py`, `scripts/hooks/stop-delegate-continue.py`, `scripts/hooks/delegate_run.py` — name the new command and file
+- `scripts/hooks/test_command_stub.py` — the stub is a regular file and forwards; the workflow's usage line; both hooks name only `commands/unit/direct.md`
+- `scripts/model_study/turns.py`, `scripts/model_study/test_turns.py` — both names, with a case for each
+- `docs/as-built/director-model-study.md` — the boundary rule names both
 
-**Seats:** 1 writer + 1 tester — the Spec fixes the stub's bytes and the hook paths, so the tests are written from it.
-- `impl` — `commands/unit/direct.md`, `commands/unit/delegate.md`, `scripts/hooks/session-start-delegate-resume.py`, `scripts/hooks/stop-delegate-continue.py`, `scripts/hooks/delegate_run.py`
-- `test` — `scripts/hooks/test_command_stub.py`: the four cases of Spec item 6
+**Binds later work:** the sweep of every other file that names the command leaves these files as they are, and keeps the old name only in `CLAUDE.md` and where transcripts from before the rename are read. Launch prompts may name `/unit:direct` only once this workflow file is on `~/.claude` main, where sessions load commands from.
 
-**Constraints from prior phases:** none.
+**Gotchas:**
+- The stub stays a regular file. A symlink made Claude Code register one name for the two paths, and `/unit:delegate` answered "Unknown skill".
+- The commit records no rename, because the old path is still a file; `git blame -C` reaches the workflow's earlier history.
+- `basedpyright` exits 3 in this repository with a clean report; read its `0 errors, 0 warnings` line, never its status, and never inside a `pipefail` pipeline.
 
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/hooks -p 'test_*.py'` green, the new file included.
-- `python3 -m unittest discover -s scripts/model_study -p 'test_*.py'` green, and `basedpyright scripts/model_study/turns.py scripts/model_study/test_turns.py` reports `0 errors, 0 warnings`.
-- `basedpyright scripts/hooks/session-start-delegate-resume.py scripts/hooks/stop-delegate-continue.py scripts/hooks/delegate_run.py scripts/hooks/test_command_stub.py` reports `0 errors, 0 warnings`.
-- `git show <phase base>:commands/unit/delegate.md | diff - commands/unit/direct.md` shows lines 2, 5 and 15 changed and no other.
-- Forwarding, run by the unit director before the checkpoint, in a scratch project so no live command is involved: with `P` an empty scratch directory,
-  `mkdir -p $P/.claude/commands/probe`;
-  `sed -e 's#/unit:direct#/probe:direct#g' -e "s#~/.claude/commands/unit/direct.md#$P/.claude/commands/probe/direct.md#g" commands/unit/delegate.md > $P/.claude/commands/probe/delegate.md`;
-  `printf 'Reply with one line and nothing else: DIRECT GOT [<the arguments you were given, unchanged>]\n' > $P/.claude/commands/probe/direct.md`;
-  then, from `$P`, `claude -p '/probe:delegate docs/plans/x.md phase 2 verbose' < /dev/null` prints `DIRECT GOT [docs/plans/x.md phase 2 verbose]`.
+**Ruled out:**
+- Forwarding through the Skill tool: a compacted run and a Codex seat reach the stub by path, and a read of the file serves every caller.
+- A symlink in place of the stub.
 
 ### Phase 2 — Every file that names the command says `/unit:direct`  · status: todo
 
 #### Work Order
 
-**Goal:** Launch prompts, commands, docs and config all name `/unit:direct`; the old name is left only where old transcripts are read.
+**Goal:** Launch prompts, commands, docs and config all name `/unit:direct`; the old name stays only in `CLAUDE.md`, which this plan does not touch, and where old transcripts are read.
 
 **Spec:**
 
 Apply the rename rule (Delegation Context → Invariants) to every tracked file under **Files**. These three searches list the lines; each line gets the clause that fits it, and no line is rewrapped:
 
-- clause 1: `git grep -nI 'unit:delegate' -- . ':!docs/plans'` — 141 lines in 56 files on the base;
-- clause 2: `git grep -nI 'delegate\.md' -- . ':!docs/plans'` — 24 lines in 14 files;
-- clause 3: `git grep -nIiE 'delegate (run|phase)s?\b|^# Delegate( |$)' -- commands docs config ':!docs/plans'`, about 38 lines. One more wraps across a line end: `commands/unit/checkpoint.md` line 11 ends `If no delegate` and line 12 begins `run is active`.
+- clause 1: `git grep -nI 'unit:delegate' -- . ':!docs/plans'` — about 143 lines in 57 files once `build-followups` with Phase 1 is merged in;
+- clause 2: `git grep -nI 'delegate\.md' -- . ':!docs/plans'` — about 22 lines in 13 files;
+- clause 3: `git grep -nIiE 'delegate (run|phase)s?\b|^# Delegate( |$)' -- commands docs config ':!docs/plans'`, about 36 lines. One more wraps across a line end: `commands/unit/checkpoint.md` line 11 ends `If no delegate` and line 12 begins `run is active`.
 
 Clause 3 also covers two places where the bare word stands for the command: `commands/implement_issue.md` line 12 (`it runs no delegate` → ``it runs no `/unit:direct` ``) and `commands/unit/eta_breakdown.md` line 9 (`the delegate's own stages` → `` `/unit:direct`'s own stages``).
 
@@ -168,7 +98,7 @@ Lines these searches print that stay as they are:
 
 Code, beyond the word swap:
 
-1. `scripts/production/add_unit.py` lines 584, 586, 591 and `scripts/production/test_add_unit.py` lines 357, 538, 643: `/unit:delegate` → `/unit:direct`.
+1. `scripts/production/`: `/unit:delegate` → `/unit:direct` on every line clause 1's search prints there: the three launch-prompt strings in `add_unit.py`'s `prompt_for` with the three assertions on them in `test_add_unit.py`, and the lines in `stall_watch.py`, `unit_lookup.py`, `test_stall_watch.py` and `test_unit_lookup.py` that arrive with the merge of `build-followups`. `test_merge_checkpoint.py` stays.
 2. `scripts/lint/lint_config.sh` line 28 and `commands/lint_config.md` line 53 carry the same row; both become `/unit:direct phase-end gate`.
 3. `scripts/delegate/findings.py` line 4: the docstring's `/unit:delegate` → `/unit:direct`.
 
@@ -176,23 +106,22 @@ Code, beyond the word swap:
 - `commands/` — every line the three searches print, but for `commands/unit/direct.md` and `commands/unit/delegate.md`
 - `docs/` — every line the three searches print, but for `docs/plans/` and `docs/delegate_footprint_review.md`
 - `config/` — `README.md`, `delegate.conf`, `lint.conf`, `clippy.conf`
-- `scripts/production/add_unit.py` — three launch-prompt lines
-- `scripts/production/test_add_unit.py` — three assertions
+- `scripts/production/` — every line clause 1's search prints, but for `test_merge_checkpoint.py`
 - `scripts/lint/lint_config.sh` — line 28
 - `scripts/delegate/findings.py` — line 4
 
-**Seats:** 2 writers — the split is by tree; the test changes are three renamed assertions and two copied cases, too thin for a tester's lane.
-- `impl` — `commands/`
-- `test` — opens as impl: `docs/`, `config/`, `scripts/production/add_unit.py`, `scripts/production/test_add_unit.py`, `scripts/lint/lint_config.sh`, `scripts/delegate/findings.py`
+**Seats:** 2 writers — the split is by tree; the test changes are renamed strings in existing assertions, too thin for a tester's lane.
+- `impl` — `commands/`, `scripts/lint/lint_config.sh` (the row it shares with `commands/lint_config.md`)
+- `test` — opens as impl: `docs/`, `config/`, `scripts/production/`, `scripts/delegate/findings.py`
 
 **Constraints from prior phases:**
 - `commands/unit/direct.md` is the workflow and `commands/unit/delegate.md` is the stub. Neither changes in this phase, nor do the three hook files or `scripts/hooks/test_command_stub.py`.
 - `scripts/model_study/turns.py` reads both names through `DIRECTOR_COMMANDS`; it, `scripts/model_study/test_turns.py` and `docs/as-built/director-model-study.md` line 27 are the places the old name stays.
-- The unit director, before dispatch: the showrunner has said Phase 1 is on `~/.claude` main, and from an empty scratch directory `claude -p 'Run nothing. From the skills you can invoke, print every name that starts with "unit:", one per line, and nothing else.' --model haiku < /dev/null` prints both `unit:direct` and `unit:delegate`. If `unit:direct` is missing, stop and tell the showrunner: this phase points every launch prompt at that name.
+- The unit director, before dispatch, in this order: the showrunner has said Phase 1 is on `~/.claude` main; `build-followups` with Phase 1 in it is merged into this branch and the three searches are run again on the merged tree; and from an empty scratch directory `claude -p 'Run nothing. From the skills you can invoke, print every name that starts with "unit:", one per line, and nothing else.' --model haiku < /dev/null` prints both `unit:direct` and `unit:delegate`. If `unit:direct` is missing, stop and tell the showrunner: this phase points every launch prompt at that name.
 
 **Acceptance gate:**
-- `python3 -m unittest discover -s scripts/production -p 'test_add_unit.py'`, `python3 -m unittest discover -s scripts/model_study -p 'test_*.py'`, `python3 -m unittest discover -s scripts/lint -p 'test_*.py'` and `python3 -m unittest discover -s scripts/hooks -p 'test_*.py'` green.
-- `basedpyright scripts/production/add_unit.py scripts/production/test_add_unit.py scripts/delegate/findings.py` reports `0 errors, 0 warnings`.
+- `python3 -m unittest discover -s scripts/production -p 'test_add_unit.py'`, the same for `'test_stall_watch.py'` and `'test_unit_lookup.py'`, `python3 -m unittest discover -s scripts/model_study -p 'test_*.py'`, `python3 -m unittest discover -s scripts/lint -p 'test_*.py'` and `python3 -m unittest discover -s scripts/hooks -p 'test_*.py'` green.
+- `basedpyright` on every `.py` file the phase changed reports `0 errors, 0 warnings`.
 - `git grep -lI 'unit:delegate' -- . ':!docs/plans'` prints exactly `CLAUDE.md`, `docs/as-built/director-model-study.md`, `scripts/model_study/test_rerun.py`, `scripts/model_study/test_turns.py` and `scripts/model_study/turns.py`.
 - `git grep -nI 'unit/delegate\.md' -- . ':!docs/plans'` prints only lines of `scripts/production/test_merge_checkpoint.py` and `scripts/hooks/test_command_stub.py`.
 - `git grep -nIiE 'delegate (run|phase)s?\b|^# Delegate( |$)' -- commands docs config ':!docs/plans'` prints only `config/agents.conf` line 58, and `git grep -nIiE '\bdelegate$' -- commands docs config ':!docs/plans'` no longer prints `commands/unit/checkpoint.md`.
