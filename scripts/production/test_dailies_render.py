@@ -694,6 +694,32 @@ class EtaResolutionTests(unittest.TestCase):
         self.assertIn("widget-enhancements Phase 2 of 3 19:35 PDT, 60% done", logged)
         self.assertNotIn("tomorrow", logged)
 
+    def test_an_eta_stated_again_a_day_later_with_the_same_clock_is_read_on_its_new_day(self) -> None:
+        fields = report(held=False)
+        current = {**unit(False), "eta": {"time": "16:00", "percent": 60, "stated": "2026-10-05T09:30",
+                                          "why": "the fix needed a second day"}}
+        fields["units"] = [current]
+        previous = {
+            "phase": current["phase"],
+            "eta": "2026-10-04T16:00:00",
+            "eta_text": "16:00",
+            "held": None,
+            "first": "2026-10-04T16:00:00",
+        }
+        result, saved, _ = self.run_with_state(fields, previous, "2026-10-05T10:00")
+        self.assertEqual(result.code, 0, result.error)
+        self.assertEqual(cast(dict[str, object], saved["widget-enhancements"])["eta"], "2026-10-05T16:00:00")
+        self.assertIn("- eta: 16:00 PDT, 60% done (changed: +24:00 because the fix needed a second day)",
+                      result.lines)
+
+    def test_a_passed_etas_range_stays_on_the_etas_day(self) -> None:
+        fields = report(held=False)
+        fields["units"] = [{**unit(False), "eta": {"time": "10:00", "earliest": "09:40", "latest": "10:30",
+                                                   "percent": 60, "stated": "2026-10-04T09:00"}}]
+        result = render(fields, "2026-10-04T14:00")
+        self.assertEqual(result.code, 0, result.error)
+        self.assertIn("- eta: 10:00 PDT, 60% done (overdue; range 09:40–10:30)", result.lines)
+
     def test_state_without_eta_text_resolves_as_a_first_report(self) -> None:
         fields = report(held=False)
         current = {**unit(False), "eta": {"time": "19:35", "percent": 60}}
