@@ -16,7 +16,8 @@ from zoneinfo import ZoneInfo
 import unit_lookup
 from add_unit import Refusal, cell_value, live_unit_table, read_production, unit_table
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
-from dailies_render import InputError, StateRefused, as_list, as_map, check_render_state, local_now, parse_report, parse_time
+from dailies_render import (InputError, StateRefused, as_list, as_map, check_render_state,
+                            local_now, parse_range_end, parse_report, parse_time)
 from merge_checkpoint import NoMerge, git, merge_branch_history
 from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
 
@@ -93,6 +94,123 @@ class EtaNone(NamedTuple):
 
 
 EtaState = EtaFresh | EtaStale | EtaPassed | EtaNone
+
+
+class ReportedPhasePercent(NamedTuple):
+    percent: int
+
+
+class PhasePercentNotReported(NamedTuple):
+    pass
+
+
+class StatedPhaseEtaRange(NamedTuple):
+    earliest: datetime
+    latest: datetime
+
+
+class StatedEtaWithoutRange(NamedTuple):
+    pass
+
+
+class RendererSafeRecordEtaRange(NamedTuple):
+    earliest: str
+    latest: str
+
+
+class RecordEtaRangeOmitted(NamedTuple):
+    pass
+
+
+class CurrentStatedPhaseEta(NamedTuple):
+    time: datetime
+    range: StatedPhaseEtaRange | StatedEtaWithoutRange
+    stated_at: datetime
+    basis: str
+
+
+class CurrentProjectedPhaseEta(NamedTuple):
+    time: datetime
+    earliest: datetime
+    latest: datetime
+    as_of: datetime
+
+
+class CurrentPhaseEtaUnavailable(NamedTuple):
+    pass
+
+
+class FirstStatedEtaTarget(NamedTuple):
+    time: datetime
+
+
+class EtaNeverStated(NamedTuple):
+    pass
+
+
+class NumberedOpenPlanPhase(NamedTuple):
+    number: int
+    started: datetime
+    percent: ReportedPhasePercent | PhasePercentNotReported
+    eta: CurrentStatedPhaseEta | CurrentProjectedPhaseEta | CurrentPhaseEtaUnavailable
+    first_stated: FirstStatedEtaTarget | EtaNeverStated
+
+
+class NoOpenPhase(NamedTuple):
+    pass
+
+
+class OpenPhaseOutsidePlan(NamedTuple):
+    pass
+
+
+class NonNumericPhaseId(NamedTuple):
+    pass
+
+
+class UnitPhaseRecordUnavailable(NamedTuple):
+    reason: str
+
+
+NoNumberedOpenPlanPhaseReason = (
+    NoOpenPhase | OpenPhaseOutsidePlan | NonNumericPhaseId | UnitPhaseRecordUnavailable
+)
+
+
+class NoNumberedOpenPlanPhase(NamedTuple):
+    reason: NoNumberedOpenPlanPhaseReason
+
+
+UnitPhaseState = NumberedOpenPlanPhase | NoNumberedOpenPlanPhase
+
+
+class PhaseTablesUnavailable(NamedTuple):
+    reason: str
+
+
+class PhaseTablesAvailable(NamedTuple):
+    units: dict[str, UnitPhaseState]
+
+
+PhaseTablesState = PhaseTablesUnavailable | PhaseTablesAvailable
+
+
+class PhaseTablesPruned(NamedTuple):
+    pass
+
+
+PrunePhaseTablesState = PhaseTablesPruned | PhaseTablesUnavailable
+
+
+class JudgmentNumberedPlanPhase(NamedTuple):
+    number: int
+
+
+class JudgmentOutsideNumberedPlan(NamedTuple):
+    pass
+
+
+JudgmentPlanPhase = JudgmentNumberedPlanPhase | JudgmentOutsideNumberedPlan
 
 
 class UnitRow(NamedTuple):
@@ -279,6 +397,269 @@ def eta_value(state: EtaState, supplied: object, requested: bool = False) -> Jso
     return result
 
 
+def record_time(value: object, where: str, zone: ZoneInfo) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"{where}: expected an ISO-8601 time")
+    moment = datetime.fromisoformat(value)
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ValueError(f"{where}: expected an offset-aware ISO-8601 time")
+    return moment.astimezone(zone)
+
+
+def record_percent(value: object, where: str) -> ReportedPhasePercent | PhasePercentNotReported:
+    if value is None:
+        return PhasePercentNotReported()
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 100:
+        raise ValueError(f"{where}: expected a whole number from 0 to 100 or null")
+    return ReportedPhasePercent(value)
+
+
+def record_eta(value: object, where: str, zone: ZoneInfo) -> (
+    CurrentStatedPhaseEta | CurrentProjectedPhaseEta | CurrentPhaseEtaUnavailable
+):
+    if value is None:
+        return CurrentPhaseEtaUnavailable()
+    fields = as_map(value, where)
+    source = fields.get("source")
+    time = record_time(fields.get("time"), f"{where}.time", zone)
+    if source == "stated":
+        stated_at = record_time(fields.get("stated_at"), f"{where}.stated_at", zone)
+        basis = fields.get("basis")
+        if not isinstance(basis, str) or not basis.strip():
+            raise ValueError(f"{where}.basis: expected non-empty text")
+        earliest_value, latest_value = fields.get("earliest"), fields.get("latest")
+        if earliest_value is None and latest_value is None:
+            eta_range: StatedPhaseEtaRange | StatedEtaWithoutRange = StatedEtaWithoutRange()
+        elif earliest_value is not None and latest_value is not None:
+            eta_range = StatedPhaseEtaRange(
+                record_time(earliest_value, f"{where}.earliest", zone),
+                record_time(latest_value, f"{where}.latest", zone),
+            )
+        else:
+            raise ValueError(f"{where}: earliest and latest must both be set or both be null")
+        return CurrentStatedPhaseEta(time, eta_range, stated_at, basis)
+    if source == "projected":
+        return CurrentProjectedPhaseEta(
+            time,
+            record_time(fields.get("earliest"), f"{where}.earliest", zone),
+            record_time(fields.get("latest"), f"{where}.latest", zone),
+            record_time(fields.get("as_of"), f"{where}.as_of", zone),
+        )
+    raise ValueError(f"{where}.source: expected stated or projected")
+
+
+def unit_phase_state(value: object, where: str, zone: ZoneInfo) -> UnitPhaseState:
+    fields = as_map(value, where)
+    unavailable = fields.get("unavailable")
+    if isinstance(unavailable, str):
+        return NoNumberedOpenPlanPhase(UnitPhaseRecordUnavailable(unavailable))
+    current_value = fields.get("current")
+    if current_value is None:
+        return NoNumberedOpenPlanPhase(NoOpenPhase())
+    current = as_map(current_value, f"{where}.current")
+    phase = current.get("phase")
+    if not isinstance(phase, str) or not phase.isdigit():
+        return NoNumberedOpenPlanPhase(NonNumericPhaseId())
+    phases = as_list(fields.get("phases"), f"{where}.phases")
+    in_plan = False
+    for index, phase_value in enumerate(phases):
+        phase_fields = as_map(phase_value, f"{where}.phases[{index}]")
+        if phase_fields.get("phase") == phase and phase_fields.get("status") == "running":
+            in_plan = True
+            break
+    if not in_plan:
+        return NoNumberedOpenPlanPhase(OpenPhaseOutsidePlan())
+    first_value = current.get("first_stated_eta_target")
+    first_stated: FirstStatedEtaTarget | EtaNeverStated = (
+        EtaNeverStated() if first_value is None
+        else FirstStatedEtaTarget(record_time(first_value, f"{where}.current.first_stated_eta_target", zone))
+    )
+    return NumberedOpenPlanPhase(
+        int(phase),
+        record_time(current.get("started"), f"{where}.current.started", zone),
+        record_percent(current.get("percent"), f"{where}.current.percent"),
+        record_eta(current.get("eta"), f"{where}.current.eta", zone),
+        first_stated,
+    )
+
+
+def phase_table_path() -> Path:
+    configured = os.environ.get("DAILIES_PHASE_TABLE")
+    return Path(configured) if configured else Path(__file__).resolve().parent.parent / "delegate/phase_table.py"
+
+
+def phase_tables(production_doc: Path, zone: ZoneInfo) -> PhaseTablesState:
+    result = command(phase_table_path(), "show", "--production-doc", str(production_doc), "--json")
+    if result.returncode:
+        return PhaseTablesUnavailable(result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}")
+    try:
+        raw = cast(object, json.loads(result.stdout))
+        fields = as_map(raw, "phase tables")
+        return PhaseTablesAvailable({
+            unit: unit_phase_state(value, f"phase tables.{unit}", zone)
+            for unit, value in fields.items()
+        })
+    except (InputError, ValueError, json.JSONDecodeError) as error:
+        return PhaseTablesUnavailable(str(error))
+
+
+def prune_phase_tables(production_doc: Path) -> PrunePhaseTablesState:
+    result = command(phase_table_path(), "prune", "--production-doc", str(production_doc))
+    if result.returncode:
+        return PhaseTablesUnavailable(result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}")
+    return PhaseTablesPruned()
+
+
+def judgment_phase_number(text: str) -> JudgmentPlanPhase:
+    matched = re.match(r"^Phase (\d+) of \d+: ", text)
+    if matched is None:
+        return JudgmentOutsideNumberedPlan()
+    return JudgmentNumberedPlanPhase(int(matched.group(1)))
+
+
+def record_text(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%dT%H:%M")
+
+
+def record_clock(moment: datetime, now: datetime) -> str:
+    days = (moment.date() - now.date()).days
+    return moment.strftime("%H:%M") + (f"+{days}" if days > 0 else "")
+
+
+def record_eta_stated(target: datetime, source: datetime, rendered_time: str) -> datetime:
+    """The anchor that makes the renderer resolve `rendered_time` to `target`."""
+    target_minute = target.replace(second=0, microsecond=0, tzinfo=None)
+    source_minute = source.replace(second=0, microsecond=0, tzinfo=None)
+    if "+" not in rendered_time and parse_time(rendered_time, source_minute) != target_minute:
+        return target_minute
+    return source_minute
+
+
+def record_eta_range(
+    target: datetime,
+    earliest: datetime,
+    latest: datetime,
+    source: datetime,
+    rendered_time: str,
+    now: datetime,
+) -> RendererSafeRecordEtaRange | RecordEtaRangeOmitted:
+    """A range whose written clocks resolve to the record's own minutes."""
+    stated = record_eta_stated(target, source, rendered_time)
+    eta_moment = parse_time(rendered_time, stated if "+" not in rendered_time else now)
+    earliest_text = record_clock(earliest, now)
+    latest_text = record_clock(latest, now)
+    earliest_minute = earliest.replace(second=0, microsecond=0, tzinfo=None)
+    latest_minute = latest.replace(second=0, microsecond=0, tzinfo=None)
+    if (
+        parse_range_end(earliest_text, now, eta_moment, earliest=True) != earliest_minute
+        or parse_range_end(latest_text, now, eta_moment, earliest=False) != latest_minute
+    ):
+        return RecordEtaRangeOmitted()
+    return RendererSafeRecordEtaRange(earliest_text, latest_text)
+
+
+def record_eta_state(
+    phase: NumberedOpenPlanPhase,
+    key: str,
+    seen: JsonMap,
+    now: datetime,
+    *,
+    held: bool,
+) -> EtaState:
+    requested = isinstance(eta_requested(seen, key), EtaRequested)
+    prior_value = seen.get(key)
+    prior = cast(JsonMap, prior_value) if isinstance(prior_value, dict) else {}
+    if isinstance(phase.eta, CurrentPhaseEtaUnavailable):
+        if isinstance(phase.first_stated, EtaNeverStated):
+            return EtaNone()
+        target = phase.first_stated.time
+        source = now
+    elif isinstance(phase.eta, CurrentStatedPhaseEta):
+        target = phase.eta.time
+        source = phase.eta.stated_at
+    else:
+        target = phase.eta.time
+        source = phase.eta.as_of
+    aware_now = now.replace(tzinfo=target.tzinfo) if now.tzinfo is None else now.astimezone(target.tzinfo)
+    text = record_text(target)
+    old_text = prior.get("text")
+    legacy = isinstance(old_text, str) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d", old_text) is None
+    unchanged = old_text == text or legacy
+    first_seen_value = prior.get("first_seen")
+    prior_first_seen = (
+        datetime.fromisoformat(first_seen_value) if isinstance(first_seen_value, str) else source
+    )
+    adopted_screen_record = legacy or (old_text == text and prior_first_seen.tzinfo is None)
+    first_seen = (
+        prior_first_seen if adopted_screen_record else source
+    )
+    seen[key] = {
+        "text": text,
+        "first_seen": first_seen.isoformat(timespec="minutes"),
+        "requested": requested,
+    }
+    if isinstance(phase.eta, CurrentPhaseEtaUnavailable):
+        return EtaPassed()
+    if held and unchanged and not requested:
+        return EtaFresh(text, source)
+    if target <= aware_now:
+        return EtaPassed()
+    if aware_now - source > timedelta(hours=1):
+        return EtaStale(text, source)
+    return EtaFresh(text, source)
+
+
+def record_eta_value(
+    phase: NumberedOpenPlanPhase,
+    state: EtaState,
+    supplied: object,
+    now: datetime,
+    requested: bool = False,
+) -> JsonMap:
+    fields = as_map(supplied, "judgment.eta") if supplied is not None else {}
+    if isinstance(state, EtaPassed):
+        return {"none": "none measured - requested"}
+    if isinstance(state, EtaNone):
+        if requested:
+            return {"none": "none measured - requested"}
+        none = fields.get("none")
+        return {"none": none if isinstance(none, str) else "no ETA stated yet"}
+    eta = phase.eta
+    if isinstance(eta, CurrentPhaseEtaUnavailable):
+        return {"none": "no ETA stated yet"}
+    rendered_time = record_clock(eta.time, now)
+    result: JsonMap = {
+        "time": rendered_time,
+        "stated": record_eta_stated(eta.time, state.first_seen, rendered_time).isoformat(timespec="minutes"),
+    }
+    eta_range: RendererSafeRecordEtaRange | RecordEtaRangeOmitted
+    if isinstance(eta, CurrentStatedPhaseEta) and isinstance(eta.range, StatedPhaseEtaRange):
+        eta_range = record_eta_range(
+            eta.time, eta.range.earliest, eta.range.latest, state.first_seen, rendered_time, now)
+    elif isinstance(eta, CurrentProjectedPhaseEta):
+        eta_range = record_eta_range(
+            eta.time, eta.earliest, eta.latest, state.first_seen, rendered_time, now)
+    else:
+        eta_range = RecordEtaRangeOmitted()
+    if isinstance(eta_range, RendererSafeRecordEtaRange):
+        result.update({
+            "earliest": eta_range.earliest,
+            "latest": eta_range.latest,
+        })
+    result["percent"] = phase.percent.percent if isinstance(phase.percent, ReportedPhasePercent) else None
+    if isinstance(phase.first_stated, FirstStatedEtaTarget):
+        result["first"] = record_text(phase.first_stated.time)
+    if isinstance(eta, CurrentStatedPhaseEta):
+        result["why"] = " ".join(eta.basis.split())
+    else:
+        percent = phase.percent.percent if isinstance(phase.percent, ReportedPhasePercent) else 0
+        result["why"] = f"it is now projected from {percent}% done"
+    result.update(fields)
+    if isinstance(state, EtaStale) and "detail" not in fields:
+        result["detail"] = f"set {state.first_seen:%H:%M}"
+    return result
+
+
 def command(path: Path, *args: str) -> subprocess.CompletedProcess[str]:
     argv = [str(path), *args] if os.access(path, os.X_OK) else [sys.executable, str(path), *args]
     return subprocess.run(argv, capture_output=True, text=True, check=False)
@@ -321,9 +702,15 @@ def run(args: argparse.Namespace) -> int:
     at = cast(str | None, args.at)
     render_state = cast(Path, args.render_state)
     production = read_production(production_path)
+    prune_failure = prune_phase_tables(production.doc)
+    if isinstance(prune_failure, PhaseTablesUnavailable):
+        report("phase tables", "unavailable", prune_failure.reason)
     now, _ = local_now(str(production.zone), "--zone", at)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     units = units_from_doc(lines, production.slug)
+    table_state = phase_tables(production.doc, production.zone)
+    if isinstance(table_state, PhaseTablesUnavailable):
+        report("phase tables", "unavailable", table_state.reason)
     instance = f"showrunner-{production.slug}"
     blocks = status_blocks(status_path, units)
     report("status", "ok", f"{len(blocks)} units read")
@@ -387,17 +774,51 @@ def run(args: argparse.Namespace) -> int:
         phase_text = phase if isinstance(phase, str) else ""
         key = f"{unit.name}|{phase_text}"
         held = fields.get("held")
-        state = eta_state(block, phase_text, seen, now, ZoneInfo(str(production.zone)),
-                          held=isinstance(held, str) and bool(held.strip()))
-        if not isinstance(state, EtaNone):
-            eta_touched[key] = None
-        requested = isinstance(eta_requested(seen, key), EtaRequested)
-        result["eta"] = eta_value(state, fields.get("eta"), requested)
-        if isinstance(state, (EtaStale, EtaPassed)):
-            record = seen.get(key)
-            if isinstance(record, dict) and isinstance(eta_requested(seen, key), EtaNotYetRequested):
-                eta_request_candidates[key] = unit.name
-                cast(JsonMap, record)["requested"] = True
+        phase_state: UnitPhaseState = (
+            table_state.units.get(
+                unit.name,
+                NoNumberedOpenPlanPhase(UnitPhaseRecordUnavailable("unit missing from phase-table output")),
+            )
+            if isinstance(table_state, PhaseTablesAvailable)
+            else NoNumberedOpenPlanPhase(UnitPhaseRecordUnavailable(table_state.reason))
+        )
+        judgment_phase = judgment_phase_number(phase_text)
+        record_matches = (
+            isinstance(phase_state, NumberedOpenPlanPhase)
+            and isinstance(judgment_phase, JudgmentNumberedPlanPhase)
+            and judgment_phase.number == phase_state.number
+        )
+        supplied_eta = fields.get("eta")
+        supplied_eta_fields = as_map(supplied_eta, "judgment.eta") if supplied_eta is not None else {}
+        eta_is_decided = "time" in supplied_eta_fields or "none" in supplied_eta_fields
+        held_now = isinstance(held, str) and bool(held.strip())
+        if record_matches and isinstance(phase_state, NumberedOpenPlanPhase):
+            if "started" not in result:
+                result["started"] = record_text(phase_state.started)
+            if eta_is_decided:
+                result["eta"] = dict(supplied_eta_fields)
+            else:
+                state = record_eta_state(phase_state, key, seen, now, held=held_now)
+                if not isinstance(state, EtaNone):
+                    eta_touched[key] = None
+                requested = isinstance(eta_requested(seen, key), EtaRequested)
+                result["eta"] = record_eta_value(phase_state, state, supplied_eta, now, requested)
+                if isinstance(state, (EtaStale, EtaPassed)):
+                    record = seen.get(key)
+                    if isinstance(record, dict) and isinstance(eta_requested(seen, key), EtaNotYetRequested):
+                        eta_request_candidates[key] = unit.name
+                        cast(JsonMap, record)["requested"] = True
+        else:
+            state = eta_state(block, phase_text, seen, now, ZoneInfo(str(production.zone)), held=held_now)
+            if not isinstance(state, EtaNone):
+                eta_touched[key] = None
+            requested = isinstance(eta_requested(seen, key), EtaRequested)
+            result["eta"] = eta_value(state, supplied_eta, requested)
+            if isinstance(state, (EtaStale, EtaPassed)):
+                record = seen.get(key)
+                if isinstance(record, dict) and isinstance(eta_requested(seen, key), EtaNotYetRequested):
+                    eta_request_candidates[key] = unit.name
+                    cast(JsonMap, record)["requested"] = True
         for key in ("project", "phase", "started", "held", "update"):
             if key not in result or (key != "held" and result[key] is None):
                 missing.append(f"units[{index}].{key}: required")

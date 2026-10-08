@@ -130,7 +130,7 @@
 
 **Ruled out:** restructuring the dailies renderer's `Eta` type alongside this work (its owner is changing it); parsing old screen-capture text in `eta_seen.json` (an older record is adopted on the first record-backed build); keeping the first stated target in two JSON places; a `failed` line for an unavailable phase-table call (the dailies command stops on any `failed` line).
 
-### Phase 4 — The dailies take each unit's start and ETA from its run's records  · status: todo
+### Phase 4 — The dailies take each unit's start and ETA from its run's records  · status: done
 
 #### Work Order
 
