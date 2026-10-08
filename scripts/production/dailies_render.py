@@ -63,7 +63,12 @@ from run_out import READINGS_LOG, Reading
 from build_hold import ActiveHolders, HoldState, KnownReleaseEta, NoHolders, Holder, ReleaseRecordReadError, cycle_status_lines, holder_directory, read_cycle, read_holders, release_record_error_line
 from mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
 
-LENGTHS = {"simple": 240, "page": 480, "elaborate": None}
+# The longest update line of each length. `gantt` is the default: the chart, with only what needs the user and
+# what changed above it. It takes the input `simple` takes.
+LENGTHS = {"gantt": 240, "simple": 240, "page": 480, "elaborate": None}
+SHORT_LENGTHS = ("gantt", "simple")
+# A gantt report names an ETA that moved by at least this many minutes since the last report.
+MAJOR_ETA_MINUTES = 15
 PHASE = re.compile(r"^(?:Phase (\d+) of (\d+)|follow-up (\d+) of (\d+)): \S")
 TIME = re.compile(r"^\d{1,2}:\d{2}(?:\+\d+)?$")
 NONE = ("none measured - requested", "none measured", "no ETA stated yet")
@@ -1310,6 +1315,24 @@ def eta_text(unit: Unit, previous: Previous, resolved: ResolvedEta,
     return f"{words}; {eta.detail}" if with_note and eta.detail else words
 
 
+def major_changes(unit: Unit, last: Previous, resolved: ResolvedEta, now: datetime, zone_name: str) -> list[str]:
+    """What a gantt report says about a unit above the chart: one line for each thing that changed since its
+    last report. A unit with no last report, or with nothing changed, has none."""
+    if not isinstance(last, LastUnitReport):
+        return []
+    changes: list[str] = []
+    if not same_phase(last.phase, unit.phase):
+        changes.append(f"- {unit.name}: now on {unit.phase}")
+    if unit.held != last.held:
+        changes.append(f"- {unit.name}: checkpoint "
+                       + (f"not merged, because {unit.held}" if unit.held else "no longer held"))
+    if isinstance(resolved, ResolvedEtaMoment):
+        minutes = change_minutes(resolved.moment, last, unit.phase)
+        if minutes is not None and abs(minutes) >= MAJOR_ETA_MINUTES:
+            changes.append(f"- {unit.name}: eta {eta_text(unit, last, resolved, now, zone_name, with_note=True)}")
+    return changes
+
+
 def ordered_units(report: Report, resolved: dict[str, ResolvedEta]) -> list[Unit]:
     def key(pair: tuple[int, Unit]) -> tuple[int, float, int]:
         index, unit = pair
@@ -1355,6 +1378,7 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
     other_topics = [topic for topic in report.topics if not topic.needs_user]
     units = ordered_units(report, resolved)
     grouped_waits = {unit.unit: grouped_wait(report.length, unit) for unit in report.units}
+    gantt = report.length == "gantt"
 
     def topic_section(topic: Topic) -> None:
         lines.extend([f"### {topic.title}", f"- update: {topic.update}", f"- eta: {topic.eta}"])
@@ -1365,7 +1389,7 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
     for topic in user_topics:
         topic_section(topic)
     for unit in units:
-        if isinstance(grouped_waits[unit.unit], IdleWait):
+        if isinstance(grouped_waits[unit.unit], IdleWait) or (gantt and not unit.needs_user):
             continue
         lines.append(f"### {unit.name}: {unit.project}")
         if unit.goal:
@@ -1373,7 +1397,7 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
         lines.append(f"- phase: {unit.phase}")
         if unit.held:
             last = previous_report(previous, unit.unit)
-            repeat = (report.length == "simple" and isinstance(last, LastUnitReport)
+            repeat = (report.length in SHORT_LENGTHS and isinstance(last, LastUnitReport)
                       and same_phase(last.phase, unit.phase) and last.held == unit.held)
             examples = f", {unit.held_examples}" if unit.held_examples and not repeat else ""
             lines.append(f"- checkpoint: not merged, because {unit.held}{examples}")
@@ -1389,7 +1413,7 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
             lines.append(f"- needed: {unit.needed}")
         if isinstance(unit.upcoming_work, UpcomingWork):
             items = unit.upcoming_work.items
-            if report.length == "simple" or len(items) == 1:
+            if report.length in SHORT_LENGTHS or len(items) == 1:
                 lines.append(f"- then: {items[0]}")
             else:
                 lines.append("- then:")
@@ -1406,8 +1430,17 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
         for _, unit, wait in idle_units:
             lines.append(f"- {unit.name} until {idle_clock(wait.until, now)}: {wait.waits_for}")
         lines.append("")
-    for topic in other_topics:
-        topic_section(topic)
+    if gantt:
+        changes = [line for unit in units if not unit.needs_user
+                   for line in major_changes(unit, previous_report(previous, unit.unit), resolved[unit.unit],
+                                             now, zone_name)]
+        reported = {unit.unit for unit in report.units}
+        changes.extend(f"- {unit}: no longer in the report" for unit in previous if unit not in reported)
+        if changes:
+            lines.extend([*changes, ""])
+    else:
+        for topic in other_topics:
+            topic_section(topic)
 
     rows: list[Row] = []
     for unit in units:

@@ -265,7 +265,7 @@ The prompt:
 > <zone>). `<SCRATCH>` below stands for your own scratchpad directory: put its
 > path in place of it before you run a command. Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> --production <production doc> > <SCRATCH>/unit_status.txt`.
 > It checks every unit director: its session and Claude are running, anything waiting
-> on the user, and its latest step and ETA. Run `/showrunner:dailies simple`
+> on the user, and its latest step and ETA. Run `/showrunner:dailies gantt`
 > for every unit and open topic; its input builder reads the saved status file.
 > Pass `--render-state <SCRATCH>/dailies_state.json` to the builder; the renderer
 > uses that same file as `--state`.
@@ -297,9 +297,10 @@ compacting on every tick doubled the compaction rate and saved no tokens,
 because a unit director re-reads its files at
 once and passes 150K again within 12-20 minutes.)
 
-**Every scheduled update is a `/showrunner:dailies simple` report**, never a
-one-unit note: the user sees every unit on every tick, each checked. In a
-`simple` dailies, waiting, idle units take one line each under `### Waiting and idle`.
+**Every scheduled update is a `/showrunner:dailies gantt` report**, never a
+one-unit note: every unit is checked on every tick and has its row in the chart.
+Above the chart a `gantt` dailies prints only what needs the user and one line for
+each thing that changed; the user asks for `simple` to see every unit's section.
 
 A `/showrunner:dailies` the user runs takes the next tick's slot: it runs the
 script, and then runs `NOTIFIER restart UPDATES` so the next tick comes N minutes after
@@ -332,7 +333,7 @@ whatever arrived:
 | a unit blocked on the showrunner | <ClearGate/>, <LandingCall/>, or answer it |
 | a unit director's decision for the user | show it to the user; relay the answer |
 | a quota alert | <QuotaAlert/> |
-| the user asks for a status | `/showrunner:dailies`, `simple` unless they name a length |
+| the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
 
 A unit repairing failing tests that split by file runs parallel repair seats
 (`/unit:delegate` → <FixDispatch/>); one that runs a lone seat on them gets

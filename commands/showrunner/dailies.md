@@ -1,6 +1,6 @@
 ---
-description: Report a running production's state to the executive producer (the user) — every unit and every open topic — at one of three lengths, simple (default), page or elaborate.
-argument-hint: "[simple|page|elaborate] [default|ascii]"
+description: Report a running production's state to the executive producer (the user) — every unit and every open topic — at one of four lengths, gantt (default: the chart, with only what needs the user and what changed), simple, page or elaborate.
+argument-hint: "[gantt|simple|page|elaborate] [default|ascii]"
 ---
 
 # Dailies
@@ -11,8 +11,8 @@ producer: the user. Run it in the showrunner session during `/showrunner:produce
 whose state (`PRODUCTION_DOC`, `LOG`, `ZONE`, `UNITS`, `CHECKOUT`,
 `MERGE_BRANCH`, `NOTIFIER`, `UPDATES`) it uses.
 
-**Usage:** `/showrunner:dailies [simple|page|elaborate] [default|ascii]`. With
-no length, `simple`. With any other argument, name the choices and stop.
+**Usage:** `/showrunner:dailies [gantt|simple|page|elaborate] [default|ascii]`. With
+no length, `gantt`. With any other argument, name the choices and stop.
 
 **Chart mode.** `default` draws the timeline in coloured squares; `ascii`
 draws it with characters a code font has, for when you are remote, since the
@@ -41,7 +41,7 @@ production doc's **Updates** interval. Two steps do that:
    clock: at 19:21 with N = 60, 20:00; at 19:45, 21:00.
 
 A scheduled tick's prompt saves `<SCRATCH>/unit_status.txt`, then runs
-`/showrunner:dailies simple`. Pass that file to the builder without
+`/showrunner:dailies gantt`. Pass that file to the builder without
 `--user-run`; its clock is already right.
 
 ## Gather
@@ -95,7 +95,7 @@ the user as the failure message. Correct the named input before reporting.
 python3 ~/.claude/scripts/production/dailies_input.py \
   --production <PRODUCTION_DOC> --status <scratchpad>/unit_status.txt \
   --judgment <scratchpad>/dailies_judgment.json --state-dir <scratchpad>/dailies_input_state \
-  --out <scratchpad>/dailies_input.json --length <simple|page|elaborate> \
+  --out <scratchpad>/dailies_input.json --length <gantt|simple|page|elaborate> \
   --render-state <scratchpad>/dailies_state.json \
   --notifier <NOTIFIER> [--user-run]
 python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_input.json \
@@ -157,7 +157,7 @@ The builder's output, which the renderer consumes:
 
 | Field | Rule |
 | --- | --- |
-| `length` | `simple`, `page` or `elaborate`, from the argument. |
+| `length` | `gantt`, `simple`, `page` or `elaborate`, from the argument. |
 | `zone` | `ZONE`, as an IANA name. |
 | `next_run` | The next scheduled run, `HH:MM` in `ZONE`, after any restart. Leave it out when no schedule runs. |
 | `unit` | The unit director's session name. |
@@ -208,6 +208,11 @@ unless it names another plan's document. User, 2026-10-02.
 ### What the renderer writes
 
 - **First line:** the length and the time in `ZONE`: `**Dailies (Simple)**, 19:05 PDT`.
+- **`gantt`:** the first line, the chart and the last lines, and above the chart only two things. A subject
+  that needs the user keeps its full section. A unit that changed since the last report gets one line for each
+  change: `- <unit>: now on <phase>`, `- <unit>: checkpoint not merged, because ...` or `checkpoint no longer
+  held`, `- <unit>: eta ...` when the ETA moved 15 minutes or more, and `- <unit>: no longer in the report`.
+  Nothing changed, no lines. The rest of this list is what the other lengths print.
 - **One section per subject:** `### <unit>: <project>`, then `goal:` when given, `phase:`,
   `checkpoint: not merged, because ...` when given, `update:`, `eta:`, and
   `waiting on it:`, `needed:` and `then:` when given. In `simple`, a held
@@ -258,6 +263,7 @@ unless it names another plan's document. User, 2026-10-02.
 
 | Argument | `update:` gets |
 | --- | --- |
+| `gantt` | The same one short line as `simple`. The report prints it only for a subject that needs the user; write it for every subject all the same, since the input is checked in full. |
 | `simple` | One short line. For when the user is already following along. Waiting, idle units take one line each. |
 | `page` | The `simple` line plus one more sentence of brief context: what a named thing is (a helper, seat, round or check) and why it matters now. Example: "fifth pass on the app's wording has started; the fourth left 16 tests expecting the old words. Trunk hands each pass to a short-lived helper agent, and each can run out of room partway, so the work takes several passes." |
 | `elaborate` | More on each subject: what is moving or at risk gets the most, what is only waiting the least. Up to two pages for the whole report, and only as long as the state needs. The user asks when they want more. |
@@ -267,7 +273,7 @@ Cutting repeats is for `simple`: it says only what changed or what you need. `pa
 Every length keeps the same template and the `update:` text grows with it,
 except that `simple` gives each waiting, idle unit the one line in **Waiting
 and idle** above. An `update` is always one line, at most 240 characters for
-`simple` and 480 for `page`; the renderer refuses a longer one.
+`gantt` and `simple` and 480 for `page`; the renderer refuses a longer one.
 
 For every length:
 - **One phase per unit.** The heading names one phase: the oldest one not yet
