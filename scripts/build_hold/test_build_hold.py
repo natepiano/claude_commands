@@ -6,6 +6,7 @@ import json
 import io
 import os
 import re
+import socket
 import subprocess
 import tempfile
 import threading
@@ -44,6 +45,9 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             "BUILD_HOLD_DIR": str(self.scratch / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
             "BUILDLOG_MEMINFO": str(meminfo),
+            # No test reads the machine's own session records, or passes for the session that runs it.
+            "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
+            "CLAUDE_CODE_SESSION_ID": "",
         }))
 
 
@@ -298,6 +302,56 @@ class CommandTests(IsolatedBuildHoldTest):
         self.assertFalse(path.exists())
         self.assertFalse((scratch / "release" / "current").exists())
         self.assertIn(f"; set aside as {copy}; this hold now releases every session at once", output)
+
+    def session(self, session_id: str, name: str, *former: str) -> None:
+        """Record a live Claude session, or its rename: this test process stands in for it."""
+        path = self.scratch / f"{session_id}.sock"
+        if not path.exists():
+            held = socket.socket(socket.AF_UNIX)
+            held.bind(str(path))
+            self.addCleanup(held.close)
+        (self.scratch / "sessions").mkdir(exist_ok=True)
+        _ = (self.scratch / "sessions" / f"{session_id}.json").write_text(json.dumps({
+            "pid": os.getpid(), "sessionId": session_id, "name": name, "formerNames": list(former),
+            "messagingSocketPath": str(path), "updatedAt": 1}))
+
+    def hold(self, folder: Path, given: str | None) -> str:
+        key, label = build_hold.holder_of(given)
+        return build_hold.write_hold(folder, key, "one test", build_hold.release_request(None, None),
+                                     datetime.now().astimezone(), label)
+
+    def test_a_hold_is_kept_by_session_id_so_a_rename_between_hold_and_release_loses_nothing(self) -> None:
+        folder = self.scratch / "holders"
+        self.session("id-1", "old-name")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
+            self.assertIn("/build_hold from old-name:", self.hold(folder, None))
+        self.assertEqual([path.name for path in folder.iterdir()], ["id-1"])
+        self.session("id-1", "new-name", "old-name")
+        holders = build_hold.read_holders(folder)
+        assert isinstance(holders, build_hold.ActiveHolders)
+        self.assertEqual([(holder.name, holder.key) for holder in holders.holders], [("new-name", "id-1")])
+        # The name it had when it took the hold still finds it, and so does no name at all.
+        with self.assertRaisesRegex(ValueError, "someone-else held nothing"):
+            _ = build_hold.held_key(folder, "someone-else")
+        self.assertEqual(build_hold.held_key(folder, "old-name"), "id-1")
+        self.assertEqual(build_hold.held_key(folder, "new-name"), "id-1")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
+            self.assertEqual(build_hold.held_key(folder, None), "id-1")
+        self.assertEqual(build_hold.release_hold(folder, "id-1"), "released, builds may resume.")
+
+    def test_a_hold_taken_under_a_name_before_is_released_by_the_session_that_had_the_name(self) -> None:
+        folder = self.scratch / "holders"
+        # No live session is called this yet, so the hold is kept under the name, as every hold once was.
+        _ = self.hold(folder, "old-name")
+        self.assertEqual([path.name for path in folder.iterdir()], ["old-name"])
+        self.session("id-1", "new-name", "old-name")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
+            self.assertEqual(build_hold.held_key(folder, None), "old-name")
+        self.assertEqual(build_hold.held_key(folder, "new-name"), "old-name")
+        # With no name and no session, there is no holder to look up.
+        refused = self.run_cli(folder, "hold", "--for", "one test")
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("give --holder: this is not a live Claude session", refused.stderr)
 
     def test_last_release_sets_aside_each_damaged_record(self) -> None:
         for kind in ("cycle", "current"):
