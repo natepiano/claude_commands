@@ -80,8 +80,29 @@ request = subprocess.run([
 ], capture_output=True, text=True, check=False)
 if request.returncode:
     print(request.stdout + request.stderr, file=sys.stderr)
-    raise SystemExit(request.returncode)
+raise SystemExit(request.returncode)
 print("review threshold not reached")
+'''
+PHASE_TABLE_STUB = '''#!__PYTHON__
+import json
+import os
+from pathlib import Path
+import sys
+
+events = Path(os.environ["DAILIES_PHASE_TABLE_EVENTS"])
+with events.open("a", encoding="utf-8") as output:
+    output.write(json.dumps(sys.argv[1:]) + "\\n")
+command = sys.argv[1] if len(sys.argv) > 1 else ""
+failure = os.environ.get("DAILIES_PHASE_TABLE_FAIL", "")
+if command == failure:
+    print(f"{command} could not read records", file=sys.stderr)
+    raise SystemExit(1)
+if command == "show":
+    print(Path(os.environ["DAILIES_PHASE_TABLE_JSON"]).read_text(encoding="utf-8"))
+    raise SystemExit(0)
+if command == "prune":
+    raise SystemExit(0)
+raise SystemExit(2)
 '''
 
 
@@ -99,6 +120,9 @@ class DailiesInputTests(unittest.TestCase):
     notifier: Path = Path()
     events: Path = Path()
     notifier_failure: Path = Path()
+    phase_table: Path = Path()
+    phase_table_json: Path = Path()
+    phase_table_events: Path = Path()
     env: dict[str, str] = {}
 
     @override
@@ -122,11 +146,23 @@ class DailiesInputTests(unittest.TestCase):
         self.notifier = self.root / "notifier"
         self.events = self.root / "notifier-events.jsonl"
         self.notifier_failure = self.root / "notifier-fail"
+        self.phase_table = self.root / "phase-table.py"
+        self.phase_table_json = self.root / "phase-table.json"
+        self.phase_table_events = self.root / "phase-table-events.jsonl"
         _ = self.notifier.write_text(NOTIFIER.replace("__PYTHON__", sys.executable), encoding="utf-8")
         self.notifier.chmod(0o755)
+        _ = self.phase_table.write_text(PHASE_TABLE_STUB.replace("__PYTHON__", sys.executable), encoding="utf-8")
+        self.phase_table.chmod(0o755)
+        _ = self.phase_table_json.write_text("{}\n", encoding="utf-8")
         self.env = {**os.environ, "HOME": str(self.home), "BUILD_HOLD_DIR": str(self.holders),
                     "MAC_TEST_STATE_DIR": str(self.root / "mac-test"),
                     "DAILIES_TEST_EVENTS": str(self.events), "DAILIES_TEST_FAIL": str(self.notifier_failure),
+                    "DAILIES_PHASE_TABLE": str(self.phase_table),
+                    "DAILIES_PHASE_TABLE_JSON": str(self.phase_table_json),
+                    "DAILIES_PHASE_TABLE_EVENTS": str(self.phase_table_events),
+                    "PHASE_TABLE_VAULT": str(self.root / "vault"),
+                    "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
+                    "NOTIFIER_STATE_DIR": str(self.root / "notifier-state"),
                     # Unit sessions are looked up in this stand-in; with no state file it has no sessions.
                     "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
                     "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
@@ -236,6 +272,58 @@ class DailiesInputTests(unittest.TestCase):
             return []
         return [cast(list[str], json.loads(line)) for line in self.events.read_text(encoding="utf-8").splitlines()]
 
+    def phase_table_calls(self) -> list[list[str]]:
+        if not self.phase_table_events.exists():
+            return []
+        return [cast(list[str], json.loads(line))
+                for line in self.phase_table_events.read_text(encoding="utf-8").splitlines()]
+
+    def open_phase_record(
+        self,
+        *,
+        phase: str = "2",
+        started: str = "2026-10-06T15:30:00+00:00",
+        percent: int | None = 60,
+        eta: dict[str, object] | None = None,
+        has_eta: bool = True,
+        first: str | None = "2026-10-07T00:30:00+00:00",
+        status: str = "running",
+    ) -> None:
+        current_eta: dict[str, object] | None = eta if eta is not None else {
+            "time": "2026-10-07T00:40:00+00:00",
+            "earliest": "2026-10-07T00:35:00+00:00",
+            "latest": "2026-10-07T00:55:00+00:00",
+            "source": "stated",
+            "stated_at": "2026-10-06T23:45:00+00:00",
+            "basis": "the checks are nearly done",
+            "as_of": None,
+        }
+        if not has_eta:
+            current_eta = None
+        record: dict[str, object] = {
+            "plan": str(self.root / "alpha/docs/alpha.md"),
+            "updated": "2026-10-06T23:45:00+00:00",
+            "plan_finish": "2026-10-07T01:00:00+00:00",
+            "current": {
+                "phase": phase,
+                "of": 3,
+                "title": "panel labels stay clear",
+                "started": started,
+                "percent": percent,
+                "eta": current_eta,
+                "first_stated_eta_target": first,
+            },
+            "phases": [{
+                "phase": phase,
+                "title": "panel labels stay clear",
+                "status": status,
+                "start": started,
+                "finish": None,
+                "seconds": None,
+            }],
+        }
+        _ = self.phase_table_json.write_text(json.dumps({ALPHA: record}) + "\n", encoding="utf-8")
+
     def watch_stubs(self) -> Path:
         bin_path = self.root / "bin"
         bin_path.mkdir()
@@ -335,6 +423,513 @@ class DailiesInputTests(unittest.TestCase):
                                            "--at", "2026-10-06T17:00"],
                                           env=self.env, capture_output=True, text=True, check=False)
                 self.assertEqual(rendered.returncode, 0, rendered.stderr)
+
+    def test_record_supplies_start_stated_eta_range_percent_first_and_reason_without_screen_eta(self) -> None:
+        self.open_phase_record(eta={
+            "time": "2026-10-07T00:40:00+00:00",
+            "earliest": "2026-10-07T00:35:00+00:00",
+            "latest": "2026-10-07T00:55:00+00:00",
+            "source": "stated",
+            "stated_at": "2026-10-06T23:45:00+00:00",
+            "basis": "checks\n  and   build remain",
+            "as_of": None,
+        })
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        fields = cast(dict[str, object], json.loads(self.judgment.read_text(encoding="utf-8")))
+        unit = cast(list[dict[str, object]], fields["units"])[0]
+        del unit["started"]
+        _ = self.judgment.write_text(json.dumps(fields), encoding="utf-8")
+
+        built = self.run_builder()
+
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        self.assertEqual(self.unit()["started"], "2026-10-06T08:30")
+        self.assertEqual(self.unit()["eta"], {
+            "time": "17:40", "earliest": "17:35", "latest": "17:55", "percent": 60,
+            "first": "2026-10-06T17:30", "why": "checks and build remain",
+            "stated": "2026-10-06T16:45",
+        })
+        self.assertEqual(self.phase_table_calls(), [
+            ["prune", "--production-doc", str(self.doc)],
+            ["show", "--production-doc", str(self.doc), "--json"],
+        ])
+
+    def test_real_phase_table_command_supplies_the_record_after_peer_handoff(self) -> None:
+        plan = self.root / "alpha/docs/alpha.md"
+        plan.parent.mkdir()
+        _ = plan.write_text(
+            "# Alpha plan\n\n"
+            + "### Phase 1 — Earlier work  · status: done\n\n"
+            + "### Phase 2 — Panel labels stay clear  · status: todo\n",
+            encoding="utf-8",
+        )
+        utc = ZoneInfo("UTC")
+        midnight = datetime(2026, 10, 6, tzinfo=utc)
+
+        def epoch(hour: int, minute: int) -> int:
+            return int((midnight + timedelta(hours=hour, minutes=minute)).timestamp())
+
+        run = self.root / "history/runs/current.jsonl"
+        run.parent.mkdir(parents=True)
+        events = (
+            {"event_type": "run_started", "working_dir": str(self.root / "alpha"),
+             "plan_doc": "docs/alpha.md", "run_started_at": epoch(22, 0),
+             "timestamp_epoch": epoch(22, 0)},
+            {"event_type": "phase_started", "phase_id": "2", "phase_instance_id": "two",
+             "phase_title": "Panel labels stay clear", "timestamp_epoch": epoch(22, 30)},
+            {"event_type": "eta_stated", "phase_id": "2", "phase_instance_id": "two",
+             "eta_at": epoch(24, 40), "basis": "two checks remain",
+             "timestamp_epoch": epoch(23, 20)},
+            {"event_type": "progress_reported", "phase_id": "2", "phase_instance_id": "two",
+             "phase_percent": 60, "phase_elapsed_seconds": 3000, "phase_calibration": None,
+             "timestamp_epoch": epoch(23, 30)},
+        )
+        _ = run.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        fields = cast(dict[str, object], json.loads(self.judgment.read_text(encoding="utf-8")))
+        del cast(list[dict[str, object]], fields["units"])[0]["started"]
+        _ = self.judgment.write_text(json.dumps(fields), encoding="utf-8")
+        _ = self.env.pop("DAILIES_PHASE_TABLE")
+        self.env["PLAN_DELEGATE_NOW_EPOCH"] = str(epoch(23, 35))
+
+        built = self.run_builder()
+
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        self.assertEqual(self.unit()["started"], "2026-10-06T15:30")
+        eta = cast(dict[str, object], self.unit()["eta"])
+        self.assertEqual((eta["time"], eta["percent"], eta["why"], eta["stated"]),
+                         ("17:40", 60, "two checks remain", "2026-10-06T16:20"))
+
+    def test_record_projected_eta_uses_projection_reason_and_report_zone(self) -> None:
+        self.open_phase_record(eta={
+            "time": "2026-10-07T01:10:00+00:00",
+            "earliest": "2026-10-07T01:00:00+00:00",
+            "latest": "2026-10-07T01:25:00+00:00",
+            "source": "projected",
+            "stated_at": None,
+            "basis": None,
+            "as_of": "2026-10-06T23:50:00+00:00",
+        })
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+
+        built = self.run_builder()
+
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        self.assertEqual(self.unit()["eta"], {
+            "time": "18:10", "earliest": "18:00", "latest": "18:25", "percent": 60,
+            "first": "2026-10-06T17:30", "why": "it is now projected from 60% done",
+            "stated": "2026-10-06T16:50",
+        })
+
+    def test_record_eta_each_judgment_field_wins_and_a_deciding_value_keeps_record_out(self) -> None:
+        self.open_phase_record()
+        self.status_lines(f"== {ALPHA}", "ETA 18:55")
+        self.judgment_file(alpha={
+            "started": "2026-10-06T09:12",
+            "eta": {"earliest": "17:32", "percent": 72, "first": "2026-10-06T16:00",
+                    "why": "the showrunner knows why", "fixes": 3},
+        })
+        filled = self.run_builder()
+        self.assertEqual(filled.returncode, 0, filled.stdout + filled.stderr)
+        self.assertEqual(self.unit()["started"], "2026-10-06T09:12")
+        eta = cast(dict[str, object], self.unit()["eta"])
+        self.assertEqual((eta["time"], eta["earliest"], eta["latest"]), ("17:40", "17:32", "17:55"))
+        self.assertEqual((eta["percent"], eta["first"], eta["why"], eta["fixes"]),
+                         (72, "2026-10-06T16:00", "the showrunner knows why", 3))
+
+        self.judgment_file(alpha={"eta": {"none": "none measured"}})
+        decided = self.run_builder()
+        self.assertEqual(decided.returncode, 0, decided.stdout + decided.stderr)
+        self.assertEqual(self.unit()["eta"], {"none": "none measured"})
+        self.assertNotIn("request /unit:eta:", decided.stdout)
+
+        self.judgment_file(alpha={"eta": {"time": "18:20", "percent": 44,
+                                                   "why": "the showrunner set the target"}})
+        timed = self.run_builder()
+        self.assertEqual(timed.returncode, 0, timed.stdout + timed.stderr)
+        self.assertEqual(self.unit()["eta"], {
+            "time": "18:20", "percent": 44, "why": "the showrunner set the target",
+        })
+        self.assertNotIn("request /unit:eta:", timed.stdout)
+
+    def test_record_with_no_percent_still_supplies_start_and_eta(self) -> None:
+        self.open_phase_record(percent=None)
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        self.judgment_file(alpha={"eta": {}})
+        built = self.run_builder()
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        eta = cast(dict[str, object], self.unit()["eta"])
+        self.assertEqual((eta["time"], eta["percent"]), ("17:40", None))
+
+    def test_stale_record_eta_uses_its_source_time_and_requests_once(self) -> None:
+        cases: tuple[tuple[str, dict[str, object]], ...] = (
+            ("stated", {
+                "time": "2026-10-07T01:40:00+00:00", "earliest": None, "latest": None,
+                "source": "stated", "stated_at": "2026-10-06T22:30:00+00:00",
+                "basis": "the panel pass remains", "as_of": None,
+            }),
+            ("projected", {
+                "time": "2026-10-07T01:40:00+00:00", "earliest": "2026-10-07T01:30:00+00:00",
+                "latest": "2026-10-07T01:50:00+00:00", "source": "projected",
+                "stated_at": None, "basis": None, "as_of": "2026-10-06T22:30:00+00:00",
+            }),
+        )
+        for source, eta_record in cases:
+            with self.subTest(source=source):
+                self.state.mkdir(exist_ok=True)
+                for path in (self.state / "eta_seen.json", self.phase_table_events):
+                    if path.exists():
+                        path.unlink()
+                self.open_phase_record(eta=eta_record)
+                self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+                first = self.run_builder()
+                self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+                eta = cast(dict[str, object], self.unit()["eta"])
+                self.assertEqual(eta["detail"], "set 15:30")
+                self.assertEqual(eta["stated"], "2026-10-06T15:30")
+                self.assertEqual(first.stdout.count(f"request /unit:eta: {ALPHA}"), 1)
+                repeated = self.run_builder()
+                self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+                self.assertNotIn("request /unit:eta:", repeated.stdout)
+
+    def test_passed_record_eta_and_passed_first_target_each_request_once(self) -> None:
+        self.open_phase_record(eta={
+            "time": "2026-10-06T23:40:00+00:00", "earliest": None, "latest": None,
+            "source": "stated", "stated_at": "2026-10-06T23:30:00+00:00",
+            "basis": "the panel pass remained", "as_of": None,
+        })
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        passed = self.run_builder()
+        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
+        self.assertEqual(self.unit()["eta"], {"none": "none measured - requested"})
+        self.assertEqual(passed.stdout.count(f"request /unit:eta: {ALPHA}"), 1)
+
+        self.state.mkdir(exist_ok=True)
+        (self.state / "eta_seen.json").unlink()
+        self.open_phase_record(has_eta=False, first="2026-10-06T23:40:00+00:00")
+        self.judgment_file(alpha={"held": "the panel review is paused", "eta": {}})
+        first_target_passed = self.run_builder()
+        self.assertEqual(first_target_passed.returncode, 0, first_target_passed.stdout + first_target_passed.stderr)
+        self.assertEqual(self.unit()["eta"], {"none": "none measured - requested"})
+        self.assertEqual(first_target_passed.stdout.count(f"request /unit:eta: {ALPHA}"), 1)
+        repeated = self.run_builder()
+        self.assertNotIn("request /unit:eta:", repeated.stdout)
+
+    def test_record_with_no_eta_ever_stated_uses_none_without_request(self) -> None:
+        self.open_phase_record(has_eta=False, first=None)
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        built = self.run_builder()
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        self.assertEqual(self.unit()["eta"], {"none": "no ETA stated yet"})
+        self.assertNotIn("request /unit:eta:", built.stdout)
+
+    def test_nonmatching_record_keeps_the_screen_capture_path(self) -> None:
+        self.open_phase_record(phase="3")
+        self.status_lines(f"== {ALPHA}", "● Held checkpoint remains", "ETA 18:15")
+        self.judgment_file(alpha={"held": "the checkpoint awaits its merge"})
+        built = self.run_builder()
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        self.assertEqual(self.unit()["started"], "2026-10-06T09:00")
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "18:15")
+
+    def test_follow_up_judgment_keeps_the_screen_capture_path(self) -> None:
+        self.open_phase_record()
+        self.status_lines(f"== {ALPHA}", "ETA 18:15")
+        self.judgment_file(alpha={
+            "phase": "follow-up 1 of 1: urgent panel repair",
+            "then": ["the plan at Phase 2: panel labels stay clear"],
+        })
+        built = self.run_builder()
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "18:15")
+
+    def test_no_open_or_unavailable_record_keeps_the_screen_capture_path(self) -> None:
+        self.open_phase_record()
+        payload = cast(dict[str, dict[str, object]], json.loads(self.phase_table_json.read_text()))
+        for record in ({**payload[ALPHA], "current": None}, {"unavailable": "plan cannot be read"}):
+            with self.subTest(record=record):
+                _ = self.phase_table_json.write_text(json.dumps({ALPHA: record}), encoding="utf-8")
+                self.status_lines(f"== {ALPHA}", "ETA 18:15")
+                built = self.run_builder()
+                self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+                self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "18:15")
+
+    def test_record_phase_outside_plan_and_non_numeric_phase_keep_the_screen_capture_path(self) -> None:
+        for phase, status in (("2", "todo"), ("12a", "running")):
+            with self.subTest(phase=phase, status=status):
+                self.open_phase_record(phase=phase, status=status)
+                self.status_lines(f"== {ALPHA}", "ETA 18:15")
+                built = self.run_builder()
+                self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+                self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "18:15")
+
+    def test_held_record_adopts_screen_text_without_requesting_again(self) -> None:
+        self.open_phase_record(eta={
+            "time": "2026-10-07T01:40:00+00:00", "earliest": None, "latest": None,
+            "source": "stated", "stated_at": "2026-10-06T22:30:00+00:00",
+            "basis": "the panel pass remains", "as_of": None,
+        })
+        key = f"{ALPHA}|Phase 2 of 3: panel labels stay clear"
+        old = {key: {"text": "ETA 18:40", "first_seen": "2026-10-06T14:00", "requested": False}}
+        _ = (self.state / "eta_seen.json").write_text(json.dumps(old), encoding="utf-8")
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        self.judgment_file(alpha={"held": "the panel review is paused", "eta": {}})
+        built = self.run_builder()
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        eta = cast(dict[str, object], self.unit()["eta"])
+        self.assertNotIn("detail", eta)
+        self.assertEqual(eta["stated"], "2026-10-06T15:30")
+        self.assertNotIn("request /unit:eta:", built.stdout)
+        saved = cast(dict[str, dict[str, object]], json.loads((self.state / "eta_seen.json").read_text()))
+        self.assertEqual(saved[key]["text"], "2026-10-06T18:40")
+        self.assertEqual(saved[key]["first_seen"], "2026-10-06T14:00")
+
+    def test_held_record_target_passed_earlier_that_day_stays_overdue(self) -> None:
+        self.open_phase_record(eta={
+            "time": "2026-10-06T23:00:00+00:00",
+            "earliest": "2026-10-06T22:50:00+00:00",
+            "latest": "2026-10-06T23:10:00+00:00",
+            "source": "projected", "stated_at": None,
+            "basis": None, "as_of": "2026-10-06T22:30:00+00:00",
+        }, first="2026-10-06T23:00:00+00:00")
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        self.judgment_file(alpha={"held": "the panel review is paused", "eta": {}})
+        first = self.run_builder("--at", "2026-10-06T15:50", "--length", "simple")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+
+        built = self.run_builder("--at", "2026-10-06T19:00", "--length", "simple")
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        eta = cast(dict[str, object], self.unit()["eta"])
+        self.assertEqual((eta["time"], eta["stated"]), ("16:00", "2026-10-06T15:30"))
+        self.assertEqual((eta["earliest"], eta["latest"]), ("15:50", "16:10"))
+        rendered = self.run_renderer("2026-10-06T19:00")
+        self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
+        self.assertIn(
+            "- eta: 16:00 PDT, 60% done (overdue; range 15:50–16:10)", rendered.stdout)
+        self.assertNotIn("tomorrow", rendered.stdout)
+        saved = cast(dict[str, dict[str, object]], json.loads(
+            (self.root / "render-state.json").read_text(encoding="utf-8")))
+        self.assertEqual(saved[ALPHA]["eta"], "2026-10-06T16:00:00")
+
+    def test_held_record_target_from_an_earlier_day_stays_on_that_day(self) -> None:
+        self.open_phase_record(
+            started="2026-10-05T21:00:00+00:00",
+            eta={
+                "time": "2026-10-05T23:00:00+00:00",
+                "earliest": "2026-10-05T22:50:00+00:00",
+                "latest": "2026-10-05T23:10:00+00:00",
+                "source": "projected", "stated_at": None,
+                "basis": None, "as_of": "2026-10-05T22:30:00+00:00",
+            },
+            first="2026-10-05T23:00:00+00:00",
+        )
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        self.judgment_file(alpha={"held": "the panel review is paused", "eta": {}})
+        first = self.run_builder("--at", "2026-10-05T15:50", "--length", "simple")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+
+        built = self.run_builder("--at", "2026-10-06T19:00", "--length", "simple")
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        eta = cast(dict[str, object], self.unit()["eta"])
+        self.assertEqual((eta["time"], eta["stated"]), ("16:00", "2026-10-05T15:30"))
+        self.assertEqual((eta["earliest"], eta["latest"]), ("15:50", "16:10"))
+        rendered = self.run_renderer("2026-10-06T19:00")
+        self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
+        self.assertIn("overdue", rendered.stdout)
+        self.assertIn("range Mon 15:50–Mon 16:10", rendered.stdout)
+        self.assertNotIn("tomorrow", rendered.stdout)
+        saved = cast(dict[str, dict[str, object]], json.loads(
+            (self.root / "render-state.json").read_text(encoding="utf-8")))
+        self.assertEqual(saved[ALPHA]["eta"], "2026-10-05T16:00:00")
+
+    def test_record_range_that_resolves_to_its_own_minutes_is_kept(self) -> None:
+        self.open_phase_record(eta={
+            "time": "2026-10-06T23:00:00+00:00",
+            "earliest": "2026-10-06T22:50:00+00:00",
+            "latest": "2026-10-06T23:10:00+00:00",
+            "source": "projected", "stated_at": None,
+            "basis": None, "as_of": "2026-10-06T20:30:00+00:00",
+        }, first="2026-10-06T23:00:00+00:00")
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        self.judgment_file(alpha={"eta": {}})
+        built = self.run_builder("--at", "2026-10-06T14:00", "--length", "simple")
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        eta = cast(dict[str, object], self.unit()["eta"])
+        self.assertEqual((eta["earliest"], eta["latest"]), ("15:50", "16:10"))
+        rendered = self.run_renderer("2026-10-06T14:00")
+        self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
+        self.assertIn("range 15:50–16:10", rendered.stdout)
+        saved = cast(dict[str, dict[str, object]], json.loads(
+            (self.root / "render-state.json").read_text(encoding="utf-8")))
+        self.assertEqual(saved[ALPHA]["eta"], "2026-10-06T16:00:00")
+
+    def test_record_range_more_than_a_day_from_eta_is_omitted(self) -> None:
+        self.open_phase_record(eta={
+            "time": "2026-10-07T23:00:00+00:00",
+            "earliest": "2026-10-06T22:50:00+00:00",
+            "latest": "2026-10-07T23:10:00+00:00",
+            "source": "projected", "stated_at": None,
+            "basis": None, "as_of": "2026-10-06T20:30:00+00:00",
+        }, first="2026-10-07T23:00:00+00:00")
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        self.judgment_file(alpha={"eta": {}})
+        built = self.run_builder("--at", "2026-10-06T14:00", "--length", "simple")
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        eta = cast(dict[str, object], self.unit()["eta"])
+        self.assertEqual(eta["time"], "16:00+1")
+        self.assertNotIn("earliest", eta)
+        self.assertNotIn("latest", eta)
+        rendered = self.run_renderer("2026-10-06T14:00")
+        self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
+        self.assertIn("- eta: 16:00 PDT tomorrow, 60% done", rendered.stdout)
+
+    def test_record_target_the_day_after_the_report_keeps_plus_one(self) -> None:
+        self.open_phase_record(eta={
+            "time": "2026-10-08T00:40:00+00:00", "earliest": None, "latest": None,
+            "source": "stated", "stated_at": "2026-10-06T23:45:00+00:00",
+            "basis": "the panel pass remains", "as_of": None,
+        }, first="2026-10-08T00:40:00+00:00")
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        self.judgment_file(alpha={"eta": {}})
+        built = self.run_builder("--length", "simple")
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        eta = cast(dict[str, object], self.unit()["eta"])
+        self.assertEqual((eta["time"], eta["stated"]), ("17:40+1", "2026-10-06T16:45"))
+        rendered = self.run_renderer(AT)
+        self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
+        saved = cast(dict[str, dict[str, object]], json.loads(
+            (self.root / "render-state.json").read_text(encoding="utf-8")))
+        self.assertEqual(saved[ALPHA]["eta"], "2026-10-07T17:40:00")
+
+    def test_record_target_far_after_its_source_uses_target_as_renderer_anchor(self) -> None:
+        self.open_phase_record(eta={
+            "time": "2026-10-07T00:00:00+00:00", "earliest": None, "latest": None,
+            "source": "stated", "stated_at": "2026-10-06T01:00:00+00:00",
+            "basis": "the long panel pass remains", "as_of": None,
+        }, first="2026-10-07T00:00:00+00:00")
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        self.judgment_file(alpha={"eta": {}})
+        built = self.run_builder("--at", "2026-10-06T16:00", "--length", "simple")
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        eta = cast(dict[str, object], self.unit()["eta"])
+        self.assertEqual((eta["time"], eta["stated"]), ("17:00", "2026-10-06T17:00"))
+        rendered = self.run_renderer("2026-10-06T16:00")
+        self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
+        saved = cast(dict[str, dict[str, object]], json.loads(
+            (self.root / "render-state.json").read_text(encoding="utf-8")))
+        self.assertEqual(saved[ALPHA]["eta"], "2026-10-06T17:00:00")
+
+    def test_record_backed_session_flags_stay_first(self) -> None:
+        self.open_phase_record()
+        for marker in ("SESSION GONE", "CLAUDE NOT RUNNING"):
+            with self.subTest(marker=marker):
+                self.status_lines(f"== {ALPHA}", marker)
+                built = self.run_builder()
+                self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+                self.assertIn(f"flags first: {ALPHA}: {marker}", built.stdout)
+                self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "17:40")
+
+    def test_phase_table_failures_continue_from_the_status_capture(self) -> None:
+        self.env["DAILIES_PHASE_TABLE_FAIL"] = "show"
+        built = self.run_builder()
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        self.assertIn("phase tables: unavailable — show could not read records", built.stdout)
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
+
+        self.open_phase_record()
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        judgment = cast(dict[str, list[dict[str, object]]], json.loads(
+            self.judgment.read_text(encoding="utf-8")))
+        del judgment["units"][0]["started"]
+        _ = self.judgment.write_text(json.dumps(judgment) + "\n", encoding="utf-8")
+        self.env["DAILIES_PHASE_TABLE_FAIL"] = "prune"
+        pruned = self.run_builder()
+        self.assertEqual(pruned.returncode, 0, pruned.stdout + pruned.stderr)
+        self.assertIn("phase tables: unavailable — prune could not read records", pruned.stdout)
+        self.assertEqual(self.unit()["started"], "2026-10-06T08:30")
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "17:40")
+
+        _ = self.env.pop("DAILIES_PHASE_TABLE_FAIL")
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 23:40")
+        self.judgment_file()
+        _ = self.phase_table_json.write_text("not json\n", encoding="utf-8")
+        unparsable = self.run_builder()
+        self.assertEqual(unparsable.returncode, 0, unparsable.stdout + unparsable.stderr)
+        self.assertIn("phase tables: unavailable —", unparsable.stdout)
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
+
+    def test_retiring_the_last_unit_runs_prune_before_no_live_units(self) -> None:
+        note = self.root / "vault/old-showrunner/alpha-unit.md"
+        note.parent.mkdir(parents=True)
+        _ = note.write_text(
+            "---\nphase_table: true\nproduction: example\nunit: alpha-unit\n---\n\n# Alpha\n",
+            encoding="utf-8",
+        )
+        content = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(content.replace("`docs/alpha.md`", "retired after completion", 1),
+                                encoding="utf-8")
+        _ = self.env.pop("DAILIES_PHASE_TABLE")
+        _ = self.assert_refused_without_output(mention="no live units: every Units row is retired")
+        self.assertFalse(note.exists())
+        self.assertFalse(note.parent.exists())
+
+    def test_record_backed_input_renders_at_every_length_without_screen_eta(self) -> None:
+        self.open_phase_record()
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        for length in ("gantt", "simple", "page", "elaborate"):
+            with self.subTest(length=length):
+                built = self.run_builder("--length", length)
+                self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+                rendered = subprocess.run(
+                    [sys.executable, str(RENDERER), str(self.output), "--at", AT],
+                    env=self.env, capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
+
+    def test_projected_move_generates_the_gantt_change_reason(self) -> None:
+        def projected(time: str) -> dict[str, object]:
+            return {
+                "time": time, "earliest": time, "latest": time, "source": "projected",
+                "stated_at": None, "basis": None, "as_of": "2026-10-06T23:50:00+00:00",
+            }
+
+        self.open_phase_record(eta=projected("2026-10-07T00:40:00+00:00"))
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        first = self.run_builder()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        first_render = self.run_renderer(AT)
+        self.assertEqual(first_render.returncode, 0, first_render.stdout + first_render.stderr)
+        self.open_phase_record(eta=projected("2026-10-07T01:00:00+00:00"))
+        moved = self.run_builder()
+        self.assertEqual(moved.returncode, 0, moved.stdout + moved.stderr)
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["why"],
+                         "it is now projected from 60% done")
+        rendered = self.run_renderer(AT)
+        self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
+        self.assertIn("changed: +0:20 because it is now projected from 60% done", rendered.stdout)
+
+    def test_stated_move_uses_basis_unless_judgment_supplies_why(self) -> None:
+        def stated(time: str, basis: str) -> dict[str, object]:
+            return {
+                "time": time, "earliest": None, "latest": None, "source": "stated",
+                "stated_at": "2026-10-06T23:50:00+00:00", "basis": basis, "as_of": None,
+            }
+
+        self.open_phase_record(eta=stated("2026-10-07T00:40:00+00:00", "the first pass remains"))
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        first = self.run_builder()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(self.run_renderer(AT).returncode, 0)
+        self.open_phase_record(eta=stated("2026-10-07T01:00:00+00:00", "two panel checks remain"))
+        generated = self.run_builder()
+        self.assertEqual(generated.returncode, 0, generated.stdout + generated.stderr)
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["why"], "two panel checks remain")
+
+        self.judgment_file(alpha={"eta": {"why": "the showrunner saw one more check"}})
+        overridden = self.run_builder()
+        self.assertEqual(overridden.returncode, 0, overridden.stdout + overridden.stderr)
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["why"],
+                         "the showrunner saw one more check")
 
     def test_retired_unit_needs_no_status_or_judgment_entry(self) -> None:
         retired_row = (f"| `{BETA}` | (retired by the user; run done) | `{self.root / 'beta'}` | "

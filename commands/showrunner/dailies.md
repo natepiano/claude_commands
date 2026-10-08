@@ -51,8 +51,12 @@ Read the current state, not memory, and check what you state the way
 
 1. **Time.** `TZ=<ZONE> date '+%H:%M %Z'`. `ZONE` only, never UTC (user, 2026-10-02).
 2. **Log.** The latest `### STATE` block in `LOG` and every event after it.
-3. **Each unit.** Use the saved status output for its latest activity and ETA.
-   The input builder keeps the ETA's first-seen time and prints
+3. **Each unit.** Use the saved status output for its latest activity. For a
+   numbered open plan phase, the input builder takes its start and ETA from
+   the unit's run records when that phase number matches the judgment. No
+   `Phase ETA:` line is needed in the status capture. A judgment value wins;
+   in particular, a judgment ETA `time` or `none` is final. Otherwise the
+   input builder keeps the ETA's first-seen time and prints
    `request /unit:eta: <unit>` once per phase when that ETA is over an hour
    old or past. Send that request this turn. It writes `set HH:MM` for a stale
    ETA and `none measured - requested` for a passed one. A held unit's ETA
@@ -92,6 +96,9 @@ Never edit the output: to change a line, change the input and run it again.
 When the renderer refuses the input (exit 2), fix what it names and run again.
 When the builder prints `<step>: failed — <reason>`, give that exact line to
 the user as the failure message. Correct the named input before reporting.
+When it prints `phase tables: unavailable — <reason>`, continue. Only a unit
+whose records could not be read takes its start and ETA from the saved status
+capture; failed removal of retired notes changes nothing else.
 
 ```sh
 python3 ~/.claude/scripts/production/dailies_input.py \
@@ -114,12 +121,15 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
 ### Input
 
 The judgment file has `units` and optional `topics` and `merge`. Each unit
-has its `unit` session name and only the fields requiring judgment: `project`,
+has its Units table id in `unit`, never the session's current name; the builder
+joins run records and status blocks on that id. It has only the fields requiring judgment: `project`,
 `goal` when measured, `phase`, `started`, `held`, `held_examples` when useful,
 `update`, `waiting_on_it`, `needed`, `needs_user` when you know the answer, `idle`,
 `then`, `label` (up to eight characters; needed when the session name without
 `-unit` is longer), and ETA numbers (`percent`, `earliest`, `latest`, `first`, `fixes`,
-`why`) in `eta`. The builder takes the ETA time from status. Write `merge.held`
+`why`) in `eta`. For a matching numbered open phase the builder takes an absent
+start and ETA fields from the run record; a judgment value wins. Otherwise it
+takes the ETA time from status. Write `merge.held`
 or `merge.testing` when relevant. It fills `length`, `zone`, `unit`,
 `next_run`, build holds, review watch and merge branch. A refusal names what
 needs correction and leaves the output file untouched; fix the judgment file
@@ -162,21 +172,21 @@ The builder's output, which the renderer consumes:
 | `length` | `gantt`, `simple`, `page` or `elaborate`, from the argument. |
 | `zone` | `ZONE`, as an IANA name. |
 | `next_run` | The next scheduled run, `HH:MM` in `ZONE`, after any restart. Leave it out when no schedule runs. |
-| `unit` | The unit director's session name. |
+| `unit` | The Units table's unit id, never the session's current name. The builder joins on this id. |
 | `name` | The plan the unit runs, when its session name does not say it (a lane that took on another plan): `hana_organon`. Defaults to `unit`. |
 | `label` | The timeline row name, at most 8 characters. Defaults to the unit name without `-unit`. |
 | `project` | The goal of the unit's whole plan, in a few words, from its plan doc's opening: what you get when every phase is done. Not this phase, and not a list. Example: `tools you build and edit in the 3D scene`. It is the section heading. |
 | `goal` | Required when the unit owns a measurable goal: `target` (the goal in words, its number included), `unit` (`ms`), and the measured `start`, `now` and `aim` from the unit's latest measured run. The renderer prints `goal: <target> - <x>% of <aim> <unit> target achieved`, x from the three numbers. A goal with no number yet gets one before the next report: ask the unit director for a measured baseline and settle the aim. User, 2026-10-04. |
 | `phase` | `Phase <N> of <M>: <what it changes>` from the unit's plan. Work outside a numbered plan gives its place in the unit's queue: `follow-up <K> of <Q>: <what it changes>`. The renderer refuses anything else. |
-| `started` | When the phase started, `YYYY-MM-DDTHH:MM` in `ZONE`, from the unit director or `LOG`. The timeline row starts there. |
+| `started` | When the phase started, `YYYY-MM-DDTHH:MM` in `ZONE`. A matching numbered open phase supplies it from the run record; a judgment value wins. Otherwise use the unit director or `LOG`. The timeline row starts there. |
 | `held` | Required. When the phase's checkpoint waits unmerged, the reason alone, in a few words, written to follow "not merged, because": `the design check found 16 defects`. `null` when no checkpoint waits. No examples here; the renderer refuses `such as`. |
 | `idle` | Only while the unit waits on a clock gate, a data window or another unit and nothing of its runs: no seats, no helpers, no build or test. `waits_for` is what it waits for, one short line of at most 80 characters; `until` is when it comes back, `YYYY-MM-DDTHH:MM` in `ZONE`, from the unit director's own statement or `LOG`, never made up. Remove it once the unit works again; the renderer refuses an `until` that has passed. A unit with no known return time gets no `idle`. |
 | unit `build_hold` | `true` while the unit is under a `/build_hold` (its unit director told to stop builds); leave it out otherwise. A holder's own unit is never marked. It ends the unit's timeline row with `build hold`. Holder files in `~/.local/state/build-hold/` supply one footer line per active holder. A Mac block has no unit row or input key; its file in `~/.local/state/mac-test/` supplies its footer line. The renderer refuses a marker with no holder file and active files with no marked unit. No marker means not held (user, 2026-10-03: "Without that marker I will assume it is not held"). |
 | `held_examples` | Optional examples for `held`, written to follow a comma: `such as a main bar clipped in small windows`. In a `simple` report the renderer prints them only the first time that reason appears for the phase; `page` and `elaborate` always print them. |
 | `update` | What the unit is doing now, one line. The length sets how long (below). A unit waiting on another unit says so, with the wait's start and expected clear times from `LOG` (`/showrunner:produce` → Dependencies). |
-| `eta` | The unit's latest stated phase ETA, in `ZONE`. `time` is `HH:MM`, `+1` for tomorrow (`11:21+1`); add `earliest` and `latest` when the unit director gave a range; each is read on the ETA's own day, earliest at or before it and latest at or after. With no ETA, `none` in place of `time`, one of: `none measured - requested` (after sending that unit director `/unit:eta` in this turn, the unmeasured-ETA rule in `/showrunner:produce`), `none measured`, `no ETA stated yet`. Never make one up. `percent` is required with `time`: the unit director's phase percent done (the recorder's phase `%`, 0–100), or `null` when it stated none. `detail` is an optional short note on what the time covers (`checks and build included`). It never says where the ETA came from: no `from the recorder`, no `from past runs` (user, 2026-10-02); the renderer refuses a `detail` that starts with `from`. `why` says in a few words why the ETA moved since the last report, from the unit director's own reports (`the four remaining app tests need a new floor anchor`); the renderer prints it after `because` and refuses a move of 15 minutes or more without it (user, 2026-10-01). |
+| `eta` | The unit's latest phase ETA, in `ZONE`. A matching numbered open phase supplies its absent values from the run record; no `Phase ETA:` line is needed in the status capture, and each judgment value wins. A judgment `time` or `none` decides the ETA entirely. Otherwise the status capture supplies the time. `time` is `HH:MM`, `+1` for tomorrow (`11:21+1`); add `earliest` and `latest` when the unit director gave a range; each is read on the ETA's own day, earliest at or before it and latest at or after. The builder omits both ends of a recorded range when the renderer would place either on the wrong day. With no ETA, `none` in place of `time`, one of: `none measured - requested` (after sending that unit director `/unit:eta` in this turn, the unmeasured-ETA rule in `/showrunner:produce`), `none measured`, `no ETA stated yet`. Never make one up. `percent` is required with `time`: the unit director's phase percent done (the recorder's phase `%`, 0–100), or `null` when it stated none. `detail` is an optional short note on what the time covers (`checks and build included`). It never says where the ETA came from: no `from the recorder`, no `from past runs` (user, 2026-10-02); the renderer refuses a `detail` that starts with `from`. `why` says in a few words why the ETA moved since the last report, from the unit director's own reports (`the four remaining app tests need a new floor anchor`); the renderer prints it after `because` and refuses a move of 15 minutes or more without it (user, 2026-10-01). |
 | `eta.first`, `eta.fixes` | The phase's first stated ETA (`YYYY-MM-DDTHH:MM`), and the fix rounds added since it. `first` seeds the state once; the state then keeps it for the phase. Give `fixes` every report: the repair rounds started after the first ETA. User, 2026-10-03. |
-| `eta.stated` | Written by the builder, never by you: when it first saw this ETA. The renderer reads a time that names no day on that day. |
+| `eta.stated` | Written by the builder with `eta.time`, never by you. A record-backed ETA uses its `stated_at` or projection `as_of` minute in `ZONE`; when that would make a bare clock resolve to the wrong day, it uses the target's own minute. The renderer reads a time that names no day on that date. It is absent without `time`. |
 | `waiting_on_it` | Only for a topic that lands with this unit's phase, and who waits. |
 | `needed` | Only when the subject needs a follow-up nobody has started, from you (the user), the showrunner or another unit director. Say who. |
 | `needs_user` | `true` when the subject waits on you. It then goes first. |

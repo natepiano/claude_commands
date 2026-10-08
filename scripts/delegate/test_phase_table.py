@@ -162,6 +162,123 @@ class PhaseTableTests(unittest.TestCase):
         )
         return path
 
+    def write_units_production(
+        self,
+        *rows: tuple[str, str, Path],
+        checkout: Path | None = None,
+    ) -> Path:
+        path = self.working_dir / "docs" / "show-production.md"
+        checkout_path = checkout or self.working_dir
+        table_rows = [
+            f"| {unit} | {plan} | {worktree} | branch | file.py |"
+            for unit, plan, worktree in rows
+        ]
+        _ = path.write_text(
+            plan_text(
+                "# Production — show",
+                "",
+                "## Production Context",
+                "",
+                "- **Merge branch:** main",
+                f"- **Showrunner checkout:** {checkout_path}",
+                "- **Log:** docs/show.log",
+                "- **User zone:** America/Los_Angeles",
+                "",
+                "## Units",
+                "",
+                "| Unit | Plan | Worktree | Branch | Owns |",
+                "| --- | --- | --- | --- | --- |",
+                *table_rows,
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def make_live_worktree(self, name: str) -> Path:
+        worktree = self.root / name
+        worktree.mkdir()
+        _ = (worktree / ".git").write_text("gitdir: test\n", encoding="utf-8")
+        return worktree
+
+    def write_run_for_plan(
+        self,
+        name: str,
+        plan: Path,
+        worktree: Path,
+        started_at: int,
+        *events: dict[str, object],
+    ) -> None:
+        path = self.history_dir / "runs" / f"{name}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        started = {
+            "event_type": "run_started",
+            "working_dir": str(worktree),
+            "plan_doc": str(plan.relative_to(worktree)),
+            "run_started_at": started_at,
+            "timestamp_epoch": started_at,
+        }
+        lines = [json.dumps(started), *(json.dumps(event) for event in events)]
+        _ = path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def run_show_production(
+        self, production: Path, at: int = 1_200
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "show",
+                "--production-doc",
+                str(production),
+                "--json",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=self.environment(at),
+        )
+
+    def run_prune(
+        self, production: Path
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "prune",
+                "--production-doc",
+                str(production),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=self.environment(),
+        )
+
+    def write_phase_note(
+        self,
+        folder: str,
+        name: str,
+        production: str,
+        unit: str,
+    ) -> Path:
+        path = self.vault_root / folder / f"{name}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(
+            "\n".join(
+                (
+                    "---",
+                    "phase_table: true",
+                    f"production: {production}",
+                    f"unit: {unit}",
+                    "---",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        return path
+
     def write_showrunner(self, name: str = "showrunner") -> None:
         self.showrunner_record_number += 1
         session_id = f"showrunner-{self.showrunner_record_number}"
@@ -1481,7 +1598,6 @@ class PhaseTableTests(unittest.TestCase):
                 "stated_at",
                 "basis",
                 "as_of",
-                "first",
             },
         )
         self.assertEqual(eta_json["source"], "stated")
@@ -1489,7 +1605,10 @@ class PhaseTableTests(unittest.TestCase):
         self.assertIsNone(eta_json["latest"])
         self.assertIsNone(eta_json["as_of"])
         self.assertEqual(eta_json["basis"], "two checks remain")
-        self.assertEqual(eta_json["time"], eta_json["first"])
+        self.assertNotIn("first", eta_json)
+        self.assertEqual(
+            eta_json["time"], current_json["first_stated_eta_target"]
+        )
         self.assertTrue(cast(str, eta_json["stated_at"]).endswith("-07:00"))
 
     def test_render_ranged_stated_eta(self) -> None:
@@ -1673,14 +1792,174 @@ class PhaseTableTests(unittest.TestCase):
                 "stated_at",
                 "basis",
                 "as_of",
-                "first",
             },
         )
         self.assertEqual(eta["source"], "projected")
         self.assertIsNone(eta["stated_at"])
         self.assertIsNone(eta["basis"])
         self.assertTrue(cast(str, eta["as_of"]).endswith("-07:00"))
-        self.assertIsNone(eta["first"])
+        self.assertNotIn("first", eta)
+        self.assertIsNone(current["first_stated_eta_target"])
+
+    def test_json_keeps_first_stated_target_after_the_eta_passes(self) -> None:
+        self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
+        _ = self.write_run(
+            "current",
+            900,
+            self.phase_event("phase_started", "1", "one", 1_000),
+            self.phase_event(
+                "eta_stated",
+                "1",
+                "one",
+                1_050,
+                eta_at=1_100,
+                basis="first promise",
+            ),
+        )
+        self.write_state(None)
+
+        with patch.dict(
+            os.environ,
+            {
+                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
+                "PLAN_DELEGATE_NOW_EPOCH": "1200",
+            },
+        ):
+            parsed = cast(
+                "dict[str, object]",
+                json.loads(
+                    phase_table.show(
+                        self.session_dir,
+                        ZoneInfo("UTC"),
+                        json_output=True,
+                    )
+                ),
+            )
+
+        current = cast("dict[str, object]", parsed["current"])
+        self.assertIsNone(current["eta"])
+        self.assertEqual(
+            current["first_stated_eta_target"], "1970-01-01T00:18:20+00:00"
+        )
+
+    def test_json_marks_an_open_phase_whose_eta_was_never_stated(self) -> None:
+        self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
+        _ = self.write_run(
+            "current",
+            900,
+            self.phase_event("phase_started", "1", "one", 1_000),
+        )
+        self.write_state(None)
+
+        with patch.dict(
+            os.environ,
+            {
+                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
+                "PLAN_DELEGATE_NOW_EPOCH": "1200",
+            },
+        ):
+            parsed = cast(
+                "dict[str, object]",
+                json.loads(
+                    phase_table.show(
+                        self.session_dir,
+                        ZoneInfo("UTC"),
+                        json_output=True,
+                    )
+                ),
+            )
+
+        current = cast("dict[str, object]", parsed["current"])
+        self.assertIsNone(current["eta"])
+        self.assertIsNone(current["first_stated_eta_target"])
+
+    def test_production_json_resolves_each_plan_from_its_unit_worktree(
+        self,
+    ) -> None:
+        worktree = self.make_live_worktree("unit-worktree")
+        plan = worktree / "docs" / "unit-plan.md"
+        plan.parent.mkdir()
+        _ = plan.write_text(
+            plan_text("### Phase 4 — Unit delivery  · status: todo"),
+            encoding="utf-8",
+        )
+        self.write_run_for_plan(
+            "unit",
+            plan,
+            worktree,
+            900,
+            self.phase_event(
+                "phase_started",
+                "4",
+                "four",
+                1_000,
+                phase_title="Unit delivery",
+            ),
+        )
+        showrunner_checkout = self.root / "showrunner-checkout"
+        showrunner_checkout.mkdir()
+        production = self.write_units_production(
+            ("worker", "docs/unit-plan.md commentary", worktree),
+            checkout=showrunner_checkout,
+        )
+
+        result = self.run_show_production(production)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = cast("dict[str, object]", json.loads(result.stdout))
+        record = cast("dict[str, object]", records["worker"])
+        current = cast("dict[str, object]", record["current"])
+        self.assertEqual(record["plan"], str(plan.resolve()))
+        self.assertNotEqual(plan.parent, showrunner_checkout)
+        self.assertEqual(current["phase"], "4")
+        self.assertTrue(cast(str, current["started"]).endswith("-08:00"))
+
+    def test_production_json_keeps_an_unreadable_plan_local_to_its_unit(
+        self,
+    ) -> None:
+        readable_worktree = self.make_live_worktree("readable-worktree")
+        readable_plan = readable_worktree / "plan.md"
+        _ = readable_plan.write_text(
+            plan_text("### Phase 1 — Ready  · status: todo"),
+            encoding="utf-8",
+        )
+        missing_worktree = self.make_live_worktree("missing-worktree")
+        production = self.write_units_production(
+            ("ready", "plan.md", readable_worktree),
+            ("missing", "missing.md", missing_worktree),
+        )
+
+        result = self.run_show_production(production)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = cast("dict[str, object]", json.loads(result.stdout))
+        ready = cast("dict[str, object]", records["ready"])
+        missing = cast("dict[str, object]", records["missing"])
+        self.assertIsNone(ready["current"])
+        self.assertEqual(set(missing), {"unavailable"})
+        self.assertIn(
+            str(missing_worktree / "missing.md"),
+            cast(str, missing["unavailable"]),
+        )
+
+    def test_production_json_omits_retired_rows(self) -> None:
+        live_worktree = self.make_live_worktree("live-worktree")
+        live_plan = live_worktree / "plan.md"
+        _ = live_plan.write_text(
+            plan_text("### Phase 1 — Live  · status: todo"),
+            encoding="utf-8",
+        )
+        retired_worktree = self.root / "retired-worktree"
+        production = self.write_units_production(
+            ("live", "plan.md", live_worktree),
+            ("retired", "retired plan.md", retired_worktree),
+        )
+
+        result = self.run_show_production(production)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = cast("dict[str, object]", json.loads(result.stdout))
+        self.assertEqual(set(records), {"live"})
 
     def test_cli_reports_missing_state_or_plan_on_one_line(self) -> None:
         empty_session = self.root / "empty-session"
@@ -2117,6 +2396,86 @@ class PhaseTableTests(unittest.TestCase):
         self.assertIn(str(missing_plan), unreadable_plan.stderr)
         self.assertEqual(unreadable_show.returncode, 1)
         self.assertIn(str(missing_plan), unreadable_show.stderr)
+
+    def test_prune_removes_retired_notes_across_showrunner_directories(
+        self,
+    ) -> None:
+        live_worktree = self.make_live_worktree("live-prune-worktree")
+        live_plan = live_worktree / "plan.md"
+        _ = live_plan.write_text(
+            plan_text("### Phase 1 — Live  · status: todo"),
+            encoding="utf-8",
+        )
+        production = self.write_units_production(
+            ("live", "plan.md", live_worktree),
+        )
+        live = self.write_phase_note("current", "live", "show", "live")
+        retired_one = self.write_phase_note(
+            "old-one", "retired-one", "show", "retired-one"
+        )
+        retired_two = self.write_phase_note(
+            "old-two", "retired-two", "show", "retired-two"
+        )
+        other_production = self.write_phase_note(
+            "old-two", "other", "other-show", "retired-two"
+        )
+        handwritten = self.vault_root / "old-two" / "notes.md"
+        _ = handwritten.write_text("kept by a person\n", encoding="utf-8")
+
+        result = self.run_prune(production)
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertTrue(live.is_file())
+        self.assertFalse(retired_one.exists())
+        self.assertFalse(retired_one.parent.exists())
+        self.assertFalse(retired_two.exists())
+        self.assertTrue(other_production.is_file())
+        self.assertEqual(
+            handwritten.read_text(encoding="utf-8"), "kept by a person\n"
+        )
+
+    def test_prune_with_only_retired_rows_removes_every_production_note(
+        self,
+    ) -> None:
+        production = self.write_units_production(
+            ("retired-one", "retired one.md", self.root / "gone-one"),
+            ("retired-two", "retired two.md", self.root / "gone-two"),
+        )
+        first = self.write_phase_note(
+            "showrunner-one", "first", "show", "retired-one"
+        )
+        second = self.write_phase_note(
+            "showrunner-two", "second", "show", "retired-two"
+        )
+
+        result = self.run_prune(production)
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
+        self.assertFalse(first.parent.exists())
+        self.assertFalse(second.parent.exists())
+
+    def test_prune_leaves_handwritten_notes_untouched(self) -> None:
+        production = self.write_units_production()
+        folder = self.vault_root / "showrunner"
+        folder.mkdir(parents=True)
+        plain = folder / "plain.md"
+        _ = plain.write_text("personal status\n", encoding="utf-8")
+        marked_without_owner = folder / "marked.md"
+        _ = marked_without_owner.write_text(
+            "---\nphase_table: true\n---\npersonal status\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_prune(production)
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual(plain.read_text(encoding="utf-8"), "personal status\n")
+        self.assertIn(
+            "personal status",
+            marked_without_owner.read_text(encoding="utf-8"),
+        )
 
     def test_show_help_loads_outside_repository(self) -> None:
         result = subprocess.run(

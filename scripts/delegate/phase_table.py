@@ -25,7 +25,13 @@ sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 
 from scripts.delegate import progress_history
 from scripts.production import showrunners, unit_lookup
-from scripts.production.add_unit import Refusal, read_production
+from scripts.production.add_unit import (
+    Production,
+    Refusal,
+    cell_value,
+    live_unit_table,
+    read_production,
+)
 
 
 class ProjectedEta(NamedTuple):
@@ -254,6 +260,13 @@ class ProductionReference(NamedTuple):
     production: str
     unit: str
     document: str
+
+
+class ProductionUnitPlan(NamedTuple):
+    """A live production unit and the plan inside its own worktree."""
+
+    unit: str
+    plan: Path
 
 
 class PlanOutsideProduction(NamedTuple):
@@ -997,9 +1010,9 @@ def _json_record(record: PhaseRecord, zone: ZoneInfo) -> dict[str, object]:
         percent: int | None = None
         if isinstance(current.progress, ReportedPhaseProgress):
             percent = current.progress.percent
-        first: str | None = None
+        first_stated_eta_target: str | None = None
         if isinstance(current.first_stated, FirstStatedEtaTarget):
-            first = _iso(current.first_stated.time, zone)
+            first_stated_eta_target = _iso(current.first_stated.time, zone)
         if isinstance(current.eta, ProjectedEta):
             eta = current.eta
             eta_json = {
@@ -1010,7 +1023,6 @@ def _json_record(record: PhaseRecord, zone: ZoneInfo) -> dict[str, object]:
                 "stated_at": None,
                 "basis": None,
                 "as_of": _iso(eta.as_of, zone),
-                "first": first,
             }
         elif isinstance(current.eta, StatedEta):
             eta = current.eta
@@ -1027,7 +1039,6 @@ def _json_record(record: PhaseRecord, zone: ZoneInfo) -> dict[str, object]:
                 "stated_at": _iso(eta.stated_at, zone),
                 "basis": eta.basis,
                 "as_of": None,
-                "first": first,
             }
         current_json = {
             "phase": current.phase,
@@ -1036,6 +1047,7 @@ def _json_record(record: PhaseRecord, zone: ZoneInfo) -> dict[str, object]:
             "started": _iso(current.started, zone),
             "percent": percent,
             "eta": eta_json,
+            "first_stated_eta_target": first_stated_eta_target,
         }
     plan_finish: str | None = None
     if isinstance(record.plan_finish, FinishedAt | PredictedFinish):
@@ -1055,6 +1067,41 @@ def show(session_dir: Path, zone: ZoneInfo, json_output: bool = False) -> str:
     if json_output:
         return json.dumps(_json_record(record, zone), indent=2)
     return render(record, zone)
+
+
+def _production_lines(production: Production) -> list[str]:
+    try:
+        return production.doc.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise Refusal(f"cannot read production doc: {error}") from error
+
+
+def _production_unit_plans(production: Production) -> list[ProductionUnitPlan]:
+    plans: list[ProductionUnitPlan] = []
+    for cells in live_unit_table(_production_lines(production), production.slug):
+        unit = cell_value(cells.get("Unit", ""))
+        worktree = Path(cell_value(cells.get("Worktree", ""))).expanduser()
+        plan_text = cell_value(cells.get("Plan", "")).split(" ", 1)[0]
+        plan = Path(plan_text).expanduser()
+        if not plan.is_absolute():
+            plan = worktree / plan
+        plans.append(ProductionUnitPlan(unit=unit, plan=plan.resolve()))
+    return plans
+
+
+def show_production(production_doc: Path) -> str:
+    """Return every live unit's phase record as one JSON object."""
+    production = read_production(production_doc)
+    records: dict[str, object] = {}
+    for unit_plan in _production_unit_plans(production):
+        try:
+            record: object = _json_record(
+                build_plan(unit_plan.plan), production.zone
+            )
+        except NoPlan as error:
+            record = {"unavailable": str(error)}
+        records[unit_plan.unit] = record
+    return json.dumps(records, indent=2)
 
 
 PRODUCTION_PATTERN = re.compile(
@@ -1269,16 +1316,54 @@ def _remove_stale_notes(
                 ) from error
 
 
+def _vault_root() -> Path:
+    return Path(
+        os.environ.get("PHASE_TABLE_VAULT")
+        or Path.home() / "rust" / "hanadocs" / "showrunners"
+    ).expanduser()
+
+
+def prune(production_doc: Path) -> None:
+    """Remove generated notes for units no longer live in a production."""
+    production = read_production(production_doc)
+    live_units = {
+        unit_plan.unit for unit_plan in _production_unit_plans(production)
+    }
+    vault_root = _vault_root()
+    for candidate in vault_root.glob("*/*.md"):
+        ownership = _note_ownership(candidate)
+        if (
+            not isinstance(ownership, NoteOwnership)
+            or ownership.production != production.slug
+            or ownership.unit in live_units
+        ):
+            continue
+        try:
+            candidate.unlink()
+        except OSError as error:
+            raise Refusal(
+                f"cannot remove retired phase note {candidate}: {error}"
+            ) from error
+        try:
+            candidate.parent.rmdir()
+        except OSError as error:
+            try:
+                if any(candidate.parent.iterdir()):
+                    continue
+            except OSError:
+                pass
+            raise Refusal(
+                f"cannot remove empty phase note directory {candidate.parent}: {error}"
+            ) from error
+
+
 def refresh(session_dir: Path) -> None:
     """Rewrite a production unit's generated phase note, when it has one."""
     record = build(session_dir)
     reference = _production_reference(record.plan)
     if isinstance(reference, PlanOutsideProduction):
         return
-    vault_root = Path(
-        os.environ.get("PHASE_TABLE_VAULT")
-        or Path.home() / "rust" / "hanadocs" / "showrunners"
-    ).expanduser()
+    vault_root = _vault_root()
     if not vault_root.parent.exists():
         return
     production = read_production(_production_document(record.plan, reference))
@@ -1338,11 +1423,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     show_parser = commands.add_parser("show")
-    _ = show_parser.add_argument("--session-dir", type=Path, required=True)
+    show_target = show_parser.add_mutually_exclusive_group(required=True)
+    _ = show_target.add_argument("--session-dir", type=Path)
+    _ = show_target.add_argument("--production-doc", type=Path)
     _ = show_parser.add_argument("--zone", default="")
     _ = show_parser.add_argument("--json", action="store_true")
     refresh_parser = commands.add_parser("refresh")
     _ = refresh_parser.add_argument("--session-dir", type=Path, required=True)
+    prune_parser = commands.add_parser("prune")
+    _ = prune_parser.add_argument("--production-doc", type=Path, required=True)
     return parser
 
 
@@ -1350,14 +1439,25 @@ def main() -> int:
     args = _build_parser().parse_args()
     command_value: object = getattr(args, "command", "")
     session_value: object = getattr(args, "session_dir", Path())
+    production_value: object = getattr(args, "production_doc", None)
     zone_value: object = getattr(args, "zone", "")
     json_value: object = getattr(args, "json", False)
     command = command_value if isinstance(command_value, str) else ""
     session_dir = session_value if isinstance(session_value, Path) else Path()
+    production_doc = production_value if isinstance(production_value, Path) else None
     zone_name = zone_value if isinstance(zone_value, str) else ""
     try:
         if command == "refresh":
             refresh(session_dir.expanduser().resolve())
+            return 0
+        if command == "prune":
+            if production_doc is None:
+                raise Refusal("prune requires a production document")
+            prune(production_doc.expanduser().resolve())
+            return 0
+        if production_doc is not None:
+            output = show_production(production_doc.expanduser().resolve())
+            print(output)
             return 0
         zone = ZoneInfo(zone_name) if zone_name else _local_zone()
         output = show(session_dir.expanduser().resolve(), zone, json_value is True)
