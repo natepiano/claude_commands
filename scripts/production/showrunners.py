@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import NamedTuple, TypedDict, cast
+from typing import NamedTuple, NotRequired, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 import unit_lookup
@@ -29,6 +29,10 @@ class Showrunner(TypedDict):
     # The production doc, whose Units table says which units the showrunner has. Empty until the
     # showrunner registers; its units are then unknown, not none.
     doc: str
+    # The unit list an entry held before units were looked up. Nothing here reads it. It is kept
+    # through every rewrite, because `adopt.py` takes each unit's run state from it, and one
+    # showrunner's write must not lose the states of a showrunner that has not adopted yet.
+    units: NotRequired[list[object]]
 
 
 class ShowrunnerSettings(TypedDict):
@@ -94,13 +98,16 @@ def load_settings_from(path: Path) -> ShowrunnerSettings:
             if not isinstance(item, dict):
                 raise ValueError("invalid showrunner")
             entry = cast(dict[str, object], item)
-            # An entry written before units were looked up also lists them; that list is not read.
             session, zone, doc = entry.get("session"), entry.get("zone"), entry.get("doc", "")
             if (not isinstance(session, str) or not session or not isinstance(zone, str)
                     or not isinstance(doc, str)):
                 raise ValueError("invalid showrunner fields")
             _ = ZoneInfo(zone)
-            checked.append(Showrunner(session=session, zone=zone, doc=doc))
+            runner = Showrunner(session=session, zone=zone, doc=doc)
+            units = entry.get("units")
+            if isinstance(units, list):
+                runner["units"] = cast(list[object], units)
+            checked.append(runner)
         return ShowrunnerSettings(threshold_percent=cast(float, data["threshold_percent"]),
                                   repeat_minutes=cast(float, data["repeat_minutes"]),
                                   stall_minutes=cast(float, data["stall_minutes"]),
@@ -267,7 +274,8 @@ def set_own_state(state: str) -> None:
 def stored_settings(settings: ShowrunnerSettings) -> dict[str, object]:
     runners: list[dict[str, object]] = []
     for runner in settings["showrunners"]:
-        runners.append({"session": runner["session"], "zone": runner["zone"], "doc": runner["doc"]})
+        runners.append({"session": runner["session"], "zone": runner["zone"], "doc": runner["doc"],
+                        **({"units": runner["units"]} if "units" in runner else {})})
     return {**settings, "showrunners": runners}
 
 

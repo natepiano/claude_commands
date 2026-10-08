@@ -124,6 +124,15 @@ class UnitLookupTests(unittest.TestCase):
         unit_lookup.set_state("%4", UnitState.RUN_FINISHED)
         self.assertEqual(unit_lookup.marked_units("show")["trunk-unit"].state, UnitState.RUN_FINISHED)
 
+    def test_the_showrunner_sets_a_units_state_by_unit_id_from_outside_its_pane(self) -> None:
+        fake_tmux.write(self.state, {"$1": marked("any-label", "%4", "trunk-unit")})
+        self.assertEqual(self.run_script("state", "show", "trunk-unit", "run-finished").returncode, 0)
+        self.assertEqual(unit_lookup.marked_units("show")["trunk-unit"].state, UnitState.RUN_FINISHED)
+        self.assertEqual(self.run_script("state", "show", "trunk-unit", "running").returncode, 0)
+        self.assertEqual(unit_lookup.marked_units("show")["trunk-unit"].state, UnitState.RUNNING)
+        self.assertEqual(self.run_script("state", "show", "fps-unit", "run-finished").returncode, 1)
+        self.assertEqual(self.run_script("state", "show", "trunk-unit", "asleep").returncode, 2)
+
 
 if __name__ == "__main__":
     _ = unittest.main()

@@ -140,8 +140,8 @@ class RegistrationTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(script), *args, "--production", str(self.doc)],
                               cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False)
 
-    def test_register_records_where_the_doc_is_and_no_unit_names(self) -> None:
-        # A registry written before the change still lists units; the next register drops the list.
+    def test_register_records_where_the_doc_is_and_keeps_an_old_unit_list_for_adopt(self) -> None:
+        # A registry written before the change still lists units; adopt reads run states from the list.
         _ = self.config.write_text(json.dumps({
             "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "natedev",
             "always": ["natedev"], "showrunners": [{
@@ -150,7 +150,8 @@ class RegistrationTests(unittest.TestCase):
         first = self.run_command("register", "--session", "first-showrunner")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertEqual(self.registry(), [{"session": "first-showrunner", "zone": "America/Los_Angeles",
-                                            "doc": str(self.doc)}])
+                                            "doc": str(self.doc),
+                                            "units": [{"session": "a-name-since-changed", "status": "running"}]}])
 
     def test_start_and_resume_retarget_only_updates_and_retire_old_session(self) -> None:
         first = self.run_command("register", "--session", "first-showrunner")

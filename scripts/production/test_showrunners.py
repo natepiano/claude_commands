@@ -211,7 +211,7 @@ raise SystemExit(1)
         self.assertEqual(result.returncode, 1)
         self.assertIn("not a production doc: none registered", result.stderr)
 
-    def test_old_layout_is_read_and_its_unit_list_is_dropped_at_the_next_write(self) -> None:
+    def test_old_layout_is_read_and_its_unit_list_is_kept_through_a_write_for_adopt(self) -> None:
         document = {**showrunners.defaults(), "showrunners": [{
             "session": "director", "zone": LOS_ANGELES,
             "units": ["working", {"session": "finished", "status": "run-finished"}], "standby": ["waiting"],
@@ -219,7 +219,9 @@ raise SystemExit(1)
         _ = self.config.write_text(json.dumps(document), encoding="utf-8")
         self.assertIn("director\tnot running\tAmerica/Los_Angeles\t<no doc registered>", self.successful("list"))
         _ = self.successful("add", "director", "--zone", LOS_ANGELES, "--doc", str(self.doc))
-        self.assertEqual(self.entries(), [{"session": "director", "zone": LOS_ANGELES, "doc": str(self.doc)}])
+        self.assertEqual(self.entries(), [{
+            "session": "director", "zone": LOS_ANGELES, "doc": str(self.doc),
+            "units": ["working", {"session": "finished", "status": "run-finished"}]}])
 
     def test_status_marks_the_tmux_session_the_unit_calls_from(self) -> None:
         self.unit_session("alpha", "%4")

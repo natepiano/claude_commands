@@ -109,11 +109,28 @@ class AdoptTests(unittest.TestCase):
                                      "| --- | --- | --- | --- | --- | --- |"])
         self.assertEqual(table[3], f"| `beta-unit` | `docs/beta.md` | `{self.root / 'beta'}` | `beta` | 4100 | — |")
         registry = cast(dict[str, list[dict[str, str]]], json.loads(self.config.read_text(encoding="utf-8")))
-        self.assertEqual(registry["showrunners"],
-                         [{"session": "director", "zone": "America/Los_Angeles", "doc": str(self.doc)}])
+        self.assertEqual([(runner["session"], runner["zone"], runner["doc"]) for runner in registry["showrunners"]],
+                         [("director", "America/Los_Angeles", str(self.doc))])
         self.assertEqual((self.scratch / "unit_status/decisions_seen").read_text(encoding="utf-8"),
                          "alpha-unit|which colour\nbeta-unit|which size\n")
         self.assertEqual(self.commits(), ["production(show): unit sessions are looked up, not written down", "base"])
+
+    def test_another_showrunners_registry_write_does_not_lose_this_ones_unit_states(self) -> None:
+        other = subprocess.run([sys.executable, str(SCRIPT.with_name("showrunners.py")), "add", "other",
+                                "--zone", "America/Los_Angeles"], env=self.environment, capture_output=True,
+                               text=True, check=False)
+        self.assertEqual(other.returncode, 0, other.stderr)
+        self.assertEqual(self.run_adopt().returncode, 0)
+        self.assertEqual(self.marks()["beta-renamed"]["SHOWRUNNER_UNIT_STATE"], "run-finished")
+
+    def test_a_unit_marked_by_hand_before_the_run_still_gets_its_run_state(self) -> None:
+        sessions = fake_tmux.read(self.tmux)
+        sessions["$2"]["env"].update({"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "beta-unit"})
+        fake_tmux.write(self.tmux, sessions)
+        result = self.run_adopt()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.marks()["beta-renamed"]["SHOWRUNNER_UNIT_STATE"], "run-finished")
+        self.assertEqual(self.marks()["alpha"]["SHOWRUNNER_UNIT_STATE"], "running")
 
     def test_a_second_run_changes_nothing(self) -> None:
         self.assertEqual(self.run_adopt().returncode, 0)

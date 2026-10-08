@@ -28,7 +28,10 @@ COLUMN = "Session"
 
 
 class Marked(NamedTuple):
-    """The unit's tmux session already carries its mark."""
+    """The unit's tmux session already carries its mark, set by hand before this run."""
+
+    pane: str
+    state: UnitState
 
 
 class ToMark(NamedTuple):
@@ -83,7 +86,7 @@ def unit_rows(production: add_unit.Production, lines: list[str], gone: set[str])
         found = ({owner[pane] for pane in claudes.get(old_name, ()) if pane in owner}
                  | {session for session, (label, _) in tmux.items() if label == old_name})
         if unit in marked:
-            rows.append(UnitRow(unit, old_name, Marked()))
+            rows.append(UnitRow(unit, old_name, Marked(marked[unit].pane, marked[unit].state)))
         elif len(found) == 1:
             target = next(iter(found))
             rows.append(UnitRow(unit, old_name, ToMark(target, tmux[target][0])))
@@ -152,6 +155,12 @@ def adopt(production: add_unit.Production, scratch: Path, gone: set[str]) -> int
             if row.old_name in states:
                 unit_lookup.set_state(row.session.target, states[row.old_name])
             print(f"adopt: {row.unit} is the tmux session {row.session.label}")
+        elif isinstance(row.session, Marked):
+            # A mark set by hand says nothing of the run state, so the session reads as running.
+            held = states.get(row.old_name, UnitState.RUNNING)
+            if row.session.state is UnitState.RUNNING and held is not UnitState.RUNNING:
+                unit_lookup.set_state(row.session.pane, held)
+            print(f"adopt: {row.unit} was already marked")
         elif isinstance(row.session, StatedGone):
             print(f"adopt: {row.unit} has no session now")
         if row.old_name and row.old_name != row.unit:
