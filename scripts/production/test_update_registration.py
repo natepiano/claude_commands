@@ -211,7 +211,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
         prompt = prompts[0].read_text(encoding="utf-8")
         self.assertIn("unit_status.txt", prompt)
-        self.assertIn("/showrunner:dailies simple", prompt)
+        self.assertIn("/showrunner:dailies gantt", prompt)
         self.assertEqual(prompt.count("Pass `--render-state <SCRATCH>/dailies_state.json` to the builder"), 1)
         self.assertEqual(prompt.count("--render-state"), 1)
         self.assertIn("America/Los_Angeles", prompt)

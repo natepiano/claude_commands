@@ -19,10 +19,11 @@ import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, tzinfo
 from functools import cache
 from pathlib import Path
-from typing import NamedTuple, TypedDict, cast
+from typing import NamedTuple, NoReturn, TypedDict, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 SCHEMA_VERSION = 1
@@ -348,6 +349,37 @@ def _arg_string(args: argparse.Namespace, name: str, default: str = "") -> str:
 def _arg_integer(args: argparse.Namespace, name: str, default: int = 0) -> int:
     value: object = getattr(args, name)  # pyright: ignore[reportAny]
     return _integer(value, default)
+
+
+def _refuse_eta(message: str) -> NoReturn:
+    print(message, file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _process_timezone() -> tzinfo:
+    configured = os.environ.get("TZ")
+    if configured:
+        try:
+            return ZoneInfo(configured)
+        except ZoneInfoNotFoundError:
+            pass
+    detected = datetime.now().astimezone().tzinfo
+    return detected if detected is not None else UTC
+
+
+def _local_eta_epoch(value: str, option: str) -> float:
+    layout = "%Y-%m-%dT%H:%M"
+    try:
+        parsed = datetime.strptime(value, layout)
+    except ValueError:
+        _refuse_eta(f"{option} must use YYYY-MM-DDTHH:MM")
+    if parsed.strftime(layout) != value:
+        _refuse_eta(f"{option} must use YYYY-MM-DDTHH:MM")
+    zone = _process_timezone()
+    epoch = parsed.replace(tzinfo=zone).timestamp()
+    if datetime.fromtimestamp(epoch, zone).strftime(layout) != value:
+        _refuse_eta(f"{option} is a time the local clock skips")
+    return epoch
 
 
 def _session_dir(args: argparse.Namespace) -> Path:
@@ -4247,6 +4279,48 @@ def _progress(args: argparse.Namespace) -> None:
     _refresh_phase_table(session_dir)
 
 
+def _eta(args: argparse.Namespace) -> None:
+    session_dir = _session_dir(args)
+    state = _read_state(session_dir)
+    phase = _object_dict(state.get("phase"))
+    if phase is None or _string(phase.get("status")) != "active":
+        _refuse_eta("An active phase is required to record an ETA")
+    basis = _arg_string(args, "basis").strip()
+    if not basis:
+        _refuse_eta("--basis must not be blank")
+
+    now = now_epoch()
+    eta_at = _local_eta_epoch(_arg_string(args, "time"), "--time")
+    if eta_at < now:
+        _refuse_eta("--time must not be in the past")
+
+    earliest_text = _arg_string(args, "earliest")
+    latest_text = _arg_string(args, "latest")
+    if bool(earliest_text) != bool(latest_text):
+        _refuse_eta("--earliest and --latest must be supplied together")
+
+    event = _event(state, "eta_stated", now)
+    event.update({"eta_at": eta_at, "basis": basis})
+    if earliest_text and latest_text:
+        earliest_at = _local_eta_epoch(earliest_text, "--earliest")
+        latest_at = _local_eta_epoch(latest_text, "--latest")
+        if earliest_at > eta_at:
+            _refuse_eta("--earliest must not be after --time")
+        if latest_at < eta_at:
+            _refuse_eta("--latest must not be before --time")
+        event.update(
+            {
+                "eta_earliest_at": earliest_at,
+                "eta_latest_at": latest_at,
+            }
+        )
+
+    _append_event(state, event)
+    _refresh_phase_table(session_dir)
+    local_eta = datetime.fromtimestamp(eta_at, _process_timezone())
+    print(f"ETA recorded: {local_eta:%H:%M %Z}")
+
+
 def _finish_phase(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
@@ -4532,6 +4606,14 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = progress.add_argument("--project-override-reason", default="")
     _ = progress.add_argument("--phase-override-reason", default="")
     progress.set_defaults(handler=_progress)
+
+    eta = subparsers.add_parser("eta")
+    _ = eta.add_argument("--session-dir", required=True)
+    _ = eta.add_argument("--time", required=True)
+    _ = eta.add_argument("--earliest", default="")
+    _ = eta.add_argument("--latest", default="")
+    _ = eta.add_argument("--basis", required=True)
+    eta.set_defaults(handler=_eta)
 
     timeline = subparsers.add_parser("timeline")
     _ = timeline.add_argument("--session-dir", required=True)

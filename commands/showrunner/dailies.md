@@ -1,6 +1,6 @@
 ---
-description: Report a running production's state to the executive producer (the user) — every unit and every open topic — at one of three lengths, simple (default), page or elaborate.
-argument-hint: "[simple|page|elaborate] [default|ascii]"
+description: Report a running production's state to the executive producer (the user) — every unit and every open topic — at one of four lengths, gantt (default: the chart, with only what needs the user and what changed), simple, page or elaborate.
+argument-hint: "[gantt|simple|page|elaborate] [default|ascii]"
 ---
 
 # Dailies
@@ -11,8 +11,8 @@ producer: the user. Run it in the showrunner session during `/showrunner:produce
 whose state (`PRODUCTION_DOC`, `LOG`, `ZONE`, `UNITS`, `CHECKOUT`,
 `MERGE_BRANCH`, `NOTIFIER`, `UPDATES`) it uses.
 
-**Usage:** `/showrunner:dailies [simple|page|elaborate] [default|ascii]`. With
-no length, `simple`. With any other argument, name the choices and stop.
+**Usage:** `/showrunner:dailies [gantt|simple|page|elaborate] [default|ascii]`. With
+no length, `gantt`. With any other argument, name the choices and stop.
 
 **Chart mode.** `default` draws the timeline in coloured squares; `ascii`
 draws it with characters a code font has, for when you are remote, since the
@@ -41,7 +41,7 @@ production doc's **Updates** interval. Two steps do that:
    clock: at 19:21 with N = 60, 20:00; at 19:45, 21:00.
 
 A scheduled tick's prompt saves `<SCRATCH>/unit_status.txt`, then runs
-`/showrunner:dailies simple`. Pass that file to the builder without
+`/showrunner:dailies gantt`. Pass that file to the builder without
 `--user-run`; its clock is already right.
 
 ## Gather
@@ -57,7 +57,8 @@ Read the current state, not memory, and check what you state the way
    old or past. Send that request this turn. It writes `set HH:MM` for a stale
    ETA and `none measured - requested` for a passed one. A held unit's ETA
    that has not changed since the builder first saw it is never requested and
-   stays as stated. Supply the phase, started time, current update, and ETA
+   stays as stated, unless a new one was already asked for before the hold:
+   that one is not brought back. Supply the phase, started time, current update, and ETA
    numbers from the unit's plan and reports. Text after `❯` may be a prompt
    suggestion, not the user's draft:
    `capture-pane -e` shows a suggestion dimmed (`ESC[2m`).
@@ -94,7 +95,7 @@ the user as the failure message. Correct the named input before reporting.
 python3 ~/.claude/scripts/production/dailies_input.py \
   --production <PRODUCTION_DOC> --status <scratchpad>/unit_status.txt \
   --judgment <scratchpad>/dailies_judgment.json --state-dir <scratchpad>/dailies_input_state \
-  --out <scratchpad>/dailies_input.json --length <simple|page|elaborate> \
+  --out <scratchpad>/dailies_input.json --length <gantt|simple|page|elaborate> \
   --render-state <scratchpad>/dailies_state.json \
   --notifier <NOTIFIER> [--user-run]
 python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_input.json \
@@ -156,7 +157,7 @@ The builder's output, which the renderer consumes:
 
 | Field | Rule |
 | --- | --- |
-| `length` | `simple`, `page` or `elaborate`, from the argument. |
+| `length` | `gantt`, `simple`, `page` or `elaborate`, from the argument. |
 | `zone` | `ZONE`, as an IANA name. |
 | `next_run` | The next scheduled run, `HH:MM` in `ZONE`, after any restart. Leave it out when no schedule runs. |
 | `unit` | The unit director's session name. |
@@ -173,6 +174,7 @@ The builder's output, which the renderer consumes:
 | `update` | What the unit is doing now, one line. The length sets how long (below). A unit waiting on another unit says so, with the wait's start and expected clear times from `LOG` (`/showrunner:produce` → Dependencies). |
 | `eta` | The unit's latest stated phase ETA, in `ZONE`. `time` is `HH:MM`, `+1` for tomorrow (`11:21+1`); add `earliest` and `latest` when the unit director gave a range. With no ETA, `none` in place of `time`, one of: `none measured - requested` (after sending that unit director `/unit:eta` in this turn, the unmeasured-ETA rule in `/showrunner:produce`), `none measured`, `no ETA stated yet`. Never make one up. `percent` is required with `time`: the unit director's phase percent done (the recorder's phase `%`, 0–100), or `null` when it stated none. `detail` is an optional short note on what the time covers (`checks and build included`). It never says where the ETA came from: no `from the recorder`, no `from past runs` (user, 2026-10-02); the renderer refuses a `detail` that starts with `from`. `why` says in a few words why the ETA moved since the last report, from the unit director's own reports (`the four remaining app tests need a new floor anchor`); the renderer prints it after `because` and refuses a move of 15 minutes or more without it (user, 2026-10-01). |
 | `eta.first`, `eta.fixes` | The phase's first stated ETA (`YYYY-MM-DDTHH:MM`), and the fix rounds added since it. `first` seeds the state once; the state then keeps it for the phase. Give `fixes` every report: the repair rounds started after the first ETA. User, 2026-10-03. |
+| `eta.stated` | Written by the builder, never by you: when it first saw this ETA. The renderer reads a time that names no day on that day. |
 | `waiting_on_it` | Only for a topic that lands with this unit's phase, and who waits. |
 | `needed` | Only when the subject needs a follow-up nobody has started, from you (the user), the showrunner or another unit director. Say who. |
 | `needs_user` | `true` when the subject waits on you. It then goes first. |
@@ -207,6 +209,11 @@ unless it names another plan's document. User, 2026-10-02.
 ### What the renderer writes
 
 - **First line:** the length and the time in `ZONE`: `**Dailies (Simple)**, 19:05 PDT`.
+- **`gantt`:** the first line, the chart and the last lines, and above the chart only two things. A subject
+  that needs the user keeps its full section. A unit that changed since the last report gets one line for each
+  change: `- <unit>: now on <phase>`, `- <unit>: checkpoint not merged, because ...` or `checkpoint no longer
+  held`, `- <unit>: eta ...` when the ETA moved 15 minutes or more, and `- <unit>: no longer in the report`.
+  Nothing changed, no lines. The rest of this list is what the other lengths print.
 - **One section per subject:** `### <unit>: <project>`, then `goal:` when given, `phase:`,
   `checkpoint: not merged, because ...` when given, `update:`, `eta:`, and
   `waiting on it:`, `needed:` and `then:` when given. In `simple`, a held
@@ -216,7 +223,8 @@ unless it names another plan's document. User, 2026-10-02.
 - **eta:** the time, then the percent done: `10:46 PDT, 85% done`.
 - **eta note:** against the last report's ETA for the same phase:
   `(unchanged)`, `(changed: +0:27 because <why>)`, or `(unchanged, overdue)`
-  once the time has passed. No note on a subject's first ETA or a new phase.
+  once the time has passed. A subject's first ETA or a new phase has no note,
+  except `(overdue)` when its time has already passed.
   A new phase has a new title; a renumbered phase with the same title keeps its notes.
 - **first eta:** once the ETA has moved from the phase's first: `05:43 PDT (now
   +17:12, 8 fix rounds added)`. User, 2026-10-03. A
@@ -256,6 +264,7 @@ unless it names another plan's document. User, 2026-10-02.
 
 | Argument | `update:` gets |
 | --- | --- |
+| `gantt` | The same one short line as `simple`. The report prints it only for a subject that needs the user; write it for every subject all the same, since the input is checked in full. |
 | `simple` | One short line. For when the user is already following along. Waiting, idle units take one line each. |
 | `page` | The `simple` line plus one more sentence of brief context: what a named thing is (a helper, seat, round or check) and why it matters now. Example: "fifth pass on the app's wording has started; the fourth left 16 tests expecting the old words. Trunk hands each pass to a short-lived helper agent, and each can run out of room partway, so the work takes several passes." |
 | `elaborate` | More on each subject: what is moving or at risk gets the most, what is only waiting the least. Up to two pages for the whole report, and only as long as the state needs. The user asks when they want more. |
@@ -265,7 +274,7 @@ Cutting repeats is for `simple`: it says only what changed or what you need. `pa
 Every length keeps the same template and the `update:` text grows with it,
 except that `simple` gives each waiting, idle unit the one line in **Waiting
 and idle** above. An `update` is always one line, at most 240 characters for
-`simple` and 480 for `page`; the renderer refuses a longer one.
+`gantt` and `simple` and 480 for `page`; the renderer refuses a longer one.
 
 For every length:
 - **One phase per unit.** The heading names one phase: the oldest one not yet

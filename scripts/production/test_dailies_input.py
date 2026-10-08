@@ -287,7 +287,7 @@ class DailiesInputTests(unittest.TestCase):
         return result.stdout + result.stderr
 
     def test_each_length_produces_input_the_renderer_accepts(self) -> None:
-        for length in ("simple", "page", "elaborate"):
+        for length in ("gantt", "simple", "page", "elaborate"):
             with self.subTest(length=length):
                 result = self.run_builder("--length", length)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -484,16 +484,21 @@ class DailiesInputTests(unittest.TestCase):
                 self.assertEqual(len(positions), 1, result.stdout)
                 self.assertLess(positions[0], input_index)
 
-    def test_scheduled_prompt_saves_complete_status_for_dailies_simple(self) -> None:
+    def test_with_no_length_the_builder_writes_a_gantt_report(self) -> None:
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.report()["length"], "gantt")
+
+    def test_scheduled_prompt_saves_complete_status_for_dailies_gantt(self) -> None:
         commands = SCRIPT.parents[2] / "commands/showrunner"
         produce = (commands / "produce.md").read_text(encoding="utf-8")
         dailies = (commands / "dailies.md").read_text(encoding="utf-8")
         prompt = produce.split("The prompt:", 1)[1].split("**A tick**", 1)[0]
         self.assertIn("> <SCRATCH>/unit_status.txt", prompt)
         self.assertNotIn("cut -c1-400", prompt)
-        self.assertIn("/showrunner:dailies simple", prompt)
+        self.assertIn("/showrunner:dailies gantt", prompt)
         self.assertIn("unit_status.txt", dailies)
-        self.assertIn("/showrunner:dailies simple", dailies)
+        self.assertIn("/showrunner:dailies gantt", dailies)
 
     def test_dailies_command_surfaces_builder_step_failure_to_user(self) -> None:
         command = SCRIPT.parents[2] / "commands/showrunner/dailies.md"
@@ -690,14 +695,14 @@ class DailiesInputTests(unittest.TestCase):
             "held": "the panel review is paused",
             "eta": {"percent": 60},
         })
-        baseline = self.run_builder("--at", "2026-10-06T19:30")
+        baseline = self.run_builder("--at", "2026-10-06T19:30", "--length", "simple")
         self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
         first_report = self.run_renderer("2026-10-06T19:30")
         self.assertEqual(first_report.returncode, 0, first_report.stdout + first_report.stderr)
 
         for at in ("2026-10-06T20:00", "2026-10-06T21:36", "2026-10-06T23:50"):
             with self.subTest(at=at):
-                built = self.run_builder("--at", at)
+                built = self.run_builder("--at", at, "--length", "simple")
                 self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
                 self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "19:35")
                 self.assertNotIn("request /unit:eta:", built.stdout)
@@ -721,6 +726,47 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
         self.assertEqual(self.unit()["eta"], {"none": "none measured - requested"})
         self.assertEqual(passed.stdout.count(f"request /unit:eta: {ALPHA}"), 1)
+
+    def test_an_eta_a_new_one_was_asked_for_is_not_brought_back_when_its_unit_is_held(self) -> None:
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 19:35")
+        first = self.run_builder("--at", "2026-10-06T19:30")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        passed = self.run_builder("--at", "2026-10-06T20:00")
+        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
+        self.assertEqual(self.unit()["eta"], {"none": "none measured - requested"})
+        self.judgment_file(alpha={"held": "the panel review is paused", "eta": {"percent": 60}})
+
+        held = self.run_builder("--at", "2026-10-06T20:10")
+        self.assertEqual(held.returncode, 0, held.stdout + held.stderr)
+        self.assertEqual(self.unit()["eta"], {"none": "none measured - requested"})
+        self.assertNotIn("request /unit:eta:", held.stdout)
+
+    def test_a_held_units_passed_eta_is_marked_overdue_in_a_report_with_no_earlier_report_of_it(self) -> None:
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 23:00")
+        self.judgment_file(alpha={"held": "the panel review is paused", "eta": {"percent": 60}})
+        baseline = self.run_builder("--at", "2026-10-06T19:30")
+        self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
+
+        built = self.run_builder("--at", "2026-10-06T23:30", "--length", "simple")
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        rendered = self.run_renderer("2026-10-06T23:30")
+        self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
+        self.assertIn("- eta: 23:00 PDT, 60% done (overdue)", rendered.stdout)
+
+    def test_a_time_that_names_no_day_is_read_on_the_day_it_was_stated(self) -> None:
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 19:35")
+        self.judgment_file(alpha={"held": "the panel review is paused", "eta": {"percent": 60}})
+        baseline = self.run_builder("--at", "2026-10-06T19:30")
+        self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
+
+        # No report was rendered at 19:30, so the renderer has no moment saved for this ETA.
+        built = self.run_builder("--at", "2026-10-06T23:50", "--length", "simple")
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["stated"], "2026-10-06T19:30")
+        rendered = self.run_renderer("2026-10-06T23:50")
+        self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
+        self.assertIn("- eta: 19:35 PDT, 60% done (overdue)", rendered.stdout)
+        self.assertNotIn("tomorrow", rendered.stdout)
 
     def test_held_changed_eta_uses_the_two_hour_rule_in_the_renderer(self) -> None:
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 19:35")
