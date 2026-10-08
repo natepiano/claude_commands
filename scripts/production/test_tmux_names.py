@@ -19,6 +19,10 @@ SCRIPT = Path(__file__).with_name("tmux_names.py")
 TEST_TMUX_SOCKET = "/tmp/tmux-test/default"
 
 
+def registered(session: str, status: str = "running") -> dict[str, str]:
+    return {"session": session, "status": status}
+
+
 class TmuxNamesTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -90,7 +94,7 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         _ = self.config.write_text(json.dumps({"threshold_percent": 2, "repeat_minutes": 30,
                                            "stall_minutes": 5, "faults_to": "natedev", "always": [],
                                            "showrunners": [{"session": "director", "zone": "America/Los_Angeles",
-                                                            "units": ["old"]}]}))
+                                                            "units": [registered("old")]}]}))
         self.environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
                             "SHOWRUNNERS_CONFIG": str(self.config),
                             "SHOWRUNNERS_SESSIONS": str(sessions_script),
@@ -137,7 +141,33 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         result = self.tick()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.names(), {"new": ["%1"]})
-        self.assertEqual(self.entries()[0]["units"], ["new"])
+        self.assertEqual(self.entries()[0]["units"], [registered("new")])
+
+    def test_unit_renames_keep_all_three_registry_statuses(self) -> None:
+        statuses = ("running", "run-finished", "standing-by")
+        old_names = [f"old-{status}" for status in statuses]
+        _ = self.config.write_text(json.dumps({
+            "threshold_percent": 2,
+            "repeat_minutes": 30,
+            "stall_minutes": 5,
+            "faults_to": "natedev",
+            "always": [],
+            "showrunners": [{
+                "session": "director",
+                "zone": "America/Los_Angeles",
+                "units": [registered(name, status) for name, status in zip(old_names, statuses)],
+            }],
+        }))
+        _ = self.tmux.write_text(json.dumps({name: [f"%{index}"]
+                                             for index, name in enumerate(old_names, start=1)}))
+        for index, status in enumerate(statuses, start=1):
+            self.session(f"new-{status}", f"%{index}")
+
+        result = self.tick()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.entries()[0]["units"],
+                         [registered(f"new-{status}", status) for status in statuses])
 
     def test_showrunner_rename_changes_config_session(self) -> None:
         _ = self.tmux.write_text(json.dumps({"director": ["%1"]}))
@@ -157,7 +187,7 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
                 self.session("nixos-45", "%1", source=source)
                 self.assertEqual(self.tick().returncode, 0)
                 self.assertEqual(self.names(), {"old": ["%1"]})
-                self.assertEqual(self.entries()[0]["units"], ["old"])
+                self.assertEqual(self.entries()[0]["units"], [registered("old")])
 
     def test_rename_works_before_registry_has_been_created(self) -> None:
         self.config.unlink()
@@ -176,7 +206,7 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         self.assertEqual(self.names(), {"old": ["%1"]})
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.names(), {"new": ["%1"]})
-        self.assertEqual(self.entries()[0]["units"], ["new"])
+        self.assertEqual(self.entries()[0]["units"], [registered("new")])
 
     def test_tmux_failure_after_registry_change_is_finished_next_tick(self) -> None:
         self.session("new", "%1")
@@ -184,11 +214,11 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         first = self.tick()
         self.assertIn("tmux session still names", first.stderr)
         self.assertEqual(self.names(), {"old": ["%1"]})
-        self.assertEqual(self.entries()[0]["units"], ["new"])
+        self.assertEqual(self.entries()[0]["units"], [registered("new")])
         (self.root / "rename-failure").unlink()
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.names(), {"new": ["%1"]})
-        self.assertEqual(self.entries()[0]["units"], ["new"])
+        self.assertEqual(self.entries()[0]["units"], [registered("new")])
 
     def test_rename_session_does_not_change_another_pane_session(self) -> None:
         _ = self.tmux.write_text(json.dumps({"old": ["%1"], "other": ["%2"]}))

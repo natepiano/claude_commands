@@ -248,7 +248,30 @@ class AddUnitTests(unittest.TestCase):
         runners = cast(list[dict[str, object]], data["showrunners"])
         runner = next(item for item in runners if item["session"] == "director")
         self.assertEqual(runner["zone"], "America/Los_Angeles")
-        return cast(list[str], runner["units"])
+        units = cast(list[dict[str, str]], runner["units"])
+        return [unit["session"] for unit in units]
+
+    def registry_statuses(self) -> dict[str, str]:
+        data = cast(dict[str, object], json.loads(self.config.read_text()))
+        runners = cast(list[dict[str, object]], data["showrunners"])
+        runner = next(item for item in runners if item["session"] == "director")
+        units = cast(list[dict[str, str]], runner["units"])
+        return {unit["session"]: unit["status"] for unit in units}
+
+    def seed_finished_registration(self, session: str = "alpha") -> None:
+        self.config.parent.mkdir(parents=True)
+        _ = self.config.write_text(json.dumps({
+            "threshold_percent": 2,
+            "repeat_minutes": 30,
+            "stall_minutes": 5,
+            "faults_to": "natedev",
+            "always": ["natedev"],
+            "showrunners": [{
+                "session": "director",
+                "zone": "America/Los_Angeles",
+                "units": [{"session": session, "status": "run-finished"}],
+            }],
+        }), encoding="utf-8")
 
     def test_standby_launch_records_state_without_writing_a_plan(self) -> None:
         _ = self.successful("alpha", "--standby", "--port", "8123", "--owns", "src/alpha")
@@ -262,9 +285,7 @@ class AddUnitTests(unittest.TestCase):
         self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
         self.assertFalse((worktree / "docs/plans/build-followups-alpha.md").exists())
         self.assertEqual(self.registry_units(), ["alpha"])
-        data = cast(dict[str, object], json.loads(self.config.read_text()))
-        runner = cast(list[dict[str, object]], data["showrunners"])[0]
-        self.assertEqual(runner["standby"], ["alpha"])
+        self.assertEqual(self.registry_statuses(), {"alpha": "standing-by"})
         tmux = next(record for record in self.events("tmux")
                     if cast(list[str], record["args"])[:1] == ["new-session"])
         command = cast(list[str], tmux["args"])[-1]
@@ -322,10 +343,16 @@ class AddUnitTests(unittest.TestCase):
         self.assert_director_flags("opus", "xhigh")
         self.assertIn("'/unit:delegate docs/plans/given.md'", args[-1])
         self.assertEqual(self.registry_units(), ["alpha"])
+        self.assertEqual(self.registry_statuses(), {"alpha": "running"})
         self.assertRegex(self.log.read_text(),
                          r"^- \d\d:\d\d PDT: added alpha-unit \(plan\), tmux alpha, worktree ")
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
         self.assertIn("alpha-unit started: tmux attach -t alpha", result.stdout)
+
+    def test_launch_sets_a_finished_registration_back_to_running(self) -> None:
+        self.seed_finished_registration()
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(self.registry_statuses(), {"alpha": "running"})
 
     def test_sonnet_director_row_changes_launch_model_and_effort(self) -> None:
         self.write_agent_config(director="sonnet:xhigh")
@@ -375,6 +402,12 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(len(self.events("systemd-run")), 1)
         self.assertEqual(self.registry_units(), ["alpha"])
         self.assertIn("added alpha-unit (plan)", self.log.read_text())
+
+    def test_prepared_row_adoption_sets_a_finished_registration_back_to_running(self) -> None:
+        self.commit_prepared_row(self.prepared_row())
+        self.seed_finished_registration()
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(self.registry_statuses(), {"alpha": "running"})
 
     def test_prepared_row_uses_its_renamed_session_for_every_launch_target(self) -> None:
         self.commit_prepared_row(self.prepared_row(session="renamed-alpha"))

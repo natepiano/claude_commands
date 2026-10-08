@@ -27,7 +27,7 @@ def live_units(session: str) -> list[str]:
                 retired.update(retired_sessions(lines))
         except (OSError, UnicodeError, Refusal):
             continue
-    return [unit.name for unit in runner["units"] if unit.name not in retired]
+    return [unit.session for unit in runner["units"] if unit.session not in retired]
 
 
 def main(arguments: list[str]) -> int:

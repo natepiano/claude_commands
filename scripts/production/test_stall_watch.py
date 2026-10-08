@@ -146,6 +146,18 @@ raise SystemExit(1 if record['to'] in fail else 0)
             ],
         }))
 
+    def configure_registered(self, runners: dict[str, list[tuple[str, str]]],
+                             *, stall_minutes: int = 5) -> None:
+        _ = self.config.write_text(json.dumps({
+            "threshold_percent": 1, "repeat_minutes": 30, "stall_minutes": stall_minutes,
+            "faults_to": "natedev", "always": ["natedev"], "showrunners": [
+                {"session": session, "zone": "America/Los_Angeles", "units": [
+                    {"session": unit, "status": status} for unit, status in units
+                ]}
+                for session, units in runners.items()
+            ],
+        }))
+
     def close_processes(self) -> None:
         for child in self.children:
             child.terminate()
@@ -517,6 +529,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
 
     def test_standby_unit_is_skipped_until_ready(self) -> None:
         registry = SCRIPT.with_name("showrunners.py")
+        self.configure({"showrunner": []})
         added = subprocess.run([sys.executable, str(registry), "add", "showrunner",
                                 "--zone", "America/Los_Angeles", "--unit", "unit-one",
                                 "--standby"], env=self.environment, capture_output=True,
@@ -538,26 +551,24 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
                          {"bump", "tell"})
 
-    def test_finished_run_has_no_bump_notice_or_stretch_and_live_plan_is_bumped(self) -> None:
+    def test_run_done_words_in_live_plan_do_not_stop_watching(self) -> None:
         import stall_watch
-        doc = self.production_plan("`docs/as-built/example.md` (run done; as-built merged)")
+        _ = self.production_plan("run done appears here only as a description")
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 600).returncode, 0)
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
+                         {"bump", "tell"})
+        self.assertTrue((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
+
+    def test_finished_registry_unit_has_no_notice_or_stretch(self) -> None:
+        import stall_watch
+        self.configure_registered({"showrunner": [("unit-one", "run-finished")]})
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.tick(START + 600).returncode, 0)
         self.assertEqual(self.sent(), [])
         self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
 
-        self.set_production_plan(doc, "`docs/plans/example.md`")
-        self.assertEqual(self.tick(START + 601).returncode, 0)
-        self.assertEqual(self.tick(START + 901).returncode, 0)
-        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
-                         {"bump", "tell"})
-
-        self.set_production_plan(doc, "`docs/as-built/example.md` (run done; as-built merged)")
-        self.assertEqual(self.tick(START + 902).returncode, 0)
-        self.assertEqual(len(self.sent()), 2)
-        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
-
-    def test_retired_plan_without_run_done_is_finished(self) -> None:
+    def test_retired_plan_without_run_done_is_skipped(self) -> None:
         import stall_watch
         _ = self.production_plan("(retired by the user 2026-10-07, worktree removed)")
         first = self.tick(START)
@@ -567,7 +578,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(self.sent(), [])
         self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
 
-    def test_finished_session_names_are_skipped_while_live_session_is_bumped(self) -> None:
+    def test_finished_registry_sessions_are_skipped_while_running_session_is_bumped(self) -> None:
         import stall_watch
         doc = self.production_plan("`docs/plans/example.md`")
         _ = doc.write_text("## Units\n\n" +
@@ -576,7 +587,11 @@ raise SystemExit(1 if record['to'] in fail else 0)
                            "| build-report-unit | `docs/as-built/build-report-session.md` (run done; as-built 2b4d952) | /home/natepiano/worktrees/claude-build-followups-build-report | build-followups-build-report | build-report | — | `docs/plans/build-followups-build-report.md`; `commands/watcher.md`, `commands/builds.md` |\n" +
                            "| hook-unit | `docs/plans/hook.md` | /tmp/hook | hook | hook | — | — |\n" +
                            "| notifier-unit | `docs/as-built/validate-and-push-cancel-prior.md` (run done; as-built merged as 8772951) | `/home/natepiano/worktrees/claude-build-followups-notifier` | `build-followups-notifier` | `session-notifier` (resumed in `~/.claude`, the directory its session began in) | — | `scripts/validate_and_push/`, `commands/showrunner/produce.md` (the cancel-prior rule); promoted from tool-based-ui by the user 2026-10-04 |\n")
-        self.configure({"showrunner": ["build-report", "hook", "session-notifier"]})
+        self.configure_registered({"showrunner": [
+            ("build-report", "run-finished"),
+            ("hook", "running"),
+            ("session-notifier", "run-finished"),
+        ]})
         for name in ("build-report", "hook", "session-notifier"):
             _ = self.unit(name)
 
