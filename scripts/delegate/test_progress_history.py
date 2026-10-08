@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.delegate import progress_history
+
 
 SCRIPT = Path(__file__).with_name("progress_history.py")
 FINDINGS = Path(__file__).with_name("findings.py")
@@ -4226,6 +4228,155 @@ class PhaseCountTests(unittest.TestCase):
         counts = self._count("# A document with no phases\n")
         self.assertIs(counts["available"], False)
         self.assertIsNone(counts["project_percent"])
+
+
+class PublicPhaseHelperTests(unittest.TestCase):
+    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
+    root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+
+    @override
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def test_recorder_helpers_use_public_names_without_private_aliases(self) -> None:
+        with patch.dict(os.environ, {"PLAN_DELEGATE_NOW_EPOCH": "123.5"}):
+            self.assertEqual(progress_history.now_epoch(), 123.5)
+        self.assertEqual(
+            progress_history.resolve_plan_path(self.root, "docs/plan.md"),
+            (self.root / "docs" / "plan.md").resolve(),
+        )
+        self.assertEqual(progress_history.percent_spread(None), 10.0)
+        self.assertFalse(hasattr(progress_history, "_now_epoch"))
+        self.assertFalse(hasattr(progress_history, "_plan_path"))
+        self.assertFalse(hasattr(progress_history, "_percent_spread"))
+
+    def test_plan_phases_classifies_and_cleans_every_heading_form(self) -> None:
+        plan = self.root / "plan.md"
+        _ = plan.write_text(
+            "\n".join(
+                (
+                    "### Phase 1 — Archived delivery (`abc1234`)",
+                    "",
+                    "### Phase 2 — Finished delivery  · status: done",
+                    "",
+                    "#### Phase 2 — Duplicate is ignored  · status: done",
+                    "",
+                    "### Phase 2 Review",
+                    "",
+                    "### Phase 3 — Live delivery  · status: todo",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            progress_history.plan_phases(plan),
+            [
+                {"id": "1", "title": "Archived delivery", "done": True},
+                {"id": "2", "title": "Finished delivery", "done": True},
+                {"id": "3", "title": "Live delivery", "done": False},
+            ],
+        )
+
+    def test_plan_phases_preserves_descriptive_parentheticals(self) -> None:
+        plan = self.root / "plan.md"
+        _ = plan.write_text(
+            "\n".join(
+                (
+                    "### Phase 1 — Gradients (COLRv1 solid + linear/radial)  · status: done",
+                    "### Phase 2 — Support (macOS)  · status: todo",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            [phase["title"] for phase in progress_history.plan_phases(plan)],
+            ["Gradients (COLRv1 solid + linear/radial)", "Support (macOS)"],
+        )
+
+    def test_plan_phases_strips_only_commit_annotations(self) -> None:
+        plan = self.root / "plan.md"
+        _ = plan.write_text(
+            "\n".join(
+                (
+                    "### Phase 1 — Title (abc1234)",
+                    "### Phase 2 — Title (commit abc1234def)",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            [phase["title"] for phase in progress_history.plan_phases(plan)],
+            ["Title", "Title"],
+        )
+
+    def test_eta_band_seconds_exposes_the_existing_projection_math(self) -> None:
+        self.assertEqual(
+            progress_history.eta_band_seconds(50, 100, 10.0),
+            (100, 66, 150),
+        )
+        self.assertIsNone(progress_history.eta_band_seconds(0, 100, 10.0))
+
+    def test_plan_runs_finds_matching_history_oldest_first(self) -> None:
+        working_dir = self.root / "worktree"
+        plan = working_dir / "docs" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        _ = plan.write_text("# Plan\n", encoding="utf-8")
+        runs_dir = self.root / "history" / "runs"
+        runs_dir.mkdir(parents=True)
+
+        def write_run(name: str, plan_doc: str, started_at: int) -> Path:
+            path = runs_dir / f"{name}.jsonl"
+            event = {
+                "event_type": "run_started",
+                "working_dir": str(working_dir),
+                "plan_doc": plan_doc,
+                "run_started_at": started_at,
+            }
+            _ = path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+            return path
+
+        newer = write_run("alphabetically-first", str(plan), 200)
+        older = write_run("alphabetically-last", "docs/plan.md", 100)
+        _ = write_run("another-plan", "docs/other.md", 50)
+
+        with patch.dict(
+            os.environ,
+            {"PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history")},
+        ):
+            self.assertEqual(progress_history.plan_runs(plan), [older, newer])
+
+    def test_plan_runs_ignores_project_plan_inherited_without_a_run_plan(self) -> None:
+        working_dir = self.root / "worktree"
+        plan = working_dir / "docs" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        _ = plan.write_text("# Plan\n", encoding="utf-8")
+        runs_dir = self.root / "history" / "runs"
+        runs_dir.mkdir(parents=True)
+        inherited = {
+            "event_type": "run_started",
+            "working_dir": str(working_dir),
+            "plan_doc": "",
+            "project_plan_doc": str(plan),
+            "run_started_at": 100,
+        }
+        _ = (runs_dir / "inherited.jsonl").write_text(
+            json.dumps(inherited) + "\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(
+            os.environ,
+            {"PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history")},
+        ):
+            self.assertEqual(progress_history.plan_runs(plan), [])
 
 
 if __name__ == "__main__":

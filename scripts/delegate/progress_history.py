@@ -167,6 +167,14 @@ class FindingTally(TypedDict):
     reopened: int
 
 
+class PlanPhase(TypedDict):
+    """One real phase heading, classified as the plan records it now."""
+
+    id: str
+    title: str
+    done: bool
+
+
 def _history_root() -> Path:
     configured = os.environ.get("PLAN_DELEGATE_HISTORY_DIR")
     if configured:
@@ -174,7 +182,7 @@ def _history_root() -> Path:
     return Path.home() / ".local" / "state" / "plan-delegate"
 
 
-def _now_epoch() -> float:
+def now_epoch() -> float:
     configured = os.environ.get("PLAN_DELEGATE_NOW_EPOCH")
     if configured:
         return float(configured)
@@ -530,9 +538,51 @@ def _iso_epoch(value: str, context: str) -> float:
     return parsed.timestamp()
 
 
-def _plan_path(working_dir: Path, value: str) -> Path:
+def resolve_plan_path(working_dir: Path, value: str) -> Path:
     path = Path(value).expanduser()
     return path.resolve() if path.is_absolute() else (working_dir / path).resolve()
+
+
+def _plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
+    text = plan_path.read_text(encoding="utf-8")
+    phases: list[PlanPhase] = []
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for match in PHASE_HEADING_PATTERN.finditer(text):
+        rest = match.group("rest")
+        status_match = PHASE_STATUS_PATTERN.search(rest)
+        # `### Phase 12 Review` and its like are sections, not phases.
+        if status_match is None and not PHASE_TITLE_PATTERN.match(rest):
+            continue
+        identifier = match.group("id")
+        if identifier in seen:
+            duplicates.append(identifier)
+            continue
+        seen.add(identifier)
+        title_text = rest if status_match is None else rest[: status_match.start()]
+        title_text = re.sub(r"^[ \t]*[—–-][ \t]*", "", title_text, count=1)
+        title = re.sub(
+            r"[ \t]+\((?:commit[ \t]+)?(?:`[0-9a-fA-F]{7,40}`|[0-9a-fA-F]{7,40})\)[ \t]*$",
+            "",
+            title_text,
+        ).strip()
+        # No status marker means the phase was shrunk into its as-built record,
+        # which only happens after the phase completed.
+        done = status_match is None or status_match.group("status") == "done"
+        phases.append(
+            PlanPhase(
+                id=identifier,
+                title=title,
+                done=done,
+            )
+        )
+    return phases, duplicates
+
+
+def plan_phases(plan_path: Path) -> list[PlanPhase]:
+    """Return the plan's unique phase headings in document order."""
+    phases, _ = _plan_phase_details(plan_path)
+    return phases
 
 
 def _count_plan_phases(plan_path: Path) -> dict[str, object]:
@@ -543,32 +593,11 @@ def _count_plan_phases(plan_path: Path) -> dict[str, object]:
     silently corrupts every project percentage the run reports.
     """
     try:
-        text = plan_path.read_text(encoding="utf-8")
+        phases, duplicates = _plan_phase_details(plan_path)
     except OSError:
         return {"available": False, "reason": f"unable to read {plan_path}"}
-    done = 0
-    todo = 0
-    seen: set[str] = set()
-    order: list[str] = []
-    duplicates: list[str] = []
-    for match in PHASE_HEADING_PATTERN.finditer(text):
-        rest = match.group("rest")
-        status_match = PHASE_STATUS_PATTERN.search(rest)
-        if status_match is None and not PHASE_TITLE_PATTERN.match(rest):
-            # `### Phase 12 Review` and friends — a section, not a phase.
-            continue
-        identifier = match.group("id")
-        if identifier in seen:
-            duplicates.append(identifier)
-            continue
-        seen.add(identifier)
-        order.append(identifier)
-        # No status marker means the phase was shrunk into an as-built record,
-        # which only ever happens after it completed.
-        if status_match is not None and status_match.group("status") == "todo":
-            todo += 1
-        else:
-            done += 1
+    done = sum(phase["done"] for phase in phases)
+    todo = len(phases) - done
     total = done + todo
     if total == 0:
         return {"available": False, "reason": f"no phase headings in {plan_path}"}
@@ -577,7 +606,7 @@ def _count_plan_phases(plan_path: Path) -> dict[str, object]:
         "done": done,
         "todo": todo,
         "total": total,
-        "order": order,
+        "order": [phase["id"] for phase in phases],
         "duplicate_ids": sorted(set(duplicates)),
     }
 
@@ -659,7 +688,7 @@ def _explicit_plan_timing(
     plan_doc: str,
     now: float,
 ) -> ProjectTiming:
-    plan_path = _plan_path(working_dir, plan_doc)
+    plan_path = resolve_plan_path(working_dir, plan_doc)
     existing = _read_plan_project_start(plan_path)
     if existing is not None:
         return ProjectTiming(
@@ -712,6 +741,31 @@ def _run_started_event(path: Path) -> dict[str, object] | None:
     return event
 
 
+def plan_runs(plan_path: Path) -> list[Path]:
+    """Return this plan's durable run files, oldest first."""
+    target = plan_path.expanduser().resolve()
+    try:
+        paths = list((_history_root() / "runs").glob("*.jsonl"))
+    except OSError:
+        return []
+    matches: list[tuple[float, str, Path]] = []
+    for path in paths:
+        event = _run_started_event(path)
+        if event is None:
+            continue
+        working_dir = _string(event.get("working_dir"))
+        plan_doc = _string(event.get("plan_doc"))
+        if not working_dir or not plan_doc:
+            continue
+        if resolve_plan_path(Path(working_dir), plan_doc) != target:
+            continue
+        started_at = _number(
+            event.get("run_started_at"), _number(event.get("timestamp_epoch"))
+        )
+        matches.append((started_at, path.name, path))
+    return [path for _, _, path in sorted(matches)]
+
+
 def _historical_project_timing(
     working_dir: Path,
     branch: str,
@@ -747,7 +801,7 @@ def _historical_project_timing(
     project_plan_doc = _string(latest_event.get("project_plan_doc")) or _string(
         latest_event.get("plan_doc")
     )
-    plan_path = _plan_path(working_dir, project_plan_doc)
+    plan_path = resolve_plan_path(working_dir, project_plan_doc)
     if plan_path.is_file():
         existing = _read_plan_project_start(plan_path)
         if existing is not None:
@@ -1048,7 +1102,7 @@ def _start_activity(args: argparse.Namespace) -> None:
         raise SystemExit("Cannot start an activity: the run is finished")
     if _object_dict(state.get("phase")) is None:
         raise SystemExit("Start a phase before starting an activity")
-    now = _now_epoch()
+    now = now_epoch()
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
     _refresh_main_identity(state)
@@ -1073,7 +1127,7 @@ def _finish_activity(args: argparse.Namespace) -> None:
         state,
         status,
         _arg_string(args, "result"),
-        _now_epoch(),
+        now_epoch(),
     )
 
 
@@ -1084,7 +1138,7 @@ def _start_run(args: argparse.Namespace) -> None:
         state = _ensure_project_timing(
             session_dir,
             _read_state(session_dir),
-            _now_epoch(),
+            now_epoch(),
         )
         print(_string(state.get("history_file"), str(existing)))
         return
@@ -1093,7 +1147,7 @@ def _start_run(args: argparse.Namespace) -> None:
     if not working_dir_value:
         raise SystemExit("--working-dir is required")
     working_dir = Path(working_dir_value).expanduser().resolve()
-    now = _now_epoch()
+    now = now_epoch()
     run_id = session_dir.name
     branch = _git_value(working_dir, "branch", "--show-current")
     if not branch:
@@ -1169,7 +1223,7 @@ def _work_order_metrics(work_order_file: str) -> dict[str, object]:
 def _start_phase(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    now = _now_epoch()
+    now = now_epoch()
     active = _object_dict(state.get("phase"))
     if active is not None and _string(active.get("status")) == "active":
         if _string(active.get("id")) == _arg_string(args, "phase_id"):
@@ -1217,7 +1271,7 @@ def _start_pass(args: argparse.Namespace) -> None:
     phase = _object_dict(state.get("phase"))
     if phase is None or _string(phase.get("status")) != "active":
         raise SystemExit("Start a phase before starting a pass")
-    now = _now_epoch()
+    now = now_epoch()
     # This slot's stale pass and no other. The peers belong to launchers still
     # waiting on their own agents, and a phase team opens both within the same
     # second: closing them here is the corruption this key exists to
@@ -1273,7 +1327,7 @@ def _finish_pass(args: argparse.Namespace) -> None:
         state,
         slot,
         status,
-        _now_epoch(),
+        now_epoch(),
         _arg_integer(args, "agent_awake_seconds", -1),
     )
     if orphaned and not closed:
@@ -1338,7 +1392,7 @@ def _arm_review(args: argparse.Namespace) -> None:
             + "a pass must be open. With none open the review is not early -- "
             + "launch it through review.sh and let it record its own pass."
         )
-    now = _now_epoch()
+    now = now_epoch()
     called_task = _arg_string(args, "called_task", "delegate.review") or "delegate.review"
     lens = _arg_string(args, "lens")
     suffix = f"_{lens}" if lens else ""
@@ -1402,7 +1456,7 @@ def _disarm_review(args: argparse.Namespace) -> None:
         session_dir,
         state,
         _arg_string(args, "reason", "cleared") or "cleared",
-        _now_epoch(),
+        now_epoch(),
     )
 
 
@@ -1761,7 +1815,7 @@ def _current_hold_seconds(state: dict[str, object], candidate_percent: int, now:
 def _calibrate(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    now = _now_epoch()
+    now = now_epoch()
     candidate = _arg_integer(args, "candidate_percent")
     if not 0 <= candidate <= 100:
         raise SystemExit("--candidate-percent must be between 0 and 100")
@@ -3429,20 +3483,31 @@ def _eta_band_cells(
     otherwise push the pessimistic end down to 1% and quote an arrival ninety-nine
     times the elapsed clock — a number no reader can use and none should trust.
     """
-    eta = _eta_seconds(percent, elapsed)
-    if eta is None:
+    band = eta_band_seconds(percent, elapsed, spread)
+    if band is None:
         return "", ""
-    optimistic = min(99.0, percent * RATE_FACTOR_LIMIT, percent + max(0.0, spread))
-    pessimistic = max(1.0, percent / RATE_FACTOR_LIMIT, percent - max(0.0, spread))
-    low = int(elapsed * (100.0 - optimistic) / optimistic)
-    high = int(elapsed * (100.0 - pessimistic) / pessimistic)
+    eta, low, high = band
     return (
         f"{_arrival_label(as_of + low, now)} (-{_format_offset(eta - low)})",
         f"{_arrival_label(as_of + high, now)} (+{_format_offset(high - eta)})",
     )
 
 
-def _percent_spread(calibration: dict[str, object] | None) -> float:
+def eta_band_seconds(
+    percent: int, elapsed: int, spread: float
+) -> tuple[int, int, int] | None:
+    """Return the projected remaining seconds and its optimistic/pessimistic band."""
+    eta = _eta_seconds(percent, elapsed)
+    if eta is None:
+        return None
+    optimistic = min(99.0, percent * RATE_FACTOR_LIMIT, percent + max(0.0, spread))
+    pessimistic = max(1.0, percent / RATE_FACTOR_LIMIT, percent - max(0.0, spread))
+    low = int(elapsed * (100.0 - optimistic) / optimistic)
+    high = int(elapsed * (100.0 - pessimistic) / pessimistic)
+    return eta, low, high
+
+
+def percent_spread(calibration: dict[str, object] | None) -> float:
     """How far off the percentage has actually run, when history can say.
 
     A calibration that cleared its sample floor has measured this reporter's
@@ -3486,7 +3551,7 @@ def _timeline(args: argparse.Namespace) -> None:
     """
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    now = _now_epoch()
+    now = now_epoch()
     events = _run_events(state)
     wanted = _arg_string(args, "phase")
     started: list[tuple[str, str, str, float]] = []
@@ -3869,7 +3934,7 @@ def _print_last_recorded(
             recorded["project"],
             recorded["phase"],
             plan_phase_counts,
-            _percent_spread(recorded["calibration"]),
+            percent_spread(recorded["calibration"]),
             recorded["at"],
             now,
         ),
@@ -3882,7 +3947,7 @@ def _print_last_recorded(
 
 def _progress(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
-    now = _now_epoch()
+    now = now_epoch()
     notifier_due = _restart_unit_notifier(session_dir)
     state = _ensure_project_timing(session_dir, _read_state(session_dir), now)
     phase = _object_dict(state.get("phase"))
@@ -4092,7 +4157,7 @@ def _progress(args: argparse.Namespace) -> None:
                     unchanged=phase_unchanged_seconds,
                 ),
                 plan_phase_counts,
-                _percent_spread(phase_calibration),
+                percent_spread(phase_calibration),
                 now,
                 now,
             ),
@@ -4124,7 +4189,7 @@ def _finish_phase(args: argparse.Namespace) -> None:
     phase = _object_dict(state.get("phase"))
     if phase is None or _string(phase.get("status")) != "active":
         return
-    now = _now_epoch()
+    now = now_epoch()
     _close_open_passes(session_dir, state, "interrupted", now)
     state = _read_state(session_dir)
     _close_active_activity(session_dir, state, "interrupted", "", now)
@@ -4147,7 +4212,7 @@ def _finish_phase(args: argparse.Namespace) -> None:
 def _finish_run(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    now = _now_epoch()
+    now = now_epoch()
     run_status = _arg_string(args, "status")
     phase = _object_dict(state.get("phase"))
     if phase is not None and _string(phase.get("status")) == "active":
@@ -4273,7 +4338,7 @@ def _aggregate(args: argparse.Namespace) -> None:
         )
     output = {
         "schema_version": SCHEMA_VERSION,
-        "generated_at": _iso_time(_now_epoch()),
+        "generated_at": _iso_time(now_epoch()),
         "history_root": str(_history_root()),
         "completed_raw_estimate_samples": len(samples),
         "ignored_history_rows": ignored,
