@@ -166,6 +166,8 @@ class TimedEta:
     # The phase's first ETA, and the fix rounds added since it.
     first: datetime | None
     fixes: int
+    # When the unit stated this time, as the builder first saw it. `None` in an input written by hand.
+    stated: datetime | None
 
 
 @dataclass(frozen=True)
@@ -587,7 +589,7 @@ def clock_text(fields: JsonMap, key: str, where: str) -> str | None:
 
 def parse_eta(value: object, where: str) -> Eta:
     fields = as_map(value, where)
-    check_keys(fields, {"time", "earliest", "latest", "none", "detail", "percent", "why", "first", "fixes"}, where)
+    check_keys(fields, {"time", "earliest", "latest", "none", "detail", "percent", "why", "first", "fixes", "stated"}, where)
     time = clock_text(fields, "time", where)
     earliest = clock_text(fields, "earliest", where)
     latest = clock_text(fields, "latest", where)
@@ -623,12 +625,19 @@ def parse_eta(value: object, where: str) -> Eta:
         raise InputError(f"{where}.fixes: the fix rounds added since the first ETA, a whole number from 0")
     if time is None and (first is not None or fixes):
         raise InputError(f"{where}: first and fixes only with a time")
+    stated_text = optional_text(fields, "stated", where)
+    try:
+        stated = datetime.fromisoformat(stated_text) if stated_text is not None else None
+    except ValueError:
+        raise InputError(f"{where}.stated: when the ETA was stated, as YYYY-MM-DDTHH:MM") from None
+    if time is None and stated is not None:
+        raise InputError(f"{where}.stated: only with a time")
     if none is not None:
         return NoEta(none, detail)
     if time is None:
         raise InputError(f"{where}: give exactly one of time or none")
     spread = EtaRange(earliest, latest) if earliest is not None and latest is not None else None
-    return TimedEta(time, spread, percent, why, detail, first, fixes)
+    return TimedEta(time, spread, percent, why, detail, first, fixes, stated)
 
 
 def measure(fields: JsonMap, key: str, where: str) -> float:
@@ -994,6 +1003,11 @@ def resolve_eta_moment(unit: Unit, previous: Previous, now: datetime) -> Resolve
             and isinstance(previous.eta, LastReportedEta)
             and previous.eta.text == eta.time):
         return ResolvedEtaMoment(previous.eta.moment)
+    # A time that names no day is read on the day it was stated. `+N` counts days from the report, as the
+    # builder writes it.
+    if eta.stated is not None and "+" not in eta.time:
+        stated = eta.stated if eta.stated.tzinfo is not None else eta.stated.replace(tzinfo=now.tzinfo)
+        return ResolvedEtaMoment(parse_time(eta.time, stated))
     return ResolvedEtaMoment(parse_time(eta.time, now))
 
 
