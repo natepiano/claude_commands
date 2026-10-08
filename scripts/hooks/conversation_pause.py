@@ -69,8 +69,22 @@ class QuestionPending:
 
 
 @dataclass(frozen=True)
+class QuestionNotRead:
+    pass
+
+
+@dataclass(frozen=True)
+class QuestionRead:
+    replies_ended: int
+
+
+QuestionReading = QuestionNotRead | QuestionRead
+
+
+@dataclass(frozen=True)
 class Asked:
     asked_at: int
+    reading: QuestionReading
 
 
 @dataclass(frozen=True)
@@ -256,6 +270,15 @@ def scheduled_senders() -> frozenset[str]:
     return frozenset(senders)
 
 
+def is_return_question(prompt: str) -> bool:
+    text = prompt.lstrip()
+    if CROSS_SESSION_TAG.match(text) is None:
+        return False
+    opening_tag = text.partition(">")[0]
+    match = FROM_NAME.search(opening_tag)
+    return match is not None and match.group(1) == WATCHER
+
+
 def prompt_source(prompt: str, senders: Callable[[], frozenset[str]]) -> PromptSource:
     text = prompt.lstrip()
     if not text:
@@ -316,7 +339,16 @@ def _phase_json(phase: PausePhase) -> dict[str, object]:
     if isinstance(phase, QuestionPending):
         return {"kind": "question_pending", "due_at": phase.due_at}
     if isinstance(phase, Asked):
-        return {"kind": "asked", "asked_at": phase.asked_at}
+        reading: dict[str, object]
+        if isinstance(phase.reading, QuestionNotRead):
+            reading = {"kind": "not_read"}
+        else:
+            reading = {"kind": "read", "replies_ended": phase.reading.replies_ended}
+        return {
+            "kind": "asked",
+            "asked_at": phase.asked_at,
+            "reading": reading,
+        }
     if isinstance(phase, KeptOff):
         return {"kind": "kept_off"}
     return {"kind": "returned", "returned_at": phase.returned_at}
@@ -341,6 +373,18 @@ def _string_tuple(value: object, field: str) -> tuple[str, ...]:
     return tuple(cast(list[str], items))
 
 
+def _question_reading_from_json(value: object) -> QuestionReading:
+    if not isinstance(value, dict):
+        raise ValueError("invalid reading")
+    fields = cast(dict[str, object], value)
+    kind = fields.get("kind")
+    if kind == "not_read":
+        return QuestionNotRead()
+    if kind == "read":
+        return QuestionRead(_integer(fields.get("replies_ended"), "replies_ended"))
+    raise ValueError("invalid reading kind")
+
+
 def _phase_from_json(value: object) -> PausePhase:
     if not isinstance(value, dict):
         raise ValueError("invalid phase")
@@ -354,7 +398,16 @@ def _phase_from_json(value: object) -> PausePhase:
     if kind == "question_pending":
         return QuestionPending(_integer(fields.get("due_at"), "due_at"))
     if kind == "asked":
-        return Asked(_integer(fields.get("asked_at"), "asked_at"))
+        reading = (
+            _question_reading_from_json(fields.get("reading"))
+            if "reading" in fields
+            else QuestionRead(_integer(fields.get("replies_ended_since_question", 1),
+                                       "replies_ended_since_question"))
+        )
+        return Asked(
+            _integer(fields.get("asked_at"), "asked_at"),
+            reading,
+        )
     if kind == "kept_off":
         return KeptOff()
     if kind == "returned":
@@ -587,13 +640,27 @@ def resume(session_id: str) -> tuple[str, ...]:
         return _resume_locked(session_id)
 
 
-def mark_answered(session_id: str, now: int) -> None:
+def mark_reply_ended(session_id: str, now: int) -> None:
     with record_lock():
         current = _record(session_id)
-        if isinstance(current, PauseRecord) and isinstance(current.phase, Replying):
+        if not isinstance(current, PauseRecord):
+            return
+        phase = current.phase
+        if isinstance(phase, Replying):
             write_record(replace(
                 current,
-                phase=Quiet(current.phase.user_wrote_at, now),
+                phase=Quiet(phase.user_wrote_at, now),
+            ))
+        elif isinstance(phase, Asked) and isinstance(phase.reading, QuestionRead):
+            write_record(replace(
+                current,
+                phase=replace(
+                    phase,
+                    reading=replace(
+                        phase.reading,
+                        replies_ended=phase.reading.replies_ended + 1,
+                    ),
+                ),
             ))
 
 
@@ -633,9 +700,30 @@ def _keep_context() -> str:
 
 def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int) -> HookReply:
     response = answer(prompt) if source is PromptSource.TYPED else NotAnAnswer()
+    return_question = is_return_question(prompt)
     with record_lock():
         current = _record(session_id)
+        if return_question:
+            if isinstance(current, PauseRecord):
+                phase = current.phase
+                if isinstance(phase, QuestionPending):
+                    write_record(replace(
+                        current,
+                        phase=Asked(now, QuestionRead(0)),
+                    ))
+                elif (isinstance(phase, Asked)
+                      and isinstance(phase.reading, QuestionNotRead)):
+                    write_record(replace(
+                        current,
+                        phase=replace(phase, reading=QuestionRead(0)),
+                    ))
+            return NoReply.NOTHING
         if isinstance(current, PauseRecord) and isinstance(current.phase, Asked):
+            phase = current.phase
+            if (isinstance(phase.reading, QuestionRead)
+                    and phase.reading.replies_ended > 1
+                    and isinstance(response, (Yes, No))):
+                return NoReply.NOTHING
             if isinstance(response, Yes):
                 words = _resume_locked(session_id)
                 return ShownToUser(
@@ -812,7 +900,10 @@ def tick(now: int) -> tuple[str, ...]:
             if (isinstance(current, PauseRecord)
                     and isinstance(current.phase, QuestionPending)
                     and current.phase.due_at == delivery.due_at):
-                write_record(replace(current, phase=Asked(delivered_at)))
+                write_record(replace(
+                    current,
+                    phase=Asked(delivered_at, QuestionNotRead()),
+                ))
     return tuple(actions)
 
 
@@ -823,6 +914,10 @@ def _status(session_id: str) -> str:
             return "not paused"
         names = ", ".join(user_words(current.instances, current.footers))
         kind = _phase_kind(current.phase)
+        if (isinstance(current.phase, Asked)
+                and isinstance(current.phase.reading, QuestionRead)
+                and current.phase.reading.replies_ended > 1):
+            kind += "; a newer reply ended; bare yes/no belongs to the session"
         return f"paused: {names} ({kind})" if names else f"not paused ({kind})"
 
 
