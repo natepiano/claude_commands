@@ -13,6 +13,7 @@ from typing import NamedTuple
 
 from dailies_input import (ClaudeNotRunning, Decision, SessionGone, StatusBlock, StillWaiting, UnitRow,
                            status_blocks)
+from unit_lookup import UnitState
 
 
 SCRIPT = Path(__file__).with_name("unit_status.sh")
@@ -184,7 +185,7 @@ exit 0
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "status.txt"
             _ = path.write_text(output, encoding="utf-8")
-            return status_blocks(path, tuple(UnitRow(unit, unit) for unit in units))
+            return status_blocks(path, tuple(UnitRow(unit, unit, UnitState.RUNNING) for unit in units))
 
     def test_blocks_are_headed_by_the_unit_ids_of_the_registered_doc(self) -> None:
         output, _ = self.run_status(None, "ok", 0)
