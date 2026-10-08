@@ -17,6 +17,7 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
@@ -3592,6 +3593,25 @@ class RecordedReport(TypedDict):
     calibration: dict[str, object] | None
 
 
+@dataclass(frozen=True)
+class ReportedPassWindow:
+    """A progress report that measures a live launcher pass."""
+
+    record: dict[str, object]
+
+
+@dataclass(frozen=True)
+class ReportedActivityWindow:
+    """A progress report that describes a live unit-director activity."""
+
+    record: dict[str, object]
+
+
+@dataclass(frozen=True)
+class NoReportedWindow:
+    """A progress report made between live windows."""
+
+
 def _state_plan_phase_counts(state: dict[str, object]) -> dict[str, object]:
     """The run's plan counted by phase heading, unavailable without an absolute path."""
     plan_doc = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
@@ -3602,8 +3622,10 @@ def _state_plan_phase_counts(state: dict[str, object]) -> dict[str, object]:
     return {"available": False, "reason": "no plan doc"}
 
 
-def _reported_window(state: dict[str, object]) -> tuple[str, dict[str, object] | None]:
-    """The window a report describes and the state key holding it, or no window.
+def _reported_window(
+    state: dict[str, object],
+) -> ReportedPassWindow | ReportedActivityWindow | NoReportedWindow:
+    """The live window a report describes, or the state between windows.
 
     A launcher's pass when one is open, and otherwise the unit director's
     activity. Both render the same line under the round table; only a pass
@@ -3612,11 +3634,11 @@ def _reported_window(state: dict[str, object]) -> tuple[str, dict[str, object] |
     """
     current_pass = _reporting_pass(state)
     if current_pass is not None:
-        return "pass", current_pass
+        return ReportedPassWindow(current_pass)
     activity = _object_dict(state.get("activity"))
     if activity is not None and _string(activity.get("status")) == "active":
-        return "activity", activity
-    return "pass", None
+        return ReportedActivityWindow(activity)
+    return NoReportedWindow()
 
 
 def _scope_row(label: str, clock: ScopeClock, as_of: float, now: float) -> list[str]:
@@ -3811,20 +3833,31 @@ def _print_last_recorded(
     phase: dict[str, object],
     now: float,
     notifier_due: int | None,
+    reported_window: ReportedActivityWindow | NoReportedWindow,
 ) -> None:
-    """Report an active phase that has no window open.
+    """Report the last recorded clocks without assessing progress again.
 
     Between windows -- the reviews closed, the repair writers not launched yet
-    -- there is nothing live to measure, and the unit is still in this phase.
-    The report keeps every section: the clocks table as the last `progress`
-    call left it, stamped with when that was, and the round table as the
-    phase's windows stand now. It writes nothing -- no event, no window, no
-    state -- so pass counts, convergence and calibration never see it.
+    -- there is nothing live to measure. The same is true of an activity opened
+    after its phase closed: it belongs in the round table, but does not revise
+    the closed phase's assessment. The report keeps every section: the clocks
+    table as the last `progress` call left it, stamped with when that was, and
+    the round table as the phase's windows stand now. It writes nothing -- no
+    event, no window, no state -- so pass counts, convergence and calibration
+    never see it.
     """
     events = _run_events(state)
     plan_phase_counts = _state_plan_phase_counts(state)
     recorded = _recorded_report(state, phase, events, plan_phase_counts, now)
-    section, _, _ = _phase_section(session_dir, state, phase, events, now)
+    section, stage_windows, stage_labels = _phase_section(
+        session_dir, state, phase, events, now
+    )
+    if isinstance(reported_window, ReportedActivityWindow):
+        activity = reported_window.record
+        reported_label = _reported_label(stage_windows, stage_labels, activity)
+        window_line = f"▸ **{reported_label} - {_string(activity.get('activity'))}**"
+    else:
+        window_line = f"No pass or activity is open. {WORKERS_UNSEEN}"
     lines = [
         _scope_line(state),
         "",
@@ -3841,7 +3874,7 @@ def _print_last_recorded(
             now,
         ),
         *section,
-        f"No pass or activity is open. {WORKERS_UNSEEN}",
+        window_line,
         _clock_line(now, _next_report_at(session_dir, now, notifier_due)),
     ]
     print("\n".join(lines))
@@ -3853,13 +3886,23 @@ def _progress(args: argparse.Namespace) -> None:
     notifier_due = _restart_unit_notifier(session_dir)
     state = _ensure_project_timing(session_dir, _read_state(session_dir), now)
     phase = _object_dict(state.get("phase"))
-    if phase is None or _string(phase.get("status")) != "active":
-        phase_status = _string((phase or {}).get("status")) or "missing"
+    reported_window = _reported_window(state)
+    if phase is None:
+        raise SystemExit(f"No active phase to report: phase missing. {WORKERS_UNSEEN}")
+    if _string(phase.get("status")) != "active":
+        if isinstance(reported_window, ReportedActivityWindow):
+            _print_last_recorded(
+                session_dir, state, phase, now, notifier_due, reported_window
+            )
+            return
+        phase_status = _string(phase.get("status")) or "missing"
         raise SystemExit(f"No active phase to report: phase {phase_status}. {WORKERS_UNSEEN}")
-    window_key, current_pass = _reported_window(state)
-    if current_pass is None:
-        _print_last_recorded(session_dir, state, phase, now, notifier_due)
+    if isinstance(reported_window, NoReportedWindow):
+        _print_last_recorded(
+            session_dir, state, phase, now, notifier_due, reported_window
+        )
         return
+    current_pass = reported_window.record
     legacy_raw_percent = _arg_integer(args, "raw_percent", -1)
     legacy_percent = _arg_integer(args, "percent", -1)
     project_raw_percent = _arg_integer(args, "project_raw_percent", -1)
@@ -4018,7 +4061,7 @@ def _progress(args: argparse.Namespace) -> None:
     # The reported window is the object state already holds, so the activity
     # edit above has landed either way; a pass is written back through its slot,
     # never over the map that holds every slot's.
-    if window_key == "activity":
+    if isinstance(reported_window, ReportedActivityWindow):
         state["activity"] = current_pass
     _write_state(session_dir, state)
 
