@@ -239,7 +239,7 @@ def _config_digest() -> str:
 
     Cached for the life of the process: one launcher records one pass, and both
     files answer the same way every call. This is telemetry and must never stop
-    a delegate run, so an unreadable file returns empty rather than raising --
+    a unit run, so an unreadable file returns empty rather than raising --
     and empty rather than the hash of the half that could be read, which would
     name a configuration this process never saw and group unlike passes under it.
     """

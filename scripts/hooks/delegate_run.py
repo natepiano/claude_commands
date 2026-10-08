@@ -4,7 +4,7 @@
 `prepare_session.sh` drops a marker file named for `CLAUDE_CODE_SESSION_ID`
 (verified identical to the `session_id` in every hook payload) holding the
 delegate session directory. `end_session.sh` removes it. Anything that needs to
-know "is this session mid-delegate-run" reads the marker.
+know "is this session mid-unit-run" reads the marker.
 
 Markers are in /tmp and a killed run never removes its own, so a run with no
 write inside MAX_AGE_SECONDS is treated as debris rather than an active run.
