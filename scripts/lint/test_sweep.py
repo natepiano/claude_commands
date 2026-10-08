@@ -11,6 +11,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -558,21 +559,66 @@ class FloorTests(SweepCase):
         self.assertNotIn("phone alert failed", errors.getvalue())
 
     def test_one_channel_delivering_counts_and_both_results_print(self) -> None:
+        fake_module = Path(self.enterContext(tempfile.TemporaryDirectory())) / "scripts/lint/sweep.py"
+        sender = fake_module.parents[1] / "message/send.py"
+        sender.parent.mkdir(parents=True)
+        _ = sender.write_text(
+            """import os
+import sys
+
+recipient = sys.argv[sys.argv.index("--to") + 1]
+variable = "SWEEP_USER_EXIT" if recipient == "user" else "SWEEP_NATEDEV_EXIT"
+raise SystemExit(int(os.environ[variable]))
+""",
+            encoding="utf-8",
+        )
         output = io.StringIO()
         errors = io.StringIO()
-        results = [
-            subprocess.CompletedProcess([], 1, "", "relay unavailable"),
-            subprocess.CompletedProcess([], 0, "", ""),
+        expected_commands = [
+            [sys.executable, str(sender), "--to", "natedev", "--from", "disk_floor", "--timeout", "30"],
+            [sys.executable, str(sender), "--to", "user", "--need", "note", "--summary",
+             "natedev: disk under its floor", "--text", "disk notice"],
         ]
-        with (mock.patch.object(subprocess, "run", side_effect=results) as run,
+        real_run = subprocess.run
+        with (mock.patch.object(sweep, "__file__", str(fake_module)),
+              mock.patch.object(subprocess, "run", wraps=real_run) as run,
+              mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "1", "SWEEP_USER_EXIT": "0"}),
               redirect_stdout(output), redirect_stderr(errors)):
             self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE))
         self.assertEqual(run.call_count, 2)
+        self.assertEqual([call.args[0] for call in run.call_args_list], expected_commands)
         self.assertEqual(run.call_args_list[0].kwargs["input"], "disk notice")
-        phone_command = cast(list[str], run.call_args_list[1].args[0])
-        self.assertEqual(phone_command[-4:], ["--priority", "0", "natedev: disk under its floor", "disk notice"])
+        self.assertIsNone(cast(object, run.call_args_list[1].kwargs["input"]))
         self.assertIn("message alert queued", output.getvalue())
         self.assertIn("phone alert delivered", output.getvalue())
+
+        with (mock.patch.object(sweep, "__file__", str(fake_module)),
+              mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "0", "SWEEP_USER_EXIT": "3"}),
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+            self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE))
+        with (mock.patch.object(sweep, "__file__", str(fake_module)),
+              mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "3", "SWEEP_USER_EXIT": "3"}),
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+            self.assertFalse(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE))
+
+    def test_failed_phone_send_reports_the_cause_printed_on_stdout(self) -> None:
+        fake_module = Path(self.enterContext(tempfile.TemporaryDirectory())) / "scripts/lint/sweep.py"
+        sender = fake_module.parents[1] / "message/send.py"
+        sender.parent.mkdir(parents=True)
+        _ = sender.write_text(
+            """import sys
+
+if sys.argv[sys.argv.index("--to") + 1] == "user":
+    print("FAILED: Pushover keys are missing")
+    raise SystemExit(3)
+""",
+            encoding="utf-8",
+        )
+        errors = io.StringIO()
+        with (mock.patch.object(sweep, "__file__", str(fake_module)),
+              redirect_stdout(io.StringIO()), redirect_stderr(errors)):
+            self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE))
+        self.assertIn("phone alert failed (3): FAILED: Pushover keys are missing", errors.getvalue())
 
     def test_natedev_only_channel_never_calls_phone(self) -> None:
         result = subprocess.CompletedProcess([], 1, "", "")

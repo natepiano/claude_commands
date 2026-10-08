@@ -154,9 +154,10 @@ def cargo_building() -> bool:
 
 
 def send_release_text(title: str, message: str) -> bool:
-    sender = Path(__file__).resolve().parents[1] / "notify/pushover.py"
+    sender = Path(__file__).resolve().parents[1] / "message/send.py"
     result = subprocess.run(
-        ["python3", str(sender), "--priority", "0", title, message],
+        ["python3", str(sender), "--to", "user", "--need", "note",
+         "--summary", title, "--text", message],
         capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
     )
     return result.returncode == 0

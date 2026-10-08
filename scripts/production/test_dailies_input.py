@@ -48,7 +48,7 @@ import sys
 events = Path(os.environ["DAILIES_WATCH_EVENTS"])
 with events.open("a", encoding="utf-8") as output:
     output.write(json.dumps([Path(sys.argv[0]).name, *sys.argv[1:]]) + "\\n")
-if Path(sys.argv[0]).name == "pushover.py":
+if Path(sys.argv[0]).name == "send.py":
     raise SystemExit(0)
 if sys.argv[1:2] == ["watch"]:
     print("12 of 12 phases: report ready, waiting for your acknowledgment")
@@ -230,14 +230,14 @@ class DailiesInputTests(unittest.TestCase):
         bin_path = self.root / "bin"
         bin_path.mkdir()
         events = self.root / "watch-events.jsonl"
-        for name in ("review_regime.py", "pushover.py"):
+        for name in ("review_regime.py",):
             stub = bin_path / name
             _ = stub.write_text(WATCH_STUB.replace("__PYTHON__", sys.executable), encoding="utf-8")
             stub.chmod(0o755)
-        push = self.home / ".claude/scripts/notify/pushover.py"
-        push.parent.mkdir(parents=True, exist_ok=True)
-        _ = push.write_text(WATCH_STUB.replace("__PYTHON__", sys.executable), encoding="utf-8")
-        push.chmod(0o755)
+        send = self.home / ".claude/scripts/message/send.py"
+        send.parent.mkdir(parents=True, exist_ok=True)
+        _ = send.write_text(WATCH_STUB.replace("__PYTHON__", sys.executable), encoding="utf-8")
+        send.chmod(0o755)
         self.env["DAILIES_WATCH_EVENTS"] = str(events)
         self.env["DAILIES_REVIEW_REGIME"] = str(bin_path / "review_regime.py")
         self.env["CI_POINTS_REVIEW_REGIME"] = str(bin_path / "review_regime.py")
@@ -559,7 +559,10 @@ class DailiesInputTests(unittest.TestCase):
         self.assertNotIn("| phases merged |", later.stdout)
         calls = self.watch_events(events)
         self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
-        self.assertEqual(sum(row[0] == "pushover.py" for row in calls), 1)
+        self.assertEqual([row for row in calls if row[0] == "send.py"], [[
+            "send.py", "--to", "user", "--need", "decision", "--summary", "Hana: review watch", "--text",
+            "12 of 12 phases: report ready, waiting for your acknowledgment; the table is in this session",
+        ]])
         self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
 
     def test_merge_first_review_alert_is_not_repeated_by_dailies(self) -> None:
@@ -574,7 +577,10 @@ class DailiesInputTests(unittest.TestCase):
         self.assertTrue(watch["needs_user"])
         calls = self.watch_events(events)
         self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
-        self.assertEqual(sum(row[0] == "pushover.py" for row in calls), 1)
+        self.assertEqual([row for row in calls if row[0] == "send.py"], [[
+            "send.py", "--to", "user", "--need", "decision", "--summary", "Hana: review watch", "--text",
+            "12 of 12 phases: report ready, waiting for your acknowledgment; the table is in this session",
+        ]])
         self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
 
     def test_judgment_held_and_testing_keep_merge_topic_even_when_pushed(self) -> None:

@@ -143,6 +143,28 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual([], texts)
         self.assertEqual([], rust_release.report_line())
 
+    def test_release_text_uses_user_send_and_only_success_returns_true(self) -> None:
+        fake_module = self.scratch / "scripts/buildlog/rust_release.py"
+        sender = self.scratch / "scripts/message/send.py"
+        sender.parent.mkdir(parents=True)
+        _ = sender.write_text(
+            "import os\nraise SystemExit(int(os.environ['RELEASE_SEND_EXIT']))\n",
+            encoding="utf-8",
+        )
+        command = [
+            "python3", str(sender), "--to", "user", "--need", "note",
+            "--summary", "Rust 1.100.0 out", "--text", "trial passed",
+        ]
+        real_run = subprocess.run
+        with (mock.patch.object(rust_release, "__file__", str(fake_module)),
+              mock.patch.object(subprocess, "run", wraps=real_run) as run,
+              mock.patch.dict(os.environ, {"RELEASE_SEND_EXIT": "0"})):
+            self.assertTrue(rust_release.send_release_text("Rust 1.100.0 out", "trial passed"))
+            self.assertEqual(run.call_args.args[0], command)
+        with (mock.patch.object(rust_release, "__file__", str(fake_module)),
+              mock.patch.dict(os.environ, {"RELEASE_SEND_EXIT": "3"})):
+            self.assertFalse(rust_release.send_release_text("Rust 1.100.0 out", "trial passed"))
+
     def test_newer_stable_is_fetched_once_per_local_day(self) -> None:
         fetches: list[str] = []
         self.assertEqual(0, self.invoke(at=datetime(2026, 11, 12, 12), fetches=fetches))
