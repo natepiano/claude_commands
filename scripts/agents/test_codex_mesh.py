@@ -1299,6 +1299,47 @@ class RetryDecisionTests(unittest.TestCase):
         )
 
 
+class QuotaRefusalTests(unittest.TestCase):
+    """Which usage-limit failures are the provider's own, and so reported to the quota alert."""
+
+    @staticmethod
+    def refused(outcome: codex_mesh.RunOutcome, tested: bool, resident: bool = False) -> bool:
+        return codex_mesh._quota_refused(outcome, tested, resident)  # pyright: ignore[reportPrivateUsage]
+
+    def test_a_refusal_from_a_server_this_launcher_started_is_the_providers(self) -> None:
+        self.assertTrue(self.refused(_attempt(), tested=True))
+        self.assertTrue(self.refused(_attempt(thread_exists=True), tested=True, resident=True))
+
+    def test_a_fast_refusal_from_an_inherited_server_proves_nothing(self) -> None:
+        # The wedged server's replay: same words, no round trip.
+        self.assertFalse(self.refused(_attempt(thread_exists=True), tested=False))
+
+    def test_a_refusal_after_real_work_reached_the_provider(self) -> None:
+        slow = _attempt(seconds=codex_mesh.RETRY_FAST_FAILURE_SECS + 1, thread_exists=True)
+        self.assertTrue(self.refused(slow, tested=False))
+        # A resident's clock spans every turn it ever ran.
+        self.assertFalse(self.refused(slow, tested=False, resident=True))
+
+    def test_other_failures_and_capacity_are_not_quota(self) -> None:
+        self.assertFalse(self.refused(codex_mesh.FailedWithThread(THREAD_ID, CAPACITY, 3.0), tested=True))
+        self.assertFalse(self.refused(codex_mesh.RunCompleted(), tested=True))
+        self.assertFalse(self.refused(codex_mesh.CapacityRetriesExhausted(THREAD_ID, 3, 20), tested=True))
+
+    def test_the_report_runs_the_blocked_verb_and_survives_its_failure(self) -> None:
+        done = subprocess.CompletedProcess([], 0, "switched to claude for codex 1: delegate\n", "")
+        with patch.object(subprocess, "run", return_value=done) as run, \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            codex_mesh._report_quota_refusal("seat")  # pyright: ignore[reportPrivateUsage]
+        command = cast("list[str]", run.call_args.args[0])
+        self.assertEqual(command[1:], [str(codex_mesh.QUOTA_REPORT), "blocked"])
+        self.assertTrue(codex_mesh.QUOTA_REPORT.is_file())
+        self.assertIn("codex_mesh: seat: quota: switched to claude for codex 1: delegate", errors.getvalue())
+        with patch.object(subprocess, "run", side_effect=OSError("no interpreter")), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            codex_mesh._report_quota_refusal("seat")  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("quota refusal not reported: no interpreter", errors.getvalue())
+
+
 class ThreadStartTests(unittest.TestCase):
     """The speed tier reaches the thread only when the registry sets one."""
 

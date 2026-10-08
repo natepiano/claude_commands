@@ -84,6 +84,12 @@ RESIDENT_POLL_SECS = 1.0
 # cached, without a round trip, so it fails in seconds; a refusal that travelled
 # to the provider and back does not arrive this quickly and this consistently.
 RETRY_FAST_FAILURE_SECS = 120.0
+# The provider's words for an account with no allowance or credits left to spend.
+QUOTA_REFUSAL = "hit your usage limit"
+# agent_notes.py's `blocked` verb moves Codex work to Claude; one switch took 8 s
+# and one relay 9 s when measured, and the relays run in parallel.
+QUOTA_REPORT = Path(__file__).resolve().parent.parent / "whoami" / "agent_notes.py"
+QUOTA_REPORT_TIMEOUT_SECS = 120
 CAPACITY_WAIT_SECS = 30.0
 CAPACITY_MAX_WAIT_SECS = 300.0
 CAPACITY_BUDGET_SECS = 1200.0
@@ -1017,6 +1023,35 @@ def _retry_warranted(outcome: RunOutcome, fresh_server: bool, resident: bool) ->
     )
 
 
+def _quota_refused(outcome: RunOutcome, tested: bool, resident: bool) -> bool:
+    """Whether the provider itself turned this run away for quota.
+
+    A wedged app-server replays a usage limit it cached, so the words count only
+    from a server this launcher started or retried on, or from a run long enough
+    to have reached the provider. A resident's clock spans many turns and proves
+    nothing about the last one.
+    """
+    return (
+        isinstance(outcome, (FailedBeforeThread, FailedWithThread))
+        and QUOTA_REFUSAL in outcome.failure
+        and (tested or (not resident and outcome.seconds > RETRY_FAST_FAILURE_SECS))
+    )
+
+
+def _report_quota_refusal(name: str) -> None:
+    """Hand a proven refusal to the quota alert, which decides whether Codex work moves to Claude."""
+    try:
+        done = subprocess.run(
+            [sys.executable, str(QUOTA_REPORT), "blocked"],
+            capture_output=True, text=True, timeout=QUOTA_REPORT_TIMEOUT_SECS, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"codex_mesh: {name}: quota refusal not reported: {exc}", file=sys.stderr)
+        return
+    for line in (done.stdout + done.stderr).splitlines():
+        print(f"codex_mesh: {name}: quota: {line}", file=sys.stderr)
+
+
 def command_start(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
@@ -1074,6 +1109,7 @@ def command_start(args: argparse.Namespace) -> int:
                 return 2
     port, fresh_server = ensure_server(session_dir)
     outcome = _run_delegate(args, port)
+    tested = fresh_server
     if _retry_warranted(outcome, fresh_server, resident):
         _ = _retire_server(session_dir, port)
         port, _fresh = ensure_server(session_dir)
@@ -1083,8 +1119,11 @@ def command_start(args: argparse.Namespace) -> int:
         print(f"codex_mesh: {name}: {note} the provider; retrying on a new one",
               file=sys.stderr)
         outcome = _run_delegate(args, port)
+        tested = True
     if isinstance(outcome, (FailedBeforeThread, FailedWithThread)):
         print(f"codex_mesh: {name}: {outcome.failure}", file=sys.stderr)
+        if _quota_refused(outcome, tested, resident):
+            _report_quota_refusal(name)
         return 1
     if isinstance(outcome, CapacityRetriesExhausted):
         print(f"codex_mesh: {name}: {outcome.message(name)}", file=sys.stderr)

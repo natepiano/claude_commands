@@ -213,6 +213,15 @@ racing the same recovery replace one server between them rather than one each.
 Same failure on the fresh server means the provider really did refuse, and it is
 reported unchanged.
 
+**A proven usage limit reaches the quota alert.** When a start fails with the
+provider's usage-limit words on a server the launcher started or retried on, or
+after a non-resident run longer than `RETRY_FAST_FAILURE_SECS`, `command_start`
+runs `scripts/whoami/agent_notes.py blocked` (`_quota_refused`,
+`_report_quota_refusal`). `quota_alert.blocked()` then moves every function on
+codex to claude, but only while the active Codex account is at or under the
+alert threshold, and tells every alert recipient at once. A fast refusal from an
+inherited server that was never retried proves nothing and is not reported.
+
 **Model at capacity.** A turn ends `TurnCompleted`, `TurnRefusedForCapacity` or `TurnFailed`; a run ends `RunCompleted`, `FailedBeforeThread`, `FailedWithThread` or `CapacityRetriesExhausted`. Capacity is the error's `codexErrorInfo` `serverOverloaded` / `flexUnavailable`, or the message `Selected model is at capacity`. On a refusal the launcher keeps the same thread and roster entry and owes the seat a resume turn. It moves messages queued for the thread to `<seat>.pending.json`, reads the thread (`_read_live_turn`), and, if a queued peer turn is already running, streams that turn first with the resume still owed. Once the thread reads `ThreadIdle`, it marks the entry `waiting_capacity` with its own `launcher_pid`, logs `capacity retry N: next turn at <time>`, waits, and starts a resume turn: `Your last turn stopped because the model was at capacity. Continue from where you stopped; your edits are already in the tree.`, followed by the held messages. The original prompt is never sent again. Before each resume it checks, under the pending-file lock, that no `end` marker exists and the roster still names this thread; otherwise it logs `capacity launcher ended|replaced; no resume turn started` and returns `FailedWithThread`.
 
 The wait budget is per busy spell. Within a spell the wait is `CAPACITY_WAIT_SECS` (30 s) doubling to `CAPACITY_MAX_WAIT_SECS` (300 s), with `CAPACITY_BUDGET_SECS` (1200 s) in all. `capacity_waited` and `capacity_retries` reset at one site in `_attach_and_run`, the `else` of the capacity check, just before the `resume_owed` branch: any turn that ends without a capacity refusal resets them, a peer turn that completes while a resume is owed included. Only a capacity refusal earns a wait, so an owed resume starts at once after a turn that ended any other way. A refusal that finds the budget spent sets the entry to `capacity_exhausted`, drops the thread's queue and interrupts any live turn (`_end_unwatched_turn`), and `start` exits 1 with `codex_mesh: <seat>: model still at capacity after 7 retries over 20 min; thread <id> stays on the roster (codex_mesh.py end --to <seat>)`.

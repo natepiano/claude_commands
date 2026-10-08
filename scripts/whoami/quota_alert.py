@@ -16,10 +16,12 @@ reports a reset, and says so even when the timer closed the episode first.
 
 Reaching the threshold switches nothing, for either tool: a Codex account whose
 weekly allowance is used up may keep working on its credits, so its alert says to
-keep delegating (user, 2026-10-07). switch_to_claude() moves every [assignments]
-entry on codex to claude through agents_config.sh's validated editor; it is for a
-caller that has seen Codex refuse work for quota, and alert() never calls it. A
-later alert says what a switch moved, or why the editor refused. Once no Codex
+keep delegating (user, 2026-10-07). The switch waits for Codex to refuse work:
+codex_mesh.py runs `agent_notes.py blocked` when the provider turns a launch away
+for quota, and blocked() then moves every [assignments] entry on codex to claude
+through agents_config.sh's validated editor and tells every recipient at once
+what moved, or why the editor refused. It switches only inside an episode, so a
+refusal while the week is measured above the threshold moves nothing. Once no Codex
 episode is open, the entries a switch moved that are still on claude go back to
 codex, and "Quota restored:" says which. Each
 switch and switch-back waits in the state until the user's next prompt in OWNER,
@@ -278,7 +280,7 @@ def switch_to_claude(state: State, note: AgentNote, stamp: str) -> str:
     if not moved and error:
         episode["switch_failed"] = error
         state.setdefault("unseen", []).append(
-            f"Codex ran out of quota ({account}), and the automatic switch to Claude failed at "
+            f"Codex refused work for quota ({account}), and the automatic switch to Claude failed at "
             + f"{local_time(stamp)}: {error}")
         return f"switch to claude for {note.path.stem} failed: {error}"
     if not moved:
@@ -286,7 +288,7 @@ def switch_to_claude(state: State, note: AgentNote, stamp: str) -> str:
     switch = state.setdefault("switch", {"at": stamp, "moved": []})
     switch["moved"] += [key for key in moved if key not in switch["moved"]]
     state.setdefault("unseen", []).append(
-        f"Codex ran out of quota ({account}): {', '.join(moved)} moved to Claude at {local_time(stamp)}, "
+        f"Codex refused work for quota ({account}): {', '.join(moved)} moved to Claude at {local_time(stamp)}, "
         + "and move back when Codex recovers.")
     return f"switched to claude for {note.path.stem}: {', '.join(moved)}"
 
@@ -401,6 +403,19 @@ def deliver(jobs: list[Job]) -> list[str | None]:
         return list(pool.map(relay, [job.recipient for job in jobs], [job.text for job in jobs], keys))
 
 
+def deliver_and_record(jobs: list[Job], stamp: str) -> list[str]:
+    """Deliver every job, stamp each alert's attempt on its episode, and return one log line per job."""
+    errors = deliver(jobs)
+    log: list[str] = []
+    with state_file() as state:
+        for job, error in zip(jobs, errors):
+            if job.kind == "alert" and job.name in state["episodes"]:
+                state["episodes"][job.name]["last"][job.recipient] = stamp
+            outcome = "sent" if error is None else f"not delivered: {error}"
+            log.append(f"quota {job.kind} {job.name} -> {job.recipient}: {outcome}")
+    return log
+
+
 def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
     """Send what is due, record it, and return one log line per attempt."""
     now = now or datetime.now(timezone.utc)
@@ -436,14 +451,34 @@ def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
             text = restored_message(accounts, f"the {name} alert is closed", threshold,
                                     back if tool == "codex" else None)
             jobs += [Job(name, recipient, text, "restored") for recipient in recipients(config)]
-    errors = deliver(jobs)
+    return log + deliver_and_record(jobs, stamp)
+
+
+def blocked(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
+    """Codex refused work for quota: move its functions to Claude and tell every recipient at once.
+
+    Only inside an episode, so only while the active Codex account is measured at or under the
+    threshold: above it the refusal is a 5-hour limit or a stale reply, and nothing moves. An
+    acknowledged episode is told too, since the switch is news its alert never carried.
+    """
+    stamp = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
+    config = load_config()
     with state_file() as state:
-        for job, error in zip(jobs, errors):
-            if job.kind == "alert" and job.name in state["episodes"]:
-                state["episodes"][job.name]["last"][job.recipient] = stamp
-            outcome = "sent" if error is None else f"not delivered: {error}"
-            log.append(f"quota {job.kind} {job.name} -> {job.recipient}: {outcome}")
-    return log
+        out = [note for note in low(notes, config["threshold_percent"]) if note.tool == "codex"]
+        if not out:
+            return ["codex refused work for quota, but no active codex account is at or under the threshold; "
+                    + "nothing switched"]
+        if switch := state.get("switch"):
+            return [f"codex refused work for quota; its functions were already moved to claude at {switch['at']}"]
+        note = out[0]
+        name = note.path.stem
+        episode = state["episodes"].setdefault(name, {"since": stamp, "last": {}})
+        _ = episode.pop("switch_failed", None)
+        log = [switch_to_claude(state, note, stamp)]
+        if "switch" not in state and "switch_failed" not in episode:
+            return log
+        text = message(note, notes, config, state.get("switch"), episode.get("switch_failed"))
+    return log + deliver_and_record([Job(name, recipient, text, "alert") for recipient in recipients(config)], stamp)
 
 
 def refresh(notes: list[AgentNote], here: str | None, now: datetime | None = None) -> list[str]:
