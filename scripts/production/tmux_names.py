@@ -91,8 +91,7 @@ def live_sessions() -> list[ClaudeSession] | TmuxServerUnavailable:
 
 
 def _registry_holds(settings: showrunners.ShowrunnerSettings, name: str) -> bool:
-    return any(runner["session"] == name or any(unit.session == name for unit in runner["units"])
-               for runner in settings["showrunners"])
+    return any(runner["session"] == name for runner in settings["showrunners"])
 
 
 def _rename_session(pane: str, old: str, new: str, panes: dict[str, str]) -> SessionRenamed | RenameIncomplete:
@@ -100,7 +99,7 @@ def _rename_session(pane: str, old: str, new: str, panes: dict[str, str]) -> Ses
     try:
         settings = showrunners.load_settings() if showrunners.CONFIG.exists() else showrunners.defaults()
         if _registry_holds(settings, old):
-            showrunners.change("rename", old, "", [], new)
+            showrunners.change("rename", old, "", "", new)
             changed.append("showrunner registry")
     except (OSError, ValueError) as error:
         return RenameIncomplete(f"the showrunner registry still names {old}: {error}")

@@ -63,9 +63,13 @@ State:
   After a compaction, the production doc plus `LOG` is the whole state.
 - **Unit worktrees.** Never `cd` into one; use `git -C`. Never commit, reset or
   edit files there.
+- **A unit's pane** is looked up each time it is needed, never remembered:
+  `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
+  prints it (`<unit>` is the Units row's Unit value). No tool finds a pane by a
+  session name; the user may rename a session at any time.
 - **The user's words for a unit director** go into its terminal. Send
-  `tmux send-keys -t <session> -l "From the user (via the showrunner): <words>"`,
-  then `tmux send-keys -t <session> Enter` as a separate call:
+  `tmux send-keys -t <pane> -l "From the user (via the showrunner): <words>"`,
+  then `tmux send-keys -t <pane> Enter` as a separate call:
   - Relay only words the user gave.
   - Never send C-c or Escape; typing replaces a prompt suggestion.
   - Text after a unit director's `❯` in a pane capture may be a prompt
@@ -225,8 +229,8 @@ Use `--standby` for a unit waiting for an assignment. Tell the user one line
 per unit director: its session name and `tmux attach -t <session>`.
 
 When a unit director is blocked on a full context, first capture its pane to
-confirm the block remains and no compaction is running. Type `/compact` with
-`tmux send-keys -l`, then send `Enter` separately.
+confirm the block remains and no compaction is running. Type `/compact` into its pane with
+`tmux send-keys -t <pane> -l`, then send `Enter` separately.
 
 **Resume.** To bring back a unit director whose session ended, use
    `claude --resume <session-id> <flags> --remote-control <session> -n <session>`, which keeps its link and its place in the list.
@@ -280,7 +284,7 @@ is the update tick, not a peer's message. Do not reply to it.
 **Compact after a checkpoint.** At most once per phase: on the first tick or
 dailies after a unit director checkpoints a phase, read its context size from its pane
 footer (`<session> | 157,352 | <model>`). When it is at 150,000 tokens or more
-and idle, type `/compact` into it: `tmux send-keys -t <session> -l
+and idle, type `/compact` into it: `tmux send-keys -t <pane> -l
 "/compact"`, then `Enter` as a separate call. Idle means no spinner line
 (`✶ Doing… (12s …)`), nothing after `❯` except a ghost suggestion (dim:
 `tmux capture-pane -e` shows `\e[2m` before it), and no form, permission

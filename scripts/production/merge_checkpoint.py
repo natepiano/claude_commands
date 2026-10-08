@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
-from add_unit import Production, Refusal, cell_value, read_production, unit_rows
+from add_unit import Production, Refusal, cell_value, read_production, unit_table
 
 
 class ValidateAndPush(NamedTuple):
@@ -220,14 +220,12 @@ def promotion_from_doc(lines: list[str]) -> NoPromotion | PromoteTo:
 
 
 def parse_units(lines: list[str]) -> tuple[Unit, ...]:
-    _, rows = unit_rows(lines)
     result: list[Unit] = []
-    for row in rows:
-        cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
-        if len(cells) < 7:
+    for cells in unit_table(lines):
+        if not all(heading in cells for heading in ("Unit", "Plan", "Worktree", "Branch", "Owns")):
             continue
-        plan = Path(cell_value(cells[1]).split(" ", 1)[0])
-        owns_cell = cells[6]
+        plan = Path(cell_value(cells["Plan"]).split(" ", 1)[0])
+        owns_cell = cells["Owns"]
         quoted = cast(list[str], re.findall(r"`([^`]+)`", owns_cell))
         plain = owns_cell.split(" — ", 1)[0]
         if quoted:
@@ -243,8 +241,8 @@ def parse_units(lines: list[str]) -> tuple[Unit, ...]:
             owns = tuple(owned)
         else:
             owns = tuple(part.strip() for part in plain.split(",") if part.strip())
-        result.append(Unit(cell_value(cells[0]), plan,
-                           Path(cell_value(cells[2])).expanduser(), cell_value(cells[3]), owns))
+        result.append(Unit(cell_value(cells["Unit"]), plan,
+                           Path(cell_value(cells["Worktree"])).expanduser(), cell_value(cells["Branch"]), owns))
     return tuple(result)
 
 

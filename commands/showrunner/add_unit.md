@@ -22,4 +22,4 @@ The unit director launch takes its model and effort from `/agent production.dire
 For a standby unit, send its work when assigned, set the Units row's Plan cell
 to the plan path, commit that doc on the merge branch without pushing it (it
 goes out with your next merge push), then run
-`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py ready <showrunner session> --unit <name>`.
+`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py ready <showrunner session> --unit <name>-unit`.
