@@ -146,6 +146,10 @@ class DailiesInputTests(unittest.TestCase):
         return result.stdout.strip()
 
     def production_doc(self, *, beta: bool = False) -> None:
+        for name in ("alpha", "beta"):
+            # A linked worktree, where `.git` is a file: its unit is never taken for a removed one.
+            (self.root / name).mkdir(exist_ok=True)
+            _ = (self.root / name / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
         rows = [
             "# Production — example", "", "## Production Context", "",
             "- **Merge branch:** `production`",
@@ -309,7 +313,7 @@ class DailiesInputTests(unittest.TestCase):
         _ = self.doc.write_text(content.replace("`docs/alpha.md`", "retired after completion", 1),
                                 encoding="utf-8")
         _ = self.assert_refused_without_output(
-            mention="no live units: every Units row is marked retired")
+            mention="no live units: every Units row is retired")
 
     def test_short_session_without_judgment_label_uses_renderer_default(self) -> None:
         result = self.run_builder()

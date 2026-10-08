@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 
-from add_unit import Production, Refusal, cell_value, read_production, unit_rows
+from add_unit import Production, Refusal, cell_value, read_production, retired_sessions, row_is_retired, unit_rows
 from merge_checkpoint import NoMerge, merge_branch_history, report
 
 if TYPE_CHECKING:
@@ -116,13 +116,15 @@ def session_line(production: Production, session: str) -> SessionLineSame | Sess
 
 
 def unit_sessions(lines: list[str]) -> list[str]:
+    """Return the session of every unit that is not retired."""
     _, rows = unit_rows(lines)
     sessions: list[str] = []
     for row in rows:
         cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
         if len(cells) < 5:
             raise RegistrationFailure("registry", f"invalid Units row: {row}")
-        sessions.append(cell_value(cells[4]))
+        if not row_is_retired(row):
+            sessions.append(cell_value(cells[4]))
     return sessions
 
 
@@ -166,6 +168,11 @@ def register(production: Production, session: str) -> None:
         _ = command("register", [sys.executable, str(registry), "rename", production.showrunner_session, session])
     _ = command("register", [sys.executable, str(registry), "add", session, "--zone", str(production.zone),
                          *(argument for unit in sessions for argument in ("--unit", unit))])
+    # The registry only gains names on `add`, so a retired unit leaves it here.
+    retired = sorted(retired_sessions(lines) - set(sessions))
+    if retired:
+        _ = command("register", [sys.executable, str(registry), "remove", session,
+                             *(argument for unit in retired for argument in ("--unit", unit))])
     _ = session_line(production, session)
     state_root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
     prompt_file = state_root / production.slug / "prompt.txt"

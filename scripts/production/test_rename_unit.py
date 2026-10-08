@@ -172,6 +172,10 @@ class RenameUnitTests(unittest.TestCase):
             _ = self.child.wait(timeout=3)
 
     def production_doc(self) -> str:
+        # A linked worktree, where `.git` is a file: tmux is never asked whether its unit is gone.
+        alpha = self.root / "alpha-worktree"
+        alpha.mkdir(exist_ok=True)
+        _ = (alpha / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
         return ("# Production\n\n"
                 "- **Merge branch:** `build-followups`\n"
                 f"- **Showrunner checkout:** `{self.checkout}`\n"
@@ -181,7 +185,7 @@ class RenameUnitTests(unittest.TestCase):
                 "## Units\n\n"
                 "| Unit | Plan | Worktree | Branch | Session | Port | Owns |\n"
                 "| --- | --- | --- | --- | --- | --- | --- |\n"
-                "| alpha-unit | docs/plans/alpha.md | /tmp/alpha | build-followups-alpha | `old` — active | — | src/alpha |\n\n"
+                f"| alpha-unit | docs/plans/alpha.md | {alpha} | build-followups-alpha | `old` — active | — | src/alpha |\n\n"
                 "## Gates\n")
 
     def git(self, *args: str, cwd: Path | None = None) -> str:

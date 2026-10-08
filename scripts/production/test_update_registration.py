@@ -80,6 +80,10 @@ class RegistrationTests(unittest.TestCase):
         _ = self.git("config", "user.name", "Registration Test")
         _ = self.git("config", "user.email", "registration@example.invalid")
         self.doc.parent.mkdir(parents=True)
+        # A linked worktree, where `.git` is a file: tmux is never asked whether its unit is gone.
+        alpha = self.root / "alpha"
+        alpha.mkdir()
+        _ = (alpha / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
         _ = self.doc.write_text("\n".join((
             "# Production — example", "", "## Production Context", "",
             "- **Merge branch:** `production`", f"- **Showrunner checkout:** `{self.checkout}`",
@@ -87,7 +91,7 @@ class RegistrationTests(unittest.TestCase):
             "- **User zone:** America/Los_Angeles", "- **Updates:** every 15 minutes", "",
             "## Units", "", "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
             "| --- | --- | --- | --- | --- | --- | --- |",
-            "| `alpha-unit` | `docs/alpha.md` | `/tmp/alpha` | `alpha` | `alpha-session` | — | — |",
+            f"| `alpha-unit` | `docs/alpha.md` | `{alpha}` | `alpha` | `alpha-session` | — | — |",
             "", "## Gates", "",
         )), encoding="utf-8")
         _ = self.git("add", ".")
@@ -133,6 +137,33 @@ class RegistrationTests(unittest.TestCase):
     def run_copy(self, script: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(script), *args, "--production", str(self.doc)],
                               cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False)
+
+    def test_a_unit_with_no_session_and_no_worktree_leaves_the_registry(self) -> None:
+        first = self.run_command("register", "--session", "first-showrunner")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        # tmux knows only `kept-session`, and neither added unit has a worktree of its own.
+        tmux = self.root / "bin" / "tmux"
+        _ = tmux.write_text("#!/bin/sh\n[ \"$1\" = has-session ] || exit 99\n"
+                            + "[ \"$3\" = '=kept-session' ] && exit 0\nexit 1\n", encoding="utf-8")
+        tmux.chmod(0o755)
+        rows = ("| `gone-unit` | `docs/gone.md` | `/nonexistent/gone` | `gone` | `gone-session` | — | — |\n"
+                + "| `kept-unit` | `docs/kept.md` | `/nonexistent/kept` | `kept` | `kept-session` | — | — |\n")
+        content = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(content.replace("\n\n## Gates", f"\n{rows}\n## Gates"), encoding="utf-8")
+        _ = self.git("commit", "-am", "two more units")
+        # The removed unit was registered while it was still there.
+        added = subprocess.run([sys.executable, str(SCRIPT.with_name("showrunners.py")), "add", "first-showrunner",
+                                "--zone", "America/Los_Angeles", "--unit", "gone-session"],
+                               env=self.env, capture_output=True, text=True, check=False)
+        self.assertEqual(added.returncode, 0, added.stderr)
+        self.assertIn("gone-session", self.config.read_text(encoding="utf-8"))
+
+        again = self.run_command("register", "--session", "first-showrunner")
+
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(self.registry()[0]["units"],
+                         [{"session": "alpha-session", "status": "running"},
+                          {"session": "kept-session", "status": "running"}])
 
     def test_start_and_resume_retarget_only_updates_and_retire_old_session(self) -> None:
         first = self.run_command("register", "--session", "first-showrunner")

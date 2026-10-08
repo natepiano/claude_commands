@@ -113,7 +113,7 @@ def units_from_doc(lines: list[str]) -> tuple[UnitRow, ...]:
     _, rows = unit_rows(lines)
     live_rows = live_unit_rows(lines)
     if rows and not live_rows:
-        raise DailiesFailure("production", "no live units: every Units row is marked retired")
+        raise DailiesFailure("production", "no live units: every Units row is retired")
     units: list[UnitRow] = []
     for row in live_rows:
         cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
