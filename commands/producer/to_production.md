@@ -114,7 +114,6 @@ production format, with status `planned`:
 - **User zone:** the zone in memory for where the user is now, or else the
   machine's zone.
 - **Updates:** every 15 minutes (user, 2026-09-28).
-- **Showrunner session:** leave it out; `/showrunner:produce` writes it.
 - **Close-out:** the source plans' production-level steps, meaning work that
   no one unit owns or that runs after the last merge. Examples: data or
   saved-state migrations, checks on other machines, final validation.

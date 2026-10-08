@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import cast, override
+from typing import override
 
 import fake_tmux
 from fake_tmux import FakeSession
@@ -96,6 +96,7 @@ class AdoptTests(unittest.TestCase):
                 (self.scratch / "unit_status/decisions_seen").read_bytes())
 
     def test_each_unit_is_marked_and_no_copy_of_its_name_is_left(self) -> None:
+        registry = self.config.read_bytes()
         result = self.run_adopt()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.marks(), {
@@ -108,20 +109,11 @@ class AdoptTests(unittest.TestCase):
         self.assertEqual(table[:2], ["| Unit | Plan | Worktree | Branch | Port | Owns |",
                                      "| --- | --- | --- | --- | --- | --- |"])
         self.assertEqual(table[3], f"| `beta-unit` | `docs/beta.md` | `{self.root / 'beta'}` | `beta` | 4100 | — |")
-        registry = cast(dict[str, list[dict[str, str]]], json.loads(self.config.read_text(encoding="utf-8")))
-        self.assertEqual([(runner["session"], runner["zone"], runner["doc"]) for runner in registry["showrunners"]],
-                         [("director", "America/Los_Angeles", str(self.doc))])
+        # The registry is read for the old run states and never written.
+        self.assertEqual(self.config.read_bytes(), registry)
         self.assertEqual((self.scratch / "unit_status/decisions_seen").read_text(encoding="utf-8"),
                          "alpha-unit|which colour\nbeta-unit|which size\n")
         self.assertEqual(self.commits(), ["production(show): unit sessions are looked up, not written down", "base"])
-
-    def test_another_showrunners_registry_write_does_not_lose_this_ones_unit_states(self) -> None:
-        other = subprocess.run([sys.executable, str(SCRIPT.with_name("showrunners.py")), "add", "other",
-                                "--zone", "America/Los_Angeles"], env=self.environment, capture_output=True,
-                               text=True, check=False)
-        self.assertEqual(other.returncode, 0, other.stderr)
-        self.assertEqual(self.run_adopt().returncode, 0)
-        self.assertEqual(self.marks()["beta-renamed"]["SHOWRUNNER_UNIT_STATE"], "run-finished")
 
     def test_a_unit_marked_by_hand_before_the_run_still_gets_its_run_state(self) -> None:
         sessions = fake_tmux.read(self.tmux)

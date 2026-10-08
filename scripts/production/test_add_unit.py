@@ -263,13 +263,6 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(self.events("tmux"), [])
         self.assertEqual(self.events("systemd-run"), [])
 
-    def registered_doc(self) -> str:
-        """The production doc the registry holds for the showrunner: all it holds about the production."""
-        data = cast(dict[str, object], json.loads(self.config.read_text()))
-        runners = cast(list[dict[str, str]], data["showrunners"])
-        self.assertEqual(runners, [{"session": "director", "zone": "America/Los_Angeles", "doc": runners[0]["doc"]}])
-        return runners[0]["doc"]
-
     def marks(self, session: str) -> dict[str, str]:
         return cast(dict[str, str], json.loads((self.state / f"env-{session}.json").read_text()))
 
@@ -288,14 +281,17 @@ class AddUnitTests(unittest.TestCase):
                          "docs/plans/build-followups-production.md")
         self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
         self.assertFalse((worktree / "docs/plans/build-followups-alpha.md").exists())
-        self.assertEqual(self.registered_doc(), str(self.doc))
+        # Adding a unit registers nothing: the showrunner's update timer already names the doc.
+        self.assertFalse(self.config.exists())
         self.assertEqual(self.marks("alpha"), {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "alpha-unit",
                                                "SHOWRUNNER_UNIT_STATE": "standing-by"})
         tmux = next(record for record in self.events("tmux")
                     if cast(list[str], record["args"])[:1] == ["new-session"])
         command = cast(list[str], tmux["args"])[-1]
         prompt = (f"You are alpha-unit in production build-followups (doc {self.doc}), "
-                  f"under the showrunner director, on standby. Work only in your worktree {worktree}, "
+                  "under the showrunner, whose session name `~/.claude/scripts/lib/py "
+                  "~/.claude/scripts/production/showrunners.py name build-followups` prints (look it up "
+                  f"before each message: the name can change), on standby. Work only in your worktree {worktree}, "
                   "branch build-followups-alpha. Do nothing until the showrunner sends you work.")
         self.assertIn(prompt, command)
         self.assert_director_flags("opus", "xhigh")
@@ -355,7 +351,8 @@ class AddUnitTests(unittest.TestCase):
         self.assertIn("claude --model opus --effort xhigh --remote-control alpha -n alpha", args[-1])
         self.assert_director_flags("opus", "xhigh")
         self.assertIn("'/unit:delegate docs/plans/given.md'", args[-1])
-        self.assertEqual(self.registered_doc(), str(self.doc))
+        # Adding a unit registers nothing: the showrunner's update timer already names the doc.
+        self.assertFalse(self.config.exists())
         self.assertRegex(self.log.read_text(),
                          r"^- \d\d:\d\d PDT: added alpha-unit \(plan\), worktree ")
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
@@ -424,7 +421,8 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(self.git("branch", "--show-current", cwd=self.root / "project-alpha"),
                          "build-followups-alpha")
         self.assertEqual(len(self.events("systemd-run")), 1)
-        self.assertEqual(self.registered_doc(), str(self.doc))
+        # Adding a unit registers nothing: the showrunner's update timer already names the doc.
+        self.assertFalse(self.config.exists())
         self.assertIn("added alpha-unit (plan)", self.log.read_text())
 
     def test_prepared_row_refuses_mismatched_identity_cells_before_launch(self) -> None:
@@ -571,7 +569,8 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(self.doc.read_text().count("| alpha-unit |"), 1)
         self.assertEqual(len([event for event in self.events("tmux")
                               if cast(list[str], event["args"])[:1] == ["new-session"]]), 1)
-        self.assertEqual(self.registered_doc(), str(self.doc))
+        # Adding a unit registers nothing: the showrunner's update timer already names the doc.
+        self.assertFalse(self.config.exists())
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
 
     def test_refusals_change_no_repository_or_registry_state(self) -> None:

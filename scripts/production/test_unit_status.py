@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
@@ -133,23 +132,8 @@ exit 0
             )
             if real_tmux is not None:
                 environment = real_tmux.environment(environment)
-            config = root / "config" / "showrunners.json"
-            config.parent.mkdir()
-            _ = config.write_text(json.dumps({
-                "threshold_percent": 2,
-                "repeat_minutes": 30,
-                "stall_minutes": 5,
-                "faults_to": "natedev",
-                "always": [],
-                "showrunners": [{
-                    "session": "director",
-                    "zone": "America/Los_Angeles",
-                    "doc": str(root / "example-production.md"),
-                }],
-            }))
             for source_name in ("add_unit.py", "live_units.py", "showrunners.py", "unit_lookup.py"):
                 _ = shutil.copy2(SCRIPT.with_name(source_name), script.with_name(source_name))
-            environment["SHOWRUNNERS_CONFIG"] = str(config)
             (root / "sessions").mkdir()
             rows: list[str] = []
             for unit in units:
@@ -173,7 +157,7 @@ exit 0
                     )
                 result = subprocess.run(
                     [zsh, str(script), str(root / "status"), "America/Los_Angeles",
-                     "--showrunner", "director"],
+                     "--production", str(root / "example-production.md")],
                     check=True,
                     capture_output=True,
                     text=True,

@@ -135,7 +135,6 @@ def adopt(production: add_unit.Production, scratch: Path, gone: set[str]) -> int
     text = production.doc.read_text(encoding="utf-8")
     lines = text.splitlines()
     if COLUMN not in add_unit.unit_headings(lines):
-        showrunners.change("add", production.showrunner_session, production.zone.key, str(production.doc))
         print(f"adopt: nothing to do — the Units table of {production.doc.name} has no {COLUMN} column")
         return 0
     rows = unit_rows(production, lines, gone)
@@ -148,7 +147,12 @@ def adopt(production: add_unit.Production, scratch: Path, gone: set[str]) -> int
         print(f"  unit_lookup.py mark {production.slug} <unit> <tmux session>")
         print("For a unit that has no session now, run adopt again with: --gone <unit>")
         return 1
-    states = registry_states(production.showrunner_session)
+    try:
+        # The doc still has the line that named the showrunner when the registry listed its units.
+        states = registry_states(add_unit.production_field(
+            production.doc.read_text(encoding="utf-8").splitlines(), "Showrunner session"))
+    except add_unit.Refusal:
+        states = {}
     for row in rows:
         if isinstance(row.session, ToMark):
             unit_lookup.mark(row.session.target, production.slug, row.unit)
@@ -166,7 +170,6 @@ def adopt(production: add_unit.Production, scratch: Path, gone: set[str]) -> int
         if row.old_name and row.old_name != row.unit:
             for store in rename_state.rename_scratch(row.old_name, row.unit, scratch):
                 print(f"adopt: {store}: {row.old_name} is now {row.unit}")
-    showrunners.change("add", production.showrunner_session, production.zone.key, str(production.doc))
     # Last, so a run stopped part way still has the old names to finish from.
     _ = production.doc.write_text("\n".join(without_column(lines)) + ("\n" if text.endswith("\n") else ""),
                                   encoding="utf-8")

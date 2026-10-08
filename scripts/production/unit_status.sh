@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
 # Unit status for /showrunner:produce's update schedule.
-# Usage: unit_status.sh <state-dir> <user-zone> --showrunner <session>
+# Usage: unit_status.sh <state-dir> <user-zone> --production <production doc>
 # The units are the live rows of the showrunner's production doc. Each is found by the mark on
 # its tmux session, so a block is headed by the unit id, which no rename changes.
 # Each call checks every unit director: that its session and Claude are running, tick
@@ -10,15 +10,17 @@
 # No pipefail: each test reads grep's own status, and an early `grep -q` exit
 # would fail the `tail` before it with SIGPIPE.
 
-if (( $# != 4 )) || [[ $3 != --showrunner ]]; then
-  print -u2 'usage: unit_status.sh <state-dir> <user-zone> --showrunner <session>'
+if (( $# != 4 )) || [[ $3 != --production && $3 != --showrunner ]]; then
+  print -u2 'usage: unit_status.sh <state-dir> <user-zone> --production <production doc>'
   exit 2
 fi
+# An update prompt written before a production was named by its doc passes `--showrunner <session>`.
+[[ $3 == --production ]] && production=(--production "$4") || production=("$4")
 DIR=$1
 ZONE=$2
 REPO=${0:A:h:h:h}
 # One line per unit: its id, its pane now, whether Claude runs there, its session name now.
-unit_lines=$("$REPO/scripts/lib/py" "$REPO/scripts/production/live_units.py" "$4") || exit 1
+unit_lines=$("$REPO/scripts/lib/py" "$REPO/scripts/production/live_units.py" "${production[@]}") || exit 1
 [[ -n $unit_lines ]] && units=("${(@f)unit_lines}") || units=()
 # What a gate line may call a peer: its unit id, or its session name now.
 names=()
