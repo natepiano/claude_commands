@@ -20,6 +20,7 @@ import conversation_pause
 LIBRARY = Path(__file__).with_name("conversation_pause.py")
 PROMPT_HOOK = Path(__file__).with_name("user-prompt-submit-conversation-pause.py")
 STOP_HOOK = Path(__file__).with_name("stop-conversation-pause.py")
+SETTINGS = LIBRARY.parent.parent.parent / "settings.json"
 SESSION = "session-1"
 NOW = 10_000
 QUESTION = (
@@ -49,6 +50,45 @@ NO_CONTEXT = (
     f"the user asks for them; then run: {RESUME}. Confirm it in one line. That no "
     "answers only this question."
 )
+
+
+class ConversationPauseRegistrationTests(unittest.TestCase):
+    def test_settings_registers_hooks_and_permission_once(self) -> None:
+        settings = cast(dict[str, object], json.loads(SETTINGS.read_text()))
+        hooks = cast(dict[str, list[dict[str, object]]], settings["hooks"])
+
+        def registered_commands(groups: list[dict[str, object]]) -> list[str]:
+            commands: list[str] = []
+            for group in groups:
+                registered = cast(list[dict[str, object]], group["hooks"])
+                commands.extend(
+                    command
+                    for hook in registered
+                    if isinstance(command := hook.get("command"), str)
+                )
+            return commands
+
+        prompt_command = (
+            '"$HOME/.claude/scripts/lib/py" '
+            '"$HOME/.claude/scripts/hooks/user-prompt-submit-conversation-pause.py"'
+        )
+        self.assertEqual(
+            registered_commands(hooks["UserPromptSubmit"]).count(prompt_command), 1
+        )
+
+        stop_command = (
+            '"$HOME/.claude/scripts/lib/py" '
+            '"$HOME/.claude/scripts/hooks/stop-conversation-pause.py"'
+        )
+        self.assertEqual(registered_commands(hooks["Stop"]).count(stop_command), 1)
+
+        resume_prefix = conversation_pause.RESUME_COMMAND.rsplit(" ", 1)[0]
+        self.assertEqual(
+            conversation_pause.KEEP_COMMAND.rsplit(" ", 1)[0], resume_prefix
+        )
+        permissions = cast(dict[str, object], settings["permissions"])
+        allow = cast(list[str], permissions["allow"])
+        self.assertEqual(allow.count(f"Bash({resume_prefix} *)"), 1)
 
 
 def cross_session(sender: str, text: str) -> str:

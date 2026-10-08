@@ -531,8 +531,10 @@ if a tick arrived recently.
 
 A user-requested status check emits <ProgressReport/> immediately. If the user
 stops updates, use `/unit:report off` for Claude; Codex keeps polling without
-reports. Resume Claude updates with `/unit:report on`. Change one unit's
-interval with `/unit:interval <min>`.
+reports. A message the user types pauses these status reports on its own; later
+a `conversation-pause:` message asks you to put its question to the user word
+for word. Never answer it for them. Resume Claude updates with
+`/unit:report on`. Change one unit's interval with `/unit:interval <min>`.
 </ProgressContract>
 
 <AuthorizationContract>
