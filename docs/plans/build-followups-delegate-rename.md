@@ -70,7 +70,7 @@ The model study finds where a unit director's work begins under either name: `DI
 - Forwarding through the Skill tool: a compacted run and a Codex seat reach the stub by path, and a read of the file serves every caller.
 - A symlink in place of the stub.
 
-### Phase 2 — Every file that names the command says `/unit:direct`  · status: todo
+### Phase 2 — Every file that names the command says `/unit:direct`  · status: done
 
 #### Work Order
 
@@ -91,6 +91,7 @@ Lines these searches print that stay as they are:
 - `config/agents.conf` line 58 (`A codex delegate runs as a thread`): the agent, clause 4.
 - `CLAUDE.md` line 7: not touched (Invariants).
 - `scripts/production/test_merge_checkpoint.py` lines 33 and 318: the frozen Owns cell.
+- `scripts/production/test_add_unit.py` line 221 (the `enh-showrunner-unit` row of `test_retired_readers_use_marker_on_production_rows`): a frozen copy of a production row; its `commands/unit/delegate.md` stays.
 - `scripts/model_study/test_rerun.py` and the existing cases in `scripts/model_study/test_turns.py`: transcripts from before the rename.
 - `docs/as-built/director-model-study.md` line 108: it reports how recorded sessions were read.
 - `docs/delegate_footprint_review.md`: not touched (Invariants).
@@ -106,7 +107,7 @@ Code, beyond the word swap:
 - `commands/` — every line the three searches print, but for `commands/unit/direct.md` and `commands/unit/delegate.md`
 - `docs/` — every line the three searches print, but for `docs/plans/` and `docs/delegate_footprint_review.md`
 - `config/` — `README.md`, `delegate.conf`, `lint.conf`, `clippy.conf`
-- `scripts/production/` — every line clause 1's search prints, but for `test_merge_checkpoint.py`
+- `scripts/production/` — every line clause 1's search prints; `test_merge_checkpoint.py` and the frozen row in `test_add_unit.py` stay
 - `scripts/lint/lint_config.sh` — line 28
 - `scripts/delegate/findings.py` — line 4
 
@@ -123,7 +124,7 @@ Code, beyond the word swap:
 - `python3 -m unittest discover -s scripts/production -p 'test_add_unit.py'`, the same for `'test_stall_watch.py'` and `'test_unit_lookup.py'`, `python3 -m unittest discover -s scripts/model_study -p 'test_*.py'`, `python3 -m unittest discover -s scripts/lint -p 'test_*.py'` and `python3 -m unittest discover -s scripts/hooks -p 'test_*.py'` green.
 - `basedpyright` on every `.py` file the phase changed reports `0 errors, 0 warnings`.
 - `git grep -lI 'unit:delegate' -- . ':!docs/plans'` prints exactly `CLAUDE.md`, `docs/as-built/director-model-study.md`, `scripts/model_study/test_rerun.py`, `scripts/model_study/test_turns.py` and `scripts/model_study/turns.py`.
-- `git grep -nI 'unit/delegate\.md' -- . ':!docs/plans'` prints only lines of `scripts/production/test_merge_checkpoint.py` and `scripts/hooks/test_command_stub.py`.
+- `git grep -nI 'unit/delegate\.md' -- . ':!docs/plans'` prints only lines of `scripts/production/test_merge_checkpoint.py`, `scripts/hooks/test_command_stub.py` and the one frozen row in `scripts/production/test_add_unit.py`.
 - `git grep -nIiE 'delegate (run|phase)s?\b|^# Delegate( |$)' -- commands docs config ':!docs/plans'` prints only `config/agents.conf` line 58, and `git grep -nIiE '\bdelegate$' -- commands docs config ':!docs/plans'` no longer prints `commands/unit/checkpoint.md`.
 - `git diff --stat <phase base>` names no file under `docs/plans/` but this plan, and neither `settings.json` nor `CLAUDE.md`.
 

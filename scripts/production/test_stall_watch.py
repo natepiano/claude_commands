@@ -232,7 +232,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
         _ = self.ps_file.write_text("\n".join(self.process_rows) + "\n")
         _ = self.tmux_file.write_text(json.dumps({
             name: dict(pane) for name, pane in self.panes.items()}))
-        # A unit's run state is read from the record of the newest /unit:delegate run in its worktree.
+        # A unit's run state is read from the record of the newest /unit:direct run in its worktree.
         runs = self.root / "history/runs"
         runs.mkdir(parents=True, exist_ok=True)
         for record in runs.iterdir():

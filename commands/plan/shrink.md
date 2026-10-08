@@ -17,14 +17,14 @@ process narration goes, prospective phrasing goes. Facts survive.
 **Usage:** `/plan:shrink [plan-doc-path] [--phases <ids>] [--closeout <session-dir>]`
 
 **Argument:** the in-flight plan doc. **Omitting it is the normal case** — with no
-argument this command shrinks the plan the current `/unit:delegate` run is
+argument this command shrinks the plan the current `/unit:direct` run is
 executing, resolved from the run record rather than from memory. See
 `<ResolvePlan/>`.
 
 **`--phases <ids>`** (optional) comma-separated phase identifiers (`1,4b,7`) to
 limit the run to those phases. Without it, every `done` phase is shrunk.
 
-**`--closeout <session-dir>`** is the `/unit:delegate` phase-end path. It
+**`--closeout <session-dir>`** is the `/unit:direct` phase-end path. It
 requires exactly one `--phases` id plus that phase's
 `phase_review_retrospective_<id>.md` and `phase_review_outcomes_<id>.md`. It
 shrinks only that phase, uses no dependency-index or verification subagent, and
@@ -34,7 +34,7 @@ Parse `--phases` and `--closeout` before <ResolvePlan/> and remove them from the
 path arguments. Set `${CLOSEOUT_DIR}` only when closeout was supplied; reject a
 missing directory, multiple phase ids, or closeout without `--phases`.
 
-`/unit:delegate` runs closeout mode after the code commit, beside the next
+`/unit:direct` runs closeout mode after the code commit, beside the next
 phase's seats, then makes a plan-doc-only shrink commit. Standalone mode remains
 for legacy accumulated plans and immediately before `/plan:to_as_built`.
 Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
@@ -62,10 +62,10 @@ This command does not change code and does not commit.
 <ArchiveOnly>
 **Shrinking touches `done` phases and nothing else.** Not the title, not the
 status line, not the `As-built disposition` line, not `## Delegation Context`
-(including `Project started`, which `/unit:delegate`'s recorder treats as
+(including `Project started`, which `/unit:direct`'s recorder treats as
 authoritative),
 not `## Gates` or any other doc-level section, and above all not a single byte of
-any `todo` phase. The live zone is the dispatch contract `/unit:delegate` reads;
+any `todo` phase. The live zone is the dispatch contract `/unit:direct` reads;
 this command has no opinion about it.
 
 Closeout mode is stricter: exactly one current phase may change. Every earlier
@@ -93,14 +93,14 @@ normalize them here, and do not treat their presence as license to create more.
 <ResolvePlan>
 This command exists for long-running plans, so the context that would "remember"
 which plan is in flight is exactly the context most likely to have been compacted
-away. Do not rely on it. `/unit:delegate` records the plan doc durably at run
+away. Do not rely on it. `/unit:direct` records the plan doc durably at run
 start; read that record.
 
 **Resolution order — stop at the first that produces a path:**
 
 1. **The argument**, when one is given.
 
-2. **The delegate run active in this session.** `/unit:delegate` writes
+2. **The `/unit:direct` run active in this session.** `/unit:direct` writes
    `/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}` containing the run's
    session directory, whose basename is the run id:
 
@@ -161,7 +161,7 @@ head carries a `## Delegation Context` section. A plan doc that fails this is no
 delegate-ready and this command does not apply to it — say so and stop.
 
 **Running mid-run is fine** — shrinking only touches `done` phases, and the
-phase `/unit:delegate` is working is `todo`. Under `/unit:delegate`, the code
+phase `/unit:direct` is working is `todo`. Under `/unit:direct`, the code
 checkpoint is already committed; closeout shrink runs beside the next phase's
 seats and receives its own plan-doc-only commit. State in one line that any copy
 of the doc already in the orchestrator's context is stale (a later `Edit`
@@ -207,7 +207,7 @@ Then:
 - **Nothing to do** — no shrinkable `done` phase → say so in one line and stop.
 - **No `todo` phases remain** — say so in one line, note that `/plan:to_as_built`
   is the finishing move, and continue; shrinking makes that command's job
-  cheaper. Under `/unit:delegate` that command runs on its own from
+  cheaper. Under `/unit:direct` that command runs on its own from
   `<RunAsBuilt/>` after the final gate; standalone, the user runs it. Do not stop
   to ask.
 - **Closeout validation** — require exactly one target phase and readable
@@ -491,7 +491,7 @@ Then stop.
 
 ## Rules
 
-- With no argument, the plan is the one the current `/unit:delegate` run is
+- With no argument, the plan is the one the current `/unit:direct` run is
   executing, read from the durable run record — not inferred from conversation.
   See `<ResolvePlan/>`; the context that would remember it is the context this
   command exists to stop bloating.
@@ -516,5 +516,5 @@ Then stop.
 - Do not change code and do not commit.
 - After the last phase ships, `/plan:to_as_built` is still the finishing move.
   This command shrinks the archive; it does not convert the plan into a reference
-  doc, and it does not reconcile sibling docs. `/unit:delegate` invokes that
+  doc, and it does not reconcile sibling docs. `/unit:direct` invokes that
   command itself from `<RunAsBuilt/>`; a standalone shrink leaves it to the user.

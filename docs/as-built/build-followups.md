@@ -18,7 +18,7 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 | `scripts/lint/sweep.py` | `directory_blocks(directory, seen=None)`, `config_values`, `floor_bytes`, shared with the lint sweep. |
 | `scripts/buildlog/test_index.py` | `use_test_log`, `point_root_at`, `LogIsolationTests`, and the record builders other tests import. |
 | `scripts/buildlog/test_report.py`, `test_disk.py`, `scripts/lint/test_sweep.py` | Report sections; the walk on fake trees; a hard link across two `directory_blocks` calls sharing `seen`. |
-| `commands/unit/delegate.md` | The seats' command table; its `--filter` row reads `--filter <name> [--filter <name> …]`. |
+| `commands/unit/direct.md` | The seats' command table; its `--filter` row reads `--filter <name> [--filter <name> …]`. |
 | `pyrightconfig.json` | `scripts/lint` on the `scripts/buildlog` environment's `extraPaths`, for `import sweep`. |
 | `/etc/nixos`, `nate.jobs.buildlog-disk` | The 10-minute timer that runs `buildlog disk` on natedev. Not in this repo. |
 

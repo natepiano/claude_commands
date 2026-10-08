@@ -1,5 +1,5 @@
 ---
-description: Run a production as its showrunner — launch each unit director (a /unit:delegate session), merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA on a schedule.
+description: Run a production as its showrunner — launch each unit director (a /unit:direct session), merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA on a schedule.
 ---
 
 # Produce
@@ -335,7 +335,7 @@ whatever arrived:
 | the user asks for a status | `/showrunner:dailies`, `simple` unless they name a length |
 
 A unit repairing failing tests that split by file runs parallel repair seats
-(`/unit:delegate` → <FixDispatch/>); one that runs a lone seat on them gets
+(`/unit:direct` → <FixDispatch/>); one that runs a lone seat on them gets
 told to split. User, 2026-10-04.
 
 Merge one checkpoint at a time. A notice that arrives while a merge is testing
@@ -920,7 +920,7 @@ When every unit's final-gate and as-built checkpoints are merged:
     unmerged phase, with the others in `update`. If builds queue on the shared
     lock, run fewer at once, never none. User, 2026-10-06, replacing the
     2026-10-01 one-phase rule.
-- **Disk.** Units keep saved run output under a few GB (`/unit:delegate` →
+- **Disk.** Units keep saved run output under a few GB (`/unit:direct` →
   <ToolingContract/>). When builds turn cold for no reason, run `df -h /` and
   find the large output before anything else. User, 2026-10-04.
 - Never ask the user to review until <DesignCheck/> passed on the shots.

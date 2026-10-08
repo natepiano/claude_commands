@@ -1,6 +1,6 @@
 # Close the run
 
-Read at the point of use from `/unit:delegate`. Defines `<FinalGateCommit/>`,
+Read at the point of use from `/unit:direct`. Defines `<FinalGateCommit/>`,
 `<RunAsBuilt/>`, and `<AsBuiltCommit/>` in full.
 
 **Read when:** `<FinalGate/>` is green, or a `single` task finishes.
