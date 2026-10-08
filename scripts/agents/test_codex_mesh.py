@@ -1538,32 +1538,96 @@ class SweepTests(unittest.TestCase):
             busy = codex_mesh._busy_threads(4000, {})  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(busy, ("the server could not be asked (refused)",))
 
-    def test_the_report_stops_nothing_and_fails_closed_when_it_cannot_look(self) -> None:
-        self.assertNotIn("kill", codex_mesh.command_sweep.__code__.co_names)
-        self.assertNotIn("_reap", codex_mesh.command_sweep.__code__.co_names)
+    def test_the_sweep_fails_closed_when_it_cannot_look(self) -> None:
         with patch.object(codex_mesh, "_running_servers", side_effect=OSError("no ps")), \
+                patch.object(codex_mesh, "_stop_unused") as stop, \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root="")), 1)
+            self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root="", stop=True)), 1)
         self.assertIn("nothing judged", errors.getvalue())
+        stop.assert_not_called()
 
-    def test_the_report_lists_each_server_with_its_verdict(self) -> None:
+    def sweep(self, stop: bool, stops: bool = True) -> tuple[list[list[str]], list[int]]:
+        """The rows `sweep` prints for a busy, an unused and an unplaced server, and the pids it stopped."""
         old = codex_mesh.SWEEP_IDLE_SECS + 60
+        asked: list[int] = []
 
-        def folder(pid: int) -> Path | None:
-            return None if pid == 3 else Path(directory) / "gone"
+        def stopper(_root: Path, pid: int, _port: int, _folder: Path) -> bool:
+            asked.append(pid)
+            return stops
 
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(codex_mesh, "_running_servers", return_value=[(1, 4001, old), (2, 4002, old), (3, 4003, old)]), \
                 patch.object(codex_mesh, "_client_counts", return_value={4001: 1}), \
-                patch.object(codex_mesh, "_server_folder", side_effect=folder), \
-                patch.object(codex_mesh, "_busy_threads", return_value=()) as asked, \
+                patch.object(codex_mesh, "_server_folder",
+                             side_effect=[Path(directory) / "gone", Path(directory) / "gone", None]), \
+                patch.object(codex_mesh, "_busy_threads", return_value=()) as busy, \
+                patch.object(codex_mesh, "_stop_unused", side_effect=stopper), \
                 contextlib.redirect_stdout(io.StringIO()) as printed:
-            self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root=directory)), 0)
-        rows = [line.split("\t") for line in printed.getvalue().splitlines()]
+            self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root=directory, stop=stop)), 0)
+        # Only the server every other check cleared is asked about its conversations.
+        busy.assert_called_once_with(4002, {})
+        return [line.split("\t") for line in printed.getvalue().splitlines()], asked
+
+    def test_the_report_lists_each_server_and_stops_nothing(self) -> None:
+        rows, asked = self.sweep(stop=False)
         self.assertEqual([row[2] for row in rows[:3]], ["in use", "unused", "unknown"])
         self.assertEqual(rows[3], ["3 app-server(s), 1 unused; report only, nothing was stopped"])
-        # Only the server every other check cleared is asked about its conversations.
-        asked.assert_called_once_with(4002, {})
+        self.assertEqual(asked, [])
+
+    def test_stop_reaches_only_the_unused_server(self) -> None:
+        rows, asked = self.sweep(stop=True)
+        self.assertEqual([row[2] for row in rows[:3]], ["in use", "stopped", "unknown"])
+        self.assertEqual(rows[3], ["3 app-server(s), 1 unused; 1 stopped"])
+        self.assertEqual(asked, [2])
+        rows, _asked = self.sweep(stop=True, stops=False)
+        self.assertEqual([row[2] for row in rows[:3]], ["in use", "kept", "unknown"])
+        self.assertEqual(rows[3], ["3 app-server(s), 1 unused; 0 stopped"])
+
+    def second_look(self, folder: Path, running: list[tuple[int, int, float]], clients: dict[int, int],
+                    verdict: codex_mesh.SweepVerdict) -> tuple[bool, list[int]]:
+        """Whether `_stop_unused` stopped pid 2 on port 4002, and the pids it signalled."""
+        reaped: list[int] = []
+
+        def reap(pid: int) -> bool:
+            reaped.append(pid)
+            return True
+
+        with patch.object(codex_mesh, "_running_servers", return_value=running), \
+                patch.object(codex_mesh, "_client_counts", return_value=clients), \
+                patch.object(codex_mesh, "_judge", return_value=(verdict, folder)) as judge, \
+                patch.object(codex_mesh, "_reap", side_effect=reap):
+            stopped = codex_mesh._stop_unused(folder.parent, 2, 4002, folder)  # pyright: ignore[reportPrivateUsage]
+        if judge.called:
+            self.assertEqual(judge.call_args.args[1:], (2, 4002, 9000.0, clients.get(4002, 0)))
+        return stopped, reaped
+
+    def test_a_server_is_stopped_only_when_the_second_look_agrees(self) -> None:
+        unused, in_use = codex_mesh.ServerUnused("idle"), codex_mesh.ServerInUse("1 client connection(s)")
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory) / "run-a"
+            run.mkdir()
+            record = run / codex_mesh.SERVER_FILE
+            _ = record.write_text(json.dumps({"pid": 2, "port": 4002}))
+            # The pid stopped running this server, or now runs it on another port: nothing is signalled.
+            self.assertEqual(self.second_look(run, [], {}, unused), (False, []))
+            self.assertEqual(self.second_look(run, [(2, 4999, 9000.0)], {}, unused), (False, []))
+            # A client arrived between the two looks.
+            self.assertEqual(self.second_look(run, [(2, 4002, 9000.0)], {4002: 1}, in_use), (False, []))
+            self.assertTrue(record.exists())
+            self.assertEqual(self.second_look(run, [(2, 4002, 9000.0)], {}, unused), (True, [2]))
+            self.assertFalse(record.exists())
+            # A record that names a newer server is left for that server.
+            _ = record.write_text(json.dumps({"pid": 7, "port": 4007}))
+            self.assertEqual(self.second_look(run, [(2, 4002, 9000.0)], {}, unused), (True, [2]))
+            self.assertTrue(record.exists())
+            # A deleted run folder is not created again.
+            gone = Path(directory) / "gone"
+            self.assertEqual(self.second_look(gone, [(2, 4002, 9000.0)], {}, unused), (True, [2]))
+            self.assertFalse(gone.exists())
+        with patch.object(codex_mesh, "_running_servers", side_effect=OSError("no ps")), \
+                patch.object(codex_mesh, "_reap") as reap:
+            self.assertFalse(codex_mesh._stop_unused(gone.parent, 2, 4002, gone))  # pyright: ignore[reportPrivateUsage]
+        reap.assert_not_called()
 
 
 class ServerRecordTests(unittest.TestCase):

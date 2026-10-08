@@ -2053,31 +2053,70 @@ def _busy_threads(port: int, seats: dict[str, str]) -> tuple[str, ...]:
         client.close()
 
 
+def _judge(root: Path, pid: int, port: int, age: float, clients: int) -> tuple[SweepVerdict, Path | None]:
+    """The verdict on one running app-server, and the run folder that started it."""
+    folder = _server_folder(pid)
+    exists = folder is not None and folder.is_dir()
+    facts = ServerFacts(
+        pid, port, age, clients, folder, exists,
+        marked_active=folder is not None and _marked_active(root, folder),
+        live_launchers=_live_launchers(folder) if folder is not None and exists else (),
+        quiet_secs=_quiet_secs(folder, time.time()) if folder is not None and exists else None,
+    )
+    seats = _roster_threads(folder) if folder is not None and exists else {}
+    return _sweep_verdict(facts, lambda: _busy_threads(port, seats)), folder
+
+
+def _stop_unused(root: Path, pid: int, port: int, folder: Path) -> bool:
+    """Stop a server the sweep called unused, if a second look at this moment agrees.
+
+    The second look runs under the run folder's server lock, so a launcher reaching
+    `ensure_server` meanwhile waits and then starts a server of its own. A deleted folder has no
+    launcher to wait and is not created again for the lock."""
+    with _server_lock(str(folder)) if folder.is_dir() else contextlib.nullcontext():
+        try:
+            running = {(found, at): age for found, at, age in _running_servers()}
+            clients = _client_counts()
+        except (OSError, subprocess.CalledProcessError):
+            return False
+        # A pid that no longer runs this server on this port is not the process that was judged.
+        age = running.get((pid, port))
+        if age is None:
+            return False
+        verdict, _folder = _judge(root, pid, port, age, clients.get(port, 0))
+        if not isinstance(verdict, ServerUnused) or not _reap(pid):
+            return False
+        record = folder / SERVER_FILE
+        if _read_json_object(record).get("pid") == pid:
+            record.unlink(missing_ok=True)
+        return True
+
+
 def command_sweep(args: argparse.Namespace) -> int:
-    """Print every running app-server with whether anything still needs it. Stops nothing."""
+    """Print every running app-server with whether anything still needs it. Stops one only
+    under `--stop`, and then only a server two looks in a row called unused."""
     root = Path(_as_str(_attr(args, "root")) or SWEEP_ROOT)
+    stop = _attr(args, "stop") is True
     try:
         servers, clients = _running_servers(), _client_counts()
     except (OSError, subprocess.CalledProcessError) as exc:
         print(f"codex_mesh: sweep: cannot list servers or connections ({exc}); nothing judged", file=sys.stderr)
         return 1
-    now = time.time()
-    unused = 0
+    unused = stopped = 0
     for pid, port, age in sorted(servers):
-        folder = _server_folder(pid)
-        exists = folder is not None and folder.is_dir()
-        facts = ServerFacts(
-            pid, port, age, clients.get(port, 0), folder, exists,
-            marked_active=folder is not None and _marked_active(root, folder),
-            live_launchers=_live_launchers(folder) if folder is not None and exists else (),
-            quiet_secs=_quiet_secs(folder, now) if folder is not None and exists else None,
-        )
-        seats = _roster_threads(folder) if folder is not None and exists else {}
-        verdict = _sweep_verdict(facts, lambda port=port, seats=seats: _busy_threads(port, seats))
-        unused += isinstance(verdict, ServerUnused)
+        verdict, folder = _judge(root, pid, port, age, clients.get(port, 0))
         label = {ServerInUse: "in use", ServerUnused: "unused", ServerUnknown: "unknown"}[type(verdict)]
-        print(f"{pid}\t{port}\t{label}\t{verdict.reason}\t{folder or '-'}")
-    print(f"{len(servers)} app-server(s), {unused} unused; report only, nothing was stopped")
+        reason = verdict.reason
+        if isinstance(verdict, ServerUnused) and folder is not None:
+            unused += 1
+            if stop and _stop_unused(root, pid, port, folder):
+                stopped += 1
+                label = "stopped"
+            elif stop:
+                label, reason = "kept", "unused at the first look, not stopped at the second"
+        print(f"{pid}\t{port}\t{label}\t{reason}\t{folder or '-'}")
+    tail = f"{stopped} stopped" if stop else "report only, nothing was stopped"
+    print(f"{len(servers)} app-server(s), {unused} unused; {tail}")
     return 0
 
 
@@ -2170,8 +2209,9 @@ def main(argv: list[str] | None = None) -> int:
     _ = stop.add_argument("--session-dir", required=True)
     stop.set_defaults(handler=command_stop)
 
-    sweep = subparsers.add_parser("sweep", help="report app-servers nothing is using; stops nothing")
+    sweep = subparsers.add_parser("sweep", help="report app-servers nothing is using")
     _ = sweep.add_argument("--root", default="")
+    _ = sweep.add_argument("--stop", action="store_true", help="stop each server two looks in a row call unused")
     sweep.set_defaults(handler=command_sweep)
 
     roster = subparsers.add_parser("list", help="print the delegate roster")
