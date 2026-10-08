@@ -485,23 +485,25 @@ def remote_head(production: Production, branch: str) -> str:
     return result.stdout.split()[0] if result.stdout.strip() else ""
 
 
-def commit_paths_and_push(production: Production, paths: list[Path], message: str) -> None:
+def commit_paths(production: Production, paths: list[Path], message: str) -> None:
+    """Commit `paths` on the merge branch and push nothing of it.
+
+    The commit goes out with the showrunner's next merge push: a push here would carry every
+    unpushed merge with it and start CI where pushes to the merge branch do (user, 2026-10-08).
+    """
     relative_paths = [str(path.relative_to(production.checkout) if path.is_absolute() else path)
                       for path in paths]
     status = git(production, "status", "--porcelain", "--", *relative_paths).stdout
     if status:
         _ = git(production, "add", "--", *relative_paths)
         _ = git(production, "commit", "--only", "-m", message, "--", *relative_paths)
-    head = git(production, "rev-parse", production.merge_branch).stdout.strip()
-    if remote_head(production, production.merge_branch) != head:
-        _ = git(production, "push", "origin", production.merge_branch)
 
 
-def commit_and_push(request: UnitLaunch) -> None:
+def commit_unit(request: UnitLaunch) -> None:
     paths = [request.production.doc]
     if isinstance(request.plan, BriefGiven):
         paths.append(request.production.checkout / request.plan.stub)
-    commit_paths_and_push(
+    commit_paths(
         request.production,
         paths,
         f"production({request.production.slug}): add unit {request.identity.unit} ({request.mode_name})",
@@ -669,7 +671,7 @@ def main(argv: list[str]) -> int:
             raise Refusal(f"tmux session {request.identity.session} is already live")
         write_stub(request)
         append_row(request, ready.row)
-        commit_and_push(request)
+        commit_unit(request)
         ensure_worktree(request)
         launch_session(request, tmux, ready.director)
         wait_for_remote_control(request, tmux)

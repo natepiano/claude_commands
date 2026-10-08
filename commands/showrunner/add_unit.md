@@ -20,5 +20,6 @@ An existing Units row is adopted; its Port and Owns values stand when omitted.
 Add `--check` to run preflight without launching or writing anything.
 The unit director launch takes its model and effort from `/agent production.director`.
 For a standby unit, send its work when assigned, set the Units row's Plan cell
-to the plan path, commit and push that doc, then run
+to the plan path, commit that doc on the merge branch without pushing it (it
+goes out with your next merge push), then run
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py ready <showrunner session> --unit <name>`.

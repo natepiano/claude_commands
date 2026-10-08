@@ -239,18 +239,13 @@ def _commit_row(plan: RenamePlan, old: str, new: str) -> list[str]:
         changed.append("production Units row")
     path = production.doc.relative_to(production.checkout)
     dirty = bool(add_unit.git(production, "status", "--porcelain", "--", str(path)).stdout)
-    head_before = add_unit.git(production, "rev-parse", production.merge_branch).stdout.strip()
-    push_needed = add_unit.remote_head(production, production.merge_branch) != head_before
-    add_unit.commit_paths_and_push(
+    add_unit.commit_paths(
         production,
         [production.doc],
         f"production({production.slug}): {plan.unit}'s session is now {new}",
     )
     if dirty:
         changed.append("production commit")
-        push_needed = True
-    if push_needed:
-        changed.append("merge branch push")
     return changed
 
 
