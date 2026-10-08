@@ -154,7 +154,8 @@ The direct Python callers are `ci_points.review_watch` with `--need decision`, `
 ## Gotchas
 
 - The two pause hooks and their permission entry are registered in the repository's `settings.json` by the run's closing commit. The pause does not run in a live session until the showrunner promotes that file with the user's go.
-- Not yet checked live: the whole pause through the registered hooks in a real session, and the permission entry answering with no prompt. A scratch session exercised the bare yes/no protection.
+- Checked live 2026-10-07 through the registered hooks, in a scratch session and one real unit session: a typed message paused the session's report, the question arrived after five quiet minutes, a worded yes ran the resume command with no permission prompt, and an unanswered question returned the report by timeout. Both sessions ran in auto mode, where a missing permission entry would show as a refusal and not as a prompt.
+- Not yet checked live: a bare yes or no typed after registration (a scratch session exercised that protection before it), and renaming a unit that is running.
 - A unit that had already finished when the registry first recorded statuses is recorded `running` until it is set once with `showrunners.py status <showrunner-session> --unit <unit-session> --state run-finished`.
 - A question arrives about two seconds before `send.py` finishes; the question's prompt-hook arrival is the delivery proof.
 - An interrupted assistant reply emits no normal Stop. `UNANSWERED_SECONDS` prevents that state from lasting forever.
