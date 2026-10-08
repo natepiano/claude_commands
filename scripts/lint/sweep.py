@@ -127,7 +127,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -212,7 +212,10 @@ class Group:
     inodes: list[InodeKey] = field(default_factory=list)
     last_used: float = 0.0
     compiled: float = 0.0
-    target_used: float = 0.0
+
+
+# Sort key for build units; the unit with the smallest key is removed first.
+RemovalOrder = Callable[[Group], tuple[float, ...]]
 
 
 @dataclass
@@ -596,15 +599,17 @@ def freed_by(group: Group, scan: Scan, remaining: dict[InodeKey, int]) -> int:
     return freed
 
 
-def choose(scan: Scan, total: int, budget: int, remaining: dict[InodeKey, int]) -> tuple[list[tuple[Group, int]], int]:
-    """Least recently used groups to remove, and the size left once they go."""
-    now = time.time()
-    order = sorted(
-        scan.groups,
-        key=lambda group: (group.target_used, -int((now - group.last_used) // DAY_SECONDS), group.compiled),
-    )
+def unit_age(group: Group, now: float) -> tuple[float, float]:
+    """Sorts the build unit unused for the most whole days first, then the oldest compile."""
+    return (-int((now - group.last_used) // DAY_SECONDS), group.compiled)
+
+
+def choose(
+    scan: Scan, total: int, budget: int, remaining: dict[InodeKey, int], removal_order: RemovalOrder
+) -> tuple[list[tuple[Group, int]], int]:
+    """Groups to remove, first in removal_order first, and the size left once they go."""
     chosen: list[tuple[Group, int]] = []
-    for group in order:
+    for group in sorted(scan.groups, key=removal_order):
         if total <= budget:
             break
         freed = freed_by(group, scan, remaining)
@@ -735,7 +740,8 @@ def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run:
     label = ", ".join(roots)
     state = "within" if total <= budget else "over"
     print(f"lint sweep: {label} is {gib(total)}, {state} the {gib(budget)} budget ({source})")
-    left, failures, _ = shrink(scan, total, budget, dry_run)
+    now = time.time()
+    left, failures, _ = shrink(scan, total, budget, dry_run, lambda group: unit_age(group, now))
     if left > budget:
         print(
             f"lint sweep: {gib(left)} remains over budget in output this sweep never removes"
@@ -744,9 +750,11 @@ def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run:
     return 1 if failures else 0
 
 
-def shrink(scan: Scan, total: int, budget: int, dry_run: bool) -> tuple[int, int, list[tuple[Group, int]]]:
-    """Remove the orphans, then the least recently used groups until total fits
-    budget, and say what went; return the size left, failures, and groups taken."""
+def shrink(
+    scan: Scan, total: int, budget: int, dry_run: bool, removal_order: RemovalOrder
+) -> tuple[int, int, list[tuple[Group, int]]]:
+    """Remove the orphans, then groups in removal_order until total fits budget,
+    and say what went; return the size left, failures, and groups taken."""
     verb, result = ("would remove", "would leave") if dry_run else ("removed", "left")
     remaining = dict(scan.links)
     failures = 0
@@ -770,7 +778,7 @@ def shrink(scan: Scan, total: int, budget: int, dry_run: bool) -> tuple[int, int
         )
     if total <= budget:
         return total, failures, taken
-    chosen, left = choose(scan, total, budget, remaining)
+    chosen, left = choose(scan, total, budget, remaining, removal_order)
     for group, freed in chosen:
         if dry_run:
             taken.append((group, freed))
@@ -1100,10 +1108,6 @@ def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = FLOOR_ROOTS, lo
         for group in scan.groups:
             target_groups[tree_targets[group.build_tree]].append(group)
         target_uses = {root: target_last_use(root, groups) for root, groups in target_groups.items()}
-        for root, groups in target_groups.items():
-            used = target_uses[root]
-            for group in groups:
-                group.target_used = used
         total = sum(scan.blocks.values())
         held_bytes = sum(directory_blocks(path) for path in busy)
         ci_bytes = sum(directory_blocks(path) for path in CI_TARGETS)
@@ -1114,7 +1118,14 @@ def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = FLOOR_ROOTS, lo
             + f" target dirs ({gib(total)}), {len(busy)} left alone while a build holds them"
         )
         budget = total - (floor - free)
-        left, failures, chosen = shrink(scan, total, budget, dry_run)
+        ordered_at = time.time()
+        left, failures, chosen = shrink(
+            scan,
+            total,
+            budget,
+            dry_run,
+            lambda group: (target_uses[tree_targets[group.build_tree]], *unit_age(group, ordered_at)),
+        )
         taken: dict[str, int] = {}
         for group, freed in chosen:
             root = tree_targets[group.build_tree]
