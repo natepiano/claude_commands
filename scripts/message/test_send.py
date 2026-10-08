@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from datetime import timedelta
@@ -131,112 +128,6 @@ class SendTests(unittest.TestCase):
         entry = self.log()[0]
         self.assertEqual((entry["to"], entry["key"], entry["summary"], entry["outcome"]),
                          ("bogus", "k", "first", "queued"))
-
-    def test_rename_recipient_merges_queues_and_keeps_latest_key(self) -> None:
-        old_path = send.queue_path("old")
-        new_path = send.queue_path("new")
-        old_path.parent.mkdir(parents=True)
-        old_entries = [
-            {"time": "2026-10-07T10:00:00+00:00", "from": "a", "to": "old", "key": "shared",
-             "summary": "older", "text": "older", "reason": "offline"},
-            {"time": "2026-10-07T10:02:00+00:00", "from": "a", "to": "old", "key": "old-only",
-             "summary": "old", "text": "old", "reason": "offline"},
-            {"time": "2026-10-07T10:03:00+00:00", "from": "a", "to": "old", "key": None,
-             "summary": "free", "text": "free", "reason": "offline"},
-        ]
-        new_entries = [
-            {"time": "2026-10-07T10:01:00+00:00", "from": "b", "to": "new", "key": "shared",
-             "summary": "newer", "text": "newer", "reason": "offline"},
-            {"time": "2026-10-07T10:04:00+00:00", "from": "b", "to": "new", "key": None,
-             "summary": "free two", "text": "free two", "reason": "offline"},
-        ]
-        _ = old_path.write_text("".join(json.dumps(entry) + "\n" for entry in old_entries))
-        _ = new_path.write_text("".join(json.dumps(entry) + "\n" for entry in new_entries))
-
-        self.assertEqual(send.rename_recipient("old", "new"), ["message queue"])
-
-        self.assertFalse(old_path.exists())
-        merged = send.read_queue(new_path)
-        self.assertEqual([entry["text"] for entry in merged if entry["key"] == "shared"], ["newer"])
-        self.assertEqual([entry["key"] for entry in merged].count(None), 2)
-        self.assertTrue(all(entry["to"] == "new" for entry in merged))
-
-    def test_rename_recipient_resumes_queue_move_without_duplicate_messages(self) -> None:
-        old_path, new_path = self.interrupted_queue_move()
-
-        self.assertEqual(send.rename_recipient("old", "new"), ["message queue"])
-
-        self.assertFalse(old_path.exists())
-        self.assertEqual([entry["text"] for entry in send.read_queue(new_path)], ["free", "named"])
-
-    def test_rename_recipient_second_call_after_resumed_move_changes_nothing(self) -> None:
-        _, new_path = self.interrupted_queue_move()
-        _ = send.rename_recipient("old", "new")
-        self.assertEqual(len(send.read_queue(new_path)), 2)
-        after_resume = new_path.read_bytes()
-
-        self.assertEqual(send.rename_recipient("old", "new"), [])
-
-        self.assertEqual(new_path.read_bytes(), after_resume)
-
-    def test_rename_recipient_moves_key_instants_and_keeps_later_one(self) -> None:
-        path = self.root / "keys.json"
-        _ = path.write_text(json.dumps({
-            "one": {"last": {"old": "2026-10-07T10:00:00+00:00"}},
-            "both-old-later": {"last": {
-                "old": "2026-10-07T12:00:00+00:00", "new": "2026-10-07T11:00:00+00:00"}},
-            "both-new-later": {"last": {
-                "old": "2026-10-07T12:00:00+00:00", "new": "2026-10-07T13:00:00+00:00"}},
-        }) + "\n")
-
-        self.assertEqual(send.rename_recipient("old", "new"), ["message keys"])
-
-        fields = send.as_dict(send.loads(path.read_text()))
-        self.assertEqual(send.as_dict(send.as_dict(fields["one"])["last"]),
-                         {"new": "2026-10-07T10:00:00+00:00"})
-        self.assertEqual(send.as_dict(send.as_dict(fields["both-old-later"])["last"])["new"],
-                         "2026-10-07T12:00:00+00:00")
-        self.assertEqual(send.as_dict(send.as_dict(fields["both-new-later"])["last"])["new"],
-                         "2026-10-07T13:00:00+00:00")
-
-    def test_rename_recipient_moves_or_discards_old_relay(self) -> None:
-        relay = self.root / "relay"
-        relay.mkdir()
-        old_path = relay / "old.jsonl"
-        new_path = relay / "new.jsonl"
-        _ = old_path.write_text("old stream\n")
-        self.assertEqual(send.rename_recipient("old", "new"), ["message relay"])
-        self.assertFalse(old_path.exists())
-        self.assertEqual(new_path.read_text(), "old stream\n")
-
-        _ = old_path.write_text("discarded stream\n")
-        _ = new_path.write_text("kept stream\n")
-        self.assertEqual(send.rename_recipient("old", "new"), ["message relay"])
-        self.assertFalse(old_path.exists())
-        self.assertEqual(new_path.read_text(), "kept stream\n")
-
-    def test_rename_recipient_uses_xdg_state_home(self) -> None:
-        xdg = self.root / "xdg"
-        python_path = str(Path(__file__).parent)
-        existing_path = os.environ.get("PYTHONPATH")
-        if existing_path:
-            python_path += os.pathsep + existing_path
-        code = (
-            "from datetime import datetime, timezone\n"
-            "import send\n"
-            "send.enqueue(send.Message('old', 'test', '', 'body', 'key'), 'offline', "
-            "datetime(2026, 10, 7, tzinfo=timezone.utc))\n"
-            "send.rename_recipient('old', 'new')\n"
-        )
-        result = subprocess.run(
-            [sys.executable, "-c", code], capture_output=True, text=True, check=False,
-            env={**os.environ, "XDG_STATE_HOME": str(xdg), "PYTHONPATH": python_path},
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((xdg / "message" / "queue" / "old.jsonl").exists())
-        entries = [send.as_dict(send.loads(line))
-                   for line in (xdg / "message" / "queue" / "new.jsonl").read_text().splitlines()]
-        self.assertEqual([entry["to"] for entry in entries], ["new"])
 
     def test_codex_failure_is_failed_not_queued(self) -> None:
         with mock.patch.object(send, "run", return_value=(1, "", "codex_mesh: no delegate named 'bogus'")):

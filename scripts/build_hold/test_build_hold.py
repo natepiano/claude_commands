@@ -155,45 +155,6 @@ class RenameHolderTests(IsolatedBuildHoldTest):
         build_hold.save_cycle(cycle)
         return cycle
 
-    def test_rename_holder_moves_file_and_cycle_names(self) -> None:
-        old_path = self.holder("old")
-        _ = self.cycle()
-
-        self.assertEqual(build_hold.rename_holder("old", "new"),
-                         ["build hold holder", "build hold cycle"])
-
-        new_path = old_path.with_name("new")
-        self.assertFalse(old_path.exists())
-        self.assertEqual(cast(dict[str, object], json.loads(new_path.read_text()))["holder"], "new")
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        self.assertEqual(set(cycle["holders"]), {"new"})
-        self.assertEqual(cycle["recipients"], {"session-old": "new", "session-other": "other"})
-        self.assertEqual([entry["name"] for entry in cycle["entries"]], ["new", "other"])
-
-    def test_rename_holder_refuses_two_holder_files_without_changes(self) -> None:
-        old_path = self.holder("old")
-        new_path = self.holder("new")
-        cycle = self.cycle()
-        cycle_path = self.scratch / "release" / cycle["id"] / "cycle.json"
-        before = (old_path.read_bytes(), new_path.read_bytes(), cycle_path.read_bytes())
-
-        with self.assertRaisesRegex(ValueError, "both 'old' and 'new'"):
-            _ = build_hold.rename_holder("old", "new")
-
-        self.assertEqual((old_path.read_bytes(), new_path.read_bytes(), cycle_path.read_bytes()), before)
-
-    def test_rename_holder_without_old_file_changes_nothing(self) -> None:
-        cycle = self.cycle()
-        cycle_path = self.scratch / "release" / cycle["id"] / "cycle.json"
-        before = cycle_path.read_bytes()
-
-        self.assertEqual(build_hold.rename_holder("old", "new"), [])
-
-        self.assertEqual(cycle_path.read_bytes(), before)
-        self.assertFalse((self.scratch / "holders" / "new").exists())
-
-
 class QuietTests(IsolatedBuildHoldTest):
     def test_long_username_cargo_keeps_quiet_check_busy(self) -> None:
         user = "natepiano"

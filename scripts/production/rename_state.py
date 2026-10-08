@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
-"""Move state owned by a renamed showrunner unit."""
+"""Move a showrunner's saved report state from one unit key to another."""
 
 from __future__ import annotations
 
 import json
 import os
-import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-
-import build_hold
-import send
 
 JsonObject = dict[str, object]
 
@@ -196,16 +189,3 @@ def rename_scratch(old: str, new: str, scratch: Path) -> list[str]:
         raise
     except (OSError, ValueError) as error:
         raise RenameRefused(str(error)) from error
-
-
-def rename_all(old: str, new: str, scratch: Path) -> list[str]:
-    """Move every store entry from the old unit name to the new one."""
-    try:
-        changed = _rename_scratch(old, new, scratch)
-        changed.extend(send.rename_recipient(old, new))
-        changed.extend(build_hold.rename_holder(old, new))
-    except RenameRefused:
-        raise
-    except (OSError, ValueError) as error:
-        raise RenameRefused(str(error)) from error
-    return changed
