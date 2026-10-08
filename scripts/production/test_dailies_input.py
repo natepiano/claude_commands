@@ -722,6 +722,32 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(self.unit()["eta"], {"none": "none measured - requested"})
         self.assertEqual(passed.stdout.count(f"request /unit:eta: {ALPHA}"), 1)
 
+    def test_an_eta_a_new_one_was_asked_for_is_not_brought_back_when_its_unit_is_held(self) -> None:
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 19:35")
+        first = self.run_builder("--at", "2026-10-06T19:30")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        passed = self.run_builder("--at", "2026-10-06T20:00")
+        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
+        self.assertEqual(self.unit()["eta"], {"none": "none measured - requested"})
+        self.judgment_file(alpha={"held": "the panel review is paused", "eta": {"percent": 60}})
+
+        held = self.run_builder("--at", "2026-10-06T20:10")
+        self.assertEqual(held.returncode, 0, held.stdout + held.stderr)
+        self.assertEqual(self.unit()["eta"], {"none": "none measured - requested"})
+        self.assertNotIn("request /unit:eta:", held.stdout)
+
+    def test_a_held_units_passed_eta_is_marked_overdue_in_a_report_with_no_earlier_report_of_it(self) -> None:
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 23:00")
+        self.judgment_file(alpha={"held": "the panel review is paused", "eta": {"percent": 60}})
+        baseline = self.run_builder("--at", "2026-10-06T19:30")
+        self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
+
+        built = self.run_builder("--at", "2026-10-06T23:30")
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        rendered = self.run_renderer("2026-10-06T23:30")
+        self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
+        self.assertIn("- eta: 23:00 PDT, 60% done (overdue)", rendered.stdout)
+
     def test_held_changed_eta_uses_the_two_hour_rule_in_the_renderer(self) -> None:
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 19:35")
         self.judgment_file(alpha={

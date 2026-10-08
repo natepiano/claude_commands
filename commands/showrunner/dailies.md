@@ -57,7 +57,8 @@ Read the current state, not memory, and check what you state the way
    old or past. Send that request this turn. It writes `set HH:MM` for a stale
    ETA and `none measured - requested` for a passed one. A held unit's ETA
    that has not changed since the builder first saw it is never requested and
-   stays as stated. Supply the phase, started time, current update, and ETA
+   stays as stated, unless a new one was already asked for before the hold:
+   that one is not brought back. Supply the phase, started time, current update, and ETA
    numbers from the unit's plan and reports. Text after `❯` may be a prompt
    suggestion, not the user's draft:
    `capture-pane -e` shows a suggestion dimmed (`ESC[2m`).
@@ -216,7 +217,8 @@ unless it names another plan's document. User, 2026-10-02.
 - **eta:** the time, then the percent done: `10:46 PDT, 85% done`.
 - **eta note:** against the last report's ETA for the same phase:
   `(unchanged)`, `(changed: +0:27 because <why>)`, or `(unchanged, overdue)`
-  once the time has passed. No note on a subject's first ETA or a new phase.
+  once the time has passed. A subject's first ETA or a new phase has no note,
+  except `(overdue)` when its time has already passed.
   A new phase has a new title; a renumbered phase with the same title keeps its notes.
 - **first eta:** once the ETA has moved from the phase's first: `05:43 PDT (now
   +17:12, 8 fix rounds added)`. User, 2026-10-03. A

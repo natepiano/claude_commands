@@ -238,7 +238,9 @@ def eta_state(block: StatusBlock, phase: str, seen: JsonMap, now: datetime, zone
     seen[key] = {"text": line, "first_seen": first_seen.isoformat(timespec="minutes"), "requested": requested,
                  **({"also": others} if others else {})}
     shown = in_report_zone(line, now, zone)
-    if held and unchanged:
+    # A held unit cannot move, so the ETA it had is kept and no new one is asked for. One that had gone
+    # old or passed before the hold, so that a new one was asked for, is not brought back as current.
+    if held and unchanged and not requested:
         return EtaFresh(shown)
     time = re.search(r"\b(\d{1,2}:\d{2}(?:\+\d+)?)\b", shown)
     if time is not None:
