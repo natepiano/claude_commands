@@ -313,7 +313,8 @@ class AddUnitTests(unittest.TestCase):
                 self.assertFalse((self.root / "project-alpha").exists())
                 self.assertEqual(self.events("systemd-run"), [])
 
-    def test_plan_adds_row_commits_pushes_worktree_launches_and_records(self) -> None:
+    def test_plan_adds_row_commits_worktree_launches_and_records(self) -> None:
+        pushed = self.git("--git-dir", str(self.origin), "rev-parse", "refs/heads/build-followups")
         result = self.successful("alpha", "--plan", "docs/plans/given.md", "--port", "8123",
                                  "--owns", "src/alpha")
         worktree = self.root / "project-alpha"
@@ -323,8 +324,10 @@ class AddUnitTests(unittest.TestCase):
                          "docs/plans/build-followups-production.md")
         self.assertIn("production(build-followups): add unit alpha-unit (plan)",
                       self.git("log", "-1", "--format=%s"))
-        for branch in ("build-followups", "build-followups-alpha"):
-            _ = self.git("--git-dir", str(self.origin), "rev-parse", f"refs/heads/{branch}")
+        # The unit's commit stays local until the next merge push; the unit branch goes out with it inside.
+        self.assertEqual(self.git("--git-dir", str(self.origin), "rev-parse", "refs/heads/build-followups"), pushed)
+        self.assertEqual(self.git("--git-dir", str(self.origin), "rev-parse", "refs/heads/build-followups-alpha"),
+                         self.git("rev-parse", "build-followups"))
         self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD", cwd=worktree),
                          "build-followups-alpha")
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=worktree),

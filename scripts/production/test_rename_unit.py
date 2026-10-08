@@ -81,6 +81,7 @@ class RenameUnitTests(unittest.TestCase):
         self.root = Path()
         self.checkout = Path()
         self.origin = Path()
+        self.pushed = ""
         self.doc = Path()
         self.scratch = Path()
         self.sessions = Path()
@@ -109,6 +110,7 @@ class RenameUnitTests(unittest.TestCase):
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "initial")
         _ = self.git("push", "-u", "origin", "build-followups")
+        self.pushed = self.git("rev-parse", "HEAD")
 
         self.scratch = self.root / "scratch"
         eta = self.scratch / "dailies_input_state/eta_seen.json"
@@ -256,8 +258,7 @@ class RenameUnitTests(unittest.TestCase):
         self.assertIn("| `new` — active |", self.doc.read_text())
         self.assertEqual(self.git("log", "-1", "--format=%s"),
                          "production(build-followups): alpha-unit's session is now new")
-        self.assertEqual(self.git("rev-parse", "HEAD"),
-                         self.git("--git-dir", str(self.origin), "rev-parse", "refs/heads/build-followups"))
+        self.assert_row_commit_is_not_pushed()
         eta = cast(dict[str, object], json.loads(
             (self.scratch / "dailies_input_state/eta_seen.json").read_text()))
         self.assertEqual(eta, {"new|phase": "seen"})
@@ -372,7 +373,7 @@ class RenameUnitTests(unittest.TestCase):
         self.assertEqual(second, 0, errors)
         self.assert_finished()
 
-    def test_retry_after_commit_finishes_push(self) -> None:
+    def test_retry_after_commit_finishes(self) -> None:
         def commit_then_fail(plan: rename_unit.RenamePlan, old: str, new: str) -> list[str]:
             assert isinstance(plan.row, rename_unit.RowNamesOld)
             rename_unit.rewrite_row(plan.production, plan.row.row, old, new)
@@ -401,14 +402,13 @@ class RenameUnitTests(unittest.TestCase):
         self.assertEqual(second, 0, errors)
         self.assert_finished()
 
-    def test_retry_after_push_finishes_state(self) -> None:
-        refusal = rename_state.RenameRefused("after push")
+    def test_retry_after_row_commit_finishes_state(self) -> None:
+        refusal = rename_state.RenameRefused("after row commit")
         with mock.patch.object(rename_state, "rename_all", side_effect=refusal):
             first, _output, errors = self.cli()
         self.assertEqual(first, 1)
-        self.assertIn("after push", errors)
-        self.assertEqual(self.git("rev-parse", "HEAD"),
-                         self.git("--git-dir", str(self.origin), "rev-parse", "refs/heads/build-followups"))
+        self.assertIn("after row commit", errors)
+        self.assert_row_commit_is_not_pushed()
         second, _output, errors = self.cli()
         self.assertEqual(second, 0, errors)
         self.assert_finished()
@@ -498,14 +498,18 @@ class RenameUnitTests(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
         self.assertFalse(any(event[:1] == ["send-keys"] for event in self.events()))
 
+    def assert_row_commit_is_not_pushed(self) -> None:
+        # The rename's commit waits for the showrunner's next merge push.
+        self.assertNotEqual(self.git("rev-parse", "HEAD"), self.pushed)
+        self.assertEqual(self.git("--git-dir", str(self.origin), "rev-parse", "refs/heads/build-followups"), self.pushed)
+
     def assert_finished(self) -> None:
         record = cast(dict[str, object], json.loads(self.record_path.read_text()))
         self.assertEqual(record["name"], "new")
         self.assertEqual(json.loads(self.tmux_state.read_text()), {"new": ["%1"]})
         self.assertEqual(self.registry()[0]["units"], [registered("new")])
         self.assertIn("| `new` — active |", self.doc.read_text())
-        self.assertEqual(self.git("rev-parse", "HEAD"),
-                         self.git("--git-dir", str(self.origin), "rev-parse", "refs/heads/build-followups"))
+        self.assert_row_commit_is_not_pushed()
         eta = cast(dict[str, object], json.loads(
             (self.scratch / "dailies_input_state/eta_seen.json").read_text()))
         self.assertEqual(eta, {"new|phase": "seen"})
