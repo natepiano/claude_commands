@@ -155,5 +155,10 @@ for u in $units; do
   print -r -- "$pane" | grep -E '^\s*▸ ' | tail -1 | sed 's/^ *//' | cut -c1-160
   print -r -- "$pane" | grep -E '^\s*[✢✻✽✶·*] [A-Z][a-z]+( [a-z]+)?…' | tail -1 | sed 's/^ *//' | cut -c1-80
   print -r -- "$pane" | grep -nE -- '^\s*(— )?(decision|blocked|gate):' | tail -1 | cut -c1-200
-  print -r -- "$pane" | grep -wE 'ETA' | grep -v 'From the user' | tail -1 | sed 's/^ *//' | cut -c1-160
+  # The last three distinct ETA lines, in pane order. The dailies builder, which remembers when
+  # it first saw each, picks the newest: the lowest line may be an old one pinned under later text.
+  print -r -- "$pane" | grep -wE 'ETA' | grep -v 'From the user' | sed 's/^ *//' | cut -c1-160 \
+    | awk '{ line[NR] = $0; last[$0] = NR }
+           END { for (i = NR; i >= 1 && n < 3; i--) if (last[line[i]] == i) keep[++n] = line[i]
+                 for (i = n; i >= 1; i--) print keep[i] }'
 done

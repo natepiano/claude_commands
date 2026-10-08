@@ -637,6 +637,48 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertNotIn("request /unit:eta:", repeated.stdout)
 
+    def test_an_eta_with_a_zone_is_read_in_the_report_zone(self) -> None:
+        # The report zone is Pacific; 20:55 EDT is 17:55 there, still ahead of 17:00.
+        for stated, shown in (("ETA 20:55 EDT", "17:55"), ("Phase ETA: 18:10 PDT", "18:10"),
+                              ("ETA 01:30 UTC", "18:30"), ("ETA 20:55 ET (range 20:40-21:10)", "17:55"),
+                              ("ETA 17:40 XYZ", "17:40"), ("ETA 02:10+1 EDT", "23:10")):
+            with self.subTest(stated=stated):
+                self.status_lines(f"== {ALPHA}", "● Checking panel labels", stated)
+                self.judgment_file(alpha={"eta": {"percent": 60}})
+                built = self.run_builder()
+                self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+                self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], shown)
+
+    def test_an_eta_already_passed_in_its_own_zone_is_hidden(self) -> None:
+        # 19:50 EDT is 16:50 Pacific, ten minutes before the report; read as 19:50 it looked ahead.
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels", "Phase ETA: 19:50 EDT")
+        built = self.run_builder()
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        self.assertEqual(self.unit()["eta"], {"none": "none measured - requested"})
+
+    def test_an_eta_line_that_sat_in_the_pane_never_outranks_a_newer_one(self) -> None:
+        pinned = "Phase ETA: 18:55 PDT"
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels", pinned)
+        first = self.run_builder("--at", "2026-10-06T17:00")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "18:55")
+
+        # The unit states a new ETA above the pinned line, which stays the pane's lowest.
+        self.status_lines(f"== {ALPHA}", "● ETA 18:05 PDT, the repair is in", pinned)
+        second = self.run_builder("--at", "2026-10-06T17:20")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "18:05")
+        third = self.run_builder("--at", "2026-10-06T17:40")
+        self.assertEqual(third.returncode, 0, third.stdout + third.stderr)
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "18:05")
+
+        # Once the newer line has scrolled away the pinned one is all there is, and it reads as old.
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels", pinned)
+        last = self.run_builder("--at", "2026-10-06T18:20")
+        self.assertEqual(last.returncode, 0, last.stdout + last.stderr)
+        eta = cast(dict[str, object], self.unit()["eta"])
+        self.assertEqual((eta["time"], eta["detail"]), ("18:55", "set 17:00"))
+
     def test_held_unchanged_eta_keeps_one_moment_through_builder_and_renderer(self) -> None:
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 19:35")
         self.judgment_file(alpha={
