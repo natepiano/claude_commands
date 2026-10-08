@@ -1,11 +1,11 @@
 ---
-description: Judge whether delegate-ready phased plans should run as a production — several /unit:delegate units in parallel under one showrunner — and propose the units, hub-file owners and gates between units.
+description: Judge whether delegate-ready phased plans should run as a production — several /unit:direct units in parallel under one showrunner — and propose the units, hub-file owners and gates between units.
 ---
 
 # Greenlight
 
 **Purpose:** decide whether phased plans run faster as a **production** than as
-one `/unit:delegate` run. The words and the production doc are defined in
+one `/unit:direct` run. The words and the production doc are defined in
 `~/.claude/docs/production_format.md`; read it first.
 
 **Usage:** `/producer:greenlight <plan> [<plan>…]`
@@ -108,7 +108,7 @@ is unmeasured. Never state a speedup that no measured run supports.
   overlap;
 - units that change what users see can each launch the app on their own port.
 
-Otherwise it is **one `/unit:delegate` run**. Give the reason in one line, for
+Otherwise it is **one `/unit:direct` run**. Give the reason in one line, for
 example "every phase builds on the one before it".
 </Verdict>
 
@@ -118,12 +118,12 @@ example "every phase builds on the one before it".
 ```markdown
 | Area | Result |
 | --- | --- |
-| Verdict | Production of <n> units / One delegate run — <one-line reason> |
+| Verdict | Production of <n> units / One `/unit:direct` run — <one-line reason> |
 | Units | <unit>: phases <source numbers> — owns <dirs/files>; one row per unit |
 | Hub files | <file> → <owner unit>; or None |
 | Gates | G<k>: <unit> phase <N> waits on <unit> phase <M>; or None |
 | Capacity | <cores, memory; known load-sensitive flakes; ceiling measured or unmeasured> |
-| Next | `/producer:to_production <plan>…` or `/unit:delegate <plan>` |
+| Next | `/producer:to_production <plan>…` or `/unit:direct <plan>` |
 ```
 
 Then stop.

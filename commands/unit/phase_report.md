@@ -1,17 +1,17 @@
 ---
-description: Write the report for a delegate phase that finished without one, or whose report was thin.
+description: Write the report for a /unit:direct phase that finished without one, or whose report was thin.
 ---
 
-# Delegate — phase report
+# Direct — phase report
 
 **Usage:** `/unit:phase_report`
 
 Type this when a phase finished and no report arrived, or when the report that
 arrived was thin. It runs inside the current session and already knows the plan,
-the phase, and what was committed. If no delegate run is active, say so in one
+the phase, and what was committed. If no `/unit:direct` run is active, say so in one
 line and stop.
 
-`/unit:delegate` reads this file after a completed phase. It defines
+`/unit:direct` reads this file after a completed phase. It defines
 `<VerbosePostPhaseReport/>`, `<CombinedWindowReport/>`, and
 `<RemainingWorkOutlook/>` in full. Never compose the report from memory of an
 earlier read: the closing control line and the phase count are the parts that

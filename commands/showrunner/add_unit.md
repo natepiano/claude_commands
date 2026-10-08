@@ -22,5 +22,5 @@ The unit director launch takes its model and effort from `/agent production.dire
 For a standby unit, send its work when assigned, set the Units row's Plan cell
 to the plan path, and commit that doc on the merge branch without pushing it (it
 goes out with your next merge push). Nothing else marks the unit as working: it
-reads as running from the moment it starts its `/unit:delegate` run, and the
+reads as running from the moment it starts its `/unit:direct` run, and the
 stall watch watches it from then.

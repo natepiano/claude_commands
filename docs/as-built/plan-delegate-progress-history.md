@@ -1,7 +1,7 @@
 # Plan-delegate progress history
 
 `scripts/delegate/progress_history.py` is the shared progress recorder for
-Claude and Codex implementations of `/unit:delegate`. It writes append-only
+Claude and Codex implementations of `/unit:direct`. It writes append-only
 per-run JSONL files under:
 
 ```text
@@ -146,7 +146,7 @@ whether the calibration helped and continue tuning that original estimate.
 
 ## Findings ledger
 
-`scripts/delegate/findings.py` bounds `/unit:delegate`'s fix loop. It replaced a
+`scripts/delegate/findings.py` bounds `/unit:direct`'s fix loop. It replaced a
 `FIX_PASS < 10` counter, which could not converge: the re-review after each fix
 was a fresh blind review of a now-larger diff, with no memory of what had already
 been accepted, so it always returned something.

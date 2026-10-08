@@ -189,7 +189,7 @@ def tick(now: float) -> None:
             print(f"stall-watch: {configured['slug']}: its units are not watched: {error}", file=sys.stderr)
             continue
         for name, unit in marked.items():
-            # A unit is watched while the newest /unit:delegate run in its worktree is unfinished.
+            # A unit is watched while the newest /unit:direct run in its worktree is unfinished.
             try:
                 running = name in live and unit_lookup.run_state(Path(live[name])) is unit_lookup.UnitState.RUNNING
             except (OSError, UnicodeError) as error:

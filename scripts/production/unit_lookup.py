@@ -5,7 +5,7 @@ A unit's tmux session carries two marks in its environment: the production slug 
 Nothing else records which session is which unit. A unit's current name, pane and socket are read
 here, from tmux and the live session records, each time they are needed, so a rename or a relaunch
 leaves nothing to bring in step. Its run state is stored nowhere either: it is read from the
-records /unit:delegate keeps of its runs.
+records /unit:direct keeps of its runs.
 """
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ class MarkedUnit(NamedTuple):
 
 
 def runs_dir() -> Path:
-    """Where /unit:delegate keeps one record per run. Read at each call, as the recorder reads it."""
+    """Where /unit:direct keeps one record per run. Read at each call, as the recorder reads it."""
     root = os.environ.get("PLAN_DELEGATE_HISTORY_DIR")
     return (Path(root).expanduser() if root else Path.home() / ".local/state/plan-delegate") / "runs"
 
@@ -83,7 +83,7 @@ def _events(path: Path) -> list[dict[str, object]]:
 
 
 def run_state(worktree: Path) -> UnitState:
-    """A unit's run state, read from the newest record of a /unit:delegate run in its worktree.
+    """A unit's run state, read from the newest record of a /unit:direct run in its worktree.
 
     No record means the unit has started no run, so it is standing by. Raises OSError when the
     records cannot be read, which says nothing about the unit.

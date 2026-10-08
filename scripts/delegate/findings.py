@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Per-phase finding ledger, fix-round batching, and the convergence test.
 
-`/unit:delegate` used to bound its fix loop with a counter (`FIX_PASS < 10`).
+`/unit:direct` used to bound its fix loop with a counter (`FIX_PASS < 10`).
 A counter punishes a phase with ten real defects exactly as hard as one whose
 reviews keep re-litigating settled ground, so it stopped runs that were working
 and let runs that were not grind to the cap.

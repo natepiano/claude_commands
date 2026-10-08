@@ -1,21 +1,21 @@
 ---
-description: Show what this unit's delegate run and its agents are doing right now.
+description: Show what this unit's /unit:direct run and its agents are doing right now.
 argument-hint: "[on|off]"
 ---
 
-# Delegate — status report
+# Direct — status report
 
 **Usage:** `/unit:report [on|off]`
 
 Type this when a run has gone quiet, when an update arrived without its tables,
 or any time you want to know what the agents are doing right now. It runs inside
 the current session and already knows the session directory, the phase, and
-which dispatches are live. If no delegate run is active, say so in one line and
+which dispatches are live. If no `/unit:direct` run is active, say so in one line and
 stop.
 
-`/unit:delegate` reads this file at every notifier tick and Codex poll timeout.
+`/unit:direct` reads this file at every notifier tick and Codex poll timeout.
 It defines `<ProgressReport/>` — the content of an update. `<ProgressContract/>` in
-`~/.claude/commands/unit/delegate.md` keeps the timing rules that say when one is
+`~/.claude/commands/unit/direct.md` keeps the timing rules that say when one is
 owed. Never compose a report from memory of an earlier read: the byte-for-byte
 copy rule and the ordinary-English closing sentences are the parts that decay.
 

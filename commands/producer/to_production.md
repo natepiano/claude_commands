@@ -52,8 +52,8 @@ State each default in one line.
 <Units>
 Reuse the `/producer:greenlight` report for these plans if it is in the conversation
 and no plan changed since. Otherwise read `~/.claude/commands/producer/greenlight.md`
-and run its STEPS 1–5. A verdict of one delegate run stops this command:
-`Greenlight says one delegate run — <reason>. Run /unit:delegate <plan>.`
+and run its STEPS 1–5. A verdict of one `/unit:direct` run stops this command:
+`Greenlight says one /unit:direct run — <reason>. Run /unit:direct <plan>.`
 
 Apply the user's adjustments from the conversation, such as names, ownership
 and merged units.

@@ -1,11 +1,11 @@
 # Phase end
 
-Read at the point of use from `/unit:delegate`. Defines `<PhaseEnd/>` in full.
+Read at the point of use from `/unit:direct`. Defines `<PhaseEnd/>` in full.
 
 **Read when:** a loop or verbose phase's gates pass. `single` keeps its order in
-`commands/unit/delegate.md` and never commits.
+`commands/unit/direct.md` and never commits.
 
-Pointing files: `commands/unit/delegate.md`, `commands/unit/checkpoint.md`,
+Pointing files: `commands/unit/direct.md`, `commands/unit/checkpoint.md`,
 `docs/delegate/run_phase_review.md`, `docs/production_format.md`,
 `commands/unit/add_ons.md`, `commands/plan/shrink.md`, and
 `commands/plan/phase_review.md`.

@@ -15,7 +15,7 @@ arguments can reach `lint clippy`, then strip them from `$ARGUMENTS`:
 - `since <ref>` sets `STYLE_SINCE = <ref>` and consumes the argument after it.
   <StyleReview/> then reviews everything that changed from that commit forward —
   committed work included — instead of the working tree alone. Use it when the
-  work under review is already committed, as /unit:delegate's branch-wide review
+  work under review is already committed, as /unit:direct's branch-wide review
   is. STOP and report if `git rev-parse --verify <ref>` does not resolve.
 - `no-agents` sets `NO_AGENTS = true`. This invocation runs every stage in the
   main agent: no fix wave, whatever `config/clippy.conf` says. It does not edit
@@ -27,7 +27,7 @@ mutually exclusive. `STYLE_ONLY`, `NO_STYLE`, and `NO_AGENTS` default to false;
 </InvocationModes>
 
 <AutoProceed>
-If $ARGUMENTS contains the token `auto-proceed` (injected by /unit:delegate and
+If $ARGUMENTS contains the token `auto-proceed` (injected by /unit:direct and
 the codex work orders it composes), this run is non-interactive: strip the token
 before any remaining arguments reach `lint clippy`, and <BatchDecisionPoint/>
 reports the batch then immediately executes it as **proceed** — no stop, no user
@@ -36,7 +36,7 @@ environmental-failure handling anywhere in this skill — those still stop.
 
 Auto-proceed also sets `NO_AGENTS = true`. The callers that inject the token are
 delegate work orders and codex sub-sessions; a codex session has no agent tool
-to launch a fix wave with, and a delegate phase is already parallel at the phase
+to launch a fix wave with, and a `/unit:direct` phase is already parallel at the phase
 level with a reservation held over the worktree. Both fix inline; both still run
 the scan script.
 </AutoProceed>
@@ -69,7 +69,7 @@ allowed to run.
 
 These are the same switches `scripts/delegate/verify.sh` and the fix pipeline read —
 one key per check, no per-consumer override — so `clippy=off` here means clippy
-is off in every delegate phase too.
+is off in every `/unit:direct` phase too.
 
 One interaction the switches change:
 
@@ -694,7 +694,7 @@ one that ended its turn blocked both count:
 4. If fixers remain, arm a fresh timer and end the turn.
 
 This is deliberately **not** the progress contract in
-`commands/unit/delegate.md`. No `progress_history.py`, no calibration, no ETA
+`commands/unit/direct.md`. No `progress_history.py`, no calibration, no ETA
 bands, no cap stages: that machinery reads a plan document with phase headings,
 and /clippy has no plan.
 

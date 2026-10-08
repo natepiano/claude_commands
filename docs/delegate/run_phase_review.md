@@ -1,6 +1,6 @@
 # Run phase review
 
-Read at the point of use from `/unit:delegate`. Defines `<RunPhaseReview/>` and
+Read at the point of use from `/unit:direct`. Defines `<RunPhaseReview/>` and
 `<RunPhaseShrink/>` in full.
 Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 

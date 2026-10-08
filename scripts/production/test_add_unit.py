@@ -349,7 +349,7 @@ class AddUnitTests(unittest.TestCase):
                                      "zsh"])
         self.assertIn("claude --model opus --effort xhigh --remote-control alpha -n alpha", args[-1])
         self.assert_director_flags("opus", "xhigh")
-        self.assertIn("'/unit:delegate docs/plans/given.md'", args[-1])
+        self.assertIn("'/unit:direct docs/plans/given.md'", args[-1])
         # Adding a unit registers nothing: the showrunner's update timer already names the doc.
         self.assertFalse(self.config.exists())
         self.assertRegex(self.log.read_text(),
@@ -532,7 +532,7 @@ class AddUnitTests(unittest.TestCase):
                     if cast(list[str], record["args"])[:1] == ["new-session"])
         prompt = cast(list[str], tmux["args"])[-1]
         self.assertIn("Write the full phased plan there", prompt)
-        self.assertIn("wait for its approval before you run /unit:delegate docs/plans/build-followups-alpha.md", prompt)
+        self.assertIn("wait for its approval before you run /unit:direct docs/plans/build-followups-alpha.md", prompt)
         self.assertIn("alpha-unit started: tmux attach -t alpha", result.stdout)
         self.assert_director_flags("opus", "xhigh")
 
@@ -638,7 +638,7 @@ class AddUnitTests(unittest.TestCase):
         self.assertIn("You are now alpha-unit in production build-followups", command)
         promoted_plan = self.root / "project-alpha/docs/plans/given.md"
         self.assertTrue(promoted_plan.exists())
-        self.assertIn(f"Run /unit:delegate {promoted_plan}", command)
+        self.assertIn(f"Run /unit:direct {promoted_plan}", command)
 
     def test_brief_row_cannot_be_retried_as_plan_on_its_stub(self) -> None:
         _ = self.successful("alpha", "--brief", "Write a full plan")
