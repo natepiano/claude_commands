@@ -76,6 +76,11 @@ Everything below is the contract.
 
    `python3 ~/.claude/scripts/delegate/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_RAW_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --cap-stage "<stage>" --activity "<current activity>" [--phase-override-reason "<specific evidence>"]`
 
+   The `progress` call also rewrites this unit's phase note; write nothing in
+   that note by hand. When the user asks for the phase table, paste the output
+   of `python3 ~/.claude/scripts/delegate/phase_table.py show --session-dir
+   "${SESSION_DIR}" --zone <User zone>`.
+
    **Between windows the tables still print.** With the phase active and no
    pass or activity open — reviews closed, repair writers not started — the
    recorder prints both tables from the phase's last recorded values, under an

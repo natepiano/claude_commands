@@ -12,6 +12,7 @@ import re
 import shutil
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -21,7 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NamedTuple, TypedDict, cast
 
 
 SCHEMA_VERSION = 1
@@ -173,6 +174,18 @@ class PlanPhase(TypedDict):
     id: str
     title: str
     done: bool
+
+
+class EtaBand(NamedTuple):
+    """Remaining seconds and the earliest and latest plausible arrivals."""
+
+    remaining: int
+    earliest: int
+    latest: int
+
+
+class EtaProjectionUnavailable(NamedTuple):
+    """The reported progress cannot support an ETA projection."""
 
 
 def _history_root() -> Path:
@@ -373,6 +386,49 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
         _ = handle.write("\n")
         temporary = Path(handle.name)
     os.replace(temporary, target)
+
+
+def _refresh_phase_table(session_dir: Path) -> None:
+    """Rewrite a production unit's phase note without affecting the recorder."""
+    try:
+        state = _read_state(session_dir)
+        plan_doc = _string(state.get("project_plan_doc")) or _string(
+            state.get("plan_doc")
+        )
+        if not plan_doc:
+            return
+        plan_path = resolve_plan_path(
+            Path(_string(state.get("working_dir"))),
+            plan_doc,
+        )
+        if "> **Production:" not in plan_path.read_text(encoding="utf-8"):
+            return
+    except (OSError, UnicodeError, SystemExit):
+        return
+
+    command = [
+        sys.executable,
+        str(Path(__file__).with_name("phase_table.py")),
+        "refresh",
+        "--session-dir",
+        str(session_dir),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"phase table not written: {error}", file=sys.stderr)
+        return
+    if result.returncode == 0:
+        return
+    reason = " ".join(result.stderr.split()) or f"exit status {result.returncode}"
+    print(f"phase table not written: {reason}", file=sys.stderr)
 
 
 def _append_event(state: dict[str, object], event: dict[str, object]) -> None:
@@ -1252,6 +1308,7 @@ def _start_phase(args: argparse.Namespace) -> None:
     event = _event(state, "phase_started", now)
     event.update(_work_order_metrics(_arg_string(args, "work_order_file")))
     _append_event(state, event)
+    _refresh_phase_table(session_dir)
 
 
 def _start_pass(args: argparse.Namespace) -> None:
@@ -3484,27 +3541,28 @@ def _eta_band_cells(
     times the elapsed clock — a number no reader can use and none should trust.
     """
     band = eta_band_seconds(percent, elapsed, spread)
-    if band is None:
+    if isinstance(band, EtaProjectionUnavailable):
         return "", ""
-    eta, low, high = band
     return (
-        f"{_arrival_label(as_of + low, now)} (-{_format_offset(eta - low)})",
-        f"{_arrival_label(as_of + high, now)} (+{_format_offset(high - eta)})",
+        f"{_arrival_label(as_of + band.earliest, now)} "
+        + f"(-{_format_offset(band.remaining - band.earliest)})",
+        f"{_arrival_label(as_of + band.latest, now)} "
+        + f"(+{_format_offset(band.latest - band.remaining)})",
     )
 
 
 def eta_band_seconds(
     percent: int, elapsed: int, spread: float
-) -> tuple[int, int, int] | None:
+) -> EtaBand | EtaProjectionUnavailable:
     """Return the projected remaining seconds and its optimistic/pessimistic band."""
     eta = _eta_seconds(percent, elapsed)
     if eta is None:
-        return None
+        return EtaProjectionUnavailable()
     optimistic = min(99.0, percent * RATE_FACTOR_LIMIT, percent + max(0.0, spread))
     pessimistic = max(1.0, percent / RATE_FACTOR_LIMIT, percent - max(0.0, spread))
     low = int(elapsed * (100.0 - optimistic) / optimistic)
     high = int(elapsed * (100.0 - pessimistic) / pessimistic)
-    return eta, low, high
+    return EtaBand(remaining=eta, earliest=low, latest=high)
 
 
 def percent_spread(calibration: dict[str, object] | None) -> float:
@@ -3945,7 +4003,7 @@ def _print_last_recorded(
     print("\n".join(lines))
 
 
-def _progress(args: argparse.Namespace) -> None:
+def _report_progress(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = now_epoch()
     notifier_due = _restart_unit_notifier(session_dir)
@@ -4183,6 +4241,12 @@ def _progress(args: argparse.Namespace) -> None:
     print("\n".join(lines))
 
 
+def _progress(args: argparse.Namespace) -> None:
+    session_dir = _session_dir(args)
+    _report_progress(args)
+    _refresh_phase_table(session_dir)
+
+
 def _finish_phase(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
@@ -4207,6 +4271,7 @@ def _finish_phase(args: argparse.Namespace) -> None:
     phase["finished_at"] = now
     state["phase"] = phase
     _write_state(session_dir, state)
+    _refresh_phase_table(session_dir)
 
 
 def _finish_run(args: argparse.Namespace) -> None:
@@ -4237,6 +4302,7 @@ def _finish_run(args: argparse.Namespace) -> None:
     state["status"] = run_status
     state["finished_at"] = now
     _write_state(session_dir, state)
+    _refresh_phase_table(session_dir)
 
 
 def _finding_lenses(event: dict[str, object]) -> set[str]:
