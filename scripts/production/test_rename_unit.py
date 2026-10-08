@@ -6,9 +6,11 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Generator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
@@ -229,7 +231,8 @@ class RenameUnitTests(unittest.TestCase):
             return []
         return [cast(list[str], json.loads(line)) for line in self.events_path.read_text().splitlines()]
 
-    def cli(self, old: str = "old", new: str = "new") -> tuple[int, str, str]:
+    @contextmanager
+    def patched(self) -> Generator[tuple[io.StringIO, io.StringIO]]:
         output, errors = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, self.environment, clear=True), \
                 mock.patch.object(tmux_names, "SESSIONS_DIR", self.sessions), \
@@ -239,11 +242,108 @@ class RenameUnitTests(unittest.TestCase):
                 mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"), \
                 mock.patch.object(send, "STATE", self.root / "state/message"), \
                 mock.patch.object(rename_unit, "WAIT", rename_unit.RenameWait(0, no_sleep)), \
+                mock.patch.object(rename_unit, "SCRATCH_ROOT", self.root / "scratchpads"), \
                 redirect_stdout(output), redirect_stderr(errors):
+            yield output, errors
+
+    def cli(self, old: str = "old", new: str = "new") -> tuple[int, str, str]:
+        with self.patched() as (output, errors):
             result = rename_unit.main([
                 "--production", str(self.doc), "--scratch", str(self.scratch), old, new,
             ])
         return result, output.getvalue(), errors.getvalue()
+
+    def follow(self) -> tuple[str, str]:
+        with self.patched() as (output, errors):
+            rename_unit.follow_renames()
+        return output.getvalue(), errors.getvalue()
+
+    def renamed_in_claude(self, new: str = "new", *, ticked: bool = True, scratchpad: bool = True) -> Path:
+        """The user renames the unit in Claude itself. One timer tick then carries the name to tmux
+        and the registry; the Units row and the stores are what `follow_renames` must finish.
+        Returns the showrunner's scratchpad."""
+        self.set_claude_name(new, former="old")
+        if ticked:
+            self.write_registry([{"session": "director", "zone": "America/New_York",
+                                  "units": [registered(new)]}])
+            _ = self.tmux_state.write_text(json.dumps({new: ["%1"]}), encoding="utf-8")
+        instance = self.root / "notifier/showrunner-build-followups"
+        instance.mkdir(parents=True)
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:runner-1\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
+        scratch = self.root / "scratchpads/project/runner-1/scratchpad"
+        if scratchpad:
+            scratch.parent.mkdir(parents=True)
+            _ = self.scratch.rename(scratch)
+        return scratch
+
+    def eta(self, scratch: Path) -> dict[str, object]:
+        return cast(dict[str, object], json.loads((scratch / "dailies_input_state/eta_seen.json").read_text()))
+
+    def test_a_rename_made_in_claude_is_finished_in_the_doc_and_the_stores(self) -> None:
+        scratch = self.renamed_in_claude()
+        output, errors = self.follow()
+        self.assertEqual(errors, "")
+        self.assertIn("| `new` — active |", self.doc.read_text())
+        self.assertEqual(self.git("log", "-1", "--format=%s"),
+                         "production(build-followups): alpha-unit's session is now new")
+        self.assert_row_commit_is_not_pushed()
+        self.assertEqual(self.eta(scratch), {"new|phase": "seen"})
+        self.assertIn("renamed: production Units row", output)
+        self.assertFalse(any(event[:1] == ["send-keys"] for event in self.events()))
+
+        head = self.git("rev-parse", "HEAD")
+        self.assertEqual(self.follow(), ("", ""))
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+
+    def test_one_timer_tick_carries_a_rename_to_every_reader(self) -> None:
+        scratch = self.renamed_in_claude(ticked=False)
+        result = subprocess.run(
+            [sys.executable, str(Path(tmux_names.__file__).resolve())],
+            env={**self.environment, "RENAME_UNIT_SCRATCH_ROOT": str(self.root / "scratchpads")},
+            capture_output=True, text=True, check=False)
+        self.assertEqual((result.returncode, result.stderr), (0, ""), result.stdout)
+        self.assertEqual(json.loads(self.tmux_state.read_text()), {"new": ["%1"]})
+        self.assertEqual(self.registry()[0]["units"], [registered("new")])
+        self.assertIn("| `new` — active |", self.doc.read_text())
+        self.assertEqual(self.eta(scratch), {"new|phase": "seen"})
+
+    def test_a_name_the_user_gave_in_claude_may_hold_a_space(self) -> None:
+        _ = self.renamed_in_claude("cache eviction")
+        _, errors = self.follow()
+        self.assertEqual(errors, "")
+        self.assertIn("| `cache eviction` — active |", self.doc.read_text())
+
+    def test_a_rename_is_followed_when_the_showrunner_has_no_scratchpad(self) -> None:
+        _ = self.renamed_in_claude(scratchpad=False)
+        output, errors = self.follow()
+        self.assertEqual(errors, "")
+        self.assertIn("| `new` — active |", self.doc.read_text())
+        self.assertIn("left: the showrunner's report state", output)
+        self.assertEqual(self.eta(self.scratch), {"old|phase": "seen"})
+
+    def test_a_unit_no_session_ever_named_is_left_alone(self) -> None:
+        _ = self.renamed_in_claude()
+        self.set_claude_name("new")
+        document, head = self.doc.read_bytes(), self.git("rev-parse", "HEAD")
+        self.assertEqual(self.follow(), ("", ""))
+        self.assertEqual((self.doc.read_bytes(), self.git("rev-parse", "HEAD")), (document, head))
+
+    def test_a_failed_commit_puts_the_row_back_and_the_next_tick_finishes(self) -> None:
+        scratch = self.renamed_in_claude()
+        document = self.doc.read_bytes()
+        refused = subprocess.CalledProcessError(1, ["git", "commit"])
+        with mock.patch.object(add_unit, "commit_paths", side_effect=refused):
+            _, errors = self.follow()
+        self.assertIn("rename_unit: old to new:", errors)
+        self.assertEqual(self.doc.read_bytes(), document)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.eta(scratch), {"old|phase": "seen"})
+
+        _, errors = self.follow()
+        self.assertEqual(errors, "")
+        self.assertIn("| `new` — active |", self.doc.read_text())
+        self.assertEqual(self.eta(scratch), {"new|phase": "seen"})
 
     def registry(self) -> list[dict[str, object]]:
         return cast(list[dict[str, object]], json.loads(self.config.read_text())["showrunners"])

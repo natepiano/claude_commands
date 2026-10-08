@@ -8,7 +8,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo
@@ -181,35 +181,64 @@ def status_blocks(path: Path, units: tuple[UnitRow, ...]) -> tuple[StatusBlock, 
     return tuple(blocks)
 
 
-def eta_state(block: StatusBlock, phase: str, seen: JsonMap, now: datetime, *, held: bool) -> EtaState:
-    line = next((item.text for item in reversed(block.activity) if "ETA" in item.text), "")
-    if not line:
+# The time an ETA line states: the clock, `+N` days, and the zone word after it when there is one.
+ETA_TIME = re.compile(r"\b(\d{1,2}:\d{2})(\+\d+)?(?: ([A-Z]{2,4})\b)?")
+# Zone words a unit writes after an ETA. An unknown word leaves the time as written.
+ETA_ZONES: dict[str, tzinfo] = {
+    **{word: timezone(timedelta(hours=hours)) for word, hours in (
+        ("UTC", 0), ("GMT", 0), ("EDT", -4), ("EST", -5), ("CDT", -5), ("CST", -6),
+        ("MDT", -6), ("MST", -7), ("PDT", -7), ("PST", -8))},
+    **{word: ZoneInfo(name) for word, name in (
+        ("ET", "America/New_York"), ("CT", "America/Chicago"),
+        ("MT", "America/Denver"), ("PT", "America/Los_Angeles"))},
+}
+
+
+def in_report_zone(line: str, now: datetime, zone: ZoneInfo) -> str:
+    """`line` with a time stated in another zone rewritten as a clock in the report's zone."""
+    found = ETA_TIME.search(line)
+    stated = ETA_ZONES.get(found.group(3) or "") if found is not None else None
+    if found is None or stated is None:
+        return line
+    hour, minute = found.group(1).split(":")
+    days = int(found.group(2) or 0)
+    there = now.replace(tzinfo=zone).astimezone(stated)
+    local = (there.replace(hour=int(hour), minute=int(minute)) + timedelta(days=days)).astimezone(zone)
+    # A line that named no day keeps none: the renderer's own rule decides today or tomorrow.
+    ahead = (local.date() - now.date()).days if days else 0
+    clock = f"{local:%H:%M}" + (f"+{ahead}" if ahead > 0 else "")
+    return line[:found.start()] + clock + line[found.end():]
+
+
+def eta_state(block: StatusBlock, phase: str, seen: JsonMap, now: datetime, zone: ZoneInfo, *, held: bool) -> EtaState:
+    lines = list(dict.fromkeys(item.text for item in block.activity if "ETA" in item.text))
+    if not lines:
         return EtaNone()
     key = f"{block.session}|{phase}"
     prior = seen.get(key)
     requested = isinstance(eta_requested(seen, key), EtaRequested)
-    unchanged = False
-    if isinstance(prior, dict):
-        record = cast(JsonMap, prior)
-        text = record.get("text")
-        first = record.get("first_seen")
-        if text == line and isinstance(first, str):
-            first_seen = datetime.fromisoformat(first)
-            unchanged = True
-        else:
-            first_seen = now
-    else:
-        first_seen = now
-    seen[key] = {"text": line, "first_seen": first_seen.isoformat(timespec="minutes"), "requested": requested}
+    record = cast(JsonMap, prior) if isinstance(prior, dict) else {}
+    also = record.get("also")
+    known = {**(cast(JsonMap, also) if isinstance(also, dict) else {}), record.get("text"): record.get("first_seen")}
+    first = {text: datetime.fromisoformat(stamp) if isinstance(stamp := known.get(text), str) else now for text in lines}
+    # The pane's lowest ETA line is not its newest: a pinned table sits below later messages. The
+    # line first seen most recently is the one the unit stated last; among equals the lowest wins.
+    line = max(reversed(lines), key=lambda text: first[text])
+    first_seen = first[line]
+    unchanged = record.get("text") == line and isinstance(record.get("first_seen"), str)
+    others = {text: first[text].isoformat(timespec="minutes") for text in lines if text != line}
+    seen[key] = {"text": line, "first_seen": first_seen.isoformat(timespec="minutes"), "requested": requested,
+                 **({"also": others} if others else {})}
+    shown = in_report_zone(line, now, zone)
     if held and unchanged:
-        return EtaFresh(line)
-    time = re.search(r"\b(\d{1,2}:\d{2}(?:\+\d+)?)\b", line)
+        return EtaFresh(shown)
+    time = re.search(r"\b(\d{1,2}:\d{2}(?:\+\d+)?)\b", shown)
     if time is not None:
         if parse_time(time.group(1), now) < now:
             return EtaPassed()
     if now - first_seen > timedelta(hours=1):
-        return EtaStale(line, first_seen)
-    return EtaFresh(line)
+        return EtaStale(shown, first_seen)
+    return EtaFresh(shown)
 
 
 def eta_value(state: EtaState, supplied: object, requested: bool = False) -> JsonMap:
@@ -329,7 +358,7 @@ def run(args: argparse.Namespace) -> int:
         phase_text = phase if isinstance(phase, str) else ""
         key = f"{unit.session}|{phase_text}"
         held = fields.get("held")
-        state = eta_state(block, phase_text, seen, now,
+        state = eta_state(block, phase_text, seen, now, ZoneInfo(str(production.zone)),
                           held=isinstance(held, str) and bool(held.strip()))
         if not isinstance(state, EtaNone):
             eta_touched[key] = None

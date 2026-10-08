@@ -205,6 +205,13 @@ esac
         self.assertNotIn("== stalls", outputs[0])
         self.assertNotIn("SESSION GONE", outputs[0])
 
+    def test_the_last_three_distinct_eta_lines_are_printed_in_pane_order(self) -> None:
+        pane = "\n".join(("ETA 09:00", "ETA 10:00 PDT", "  Phase ETA: 12:55 EDT", "ETA 11:00",
+                          "From the user: what is the ETA", "ETA 10:00 PDT", "— holding: waiting on x")) + "\n"
+        outputs, _, _ = self.run_statuses(None, "ok", 0, panes=({"hook": pane},))
+        stated = [line for line in outputs[0].splitlines() if "ETA" in line]
+        self.assertEqual(stated, ["Phase ETA: 12:55 EDT", "ETA 11:00", "ETA 10:00 PDT"])
+
     def test_idle_run_reports_failed_tick_health(self) -> None:
         output, calls = self.run_status("/tmp/test-run\n", "failing: no instance", 1)
         self.assertIn("TICKS FAILING (no instance)", output)

@@ -68,6 +68,8 @@ class RenamePlan(NamedTuple):
 
 
 WAIT = RenameWait(30, time.sleep)
+# Where Claude Code keeps each session's scratchpad: <root>/<project>/<session id>/scratchpad.
+SCRATCH_ROOT = Path(os.environ.get("RENAME_UNIT_SCRATCH_ROOT") or f"/tmp/claude-{os.getuid()}")
 
 
 def _session_record(session_id: str) -> SessionRecord:
@@ -164,8 +166,8 @@ def _registry_collisions(claude: ClaudeSide, old: str, new: str) -> None:
 
 
 def preflight(production_path: Path, old: str, new: str) -> RenamePlan:
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", new):
-        raise add_unit.Refusal("new name must contain only letters, numbers, hyphens, or underscores")
+    if not new.strip() or re.search(r"[|`\n]", new):
+        raise add_unit.Refusal("new name must not be empty or contain |, ` or a line break")
     if new == old:
         raise add_unit.Refusal("new name must differ from old name")
     production = add_unit.read_production(production_path)
@@ -173,6 +175,9 @@ def preflight(production_path: Path, old: str, new: str) -> RenamePlan:
     if branch != production.merge_branch:
         raise add_unit.Refusal(f"Showrunner checkout is not on {production.merge_branch}")
     claude = _claude_side(old, new)
+    # Only a name this script types is held to the narrow rule; one the user gave in Claude is followed.
+    if isinstance(claude, AwaitingRename) and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", new):
+        raise add_unit.Refusal("new name must contain only letters, numbers, hyphens, or underscores")
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     row = _row_side(lines, claude, old, new)
     pane_names = _tmux_panes()
@@ -234,22 +239,29 @@ def rewrite_row(production: add_unit.Production, row: str, old: str, new: str) -
 def _commit_row(plan: RenamePlan, old: str, new: str) -> list[str]:
     production = plan.production
     changed: list[str] = []
+    original = production.doc.read_text(encoding="utf-8")
     if isinstance(plan.row, RowNamesOld):
         rewrite_row(production, plan.row.row, old, new)
         changed.append("production Units row")
     path = production.doc.relative_to(production.checkout)
     dirty = bool(add_unit.git(production, "status", "--porcelain", "--", str(path)).stdout)
-    add_unit.commit_paths(
-        production,
-        [production.doc],
-        f"production({production.slug}): {plan.unit}'s session is now {new}",
-    )
+    try:
+        add_unit.commit_paths(
+            production,
+            [production.doc],
+            f"production({production.slug}): {plan.unit}'s session is now {new}",
+        )
+    except subprocess.CalledProcessError:
+        # The row goes back, so the next try starts from the old name and moves the stores too.
+        _ = production.doc.write_text(original, encoding="utf-8")
+        _ = add_unit.git(production, "reset", "-q", "--", str(path), check=False)
+        raise
     if dirty:
         changed.append("production commit")
     return changed
 
 
-def rename(production_path: Path, scratch: Path, old: str, new: str, wait: RenameWait = WAIT) -> int:
+def rename(production_path: Path, scratch: Path | None, old: str, new: str, wait: RenameWait = WAIT) -> int:
     plan = preflight(production_path, old, new)
     if isinstance(plan.claude, AwaitingRename):
         _type_rename(plan.claude, new)
@@ -276,10 +288,69 @@ def rename(production_path: Path, scratch: Path, old: str, new: str, wait: Renam
     for description in state_changes:
         print(f"renamed: {description}")
 
+    if scratch is None:
+        print("left: the showrunner's report state — its scratchpad was not found")
     print("left: remote-control name — fixed at launch")
     print("left: systemd scope — fixed at launch")
     print(f"left: production LOG entry added {plan.unit} …, tmux {old} — history")
     return 0
+
+
+def _showrunner_scratch(instance: Path) -> Path | None:
+    """The scratchpad of the session an update instance prompts, where a showrunner keeps its report state."""
+    session_id = showrunners.target_session(instance)
+    if session_id is None:
+        return None
+    try:
+        found = [project / session_id / "scratchpad" for project in SCRATCH_ROOT.iterdir()]
+    except OSError:
+        return None
+    found = [path for path in found if path.is_dir()]
+    return found[0] if len(found) == 1 else None
+
+
+def follow_renames() -> None:
+    """Finish every rename a unit's user made in Claude itself.
+
+    `tmux_names.tick` carries such a rename to tmux and the registry. The Units row and the
+    name-keyed stores follow here through `rename`, so the Claude name is the one truth and both
+    ways of renaming end the same. A rename that cannot finish is one stderr line and is tried
+    again at the next tick.
+    """
+    settings = showrunners.load_settings() if showrunners.CONFIG.exists() else showrunners.defaults()
+    registered = {runner["session"]: {unit.session for unit in runner["units"]}
+                  for runner in settings["showrunners"]}
+    sessions: list[tmux_names.ClaudeSession] | None = None
+    for instance in sorted(showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*")):
+        located = showrunners.checked_doc(instance)
+        if isinstance(located, showrunners.NoCheckedDoc):
+            continue
+        try:
+            lines = located.path.read_text(encoding="utf-8").splitlines()
+            units = registered.get(add_unit.production_field(lines, "Showrunner session"), set())
+            _, rows = add_unit.unit_rows(lines)
+        except (OSError, UnicodeError, add_unit.Refusal):
+            continue
+        in_doc = {_row_session(row) for row in rows}
+        behind = sorted(units - in_doc)
+        if not behind:
+            continue
+        if sessions is None:
+            live = tmux_names.live_sessions()
+            if isinstance(live, tmux_names.TmuxServerUnavailable):
+                return
+            sessions = live
+        for new in behind:
+            named = [session for session in sessions if session.name == new]
+            if len(named) != 1:
+                continue
+            former = [old for old in sorted(in_doc - units) if _was_named(named[0].session_id, old)]
+            if len(former) != 1:
+                continue
+            try:
+                _ = rename(located.path, _showrunner_scratch(instance), former[0], new)
+            except (add_unit.Refusal, OSError, UnicodeError, subprocess.CalledProcessError, ValueError) as error:
+                print(f"rename_unit: {former[0]} to {new}: {error}", file=sys.stderr)
 
 
 def main(argv: list[str]) -> int:
@@ -288,8 +359,11 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--scratch", required=True)
     _ = parser.add_argument("old")
     _ = parser.add_argument("new")
-    args = parser.parse_args(argv)
     try:
+        if argv == ["--follow"]:
+            follow_renames()
+            return 0
+        args = parser.parse_args(argv)
         return rename(Path(cast(str, args.production)), Path(cast(str, args.scratch)),
                       cast(str, args.old), cast(str, args.new), WAIT)
     except add_unit.Refusal as error:
