@@ -105,12 +105,13 @@ python3 ~/.claude/scripts/production/dailies_input.py \
   --production <PRODUCTION_DOC> --status <scratchpad>/unit_status.txt \
   --judgment <scratchpad>/dailies_judgment.json --state-dir <scratchpad>/dailies_input_state \
   --out <scratchpad>/dailies_input.json --length <gantt|simple|page|elaborate> \
-  --render-state <scratchpad>/dailies_state.json \
-  --notifier <NOTIFIER> [--user-run]
+  --render-state <scratchpad>/dailies_state.json [--user-run]
 python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_input.json \
   --state <scratchpad>/dailies_state.json --log <LOG> --outstanding <OUTSTANDING>
 ```
 
+- The builder runs the notifier script beside it, the one `NOTIFIER` names;
+  pass it no notifier.
 - `--state` holds each unit's last reported phase and ETA. The renderer
   compares this report against it for the change notes, then saves this
   report's. Keep the same file for the whole production. When it is missing,
