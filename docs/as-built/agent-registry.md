@@ -321,7 +321,8 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - A server nothing stops stays up for good: one started outside a delegate run
   (`/ask_a_friend`, a seat launched by hand), one whose run ended without
   `end_session.sh`, and one whose run folder was deleted. `codex_mesh.py sweep`
-  reports them and stops nothing. It reads each server's run folder from the
+  reports them and stops nothing; `sweep --stop` stops the ones it calls unused
+  (user 2026-10-08, after a notice to every showrunner and unit director). It reads each server's run folder from the
   server's own stderr handle (`/proc/<pid>/fd/2` is that folder's
   `mesh_server.log`), which survives a rewritten `mesh_server.json` and a
   deleted folder. A server is `in use` on any one of: a client connected to its
@@ -335,7 +336,13 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   run folder is `unknown`. Measured 2026-10-08 on natedev: 66 servers, 42
   unused (11 with a deleted folder), 24 in use. A stale run-active marker keeps
   its server `in use`: the sweep does not yet check that the marker's session is
-  alive, as `remove_seats.py` does.
+  alive, as `remove_seats.py` does. Under `--stop` each unused server gets a
+  second look at the moment before it is signalled, under its run folder's
+  server lock so a launcher reaching `ensure_server` waits and then starts its
+  own. The second look must find the same pid still serving the same port and
+  must again say unused; then `_reap` stops it and `mesh_server.json` is removed
+  if it names that pid. A deleted run folder is not created again for the lock.
+  Nothing runs the sweep on a schedule.
 - A codex delegate's launcher ends with its last turn, and `send` then refuses it
   though the thread persists. Unlike a claude delegate, whose
   background session stays resumable, a finished codex peer cannot be messaged;
