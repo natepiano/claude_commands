@@ -52,6 +52,16 @@ sonnet=low,medium,high
 REAL_RECIPIENTS = quota_alert.recipients
 
 
+def all_live(names: list[str]) -> list[str]:
+    """Stands in for the live session lookup: every configured name is a live session."""
+    del names
+    return []
+
+
+def natedev_gone(names: list[str]) -> list[str]:
+    return [name for name in names if name == "natedev"]
+
+
 def running(*names: str) -> list[quota_alert.Showrunner]:
     """Running showrunners called `names`, as their update timers and session records would give them."""
     return [quota_alert.Showrunner(session=name, socket=f"/{name}.sock", slug=name.replace(" ", "-"),
@@ -83,7 +93,7 @@ class QuotaAlertTests(unittest.TestCase):
         registry = self.root / "agents.conf"
         _ = registry.write_text(REGISTRY)
         for name, value in (("CONFIG", config), ("STATE", self.root / "state.json"), ("relay", self.relay),
-                            ("REGISTRY", registry)):
+                            ("REGISTRY", registry), ("not_live", all_live)):
             patcher = mock.patch.object(quota_alert, name, value)
             _ = patcher.start()
             self.addCleanup(patcher.stop)
@@ -313,6 +323,13 @@ class QuotaAlertTests(unittest.TestCase):
                         self.note("claude 2.md", "active", "null"), self.note("codex 1.md", "active", "0", past)]
         self.assertEqual(quota_alert.alert(notes, self.now), [])
         self.assertEqual(self.sent, [])
+
+    def test_a_configured_name_that_is_no_live_session_is_named_in_the_alert_the_others_get(self) -> None:
+        notes: Notes = [self.note("codex 1.md", "active", "1")]
+        with mock.patch.object(quota_alert, "not_live", natedev_gone):
+            _ = quota_alert.alert(notes, self.now)
+        self.assertIn("natedev, which", self.sent[0][1])
+        self.assertTrue(self.sent[0][1].endswith("is not a live session and has not seen it."))
 
     def test_message_names_the_note_and_its_siblings_but_no_login(self) -> None:
         notes: Notes = [self.note("codex 1.md", "active", "1"), self.note("codex 2.md", "inactive", "40"),

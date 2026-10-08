@@ -133,19 +133,27 @@ def fault(kind: str, old: str, new: str, settings: showrunners.ShowrunnerSetting
         return
     try:
         socket = showrunners.socket_for(settings["faults_to"])
+        # The session named for faults is not live: every running showrunner is told instead, and told why.
+        sockets = [socket] if socket is not None else [
+            runner["socket"] for runner in showrunners.registered_showrunners() if runner["socket"]]
     except OSError as error:
         print(f"tmux-names: {error}", file=sys.stderr)
         return
-    if socket is None:
-        return
     message = f"tmux-names: skipped {old} → {new}: {kind}"
-    result = subprocess.run([sys.executable, str(SEND), "--to", f"uds:{socket}", "--from", "tmux-names",
-                             "--key", f"tmux-names:{key}", "--text", message],
-                            capture_output=True, text=True, check=False)
-    if result.returncode == 0:
+    if socket is None:
+        message += (f". {settings['faults_to']}, which {showrunners.CONFIG} names for faults, is not a live session,"
+                    + " so every running showrunner is told.")
+    if not sockets:
+        print(f"{message} No showrunner is running to tell.", file=sys.stderr)
+        return
+    results = [subprocess.run([sys.executable, str(SEND), "--to", f"uds:{one}", "--from", "tmux-names",
+                               "--key", f"tmux-names:{key}", "--text", message],
+                              capture_output=True, text=True, check=False) for one in sockets]
+    failed = [result.stderr.strip() for result in results if result.returncode != 0]
+    if not failed:
         marker.touch()
     else:
-        print(f"tmux-names: fault delivery failed: {result.stderr.strip()}", file=sys.stderr)
+        print(f"tmux-names: fault delivery failed: {'; '.join(failed)}", file=sys.stderr)
 
 
 def tick() -> None:

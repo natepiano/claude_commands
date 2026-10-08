@@ -198,6 +198,31 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         self.assertIn("tmux-names: cannot tell whether director is running", errors.getvalue())
         self.assertEqual(list(state.iterdir()), [])
 
+    def test_a_fault_for_a_session_that_is_not_live_goes_to_every_running_showrunner_and_says_so(self) -> None:
+        settings = showrunners.ShowrunnerSettings(threshold_percent=90.0, repeat_minutes=1.0, stall_minutes=1.0,
+                                                  faults_to="director", always=[])
+        state = self.root / "fault-state"
+        runners = [showrunners.Showrunner(session="one", socket="/tmp/one.sock", slug="one", zone="UTC", doc="/d"),
+                   showrunners.Showrunner(session="", socket="", slug="stopped", zone="UTC", doc="/d")]
+        sent = subprocess.CompletedProcess[str]([], 0, "", "")
+        errors = io.StringIO()
+        with mock.patch.object(tmux_names, "FAULT_STATE_DIR", state), \
+                mock.patch.object(showrunners, "socket_for", return_value=None), \
+                mock.patch.object(showrunners, "registered_showrunners", return_value=runners), \
+                mock.patch.object(subprocess, "run", return_value=sent) as run:
+            tmux_names.fault("name taken", "old", "new", settings)
+            command = cast(list[str], run.call_args.args[0])
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(command[command.index("--to") + 1], "uds:/tmp/one.sock")
+            self.assertIn("director, which", command[-1])
+            self.assertIn("is not a live session, so every running showrunner is told.", command[-1])
+            self.assertEqual(len(list(state.iterdir())), 1)
+            # With no showrunner running either, the fault is printed and tried again at the next tick.
+            with mock.patch.object(showrunners, "registered_showrunners", return_value=[]), redirect_stderr(errors):
+                tmux_names.fault("name taken", "other", "new", settings)
+        self.assertIn("No showrunner is running to tell.", errors.getvalue())
+        self.assertEqual(len(list(state.iterdir())), 1)
+
     def test_live_sessions_require_the_tmux_server_socket_to_match(self) -> None:
         self.session("local", "%0")
         self.session("stranger", "%0", tmux_socket="/tmp/tmux-test/other")

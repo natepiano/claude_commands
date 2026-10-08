@@ -1274,7 +1274,7 @@ def footer(
         except ReleaseRecordReadError as error:
             items.append(f"  {release_record_error_line(error)}")
         else:
-            if cycle is not None and any(holder.name in cycle["holders"] for holder in hold.holders):
+            if cycle is not None and any(holder.key in cycle["holders"] for holder in hold.holders):
                 items.extend(f"  {line}" for line in cycle_status_lines(cycle, now, zone))
     if not isinstance(mac_block, NoMacBlock):
         items.append(mac_block_line(mac_block, zone))
