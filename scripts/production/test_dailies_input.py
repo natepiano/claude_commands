@@ -287,7 +287,7 @@ class DailiesInputTests(unittest.TestCase):
         return result.stdout + result.stderr
 
     def test_each_length_produces_input_the_renderer_accepts(self) -> None:
-        for length in ("simple", "page", "elaborate"):
+        for length in ("gantt", "simple", "page", "elaborate"):
             with self.subTest(length=length):
                 result = self.run_builder("--length", length)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -484,16 +484,21 @@ class DailiesInputTests(unittest.TestCase):
                 self.assertEqual(len(positions), 1, result.stdout)
                 self.assertLess(positions[0], input_index)
 
-    def test_scheduled_prompt_saves_complete_status_for_dailies_simple(self) -> None:
+    def test_with_no_length_the_builder_writes_a_gantt_report(self) -> None:
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.report()["length"], "gantt")
+
+    def test_scheduled_prompt_saves_complete_status_for_dailies_gantt(self) -> None:
         commands = SCRIPT.parents[2] / "commands/showrunner"
         produce = (commands / "produce.md").read_text(encoding="utf-8")
         dailies = (commands / "dailies.md").read_text(encoding="utf-8")
         prompt = produce.split("The prompt:", 1)[1].split("**A tick**", 1)[0]
         self.assertIn("> <SCRATCH>/unit_status.txt", prompt)
         self.assertNotIn("cut -c1-400", prompt)
-        self.assertIn("/showrunner:dailies simple", prompt)
+        self.assertIn("/showrunner:dailies gantt", prompt)
         self.assertIn("unit_status.txt", dailies)
-        self.assertIn("/showrunner:dailies simple", dailies)
+        self.assertIn("/showrunner:dailies gantt", dailies)
 
     def test_dailies_command_surfaces_builder_step_failure_to_user(self) -> None:
         command = SCRIPT.parents[2] / "commands/showrunner/dailies.md"
@@ -690,14 +695,14 @@ class DailiesInputTests(unittest.TestCase):
             "held": "the panel review is paused",
             "eta": {"percent": 60},
         })
-        baseline = self.run_builder("--at", "2026-10-06T19:30")
+        baseline = self.run_builder("--at", "2026-10-06T19:30", "--length", "simple")
         self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
         first_report = self.run_renderer("2026-10-06T19:30")
         self.assertEqual(first_report.returncode, 0, first_report.stdout + first_report.stderr)
 
         for at in ("2026-10-06T20:00", "2026-10-06T21:36", "2026-10-06T23:50"):
             with self.subTest(at=at):
-                built = self.run_builder("--at", at)
+                built = self.run_builder("--at", at, "--length", "simple")
                 self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
                 self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "19:35")
                 self.assertNotIn("request /unit:eta:", built.stdout)
@@ -742,7 +747,7 @@ class DailiesInputTests(unittest.TestCase):
         baseline = self.run_builder("--at", "2026-10-06T19:30")
         self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
 
-        built = self.run_builder("--at", "2026-10-06T23:30")
+        built = self.run_builder("--at", "2026-10-06T23:30", "--length", "simple")
         self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
         rendered = self.run_renderer("2026-10-06T23:30")
         self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
