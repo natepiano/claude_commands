@@ -120,9 +120,9 @@ class AddUnitTests(unittest.TestCase):
                    "[claude.agents]\nopus=low,medium,high,xhigh\nsonnet=low,medium,high,xhigh\n")
         _ = self.agent_config.write_text(content, encoding="utf-8")
 
-    def production_doc(self) -> str:
+    def production_doc(self, merge_branch: str = "build-followups") -> str:
         return ("# Production\n\n"
-                "- **Merge branch:** `build-followups` — unit checkpoints merge here\n"
+                f"- **Merge branch:** `{merge_branch}` — unit checkpoints merge here\n"
                 f"- **Showrunner checkout:** `{self.checkout}`\n"
                 "- **Showrunner session:** director\n"
                 "- **Log:** `docs/plans/build-followups-log.md` — git-excluded\n"
@@ -542,6 +542,23 @@ class AddUnitTests(unittest.TestCase):
         self.assertIn("wait for its approval before you run /unit:delegate docs/plans/build-followups-alpha.md", prompt)
         self.assertIn("alpha-unit started: tmux attach -t alpha", result.stdout)
         self.assert_director_flags("opus", "xhigh")
+
+    def test_branch_takes_the_slug_and_the_stub_sits_beside_the_production_doc(self) -> None:
+        _ = self.git("checkout", "-b", "init/catalyst")
+        self.doc = self.checkout / "docs/hana/tool-based-ui-production.md"
+        _ = self.doc.parent.mkdir(parents=True)
+        _ = self.doc.write_text(self.production_doc("init/catalyst"), encoding="utf-8")
+        _ = self.git("add", "docs/hana/tool-based-ui-production.md")
+        _ = self.git("commit", "-m", "production under another merge branch")
+        _ = self.successful("lfo", "--brief", "Add the LFO tool")
+        worktree = self.root / "project-lfo"
+        self.assertIn(self.unit_row("lfo", branch="tool-based-ui-lfo", worktree=worktree,
+                                    plan="docs/hana/tool-based-ui-lfo.md"), self.doc.read_text())
+        self.assertEqual(self.git("branch", "--show-current", cwd=worktree), "tool-based-ui-lfo")
+        self.assertEqual(set(self.git("show", "--pretty=format:", "--name-only", "HEAD").splitlines()),
+                         {"docs/hana/tool-based-ui-production.md", "docs/hana/tool-based-ui-lfo.md"})
+        self.assertFalse((self.checkout / "docs/plans/init").exists())
+        self.assertEqual(self.git("branch", "--list", "init/catalyst-lfo"), "")
 
     def test_timeout_keeps_session_then_rerun_finishes_without_duplicate_steps(self) -> None:
         _ = (self.state / "ready").unlink()

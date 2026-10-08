@@ -195,6 +195,14 @@ def relative_plan(production: Production, raw: str) -> Path:
         raise Refusal("plan must be inside Showrunner checkout") from error
 
 
+def stub_plan(production: Production, branch: str) -> Path:
+    """Name a brief's stub plan beside the production doc, relative to Showrunner checkout."""
+    try:
+        return production.doc.parent.relative_to(production.checkout) / f"{branch}.md"
+    except ValueError as error:
+        raise Refusal("production doc must be inside Showrunner checkout") from error
+
+
 def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     production = read_production(Path(cast(str, args.production)))
     name = cast(str, args.name)
@@ -206,7 +214,8 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     if sum((given_plan is not None, given_brief is not None, standby)) != 1:
         raise Refusal("give exactly one of --plan, --brief, or --standby")
     kebab = name.replace("_", "-")
-    branch = f"{production.merge_branch}-{kebab}"
+    # The slug names the branch, as it names the production's plans; the merge branch may differ.
+    branch = f"{production.slug}-{kebab}"
     checkout_name = production.checkout.name.removesuffix("-trunk")
     worktree = production.checkout.parent / f"{checkout_name}-{kebab}"
     plan: PlanGiven | BriefGiven | Standby
@@ -214,7 +223,7 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
         plan = PlanGiven(relative_plan(production, given_plan))
     elif given_brief is not None:
         assert given_brief is not None
-        plan = BriefGiven(given_brief, Path("docs/plans") / f"{branch}.md")
+        plan = BriefGiven(given_brief, stub_plan(production, branch))
     else:
         plan = Standby()
     resumed = cast(str | None, args.resume)
@@ -345,7 +354,7 @@ def recorded_mode(request: UnitLaunch, row: ExistingUnitRow) -> str:
             return subject.removeprefix(subject_prefix).removesuffix(")")
     if row.plan == "standby":
         return "standby"
-    stub = request.production.checkout / "docs/plans" / f"{request.branch}.md"
+    stub = request.production.checkout / stub_plan(request.production, request.branch)
     if stub.exists() and request.plan_path == stub.relative_to(request.production.checkout):
         if "## Source\n\n" in stub.read_text(encoding="utf-8"):
             return "brief"
