@@ -328,7 +328,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   deleted folder. A server is `in use` on any one of: a client connected to its
   port, a roster launcher still alive (a resident seat waits between turns with
   no socket open), a run-active marker naming its folder, a start or a folder
-  change inside `SWEEP_IDLE_SECS` (30 minutes), or a conversation that is not
+  change inside `SERVER_IDLE_SECS` (30 minutes), or a conversation that is not
   idle. The last is asked of the server itself (`thread/loaded/list`, then
   `thread/read` on each loaded and each roster thread), so a turn left running
   by a launcher killed at its time limit is seen with no client and no roster.
@@ -342,7 +342,31 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   own. The second look must find the same pid still serving the same port and
   must again say unused; then `_reap` stops it and `mesh_server.json` is removed
   if it names that pid. A deleted run folder is not created again for the lock.
-  Nothing runs the sweep on a schedule.
+  Nothing runs the sweep on a schedule; it stays as a hand tool.
+- A codex app-server stops itself once nothing uses it (user 2026-10-08:
+  "i would rather have them be self-cleaning than have a sweep job").
+  `ensure_server` starts a watcher with each server: a detached shell that wakes
+  every `WATCH_WAKE_SECS` (5 minutes) and looks at the change time of
+  `mesh_server.json`, which `ensure_server` touches on every use. Only when that
+  is older than `SERVER_IDLE_SECS` does it run `codex_mesh.py idle-stop`, which
+  applies the sweep's verdict without the run-active marker and stops the
+  server through the same second look under the run folder's lock, or keeps it
+  and touches the record. The marker is left out because a stopped server comes
+  back at the next use: `follow` starts one and sends `thread/resume`, and `send`
+  now reopens a thread the server has not loaded (`_load_thread`; a new server
+  accepts a queued message for an unloaded thread and never runs it). Measured
+  2026-10-08: a seat told a word, its server stopped, a follow on a new server
+  answered with the word. A stopped server leaves no `mesh_server.json` and one
+  line in `mesh_server.log` saying why. Cost: a shell and a `sleep` per server
+  (under 1 MB of their own memory against a mean 38 MB per app-server), one
+  `find` per wake, and one short Python run about twice an hour while the server
+  is in use. The connection count needs `ss` and the run folder needs `/proc`,
+  so on the Mac a server is kept as before and `end_session.sh` stops it.
+  `end_session.sh`, `end_friend.sh` and `stop` still stop a server at once. What
+  left servers behind before: run folders a director named itself for extra
+  seats, which no end step covers, and work that went on in a run folder after
+  its run had closed, where a later dispatch started a server no end step
+  followed.
 - A codex delegate's launcher ends with its last turn, and `send` then refuses it
   though the thread persists. Unlike a claude delegate, whose
   background session stays resumable, a finished codex peer cannot be messaged;
