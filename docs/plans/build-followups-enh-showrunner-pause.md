@@ -323,32 +323,29 @@ Three instruction files say that an out-of-date as-built doc may always be corre
 
 ### Phase 10 — Every phone alert goes through the one command that reaches the user  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** Nothing sends a phone alert directly. Every script and command that reaches the user's phone does it through `send.py --to user`, so the urgency levels and anything else that command does apply everywhere. The user, 2026-10-07 about 15:55 PDT: "they should all be updated to use the one path to communicate with me". Asked first by the showrunner (natedev) the same day.
+Every phone alert in the repository goes through `scripts/message/send.py --to user`, each with the title, message and urgency it had.
 
-**Spec:**
-- `scripts/message/send.py --to user --summary TITLE [--need note|decision|blocked] --text MESSAGE` is the one way (main `49573a8`); need maps to priority: note 0, decision 1, blocked 2. Each caller below stops calling `scripts/notify/pushover.py` and calls it, keeping its title, its message and its urgency (priority 0 → `note`, 1 → `decision`, 2 → `blocked`), and keeping what it does today when the send fails.
-- `scripts/production/ci_points.py` (near line 234), `scripts/buildlog/rust_release.py` (near line 157), `scripts/lint/sweep.py` (near line 1052): the call and its test, each test proving the command line the script runs, with a stub in place of `send.py`.
-- `commands/showrunner/produce.md` (the section near line 710 that tells the showrunner to run `pushover.py`) and `commands/builds.md`: the instruction names `send.py --to user`, as `commands/alert_user.md` already does, the Mac's `--machine natedev` included where the command can run on the Mac.
-- A caller that can run on the Mac passes `--machine natedev`: the keys exist only on natedev.
-- `scripts/notify/pushover.py` stays: `send.py` calls it.
-- The moves, checked against the code: `ci_points.review_watch` calls `send.py --to user --need decision --summary "Hana: review watch" --text <notice>` and keeps its `required(...)` failure handling. `rust_release.send_release_text` calls `--need note --summary <title> --text <message>` and still returns true only on exit 0. `sweep.send_floor_alert` keeps its `--to natedev` delivery and replaces only the phone command, with `--to user --need note --summary "natedev: disk under its floor" --text <message>`; either channel succeeding still counts as delivered. `commands/showrunner/produce.md` maps priorities 0/1/2 to note/decision/blocked, keeps its fallback when the send fails, and adds `--machine natedev` when run on the Mac. `commands/builds.md` uses `--need decision` with its present title and line, and adds `--machine natedev` on the Mac.
-- `test_ci_points.py` and `test_dailies_input.py` stub `send.py` and assert that exact review-watch command (`dailies_input.py` imports `ci_points.review_watch`, and its test asserts today's Pushover stub); the rust-release and sweep tests assert their exact commands and the unchanged failure outcomes.
+- `ci_points.review_watch` runs `send.py --to user --need decision --summary "Hana: review watch" --text <notice>` through `required(...)`, so a failed send raises `PointFailure` with the cause.
+- `rust_release.send_release_text(title, message)` runs `--need note --summary <title> --text <message>` and returns true only on exit 0.
+- `sweep.send_floor_alert` keeps its `--to natedev` message and sends the phone alert as `--to user --need note --summary "natedev: disk under its floor" --text <message>`. Either channel delivering counts; a failed send prints stderr, else stdout.
+- <Notify/> in `commands/showrunner/produce.md` maps priority 2, 1 and 0 to `--need blocked`, `decision` and `note`. It, `commands/builds.md` and `commands/fix.md` name the same command, add `--machine natedev` on the Mac, and keep PushNotification only as the fallback on `FAILED` (exit 3).
 
 **Files:**
-- `scripts/production/ci_points.py`, `scripts/production/test_ci_points.py`, `scripts/production/test_dailies_input.py`
-- `scripts/buildlog/rust_release.py`, `scripts/buildlog/test_rust_release.py`
-- `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`
-- `commands/showrunner/produce.md`, `commands/builds.md`, `commands/fix.md` (found in review: its failure alert called PushNotification directly)
+- `scripts/production/ci_points.py` — the review-watch alert.
+- `scripts/buildlog/rust_release.py` — the Rust release alert.
+- `scripts/lint/sweep.py` — the disk-floor alert.
+- `commands/showrunner/produce.md`, `commands/builds.md`, `commands/fix.md` — the alert instructions.
+- `scripts/production/test_ci_points.py`, `scripts/production/test_dailies_input.py`, `scripts/buildlog/test_rust_release.py`, `scripts/lint/test_sweep.py` — each runs a stand-in `send.py` and asserts the exact command; no real alert is sent.
 
-**Seats:** 2 writers, each writing the tests for its own files.
-- `impl` — `scripts/production/ci_points.py`, `scripts/production/test_ci_points.py`, `scripts/production/test_dailies_input.py`, `commands/showrunner/produce.md`, `commands/builds.md`.
-- `test` — opens as impl: `scripts/buildlog/rust_release.py`, `scripts/buildlog/test_rust_release.py`, `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`.
+**Gotchas:**
+- `send.py` prints `FAILED: …` on stdout and exits 3, where `pushover.py` wrote to stderr; a caller that reports a failed send reads stdout too (`test_failed_phone_send_reports_the_cause_printed_on_stdout`).
+- The three Python callers pass no `--machine natedev`: they run only on natedev.
+- `commands/fix.md` sends `--need note`, the urgency of the ordinary push it replaced.
+- A search for `pushover.py` alone misses a direct PushNotification call; search for both.
 
-**Constraints from prior phases:** Phase 4 added `rename_recipient`, `_rename_queue` and `_merge_queues` to `scripts/message/send.py`; its `USER_CHANNEL`, `user()`, the `--to user` parsing, the need-to-priority mapping and the exit contract were not changed. This phase treats `send.py` as an existing interface and does not edit it. Phase 9 adds text to `commands/showrunner/produce.md`; change only the phone-alert instruction there. None of these files is in this unit's row: the checkpoint notice names each as `also touches`, with its owner where the production doc gives one. Tests never send a real alert and never read `~/.config/pushover/env`. The merge branch has changed `scripts/lint/sweep.py` since this branch last merged it (`send_floor_alert` is at a different line there): find each function by name, never by line, and trial-merge the merge branch before the checkpoint notice. Phase 8 (`c265820`) changed a registry function and its listed gate missed an importer in another directory: before the gate, search the whole repository for every importer and caller of `review_watch`, `send_release_text` and `send_floor_alert` (`rg -n 'review_watch|send_release_text|send_floor_alert' scripts commands`) and run the tests of each directory that has one. The registration left the stack in `de6fd83` (the showrunner's landing call, 2026-10-07): `settings.json` is the merge branch's copy, and Phase 6's paragraph in `commands/showrunner/produce.md`, its sentence in the progress contract of `commands/unit/delegate.md` and its registration test are out until the run's closing commit puts them back (`## Closing commit`). Do not re-add them here.
-
-**Acceptance gate:** `python3 -m unittest discover -s <dir> -p 'test_*.py'` green for `scripts/production`, `scripts/buildlog`, `scripts/lint` and `scripts/message`; `basedpyright scripts/production` ends `0 errors, 0 warnings, 0 notes`, and `basedpyright` on `scripts/buildlog` and `scripts/lint` reports no more problems than the unit director measures on this phase's starting commit; `rg -n 'pushover\.py' scripts commands -g '!scripts/notify/**' -g '!scripts/message/send.py' -g '!commands/alert_user.md' -g '!**/test_*.py'` prints nothing: the phone script is named only inside `scripts/notify/`, `scripts/message/send.py`, `commands/alert_user.md` and test fixtures.
+**Ruled out:** editing `scripts/message/send.py` or `scripts/notify/pushover.py` — the one command already does what each caller needs.
 
 ## Closing commit
 
