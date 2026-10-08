@@ -466,7 +466,31 @@ class IndexTests(unittest.TestCase):
             self.rows("SELECT id, token_wait_s FROM calls ORDER BY id"),
             [("new", 13), ("old", 0)],
         )
-        self.assertEqual(index.SCHEMA_VERSION, 9)
+
+    def test_mac_call_fields_reach_index_and_old_records_read_as_null(self) -> None:
+        self.write(
+            self.host_file,
+            call("old"),
+            call(
+                "offloaded",
+                mac="declined",
+                mac_reason="no_tests",
+                mac_s=12.5,
+            ),
+        )
+
+        _ = index.update()
+
+        self.assertEqual(
+            self.rows(
+                "SELECT id, mac, mac_reason, mac_s FROM calls ORDER BY id"
+            ),
+            [
+                ("offloaded", "declined", "no_tests", 12.5),
+                ("old", None, None, None),
+            ],
+        )
+        self.assertEqual(index.SCHEMA_VERSION, 10)
 
     def test_ci_skipped_and_zero_queue_jobs_have_distinct_states(self) -> None:
         same_stamp = "2026-10-02T12:00:00Z"

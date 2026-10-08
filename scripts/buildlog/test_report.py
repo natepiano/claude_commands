@@ -106,6 +106,27 @@ class ReportTests(unittest.TestCase):
         end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("### ")), len(lines))
         return lines[start:end]
 
+    def mac_tests_lines(self, day: str = "2026-10-02") -> list[str]:
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            return report.mac_tests_section(connection, day)
+
+    def nextest_step(
+        self,
+        record_id: str,
+        call_id: str,
+        caller: str = "verify",
+        **fields: object,
+    ) -> Record:
+        return step(
+            record_id,
+            call_id=call_id,
+            step="nextest",
+            caller=caller,
+            argv=["cargo", "nextest", "run", "-E", "package(hana)"],
+            **fields,
+        )
+
     def test_waiting_section_shows_each_tail_and_top_three(self) -> None:
         at = "2026-10-02T12:00:00Z"
         calls = [
@@ -473,6 +494,595 @@ class ReportTests(unittest.TestCase):
         section = lines[lines.index("### Test builds (temporary)") : lines.index("### Summary")]
         self.assertIn("| 2026-10-04 | whole-package | 1.5 min | 1.5 min |", section)
         self.assertFalse(any(line.startswith("| 2026-10-04 | --filter |") for line in section))
+
+    def test_recorded_pass_local_call_remains_in_agent_outcomes(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call(
+                "recorded-pass",
+                outcome="reused",
+                saved_s=60,
+                mac="declined",
+                mac_reason="local_flag",
+                mac_s=None,
+            ),
+        )
+
+        lines = self.render().splitlines()
+        section = lines[
+            lines.index("### Agent calls (verify.sh)") : lines.index(
+                "### Tests per edit"
+            )
+        ]
+        self.assertIn("| reused | 1 |  | 1.0 min |", section)
+
+    def test_disabled_decline_without_step_remains_in_token_waits(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call(
+                "waited-with-switch-off",
+                wait_s=300,
+                token_wait_s=300,
+                mac="declined",
+                mac_reason="off",
+                mac_s=0.0,
+            ),
+        )
+
+        waits = self.waiting_rows()["Build-folder turn, behind another seat"]
+        self.assertEqual(waits[0], f"5.0 min (feature, {local_clock(STAMP)})")
+        self.assertEqual(waits[2], "1 of 1 calls")
+
+    def test_mac_completed_calls_are_absent_from_agent_outcomes(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("kept", outcome="reused", saved_s=60),
+            call(
+                "failed-on-mac",
+                outcome="failed",
+                status=1,
+                mac="failed",
+                mac_reason="",
+                mac_s=10.0,
+            ),
+            call(
+                "passed-filter-on-mac",
+                outcome="ran",
+                mac="passed_filter",
+                mac_reason="",
+                mac_s=10.0,
+            ),
+        )
+
+        lines = self.render().splitlines()
+        section = lines[
+            lines.index("### Agent calls (verify.sh)") : lines.index(
+                "### Tests on the Mac"
+            )
+        ]
+        self.assertIn("| reused | 1 |  | 1.0 min |", section)
+        self.assertFalse(any(line.startswith("| failed |") for line in section))
+        self.assertFalse(any(line.startswith("| ran |") for line in section))
+
+    def test_offload_columns_become_domain_values(self) -> None:
+        self.assertIsInstance(
+            report.offload_record(None, None, None), report.NoOffloadRecord
+        )
+        self.assertIsInstance(
+            report.offload_record("", "", None), report.NoOffloadRecord
+        )
+        self.assertIsInstance(
+            report.offload_record("declined", "local_flag", None),
+            report.LocalRunRequested,
+        )
+        self.assertIsInstance(
+            report.offload_record("declined", "runner", None),
+            report.RunnerResultUnavailable,
+        )
+
+        decline = report.offload_record("declined", "busy", 2.5)
+        self.assertIsInstance(decline, report.OffloadDeclined)
+        if isinstance(decline, report.OffloadDeclined):
+            self.assertEqual(decline.reason, "busy")
+            self.assertEqual(decline.seconds, 2.5)
+
+        completed = report.offload_record("passed_filter", "", 3.5)
+        self.assertIsInstance(completed, report.MacRunCompleted)
+        if isinstance(completed, report.MacRunCompleted):
+            self.assertEqual(completed.outcome, "passed_filter")
+            self.assertEqual(completed.seconds, 3.5)
+
+        lost = report.offload_record("lost", "", 4.5)
+        self.assertIsInstance(lost, report.MacRunLost)
+        if isinstance(lost, report.MacRunLost):
+            self.assertEqual(lost.seconds, 4.5)
+
+        no_test = report.offload_record("declined", "no_tests", 5.5)
+        self.assertIsInstance(no_test, report.MacRunMatchedNoTest)
+        if isinstance(no_test, report.MacRunMatchedNoTest):
+            self.assertEqual(no_test.seconds, 5.5)
+
+    def test_invalid_offload_records_become_unrecognized(self) -> None:
+        values = (
+            report.offload_record("declined", "new_reason", 1.0),
+            report.offload_record("passed", "", None),
+            report.offload_record("new_word", "", 1.0),
+        )
+        for value in values:
+            with self.subTest(value=value):
+                self.assertIsInstance(value, report.UnrecognizedOffloadRecord)
+
+    def test_mac_section_omits_empty_records_and_ignores_unrecognized_ones(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("old"),
+            call("empty", mac="", mac_reason="", mac_s=None),
+        )
+        self.assertEqual(self.mac_tests_lines(), [])
+        self.assertNotIn("### Tests on the Mac", self.render())
+
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("unknown-reason", mac="declined", mac_reason="new_reason", mac_s=1.0),
+            call("missing-seconds", mac="passed", mac_reason="", mac_s=None),
+        )
+        self.assertEqual(self.mac_tests_lines(), [])
+        self.assertNotIn("### Tests on the Mac", self.render())
+
+    def test_disabled_unenrolled_local_and_runner_results_create_no_mac_section(
+        self,
+    ) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("disabled", mac="declined", mac_reason="off", mac_s=0.0),
+            call("unenrolled", mac="declined", mac_reason="repo", mac_s=0.0),
+            call(
+                "local",
+                mac="declined",
+                mac_reason="local_flag",
+                mac_s=None,
+            ),
+            call(
+                "runner",
+                mac="declined",
+                mac_reason="runner",
+                mac_s=None,
+            ),
+        )
+
+        self.assertEqual(self.mac_tests_lines(), [])
+        self.assertNotIn("### Tests on the Mac", self.render())
+
+    def test_disabled_counts_are_absent_from_reported_declines(self) -> None:
+        calls = [
+            call(
+                f"blocked-{number}",
+                mac="declined",
+                mac_reason="blocked",
+                mac_s=1.0,
+            )
+            for number in range(2)
+        ]
+        calls += [
+            call(
+                f"disabled-{number}",
+                mac="declined",
+                mac_reason="off",
+                mac_s=0.0,
+            )
+            for number in range(5)
+        ]
+        self.write(self.root / "natedev" / "2026-10.jsonl", *calls)
+
+        section = self.mac_tests_lines()
+        row = next(line for line in section if line.startswith("| hana |"))
+        self.assertIn("blocked 2", row)
+        self.assertNotIn("off 5", row)
+
+    def test_no_test_match_is_tried_not_failed_or_stayed_local(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call(
+                "no-test",
+                mac="declined",
+                mac_reason="no_tests",
+                mac_s=15.0,
+                wall_s=120,
+                token_wait_s=30,
+            ),
+            self.nextest_step("local-no-test", "no-test"),
+        )
+
+        section = self.mac_tests_lines()
+        heading = next(line for line in section if line.startswith("| Package |"))
+        row = next(line for line in section if line.startswith("| hana |"))
+        names = [cell.strip() for cell in heading.strip("|").split("|")]
+        values = [cell.strip() for cell in row.strip("|").split("|")]
+        cells = dict(zip(names, values, strict=True))
+        self.assertEqual(cells["Tried"], "1")
+        self.assertEqual(cells["Failed on the Mac"], "0")
+        self.assertEqual(cells["Passed there"], "0")
+        self.assertEqual(cells["Stayed local"], "")
+        self.assertIn("No test matched on the Mac: 1 (hana)", section)
+
+    def test_mac_section_reports_outcomes_estimates_and_pairing(self) -> None:
+        at = "2026-10-02T12:00:00Z"
+        calls = [
+            call("confirmed", started_at=at, mac="passed", mac_reason="", mac_s=10.0,
+                 wall_s=120, token_wait_s=12, build_s=120),
+            call("filtered", started_at="2026-10-02T12:01:00Z", mac="passed_filter", mac_reason="", mac_s=20.0),
+            call("failed-paired", started_at="2026-10-02T12:02:00Z", ended_at="2026-10-02T12:03:00Z",
+                 mac="failed", mac_reason="", mac_s=30.0, status=1, outcome="failed"),
+            call("failed-avoided", started_at="2026-10-02T12:04:00Z", ended_at="2026-10-02T12:05:00Z",
+                 command="test hana --filter other", worktree="/r/other", mac="failed", mac_reason="",
+                 mac_s=40.0, status=1, outcome="failed"),
+            call("lost", started_at="2026-10-02T12:06:00Z", mac="lost", mac_reason="", mac_s=50.0),
+            call("no-test", started_at="2026-10-02T12:07:00Z", mac="declined", mac_reason="no_tests",
+                 mac_s=60.0, wall_s=120, token_wait_s=12),
+            call("local-pass", started_at="2026-10-02T12:08:00Z", command="test hana", mac="declined",
+                 mac_reason="local_flag", mac_s=None, wall_s=120, token_wait_s=12),
+        ]
+        calls += [
+            call(f"blocked-{number}", started_at=f"2026-10-02T12:{10 + number:02d}:00Z", mac="declined",
+                 mac_reason="blocked", mac_s=1.0, wall_s=120, token_wait_s=12)
+            for number in range(3)
+        ]
+        calls += [
+            call(f"mac-busy-{number}", started_at=f"2026-10-02T12:{20 + number:02d}:00Z", mac="declined",
+                 mac_reason="mac_busy", mac_s=1.0, wall_s=120, token_wait_s=12)
+            for number in range(2)
+        ]
+        local_call_ids = ["confirmed", "no-test", "local-pass"] + [
+            f"blocked-{number}" for number in range(3)
+        ] + [f"mac-busy-{number}" for number in range(2)]
+        local_steps = [
+            self.nextest_step(f"local-{call_id}", call_id)
+            for call_id in local_call_ids
+        ]
+        mac_call_ids = [
+            "confirmed",
+            "filtered",
+            "failed-paired",
+            "failed-avoided",
+            "lost",
+            "no-test",
+        ]
+        mac_steps = [
+            self.nextest_step(
+                f"mac-{call_id}",
+                call_id,
+                caller="verify-mac",
+                host="Mac",
+                repo_path=None,
+                worktree=None,
+                branch=None,
+                sha=None,
+            )
+            for call_id in mac_call_ids
+        ]
+        self.write(self.root / "natedev" / "2026-10.jsonl", *calls, *local_steps)
+        self.write(self.root / "Mac" / "2026-10.jsonl", *mac_steps)
+
+        lines = self.render().splitlines()
+        start = lines.index("### Tests on the Mac")
+        end = next(
+            index
+            for index in range(start + 1, len(lines))
+            if lines[index].startswith("### ")
+        )
+        section = lines[start:end]
+        heading = next(line for line in section if line.startswith("| Package |"))
+        row = next(line for line in section if line.startswith("| hana |"))
+        names = [cell.strip() for cell in heading.strip("|").split("|")]
+        values = [cell.strip() for cell in row.strip("|").split("|")]
+        cells = dict(zip(names, values, strict=True))
+        self.assertEqual(cells["Tried"], "6")
+        self.assertEqual(cells["Failed on the Mac"], "2")
+        self.assertEqual(cells["Passed there"], "2")
+        self.assertEqual(cells["Mac p50"], "20.0 s")
+        self.assertEqual(cells["natedev p50"], "2.0 min")
+        self.assertEqual(cells["Stayed local"], "blocked 3, Mac busy 2")
+        self.assertEqual(
+            sum(line.startswith("Source:") for line in section), 1
+        )
+        avoided = next(line for line in section if line.startswith("natedev runs avoided:"))
+        self.assertIn("natedev runs avoided: 2", avoided)
+        self.assertIn("4.0 min of build and test time", avoided)
+        self.assertIn("0.4 min of waiting", avoided)
+        self.assertIn(
+            "Failed on the Mac, then passed on natedev with --local: 1 (hana)",
+            section,
+        )
+        self.assertIn("No test matched on the Mac: 1 (hana)", section)
+        self.assertLess(lines.index("### Test builds (temporary)"), start)
+        self.assertLess(start, lines.index("### Tests per edit"))
+
+    def test_local_pass_pairs_only_the_nearest_matching_failure(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("first", started_at="2026-10-02T12:00:00Z", mac="failed", mac_reason="", mac_s=10.0,
+                 status=1, outcome="failed"),
+            call("nearest", started_at="2026-10-02T12:05:00Z", mac="failed", mac_reason="", mac_s=10.0,
+                 status=1, outcome="failed"),
+            call("local", started_at="2026-10-02T12:10:00Z", mac="declined", mac_reason="local_flag",
+                 mac_s=None, status=0),
+            self.nextest_step("local-step", "local"),
+        )
+        section = self.mac_tests_lines()
+        self.assertIn(
+            "Failed on the Mac, then passed on natedev with --local: 1 (hana)",
+            section,
+        )
+        avoided = next(line for line in section if line.startswith("natedev runs avoided:"))
+        self.assertIn("natedev runs avoided: 1", avoided)
+
+    def test_next_day_local_pass_pairs_with_late_mac_failure(self) -> None:
+        failed_at = datetime(2026, 10, 2, 23, 50).astimezone().isoformat()
+        passed_at = datetime(2026, 10, 3, 0, 10).astimezone().isoformat()
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call(
+                "late-failure",
+                started_at=failed_at,
+                mac="failed",
+                mac_reason="",
+                mac_s=10.0,
+                status=1,
+                outcome="failed",
+            ),
+            call(
+                "next-day-local",
+                started_at=passed_at,
+                mac="declined",
+                mac_reason="local_flag",
+                mac_s=None,
+                status=0,
+            ),
+            self.nextest_step(
+                "next-day-local-step",
+                "next-day-local",
+                started_at=passed_at,
+            ),
+        )
+
+        section = self.mac_tests_lines("2026-10-02")
+        avoided = next(line for line in section if line.startswith("natedev runs avoided:"))
+        self.assertIn("natedev runs avoided: 0", avoided)
+        self.assertIn(
+            "Failed on the Mac, then passed on natedev with --local: 1 (hana)",
+            section,
+        )
+
+    def test_avoided_time_uses_each_packages_natedev_medians(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("hana-reference", wall_s=60, token_wait_s=6),
+            call("hana-avoided", started_at="2026-10-02T12:01:00Z", mac="passed_filter",
+                 mac_reason="", mac_s=10.0),
+            call("beta-reference", started_at="2026-10-02T12:02:00Z", package="beta",
+                 command="test beta", wall_s=120, token_wait_s=12),
+            call("beta-avoided", started_at="2026-10-02T12:03:00Z", package="beta",
+                 command="test beta", mac="failed", mac_reason="", mac_s=20.0,
+                 status=1, outcome="failed"),
+            self.nextest_step("hana-reference-step", "hana-reference"),
+            self.nextest_step("beta-reference-step", "beta-reference"),
+        )
+
+        section = self.mac_tests_lines()
+        avoided = next(line for line in section if line.startswith("natedev runs avoided:"))
+        self.assertIn("natedev runs avoided: 2", avoided)
+        self.assertIn("3.0 min of build and test time", avoided)
+        self.assertIn("0.3 min of waiting", avoided)
+
+    def test_local_pass_with_different_command_matches_no_failure(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("failed", started_at="2026-10-02T12:00:00Z", command="test hana --filter one",
+                 mac="failed", mac_reason="", mac_s=10.0, status=1, outcome="failed"),
+            call("local", started_at="2026-10-02T12:10:00Z", command="test hana --filter two",
+                 mac="declined", mac_reason="local_flag", mac_s=None, status=0),
+            self.nextest_step("local-step", "local"),
+        )
+        section = self.mac_tests_lines()
+        self.assertFalse(
+            any("Failed on the Mac, then passed" in line for line in section)
+        )
+        avoided = next(line for line in section if line.startswith("natedev runs avoided:"))
+        self.assertIn("natedev runs avoided: 1", avoided)
+
+    def test_recorded_local_pass_does_not_pair_or_set_natedev_median(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("failed", started_at="2026-10-02T12:00:00Z", mac="failed", mac_reason="", mac_s=10.0,
+                 status=1, outcome="failed"),
+            call("recorded", started_at="2026-10-02T12:10:00Z", mac="declined", mac_reason="local_flag",
+                 mac_s=None, wall_s=900, status=0, outcome="reused"),
+            call("ran", started_at="2026-10-02T12:20:00Z", mac="declined", mac_reason="blocked",
+                 mac_s=1.0, wall_s=60, status=0),
+            self.nextest_step("ran-step", "ran"),
+        )
+        section = self.mac_tests_lines()
+        row = next(line for line in section if line.startswith("| hana |"))
+        self.assertIn("| 1.0 min |", row)
+        self.assertFalse(
+            any("Failed on the Mac, then passed" in line for line in section)
+        )
+        avoided = next(line for line in section if line.startswith("natedev runs avoided:"))
+        self.assertIn("natedev runs avoided: 1", avoided)
+
+    def test_test_builds_keep_confirmed_and_old_calls_but_not_mac_only_calls(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("confirmed", mac="passed", mac_reason="", mac_s=10.0, build_s=60),
+            call("mac-only", mac="passed_filter", mac_reason="", mac_s=10.0, build_s=600),
+            call("old", build_s=120),
+            self.nextest_step("confirmed-local", "confirmed"),
+        )
+        self.write(
+            self.root / "Mac" / "2026-10.jsonl",
+            self.nextest_step(
+                "confirmed-mac",
+                "confirmed",
+                caller="verify-mac",
+                host="Mac",
+            ),
+            self.nextest_step(
+                "only-mac",
+                "mac-only",
+                caller="verify-mac",
+                host="Mac",
+            ),
+        )
+
+        lines = self.render().splitlines()
+        section = lines[
+            lines.index("### Test builds (temporary)") : lines.index("### Tests on the Mac")
+        ]
+        self.assertIn(
+            "| 2026-10-02 | whole-package | 3.0 min | 2.0 min |",
+            section,
+        )
+
+    def test_offloaded_steps_stay_out_of_every_natedev_query(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call(
+                "local",
+                mac="passed",
+                mac_reason="",
+                mac_s=10.0,
+                build_s=60,
+                delegate_session="seat-a",
+            ),
+            call(
+                "mac-only",
+                started_at="2026-10-02T12:01:00Z",
+                mac="passed_filter",
+                mac_reason="",
+                mac_s=20.0,
+                build_s=600,
+                delegate_session="seat-a",
+            ),
+            self.nextest_step(
+                "local-step",
+                "local",
+                duration_s=20.0,
+                finished_s=10.0,
+                crates_compiled=1,
+                mem_wait_s=60,
+                tree_key="tree-a",
+            ),
+        )
+        self.write(
+            self.root / "Mac" / "2026-10.jsonl",
+            self.nextest_step(
+                "mac-linked",
+                "mac-only",
+                caller="verify-mac",
+                host="Mac",
+                duration_s=900.0,
+                finished_s=800.0,
+                crates_compiled=50,
+                mem_wait_s=600,
+                tree_key="tree-b",
+            ),
+            self.nextest_step(
+                "mac-orphan",
+                "call-with-no-record",
+                caller="verify-mac",
+                host="Mac",
+                duration_s=900.0,
+                finished_s=800.0,
+                crates_compiled=50,
+                mem_wait_s=600,
+                tree_key="tree-c",
+            ),
+            step(
+                "mac-only-kind",
+                step="fmt",
+                caller="verify-mac",
+                call_id="mac-only",
+                host="Mac",
+            ),
+        )
+
+        lines = self.render().splitlines()
+
+        waiting_rows = self.waiting_rows()
+        waiting = waiting_rows["Memory admission"]
+        self.assertEqual(waiting[0], f"1.0 min (feature, {local_clock(STAMP)})")
+        self.assertEqual(waiting[2], "1 of 1 steps")
+        folder_waiting = waiting_rows[
+            "Build-folder turn, behind another seat"
+        ]
+        self.assertEqual(folder_waiting[2], "0 of 1 calls")
+
+        nextest = lines[lines.index("### nextest") : lines.index("### Memory pressure")]
+        self.assertTrue(any(line.startswith("| verify.sh (agents) | 1 |") for line in nextest))
+        self.assertFalse(any("(Mac)" in line for line in nextest))
+        self.assertNotIn("### fmt", lines)
+
+        builds = lines[
+            lines.index("### Test builds (temporary)") : lines.index("### Tests on the Mac")
+        ]
+        self.assertIn(
+            "| 2026-10-02 | whole-package | 1.0 min | 1.0 min |",
+            builds,
+        )
+
+        agent_calls = lines[
+            lines.index("### Agent calls (verify.sh)") : lines.index(
+                "### Test builds (temporary)"
+            )
+        ]
+        self.assertTrue(any(line.startswith("| ran | 1 |") for line in agent_calls))
+
+        per_edit = lines[
+            lines.index("### Tests per edit") : lines.index("### Summary: successes")
+        ]
+        self.assertIn("| 2026-10-02 | 1 | 0 | — | — |", per_edit)
+
+        rebuilds = self.rebuilds_lines()
+        self.assertIn(
+            "| edited crate (1–3 crates) | 1 | 10.0 s | 10.0 s | 20.0 s | 100% | 100% |",
+            rebuilds,
+        )
+        self.assertIn("| cold (50+ crates) | 0 | — | — | — | — | — |", rebuilds)
+
+        successes = lines[
+            lines.index("### Summary: successes") : lines.index("### Summary: failures")
+        ]
+        self.assertIn(
+            "| **All steps** | 1 | 20.0 s | 20.0 s | 20.0 s |  |",
+            successes,
+        )
+        self.assertFalse(any(line.startswith("| fmt |") for line in lines))
+
+    def test_verify_step_without_call_record_remains_in_reports(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            step(
+                "unlinked-local-step",
+                step="doc",
+                caller="verify",
+                call_id="call-record-not-written",
+                duration_s=30.0,
+            ),
+        )
+
+        lines = self.render().splitlines()
+        doc = lines[lines.index("### doc") : lines.index("### Memory pressure")]
+        self.assertTrue(
+            any(line.startswith("| verify.sh (agents) | 1 |") for line in doc)
+        )
+        successes = lines[
+            lines.index("### Summary: successes") : lines.index(
+                "### Summary: failures"
+            )
+        ]
+        all_steps = lines[lines.index("### Summary: all") :]
+        self.assertTrue(any(line.startswith("| doc | 1 |") for line in successes))
+        self.assertTrue(any(line.startswith("| doc | 1 |") for line in all_steps))
 
     def verify_call(
         self,

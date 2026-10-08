@@ -428,6 +428,34 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.assertEqual(record["mac_s"], 3.25)
         self.assertNotIn("--no-cache", record["command"])
 
+    def test_no_test_match_runs_locally_and_reaches_call_record(self) -> None:
+        result = self.verify(
+            "test",
+            "sample",
+            "--no-cache",
+            extra={
+                "TEST_RUNNER_MAC": "declined",
+                "TEST_RUNNER_REASON": "no_tests",
+                "TEST_RUNNER_SECONDS": "4.5",
+                "TEST_RUNNER_STATUS": "75",
+                "TEST_RUNNER_OUTPUT": (
+                    "mac_test: no test matched on the Mac; "
+                    "running on natedev instead"
+                ),
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "mac_test: no test matched on the Mac; running on natedev instead",
+            result.stdout,
+        )
+        self.assertEqual(len(self.local_runs()), 1)
+        record = self.last_call()
+        self.assertEqual(record["mac"], "declined")
+        self.assertEqual(record["mac_reason"], "no_tests")
+        self.assertEqual(record["mac_s"], 4.5)
+
     def test_runner_result_uses_fixture_temp_directory(self) -> None:
         result = self.verify(
             "test",

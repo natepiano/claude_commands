@@ -35,7 +35,8 @@ class CommandFixture(TypedDict):
     probe_lines: list[str]
     rsync_status: int
     run_lines: list[RemoteLine]
-    run_status_line: str | None
+    run_status_reported: bool
+    run_status_line: str
     run_delay_s: float
     hold_after_first_line: bool
     cleanup_status: int
@@ -108,9 +109,8 @@ if "lint nextest" in remote:
             while not (root / "continue-run").exists():
                 time.sleep(0.01)
         time.sleep(0.02)
-    status_line = fixture["run_status_line"]
-    if status_line is not None:
-        print(status_line, flush=True)
+    if fixture["run_status_reported"]:
+        print(fixture["run_status_line"], flush=True)
     raise SystemExit(0)
 
 (root / "probe-started").write_text("started\n", encoding="utf-8")
@@ -168,6 +168,7 @@ class OffloadCommandTests(unittest.TestCase):
             "probe_lines": [],
             "rsync_status": 0,
             "run_lines": [],
+            "run_status_reported": True,
             "run_status_line": "mac_exit=0",
             "run_delay_s": 0.0,
             "hold_after_first_line": False,
@@ -228,6 +229,7 @@ class OffloadCommandTests(unittest.TestCase):
             ],
             "rsync_status": 0,
             "run_lines": [],
+            "run_status_reported": True,
             "run_status_line": "mac_exit=0",
             "run_delay_s": 0.0,
             "hold_after_first_line": False,
@@ -683,7 +685,7 @@ class OffloadCommandTests(unittest.TestCase):
             ["~/.claude/scripts/lint/lint", "nextest", *words],
         )
         self.assertIn("PATH=$HOME/.cargo/bin:$PATH", remote_words)
-        self.assertIn("BUILDLOG_CALLER=verify", remote_words)
+        self.assertIn("BUILDLOG_CALLER=verify-mac", remote_words)
         self.assertIn("BUILDLOG_CALL_ID=call-17", remote_words)
         self.assertIn("BUILDLOG_SYNC=1", remote_words)
         self.assertIn("LINT_SWEEP_BUDGET_GIB=64", remote_words)
@@ -779,11 +781,35 @@ class OffloadCommandTests(unittest.TestCase):
         self.assert_wire("failed", "")
         self.assertFalse((self.state_directory / "run.json").exists())
 
+    def test_no_test_status_runs_on_natedev_instead(self) -> None:
+        self.fixture["run_status_line"] = "mac_exit=4"
+        self.sync_fixture()
+
+        result = self.command()
+
+        self.assertEqual(result.returncode, 75, result.stdout)
+        self.assertIn(
+            "mac_test: no test matched on the Mac; running on natedev instead\n",
+            result.stdout,
+        )
+        self.assertNotIn("mac_exit=4", result.stdout)
+        self.assert_wire("declined", "no_tests")
+        self.assertFalse((self.state_directory / "run.json").exists())
+
+    def test_nextest_failure_status_remains_a_mac_failure(self) -> None:
+        self.fixture["run_status_line"] = "mac_exit=1"
+        self.sync_fixture()
+
+        result = self.command()
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assert_wire("failed", "")
+
     def test_missing_run_status_is_lost_and_releases_claim(self) -> None:
         self.fixture["run_lines"] = [
             {"stream": "stdout", "text": "partial output"}
         ]
-        self.fixture["run_status_line"] = None
+        self.fixture["run_status_reported"] = False
         self.sync_fixture()
         result = self.command()
         self.assertEqual(result.returncode, 75, result.stdout)

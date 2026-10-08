@@ -74,6 +74,13 @@ class FailedOnMac:
 
 
 @dataclass(frozen=True)
+class NoTestMatchedOnMac:
+    """A completed Mac run whose filter selected no test."""
+
+    seconds: float
+
+
+@dataclass(frozen=True)
 class LostMacRun:
     """A Mac run whose final test status was not received."""
 
@@ -88,7 +95,9 @@ class DeclinedMacRun:
     seconds: float
 
 
-MacOffloadResult = PassedOnMac | FailedOnMac | LostMacRun | DeclinedMacRun
+MacOffloadResult = (
+    PassedOnMac | FailedOnMac | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun
+)
 
 
 @dataclass(frozen=True)
@@ -419,6 +428,11 @@ def write_result(result: MacOffloadResult, destination: ResultDestination) -> in
         mac = "passed"
         reason = ""
         status = 0
+    elif isinstance(result, NoTestMatchedOnMac):
+        mac = "declined"
+        reason = "no_tests"
+        status = 75
+        print("mac_test: no test matched on the Mac; running on natedev instead")
     elif isinstance(result, FailedOnMac):
         mac = "failed"
         reason = ""
@@ -692,7 +706,7 @@ def remote_test_command(
     return (
         f"cd {shlex.quote(remote_mirror(repository))} && "
         'PATH="$HOME/.cargo/bin:$PATH" '
-        "BUILDLOG_CALLER=verify "
+        "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_CALL_ID={shlex.quote(request.call_id)} "
         "BUILDLOG_SYNC=1 "
         f"LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "
@@ -756,6 +770,8 @@ def claimed_run(
             return LostMacRun(seconds)
         if remote_status.status == 0:
             return PassedOnMac(seconds)
+        if remote_status.status == 4:
+            return NoTestMatchedOnMac(seconds)
         return FailedOnMac(remote_status.status, seconds)
     except OffloadInterrupted:
         end_remote_work(config, repository)
