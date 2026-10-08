@@ -149,10 +149,10 @@ State:
   handled without you while the reply that put the question is your latest.
   Once you have replied again, a bare yes or no reaches you as the answer to
   whatever you asked last, and the pause's question stays open until it times
-  out. The question comes five minutes after your reply ends, or thirty minutes
-  after their message when the reply was interrupted. Unanswered for five
-  minutes, the updates return on their own. While an `/adhoc_review` is open
-  here, the question waits for the review to end.
+  out. The question comes fifteen minutes after your reply ends, or thirty
+  minutes after their message when the reply was interrupted. Unanswered for
+  five minutes, the updates return on their own. While an `/adhoc_review` is
+  open here, the question waits for the review to end.
   `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/conversation_pause.py" status`
   says what is paused.
 

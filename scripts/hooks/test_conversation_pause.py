@@ -24,7 +24,7 @@ SETTINGS = LIBRARY.parent.parent.parent / "settings.json"
 SESSION = "session-1"
 NOW = 10_000
 QUESTION = (
-    "conversation-pause: the user has been quiet here for 5 minutes. Ask them this, "
+    "conversation-pause: the user has been quiet here for 15 minutes. Ask them this, "
     "word for word, and nothing else: Return to automatic updates? (yes / no) They "
     "return on their own in 5 minutes. Their yes or no is handled when they type it."
 )
@@ -32,6 +32,8 @@ RESUME = (
     '"$HOME/.claude/scripts/lib/py" '
     '"$HOME/.claude/scripts/hooks/conversation_pause.py" resume'
 )
+RETURN_SCHEDULE = "They return 20 minutes after my last reply; I ask you first at 15."
+ASK_AGAIN = "If you write again, I ask about them 15 minutes after my reply."
 PAUSE_CONTEXT = (
     "Automatic updates for this session are paused while the user talks to you: "
     "dailies, footer. Leave them off; the session asks the user before they return. "
@@ -575,7 +577,7 @@ print("SENT: delivered")
         reply = cast(dict[str, object], json.loads(result.stdout))
         self.assertEqual(
             reply["systemMessage"],
-            "Automatic updates paused while we talk: status reports.",
+            f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
@@ -583,7 +585,9 @@ print("SENT: delivered")
         instance = self.create_instance("showrunner-demo")
         first = self.parsed_reply(self.run_prompt("hello", now=100))
         self.assertEqual(first, {
-            "systemMessage": "Automatic updates paused while we talk: dailies, footer.",
+            "systemMessage": (
+                f"Automatic updates paused while we talk: dailies, footer. {RETURN_SCHEDULE}"
+            ),
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
                 "additionalContext": PAUSE_CONTEXT,
@@ -619,7 +623,7 @@ print("SENT: delivered")
                 reply = self.parsed_reply(self.run_prompt("hello"))
                 self.assertEqual(
                     reply["systemMessage"],
-                    f"Automatic updates paused while we talk: {words}.",
+                    f"Automatic updates paused while we talk: {words}. {RETURN_SCHEDULE}",
                 )
                 (self.pause_root / f"{SESSION}.json").unlink()
                 (instance / "conf").unlink()
@@ -653,7 +657,7 @@ print("SENT: delivered")
         reply = self.parsed_reply(self.run_prompt("second", now=120))
         self.assertEqual(
             reply["systemMessage"],
-            "Automatic updates paused while we talk: build report.",
+            f"Automatic updates paused while we talk: build report. {RETURN_SCHEDULE}",
         )
         self.assertEqual(
             self.record()["instances"], ["delegate-abc", "report-builds"]
@@ -787,7 +791,7 @@ print("SENT: delivered")
 
         self.assertEqual(
             reply["systemMessage"],
-            "Automatic updates paused while we talk: status reports.",
+            f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
@@ -798,7 +802,7 @@ print("SENT: delivered")
 
         self.assertEqual(
             reply["systemMessage"],
-            "Automatic updates paused while we talk: status reports.",
+            f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
@@ -838,7 +842,7 @@ print("SENT: delivered")
         typed = self.parsed_reply(self.run_prompt("a different thought"))
         self.assertEqual(
             typed["systemMessage"],
-            "Automatic updates paused while we talk: status reports.",
+            f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
         )
         self.assertTrue((self.escalate_root / "typed").exists())
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
@@ -879,7 +883,7 @@ print("SENT: delivered")
         slash = self.parsed_reply(self.run_prompt("/unit:report"))
         self.assertEqual(
             slash["systemMessage"],
-            "Automatic updates paused while we talk: status reports.",
+            f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
@@ -1230,12 +1234,12 @@ print("SENT: delivered")
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
 
-    def test_tick_waits_for_five_quiet_minutes_and_sends_question_once(self) -> None:
+    def test_tick_waits_for_fifteen_quiet_minutes_and_sends_question_once(self) -> None:
         _ = self.write_record(
             {"kind": "quiet", "user_wrote_at": 10, "reply_ended_at": 100},
             instances=("delegate-abc",),
         )
-        before = self.run_cli("tick", now=399)
+        before = self.run_cli("tick", now=999)
         self.assertEqual(before.returncode, 0, before.stderr)
         self.assertEqual(self.calls(self.send_log), [])
         self.assertEqual(
@@ -1243,9 +1247,9 @@ print("SENT: delivered")
             {"kind": "quiet", "user_wrote_at": 10, "reply_ended_at": 100},
         )
 
-        at_five = self.run_cli("tick", now=400)
-        self.assertEqual(at_five.returncode, 0, at_five.stderr)
-        self.assertEqual(self.record()["phase"], asked_not_read(400))
+        at_fifteen = self.run_cli("tick", now=1_000)
+        self.assertEqual(at_fifteen.returncode, 0, at_fifteen.stderr)
+        self.assertEqual(self.record()["phase"], asked_not_read(1_000))
         self.assertEqual(self.calls(self.sessions_log)[-1], ["socket", f"session:{SESSION}"])
         self.assertEqual(self.calls(self.send_log), [[
             "--to", f"uds:{self.socket_path}",
@@ -1253,7 +1257,7 @@ print("SENT: delivered")
             "--key", f"conversation-pause-{SESSION}",
             "--text", QUESTION,
         ]])
-        after = self.run_cli("tick", now=450)
+        after = self.run_cli("tick", now=1_050)
         self.assertEqual(after.returncode, 0, after.stderr)
         self.assertEqual(len(self.calls(self.send_log)), 1)
 
@@ -1363,7 +1367,7 @@ print("SENT: delivered")
 
     def test_return_question_sender_is_recognized_when_text_changes(self) -> None:
         _ = self.write_record({"kind": "question_pending", "due_at": 100})
-        changed_question = QUESTION.replace("5 minutes", "six minutes", 1)
+        changed_question = QUESTION.replace("15 minutes", "six minutes", 1)
 
         delivered = self.run_prompt(
             cross_session("conversation-pause", changed_question),
@@ -1542,7 +1546,7 @@ print("SENT: delivered")
         )
         reply = self.parsed_reply(self.run_prompt("NO!"))
         self.assertEqual(reply, {
-            "systemMessage": "Automatic updates stay off.",
+            "systemMessage": f"Automatic updates stay off. {ASK_AGAIN}",
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
                 "additionalContext": NO_CONTEXT,
@@ -1604,7 +1608,7 @@ print("SENT: delivered")
                 else:
                     self.assertEqual(
                         answer["systemMessage"],
-                        "Automatic updates stay off.",
+                        f"Automatic updates stay off. {ASK_AGAIN}",
                     )
                     self.assertEqual(self.record()["phase"], {"kind": "kept_off"})
                     self.assertTrue(
@@ -1789,7 +1793,7 @@ print("SENT: delivered")
         _ = self.write_record({"kind": "returned", "returned_at": NOW - 60})
         reply = self.parsed_reply(self.run_prompt("no"))
         self.assertEqual(reply, {
-            "systemMessage": "Automatic updates are off again: status reports.",
+            "systemMessage": f"Automatic updates are off again: status reports. {ASK_AGAIN}",
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
                 "additionalContext": NO_CONTEXT,
@@ -1804,7 +1808,7 @@ print("SENT: delivered")
         reply = self.parsed_reply(self.run_prompt("new topic", now=200))
         self.assertEqual(
             reply["systemMessage"],
-            "Automatic updates paused while we talk: status reports.",
+            f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
         )
         self.assertEqual(
             self.record()["phase"],
@@ -1889,7 +1893,7 @@ print("SENT: delivered")
         reply = self.parsed_reply(self.run_prompt("no", now=410))
         self.assertEqual(
             reply["systemMessage"],
-            "Automatic updates are off again: status reports.",
+            f"Automatic updates are off again: status reports. {ASK_AGAIN}",
         )
         self.assertEqual(self.record()["phase"], {"kind": "kept_off"})
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
@@ -2060,16 +2064,16 @@ print("SENT: delivered")
             session_id="kept-session",
         )
         result = self.run_cli(
-            "tick", now=400, extra_env={"CONVERSATION_PAUSE_SESSIONS": str(failing)}
+            "tick", now=1_000, extra_env={"CONVERSATION_PAUSE_SESSIONS": str(failing)}
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self.record("quiet-session")["phase"],
-            {"kind": "question_pending", "due_at": 400},
+            {"kind": "question_pending", "due_at": 1_000},
         )
         self.assertEqual(
             self.record("asked-session")["phase"],
-            {"kind": "returned", "returned_at": 400},
+            {"kind": "returned", "returned_at": 1_000},
         )
         self.assertEqual(
             self.record("kept-session")["phase"], {"kind": "kept_off"}
@@ -2087,12 +2091,12 @@ print("SENT: delivered")
         self.assertTrue(watcher.exists())
 
         result = self.run_cli(
-            "tick", now=700, extra_env={"CONVERSATION_PAUSE_SESSIONS": str(failing)}
+            "tick", now=1_300, extra_env={"CONVERSATION_PAUSE_SESSIONS": str(failing)}
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self.record("quiet-session")["phase"],
-            {"kind": "returned", "returned_at": 700},
+            {"kind": "returned", "returned_at": 1_300},
         )
         self.assertTrue(
             (quiet_instance / "state").read_text().startswith("ENABLED=1\n")
@@ -2110,7 +2114,7 @@ print("SENT: delivered")
         )
         environment = {
             **self.environment,
-            "CONVERSATION_PAUSE_NOW_EPOCH": "400",
+            "CONVERSATION_PAUSE_NOW_EPOCH": "1000",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "missing-sessions"),
         }
         _ = environment.pop("CONVERSATION_PAUSE_SESSIONS")
@@ -2124,7 +2128,7 @@ print("SENT: delivered")
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
-            self.record()["phase"], {"kind": "question_pending", "due_at": 400}
+            self.record()["phase"], {"kind": "question_pending", "due_at": 1_000}
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
@@ -2169,7 +2173,7 @@ print("SENT: delivered")
             _ = review_path.write_text("{}\n")
         before = {slug: path.read_bytes() for slug, path in paths.items()}
 
-        held = self.run_cli("tick", now=400)
+        held = self.run_cli("tick", now=1_000)
         self.assertEqual(held.returncode, 0, held.stderr)
         self.assertEqual(
             {slug: path.read_bytes() for slug, path in paths.items()}, before
@@ -2182,15 +2186,15 @@ print("SENT: delivered")
 
         for review_path in review_paths:
             review_path.unlink()
-        advanced = self.run_cli("tick", now=400)
+        advanced = self.run_cli("tick", now=1_000)
         self.assertEqual(advanced.returncode, 0, advanced.stderr)
         self.assertEqual(
             self.record("asked-session")["phase"],
-            {"kind": "returned", "returned_at": 400},
+            {"kind": "returned", "returned_at": 1_000},
         )
         self.assertEqual(
             self.record("quiet-session")["phase"],
-            asked_not_read(400),
+            asked_not_read(1_000),
         )
         self.assertFalse(paths["returned"].exists())
         self.assertEqual(len(self.calls(self.send_log)), 1)
@@ -2245,7 +2249,8 @@ print("SENT: delivered")
         _ = self.write_record({"kind": "returned", "returned_at": 100})
         reply = self.parsed_reply(self.run_prompt("yes", now=400))
         self.assertEqual(
-            reply["systemMessage"], "Automatic updates paused while we talk: status reports."
+            reply["systemMessage"],
+            f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
         )
         self.assertEqual(
             self.record()["phase"],

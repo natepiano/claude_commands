@@ -2,7 +2,7 @@
 
 ## What it is
 
-Conversation pause keeps a session quiet while the user talks to it. It stops that session's scheduled reports and, for a showrunner, its dailies footer. After the reply ends and five quiet minutes pass, the session asks whether automatic updates may return. A yes restores them, a no leaves them off, and no answer restores them after another five minutes. The related contracts keep closing unit work visible, record each unit director's status for the stall watch, allow corrections to stale as-built docs, and send every phone alert through `scripts/message/send.py --to user`.
+Conversation pause keeps a session quiet while the user talks to it. It stops that session's scheduled reports and, for a showrunner, its dailies footer. After the reply ends and fifteen quiet minutes pass, the session asks whether automatic updates may return. A yes restores them, a no leaves them off, and no answer restores them after another five minutes. The related contracts keep closing unit work visible, record each unit director's status for the stall watch, allow corrections to stale as-built docs, and send every phone alert through `scripts/message/send.py --to user`.
 
 ## How it works
 
@@ -56,13 +56,13 @@ notifier.sh new conversation-pause --every 1 \
 The timers are:
 
 ```python
-QUIET_SECONDS = 300
+QUIET_SECONDS = 900
 ANSWER_SECONDS = 300
 UNANSWERED_SECONDS = 1800
 TOMBSTONE_SECONDS = 300
 ```
 
-Five minutes after a reply ends, `tick` sends the question as `conversation-pause`. Delivery changes `QuestionPending` to `Asked`. A typed `yes` runs the equivalent of `resume`; a typed `no` changes the record to `KeptOff`. Five unanswered minutes restore the recorded items. If no reply ever ends, the question becomes due after 30 minutes. While an `/adhoc_review` record is open, `tick` neither asks nor restores.
+Fifteen minutes after a reply ends, `tick` sends the question as `conversation-pause`. Delivery changes `QuestionPending` to `Asked`. A typed `yes` runs the equivalent of `resume`; a typed `no` changes the record to `KeptOff`. Five unanswered minutes restore the recorded items. If no reply ever ends, the question becomes due after 30 minutes. While an `/adhoc_review` record is open, `tick` neither asks nor restores.
 
 `notifier.sh resume <instance>` re-enables an instance without changing `NEXT_DUE`; missed work runs on the next tick and future work keeps its former time. Resume failures leave only the unrestored items in the record for the next tick. The footer uses `showrunner_footer.set_footer_state(slug, FooterState.ON | OFF)`.
 

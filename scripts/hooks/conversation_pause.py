@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import cast
 
 
-QUIET_SECONDS = 300
+QUIET_SECONDS = 900
 ANSWER_SECONDS = 300
 UNANSWERED_SECONDS = 1800
 TOMBSTONE_SECONDS = 300
@@ -28,8 +28,9 @@ WATCHER = "conversation-pause"
 JOB_SENDERS = frozenset({WATCHER, "stall-watch", "tmux-names", "quota_alert", "mac-test",
                          "disk_floor"})
 QUESTION = (
-    "conversation-pause: the user has been quiet here for 5 minutes. Ask them this, word for word, "
-    "and nothing else: Return to automatic updates? (yes / no) They return on their own in 5 minutes. "
+    f"conversation-pause: the user has been quiet here for {QUIET_SECONDS // 60} minutes. "
+    "Ask them this, word for word, and nothing else: Return to automatic updates? (yes / no) "
+    f"They return on their own in {ANSWER_SECONDS // 60} minutes. "
     "Their yes or no is handled when they type it."
 )
 USAGE = "usage: conversation_pause.py status|resume|keep|tick"
@@ -749,12 +750,22 @@ def _with_list(sentence: str, words: tuple[str, ...]) -> str:
     return f"{sentence}: {', '.join(words)}." if words else f"{sentence}."
 
 
+def _return_schedule() -> str:
+    ask = QUIET_SECONDS // 60
+    back = (QUIET_SECONDS + ANSWER_SECONDS) // 60
+    return f"They return {back} minutes after my last reply; I ask you first at {ask}."
+
+
+def _ask_again() -> str:
+    return f"If you write again, I ask about them {QUIET_SECONDS // 60} minutes after my reply."
+
+
 def _pause_reply(result: PauseResult) -> HookReply:
     if not isinstance(result, Paused) or not result.newly:
         return NoReply.NOTHING
     names = ", ".join(result.newly)
     return ShownToUser(
-        f"Automatic updates paused while we talk: {names}.",
+        f"Automatic updates paused while we talk: {names}. {_return_schedule()}",
         "Automatic updates for this session are paused while the user talks to you: "
         +
         f"{names}. Leave them off; the session asks the user before they return. If the user asks "
@@ -806,7 +817,10 @@ def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int
                 )
             if isinstance(response, No):
                 write_record(replace(current, phase=KeptOff()))
-                return ShownToUser("Automatic updates stay off.", _keep_context())
+                return ShownToUser(
+                    f"Automatic updates stay off. {_ask_again()}",
+                    _keep_context(),
+                )
             _ = _pause_locked(session_id, now)
             if source is not PromptSource.TYPED:
                 return NoReply.NOTHING
@@ -831,7 +845,8 @@ def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int
                     write_record(replace(refreshed, phase=KeptOff()))
                 words = result.newly if isinstance(result, Paused) else ()
                 return ShownToUser(
-                    _with_list("Automatic updates are off again", words),
+                    _with_list("Automatic updates are off again", words)
+                    + f" {_ask_again()}",
                     _keep_context(),
                 )
             record_path(session_id).unlink(missing_ok=True)
