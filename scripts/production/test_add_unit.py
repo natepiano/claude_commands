@@ -324,10 +324,14 @@ class AddUnitTests(unittest.TestCase):
                          "docs/plans/build-followups-production.md")
         self.assertIn("production(build-followups): add unit alpha-unit (plan)",
                       self.git("log", "-1", "--format=%s"))
-        # The unit's commit stays local until the next merge push; the unit branch goes out with it inside.
+        # An add pushes nothing: the unit's commit waits for the next merge push, and the unit branch
+        # for its first checkpoint push, which sets the upstream.
         self.assertEqual(self.git("--git-dir", str(self.origin), "rev-parse", "refs/heads/build-followups"), pushed)
-        self.assertEqual(self.git("--git-dir", str(self.origin), "rev-parse", "refs/heads/build-followups-alpha"),
-                         self.git("rev-parse", "build-followups"))
+        self.assertEqual(self.git("--git-dir", str(self.origin), "for-each-ref", "--format=%(refname)", "refs/heads"),
+                         "refs/heads/build-followups")
+        self.assertEqual(self.git("for-each-ref", "--format=%(refname) upstream=%(upstream)",
+                                  "refs/heads/build-followups-alpha"),
+                         "refs/heads/build-followups-alpha upstream=")
         self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD", cwd=worktree),
                          "build-followups-alpha")
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=worktree),

@@ -511,6 +511,11 @@ def commit_unit(request: UnitLaunch) -> None:
 
 
 def ensure_worktree(request: UnitLaunch) -> None:
+    """Create the unit's worktree on its own branch and push nothing.
+
+    The unit director's first checkpoint push puts the branch on origin and sets its upstream
+    (user, 2026-10-08).
+    """
     production = request.production
     worktree = request.worktree
     if worktree.exists():
@@ -518,10 +523,6 @@ def ensure_worktree(request: UnitLaunch) -> None:
     else:
         _ = git(production, "worktree", "add", str(worktree), "-b", request.branch,
                 production.merge_branch)
-    head = git(production, "rev-parse", request.branch).stdout.strip()
-    upstream = git(production, "config", "--get", f"branch.{request.branch}.remote", check=False).stdout.strip()
-    if remote_head(production, request.branch) != head or upstream != "origin":
-        _ = git(production, "push", "-u", "origin", request.branch)
     if (production.checkout / ".claude/config/berth.toml").exists():
         key = f"branch.{request.branch}.cargoBerthTarget"
         current = git(production, "config", "--get", key, check=False).stdout.strip()
