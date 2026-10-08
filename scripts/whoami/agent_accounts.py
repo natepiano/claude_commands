@@ -69,6 +69,9 @@ class Report:
     limit_reset_expirations: list[datetime] = field(default_factory=list)
     # The 5-hour window, kept out of `quotas`, which hold the weekly ones.
     five_hour: Quota | None = None
+    # Codex credits that carry work past the weekly allowance: whole credits, "unlimited", or "null"
+    # when the rate limits were read and report none. None means they were not read.
+    credit_balance: str | None = None
 
     @property
     def weekly_reset(self) -> datetime | None:
@@ -154,9 +157,16 @@ class CodexWindow(TypedDict, total=False):
     resetsAt: int | None
 
 
+class CodexCredits(TypedDict, total=False):
+    hasCredits: bool
+    unlimited: bool
+    balance: str | None
+
+
 class CodexBucket(TypedDict, total=False):
     primary: CodexWindow | None
     secondary: CodexWindow | None
+    credits: CodexCredits | None
 
 
 class CodexRateLimits(TypedDict, total=False):
@@ -405,6 +415,20 @@ def codex_weekly_quotas(usage: CodexRateLimits) -> list[Quota]:
     return quotas
 
 
+def codex_credits(usage: CodexRateLimits) -> str:
+    """The main Codex bucket's credit balance as Report.credit_balance holds it."""
+    bucket = (usage.get("rateLimitsByLimitId") or {}).get("codex") or usage.get("rateLimits", {})
+    credits = bucket.get("credits")
+    if not credits:
+        return "null"
+    if credits.get("unlimited"):
+        return "unlimited"
+    try:
+        return f"{float(credits.get('balance') or ''):.0f}"
+    except ValueError:
+        return "null" if credits.get("hasCredits") else "0"
+
+
 def codex_five_hour(usage: CodexRateLimits) -> Quota | None:
     """The main Codex bucket's 5-hour window."""
     bucket = (usage.get("rateLimitsByLimitId") or {}).get("codex") or usage.get("rateLimits", {})
@@ -439,6 +463,7 @@ async def codex_live() -> Report:
             usage = cast(CodexRateLimits, await server.request(3, "account/rateLimits/read", {}))
             report.quotas = codex_weekly_quotas(usage)
             report.five_hour = codex_five_hour(usage)
+            report.credit_balance = codex_credits(usage)
             reset_credits(report, usage.get("rateLimitResetCredits"))
             if not report.quotas:
                 report.quota_problem = "Weekly quota: unavailable (no weekly window returned)"

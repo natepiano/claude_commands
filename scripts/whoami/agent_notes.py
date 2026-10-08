@@ -185,6 +185,8 @@ def apply(notes: list[Note], account: Report, checked_at: datetime) -> list[str]
                 # Preserve the earliest known expiration, including its Eastern offset.
                 expirations = account.limit_reset_expirations
                 updates["limit_reset"] = expirations[0].astimezone(EASTERN).isoformat(timespec="seconds") if expirations else "null"
+            if account.credit_balance is not None:
+                updates["credit_balance"] = account.credit_balance
             updates["weekly_remaining_usage"] = "null" if remaining is None else f"{remaining:g}"
             if fresh is not None:
                 updates["resets"] = local_reset(fresh)

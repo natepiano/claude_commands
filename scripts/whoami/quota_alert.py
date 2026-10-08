@@ -322,6 +322,18 @@ def account_line(note: AgentNote, threshold: float) -> str:
             + f"usage left (threshold {threshold:g}%); it resets {note.get('resets')}.")
 
 
+def credit_line(note: AgentNote) -> str:
+    """The credits Codex reports for the account, which carry work once its weekly allowance is used up."""
+    name = note.path.stem
+    balance = note.get("credit_balance")
+    if balance == "unlimited":
+        return f"Credits on {name}: unlimited."
+    try:
+        return f"Credits left on {name}: {float(balance or ''):,.0f}."
+    except ValueError:
+        return f"No credit balance is reported for {name}."
+
+
 def instruction(tool: str, switch: Switch | None, failed: str | None) -> str:
     """What the alert asks of its recipient, given the switch to Claude made or refused."""
     refused = f"The automatic switch from {tool} to Claude failed: {failed} " if failed else ""
@@ -344,6 +356,8 @@ def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: Swi
     tool = note.tool.capitalize()
     threshold = f"{config['threshold_percent']:g}%"
     lines = [f"Quota alert: {account_line(note, config['threshold_percent'])}"]
+    if note.tool == "codex":
+        lines.append(credit_line(note))
     count = note.get("limit_reset_count")
     if count and count != "null":
         lines.append(f"Limit resets available on {name}: {count}, earliest expiring {note.get('limit_reset')}.")

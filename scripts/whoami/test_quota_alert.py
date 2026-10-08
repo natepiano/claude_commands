@@ -407,6 +407,22 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertEqual(log[0], "switched to claude for codex 1: delegate, fix")
         self.assertEqual([recipient for recipient, _ in self.sent], ["natedev", "boss of bosses"])
 
+    def test_a_codex_alert_shows_the_credit_balance_or_says_none_is_reported(self) -> None:
+        note = self.note("codex 1.md", "active", "0")
+        _ = quota_alert.alert([note], self.now)
+        self.assertEqual(self.sent[0][1].splitlines()[1], "No credit balance is reported for codex 1.")
+        for value, line in (("60498", "Credits left on codex 1: 60,498."), ("0", "Credits left on codex 1: 0."),
+                            ("unlimited", "Credits on codex 1: unlimited."),
+                            ("null", "No credit balance is reported for codex 1.")):
+            _ = note.path.write_text(note.path.read_text().replace("---\n", f"---\ncredit_balance: {value}\n", 1))
+            read = read_note(note.path)
+            assert read is not None
+            self.assertEqual(quota_alert.credit_line(read), line)
+            _ = note.path.write_text(note.path.read_text().replace(f"credit_balance: {value}\n", "", 1))
+        self.sent.clear()
+        _ = quota_alert.alert([self.note("claude 2.md", "active", "0")], self.now)
+        self.assertNotIn("redit", self.sent[0][1])
+
     def test_claude_running_out_switches_nothing(self) -> None:
         _ = quota_alert.alert([self.note("claude 2.md", "active", "0")], self.now)
         self.assertEqual(self.assignments()["delegate"], "codex")
