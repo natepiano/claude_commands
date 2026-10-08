@@ -1057,7 +1057,7 @@ def send_floor_alert(message: str, channels: FloorAlertChannels) -> bool:
         ("message", [sys.executable, str(scripts / "message/send.py"), "--to", "natedev", "--from", "disk_floor", "--timeout", "30"]),
     ]
     if channels is FloorAlertChannels.NATEDEV_AND_PHONE:
-        commands.append(("phone", [sys.executable, str(scripts / "notify/pushover.py"), "--priority", "0", "natedev: disk under its floor", message]))
+        commands.append(("phone", [sys.executable, str(scripts / "message/send.py"), "--to", "user", "--need", "note", "--summary", "natedev: disk under its floor", "--text", message]))
     delivered = False
     for channel, command in commands:
         try:
@@ -1067,7 +1067,7 @@ def send_floor_alert(message: str, channels: FloorAlertChannels) -> bool:
                 state = "queued" if result.returncode == 1 else "delivered"
                 print(f"lint sweep: {channel} alert {state}")
             else:
-                print(f"lint sweep: {channel} alert failed ({result.returncode}): {result.stderr.strip()}", file=sys.stderr)
+                print(f"lint sweep: {channel} alert failed ({result.returncode}): {result.stderr.strip() or result.stdout.strip()}", file=sys.stderr)
         except (OSError, subprocess.TimeoutExpired) as error:
             print(f"lint sweep: {channel} alert failed: {error}", file=sys.stderr)
     return delivered

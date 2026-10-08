@@ -57,7 +57,7 @@ if name == "gh":
     else:
         raise SystemExit(99)
     raise SystemExit(0)
-if name in ("pushover.py", "tmux", "claude", "systemd-run", "ssh", "nix", "cargo-berth", "notifier.sh", "showrunners.py", "py"):
+if name in ("send.py", "tmux", "claude", "systemd-run", "ssh", "nix", "cargo-berth", "notifier.sh", "showrunners.py", "py"):
     raise SystemExit(0)
 raise SystemExit(99)
 '''
@@ -100,7 +100,7 @@ class CiPointsTests(unittest.TestCase):
         self.bin.mkdir()
         self.doc = self.root / "example-production.md"
         self.log = self.checkout / "production.log"
-        for name in ("review_regime.py", "pushover.py", "gh", "tmux", "claude",
+        for name in ("review_regime.py", "gh", "tmux", "claude",
                      "systemd-run", "ssh", "nix", "cargo-berth"):
             self.stub(self.bin / name)
         for path in (self.bin / "validate_and_push.sh",
@@ -108,7 +108,7 @@ class CiPointsTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             self.write(path, VALIDATE_STUB)
             path.chmod(0o755)
-        for relative in (".claude/scripts/notify/pushover.py", ".claude/scripts/message/notifier.sh",
+        for relative in (".claude/scripts/message/send.py", ".claude/scripts/message/notifier.sh",
                          ".claude/scripts/production/showrunners.py", ".claude/scripts/lib/py"):
             self.stub(self.home / relative)
         self.env = {**os.environ, "HOME": str(self.home), "CI_POINTS_TEST_STATE": str(self.stub_state),
@@ -417,7 +417,10 @@ class CiPointsTests(unittest.TestCase):
         second = self.run_ci("watch", "--state-dir", str(self.state))
         self.assert_step(second, "watch", True)
         self.assertNotIn("| phases merged | 12 |", second.stdout)
-        self.assertEqual(len(self.calls("pushover.py")), 1)
+        self.assertEqual(self.calls("send.py"), [[
+            "--to", "user", "--need", "decision", "--summary", "Hana: review watch", "--text",
+            "12 of 12 phases: report ready, waiting for your acknowledgment; the table is in this session",
+        ]])
         self.assertEqual(len(self.calls("review_regime.py")), 3)
         self.assertEqual(self.log.read_text().count("review watch"), 1)
 
@@ -432,7 +435,7 @@ class CiPointsTests(unittest.TestCase):
         results = [process.communicate(timeout=25) for process in processes]
         self.assertTrue(all(process.returncode == 0 for process in processes), results)
         self.assertEqual(sum("| phases merged | 12 |" in stdout for stdout, _ in results), 1)
-        self.assertEqual(len(self.calls("pushover.py")), 1)
+        self.assertEqual(len(self.calls("send.py")), 1)
         self.assertEqual(self.log.read_text().count("review watch"), 1)
 
     def test_notice_clear_names_waiting_unit_and_merge_hash(self) -> None:

@@ -321,7 +321,7 @@ Three instruction files say that an out-of-date as-built doc may always be corre
 
 **Ruled out:** running the registration as a last phase — the as-built pass needs every phase done, so it is a closing commit after the as-built commit.
 
-### Phase 10 — Every phone alert goes through the one command that reaches the user  · status: todo
+### Phase 10 — Every phone alert goes through the one command that reaches the user  · status: done
 
 #### Work Order
 
@@ -340,7 +340,7 @@ Three instruction files say that an out-of-date as-built doc may always be corre
 - `scripts/production/ci_points.py`, `scripts/production/test_ci_points.py`, `scripts/production/test_dailies_input.py`
 - `scripts/buildlog/rust_release.py`, `scripts/buildlog/test_rust_release.py`
 - `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`
-- `commands/showrunner/produce.md`, `commands/builds.md`
+- `commands/showrunner/produce.md`, `commands/builds.md`, `commands/fix.md` (found in review: its failure alert called PushNotification directly)
 
 **Seats:** 2 writers, each writing the tests for its own files.
 - `impl` — `scripts/production/ci_points.py`, `scripts/production/test_ci_points.py`, `scripts/production/test_dailies_input.py`, `commands/showrunner/produce.md`, `commands/builds.md`.

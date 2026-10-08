@@ -692,7 +692,7 @@ it needs. Every other wait is yours to clear, and fast.
    3. **Otherwise, tell the user exactly what to do,** in one line they can act on from
       a phone: the session, the exact words to type or the exact allow rule
       to add, and why the check refused it, in a few words. Put it in
-      `needed:` and send it as a <Notify/> priority 2 alert.
+      `needed:` and send it as a <Notify/> `blocked` alert.
    4. **Rule 4's limit holds.** Read the pane again each hour, and repeat 1–3.
       A `needed:` line never repeats unchanged from tick to tick.
    5. **Prevent the next one.** When a routine action for the unit is refused
@@ -704,17 +704,17 @@ it needs. Every other wait is yours to clear, and fast.
 </Dependencies>
 
 <Notify>
-Phone alerts go through Pushover (user's pick, 2026-10-03), because the user
-often ignores ordinary push notifications:
+Phone alerts use the one message path, which reaches the phone through
+Pushover (user's pick, 2026-10-03), because the user often ignores ordinary
+push notifications:
 
-`~/.claude/scripts/notify/pushover.py [--priority 0|1|2] "Hana: <unit or topic>" "<message>"`
+`python3 ~/.claude/scripts/message/send.py --to user --need note|decision|blocked --summary "Hana: <unit or topic>" --text "<message>"`
 
-The message is the one action or fact, under 200 characters. Exit 0 means
-sent. On 1 (refused or unreachable) or 2 (bad usage or missing keys), fall back
-to PushNotification and say so in the log. Never read or print
-`~/.config/pushover/env`. Every send is logged in
-`~/.local/state/notify/pushover.jsonl`, one JSON line holding the time,
-priority, title, full message and outcome.
+On the Mac, add `--machine natedev`; the keys exist only on natedev. The
+message is the one action or fact, under 200 characters. Exit 0 means sent. On
+`FAILED` (exit 3), fall back to PushNotification and say so in the log. Never
+read or print `~/.config/pushover/env`. Every attempt is logged in
+`~/.local/state/message/log.jsonl`.
 
 **Push whenever work waits on the user.** When the production or any unit is
 blocked on something only the user can do (a rebuild, `github-warmup`, an
@@ -723,14 +723,14 @@ blocked, the exact action, and on which machine. One push per new block.
 Units tell you, and you push; the machine-config session (natedev, macbook)
 pushes for blocks it owns. Each block has one owner. User, 2026-10-04, after a
 rebuild waited 1.5 h with no push. A rebuild is pushed even when nothing waits
-on it, at priority 1: the user wants a text for every rebuild needed (user,
+on it, with `--need decision`: the user wants a text for every rebuild needed (user,
 2026-10-04).
 
-| Priority | When |
+| Need | When |
 | --- | --- |
-| 2: emergency, repeats every 5 min until the user taps Acknowledge | Work has stopped, and only the user can restart it: a block under <Dependencies/> rule 6, after steps 1–2, carrying the exact action; a cold gpg-agent stopping every push (the user runs `github-warmup`). Send once per block. |
-| 1: high | The user is needed, but nothing has stopped: a product decision only they can make while units have other work; main's CI red after <PromoteMain/>; a block still open an hour after they acknowledged it. That last one says what changed, never the same text again. |
-| 0: normal | A unit's whole plan finished and merged; before/after shots ready for the user's review. |
+| `blocked` (priority 2; repeats every 5 min until the user taps Acknowledge) | Work has stopped, and only the user can restart it: a block under <Dependencies/> rule 6, after steps 1–2, carrying the exact action; a cold gpg-agent stopping every push (the user runs `github-warmup`). Send once per block. |
+| `decision` (priority 1) | The user is needed, but nothing has stopped: a product decision only they can make while units have other work; main's CI red after <PromoteMain/>; a block still open an hour after they acknowledged it. That last one says what changed, never the same text again. |
+| `note` (priority 0) | A unit's whole plan finished and merged; before/after shots ready for the user's review. |
 
 Never sent: dailies, ETAs, routine merges, green CI, flakes rerun, and hardware
 checks that wait on the user's travel.
