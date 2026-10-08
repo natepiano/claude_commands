@@ -76,6 +76,7 @@ class StatusBlock(NamedTuple):
 
 class EtaFresh(NamedTuple):
     text: str
+    first_seen: datetime
 
 
 class EtaStale(NamedTuple):
@@ -241,14 +242,14 @@ def eta_state(block: StatusBlock, phase: str, seen: JsonMap, now: datetime, zone
     # A held unit cannot move, so the ETA it had is kept and no new one is asked for. One that had gone
     # old or passed before the hold, so that a new one was asked for, is not brought back as current.
     if held and unchanged and not requested:
-        return EtaFresh(shown)
+        return EtaFresh(shown, first_seen)
     time = re.search(r"\b(\d{1,2}:\d{2}(?:\+\d+)?)\b", shown)
     if time is not None:
         if parse_time(time.group(1), now) < now:
             return EtaPassed()
     if now - first_seen > timedelta(hours=1):
         return EtaStale(shown, first_seen)
-    return EtaFresh(shown)
+    return EtaFresh(shown, first_seen)
 
 
 def eta_value(state: EtaState, supplied: object, requested: bool = False) -> JsonMap:
@@ -264,6 +265,8 @@ def eta_value(state: EtaState, supplied: object, requested: bool = False) -> Jso
     found = re.search(r"\b(\d{1,2}:\d{2}(?:\+\d+)?)\b", state.text)
     if found:
         result["time"] = found.group(1)
+        # A time that names no day is read on the day the unit stated it, not the day of the report.
+        result["stated"] = state.first_seen.isoformat(timespec="minutes")
         _ = result.pop("none", None)
     if isinstance(state, EtaStale):
         result["detail"] = f"set {state.first_seen.strftime('%H:%M')}"
