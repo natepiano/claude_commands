@@ -94,7 +94,8 @@
     {
       "root": "scripts/build_hold",
       "extraPaths": [
-        "scripts/build_hold"
+        "scripts/build_hold",
+        "scripts/message"
       ]
     },
     {

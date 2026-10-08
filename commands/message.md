@@ -6,7 +6,7 @@ description: Rules every message between Claude sessions or Codex seats follows 
 
 ## Sending
 
-- **Agents** holding `SendMessage` call it directly. **Scripts** run `~/.claude/scripts/message/send.py` (usage in its docstring): it delivers by session name, queues what does not arrive (`send.py pending <name>` prints and clears it), reaches a Codex seat with `--codex --session-dir`, and the Mac with `--machine mac`.
+- **Agents** holding `SendMessage` call it directly. **Scripts** run `~/.claude/scripts/message/send.py` (usage in its docstring): it delivers by session name, keeps what does not arrive under the recipient's session id, so a rename loses nothing (`send.py pending` prints and clears what is kept for your own session, whatever it is called now), reaches a Codex seat with `--codex --session-dir`, and the Mac with `--machine mac`.
 - **The first line stands alone.** It is the recipient's preview and the inbox log entry. If it would open mid-thought or with a bare name, open with `Message from <your name>: <gist>`.
 - **Carry the context.** The recipient shares no memory with you: name the repo, worktree, branch, paths, commit or test. No tokens or secrets.
 - **Address by ListAgents name.** Its first line, `This session is <name>`, is you; never send to it. Two live rows with one name: append the row's ` [ref]`. A ref does not cross machines; to tell sessions apart there, ask each for `hostname` and `pwd`.
