@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record when the first reply after a pausing message finishes."""
+"""Record when a session reply finishes during an update pause."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ class HookBudgetSpent(Exception):
 class StopPayload(TypedDict, total=False):
     session_id: str
     agent_id: str
+    stop_hook_active: bool
 
 
 def pause_record_path(session_id: str) -> Path:
@@ -32,7 +33,7 @@ def pause_record_path(session_id: str) -> Path:
 
 def main() -> None:
     payload = cast(StopPayload, json.loads(sys.stdin.read()))
-    if "agent_id" in payload:
+    if "agent_id" in payload or payload.get("stop_hook_active", False):
         return
     session_id = payload.get("session_id", "")
     if not session_id or not pause_record_path(session_id).exists():
@@ -48,7 +49,7 @@ def main() -> None:
     try:
         import conversation_pause
 
-        conversation_pause.mark_answered(session_id, conversation_pause.now_epoch())
+        conversation_pause.mark_reply_ended(session_id, conversation_pause.now_epoch())
     finally:
         _ = signal.alarm(0)
 
