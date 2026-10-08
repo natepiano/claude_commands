@@ -36,6 +36,11 @@ if args[0] == "list-panes":
     for name, panes in state.items():
         for pane in panes:
             print(name + "\t" + pane)
+elif args[0] == "display-message":
+    if os.environ.get("TEST_TMUX_SOCKET_FAILURE") == "1":
+        print("injected socket query failure", file=sys.stderr)
+        raise SystemExit(1)
+    print(os.environ["TEST_TMUX_SOCKET"])
 elif args[0] == "send-keys":
     if "-l" in args:
         Path(os.environ["TEST_TMUX_PENDING"]).write_text(args[-1].removeprefix("/rename "))
@@ -121,7 +126,7 @@ class RenameUnitTests(unittest.TestCase):
         }), encoding="utf-8")
         process = self.proc / str(self.child.pid)
         process.mkdir()
-        _ = (process / "environ").write_bytes(b"TMUX_PANE=%1\0")
+        _ = (process / "environ").write_bytes(b"TMUX=/tmp/tmux-test/default,123,0\0TMUX_PANE=%1\0")
 
         self.config = self.root / "showrunners.json"
         self.write_registry([{"session": "director", "zone": "America/New_York", "units": ["old"]}])
@@ -146,6 +151,7 @@ class RenameUnitTests(unittest.TestCase):
             "XDG_STATE_HOME": str(self.root / "state"),
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "TEST_TMUX_STATE": str(self.tmux_state),
+            "TEST_TMUX_SOCKET": "/tmp/tmux-test/default",
             "TEST_TMUX_EVENTS": str(self.events_path),
             "TEST_TMUX_PENDING": str(self.root / "pending"),
             "TEST_TMUX_RENAME_FAILURE": str(self.root / "tmux-failure"),
@@ -257,7 +263,7 @@ class RenameUnitTests(unittest.TestCase):
         second, second_output, second_errors = self.cli()
         self.assertEqual(second, 0, second_errors)
         self.assertNotIn("renamed:", second_output)
-        self.assertEqual(len(self.events()), event_count + 2)
+        self.assertEqual(len(self.events()), event_count + 3)
 
     def test_record_that_already_has_new_name_sends_no_keys(self) -> None:
         self.set_claude_name("new", former="old")
@@ -272,6 +278,16 @@ class RenameUnitTests(unittest.TestCase):
         result, _output, errors = self.cli()
         self.assertEqual(result, 0, errors)
         self.assert_finished()
+
+    def test_session_on_another_tmux_server_is_not_typed_into(self) -> None:
+        _ = (self.proc / self.record_path.stem / "environ").write_bytes(
+            b"TMUX=/tmp/tmux-test/other,123,0\0TMUX_PANE=%1\0"
+        )
+        self.assert_refused("Claude sessions found: 0 named old")
+
+    def test_tmux_socket_query_failure_refuses_before_changes(self) -> None:
+        self.environment["TEST_TMUX_SOCKET_FAILURE"] = "1"
+        self.assert_refused("tmux could not be asked")
 
     def test_rerun_ignores_dead_record_with_same_session_id(self) -> None:
         self.set_claude_name("new", former="old")

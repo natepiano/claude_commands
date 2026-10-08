@@ -95,6 +95,8 @@ def _was_named(session_id: str, old: str) -> bool:
 
 def _claude_side(old: str, new: str) -> ClaudeSide:
     sessions = tmux_names.live_sessions()
+    if isinstance(sessions, tmux_names.TmuxServerUnavailable):
+        raise add_unit.Refusal(f"tmux could not be asked: {sessions.reason}")
     old_sessions = [session for session in sessions if session.name == old]
     new_sessions = [session for session in sessions if session.name == new]
     if len(old_sessions) == 1 and not new_sessions:
