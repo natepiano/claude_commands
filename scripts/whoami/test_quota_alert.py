@@ -146,10 +146,8 @@ class QuotaAlertTests(unittest.TestCase):
 
         self.assertEqual(config["threshold_percent"], 7)
         self.assertEqual(config["always"], ["always-there"])
+        # A unit list left in the file is not read: a unit's run state is a mark on its own session.
         self.assertEqual(config["showrunners"][0]["session"], "named-director")
-        self.assertEqual([(unit.session, type(unit).__name__)
-                          for unit in config["showrunners"][0]["units"]],
-                         [("named-unit", "RunFinishedUnitDirector")])
 
     def test_repeats_to_every_recipient_until_acknowledged(self) -> None:
         notes: Notes = [self.note("codex 1.md", "active", "1")]

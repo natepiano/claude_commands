@@ -15,7 +15,9 @@ from pathlib import Path
 from typing import NamedTuple, NotRequired, TypedDict, cast
 from zoneinfo import ZoneInfo
 
-import unit_lookup
+# The alert tools load this file as part of a package, where its own directory is not on the path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import unit_lookup  # noqa: E402
 
 CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or Path(__file__).resolve().parents[2] / "config/showrunners.json")
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
