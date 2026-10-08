@@ -3,7 +3,7 @@
 
 Two hooks need the same answer to "how full is this agent's context right now":
 `post-tool-use-context-usage.py`, which reports it after every tool call, and
-`stop-delegate-continue.py`, which refuses to let a delegate run end its turn
+`stop-delegate-continue.py`, which refuses to let a unit run end its turn
 near the auto-compaction trigger. The measurement lives here so the two can
 never drift onto different thresholds.
 """
@@ -39,7 +39,7 @@ PRECOMPUTE_RESERVE_TOKENS = 13_000
 # its 1M window starts at, plus a `default`. This module only parses model ids
 # and applies those rows. An exact-id table once lived here, listed
 # `claude-fable-5`, and missed `claude-fable-5-1`: the hook quoted a 167k
-# trigger on a 1M model and a live delegate run stalled at "100% full" with
+# trigger on a 1M model and a live unit run stalled at "100% full" with
 # over 800k tokens of headroom.
 AGENTS_CONFIG_ENV = "AGENTS_CONFIG_FILE"
 DEFAULT_AGENTS_CONFIG_PATH = Path("~/.claude/config/agents.conf").expanduser()

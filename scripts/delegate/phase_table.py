@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and render a delegate run's plan-phase table from durable events."""
+"""Build and render a unit run's plan-phase table from durable events."""
 
 from __future__ import annotations
 
@@ -1334,7 +1334,7 @@ def _local_zone() -> ZoneInfo:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Show or refresh a delegate run's plan phases."
+        description="Show or refresh a unit run's plan phases."
     )
     commands = parser.add_subparsers(dest="command", required=True)
     show_parser = commands.add_parser("show")

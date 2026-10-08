@@ -152,14 +152,14 @@ class DelegateCheckTests(unittest.TestCase):
     def test_unit_notifier_off_without_marker_leaves_state_untouched(self) -> None:
         result = self.run_unit_notifier("off")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("no active delegate run marker:", result.stderr)
+        self.assertIn("no active unit run marker:", result.stderr)
         self.assertFalse(self.state_dir.exists())
 
     def test_unit_notifier_on_with_empty_marker_leaves_state_untouched(self) -> None:
         _ = (self.active_dir / self.session_id).write_text("", encoding="utf-8")
         result = self.run_unit_notifier("on")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("empty delegate run marker:", result.stderr)
+        self.assertIn("empty unit run marker:", result.stderr)
         self.assertFalse(self.state_dir.exists())
 
     def test_unit_notifier_rejects_bad_mode_and_extra_arguments(self) -> None:
