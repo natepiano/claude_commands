@@ -701,11 +701,11 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
         eta = cast(dict[str, object], self.unit()["eta"])
         self.assertEqual((eta["time"], eta["stated"]), ("16:00", "2026-10-06T15:30"))
-        self.assertNotIn("earliest", eta)
-        self.assertNotIn("latest", eta)
+        self.assertEqual((eta["earliest"], eta["latest"]), ("15:50", "16:10"))
         rendered = self.run_renderer("2026-10-06T19:00")
         self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
-        self.assertIn("- eta: 16:00 PDT, 60% done (overdue)", rendered.stdout)
+        self.assertIn(
+            "- eta: 16:00 PDT, 60% done (overdue; range 15:50–16:10)", rendered.stdout)
         self.assertNotIn("tomorrow", rendered.stdout)
         saved = cast(dict[str, dict[str, object]], json.loads(
             (self.root / "render-state.json").read_text(encoding="utf-8")))
@@ -732,11 +732,11 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
         eta = cast(dict[str, object], self.unit()["eta"])
         self.assertEqual((eta["time"], eta["stated"]), ("16:00", "2026-10-05T15:30"))
-        self.assertNotIn("earliest", eta)
-        self.assertNotIn("latest", eta)
+        self.assertEqual((eta["earliest"], eta["latest"]), ("15:50", "16:10"))
         rendered = self.run_renderer("2026-10-06T19:00")
         self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
         self.assertIn("overdue", rendered.stdout)
+        self.assertIn("range Mon 15:50–Mon 16:10", rendered.stdout)
         self.assertNotIn("tomorrow", rendered.stdout)
         saved = cast(dict[str, dict[str, object]], json.loads(
             (self.root / "render-state.json").read_text(encoding="utf-8")))
@@ -762,6 +762,26 @@ class DailiesInputTests(unittest.TestCase):
         saved = cast(dict[str, dict[str, object]], json.loads(
             (self.root / "render-state.json").read_text(encoding="utf-8")))
         self.assertEqual(saved[ALPHA]["eta"], "2026-10-06T16:00:00")
+
+    def test_record_range_more_than_a_day_from_eta_is_omitted(self) -> None:
+        self.open_phase_record(eta={
+            "time": "2026-10-07T23:00:00+00:00",
+            "earliest": "2026-10-06T22:50:00+00:00",
+            "latest": "2026-10-07T23:10:00+00:00",
+            "source": "projected", "stated_at": None,
+            "basis": None, "as_of": "2026-10-06T20:30:00+00:00",
+        }, first="2026-10-07T23:00:00+00:00")
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        self.judgment_file(alpha={"eta": {}})
+        built = self.run_builder("--at", "2026-10-06T14:00", "--length", "simple")
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        eta = cast(dict[str, object], self.unit()["eta"])
+        self.assertEqual(eta["time"], "16:00+1")
+        self.assertNotIn("earliest", eta)
+        self.assertNotIn("latest", eta)
+        rendered = self.run_renderer("2026-10-06T14:00")
+        self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
+        self.assertIn("- eta: 16:00 PDT tomorrow, 60% done", rendered.stdout)
 
     def test_record_target_the_day_after_the_report_keeps_plus_one(self) -> None:
         self.open_phase_record(eta={
