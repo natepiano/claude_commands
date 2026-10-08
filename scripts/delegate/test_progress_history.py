@@ -112,12 +112,29 @@ class ProgressHistoryTests(unittest.TestCase):
         _ = environment.pop("CODEX_THREAD_ID", None)
         _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
 
-    def run_command(self, *arguments: str, at: int, claude_session: str = "") -> str:
+    def isolate_recorder_roots(self, environment: dict[str, str]) -> None:
+        """Keep every recorder integration inside this test's temporary root."""
+        environment["PHASE_TABLE_VAULT"] = str(
+            self.root / "vault" / "showrunners"
+        )
+        environment["NOTIFIER_STATE_DIR"] = str(self.root / "notifier")
+        environment["NOTIFIER_SESSIONS_DIR"] = str(
+            self.root / "notifier-sessions"
+        )
+        environment["UNIT_LOOKUP_TMUX"] = "/bin/false"
+
+    def run_command(
+        self,
+        *arguments: str,
+        at: int,
+        claude_session: str = "",
+        zone: str = "UTC",
+    ) -> str:
         environment = os.environ.copy()
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
-        environment["TZ"] = "UTC"
+        environment["TZ"] = zone
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         # Popped rather than left alone: the suite copies the ambient
@@ -127,6 +144,7 @@ class ProgressHistoryTests(unittest.TestCase):
             environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_slot
         else:
             _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
+        self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
         if claude_session:
             environment["CLAUDE_CODE_SESSION_ID"] = claude_session
@@ -139,12 +157,14 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         return result.stdout.strip()
 
-    def run_failing_command(self, *arguments: str, at: int) -> subprocess.CompletedProcess[str]:
+    def run_failing_command(
+        self, *arguments: str, at: int, zone: str = "UTC"
+    ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
-        environment["TZ"] = "UTC"
+        environment["TZ"] = zone
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         # Popped rather than left alone: the suite copies the ambient
@@ -154,6 +174,7 @@ class ProgressHistoryTests(unittest.TestCase):
             environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_slot
         else:
             _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
+        self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
         return subprocess.run(
             ["python3", str(SCRIPT), *arguments],
@@ -174,10 +195,10 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
-        environment["PHASE_TABLE_VAULT"] = str(self.root / "vault")
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         environment["TZ"] = "UTC"
+        self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -1794,6 +1815,7 @@ class ProgressHistoryTests(unittest.TestCase):
             environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_slot
         else:
             _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
+        self.isolate_recorder_roots(environment)
         return subprocess.run(
             ["python3", str(SCRIPT), *arguments],
             check=False,
@@ -4212,6 +4234,296 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         self.assertEqual(header.splitlines()[0], "**bevy_hana_rubric**")
 
+    def test_eta_records_exact_and_ranged_events(self) -> None:
+        now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
+        session_dir = self.start_run("eta-events", now - 100)
+        self.start_phase(session_dir, now - 50)
+
+        exact = self.run_command(
+            "eta",
+            "--session-dir",
+            str(session_dir),
+            "--time",
+            "2026-10-08T13:00",
+            "--basis",
+            "the remaining checks took an hour last phase",
+            at=now,
+        )
+        ranged = self.run_command(
+            "eta",
+            "--session-dir",
+            str(session_dir),
+            "--time",
+            "2026-10-08T14:00",
+            "--earliest",
+            "2026-10-08T13:40",
+            "--latest",
+            "2026-10-08T14:30",
+            "--basis",
+            "the last two full gates took 100–150 minutes",
+            at=now + 60,
+        )
+
+        self.assertEqual(exact, "ETA recorded: 13:00 UTC")
+        self.assertEqual(ranged, "ETA recorded: 14:00 UTC")
+        events = [
+            event
+            for event in self.read_events("eta-events")
+            if event.get("event_type") == "eta_stated"
+        ]
+        self.assertEqual(len(events), 2)
+        self.assertEqual(
+            events[0].get("eta_at"),
+            datetime(2026, 10, 8, 13, tzinfo=UTC).timestamp(),
+        )
+        self.assertEqual(
+            events[0].get("basis"),
+            "the remaining checks took an hour last phase",
+        )
+        self.assertNotIn("eta_earliest_at", events[0])
+        self.assertNotIn("eta_latest_at", events[0])
+        self.assertEqual(
+            events[1].get("eta_earliest_at"),
+            datetime(2026, 10, 8, 13, 40, tzinfo=UTC).timestamp(),
+        )
+        self.assertEqual(
+            events[1].get("eta_latest_at"),
+            datetime(2026, 10, 8, 14, 30, tzinfo=UTC).timestamp(),
+        )
+
+    def test_eta_uses_the_process_timezone(self) -> None:
+        now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
+        session_dir = self.start_run("eta-local-zone", now - 100)
+        self.start_phase(session_dir, now - 50)
+
+        output = self.run_command(
+            "eta",
+            "--session-dir",
+            str(session_dir),
+            "--time",
+            "2026-10-08T13:00",
+            "--basis",
+            "the measured final checks",
+            at=now,
+            zone="America/Los_Angeles",
+        )
+
+        self.assertEqual(output, "ETA recorded: 13:00 PDT")
+        eta_events = [
+            event
+            for event in self.read_events("eta-local-zone")
+            if event.get("event_type") == "eta_stated"
+        ]
+        self.assertEqual(len(eta_events), 1)
+        self.assertEqual(
+            eta_events[0].get("eta_at"),
+            datetime(2026, 10, 8, 20, tzinfo=UTC).timestamp(),
+        )
+
+    def test_eta_refuses_invalid_times_without_recording_an_event(self) -> None:
+        now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
+        cases = (
+            (
+                "past",
+                ["--time", "2026-10-08T11:59"],
+                "--time must not be in the past",
+            ),
+            (
+                "late-earliest",
+                [
+                    "--time",
+                    "2026-10-08T13:00",
+                    "--earliest",
+                    "2026-10-08T13:01",
+                    "--latest",
+                    "2026-10-08T13:30",
+                ],
+                "--earliest must not be after --time",
+            ),
+            (
+                "early-latest",
+                [
+                    "--time",
+                    "2026-10-08T13:00",
+                    "--earliest",
+                    "2026-10-08T12:30",
+                    "--latest",
+                    "2026-10-08T12:59",
+                ],
+                "--latest must not be before --time",
+            ),
+            (
+                "earliest-only",
+                [
+                    "--time",
+                    "2026-10-08T13:00",
+                    "--earliest",
+                    "2026-10-08T12:30",
+                ],
+                "--earliest and --latest must be supplied together",
+            ),
+            (
+                "latest-only",
+                [
+                    "--time",
+                    "2026-10-08T13:00",
+                    "--latest",
+                    "2026-10-08T13:30",
+                ],
+                "--earliest and --latest must be supplied together",
+            ),
+        )
+        for name, time_arguments, message in cases:
+            with self.subTest(name=name):
+                session_dir = self.start_run(f"eta-refused-{name}", now - 100)
+                self.start_phase(session_dir, now - 50)
+                result = self.run_failing_command(
+                    "eta",
+                    "--session-dir",
+                    str(session_dir),
+                    *time_arguments,
+                    "--basis",
+                    "measured gates",
+                    at=now,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(message, result.stderr)
+                self.assertFalse(
+                    any(
+                        event.get("event_type") == "eta_stated"
+                        for event in self.read_events(f"eta-refused-{name}")
+                    )
+                )
+
+    def test_eta_refuses_a_time_the_local_clock_skips(self) -> None:
+        now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
+        session_dir = self.start_run("eta-skipped-hour", now - 100)
+        self.start_phase(session_dir, now - 50)
+
+        result = self.run_failing_command(
+            "eta",
+            "--session-dir",
+            str(session_dir),
+            "--time",
+            "2027-03-14T02:30",
+            "--basis",
+            "measured gates",
+            at=now,
+            zone="America/Los_Angeles",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("--time is a time the local clock skips", result.stderr)
+        self.assertFalse(
+            any(
+                event.get("event_type") == "eta_stated"
+                for event in self.read_events("eta-skipped-hour")
+            )
+        )
+
+    def test_eta_refuses_a_blank_basis(self) -> None:
+        now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
+        session_dir = self.start_run("eta-blank-basis", now - 100)
+        self.start_phase(session_dir, now - 50)
+
+        result = self.run_failing_command(
+            "eta",
+            "--session-dir",
+            str(session_dir),
+            "--time",
+            "2026-10-08T13:00",
+            "--basis",
+            "  ",
+            at=now,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("--basis must not be blank", result.stderr)
+        self.assertFalse(
+            any(
+                event.get("event_type") == "eta_stated"
+                for event in self.read_events("eta-blank-basis")
+            )
+        )
+
+    def test_eta_requires_an_active_phase(self) -> None:
+        now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
+        session_dir = self.start_run("eta-no-phase", now - 100)
+
+        result = self.run_failing_command(
+            "eta",
+            "--session-dir",
+            str(session_dir),
+            "--time",
+            "2026-10-08T13:00",
+            "--basis",
+            "measured gates",
+            at=now,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("An active phase is required", result.stderr)
+        self.assertFalse(
+            any(
+                event.get("event_type") == "eta_stated"
+                for event in self.read_events("eta-no-phase")
+            )
+        )
+
+    def test_eta_refresh_failures_keep_the_event_and_success_output(self) -> None:
+        parser = recorder_parser()
+        now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
+        failures: tuple[
+            tuple[str, subprocess.CompletedProcess[str] | BaseException], ...
+        ] = (
+            (
+                "refused",
+                subprocess.CompletedProcess(
+                    [], 1, "", "target belongs to another unit\n"
+                ),
+            ),
+            ("timeout", subprocess.TimeoutExpired(["phase_table.py"], 10)),
+            ("launch", OSError("phase table unavailable")),
+        )
+
+        for name, refresh_result in failures:
+            with self.subTest(name=name):
+                session_dir = self.start_run(f"eta-refresh-{name}", now - 100)
+                self.start_phase(session_dir, now - 50)
+                self.add_production_marker(session_dir)
+                arguments = parser.parse_args(
+                    [
+                        "eta",
+                        "--session-dir",
+                        str(session_dir),
+                        "--time",
+                        "2026-10-08T13:00",
+                        "--basis",
+                        "the measured final checks",
+                    ]
+                )
+
+                returned, stdout, stderr = self.invoke_handler(
+                    recorder_handler("_eta"),
+                    arguments,
+                    at=now,
+                    refresh_result=refresh_result,
+                )
+
+                self.assertIsNone(returned)
+                self.assertEqual(stdout, "ETA recorded: 13:00 UTC\n")
+                self.assertEqual(len(stderr.splitlines()), 1)
+                self.assertTrue(stderr.startswith("phase table not written:"))
+                events = [
+                    event
+                    for event in self.read_events(f"eta-refresh-{name}")
+                    if event.get("event_type") == "eta_stated"
+                ]
+                self.assertEqual(len(events), 1)
+
     def test_phase_table_failure_does_not_change_recorder_command_results(self) -> None:
         parser = recorder_parser()
         started_at = 40_000
@@ -4468,6 +4780,79 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(
             {path.relative_to(self.history_dir) for path in self.history_dir.rglob("*")},
             history_paths_before,
+        )
+
+    def test_eta_refresh_rewrites_the_production_phase_note(self) -> None:
+        from scripts.production import fake_showrunner
+
+        now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
+        session_dir = self.start_run("eta-refresh-end-to-end", now - 100)
+        self.start_phase(session_dir, now - 50)
+        state = self.read_state(session_dir)
+        plan_path = Path(cast(str, state["project_plan_doc"]))
+        plan_text = plan_path.read_text(encoding="utf-8")
+        _ = plan_path.write_text(
+            plan_text + "### Phase 3 — Retry handling  · status: todo\n\n",
+            encoding="utf-8",
+        )
+        self.add_production_marker(session_dir)
+        production_doc = self.working_dir / "docs" / "example-production.md"
+        _ = production_doc.write_text(
+            "\n".join(
+                (
+                    "# Example production",
+                    "",
+                    "- **Merge branch:** main",
+                    f"- **Showrunner checkout:** {self.working_dir}",
+                    "- **Log:** logs/showrunner.md",
+                    "- **User zone:** UTC",
+                    "",
+                    "## Units",
+                    "",
+                    "| Unit | Plan | Worktree | Branch | Port | Owns |",
+                    "| --- | --- | --- | --- | --- | --- |",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        notifier_dir = self.root / "notifier"
+        sessions_dir = self.root / "notifier-sessions"
+        _ = fake_showrunner.write_timer(
+            notifier_dir,
+            "example",
+            "eta-example-showrunner-id",
+            "UTC",
+            production_doc,
+        )
+        held = fake_showrunner.write_session(
+            sessions_dir,
+            "example-showrunner",
+            "eta-example-showrunner-id",
+        )
+        self.addCleanup(held.close)
+        vault_root = self.root / "vault" / "showrunners"
+        vault_root.parent.mkdir(parents=True)
+
+        result = self.run_command(
+            "eta",
+            "--session-dir",
+            str(session_dir),
+            "--time",
+            "2026-10-08T13:00",
+            "--basis",
+            "the measured final checks",
+            at=now,
+        )
+
+        self.assertEqual(result, "ETA recorded: 13:00 UTC")
+        note = vault_root / "example-showrunner" / "unit-a.md"
+        self.assertTrue(note.is_file())
+        note_text = note.read_text(encoding="utf-8")
+        self.assertIn("| ETA | 10-08 13:00 |", note_text)
+        self.assertIn(
+            "| ETA from | stated 12:00: the measured final checks |",
+            note_text,
         )
 
 
