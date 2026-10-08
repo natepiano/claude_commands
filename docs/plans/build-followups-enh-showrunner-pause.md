@@ -303,31 +303,23 @@ The showrunner registry records one status for each unit director, and the stall
 
 ### Phase 9 — Showrunners and unit directors are told they may always correct an out-of-date as-built doc  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** No showrunner or unit director asks before correcting an as-built doc that no longer matches the code, whichever unit owns the doc. The user, 2026-10-07 about 16:10 PDT: "you never have to ask about correcting out of date as-built's - add a note to follow up and fix the instructions taht guide showrunners and that guides unit directors that they should always be free to correct as-built documentation".
+Three instruction files say that an out-of-date as-built doc may always be corrected, and two say what a progress report shows after the last phase closes.
 
-**Spec:**
-- `docs/production_format.md`, <ProductionUnit/> item 9 (files you do not own): one sentence. Correcting an as-built doc under `docs/as-built/` that contradicts the code is always allowed, in any unit's doc, without asking the user, the showrunner or the owner; the checkpoint notice still names the file as `also touches`.
-- `commands/showrunner/produce.md`, in its rules: the same rule for the showrunner, and that it never holds a merge because a unit corrected another unit's as-built doc.
-- `docs/delegate/final_gate_commit.md`, where the as-built pass is defined: the same rule for the as-built pass.
-- Each of those three sentences cites the user and the date.
-- `commands/unit/report.md` step 5 and `commands/unit/delegate.md` `<DelegationResultFormat/>`: when the last phase is closed but an activity remains open, `progress` prints both tables from that phase's last recorded values with the activity as the running row; copy them like any other tick. `No active phase to report` remains only when no activity is open.
-- Nothing else in the five files changes.
+- `docs/production_format.md` <ProductionUnit/> item 9, the Rules of `commands/showrunner/produce.md` and <RunAsBuilt/> in `docs/delegate/final_gate_commit.md` each say: correcting an as-built doc under `docs/as-built/` that contradicts the code is always allowed, in any unit's doc, without asking the user, the showrunner or the owner; the checkpoint notice still names the file as `also touches`. Each cites the user, 2026-10-07.
+- The showrunner's rule adds that a merge is never held because a unit corrected another unit's as-built doc.
+- `commands/unit/report.md` step 5 and <DelegationResultFormat/> in `commands/unit/delegate.md` say: when the last phase is closed but an activity is still open, `progress` prints both tables from that phase's last recorded values with the activity as the running row; `No active phase to report` remains only when no phase is active and no activity is open.
 
 **Files:**
 - `docs/production_format.md` — the rule for unit directors.
 - `commands/showrunner/produce.md` — the rule for showrunners.
 - `docs/delegate/final_gate_commit.md` — the rule in the as-built pass.
-- `commands/unit/report.md` — step 5's rule for a report after the last phase closes.
-- `commands/unit/delegate.md` — `<DelegationResultFormat/>`'s rule for the closing progress tables.
+- `commands/unit/report.md`, `commands/unit/delegate.md` — the closed-phase report rule.
 
-**Seats:** 1 writer. The unit director makes these edits directly: a few sentences of instruction text, no code.
-- `impl` — `docs/production_format.md`, `commands/showrunner/produce.md`, `docs/delegate/final_gate_commit.md`, `commands/unit/report.md`, `commands/unit/delegate.md`.
+**Gotchas:** production tests read these instruction files (`test_production_lifecycle.py`, `test_merge_checkpoint.py` and others under `scripts/production`); run them after any edit to these files.
 
-**Constraints from prior phases:** Phase 8 (`c265820`) put two sentences before item 1 of <ProductionUnit/> in `docs/production_format.md` and one at the end of <RunAsBuilt/> in `docs/delegate/final_gate_commit.md`. Add beside them, change none of them. Phase 7 (`388cc0e`) made `progress_history.py progress` print the closed phase's tables while an activity is open; `scripts/delegate/test_progress_history.py` pins it. `commands/unit/report.md` is in the retired stalls unit's row: the checkpoint notice names it as `also touches`. Every unit reads these five files from the live checkout. The registration left the stack in `de6fd83` (the showrunner's landing call, 2026-10-07): `settings.json` is the merge branch's copy, and Phase 6's paragraph in `commands/showrunner/produce.md`, its sentence in the progress contract of `commands/unit/delegate.md` and its registration test are out until the run's closing commit puts them back (`## Closing commit`). Do not re-add them here.
-
-**Acceptance gate:** each of the three as-built files states the as-built rule once; `commands/unit/report.md` and `commands/unit/delegate.md` each state the closed-phase report rule once and no longer call the refusal the only answer when no phase is active; `python3 -m unittest discover -s scripts/delegate -p 'test_progress_history.py'` green; `git diff --stat` for the phase names only those five files and the plan doc.
+**Ruled out:** running the registration as a last phase — the as-built pass needs every phase done, so it is a closing commit after the as-built commit.
 
 ### Phase 10 — Every phone alert goes through the one command that reaches the user  · status: todo
 
