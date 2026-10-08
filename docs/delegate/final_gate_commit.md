@@ -57,6 +57,8 @@ the user, so it needs no gate here. It changes no code and commits nothing itsel
 <AsBuiltCommit/> after it and leave the run's tree clean. Carry both reports into
 <RunSummary/>. A refusal there is reported, not repaired, and leaves nothing to
 commit.
+
+Only after <RunAsBuilt/> and, where it applies, <AsBuiltCommit/> are complete, a production unit runs `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/showrunners.py" status "<showrunner session>" --unit "<this row's Session cell>" --state run-finished` before <RunSummary/>; a run that stopped, failed, or waits on a decision does not mark itself finished, and nothing asks for `run done` text in the Plan cell.
 </RunAsBuilt>
 
 <AsBuiltCommit>

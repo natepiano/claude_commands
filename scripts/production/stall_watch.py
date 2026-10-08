@@ -140,8 +140,8 @@ def stretch_path(slug: str, unit: str) -> Path:
     return STATE_DIR / f"{name}.json"
 
 
-def finished_run_units(runner: showrunners.RunningShowrunner) -> set[str]:
-    """Read the production doc named by this notifier's check command."""
+def retired_units(runner: showrunners.RunningShowrunner) -> set[str]:
+    """Read retired unit names from the production doc named by the check command."""
     located = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{runner.slug}")
     if isinstance(located, showrunners.NoCheckedDoc):
         return set()
@@ -150,7 +150,7 @@ def finished_run_units(runner: showrunners.RunningShowrunner) -> set[str]:
     except (OSError, UnicodeError):
         return set()
 
-    finished: set[str] = set()
+    retired: set[str] = set()
     in_units = False
     for line in lines:
         if line.strip() == "## Units":
@@ -160,12 +160,11 @@ def finished_run_units(runner: showrunners.RunningShowrunner) -> set[str]:
         elif in_units:
             cells = line.split("|")
             if (len(cells) >= 4 and not cells[0].strip()
-                    and (re.search(r"\brun done\b", cells[2]) is not None
-                         or plan_cell_is_retired(cells[2]))):
-                finished.add(cells[1].strip())
+                    and plan_cell_is_retired(cells[2])):
+                retired.add(cells[1].strip())
                 if len(cells) >= 6:
-                    finished.add(cell_value(cells[5]))
-    return finished
+                    retired.add(cell_value(cells[5]))
+    return retired
 
 
 def rename_state(old: str, new: str, runner_before: str, runner_after: str,
@@ -296,17 +295,19 @@ def tick(now: float) -> None:
             continue
         showrunner_socket = showrunner_lookup.path
         runner = runners_by_socket.get(showrunner_socket)
-        finished: set[str] = finished_run_units(runner) if runner is not None else set()
+        retired: set[str] = retired_units(runner) if runner is not None else set()
         try:
             zone = ZoneInfo(configured["zone"])
         except (KeyError, ValueError):
             print(f"stall-watch: invalid zone for {configured['session']}: {configured['zone']}", file=sys.stderr)
             continue
         for unit in configured["units"]:
-            if isinstance(unit, showrunners.StandbyUnit) or unit.name in finished:
-                stretch_path(configured["session"], unit.name).unlink(missing_ok=True)
+            if (isinstance(unit, (showrunners.RunFinishedUnitDirector,
+                                  showrunners.StandingByUnitDirector))
+                    or unit.session in retired):
+                stretch_path(configured["session"], unit.session).unlink(missing_ok=True)
                 continue
-            name = unit.name
+            name = unit.session
             if subprocess.run([TMUX, "has-session", "-t", f"={name}"], capture_output=True, check=False).returncode != 0:
                 continue
             try:

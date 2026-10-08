@@ -56,7 +56,7 @@ if __package__ in (None, ""):
 from ..production.showrunners import (
     CONFIG as CONFIG,
     ShowrunnerSettings as ShowrunnerSettings,
-    load_settings as load_settings,
+    load_settings_from as load_settings_from,
 )
 
 
@@ -133,7 +133,7 @@ class Job(NamedTuple):
 
 
 def load_config() -> Config:
-    return load_settings(CONFIG)
+    return load_settings_from(CONFIG)
 
 
 def recipients(config: Config, here: str | None = None) -> list[str]:

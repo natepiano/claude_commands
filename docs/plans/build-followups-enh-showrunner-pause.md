@@ -270,7 +270,7 @@ The pause is safe to register: it cannot delay a prompt, cannot stay on for ever
 
 **Ruled out:** skipping the project-clock backfill on the closed-phase path (unreachable for a run started since 2026-08-11, and the between-windows report shares it).
 
-### Phase 8 — The registry records each unit director's status, and the stall watch reads it there  · status: todo
+### Phase 8 — The registry records each unit director's status, and the stall watch reads it there  · status: done
 
 #### Work Order
 

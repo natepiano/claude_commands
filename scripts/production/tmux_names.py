@@ -91,7 +91,7 @@ def live_sessions() -> list[ClaudeSession] | TmuxServerUnavailable:
 
 
 def _registry_holds(settings: showrunners.ShowrunnerSettings, name: str) -> bool:
-    return any(runner["session"] == name or any(unit.name == name for unit in runner["units"])
+    return any(runner["session"] == name or any(unit.session == name for unit in runner["units"])
                for runner in settings["showrunners"])
 
 

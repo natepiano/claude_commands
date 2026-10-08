@@ -131,6 +131,9 @@ Applies to a `/unit:delegate` run whose plan header carries a
 run and after every compaction. Your row in its **Units** table gives your name,
 branch, port and the files you own.
 
+At <PrepareSession/>, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/showrunners.py" status "<showrunner session>" --unit "<this row's Session cell>" --state running`; a session stays live after its run ends and can start another run without a new launch, so this sets a finished entry back to running for the stall watch and rewrites nothing when it is already running.
+Only after <RunAsBuilt/> and, where it applies, <AsBuiltCommit/> are complete, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/showrunners.py" status "<showrunner session>" --unit "<this row's Session cell>" --state run-finished` before <RunSummary/>; a run that stopped, failed, or waits on a decision does not mark itself finished, and nothing asks for `run done` text in the Plan cell.
+
 1. **Your port.** Every app launch for smoke tests and shots uses your port,
    never the user's default port or another unit's.
 2. **Whose words.** Text typed into your session that begins

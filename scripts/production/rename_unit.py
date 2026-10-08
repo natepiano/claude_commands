@@ -158,7 +158,7 @@ def _registry_collisions(claude: ClaudeSide, old: str, new: str) -> None:
     settings = showrunners.load_settings() if showrunners.CONFIG.exists() else showrunners.defaults()
     if any(runner["session"] == new for runner in settings["showrunners"]):
         raise add_unit.Refusal(f"showrunner registry session {new} is already taken")
-    units = [unit.name for runner in settings["showrunners"] for unit in runner["units"]]
+    units = [unit.session for runner in settings["showrunners"] for unit in runner["units"]]
     if new in units and (old in units or isinstance(claude, AwaitingRename)):
         raise add_unit.Refusal(f"showrunner registry unit {new} is already taken")
 

@@ -140,7 +140,8 @@ class RegistrationTests(unittest.TestCase):
         self.assertIn("register: ok", first.stdout)
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
         self.assertEqual(self.registry()[0]["session"], "first-showrunner")
-        self.assertEqual(self.registry()[0]["units"], ["alpha-session"])
+        self.assertEqual(self.registry()[0]["units"],
+                         [{"session": "alpha-session", "status": "running"}])
         initial_calls = self.notifier_calls()
         self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", "showrunner-example"]]), 1)
         updates = next(call for call in initial_calls if call[:2] == ["new", "showrunner-example"])
@@ -156,7 +157,8 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(self.git("log", "-1", "--format=%s"),
                          "production(example): showrunner session resumed-showrunner")
         self.assertEqual([entry["session"] for entry in self.registry()], ["resumed-showrunner"])
-        self.assertEqual(self.registry()[0]["units"], ["alpha-session"])
+        self.assertEqual(self.registry()[0]["units"],
+                         [{"session": "alpha-session", "status": "running"}])
         registry_bytes = self.config.read_bytes()
         doc_bytes = self.doc.read_bytes()
         repeated = self.run_command("register", "--session", "resumed-showrunner", env=new_env)

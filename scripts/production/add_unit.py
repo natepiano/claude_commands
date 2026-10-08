@@ -612,11 +612,12 @@ def registry_has_unit(request: UnitLaunch) -> bool:
     path = Path(os.environ.get("SHOWRUNNERS_CONFIG") or Path(__file__).resolve().parents[2] / "config/showrunners.json")
     if not path.exists():
         return False
-    for runner in showrunners.load_settings(path)["showrunners"]:
+    expected = showrunners.StandingByUnitDirector if isinstance(request.plan, Standby) \
+        else showrunners.RunningUnitDirector
+    for runner in showrunners.load_settings_from(path)["showrunners"]:
         if runner["session"] == request.production.showrunner_session and runner["zone"] == request.production.zone.key:
-            for unit in runner["units"]:
-                if unit.name == request.identity.session:
-                    return not isinstance(request.plan, Standby) or isinstance(unit, showrunners.StandbyUnit)
+            return any(unit.session == request.identity.session and isinstance(unit, expected)
+                       for unit in runner["units"])
     return False
 
 
@@ -626,9 +627,12 @@ def record(request: UnitLaunch) -> None:
         script = Path(__file__).resolve().parent / "showrunners.py"
         command = [sys.executable, str(script), "add", production.showrunner_session,
                    "--zone", production.zone.key, "--unit", request.identity.session]
+        state = "standing-by" if isinstance(request.plan, Standby) else "running"
         if isinstance(request.plan, Standby):
             command.append("--standby")
-        _ = subprocess.run(command,
+        _ = subprocess.run(command, text=True, capture_output=True, check=True)
+        _ = subprocess.run([sys.executable, str(script), "status", production.showrunner_session,
+                            "--unit", request.identity.session, "--state", state],
                            text=True, capture_output=True, check=True)
     update_old_prompt(request)
     log_line = (f"added {request.identity.unit} ({request.mode_name}), tmux {request.identity.session}, "

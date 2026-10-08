@@ -124,7 +124,32 @@ class QuotaAlertTests(unittest.TestCase):
 
     def test_quota_config_uses_shared_showrunner_settings(self) -> None:
         self.assertEqual(quota_alert.Config.__module__, "scripts.production.showrunners")
-        self.assertEqual(quota_alert.load_settings.__module__, "scripts.production.showrunners")
+        self.assertEqual(quota_alert.load_settings_from.__module__, "scripts.production.showrunners")
+
+    def test_load_config_reads_the_named_object_layout_registry(self) -> None:
+        named_config = self.root / "named-showrunners.json"
+        _ = named_config.write_text(json.dumps({
+            "threshold_percent": 7,
+            "repeat_minutes": 45,
+            "stall_minutes": 9,
+            "faults_to": "fault-handler",
+            "always": ["always-there"],
+            "showrunners": [{
+                "session": "named-director",
+                "zone": "America/New_York",
+                "units": [{"session": "named-unit", "status": "run-finished"}],
+            }],
+        }), encoding="utf-8")
+
+        with mock.patch.object(quota_alert, "CONFIG", named_config):
+            config = quota_alert.load_config()
+
+        self.assertEqual(config["threshold_percent"], 7)
+        self.assertEqual(config["always"], ["always-there"])
+        self.assertEqual(config["showrunners"][0]["session"], "named-director")
+        self.assertEqual([(unit.session, type(unit).__name__)
+                          for unit in config["showrunners"][0]["units"]],
+                         [("named-unit", "RunFinishedUnitDirector")])
 
     def test_repeats_to_every_recipient_until_acknowledged(self) -> None:
         notes: Notes = [self.note("codex 1.md", "active", "1")]
