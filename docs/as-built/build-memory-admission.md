@@ -24,23 +24,37 @@ The two ceilings (44G + 18G) deliberately exceed physical RAM together; decision
 
 On 2026-10-06 06:54 PDT, two hung hana tests in one local `verify.sh test` step held 11.4 GB and 15.5 GB; earlyoom first sent SIGTERM to 26 other processes, including six CI compilers (four hana CI jobs failed), and killed the tests last. `builds.slice` peaked at 37.7 GiB, under its 44G, because zram (10 GiB), sessions (8 GiB) and CI (3.4 GiB) had already taken the machine to earlyoom's 5% line.
 
-### The memory gate (`scripts/lint/memory_gate.sh`)
+### The memory gate (`scripts/lint/memory_gate.sh`, `scripts/lint/memory_admit.py`)
 
-Sourced by `scripts/lint/invoke.sh` and by the BRP launch hook. `buildlog_wait_for_memory` holds a step while `MemAvailable` in `${BUILDLOG_MEMINFO:-/proc/meminfo}` is under 12 GiB (12582912 kB, steve's slot floor), polling every `BUILDLOG_MEM_POLL_S` (5 s) up to `BUILDLOG_MEM_WAIT_LIMIT_S` (900 s). It sets, in the calling shell:
+Sourced by `scripts/lint/invoke.sh` and by the BRP launch hook. A step that compiles starts only when the process memory it is expected to need fits beside the growth still promised to steps already running. All sizes are process memory (`memory.stat` `anon`), not `memory.peak`.
 
-- `BUILDLOG_MEM_OUTCOME`: `Granted` (read at or above the floor), `TimedOut` (limit reached), `MeminfoUnavailable` (file missing or unreadable, or no `MemAvailable: <digits> kB` line; no wait).
-- `BUILDLOG_MEM_WAIT_S`: seconds from the first below-floor read; 0 when it never waited.
+- **Rule** (`memory_admit.py` `decide(available, total, need, running)`). Admit when `MemAvailable >= need + promised + reserve`; with no live reservation, admit at `min(need + reserve, 12 GiB)`. `reserve` is 5% of `MemTotal` (0 without a `MemTotal` line). `promised` is the sum over live reservations of `max(0, need_i - anon_i)`, with `anon_i` read from the step's scope cgroup and 0 when the scope or cgroup is gone, so an unscoped step counts its whole `need`.
+- **`need`** (`expected_peak`). The first tier that applies, each a p90 over this host, repo and step in 14 days with at least 5 values: measured anon peaks (`admission/anon_peaks.jsonl`), then build-log `peak_mem_bytes` x `ANON_SHARE` 0.65, then the 12 GiB fallback. Repo and step come from `parse.step_name` and `record.git_facts` in `scripts/buildlog`; a missing index, history file or repo skips that tier.
+- **Ledger.** One `*.reservation` JSON file per admitted step under the build log's `admission/` directory (pid, pid start time, need, repo, step, worktree, admitted_at, sidecar path). Check, prune and write happen under one exclusive `flock` on `admission/lock`; a reservation whose pid is gone or reused is deleted when read. `MemAvailable` is read inside the lock, after the anon reads.
+- **`check` and `release`.** `check` returns a frozen `CheckResult` whose `reservation` is `Reserved(path)` or `NotReserved(held|launch|untracked)`. `StepProfile` (repo, step, worktree, peak) is resolved once per wait and passed back on later polls, so a poll costs one short Python start (first check 431 ms, later polls 102 ms, release 97 ms on hana nextest).
 
-Printed to stderr, once each:
+`buildlog_wait_for_memory [ARGV...]` polls every `BUILDLOG_MEM_POLL_S` (5 s) up to `BUILDLOG_MEM_WAIT_LIMIT_S` (900 s). It decides first, so only a step still held at the limit times out, and a step admitted at the limit writes its reservation too. A call with no argv (the BRP launch hook) uses the fallback `need`, writes no reservation, and is granted from the shell's own read of meminfo at or above 12 GiB. It sets, in the calling shell:
+
+- `BUILDLOG_MEM_OUTCOME`: `Granted`, `TimedOut` (limit reached), `MeminfoUnavailable` (file missing or unreadable, or no `MemAvailable: <digits> kB` line; no wait).
+- `BUILDLOG_MEM_WAIT_S`: seconds from the first hold; 0 when it never waited.
+- `BUILDLOG_MEM_RESERVATION`: the reservation path, empty when none was written. `buildlog_release_memory` deletes it.
+
+The gate fails open: a meminfo it cannot read, a Python failure or an untracked step never stops or delays a build. Printed to stderr:
 
 ```
-waiting for memory since HH:MM PDT: the machine has X.X GiB free; a build starts at 12.0
+waiting for memory since HH:MM PDT: ...            (first hold: need, its source, promised GiB, running steps)
+still waiting for memory (N min): ...              (every 60 s)
+memory free after N min S s: starting
 memory wait limit reached after 15 min; starting anyway
+memory gate failed (<last line of the Python output>); starting anyway
+memory gate could not track this step; starting without a reservation
 ```
 
 `build_hold_mark <state> [outcome]` calls `build_hold.py mark` only when `CLAUDE_CODE_SESSION_ID` is set and a holder file exists; it checks for the file before touching any lock or directory, discards output and never fails. The gate writes `WaitingForMemory` when it first starts waiting.
 
 In `invoke.sh`, `run_once` runs the gate for every step that compiles, recorded or not (`BUILDLOG_SCOPE=0` too), then marks `MemoryGateReturned <outcome>`, then restarts the step's clock, then calls `buildlog_exec`. `buildlog_step_compiles` exempts `*/sweep.py` and `cargo [+toolchain] fmt`. `buildlog_exec` runs a recorded step with `systemd-run --user --scope --slice=builds.slice`. The scope's shell, `BUILDLOG_SCOPE_SH`, writes its marker, then runs `{ echo 500 > /proc/self/oom_score_adj; } 2>/dev/null || true;` before `"$@"`, so every process the step starts in the scope (cargo, build scripts, test binaries, any rustc or linker the step runs itself) inherits oom_score_adj 500; an unprivileged process may raise its own. Builds outside `invoke.sh` keep 200, and the Mac runs no scope. `scripts/lint/test_invoke_scope.py` runs the extracted string under `/bin/sh -c` with fd 3 set as `buildlog_exec` sets it: step and child read 500, exit 7 passes through, and a failed write stays silent under an exported `SHELLOPTS=errexit`; the 500 checks skip when the runner already runs at 500 or more.
+
+`BUILDLOG_SCOPE_SH` also writes the scope's cgroup directory to `"$BUILDLOG_PEAK.cgroup"`. `run_once` passes the step's argv to the gate and runs one `buildlog_sample_anon` sampler, which reads the scope's `anon` every second, keeps the maximum in the `.max` file beside the reservation, and exits when its parent is gone. `buildlog_finish_memory` stops the sampler, releases the reservation and removes the sidecar on every path; the release appends the maximum to `anon_peaks.jsonl` (host, repo, step, worktree, anon peak, exit status, UTC end time), and nothing for an unscoped step. `scripts/lint/test_memory_admit.py` covers the rule, the ledger and the shell gate over a fake meminfo, index and cgroup tree; its shell tests run the gate under `set -e`, as `invoke.sh` does.
 
 ### BRP launches
 
@@ -167,6 +181,17 @@ Slice lines use the snapshots nearest each edge within `SNAPSHOT_DISTANCE_S` (12
 - `### Agents` sits after the hold lines and above `waiting on you:` (the `--footer` form writes the same lines as bullets, with no heading): one line per `state: active` note in `AGENTS_DIR` (`~/rust/hanadocs/agents/`), by file stem, e.g. `- codex 2: 78%; runs out about 20:45 PDT today, before its Sun 02:25 refill; 1 reset available until Oct 29`; `- none active` otherwise. Run-out = reading time + (100 - used) / rate, rounded to the minute. The rate is `run_out.weighted_rate` over the `READINGS_LOG` readings: each rise weighted by half per 12 h of age; refills, time at 100% and gaps over 15 min are skipped. Until the readings cover a weighted hour, it is used percent over the time since the later of the last refill and 24 h ago. `scripts/whoami/agent_notes.apply` appends `{"account", "at", "remaining"}` to `~/.local/state/agent-notes/readings.jsonl` and keeps 8 days.
 - `same_phase` compares only the title after the first `: `, so a renumbered phase keeps its ETA history and a retitled one starts afresh. `draw_from` sets the latest cell only when it is after the ETA cell.
 
+### Disk floor: what it removes (`scripts/lint/sweep.py`)
+
+While `/` has less free than `sweep_free_floor_gib.<host>` in `config/lint.conf` (300 GiB on natedev), `hold_floor` removes build output from the cargo target directories under `FLOOR_ROOTS` that no build holds. It removes only the shortfall (`budget = total - (floor - free)`), least recently used target first:
+
+- **Use stamp.** `sweep_workspace()` sets the mtime of `.lint-sweep-used` (`USE_STAMP`) in every root `cargo_roots()` returns, before `lock_trees`, so a step that compiled nothing, or whose sweep was skipped because a build held a lock, still counts as use. A dry run and `--target-dir` (CI) write none; a write failure is ignored.
+- **Target last use.** `target_last_use(root, groups)` is the newest of the stamp's mtime and the target's build units' `last_used`.
+- **Order.** `shrink()` and `choose()` take a `RemovalOrder`, a sort key over `Group`; the smallest key goes first. The workspace budget sweep passes `unit_age` (most whole days unused, then oldest compile). The floor passes the target's last use, then `unit_age`, so the least recently used target loses output until the shortfall is met, then the next one. Orphaned files (`Scan.orphans`, one group per build tree) go first from any idle target, whatever the order.
+- **Lines.** After the removal lines, one line per target that lost output, largest first: `lint sweep: the floor took <gib> from <target>, last used <when>` (`would take` on a dry run). Orphan bytes count toward their target, and a group whose removal failed is left out, so each line is GiB actually taken. The removal line's `last used <oldest> to <newest>` spans the oldest and newest unit among those chosen.
+
+Measured over the 24 h after the order went live (2026-10-06 16:33 PDT, 300 GiB floor): the 2-minute timer took 84.0 GiB in 17 sweeps, 98.3% of it from targets idle over 6 h, and the newest unit a sweep took was last used a median 15.2 h earlier. The 24 h before, under the old order by build unit and almost all at a 500 GiB floor: 870.1 GiB in 155 sweeps, median 3.3 h. The two days differ in floor as well as order, and the memory gate above went live 85 minutes into the second.
+
 ### Disk-floor alerts (`scripts/lint/sweep.py`, `scripts/buildlog/disk.py`)
 
 `hold_floor` writes `floor.json` in `${LINT_SWEEP_STATE_DIR:-~/.local/state/lint-sweep}` under `FLOOR_LOCK` after each floor sweep: time, free bytes, build-cache bytes (idle and busy target dirs plus both CI runner trees), `last_alert_at` and `last_push_at`. After a non-dry sweep it sends at most one alert:
@@ -191,6 +216,8 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 ## Invariants
 
 - Every compiling step and every BRP launch passes the memory gate before it starts. Sweep and `cargo fmt` steps never wait on it, so the disk floor is never held by memory.
+- The memory gate fails open: when it cannot read meminfo, cannot run its Python, or cannot track a step, the step starts.
+- The disk floor never removes output from a target whose cargo locks a build holds, removes no more than the shortfall plus the last group's overshoot, and prints no new line containing `removed` (`scripts/buildlog/parse.py` counts those lines as freed bytes).
 - The gate never fails or alters a step: no reading means no wait, the limit always starts the step, and `build_hold_mark` swallows every error. Ordinary builds without a holder file pay no lock or directory access.
 - `BUILDLOG_MEM_WAIT_S` and the gate outcome are set in the calling shell before any `| tee` pipe; a step's recorded start excludes the wait.
 - The sccache server stays in `builds.slice`; moving only the steps would leave every compile outside the limit.
@@ -210,7 +237,7 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 
 ## Calibration and gotchas
 
-- **12 GiB floor.** The gate admits at `MemAvailable` 12 GiB, steve's slot floor. Quiet use outside builds is about 20 GiB of 60.5. The limit message says "15 min" whatever `BUILDLOG_MEM_WAIT_LIMIT_S` holds.
+- **Memory gate sizes.** Alone, a step is admitted at `min(need + reserve, 12 GiB)`, and 12 GiB (steve's slot floor) is also the fallback `need`. The build-log tier is 0.65 x the build-log p90 (measured p90 anon share 61-65%), conservative until 5 measured runs exist per repo and step. At the 15 min limit a held step starts anyway, so a sustained overload can still burst. Quiet use outside builds is about 20 GiB of 60.5. The limit message says "15 min" whatever `BUILDLOG_MEM_WAIT_LIMIT_S` holds. Reading `MemAvailable` before the anon reads, or outside the lock, admits on stale numbers.
 - **The gate does not stagger.** Measured 2026-10-04 22:42 PDT: four held sessions started builds within 73 s of one release with zero memory waits, because memory was ample at that instant and compilers grow after admission. That is why the release is one session at a time with a 60 s settle after each gate return.
 - **A held session's turn can take about 16 minutes** (gate up to 900 s), so `release` runs in the background and the BRP hook's timeout is 960 s.
 - **Release outcomes vanish with the last holder file**; set-aside `*.damaged-*` files are never cleaned up. A holder joining a no-cycle hold learns nothing until the final release line tells it to broadcast.
@@ -229,6 +256,7 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 - **Build-folder waits.** The `calls` table also holds port-lint calls, so every query over the call population, counted calls and token holders alike, filters `tool = 'verify.sh'`. Holders are fetched by `ended_at`, not `started_at`, so a holder that began the previous day is found.
 - **Mac commands.** Tailscale SSH runs them under `/usr/bin/login`, which exits 0; judge the printed `rc=`. A sync pause never expires (the report's Mac line shows it), an unreadable pause file reads as paused, and `pause` can wait up to 30 s + 2 x 600 s for a running sync. `polled.json` is in `ci/` so sync carries it to the Mac; `sync_paused.json` stays local.
 - **Disk.** send.py exit 1 (queued) counts as delivered. `disk.py`'s first walk is the cost (35 s under load 104). A file hard-linked into a target dir and elsewhere counts outside the caches. `floor.json` and `disk.json` hold only the latest record; past sweeps come from `journalctl --user -u disk-floor.service`. `sweep.py` reads `disk.json` by path and never imports `scripts/buildlog`, since `disk.py` imports `sweep`.
+- **Disk floor order.** A no-op cargo build writes nothing under `target/`, and relatime refreshes atimes at most once a day, so only the use stamp records a step that compiled nothing. The stamp lags a lint step by up to 5 minutes (`invoke.sh`'s sweep rate limit), which only reorders targets used within the same 5 minutes. The build log's `sweep_freed_bytes` counts each workspace's budget sweep and the floor sweep after it together, so it is not the floor's cost alone; the journal's per-target lines are.
 - **procps cuts user names** over 8 characters unless the format says `user:32`. With `UnknownCores`, `quiet` waits its full `--max-wait`.
 - **Codex.** On an idle thread the app-server opens a turn per queued message, so never `thread/queue/add` to a thread no launcher streams. `thread/read` can report active with no turn id; get the id from a steer probe before `turn/interrupt`. `turn/interrupt` errors when the turn ended in between; only a re-read tells that from a live turn.
 - **Dailies.** The run-out time rounds to the minute in epoch seconds (rounding aware local time loses the DST fold). `resets` and a naive `limit_reset` are the writing machine's wall time. Every subprocess dailies test sets `HOME` to a temporary directory.
@@ -238,7 +266,8 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 
 ## Why
 
-- **Admission by free memory, not by slice limit.** `memory.high` counts page cache and throttled builds that were not short of memory; `MemAvailable` is what earlyoom acts on. 12 GiB matches the floor steve already uses for slots.
+- **Admission by free memory, not by slice limit.** `memory.high` counts page cache and throttled builds that were not short of memory; `MemAvailable` is what earlyoom acts on. 12 GiB matches the floor steve already uses for slots, and a step's expected need replaces it once history exists, so parallel large builds no longer start together into memory only one of them fits in.
+- **Target first below the disk floor.** Ordering every idle build unit by compile age spread each shortfall across the targets in active use, which rebuilt the output minutes later. One worktree's target is what a unit owns, so the least recently used target goes first and a target used minutes ago goes last. A forecast mode was ruled out: every build goes ahead, and the journal names whose cache went.
 - **One slice for every session build, sccache included.** Every compile reaches the sccache server, so the server's cgroup is where compiles are charged; a limit on the step scopes alone would bound nothing.
 - **CI in its own pool, a smaller slice and a lower kill order.** Shared steve slots alone did not stop kills (a CI run lost both Linux jobs after it). Its own 14-slot pool keeps CI from starving sessions and the reverse; `PIPELINE_JOB_OOMSCOREADJ` is the only setting that reaches job processes, because the runner sets every job to 500 itself. At 100 a CI job goes after a build step (500) or a session process (200) of the same size.
 - **Build steps at 500, and no `--prefer`.** The level sets the order and size decides within it. A `--prefer` for compiler names (+300) let two hung hana tests (11.4 GB, 15.5 GB) outlive 26 smaller processes, six CI compilers among them; without it, a hung 15 GB test scores about 1100 against a 2 GB CI compiler's 750, and a session's rust-analyzer at 200 stays behind every build step of similar size. The adj is set inside the step's scope, so every process the step starts inherits it.

@@ -1309,8 +1309,16 @@ def command_claim(args: CliArguments, paths: StatePaths) -> int:
     deadline = time.monotonic() + max(args.wait, 0.0)
     while True:
         with locked(paths.lock):
-            run = live_run(paths)
-            block = read_block(paths.block)
+            try:
+                run = live_run(paths)
+            except (OSError, ValueError):
+                print(f"state unreadable: {paths.run}")
+                return 12
+            try:
+                block = read_block(paths.block)
+            except (OSError, ValueError):
+                print(f"state unreadable: {paths.block}")
+                return 12
             if not isinstance(block, NoMacBlock):
                 print(f"blocked by {block.holder}: {block.reason}")
                 return 10
