@@ -2,7 +2,7 @@
 
 ## What it is
 
-Conversation pause keeps a session quiet while the user talks to it. It stops that session's scheduled reports and, for a showrunner, its dailies footer. After the reply ends and fifteen quiet minutes pass, the session asks whether automatic updates may return. A yes restores them, a no leaves them off, and no answer restores them after another five minutes. The related contracts keep closing unit work visible, record each unit director's status for the stall watch, allow corrections to stale as-built docs, and send every phone alert through `scripts/message/send.py --to user`.
+Conversation pause keeps a session quiet while the user talks to it. It stops that session's scheduled reports and, for a showrunner, its dailies footer. After the reply ends and fifteen quiet minutes pass, the session asks whether automatic updates may return. A yes restores them, a no leaves them off, and no answer restores them after another five minutes. The related contracts keep closing unit work visible, read each unit's run state for the stall watch from its run records, allow corrections to stale as-built docs, and send every phone alert through `scripts/message/send.py --to user`.
 
 ## How it works
 
@@ -91,35 +91,7 @@ When the last phase is closed but an activity remains open, `progress` calls `_p
 
 ### Unit status and stall watch
 
-> **Superseded 2026-10-08.** Showrunners and units are no longer stored in `config/showrunners.json`: a unit is a mark on its tmux session and a showrunner is its update timer. See `showrunner-automation.md`, "Unit lookup".
-
-`scripts/production/showrunners.py` represents registry units as:
-
-```python
-RunningUnitDirector(session)
-RunFinishedUnitDirector(session)
-StandingByUnitDirector(session)
-```
-
-Together they form `RegisteredUnitDirector`. The stored form is one object per unit:
-
-```json
-{"session": "<unit-session>", "status": "running|run-finished|standing-by"}
-```
-
-`load_settings()` reads the configured registry; `load_settings_from(path)` reads a named file. The older string list plus `standby` list remains readable, and the next write emits the object form.
-
-The status command is:
-
-```text
-showrunners.py status <showrunner-session> \
-  --unit <unit-session> \
-  --state running|run-finished|standing-by
-```
-
-It calls `set_unit_status(...)` under the registry lock. It refuses an absent or ambiguous showrunner or unit, exits 1 with one error line, and performs no write when the status is unchanged. `add` preserves an existing unit's status, `ready` changes only standing-by units to running, `rename` preserves the status variant, and `list` prints each unit as `<session>:<status>`. A unit sets itself to `running` when a run starts and to `run-finished` after its as-built work is complete.
-
-`scripts/production/stall_watch.py` reads these variants directly. It skips `RunFinishedUnitDirector`, `StandingByUnitDirector`, and retired production rows, and clears their saved stretch state. It does not inspect a unit row for `run done`. Finished units remain in the live-unit set so the registry retains their identity.
+A unit's run state is stored nowhere. `unit_lookup.run_state(worktree) -> UnitState` reads `RUNNING`, `RUN_FINISHED` or `STANDING_BY` from the newest `/unit:direct` run record in the unit's worktree. `scripts/production/stall_watch.py` watches a unit only while that state is `RUNNING`; it skips every other unit and retired production rows, and clears their saved stretch state. It does not inspect a unit row for `run done`. `showrunners.py status` and `showrunners.py ready` parse their arguments and do nothing. The full account is in [showrunner automation](showrunner-automation.md), "Unit status" and "Unit lookup".
 
 ### As-built corrections and phone alerts
 
@@ -149,7 +121,7 @@ The direct Python callers are `ci_points.review_watch` with `--need decision`, `
 - The answer window begins when the question reaches the session. A failed delivery still reaches automatic return five minutes after the question became due.
 - An open review suspends question and return actions. Each pause mechanism restores only what it changed.
 - Both hooks have a five-second budget, print at most one error line, and exit 0 so a prompt or reply cannot fail because the pause failed.
-- The registry status, not prose in a production row, is authoritative for whether the stall watch monitors a unit.
+- `unit_lookup.run_state`, not prose in a production row, is authoritative for whether the stall watch monitors a unit.
 - Correcting an as-built doc that contradicts the code is always allowed; cross-unit notice rules still apply.
 - Every scripted phone alert enters `scripts/message/send.py --to user`; channel choice stays inside `send.py`.
 
@@ -158,14 +130,12 @@ The direct Python callers are `ci_points.review_watch` with `--need decision`, `
 - The two pause hooks and their permission entry are registered in the repository's `settings.json` by the run's closing commit. The pause does not run in a live session until the showrunner promotes that file with the user's go.
 - Checked live 2026-10-07 through the registered hooks, in a scratch session and one real unit session: a typed message paused the session's report, the question arrived after five quiet minutes, a worded yes ran the resume command with no permission prompt, and an unanswered question returned the report by timeout. Both sessions ran in auto mode, where a missing permission entry would show as a refusal and not as a prompt.
 - Not yet checked live: a bare yes or no typed after registration (a scratch session exercised that protection before it), and renaming a unit that is running.
-- A unit that had already finished when the registry first recorded statuses is recorded `running` until it is set once with `showrunners.py status <showrunner-session> --unit <unit-session> --state run-finished`.
 - A question arrives about two seconds before `send.py` finishes; the question's prompt-hook arrival is the delivery proof.
 - An interrupted assistant reply emits no normal Stop. `UNANSWERED_SECONDS` prevents that state from lasting forever.
 - An older `asked` record without `reading` is read as `QuestionRead(1)`.
 - A message after `KeptOff` begins another conversation cycle. When that exchange becomes quiet, the question can return.
 - An unreadable session record means "unknown," not "ended." A registry-list failure also prevents dead-session cleanup for that tick.
 - `progress` still restarts the unit notifier on the closed-phase reporting path. Its tables are read-only, but the next report time moves.
-- The older registry layout cannot identify units that had already finished; it treats non-standby entries as running until an explicit status update.
 - `send.py` prints `FAILED: ...` on stdout and exits 3 for an undelivered user alert. Callers reporting the cause must inspect stdout as well as stderr.
 
 ## Why
@@ -176,7 +146,7 @@ The direct Python callers are `ci_points.review_watch` with `--need decision`, `
 - Sender identity protects the return question from wording changes and relays.
 - The reply-count guard keeps a bare answer attached to the most recent question the user sees.
 - A bounded hook favors an occasional report over delaying the user's message.
-- Named registry states let the stall watch act on durable machine data instead of parsing descriptive text.
+- Run records let the stall watch act on durable machine data instead of parsing descriptive text.
 - The closed-phase report keeps final verification, documentation and other closing work visible without rewriting completed progress.
 - One user-message command centralizes urgency, remote delivery, logging, failure behavior and the phone channel.
 - Allowing stale as-built docs to be corrected keeps documentation aligned with shipped behavior wherever the contradiction is found.

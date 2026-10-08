@@ -235,20 +235,19 @@ progress_history.py phase-count --plan-doc <path> [--phase-percent <N>]
 progress_history.py aggregate [--percent <N>]
 ```
 
-For production plans, `start-phase`, every `progress` report, `eta`,
-`finish-phase`, and `finish-run` end by asking `phase_table.py refresh` to
-rewrite the unit's vault note from the event stream. The refresh has a
-ten-second limit and is best-effort: a refusal, timeout, or launch error writes
-one diagnostic to stderr without changing the recorder command's output or
-status. Plans without a `> **Production:` line skip the subprocess entirely.
+For production plans, `start-phase`, every `progress` report, `finish-phase`,
+and `finish-run` end by asking `phase_table.py refresh` to rewrite the unit's
+phase note from the event stream; `eta` asks for it after its append and before
+its `ETA recorded:` line. A refresh failure adds one stderr line and changes
+neither the command's output nor its exit status. Plans without a
+`> **Production:` line skip the subprocess. [Phase tables](phase-tables.md)
+covers the note, the table built from these events and the hook's limits.
 
-`eta` accepts local wall-clock timestamps in the process `TZ`, requires an
-active phase, and writes `ETA recorded: <HH:MM zone>` after the durable append.
-It rejects a past target, a time the local clock skips, a range that does not
-enclose the target, only one range endpoint, or a blank basis with status 2.
-A note-refresh failure does not change the appended event, success line, or
-exit status. `/unit:eta` and `/unit:eta_breakdown` run it under
-`TZ=<User zone>`.
+`eta` reads its times in the process `TZ`, requires an active phase, appends
+one `eta_stated` event, and prints `ETA recorded: <HH:MM zone>`. It exits 2 on
+a malformed or past time, a time the local clock skips, a range that does not
+enclose the target, one range end alone, a blank basis, or no active phase.
+`/unit:eta` and `/unit:eta_breakdown` run it under `TZ=<User zone>`.
 
 `implement.sh` and `review.sh` own pass lifecycle: they set
 `PLAN_DELEGATE_PASS_OWNER=launcher` on their own `start-pass` / `finish-pass`
