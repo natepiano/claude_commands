@@ -753,6 +753,21 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
         self.assertIn("- eta: 23:00 PDT, 60% done (overdue)", rendered.stdout)
 
+    def test_a_time_that_names_no_day_is_read_on_the_day_it_was_stated(self) -> None:
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 19:35")
+        self.judgment_file(alpha={"held": "the panel review is paused", "eta": {"percent": 60}})
+        baseline = self.run_builder("--at", "2026-10-06T19:30")
+        self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
+
+        # No report was rendered at 19:30, so the renderer has no moment saved for this ETA.
+        built = self.run_builder("--at", "2026-10-06T23:50", "--length", "simple")
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["stated"], "2026-10-06T19:30")
+        rendered = self.run_renderer("2026-10-06T23:50")
+        self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
+        self.assertIn("- eta: 19:35 PDT, 60% done (overdue)", rendered.stdout)
+        self.assertNotIn("tomorrow", rendered.stdout)
+
     def test_held_changed_eta_uses_the_two_hour_rule_in_the_renderer(self) -> None:
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 19:35")
         self.judgment_file(alpha={

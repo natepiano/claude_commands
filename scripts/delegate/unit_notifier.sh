@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# Make or retarget the notifier for one delegate run.
+# Make or retarget the notifier for one unit run.
 
 setopt no_unset pipe_fail extended_glob
 
@@ -14,12 +14,12 @@ fi
 session_id=$1
 marker=${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}/$session_id
 if [[ ! -f $marker ]]; then
-  print -u2 -r -- "no active delegate run marker: $marker"
+  print -u2 -r -- "no active unit run marker: $marker"
   exit 1
 fi
 session_dir=$(< "$marker")
 if [[ -z $session_dir ]]; then
-  print -u2 -r -- "empty delegate run marker: $marker"
+  print -u2 -r -- "empty unit run marker: $marker"
   exit 1
 fi
 run_id=${session_dir:t}
