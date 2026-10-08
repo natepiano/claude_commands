@@ -29,6 +29,10 @@ RELEASE_SETTLE_S = 60
 NO_ADMISSION_ACK_S = 900
 NO_REGISTRATION_S = 60
 RELEASE_POLL_S = 15
+# A lookup that cannot read the session records is tried again before the release gives up on the
+# session: a record caught half-written reads cleanly a moment later.
+LOOKUP_TRIES = 3
+LOOKUP_RETRY_S = 1.0
 
 GateOutcome = Literal["Granted", "TimedOut", "MeminfoUnavailable"]
 
@@ -694,10 +698,23 @@ def answer_nothing_to_build(session_id: str) -> str:
         return f"{entry_text(entry)}; the release moves on to the next session"
 
 
+class SessionLookupUnavailable(Exception):
+    """`sessions.py` could not read the session records, which says nothing about the session."""
+
+
 def socket_for(session_id: str) -> str | None:
+    """The session's socket, or None when it is not running."""
     script = Path(__file__).resolve().parent.parent / "message" / "sessions.py"
-    result = subprocess.run([sys.executable, str(script), "socket", f"session:{session_id}"], capture_output=True, text=True)
-    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
+    reason = ""
+    for attempt in range(LOOKUP_TRIES):
+        if attempt:
+            time.sleep(LOOKUP_RETRY_S)
+        result = subprocess.run([sys.executable, str(script), "socket", f"session:{session_id}"], capture_output=True, text=True)
+        # Exit 1 is no such live session. Any other failure is the lookup itself failing.
+        if result.returncode in (0, 1):
+            return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
+        reason = result.stderr.strip() or f"sessions.py exited {result.returncode}"
+    raise SessionLookupUnavailable(reason)
 
 
 def send_release(entry: ReleaseEntry, socket: str) -> int:
@@ -771,18 +788,24 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
                 target = entry_text(next_entry) if next_entry is not None else "final check"
                 return False, f"{entry_text(entry)}; next {target} at {ready.astimezone():%H:%M:%S %Z}"
         elif isinstance(state, AwaitingRelease):
-            socket = socket_for(entry["session_id"])
-            if socket is None:
-                store_release_state(entry, RecipientGone())
+            try:
+                socket = socket_for(entry["session_id"])
+            except SessionLookupUnavailable as error:
+                # Not knowing is not the session being gone: this is a delivery that failed.
+                print(f"build_hold: {entry_text(entry)}: {error}", file=sys.stderr)
+                store_release_state(entry, DeliveryFailed(clock()))
             else:
-                attempted_at = clock()
-                outcome = send_release(entry, socket)
-                if outcome == 0:
-                    store_release_state(entry, ReleasedAwaitingAdmission(clock()))
-                elif outcome == 1:
-                    store_release_state(entry, DeliveryQueued(attempted_at))
+                if socket is None:
+                    store_release_state(entry, RecipientGone())
                 else:
-                    store_release_state(entry, DeliveryFailed(attempted_at))
+                    attempted_at = clock()
+                    outcome = send_release(entry, socket)
+                    if outcome == 0:
+                        store_release_state(entry, ReleasedAwaitingAdmission(clock()))
+                    elif outcome == 1:
+                        store_release_state(entry, DeliveryQueued(attempted_at))
+                    else:
+                        store_release_state(entry, DeliveryFailed(attempted_at))
             save_cycle(cycle)
             if isinstance(read_release_state(entry), active):
                 return False, entry_text(entry)

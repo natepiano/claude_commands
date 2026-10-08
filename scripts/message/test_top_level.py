@@ -35,7 +35,7 @@ class TopLevelTests(unittest.TestCase):
     def add(
         self, name: str, *, session_id: str = "", file_name: str = "",
         socket: str | None = "auto", pid: int | None = None,
-        start: str | None = None, tmux: str | None = None,
+        start: str | None = None, tmux: str | None = None, updated: int | None = None,
     ) -> str:
         pid = os.getpid() if pid is None else pid
         session: dict[str, object] = {
@@ -51,6 +51,8 @@ class TopLevelTests(unittest.TestCase):
             address = ""
         if tmux is not None:
             session["tmux"] = tmux
+        if updated is not None:
+            session["updatedAt"] = updated
         _ = (self.folder / f"{file_name or name}.json").write_text(json.dumps(session))
         return address
 
@@ -77,6 +79,16 @@ class TopLevelTests(unittest.TestCase):
         self.assertEqual(lines, [f"shared\tuds:{first}", f"shared\tuds:{second}"])
         self.assertEqual(errors, [])
         self.assertEqual(recorded, [("shared", "session-a"), ("shared", "session-b")])
+
+    def test_a_conversation_two_processes_hold_is_listed_once_from_its_newest_record(self) -> None:
+        # Seen 2026-10-08: the desktop app still held a conversation a terminal had resumed.
+        _ = self.add("shared", session_id="one-id", file_name="desktop", updated=100)
+        resumed = self.add("shared", session_id="one-id", file_name="terminal", updated=200)
+        _ = self.add("shared", session_id="one-id", file_name="zz-older", updated=150)
+        result, lines, errors, recorded = self.run_main()
+        self.assertEqual((result, errors), (0, []))
+        self.assertEqual(lines, [f"shared\tuds:{resumed}"])
+        self.assertEqual(recorded, [("shared", "one-id")])
 
     def test_sorting_uses_name_then_address(self) -> None:
         zulu = self.add("zulu", socket="/tmp/zulu.sock")

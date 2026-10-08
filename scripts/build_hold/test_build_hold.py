@@ -839,6 +839,39 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
             self.assertEqual(self.entries()[0]["state"], "NoAdmissionAck")
             self.assertEqual(self.entries()[1]["state"], "ReleasedAwaitingAdmission")
 
+    def test_unreadable_session_records_are_a_failed_delivery_not_a_gone_session(self) -> None:
+        now = self.begin("unknown", "next")
+
+        def socket_for(session_id: str) -> str | None:
+            if session_id == "unknown":
+                raise build_hold.SessionLookupUnavailable("sessions: one or more registry files could not be read")
+            return "/tmp/next.sock"
+
+        errors = io.StringIO()
+        with mock.patch.object(build_hold, "socket_for", side_effect=socket_for), \
+             mock.patch.object(build_hold, "send_release", return_value=0) as send, redirect_stderr(errors):
+            _ = self.advance(now)
+        self.assertEqual(self.entries()[0]["state"], "DeliveryFailed")
+        self.assertEqual(self.entries()[1]["state"], "ReleasedAwaitingAdmission")
+        self.assertEqual(send.call_count, 1)
+        self.assertIn("one or more registry files could not be read", errors.getvalue())
+
+    def test_a_lookup_is_tried_again_before_it_is_called_unavailable(self) -> None:
+        def answers(*codes: int) -> list[subprocess.CompletedProcess[str]]:
+            return [subprocess.CompletedProcess([], code, "/tmp/late.sock\n" if code == 0 else "",
+                                                "records unreadable\n" if code == 3 else "") for code in codes]
+
+        with mock.patch.object(subprocess, "run", side_effect=answers(3, 3, 0)), \
+             mock.patch.object(time, "sleep") as sleep:
+            self.assertEqual(build_hold.socket_for("session-a"), "/tmp/late.sock")
+            self.assertEqual(sleep.call_count, 2)
+        with mock.patch.object(subprocess, "run", side_effect=answers(3, 3, 3)), mock.patch.object(time, "sleep"), \
+             self.assertRaisesRegex(build_hold.SessionLookupUnavailable, "records unreadable"):
+            _ = build_hold.socket_for("session-a")
+        with mock.patch.object(subprocess, "run", side_effect=answers(1)), mock.patch.object(time, "sleep") as sleep:
+            self.assertIsNone(build_hold.socket_for("session-a"))
+            sleep.assert_not_called()
+
     def test_delivery_states_and_gone_recipient_advance_immediately(self) -> None:
         now = self.begin("failed", "gone", "queued")
         sockets = {"failed": "/tmp/failed.sock", "gone": None, "queued": "/tmp/queued.sock"}

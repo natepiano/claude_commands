@@ -278,8 +278,10 @@ instance_tick() {
   fi
 
   socket=$(NOTIFIER_SESSIONS_DIR="$SESSIONS_DIR" "$PY" "$SESSIONS" socket "${conf[TARGET]}" 2>/dev/null)
+  rc=$?
   if [[ -z $socket ]]; then
-    log_skip 'session not running'
+    # Exit 1 is no such live session. Any other failure is the lookup itself failing.
+    if (( rc == 0 || rc == 1 )); then log_skip 'session not running'; else log_skip "session lookup exit $rc"; fi
     return 0
   fi
 

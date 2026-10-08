@@ -10,6 +10,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
+from unittest import mock
+
+import codex_hooks
 
 
 INSTALLER = Path(__file__).with_name("codex_hooks.py")
@@ -416,6 +419,27 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, "")
         self.assertIn("codex hooks: app-server closed before replying", result.stderr)
+
+    def started_server(self, script: str) -> codex_hooks.AppServer:
+        executable = Path(self.environment["PATH"]) / "codex"
+        _ = executable.write_text(script)
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            server = codex_hooks.AppServer(str(executable), str(self.codex_home))
+        self.addCleanup(server.close)
+        return server
+
+    # A server that ends is met either by the write of the request or by the read of the reply,
+    # whichever comes first. The two tests below fix the order each way; both must read the same.
+    def test_a_server_gone_before_the_request_is_written_reads_as_closed(self) -> None:
+        server = self.started_server("#!/bin/sh\nexit 7\n")
+        _ = server.process.wait(timeout=10)
+        with self.assertRaisesRegex(codex_hooks.HookError, "^app-server closed before replying$"):
+            _ = server.call("initialize", {})
+
+    def test_a_server_that_ends_after_reading_the_request_reads_as_closed(self) -> None:
+        server = self.started_server("#!/bin/sh\nread line\nexit 7\n")
+        with self.assertRaisesRegex(codex_hooks.HookError, "^app-server closed before replying$"):
+            _ = server.call("initialize", {})
 
     def test_invalid_hooks_json_is_unchanged(self) -> None:
         original = b"{ invalid json\n"

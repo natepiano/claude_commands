@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
@@ -238,6 +240,19 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(len((self.root / "faults").read_text().splitlines()), 2)
+
+    def test_a_fault_waits_for_the_next_tick_when_the_session_records_cannot_be_read(self) -> None:
+        settings = showrunners.ShowrunnerSettings(threshold_percent=90.0, repeat_minutes=1.0, stall_minutes=1.0,
+                                                  faults_to="director", always=[], showrunners=[])
+        errors = io.StringIO()
+        state = self.root / "fault-state"
+        refused = OSError("cannot tell whether director is running: records unreadable")
+        with mock.patch.object(tmux_names, "FAULT_STATE_DIR", state), \
+                mock.patch.object(showrunners, "socket_for", side_effect=refused), \
+                redirect_stderr(errors):
+            tmux_names.fault("name taken", "old", "new", settings)
+        self.assertIn("tmux-names: cannot tell whether director is running", errors.getvalue())
+        self.assertEqual(list(state.iterdir()), [])
 
     def test_live_sessions_require_the_tmux_server_socket_to_match(self) -> None:
         self.session("local", "%0")

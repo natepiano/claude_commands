@@ -115,6 +115,10 @@ The showrunner still judges, before the call: the other units' overlap notice, n
 - `notice clear <gate>` drafts `send <waiting unit>: From the showrunner: <gate> clear — <unit> phase <N> is on <merge branch> as <merge hash>. Merge <merge branch> and continue.` (refused until that code merge exists); `notice lift <gate> --log <path>` drafts `… <gate> lifted — your tests pass without <unit> phase <N> (<log>). Continue.` Gates rows read `| <id> | <waiting unit> phase <N> | <unit> phase <N> | … |`.
 - Overrides for tests: `CI_POINTS_VALIDATE_SCRIPT`, `CI_POINTS_REVIEW_REGIME`, `DAILIES_REVIEW_REGIME`.
 
+### Session lookups: `sessions.py` exit 1 and exit 3
+
+`sessions.py` exits 1 when no live session matches and 3 when it could not read the session records. Exit 3 says nothing about the session, so no caller reads it as "not running". `showrunners.socket_for` raises `OSError` on it: `list` and the missing-showrunner report stop with `cannot tell whether <session> is running: <reason>` where they printed `not running` and reported every running showrunner as missing; `running_showrunners` prints `skipping <instance>: <reason>`; `tmux_names.fault` prints the reason and leaves its marker unwritten, so the next tick sends the fault. `stall_watch.unit_socket` prints `stall-watch: pid <pid>: <reason>` and skips the unit for that tick; a pid with no session record yet (exit 1) stays silent. `unit_status.sh` no longer discards the lookup's stderr. `stall_watch.socket_for_target` and `conversation_pause._session_lookup` already told the two apart. `mac_test.delivery_target` falls back to the holder's name on both, which is right for both: the sender does its own lookup by name.
+
 ### Rename unit: `rename_unit.py` and `/showrunner:rename_unit`
 
 `/showrunner:rename_unit <old> <new>` runs `rename_unit.py --production <PRODUCTION_DOC> --scratch <SCRATCH> <old> <new>`. The command changes the session name without changing the Unit cell, plan path, branch or worktree.

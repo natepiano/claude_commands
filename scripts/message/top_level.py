@@ -32,6 +32,7 @@ class Session(TypedDict, total=False):
     tmux: str
     sessionId: str
     messagingSocketPath: str
+    updatedAt: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,9 +71,11 @@ def is_unit(tmux_target: str) -> bool:
 
 
 def forwarded_sessions(sessions_dir: Path = SESSIONS_DIR, unit: Callable[[str], bool] = is_unit) -> list[ForwardedSession]:
-    sessions: list[ForwardedSession] = []
+    # Two live processes can hold one conversation, as when it is resumed in a terminal while the
+    # desktop app still has it open. It is listed once, from the record updated last.
+    newest: dict[str, tuple[int, ForwardedSession]] = {}
     own_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    for path in sessions_dir.glob("*.json"):
+    for path in sorted(sessions_dir.glob("*.json")):
         try:
             session = cast(Session, json.loads(path.read_text()))
         except (OSError, json.JSONDecodeError):
@@ -84,13 +87,16 @@ def forwarded_sessions(sessions_dir: Path = SESSIONS_DIR, unit: Callable[[str], 
         tmux = session.get("tmux")
         if tmux and unit(tmux):
             continue
+        updated = session.get("updatedAt", 0)
+        if session_id in newest and newest[session_id][0] > updated:
+            continue
         socket_path = session.get("messagingSocketPath")
         if isinstance(socket_path, str) and socket_path:
-            sessions.append(AddressableSession(name, session_id, f"uds:{socket_path}"))
+            newest[session_id] = updated, AddressableSession(name, session_id, f"uds:{socket_path}")
         else:
-            sessions.append(UnaddressableSession(name, session_id))
+            newest[session_id] = updated, UnaddressableSession(name, session_id)
     return sorted(
-        sessions,
+        (session for _, session in newest.values()),
         key=lambda session: (
             session.name,
             session.address if isinstance(session, AddressableSession) else "",

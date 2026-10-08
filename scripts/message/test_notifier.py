@@ -321,6 +321,15 @@ class NotifierTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(mkdir_marker.exists())
 
+    def test_unreadable_session_records_are_logged_as_a_failed_lookup(self) -> None:
+        _ = self.new()
+        self.live_socket.close()
+        self.socket_path.unlink()
+        _ = (self.sessions_dir / "broken.json").write_text("{ not json")
+        _ = self.successful("fire", "example")
+        self.assertIn(" | skip session lookup exit 3", self.lines()[-1])
+        self.assertFalse(self.send_args.exists())
+
     def test_check_zero_and_missing_session(self) -> None:
         _ = self.new("--check", "/bin/sh -c 'exit 0'")
         _ = self.successful("fire", "example")
