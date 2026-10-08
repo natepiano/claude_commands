@@ -470,7 +470,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("production", "status", "judgment", "state-dir", "out"):
         _ = parser.add_argument(f"--{name}", required=True, type=Path)
-    _ = parser.add_argument("--length", choices=("simple", "page", "elaborate"), default="simple")
+    _ = parser.add_argument("--length", choices=("gantt", "simple", "page", "elaborate"), default="gantt")
     _ = parser.add_argument("--holders", type=Path)
     _ = parser.add_argument("--notifier", type=Path)
     _ = parser.add_argument("--render-state", required=True, type=Path)
