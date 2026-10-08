@@ -11,7 +11,7 @@ The session notifier sends a message to a live Claude session on a schedule: the
 | File | Role |
 | --- | --- |
 | `scripts/message/notifier.sh` | The notifier: instance state, every CLI verb, and `tick`. zsh; its only systemd or launchd call is `launch_run`, which starts a run-only job. |
-| `scripts/message/sessions.py` | `socket <session:id\|name>` gives a live session's socket; `id <pid\|name>` gives its session id. |
+| `scripts/message/sessions.py` | `socket <session:id\|name>` gives a live session's socket; `id <pid\|name>` gives its session id. `read_session(path) -> SessionRecord | UnreadableSessionRecord` keeps an unreadable registry entry distinct from no live match. |
 | `scripts/message/send.py` | Delivery. A `--to uds:<socket>` send runs a headless `claude -p` relay whose only tool is `SendMessage`. |
 | `scripts/production/production_check.sh` | The showrunner instance's check: the production doc's status as an exit code. |
 | `scripts/production/unit_status.sh` | The showrunner's per-unit status script; prints `TICKS FAILING (…)`. |
@@ -71,7 +71,7 @@ The slot is claimed before the check runs, so a concurrent tick or `fire` cannot
 
 ### Delivery
 
-`sessions.py socket` reads every `*.json` record in the sessions directory, matches `session:<id>` against `sessionId` or a bare name against `name`, keeps records whose pid is alive (`PermissionError` counts as alive) and whose `messagingSocketPath` is a socket, and prints the socket with the newest `updatedAt`. No match exits 1; a usage error exits 2. The socket is resolved on every send, so a restarted process is found at its new socket. `send.py` then relays through a headless `claude -p` (sonnet) that makes one `SendMessage` call to that socket. A `COMMAND` is sent as text; a `PROMPT_FILE` is read at send time, so editing the file changes the next tick's text. The key `notifier-<instance>` means a tick that could not be delivered (`QUEUED`, exit 1) replaces the previous queued one, so each instance has at most one tick in `send.py`'s queue.
+`sessions.py socket` reads every `*.json` record in the sessions directory, matches `session:<id>` against `sessionId` or a bare name against `name`, keeps records whose pid is alive (`PermissionError` counts as alive) and whose `messagingSocketPath` is a socket, and prints the socket with the newest `updatedAt`. No match exits 1; a usage error exits 2; a registry that cannot be listed, or an unreadable entry with no live match, exits 3. The socket is resolved on every send, so a restarted process is found at its new socket. `send.py` then relays through a headless `claude -p` (sonnet) that makes one `SendMessage` call to that socket. A `COMMAND` is sent as text; a `PROMPT_FILE` is read at send time, so editing the file changes the next tick's text. The key `notifier-<instance>` means a tick that could not be delivered (`QUEUED`, exit 1) replaces the previous queued one, so each instance has at most one tick in `send.py`'s queue.
 
 ### CLI
 
