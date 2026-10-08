@@ -32,49 +32,23 @@
 
 ### Phase 3 — The workflow's scripts say "unit run"  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** Every message, `--help` text, comment and docstring in `scripts/` that calls a run a "delegate run" calls it a "unit run".
+Every message, `--help` text, comment and docstring under `scripts/` that names a run calls it a "unit run", never a "delegate run" (user rule, 2026-10-08). The three spellings in use are `Unit run`, `unit run` and `mid-unit-run`.
 
-**Spec:**
-
-The user, 2026-10-08: "workflow scripts should say unit run not delegate run".
-
-On each line below, replace the phrase and change nothing else on the line. Keep the capital where the line has one: `Delegate run` → `Unit run`, `delegate run` → `unit run`, `mid-delegate-run` → `mid-unit-run`.
-
-1. `scripts/delegate/end_session.sh` — line 2 (the header comment), line 56 (`echo "Unit run ended; marker cleared."`), line 58 (`echo "No active unit run marker for this session."`).
-2. `scripts/delegate/unit_notifier.sh` — line 2 (the header comment), line 17 (`"no active unit run marker: $marker"`), line 22 (`"empty unit run marker: $marker"`).
-3. `scripts/delegate/test_delegate_check.py` — lines 155 and 162: the two `assertIn` strings follow the messages on lines 17 and 22 of `unit_notifier.sh`.
-4. `scripts/delegate/phase_table.py` — line 2 (the module docstring) and line 1337 (`description="Show or refresh a unit run's plan phases."`).
-5. `scripts/delegate/progress_history.py` — line 242 (`a unit run`).
-6. `scripts/hooks/context_usage.py` — lines 6 and 42.
-7. `scripts/hooks/delegate_run.py` — line 7 (`mid-unit-run`).
-
-Lines that keep the word: `scripts/delegate/style_branch.sh` line 135 (`delegate-run`, a fallback branch slug) and `scripts/delegate/test_delegate_check.py` line 34 (a temporary directory's name). Both are internal names.
+- `end_session.sh` prints "Unit run ended; marker cleared." or "No active unit run marker for this session." once at a run's end. The wording carries no contract: nothing parses it and no test asserts it.
+- `unit_notifier.sh` writes "no active unit run marker: <path>" or "empty unit run marker: <path>" to stderr when a session's run marker is missing or empty. `/unit:report on|off` shows them, and `test_delegate_check.py` asserts both.
 
 **Files:**
-- `scripts/delegate/end_session.sh` — lines 2, 56, 58
-- `scripts/delegate/unit_notifier.sh` — lines 2, 17, 22
-- `scripts/delegate/test_delegate_check.py` — lines 155, 162
-- `scripts/delegate/phase_table.py` — lines 2, 1337
-- `scripts/delegate/progress_history.py` — line 242
-- `scripts/hooks/context_usage.py` — lines 6, 42
-- `scripts/hooks/delegate_run.py` — line 7
+- `scripts/delegate/end_session.sh` — header comment and the two end-of-run messages
+- `scripts/delegate/unit_notifier.sh` — header comment and the two marker errors
+- `scripts/delegate/test_delegate_check.py` — the two `assertIn` strings that match those errors
+- `scripts/delegate/phase_table.py` — module docstring and the `--help` description, "Show or refresh a unit run's plan phases."
+- `scripts/delegate/progress_history.py` — one docstring line
+- `scripts/hooks/context_usage.py` — one docstring line and one comment
+- `scripts/hooks/delegate_run.py` — one docstring line ("mid-unit-run")
 
-**Seats:** 2 writers — the split is by language; the test change is two renamed strings in existing assertions, too thin for a tester's lane.
-- `impl` — `scripts/delegate/end_session.sh`, `scripts/delegate/unit_notifier.sh`, `scripts/delegate/test_delegate_check.py`
-- `test` — opens as impl: `scripts/delegate/phase_table.py`, `scripts/delegate/progress_history.py`, `scripts/hooks/context_usage.py`, `scripts/hooks/delegate_run.py`
-
-**Constraints from prior phases:**
-- The command is `/unit:direct` and `commands/unit/delegate.md` forwards to it. Command pages and docs call a run "a `/unit:direct` run"; they do not change in this phase.
-- The two hook messages a session shows after its context is compacted already name `/unit:direct`; they do not change.
-
-**Acceptance gate:**
-- `git grep -niE 'delegate[ -]run' -- scripts` prints exactly two lines: `scripts/delegate/style_branch.sh:135` and `scripts/delegate/test_delegate_check.py:34`.
-- `python3 -m unittest discover -s scripts/delegate -p 'test_delegate_check.py'`, the same for `'test_phase_table.py'` and `'test_progress_history.py'`, and `python3 -m unittest discover -s scripts/hooks -p 'test_*.py'` green.
-- `bash -n scripts/delegate/end_session.sh` and `zsh -n scripts/delegate/unit_notifier.sh` exit 0.
-- `basedpyright` on each changed `.py` file reports no error or warning that the phase base does not report.
-- `git diff --stat <phase base>` names only the seven files under **Files** and this plan.
+**Gotchas:** Two internal names keep the word: the `delegate-run` fallback branch slug in `scripts/delegate/style_branch.sh` and a temporary directory's name in `scripts/delegate/test_delegate_check.py`. `git grep -niE 'delegate[ -]run' -- scripts` prints exactly those two lines. The search matches a space or a hyphen only, so the names `scripts/delegate/` and `delegate_run.py` are outside it and are unchanged.
 
 ## Source
 
