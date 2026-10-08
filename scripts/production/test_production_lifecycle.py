@@ -280,19 +280,18 @@ class LifecycleTests(unittest.TestCase):
         self.assert_step(retried, "ok")
         self.assertEqual(self.git("rev-parse", "HEAD"), first_tip)
         self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), first_tip)
-        self.assertNotIn("old-showrunner", self.doc.read_text())
-        self.assertIn("test-showrunner", self.doc.read_text())
+        # The showrunner's name is written nowhere: open leaves no name in the doc.
+        self.assertNotIn("test-showrunner", self.doc.read_text())
         self.assertTrue(self.log.read_text().startswith("# Production log — example"))
         common_dir = Path(self.git("rev-parse", "--git-common-dir"))
         self.assertIn("production.log", (self.checkout / common_dir / "info/exclude").read_text())
 
-    def test_open_requires_explicit_session_even_with_environment_names(self) -> None:
+    def test_open_needs_no_session_name(self) -> None:
         result = self.run_lifecycle("open")
-        self.assert_step(result, "failed")
-        self.assertIn("input: failed — open needs --session", result.stdout)
-        self.assertEqual(self.git("branch", "--show-current"), "main")
+        self.assert_step(result, "ok")
+        self.assertIn("doc: ok — running", result.stdout)
 
-    def test_open_rerun_preserves_session_and_does_not_commit_plans_twice(self) -> None:
+    def test_open_rerun_does_not_commit_plans_twice_and_writes_no_session_name(self) -> None:
         first = self.run_lifecycle("open", "--session", "first-showrunner")
         self.assert_step(first, "ok")
         tip = self.git("rev-parse", "HEAD")
@@ -302,7 +301,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), tip)
         self.assertEqual(self.git("log", "--format=%s", "--grep=^production(example): plans for 2 units$", "production"),
                          "production(example): plans for 2 units")
-        self.assertIn("**Showrunner session:** first-showrunner", self.doc.read_text())
+        self.assertNotIn("first-showrunner", self.doc.read_text())
         self.assertNotIn("other-showrunner", self.doc.read_text())
 
     def test_open_running_with_committed_plans_skips_commit_and_push(self) -> None:
@@ -578,8 +577,8 @@ class LifecycleTests(unittest.TestCase):
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
         self.assertIn(f"cargo-berth release alpha-reservation --json cwd={self.alpha}", self.calls())
-        self.assertEqual((self.home / ".claude/scripts/production/showrunners.py").stat().st_mode & 0o111, 0)
-        self.assertIn(f"py {self.home}/.claude/scripts/production/showrunners.py remove old-showrunner", self.calls())
+        # Removing the update timer is the whole of forgetting a showrunner: no registry is rewritten.
+        self.assertNotIn("showrunners.py", self.calls())
 
     def test_wrap_resumes_after_final_push_rejection_without_second_commit(self) -> None:
         self.running()
@@ -640,7 +639,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertIn(f"| {area} |", result.stdout)
         calls = (self.state / "calls").read_text()
         self.assertIn("notifier.sh remove", calls)
-        self.assertIn("showrunners.py remove", calls)
+        self.assertNotIn("showrunners.py", calls)
         self.assertNotIn("gh ", calls)
         self.assertNotIn("ssh ", calls)
 

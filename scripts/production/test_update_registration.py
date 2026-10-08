@@ -114,10 +114,6 @@ class RegistrationTests(unittest.TestCase):
         return ([cast(list[str], json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines()]
                 if path.exists() else [])
 
-    def registry(self) -> list[dict[str, object]]:
-        data = cast(dict[str, object], json.loads(self.config.read_text(encoding="utf-8")))
-        return cast(list[dict[str, object]], data["showrunners"])
-
     def outstanding(self) -> Path:
         path = self.state / "showrunner/outstanding/example.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -140,26 +136,11 @@ class RegistrationTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(script), *args, "--production", str(self.doc)],
                               cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False)
 
-    def test_register_records_where_the_doc_is_and_keeps_an_old_unit_list_for_adopt(self) -> None:
-        # A registry written before the change still lists units; adopt reads run states from the list.
-        _ = self.config.write_text(json.dumps({
-            "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "natedev",
-            "always": ["natedev"], "showrunners": [{
-                "session": "first-showrunner", "zone": "America/New_York",
-                "units": [{"session": "a-name-since-changed", "status": "running"}]}]}), encoding="utf-8")
-        first = self.run_command("register", "--session", "first-showrunner")
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.assertEqual(self.registry(), [{"session": "first-showrunner", "zone": "America/Los_Angeles",
-                                            "doc": str(self.doc),
-                                            "units": [{"session": "a-name-since-changed", "status": "running"}]}])
-
     def test_start_and_resume_retarget_only_updates_and_retire_old_session(self) -> None:
-        first = self.run_command("register", "--session", "first-showrunner")
+        doc_bytes = self.doc.read_bytes()
+        first = self.run_command("register")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertIn("register: ok", first.stdout)
-        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
-        self.assertEqual(self.registry()[0]["session"], "first-showrunner")
-        self.assertEqual(self.registry()[0]["doc"], str(self.doc))
         initial_calls = self.notifier_calls()
         self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", "showrunner-example"]]), 1)
         updates = next(call for call in initial_calls if call[:2] == ["new", "showrunner-example"])
@@ -171,18 +152,12 @@ class RegistrationTests(unittest.TestCase):
         new_env = {**self.env, "CLAUDE_CODE_SESSION_ID": "resume-session-id"}
         resumed = self.run_command("register", "--session", "resumed-showrunner", env=new_env)
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
-        self.assertIn("**Showrunner session:** resumed-showrunner", self.doc.read_text(encoding="utf-8"))
-        self.assertEqual(self.git("log", "-1", "--format=%s"),
-                         "production(example): showrunner session resumed-showrunner")
-        self.assertEqual([entry["session"] for entry in self.registry()], ["resumed-showrunner"])
-        self.assertEqual(self.registry()[0]["doc"], str(self.doc))
-        registry_bytes = self.config.read_bytes()
-        doc_bytes = self.doc.read_bytes()
         repeated = self.run_command("register", "--session", "resumed-showrunner", env=new_env)
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
-        self.assertEqual(self.config.read_bytes(), registry_bytes)
+        # The showrunner's name is written nowhere: no registry, no doc line, no commit.
+        self.assertFalse(self.config.exists())
         self.assertEqual(self.doc.read_bytes(), doc_bytes)
-        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "2")
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
         calls = self.notifier_calls()
         self.assertEqual(len([call for call in calls if call[:2] == ["new", "showrunner-example"]]), 3)
         updates = [call for call in calls if call[:2] == ["new", "showrunner-example"]]
@@ -191,10 +166,7 @@ class RegistrationTests(unittest.TestCase):
         for instance in ("stall-watch", "tmux-names"):
             self.assertEqual(len([call for call in calls if call[:2] == ["new", instance]]), 1)
 
-    def test_register_requires_session_and_environment_session_id(self) -> None:
-        missing_name = self.run_command("register")
-        self.assertEqual(missing_name.returncode, 2)
-        self.assertEqual(self.notifier_calls(), [])
+    def test_register_requires_the_environment_session_id(self) -> None:
         without_id = {key: value for key, value in self.env.items() if key != "CLAUDE_CODE_SESSION_ID"}
         missing_id = self.run_command("register", "--session", "first-showrunner", env=without_id)
         self.assertEqual(missing_id.returncode, 2)
@@ -214,26 +186,6 @@ class RegistrationTests(unittest.TestCase):
         self.assertFalse(self.config.exists())
         self.assertEqual(self.notifier_calls(), [])
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
-
-    def test_failed_registry_rename_keeps_old_session_line_for_retry(self) -> None:
-        first = self.run_command("register", "--session", "first-showrunner")
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        script = self.copied_command()
-        registry = script.with_name("showrunners.py")
-        _ = registry.write_text("\n".join(("import sys", "if __name__ == '__main__':",
-                                             "    print('rename unavailable', file=sys.stderr)",
-                                             "    raise SystemExit(1)", "")), encoding="utf-8")
-        doc_before = self.doc.read_bytes()
-        commit_before = self.git("rev-parse", "HEAD")
-        failed = self.run_copy(script, "register", "--session", "resumed-showrunner")
-        self.assertEqual(failed.returncode, 2, failed.stdout + failed.stderr)
-        self.assertIn("rename unavailable", failed.stdout)
-        self.assertEqual(self.doc.read_bytes(), doc_before)
-        self.assertEqual(self.git("rev-parse", "HEAD"), commit_before)
-        self.assertEqual([entry["session"] for entry in self.registry()], ["first-showrunner"])
-        retry = self.run_command("register", "--session", "resumed-showrunner")
-        self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
-        self.assertEqual([entry["session"] for entry in self.registry()], ["resumed-showrunner"])
 
     def test_missing_prompt_markers_fail_before_registration_changes(self) -> None:
         for marker in ("The prompt:", "**A tick**"):
@@ -263,7 +215,8 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(prompt.count("Pass `--render-state <SCRATCH>/dailies_state.json` to the builder"), 1)
         self.assertEqual(prompt.count("--render-state"), 1)
         self.assertIn("America/Los_Angeles", prompt)
-        self.assertIn("first-showrunner", prompt)
+        self.assertIn(f"--production {self.doc}", prompt)
+        self.assertNotIn("first-showrunner", prompt)
 
     def test_time_converts_midnight_and_daylight_change_to_document_zone(self) -> None:
         midnight = self.run_command("time", "2026-10-07T06:30:00+00:00")

@@ -30,7 +30,7 @@ dailies the user runs takes the next tick's place. N is the
 production doc's **Updates** interval. Two steps do that:
 
 1. **Check every unit.** Save the status script's complete output before Gather:
-   `zsh ~/.claude/scripts/production/unit_status.sh <scratchpad>/unit_status <ZONE> --showrunner <this session's name> > <scratchpad>/unit_status.txt`.
+   `zsh ~/.claude/scripts/production/unit_status.sh <scratchpad>/unit_status <ZONE> --production PRODUCTION_DOC > <scratchpad>/unit_status.txt`.
    The input builder reads that file and prints `flags first:` for SESSION GONE,
    CLAUDE NOT RUNNING, FORM WAITING, a usage limit, and a DECISION. Put these
    first in the report.

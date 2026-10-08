@@ -154,15 +154,14 @@ raise SystemExit(1 if record['to'] in fail else 0)
         _ = self.unit("unit-one")
 
     def configure(self, runners: dict[str, list[str]], *, stall_minutes: int = 5) -> None:
-        """Register each showrunner with a production doc that lists its units. The slug is its name."""
+        """Give each showrunner an update timer and a production doc that lists its units. The slug is its name."""
         _ = self.config.write_text(json.dumps({
             "threshold_percent": 1, "repeat_minutes": 30, "stall_minutes": stall_minutes,
-            "faults_to": "natedev", "always": ["natedev"], "showrunners": [
-                {"session": session, "zone": "America/Los_Angeles", "doc": str(self.root / f"{session}-production.md")}
-                for session in runners
-            ],
+            "faults_to": "natedev", "always": ["natedev"],
         }))
         for session, units in runners.items():
+            # A showrunner is recorded by its update timer alone, addressed to its Claude session id.
+            self.production(session, tuple(units), doc=self.root / f"{session}-production.md")
             rows = [f"| {unit} | {self.plans.get(unit, '`docs/plan.md`')} | /tmp/no-worktree-of-{unit} | {unit} | — | — |"
                     for unit in units]
             _ = (self.root / f"{session}-production.md").write_text("\n".join((
@@ -195,7 +194,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
     def production(self, slug: str, units: tuple[str, ...], *, target: str = "session:show-id",
                    doc: Path | None = None) -> None:
         directory = self.notifier / f"showrunner-{slug}"
-        directory.mkdir()
+        directory.mkdir(exist_ok=True)
         prompt = directory / "prompt"
         _ = prompt.write_text("Run `zsh ~/.claude/scripts/production/unit_status.sh /tmp/status "
                               + f"America/Los_Angeles {' '.join(units)} | cut -c1-400`.\n")
@@ -613,74 +612,20 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(self.tick(START + 600).returncode, 0)
         self.assertEqual(self.sent(), [])
 
-    def test_unavailable_configured_lookup_preserves_missing_state_and_sends_nothing(self) -> None:
-        self.production("showrunner", ("unit-one",))
-        self.environment["STALL_TEST_SESSION_ERRORS"] = json.dumps(["showrunner"])
-        self.state.mkdir()
-        saved = self.state / "missing-showrunner.json"
-        prior = b"saved earlier\n"
-        _ = saved.write_bytes(prior)
-
-        result = self.tick(START)
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(saved.read_bytes(), prior)
-        self.assertEqual(self.sent(), [])
-
-    def test_configured_name_is_not_missing_when_lookup_finds_another_session(self) -> None:
-        self.production("showrunner", ("unit-one",))
-        self.environment["STALL_TEST_SESSION_OVERRIDES"] = json.dumps({
-            "showrunner": str(self.root / "fault-id.sock"),
-        })
-
-        result = self.tick(START)
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((self.state / "missing-showrunner.json").exists())
-        self.assertEqual(self.sent(), [])
-
-    def test_live_unconfigured_showrunner_fault_retries_and_rearms_after_removal(self) -> None:
-        missing = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.children.append(missing)
-        _ = self.record_session(missing.pid, "missing-id", "missing director")
-        self.production("missing", ("extra-unit",), target="session:missing-id",
-                        doc=self.root / "missing-production.md")
-        fault_socket = f"uds:{self.root / 'fault-id.sock'}"
-        _ = self.fail_file.write_text(json.dumps([fault_socket]))
+    def test_a_showrunner_lookup_that_cannot_say_sends_nothing(self) -> None:
+        self.environment["STALL_TEST_SESSION_ERRORS"] = json.dumps(["session:show-id"])
         _ = self.tick(START)
-        first = self.sent()
-        self.assertEqual(len(first), 1)
-        self.assertEqual(first[0]["to"], fault_socket)
-        self.assertIn("showrunner missing", first[0]["text"])
-        self.assertIn("session missing director", first[0]["text"])
-        self.assertIn("showrunners.py add", first[0]["text"])
-        self.assertIn(f"--zone America/Los_Angeles --doc {self.root / 'missing-production.md'}.", first[0]["text"])
-        _ = self.tick(START + 10)
-        self.assertEqual(len(self.sent()), 2)
-        self.assertEqual(self.sent()[0]["key"], self.sent()[1]["key"])
-        _ = self.fail_file.write_text("[]")
-        _ = self.tick(START + 20)
-        _ = self.tick(START + 30)
-        self.assertEqual(len(self.sent()), 3)
-        self.configure({"showrunner": ["unit-one"], "missing director": []})
-        _ = self.tick(START + 40)
-        self.configure({"showrunner": ["unit-one"]})
-        _ = self.tick(START + 50)
-        self.assertEqual(len(self.sent()), 4)
-        self.assertNotEqual(self.sent()[0]["key"], self.sent()[3]["key"])
+        result = self.tick(START + 600)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot tell whether session:show-id is running", result.stderr)
+        self.assertEqual(self.sent(), [])
 
-    def test_live_showrunner_with_unreadable_prompt_sends_placeholder_fault(self) -> None:
-        missing = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.children.append(missing)
-        _ = self.record_session(missing.pid, "missing-id", "missing director")
-        self.production("missing", ("extra-unit",), target="session:missing-id")
-        (self.notifier / "showrunner-missing" / "prompt").unlink()
-        result = self.tick(START)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        sent = self.sent()
-        self.assertEqual(len(sent), 1)
-        self.assertIn("--zone <zone> --doc <production doc>.", sent[0]["text"])
-        self.assertIn("prompt could not be read", sent[0]["text"])
+    def test_a_renamed_showrunner_is_still_told_of_its_stalled_unit(self) -> None:
+        _ = self.record_session(os.getpid(), "show-id", "renamed-since-it-registered")
+        _ = self.tick(START)
+        _ = self.tick(START + 600)
+        self.assertEqual([one["to"] for one in self.sent() if "idle since" in one["text"] and "bumped" in one["text"]],
+                         [f"uds:{self.root / 'show-id.sock'}"])
 
     def test_locked_tick_exits_without_sending(self) -> None:
         _ = self.tick(START)

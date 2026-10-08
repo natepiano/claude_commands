@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, NamedTuple, TypeVar, cast
 
+import showrunners
 import unit_lookup
 from add_unit import Production, Refusal, cell_value, live_unit_table, read_production, retired_units
 from merge_checkpoint import MergeEntry, NoMerge, Stop, git, merge_branch_history, report as merge_report
@@ -604,7 +605,7 @@ def quota(production: Production, notice: str, state_dir: Path) -> None:
             continue
         try:
             delivered = subprocess.run([sys.executable, sender, "--to", unit.session,
-                                        "--from", production.showrunner_session,
+                                        "--from", showrunners.current_name(production.slug) or "showrunner",
                                         "--text", f"From the showrunner: {action}"],
                                        capture_output=True, text=True, check=False)
         except OSError as error:

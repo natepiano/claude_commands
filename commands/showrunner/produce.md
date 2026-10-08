@@ -213,8 +213,7 @@ When the production doc's **Production rules** say CI does not apply, pass
 <OpenMergeBranch>
 For a planned production, run
 `python3 ~/.claude/scripts/production/production_lifecycle.py open
---production PRODUCTION_DOC --session <this session's name>`, using the first
-line of ListAgents for the name. The command creates and pushes the merge
+--production PRODUCTION_DOC`. The command creates and pushes the merge
 branch, records the running doc and plans, and initializes `LOG`. Rerun it
 after a failed step; it resumes at the first unfinished step.
 </OpenMergeBranch>
@@ -248,14 +247,14 @@ The instance belongs to the production and keeps running when this session
 exits. On resume, retarget it. Remove it at <Wrap/>; its check removes it after
 the doc says `wrapped`. Each production has its own instance and log.
 
-At the start and on every resume, take this session's current name from the
-first line of ListAgents and run:
+At the start and on every resume, run:
 
 `python3 ~/.claude/scripts/production/update_registration.py register
---production PRODUCTION_DOC --session <this session's name>`
+--production PRODUCTION_DOC`
 
-The command sets and commits a changed showrunner session line, retires the old
-registry name, registers the current name and unit sessions, writes `PROMPT_FILE`,
+This session's name is written nowhere: the update timer is addressed to its
+Claude session id, and every tool looks the name up from that when it needs it.
+The command writes `PROMPT_FILE`,
 retargets `UPDATES` with `NOTIFIER new` without moving its clock, creates
 stall-watch and tmux-names only when absent, and prints `next_due`. Use the
 reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
@@ -263,7 +262,7 @@ reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
 The prompt:
 
 > Scheduled update (every <N> minutes, every unit checked; the user is in
-> <zone>). Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> --showrunner <this session's name> > <SCRATCH>/unit_status.txt`.
+> <zone>). Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> --production <production doc> > <SCRATCH>/unit_status.txt`.
 > It checks every unit director: its session and Claude are running, anything waiting
 > on the user, and its latest step and ETA. Run `/showrunner:dailies simple`
 > for every unit and open topic; its input builder reads the saved status file.

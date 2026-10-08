@@ -136,7 +136,7 @@ class WaitingTests(unittest.TestCase):
         (self.root / "sessions").mkdir()
         self.write(self.root / "showrunners.json", json.dumps({
             "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "natedev",
-            "always": [], "showrunners": []}))
+            "always": []}))
         self.enterContext(mock.patch.dict(os.environ, {
             "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
             "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
@@ -425,7 +425,6 @@ class WaitingTests(unittest.TestCase):
             "stall_minutes": 5.0,
             "faults_to": "showrunner-example",
             "always": [],
-            "showrunners": [],
         }
         return quota_alert.message(note, [], config)
 

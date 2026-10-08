@@ -91,6 +91,8 @@ When the last phase is closed but an activity remains open, `progress` calls `_p
 
 ### Unit status and stall watch
 
+> **Superseded 2026-10-08.** Showrunners and units are no longer stored in `config/showrunners.json`: a unit is a mark on its tmux session and a showrunner is its update timer. See `showrunner-automation.md`, "Unit lookup".
+
 `scripts/production/showrunners.py` represents registry units as:
 
 ```python
