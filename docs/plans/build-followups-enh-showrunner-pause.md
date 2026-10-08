@@ -250,7 +250,7 @@ The pause is safe to register: it cannot delay a prompt, cannot stay on for ever
 
 **Ruled out:** putting the Stop hook at the tail of its group (an existing test pins the last two hooks; hooks of one group run on the same event, so the order changes no behavior); treating every prompt that opens with a tag as a notice (a paste opens with one).
 
-### Phase 7 — A progress report shows the closing work of a unit's last piece of work  · status: todo
+### Phase 7 — A progress report shows the closing work of a unit's last piece of work  · status: done
 
 #### Work Order
 
