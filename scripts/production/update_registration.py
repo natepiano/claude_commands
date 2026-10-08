@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 
-from add_unit import Production, Refusal, cell_value, read_production, retired_sessions, row_is_retired, unit_rows
+from add_unit import Production, Refusal, cell_value, read_production, unit_table
 from merge_checkpoint import NoMerge, merge_branch_history, report
 
 if TYPE_CHECKING:
@@ -115,19 +115,6 @@ def session_line(production: Production, session: str) -> SessionLineSame | Sess
     raise RegistrationFailure("session", "production doc lacks Showrunner session")
 
 
-def unit_sessions(lines: list[str]) -> list[str]:
-    """Return the session of every unit that is not retired."""
-    _, rows = unit_rows(lines)
-    sessions: list[str] = []
-    for row in rows:
-        cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
-        if len(cells) < 5:
-            raise RegistrationFailure("registry", f"invalid Units row: {row}")
-        if not row_is_retired(row):
-            sessions.append(cell_value(cells[4]))
-    return sessions
-
-
 def update_interval(lines: list[str]) -> tuple[int, bool]:
     line = next((line for line in lines if line.startswith("- **Updates:**")), "")
     match = re.search(r"every (\d+) minutes", line)
@@ -158,7 +145,6 @@ def register(production: Production, session: str) -> None:
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     minutes, aligned = update_interval(lines)
     prompt = scheduled_prompt(minutes, str(production.zone), session)
-    sessions = unit_sessions(lines)
     relative = production.doc.relative_to(production.checkout)
     dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
     if dirty:
@@ -166,13 +152,9 @@ def register(production: Production, session: str) -> None:
     registry = Path(__file__).with_name("showrunners.py")
     if production.showrunner_session != session:
         _ = command("register", [sys.executable, str(registry), "rename", production.showrunner_session, session])
+    # The registry holds only where the doc is: the units are read from its Units table when needed.
     _ = command("register", [sys.executable, str(registry), "add", session, "--zone", str(production.zone),
-                         *(argument for unit in sessions for argument in ("--unit", unit))])
-    # The registry only gains names on `add`, so a retired unit leaves it here.
-    retired = sorted(retired_sessions(lines) - set(sessions))
-    if retired:
-        _ = command("register", [sys.executable, str(registry), "remove", session,
-                             *(argument for unit in retired for argument in ("--unit", unit))])
+                         "--doc", str(production.doc)])
     _ = session_line(production, session)
     state_root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
     prompt_file = state_root / production.slug / "prompt.txt"
@@ -284,16 +266,11 @@ def outstanding_path(production: Production) -> Path:
 
 def state_block(production: Production, state: ShowrunnerState, timestamp: str) -> str:
     history = merge_branch_history(production.checkout, production.merge_branch)
-    _, rows = unit_rows(production.doc.read_text(encoding="utf-8").splitlines())
     judgments = {unit.unit: unit for unit in state.units}
     unit_lines: list[str] = []
-    for row in rows:
-        cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
-        if len(cells) < 5:
-            raise RegistrationFailure("log", f"invalid Units row: {row}")
-        name = cell_value(cells[0])
-        session = cell_value(cells[4])
-        judgment = judgments.get(session)
+    for cells in unit_table(production.doc.read_text(encoding="utf-8").splitlines()):
+        name = cell_value(cells.get("Unit", ""))
+        judgment = judgments.get(name)
         merged = history.last_code_for_unit(name)
         last = "none" if isinstance(merged, NoMerge) else f"phase {merged.phase} ({merged.short})"
         phase = judgment.phase if judgment is not None else "not stated"

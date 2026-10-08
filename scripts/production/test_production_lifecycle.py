@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, final, override
+
+import fake_tmux
+from fake_tmux import FakeSession
 
 
 SCRIPT = Path(__file__).with_name("production_lifecycle.py")
@@ -77,6 +79,9 @@ class LifecycleTests(unittest.TestCase):
             self.stub(self.home / relative)
         self.env = {**os.environ, "HOME": str(self.home), "LIFECYCLE_TEST_STATE": str(self.state),
                     "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
+                    # Unit sessions are looked up in this stand-in; with no state file it has no sessions.
+                    "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
+                    "FAKE_TMUX_STATE": str(self.state / "tmux.json"),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
                     "SHOWRUNNER_SESSION": "environment-showrunner",
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"),
@@ -237,27 +242,21 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("beta-unit", result.stdout)
         self.assertIn(alpha_merge[:7], result.stdout)
         self.assertIn(beta_merge[:7], result.stdout)
-        self.assertIn("alpha", (self.state / "calls").read_text())
-        self.assertIn("beta", (self.state / "calls").read_text())
+        self.assertIn("session: ok — alpha-unit: gone", result.stdout)
+        self.assertIn("session: ok — beta-unit: gone", result.stdout)
 
-    def test_load_reads_a_gone_unit_as_gone_while_a_session_its_name_prefixes_lives(self) -> None:
-        binary = shutil.which("tmux")
-        if binary is None:
-            self.skipTest("tmux is required to check its session matching")
+    def test_load_finds_each_unit_session_by_its_mark_whatever_it_is_called(self) -> None:
         self.running()
-        server_dir = self.root / "tmux"
-        server_dir.mkdir()
-        self.env["TMUX_TMPDIR"] = str(server_dir)
-        _ = self.env.pop("TMUX", None)
-        self.write(self.root / "bin" / "tmux", f'#!/bin/sh\nexec {binary} "$@"\n')
-        self.addCleanup(subprocess.run, [binary, "kill-server"], env=self.env, capture_output=True, check=False)
-        for name in ("alphabet", "beta"):
-            _ = subprocess.run([binary, "-f", "/dev/null", "new-session", "-d", "-s", name, "sleep 60"],
-                               env=self.env, check=True)
+        fake_tmux.write(self.state / "tmux.json", {
+            # A session that only has the name the unit was launched under is not the unit.
+            "$1": FakeSession(label="alpha", panes=["%1"], env={}),
+            "$2": FakeSession(label="renamed-since-launch", panes=["%2"],
+                              env={"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": "beta-unit"}),
+        })
         result = self.run_lifecycle("load", "--no-ci", "--resume")
         self.assert_step(result, "ok")
-        self.assertIn("alpha-unit: alpha gone", result.stdout)
-        self.assertIn("beta-unit: beta live", result.stdout)
+        self.assertIn("alpha-unit: gone", result.stdout)
+        self.assertIn("beta-unit: renamed-since-launch live", result.stdout)
 
     def test_open_holds_when_production_is_wrapped(self) -> None:
         self.running()

@@ -18,6 +18,8 @@ class SessionRecord(TypedDict):
     name: str
     messagingSocketPath: str
     updatedAt: int
+    # "<tmux session name at start>:@<window>.%<pane>"; empty outside tmux. Only the pane id stays true.
+    tmux: str
 
 
 class UnreadableSessionRecord(Enum):
@@ -38,6 +40,7 @@ def read_session(path: Path) -> RegistryEntry:
         name = data.get("name")
         socket_path = data.get("messagingSocketPath")
         updated_at = data.get("updatedAt")
+        tmux = data.get("tmux")
         if (
             not isinstance(pid, int)
             or isinstance(pid, bool)
@@ -55,6 +58,7 @@ def read_session(path: Path) -> RegistryEntry:
             name=name,
             messagingSocketPath=socket_path,
             updatedAt=updated_at,
+            tmux=tmux if isinstance(tmux, str) else "",
         )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return UnreadableSessionRecord.FOUND

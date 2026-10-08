@@ -79,9 +79,17 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 
 ## Units
 
-| Unit | Plan | Worktree | Branch | Session | Port | Owns |
-| --- | --- | --- | --- | --- | --- | --- |
-| <name>-unit | <plan path> | <path> | <branch> | <tmux and remote-control name> | <app port or —> | <dirs/files> |
+| Unit | Plan | Worktree | Branch | Port | Owns |
+| --- | --- | --- | --- | --- | --- |
+| <name>-unit | <plan path> | <path> | <branch> | <app port or —> | <dirs/files> |
+
+The Unit value names the unit everywhere: in the log, the dailies, the waits and every
+tool's arguments. A unit's session name is written nowhere, because the user may rename
+a session at any time. The unit's tmux session carries the production's slug and the
+unit's id as marks, set at launch. To reach a unit, look it up at that moment:
+`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
+prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and its
+session name now. `<slug>` is this doc's file name without `-production.md`.
 
 A retired unit keeps its row. Its Plan cell begins with `retired`, alone or inside
 an opening parenthesis, as in `(retired by the user 2026-10-07, worktree removed)`.
@@ -131,8 +139,8 @@ Applies to a `/unit:delegate` run whose plan header carries a
 run and after every compaction. Your row in its **Units** table gives your name,
 branch, port and the files you own.
 
-At <PrepareSession/>, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/showrunners.py" status "<showrunner session>" --unit "<this row's Session cell>" --state running`; a session stays live after its run ends and can start another run without a new launch, so this sets a finished entry back to running for the stall watch and rewrites nothing when it is already running.
-Only after <RunAsBuilt/> and, where it applies, <AsBuiltCommit/> are complete, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/showrunners.py" status "<showrunner session>" --unit "<this row's Session cell>" --state run-finished` before <RunSummary/>; a run that stopped, failed, or waits on a decision does not mark itself finished, and nothing asks for `run done` text in the Plan cell.
+At <PrepareSession/>, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/showrunners.py" status --state running` from the unit director's own pane; a session stays live after its run ends and can start another run without a new launch, so this sets a finished unit back to running for the stall watch and changes nothing when it is already running. The state is a mark on the unit's own tmux session, so the call names no session.
+Only after <RunAsBuilt/> and, where it applies, <AsBuiltCommit/> are complete, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/showrunners.py" status --state run-finished` from the unit director's own pane before <RunSummary/>; a run that stopped, failed, or waits on a decision does not mark itself finished, and nothing asks for `run done` text in the Plan cell.
 
 1. **Your port.** Every app launch for smoke tests and shots uses your port,
    never the user's default port or another unit's.

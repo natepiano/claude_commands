@@ -188,6 +188,16 @@ def _rename_scratch(old: str, new: str, scratch: Path) -> list[str]:
     return changed
 
 
+def rename_scratch(old: str, new: str, scratch: Path) -> list[str]:
+    """Move a showrunner's saved report state from one unit key to another."""
+    try:
+        return _rename_scratch(old, new, scratch)
+    except RenameRefused:
+        raise
+    except (OSError, ValueError) as error:
+        raise RenameRefused(str(error)) from error
+
+
 def rename_all(old: str, new: str, scratch: Path) -> list[str]:
     """Move every store entry from the old unit name to the new one."""
     try:
