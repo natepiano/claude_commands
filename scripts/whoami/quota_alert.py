@@ -14,11 +14,14 @@ new window, another account made active -- and that sends "Quota restored:".
 /quota_refresh (`agent_notes.py refresh`) does the same at once when the user
 reports a reset, and says so even when the timer closed the episode first.
 
-A Codex episode opening also moves every [assignments] entry on codex to claude
-through agents_config.sh's validated editor, so delegation goes on without Codex;
-the alert says what moved, or why the editor refused. Once no Codex episode is
-open, the entries it moved that are still on claude go back to codex, and
-"Quota restored:" says which. A Claude episode never switches anything. Each
+Reaching the threshold switches nothing, for either tool: a Codex account whose
+weekly allowance is used up may keep working on its credits, so its alert says to
+keep delegating (user, 2026-10-07). switch_to_claude() moves every [assignments]
+entry on codex to claude through agents_config.sh's validated editor; it is for a
+caller that has seen Codex refuse work for quota, and alert() never calls it. A
+later alert says what a switch moved, or why the editor refused. Once no Codex
+episode is open, the entries a switch moved that are still on claude go back to
+codex, and "Quota restored:" says which. Each
 switch and switch-back waits in the state until the user's next prompt in OWNER,
 where `notice`, a UserPromptSubmit hook in /etc/nixos/.claude/settings.json,
 shows it to them. Only this machine's registry is switched.
@@ -261,7 +264,7 @@ def edit_registry(editor: str, *args: str) -> str | None:
 
 
 def switch_to_claude(state: State, note: AgentNote, stamp: str) -> str:
-    """Move every [assignments] entry on codex to claude as `note`'s episode opens; return the log line."""
+    """Move every [assignments] entry on codex to claude within `note`'s open episode; return the log line."""
     episode = state["episodes"][note.path.stem]
     account = f"{note.path.stem} at {percent(note)}, resets {note.get('resets')}"
     moved: list[str] = []
@@ -320,6 +323,10 @@ def account_line(note: AgentNote, threshold: float) -> str:
 def instruction(tool: str, switch: Switch | None, failed: str | None) -> str:
     """What the alert asks of its recipient, given the switch to Claude made or refused."""
     refused = f"The automatic switch from {tool} to Claude failed: {failed} " if failed else ""
+    if switch is None and tool == "Codex" and not failed:
+        return ("Its weekly allowance is used up or nearly so, and Codex may keep working on the account's credits, "
+                + "so nothing was switched to Claude: keep delegating Codex work. Bring this to your user, and if "
+                + "Codex refuses work for quota, bring that to them at once.")
     if switch is None:
         return (f"{refused}Bring this to your user, and if you delegate {tool} work, start no new {tool} work "
                 + 'until a "Quota restored:" notice.')
@@ -410,8 +417,6 @@ def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
             name = note.path.stem
             if name not in episodes:
                 episodes[name] = {"since": stamp, "last": {}}
-                if note.tool == "codex":
-                    log.append(switch_to_claude(state, note, stamp))
             episode = episodes[name]
             if "acknowledged" in episode:
                 continue
