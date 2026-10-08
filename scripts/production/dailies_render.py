@@ -1036,7 +1036,8 @@ def change_note(moment: datetime, previous: Previous, phase: str,
                 now: datetime, why: str | None) -> str | None:
     minutes = change_minutes(moment, previous, phase)
     if minutes is None:
-        return None
+        # No earlier report to compare with: a time that has passed is still said to have passed.
+        return "overdue" if moment < now else None
     if minutes == 0:
         return "unchanged, overdue" if moment < now else "unchanged"
     hours, rest = divmod(abs(minutes), 60)
