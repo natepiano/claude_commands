@@ -72,61 +72,28 @@ The model study finds where a unit director's work begins under either name: `DI
 
 ### Phase 2 — Every file that names the command says `/unit:direct`  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** Launch prompts, commands, docs and config all name `/unit:direct`; the old name stays only in `CLAUDE.md`, which this plan does not touch, and where old transcripts are read.
+Every command page, doc, config comment and script comment that named the command says `/unit:direct`, and every path to the workflow says `commands/unit/direct.md`. Where the bare word stood for the command (`delegate run`, `delegate phase`, a title beginning `# Delegate —`) it reads `/unit:direct` or `Direct`; no line was rewrapped. `scripts/production/add_unit.py` writes launch prompts that run `/unit:direct`. `commands/history.md` tells the command from its history store: neither `--skill direct` nor `--skill delegate` matches one, and `plan-delegate` is the only store.
 
-**Spec:**
-
-Apply the rename rule (Delegation Context → Invariants) to every tracked file under **Files**. These three searches list the lines; each line gets the clause that fits it, and no line is rewrapped:
-
-- clause 1: `git grep -nI 'unit:delegate' -- . ':!docs/plans'` — about 143 lines in 57 files once `build-followups` with Phase 1 is merged in;
-- clause 2: `git grep -nI 'delegate\.md' -- . ':!docs/plans'` — about 22 lines in 13 files;
-- clause 3: `git grep -nIiE 'delegate (run|phase)s?\b|^# Delegate( |$)' -- commands docs config ':!docs/plans'`, about 36 lines. One more wraps across a line end: `commands/unit/checkpoint.md` line 11 ends `If no delegate` and line 12 begins `run is active`.
-
-Clause 3 also covers two places where the bare word stands for the command: `commands/implement_issue.md` line 12 (`it runs no delegate` → ``it runs no `/unit:direct` ``) and `commands/unit/eta_breakdown.md` line 9 (`the delegate's own stages` → `` `/unit:direct`'s own stages``).
-
-Lines these searches print that stay as they are:
-
-- `config/agents.conf` line 58 (`A codex delegate runs as a thread`): the agent, clause 4.
-- `CLAUDE.md` line 7: not touched (Invariants).
-- `scripts/production/test_merge_checkpoint.py` lines 33 and 318: the frozen Owns cell.
-- `scripts/production/test_add_unit.py` line 221 (the `enh-showrunner-unit` row of `test_retired_readers_use_marker_on_production_rows`): a frozen copy of a production row; its `commands/unit/delegate.md` stays.
-- `scripts/model_study/test_rerun.py` and the existing cases in `scripts/model_study/test_turns.py`: transcripts from before the rename.
-- `docs/as-built/director-model-study.md` line 108: it reports how recorded sessions were read.
-- `docs/delegate_footprint_review.md`: not touched (Invariants).
-- `commands/unit/direct.md`, `commands/unit/delegate.md`, the three hook files, `scripts/hooks/test_command_stub.py`, `scripts/model_study/turns.py`, `scripts/model_study/test_turns.py` and `docs/as-built/director-model-study.md` line 27: finished in Phase 1.
-
-Code, beyond the word swap:
-
-1. `scripts/production/`: `/unit:delegate` → `/unit:direct` on every line clause 1's search prints there: the three launch-prompt strings in `add_unit.py`'s `prompt_for` with the three assertions on them in `test_add_unit.py`, and the lines in `stall_watch.py`, `unit_lookup.py`, `test_stall_watch.py` and `test_unit_lookup.py` that arrive with the merge of `build-followups`. `test_merge_checkpoint.py` stays.
-2. `scripts/lint/lint_config.sh` line 28 and `commands/lint_config.md` line 53 carry the same row; both become `/unit:direct phase-end gate`.
-3. `scripts/delegate/findings.py` line 4: the docstring's `/unit:delegate` → `/unit:direct`.
+Internal names are unchanged: `scripts/delegate/`, `docs/delegate/`, `config/delegate.conf`, the `plan-delegate` store, the `delegate` task and `[delegate.codex]`, the `delegate/<plan-slug>` branches, and "delegate" wherever it means the agent that writes code.
 
 **Files:**
-- `commands/` — every line the three searches print, but for `commands/unit/direct.md` and `commands/unit/delegate.md`
-- `docs/` — every line the three searches print, but for `docs/plans/` and `docs/delegate_footprint_review.md`
-- `config/` — `README.md`, `delegate.conf`, `lint.conf`, `clippy.conf`
-- `scripts/production/` — every line clause 1's search prints; `test_merge_checkpoint.py` and the frozen row in `test_add_unit.py` stay
-- `scripts/lint/lint_config.sh` — line 28
-- `scripts/delegate/findings.py` — line 4
+- `commands/` — every page that named the command, but for `commands/unit/direct.md` and `commands/unit/delegate.md`
+- `docs/` — every doc that named it, but for `docs/plans/` and `docs/delegate_footprint_review.md`
+- `config/README.md`, `config/clippy.conf`, `config/delegate.conf`, `config/lint.conf`, `config/agents.conf` — comments; the `agents.conf` section header had the older spelling `/plan:delegate`
+- `scripts/production/add_unit.py`, `stall_watch.py`, `unit_lookup.py` and their tests — the lines that name the command and the assertions on them
+- `scripts/lint/lint_config.sh` — the row it shares with `commands/lint_config.md`, `/unit:direct phase-end gate`
+- `scripts/delegate/findings.py` — docstring
 
-**Seats:** 2 writers — the split is by tree; the test changes are renamed strings in existing assertions, too thin for a tester's lane.
-- `impl` — `commands/`, `scripts/lint/lint_config.sh` (the row it shares with `commands/lint_config.md`)
-- `test` — opens as impl: `docs/`, `config/`, `scripts/production/`, `scripts/delegate/findings.py`
+**Gotchas:**
+- `/unit:delegate` stays in `CLAUDE.md` and where transcripts from before the rename are read: `docs/as-built/director-model-study.md`, `scripts/model_study/turns.py`, `test_turns.py` and `test_rerun.py`.
+- The path `commands/unit/delegate.md` stays in `scripts/hooks/test_command_stub.py`, which tests the stub, and in frozen production rows: `scripts/production/test_merge_checkpoint.py` and one row of `scripts/production/test_add_unit.py`.
+- Scripts under `scripts/delegate/` still print "delegate run" (`end_session.sh`: `Delegate run ended; marker cleared.`).
+- A branch with unmerged edits to `commands/unit/delegate.md` conflicts with the stub; the edits belong in `commands/unit/direct.md`.
 
-**Constraints from prior phases:**
-- `commands/unit/direct.md` is the workflow and `commands/unit/delegate.md` is the stub. Neither changes in this phase, nor do the three hook files or `scripts/hooks/test_command_stub.py`.
-- `scripts/model_study/turns.py` reads both names through `DIRECTOR_COMMANDS`; it, `scripts/model_study/test_turns.py` and `docs/as-built/director-model-study.md` line 27 are the places the old name stays.
-- The unit director, before dispatch, in this order: the showrunner has said Phase 1 is on `~/.claude` main; `build-followups` with Phase 1 in it is merged into this branch and the three searches are run again on the merged tree; and from an empty scratch directory `claude -p 'Run nothing. From the skills you can invoke, print every name that starts with "unit:", one per line, and nothing else.' --model haiku < /dev/null` prints both `unit:direct` and `unit:delegate`. If `unit:direct` is missing, stop and tell the showrunner: this phase points every launch prompt at that name.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/production -p 'test_add_unit.py'`, the same for `'test_stall_watch.py'` and `'test_unit_lookup.py'`, `python3 -m unittest discover -s scripts/model_study -p 'test_*.py'`, `python3 -m unittest discover -s scripts/lint -p 'test_*.py'` and `python3 -m unittest discover -s scripts/hooks -p 'test_*.py'` green.
-- `basedpyright` on every `.py` file the phase changed reports `0 errors, 0 warnings`.
-- `git grep -lI 'unit:delegate' -- . ':!docs/plans'` prints exactly `CLAUDE.md`, `docs/as-built/director-model-study.md`, `scripts/model_study/test_rerun.py`, `scripts/model_study/test_turns.py` and `scripts/model_study/turns.py`.
-- `git grep -nI 'unit/delegate\.md' -- . ':!docs/plans'` prints only lines of `scripts/production/test_merge_checkpoint.py`, `scripts/hooks/test_command_stub.py` and the one frozen row in `scripts/production/test_add_unit.py`.
-- `git grep -nIiE 'delegate (run|phase)s?\b|^# Delegate( |$)' -- commands docs config ':!docs/plans'` prints only `config/agents.conf` line 58, and `git grep -nIiE '\bdelegate$' -- commands docs config ':!docs/plans'` no longer prints `commands/unit/checkpoint.md`.
-- `git diff --stat <phase base>` names no file under `docs/plans/` but this plan, and neither `settings.json` nor `CLAUDE.md`.
+**Ruled out:**
+- Renaming the internals: the rename covers the command and the prose people and agents read.
 
 ## Source
 
