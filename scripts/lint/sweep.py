@@ -61,7 +61,7 @@ creates carries the tag from its first moment, and .rustc_info.json may come
 only when the first build ends, or never. Cargo's registry carries the same
 tag with no build tree. A folder made before a build with
 CARGO_CACHE_RUSTC_INFO=0 has neither and stays unseen. Orphaned files go first
-from every idle target, as before. Then idle targets under SCRATCH_ROOTS lose
+from every idle target. Then idle targets under SCRATCH_ROOTS lose
 output, then the least recently used target, then by build-unit use within
 each target. On 2026-10-08 the tag rule found 76 targets where
 .rustc_info.json alone found 41: 31 finished scratch targets carried only the
