@@ -19,7 +19,7 @@ from typing import NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 import showrunners
-from add_unit import cell_value, plan_cell_is_retired
+import add_unit
 
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
@@ -147,24 +147,9 @@ def retired_units(runner: showrunners.RunningShowrunner) -> set[str]:
         return set()
     try:
         lines = located.path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
+        return add_unit.retired_units(lines) | add_unit.retired_sessions(lines)
+    except (OSError, UnicodeError, add_unit.Refusal):
         return set()
-
-    retired: set[str] = set()
-    in_units = False
-    for line in lines:
-        if line.strip() == "## Units":
-            in_units = True
-        elif in_units and line.startswith("## "):
-            break
-        elif in_units:
-            cells = line.split("|")
-            if (len(cells) >= 4 and not cells[0].strip()
-                    and plan_cell_is_retired(cells[2])):
-                retired.add(cells[1].strip())
-                if len(cells) >= 6:
-                    retired.add(cell_value(cells[5]))
-    return retired
 
 
 def rename_state(old: str, new: str, runner_before: str, runner_after: str,

@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, final, override
+from unittest.mock import patch
 
+import add_unit
 from add_unit import live_unit_rows, plan_cell_is_retired, retired_sessions, retired_units
 
 
@@ -65,6 +68,10 @@ class AddUnitTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        # Rows read in this process name worktrees and sessions that exist nowhere: answer for
+        # them here, so no test asks the real disk or the real tmux. RetiredRowTests covers the rule.
+        for name, answer in (("worktree_is_linked", True), ("session_is_gone", False)):
+            _ = self.enterContext(patch.object(add_unit, name, return_value=answer))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.checkout = self.root / "project-trunk"
         self.checkout.mkdir()
@@ -747,6 +754,69 @@ class AddUnitTests(unittest.TestCase):
         _ = self.prompt.write_text("Run `unit_status.sh --showrunner director`.\n", encoding="utf-8")
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(self.prompt.read_text(), "Run `unit_status.sh --showrunner director`.\n")
+
+
+class RetiredRowTests(unittest.TestCase):
+    """A unit is retired by its Plan cell, or when its worktree and its tmux session are both gone."""
+
+    root: Path = Path()
+    linked: Path = Path()
+    main: Path = Path()
+    missing: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root)
+        self.linked = self.root / "linked"
+        self.linked.mkdir()
+        _ = (self.linked / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+        self.main = self.root / "main"
+        (self.main / ".git").mkdir(parents=True)
+        self.missing = self.root / "missing"
+
+    def row(self, unit: str, worktree: Path, plan: str = "`docs/plan.md`") -> str:
+        return f"| `{unit}-unit` | {plan} | `{worktree}` | `branch` | `{unit}` (resumed elsewhere) | — | — |"
+
+    def retired(self, worktree: Path, *, gone: bool, plan: str = "`docs/plan.md`") -> tuple[bool, int]:
+        """Whether the row is retired, and how many times tmux was asked."""
+        with patch.object(add_unit, "session_is_gone", return_value=gone) as asked:
+            return add_unit.row_is_retired(self.row("some", worktree, plan)), asked.call_count
+
+    def test_a_unit_is_gone_only_without_both_its_worktree_and_its_session(self) -> None:
+        self.assertEqual(self.retired(self.missing, gone=True), (True, 1))
+        self.assertEqual(self.retired(self.missing, gone=False), (False, 1))
+        # A session that is only restarting keeps its row: its worktree is there, and tmux is not asked.
+        self.assertEqual(self.retired(self.linked, gone=True), (False, 0))
+        # A main checkout is shared, so it holds no unit once the session is gone.
+        self.assertEqual(self.retired(self.main, gone=True), (True, 1))
+        self.assertEqual(self.retired(self.main, gone=False), (False, 1))
+        self.assertEqual(self.retired(self.linked, gone=False, plan="retired after completion"), (True, 0))
+
+    def test_tmux_must_say_the_session_is_gone(self) -> None:
+        for code, expected in ((1, True), (0, False), (99, False)):
+            with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, "", "")) as run:
+                self.assertEqual(add_unit.session_is_gone("name"), expected, code)
+            self.assertEqual(cast("list[str]", run.call_args.args[0]), ["tmux", "has-session", "-t", "=name"])
+        with patch.object(subprocess, "run", side_effect=FileNotFoundError("tmux")):
+            self.assertFalse(add_unit.session_is_gone("name"))
+        with patch.object(subprocess, "run") as run:
+            self.assertTrue(add_unit.session_is_gone(""))
+        run.assert_not_called()
+
+    def test_every_list_drops_a_unit_that_is_gone(self) -> None:
+        lines = [
+            "## Units",
+            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+            self.row("marked", self.linked, "retired after completion"),
+            self.row("gone", self.missing),
+            self.row("parked", self.linked),
+        ]
+        with patch.object(add_unit, "session_is_gone", return_value=True):
+            self.assertEqual(retired_units(lines), {"marked-unit", "gone-unit"})
+            self.assertEqual(retired_sessions(lines), {"marked", "gone"})
+            self.assertEqual(live_unit_rows(lines), lines[-1:])
 
 
 if __name__ == "__main__":

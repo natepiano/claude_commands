@@ -273,24 +273,60 @@ def plan_cell_is_retired(plan_cell: str) -> bool:
     return re.match(r"^\s*\(?retired\b", plan_cell) is not None
 
 
+def worktree_is_linked(worktree: str) -> bool:
+    """Return whether `worktree` is a linked worktree on disk.
+
+    A main checkout, where `.git` is a directory, is shared and is no unit's own worktree.
+    """
+    return bool(worktree) and (Path(worktree) / ".git").is_file()
+
+
+def session_is_gone(session: str) -> bool:
+    """Return whether tmux says no session has this name.
+
+    A tmux that cannot run, or that answers anything but "no such session", has not said so.
+    """
+    if not session:
+        return True
+    try:
+        result = subprocess.run(["tmux", "has-session", "-t", f"={session}"], capture_output=True, text=True,
+                                check=False)
+    except OSError:
+        return False
+    return result.returncode == 1
+
+
+def row_is_retired(row: str) -> bool:
+    """Return whether a Units row's unit is retired.
+
+    It is when its Plan cell says so, or when its worktree and its tmux session are both gone
+    (user 2026-10-08): such a unit has nothing left to address. The worktree is asked first, so a
+    unit whose session is only restarting keeps its row, and tmux is asked only about a unit
+    with no worktree of its own.
+    """
+    cells = row.strip("|").split("|")
+    if len(cells) < 2:
+        return False
+    if plan_cell_is_retired(cells[1]):
+        return True
+    if len(cells) < 5:
+        return False
+    return not worktree_is_linked(cell_value(cells[2].strip())) and session_is_gone(cell_value(cells[4].strip()))
+
+
 def live_unit_rows(lines: list[str]) -> list[str]:
-    """Return Units rows whose Plan cell does not retire the unit."""
+    """Return Units rows whose unit is not retired."""
     _, rows = unit_rows(lines)
-    live: list[str] = []
-    for row in rows:
-        cells = row.strip("|").split("|")
-        if len(cells) < 2 or not plan_cell_is_retired(cells[1]):
-            live.append(row)
-    return live
+    return [row for row in rows if not row_is_retired(row)]
 
 
 def retired_sessions(lines: list[str]) -> set[str]:
-    """Return session names from Units rows marked retired in their Plan cell."""
+    """Return session names from Units rows whose unit is retired."""
     _, rows = unit_rows(lines)
     retired: set[str] = set()
     for row in rows:
         cells = row.strip("|").split("|")
-        if len(cells) >= 5 and plan_cell_is_retired(cells[1]):
+        if len(cells) >= 5 and row_is_retired(row):
             session = cell_value(cells[4].strip())
             if session:
                 retired.add(session)
@@ -298,13 +334,12 @@ def retired_sessions(lines: list[str]) -> set[str]:
 
 
 def retired_units(lines: list[str]) -> set[str]:
-    """Return unit names from Units rows marked retired in their Plan cell."""
+    """Return unit names from Units rows whose unit is retired."""
     _, rows = unit_rows(lines)
     retired: set[str] = set()
     for row in rows:
-        cells = row.strip("|").split("|")
-        if len(cells) >= 2 and plan_cell_is_retired(cells[1]):
-            unit = cell_value(cells[0].strip())
+        if row_is_retired(row):
+            unit = cell_value(row.strip("|").split("|")[0].strip())
             if unit:
                 retired.add(unit)
     return retired
