@@ -225,8 +225,12 @@ def claude_config_dir() -> Path:
     return Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
 
 
-def claude_config_file() -> Path:
+def claude_config_file(config_dir: Path | None = None) -> Path:
     """Claude Code's `.claude.json`: inside CLAUDE_CONFIG_DIR when set, else in home."""
+    if config_dir is not None:
+        return (Path.home() / ".claude.json"
+                if config_dir == Path.home() / ".claude"
+                else config_dir / ".claude.json")
     if "CLAUDE_CONFIG_DIR" in os.environ:
         return claude_config_dir() / ".claude.json"
     return Path.home() / ".claude.json"
@@ -311,7 +315,7 @@ def claude_live() -> Report:
     return report
 
 
-def claude_on_disk() -> Report:
+def claude_on_disk(config_dir: Path | None = None) -> Report:
     """The logged-in Claude account and the usage Claude Code last cached for it.
 
     The cache is trusted only when its accountUuid is the logged-in account's, so
@@ -320,18 +324,44 @@ def claude_on_disk() -> Report:
     """
     report = Report("Claude")
     try:
-        config = cast(ClaudeConfig, json.loads(claude_config_file().read_text()))
+        decoded = cast(object, json.loads(claude_config_file(config_dir).read_text()))
     except (OSError, ValueError):
         report.problem = "Account unavailable (could not read Claude config)"
         return report
-    account = config.get("oauthAccount")
-    if not account or not account.get("emailAddress"):
+    if not isinstance(decoded, dict):
+        report.problem = "Account unavailable (could not read Claude config)"
+        return report
+    config = cast(dict[str, object], cast(object, decoded))
+    decoded_account = config.get("oauthAccount")
+    if decoded_account is not None and not isinstance(decoded_account, dict):
+        report.problem = "Account unavailable (could not read Claude config)"
+        return report
+    if decoded_account is None:
         report.problem = "Not logged in"
         return report
-    report.email = account.get("emailAddress")
-    cached = config.get("cachedUsageUtilization")
-    if cached and cached.get("accountUuid") == account.get("accountUuid"):
-        report.quotas = claude_usage_quotas(cached.get("utilization", {}))
+    account = cast(dict[str, object], cast(object, decoded_account))
+    email = account.get("emailAddress")
+    if not isinstance(email, str) or not email:
+        report.problem = "Not logged in"
+        return report
+    report.email = email
+    decoded_cached = config.get("cachedUsageUtilization")
+    if decoded_cached is not None and not isinstance(decoded_cached, dict):
+        report.quota_problem = "Weekly quota: cached usage unreadable"
+        return report
+    cached = (
+        cast(dict[str, object], cast(object, decoded_cached))
+        if decoded_cached
+        else None
+    )
+    utilization = cached.get("utilization") if cached is not None else None
+    if utilization is not None and not isinstance(utilization, dict):
+        report.quota_problem = "Weekly quota: cached usage unreadable"
+        return report
+    if cached is not None and cached.get("accountUuid") == account.get("accountUuid"):
+        report.quotas = claude_usage_quotas(
+            cast(dict[str, object], cast(object, utilization or {}))
+        )
     else:
         report.quota_problem = "Weekly quota: no cached usage for this account"
     return report
@@ -340,22 +370,41 @@ def claude_on_disk() -> Report:
 # --- Codex -------------------------------------------------------------------
 
 
-def codex_email_on_disk() -> str | None:
+def codex_email_on_disk(home: Path | None = None) -> str | None:
     """The email claim of the id_token in Codex's auth.json, if logged in with ChatGPT."""
     try:
-        auth = cast(CodexAuth, json.loads((codex_home() / "auth.json").read_text()))
+        decoded = cast(
+            object,
+            json.loads(((home or codex_home()) / "auth.json").read_text()),
+        )
     except (OSError, ValueError):
         return None
-    token = auth.get("tokens", {}).get("id_token", "")
+    if not isinstance(decoded, dict):
+        return None
+    auth = cast(dict[str, object], cast(object, decoded))
+    decoded_tokens = auth.get("tokens")
+    if not isinstance(decoded_tokens, dict):
+        return None
+    tokens = cast(dict[str, object], cast(object, decoded_tokens))
+    token = tokens.get("id_token", "")
+    if not isinstance(token, str):
+        return None
     parts = token.split(".")
     if len(parts) != 3:
         return None
     payload = parts[1] + "=" * (-len(parts[1]) % 4)
     try:
-        claims = cast(IdTokenClaims, json.loads(base64.urlsafe_b64decode(payload)))
+        decoded_claims = cast(
+            object,
+            json.loads(base64.urlsafe_b64decode(payload)),
+        )
     except (binascii.Error, ValueError):
         return None
-    return claims.get("email") or None
+    if not isinstance(decoded_claims, dict):
+        return None
+    claims = cast(dict[str, object], cast(object, decoded_claims))
+    email = claims.get("email")
+    return email if isinstance(email, str) and email else None
 
 
 class CodexServer:

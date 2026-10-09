@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 
+from account import label_for
 from agent_accounts import EASTERN, Quota, Report, live_reports
 from agent_notes import AGENTS_DIR, read_note
 
@@ -26,7 +27,12 @@ def render(report: Report) -> list[str]:
     lines = [report.tool]
     if report.problem:
         return lines + [f"  {report.problem}"]
-    lines.append(f"  Account: {report.email or 'email unavailable'}")
+    email = report.email
+    if email is None:
+        lines.append("  Account: email unavailable")
+    else:
+        label = label_for(report.tool, email)
+        lines.append(f"  Account: {label} — {email}" if label != email else f"  Account: {email}")
     lines.append(f"  Plan: {report.plan or 'unavailable'}")
     lines += [quota_line(quota) for quota in report.quotas]
     if report.quota_problem:
