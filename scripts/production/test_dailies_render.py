@@ -25,6 +25,24 @@ FOOTER_HEAD = ["", "---", "11:00 PDT update:", ""]
 AGENT_LINES = ["* none active"]
 
 
+def setUpModule() -> None:
+    # The state check reads the build hold and mac_test state; no test sees the machine's own.
+    scratch = tempfile.TemporaryDirectory()
+    previous = {name: os.environ.get(name) for name in ("BUILD_HOLD_DIR", "MAC_TEST_STATE_DIR")}
+    os.environ["BUILD_HOLD_DIR"] = str(Path(scratch.name) / "build-hold")
+    os.environ["MAC_TEST_STATE_DIR"] = str(Path(scratch.name) / "mac-test")
+
+    def restore() -> None:
+        for name, value in previous.items():
+            if value is None:
+                _ = os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        scratch.cleanup()
+
+    unittest.addModuleCleanup(restore)
+
+
 @dataclass(frozen=True)
 class Run:
     code: int

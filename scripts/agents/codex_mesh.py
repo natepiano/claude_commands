@@ -38,6 +38,10 @@ Verbs:
   end    Finish a resident delegate: drop its queued messages, interrupt its
          running turn, if any, and release its `start`.
   stop   Stop the session's app-server, and any it replaced mid-run.
+  signin-changed
+         Move every run off an app-server started before the Codex sign-in
+         last changed, and tell the session holding each run. A path watch
+         on the sign-in file runs it.
   list   Print the roster of named delegates and what each is doing.
 """
 
@@ -136,23 +140,28 @@ class FollowableRecord(TypedDict):
     status: Literal["done", "failed"]
 
 
+# `port` is the app-server the seat's launcher is attached to. It stays the seat's way in while
+# that launcher lives, even after the run has moved to a newer server.
 class ActiveRecord(TypedDict):
     thread_id: str
     status: Literal["running"]
     turn_id: str
     launcher_pid: NotRequired[int]
+    port: NotRequired[int]
 
 
 class StartingRecord(TypedDict):
     thread_id: str
     status: Literal["starting"]
     launcher_pid: NotRequired[int]
+    port: NotRequired[int]
 
 
 class WaitingCapacityRecord(TypedDict):
     thread_id: str
     status: Literal["waiting_capacity"]
     launcher_pid: int
+    port: NotRequired[int]
 
 
 class ExhaustedRecord(TypedDict):
@@ -483,6 +492,9 @@ def _update_roster(session_dir: str, name: str, record: ThreadRecord) -> None:
             pid = record.get("launcher_pid", previous.get("launcher_pid"))
             if isinstance(pid, int) and pid > 0:
                 stored["launcher_pid"] = pid
+            port = record.get("port", previous.get("port"))
+            if isinstance(port, int) and port > 0:
+                stored["port"] = port
         roster[name] = stored
         _ = handle.seek(0)
         _ = handle.truncate()
@@ -610,6 +622,20 @@ def _server_availability(session_dir: str) -> ServerAvailability:
     return ServerRestartRequired()
 
 
+def _seat_port(session_dir: str, record: ThreadRecord) -> int:
+    """The server that reaches a seat: the one its launcher is attached to while that launcher
+    lives, which after a sign-in change can be one the run has retired; otherwise the run's own."""
+    port, pid = record.get("port"), record.get("launcher_pid")
+    if isinstance(port, int) and isinstance(pid, int) and pid > 0 and _pid_alive(pid):
+        return port
+    return ensure_server(session_dir)[0]
+
+
+def _record_port(session_dir: str) -> int | None:
+    port = _read_json_object(_session_path(session_dir, SERVER_FILE)).get("port")
+    return port if isinstance(port, int) else None
+
+
 def _end_marker_path(session_dir: str, name: str) -> Path:
     return _session_path(session_dir, f"{name}.end")
 
@@ -648,8 +674,9 @@ def _add_pending(session_dir: str, name: str, thread_id: str, message: str) -> N
         _write_pending(handle, thread_id, messages)
 
 
-def _move_queue_to_pending(client: Client, session_dir: str, name: str, thread_id: str) -> None:
-    """Park queued text locally before an idle server opens another turn."""
+def _move_queue_to_pending(client: Client, thread_id: str, park: Callable[[str], None]) -> None:
+    """Park queued text locally before an idle server opens another turn. Each message is parked
+    before it is deleted from the server's queue."""
     for _ in range(END_QUEUE_DRAIN_ROUNDS):
         listed = _require(client.call("thread/queue/list", {"threadId": thread_id}), "thread/queue/list")
         items = listed.get("data")
@@ -666,7 +693,7 @@ def _move_queue_to_pending(client: Client, session_dir: str, name: str, thread_i
                 if _as_str(_as_dict(part).get("type")) == "text"
             ]
             if messages:
-                _add_pending(session_dir, name, thread_id, "\n".join(messages))
+                park("\n".join(messages))
             _ = _require(client.call("thread/queue/delete", {
                 "threadId": thread_id, "queuedSubmissionId": submission
             }), "thread/queue/delete")
@@ -772,19 +799,67 @@ def _retire_server(session_dir: str, port: int) -> bool:
     seat rewrites its own entry when it re-attaches.
     """
     with _server_lock(session_dir):
-        path = _session_path(session_dir, SERVER_FILE)
-        record = _read_json_object(path)
+        record = _read_json_object(_session_path(session_dir, SERVER_FILE))
         if record.get("port") != port:
             return False
-        retired_path = _session_path(session_dir, RETIRED_FILE)
-        stored = _read_json_object(retired_path).get("servers")
-        servers: list[object] = cast("list[object]", stored) if isinstance(stored, list) else []
-        servers.append(record)
-        _ = retired_path.write_text(
-            json.dumps({"servers": servers}, indent=2), encoding="utf-8"
-        )
-        path.unlink(missing_ok=True)
+        _retire_record(session_dir, record)
         return True
+
+
+def _retire_record(session_dir: str, record: dict[str, object]) -> None:
+    """Move the server record onto RETIRED_FILE. The caller holds the server lock."""
+    retired_path = _session_path(session_dir, RETIRED_FILE)
+    stored = _read_json_object(retired_path).get("servers")
+    servers: list[object] = cast("list[object]", stored) if isinstance(stored, list) else []
+    servers.append(record)
+    _ = retired_path.write_text(json.dumps({"servers": servers}, indent=2), encoding="utf-8")
+    _session_path(session_dir, SERVER_FILE).unlink(missing_ok=True)
+
+
+def _log_server(session_dir: str, line: str) -> None:
+    with contextlib.suppress(OSError), _session_path(session_dir, SERVER_LOG).open("a", encoding="utf-8") as log:
+        _ = log.write(f"[{_now_stamp()}] mesh: {line}\n")
+
+
+def _sign_in_changed_at() -> float | None:
+    """When Codex's sign-in file last changed. Only its change time is read, never its contents."""
+    home = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
+    try:
+        return (Path(home) / "auth.json").stat().st_mtime
+    except OSError:
+        return None
+
+
+def _elapsed_secs(text: str) -> float | None:
+    """Seconds from `ps`'s etime, written [[dd-]hh:]mm:ss."""
+    days, _dash, clock = text.strip().rpartition("-")
+    parts = clock.split(":")
+    if not 2 <= len(parts) <= 3 or not all(part.isdigit() for part in parts) or (days and not days.isdigit()):
+        return None
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + int(part)
+    return float(seconds + int(days or "0") * 86400)
+
+
+def _server_started_at(pid: int) -> float | None:
+    """When the process started. `ps -o etime` reads the same on Linux and macOS."""
+    try:
+        listed = subprocess.run(["ps", "-o", "etime=", "-p", str(pid)], capture_output=True, text=True, check=False)
+    except OSError:
+        return None
+    elapsed = _elapsed_secs(listed.stdout)
+    return None if elapsed is None else time.time() - elapsed
+
+
+def _holds_old_sign_in(pid: int) -> bool:
+    """Whether the server started before Codex's sign-in last changed. It read the sign-in once, at
+    start, and cannot refresh a token the change revoked."""
+    changed = _sign_in_changed_at()
+    if changed is None:
+        return False
+    started = _server_started_at(pid)
+    return started is not None and started < changed
 
 
 def _start_watcher(session_dir: str, pid: int, port: int) -> subprocess.Popen[bytes]:
@@ -793,19 +868,21 @@ def _start_watcher(session_dir: str, pid: int, port: int) -> subprocess.Popen[by
     The server is detached so it outlives each delegate, and only a run's end step stops one; a
     run folder that never reaches that step kept its server for good. The shell wakes every
     WATCH_WAKE_SECS, and only when the record has gone SERVER_IDLE_SECS without a touch does it
-    run `idle-stop`, which stops the server or touches the record. Its cost is a shell and a
+    run `idle-stop`, which stops the server or touches the record. A server RETIRED_FILE lists is
+    asked about at every wake instead: the run's newer server keeps the record fresh. Its cost is a shell and a
     `sleep`, under 1 MB of their own memory, one `find` per wake, and one short Python run about
     twice an hour while the server is in use. It leaves with the server.
     """
     script = (
         'while kill -0 "$1" 2>/dev/null; do sleep "$5"; '
-        + '[ -n "$(find "$3/$6" -mmin "-$7" 2>/dev/null)" ] && continue; '
+        + '[ -n "$(find "$3/$6" -mmin "-$7" 2>/dev/null)" ] '
+        + '&& ! grep -Eq "\\"pid\\": $1([^0-9]|\\$)" "$3/$8" 2>/dev/null && continue; '
         + '"$4" "$0" idle-stop --session-dir "$3" --pid "$1" --port "$2" && exit 0; done'
     )
     return subprocess.Popen(
         ["sh", "-c", script, str(Path(__file__).resolve()), str(pid), str(port),
          str(Path(session_dir).resolve()), sys.executable, str(WATCH_WAKE_SECS), SERVER_FILE,
-         str(int(SERVER_IDLE_SECS // 60))],
+         str(int(SERVER_IDLE_SECS // 60)), RETIRED_FILE],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
@@ -825,36 +902,48 @@ def ensure_server(session_dir: str) -> tuple[int, bool]:
         port = record.get("port")
         pid = record.get("pid")
         if isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid):
-            # The record's change time is when the server was last used; its watcher reads it.
-            os.utime(path)
-            return port, False
+            if not _holds_old_sign_in(pid):
+                # The record's change time is when the server was last used; its watcher reads it.
+                os.utime(path)
+                return port, False
+            # A sign-in change `signin-changed` did not catch. The seats still on this server keep
+            # it until they let go; its watcher then stops it.
+            _retire_record(session_dir, record)
+            _log_server(session_dir, f"app-server {pid} holds a Codex sign-in that has since changed; "
+                        + "retired, starting a new one")
+            _ = _start_watcher(session_dir, pid, port)
+        return _start_server(session_dir), True
 
-        chosen = _free_port()
-        log_path = _session_path(session_dir, SERVER_LOG)
-        with log_path.open("ab") as log_handle:
-            process = subprocess.Popen(
-                ["codex", "app-server", "--listen", f"ws://127.0.0.1:{chosen}"],
-                stdout=subprocess.DEVNULL,
-                stderr=log_handle,
-                start_new_session=True,
+
+def _start_server(session_dir: str) -> int:
+    """Start this session's app-server and record it. The caller holds the server lock."""
+    path = _session_path(session_dir, SERVER_FILE)
+    chosen = _free_port()
+    log_path = _session_path(session_dir, SERVER_LOG)
+    with log_path.open("ab") as log_handle:
+        process = subprocess.Popen(
+            ["codex", "app-server", "--listen", f"ws://127.0.0.1:{chosen}"],
+            stdout=subprocess.DEVNULL,
+            stderr=log_handle,
+            start_new_session=True,
+        )
+    deadline = time.time() + SERVER_START_TIMEOUT_SECS
+    while time.time() < deadline:
+        if process.poll() is not None:
+            raise SystemExit(
+                f"codex_mesh: app-server exited immediately; see {log_path}"
             )
-        deadline = time.time() + SERVER_START_TIMEOUT_SECS
-        while time.time() < deadline:
-            if process.poll() is not None:
-                raise SystemExit(
-                    f"codex_mesh: app-server exited immediately; see {log_path}"
-                )
-            try:
-                probe = WebSocket(chosen)
-            except (OSError, ConnectionError):
-                time.sleep(0.4)
-                continue
-            probe.close()
-            served: ServerRecord = {"port": chosen, "pid": process.pid}
-            _ = path.write_text(json.dumps(served, indent=2), encoding="utf-8")
-            _ = _start_watcher(session_dir, process.pid, chosen)
-            return chosen, True
-        raise SystemExit(f"codex_mesh: app-server did not accept connections on {chosen}")
+        try:
+            probe = WebSocket(chosen)
+        except (OSError, ConnectionError):
+            time.sleep(0.4)
+            continue
+        probe.close()
+        served: ServerRecord = {"port": chosen, "pid": process.pid}
+        _ = path.write_text(json.dumps(served, indent=2), encoding="utf-8")
+        _ = _start_watcher(session_dir, process.pid, chosen)
+        return chosen
+    raise SystemExit(f"codex_mesh: app-server did not accept connections on {chosen}")
 
 
 # ---------------------------------------------------------------------------
@@ -1402,7 +1491,9 @@ def _stream_turn(
         if not turn_id:
             raise SystemExit("codex_mesh: turn/start returned no turn id")
         followed_turn = turn_id if follow else ""
-        _update_roster(session_dir, name, {"thread_id": thread_id, "turn_id": turn_id, "status": "running"})
+        _update_roster(session_dir, name, {
+            "thread_id": thread_id, "turn_id": turn_id, "status": "running", "port": port
+        })
         with log_path.open("a", encoding="utf-8") as log:
             _ = log.write(f"[{_now_stamp()}] mesh: {name} thread {thread_id}\n")
             log.flush()
@@ -1413,6 +1504,14 @@ def _stream_turn(
                 if frame is None:
                     if end_marker.exists():
                         break
+                    if resident and _record_port(session_dir) != port:
+                        moved = _move_resident(args, session_dir, name, thread_id, client)
+                        if moved is not None:
+                            client, port = moved.client, moved.port
+                            turn_id = moved.turn_id or turn_id
+                            _ = log.write(f"[{_now_stamp()}] mesh: {name} moved to the run's app-server on "
+                                          + f"port {port}; the run retired the one it was on\n")
+                            log.flush()
                     continue
                 method = frame.get("method")
                 params = _as_dict(frame.get("params"))
@@ -1441,7 +1540,8 @@ def _stream_turn(
                     if isinstance(turn_outcome, TurnRefusedForCapacity):
                         resume_owed = True
                         retry_waited = False
-                        _move_queue_to_pending(client, session_dir, name, thread_id)
+                        _move_queue_to_pending(
+                            client, thread_id, lambda message: _add_pending(session_dir, name, thread_id, message))
                         remaining = CAPACITY_BUDGET_SECS - capacity_waited
                         if remaining <= 0:
                             run_outcome = CapacityRetriesExhausted(
@@ -1582,6 +1682,51 @@ def _stream_turn(
         client.close()
 
 
+@dataclass(frozen=True)
+class MovedSeat:
+    client: Client
+    port: int
+    # The turn opened for messages that were waiting; empty when none were.
+    turn_id: str
+
+
+def _move_resident(
+    args: argparse.Namespace, session_dir: str, name: str, thread_id: str, client: Client
+) -> MovedSeat | None:
+    """Move a resident seat between turns onto the run's current app-server; None while a turn runs.
+
+    The run retired the server this seat is attached to, most often because Codex was signed in
+    again after it started. The move holds the seat's pending lock, which `send` also takes, so no
+    message lands between the two servers: what was queued on the old one opens the first turn on
+    the new one.
+    """
+    if not isinstance(_read_live_turn(client, thread_id), ThreadIdle):
+        return None
+    with _pending_file(session_dir, name) as handle:
+        if not isinstance(_read_live_turn(client, thread_id), ThreadIdle):
+            return None
+        messages = _pending_for_thread(handle, thread_id)
+
+        def park(message: str) -> None:
+            messages.append(message)
+            _write_pending(handle, thread_id, messages)
+
+        _move_queue_to_pending(client, thread_id, park)
+        client.close()
+        port, _fresh = ensure_server(session_dir)
+        moved = Client(port, name)
+        _ = _require(moved.call("thread/resume", {"threadId": thread_id}), "thread/resume")
+        turn_id = ""
+        if messages:
+            turn_id = _start_turn(moved, args, thread_id, messages[0], tuple(messages[1:]))
+            _write_pending(handle, thread_id, [])
+        previous = _as_str(_as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)).get("turn_id"))
+        _update_roster(session_dir, name, {
+            "thread_id": thread_id, "turn_id": turn_id or previous, "status": "running", "port": port
+        })
+    return MovedSeat(moved, port, turn_id)
+
+
 def _start_turn(
     client: Client, args: argparse.Namespace, thread_id: str, message: str,
     pending: tuple[str, ...] = (),
@@ -1674,8 +1819,7 @@ def command_send(args: argparse.Namespace) -> int:
             _write_pending(pending_file, record["thread_id"], messages)
             print(f"message for {target} will be delivered when the seat resumes")
             return 0
-        port, _fresh = ensure_server(session_dir)
-        client = Client(port, f"send-{os.getpid()}")
+        client = Client(_seat_port(session_dir, record), f"send-{os.getpid()}")
         try:
             _load_thread(client, record["thread_id"])
             _ = _require(
@@ -1706,8 +1850,7 @@ def command_steer(args: argparse.Namespace) -> int:
         raise SystemExit(
             f"codex_mesh: {target} has no running turn to steer ({detail}); use `send`"
         )
-    port, _fresh = ensure_server(session_dir)
-    client = Client(port, f"steer-{os.getpid()}")
+    client = Client(_seat_port(session_dir, record), f"steer-{os.getpid()}")
     message = _message_text(args)
     reply = client.call(
         "turn/steer",
@@ -1977,6 +2120,8 @@ class ServerFacts:
     live_launchers: tuple[str, ...]
     # Seconds since the run folder's newest activity file changed; None when it has none.
     quiet_secs: float | None
+    # Its run has moved to a newer server and listed this one in RETIRED_FILE.
+    retired: bool = False
 
 
 def _sweep_verdict(facts: ServerFacts, busy_threads: Callable[[], tuple[str, ...]]) -> SweepVerdict:
@@ -1986,6 +2131,12 @@ def _sweep_verdict(facts: ServerFacts, busy_threads: Callable[[], tuple[str, ...
         return ServerInUse(f"{facts.clients} client connection(s) on its port")
     if facts.session_dir is None:
         return ServerUnknown("its log names no run folder, so this launcher did not start it")
+    if facts.retired:
+        # The run's marker, launchers and activity belong to its newer server. Only a seat still
+        # attached here holds a connection, and a turn whose launcher died shows as a conversation.
+        if busy := busy_threads():
+            return ServerInUse("a conversation is not idle: " + "; ".join(busy))
+        return ServerUnused("retired by its run; no client and no conversation mid-turn")
     if facts.live_launchers:
         # A resident seat waits between turns with nothing on the socket.
         return ServerInUse("a seat's launcher is still running: " + ", ".join(facts.live_launchers))
@@ -2069,6 +2220,25 @@ def _live_launchers(folder: Path) -> tuple[str, ...]:
     )
 
 
+def _retired_pids(folder: Path) -> set[int]:
+    stored = _read_json_object(folder / RETIRED_FILE).get("servers")
+    records = cast("list[object]", stored) if isinstance(stored, list) else []
+    return {pid for record in records for pid in [_as_dict(record).get("pid")] if isinstance(pid, int)}
+
+
+def _forget_retired(folder: Path, pid: int) -> None:
+    """Drop a stopped server from RETIRED_FILE: `stop` signals every pid listed there, and by the
+    run's end this one could belong to another process."""
+    path = folder / RETIRED_FILE
+    stored = _read_json_object(path).get("servers")
+    if not isinstance(stored, list):
+        return
+    records = cast("list[object]", stored)
+    kept = [record for record in records if _as_dict(record).get("pid") != pid]
+    if len(kept) != len(records):
+        _ = path.write_text(json.dumps({"servers": kept}, indent=2), encoding="utf-8")
+
+
 def _roster_threads(folder: Path) -> dict[str, str]:
     """Thread id to seat name for every conversation the run folder's roster lists."""
     roster = _read_json_object(folder / ROSTER_FILE)
@@ -2119,6 +2289,7 @@ def _judge(root: Path | None, pid: int, port: int, age: float,
         marked_active=root is not None and folder is not None and _marked_active(root, folder),
         live_launchers=_live_launchers(folder) if folder is not None and exists else (),
         quiet_secs=_quiet_secs(folder, time.time()) if folder is not None and exists else None,
+        retired=folder is not None and exists and pid in _retired_pids(folder),
     )
     seats = _roster_threads(folder) if folder is not None and exists else {}
     return _sweep_verdict(facts, lambda: _busy_threads(port, seats)), folder
@@ -2143,6 +2314,8 @@ def _stop_unused(root: Path | None, pid: int, port: int, folder: Path) -> bool:
         verdict, _folder = _judge(root, pid, port, age, clients.get(port, 0))
         if not isinstance(verdict, ServerUnused) or not _reap(pid):
             return False
+        if folder.is_dir():
+            _forget_retired(folder, pid)
         record = folder / SERVER_FILE
         if _read_json_object(record).get("pid") == pid:
             record.unlink(missing_ok=True)
@@ -2170,8 +2343,7 @@ def command_idle_stop(args: argparse.Namespace) -> int:
             return 0
         verdict, _folder = _judge(None, pid, port, age, clients.get(port, 0))
         if isinstance(verdict, ServerUnused) and _stop_unused(None, pid, port, folder):
-            with contextlib.suppress(OSError), (folder / SERVER_LOG).open("a", encoding="utf-8") as log:
-                _ = log.write(f"[{_now_stamp()}] mesh: app-server {pid} stopped itself: {verdict.reason}\n")
+            _log_server(str(folder), f"app-server {pid} stopped itself: {verdict.reason}")
             return 0
     if _read_json_object(record).get("pid") == pid:
         with contextlib.suppress(OSError):
@@ -2204,6 +2376,80 @@ def command_sweep(args: argparse.Namespace) -> int:
         print(f"{pid}\t{port}\t{label}\t{reason}\t{folder or '-'}")
     tail = f"{stopped} stopped" if stop else "report only, nothing was stopped"
     print(f"{len(servers)} app-server(s), {unused} unused; {tail}")
+    return 0
+
+
+# Delivers the sign-in change notice to the session holding a run.
+SEND_SCRIPT = Path(__file__).resolve().parent.parent / "message" / "send.py"
+NOTICE_TIMEOUT_SECS = 120
+
+
+def _marker_sessions(root: Path, folder: Path) -> list[str]:
+    """The sessions whose run-active marker names `folder`: the marker's file name is the session id."""
+    active = root / "active"
+    holders: list[str] = []
+    for marker in sorted(active.iterdir()) if active.is_dir() else []:
+        try:
+            lines = marker.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        if lines and lines[0].strip() and Path(lines[0].strip()).resolve() == folder.resolve():
+            holders.append(marker.name)
+    return holders
+
+
+def _notify_holder(session_id: str, line: str) -> None:
+    try:
+        sent = subprocess.run(
+            [sys.executable, str(SEND_SCRIPT), "--to", f"session:{session_id}", "--from", "codex-sign-in",
+             "--summary", "Codex sign-in changed", "--text", line],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=NOTICE_TIMEOUT_SECS, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"codex_mesh: could not tell session {session_id}: {exc}", file=sys.stderr)
+        return
+    if sent.returncode:
+        print(f"codex_mesh: could not tell session {session_id}: {sent.stderr.strip()}", file=sys.stderr)
+
+
+def command_signin_changed(args: argparse.Namespace) -> int:
+    """Move every run off an app-server started before the Codex sign-in last changed.
+
+    A path watch on the sign-in file runs this the moment it changes; `ensure_server` makes the
+    same check at each launch for a run this missed. Each run's record is retired, so its next
+    dispatch starts a server that reads the current sign-in. A seat mid-turn keeps the old server
+    until the turn ends, and a resident seat then moves itself. The old server is stopped now if
+    nothing uses it, otherwise by its watcher once nothing does. Run twice for one change, the
+    second run finds nothing older and moves nothing.
+    """
+    root = Path(_as_str(_attr(args, "root")) or SWEEP_ROOT)
+    changed = _sign_in_changed_at()
+    if changed is None:
+        print("codex_mesh: no Codex sign-in file; nothing moved")
+        return 0
+    at = datetime.fromtimestamp(changed).astimezone().strftime("%H:%M %Z")
+    moved = 0
+    for record_path in sorted(root.glob(f"*/{SERVER_FILE}")):
+        folder = record_path.parent
+        with _server_lock(str(folder)):
+            record = _read_json_object(record_path)
+            port, pid = record.get("port"), record.get("pid")
+            if not (isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid) and _holds_old_sign_in(pid)):
+                continue
+            _retire_record(str(folder), record)
+        stopped = _stop_unused(None, pid, port, folder)
+        if not stopped:
+            _ = _start_watcher(str(folder), pid, port)
+        old = "is stopped" if stopped else "stops once nothing uses it"
+        line = (f"Codex sign-in changed at {at}: run {folder.name}'s app-server {pid} started before it, so the "
+                + "run's seats move to a new server, an idle seat at its next turn and a seat mid-turn when "
+                + f"that turn ends; the old server {old}.")
+        _log_server(str(folder), line)
+        for session_id in _marker_sessions(root, folder):
+            _notify_holder(session_id, line)
+        print(line)
+        moved += 1
+    print(f"{moved} run(s) moved off the old sign-in")
     return 0
 
 
@@ -2306,6 +2552,11 @@ def main(argv: list[str] | None = None) -> int:
     _ = sweep.add_argument("--root", default="")
     _ = sweep.add_argument("--stop", action="store_true", help="stop each server two looks in a row call unused")
     sweep.set_defaults(handler=command_sweep)
+
+    signin_changed = subparsers.add_parser(
+        "signin-changed", help="move every run off an app-server older than the Codex sign-in")
+    _ = signin_changed.add_argument("--root", default="")
+    signin_changed.set_defaults(handler=command_signin_changed)
 
     roster = subparsers.add_parser("list", help="print the delegate roster")
     _ = roster.add_argument("--session-dir", required=True)

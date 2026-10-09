@@ -252,6 +252,10 @@ happened and the failure survived it; absent, the launcher held back — the sea
 had already done work, or the failure took too long to be local — and the
 paragraphs above are yours to apply.
 
+A new Codex sign-in moves the run by itself. A message from `codex-sign-in` names
+the server it retired; the next dispatch starts on a new one, a seat mid-turn
+finishes first, and nothing is owed in reply.
+
 Recovering by hand, in that case only. Check that no peer run claims the
 recorded pid or port before signalling anything —
 `grep -l '<pid>\|<port>' /tmp/claude/delegate/*/mesh_server.json` should name
