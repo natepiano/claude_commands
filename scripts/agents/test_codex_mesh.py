@@ -14,14 +14,17 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import io
 import json
 import os
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1299,6 +1302,47 @@ class RetryDecisionTests(unittest.TestCase):
         )
 
 
+class QuotaRefusalTests(unittest.TestCase):
+    """Which usage-limit failures are the provider's own, and so reported to the quota alert."""
+
+    @staticmethod
+    def refused(outcome: codex_mesh.RunOutcome, tested: bool, resident: bool = False) -> bool:
+        return codex_mesh._quota_refused(outcome, tested, resident)  # pyright: ignore[reportPrivateUsage]
+
+    def test_a_refusal_from_a_server_this_launcher_started_is_the_providers(self) -> None:
+        self.assertTrue(self.refused(_attempt(), tested=True))
+        self.assertTrue(self.refused(_attempt(thread_exists=True), tested=True, resident=True))
+
+    def test_a_fast_refusal_from_an_inherited_server_proves_nothing(self) -> None:
+        # The wedged server's replay: same words, no round trip.
+        self.assertFalse(self.refused(_attempt(thread_exists=True), tested=False))
+
+    def test_a_refusal_after_real_work_reached_the_provider(self) -> None:
+        slow = _attempt(seconds=codex_mesh.RETRY_FAST_FAILURE_SECS + 1, thread_exists=True)
+        self.assertTrue(self.refused(slow, tested=False))
+        # A resident's clock spans every turn it ever ran.
+        self.assertFalse(self.refused(slow, tested=False, resident=True))
+
+    def test_other_failures_and_capacity_are_not_quota(self) -> None:
+        self.assertFalse(self.refused(codex_mesh.FailedWithThread(THREAD_ID, CAPACITY, 3.0), tested=True))
+        self.assertFalse(self.refused(codex_mesh.RunCompleted(), tested=True))
+        self.assertFalse(self.refused(codex_mesh.CapacityRetriesExhausted(THREAD_ID, 3, 20), tested=True))
+
+    def test_the_report_runs_the_blocked_verb_and_survives_its_failure(self) -> None:
+        done = subprocess.CompletedProcess([], 0, "switched to claude for codex 1: delegate\n", "")
+        with patch.object(subprocess, "run", return_value=done) as run, \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            codex_mesh._report_quota_refusal("seat")  # pyright: ignore[reportPrivateUsage]
+        command = cast("list[str]", run.call_args.args[0])
+        self.assertEqual(command[1:], [str(codex_mesh.QUOTA_REPORT), "blocked"])
+        self.assertTrue(codex_mesh.QUOTA_REPORT.is_file())
+        self.assertIn("codex_mesh: seat: quota: switched to claude for codex 1: delegate", errors.getvalue())
+        with patch.object(subprocess, "run", side_effect=OSError("no interpreter")), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            codex_mesh._report_quota_refusal("seat")  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("quota refusal not reported: no interpreter", errors.getvalue())
+
+
 class ThreadStartTests(unittest.TestCase):
     """The speed tier reaches the thread only when the registry sets one."""
 
@@ -1383,6 +1427,304 @@ class ReplyDeliveryTests(unittest.TestCase):
         )
 
 
+class SweepTests(unittest.TestCase):
+    """The report of app-servers nothing is using. Every doubt must read as in use."""
+
+    @staticmethod
+    def facts(**changes: object) -> codex_mesh.ServerFacts:
+        quiet = codex_mesh.SERVER_IDLE_SECS + 60
+        base = codex_mesh.ServerFacts(pid=10, port=4000, age_secs=quiet, clients=0, session_dir=Path("/run"),
+                                      folder_exists=True, marked_active=False, live_launchers=(), quiet_secs=quiet)
+        return dataclasses.replace(base, **changes)
+
+    @staticmethod
+    def verdict(facts: codex_mesh.ServerFacts, busy: tuple[str, ...] = ()) -> codex_mesh.SweepVerdict:
+        return codex_mesh._sweep_verdict(facts, lambda: busy)  # pyright: ignore[reportPrivateUsage]
+
+    def test_only_a_server_cleared_by_every_check_is_unused(self) -> None:
+        self.assertIsInstance(self.verdict(self.facts()), codex_mesh.ServerUnused)
+        self.assertIsInstance(self.verdict(self.facts(quiet_secs=None)), codex_mesh.ServerUnused)
+        deleted = self.verdict(self.facts(folder_exists=False, quiet_secs=None))
+        self.assertIsInstance(deleted, codex_mesh.ServerUnused)
+        self.assertIn("deleted", deleted.reason)
+        for change in ({"clients": 1}, {"marked_active": True}, {"live_launchers": ("impl",)},
+                       {"age_secs": 60.0}, {"quiet_secs": 60.0}):
+            self.assertIsInstance(self.verdict(self.facts(**change)), codex_mesh.ServerInUse, change)
+        self.assertIsInstance(self.verdict(self.facts(), ("impl: ThreadLive",)), codex_mesh.ServerInUse)
+        self.assertIsInstance(self.verdict(self.facts(folder_exists=False), ("t1: ThreadLive",)),
+                              codex_mesh.ServerInUse)
+
+    def test_a_server_whose_log_names_no_run_folder_is_never_called_unused(self) -> None:
+        self.assertIsInstance(self.verdict(self.facts(session_dir=None)), codex_mesh.ServerUnknown)
+
+    def test_servers_and_connections_are_read_from_ps_and_ss(self) -> None:
+        ps = ("  111 7200 codex app-server --listen ws://127.0.0.1:47165\n"
+              "  222   30 /nix/store/x/bin/codex app-server --listen ws://127.0.0.1:51009\n"
+              "  333   99 zsh -c pgrep -af codex app-server --listen ws://127.0.0.1: | head\n"
+              "  444   99 codex app-server --listen stdio://\n")
+        ss = "0 0 127.0.0.1:47165 127.0.0.1:60000\n0 0 127.0.0.1:60000 127.0.0.1:47165\n0 0 [::1]:47165 [::1]:60001\n"
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, ps, "")):
+            servers = codex_mesh._running_servers()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(servers, [(111, 47165, 7200.0), (222, 51009, 30.0)])
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, ss, "")):
+            counts = codex_mesh._client_counts()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(counts, {47165: 2, 60000: 1})
+
+    def test_the_run_folder_comes_from_the_servers_own_log_handle(self) -> None:
+        folder = codex_mesh._server_folder  # pyright: ignore[reportPrivateUsage]
+        with patch.object(os, "readlink", return_value="/tmp/x/run-a/mesh_server.log"):
+            self.assertEqual(folder(5), Path("/tmp/x/run-a"))
+        with patch.object(os, "readlink", return_value="/tmp/x/gone/mesh_server.log (deleted)"):
+            self.assertEqual(folder(5), Path("/tmp/x/gone"))
+        with patch.object(os, "readlink", return_value="/dev/null"):
+            self.assertIsNone(folder(5))
+        with patch.object(os, "readlink", side_effect=OSError("no such process")):
+            self.assertIsNone(folder(5))
+
+    def test_a_run_folder_reports_its_marker_its_quiet_time_and_its_live_launchers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run-a"
+            (root / "active").mkdir()
+            run.mkdir()
+            self.assertFalse(codex_mesh._marked_active(root, run))  # pyright: ignore[reportPrivateUsage]
+            self.assertIsNone(codex_mesh._quiet_secs(run, 0.0))  # pyright: ignore[reportPrivateUsage]
+            _ = (root / "active" / "session-1").write_text(f"{run}\n")
+            self.assertTrue(codex_mesh._marked_active(root, run))  # pyright: ignore[reportPrivateUsage]
+            _ = (run / "board.log").write_text("x")
+            quiet = codex_mesh._quiet_secs(run, (run / "board.log").stat().st_mtime + 5)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(quiet, 5.0)
+            _ = (run / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+                "impl": {"thread_id": "t1", "launcher_pid": os.getpid()},
+                "tests": {"thread_id": "t2", "launcher_pid": 0},
+                "queued": {},
+            }))
+            self.assertEqual(codex_mesh._live_launchers(run), ("impl",))  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(codex_mesh._roster_threads(run), {"t1": "impl", "t2": "tests"})  # pyright: ignore[reportPrivateUsage]
+
+    def busy(self, loaded: dict[str, object], statuses: dict[str, str]) -> tuple[str, ...]:
+        """What `_busy_threads` says of a server answering with `loaded` and these thread statuses."""
+
+        @final
+        class FakeClient:
+            def __init__(self, _port: int, _name: str) -> None:
+                pass
+
+            def call(self, method: str, params: dict[str, object]) -> dict[str, object]:
+                if method == "thread/loaded/list":
+                    return loaded
+                status = statuses[cast("str", params["threadId"])]
+                return {"result": {"thread": {"status": {"type": status}, "turns": [{"id": "u", "status": "inProgress"}]}}}
+
+            def close(self) -> None:
+                pass
+
+        with patch.object(codex_mesh, "Client", FakeClient):
+            return codex_mesh._busy_threads(4000, {"t1": "impl"})  # pyright: ignore[reportPrivateUsage]
+
+    def test_the_server_is_asked_for_every_conversation_it_holds(self) -> None:
+        listed: dict[str, object] = {"result": {"data": ["t9"], "nextCursor": None}}
+        self.assertEqual(self.busy(listed, {"t1": "idle", "t9": "notLoaded"}), ())
+        # A conversation no roster names is still seen mid-turn.
+        self.assertEqual(self.busy(listed, {"t1": "idle", "t9": "active"}), ("t9: ThreadLive",))
+        self.assertEqual(self.busy(listed, {"t1": "active", "t9": "idle"}), ("impl: ThreadLive",))
+        self.assertEqual(self.busy(listed, {"t1": "odd", "t9": "idle"}), ("impl: ThreadStateUnknown",))
+
+    def test_a_server_that_cannot_be_asked_in_full_reads_as_busy(self) -> None:
+        replies: list[dict[str, object]] = [
+            {"error": {"message": "no"}}, {"result": {}}, {"result": {"data": [], "nextCursor": "more"}},
+        ]
+        for reply in replies:
+            self.assertEqual(len(self.busy(reply, {})), 1, reply)
+        with patch.object(codex_mesh, "Client", side_effect=ConnectionError("refused")):
+            busy = codex_mesh._busy_threads(4000, {})  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(busy, ("the server could not be asked (refused)",))
+
+    def test_the_sweep_fails_closed_when_it_cannot_look(self) -> None:
+        with patch.object(codex_mesh, "_running_servers", side_effect=OSError("no ps")), \
+                patch.object(codex_mesh, "_stop_unused") as stop, \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root="", stop=True)), 1)
+        self.assertIn("nothing judged", errors.getvalue())
+        stop.assert_not_called()
+
+    def sweep(self, stop: bool, stops: bool = True) -> tuple[list[list[str]], list[int]]:
+        """The rows `sweep` prints for a busy, an unused and an unplaced server, and the pids it stopped."""
+        old = codex_mesh.SERVER_IDLE_SECS + 60
+        asked: list[int] = []
+
+        def stopper(_root: Path, pid: int, _port: int, _folder: Path) -> bool:
+            asked.append(pid)
+            return stops
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(codex_mesh, "_running_servers", return_value=[(1, 4001, old), (2, 4002, old), (3, 4003, old)]), \
+                patch.object(codex_mesh, "_client_counts", return_value={4001: 1}), \
+                patch.object(codex_mesh, "_server_folder",
+                             side_effect=[Path(directory) / "gone", Path(directory) / "gone", None]), \
+                patch.object(codex_mesh, "_busy_threads", return_value=()) as busy, \
+                patch.object(codex_mesh, "_stop_unused", side_effect=stopper), \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root=directory, stop=stop)), 0)
+        # Only the server every other check cleared is asked about its conversations.
+        busy.assert_called_once_with(4002, {})
+        return [line.split("\t") for line in printed.getvalue().splitlines()], asked
+
+    def test_the_report_lists_each_server_and_stops_nothing(self) -> None:
+        rows, asked = self.sweep(stop=False)
+        self.assertEqual([row[2] for row in rows[:3]], ["in use", "unused", "unknown"])
+        self.assertEqual(rows[3], ["3 app-server(s), 1 unused; report only, nothing was stopped"])
+        self.assertEqual(asked, [])
+
+    def test_stop_reaches_only_the_unused_server(self) -> None:
+        rows, asked = self.sweep(stop=True)
+        self.assertEqual([row[2] for row in rows[:3]], ["in use", "stopped", "unknown"])
+        self.assertEqual(rows[3], ["3 app-server(s), 1 unused; 1 stopped"])
+        self.assertEqual(asked, [2])
+        rows, _asked = self.sweep(stop=True, stops=False)
+        self.assertEqual([row[2] for row in rows[:3]], ["in use", "kept", "unknown"])
+        self.assertEqual(rows[3], ["3 app-server(s), 1 unused; 0 stopped"])
+
+    def second_look(self, folder: Path, running: list[tuple[int, int, float]], clients: dict[int, int],
+                    verdict: codex_mesh.SweepVerdict) -> tuple[bool, list[int]]:
+        """Whether `_stop_unused` stopped pid 2 on port 4002, and the pids it signalled."""
+        reaped: list[int] = []
+
+        def reap(pid: int) -> bool:
+            reaped.append(pid)
+            return True
+
+        with patch.object(codex_mesh, "_running_servers", return_value=running), \
+                patch.object(codex_mesh, "_client_counts", return_value=clients), \
+                patch.object(codex_mesh, "_judge", return_value=(verdict, folder)) as judge, \
+                patch.object(codex_mesh, "_reap", side_effect=reap):
+            stopped = codex_mesh._stop_unused(folder.parent, 2, 4002, folder)  # pyright: ignore[reportPrivateUsage]
+        if judge.called:
+            self.assertEqual(judge.call_args.args[1:], (2, 4002, 9000.0, clients.get(4002, 0)))
+        return stopped, reaped
+
+    def test_a_server_is_stopped_only_when_the_second_look_agrees(self) -> None:
+        unused, in_use = codex_mesh.ServerUnused("idle"), codex_mesh.ServerInUse("1 client connection(s)")
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory) / "run-a"
+            run.mkdir()
+            record = run / codex_mesh.SERVER_FILE
+            _ = record.write_text(json.dumps({"pid": 2, "port": 4002}))
+            # The pid stopped running this server, or now runs it on another port: nothing is signalled.
+            self.assertEqual(self.second_look(run, [], {}, unused), (False, []))
+            self.assertEqual(self.second_look(run, [(2, 4999, 9000.0)], {}, unused), (False, []))
+            # A client arrived between the two looks.
+            self.assertEqual(self.second_look(run, [(2, 4002, 9000.0)], {4002: 1}, in_use), (False, []))
+            self.assertTrue(record.exists())
+            self.assertEqual(self.second_look(run, [(2, 4002, 9000.0)], {}, unused), (True, [2]))
+            self.assertFalse(record.exists())
+            # A record that names a newer server is left for that server.
+            _ = record.write_text(json.dumps({"pid": 7, "port": 4007}))
+            self.assertEqual(self.second_look(run, [(2, 4002, 9000.0)], {}, unused), (True, [2]))
+            self.assertTrue(record.exists())
+            # A deleted run folder is not created again.
+            gone = Path(directory) / "gone"
+            self.assertEqual(self.second_look(gone, [(2, 4002, 9000.0)], {}, unused), (True, [2]))
+            self.assertFalse(gone.exists())
+        with patch.object(codex_mesh, "_running_servers", side_effect=OSError("no ps")), \
+                patch.object(codex_mesh, "_reap") as reap:
+            self.assertFalse(codex_mesh._stop_unused(gone.parent, 2, 4002, gone))  # pyright: ignore[reportPrivateUsage]
+        reap.assert_not_called()
+
+    def idle_stop(self, folder: Path, running: list[tuple[int, int, float]] | OSError,
+                  verdict: codex_mesh.SweepVerdict, stops: bool = True) -> tuple[int, list[tuple[object, ...]]]:
+        stopped: list[tuple[object, ...]] = []
+
+        def stopper(*arguments: object) -> bool:
+            stopped.append(arguments)
+            return stops
+
+        with patch.object(codex_mesh, "_running_servers", side_effect=[running]), \
+                patch.object(codex_mesh, "_client_counts", return_value={}), \
+                patch.object(codex_mesh, "_judge", return_value=(verdict, folder)) as judge, \
+                patch.object(codex_mesh, "_stop_unused", side_effect=stopper):
+            result = codex_mesh.command_idle_stop(argparse.Namespace(session_dir=str(folder), pid=2, port=4002))
+        if judge.called:
+            # A server judging itself never reads the run-active markers.
+            self.assertEqual(judge.call_args.args[:1], (None,))
+        return result, stopped
+
+    def test_a_server_stops_itself_only_when_nothing_uses_it(self) -> None:
+        unused, in_use = codex_mesh.ServerUnused("quiet for 1.0 h"), codex_mesh.ServerInUse("1 client connection(s)")
+        old = time.time() - 7200
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            record = run / codex_mesh.SERVER_FILE
+            _ = record.write_text(json.dumps({"pid": 2, "port": 4002}))
+
+            def aged() -> float:
+                os.utime(record, (old, old))
+                return old
+
+            # In use, or unused at the first look only: kept, and the record is touched so the
+            # watcher waits out the idle time before it asks again.
+            for verdict, stops in ((in_use, True), (unused, False)):
+                _ = aged()
+                self.assertEqual(self.idle_stop(run, [(2, 4002, 9000.0)], verdict, stops)[0], 1)
+                self.assertGreater(record.stat().st_mtime, old + 3600)
+            # It cannot look: kept.
+            _ = aged()
+            self.assertEqual(self.idle_stop(run, OSError("no ps"), unused), (1, []))
+            self.assertGreater(record.stat().st_mtime, old + 3600)
+            # A record that names a newer server is that server's to touch.
+            _ = record.write_text(json.dumps({"pid": 7, "port": 4007}))
+            _ = aged()
+            self.assertEqual(self.idle_stop(run, [(2, 4002, 9000.0)], in_use)[0], 1)
+            self.assertLess(record.stat().st_mtime, old + 1)
+            # The server no longer runs: the watcher is told to leave, and nothing is judged.
+            self.assertEqual(self.idle_stop(run, [(2, 4999, 9000.0)], unused), (0, []))
+            # Unused at both looks: stopped, with a line in the server's log saying why.
+            self.assertEqual(self.idle_stop(run, [(2, 4002, 9000.0)], unused), (0, [(None, 2, 4002, run)]))
+            self.assertIn("app-server 2 stopped itself: quiet for 1.0 h",
+                          (run / codex_mesh.SERVER_LOG).read_text(encoding="utf-8"))
+
+    def test_a_server_judging_itself_ignores_the_run_active_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            with patch.object(codex_mesh, "_server_folder", return_value=run), \
+                    patch.object(codex_mesh, "_marked_active", return_value=True) as marked, \
+                    patch.object(codex_mesh, "_busy_threads", return_value=()):
+                judge = codex_mesh._judge  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(judge(None, 2, 4002, 9000.0, 0)[0], codex_mesh.ServerUnused)
+                marked.assert_not_called()
+                self.assertIsInstance(judge(run, 2, 4002, 9000.0, 0)[0], codex_mesh.ServerInUse)
+
+    def test_a_send_reopens_a_conversation_the_server_has_not_loaded(self) -> None:
+        calls: list[str] = []
+        loaded: list[object] = [["thread-1"]]
+
+        class FakeClient:
+            def __init__(self, _port: int, _name: str) -> None:
+                pass
+
+            def call(self, method: str, _params: dict[str, object]) -> dict[str, object]:
+                calls.append(method)
+                return {"result": {"data": loaded[0]}}
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            _ = (Path(directory) / codex_mesh.ROSTER_FILE).write_text(
+                json.dumps({"seat": {"thread_id": "thread-1", "status": "running"}}))
+            arguments = argparse.Namespace(session_dir=directory, to="seat", message="again", message_file="")
+            for held, expected in ((["thread-1"], ["thread/loaded/list", "thread/queue/add"]),
+                                   ([], ["thread/loaded/list", "thread/resume", "thread/queue/add"]),
+                                   (None, ["thread/loaded/list", "thread/resume", "thread/queue/add"])):
+                calls.clear()
+                loaded[0] = held
+                with patch.object(codex_mesh, "ensure_server", return_value=(4002, True)), \
+                        patch.object(codex_mesh, "Client", FakeClient), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(codex_mesh.command_send(arguments), 0)
+                self.assertEqual(calls, expected)
+
+
 class ServerRecordTests(unittest.TestCase):
     """Dropping a wedged server, and reaping what was dropped."""
 
@@ -1437,6 +1779,51 @@ class ServerRecordTests(unittest.TestCase):
         # Never started a server, so `codex` need not even be installed here --
         # which is the point: an inherited server is exactly what goes unchecked.
         self.assertEqual((port, fresh), (4321, False))
+
+    def test_using_a_live_server_marks_its_record_as_used(self) -> None:
+        self.write_server(4321, self.sleeper())
+        record = self.session_dir / codex_mesh.SERVER_FILE
+        old = time.time() - 7200
+        os.utime(record, (old, old))
+        _ = codex_mesh.ensure_server(str(self.session_dir))
+        self.assertGreater(record.stat().st_mtime, old + 3600)
+
+    def watcher(self, pid: int) -> tuple[subprocess.Popen[bytes], Path]:
+        """Start the real watcher with a stand-in for the Python that would run `idle-stop`."""
+        calls = self.session_dir / "calls"
+        stub = self.session_dir / "python"
+        _ = stub.write_text(f'#!/bin/sh\necho "$@" >> "{calls}"\n', encoding="utf-8")
+        stub.chmod(0o755)
+        with patch.object(codex_mesh, "WATCH_WAKE_SECS", 0.1), \
+                patch.object(codex_mesh, "SERVER_IDLE_SECS", 60.0), \
+                patch.object(sys, "executable", str(stub)):
+            process = codex_mesh._start_watcher(str(self.session_dir), pid, 4321)  # pyright: ignore[reportPrivateUsage]
+        self.spawned.append(process)
+        return process, calls
+
+    def test_the_watcher_asks_only_about_a_record_gone_untouched_and_then_leaves(self) -> None:
+        pid = self.sleeper()
+        self.write_server(4321, pid)
+        process, calls = self.watcher(pid)
+        time.sleep(0.5)
+        # Several wakes on a record touched this minute: nothing is asked.
+        self.assertFalse(calls.exists())
+        old = time.time() - 7200
+        os.utime(self.session_dir / codex_mesh.SERVER_FILE, (old, old))
+        self.assertEqual(process.wait(timeout=10), 0)
+        self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), [
+            f"{Path(codex_mesh.__file__).resolve()} idle-stop --session-dir {self.session_dir.resolve()} "
+            + f"--pid {pid} --port 4321",
+        ])
+
+    def test_the_watcher_leaves_with_its_server(self) -> None:
+        server = subprocess.Popen(["sleep", "30"])
+        self.write_server(4321, server.pid)
+        process, calls = self.watcher(server.pid)
+        server.kill()
+        _ = server.wait(timeout=5)
+        _ = process.wait(timeout=10)
+        self.assertFalse(calls.exists())
 
     def test_retiring_drops_the_record_and_keeps_the_pid_for_stop(self) -> None:
         pid = self.sleeper()

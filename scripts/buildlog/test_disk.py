@@ -223,6 +223,44 @@ class DiskTests(unittest.TestCase):
         marker_bytes = (target / sweep.RUSTC_INFO).stat().st_blocks * 512
         self.assertEqual(measured["rows"][0]["bytes"], blocks + target_bytes + marker_bytes)
 
+    def test_outside_directories_exclude_cargo_tag_target(self) -> None:
+        root = self.base() / "rust"
+        target = root / "project" / "target"
+        fingerprint = target / "debug" / ".fingerprint" / "app-0123456789abcdef"
+        fingerprint.mkdir(parents=True)
+        _ = (fingerprint / "bin-app.json").write_text("{}")
+        _ = (target / sweep.CACHE_TAG).write_text(
+            f"Signature: 8a477f597d28d172789f06886806bc55\n{sweep.CARGO_TAG_LINE}\n"
+        )
+        _ = (target / "debug" / "app").write_bytes(os.urandom(4096))
+
+        with mock.patch.object(disk, "MIN_OUTSIDE_DIRECTORY_BYTES", 1):
+            measured = disk.measure([("rust", str(root))], lambda: disk.FilesystemUsage(0, 0), None)
+
+        self.assertEqual(measured["outside_build_caches"], [])
+        self.assertEqual(measured["outside_build_cache_totals"], [
+            {"label": "rust", "bytes": 0, "growth_bytes": 0},
+        ])
+
+    def test_outside_directories_count_another_tools_cache_tag(self) -> None:
+        root = self.base() / "rust"
+        target = root / "project" / "cache"
+        fingerprint = target / "debug" / ".fingerprint" / "app-0123456789abcdef"
+        fingerprint.mkdir(parents=True)
+        _ = (fingerprint / "bin-app.json").write_text("{}")
+        _ = (target / sweep.CACHE_TAG).write_text(
+            "Signature: 8a477f597d28d172789f06886806bc55\n"
+            + "# This file is a cache directory tag created by another tool.\n"
+        )
+        _ = (target / "debug" / "app").write_bytes(os.urandom(4096))
+
+        with mock.patch.object(disk, "MIN_OUTSIDE_DIRECTORY_BYTES", 1):
+            measured = disk.measure([("rust", str(root))], lambda: disk.FilesystemUsage(0, 0), None)
+
+        by_path = {row["path"]: row for row in measured["outside_build_caches"]}
+        self.assertIn(str(target), by_path)
+        self.assertGreater(by_path[str(target)]["bytes"], 0)
+
     def test_outside_directories_compare_previous_snapshot_and_count_new_directory(self) -> None:
         root = self.base() / "tmp"
         old = root / "old"

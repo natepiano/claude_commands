@@ -97,9 +97,9 @@ table|json|csv`. Beyond those:
 - **`N.Nx faster|slower`** — enough samples, and past the noise factor.
 
 **`--skill plan-delegate`** — the value is the store directory name under
-`~/.local/state/`, not the user-facing skill name. Every visible name says
-"delegate" (`/unit:delegate`, `[delegate.codex]`), but `--skill delegate` matches no
-store. `plan-delegate` is the only one.
+`~/.local/state/`, not the user-facing skill name. The command is `/unit:direct`
+and its config section is `[delegate.codex]`, but neither `--skill direct` nor
+`--skill delegate` matches a store. `plan-delegate` is the only one.
 
 ## Reading
 

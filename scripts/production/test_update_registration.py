@@ -75,19 +75,25 @@ class RegistrationTests(unittest.TestCase):
                     "REGISTRATION_TEST_STATE": str(self.state), "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
                     "MAC_TEST_STATE_DIR": str(self.state / "mac-test"),
+                    # No test here may ask a real tmux which unit sessions exist.
+                    "UNIT_LOOKUP_TMUX": str(self.root / "no-tmux"),
                     "CLAUDE_CODE_SESSION_ID": "current-session-id"}
         _ = self.git("init", "-b", "production", str(self.checkout), cwd=self.root)
         _ = self.git("config", "user.name", "Registration Test")
         _ = self.git("config", "user.email", "registration@example.invalid")
         self.doc.parent.mkdir(parents=True)
+        # A linked worktree, where `.git` is a file: tmux is never asked whether its unit is gone.
+        alpha = self.root / "alpha"
+        alpha.mkdir()
+        _ = (alpha / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
         _ = self.doc.write_text("\n".join((
             "# Production — example", "", "## Production Context", "",
             "- **Merge branch:** `production`", f"- **Showrunner checkout:** `{self.checkout}`",
             "- **Showrunner session:** first-showrunner", "- **Log:** `production.log`",
             "- **User zone:** America/Los_Angeles", "- **Updates:** every 15 minutes", "",
-            "## Units", "", "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-            "| `alpha-unit` | `docs/alpha.md` | `/tmp/alpha` | `alpha` | `alpha-session` | — | — |",
+            "## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |",
+            "| --- | --- | --- | --- | --- | --- |",
+            f"| `alpha-unit` | `docs/alpha.md` | `{alpha}` | `alpha` | — | — |",
             "", "## Gates", "",
         )), encoding="utf-8")
         _ = self.git("add", ".")
@@ -108,10 +114,6 @@ class RegistrationTests(unittest.TestCase):
         return ([cast(list[str], json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines()]
                 if path.exists() else [])
 
-    def registry(self) -> list[dict[str, object]]:
-        data = cast(dict[str, object], json.loads(self.config.read_text(encoding="utf-8")))
-        return cast(list[dict[str, object]], data["showrunners"])
-
     def outstanding(self) -> Path:
         path = self.state / "showrunner/outstanding/example.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,7 +122,7 @@ class RegistrationTests(unittest.TestCase):
     def copied_command(self) -> Path:
         tree = Path(tempfile.mkdtemp(prefix="command-copy-", dir=self.root))
         _ = shutil.copytree(SCRIPT.parent, tree / "scripts/production")
-        for name in ("build_hold", "lint", "mac_test", "whoami"):
+        for name in ("build_hold", "lint", "mac_test", "message", "whoami"):
             _ = shutil.copytree(SCRIPT.parent.parent / name, tree / "scripts" / name)
         hooks = tree / "scripts/hooks"
         hooks.mkdir(parents=True)
@@ -135,12 +137,10 @@ class RegistrationTests(unittest.TestCase):
                               cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False)
 
     def test_start_and_resume_retarget_only_updates_and_retire_old_session(self) -> None:
-        first = self.run_command("register", "--session", "first-showrunner")
+        doc_bytes = self.doc.read_bytes()
+        first = self.run_command("register")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertIn("register: ok", first.stdout)
-        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
-        self.assertEqual(self.registry()[0]["session"], "first-showrunner")
-        self.assertEqual(self.registry()[0]["units"], ["alpha-session"])
         initial_calls = self.notifier_calls()
         self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", "showrunner-example"]]), 1)
         updates = next(call for call in initial_calls if call[:2] == ["new", "showrunner-example"])
@@ -152,18 +152,12 @@ class RegistrationTests(unittest.TestCase):
         new_env = {**self.env, "CLAUDE_CODE_SESSION_ID": "resume-session-id"}
         resumed = self.run_command("register", "--session", "resumed-showrunner", env=new_env)
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
-        self.assertIn("**Showrunner session:** resumed-showrunner", self.doc.read_text(encoding="utf-8"))
-        self.assertEqual(self.git("log", "-1", "--format=%s"),
-                         "production(example): showrunner session resumed-showrunner")
-        self.assertEqual([entry["session"] for entry in self.registry()], ["resumed-showrunner"])
-        self.assertEqual(self.registry()[0]["units"], ["alpha-session"])
-        registry_bytes = self.config.read_bytes()
-        doc_bytes = self.doc.read_bytes()
         repeated = self.run_command("register", "--session", "resumed-showrunner", env=new_env)
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
-        self.assertEqual(self.config.read_bytes(), registry_bytes)
+        # The showrunner's name is written nowhere: no registry, no doc line, no commit.
+        self.assertFalse(self.config.exists())
         self.assertEqual(self.doc.read_bytes(), doc_bytes)
-        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "2")
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
         calls = self.notifier_calls()
         self.assertEqual(len([call for call in calls if call[:2] == ["new", "showrunner-example"]]), 3)
         updates = [call for call in calls if call[:2] == ["new", "showrunner-example"]]
@@ -172,10 +166,7 @@ class RegistrationTests(unittest.TestCase):
         for instance in ("stall-watch", "tmux-names"):
             self.assertEqual(len([call for call in calls if call[:2] == ["new", instance]]), 1)
 
-    def test_register_requires_session_and_environment_session_id(self) -> None:
-        missing_name = self.run_command("register")
-        self.assertEqual(missing_name.returncode, 2)
-        self.assertEqual(self.notifier_calls(), [])
+    def test_register_requires_the_environment_session_id(self) -> None:
         without_id = {key: value for key, value in self.env.items() if key != "CLAUDE_CODE_SESSION_ID"}
         missing_id = self.run_command("register", "--session", "first-showrunner", env=without_id)
         self.assertEqual(missing_id.returncode, 2)
@@ -195,26 +186,6 @@ class RegistrationTests(unittest.TestCase):
         self.assertFalse(self.config.exists())
         self.assertEqual(self.notifier_calls(), [])
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
-
-    def test_failed_registry_rename_keeps_old_session_line_for_retry(self) -> None:
-        first = self.run_command("register", "--session", "first-showrunner")
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        script = self.copied_command()
-        registry = script.with_name("showrunners.py")
-        _ = registry.write_text("\n".join(("import sys", "if __name__ == '__main__':",
-                                             "    print('rename unavailable', file=sys.stderr)",
-                                             "    raise SystemExit(1)", "")), encoding="utf-8")
-        doc_before = self.doc.read_bytes()
-        commit_before = self.git("rev-parse", "HEAD")
-        failed = self.run_copy(script, "register", "--session", "resumed-showrunner")
-        self.assertEqual(failed.returncode, 2, failed.stdout + failed.stderr)
-        self.assertIn("rename unavailable", failed.stdout)
-        self.assertEqual(self.doc.read_bytes(), doc_before)
-        self.assertEqual(self.git("rev-parse", "HEAD"), commit_before)
-        self.assertEqual([entry["session"] for entry in self.registry()], ["first-showrunner"])
-        retry = self.run_command("register", "--session", "resumed-showrunner")
-        self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
-        self.assertEqual([entry["session"] for entry in self.registry()], ["resumed-showrunner"])
 
     def test_missing_prompt_markers_fail_before_registration_changes(self) -> None:
         for marker in ("The prompt:", "**A tick**"):
@@ -240,11 +211,12 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
         prompt = prompts[0].read_text(encoding="utf-8")
         self.assertIn("unit_status.txt", prompt)
-        self.assertIn("/showrunner:dailies simple", prompt)
+        self.assertIn("/showrunner:dailies gantt", prompt)
         self.assertEqual(prompt.count("Pass `--render-state <SCRATCH>/dailies_state.json` to the builder"), 1)
         self.assertEqual(prompt.count("--render-state"), 1)
         self.assertIn("America/Los_Angeles", prompt)
-        self.assertIn("first-showrunner", prompt)
+        self.assertIn(f"--production {self.doc}", prompt)
+        self.assertNotIn("first-showrunner", prompt)
 
     def test_time_converts_midnight_and_daylight_change_to_document_zone(self) -> None:
         midnight = self.run_command("time", "2026-10-07T06:30:00+00:00")
@@ -273,13 +245,13 @@ class RegistrationTests(unittest.TestCase):
         self.assertIn("alpha-unit: not stated; last merged none; waits on not stated", log)
         self.assertIn("beta-unit: not stated; last merged none; waits on not stated", log)
 
-    def test_state_block_matches_session_and_merge_history_and_reads_outstanding(self) -> None:
+    def test_state_block_matches_unit_and_merge_history_and_reads_outstanding(self) -> None:
         _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit phase 2 (abc1234)")
         outstanding = self.outstanding()
         _ = outstanding.write_text(json.dumps([{"since": "2026-10-04T10:00", "text": "review colors"}]) + "\n",
                                    encoding="utf-8")
         state = self.root / "judgment.json"
-        _ = state.write_text(json.dumps({"units": [{"unit": "alpha-session", "phase": "Phase 2 of 3: panels",
+        _ = state.write_text(json.dumps({"units": [{"unit": "alpha-unit", "phase": "Phase 2 of 3: panels",
                                                     "wait": "review"}],
                                            "merges_held": ["alpha phase 2"],
                                            "open_for_user": ["stale state item"]}), encoding="utf-8")

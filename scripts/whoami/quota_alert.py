@@ -14,11 +14,16 @@ new window, another account made active -- and that sends "Quota restored:".
 /quota_refresh (`agent_notes.py refresh`) does the same at once when the user
 reports a reset, and says so even when the timer closed the episode first.
 
-A Codex episode opening also moves every [assignments] entry on codex to claude
-through agents_config.sh's validated editor, so delegation goes on without Codex;
-the alert says what moved, or why the editor refused. Once no Codex episode is
-open, the entries it moved that are still on claude go back to codex, and
-"Quota restored:" says which. A Claude episode never switches anything. Each
+Reaching the threshold switches nothing, for either tool: a Codex account whose
+weekly allowance is used up may keep working on its credits, so its alert says to
+keep delegating (user, 2026-10-07). The switch waits for Codex to refuse work:
+codex_mesh.py runs `agent_notes.py blocked` when the provider turns a launch away
+for quota, and blocked() then moves every [assignments] entry on codex to claude
+through agents_config.sh's validated editor and tells every recipient at once
+what moved, or why the editor refused. It switches only inside an episode, so a
+refusal while the week is measured above the threshold moves nothing. Once no Codex
+episode is open, the entries a switch moved that are still on claude go back to
+codex, and "Quota restored:" says which. Each
 switch and switch-back waits in the state until the user's next prompt in OWNER,
 where `notice`, a UserPromptSubmit hook in /etc/nixos/.claude/settings.json,
 shows it to them. Only this machine's registry is switched.
@@ -55,8 +60,11 @@ if __package__ in (None, ""):
 
 from ..production.showrunners import (
     CONFIG as CONFIG,
+    Showrunner as Showrunner,
     ShowrunnerSettings as ShowrunnerSettings,
-    load_settings as load_settings,
+    load_settings_from as load_settings_from,
+    registered_showrunners as registered_showrunners,
+    socket_for as socket_for,
 )
 
 
@@ -133,12 +141,36 @@ class Job(NamedTuple):
 
 
 def load_config() -> Config:
-    return load_settings(CONFIG)
+    return load_settings_from(CONFIG)
+
+
+def showrunners_now() -> list[Showrunner]:
+    """Every showrunner with an update timer. None when the session records cannot say who runs."""
+    try:
+        return registered_showrunners()
+    except OSError as error:
+        print(f"quota-alert: showrunners unknown: {error}", file=sys.stderr)
+        return []
+
+
+def not_live(names: list[str]) -> list[str]:
+    """Those of `names` that no live session is called now. A lookup that cannot say leaves a name out."""
+    missed: list[str] = []
+    for name in names:
+        try:
+            if socket_for(name) is None:
+                missed.append(name)
+        except OSError:
+            continue
+    return missed
 
 
 def recipients(config: Config, here: str | None = None) -> list[str]:
-    """Keep configured names even when their sessions are currently offline."""
-    names = [*config["always"], *(runner["session"] for runner in config["showrunners"])]
+    """The configured names, offline or not, then each running showrunner by its name now.
+
+    A showrunner that is not running has no name to send to; it hears the next repeat after it resumes.
+    """
+    names = [*config["always"], *(runner["session"] for runner in showrunners_now() if runner["session"])]
     return list(dict.fromkeys(name for name in names if name != here))
 
 
@@ -261,7 +293,7 @@ def edit_registry(editor: str, *args: str) -> str | None:
 
 
 def switch_to_claude(state: State, note: AgentNote, stamp: str) -> str:
-    """Move every [assignments] entry on codex to claude as `note`'s episode opens; return the log line."""
+    """Move every [assignments] entry on codex to claude within `note`'s open episode; return the log line."""
     episode = state["episodes"][note.path.stem]
     account = f"{note.path.stem} at {percent(note)}, resets {note.get('resets')}"
     moved: list[str] = []
@@ -275,7 +307,7 @@ def switch_to_claude(state: State, note: AgentNote, stamp: str) -> str:
     if not moved and error:
         episode["switch_failed"] = error
         state.setdefault("unseen", []).append(
-            f"Codex ran out of quota ({account}), and the automatic switch to Claude failed at "
+            f"Codex refused work for quota ({account}), and the automatic switch to Claude failed at "
             + f"{local_time(stamp)}: {error}")
         return f"switch to claude for {note.path.stem} failed: {error}"
     if not moved:
@@ -283,7 +315,7 @@ def switch_to_claude(state: State, note: AgentNote, stamp: str) -> str:
     switch = state.setdefault("switch", {"at": stamp, "moved": []})
     switch["moved"] += [key for key in moved if key not in switch["moved"]]
     state.setdefault("unseen", []).append(
-        f"Codex ran out of quota ({account}): {', '.join(moved)} moved to Claude at {local_time(stamp)}, "
+        f"Codex refused work for quota ({account}): {', '.join(moved)} moved to Claude at {local_time(stamp)}, "
         + "and move back when Codex recovers.")
     return f"switched to claude for {note.path.stem}: {', '.join(moved)}"
 
@@ -317,9 +349,25 @@ def account_line(note: AgentNote, threshold: float) -> str:
             + f"usage left (threshold {threshold:g}%); it resets {note.get('resets')}.")
 
 
+def credit_line(note: AgentNote) -> str:
+    """The credits Codex reports for the account, which carry work once its weekly allowance is used up."""
+    name = note.path.stem
+    balance = note.get("credit_balance")
+    if balance == "unlimited":
+        return f"Credits on {name}: unlimited."
+    try:
+        return f"Credits left on {name}: {float(balance or ''):,.0f}."
+    except ValueError:
+        return f"No credit balance is reported for {name}."
+
+
 def instruction(tool: str, switch: Switch | None, failed: str | None) -> str:
     """What the alert asks of its recipient, given the switch to Claude made or refused."""
     refused = f"The automatic switch from {tool} to Claude failed: {failed} " if failed else ""
+    if switch is None and tool == "Codex" and not failed:
+        return ("Its weekly allowance is used up or nearly so, and Codex may keep working on the account's credits, "
+                + "so nothing was switched to Claude: keep delegating Codex work. Bring this to your user, and if "
+                + "Codex refuses work for quota, bring that to them at once.")
     if switch is None:
         return (f"{refused}Bring this to your user, and if you delegate {tool} work, start no new {tool} work "
                 + 'until a "Quota restored:" notice.')
@@ -335,6 +383,8 @@ def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: Swi
     tool = note.tool.capitalize()
     threshold = f"{config['threshold_percent']:g}%"
     lines = [f"Quota alert: {account_line(note, config['threshold_percent'])}"]
+    if note.tool == "codex":
+        lines.append(credit_line(note))
     count = note.get("limit_reset_count")
     if count and count != "null":
         lines.append(f"Limit resets available on {name}: {count}, earliest expiring {note.get('limit_reset')}.")
@@ -352,6 +402,8 @@ def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: Swi
         f"Protocol: {PROTOCOL}. Read from {note.path}, checked {note.get('weekly_usage_checked_at')}. Sent by "
         + f"{Path(__file__)} to the sessions in {CONFIG}.",
     ]
+    lines += [f"{missed}, which {CONFIG} names to always get this alert, is not a live session and has not seen it."
+              for missed in not_live(config["always"])]
     return "\n".join(lines)
 
 
@@ -394,6 +446,19 @@ def deliver(jobs: list[Job]) -> list[str | None]:
         return list(pool.map(relay, [job.recipient for job in jobs], [job.text for job in jobs], keys))
 
 
+def deliver_and_record(jobs: list[Job], stamp: str) -> list[str]:
+    """Deliver every job, stamp each alert's attempt on its episode, and return one log line per job."""
+    errors = deliver(jobs)
+    log: list[str] = []
+    with state_file() as state:
+        for job, error in zip(jobs, errors):
+            if job.kind == "alert" and job.name in state["episodes"]:
+                state["episodes"][job.name]["last"][job.recipient] = stamp
+            outcome = "sent" if error is None else f"not delivered: {error}"
+            log.append(f"quota {job.kind} {job.name} -> {job.recipient}: {outcome}")
+    return log
+
+
 def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
     """Send what is due, record it, and return one log line per attempt."""
     now = now or datetime.now(timezone.utc)
@@ -410,8 +475,6 @@ def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
             name = note.path.stem
             if name not in episodes:
                 episodes[name] = {"since": stamp, "last": {}}
-                if note.tool == "codex":
-                    log.append(switch_to_claude(state, note, stamp))
             episode = episodes[name]
             if "acknowledged" in episode:
                 continue
@@ -431,14 +494,34 @@ def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
             text = restored_message(accounts, f"the {name} alert is closed", threshold,
                                     back if tool == "codex" else None)
             jobs += [Job(name, recipient, text, "restored") for recipient in recipients(config)]
-    errors = deliver(jobs)
+    return log + deliver_and_record(jobs, stamp)
+
+
+def blocked(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
+    """Codex refused work for quota: move its functions to Claude and tell every recipient at once.
+
+    Only inside an episode, so only while the active Codex account is measured at or under the
+    threshold: above it the refusal is a 5-hour limit or a stale reply, and nothing moves. An
+    acknowledged episode is told too, since the switch is news its alert never carried.
+    """
+    stamp = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
+    config = load_config()
     with state_file() as state:
-        for job, error in zip(jobs, errors):
-            if job.kind == "alert" and job.name in state["episodes"]:
-                state["episodes"][job.name]["last"][job.recipient] = stamp
-            outcome = "sent" if error is None else f"not delivered: {error}"
-            log.append(f"quota {job.kind} {job.name} -> {job.recipient}: {outcome}")
-    return log
+        out = [note for note in low(notes, config["threshold_percent"]) if note.tool == "codex"]
+        if not out:
+            return ["codex refused work for quota, but no active codex account is at or under the threshold; "
+                    + "nothing switched"]
+        if switch := state.get("switch"):
+            return [f"codex refused work for quota; its functions were already moved to claude at {switch['at']}"]
+        note = out[0]
+        name = note.path.stem
+        episode = state["episodes"].setdefault(name, {"since": stamp, "last": {}})
+        _ = episode.pop("switch_failed", None)
+        log = [switch_to_claude(state, note, stamp)]
+        if "switch" not in state and "switch_failed" not in episode:
+            return log
+        text = message(note, notes, config, state.get("switch"), episode.get("switch_failed"))
+    return log + deliver_and_record([Job(name, recipient, text, "alert") for recipient in recipients(config)], stamp)
 
 
 def refresh(notes: list[AgentNote], here: str | None, now: datetime | None = None) -> list[str]:

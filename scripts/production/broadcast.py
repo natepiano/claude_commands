@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Literal, NamedTuple
 
 import showrunners
-from live_units import live_units
+from live_units import units_of
 
 MESSAGE = Path(__file__).resolve().parent.parent / "message"
 sys.path.insert(0, str(MESSAGE))
@@ -108,10 +108,25 @@ def codex_seats(table: Mapping[int, Process]) -> list[Recipient]:
     return list(seats)
 
 
+def unit_addresses(runner: showrunners.Showrunner) -> list[str]:
+    """What reaches each unit of the showrunner: its session name now, or its unit id when no Claude runs.
+
+    A unit id is no session's name, so the send reports that unit as having no live session.
+    """
+    try:
+        return [unit.name or unit.unit for unit in units_of(runner)]
+    except (OSError, ValueError) as error:
+        print(f"broadcast: the units of {runner['slug']} could not be listed: {error}", file=sys.stderr)
+        return []
+
+
 def recipients(live: Collection[str]) -> list[Recipient]:
     """Every configured showrunner and unit director, then every other live session and running Codex seat."""
-    runners = [runner["session"] for runner in showrunners.load_settings()["showrunners"]]
-    units = dict.fromkeys(unit for runner in runners for unit in live_units(runner) if unit not in runners)
+    registered = showrunners.registered_showrunners()
+    # A showrunner that is not running has no name to look up: its production's slug stands for it,
+    # which is no session's name, so the send reports it as having no live session.
+    runners = [runner["session"] or runner["slug"] for runner in registered]
+    units = dict.fromkeys(unit for runner in registered for unit in unit_addresses(runner) if unit not in runners)
     others = sorted(name for name in live if name not in runners and name not in units)
     return [*(Recipient(name, "showrunner") for name in runners), *(Recipient(name, "unit director") for name in units),
             *(Recipient(name, "agent") for name in others), *codex_seats(processes())]

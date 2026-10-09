@@ -17,6 +17,8 @@ The 4-hourly build report (`/builds` with no argument) runs in the build-report 
 
 There is no `CHECK`, no hold and no alignment, so the clock is the notifier's default: the next whole minute, 240 minutes out.
 
+The conversation pause treats `report-builds` like any other automatic update aimed at the session. When the user writes to the build-report session, it records and stops the enabled instance; a yes or the answer timeout runs `notifier.sh resume report-builds`, which keeps `NEXT_DUE` unchanged. See `docs/as-built/conversation-pause.md`.
+
 The build-report session owns the retarget. The "Owner session" section, last in `commands/builds.md`, holds the one command that points the schedule at the running session (`notifier.sh new report-builds --to "session:$CLAUDE_CODE_SESSION_ID" --every 240 --from report-builds --command '<the text above>'`), then `notifier.sh status report-builds`.
 
 `/watcher` STEP 5 (natedev only) runs `notifier.sh status report-builds` and nothing else. STEP 6 reports the next send from that status. The Standing reports rule in `commands/watcher.md` tells a watcher to run what a `report-<name>` message asks, show its output unchanged, and do nothing else, and points to `commands/builds.md` for `report-builds`.

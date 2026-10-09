@@ -88,12 +88,12 @@ Otherwise `waiting_reason()` returns the first failing reason (`build hold activ
 - Any other nonzero step gives `TrialFailed` with the step name and `first_error()`. That is the first stderr line containing "error", else the first rendered line of a JSON compiler error, else the first stdout line containing "error", else the first non-empty line, else `exit N`. An `OSError` or `SubprocessError` (a timeout included) gives `TrialFailed` with the step and the exception's first line.
 - Finished and failed trials record `target_gib` and `mend_target_gib`, the summed file sizes of `<clone>/target` and `<clone>/mend-target`, to calibrate the headroom.
 
-**Text.** In quiet hours, after the gate or the trial, a version whose text is not yet sent gets one. `send_release_text()` runs `python3 scripts/notify/pushover.py --priority 0 <title> <message>` (30 s). Success is exit 0. Title `Rust 1.100.0 out`; message `Rust 1.100.0 out: <result>. Tell natedev bump or wait.` `trial_text()` gives the result:
+**Text.** In quiet hours, after the gate or the trial, a version whose text is not yet sent gets one. `send_release_text()` runs `python3 scripts/message/send.py --to user --need note --summary <title> --text <message>` (30 s). Success is exit 0. Title `Rust 1.100.0 out`; message `Rust 1.100.0 out: <result>. Tell natedev bump or wait.` `trial_text()` gives the result:
 - finished: `7 new warnings in 3 crates, cargo-mend builds`, with `, 1 error in 1 crate` before the mend part when there are errors;
 - waiting: `trial waiting: 513 GiB free, needs 550`;
 - failed: `trial failed: clippy: <first error>`.
 
-If the first quiet-hours run could not trial, the text carries the waiting reason, and the later result reaches only the report. A send error or nonzero exit goes to `store.note_error`, returns 1, and leaves `text_sent` false, so the next quiet-hours run sends again. This module never reads `~/.config/pushover/env`; the sender owns its credentials.
+If the first quiet-hours run could not trial, the text carries the waiting reason, and the later result reaches only the report. A send error or nonzero exit goes to `store.note_error`, returns 1, and leaves `text_sent` false, so the next quiet-hours run sends again. This module owns no phone credentials; `send.py` owns the user channel.
 
 **State.** `ReleaseState` (`check_day`, `stable_version`, `release_date`, `pin: str | None`, `trial: TrialWaiting | TrialFinished | TrialFailed`, `text_sent`) lives in `store.root() / "rust_release.json"`, which `BUILDLOG_DIR` moves. `write_state()` writes `rust_release.json.tmp`, then renames it over the file. `read_state()` returns `None` for a missing or unreadable file.
 
@@ -159,5 +159,5 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 - **A missing pin keeps the record.** If the toolchain file goes away for a while, its return should not re-trial or re-text a release already handled.
 - **One fetch a day, retried hourly.** Stable releases are weeks apart, so a daily read is enough, and a failure is retried at the next hour.
 - **The check lives in the existing hourly job.** No new timer or unit. The cost is that sync and CI wait during a night-time trial.
-- **The text goes through `pushover.py` as a subprocess.** The sender owns its credentials, so this module never reads them.
+- **The text goes through `send.py --to user` as a subprocess.** The user channel owns phone delivery and its credentials, so this module never reads them.
 - **State sits in the build-log root.** `BUILDLOG_DIR` moves it with the log, which keeps tests off the real file.

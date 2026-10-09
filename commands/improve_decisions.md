@@ -7,13 +7,13 @@ argument-hint: [what to change, or blank to be asked]
 
 Improve `~/.claude/docs/decision_criteria.md`, the single source for how to
 decide what reaches the user when coding and reviewing code. `CLAUDE.md`,
-`/unit:delegate`, and `/team_review` all `@`-import it, so every edit lands in
+`/unit:direct`, and `/team_review` all `@`-import it, so every edit lands in
 every session.
 
 `$ARGUMENTS` — the change the user wants, in their words. Blank means ask.
 
 <Constraints>
-- Keep the `<DecisionEconomy>` … `</DecisionEconomy>` tags. `/unit:delegate`
+- Keep the `<DecisionEconomy>` … `</DecisionEconomy>` tags. `/unit:direct`
   resolves `<DecisionEconomy/>` against them at two call sites, `/team_review` at
   three.
 - One criterion per labeled bullet, stated once. No preamble repeated per bullet.

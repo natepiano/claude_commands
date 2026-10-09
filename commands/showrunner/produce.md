@@ -1,5 +1,5 @@
 ---
-description: Run a production as its showrunner — launch each unit director (a /unit:delegate session), merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA on a schedule.
+description: Run a production as its showrunner — launch each unit director (a /unit:direct session), merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA on a schedule.
 ---
 
 # Produce
@@ -63,9 +63,13 @@ State:
   After a compaction, the production doc plus `LOG` is the whole state.
 - **Unit worktrees.** Never `cd` into one; use `git -C`. Never commit, reset or
   edit files there.
+- **A unit's pane** is looked up each time it is needed, never remembered:
+  `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
+  prints it (`<unit>` is the Units row's Unit value). No tool finds a pane by a
+  session name; the user may rename a session at any time.
 - **The user's words for a unit director** go into its terminal. Send
-  `tmux send-keys -t <session> -l "From the user (via the showrunner): <words>"`,
-  then `tmux send-keys -t <session> Enter` as a separate call:
+  `tmux send-keys -t <pane> -l "From the user (via the showrunner): <words>"`,
+  then `tmux send-keys -t <pane> Enter` as a separate call:
   - Relay only words the user gave.
   - Never send C-c or Escape; typing replaces a prompt suggestion.
   - Text after a unit director's `❯` in a pane capture may be a prompt
@@ -142,6 +146,20 @@ State:
   footers, then asks whether to turn back on what it paused at the end
   (`commands/adhoc_review.md` Steps 2 and 5). The dailies keep their own switch.
 
+  When the user types a message here, the dailies and footer pause on their own.
+  Later, a `conversation-pause:` message asks you to put this question to the
+  user word for word: `Return to automatic updates? (yes / no) They return on
+  their own in 5 minutes.` Never answer it for them. Their typed yes or no is
+  handled without you while the reply that put the question is your latest.
+  Once you have replied again, a bare yes or no reaches you as the answer to
+  whatever you asked last, and the pause's question stays open until it times
+  out. The question comes fifteen minutes after your reply ends, or thirty
+  minutes after their message when the reply was interrupted. Unanswered for
+  five minutes, the updates return on their own. While an `/adhoc_review` is
+  open here, the question waits for the review to end.
+  `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/conversation_pause.py" status`
+  says what is paused.
+
   Example with a hold and an active agent (user, 2026-10-04):
 
   ```text
@@ -195,8 +213,7 @@ When the production doc's **Production rules** say CI does not apply, pass
 <OpenMergeBranch>
 For a planned production, run
 `python3 ~/.claude/scripts/production/production_lifecycle.py open
---production PRODUCTION_DOC --session <this session's name>`, using the first
-line of ListAgents for the name. The command creates and pushes the merge
+--production PRODUCTION_DOC`. The command creates and pushes the merge
 branch, records the running doc and plans, and initializes `LOG`. Rerun it
 after a failed step; it resumes at the first unfinished step.
 </OpenMergeBranch>
@@ -211,8 +228,8 @@ Use `--standby` for a unit waiting for an assignment. Tell the user one line
 per unit director: its session name and `tmux attach -t <session>`.
 
 When a unit director is blocked on a full context, first capture its pane to
-confirm the block remains and no compaction is running. Type `/compact` with
-`tmux send-keys -l`, then send `Enter` separately.
+confirm the block remains and no compaction is running. Type `/compact` into its pane with
+`tmux send-keys -t <pane> -l`, then send `Enter` separately.
 
 **Resume.** To bring back a unit director whose session ended, use
    `claude --resume <session-id> <flags> --remote-control <session> -n <session>`, which keeps its link and its place in the list.
@@ -230,14 +247,14 @@ The instance belongs to the production and keeps running when this session
 exits. On resume, retarget it. Remove it at <Wrap/>; its check removes it after
 the doc says `wrapped`. Each production has its own instance and log.
 
-At the start and on every resume, take this session's current name from the
-first line of ListAgents and run:
+At the start and on every resume, run:
 
 `python3 ~/.claude/scripts/production/update_registration.py register
---production PRODUCTION_DOC --session <this session's name>`
+--production PRODUCTION_DOC`
 
-The command sets and commits a changed showrunner session line, retires the old
-registry name, registers the current name and unit sessions, writes `PROMPT_FILE`,
+This session's name is written nowhere: the update timer is addressed to its
+Claude session id, and every tool looks the name up from that when it needs it.
+The command writes `PROMPT_FILE`,
 retargets `UPDATES` with `NOTIFIER new` without moving its clock, creates
 stall-watch and tmux-names only when absent, and prints `next_due`. Use the
 reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
@@ -245,9 +262,10 @@ reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
 The prompt:
 
 > Scheduled update (every <N> minutes, every unit checked; the user is in
-> <zone>). Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> --showrunner <this session's name> > <SCRATCH>/unit_status.txt`.
+> <zone>). `<SCRATCH>` below stands for your own scratchpad directory: put its
+> path in place of it before you run a command. Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> --production <production doc> > <SCRATCH>/unit_status.txt`.
 > It checks every unit director: its session and Claude are running, anything waiting
-> on the user, and its latest step and ETA. Run `/showrunner:dailies simple`
+> on the user, and its latest step and ETA. Run `/showrunner:dailies gantt`
 > for every unit and open topic; its input builder reads the saved status file.
 > Pass `--render-state <SCRATCH>/dailies_state.json` to the builder; the renderer
 > uses that same file as `--state`.
@@ -266,7 +284,7 @@ is the update tick, not a peer's message. Do not reply to it.
 **Compact after a checkpoint.** At most once per phase: on the first tick or
 dailies after a unit director checkpoints a phase, read its context size from its pane
 footer (`<session> | 157,352 | <model>`). When it is at 150,000 tokens or more
-and idle, type `/compact` into it: `tmux send-keys -t <session> -l
+and idle, type `/compact` into it: `tmux send-keys -t <pane> -l
 "/compact"`, then `Enter` as a separate call. Idle means no spinner line
 (`✶ Doing… (12s …)`), nothing after `❯` except a ghost suggestion (dim:
 `tmux capture-pane -e` shows `\e[2m` before it), and no form, permission
@@ -279,9 +297,10 @@ compacting on every tick doubled the compaction rate and saved no tokens,
 because a unit director re-reads its files at
 once and passes 150K again within 12-20 minutes.)
 
-**Every scheduled update is a `/showrunner:dailies simple` report**, never a
-one-unit note: the user sees every unit on every tick, each checked. In a
-`simple` dailies, waiting, idle units take one line each under `### Waiting and idle`.
+**Every scheduled update is a `/showrunner:dailies gantt` report**, never a
+one-unit note: every unit is checked on every tick and has its row in the chart.
+Above the chart a `gantt` dailies prints only what needs the user and one line for
+each thing that changed; the user asks for `simple` to see every unit's section.
 
 A `/showrunner:dailies` the user runs takes the next tick's slot: it runs the
 script, and then runs `NOTIFIER restart UPDATES` so the next tick comes N minutes after
@@ -314,10 +333,10 @@ whatever arrived:
 | a unit blocked on the showrunner | <ClearGate/>, <LandingCall/>, or answer it |
 | a unit director's decision for the user | show it to the user; relay the answer |
 | a quota alert | <QuotaAlert/> |
-| the user asks for a status | `/showrunner:dailies`, `simple` unless they name a length |
+| the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
 
 A unit repairing failing tests that split by file runs parallel repair seats
-(`/unit:delegate` → <FixDispatch/>); one that runs a lone seat on them gets
+(`/unit:direct` → <FixDispatch/>); one that runs a lone seat on them gets
 told to split. User, 2026-10-04.
 
 Merge one checkpoint at a time. A notice that arrives while a merge is testing
@@ -694,7 +713,7 @@ it needs. Every other wait is yours to clear, and fast.
    3. **Otherwise, tell the user exactly what to do,** in one line they can act on from
       a phone: the session, the exact words to type or the exact allow rule
       to add, and why the check refused it, in a few words. Put it in
-      `needed:` and send it as a <Notify/> priority 2 alert.
+      `needed:` and send it as a <Notify/> `blocked` alert.
    4. **Rule 4's limit holds.** Read the pane again each hour, and repeat 1–3.
       A `needed:` line never repeats unchanged from tick to tick.
    5. **Prevent the next one.** When a routine action for the unit is refused
@@ -706,17 +725,17 @@ it needs. Every other wait is yours to clear, and fast.
 </Dependencies>
 
 <Notify>
-Phone alerts go through Pushover (user's pick, 2026-10-03), because the user
-often ignores ordinary push notifications:
+Phone alerts use the one message path, which reaches the phone through
+Pushover (user's pick, 2026-10-03), because the user often ignores ordinary
+push notifications:
 
-`~/.claude/scripts/notify/pushover.py [--priority 0|1|2] "Hana: <unit or topic>" "<message>"`
+`python3 ~/.claude/scripts/message/send.py --to user --need note|decision|blocked --summary "Hana: <unit or topic>" --text "<message>"`
 
-The message is the one action or fact, under 200 characters. Exit 0 means
-sent. On 1 (refused or unreachable) or 2 (bad usage or missing keys), fall back
-to PushNotification and say so in the log. Never read or print
-`~/.config/pushover/env`. Every send is logged in
-`~/.local/state/notify/pushover.jsonl`, one JSON line holding the time,
-priority, title, full message and outcome.
+On the Mac, add `--machine natedev`; the keys exist only on natedev. The
+message is the one action or fact, under 200 characters. Exit 0 means sent. On
+`FAILED` (exit 3), fall back to PushNotification and say so in the log. Never
+read or print `~/.config/pushover/env`. Every attempt is logged in
+`~/.local/state/message/log.jsonl`.
 
 **Push whenever work waits on the user.** When the production or any unit is
 blocked on something only the user can do (a rebuild, `github-warmup`, an
@@ -725,14 +744,14 @@ blocked, the exact action, and on which machine. One push per new block.
 Units tell you, and you push; the machine-config session (natedev, macbook)
 pushes for blocks it owns. Each block has one owner. User, 2026-10-04, after a
 rebuild waited 1.5 h with no push. A rebuild is pushed even when nothing waits
-on it, at priority 1: the user wants a text for every rebuild needed (user,
+on it, with `--need decision`: the user wants a text for every rebuild needed (user,
 2026-10-04).
 
-| Priority | When |
+| Need | When |
 | --- | --- |
-| 2: emergency, repeats every 5 min until the user taps Acknowledge | Work has stopped, and only the user can restart it: a block under <Dependencies/> rule 6, after steps 1–2, carrying the exact action; a cold gpg-agent stopping every push (the user runs `github-warmup`). Send once per block. |
-| 1: high | The user is needed, but nothing has stopped: a product decision only they can make while units have other work; main's CI red after <PromoteMain/>; a block still open an hour after they acknowledged it. That last one says what changed, never the same text again. |
-| 0: normal | A unit's whole plan finished and merged; before/after shots ready for the user's review. |
+| `blocked` (priority 2; repeats every 5 min until the user taps Acknowledge) | Work has stopped, and only the user can restart it: a block under <Dependencies/> rule 6, after steps 1–2, carrying the exact action; a cold gpg-agent stopping every push (the user runs `github-warmup`). Send once per block. |
+| `decision` (priority 1) | The user is needed, but nothing has stopped: a product decision only they can make while units have other work; main's CI red after <PromoteMain/>; a block still open an hour after they acknowledged it. That last one says what changed, never the same text again. |
+| `note` (priority 0) | A unit's whole plan finished and merged; before/after shots ready for the user's review. |
 
 Never sent: dailies, ETAs, routine merges, green CI, flakes rerun, and hardware
 checks that wait on the user's travel.
@@ -828,8 +847,13 @@ reaches them only as your relay (<Throughout/>). Run `python3
 ~/.claude/scripts/production/waiting.py quota --production PRODUCTION_DOC
 --state-dir DAILIES_STATE_DIR --notice "<full notice>"`. It relays
 to every unit director and prints one `send <unit>:` receipt each:
-- `Quota alert:` — tell every unit director to start no new delegate work on
-  that tool; running seats finish and the unit director does the rest itself. Hold the alert as one
+- `Quota alert:` — the command picks the instruction from the notice. A Codex
+  notice that says nothing was switched: unit directors keep delegating on Codex,
+  whose account may keep working on its credits, and tell you at once if Codex
+  refuses work for quota; bring a refusal to the user. A notice that says every
+  function moved: delegation continues on Claude. A Claude notice, or a Codex one
+  whose switch failed: start no new delegate work on that tool; running seats
+  finish and the unit director does the rest itself. Hold the alert as one
   item per account, listed first in every Waiting on block with the percent left
   and the reset time, until it is acknowledged or restored.
 - `Quota alert acknowledged:` — drop the held item. Paused work stays paused.
@@ -874,6 +898,11 @@ When every unit's final-gate and as-built checkpoints are merged:
   Units push only their own branch.
 - Merge only from a checkpoint notice. Never merge a visible change before a
   fresh design-check pass on its shots (<MergeCheckpoint/> step 3).
+- **An out-of-date as-built doc may always be corrected.** You and every unit
+  may correct an as-built doc under `docs/as-built/` that contradicts the
+  code, in any unit's doc, without asking the user or the owner. Never hold a
+  merge because a unit corrected another unit's as-built doc. User,
+  2026-10-07.
 - **Check intent before ruling.** Before ruling that a design-check finding
   must change something deliberate-looking, read the repository's
   `docs/design-decisions.md`, the plan and the as-built docs; if intent stays
@@ -894,7 +923,7 @@ When every unit's final-gate and as-built checkpoints are merged:
     unmerged phase, with the others in `update`. If builds queue on the shared
     lock, run fewer at once, never none. User, 2026-10-06, replacing the
     2026-10-01 one-phase rule.
-- **Disk.** Units keep saved run output under a few GB (`/unit:delegate` →
+- **Disk.** Units keep saved run output under a few GB (`/unit:direct` →
   <ToolingContract/>). When builds turn cold for no reason, run `df -h /` and
   find the large output before anything else. User, 2026-10-04.
 - Never ask the user to review until <DesignCheck/> passed on the shots.

@@ -177,7 +177,7 @@
 - `scripts/buildlog/record.py`, `scripts/buildlog/test_record.py` — the three Mac fields and `optional_nonnegative_number()`.
 - `scripts/mac_test/offload.py`, `scripts/mac_test/test_offload.py` — the lost line, the interrupt edges, `default_target_budget_gib`.
 - `commands/showrunner/produce.md` — exit 9 in the Mac run rule.
-- `commands/unit/delegate.md` — the `--local` row of the verification table.
+- `commands/unit/direct.md` — the `--local` row of the verification table (moved from `commands/unit/delegate.md` when that command was renamed `/unit:direct`).
 - `config/README.md`, `config/mac_test.conf` — `mac_budget_gib` described as the size limit of the mirror's build folder.
 
 **Binds later work:** the build-log index and report read `mac` (`passed`, `passed_filter`, `failed`, `lost`, `declined`), `mac_reason` (the runner's twelve reasons plus `local_flag` and `runner`) and `mac_s` from each call record. The live checks on the Mac prove `stop_mac_run`'s cleanup call and the runner's interrupt cleanup against real macOS. `VERIFY_MAC_RUNNER` names the runner a test substitutes.

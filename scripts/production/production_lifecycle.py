@@ -9,7 +9,8 @@ import subprocess
 from pathlib import Path
 from typing import NamedTuple, cast
 
-from add_unit import Production, Refusal, cell_value, read_production, unit_rows
+import unit_lookup
+from add_unit import Production, Refusal, cell_value, read_production, unit_table
 from merge_checkpoint import (CodeCheckpoint, MacCheckout, MergeEntry, NoMerge, NoPromotion,
                               PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
                               PromoteTo, Stop,
@@ -45,20 +46,11 @@ class CommitVerdict(NamedTuple):
     sha: str
 
 
-class SessionLive(NamedTuple):
-    name: str
-
-
-class SessionGone(NamedTuple):
-    name: str
-
-
 class UnitRow(NamedTuple):
     name: str
     plan: Path
     worktree: Path
     branch: str
-    session: str
 
 
 class LifecycleStop(Exception):
@@ -106,16 +98,14 @@ def production_name(lines: list[str]) -> str:
 
 
 def units(lines: list[str], production: Production) -> tuple[UnitRow, ...]:
-    _, rows = unit_rows(lines)
     parsed: list[UnitRow] = []
-    for row in rows:
-        cells = [cell_value(cell) for cell in row.strip("|").split("|")]
-        if len(cells) != 7:
-            raise LifecycleStop("input", "failed", f"invalid Units row: {row}")
-        plan = Path(cells[1]).expanduser()
-        worktree = Path(cells[2]).expanduser()
-        parsed.append(UnitRow(cells[0], plan if plan.is_absolute() else production.checkout / plan,
-                              worktree, cells[3], cells[4]))
+    for cells in unit_table(lines):
+        row = {heading: cell_value(cell) for heading, cell in cells.items()}
+        if not all(heading in row for heading in ("Unit", "Plan", "Worktree", "Branch", "Port", "Owns")):
+            raise LifecycleStop("input", "failed", f"invalid Units row: {cells}")
+        plan = Path(row["Plan"]).expanduser()
+        parsed.append(UnitRow(row["Unit"], plan if plan.is_absolute() else production.checkout / plan,
+                              Path(row["Worktree"]).expanduser(), row["Branch"]))
     return tuple(parsed)
 
 
@@ -141,16 +131,6 @@ def checkout_ready(production: Production) -> PlanLanded | PlanPending:
     return state
 
 
-def session_state(name: str) -> SessionLive | SessionGone:
-    result = subprocess.run(["tmux", "has-session", "-t", f"={name}"], capture_output=True,
-                            text=True, check=False)
-    if result.returncode == 0:
-        return SessionLive(name)
-    if result.returncode == 1:
-        return SessionGone(name)
-    raise LifecycleStop("session", "failed", result.stderr.strip() or f"tmux exited {result.returncode}")
-
-
 def load(production: Production, lines: list[str], resume: bool) -> None:
     state = checkout_ready(production)
     report("load", "ok", "production doc read")
@@ -165,14 +145,17 @@ def load(production: Production, lines: list[str], resume: bool) -> None:
         report("state", "ok", "no production log yet")
     history = (merge_branch_history(production.checkout, production.merge_branch)
                if isinstance(state, PlanLanded) else None)
+    try:
+        marked = unit_lookup.marked_units(production.slug)
+    except OSError as error:
+        raise LifecycleStop("session", "failed", str(error)) from error
     for unit in units(lines, production):
         last: MergeEntry | NoMerge = history.last_code_for_unit(unit.name) if history else NoMerge()
         detail = (f"phase {last.phase} at {last.merge_hash}" if isinstance(last, MergeEntry)
                   else "no code checkpoint")
         report("last-merged", "ok", f"{unit.name}: {detail}")
-        session = session_state(unit.session)
-        report("session", "ok", f"{unit.name}: {session.name} "
-               + ("live" if isinstance(session, SessionLive) else "gone"))
+        found = marked.get(unit.name)
+        report("session", "ok", f"{unit.name}: " + (f"{found.label} live" if found is not None else "gone"))
 
 
 def doc_path_in_checkout(production: Production, path: Path) -> str:
@@ -182,7 +165,7 @@ def doc_path_in_checkout(production: Production, path: Path) -> str:
         raise LifecycleStop("open", "failed", f"{path} is outside {production.checkout}") from error
 
 
-def open_production(production: Production, lines: list[str], session: str) -> None:
+def open_production(production: Production, lines: list[str]) -> None:
     status = doc_status(lines)
     if isinstance(status, ProductionWrapped):
         raise LifecycleStop("open", "held", "production is already wrapped")
@@ -196,16 +179,9 @@ def open_production(production: Production, lines: list[str], session: str) -> N
     if isinstance(status, ProductionPlanned):
         updated = [line.replace("**Status: PRODUCTION — planned.**", "**Status: PRODUCTION — running.**")
                    for line in updated]
-    if isinstance(status, ProductionPlanned):
-        for index, line in enumerate(updated):
-            if line.startswith("- **Showrunner session:**"):
-                updated[index] = f"- **Showrunner session:** {session}"
-                break
-        else:
-            raise LifecycleStop("doc", "failed", "production doc lacks Showrunner session")
     if updated != lines:
         _ = production.doc.write_text("\n".join(updated) + "\n", encoding="utf-8")
-    report("doc", "ok", f"running; showrunner {production.showrunner_session if isinstance(status, ProductionRunning) else session}")
+    report("doc", "ok", "running")
     rows = units(updated, production)
     paths = [doc_path_in_checkout(production, production.doc)]
     paths.extend(doc_path_in_checkout(production, unit.plan) for unit in rows)
@@ -408,12 +384,9 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             elif remote.returncode != 2:
                 raise LifecycleStop("retire", "failed", remote.stderr.strip() or f"ls-remote exited {remote.returncode}")
         notifier = Path.home() / ".claude/scripts/message/notifier.sh"
-        showrunners = Path.home() / ".claude/scripts/production/showrunners.py"
-        py = Path.home() / ".claude/scripts/lib/py"
+        # The update timer is the one record of the showrunner, so removing it unregisters it.
         _ = command("notifier", production.checkout, str(notifier), "remove", f"showrunner-{production.slug}")
-        _ = command("showrunner", production.checkout, str(py), str(showrunners), "remove",
-                    production.showrunner_session)
-        report("notifier", "ok", "update instance and showrunner registration removed")
+        report("notifier", "ok", "update timer removed")
         updated = [line.replace("**Status: PRODUCTION — running.**", "**Status: PRODUCTION — wrapped.**")
                    for line in lines]
         _ = production.doc.write_text("\n".join(updated) + "\n", encoding="utf-8")
@@ -462,6 +435,7 @@ def main() -> int:
     _ = parser.add_argument("--production", required=True, type=Path)
     _ = parser.add_argument("--no-ci", action="store_true")
     _ = parser.add_argument("--resume", action="store_true")
+    # Accepted and unused: a showrunner started before its name was looked up still passes it.
     _ = parser.add_argument("--session")
     _ = parser.add_argument("--ci-green")
     _ = parser.add_argument("--smoke-passed")
@@ -476,15 +450,12 @@ def main() -> int:
             raise LifecycleStop("input", "failed", "--no-ci excludes the verdict flags")
         ci_green = CommitVerdict(ci_sha) if ci_sha is not None else VerdictMissing()
         smoke_passed = CommitVerdict(smoke_sha) if smoke_sha is not None else VerdictMissing()
-        session = cast(str | None, args.session)
-        if action == "open" and not session:
-            raise LifecycleStop("input", "failed", "open needs --session")
         production = read_production(cast(Path, args.production))
         lines = doc_lines(production)
         if action == "load":
             load(production, lines, cast(bool, args.resume))
         elif action == "open":
-            open_production(production, lines, cast(str, session))
+            open_production(production, lines)
         elif action == "promote-main":
             _ = promote_main(production, lines, no_ci, ci_green, smoke_passed)
         else:

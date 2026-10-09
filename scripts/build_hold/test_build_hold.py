@@ -6,6 +6,7 @@ import json
 import io
 import os
 import re
+import socket
 import subprocess
 import tempfile
 import threading
@@ -44,6 +45,9 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             "BUILD_HOLD_DIR": str(self.scratch / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
             "BUILDLOG_MEMINFO": str(meminfo),
+            # No test reads the machine's own session records, or passes for the session that runs it.
+            "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
+            "CLAUDE_CODE_SESSION_ID": "",
         }))
 
 
@@ -154,45 +158,6 @@ class RenameHolderTests(IsolatedBuildHoldTest):
         ]
         build_hold.save_cycle(cycle)
         return cycle
-
-    def test_rename_holder_moves_file_and_cycle_names(self) -> None:
-        old_path = self.holder("old")
-        _ = self.cycle()
-
-        self.assertEqual(build_hold.rename_holder("old", "new"),
-                         ["build hold holder", "build hold cycle"])
-
-        new_path = old_path.with_name("new")
-        self.assertFalse(old_path.exists())
-        self.assertEqual(cast(dict[str, object], json.loads(new_path.read_text()))["holder"], "new")
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        self.assertEqual(set(cycle["holders"]), {"new"})
-        self.assertEqual(cycle["recipients"], {"session-old": "new", "session-other": "other"})
-        self.assertEqual([entry["name"] for entry in cycle["entries"]], ["new", "other"])
-
-    def test_rename_holder_refuses_two_holder_files_without_changes(self) -> None:
-        old_path = self.holder("old")
-        new_path = self.holder("new")
-        cycle = self.cycle()
-        cycle_path = self.scratch / "release" / cycle["id"] / "cycle.json"
-        before = (old_path.read_bytes(), new_path.read_bytes(), cycle_path.read_bytes())
-
-        with self.assertRaisesRegex(ValueError, "both 'old' and 'new'"):
-            _ = build_hold.rename_holder("old", "new")
-
-        self.assertEqual((old_path.read_bytes(), new_path.read_bytes(), cycle_path.read_bytes()), before)
-
-    def test_rename_holder_without_old_file_changes_nothing(self) -> None:
-        cycle = self.cycle()
-        cycle_path = self.scratch / "release" / cycle["id"] / "cycle.json"
-        before = cycle_path.read_bytes()
-
-        self.assertEqual(build_hold.rename_holder("old", "new"), [])
-
-        self.assertEqual(cycle_path.read_bytes(), before)
-        self.assertFalse((self.scratch / "holders" / "new").exists())
-
 
 class QuietTests(IsolatedBuildHoldTest):
     def test_long_username_cargo_keeps_quiet_check_busy(self) -> None:
@@ -337,6 +302,56 @@ class CommandTests(IsolatedBuildHoldTest):
         self.assertFalse(path.exists())
         self.assertFalse((scratch / "release" / "current").exists())
         self.assertIn(f"; set aside as {copy}; this hold now releases every session at once", output)
+
+    def session(self, session_id: str, name: str, *former: str) -> None:
+        """Record a live Claude session, or its rename: this test process stands in for it."""
+        path = self.scratch / f"{session_id}.sock"
+        if not path.exists():
+            held = socket.socket(socket.AF_UNIX)
+            held.bind(str(path))
+            self.addCleanup(held.close)
+        (self.scratch / "sessions").mkdir(exist_ok=True)
+        _ = (self.scratch / "sessions" / f"{session_id}.json").write_text(json.dumps({
+            "pid": os.getpid(), "sessionId": session_id, "name": name, "formerNames": list(former),
+            "messagingSocketPath": str(path), "updatedAt": 1}))
+
+    def hold(self, folder: Path, given: str | None) -> str:
+        key, label = build_hold.holder_of(given)
+        return build_hold.write_hold(folder, key, "one test", build_hold.release_request(None, None),
+                                     datetime.now().astimezone(), label)
+
+    def test_a_hold_is_kept_by_session_id_so_a_rename_between_hold_and_release_loses_nothing(self) -> None:
+        folder = self.scratch / "holders"
+        self.session("id-1", "old-name")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
+            self.assertIn("/build_hold from old-name:", self.hold(folder, None))
+        self.assertEqual([path.name for path in folder.iterdir()], ["id-1"])
+        self.session("id-1", "new-name", "old-name")
+        holders = build_hold.read_holders(folder)
+        assert isinstance(holders, build_hold.ActiveHolders)
+        self.assertEqual([(holder.name, holder.key) for holder in holders.holders], [("new-name", "id-1")])
+        # The name it had when it took the hold still finds it, and so does no name at all.
+        with self.assertRaisesRegex(ValueError, "someone-else held nothing"):
+            _ = build_hold.held_key(folder, "someone-else")
+        self.assertEqual(build_hold.held_key(folder, "old-name"), "id-1")
+        self.assertEqual(build_hold.held_key(folder, "new-name"), "id-1")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
+            self.assertEqual(build_hold.held_key(folder, None), "id-1")
+        self.assertEqual(build_hold.release_hold(folder, "id-1"), "released, builds may resume.")
+
+    def test_a_hold_taken_under_a_name_before_is_released_by_the_session_that_had_the_name(self) -> None:
+        folder = self.scratch / "holders"
+        # No live session is called this yet, so the hold is kept under the name, as every hold once was.
+        _ = self.hold(folder, "old-name")
+        self.assertEqual([path.name for path in folder.iterdir()], ["old-name"])
+        self.session("id-1", "new-name", "old-name")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
+            self.assertEqual(build_hold.held_key(folder, None), "old-name")
+        self.assertEqual(build_hold.held_key(folder, "new-name"), "old-name")
+        # With no name and no session, there is no holder to look up.
+        refused = self.run_cli(folder, "hold", "--for", "one test")
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("give --holder: this is not a live Claude session", refused.stderr)
 
     def test_last_release_sets_aside_each_damaged_record(self) -> None:
         for kind in ("cycle", "current"):
@@ -838,6 +853,39 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
             _ = self.advance(released + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S))
             self.assertEqual(self.entries()[0]["state"], "NoAdmissionAck")
             self.assertEqual(self.entries()[1]["state"], "ReleasedAwaitingAdmission")
+
+    def test_unreadable_session_records_are_a_failed_delivery_not_a_gone_session(self) -> None:
+        now = self.begin("unknown", "next")
+
+        def socket_for(session_id: str) -> str | None:
+            if session_id == "unknown":
+                raise build_hold.SessionLookupUnavailable("sessions: one or more registry files could not be read")
+            return "/tmp/next.sock"
+
+        errors = io.StringIO()
+        with mock.patch.object(build_hold, "socket_for", side_effect=socket_for), \
+             mock.patch.object(build_hold, "send_release", return_value=0) as send, redirect_stderr(errors):
+            _ = self.advance(now)
+        self.assertEqual(self.entries()[0]["state"], "DeliveryFailed")
+        self.assertEqual(self.entries()[1]["state"], "ReleasedAwaitingAdmission")
+        self.assertEqual(send.call_count, 1)
+        self.assertIn("one or more registry files could not be read", errors.getvalue())
+
+    def test_a_lookup_is_tried_again_before_it_is_called_unavailable(self) -> None:
+        def answers(*codes: int) -> list[subprocess.CompletedProcess[str]]:
+            return [subprocess.CompletedProcess([], code, "/tmp/late.sock\n" if code == 0 else "",
+                                                "records unreadable\n" if code == 3 else "") for code in codes]
+
+        with mock.patch.object(subprocess, "run", side_effect=answers(3, 3, 0)), \
+             mock.patch.object(time, "sleep") as sleep:
+            self.assertEqual(build_hold.socket_for("session-a"), "/tmp/late.sock")
+            self.assertEqual(sleep.call_count, 2)
+        with mock.patch.object(subprocess, "run", side_effect=answers(3, 3, 3)), mock.patch.object(time, "sleep"), \
+             self.assertRaisesRegex(build_hold.SessionLookupUnavailable, "records unreadable"):
+            _ = build_hold.socket_for("session-a")
+        with mock.patch.object(subprocess, "run", side_effect=answers(1)), mock.patch.object(time, "sleep") as sleep:
+            self.assertIsNone(build_hold.socket_for("session-a"))
+            sleep.assert_not_called()
 
     def test_delivery_states_and_gone_recipient_advance_immediately(self) -> None:
         now = self.begin("failed", "gone", "queued")

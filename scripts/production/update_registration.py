@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 
-from add_unit import Production, Refusal, cell_value, read_production, unit_rows
+from add_unit import Production, Refusal, cell_value, read_production, unit_table
 from merge_checkpoint import NoMerge, merge_branch_history, report
 
 if TYPE_CHECKING:
@@ -29,14 +29,6 @@ class InstancePresent(NamedTuple):
 
 class InstanceAbsent(NamedTuple):
     pass
-
-
-class SessionLineSame(NamedTuple):
-    pass
-
-
-class SessionLineChanged(NamedTuple):
-    old: str
 
 
 class OutstandingItem(TypedDict):
@@ -98,34 +90,6 @@ def instance(name: str) -> InstancePresent | InstanceAbsent:
     raise RegistrationFailure("notifier", result.stderr.strip() or result.stdout.strip() or f"status exit {result.returncode}")
 
 
-def session_line(production: Production, session: str) -> SessionLineSame | SessionLineChanged:
-    lines = production.doc.read_text(encoding="utf-8").splitlines(keepends=True)
-    for index, line in enumerate(lines):
-        if line.startswith("- **Showrunner session:**"):
-            old = cell_value(line.partition(":**")[2].strip())
-            if old == session:
-                return SessionLineSame()
-            ending = "\n" if line.endswith("\n") else ""
-            lines[index] = f"- **Showrunner session:** {session}{ending}"
-            _ = production.doc.write_text("".join(lines), encoding="utf-8")
-            relative = production.doc.relative_to(production.checkout)
-            _ = command("register", ["git", "add", "--", str(relative)], cwd=production.checkout)
-            _ = command("register", ["git", "commit", "-m", f"production({production.slug}): showrunner session {session}", "--", str(relative)], cwd=production.checkout)
-            return SessionLineChanged(old)
-    raise RegistrationFailure("session", "production doc lacks Showrunner session")
-
-
-def unit_sessions(lines: list[str]) -> list[str]:
-    _, rows = unit_rows(lines)
-    sessions: list[str] = []
-    for row in rows:
-        cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
-        if len(cells) < 5:
-            raise RegistrationFailure("registry", f"invalid Units row: {row}")
-        sessions.append(cell_value(cells[4]))
-    return sessions
-
-
 def update_interval(lines: list[str]) -> tuple[int, bool]:
     line = next((line for line in lines if line.startswith("- **Updates:**")), "")
     match = re.search(r"every (\d+) minutes", line)
@@ -135,7 +99,7 @@ def update_interval(lines: list[str]) -> tuple[int, bool]:
     return minutes, "on the hour" in line
 
 
-def scheduled_prompt(minutes: int, zone: str, session: str) -> str:
+def scheduled_prompt(minutes: int, zone: str, doc: Path) -> str:
     source = Path(__file__).resolve().parents[2] / "commands/showrunner/produce.md"
     document = source.read_text(encoding="utf-8")
     if "The prompt:\n" not in document:
@@ -145,28 +109,22 @@ def scheduled_prompt(minutes: int, zone: str, session: str) -> str:
         raise RegistrationFailure("register", "**A tick** marker is missing")
     template = tail.split("\n**A tick**", 1)[0]
     prompt = "\n".join(line.removeprefix("> ").removeprefix(">") for line in template.strip().splitlines())
-    prompt = prompt.replace("<N>", str(minutes)).replace("<zone>", zone).replace("<this session's name>", session)
+    prompt = prompt.replace("<N>", str(minutes)).replace("<zone>", zone).replace("<production doc>", str(doc))
     return prompt
 
 
-def register(production: Production, session: str) -> None:
+def register(production: Production) -> None:
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     if not session_id:
         raise RegistrationFailure("register", "CLAUDE_CODE_SESSION_ID is required")
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     minutes, aligned = update_interval(lines)
-    prompt = scheduled_prompt(minutes, str(production.zone), session)
-    sessions = unit_sessions(lines)
+    prompt = scheduled_prompt(minutes, str(production.zone), production.doc)
     relative = production.doc.relative_to(production.checkout)
     dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
     if dirty:
         raise RegistrationFailure("register", "the production doc has uncommitted edits; commit or discard them first")
-    registry = Path(__file__).with_name("showrunners.py")
-    if production.showrunner_session != session:
-        _ = command("register", [sys.executable, str(registry), "rename", production.showrunner_session, session])
-    _ = command("register", [sys.executable, str(registry), "add", session, "--zone", str(production.zone),
-                         *(argument for unit in sessions for argument in ("--unit", unit))])
-    _ = session_line(production, session)
+    # Nothing registers the showrunner by name: its update timer, made below, is its one record.
     state_root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
     prompt_file = state_root / production.slug / "prompt.txt"
     prompt_file.parent.mkdir(parents=True, exist_ok=True)
@@ -277,16 +235,11 @@ def outstanding_path(production: Production) -> Path:
 
 def state_block(production: Production, state: ShowrunnerState, timestamp: str) -> str:
     history = merge_branch_history(production.checkout, production.merge_branch)
-    _, rows = unit_rows(production.doc.read_text(encoding="utf-8").splitlines())
     judgments = {unit.unit: unit for unit in state.units}
     unit_lines: list[str] = []
-    for row in rows:
-        cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
-        if len(cells) < 5:
-            raise RegistrationFailure("log", f"invalid Units row: {row}")
-        name = cell_value(cells[0])
-        session = cell_value(cells[4])
-        judgment = judgments.get(session)
+    for cells in unit_table(production.doc.read_text(encoding="utf-8").splitlines()):
+        name = cell_value(cells.get("Unit", ""))
+        judgment = judgments.get(name)
         merged = history.last_code_for_unit(name)
         last = "none" if isinstance(merged, NoMerge) else f"phase {merged.phase} ({merged.short})"
         phase = judgment.phase if judgment is not None else "not stated"
@@ -363,7 +316,8 @@ def main() -> int:
         subcommand = commands.add_parser(action)
         _ = subcommand.add_argument("--production", type=Path, required=True)
         if action == "register":
-            _ = subcommand.add_argument("--session", required=True)
+            # Accepted and unused: a showrunner started before its name was looked up still passes it.
+            _ = subcommand.add_argument("--session")
         elif action == "time":
             _ = subcommand.add_argument("stamp")
         elif action == "log":
@@ -378,7 +332,7 @@ def main() -> int:
     try:
         production = read_production(cast(Path, args.production))
         if action == "register":
-            register(production, cast(str, args.session))
+            register(production)
         elif action == "time":
             report("time", "ok", production_time(production, cast(str, args.stamp)))
         elif action == "log":

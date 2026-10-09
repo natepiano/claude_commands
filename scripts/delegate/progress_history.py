@@ -12,15 +12,18 @@ import re
 import shutil
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, tzinfo
 from functools import cache
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NamedTuple, NoReturn, TypedDict, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 SCHEMA_VERSION = 1
@@ -166,6 +169,26 @@ class FindingTally(TypedDict):
     reopened: int
 
 
+class PlanPhase(TypedDict):
+    """One real phase heading, classified as the plan records it now."""
+
+    id: str
+    title: str
+    done: bool
+
+
+class EtaBand(NamedTuple):
+    """Remaining seconds and the earliest and latest plausible arrivals."""
+
+    remaining: int
+    earliest: int
+    latest: int
+
+
+class EtaProjectionUnavailable(NamedTuple):
+    """The reported progress cannot support an ETA projection."""
+
+
 def _history_root() -> Path:
     configured = os.environ.get("PLAN_DELEGATE_HISTORY_DIR")
     if configured:
@@ -173,7 +196,7 @@ def _history_root() -> Path:
     return Path.home() / ".local" / "state" / "plan-delegate"
 
 
-def _now_epoch() -> float:
+def now_epoch() -> float:
     configured = os.environ.get("PLAN_DELEGATE_NOW_EPOCH")
     if configured:
         return float(configured)
@@ -216,7 +239,7 @@ def _config_digest() -> str:
 
     Cached for the life of the process: one launcher records one pass, and both
     files answer the same way every call. This is telemetry and must never stop
-    a delegate run, so an unreadable file returns empty rather than raising --
+    a unit run, so an unreadable file returns empty rather than raising --
     and empty rather than the hash of the half that could be read, which would
     name a configuration this process never saw and group unlike passes under it.
     """
@@ -328,6 +351,37 @@ def _arg_integer(args: argparse.Namespace, name: str, default: int = 0) -> int:
     return _integer(value, default)
 
 
+def _refuse_eta(message: str) -> NoReturn:
+    print(message, file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _process_timezone() -> tzinfo:
+    configured = os.environ.get("TZ")
+    if configured:
+        try:
+            return ZoneInfo(configured)
+        except ZoneInfoNotFoundError:
+            pass
+    detected = datetime.now().astimezone().tzinfo
+    return detected if detected is not None else UTC
+
+
+def _local_eta_epoch(value: str, option: str) -> float:
+    layout = "%Y-%m-%dT%H:%M"
+    try:
+        parsed = datetime.strptime(value, layout)
+    except ValueError:
+        _refuse_eta(f"{option} must use YYYY-MM-DDTHH:MM")
+    if parsed.strftime(layout) != value:
+        _refuse_eta(f"{option} must use YYYY-MM-DDTHH:MM")
+    zone = _process_timezone()
+    epoch = parsed.replace(tzinfo=zone).timestamp()
+    if datetime.fromtimestamp(epoch, zone).strftime(layout) != value:
+        _refuse_eta(f"{option} is a time the local clock skips")
+    return epoch
+
+
 def _session_dir(args: argparse.Namespace) -> Path:
     value = _arg_string(args, "session_dir")
     if not value:
@@ -364,6 +418,49 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
         _ = handle.write("\n")
         temporary = Path(handle.name)
     os.replace(temporary, target)
+
+
+def _refresh_phase_table(session_dir: Path) -> None:
+    """Rewrite a production unit's phase note without affecting the recorder."""
+    try:
+        state = _read_state(session_dir)
+        plan_doc = _string(state.get("project_plan_doc")) or _string(
+            state.get("plan_doc")
+        )
+        if not plan_doc:
+            return
+        plan_path = resolve_plan_path(
+            Path(_string(state.get("working_dir"))),
+            plan_doc,
+        )
+        if "> **Production:" not in plan_path.read_text(encoding="utf-8"):
+            return
+    except (OSError, UnicodeError, SystemExit):
+        return
+
+    command = [
+        sys.executable,
+        str(Path(__file__).with_name("phase_table.py")),
+        "refresh",
+        "--session-dir",
+        str(session_dir),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"phase table not written: {error}", file=sys.stderr)
+        return
+    if result.returncode == 0:
+        return
+    reason = " ".join(result.stderr.split()) or f"exit status {result.returncode}"
+    print(f"phase table not written: {reason}", file=sys.stderr)
 
 
 def _append_event(state: dict[str, object], event: dict[str, object]) -> None:
@@ -529,9 +626,51 @@ def _iso_epoch(value: str, context: str) -> float:
     return parsed.timestamp()
 
 
-def _plan_path(working_dir: Path, value: str) -> Path:
+def resolve_plan_path(working_dir: Path, value: str) -> Path:
     path = Path(value).expanduser()
     return path.resolve() if path.is_absolute() else (working_dir / path).resolve()
+
+
+def _plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
+    text = plan_path.read_text(encoding="utf-8")
+    phases: list[PlanPhase] = []
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for match in PHASE_HEADING_PATTERN.finditer(text):
+        rest = match.group("rest")
+        status_match = PHASE_STATUS_PATTERN.search(rest)
+        # `### Phase 12 Review` and its like are sections, not phases.
+        if status_match is None and not PHASE_TITLE_PATTERN.match(rest):
+            continue
+        identifier = match.group("id")
+        if identifier in seen:
+            duplicates.append(identifier)
+            continue
+        seen.add(identifier)
+        title_text = rest if status_match is None else rest[: status_match.start()]
+        title_text = re.sub(r"^[ \t]*[—–-][ \t]*", "", title_text, count=1)
+        title = re.sub(
+            r"[ \t]+\((?:commit[ \t]+)?(?:`[0-9a-fA-F]{7,40}`|[0-9a-fA-F]{7,40})\)[ \t]*$",
+            "",
+            title_text,
+        ).strip()
+        # No status marker means the phase was shrunk into its as-built record,
+        # which only happens after the phase completed.
+        done = status_match is None or status_match.group("status") == "done"
+        phases.append(
+            PlanPhase(
+                id=identifier,
+                title=title,
+                done=done,
+            )
+        )
+    return phases, duplicates
+
+
+def plan_phases(plan_path: Path) -> list[PlanPhase]:
+    """Return the plan's unique phase headings in document order."""
+    phases, _ = _plan_phase_details(plan_path)
+    return phases
 
 
 def _count_plan_phases(plan_path: Path) -> dict[str, object]:
@@ -542,32 +681,11 @@ def _count_plan_phases(plan_path: Path) -> dict[str, object]:
     silently corrupts every project percentage the run reports.
     """
     try:
-        text = plan_path.read_text(encoding="utf-8")
+        phases, duplicates = _plan_phase_details(plan_path)
     except OSError:
         return {"available": False, "reason": f"unable to read {plan_path}"}
-    done = 0
-    todo = 0
-    seen: set[str] = set()
-    order: list[str] = []
-    duplicates: list[str] = []
-    for match in PHASE_HEADING_PATTERN.finditer(text):
-        rest = match.group("rest")
-        status_match = PHASE_STATUS_PATTERN.search(rest)
-        if status_match is None and not PHASE_TITLE_PATTERN.match(rest):
-            # `### Phase 12 Review` and friends — a section, not a phase.
-            continue
-        identifier = match.group("id")
-        if identifier in seen:
-            duplicates.append(identifier)
-            continue
-        seen.add(identifier)
-        order.append(identifier)
-        # No status marker means the phase was shrunk into an as-built record,
-        # which only ever happens after it completed.
-        if status_match is not None and status_match.group("status") == "todo":
-            todo += 1
-        else:
-            done += 1
+    done = sum(phase["done"] for phase in phases)
+    todo = len(phases) - done
     total = done + todo
     if total == 0:
         return {"available": False, "reason": f"no phase headings in {plan_path}"}
@@ -576,7 +694,7 @@ def _count_plan_phases(plan_path: Path) -> dict[str, object]:
         "done": done,
         "todo": todo,
         "total": total,
-        "order": order,
+        "order": [phase["id"] for phase in phases],
         "duplicate_ids": sorted(set(duplicates)),
     }
 
@@ -658,7 +776,7 @@ def _explicit_plan_timing(
     plan_doc: str,
     now: float,
 ) -> ProjectTiming:
-    plan_path = _plan_path(working_dir, plan_doc)
+    plan_path = resolve_plan_path(working_dir, plan_doc)
     existing = _read_plan_project_start(plan_path)
     if existing is not None:
         return ProjectTiming(
@@ -711,6 +829,31 @@ def _run_started_event(path: Path) -> dict[str, object] | None:
     return event
 
 
+def plan_runs(plan_path: Path) -> list[Path]:
+    """Return this plan's durable run files, oldest first."""
+    target = plan_path.expanduser().resolve()
+    try:
+        paths = list((_history_root() / "runs").glob("*.jsonl"))
+    except OSError:
+        return []
+    matches: list[tuple[float, str, Path]] = []
+    for path in paths:
+        event = _run_started_event(path)
+        if event is None:
+            continue
+        working_dir = _string(event.get("working_dir"))
+        plan_doc = _string(event.get("plan_doc"))
+        if not working_dir or not plan_doc:
+            continue
+        if resolve_plan_path(Path(working_dir), plan_doc) != target:
+            continue
+        started_at = _number(
+            event.get("run_started_at"), _number(event.get("timestamp_epoch"))
+        )
+        matches.append((started_at, path.name, path))
+    return [path for _, _, path in sorted(matches)]
+
+
 def _historical_project_timing(
     working_dir: Path,
     branch: str,
@@ -746,7 +889,7 @@ def _historical_project_timing(
     project_plan_doc = _string(latest_event.get("project_plan_doc")) or _string(
         latest_event.get("plan_doc")
     )
-    plan_path = _plan_path(working_dir, project_plan_doc)
+    plan_path = resolve_plan_path(working_dir, project_plan_doc)
     if plan_path.is_file():
         existing = _read_plan_project_start(plan_path)
         if existing is not None:
@@ -1047,7 +1190,7 @@ def _start_activity(args: argparse.Namespace) -> None:
         raise SystemExit("Cannot start an activity: the run is finished")
     if _object_dict(state.get("phase")) is None:
         raise SystemExit("Start a phase before starting an activity")
-    now = _now_epoch()
+    now = now_epoch()
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
     _refresh_main_identity(state)
@@ -1072,7 +1215,7 @@ def _finish_activity(args: argparse.Namespace) -> None:
         state,
         status,
         _arg_string(args, "result"),
-        _now_epoch(),
+        now_epoch(),
     )
 
 
@@ -1083,7 +1226,7 @@ def _start_run(args: argparse.Namespace) -> None:
         state = _ensure_project_timing(
             session_dir,
             _read_state(session_dir),
-            _now_epoch(),
+            now_epoch(),
         )
         print(_string(state.get("history_file"), str(existing)))
         return
@@ -1092,7 +1235,7 @@ def _start_run(args: argparse.Namespace) -> None:
     if not working_dir_value:
         raise SystemExit("--working-dir is required")
     working_dir = Path(working_dir_value).expanduser().resolve()
-    now = _now_epoch()
+    now = now_epoch()
     run_id = session_dir.name
     branch = _git_value(working_dir, "branch", "--show-current")
     if not branch:
@@ -1168,7 +1311,7 @@ def _work_order_metrics(work_order_file: str) -> dict[str, object]:
 def _start_phase(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    now = _now_epoch()
+    now = now_epoch()
     active = _object_dict(state.get("phase"))
     if active is not None and _string(active.get("status")) == "active":
         if _string(active.get("id")) == _arg_string(args, "phase_id"):
@@ -1197,6 +1340,7 @@ def _start_phase(args: argparse.Namespace) -> None:
     event = _event(state, "phase_started", now)
     event.update(_work_order_metrics(_arg_string(args, "work_order_file")))
     _append_event(state, event)
+    _refresh_phase_table(session_dir)
 
 
 def _start_pass(args: argparse.Namespace) -> None:
@@ -1216,7 +1360,7 @@ def _start_pass(args: argparse.Namespace) -> None:
     phase = _object_dict(state.get("phase"))
     if phase is None or _string(phase.get("status")) != "active":
         raise SystemExit("Start a phase before starting a pass")
-    now = _now_epoch()
+    now = now_epoch()
     # This slot's stale pass and no other. The peers belong to launchers still
     # waiting on their own agents, and a phase team opens both within the same
     # second: closing them here is the corruption this key exists to
@@ -1272,7 +1416,7 @@ def _finish_pass(args: argparse.Namespace) -> None:
         state,
         slot,
         status,
-        _now_epoch(),
+        now_epoch(),
         _arg_integer(args, "agent_awake_seconds", -1),
     )
     if orphaned and not closed:
@@ -1337,7 +1481,7 @@ def _arm_review(args: argparse.Namespace) -> None:
             + "a pass must be open. With none open the review is not early -- "
             + "launch it through review.sh and let it record its own pass."
         )
-    now = _now_epoch()
+    now = now_epoch()
     called_task = _arg_string(args, "called_task", "delegate.review") or "delegate.review"
     lens = _arg_string(args, "lens")
     suffix = f"_{lens}" if lens else ""
@@ -1401,7 +1545,7 @@ def _disarm_review(args: argparse.Namespace) -> None:
         session_dir,
         state,
         _arg_string(args, "reason", "cleared") or "cleared",
-        _now_epoch(),
+        now_epoch(),
     )
 
 
@@ -1760,7 +1904,7 @@ def _current_hold_seconds(state: dict[str, object], candidate_percent: int, now:
 def _calibrate(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    now = _now_epoch()
+    now = now_epoch()
     candidate = _arg_integer(args, "candidate_percent")
     if not 0 <= candidate <= 100:
         raise SystemExit("--candidate-percent must be between 0 and 100")
@@ -3428,20 +3572,32 @@ def _eta_band_cells(
     otherwise push the pessimistic end down to 1% and quote an arrival ninety-nine
     times the elapsed clock — a number no reader can use and none should trust.
     """
+    band = eta_band_seconds(percent, elapsed, spread)
+    if isinstance(band, EtaProjectionUnavailable):
+        return "", ""
+    return (
+        f"{_arrival_label(as_of + band.earliest, now)} "
+        + f"(-{_format_offset(band.remaining - band.earliest)})",
+        f"{_arrival_label(as_of + band.latest, now)} "
+        + f"(+{_format_offset(band.latest - band.remaining)})",
+    )
+
+
+def eta_band_seconds(
+    percent: int, elapsed: int, spread: float
+) -> EtaBand | EtaProjectionUnavailable:
+    """Return the projected remaining seconds and its optimistic/pessimistic band."""
     eta = _eta_seconds(percent, elapsed)
     if eta is None:
-        return "", ""
+        return EtaProjectionUnavailable()
     optimistic = min(99.0, percent * RATE_FACTOR_LIMIT, percent + max(0.0, spread))
     pessimistic = max(1.0, percent / RATE_FACTOR_LIMIT, percent - max(0.0, spread))
     low = int(elapsed * (100.0 - optimistic) / optimistic)
     high = int(elapsed * (100.0 - pessimistic) / pessimistic)
-    return (
-        f"{_arrival_label(as_of + low, now)} (-{_format_offset(eta - low)})",
-        f"{_arrival_label(as_of + high, now)} (+{_format_offset(high - eta)})",
-    )
+    return EtaBand(remaining=eta, earliest=low, latest=high)
 
 
-def _percent_spread(calibration: dict[str, object] | None) -> float:
+def percent_spread(calibration: dict[str, object] | None) -> float:
     """How far off the percentage has actually run, when history can say.
 
     A calibration that cleared its sample floor has measured this reporter's
@@ -3485,7 +3641,7 @@ def _timeline(args: argparse.Namespace) -> None:
     """
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    now = _now_epoch()
+    now = now_epoch()
     events = _run_events(state)
     wanted = _arg_string(args, "phase")
     started: list[tuple[str, str, str, float]] = []
@@ -3592,6 +3748,25 @@ class RecordedReport(TypedDict):
     calibration: dict[str, object] | None
 
 
+@dataclass(frozen=True)
+class ReportedPassWindow:
+    """A progress report that measures a live launcher pass."""
+
+    record: dict[str, object]
+
+
+@dataclass(frozen=True)
+class ReportedActivityWindow:
+    """A progress report that describes a live unit-director activity."""
+
+    record: dict[str, object]
+
+
+@dataclass(frozen=True)
+class NoReportedWindow:
+    """A progress report made between live windows."""
+
+
 def _state_plan_phase_counts(state: dict[str, object]) -> dict[str, object]:
     """The run's plan counted by phase heading, unavailable without an absolute path."""
     plan_doc = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
@@ -3602,8 +3777,10 @@ def _state_plan_phase_counts(state: dict[str, object]) -> dict[str, object]:
     return {"available": False, "reason": "no plan doc"}
 
 
-def _reported_window(state: dict[str, object]) -> tuple[str, dict[str, object] | None]:
-    """The window a report describes and the state key holding it, or no window.
+def _reported_window(
+    state: dict[str, object],
+) -> ReportedPassWindow | ReportedActivityWindow | NoReportedWindow:
+    """The live window a report describes, or the state between windows.
 
     A launcher's pass when one is open, and otherwise the unit director's
     activity. Both render the same line under the round table; only a pass
@@ -3612,11 +3789,11 @@ def _reported_window(state: dict[str, object]) -> tuple[str, dict[str, object] |
     """
     current_pass = _reporting_pass(state)
     if current_pass is not None:
-        return "pass", current_pass
+        return ReportedPassWindow(current_pass)
     activity = _object_dict(state.get("activity"))
     if activity is not None and _string(activity.get("status")) == "active":
-        return "activity", activity
-    return "pass", None
+        return ReportedActivityWindow(activity)
+    return NoReportedWindow()
 
 
 def _scope_row(label: str, clock: ScopeClock, as_of: float, now: float) -> list[str]:
@@ -3811,20 +3988,31 @@ def _print_last_recorded(
     phase: dict[str, object],
     now: float,
     notifier_due: int | None,
+    reported_window: ReportedActivityWindow | NoReportedWindow,
 ) -> None:
-    """Report an active phase that has no window open.
+    """Report the last recorded clocks without assessing progress again.
 
     Between windows -- the reviews closed, the repair writers not launched yet
-    -- there is nothing live to measure, and the unit is still in this phase.
-    The report keeps every section: the clocks table as the last `progress`
-    call left it, stamped with when that was, and the round table as the
-    phase's windows stand now. It writes nothing -- no event, no window, no
-    state -- so pass counts, convergence and calibration never see it.
+    -- there is nothing live to measure. The same is true of an activity opened
+    after its phase closed: it belongs in the round table, but does not revise
+    the closed phase's assessment. The report keeps every section: the clocks
+    table as the last `progress` call left it, stamped with when that was, and
+    the round table as the phase's windows stand now. It writes nothing -- no
+    event, no window, no state -- so pass counts, convergence and calibration
+    never see it.
     """
     events = _run_events(state)
     plan_phase_counts = _state_plan_phase_counts(state)
     recorded = _recorded_report(state, phase, events, plan_phase_counts, now)
-    section, _, _ = _phase_section(session_dir, state, phase, events, now)
+    section, stage_windows, stage_labels = _phase_section(
+        session_dir, state, phase, events, now
+    )
+    if isinstance(reported_window, ReportedActivityWindow):
+        activity = reported_window.record
+        reported_label = _reported_label(stage_windows, stage_labels, activity)
+        window_line = f"▸ **{reported_label} - {_string(activity.get('activity'))}**"
+    else:
+        window_line = f"No pass or activity is open. {WORKERS_UNSEEN}"
     lines = [
         _scope_line(state),
         "",
@@ -3836,30 +4024,40 @@ def _print_last_recorded(
             recorded["project"],
             recorded["phase"],
             plan_phase_counts,
-            _percent_spread(recorded["calibration"]),
+            percent_spread(recorded["calibration"]),
             recorded["at"],
             now,
         ),
         *section,
-        f"No pass or activity is open. {WORKERS_UNSEEN}",
+        window_line,
         _clock_line(now, _next_report_at(session_dir, now, notifier_due)),
     ]
     print("\n".join(lines))
 
 
-def _progress(args: argparse.Namespace) -> None:
+def _report_progress(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
-    now = _now_epoch()
+    now = now_epoch()
     notifier_due = _restart_unit_notifier(session_dir)
     state = _ensure_project_timing(session_dir, _read_state(session_dir), now)
     phase = _object_dict(state.get("phase"))
-    if phase is None or _string(phase.get("status")) != "active":
-        phase_status = _string((phase or {}).get("status")) or "missing"
+    reported_window = _reported_window(state)
+    if phase is None:
+        raise SystemExit(f"No active phase to report: phase missing. {WORKERS_UNSEEN}")
+    if _string(phase.get("status")) != "active":
+        if isinstance(reported_window, ReportedActivityWindow):
+            _print_last_recorded(
+                session_dir, state, phase, now, notifier_due, reported_window
+            )
+            return
+        phase_status = _string(phase.get("status")) or "missing"
         raise SystemExit(f"No active phase to report: phase {phase_status}. {WORKERS_UNSEEN}")
-    window_key, current_pass = _reported_window(state)
-    if current_pass is None:
-        _print_last_recorded(session_dir, state, phase, now, notifier_due)
+    if isinstance(reported_window, NoReportedWindow):
+        _print_last_recorded(
+            session_dir, state, phase, now, notifier_due, reported_window
+        )
         return
+    current_pass = reported_window.record
     legacy_raw_percent = _arg_integer(args, "raw_percent", -1)
     legacy_percent = _arg_integer(args, "percent", -1)
     project_raw_percent = _arg_integer(args, "project_raw_percent", -1)
@@ -4018,7 +4216,7 @@ def _progress(args: argparse.Namespace) -> None:
     # The reported window is the object state already holds, so the activity
     # edit above has landed either way; a pass is written back through its slot,
     # never over the map that holds every slot's.
-    if window_key == "activity":
+    if isinstance(reported_window, ReportedActivityWindow):
         state["activity"] = current_pass
     _write_state(session_dir, state)
 
@@ -4049,7 +4247,7 @@ def _progress(args: argparse.Namespace) -> None:
                     unchanged=phase_unchanged_seconds,
                 ),
                 plan_phase_counts,
-                _percent_spread(phase_calibration),
+                percent_spread(phase_calibration),
                 now,
                 now,
             ),
@@ -4075,13 +4273,61 @@ def _progress(args: argparse.Namespace) -> None:
     print("\n".join(lines))
 
 
+def _progress(args: argparse.Namespace) -> None:
+    session_dir = _session_dir(args)
+    _report_progress(args)
+    _refresh_phase_table(session_dir)
+
+
+def _eta(args: argparse.Namespace) -> None:
+    session_dir = _session_dir(args)
+    state = _read_state(session_dir)
+    phase = _object_dict(state.get("phase"))
+    if phase is None or _string(phase.get("status")) != "active":
+        _refuse_eta("An active phase is required to record an ETA")
+    basis = _arg_string(args, "basis").strip()
+    if not basis:
+        _refuse_eta("--basis must not be blank")
+
+    now = now_epoch()
+    eta_at = _local_eta_epoch(_arg_string(args, "time"), "--time")
+    if eta_at < now:
+        _refuse_eta("--time must not be in the past")
+
+    earliest_text = _arg_string(args, "earliest")
+    latest_text = _arg_string(args, "latest")
+    if bool(earliest_text) != bool(latest_text):
+        _refuse_eta("--earliest and --latest must be supplied together")
+
+    event = _event(state, "eta_stated", now)
+    event.update({"eta_at": eta_at, "basis": basis})
+    if earliest_text and latest_text:
+        earliest_at = _local_eta_epoch(earliest_text, "--earliest")
+        latest_at = _local_eta_epoch(latest_text, "--latest")
+        if earliest_at > eta_at:
+            _refuse_eta("--earliest must not be after --time")
+        if latest_at < eta_at:
+            _refuse_eta("--latest must not be before --time")
+        event.update(
+            {
+                "eta_earliest_at": earliest_at,
+                "eta_latest_at": latest_at,
+            }
+        )
+
+    _append_event(state, event)
+    _refresh_phase_table(session_dir)
+    local_eta = datetime.fromtimestamp(eta_at, _process_timezone())
+    print(f"ETA recorded: {local_eta:%H:%M %Z}")
+
+
 def _finish_phase(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     phase = _object_dict(state.get("phase"))
     if phase is None or _string(phase.get("status")) != "active":
         return
-    now = _now_epoch()
+    now = now_epoch()
     _close_open_passes(session_dir, state, "interrupted", now)
     state = _read_state(session_dir)
     _close_active_activity(session_dir, state, "interrupted", "", now)
@@ -4099,12 +4345,13 @@ def _finish_phase(args: argparse.Namespace) -> None:
     phase["finished_at"] = now
     state["phase"] = phase
     _write_state(session_dir, state)
+    _refresh_phase_table(session_dir)
 
 
 def _finish_run(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    now = _now_epoch()
+    now = now_epoch()
     run_status = _arg_string(args, "status")
     phase = _object_dict(state.get("phase"))
     if phase is not None and _string(phase.get("status")) == "active":
@@ -4129,6 +4376,7 @@ def _finish_run(args: argparse.Namespace) -> None:
     state["status"] = run_status
     state["finished_at"] = now
     _write_state(session_dir, state)
+    _refresh_phase_table(session_dir)
 
 
 def _finding_lenses(event: dict[str, object]) -> set[str]:
@@ -4230,7 +4478,7 @@ def _aggregate(args: argparse.Namespace) -> None:
         )
     output = {
         "schema_version": SCHEMA_VERSION,
-        "generated_at": _iso_time(_now_epoch()),
+        "generated_at": _iso_time(now_epoch()),
         "history_root": str(_history_root()),
         "completed_raw_estimate_samples": len(samples),
         "ignored_history_rows": ignored,
@@ -4358,6 +4606,14 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = progress.add_argument("--project-override-reason", default="")
     _ = progress.add_argument("--phase-override-reason", default="")
     progress.set_defaults(handler=_progress)
+
+    eta = subparsers.add_parser("eta")
+    _ = eta.add_argument("--session-dir", required=True)
+    _ = eta.add_argument("--time", required=True)
+    _ = eta.add_argument("--earliest", default="")
+    _ = eta.add_argument("--latest", default="")
+    _ = eta.add_argument("--basis", required=True)
+    eta.set_defaults(handler=_eta)
 
     timeline = subparsers.add_parser("timeline")
     _ = timeline.add_argument("--session-dir", required=True)

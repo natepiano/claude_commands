@@ -1,21 +1,21 @@
 ---
-description: Show what this unit's delegate run and its agents are doing right now.
+description: Show what this unit's /unit:direct run and its agents are doing right now.
 argument-hint: "[on|off]"
 ---
 
-# Delegate — status report
+# Direct — status report
 
 **Usage:** `/unit:report [on|off]`
 
 Type this when a run has gone quiet, when an update arrived without its tables,
 or any time you want to know what the agents are doing right now. It runs inside
 the current session and already knows the session directory, the phase, and
-which dispatches are live. If no delegate run is active, say so in one line and
+which dispatches are live. If no `/unit:direct` run is active, say so in one line and
 stop.
 
-`/unit:delegate` reads this file at every notifier tick and Codex poll timeout.
+`/unit:direct` reads this file at every notifier tick and Codex poll timeout.
 It defines `<ProgressReport/>` — the content of an update. `<ProgressContract/>` in
-`~/.claude/commands/unit/delegate.md` keeps the timing rules that say when one is
+`~/.claude/commands/unit/direct.md` keeps the timing rules that say when one is
 owed. Never compose a report from memory of an earlier read: the byte-for-byte
 copy rule and the ordinary-English closing sentences are the parts that decay.
 
@@ -76,6 +76,11 @@ Everything below is the contract.
 
    `python3 ~/.claude/scripts/delegate/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_RAW_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --cap-stage "<stage>" --activity "<current activity>" [--phase-override-reason "<specific evidence>"]`
 
+   The `progress` call also rewrites this unit's phase note; write nothing in
+   that note by hand. When the user asks for the phase table, paste the output
+   of `python3 ~/.claude/scripts/delegate/phase_table.py show --session-dir
+   "${SESSION_DIR}" --zone <User zone>`.
+
    **Between windows the tables still print.** With the phase active and no
    pass or activity open — reviews closed, repair writers not started — the
    recorder prints both tables from the phase's last recorded values, under an
@@ -89,8 +94,11 @@ Everything below is the contract.
    and whether the launcher has exited. Alive means say so in prose and keep the
    run going; terminal means step 1's completion handling. Never open an
    activity to make the tables render — that records unit-director work that
-   never happened. `No active phase to report` is the one refusal between
-   windows: no phase is active.
+   never happened. When the last phase is closed but an activity is still
+   open, `progress` prints both tables from that phase's last recorded values
+   with the activity as the running row: copy them like any other tick. `No
+   active phase to report` remains only when no phase is active and no
+   activity is open.
 
    Include the override reason only when rejecting an applicable calibrated
    value. **Copy its Markdown output byte-for-byte** — the scope line, the

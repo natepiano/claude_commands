@@ -11,6 +11,8 @@ import unittest
 from pathlib import Path
 from typing import override
 
+import fake_showrunner
+
 SCRIPT = Path(__file__).with_name("broadcast.py")
 # Each send waits for TOGETHER sends to have started, so sends run one after another fail.
 SEND_STUB = """import os, sys, time
@@ -37,17 +39,36 @@ class BroadcastTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for name in ("notifier", "sessions"):
             (self.root / name).mkdir()
+        # hana's two units: rows of its production doc, each with a tmux session marked as that unit.
+        # Only trunk-unit has a Claude running; its session is called `trunk` now.
+        doc = self.root / "show-production.md"
+        _ = doc.write_text("\n".join(("## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
+                                      "| --- | --- | --- | --- | --- | --- |",
+                                      "| trunk-unit | docs/plan.md | /tmp/no-worktree-of-trunk | trunk | — | — |",
+                                      "| gone-unit | docs/plan.md | /tmp/no-worktree-of-gone | gone | — | — |")),
+                           encoding="utf-8")
+        _ = (self.root / "tmux.json").write_text(json.dumps({
+            f"${index}": {"label": "any-label", "panes": [f"%{index}"],
+                          "env": {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": unit}}
+            for index, unit in enumerate(("trunk-unit", "gone-unit"), start=1)}), encoding="utf-8")
         _ = (self.root / "showrunners.json").write_text(json.dumps({
             "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "hana",
-            "always": [], "showrunners": [{"session": "hana", "zone": "America/Los_Angeles", "units": ["trunk", "gone"]},
-                                          {"session": "natedev", "zone": "America/Los_Angeles", "units": []}],
+            "always": [],
         }), encoding="utf-8")
+        # A second showrunner whose production has no units.
+        other = self.root / "other-production.md"
+        _ = other.write_text("\n".join(("## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
+                                        "| --- | --- | --- | --- | --- | --- |")), encoding="utf-8")
+        # A showrunner is recorded by its update timer, addressed to its Claude session id.
+        _ = fake_showrunner.write_timer(self.root / "notifier", "show", "id-hana", "America/Los_Angeles", doc)
+        _ = fake_showrunner.write_timer(self.root / "notifier", "zz-other", "id-natedev", "America/Los_Angeles", other)
         for name, pid in (("hana", os.getpid()), ("trunk", os.getppid()), ("natedev", 1), ("ups", 2)):
             listener = socket.socket(socket.AF_UNIX)
             self.addCleanup(listener.close)
             listener.bind(str(self.root / f"{name}.sock"))
             _ = (self.root / f"sessions/{pid}.json").write_text(json.dumps({
                 "pid": pid, "sessionId": f"id-{name}", "name": name, "updatedAt": 1,
+                "tmux": "name-at-start:@1.%1" if name == "trunk" else "",
                 "messagingSocketPath": str(self.root / f"{name}.sock"),
             }), encoding="utf-8")
         _ = (self.root / "send.py").write_text(SEND_STUB, encoding="utf-8")
@@ -56,6 +77,8 @@ class BroadcastTests(unittest.TestCase):
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"), "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "BROADCAST_SEND": str(self.root / "send.py"), "LOG": str(self.root / "log"), "TOGETHER": "2",
             "BROADCAST_PS": f"cat {self.root / 'ps'}",
+            "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
+            "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
         }
         _ = (self.root / "ps").write_text(
             "40 1 python3 python3 /u/agents/codex_mesh.py start --session-dir /tmp/d1 --name fps-impl --cwd /w\n"
@@ -72,7 +95,7 @@ class BroadcastTests(unittest.TestCase):
         done = self.run_script("--all", "From the user: stop builds.", TOGETHER="4")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual(done.stdout.splitlines()[:-1], [
-            "hana - showrunner - sent", "trunk - unit director - sent", "gone - unit director - no live session",
+            "hana - showrunner - sent", "trunk - unit director - sent", "gone-unit - unit director - no live session",
             "ups - agent - sent", "fps-impl - agent - sent"])
         self.assertRegex(done.stdout.splitlines()[-1], r"^4 sent in \d+ s$")
         self.assertEqual(self.log().count("--text From the user: stop builds.\n\nEvery showrunner, unit director and"
@@ -86,7 +109,7 @@ class BroadcastTests(unittest.TestCase):
         done = self.run_script("--all", "From the user: stop builds.", TOGETHER="4")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual(done.stdout.splitlines()[:-1], [
-            "hana - showrunner - sent", "trunk - unit director - sent", "gone - unit director - no live session",
+            "hana - showrunner - sent", "trunk - unit director - sent", "gone-unit - unit director - no live session",
             "ups - agent - sent", "fps-impl - agent - sent"])
 
     def test_each_role_gets_its_own_version(self) -> None:

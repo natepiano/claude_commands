@@ -1,7 +1,7 @@
 # Plan-delegate progress history
 
 `scripts/delegate/progress_history.py` is the shared progress recorder for
-Claude and Codex implementations of `/unit:delegate`. It writes append-only
+Claude and Codex implementations of `/unit:direct`. It writes append-only
 per-run JSONL files under:
 
 ```text
@@ -21,6 +21,7 @@ Schema version 1 records these event types:
 - `pass_started` / `pass_finished`
 - `activity_started` / `activity_finished`
 - `progress_reported`
+- `eta_stated`
 - `finding_opened` / `finding_batch_dispatched` / `finding_verdict` /
   `finding_gate`, appended by `scripts/delegate/findings.py` to the same stream
 
@@ -37,6 +38,11 @@ percentages, decision source, override reason, each elapsed clock, and the
 calibration evidence used for that report. The phase decision also repeats the
 historical bias, suggested adjustment, and chosen adjustment so downstream
 analysis does not need to unpack the calibration snapshot.
+
+`eta_stated` records the active phase's promised arrival as epoch `eta_at` and
+its `basis`. A ranged statement also carries epoch `eta_earliest_at` and
+`eta_latest_at`; an exact statement carries neither range key. The event is the
+only recorder copy of a stated ETA. The live state does not duplicate it.
 
 ## Project clock
 
@@ -146,7 +152,7 @@ whether the calibration helped and continue tuning that original estimate.
 
 ## Findings ledger
 
-`scripts/delegate/findings.py` bounds `/unit:delegate`'s fix loop. It replaced a
+`scripts/delegate/findings.py` bounds `/unit:direct`'s fix loop. It replaced a
 `FIX_PASS < 10` counter, which could not converge: the re-review after each fix
 was a fresh blind review of a now-larger diff, with no memory of what had already
 been accepted, so it always returned something.
@@ -221,12 +227,27 @@ progress_history.py start-activity --session-dir <dir> --label <label> --activit
 progress_history.py finish-activity --session-dir <dir> [--status completed|error|canceled|interrupted] [--result <outcome>]
 progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
 progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>]
+progress_history.py eta --session-dir <dir> --time <YYYY-MM-DDTHH:MM> [--earliest <YYYY-MM-DDTHH:MM> --latest <YYYY-MM-DDTHH:MM>] --basis <text>
 progress_history.py finish-phase ...
 progress_history.py finish-run ...
 progress_history.py timeline --session-dir <dir> [--phase <id>]
 progress_history.py phase-count --plan-doc <path> [--phase-percent <N>]
 progress_history.py aggregate [--percent <N>]
 ```
+
+For production plans, `start-phase`, every `progress` report, `finish-phase`,
+and `finish-run` end by asking `phase_table.py refresh` to rewrite the unit's
+phase note from the event stream; `eta` asks for it after its append and before
+its `ETA recorded:` line. A refresh failure adds one stderr line and changes
+neither the command's output nor its exit status. Plans without a
+`> **Production:` line skip the subprocess. [Phase tables](phase-tables.md)
+covers the note, the table built from these events and the hook's limits.
+
+`eta` reads its times in the process `TZ`, requires an active phase, appends
+one `eta_stated` event, and prints `ETA recorded: <HH:MM zone>`. It exits 2 on
+a malformed or past time, a time the local clock skips, a range that does not
+enclose the target, one range end alone, a blank basis, or no active phase.
+`/unit:eta` and `/unit:eta_breakdown` run it under `TZ=<User zone>`.
 
 `implement.sh` and `review.sh` own pass lifecycle: they set
 `PLAN_DELEGATE_PASS_OWNER=launcher` on their own `start-pass` / `finish-pass`
@@ -408,6 +429,11 @@ capped number the row displays, it never contradicts the percentage beside it,
 and it inherits that number's accuracy: derived phase counts for the project,
 the reporter's estimate for the phase.
 
+`eta_band_seconds` names both outcomes. `EtaBand` carries the projected
+`remaining`, `earliest`, and `latest` seconds in that order;
+`EtaProjectionUnavailable` says the displayed percentage and elapsed time do
+not support a projection.
+
 `ETA low` and `ETA high` close the row with the two arrivals that same
 percentage still allows, each followed by its own distance from the ETA as
 `(-HH:MM)` and `(+HH:MM)` so the swing reads without subtracting clock times by
@@ -440,7 +466,10 @@ is still running. The percent options are neither required nor checked. The
 call appends no event and opens no window; like every `progress` call it
 restarts the notifier clock, and it writes state only to resolve a missing
 project clock.
-Only a missing or finished phase is refused, with `No active phase to report`.
+A missing phase, or a closed phase with no open activity, is refused with
+`No active phase to report`. When the last phase is closed and an activity is
+still open, `progress` prints both tables from that phase's last recorded values
+and shows the activity as the running row.
 
 `timeline` renders the stage table alone, for one phase or for every phase of
 the run, and needs no open window. It answers the questions asked after the

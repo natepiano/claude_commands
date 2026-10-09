@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
-import sys
+import socket
 import tempfile
 import unittest
 from datetime import timedelta
@@ -52,6 +51,21 @@ class SendTests(unittest.TestCase):
             patcher = mock.patch.object(send, name, value)
             _ = patcher.start()
             self.addCleanup(patcher.stop)
+        # No test reads the machine's own session records, or passes for the session that runs it.
+        (self.root / "sessions").mkdir()
+        self.enterContext(mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+                                                       "CLAUDE_CODE_SESSION_ID": ""}))
+
+    def session(self, session_id: str, name: str, *former: str) -> None:
+        """Record a live Claude session, or its rename: this test process stands in for it."""
+        path = self.root / f"{session_id}.sock"
+        if not path.exists():
+            held = socket.socket(socket.AF_UNIX)
+            held.bind(str(path))
+            self.addCleanup(held.close)
+        _ = (self.root / "sessions" / f"{session_id}.json").write_text(json.dumps({
+            "pid": os.getpid(), "sessionId": session_id, "name": name, "formerNames": list(former),
+            "messagingSocketPath": str(path), "updatedAt": 1}))
 
     def relay(self, message: send.Message, timeout: float) -> send.Result:
         del timeout
@@ -63,21 +77,6 @@ class SendTests(unittest.TestCase):
 
     def log(self) -> list[dict[str, object]]:
         return [send.as_dict(send.loads(line)) for line in (self.root / "log.jsonl").read_text().splitlines()]
-
-    def interrupted_queue_move(self) -> tuple[Path, Path]:
-        old_path = send.queue_path("old")
-        new_path = send.queue_path("new")
-        old_path.parent.mkdir(parents=True)
-        old_entries: list[dict[str, object]] = [
-            {"time": "2026-10-07T10:00:00+00:00", "from": "a", "to": "old", "key": None,
-             "summary": "free", "text": "free", "reason": "offline"},
-            {"time": "2026-10-07T10:01:00+00:00", "from": "a", "to": "old", "key": "named",
-             "summary": "named", "text": "named", "reason": "offline"},
-        ]
-        new_entries = [{**entry, "to": "new"} for entry in old_entries]
-        _ = old_path.write_text("".join(json.dumps(entry) + "\n" for entry in old_entries))
-        _ = new_path.write_text("".join(json.dumps(entry) + "\n" for entry in new_entries))
-        return old_path, new_path
 
     def test_repeat_window_is_per_key_and_recipient(self) -> None:
         self.assertEqual(self.send("--key", "k", "--repeat-minutes", "30", "--text", "one").outcome, "sent")
@@ -132,111 +131,48 @@ class SendTests(unittest.TestCase):
         self.assertEqual((entry["to"], entry["key"], entry["summary"], entry["outcome"]),
                          ("bogus", "k", "first", "queued"))
 
-    def test_rename_recipient_merges_queues_and_keeps_latest_key(self) -> None:
-        old_path = send.queue_path("old")
-        new_path = send.queue_path("new")
-        old_path.parent.mkdir(parents=True)
-        old_entries = [
-            {"time": "2026-10-07T10:00:00+00:00", "from": "a", "to": "old", "key": "shared",
-             "summary": "older", "text": "older", "reason": "offline"},
-            {"time": "2026-10-07T10:02:00+00:00", "from": "a", "to": "old", "key": "old-only",
-             "summary": "old", "text": "old", "reason": "offline"},
-            {"time": "2026-10-07T10:03:00+00:00", "from": "a", "to": "old", "key": None,
-             "summary": "free", "text": "free", "reason": "offline"},
-        ]
-        new_entries = [
-            {"time": "2026-10-07T10:01:00+00:00", "from": "b", "to": "new", "key": "shared",
-             "summary": "newer", "text": "newer", "reason": "offline"},
-            {"time": "2026-10-07T10:04:00+00:00", "from": "b", "to": "new", "key": None,
-             "summary": "free two", "text": "free two", "reason": "offline"},
-        ]
-        _ = old_path.write_text("".join(json.dumps(entry) + "\n" for entry in old_entries))
-        _ = new_path.write_text("".join(json.dumps(entry) + "\n" for entry in new_entries))
+    def test_what_did_not_arrive_is_kept_by_session_id_so_a_rename_loses_nothing(self) -> None:
+        self.session("id-1", "old")
+        self.outcome = send.Result("queued", "relay timed out after 40 s")
+        result = send.send(send.parse(["--to", "old", "--from", "test", "--text", "by name"]))
+        self.assertEqual(result, send.Result("queued", "relay timed out after 40 s"))
+        _ = send.send(send.parse(["--to", f"uds:{self.root / 'id-1.sock'}", "--from", "test", "--text", "by socket"]))
+        self.assertEqual([path.name for path in (self.root / "queue").iterdir()], ["session-id-1.jsonl"])
+        self.session("id-1", "new", "old")
+        # A send to the name the session no longer has is still kept for that session.
+        _ = send.send(send.parse(["--to", "old", "--from", "test", "--text", "by the old name"]))
+        self.assertEqual(send.pending("someone-else"), "")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
+            text = send.pending(None)
+        for sent in ("Queued message 1 of 3", "by name", "by socket", "by the old name"):
+            self.assertIn(sent, text)
+        self.assertEqual(send.pending("new"), "")
 
-        self.assertEqual(send.rename_recipient("old", "new"), ["message queue"])
+    def test_what_was_kept_under_a_name_before_is_found_by_the_session_that_had_it(self) -> None:
+        entry = {"time": "2026-10-07T10:00:00+00:00", "from": "a", "to": "old", "key": None, "summary": "s",
+                 "text": "kept before the change", "reason": "offline"}
+        path = send.queue_path("old")
+        path.parent.mkdir()
+        _ = path.write_text(json.dumps(entry) + "\n")
+        self.session("id-1", "new", "old")
+        # Another live session has the name now: what is kept under it is that session's, not the renamed one's.
+        self.session("id-2", "old")
+        self.assertEqual(send.pending("new"), "")
+        self.assertIn("kept before the change", send.pending("old"))
+        _ = path.write_text(json.dumps(entry) + "\n")
+        (self.root / "sessions/id-2.json").unlink()
+        self.assertIn("kept before the change", send.pending("new"))
+        self.assertFalse(path.exists())
 
-        self.assertFalse(old_path.exists())
-        merged = send.read_queue(new_path)
-        self.assertEqual([entry["text"] for entry in merged if entry["key"] == "shared"], ["newer"])
-        self.assertEqual([entry["key"] for entry in merged].count(None), 2)
-        self.assertTrue(all(entry["to"] == "new" for entry in merged))
-
-    def test_rename_recipient_resumes_queue_move_without_duplicate_messages(self) -> None:
-        old_path, new_path = self.interrupted_queue_move()
-
-        self.assertEqual(send.rename_recipient("old", "new"), ["message queue"])
-
-        self.assertFalse(old_path.exists())
-        self.assertEqual([entry["text"] for entry in send.read_queue(new_path)], ["free", "named"])
-
-    def test_rename_recipient_second_call_after_resumed_move_changes_nothing(self) -> None:
-        _, new_path = self.interrupted_queue_move()
-        _ = send.rename_recipient("old", "new")
-        self.assertEqual(len(send.read_queue(new_path)), 2)
-        after_resume = new_path.read_bytes()
-
-        self.assertEqual(send.rename_recipient("old", "new"), [])
-
-        self.assertEqual(new_path.read_bytes(), after_resume)
-
-    def test_rename_recipient_moves_key_instants_and_keeps_later_one(self) -> None:
-        path = self.root / "keys.json"
-        _ = path.write_text(json.dumps({
-            "one": {"last": {"old": "2026-10-07T10:00:00+00:00"}},
-            "both-old-later": {"last": {
-                "old": "2026-10-07T12:00:00+00:00", "new": "2026-10-07T11:00:00+00:00"}},
-            "both-new-later": {"last": {
-                "old": "2026-10-07T12:00:00+00:00", "new": "2026-10-07T13:00:00+00:00"}},
-        }) + "\n")
-
-        self.assertEqual(send.rename_recipient("old", "new"), ["message keys"])
-
-        fields = send.as_dict(send.loads(path.read_text()))
-        self.assertEqual(send.as_dict(send.as_dict(fields["one"])["last"]),
-                         {"new": "2026-10-07T10:00:00+00:00"})
-        self.assertEqual(send.as_dict(send.as_dict(fields["both-old-later"])["last"])["new"],
-                         "2026-10-07T12:00:00+00:00")
-        self.assertEqual(send.as_dict(send.as_dict(fields["both-new-later"])["last"])["new"],
-                         "2026-10-07T13:00:00+00:00")
-
-    def test_rename_recipient_moves_or_discards_old_relay(self) -> None:
-        relay = self.root / "relay"
-        relay.mkdir()
-        old_path = relay / "old.jsonl"
-        new_path = relay / "new.jsonl"
-        _ = old_path.write_text("old stream\n")
-        self.assertEqual(send.rename_recipient("old", "new"), ["message relay"])
-        self.assertFalse(old_path.exists())
-        self.assertEqual(new_path.read_text(), "old stream\n")
-
-        _ = old_path.write_text("discarded stream\n")
-        _ = new_path.write_text("kept stream\n")
-        self.assertEqual(send.rename_recipient("old", "new"), ["message relay"])
-        self.assertFalse(old_path.exists())
-        self.assertEqual(new_path.read_text(), "kept stream\n")
-
-    def test_rename_recipient_uses_xdg_state_home(self) -> None:
-        xdg = self.root / "xdg"
-        python_path = str(Path(__file__).parent)
-        existing_path = os.environ.get("PYTHONPATH")
-        if existing_path:
-            python_path += os.pathsep + existing_path
-        code = (
-            "from datetime import datetime, timezone\n"
-            "import send\n"
-            "send.enqueue(send.Message('old', 'test', '', 'body', 'key'), 'offline', "
-            "datetime(2026, 10, 7, tzinfo=timezone.utc))\n"
-            "send.rename_recipient('old', 'new')\n"
-        )
-        result = subprocess.run(
-            [sys.executable, "-c", code], capture_output=True, text=True, check=False,
-            env={**os.environ, "XDG_STATE_HOME": str(xdg), "PYTHONPATH": python_path},
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((xdg / "message" / "queue" / "old.jsonl").exists())
-        entries = [send.as_dict(send.loads(line))
-                   for line in (xdg / "message" / "queue" / "new.jsonl").read_text().splitlines()]
-        self.assertEqual([entry["to"] for entry in entries], ["new"])
+    def test_a_send_no_live_session_answers_to_says_so(self) -> None:
+        self.outcome = send.Result("queued", "No agent named bogus")
+        result = self.send("--text", "anyone there")
+        self.assertEqual(result.outcome, "queued")
+        self.assertIn("no live session answers to bogus, so it is kept under that name", result.detail)
+        with self.assertRaises(SystemExit) as stopped, mock.patch("sys.stderr"):
+            _ = send.main(["pending"])
+        self.assertEqual(stopped.exception.code, 2)
+        self.assertIn("anyone there", send.pending("bogus"))
 
     def test_codex_failure_is_failed_not_queued(self) -> None:
         with mock.patch.object(send, "run", return_value=(1, "", "codex_mesh: no delegate named 'bogus'")):

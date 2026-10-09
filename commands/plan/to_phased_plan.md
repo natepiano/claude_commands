@@ -1,12 +1,12 @@
 ---
-description: Compile a design/plan doc into a delegate-ready phased implementation plan — strip design narrative, bake in the codebase context every phase needs, and front each phase with a self-contained Work Order so /unit:delegate can dispatch by assembly with zero research.
+description: Compile a design/plan doc into a delegate-ready phased implementation plan — strip design narrative, bake in the codebase context every phase needs, and front each phase with a self-contained Work Order so /unit:direct can dispatch by assembly with zero research.
 ---
 
 # Phase Plan
 
 **Purpose:** Turn a plan/design doc into a **delegate-ready implementation plan**
 (format: `~/.claude/docs/delegate_plan_format.md`). After this runs, a compacted
-orchestrator can hand any phase to `/unit:delegate` by copy-and-assemble — the
+orchestrator can hand any phase to `/unit:direct` by copy-and-assemble — the
 expensive codebase research is paid **once**, here, and baked into the doc.
 
 **Usage:** `/plan:to_phased_plan [plan-doc-path] [--out <path>]`
@@ -98,7 +98,7 @@ the source doc to a pointer is a **separate, later** action the user takes once
 the compiled plan is good; never do it as part of this run.
 
 Read `~/.claude/docs/delegate_plan_format.md` — it is the target format and the
-contract `/unit:delegate`, `/plan:phase_review`, and `/plan:to_as_built` all depend on.
+contract `/unit:direct`, `/plan:phase_review`, and `/plan:to_as_built` all depend on.
 
 Resolve `${PLAN_REPOSITORY_ROOT}` from `${DEST}`'s containing Git repository.
 When `${DEST}` is not in Git, use its parent directory.
@@ -142,7 +142,7 @@ block — nothing else. The prompt must include:
 
 - The absolute plan-doc path (the subagent reads it to learn which files/areas
   the phases touch).
-- Do not return `Project started`; `/unit:delegate`'s progress recorder derives
+- Do not return `Project started`; `/unit:direct`'s progress recorder derives
   that runtime provenance from Git and memorializes it on the first delegation
   run.
 - A directive to determine and return, terse:
@@ -159,11 +159,11 @@ block — nothing else. The prompt must include:
      Test = `bash ~/.claude/scripts/delegate/verify.sh test <pkg>`;
      Lint = `bash ~/.claude/scripts/delegate/verify.sh lint <pkg>`.
      Workspace-wide breadth — `--all-targets`, all examples, the full `clippy`
-     skill — belongs to /unit:delegate's <FinalGate/> after the last phase,
+     skill — belongs to /unit:direct's <FinalGate/> after the last phase,
      never to any phase. For non-Rust projects, record the exact commands the
      project uses (read `package.json`/`justfile`/CI config; do not invent).
   6. **Style** — for Rust, record `run-end /clippy style-only auto-proceed`.
-     /unit:delegate keeps this line out of coding and fix prompts, then runs one
+     /unit:direct keeps this line out of coding and fix prompts, then runs one
      style review for the whole project at <FinalGate/>, diffing the branch so
      it reaches work every phase already checkpointed; omit for non-Rust.
   7. **Invariants** — project-wide rules every phase must preserve (from the plan
@@ -172,7 +172,7 @@ block — nothing else. The prompt must include:
      path or `none`. **Seats** (`<Restructure/>` step 2) is drafted from this
      line without opening the tree again.
 - Output format: the `## Delegation Context` bullet block from the format doc,
-  omitting `Project started` until `/unit:delegate`'s progress recorder resolves
+  omitting `Project started` until `/unit:direct`'s progress recorder resolves
   it. No prose, no findings list.
 
 The subagent does not edit anything. Capture its block as ${DELEGATION_CONTEXT}.
@@ -198,7 +198,7 @@ not codebase searching.
      and carry the gate onto the phase itself: a phase blocked by `G2` opens with
      `**Blocked by:** G2 — <the unblocking event>`. A delegate reaching that
      phase must be able to see it cannot start without reading the whole doc.
-   - **Do not mark a gated phase ready.** `/unit:delegate` runs phases in order;
+   - **Do not mark a gated phase ready.** `/unit:direct` runs phases in order;
      a gated phase is a deliberate stop, and the report at STEP 5 should say
      which phase the plan runs to before it parks.
    - **`**Scope now:**` sets the working repo** for the early phases. When the
@@ -392,7 +392,7 @@ Order before this command returns. Do not copy the parser into this command.
 | Seats | <per todo phase: `N: <opening line>`> |
 | Archived | <count of done phases preserved, or None> |
 | Stripped | <what design narrative was removed and folded where> |
-| Next | `/unit:delegate <plan path> phase <first todo N>` |
+| Next | `/unit:direct <plan path> phase <first todo N>` |
 ```
 
 **Reconcile mode** — report what changed vs what was left alone:
@@ -405,7 +405,7 @@ Order before this command returns. Do not copy the parser into this command.
 | Seats | <per compiled or re-seated phase: `N: <opening line>`> |
 | Propagated | <later phases whose Constraints from prior phases were updated, or None> |
 | Preserved | <count of done + already-compiled todo phases left untouched> |
-| Next | `/unit:delegate <plan path> phase <first todo N>` |
+| Next | `/unit:direct <plan path> phase <first todo N>` |
 ```
 
 Then stop. Do not start implementing a phase.

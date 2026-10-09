@@ -4,7 +4,7 @@ The shared contract for a **delegate-ready phased implementation plan**. Five
 commands read or write this format and must not drift from it:
 
 - `/plan:to_phased_plan` — compiles a design/plan doc into this format.
-- `/unit:delegate` — dispatches a phase by *assembling* its Work Order (fast path),
+- `/unit:direct` — dispatches a phase by *assembling* its Work Order (fast path),
   not by researching the codebase.
 - `/plan:phase_review` — keeps review prose temporary and folds durable learnings
   into remaining Work Orders.
@@ -35,12 +35,12 @@ to rediscover after a context compaction lives in the doc.
 > **As-built disposition: <amend | create>** — <amend: name the target as-built docs>
 
 <!-- Optional; set by /producer:to_production when the plan is one unit of a production.
-     Preserved verbatim by every command that edits this doc. /unit:delegate reads
+     Preserved verbatim by every command that edits this doc. /unit:direct reads
      it and applies <ProductionUnit/> from ~/.claude/docs/production_format.md. -->
 > **Production: <name>** — unit `<unit>`; production doc `<path>`
 
 ## Delegation Context
-<!-- Shared across all phases. /unit:delegate prepends this to every dispatch. -->
+<!-- Shared across all phases. /unit:direct prepends this to every dispatch. -->
 
 - **Project:** <crate / workspace member name — one-line purpose>
 - **Project started:** <ISO-8601 timestamp — written once by the
@@ -58,9 +58,9 @@ to rediscover after a context compaction lives in the doc.
 - **Lint:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh lint <pkg>`.
   Never raw cargo commands and never the full `clippy` skill here — phase
   verification is deliberately scoped; workspace breadth and the `clippy`
-  skill run once in /unit:delegate's <FinalGate/> after the last phase>
+  skill run once in /unit:direct's <FinalGate/> after the last phase>
 - **Style:** <for Rust use `run-end /clippy style-only auto-proceed`;
-  /unit:delegate omits it from coding prompts and runs it once at <FinalGate/>,
+  /unit:direct omits it from coding prompts and runs it once at <FinalGate/>,
   over the whole branch diff rather than one phase; omit for non-Rust>
 - **Invariants:** <project-wide rules every phase must preserve; omit if none>
 
@@ -80,7 +80,7 @@ to rediscover after a context compaction lives in the doc.
 
 ### Phase N — <title>  · status: todo
 <!-- status ∈ {todo, done}. The checkpoint flips it in loop/verbose, and
-     /unit:delegate shrinks the phase to As-built after the code commit
+     /unit:direct shrinks the phase to As-built after the code commit
      (~/.claude/docs/delegate/phase_end.md → <PhaseEnd/>). Review prose never
      enters this document. -->
 
@@ -152,16 +152,16 @@ a frozen `done` phase cannot follow; omit if none>
 concrete facts it produces — new types/signatures, file paths, decisions that now
 bind — must be pushed into the **Constraints from prior phases** of every later
 phase that would otherwise re-derive them. This is the single mechanism that lets
-the next `/unit:delegate` assemble its prompt with zero codebase research. After
+the next `/unit:direct` assemble its prompt with zero codebase research. After
 propagation, each remaining Work Order must still be implementable from its named
 **Files** + **Delegation Context** alone; if a change widened scope, update
 **Files** and **Spec** to match.
 
 ---
 
-## Pending decisions <!-- written by /plan:phase_review (auto mode) and /unit:delegate; consumed by /unit:delegate -->
+## Pending decisions <!-- written by /plan:phase_review (auto mode) and /unit:direct; consumed by /unit:direct -->
 
-A user decision deferred by the `/unit:delegate` loop lives inside the affected
+A user decision deferred by the `/unit:direct` loop lives inside the affected
 phase's Work Order as:
 
 ```markdown
@@ -182,7 +182,7 @@ Recommendation:
 
 Rules:
 
-- `/unit:delegate` must NOT dispatch a phase whose Work Order carries an
+- `/unit:direct` must NOT dispatch a phase whose Work Order carries an
   unresolved `**Pending decision:**` block — its pre-dispatch check presents the
   block(s) to the user first.
 - Resolving a decision means editing the outcome into the Work Order's
@@ -230,7 +230,7 @@ Rules:
    how a workaround gets built on purpose. See `~/.claude/docs/decision_criteria.md`
    → "Where a fix goes".
 7. **Seats decides the opening.** Every `todo` Work Order carries **Seats**;
-   `/unit:delegate` opens its two seats from it and partitions files by it
+   `/unit:direct` opens its two seats from it and partitions files by it
    instead of deciding at launch. `impl` always opens as `impl`. `test` opens
    as `test` wherever the phase has a **test lane** — a `tests/` directory in a
    touched crate (Delegation Context → **Test lanes**) and a Spec concrete
@@ -243,5 +243,5 @@ Rules:
    write; a Spec too thin for that is a reason to open the seat as a writer.
    When nothing splits, the opening line says so and `impl` takes every file.
    A repair runs one seat whatever Seats says. An older three-seat field maps
-   down per `/unit:delegate` → `<PhaseTeam/>`.
+   down per `/unit:direct` → `<PhaseTeam/>`.
 

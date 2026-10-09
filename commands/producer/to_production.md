@@ -52,8 +52,8 @@ State each default in one line.
 <Units>
 Reuse the `/producer:greenlight` report for these plans if it is in the conversation
 and no plan changed since. Otherwise read `~/.claude/commands/producer/greenlight.md`
-and run its STEPS 1–5. A verdict of one delegate run stops this command:
-`Greenlight says one delegate run — <reason>. Run /unit:delegate <plan>.`
+and run its STEPS 1–5. A verdict of one `/unit:direct` run stops this command:
+`Greenlight says one /unit:direct run — <reason>. Run /unit:direct <plan>.`
 
 Apply the user's adjustments from the conversation, such as names, ownership
 and merged units.
@@ -114,7 +114,6 @@ production format, with status `planned`:
 - **User zone:** the zone in memory for where the user is now, or else the
   machine's zone.
 - **Updates:** every 15 minutes (user, 2026-09-28).
-- **Showrunner session:** leave it out; `/showrunner:produce` writes it.
 - **Close-out:** the source plans' production-level steps, meaning work that
   no one unit owns or that runs after the last merge. Examples: data or
   saved-state migrations, checks on other machines, final validation.

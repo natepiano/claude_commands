@@ -6,10 +6,8 @@ import argparse
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -17,7 +15,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo
 
-import showrunners
+import unit_lookup
 
 
 class Production(NamedTuple):
@@ -25,7 +23,6 @@ class Production(NamedTuple):
     slug: str
     merge_branch: str
     checkout: Path
-    showrunner_session: str
     log: Path
     zone: ZoneInfo
 
@@ -81,13 +78,13 @@ class ExistingUnitRow(NamedTuple):
     plan: str
     worktree: str
     branch: str
-    session: str
     port: str
     owns: str
 
 
 class UnitIdentity(NamedTuple):
     unit: str
+    # The name the session is launched under. It is not recorded: the user may rename the session.
     session: str
 
 
@@ -166,7 +163,6 @@ def read_production(path: Path) -> Production:
         lines = doc.read_text(encoding="utf-8").splitlines()
         merge_branch = production_field(lines, "Merge branch")
         checkout = Path(production_field(lines, "Showrunner checkout")).expanduser().resolve()
-        showrunner_session = production_field(lines, "Showrunner session")
         log = Path(production_field(lines, "Log"))
         zone = ZoneInfo(production_field(lines, "User zone"))
         slug = doc.name.removesuffix("-production.md")
@@ -176,7 +172,7 @@ def read_production(path: Path) -> Production:
             raise Refusal("production Log must be relative to Showrunner checkout")
         if "## Units" not in lines:
             raise Refusal("production doc lacks Units table")
-        return Production(doc, slug, merge_branch, checkout, showrunner_session, checkout / log, zone)
+        return Production(doc, slug, merge_branch, checkout, checkout / log, zone)
     except (OSError, UnicodeError, KeyError, ValueError) as error:
         raise Refusal(f"cannot read production doc: {error}") from error
 
@@ -195,6 +191,14 @@ def relative_plan(production: Production, raw: str) -> Path:
         raise Refusal("plan must be inside Showrunner checkout") from error
 
 
+def stub_plan(production: Production, branch: str) -> Path:
+    """Name a brief's stub plan beside the production doc, relative to Showrunner checkout."""
+    try:
+        return production.doc.parent.relative_to(production.checkout) / f"{branch}.md"
+    except ValueError as error:
+        raise Refusal("production doc must be inside Showrunner checkout") from error
+
+
 def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     production = read_production(Path(cast(str, args.production)))
     name = cast(str, args.name)
@@ -206,7 +210,8 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     if sum((given_plan is not None, given_brief is not None, standby)) != 1:
         raise Refusal("give exactly one of --plan, --brief, or --standby")
     kebab = name.replace("_", "-")
-    branch = f"{production.merge_branch}-{kebab}"
+    # The slug names the branch, as it names the production's plans; the merge branch may differ.
+    branch = f"{production.slug}-{kebab}"
     checkout_name = production.checkout.name.removesuffix("-trunk")
     worktree = production.checkout.parent / f"{checkout_name}-{kebab}"
     plan: PlanGiven | BriefGiven | Standby
@@ -214,7 +219,7 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
         plan = PlanGiven(relative_plan(production, given_plan))
     elif given_brief is not None:
         assert given_brief is not None
-        plan = BriefGiven(given_brief, Path("docs/plans") / f"{branch}.md")
+        plan = BriefGiven(given_brief, stub_plan(production, branch))
     else:
         plan = Standby()
     resumed = cast(str | None, args.resume)
@@ -259,65 +264,107 @@ def unit_rows(lines: list[str]) -> tuple[int, list[str]]:
     return insert_at, rows[2:]
 
 
+def row_cells(row: str) -> list[str]:
+    return [cell.strip() for cell in row.strip().strip("|").split("|")]
+
+
+def unit_headings(lines: list[str]) -> list[str]:
+    """The Units table's column headings, in the doc's own order."""
+    _ = unit_rows(lines)
+    return row_cells(next(line for line in lines[lines.index("## Units"):] if line.startswith("| Unit |")))
+
+
+def unit_table(lines: list[str]) -> list[dict[str, str]]:
+    """Each Units row as its cells by column heading, as written.
+
+    Reading by heading lets a doc that still has the retired Session column read like one without it.
+    """
+    headings = unit_headings(lines)
+    _, rows = unit_rows(lines)
+    return [dict(zip(headings, row_cells(row), strict=False)) for row in rows]
+
+
 def plan_cell_is_retired(plan_cell: str) -> bool:
     """Return whether a Plan cell begins with the retired marker."""
     return re.match(r"^\s*\(?retired\b", plan_cell) is not None
 
 
-def live_unit_rows(lines: list[str]) -> list[str]:
-    """Return Units rows whose Plan cell does not retire the unit."""
-    _, rows = unit_rows(lines)
-    live: list[str] = []
-    for row in rows:
-        cells = row.strip("|").split("|")
-        if len(cells) < 2 or not plan_cell_is_retired(cells[1]):
-            live.append(row)
-    return live
+def worktree_is_linked(worktree: str) -> bool:
+    """Return whether `worktree` is a linked worktree on disk.
+
+    A main checkout, where `.git` is a directory, is shared and is no unit's own worktree.
+    """
+    return bool(worktree) and (Path(worktree) / ".git").is_file()
 
 
-def retired_sessions(lines: list[str]) -> set[str]:
-    """Return session names from Units rows marked retired in their Plan cell."""
-    _, rows = unit_rows(lines)
-    retired: set[str] = set()
-    for row in rows:
-        cells = row.strip("|").split("|")
-        if len(cells) >= 5 and plan_cell_is_retired(cells[1]):
-            session = cell_value(cells[4].strip())
-            if session:
-                retired.add(session)
-    return retired
+class SessionMarks:
+    """Which of a production's units have a tmux session, asked of tmux once and only when a row needs it."""
+
+    def __init__(self, slug: str) -> None:
+        self._slug: str = slug
+        self._units: set[str] | None = None
+        self._unknown: bool = False
+
+    def has(self, unit: str) -> bool:
+        """Whether a tmux session carries the unit's mark. A tmux that cannot say has not said no."""
+        if self._units is None:
+            try:
+                self._units = set(unit_lookup.marked_units(self._slug))
+            except OSError:
+                self._units, self._unknown = set(), True
+        return self._unknown or unit in self._units
 
 
-def retired_units(lines: list[str]) -> set[str]:
-    """Return unit names from Units rows marked retired in their Plan cell."""
-    _, rows = unit_rows(lines)
-    retired: set[str] = set()
-    for row in rows:
-        cells = row.strip("|").split("|")
-        if len(cells) >= 2 and plan_cell_is_retired(cells[1]):
-            unit = cell_value(cells[0].strip())
-            if unit:
-                retired.add(unit)
-    return retired
+def unit_is_retired(cells: dict[str, str], marks: SessionMarks) -> bool:
+    """Return whether a Units row's unit is retired.
+
+    It is when its Plan cell says so, or when its worktree and its tmux session are both gone
+    (user 2026-10-08): such a unit has nothing left to address. The worktree is asked first, so a
+    unit whose session is only restarting keeps its row, and tmux is asked only about a unit
+    with no worktree of its own. The session is the one carrying the unit's mark, whatever its name.
+    """
+    if plan_cell_is_retired(cells.get("Plan", "")):
+        return True
+    if "Worktree" not in cells:
+        return False
+    return (not worktree_is_linked(cell_value(cells["Worktree"]))
+            and not marks.has(cell_value(cells.get("Unit", ""))))
 
 
-def desired_row(request: UnitLaunch) -> str:
-    port = request.port.value if isinstance(request.port, SuppliedCell) else "—"
-    owns = request.owns.value if isinstance(request.owns, SuppliedCell) else "—"
-    return (f"| {request.identity.unit} | {request.plan_cell} | {request.worktree} | "
-            f"{request.branch} | {request.identity.session} | {port} | {owns} |")
+def live_unit_table(lines: list[str], slug: str) -> list[dict[str, str]]:
+    """Return Units rows, by column heading, whose unit is not retired."""
+    marks = SessionMarks(slug)
+    return [cells for cells in unit_table(lines) if not unit_is_retired(cells, marks)]
+
+
+def retired_units(lines: list[str], slug: str) -> set[str]:
+    """Return unit names from Units rows whose unit is retired."""
+    marks = SessionMarks(slug)
+    retired = {cell_value(cells.get("Unit", "")) for cells in unit_table(lines) if unit_is_retired(cells, marks)}
+    return retired - {""}
+
+
+def desired_row(request: UnitLaunch, headings: list[str]) -> str:
+    """The unit's row in the doc's own columns. A column this script does not fill gets a dash."""
+    cells = {"Unit": request.identity.unit, "Plan": request.plan_cell, "Worktree": str(request.worktree),
+             "Branch": request.branch}
+    for heading, cell in (("Port", request.port), ("Owns", request.owns)):
+        if isinstance(cell, SuppliedCell):
+            cells[heading] = cell.value
+    return "| " + " | ".join(cells.get(heading, "—") for heading in headings) + " |"
 
 
 def row_is_present(request: RequestedUnitLaunch, lines: list[str]) -> NoUnitRow | ExistingUnitRow:
-    _, rows = unit_rows(lines)
     matching: list[ExistingUnitRow] = []
-    for row in rows:
-        fields = [cell_value(field) for field in row.strip("|").split("|")]
-        if fields[0] == request.unit:
-            if len(fields) != 7:
-                raise Refusal(f"unit {request.unit} has an invalid Units row")
-            matching.append(ExistingUnitRow(*fields[1:7]))
-        elif len(fields) >= 4 and (fields[2] == str(request.worktree) or fields[3] == request.branch):
+    for cells in unit_table(lines):
+        fields = {heading: cell_value(cell) for heading, cell in cells.items()}
+        if fields.get("Unit") == request.unit:
+            try:
+                matching.append(ExistingUnitRow(fields["Plan"], fields["Worktree"], fields["Branch"],
+                                                fields["Port"], fields["Owns"]))
+            except KeyError as error:
+                raise Refusal(f"unit {request.unit} has an invalid Units row") from error
+        elif fields.get("Worktree") == str(request.worktree) or fields.get("Branch") == request.branch:
             raise Refusal(f"branch or worktree for {request.unit} is already used in Units table")
     if len(matching) > 1:
         raise Refusal(f"unit name {request.unit} is already taken in Units table")
@@ -345,7 +392,7 @@ def recorded_mode(request: UnitLaunch, row: ExistingUnitRow) -> str:
             return subject.removeprefix(subject_prefix).removesuffix(")")
     if row.plan == "standby":
         return "standby"
-    stub = request.production.checkout / "docs/plans" / f"{request.branch}.md"
+    stub = request.production.checkout / stub_plan(request.production, request.branch)
     if stub.exists() and request.plan_path == stub.relative_to(request.production.checkout):
         if "## Source\n\n" in stub.read_text(encoding="utf-8"):
             return "brief"
@@ -372,15 +419,6 @@ def worktree_on_branch(request: UnitLaunch) -> bool:
     if branch.returncode != 0 or branch.stdout.strip() != request.branch:
         raise Refusal(f"worktree {worktree} is not on {request.branch}")
     return True
-
-
-def tmux_binary() -> str:
-    found = shutil.which("tmux")
-    if found:
-        return found
-    result = subprocess.run(["nix", "build", "--no-link", "--print-out-paths", "nixpkgs#tmux^out"],
-                            text=True, capture_output=True, check=True)
-    return str(Path(result.stdout.strip()) / "bin/tmux")
 
 
 def tmux_live(tmux: str, name: str) -> bool:
@@ -419,10 +457,9 @@ def preflight(request: RequestedUnitLaunch) -> ReadyToLaunch:
         raise Refusal("production doc must be inside Showrunner checkout") from error
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     existing = row_is_present(request, lines)
-    session_name = existing.session if isinstance(existing, ExistingUnitRow) else request.requested_name
     launch = UnitLaunch(
         production=request.production,
-        identity=UnitIdentity(request.unit, session_name),
+        identity=UnitIdentity(request.unit, request.requested_name),
         branch=request.branch,
         worktree=request.worktree,
         plan=request.plan,
@@ -476,7 +513,7 @@ def append_row(request: UnitLaunch, existing: NoUnitRow | ExistingUnitRow) -> No
     doc = request.production.doc
     lines = doc.read_text(encoding="utf-8").splitlines()
     insert_at, _ = unit_rows(lines)
-    lines.insert(insert_at, desired_row(request))
+    lines.insert(insert_at, desired_row(request, unit_headings(lines)))
     _ = doc.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -485,23 +522,25 @@ def remote_head(production: Production, branch: str) -> str:
     return result.stdout.split()[0] if result.stdout.strip() else ""
 
 
-def commit_paths_and_push(production: Production, paths: list[Path], message: str) -> None:
+def commit_paths(production: Production, paths: list[Path], message: str) -> None:
+    """Commit `paths` on the merge branch and push nothing of it.
+
+    The commit goes out with the showrunner's next merge push: a push here would carry every
+    unpushed merge with it and start CI where pushes to the merge branch do (user, 2026-10-08).
+    """
     relative_paths = [str(path.relative_to(production.checkout) if path.is_absolute() else path)
                       for path in paths]
     status = git(production, "status", "--porcelain", "--", *relative_paths).stdout
     if status:
         _ = git(production, "add", "--", *relative_paths)
         _ = git(production, "commit", "--only", "-m", message, "--", *relative_paths)
-    head = git(production, "rev-parse", production.merge_branch).stdout.strip()
-    if remote_head(production, production.merge_branch) != head:
-        _ = git(production, "push", "origin", production.merge_branch)
 
 
-def commit_and_push(request: UnitLaunch) -> None:
+def commit_unit(request: UnitLaunch) -> None:
     paths = [request.production.doc]
     if isinstance(request.plan, BriefGiven):
         paths.append(request.production.checkout / request.plan.stub)
-    commit_paths_and_push(
+    commit_paths(
         request.production,
         paths,
         f"production({request.production.slug}): add unit {request.identity.unit} ({request.mode_name})",
@@ -509,6 +548,11 @@ def commit_and_push(request: UnitLaunch) -> None:
 
 
 def ensure_worktree(request: UnitLaunch) -> None:
+    """Create the unit's worktree on its own branch and push nothing.
+
+    The unit director's first checkpoint push puts the branch on origin and sets its upstream
+    (user, 2026-10-08).
+    """
     production = request.production
     worktree = request.worktree
     if worktree.exists():
@@ -516,10 +560,6 @@ def ensure_worktree(request: UnitLaunch) -> None:
     else:
         _ = git(production, "worktree", "add", str(worktree), "-b", request.branch,
                 production.merge_branch)
-    head = git(production, "rev-parse", request.branch).stdout.strip()
-    upstream = git(production, "config", "--get", f"branch.{request.branch}.remote", check=False).stdout.strip()
-    if remote_head(production, request.branch) != head or upstream != "origin":
-        _ = git(production, "push", "-u", "origin", request.branch)
     if (production.checkout / ".claude/config/berth.toml").exists():
         key = f"branch.{request.branch}.cargoBerthTarget"
         current = git(production, "config", "--get", key, check=False).stdout.strip()
@@ -530,28 +570,35 @@ def ensure_worktree(request: UnitLaunch) -> None:
 def prompt_for(request: UnitLaunch) -> str:
     production = request.production
     doc = str(production.doc)
+    # The showrunner's name is written nowhere: a unit looks it up, since a rename changes it.
+    showrunner = ("the showrunner, whose session name `~/.claude/scripts/lib/py "
+                  f"~/.claude/scripts/production/showrunners.py name {production.slug}` prints (look it up "
+                  "before each message: the name can change)")
     if isinstance(request.plan, Standby):
-        return (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under the "
-                f"showrunner {production.showrunner_session}, on standby. Work only in your worktree "
+        return (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under "
+                f"{showrunner}, on standby. Work only in your worktree "
                 f"{request.worktree}, branch {request.branch}. Do nothing until the showrunner sends you work.")
     plan = request.plan_path.as_posix()
     if isinstance(request.session, ResumedSession):
         plan = str(request.worktree / request.plan_path)
-        return (f"You are now {request.identity.unit} in production {production.slug} (doc {doc}), under the "
-                f"showrunner {production.showrunner_session}. Work only in your worktree {request.worktree}, "
-                f"branch {request.branch}, and name it in every Work Order. Run /unit:delegate {plan}.")
+        return (f"You are now {request.identity.unit} in production {production.slug} (doc {doc}), under "
+                f"{showrunner}. Work only in your worktree {request.worktree}, "
+                f"branch {request.branch}, and name it in every Work Order. Run /unit:direct {plan}.")
     if isinstance(request.plan, PlanGiven):
-        return f"/unit:delegate {plan}"
-    return (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under the "
-            f"showrunner {production.showrunner_session}. Work only in your worktree {request.worktree}, "
+        return f"/unit:direct {plan}"
+    return (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under "
+            f"{showrunner}. Work only in your worktree {request.worktree}, "
             f"branch {request.branch}, and name it in every Work Order. Your plan {plan} holds only the "
             f"user's words. Write the full phased plan there, send it to the showrunner, and wait for its "
-            f"approval before you run /unit:delegate {plan}.")
+            f"approval before you run /unit:direct {plan}.")
 
 
 def launch_session(request: UnitLaunch, tmux: str, director: DirectorAgent) -> None:
-    if tmux_live(tmux, request.identity.session):
-        return
+    """Start the unit's session in a tmux session marked as this unit of this production.
+
+    The marks are what finds the unit afterwards; its name is only what it is called at launch.
+    """
+    marks = {unit_lookup.PRODUCTION_MARK: request.production.slug, unit_lookup.UNIT_MARK: request.identity.unit}
     argv = ["claude", "--model", director.model]
     if isinstance(director.effort, Effort):
         argv.extend(["--effort", director.effort.value])
@@ -564,75 +611,38 @@ def launch_session(request: UnitLaunch, tmux: str, director: DirectorAgent) -> N
     environment = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")}
     _ = subprocess.run(["systemd-run", "--user", "--scope", f"--unit={request.identity.session}", tmux,
                         "new-session", "-d", "-s", request.identity.session, "-c", str(cwd),
-                        "-e", f"SHOWRUNNER_UNIT={request.production.slug}", "zsh", "-ic", command],
+                        *(argument for name, value in marks.items() for argument in ("-e", f"{name}={value}")),
+                        "zsh", "-ic", command],
                        env=environment, text=True, capture_output=True, check=True)
 
 
-def wait_for_remote_control(request: UnitLaunch, tmux: str) -> None:
+def launched_unit(request: UnitLaunch) -> unit_lookup.MarkedUnit | None:
+    """The unit's tmux session, found by its mark."""
+    return unit_lookup.marked_units(request.production.slug).get(request.identity.unit)
+
+
+def wait_for_remote_control(request: UnitLaunch, tmux: str) -> unit_lookup.MarkedUnit:
+    launched = launched_unit(request)
+    if launched is None:
+        raise RuntimeError(f"{request.identity.unit}: no tmux session carries its mark")
     deadline = time.monotonic() + request.timeout
     pane = ""
     while True:
-        result = subprocess.run([tmux, "capture-pane", "-p", "-t", f"={request.identity.session}:"],
+        result = subprocess.run([tmux, "capture-pane", "-p", "-t", launched.pane],
                                 text=True, capture_output=True, check=False)
         pane = result.stdout if result.returncode == 0 else result.stderr
         if "/remote-control is active" in pane:
-            return
+            return launched
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             tail = "\n".join(pane.splitlines()[-15:])
-            raise RuntimeError(f"{request.identity.session}: /remote-control did not become active\n{tail}")
+            raise RuntimeError(f"{launched.label}: /remote-control did not become active\n{tail}")
         time.sleep(min(0.5, remaining))
-
-
-def update_old_prompt(request: UnitLaunch) -> None:
-    path = Path.home() / ".local/state/showrunner" / request.production.slug / "prompt.txt"
-    if not path.exists():
-        return
-    prompt = path.read_text(encoding="utf-8")
-    pattern = re.compile(r"unit_status\.sh\s+\S+\s+\S+(?P<units>[^|`\n]*)")
-    match = pattern.search(prompt)
-    if match is None or "--showrunner" in match.group(0):
-        return
-    units = shlex.split(match.group("units").strip())
-    if request.identity.session in units:
-        return
-    replacement = (match.group(0).rstrip() + " " + shlex.quote(request.identity.session)
-                   + match.group(0)[len(match.group(0).rstrip()):])
-    changed = prompt[:match.start()] + replacement + prompt[match.end():]
-    with tempfile.NamedTemporaryFile("w", dir=path.parent, prefix=".prompt-", delete=False,
-                                     encoding="utf-8") as temporary:
-        _ = temporary.write(changed)
-        temporary.flush()
-        os.fsync(temporary.fileno())
-        temporary_path = Path(temporary.name)
-    os.replace(temporary_path, path)
-
-
-def registry_has_unit(request: UnitLaunch) -> bool:
-    path = Path(os.environ.get("SHOWRUNNERS_CONFIG") or Path(__file__).resolve().parents[2] / "config/showrunners.json")
-    if not path.exists():
-        return False
-    for runner in showrunners.load_settings(path)["showrunners"]:
-        if runner["session"] == request.production.showrunner_session and runner["zone"] == request.production.zone.key:
-            for unit in runner["units"]:
-                if unit.name == request.identity.session:
-                    return not isinstance(request.plan, Standby) or isinstance(unit, showrunners.StandbyUnit)
-    return False
 
 
 def record(request: UnitLaunch) -> None:
     production = request.production
-    if not registry_has_unit(request):
-        script = Path(__file__).resolve().parent / "showrunners.py"
-        command = [sys.executable, str(script), "add", production.showrunner_session,
-                   "--zone", production.zone.key, "--unit", request.identity.session]
-        if isinstance(request.plan, Standby):
-            command.append("--standby")
-        _ = subprocess.run(command,
-                           text=True, capture_output=True, check=True)
-    update_old_prompt(request)
-    log_line = (f"added {request.identity.unit} ({request.mode_name}), tmux {request.identity.session}, "
-                f"worktree {request.worktree}")
+    log_line = f"added {request.identity.unit} ({request.mode_name}), worktree {request.worktree}"
     if production.log.exists() and any(log_line in line for line in production.log.read_text(encoding="utf-8").splitlines()):
         return
     stamp = datetime.now(production.zone).strftime("%H:%M %Z")
@@ -660,17 +670,20 @@ def main(argv: list[str]) -> int:
         request = ready.launch
         if cast(bool, args.check):
             return 0
-        tmux = tmux_binary()
-        if tmux_live(tmux, request.identity.session) and isinstance(ready.row, NoUnitRow):
-            raise Refusal(f"tmux session {request.identity.session} is already live")
+        tmux = unit_lookup.tmux_binary()
+        already_launched = launched_unit(request) is not None
+        if not already_launched and tmux_live(tmux, request.identity.session):
+            raise Refusal(f"tmux session {request.identity.session} is already live and is not marked as "
+                          + request.identity.unit)
         write_stub(request)
         append_row(request, ready.row)
-        commit_and_push(request)
+        commit_unit(request)
         ensure_worktree(request)
-        launch_session(request, tmux, ready.director)
-        wait_for_remote_control(request, tmux)
+        if not already_launched:
+            launch_session(request, tmux, ready.director)
+        launched = wait_for_remote_control(request, tmux)
         record(request)
-        print(f"{request.identity.unit} started: tmux attach -t {request.identity.session}")
+        print(f"{request.identity.unit} started: tmux attach -t {launched.label}")
         return 0
     except Refusal as error:
         print(f"add_unit: {error}", file=sys.stderr)

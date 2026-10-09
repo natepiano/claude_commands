@@ -16,7 +16,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from agent_accounts import Report
-from quota_alert import PROTOCOL, load_config, recipients, relay
+from quota_alert import PROTOCOL, load_config, recipients, relay, showrunners_now
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 import escalate  # noqa: E402
@@ -40,7 +40,7 @@ def watch(reports: list[Report]) -> list[str]:
                 lines.append(f"5-hour limit: {report.tool} is back above {THRESHOLD}%")
             continue
         config = load_config()
-        zone = ZoneInfo(next((runner["zone"] for runner in config["showrunners"]), "UTC"))
+        zone = ZoneInfo(next((runner["zone"] for runner in showrunners_now()), "UTC"))
         resets = f"; it resets at {window.resets_at.astimezone(zone):%H:%M %Z}" if window.resets_at else ""
         news = f"{report.tool} has {left:.0f}% of its 5-hour limit left{resets}."
         if not escalate.hold(key, f"{report.tool} 5-hour limit", news, ESCALATE_MINUTES):

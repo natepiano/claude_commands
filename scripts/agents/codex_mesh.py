@@ -64,6 +64,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TextIO, TypedDict, cast, final
 
 SERVER_FILE = "mesh_server.json"
+SERVER_LOG = "mesh_server.log"
 ROSTER_FILE = "mesh_roster.json"
 # Servers dropped by _retire_server, kept so `stop` can still reap them. A
 # retired server is abandoned rather than signalled: it may still be finishing a
@@ -84,6 +85,12 @@ RESIDENT_POLL_SECS = 1.0
 # cached, without a round trip, so it fails in seconds; a refusal that travelled
 # to the provider and back does not arrive this quickly and this consistently.
 RETRY_FAST_FAILURE_SECS = 120.0
+# The provider's words for an account with no allowance or credits left to spend.
+QUOTA_REFUSAL = "hit your usage limit"
+# agent_notes.py's `blocked` verb moves Codex work to Claude; one switch took 8 s
+# and one relay 9 s when measured, and the relays run in parallel.
+QUOTA_REPORT = Path(__file__).resolve().parent.parent / "whoami" / "agent_notes.py"
+QUOTA_REPORT_TIMEOUT_SECS = 120
 CAPACITY_WAIT_SECS = 30.0
 CAPACITY_MAX_WAIT_SECS = 300.0
 CAPACITY_BUDGET_SECS = 1200.0
@@ -777,6 +784,30 @@ def _retire_server(session_dir: str, port: int) -> bool:
         return True
 
 
+def _start_watcher(session_dir: str, pid: int, port: int) -> subprocess.Popen[bytes]:
+    """Leave a sleeping shell behind that has the server stop itself once nothing uses it.
+
+    The server is detached so it outlives each delegate, and only a run's end step stops one; a
+    run folder that never reaches that step kept its server for good. The shell wakes every
+    WATCH_WAKE_SECS, and only when the record has gone SERVER_IDLE_SECS without a touch does it
+    run `idle-stop`, which stops the server or touches the record. Its cost is a shell and a
+    `sleep`, under 1 MB of their own memory, one `find` per wake, and one short Python run about
+    twice an hour while the server is in use. It leaves with the server.
+    """
+    script = (
+        'while kill -0 "$1" 2>/dev/null; do sleep "$5"; '
+        + '[ -n "$(find "$3/$6" -mmin "-$7" 2>/dev/null)" ] && continue; '
+        + '"$4" "$0" idle-stop --session-dir "$3" --pid "$1" --port "$2" && exit 0; done'
+    )
+    return subprocess.Popen(
+        ["sh", "-c", script, str(Path(__file__).resolve()), str(pid), str(port),
+         str(Path(session_dir).resolve()), sys.executable, str(WATCH_WAKE_SECS), SERVER_FILE,
+         str(int(SERVER_IDLE_SECS // 60))],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
 def ensure_server(session_dir: str) -> tuple[int, bool]:
     """This session's app-server port, and whether this call is what started it.
 
@@ -791,10 +822,12 @@ def ensure_server(session_dir: str) -> tuple[int, bool]:
         port = record.get("port")
         pid = record.get("pid")
         if isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid):
+            # The record's change time is when the server was last used; its watcher reads it.
+            os.utime(path)
             return port, False
 
         chosen = _free_port()
-        log_path = _session_path(session_dir, "mesh_server.log")
+        log_path = _session_path(session_dir, SERVER_LOG)
         with log_path.open("ab") as log_handle:
             process = subprocess.Popen(
                 ["codex", "app-server", "--listen", f"ws://127.0.0.1:{chosen}"],
@@ -816,6 +849,7 @@ def ensure_server(session_dir: str) -> tuple[int, bool]:
             probe.close()
             served: ServerRecord = {"port": chosen, "pid": process.pid}
             _ = path.write_text(json.dumps(served, indent=2), encoding="utf-8")
+            _ = _start_watcher(session_dir, process.pid, chosen)
             return chosen, True
         raise SystemExit(f"codex_mesh: app-server did not accept connections on {chosen}")
 
@@ -1017,6 +1051,35 @@ def _retry_warranted(outcome: RunOutcome, fresh_server: bool, resident: bool) ->
     )
 
 
+def _quota_refused(outcome: RunOutcome, tested: bool, resident: bool) -> bool:
+    """Whether the provider itself turned this run away for quota.
+
+    A wedged app-server replays a usage limit it cached, so the words count only
+    from a server this launcher started or retried on, or from a run long enough
+    to have reached the provider. A resident's clock spans many turns and proves
+    nothing about the last one.
+    """
+    return (
+        isinstance(outcome, (FailedBeforeThread, FailedWithThread))
+        and QUOTA_REFUSAL in outcome.failure
+        and (tested or (not resident and outcome.seconds > RETRY_FAST_FAILURE_SECS))
+    )
+
+
+def _report_quota_refusal(name: str) -> None:
+    """Hand a proven refusal to the quota alert, which decides whether Codex work moves to Claude."""
+    try:
+        done = subprocess.run(
+            [sys.executable, str(QUOTA_REPORT), "blocked"],
+            capture_output=True, text=True, timeout=QUOTA_REPORT_TIMEOUT_SECS, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"codex_mesh: {name}: quota refusal not reported: {exc}", file=sys.stderr)
+        return
+    for line in (done.stdout + done.stderr).splitlines():
+        print(f"codex_mesh: {name}: quota: {line}", file=sys.stderr)
+
+
 def command_start(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
@@ -1074,6 +1137,7 @@ def command_start(args: argparse.Namespace) -> int:
                 return 2
     port, fresh_server = ensure_server(session_dir)
     outcome = _run_delegate(args, port)
+    tested = fresh_server
     if _retry_warranted(outcome, fresh_server, resident):
         _ = _retire_server(session_dir, port)
         port, _fresh = ensure_server(session_dir)
@@ -1083,8 +1147,11 @@ def command_start(args: argparse.Namespace) -> int:
         print(f"codex_mesh: {name}: {note} the provider; retrying on a new one",
               file=sys.stderr)
         outcome = _run_delegate(args, port)
+        tested = True
     if isinstance(outcome, (FailedBeforeThread, FailedWithThread)):
         print(f"codex_mesh: {name}: {outcome.failure}", file=sys.stderr)
+        if _quota_refused(outcome, tested, resident):
+            _report_quota_refusal(name)
         return 1
     if isinstance(outcome, CapacityRetriesExhausted):
         print(f"codex_mesh: {name}: {outcome.message(name)}", file=sys.stderr)
@@ -1562,6 +1629,18 @@ def _end_unwatched_turn(
     return RelaunchAllowed()
 
 
+def _load_thread(client: Client, thread_id: str) -> None:
+    """Reopen a conversation this server has not loaded.
+
+    A server started after the last one stopped accepts a queued message for a thread it has not
+    loaded and never runs it. The first page of the list is enough: reopening a loaded thread is
+    what every `follow` does.
+    """
+    loaded = _as_dict(client.call("thread/loaded/list", {}).get("result")).get("data")
+    if not isinstance(loaded, list) or thread_id not in cast("list[object]", loaded):
+        _ = _require(client.call("thread/resume", {"threadId": thread_id}), "thread/resume")
+
+
 def command_send(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     target = _as_str(_attr(args, "to"))
@@ -1590,6 +1669,7 @@ def command_send(args: argparse.Namespace) -> int:
         port, _fresh = ensure_server(session_dir)
         client = Client(port, f"send-{os.getpid()}")
         try:
+            _load_thread(client, record["thread_id"])
             _ = _require(
                 client.call(
                     "thread/queue/add",
@@ -1840,6 +1920,285 @@ def _reap(pid: int) -> bool:
     return True
 
 
+# Where the run-active markers live.
+SWEEP_ROOT = Path("/tmp/claude/delegate")
+# How long a server and its run folder must have sat untouched before it counts as unused: the
+# one figure behind both the server's own watcher and the sweep.
+SERVER_IDLE_SECS = 1800.0
+# How often a server's watcher wakes to look at its record.
+WATCH_WAKE_SECS = 300
+# Files in a run folder whose change means the run is still working. `ensure_server` touches the
+# server's record on every use.
+SWEEP_ACTIVITY_FILES = ("heartbeat.log", "board.log", ROSTER_FILE, SERVER_LOG, SERVER_FILE)
+SERVER_COMMAND = "codex app-server --listen ws://127.0.0.1:"
+
+
+@dataclass(frozen=True)
+class ServerInUse:
+    reason: str
+
+
+@dataclass(frozen=True)
+class ServerUnused:
+    reason: str
+
+
+@dataclass(frozen=True)
+class ServerUnknown:
+    """Nothing proves it idle, so it is left alone like one in use."""
+
+    reason: str
+
+
+SweepVerdict = ServerInUse | ServerUnused | ServerUnknown
+
+
+@dataclass(frozen=True)
+class ServerFacts:
+    """What the sweep gathered about one running app-server without talking to it."""
+
+    pid: int
+    port: int
+    age_secs: float
+    clients: int
+    # The run folder that started it; None when its log handle names none.
+    session_dir: Path | None
+    folder_exists: bool
+    marked_active: bool
+    # Seats in the run folder's roster whose launcher process is alive.
+    live_launchers: tuple[str, ...]
+    # Seconds since the run folder's newest activity file changed; None when it has none.
+    quiet_secs: float | None
+
+
+def _sweep_verdict(facts: ServerFacts, busy_threads: Callable[[], tuple[str, ...]]) -> SweepVerdict:
+    """Whether anything still needs this app-server. Every doubt counts as in use, and the server
+    is asked about its conversations last, so none can be called unused without that answer."""
+    if facts.clients:
+        return ServerInUse(f"{facts.clients} client connection(s) on its port")
+    if facts.session_dir is None:
+        return ServerUnknown("its log names no run folder, so this launcher did not start it")
+    if facts.live_launchers:
+        # A resident seat waits between turns with nothing on the socket.
+        return ServerInUse("a seat's launcher is still running: " + ", ".join(facts.live_launchers))
+    if facts.marked_active:
+        return ServerInUse("its run has an active marker")
+    if facts.age_secs < SERVER_IDLE_SECS:
+        return ServerInUse(f"started {facts.age_secs / 60:.0f} min ago")
+    if facts.quiet_secs is not None and facts.quiet_secs < SERVER_IDLE_SECS:
+        return ServerInUse(f"its run folder changed {facts.quiet_secs / 60:.0f} min ago")
+    if busy := busy_threads():
+        return ServerInUse("a conversation is not idle: " + "; ".join(busy))
+    if not facts.folder_exists:
+        folder = "its run folder was deleted"
+    else:
+        folder = "no activity file" if facts.quiet_secs is None else f"quiet for {facts.quiet_secs / 3600:.1f} h"
+    return ServerUnused(f"no client, no launcher, no active marker, no conversation mid-turn, {folder}")
+
+
+def _running_servers() -> list[tuple[int, int, float]]:
+    """(pid, port, age in seconds) of every app-server listening on loopback."""
+    listed = subprocess.run(["ps", "-eo", "pid=,etimes=,args="], capture_output=True, text=True, check=True)
+    servers: list[tuple[int, int, float]] = []
+    for line in listed.stdout.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) < 3:
+            continue
+        _head, found, port = fields[2].partition(SERVER_COMMAND)
+        if found and port.isdigit() and fields[0].isdigit() and fields[1].isdigit():
+            servers.append((int(fields[0]), int(port), float(fields[1])))
+    return servers
+
+
+def _client_counts() -> dict[int, int]:
+    """Established connections per local port. A server's clients land on its own port."""
+    listed = subprocess.run(["ss", "-Htn", "state", "established"], capture_output=True, text=True, check=True)
+    counts: dict[int, int] = {}
+    for line in listed.stdout.splitlines():
+        fields = line.split()
+        port = fields[2].rpartition(":")[2] if len(fields) >= 4 else ""
+        if port.isdigit():
+            counts[int(port)] = counts.get(int(port), 0) + 1
+    return counts
+
+
+def _server_folder(pid: int) -> Path | None:
+    """The run folder that started this server: `ensure_server` points its stderr at that folder's
+    log, and the handle outlives a rewritten record or a deleted folder. None when it names no such log."""
+    try:
+        target = os.readlink(f"/proc/{pid}/fd/2")
+    except OSError:
+        return None
+    log = Path(target.removesuffix(" (deleted)"))
+    return log.parent if log.name == SERVER_LOG else None
+
+
+def _marked_active(root: Path, folder: Path) -> bool:
+    """Whether a run-active marker names `folder`. A marker that cannot be read counts as naming it."""
+    active = root / "active"
+    for marker in sorted(active.iterdir()) if active.is_dir() else []:
+        try:
+            lines = marker.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return True
+        if lines and lines[0].strip() and Path(lines[0].strip()).resolve() == folder.resolve():
+            return True
+    return False
+
+
+def _quiet_secs(folder: Path, now: float) -> float | None:
+    changed = [(folder / name).stat().st_mtime for name in SWEEP_ACTIVITY_FILES if (folder / name).exists()]
+    return now - max(changed) if changed else None
+
+
+def _live_launchers(folder: Path) -> tuple[str, ...]:
+    roster = _read_json_object(folder / ROSTER_FILE)
+    return tuple(
+        name
+        for name, entry in sorted(roster.items())
+        for pid in [_as_dict(entry).get("launcher_pid")]
+        if isinstance(pid, int) and _pid_alive(pid)
+    )
+
+
+def _roster_threads(folder: Path) -> dict[str, str]:
+    """Thread id to seat name for every conversation the run folder's roster lists."""
+    roster = _read_json_object(folder / ROSTER_FILE)
+    named = {_as_str(_as_dict(entry).get("thread_id")): name for name, entry in sorted(roster.items())}
+    return {thread_id: name for thread_id, name in named.items() if thread_id}
+
+
+def _busy_threads(port: int, seats: dict[str, str]) -> tuple[str, ...]:
+    """Conversations on this server that are not idle, or why they could not be read.
+
+    The server lists what it has loaded, so a turn left running by a launcher killed at its time
+    limit is seen with no client connected and no roster. `seats` adds the roster's conversations
+    and names them."""
+    try:
+        client = Client(port, f"sweep-{os.getpid()}")
+    except (ConnectionError, OSError, SystemExit) as exc:
+        return (f"the server could not be asked ({str(exc) or exc.__class__.__name__})",)
+    try:
+        listed = client.call("thread/loaded/list", {})
+        result = _as_dict(listed.get("result"))
+        loaded = result.get("data")
+        if listed.get("error") or not isinstance(loaded, list) or result.get("nextCursor"):
+            return ("its loaded conversations could not be listed in full",)
+        thread_ids = {*seats, *(_as_str(thread_id) for thread_id in cast("list[object]", loaded))} - {""}
+        busy: list[str] = []
+        for thread_id in sorted(thread_ids):
+            state = _read_live_turn(client, thread_id)
+            if not isinstance(state, ThreadIdle):
+                busy.append(f"{seats.get(thread_id, thread_id)}: {state.__class__.__name__}")
+        return tuple(busy)
+    except (ConnectionError, OSError, SystemExit) as exc:
+        return (f"the server stopped answering ({str(exc) or exc.__class__.__name__})",)
+    finally:
+        client.close()
+
+
+def _judge(root: Path | None, pid: int, port: int, age: float,
+           clients: int) -> tuple[SweepVerdict, Path | None]:
+    """The verdict on one running app-server, and the run folder that started it.
+
+    `root` holds the run-active markers. A server judging itself passes None: a stopped server
+    comes back at the next use, so a run that is only between dispatches does not need it kept.
+    """
+    folder = _server_folder(pid)
+    exists = folder is not None and folder.is_dir()
+    facts = ServerFacts(
+        pid, port, age, clients, folder, exists,
+        marked_active=root is not None and folder is not None and _marked_active(root, folder),
+        live_launchers=_live_launchers(folder) if folder is not None and exists else (),
+        quiet_secs=_quiet_secs(folder, time.time()) if folder is not None and exists else None,
+    )
+    seats = _roster_threads(folder) if folder is not None and exists else {}
+    return _sweep_verdict(facts, lambda: _busy_threads(port, seats)), folder
+
+
+def _stop_unused(root: Path | None, pid: int, port: int, folder: Path) -> bool:
+    """Stop a server a first look called unused, if a second look at this moment agrees.
+
+    The second look runs under the run folder's server lock, so a launcher reaching
+    `ensure_server` meanwhile waits and then starts a server of its own. A deleted folder has no
+    launcher to wait and is not created again for the lock."""
+    with _server_lock(str(folder)) if folder.is_dir() else contextlib.nullcontext():
+        try:
+            running = {(found, at): age for found, at, age in _running_servers()}
+            clients = _client_counts()
+        except (OSError, subprocess.CalledProcessError):
+            return False
+        # A pid that no longer runs this server on this port is not the process that was judged.
+        age = running.get((pid, port))
+        if age is None:
+            return False
+        verdict, _folder = _judge(root, pid, port, age, clients.get(port, 0))
+        if not isinstance(verdict, ServerUnused) or not _reap(pid):
+            return False
+        record = folder / SERVER_FILE
+        if _read_json_object(record).get("pid") == pid:
+            record.unlink(missing_ok=True)
+        return True
+
+
+def command_idle_stop(args: argparse.Namespace) -> int:
+    """Stop this run folder's app-server if nothing uses it. Its watcher runs this.
+
+    Exit 0 tells the watcher to leave: the server was stopped here, or no longer runs. Exit 1
+    keeps it watching. A server that is kept has its record touched, so the watcher sleeps through
+    the next SERVER_IDLE_SECS before it asks again. Any doubt keeps the server, as in the sweep.
+    """
+    folder = Path(_as_str(_attr(args, "session_dir")))
+    pid, port = _as_int(_attr(args, "pid")), _as_int(_attr(args, "port"))
+    record = folder / SERVER_FILE
+    try:
+        running = {(found, at): age for found, at, age in _running_servers()}
+        clients = _client_counts()
+    except (OSError, subprocess.CalledProcessError):
+        running, clients = None, {}
+    if running is not None:
+        age = running.get((pid, port))
+        if age is None:
+            return 0
+        verdict, _folder = _judge(None, pid, port, age, clients.get(port, 0))
+        if isinstance(verdict, ServerUnused) and _stop_unused(None, pid, port, folder):
+            with contextlib.suppress(OSError), (folder / SERVER_LOG).open("a", encoding="utf-8") as log:
+                _ = log.write(f"[{_now_stamp()}] mesh: app-server {pid} stopped itself: {verdict.reason}\n")
+            return 0
+    if _read_json_object(record).get("pid") == pid:
+        with contextlib.suppress(OSError):
+            os.utime(record)
+    return 1
+
+
+def command_sweep(args: argparse.Namespace) -> int:
+    """Print every running app-server with whether anything still needs it. Stops one only
+    under `--stop`, and then only a server two looks in a row called unused."""
+    root = Path(_as_str(_attr(args, "root")) or SWEEP_ROOT)
+    stop = _attr(args, "stop") is True
+    try:
+        servers, clients = _running_servers(), _client_counts()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"codex_mesh: sweep: cannot list servers or connections ({exc}); nothing judged", file=sys.stderr)
+        return 1
+    unused = stopped = 0
+    for pid, port, age in sorted(servers):
+        verdict, folder = _judge(root, pid, port, age, clients.get(port, 0))
+        label = {ServerInUse: "in use", ServerUnused: "unused", ServerUnknown: "unknown"}[type(verdict)]
+        reason = verdict.reason
+        if isinstance(verdict, ServerUnused) and folder is not None:
+            unused += 1
+            if stop and _stop_unused(root, pid, port, folder):
+                stopped += 1
+                label = "stopped"
+            elif stop:
+                label, reason = "kept", "unused at the first look, not stopped at the second"
+        print(f"{pid}\t{port}\t{label}\t{reason}\t{folder or '-'}")
+    tail = f"{stopped} stopped" if stop else "report only, nothing was stopped"
+    print(f"{len(servers)} app-server(s), {unused} unused; {tail}")
+    return 0
+
+
 def command_serve(args: argparse.Namespace) -> int:
     port, _fresh = ensure_server(_as_str(_attr(args, "session_dir")))
     print(port)
@@ -1928,6 +2287,17 @@ def main(argv: list[str] | None = None) -> int:
     stop = subparsers.add_parser("stop", help="stop the session app-server")
     _ = stop.add_argument("--session-dir", required=True)
     stop.set_defaults(handler=command_stop)
+
+    idle_stop = subparsers.add_parser("idle-stop", help="stop this session's app-server if nothing uses it")
+    _ = idle_stop.add_argument("--session-dir", required=True)
+    _ = idle_stop.add_argument("--pid", type=int, required=True)
+    _ = idle_stop.add_argument("--port", type=int, required=True)
+    idle_stop.set_defaults(handler=command_idle_stop)
+
+    sweep = subparsers.add_parser("sweep", help="report app-servers nothing is using")
+    _ = sweep.add_argument("--root", default="")
+    _ = sweep.add_argument("--stop", action="store_true", help="stop each server two looks in a row call unused")
+    sweep.set_defaults(handler=command_sweep)
 
     roster = subparsers.add_parser("list", help="print the delegate roster")
     _ = roster.add_argument("--session-dir", required=True)

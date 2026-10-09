@@ -88,8 +88,8 @@ It prints a `# set …` or `# cleared …` line, then `/agent <function>` output
 /agent module_review                      show just module_review's rows
 /agent claude                             every function switches to the claude family
 /agent gpt-6-sol                          every function on gpt-6-sol (codex), efforts kept
-/agent delegate gpt-6-sol                 /unit:delegate on gpt-6-sol, efforts kept
-/agent delegate claude                    /unit:delegate switches to the claude family
+/agent delegate gpt-6-sol                 /unit:direct on gpt-6-sol, efforts kept
+/agent delegate claude                    /unit:direct switches to the claude family
 /agent delegate.review gpt-5.6-sol:max     set agent and effort for one subtask
 /agent cli.commit_prep sonnet             set agent, keep the CLI default effort
 /agent delegate fast                      every codex delegate row on the fast tier

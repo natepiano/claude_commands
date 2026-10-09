@@ -1,17 +1,17 @@
 ---
-description: Run the end-of-run style audit over a delegate run's branch.
+description: Run the end-of-run style audit over a /unit:direct run's branch.
 ---
 
-# Delegate — style review
+# Direct — style review
 
 **Usage:** `/unit:style_review`
 
 Type this when a run reached its end without the style audit, or when you want
 the audit re-run over the project's branch. It runs inside the current session
 and already knows the mode, the diff base, and what was committed. If no
-delegate run is active, say so in one line and stop.
+`/unit:direct` run is active, say so in one line and stop.
 
-`/unit:delegate` reads this file twice: `<ResolveStyleDiffBase/>` once before the
+`/unit:direct` reads this file twice: `<ResolveStyleDiffBase/>` once before the
 first dispatch, and `<RunProjectStyleReview/>` once at the end of the run. Both
 are defined here in full. Never work from memory of an earlier read — the
 `purpose_built=false` question and the after-cleanup reverification are the parts

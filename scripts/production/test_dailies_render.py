@@ -694,6 +694,32 @@ class EtaResolutionTests(unittest.TestCase):
         self.assertIn("widget-enhancements Phase 2 of 3 19:35 PDT, 60% done", logged)
         self.assertNotIn("tomorrow", logged)
 
+    def test_an_eta_stated_again_a_day_later_with_the_same_clock_is_read_on_its_new_day(self) -> None:
+        fields = report(held=False)
+        current = {**unit(False), "eta": {"time": "16:00", "percent": 60, "stated": "2026-10-05T09:30",
+                                          "why": "the fix needed a second day"}}
+        fields["units"] = [current]
+        previous = {
+            "phase": current["phase"],
+            "eta": "2026-10-04T16:00:00",
+            "eta_text": "16:00",
+            "held": None,
+            "first": "2026-10-04T16:00:00",
+        }
+        result, saved, _ = self.run_with_state(fields, previous, "2026-10-05T10:00")
+        self.assertEqual(result.code, 0, result.error)
+        self.assertEqual(cast(dict[str, object], saved["widget-enhancements"])["eta"], "2026-10-05T16:00:00")
+        self.assertIn("- eta: 16:00 PDT, 60% done (changed: +24:00 because the fix needed a second day)",
+                      result.lines)
+
+    def test_a_passed_etas_range_stays_on_the_etas_day(self) -> None:
+        fields = report(held=False)
+        fields["units"] = [{**unit(False), "eta": {"time": "10:00", "earliest": "09:40", "latest": "10:30",
+                                                   "percent": 60, "stated": "2026-10-04T09:00"}}]
+        result = render(fields, "2026-10-04T14:00")
+        self.assertEqual(result.code, 0, result.error)
+        self.assertIn("- eta: 10:00 PDT, 60% done (overdue; range 09:40–10:30)", result.lines)
+
     def test_state_without_eta_text_resolves_as_a_first_report(self) -> None:
         fields = report(held=False)
         current = {**unit(False), "eta": {"time": "19:35", "percent": 60}}
@@ -808,6 +834,70 @@ class StatePreflightTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             result = check_render_state(fields, Path(scratch) / "missing-state.json", AT)
         self.assertIsInstance(result, StateClear)
+
+
+class GanttTests(unittest.TestCase):
+    """The default length: the chart, with only what needs the user and what changed above it."""
+
+    def gantt(self, units: list[dict[str, object]], state: dict[str, dict[str, object]] | None = None) -> Run:
+        fields: dict[str, object] = {"length": "gantt", "zone": ZONE, "units": units, "next_run": "11:30"}
+        with tempfile.TemporaryDirectory() as scratch:
+            input_path = Path(scratch) / "dailies_input.json"
+            state_path = Path(scratch) / "dailies_state.json"
+            _ = input_path.write_text(json.dumps(fields), encoding="utf-8")
+            _ = state_path.write_text(json.dumps(state or {}), encoding="utf-8")
+            return run([str(input_path), "--at", AT, "--state", str(state_path)], scratch)
+
+    def above_chart(self, result: Run) -> list[str]:
+        self.assertEqual(result.code, 0, result.error)
+        self.assertEqual(result.lines[0], "**Dailies (Gantt)**, 11:00 PDT")
+        return [line for line in result.lines[1:result.lines.index(FENCE)] if line]
+
+    def last_report(self, **changed: object) -> dict[str, object]:
+        """What the last report saved for the one unit, with `changed` fields put in."""
+        return {"phase": unit(False)["phase"], "eta": "2026-10-04T12:40:00", "eta_text": "12:40", "held": None,
+                "first": "2026-10-04T12:40:00", **changed}
+
+    def test_a_gantt_report_is_the_chart_and_the_last_lines_of_a_simple_one(self) -> None:
+        result = self.gantt([unit(False)])
+        self.assertEqual(self.above_chart(result), [])
+        simple = render(report(held=False))
+        self.assertEqual(simple.code, 0, simple.error)
+        self.assertEqual(timeline(result.lines), timeline(simple.lines))
+        self.assertEqual(after_timeline(result.lines), after_timeline(simple.lines))
+
+    def test_a_subject_that_needs_the_user_keeps_its_section_above_the_chart(self) -> None:
+        asking = {**unit(False, needed="choose the wording of the label"), "needs_user": True}
+        above = self.above_chart(self.gantt([asking]))
+        self.assertEqual(above[0], f"### widget-enhancements: {asking['project']}")
+        self.assertIn("- needed: choose the wording of the label", above)
+
+    def test_a_unit_with_nothing_changed_since_its_last_report_has_no_line(self) -> None:
+        self.assertEqual(self.above_chart(self.gantt([unit(False)], {"widget-enhancements": self.last_report()})), [])
+
+    def test_each_change_since_the_last_report_is_one_line_above_the_chart(self) -> None:
+        moved = {**unit(False), "eta": {"time": "12:40", "percent": 60, "why": "the fix needed a second pass"}}
+        name = "widget-enhancements"
+        last = self.last_report(eta="2026-10-04T12:13:00", eta_text="12:13", held="the panel check needs repair")
+        self.assertEqual(self.above_chart(self.gantt([moved], {"widget-enhancements": last})), [
+            f"- {name}: checkpoint no longer held",
+            f"- {name}: eta 12:40 PDT, 60% done (changed: +0:27 because the fix needed a second pass)",
+        ])
+        held = {**unit(False), "held": "the panel check needs repair"}
+        earlier_phase = self.last_report(phase="Phase 1 of 3: labels are named")
+        self.assertEqual(self.above_chart(self.gantt([held], {"widget-enhancements": earlier_phase})), [
+            f"- {name}: now on {held['phase']}",
+            f"- {name}: checkpoint not merged, because the panel check needs repair",
+        ])
+
+    def test_an_eta_that_moved_less_than_a_quarter_hour_has_no_line(self) -> None:
+        moved = {**unit(False), "eta": {"time": "12:40", "percent": 60, "why": "one more test run"}}
+        last = self.last_report(eta="2026-10-04T12:30:00", eta_text="12:30")
+        self.assertEqual(self.above_chart(self.gantt([moved], {"widget-enhancements": last})), [])
+
+    def test_a_unit_the_last_report_had_and_this_one_lacks_is_named(self) -> None:
+        state = {"widget-enhancements": self.last_report(), "retired-unit": self.last_report()}
+        self.assertEqual(self.above_chart(self.gantt([unit(False)], state)), ["- retired-unit: no longer in the report"])
 
 
 if __name__ == "__main__":

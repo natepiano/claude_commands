@@ -63,7 +63,12 @@ from run_out import READINGS_LOG, Reading
 from build_hold import ActiveHolders, HoldState, KnownReleaseEta, NoHolders, Holder, ReleaseRecordReadError, cycle_status_lines, holder_directory, read_cycle, read_holders, release_record_error_line
 from mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
 
-LENGTHS = {"simple": 240, "page": 480, "elaborate": None}
+# The longest update line of each length. `gantt` is the default: the chart, with only what needs the user and
+# what changed above it. It takes the input `simple` takes.
+LENGTHS = {"gantt": 240, "simple": 240, "page": 480, "elaborate": None}
+SHORT_LENGTHS = ("gantt", "simple")
+# A gantt report names an ETA that moved by at least this many minutes since the last report.
+MAJOR_ETA_MINUTES = 15
 PHASE = re.compile(r"^(?:Phase (\d+) of (\d+)|follow-up (\d+) of (\d+)): \S")
 TIME = re.compile(r"^\d{1,2}:\d{2}(?:\+\d+)?$")
 NONE = ("none measured - requested", "none measured", "no ETA stated yet")
@@ -142,16 +147,38 @@ class InputError(Exception):
 
 
 @dataclass(frozen=True)
-class Eta:
-    time: str | None
-    earliest: str | None
-    latest: str | None
-    none: str | None
-    detail: str | None
+class EtaRange:
+    """The earliest and latest the stated time may turn out to be, as clock texts."""
+
+    earliest: str
+    latest: str
+
+
+@dataclass(frozen=True)
+class TimedEta:
+    """A stated time. `spread`, `percent`, `why`, `detail` and `first` are each `None` when the input states none."""
+
+    time: str
+    spread: EtaRange | None
     percent: int | None
     why: str | None
+    detail: str | None
+    # The phase's first ETA, and the fix rounds added since it.
     first: datetime | None
     fixes: int
+    # When the unit stated this time, as the builder first saw it. `None` in an input written by hand.
+    stated: datetime | None
+
+
+@dataclass(frozen=True)
+class NoEta:
+    """No stated time, and the reason the report prints in its place."""
+
+    reason: str
+    detail: str | None
+
+
+Eta = TimedEta | NoEta
 
 
 @dataclass(frozen=True)
@@ -346,10 +373,11 @@ def parse_time(text: str, now: datetime) -> datetime:
 
 
 def parse_range_end(text: str, now: datetime, eta: datetime, *, earliest: bool) -> datetime:
-    """A range end, on the day that keeps it on its side of the ETA: earliest at or before, latest at or after."""
-    moment = parse_time(text, now)
+    """A range end, on the ETA's day or the one next to it that keeps it on its side: earliest at or before, latest at or after. `+N` counts days from the report."""
     if "+" in text:
-        return moment
+        return parse_time(text, now)
+    hour_text, minute_text = text.split(":")
+    moment = eta.replace(hour=int(hour_text), minute=int(minute_text), second=0, microsecond=0)
     if earliest and moment > eta:
         return moment - timedelta(days=1)
     if not earliest and moment < eta:
@@ -562,7 +590,7 @@ def clock_text(fields: JsonMap, key: str, where: str) -> str | None:
 
 def parse_eta(value: object, where: str) -> Eta:
     fields = as_map(value, where)
-    check_keys(fields, {"time", "earliest", "latest", "none", "detail", "percent", "why", "first", "fixes"}, where)
+    check_keys(fields, {"time", "earliest", "latest", "none", "detail", "percent", "why", "first", "fixes", "stated"}, where)
     time = clock_text(fields, "time", where)
     earliest = clock_text(fields, "earliest", where)
     latest = clock_text(fields, "latest", where)
@@ -598,7 +626,19 @@ def parse_eta(value: object, where: str) -> Eta:
         raise InputError(f"{where}.fixes: the fix rounds added since the first ETA, a whole number from 0")
     if time is None and (first is not None or fixes):
         raise InputError(f"{where}: first and fixes only with a time")
-    return Eta(time, earliest, latest, none, detail, percent, why, first, fixes)
+    stated_text = optional_text(fields, "stated", where)
+    try:
+        stated = datetime.fromisoformat(stated_text) if stated_text is not None else None
+    except ValueError:
+        raise InputError(f"{where}.stated: when the ETA was stated, as YYYY-MM-DDTHH:MM") from None
+    if time is None and stated is not None:
+        raise InputError(f"{where}.stated: only with a time")
+    if none is not None:
+        return NoEta(none, detail)
+    if time is None:
+        raise InputError(f"{where}: give exactly one of time or none")
+    spread = EtaRange(earliest, latest) if earliest is not None and latest is not None else None
+    return TimedEta(time, spread, percent, why, detail, first, fixes, stated)
 
 
 def measure(fields: JsonMap, key: str, where: str) -> float:
@@ -955,15 +995,22 @@ def same_phase(previous: str, current: str) -> bool:
 
 
 def resolve_eta_moment(unit: Unit, previous: Previous, now: datetime) -> ResolvedEta:
-    """Resolve this report's ETA once, preserving an unchanged same-phase moment."""
-    if unit.eta.time is None:
+    """Resolve this report's ETA once: from the moment it was stated, else preserving an unchanged same-phase moment."""
+    eta = unit.eta
+    if isinstance(eta, NoEta):
         return NoResolvedEtaMoment()
+    # A time that names no day is read on the day it was stated. That comes before the last report's
+    # moment: the same clock stated again a day later is a new time. `+N` counts days from the report,
+    # as the builder writes it.
+    if eta.stated is not None and "+" not in eta.time:
+        stated = eta.stated if eta.stated.tzinfo is not None else eta.stated.replace(tzinfo=now.tzinfo)
+        return ResolvedEtaMoment(parse_time(eta.time, stated))
     if (isinstance(previous, LastUnitReport)
             and same_phase(previous.phase, unit.phase)
             and isinstance(previous.eta, LastReportedEta)
-            and previous.eta.text == unit.eta.time):
+            and previous.eta.text == eta.time):
         return ResolvedEtaMoment(previous.eta.moment)
-    return ResolvedEtaMoment(parse_time(unit.eta.time, now))
+    return ResolvedEtaMoment(parse_time(eta.time, now))
 
 
 def resolve_eta_moments(report: Report, previous: dict[str, LastUnitReport],
@@ -975,7 +1022,7 @@ def resolve_eta_moments(report: Report, previous: dict[str, LastUnitReport],
 
 def first_eta(unit: Unit, previous: Previous, resolved: ResolvedEta) -> datetime | None:
     """The phase's first stated ETA: the input's `first`, else the state's for the same phase, else this report's."""
-    if unit.eta.first is not None:
+    if isinstance(unit.eta, TimedEta) and unit.eta.first is not None:
         return unit.eta.first
     if (isinstance(previous, LastUnitReport) and same_phase(previous.phase, unit.phase)
             and previous.first is not None):
@@ -987,13 +1034,14 @@ def drift_text(unit: Unit, previous: Previous, resolved: ResolvedEta,
                now: datetime, zone_name: str) -> str | None:
     """The first ETA, how far the current one has moved from it and the fix rounds added since; `None` until it moves."""
     first = first_eta(unit, previous, resolved)
-    if first is None or not isinstance(resolved, ResolvedEtaMoment):
+    eta = unit.eta
+    if first is None or not isinstance(resolved, ResolvedEtaMoment) or isinstance(eta, NoEta):
         return None
     minutes = round((resolved.moment - first).total_seconds() / 60)
-    if minutes == 0 and unit.eta.fixes == 0:
+    if minutes == 0 and eta.fixes == 0:
         return None
     hours, rest = divmod(abs(minutes), 60)
-    rounds = f", {unit.eta.fixes} fix round{'' if unit.eta.fixes == 1 else 's'} added" if unit.eta.fixes else ""
+    rounds = f", {eta.fixes} fix round{'' if eta.fixes == 1 else 's'} added" if eta.fixes else ""
     return f"{clock(first, now, zone_name)} (now {'-' if minutes < 0 else '+'}{hours}:{rest:02d}{rounds})"
 
 
@@ -1007,7 +1055,7 @@ def save_state(path: Path, report: Report, resolved: dict[str, ResolvedEta],
         state[unit.unit] = {
             "phase": unit.phase,
             "eta": moment.isoformat() if moment else None,
-            "eta_text": unit.eta.time if moment else None,
+            "eta_text": unit.eta.time if isinstance(unit.eta, TimedEta) and moment else None,
             "held": unit.held,
             "first": first.isoformat() if first else None,
         }
@@ -1036,7 +1084,8 @@ def change_note(moment: datetime, previous: Previous, phase: str,
                 now: datetime, why: str | None) -> str | None:
     minutes = change_minutes(moment, previous, phase)
     if minutes is None:
-        return None
+        # No earlier report to compare with: a time that has passed is still said to have passed.
+        return "overdue" if moment < now else None
     if minutes == 0:
         return "unchanged, overdue" if moment < now else "unchanged"
     hours, rest = divmod(abs(minutes), 60)
@@ -1048,7 +1097,7 @@ def check_changes(report: Report, previous: dict[str, LastUnitReport],
                   resolved: dict[str, ResolvedEta]) -> None:
     """An ETA that moved CHANGE_NEEDS_WHY_MINUTES or more since the last report says why."""
     for index, unit in enumerate(report.units):
-        if unit.eta.time is None or unit.eta.why is not None:
+        if isinstance(unit.eta, NoEta) or unit.eta.why is not None:
             continue
         eta = resolved[unit.unit]
         if not isinstance(eta, ResolvedEtaMoment):
@@ -1274,7 +1323,7 @@ def footer(
         except ReleaseRecordReadError as error:
             items.append(f"  {release_record_error_line(error)}")
         else:
-            if cycle is not None and any(holder.name in cycle["holders"] for holder in hold.holders):
+            if cycle is not None and any(holder.key in cycle["holders"] for holder in hold.holders):
                 items.extend(f"  {line}" for line in cycle_status_lines(cycle, now, zone))
     if not isinstance(mac_block, NoMacBlock):
         items.append(mac_block_line(mac_block, zone))
@@ -1292,8 +1341,8 @@ def footer(
 def eta_text(unit: Unit, previous: Previous, resolved: ResolvedEta,
              now: datetime, zone_name: str, with_note: bool) -> str:
     eta = unit.eta
-    if eta.time is None:
-        words = eta.none or ""
+    if isinstance(eta, NoEta):
+        words = eta.reason
     else:
         if not isinstance(resolved, ResolvedEtaMoment):
             raise InputError(f"{unit.unit}: timed ETA was not resolved")
@@ -1302,11 +1351,31 @@ def eta_text(unit: Unit, previous: Previous, resolved: ResolvedEta,
         note = change_note(moment, previous, unit.phase, now, eta.why) if with_note else None
         if note:
             notes.append(note)
-        if eta.earliest and eta.latest:
-            notes.append(f"range {range_clock(parse_range_end(eta.earliest, now, moment, earliest=True), now)}–{range_clock(parse_range_end(eta.latest, now, moment, earliest=False), now)}")
+        if eta.spread is not None:
+            earliest = range_clock(parse_range_end(eta.spread.earliest, now, moment, earliest=True), now)
+            latest = range_clock(parse_range_end(eta.spread.latest, now, moment, earliest=False), now)
+            notes.append(f"range {earliest}–{latest}")
         done = f"{eta.percent}% done" if eta.percent is not None else "percent done not stated"
         words = f"{clock(moment, now, zone_name)}, {done}" + (f" ({'; '.join(notes)})" if notes else "")
     return f"{words}; {eta.detail}" if with_note and eta.detail else words
+
+
+def major_changes(unit: Unit, last: Previous, resolved: ResolvedEta, now: datetime, zone_name: str) -> list[str]:
+    """What a gantt report says about a unit above the chart: one line for each thing that changed since its
+    last report. A unit with no last report, or with nothing changed, has none."""
+    if not isinstance(last, LastUnitReport):
+        return []
+    changes: list[str] = []
+    if not same_phase(last.phase, unit.phase):
+        changes.append(f"- {unit.name}: now on {unit.phase}")
+    if unit.held != last.held:
+        changes.append(f"- {unit.name}: checkpoint "
+                       + (f"not merged, because {unit.held}" if unit.held else "no longer held"))
+    if isinstance(resolved, ResolvedEtaMoment):
+        minutes = change_minutes(resolved.moment, last, unit.phase)
+        if minutes is not None and abs(minutes) >= MAJOR_ETA_MINUTES:
+            changes.append(f"- {unit.name}: eta {eta_text(unit, last, resolved, now, zone_name, with_note=True)}")
+    return changes
 
 
 def ordered_units(report: Report, resolved: dict[str, ResolvedEta]) -> list[Unit]:
@@ -1314,7 +1383,7 @@ def ordered_units(report: Report, resolved: dict[str, ResolvedEta]) -> list[Unit
         index, unit = pair
         if unit.needs_user:
             return (0, 0.0, index)
-        if unit.eta.time is None:
+        if isinstance(unit.eta, NoEta):
             return (2, 0.0, index)
         eta = resolved[unit.unit]
         if not isinstance(eta, ResolvedEtaMoment):
@@ -1342,7 +1411,8 @@ def plan_progress(unit: Unit) -> PlanProgress | None:
     if match is None or match.group(1) is None:
         return None
     number, total = int(match.group(1)), int(match.group(2))
-    done = (number - 1 + (unit.eta.percent or 0) / 100) / total
+    percent = unit.eta.percent if isinstance(unit.eta, TimedEta) else None
+    done = (number - 1 + (percent or 0) / 100) / total
     return PlanProgress(number, total, round(100 * done))
 
 
@@ -1354,6 +1424,7 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
     other_topics = [topic for topic in report.topics if not topic.needs_user]
     units = ordered_units(report, resolved)
     grouped_waits = {unit.unit: grouped_wait(report.length, unit) for unit in report.units}
+    gantt = report.length == "gantt"
 
     def topic_section(topic: Topic) -> None:
         lines.extend([f"### {topic.title}", f"- update: {topic.update}", f"- eta: {topic.eta}"])
@@ -1364,7 +1435,7 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
     for topic in user_topics:
         topic_section(topic)
     for unit in units:
-        if isinstance(grouped_waits[unit.unit], IdleWait):
+        if isinstance(grouped_waits[unit.unit], IdleWait) or (gantt and not unit.needs_user):
             continue
         lines.append(f"### {unit.name}: {unit.project}")
         if unit.goal:
@@ -1372,7 +1443,7 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
         lines.append(f"- phase: {unit.phase}")
         if unit.held:
             last = previous_report(previous, unit.unit)
-            repeat = (report.length == "simple" and isinstance(last, LastUnitReport)
+            repeat = (report.length in SHORT_LENGTHS and isinstance(last, LastUnitReport)
                       and same_phase(last.phase, unit.phase) and last.held == unit.held)
             examples = f", {unit.held_examples}" if unit.held_examples and not repeat else ""
             lines.append(f"- checkpoint: not merged, because {unit.held}{examples}")
@@ -1388,7 +1459,7 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
             lines.append(f"- needed: {unit.needed}")
         if isinstance(unit.upcoming_work, UpcomingWork):
             items = unit.upcoming_work.items
-            if report.length == "simple" or len(items) == 1:
+            if report.length in SHORT_LENGTHS or len(items) == 1:
                 lines.append(f"- then: {items[0]}")
             else:
                 lines.append("- then:")
@@ -1405,21 +1476,32 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
         for _, unit, wait in idle_units:
             lines.append(f"- {unit.name} until {idle_clock(wait.until, now)}: {wait.waits_for}")
         lines.append("")
-    for topic in other_topics:
-        topic_section(topic)
+    if gantt:
+        changes = [line for unit in units if not unit.needs_user
+                   for line in major_changes(unit, previous_report(previous, unit.unit), resolved[unit.unit],
+                                             now, zone_name)]
+        reported = {unit.unit for unit in report.units}
+        changes.extend(f"- {unit}: no longer in the report" for unit in previous if unit not in reported)
+        if changes:
+            lines.extend([*changes, ""])
+    else:
+        for topic in other_topics:
+            topic_section(topic)
 
     rows: list[Row] = []
     for unit in units:
         plan = plan_progress(unit)
-        if unit.eta.time is None:
+        stated = unit.eta
+        if isinstance(stated, NoEta):
             rows.append(Row(unit.label, None, unit.build_hold, plan))
             continue
         eta = resolved[unit.unit]
         if not isinstance(eta, ResolvedEtaMoment):
             raise InputError(f"{unit.unit}: timed ETA was not resolved")
         moment = eta.moment
-        earliest = parse_range_end(unit.eta.earliest, now, moment, earliest=True) if unit.eta.earliest else moment
-        latest = parse_range_end(unit.eta.latest, now, moment, earliest=False) if unit.eta.latest else moment
+        spread = stated.spread
+        earliest = parse_range_end(spread.earliest, now, moment, earliest=True) if spread else moment
+        latest = parse_range_end(spread.latest, now, moment, earliest=False) if spread else moment
         rows.append(Row(unit.label, Estimate(unit.started, moment, earliest, latest), unit.build_hold, plan))
     lines.extend(["```", *draw(now, rows, CHART_STYLES[report.chart]), "```", ""])
     needed = any(unit.needed for unit in report.units) or any(topic.needed for topic in report.topics)

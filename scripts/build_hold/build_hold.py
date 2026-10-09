@@ -21,6 +21,9 @@ from pathlib import Path
 from typing import Literal, Required, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
+from sessions import addressed, live_sessions  # noqa: E402
+
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
 INSTANT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})")
@@ -29,6 +32,10 @@ RELEASE_SETTLE_S = 60
 NO_ADMISSION_ACK_S = 900
 NO_REGISTRATION_S = 60
 RELEASE_POLL_S = 15
+# A lookup that cannot read the session records is tried again before the release gives up on the
+# session: a record caught half-written reads cleanly a moment later.
+LOOKUP_TRIES = 3
+LOOKUP_RETRY_S = 1.0
 
 GateOutcome = Literal["Granted", "TimedOut", "MeminfoUnavailable"]
 
@@ -247,10 +254,13 @@ ReleaseRequest = NoReleaseEta | ClockReleaseEta
 
 @dataclass(frozen=True)
 class Holder:
+    # The holder's name now when it is a live Claude session, else the name the hold was taken under.
     name: str
     since: datetime
     purpose: str
     release: ReleaseEta
+    # The hold file's name: the holder's Claude session id, or its name when it is no Claude session.
+    key: str
 
 
 @dataclass(frozen=True)
@@ -301,6 +311,37 @@ def holder_path(directory: Path, name: str) -> Path:
     return directory / safe
 
 
+def holder_of(given: str | None) -> tuple[str, str]:
+    """The key a holder's hold is kept under, and the holder's name now.
+
+    The key is the Claude session id of the session `given` means, or of the caller when no name is
+    given, so a rename between hold and release loses nothing. A holder that is no live Claude
+    session keeps `given` as its key.
+    """
+    records = live_sessions()
+    if given is None:
+        own = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        session = next((record for record in records if own and record["sessionId"] == own), None)
+        if session is None:
+            raise ValueError("give --holder: this is not a live Claude session")
+        return session["sessionId"], session["name"]
+    session = addressed(given, records)
+    return (given, given) if session is None else (session["sessionId"], session["name"])
+
+
+def held_key(directory: Path, given: str | None) -> str:
+    """The key of the hold `given`, or the caller, has. A hold taken under a name before holds were
+    kept by session id is found by the name given, the session's name now, and each name it once had."""
+    key, name = holder_of(given)
+    none: list[str] = []
+    former = next((record["formerNames"] for record in live_sessions() if record["sessionId"] == key), none)
+    candidates: list[str] = [key, given or name, name, *former]
+    found = next((one for one in candidates if holder_path(directory, one).is_file()), None)
+    if found is None:
+        raise ValueError(f"{given or name} held nothing")
+    return found
+
+
 def aware_instant(value: str) -> datetime:
     instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if instant.utcoffset() is None:
@@ -316,7 +357,7 @@ def read_holder(path: Path) -> Holder:
     except FileNotFoundError:
         raise
     except (OSError, UnicodeError):
-        return Holder(path.name, fallback, "unreadable holder file", UnknownReleaseEta())
+        return Holder(path.name, fallback, "unreadable holder file", UnknownReleaseEta(), path.name)
     try:
         raw = cast(object, json.loads(content))
         if isinstance(raw, dict):
@@ -327,17 +368,18 @@ def read_holder(path: Path) -> Holder:
             release = fields.get("release_eta")
             if isinstance(name, str) and isinstance(since, str) and isinstance(purpose, str) and isinstance(release, str):
                 eta: ReleaseEta = UnknownReleaseEta() if release == "unknown" else KnownReleaseEta(aware_instant(release))
-                return Holder(name, aware_instant(since), purpose, eta)
+                now = next((record["name"] for record in live_sessions() if record["sessionId"] == path.name), name)
+                return Holder(now, aware_instant(since), purpose, eta, path.name)
     except (ValueError, TypeError):
         pass
     match = INSTANT.search(content)
     if match is None:
-        return Holder(path.name, fallback, content, UnknownReleaseEta())
+        return Holder(path.name, fallback, content, UnknownReleaseEta(), path.name)
     try:
         since = aware_instant(match.group())
     except ValueError:
         since = fallback
-    return Holder(path.name, since, content[match.end():].lstrip(" ,;:-").strip(), UnknownReleaseEta())
+    return Holder(path.name, since, content[match.end():].lstrip(" ,;:-").strip(), UnknownReleaseEta(), path.name)
 
 
 def read_holders(directory: Path) -> HoldState:
@@ -389,7 +431,9 @@ def release_request(release_time: str | None, zone_name: str | None) -> ReleaseR
     return ClockReleaseEta(ClockTime(hour, minute), zone)
 
 
-def write_hold(directory: Path, name: str, purpose: str, request: ReleaseRequest, now: datetime) -> str:
+def write_hold(directory: Path, name: str, purpose: str, request: ReleaseRequest, now: datetime,
+               label: str | None = None) -> str:
+    """Keep a hold under the key `name`. `label` is the holder's name now, when the key is a session id."""
     if not purpose.strip() or "\n" in purpose:
         raise ValueError("hold purpose must be one line of text")
     if isinstance(request, NoReleaseEta):
@@ -400,9 +444,9 @@ def write_hold(directory: Path, name: str, purpose: str, request: ReleaseRequest
             raise ValueError("release ETA has already passed today")
         release_eta = release.isoformat()
     directory.mkdir(parents=True, exist_ok=True)
-    record = {"holder": name, "since": now.isoformat(), "for": purpose.strip(), "release_eta": release_eta}
+    record = {"holder": label or name, "since": now.isoformat(), "for": purpose.strip(), "release_eta": release_eta}
     _ = holder_path(directory, name).write_text(json.dumps(record, ensure_ascii=False) + "\n")
-    return f"/build_hold from {name}: stop any cargo or verify.sh you are running and start none until I release. No release after 2 h: ask me. For: {purpose.strip()}"
+    return f"/build_hold from {label or name}: stop any cargo or verify.sh you are running and start none until I release. No release after 2 h: ask me. For: {purpose.strip()}"
 
 
 def release_hold(directory: Path, name: str) -> str:
@@ -515,68 +559,6 @@ def save_cycle(cycle: HoldCycle) -> None:
     os.replace(temporary, path)
 
 
-def _renamed_holder_text(path: Path, new: str) -> str:
-    try:
-        raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, UnicodeError, ValueError) as error:
-        raise ValueError(f"cannot rename build hold holder {path}: {error}") from error
-    if not isinstance(raw, dict):
-        raise ValueError(f"cannot rename build hold holder {path}: expected object")
-    fields = cast(dict[str, object], raw)
-    fields["holder"] = new
-    return json.dumps(fields, ensure_ascii=False) + "\n"
-
-
-def _rename_cycle_holder(cycle: HoldCycle, old: str, new: str) -> bool:
-    changed = False
-    old_hold = cycle["holders"].pop(old, None)
-    if old_hold is not None:
-        changed = True
-        if new not in cycle["holders"]:
-            cycle["holders"][new] = old_hold
-    for session_id, recipient in cycle["recipients"].items():
-        if recipient == old:
-            cycle["recipients"][session_id] = new
-            changed = True
-    for entry in cycle["entries"]:
-        if entry["name"] == old:
-            entry["name"] = new
-            changed = True
-    return changed
-
-
-def rename_holder(old: str, new: str) -> list[str]:
-    """Move one build holder and its active-cycle references to a new name."""
-    directory = holder_directory()
-    old_path = holder_path(directory, old)
-    new_path = holder_path(directory, new)
-    with release_lock():
-        if not old_path.exists():
-            return []
-        if old_path != new_path and new_path.exists():
-            raise ValueError(f"build hold holders exist for both {old!r} and {new!r}")
-
-        holder_text = _renamed_holder_text(old_path, new)
-        cycle = read_cycle()
-        cycle_changed = cycle is not None and _rename_cycle_holder(cycle, old, new)
-        if cycle is not None and cycle_changed:
-            save_cycle(cycle)
-
-        temporary = old_path.with_name(f".{old_path.name}.rename-{uuid.uuid4().hex}")
-        try:
-            _ = temporary.write_text(holder_text, encoding="utf-8")
-            os.replace(temporary, old_path)
-        finally:
-            temporary.unlink(missing_ok=True)
-        if old_path != new_path:
-            os.replace(old_path, new_path)
-
-    changed = ["build hold holder"]
-    if cycle_changed:
-        changed.append("build hold cycle")
-    return changed
-
-
 def open_cycle(now: datetime) -> HoldCycle:
     cycle: HoldCycle = {"id": uuid.uuid4().hex, "opened_at": now.isoformat(), "holders": {}, "recipients": {}, "entries": [], "release_started_at": ""}
     save_cycle(cycle)
@@ -584,13 +566,14 @@ def open_cycle(now: datetime) -> HoldCycle:
     return cycle
 
 
-def start_hold(directory: Path, name: str, purpose: str, request: ReleaseRequest, now: datetime) -> str:
+def start_hold(directory: Path, name: str, purpose: str, request: ReleaseRequest, now: datetime,
+               label: str | None = None) -> str:
     with release_lock():
         if isinstance(read_holders(directory), NoHolders):
             cycle = open_cycle(now)
         else:
             cycle = read_cycle_for_change()
-        notice = write_hold(directory, name, purpose, request, now)
+        notice = write_hold(directory, name, purpose, request, now, label)
         if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
             cycle["holders"][name] = {"since": now.isoformat(), "released_at": ""}
             save_cycle(cycle)
@@ -694,10 +677,23 @@ def answer_nothing_to_build(session_id: str) -> str:
         return f"{entry_text(entry)}; the release moves on to the next session"
 
 
+class SessionLookupUnavailable(Exception):
+    """`sessions.py` could not read the session records, which says nothing about the session."""
+
+
 def socket_for(session_id: str) -> str | None:
+    """The session's socket, or None when it is not running."""
     script = Path(__file__).resolve().parent.parent / "message" / "sessions.py"
-    result = subprocess.run([sys.executable, str(script), "socket", f"session:{session_id}"], capture_output=True, text=True)
-    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
+    reason = ""
+    for attempt in range(LOOKUP_TRIES):
+        if attempt:
+            time.sleep(LOOKUP_RETRY_S)
+        result = subprocess.run([sys.executable, str(script), "socket", f"session:{session_id}"], capture_output=True, text=True)
+        # Exit 1 is no such live session. Any other failure is the lookup itself failing.
+        if result.returncode in (0, 1):
+            return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
+        reason = result.stderr.strip() or f"sessions.py exited {result.returncode}"
+    raise SessionLookupUnavailable(reason)
 
 
 def send_release(entry: ReleaseEntry, socket: str) -> int:
@@ -771,18 +767,24 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
                 target = entry_text(next_entry) if next_entry is not None else "final check"
                 return False, f"{entry_text(entry)}; next {target} at {ready.astimezone():%H:%M:%S %Z}"
         elif isinstance(state, AwaitingRelease):
-            socket = socket_for(entry["session_id"])
-            if socket is None:
-                store_release_state(entry, RecipientGone())
+            try:
+                socket = socket_for(entry["session_id"])
+            except SessionLookupUnavailable as error:
+                # Not knowing is not the session being gone: this is a delivery that failed.
+                print(f"build_hold: {entry_text(entry)}: {error}", file=sys.stderr)
+                store_release_state(entry, DeliveryFailed(clock()))
             else:
-                attempted_at = clock()
-                outcome = send_release(entry, socket)
-                if outcome == 0:
-                    store_release_state(entry, ReleasedAwaitingAdmission(clock()))
-                elif outcome == 1:
-                    store_release_state(entry, DeliveryQueued(attempted_at))
+                if socket is None:
+                    store_release_state(entry, RecipientGone())
                 else:
-                    store_release_state(entry, DeliveryFailed(attempted_at))
+                    attempted_at = clock()
+                    outcome = send_release(entry, socket)
+                    if outcome == 0:
+                        store_release_state(entry, ReleasedAwaitingAdmission(clock()))
+                    elif outcome == 1:
+                        store_release_state(entry, DeliveryQueued(attempted_at))
+                    else:
+                        store_release_state(entry, DeliveryFailed(attempted_at))
             save_cycle(cycle)
             if isinstance(read_release_state(entry), active):
                 return False, entry_text(entry)
@@ -812,7 +814,7 @@ def release_cycle(directory: Path, name: str) -> str:
                 save_cycle(cycle)
             if isinstance(holders, ActiveHolders) and len(holders.holders) > 1:
                 path.unlink()
-                return "released; still held by " + "; ".join(holder_text(holder) for holder in holders.holders if holder.name != name)
+                return "released; still held by " + "; ".join(holder_text(holder) for holder in holders.holders if holder.key != name)
             if not cycle["release_started_at"]:
                 cycle["release_started_at"] = now.isoformat()
                 save_cycle(cycle)
@@ -882,7 +884,7 @@ def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     hold = commands.add_parser("hold")
-    _ = hold.add_argument("--holder", required=True)
+    _ = hold.add_argument("--holder")
     _ = hold.add_argument("--for", dest="purpose", required=True)
     _ = hold.add_argument("--release-eta")
     _ = hold.add_argument("--zone")
@@ -906,7 +908,8 @@ def main(arguments: list[str]) -> int:
         action = cast(str, options.action)
         if action == "hold":
             request = release_request(cast(str | None, options.release_eta), cast(str | None, options.zone))
-            print(start_hold(holder_directory(), cast(str, options.holder), cast(str, options.purpose), request, datetime.now().astimezone()))
+            key, label = holder_of(cast(str | None, options.holder))
+            print(start_hold(holder_directory(), key, cast(str, options.purpose), request, datetime.now().astimezone(), label))
         elif action == "quiet":
             verdict = wait_for_quiet(cast(float, options.max_wait))
             if isinstance(verdict, Busy):
@@ -914,9 +917,10 @@ def main(arguments: list[str]) -> int:
                 return 1
             print("builds are quiet; load is below the limit")
         elif action == "release":
-            name = cast(str | None, options.holder)
+            given = cast(str | None, options.holder)
             resume_requested = cast(bool, options.resume)
-            if name is None and resume_requested:
+            name: str | None = None
+            if given is None and resume_requested:
                 with release_lock():
                     cycle = read_cycle_for_change()
                     if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
@@ -924,9 +928,11 @@ def main(arguments: list[str]) -> int:
                     elif isinstance(cycle, DamagedRecordSetAside):
                         state = read_holders(holder_directory())
                         if isinstance(state, ActiveHolders) and len(state.holders) == 1:
-                            name = state.holders[0].name
-            if name is None:
+                            name = state.holders[0].key
+            if name is None and given is None and resume_requested:
                 raise ValueError("release needs --holder, or --resume for an active release")
+            if name is None:
+                name = held_key(holder_directory(), given)
             print(release_cycle(holder_directory(), name))
         elif action == "wait":
             print(register_wait(os.environ.get("CLAUDE_CODE_SESSION_ID", "")))

@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
-from add_unit import Production, Refusal, cell_value, read_production, unit_rows
+from add_unit import Production, Refusal, cell_value, read_production, unit_table
 
 
 class ValidateAndPush(NamedTuple):
@@ -220,14 +220,12 @@ def promotion_from_doc(lines: list[str]) -> NoPromotion | PromoteTo:
 
 
 def parse_units(lines: list[str]) -> tuple[Unit, ...]:
-    _, rows = unit_rows(lines)
     result: list[Unit] = []
-    for row in rows:
-        cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
-        if len(cells) < 7:
+    for cells in unit_table(lines):
+        if not all(heading in cells for heading in ("Unit", "Plan", "Worktree", "Branch", "Owns")):
             continue
-        plan = Path(cell_value(cells[1]).split(" ", 1)[0])
-        owns_cell = cells[6]
+        plan = Path(cell_value(cells["Plan"]).split(" ", 1)[0])
+        owns_cell = cells["Owns"]
         quoted = cast(list[str], re.findall(r"`([^`]+)`", owns_cell))
         plain = owns_cell.split(" — ", 1)[0]
         if quoted:
@@ -243,8 +241,8 @@ def parse_units(lines: list[str]) -> tuple[Unit, ...]:
             owns = tuple(owned)
         else:
             owns = tuple(part.strip() for part in plain.split(",") if part.strip())
-        result.append(Unit(cell_value(cells[0]), plan,
-                           Path(cell_value(cells[2])).expanduser(), cell_value(cells[3]), owns))
+        result.append(Unit(cell_value(cells["Unit"]), plan,
+                           Path(cell_value(cells["Worktree"])).expanduser(), cell_value(cells["Branch"]), owns))
     return tuple(result)
 
 
@@ -338,6 +336,19 @@ def code_merged(request: MergeRequest) -> bool:
     return history.has_code_merge(request.unit.name, request.phase)
 
 
+def on_origin(request: MergeRequest) -> bool:
+    """Fetch the unit branch and say whether it holds the checkpoint."""
+    checkout = request.production.checkout
+    fetched = git(checkout, "fetch", "origin", request.unit.branch)
+    # A branch not pushed yet holds no commit: ls-remote exits 2 when origin lacks the ref.
+    if fetched.returncode and git(checkout, "ls-remote", "--exit-code", "origin",
+                                  f"refs/heads/{request.unit.branch}").returncode == 2:
+        return False
+    _ = good(fetched, "ancestry")
+    return git(checkout, "merge-base", "--is-ancestor", request.commit,
+               f"origin/{request.unit.branch}").returncode == 0
+
+
 def ancestry(request: MergeRequest) -> bool:
     checkout = request.production.checkout
     if git(checkout, "cat-file", "-e", f"{request.commit}^{{commit}}").returncode:
@@ -350,8 +361,7 @@ def ancestry(request: MergeRequest) -> bool:
         if git(checkout, "merge-base", "--is-ancestor", request.commit, request.production.merge_branch).returncode:
             raise Stop("ancestry", "held", "checkpoint drops an earlier merge",
                        "merge the latest unit checkpoint and send a new hash")
-    _ = good(git(checkout, "fetch", "origin", request.unit.branch), "ancestry")
-    if git(checkout, "merge-base", "--is-ancestor", request.commit, f"origin/{request.unit.branch}").returncode:
+    if not on_origin(request):
         raise Stop("ancestry", "held", "commit is not on origin",
                    "push your branch to origin and resend the checkpoint")
     already = git(checkout, "merge-base", "--is-ancestor", request.commit,

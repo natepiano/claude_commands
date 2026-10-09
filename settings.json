@@ -55,6 +55,7 @@
       "Bash(bash ~/.claude/scripts/delegate/verify.sh *)",
       "Bash(bash ~/.claude/scripts/delegate/progress_timer.sh *)",
       "Bash(zsh ~/.claude/scripts/message/notifier.sh *)",
+      "Bash(\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/conversation_pause.py\" *)",
       "Bash(cat *)",
       "Bash(head *)",
       "Bash(tail *)",
@@ -209,11 +210,25 @@
           },
           {
             "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-conversation-pause.py\""
+          },
+          {
+            "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-assistant-prose-banned-words.py\""
           },
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-showrunner-footer.py\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/user-prompt-submit-conversation-pause.py\""
           }
         ]
       }

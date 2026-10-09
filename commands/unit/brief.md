@@ -1,17 +1,17 @@
 ---
-description: Show the next phase's briefing in a delegate run, or give one a gate skipped.
+description: Show the next phase's briefing in a /unit:direct run, or give one a gate skipped.
 ---
 
-# Delegate — briefing
+# Direct — briefing
 
 **Usage:** `/unit:brief`
 
 Type this when a gate asked to start a phase without its briefing, or to see the
 next phase's briefing now. It runs inside the current session and already knows
-the plan and its phases. If no delegate run is active, say so in one line and
+the plan and its phases. If no `/unit:direct` run is active, say so in one line and
 stop.
 
-`/unit:delegate` reads this file at every pre-phase gate and auto control, and
+`/unit:direct` reads this file at every pre-phase gate and auto control, and
 before the types table of a phase report. It defines `<VerbosePrePhaseGate/>`,
 `<BriefingFreshness/>`, `<PhaseBriefing/>`, `<TypeTableCells/>`,
 `<CombinedWindowBriefing/>`, and `<AutoWindowBatchBriefing/>` in full. Never work

@@ -31,13 +31,13 @@ Which lint checks run, everywhere they run: `cache`, `mend`, `style_review`,
 `clippy`, `doc`, `fmt`, under an `[operations]` section. Values are `on` or
 `off`; a missing key or missing file means `on`. One key per check with no
 per-consumer override — `clippy=off` means cargo clippy does not run in the
-`/clippy` skill *or* in a delegate phase.
+`/clippy` skill *or* in a `/unit:direct` phase.
 
 Use `/lint_config` to view or change them. The two consumers read it on their
 next run, so a change is immediate:
 
 - the `/clippy` skill, at the start of every run — including runs started by
-  `/commit_prep` or a `/unit:delegate` work order
+  `/commit_prep` or a `/unit:direct` work order
 - `scripts/delegate/verify.sh` — the `lint`, `fmt`, and `final` arms
 
 Deliberately not gated: `verify.sh check`/`test`/`example`, the workspace check
@@ -93,7 +93,7 @@ always, since a codex sub-session has no agent tool to launch anything with.
 
 ## delegate.conf
 
-The `/unit:delegate` tuning file: the convergence limits — how many automatic
+The `/unit:direct` tuning file: the convergence limits — how many automatic
 fix rounds one phase runs before the gate remarks on how it is going — plus
 the progress-report interval. `MIN_REPAIR_BUDGET` is the floor every phase gets
 regardless of finding count (3);
@@ -112,7 +112,7 @@ made from what gets reported.
 `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` sets the Codex poll timeout and the
 default interval of a Claude unit's notifier instance. It is read by
 `scripts/delegate/unit_notifier.sh` and by the main agent per
-`<ProgressContract/>` in `commands/unit/delegate.md`, not by `findings.py`.
+`<ProgressContract/>` in `commands/unit/direct.md`, not by `findings.py`.
 Claude units do not launch `progress_timer.sh`. A missing or non-numeric value
 makes the notifier use 900 seconds; Codex requires a positive integer.
 

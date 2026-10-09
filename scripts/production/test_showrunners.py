@@ -1,23 +1,26 @@
-"""The machine-local showrunner registry and its notifier import."""
+"""Showrunners read from their update timers, their names looked up at each call."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import cast, override
-from unittest import mock
+from typing import override
 
+import fake_tmux
 import showrunners
+from fake_tmux import FakeSession
 
 
 SCRIPT = Path(__file__).with_name("showrunners.py")
+FAKE = str(Path(__file__).with_name("fake_tmux.py"))
+LOS_ANGELES = "America/Los_Angeles"
 
 
 class ShowrunnerRegistryTests(unittest.TestCase):
@@ -28,6 +31,8 @@ class ShowrunnerRegistryTests(unittest.TestCase):
         self.notifier: Path = Path()
         self.sessions: Path = Path()
         self.sessions_script: Path = Path()
+        self.tmux: Path = Path()
+        self.doc: Path = Path()
         self.children: list[subprocess.Popen[bytes]] = []
 
     @override
@@ -40,6 +45,8 @@ class ShowrunnerRegistryTests(unittest.TestCase):
         self.sessions = self.root / "sessions"
         self.sessions.mkdir()
         self.sessions_script = self.root / "sessions.py"
+        self.tmux = self.root / "tmux.json"
+        self.doc = self.root / "show-production.md"
         self.addCleanup(self.close_processes)
         _ = self.sessions_script.write_text("""import json, os, pathlib, sys
 records = [json.loads(path.read_text()) for path in pathlib.Path(os.environ['NOTIFIER_SESSIONS_DIR']).glob('*.json')]
@@ -61,7 +68,7 @@ raise SystemExit(1)
             child.terminate()
             _ = child.wait(timeout=2)
 
-    def record(self, name: str, session_id: str, *, running: bool = True, pid: int | None = None) -> None:
+    def record(self, name: str, session_id: str, *, running: bool = True, pid: int | None = None) -> int:
         if pid is None:
             child = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.children.append(child)
@@ -71,10 +78,11 @@ raise SystemExit(1)
             "messagingSocketPath": str(self.root / f"{session_id}.sock"),
             "updatedAt": 1, "running": running,
         }))
+        return pid
 
     def instance(self, name: str, *, target: str = "session:live-id", zone: str = "America/Los_Angeles",
                  units: tuple[str, ...] = ("hook", "tool-based-ui-geometry-material"),
-                 include_target: bool = True, include_prompt: bool = True) -> None:
+                 include_target: bool = True, include_prompt: bool = True, doc: Path | None = None) -> None:
         directory = self.notifier / name
         directory.mkdir()
         prompt = directory / "prompt"
@@ -85,26 +93,34 @@ raise SystemExit(1)
             fields.append(f"TARGET={target}")
         if include_prompt:
             fields.append(f"PROMPT_FILE={prompt}")
+        if doc is not None:
+            fields.append("CHECK=" + shlex.join(["zsh", "/opt/tools/production_check.sh", str(doc)]))
+            # The zone is read from the production doc's own line.
+            _ = Path(doc).write_text(f"- **User zone:** {zone}\n", encoding="utf-8")
         _ = (directory / "conf").write_text("\n".join(fields) + "\n")
 
-    def environment(self) -> dict[str, str]:
+    def environment(self, pane: str = "") -> dict[str, str]:
+        # `TMUX_PANE` is set here always: a test run from inside tmux must not hand on its own pane.
         return {**os.environ, "SHOWRUNNERS_CONFIG": str(self.config),
                 "NOTIFIER_STATE_DIR": str(self.notifier), "NOTIFIER_SESSIONS_DIR": str(self.sessions),
                 "SHOWRUNNERS_SESSIONS": str(self.sessions_script),
-                "STALL_WATCH_STATE_DIR": str(self.root / "stall-state")}
+                "UNIT_LOOKUP_TMUX": FAKE, "FAKE_TMUX_STATE": str(self.tmux), "TMUX_PANE": pane}
 
-    def cli(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), *args], env=self.environment(),
+    def cli(self, *args: str, pane: str = "") -> subprocess.CompletedProcess[str]:
+        return subprocess.run([sys.executable, str(SCRIPT), *args], env=self.environment(pane),
                               capture_output=True, text=True, check=False)
 
-    def successful(self, *args: str) -> str:
-        result = self.cli(*args)
+    def successful(self, *args: str, pane: str = "") -> str:
+        result = self.cli(*args, pane=pane)
         self.assertEqual(result.returncode, 0, (args, result.stdout, result.stderr))
         return result.stdout
 
-    def entries(self) -> list[dict[str, object]]:
-        content = cast(dict[str, object], json.loads(self.config.read_text()))
-        return cast(list[dict[str, object]], content["showrunners"])
+    def unit_session(self, unit: str, pane: str) -> None:
+        """Give the production `show` one tmux session marked as `unit`."""
+        marks = {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": unit}
+        sessions = fake_tmux.read(self.tmux) if self.tmux.exists() else {}
+        sessions[f"${len(sessions) + 1}"] = FakeSession(label=f"label-of-{unit}", panes=[pane], env=marks)
+        fake_tmux.write(self.tmux, sessions)
 
     def test_checked_doc_reads_absolute_path_after_check_script(self) -> None:
         directory = self.notifier / "showrunner-check"
@@ -128,216 +144,96 @@ raise SystemExit(1)
         result = showrunners.checked_doc(directory)
         self.assertEqual(result, showrunners.NoCheckedDoc("production doc path is relative"))
 
-    def test_add_creates_defaults_then_sets_zone_and_appends_only_new_units(self) -> None:
-        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "hook")
-        content = cast(dict[str, object], json.loads(self.config.read_text()))
-        self.assertEqual({key: content[key] for key in ("threshold_percent", "repeat_minutes",
-                                                       "stall_minutes", "faults_to", "always")},
-                         {"threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5,
-                          "faults_to": "natedev", "always": ["natedev"]})
-        _ = self.successful("add", "director", "--zone", "America/New_York", "--unit", "hook",
-                            "--unit", "organon")
-        _ = self.successful("add", "director", "--zone", "America/New_York", "--unit", "organon")
-        self.assertEqual(self.entries(), [{"session": "director", "zone": "America/New_York",
-                                           "units": ["hook", "organon"]}])
-        self.assertTrue((self.config.parent / "showrunners.lock").exists())
+    def test_list_shows_each_showrunner_under_the_name_it_has_now(self) -> None:
+        self.instance("showrunner-show", doc=self.doc)
+        self.instance("showrunner-other", target="session:stopped-id")
+        self.instance("stall-watch", doc=self.doc)
+        pid = self.record("first-name", "live-id")
+        self.assertEqual(self.successful("list").splitlines(), [
+            # A timer whose check names no production doc is not a showrunner's: it is left out.
+            f"show\tfirst-name\t{LOS_ANGELES}\t{self.doc}"])
+        self.assertEqual(self.successful("name", "show"), "first-name\n")
+        # A rename is written in one place, the session's own record, and every reader sees it.
+        _ = self.record("renamed", "live-id", pid=pid)
+        self.assertIn("show\trenamed\t", self.successful("list"))
+        self.assertEqual(self.successful("name", "show"), "renamed\n")
+        self.assertFalse(self.config.exists())
 
-    def test_remove_selected_units_then_entire_showrunner_is_idempotent(self) -> None:
-        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "hook",
-                            "--unit", "organon")
-        _ = self.successful("remove", "director", "--unit", "hook")
-        _ = self.successful("remove", "director", "--unit", "hook")
-        self.assertEqual(self.entries()[0]["units"], ["organon"])
-        _ = self.successful("remove", "director")
-        _ = self.successful("remove", "director")
-        self.assertEqual(self.entries(), [])
-
-    def test_standby_add_list_and_ready_preserve_unit_membership(self) -> None:
-        _ = self.successful("add", "director", "--zone", "America/Los_Angeles",
-                            "--unit", "alpha", "--standby")
-        self.assertEqual(self.entries()[0]["units"], ["alpha"])
-        self.assertEqual(self.entries()[0]["standby"], ["alpha"])
-        self.assertIn("alpha:standby", self.successful("list"))
-        _ = self.successful("ready", "director", "--unit", "alpha")
-        self.assertEqual(self.entries()[0]["units"], ["alpha"])
-        self.assertEqual(self.entries()[0].get("standby", []), [])
-        self.assertNotIn("alpha:standby", self.successful("list"))
-
-    def test_ready_non_standby_unit_says_so_without_changing_config(self) -> None:
-        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "alpha")
-        before = self.config.read_bytes()
-        result = self.cli("ready", "director", "--unit", "alpha")
-        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertEqual(self.config.read_bytes(), before)
-        self.assertEqual(len((result.stdout + result.stderr).strip().splitlines()), 1)
-        self.assertIn("alpha", result.stdout + result.stderr)
-        self.assertIn("not on standby", result.stdout + result.stderr)
-
-    def test_concurrent_adds_both_land(self) -> None:
-        first = subprocess.Popen([sys.executable, str(SCRIPT), "add", "first", "--zone", "America/Los_Angeles",
-                                  "--unit", "hook"], env=self.environment(), stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, text=True)
-        second = subprocess.Popen([sys.executable, str(SCRIPT), "add", "second", "--zone", "America/New_York",
-                                   "--unit", "organon"], env=self.environment(), stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, text=True)
-        first_out, first_err = first.communicate(timeout=10)
-        second_out, second_err = second.communicate(timeout=10)
-        self.assertEqual((first.returncode, second.returncode), (0, 0),
-                         (first_out, first_err, second_out, second_err))
-        self.assertEqual({entry["session"] for entry in self.entries()}, {"first", "second"})
-
-    def test_import_reads_only_live_update_instances_and_skips_incomplete_ones(self) -> None:
-        self.record("director", "live-id")
-        self.record("offline", "offline-id", running=False, pid=101)
-        self.instance("showrunner-live")
-        self.instance("showrunner-offline", target="session:offline-id", units=("offline-unit",))
-        self.instance("stall-watch", units=("ignored-unit",))
-        self.instance("showrunner-no-target", include_target=False)
-        self.instance("showrunner-no-prompt", include_prompt=False)
-        self.instance("showrunner-no-zone", zone="")
-        result = self.cli("import")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.entries(), [{"session": "director", "zone": "America/Los_Angeles",
-                                           "units": ["hook", "tool-based-ui-geometry-material"]}])
-        self.assertEqual(len(result.stderr.splitlines()), 3, result.stderr)
-
-    def test_live_instance_without_prompt_is_missing_but_import_skips_it(self) -> None:
-        _ = self.successful("add", "configured", "--zone", "America/Los_Angeles")
-        self.record("unconfigured", "live-id")
-        for slug, change, reason in (("absent", "absent", "PROMPT_FILE is missing"),
-                                     ("unreadable", "unreadable", "prompt could not be read"),
-                                     ("malformed", "malformed", "unit_status.sh command is missing")):
+    def test_name_refuses_a_showrunner_that_is_not_running_or_has_no_timer(self) -> None:
+        self.instance("showrunner-show", doc=self.doc)
+        for slug in ("show", "absent"):
             with self.subTest(slug=slug):
-                name = f"showrunner-{slug}"
-                self.instance(name, include_prompt=change != "absent")
-                if change == "unreadable":
-                    (self.notifier / name / "prompt").unlink()
-                elif change == "malformed":
-                    _ = (self.notifier / name / "prompt").write_text("No status command here.\n")
-                listed = self.successful("list")
-                self.assertIn(f"missing: {name}\tunconfigured", listed)
-                imported = self.cli("import")
-                self.assertEqual(imported.returncode, 0, imported.stderr)
-                self.assertEqual(self.entries(), [{"session": "configured", "zone": "America/Los_Angeles",
-                                                   "units": []}])
-                self.assertIn(f"skipping {name}: {reason}", imported.stderr)
-                shutil.rmtree(self.notifier / name)
+                result = self.cli("name", slug)
+                self.assertEqual((result.returncode, result.stdout), (1, ""))
+                self.assertIn(f"the showrunner of {slug} is not running", result.stderr)
 
-    def test_rename_changes_unit_and_showrunner_session_under_lock(self) -> None:
-        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "hook")
-        _ = self.successful("rename", "hook", "new hook")
-        _ = self.successful("rename", "director", "new director")
-        self.assertEqual(self.entries(), [{"session": "new director", "zone": "America/Los_Angeles",
-                                           "units": ["new hook"]}])
-        self.assertTrue((self.config.parent / "showrunners.lock").exists())
+    def test_unreadable_session_records_are_an_error_not_a_stopped_showrunner(self) -> None:
+        self.instance("showrunner-show", doc=self.doc)
+        self.assertIn("show\t<not running>", self.successful("list"))
+        _ = self.sessions_script.write_text(
+            "import sys\nprint('sessions: one or more registry files could not be read', file=sys.stderr)\n"
+            + "raise SystemExit(3)\n")
+        result = self.cli("list")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("not running", result.stdout)
+        self.assertIn("cannot tell whether session:live-id is running: sessions: one or more registry files",
+                      result.stderr)
 
-    def test_failed_stall_rename_keeps_registry_and_retry_completes(self) -> None:
-        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "hook")
-        original = self.config.read_bytes()
-        failed = subprocess.CompletedProcess(["stall_watch.py"], 1, "", "injected failure")
-        succeeded = subprocess.CompletedProcess(["stall_watch.py"], 0, "", "")
-        with mock.patch.object(showrunners, "CONFIG", self.config), \
-                mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier), \
-                mock.patch.object(subprocess, "run", return_value=failed):
-            with self.assertRaisesRegex(ValueError, "stall state rename failed"):
-                showrunners.change("rename", "hook", "", [], "new-hook")
-        self.assertEqual(self.config.read_bytes(), original)
-        with mock.patch.object(showrunners, "CONFIG", self.config), \
-                mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier), \
-                mock.patch.object(subprocess, "run", return_value=succeeded):
-            showrunners.change("rename", "hook", "", [], "new-hook")
-        self.assertEqual(self.entries()[0]["units"], ["new-hook"])
-
-    def test_second_registry_rename_changes_nothing(self) -> None:
-        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "hook")
-        _ = self.successful("rename", "hook", "new-hook")
-        renamed = self.config.read_bytes()
-        with mock.patch.object(showrunners, "CONFIG", self.config), \
-                mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier), \
-                mock.patch.object(subprocess, "run") as run:
-            showrunners.change("rename", "hook", "", [], "new-hook")
-        self.assertEqual(self.config.read_bytes(), renamed)
-        run.assert_not_called()
-
-    def test_rename_updates_old_form_unit_lists_in_every_prompt(self) -> None:
-        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "tool-based-ui-trunk")
-        _ = self.successful("add", "other", "--zone", "America/Los_Angeles", "--unit", "tool-based-ui-trunk")
-        for slug in ("showrunner-first", "showrunner-second"):
-            self.instance(slug, units=("tool-based-ui-trunk", "tool-based-ui-trunk-extra"))
-            prompt = self.notifier / slug / "prompt"
-            _ = prompt.write_text(prompt.read_text() + "Keep tool-based-ui-trunk in this note.\n")
-        _ = self.successful("rename", "tool-based-ui-trunk", "trunk")
-        for slug in ("showrunner-first", "showrunner-second"):
-            prompt = (self.notifier / slug / "prompt").read_text()
-            self.assertIn("America/Los_Angeles trunk tool-based-ui-trunk-extra |", prompt)
-            self.assertIn("Keep tool-based-ui-trunk in this note.", prompt)
-        self.assertEqual([entry["units"] for entry in self.entries()], [["trunk"], ["trunk"]])
-
-    def test_rename_updates_new_form_showrunner_argument(self) -> None:
-        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "hook")
-        self.instance("showrunner-live")
-        prompt = self.notifier / "showrunner-live" / "prompt"
-        _ = prompt.write_text("Run `zsh ~/.claude/scripts/production/unit_status.sh "
-                              + "/tmp/status America/Los_Angeles --showrunner director | cut -c1-400`.\n"
-                              + "Keep director in this note.\n")
-        _ = self.successful("rename", "director", "new-director")
-        self.assertEqual(self.entries()[0]["session"], "new-director")
-        self.assertIn("--showrunner new-director |", prompt.read_text())
-        self.assertIn("Keep director in this note.", prompt.read_text())
-
-    def test_import_new_prompt_updates_zone_without_adding_names_as_units(self) -> None:
-        _ = self.successful("add", "director", "--zone", "America/New_York", "--unit", "existing")
-        self.record("director", "live-id")
-        self.instance("showrunner-live")
-        prompt = self.notifier / "showrunner-live" / "prompt"
-        _ = prompt.write_text("Run `zsh ~/.claude/scripts/production/unit_status.sh "
-                              + "/tmp/run/unit_status America/Los_Angeles --showrunner director | cut -c1-400`.\n")
-        _ = self.successful("import")
-        self.assertEqual(self.entries(), [{"session": "director", "zone": "America/Los_Angeles",
-                                           "units": ["existing"]}])
-
-    def test_import_prefers_live_pid_record_over_stale_record_for_same_session(self) -> None:
-        self.record("old name", "live-id", running=False, pid=999999)
-        self.record("current name", "live-id")
-        self.instance("showrunner-live")
-        _ = self.successful("import")
-        self.assertEqual(self.entries()[0]["session"], "current name")
-
-    def test_import_rejects_session_with_no_live_pid_record(self) -> None:
-        self.record("stale name", "live-id", pid=999999)
-        self.instance("showrunner-live")
-        result = self.cli("import")
+    def test_a_timer_that_is_not_a_complete_showrunners_is_left_out_with_the_reason(self) -> None:
+        self.instance("showrunner-no-target", include_target=False)
+        self.instance("showrunner-no-doc")
+        self.instance("showrunner-unnamed", target="session:unnamed-id", doc=self.root / "unnamed-production.md")
+        # The zone is the doc's own line: a doc without one, or with one that names no zone, is no showrunner's.
+        self.instance("showrunner-no-zone", doc=self.root / "no-zone-production.md")
+        _ = (self.root / "no-zone-production.md").write_text("# Production\n", encoding="utf-8")
+        self.instance("showrunner-bad-zone", doc=self.root / "bad-zone-production.md", zone="Nowhere/Never")
+        self.instance("showrunner-lost-doc", doc=self.root / "lost-production.md")
+        (self.root / "lost-production.md").unlink()
+        self.instance("showrunner-show", doc=self.doc)
+        _ = self.record("director", "live-id")
+        # A session that answers on its socket and has no live named process cannot be named.
+        _ = self.record("gone", "unnamed-id", pid=99999999)
+        result = self.cli("list")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.entries(), [])
-        self.assertIn("no live named process", result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [f"show\tdirector\t{LOS_ANGELES}\t{self.doc}"])
+        self.assertIn("skipping showrunner-no-target", result.stderr)
+        self.assertIn("skipping showrunner-no-doc: CHECK is missing", result.stderr)
+        self.assertIn("skipping showrunner-no-zone: production doc lacks User zone", result.stderr)
+        self.assertIn("skipping showrunner-bad-zone: production doc has an invalid User zone", result.stderr)
+        self.assertIn("skipping showrunner-lost-doc: production doc could not be read", result.stderr)
+        self.assertIn("skipping showrunner-unnamed: session unnamed-id has no live named process", result.stderr)
 
-    def test_list_marks_running_and_reports_live_unconfigured_instance(self) -> None:
-        _ = self.successful("add", "director", "--zone", "America/Los_Angeles", "--unit", "hook")
-        _ = self.successful("add", "offline", "--zone", "America/New_York", "--unit", "organon")
-        self.record("director", "live-id")
-        self.record("offline", "offline-id", running=False, pid=101)
-        self.record("missing", "missing-id")
-        self.instance("showrunner-missing", target="session:missing-id", units=("extra-unit",))
-        listed = self.successful("list")
-        director = next(line for line in listed.splitlines() if line.startswith("director"))
-        offline = next(line for line in listed.splitlines() if line.startswith("offline"))
-        self.assertIn("running", director)
-        self.assertNotIn("not running", director)
-        self.assertIn("not running", offline)
-        self.assertIn("missing:", listed)
-        self.assertIn("showrunner-missing", listed)
+    def test_the_name_comes_from_the_live_process_not_a_stale_record_of_the_same_session(self) -> None:
+        self.instance("showrunner-show", doc=self.doc)
+        _ = self.record("stale-name", "live-id", pid=99999999)
+        _ = self.record("director", "live-id")
+        self.assertEqual(self.successful("name", "show"), "director\n")
 
-    def test_list_absent_or_invalid_file_exits_one_with_one_diagnostic(self) -> None:
-        for contents in (None, "{invalid json", '{"showrunners": "wrong"}'):
+    def test_the_old_ready_and_status_commands_do_nothing_and_succeed(self) -> None:
+        # Sessions started before a unit's run state was read from its run records still call them.
+        self.unit_session("alpha", "%4")
+        before = self.tmux.read_bytes()
+        for arguments in (("ready", "director", "--unit", "alpha"), ("ready", "no-such-showrunner", "--unit", "x"),
+                          ("status", "--state", "run-finished"),
+                          ("status", "director", "--unit", "any-name", "--state", "running")):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(self.successful(*arguments, pane="%4"), "")
+        self.assertEqual(self.tmux.read_bytes(), before)
+
+    def test_settings_ignore_a_showrunner_list_stored_before_showrunners_were_looked_up(self) -> None:
+        document = {**showrunners.defaults(), "showrunners": [{
+            "session": "director", "zone": LOS_ANGELES, "units": [{"session": "finished", "status": "run-finished"}]}]}
+        _ = self.config.write_text(json.dumps(document), encoding="utf-8")
+        self.assertEqual(showrunners.load_settings_from(self.config), showrunners.defaults())
+
+    def test_an_absent_or_invalid_settings_file_is_one_error_that_names_the_file(self) -> None:
+        for contents in (None, "{invalid json", '{"always": "wrong"}'):
             with self.subTest(contents=contents):
                 self.config.unlink(missing_ok=True)
                 if contents is not None:
                     _ = self.config.write_text(contents)
-                result = self.cli("list")
-                self.assertEqual(result.returncode, 1, result.stdout)
-                self.assertEqual(result.stdout, "")
-                self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
-                self.assertIn(str(self.config), result.stderr)
+                with self.assertRaisesRegex(ValueError, re.escape(str(self.config))):
+                    _ = showrunners.load_settings_from(self.config)
 
 
 if __name__ == "__main__":

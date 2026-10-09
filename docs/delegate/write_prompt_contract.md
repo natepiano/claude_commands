@@ -1,6 +1,6 @@
 # Write a delegate prompt
 
-Read at the point of use from `/unit:delegate`. Defines `<WritePromptContract/>`,
+Read at the point of use from `/unit:direct`. Defines `<WritePromptContract/>`,
 `<PhaseTeam/>`, `<CoordinationBoard/>`, `<PhaseMesh/>`, `<BuildTokenContract/>`,
 `<TeamFilePartition/>`, and `<RoleReassignment/>` in full.
 

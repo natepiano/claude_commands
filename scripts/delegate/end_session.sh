@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# end_session.sh — Mark this Claude session's delegate run finished.
+# end_session.sh — Mark this Claude session's unit run finished.
 #
 # Usage: end_session.sh
 #
@@ -53,7 +53,7 @@ if [[ -f "${MARKER}" ]]; then
       >/dev/null 2>&1 || true
   fi
   rm -f "${MARKER}"
-  echo "Delegate run ended; marker cleared."
+  echo "Unit run ended; marker cleared."
 else
-  echo "No active delegate run marker for this session."
+  echo "No active unit run marker for this session."
 fi

@@ -1,6 +1,6 @@
 # Close the run
 
-Read at the point of use from `/unit:delegate`. Defines `<FinalGateCommit/>`,
+Read at the point of use from `/unit:direct`. Defines `<FinalGateCommit/>`,
 `<RunAsBuilt/>`, and `<AsBuiltCommit/>` in full.
 
 **Read when:** `<FinalGate/>` is green, or a `single` task finishes.
@@ -57,6 +57,13 @@ the user, so it needs no gate here. It changes no code and commits nothing itsel
 <AsBuiltCommit/> after it and leave the run's tree clean. Carry both reports into
 <RunSummary/>. A refusal there is reported, not repaired, and leaves nothing to
 commit.
+
+Correcting an as-built doc under `docs/as-built/` that contradicts the code is
+always allowed in this pass, in any unit's doc, without asking the user, the
+showrunner or the owner; a production unit's notice names the file as
+`also touches`. User, 2026-10-07.
+
+A production unit sets no run state: the showrunner's tools read it from this run's record, which reads as finished once the run's finish is recorded. A run that stopped, failed, or waits on a decision does not read as finished, and nothing asks for `run done` text in the Plan cell.
 </RunAsBuilt>
 
 <AsBuiltCommit>

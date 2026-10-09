@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, final, override
+from unittest.mock import patch
 
-from add_unit import live_unit_rows, plan_cell_is_retired, retired_sessions, retired_units
+import add_unit
+import unit_lookup
+from add_unit import cell_value, live_unit_table, plan_cell_is_retired, retired_units
 
 
 SCRIPT = Path(__file__).with_name("add_unit.py")
+OLD_HEADER = ["## Units", "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
+              "| --- | --- | --- | --- | --- | --- | --- |"]
 STUB = r'''#!/usr/bin/env python3
 import json
 import os
@@ -29,16 +35,35 @@ with (state / "events.jsonl").open("a") as events:
     events.write(json.dumps({"command": name, "args": args,
                              "claude_env": sorted(key for key in os.environ if key.startswith("CLAUDE_"))}) + "\n")
 if name == "tmux":
-    if args[:1] == ["has-session"]:
-        target = args[args.index("-t") + 1]
-        raise SystemExit(0 if target.startswith("=") and (state / f"live-{target[1:]}").exists() else 1)
-    if args[:1] == ["capture-pane"]:
-        target = args[args.index("-t") + 1]
-        if not target.startswith("=") or not (state / f"live-{target[1:-1]}").exists():
+    # A session is a `live-<name>` file; its marks are in `env-<name>.json`, absent when it has none.
+    live = sorted(path.name[5:] for path in state.glob("live-*"))
+
+    def named(target):
+        for index, session in enumerate(live, 1):
+            if target in (f"${index}", f"%{index}", f"={session}"):
+                return session
+        return None
+
+    target = args[args.index("-t") + 1] if "-t" in args else ""
+    if args[:1] in (["has-session"], ["show-environment"], ["capture-pane"]) and named(target) is None:
+        raise SystemExit(1)
+    if args[:1] == ["list-panes"]:
+        if not live:
+            print("no server running on /tmp/stub", file=sys.stderr)
             raise SystemExit(1)
+        for index, session in enumerate(live, 1):
+            print(f"${index}\t%{index}\t{session}")
+    if args[:1] == ["show-environment"]:
+        marks = state / f"env-{named(target)}.json"
+        for key, value in (json.loads(marks.read_text()) if marks.exists() else {}).items():
+            print(f"{key}={value}")
+    if args[:1] == ["capture-pane"]:
         print("/remote-control is active" if (state / "ready").exists() else "Waiting for remote control")
     if args[:1] == ["new-session"]:
-        (state / f"live-{args[args.index('-s') + 1]}").touch()
+        session = args[args.index("-s") + 1]
+        (state / f"live-{session}").touch()
+        marks = dict(args[index + 1].split("=", 1) for index, argument in enumerate(args) if argument == "-e")
+        (state / f"env-{session}.json").write_text(json.dumps(marks))
 elif name == "systemd-run":
     raise SystemExit(subprocess.run(args[3:], check=False).returncode)
 elif name == "nix":
@@ -65,6 +90,9 @@ class AddUnitTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        # Rows read in this process name worktrees that exist nowhere: answer for them here, so no
+        # test asks the real disk, and a row with a worktree never asks tmux. RetiredRowTests covers the rule.
+        _ = self.enterContext(patch.object(add_unit, "worktree_is_linked", return_value=True))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.checkout = self.root / "project-trunk"
         self.checkout.mkdir()
@@ -104,6 +132,7 @@ class AddUnitTests(unittest.TestCase):
         self.env = {**os.environ, "HOME": str(self.root / "home"),
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "STUB_STATE": str(self.state), "STUB_TMUX": str(self.bin / "tmux"),
+                    "UNIT_LOOKUP_TMUX": str(self.bin / "tmux"), "TMUX_PANE": "",
                     "SHOWRUNNERS_CONFIG": str(self.config), "CLAUDE_TEST_SECRET": "must-not-leak",
                     "AGENTS_CONFIG_FILE": str(self.agent_config),
                     "CODEX_CONFIG_FILE": str(codex_config),
@@ -120,16 +149,17 @@ class AddUnitTests(unittest.TestCase):
                    "[claude.agents]\nopus=low,medium,high,xhigh\nsonnet=low,medium,high,xhigh\n")
         _ = self.agent_config.write_text(content, encoding="utf-8")
 
-    def production_doc(self) -> str:
+    def production_doc(self, merge_branch: str = "build-followups", *, session_column: bool = False) -> str:
+        columns = ["Unit", "Plan", "Worktree", "Branch", *(["Session"] if session_column else []), "Port", "Owns"]
         return ("# Production\n\n"
-                "- **Merge branch:** `build-followups` — unit checkpoints merge here\n"
+                f"- **Merge branch:** `{merge_branch}` — unit checkpoints merge here\n"
                 f"- **Showrunner checkout:** `{self.checkout}`\n"
                 "- **Showrunner session:** director\n"
                 "- **Log:** `docs/plans/build-followups-log.md` — git-excluded\n"
                 "- **User zone:** America/Los_Angeles — reports use PDT\n\n"
                 "## Units\n\n"
-                "| Unit | Plan | Worktree | Branch | Session | Port | Owns |\n"
-                "| --- | --- | --- | --- | --- | --- | --- |\n\n"
+                f"| {' | '.join(columns)} |\n"
+                f"| {' | '.join('---' for _ in columns)} |\n\n"
                 "## Gates\n")
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
@@ -191,18 +221,9 @@ class AddUnitTests(unittest.TestCase):
             "| enh-showrunner-unit | `docs/plans/build-followups-enh-showrunner-dailies.md` (follow-up: retired units drop out of the status and a simple dailies groups idle units; the user, 2026-10-07; the earlier run's as-built is `docs/as-built/showrunner-automation.md`) (Phases 7 and 8 of stalls-unit's plan, moved by the user 2026-10-06 14:2x PDT) | `/home/natepiano/worktrees/claude-build-followups-enh-showrunner` | `build-followups-enh-showrunner` | `enh-showrunner` | — | `docs/as-built/showrunner-automation.md`; `scripts/production/add_unit.py`, `test_add_unit.py`, `merge_checkpoint.py`, `test_merge_checkpoint.py`; `commands/showrunner/add_unit.md`; after stalls-unit Phase 6 merges: `commands/showrunner/produce.md`, `commands/showrunner/promote_unit.md`, `scripts/production/showrunners.py`, `scripts/production/stall_watch.py` and their tests (hub rows); from its Phase 5 (the user, 2026-10-06 15:25 PDT, the phase-end split): `commands/unit/delegate.md`, `commands/unit/checkpoint.md`, `docs/delegate/run_phase_review.md`, `docs/production_format.md`, `commands/unit/add_ons.md`, `commands/plan/shrink.md`, `commands/plan/phase_review.md`, `docs/delegate/phase_end.md`, `docs/delegate_plan_format.md`, `commands/unit/eta_breakdown.md`, `docs/delegate/final_gate_commit.md` |",
             "| model-study-unit | `docs/as-built/director-model-study.md` (run done; as-built 16e5ac6) | `/home/natepiano/worktrees/claude-build-followups-model-study` | `build-followups-model-study` | `model-study` | — | `docs/plans/build-followups-model-study.md`; `scripts/model_study/`; `docs/as-built/director-model-study-results.md` |",
         ]
-        self.assertEqual(retired_units(lines), {"stalls-unit"})
-        self.assertEqual(retired_sessions(lines), {"hook"})
-        self.assertEqual(live_unit_rows(lines), lines[-2:])
-
-    def test_retired_sessions_read_backticked_session_with_commentary(self) -> None:
-        lines = [
-            "## Units",
-            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-            "| old-unit | retired after completion | /tmp/old | old | `old-session` (resumed elsewhere) | — | — |",
-        ]
-        self.assertEqual(retired_sessions(lines), {"old-session"})
+        self.assertEqual(retired_units(lines, "build-followups"), {"stalls-unit"})
+        self.assertEqual([cell_value(cells["Unit"]) for cells in live_unit_table(lines, "build-followups")],
+                         ["enh-showrunner-unit", "model-study-unit"])
 
     def test_retired_units_include_retired_name_and_exclude_live_name(self) -> None:
         lines = [
@@ -212,20 +233,19 @@ class AddUnitTests(unittest.TestCase):
             "| `old-unit` | retired after completion | /tmp/old | old | old | — | — |",
             "| `live-unit` | docs/live.md | /tmp/live | live | live | — | — |",
         ]
-        self.assertEqual(retired_units(lines), {"old-unit"})
+        self.assertEqual(retired_units(lines, "show"), {"old-unit"})
 
     def unit_row(self, name: str = "alpha", *, branch: str = "build-followups-alpha",
                  worktree: Path | None = None, plan: str = "docs/plans/given.md",
                  port: str = "—", owns: str = "—") -> str:
         target = worktree or self.root / "project-alpha"
-        return f"| {name}-unit | {plan} | {target} | {branch} | {name} | {port} | {owns} |"
+        return f"| {name}-unit | {plan} | {target} | {branch} | {port} | {owns} |"
 
     def prepared_row(self, *, name: str = "alpha", plan: str = "docs/plans/given.md",
-                     worktree: Path | None = None, branch: str = "build-followups-alpha",
-                     session: str = "alpha") -> str:
+                     worktree: Path | None = None, branch: str = "build-followups-alpha") -> str:
         target = worktree or self.root / "project-alpha"
         return (f"| `{name}-unit` | `{plan}` (ready to launch) | `{target}` | "
-                f"`{branch}` | `{session}` | 8123 | `src/alpha` — assigned files |")
+                f"`{branch}` | 8123 | `src/alpha` — assigned files |")
 
     def commit_prepared_row(self, row: str) -> None:
         _ = self.doc.write_text(self.production_doc().replace("## Gates", row + "\n\n## Gates"),
@@ -243,12 +263,12 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(self.events("tmux"), [])
         self.assertEqual(self.events("systemd-run"), [])
 
-    def registry_units(self) -> list[str]:
-        data = cast(dict[str, object], json.loads(self.config.read_text()))
-        runners = cast(list[dict[str, object]], data["showrunners"])
-        runner = next(item for item in runners if item["session"] == "director")
-        self.assertEqual(runner["zone"], "America/Los_Angeles")
-        return cast(list[str], runner["units"])
+    def marks(self, session: str) -> dict[str, str]:
+        return cast(dict[str, str], json.loads((self.state / f"env-{session}.json").read_text()))
+
+    def new_sessions(self) -> list[list[str]]:
+        return [cast(list[str], record["args"]) for record in self.events("tmux")
+                if cast(list[str], record["args"])[:1] == ["new-session"]]
 
     def test_standby_launch_records_state_without_writing_a_plan(self) -> None:
         _ = self.successful("alpha", "--standby", "--port", "8123", "--owns", "src/alpha")
@@ -261,20 +281,21 @@ class AddUnitTests(unittest.TestCase):
                          "docs/plans/build-followups-production.md")
         self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
         self.assertFalse((worktree / "docs/plans/build-followups-alpha.md").exists())
-        self.assertEqual(self.registry_units(), ["alpha"])
-        data = cast(dict[str, object], json.loads(self.config.read_text()))
-        runner = cast(list[dict[str, object]], data["showrunners"])[0]
-        self.assertEqual(runner["standby"], ["alpha"])
+        # Adding a unit registers nothing: the showrunner's update timer already names the doc.
+        self.assertFalse(self.config.exists())
+        self.assertEqual(self.marks("alpha"), {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
         tmux = next(record for record in self.events("tmux")
                     if cast(list[str], record["args"])[:1] == ["new-session"])
         command = cast(list[str], tmux["args"])[-1]
         prompt = (f"You are alpha-unit in production build-followups (doc {self.doc}), "
-                  f"under the showrunner director, on standby. Work only in your worktree {worktree}, "
+                  "under the showrunner, whose session name `~/.claude/scripts/lib/py "
+                  "~/.claude/scripts/production/showrunners.py name build-followups` prints (look it up "
+                  f"before each message: the name can change), on standby. Work only in your worktree {worktree}, "
                   "branch build-followups-alpha. Do nothing until the showrunner sends you work.")
         self.assertIn(prompt, command)
         self.assert_director_flags("opus", "xhigh")
         self.assertRegex(self.log.read_text(),
-                         r"^- \d\d:\d\d PDT: added alpha-unit \(standby\), tmux alpha, worktree ")
+                         r"^- \d\d:\d\d PDT: added alpha-unit \(standby\), worktree ")
 
     def test_standby_rejects_other_modes_before_any_change(self) -> None:
         original = self.doc.read_text()
@@ -292,7 +313,8 @@ class AddUnitTests(unittest.TestCase):
                 self.assertFalse((self.root / "project-alpha").exists())
                 self.assertEqual(self.events("systemd-run"), [])
 
-    def test_plan_adds_row_commits_pushes_worktree_launches_and_records(self) -> None:
+    def test_plan_adds_row_commits_worktree_launches_and_records(self) -> None:
+        pushed = self.git("--git-dir", str(self.origin), "rev-parse", "refs/heads/build-followups")
         result = self.successful("alpha", "--plan", "docs/plans/given.md", "--port", "8123",
                                  "--owns", "src/alpha")
         worktree = self.root / "project-alpha"
@@ -302,8 +324,14 @@ class AddUnitTests(unittest.TestCase):
                          "docs/plans/build-followups-production.md")
         self.assertIn("production(build-followups): add unit alpha-unit (plan)",
                       self.git("log", "-1", "--format=%s"))
-        for branch in ("build-followups", "build-followups-alpha"):
-            _ = self.git("--git-dir", str(self.origin), "rev-parse", f"refs/heads/{branch}")
+        # An add pushes nothing: the unit's commit waits for the next merge push, and the unit branch
+        # for its first checkpoint push, which sets the upstream.
+        self.assertEqual(self.git("--git-dir", str(self.origin), "rev-parse", "refs/heads/build-followups"), pushed)
+        self.assertEqual(self.git("--git-dir", str(self.origin), "for-each-ref", "--format=%(refname)", "refs/heads"),
+                         "refs/heads/build-followups")
+        self.assertEqual(self.git("for-each-ref", "--format=%(refname) upstream=%(upstream)",
+                                  "refs/heads/build-followups-alpha"),
+                         "refs/heads/build-followups-alpha upstream=")
         self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD", cwd=worktree),
                          "build-followups-alpha")
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=worktree),
@@ -316,16 +344,35 @@ class AddUnitTests(unittest.TestCase):
         tmux = next(record for record in self.events("tmux")
                     if cast(list[str], record["args"])[:1] == ["new-session"])
         args = cast(list[str], tmux["args"])
-        self.assertEqual(args[:9], ["new-session", "-d", "-s", "alpha", "-c", str(worktree),
-                                    "-e", "SHOWRUNNER_UNIT=build-followups", "zsh"])
+        self.assertEqual(args[:11], ["new-session", "-d", "-s", "alpha", "-c", str(worktree),
+                                     "-e", "SHOWRUNNER_UNIT=build-followups", "-e", "SHOWRUNNER_UNIT_ID=alpha-unit",
+                                     "zsh"])
         self.assertIn("claude --model opus --effort xhigh --remote-control alpha -n alpha", args[-1])
         self.assert_director_flags("opus", "xhigh")
-        self.assertIn("'/unit:delegate docs/plans/given.md'", args[-1])
-        self.assertEqual(self.registry_units(), ["alpha"])
+        self.assertIn("'/unit:direct docs/plans/given.md'", args[-1])
+        # Adding a unit registers nothing: the showrunner's update timer already names the doc.
+        self.assertFalse(self.config.exists())
         self.assertRegex(self.log.read_text(),
-                         r"^- \d\d:\d\d PDT: added alpha-unit \(plan\), tmux alpha, worktree ")
+                         r"^- \d\d:\d\d PDT: added alpha-unit \(plan\), worktree ")
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
         self.assertIn("alpha-unit started: tmux attach -t alpha", result.stdout)
+
+    def test_a_doc_that_still_has_the_session_column_gets_a_dash_there(self) -> None:
+        _ = self.doc.write_text(self.production_doc(session_column=True), encoding="utf-8")
+        _ = self.git("commit", "-am", "an older production doc")
+        _ = self.git("push", "origin", "build-followups")
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--port", "8123")
+        self.assertIn(f"| alpha-unit | docs/plans/given.md | {self.root / 'project-alpha'} | build-followups-alpha "
+                      + "| — | 8123 | — |", self.doc.read_text())
+
+    def test_a_rerun_finds_the_unit_by_its_mark_after_its_session_was_renamed(self) -> None:
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        for kind, suffix in (("live", ""), ("env", ".json")):
+            _ = (self.state / f"{kind}-alpha{suffix}").rename(self.state / f"{kind}-renamed{suffix}")
+        result = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(len(self.new_sessions()), 1)
+        self.assertIn("alpha-unit started: tmux attach -t renamed", result.stdout)
+        self.assertEqual(len(self.log.read_text().splitlines()), 1)
 
     def test_sonnet_director_row_changes_launch_model_and_effort(self) -> None:
         self.write_agent_config(director="sonnet:xhigh")
@@ -373,23 +420,9 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(self.git("branch", "--show-current", cwd=self.root / "project-alpha"),
                          "build-followups-alpha")
         self.assertEqual(len(self.events("systemd-run")), 1)
-        self.assertEqual(self.registry_units(), ["alpha"])
+        # Adding a unit registers nothing: the showrunner's update timer already names the doc.
+        self.assertFalse(self.config.exists())
         self.assertIn("added alpha-unit (plan)", self.log.read_text())
-
-    def test_prepared_row_uses_its_renamed_session_for_every_launch_target(self) -> None:
-        self.commit_prepared_row(self.prepared_row(session="renamed-alpha"))
-        result = self.successful("alpha", "--plan", "docs/plans/given.md")
-        launch = self.events("systemd-run")
-        self.assertEqual(len(launch), 1)
-        self.assertEqual(cast(list[str], launch[0]["args"])[:3],
-                         ["--user", "--scope", "--unit=renamed-alpha"])
-        tmux = next(record for record in self.events("tmux")
-                    if cast(list[str], record["args"])[:1] == ["new-session"])
-        arguments = cast(list[str], tmux["args"])
-        self.assertEqual(arguments[arguments.index("-s") + 1], "renamed-alpha")
-        self.assertIn("--remote-control renamed-alpha -n renamed-alpha", arguments[-1])
-        self.assertEqual(self.registry_units(), ["renamed-alpha"])
-        self.assertIn("alpha-unit started: tmux attach -t renamed-alpha", result.stdout)
 
     def test_prepared_row_refuses_mismatched_identity_cells_before_launch(self) -> None:
         cases = (("Plan", self.prepared_row(plan="docs/plans/other.md"),
@@ -499,9 +532,26 @@ class AddUnitTests(unittest.TestCase):
                     if cast(list[str], record["args"])[:1] == ["new-session"])
         prompt = cast(list[str], tmux["args"])[-1]
         self.assertIn("Write the full phased plan there", prompt)
-        self.assertIn("wait for its approval before you run /unit:delegate docs/plans/build-followups-alpha.md", prompt)
+        self.assertIn("wait for its approval before you run /unit:direct docs/plans/build-followups-alpha.md", prompt)
         self.assertIn("alpha-unit started: tmux attach -t alpha", result.stdout)
         self.assert_director_flags("opus", "xhigh")
+
+    def test_branch_takes_the_slug_and_the_stub_sits_beside_the_production_doc(self) -> None:
+        _ = self.git("checkout", "-b", "init/catalyst")
+        self.doc = self.checkout / "docs/hana/tool-based-ui-production.md"
+        _ = self.doc.parent.mkdir(parents=True)
+        _ = self.doc.write_text(self.production_doc("init/catalyst"), encoding="utf-8")
+        _ = self.git("add", "docs/hana/tool-based-ui-production.md")
+        _ = self.git("commit", "-m", "production under another merge branch")
+        _ = self.successful("lfo", "--brief", "Add the LFO tool")
+        worktree = self.root / "project-lfo"
+        self.assertIn(self.unit_row("lfo", branch="tool-based-ui-lfo", worktree=worktree,
+                                    plan="docs/hana/tool-based-ui-lfo.md"), self.doc.read_text())
+        self.assertEqual(self.git("branch", "--show-current", cwd=worktree), "tool-based-ui-lfo")
+        self.assertEqual(set(self.git("show", "--pretty=format:", "--name-only", "HEAD").splitlines()),
+                         {"docs/hana/tool-based-ui-production.md", "docs/hana/tool-based-ui-lfo.md"})
+        self.assertFalse((self.checkout / "docs/plans/init").exists())
+        self.assertEqual(self.git("branch", "--list", "init/catalyst-lfo"), "")
 
     def test_timeout_keeps_session_then_rerun_finishes_without_duplicate_steps(self) -> None:
         _ = (self.state / "ready").unlink()
@@ -518,7 +568,8 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(self.doc.read_text().count("| alpha-unit |"), 1)
         self.assertEqual(len([event for event in self.events("tmux")
                               if cast(list[str], event["args"])[:1] == ["new-session"]]), 1)
-        self.assertEqual(self.registry_units(), ["alpha"])
+        # Adding a unit registers nothing: the showrunner's update timer already names the doc.
+        self.assertFalse(self.config.exists())
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
 
     def test_refusals_change_no_repository_or_registry_state(self) -> None:
@@ -568,6 +619,7 @@ class AddUnitTests(unittest.TestCase):
         _ = (self.state / "live-alpha").touch()
         live = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(live.returncode, 2, (live.stdout, live.stderr))
+        self.assertIn("tmux session alpha is already live and is not marked as alpha-unit", live.stderr)
         self.assertEqual(self.doc.read_text(), original)
         self.assertEqual(len(self.events("systemd-run")), 0)
 
@@ -586,7 +638,7 @@ class AddUnitTests(unittest.TestCase):
         self.assertIn("You are now alpha-unit in production build-followups", command)
         promoted_plan = self.root / "project-alpha/docs/plans/given.md"
         self.assertTrue(promoted_plan.exists())
-        self.assertIn(f"Run /unit:delegate {promoted_plan}", command)
+        self.assertIn(f"Run /unit:direct {promoted_plan}", command)
 
     def test_brief_row_cannot_be_retried_as_plan_on_its_stub(self) -> None:
         _ = self.successful("alpha", "--brief", "Write a full plan")
@@ -652,7 +704,7 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(self.doc.read_text(), original)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
 
-    def test_tmux_targets_are_exact_when_only_prefix_session_is_live(self) -> None:
+    def test_the_name_check_is_exact_and_the_pane_is_read_by_its_id(self) -> None:
         _ = (self.state / "live-alpha2").touch()
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(len(self.events("systemd-run")), 1)
@@ -663,7 +715,7 @@ class AddUnitTests(unittest.TestCase):
         self.assertTrue(has_targets)
         self.assertTrue(pane_targets)
         self.assertEqual(set(has_targets), {"=alpha"})
-        self.assertEqual(set(pane_targets), {"=alpha:"})
+        self.assertEqual(set(pane_targets), {"%1"})
 
     def test_underscore_name_and_checkout_without_trunk_suffix(self) -> None:
         renamed = self.root / "project"
@@ -681,15 +733,68 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD",
                                   cwd=self.root / "project-mul-add"), "build-followups-mul-add")
 
-    def test_old_prompt_gains_unit_and_showrunner_form_stays_intact(self) -> None:
-        _ = self.prompt.parent.mkdir(parents=True)
-        old = "Run `zsh ~/.claude/scripts/production/unit_status.sh /tmp/scratch America/Los_Angeles existing | cut -c1-400`.\n"
-        _ = self.prompt.write_text(old, encoding="utf-8")
-        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
-        self.assertIn("America/Los_Angeles existing alpha |", self.prompt.read_text())
-        _ = self.prompt.write_text("Run `unit_status.sh --showrunner director`.\n", encoding="utf-8")
-        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
-        self.assertEqual(self.prompt.read_text(), "Run `unit_status.sh --showrunner director`.\n")
+
+class RetiredRowTests(unittest.TestCase):
+    """A unit is retired by its Plan cell, or when its worktree and its tmux session are both gone."""
+
+    root: Path = Path()
+    linked: Path = Path()
+    main: Path = Path()
+    missing: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root)
+        self.linked = self.root / "linked"
+        self.linked.mkdir()
+        _ = (self.linked / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+        self.main = self.root / "main"
+        (self.main / ".git").mkdir(parents=True)
+        self.missing = self.root / "missing"
+
+    def row(self, unit: str, worktree: Path, plan: str = "`docs/plan.md`") -> str:
+        return f"| `{unit}-unit` | {plan} | `{worktree}` | `branch` | `{unit}` (resumed elsewhere) | — | — |"
+
+    def session(self, unit: str) -> unit_lookup.MarkedUnit:
+        return unit_lookup.MarkedUnit(unit, "%1", "any-label", unit_lookup.ClaudeNotRunning())
+
+    def retired(self, worktree: Path, *, gone: bool, plan: str = "`docs/plan.md`") -> tuple[bool, int]:
+        """Whether the row is retired, and how many times tmux was asked."""
+        found = {} if gone else {"some-unit": self.session("some-unit")}
+        cells = add_unit.unit_table([*OLD_HEADER, self.row("some", worktree, plan)])[0]
+        with patch.object(unit_lookup, "marked_units", return_value=found) as asked:
+            return add_unit.unit_is_retired(cells, add_unit.SessionMarks("show")), asked.call_count
+
+    def test_a_unit_is_gone_only_without_both_its_worktree_and_its_session(self) -> None:
+        self.assertEqual(self.retired(self.missing, gone=True), (True, 1))
+        self.assertEqual(self.retired(self.missing, gone=False), (False, 1))
+        # A session that is only restarting keeps its row: its worktree is there, and tmux is not asked.
+        self.assertEqual(self.retired(self.linked, gone=True), (False, 0))
+        # A main checkout is shared, so it holds no unit once the session is gone.
+        self.assertEqual(self.retired(self.main, gone=True), (True, 1))
+        self.assertEqual(self.retired(self.main, gone=False), (False, 1))
+        self.assertEqual(self.retired(self.linked, gone=False, plan="retired after completion"), (True, 0))
+
+    def test_tmux_must_say_the_session_is_gone_and_is_asked_once_for_a_whole_table(self) -> None:
+        lines = [*OLD_HEADER, self.row("first", self.missing), self.row("second", self.missing)]
+        with patch.object(unit_lookup, "marked_units", side_effect=OSError("tmux could not list panes")) as asked:
+            self.assertEqual(retired_units(lines, "show"), set())
+        self.assertEqual(asked.call_count, 1)
+        with patch.object(unit_lookup, "marked_units", return_value={"second-unit": self.session("second-unit")}) as asked:
+            self.assertEqual(retired_units(lines, "show"), {"first-unit"})
+        self.assertEqual(asked.call_count, 1)
+
+    def test_every_list_drops_a_unit_that_is_gone(self) -> None:
+        lines = [
+            *OLD_HEADER,
+            self.row("marked", self.linked, "retired after completion"),
+            self.row("gone", self.missing),
+            self.row("parked", self.linked),
+        ]
+        with patch.object(unit_lookup, "marked_units", return_value={}):
+            self.assertEqual(retired_units(lines, "show"), {"marked-unit", "gone-unit"})
+            self.assertEqual([cell_value(cells["Unit"]) for cells in live_unit_table(lines, "show")], ["parked-unit"])
 
 
 if __name__ == "__main__":

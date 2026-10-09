@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -130,6 +131,23 @@ class WaitingTests(unittest.TestCase):
         send.chmod(0o755)
         home = self.root / "home"
         home.mkdir()
+        # Each unit has a tmux session marked as that unit, with a Claude running under the unit's id
+        # as its name. Tests that call the tool in this process read the same stand-ins.
+        (self.root / "sessions").mkdir()
+        self.write(self.root / "showrunners.json", json.dumps({
+            "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "natedev",
+            "always": []}))
+        self.enterContext(mock.patch.dict(os.environ, {
+            "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
+            "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+            "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json")}))
+        self.write(self.root / "tmux.json", json.dumps({
+            f"${index}": {"label": "any-label", "panes": [f"%{index}"],
+                          "env": {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": unit}}
+            for index, unit in enumerate((ALPHA, BETA, GAMMA), start=1)}))
+        for index, unit in enumerate((ALPHA, BETA, GAMMA), start=1):
+            self.claude(unit, f"%{index}")
         self.env = {**os.environ, "HOME": str(home), "WAITING_TEST_BOARD": str(self.board),
                     "WAITING_TEST_SENDS": str(self.sends),
                     "PATH": str(self.bin_path) + os.pathsep + os.environ.get("PATH", "")}
@@ -199,6 +217,17 @@ class WaitingTests(unittest.TestCase):
     def refs(self, cwd: Path) -> str:
         return self.git("for-each-ref", "--format=%(refname) %(objectname)", cwd=cwd)
 
+    def claude(self, name: str, pane: str) -> None:
+        """Record a live Claude called `name` in `pane`: this test process stands in for it."""
+        path = self.root / f"claude-{pane.removeprefix('%')}.sock"
+        if not path.exists():
+            held = socket.socket(socket.AF_UNIX)
+            held.bind(str(path))
+            self.addCleanup(held.close)
+        self.write(self.root / "sessions" / f"{pane.removeprefix('%')}.json", json.dumps({
+            "pid": os.getpid(), "sessionId": f"id-{name}", "name": name, "messagingSocketPath": str(path),
+            "updatedAt": 1, "tmux": f"label-at-start:@1.{pane}"}))
+
     def production_doc(self) -> None:
         self.write(self.doc, "\n".join((
             "# Production — example", "", "> **Status: PRODUCTION — running.** Example.",
@@ -206,10 +235,10 @@ class WaitingTests(unittest.TestCase):
             f"- **Showrunner checkout:** `{self.checkout}`", "- **Showrunner session:** showrunner-example",
             "- **Log:** `production.log`", "- **User zone:** America/Los_Angeles",
             "- **Updates:** every 15 minutes", "", "## Units", "",
-            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-            f"| `{ALPHA}` | `docs/alpha.md` | `{self.alpha}` | `alpha-branch` | `{ALPHA}` | — | `shared.txt` |",
-            f"| `{BETA}` | `docs/beta.md` | `{self.beta}` | `beta-branch` | `{BETA}` | — | `src/beta.py` |",
+            "| Unit | Plan | Worktree | Branch | Port | Owns |",
+            "| --- | --- | --- | --- | --- | --- |",
+            f"| `{ALPHA}` | `docs/alpha.md` | `{self.alpha}` | `alpha-branch` | — | `shared.txt` |",
+            f"| `{BETA}` | `docs/beta.md` | `{self.beta}` | `beta-branch` | — | `src/beta.py` |",
             "", "## Gates", "", "| Gate | Waiting | Waits on | Clears when |",
             "| --- | --- | --- | --- |",
             f"| G1 | {ALPHA} phase 2 | {BETA} phase 1 | beta code merged |",
@@ -218,14 +247,12 @@ class WaitingTests(unittest.TestCase):
 
     def add_gamma(self) -> None:
         content = self.doc.read_text(encoding="utf-8")
-        row = f"| `{GAMMA}` | `docs/gamma.md` | `{self.root / 'gamma'}` | `gamma-branch` | `{GAMMA}` | — | — |\n"
+        row = f"| `{GAMMA}` | `docs/gamma.md` | `{self.root / 'gamma'}` | `gamma-branch` | — | — |\n"
         self.write(self.doc, content.replace("\n\n## Gates", f"\n{row}\n## Gates"))
 
     def alpha_session(self, session: str) -> None:
-        content = self.doc.read_text(encoding="utf-8")
-        old = f"| `alpha-branch` | `{ALPHA}` |"
-        self.assertIn(old, content)
-        self.write(self.doc, content.replace(old, f"| `alpha-branch` | `{session}` |"))
+        """The user renamed alpha's session: only the live session record says so."""
+        self.claude(session, "%1")
 
     def run_waiting(self, action: str, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), action, *args,
@@ -288,8 +315,7 @@ class WaitingTests(unittest.TestCase):
             session=add_unit.NewSession(),
             timeout=1.0,
         )
-        with (mock.patch.object(add_unit, "registry_has_unit", return_value=True),
-              mock.patch.object(add_unit, "update_old_prompt"), redirect_stdout(io.StringIO())):
+        with redirect_stdout(io.StringIO()):
             add_unit.record(request)
         produced = producer_log.read_text(encoding="utf-8").strip().partition(": ")[2]
         return f"- {moment:%H:%M %Z}: {produced}"
@@ -399,7 +425,6 @@ class WaitingTests(unittest.TestCase):
             "stall_minutes": 5.0,
             "faults_to": "showrunner-example",
             "always": [],
-            "showrunners": [],
         }
         return quota_alert.message(note, [], config)
 
@@ -693,8 +718,8 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
 
     def agenda_log(self, start: datetime, phase: str, *, eta: datetime | None = None,
                    wait: datetime | None = None, eta_identifier: str = ALPHA,
-                   state_session: str = ALPHA) -> None:
-        events = [(start, self.producer_launch_line(start, session=state_session))]
+                   ) -> None:
+        events = [(start, self.producer_launch_line(start))]
         if eta is not None:
             eta_moment = start + timedelta(minutes=10)
             events.append((eta_moment, self.producer_eta_line(eta_moment, phase, eta,
@@ -703,7 +728,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
             events.append((wait, f"- {wait:%H:%M %Z}: block: {ALPHA} on {BETA} "
                                  + "(files: shared.txt), clears ~23:00"))
         lines = ["# Production log — example", *(line for _, line in sorted(events))]
-        lines.append(self.producer_state_block(datetime.now(start.tzinfo), {state_session: phase}))
+        lines.append(self.producer_state_block(datetime.now(start.tzinfo), {ALPHA: phase}))
         self.write(self.log, "\n".join((*lines, "")))
 
     def test_agenda_opens_phase_started_nine_hours_ago_only_once(self) -> None:
@@ -798,8 +823,8 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
             with self.subTest(identifier=identifier):
                 _ = (self.state / "agenda_seen.json").unlink(missing_ok=True)
                 start = datetime.now(zone) - timedelta(hours=1)
-                self.agenda_log(start, PHASE, eta=start + timedelta(hours=9),
-                                eta_identifier=identifier, state_session=session)
+                # The saved report state names a unit by its id; an ETA segment may use either name.
+                self.agenda_log(start, PHASE, eta=start + timedelta(hours=9), eta_identifier=identifier)
                 result = self.run_waiting("agenda", "--state-dir", str(self.state))
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f"{ALPHA}|{PHASE_IDENTITY}", result.stdout)
@@ -905,6 +930,18 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
             self.assertIn("4%", line)
             self.assertIn("resets 2026-10-12 09:00 PDT", line)
 
+    def test_quota_tells_units_to_keep_delegating_on_codex_and_to_stop_on_claude(self) -> None:
+        codex = self.run_waiting("quota", "--notice", self.quota_message(self.quota_note("codex 1")),
+                                 "--state-dir", str(self.state))
+        self.assertEqual(codex.returncode, 0, codex.stdout + codex.stderr)
+        self.assertIn(f"send {ALPHA}: From the showrunner: keep delegating on Codex:", codex.stdout)
+        self.assertIn("tell the showrunner at once if Codex refuses work for quota", codex.stdout)
+        self.assertNotIn("start no new", codex.stdout)
+        claude = self.run_waiting("quota", "--notice", self.quota_message(self.quota_note("claude 2", "claude")),
+                                  "--state-dir", str(self.state))
+        self.assertEqual(claude.returncode, 0, claude.stdout + claude.stderr)
+        self.assertIn(f"send {ALPHA}: From the showrunner: start no new delegate work on Claude;", claude.stdout)
+
     def test_quota_queues_one_unit_collects_failure_and_saves_held_alert(self) -> None:
         self.add_gamma()
         send = self.bin_path / "send.py"
@@ -920,6 +957,16 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertIn(f"quota: failed — {GAMMA}:", result.stdout)
         held = cast(dict[str, object], json.loads((self.state / "quota_seen.json").read_text()))
         self.assertEqual(set(held), {"codex 1"})
+
+    def test_quota_reports_a_unit_with_no_claude_running_and_tells_the_others(self) -> None:
+        (self.root / "sessions" / "2.json").unlink()
+        notice = self.quota_message(self.quota_note("codex 1"))
+        result = self.run_waiting("quota", "--notice", notice, "--state-dir", str(self.state))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        calls = [cast(list[str], json.loads(line)) for line in self.sends.read_text().splitlines()]
+        self.assertEqual([call[call.index("--to") + 1] for call in calls], [ALPHA])
+        self.assertIn(f"quota: failed — {BETA}: no Claude is running in its session, so it was not told",
+                      result.stdout)
 
     def test_agenda_reports_missing_merge_branch_without_traceback(self) -> None:
         self.write(self.doc, self.doc.read_text(encoding="utf-8").replace(

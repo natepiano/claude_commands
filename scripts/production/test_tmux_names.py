@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
@@ -88,9 +90,7 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
                                    + "print('/tmp/fault.sock') if sys.argv[1:] == ['socket', 'natedev'] "
                                    + "else sys.exit(1)\n")
         _ = self.config.write_text(json.dumps({"threshold_percent": 2, "repeat_minutes": 30,
-                                           "stall_minutes": 5, "faults_to": "natedev", "always": [],
-                                           "showrunners": [{"session": "director", "zone": "America/Los_Angeles",
-                                                            "units": ["old"]}]}))
+                                           "stall_minutes": 5, "faults_to": "natedev", "always": []}))
         self.environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
                             "SHOWRUNNERS_CONFIG": str(self.config),
                             "SHOWRUNNERS_SESSIONS": str(sessions_script),
@@ -129,22 +129,14 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
     def names(self) -> dict[str, list[str]]:
         return cast(dict[str, list[str]], json.loads(self.tmux.read_text()))
 
-    def entries(self) -> list[dict[str, object]]:
-        return cast(list[dict[str, object]], json.loads(self.config.read_text())["showrunners"])
-
-    def test_unit_rename_changes_tmux_and_config_in_one_tick(self) -> None:
+    def test_unit_rename_changes_the_tmux_label_and_leaves_the_registry_alone(self) -> None:
+        before = self.config.read_bytes()
         self.session("new", "%1")
         result = self.tick()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.names(), {"new": ["%1"]})
-        self.assertEqual(self.entries()[0]["units"], ["new"])
-
-    def test_showrunner_rename_changes_config_session(self) -> None:
-        _ = self.tmux.write_text(json.dumps({"director": ["%1"]}))
-        self.session("new director", "%1")
-        self.assertEqual(self.tick().returncode, 0)
-        self.assertEqual(self.entries()[0]["session"], "new director")
-        self.assertEqual(self.names(), {"new director": ["%1"]})
+        # The registry holds no unit names, so a unit's rename leaves it as it was.
+        self.assertEqual(self.config.read_bytes(), before)
 
     def test_equal_name_does_nothing(self) -> None:
         self.session("old", "%1")
@@ -157,7 +149,6 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
                 self.session("nixos-45", "%1", source=source)
                 self.assertEqual(self.tick().returncode, 0)
                 self.assertEqual(self.names(), {"old": ["%1"]})
-                self.assertEqual(self.entries()[0]["units"], ["old"])
 
     def test_rename_works_before_registry_has_been_created(self) -> None:
         self.config.unlink()
@@ -165,30 +156,15 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.names(), {"new": ["%1"]})
 
-    def test_registry_failure_leaves_tmux_old_and_next_tick_finishes(self) -> None:
-        self.session("new", "%1")
-        with mock.patch.dict(os.environ, self.environment, clear=True), \
-                mock.patch.object(tmux_names, "TMUX", "tmux"), \
-                mock.patch.object(showrunners, "CONFIG", self.config), \
-                mock.patch.object(showrunners, "change", side_effect=ValueError("injected failure")):
-            outcome = tmux_names.rename_session("%1", "old", "new")
-        self.assertIsInstance(outcome, tmux_names.RenameIncomplete)
-        self.assertEqual(self.names(), {"old": ["%1"]})
-        self.assertEqual(self.tick().returncode, 0)
-        self.assertEqual(self.names(), {"new": ["%1"]})
-        self.assertEqual(self.entries()[0]["units"], ["new"])
-
-    def test_tmux_failure_after_registry_change_is_finished_next_tick(self) -> None:
+    def test_tmux_failure_is_finished_next_tick(self) -> None:
         self.session("new", "%1")
         _ = (self.root / "rename-failure").touch()
         first = self.tick()
         self.assertIn("tmux session still names", first.stderr)
         self.assertEqual(self.names(), {"old": ["%1"]})
-        self.assertEqual(self.entries()[0]["units"], ["new"])
         (self.root / "rename-failure").unlink()
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.names(), {"new": ["%1"]})
-        self.assertEqual(self.entries()[0]["units"], ["new"])
 
     def test_rename_session_does_not_change_another_pane_session(self) -> None:
         _ = self.tmux.write_text(json.dumps({"old": ["%1"], "other": ["%2"]}))
@@ -208,6 +184,44 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(len((self.root / "faults").read_text().splitlines()), 2)
+
+    def test_a_fault_waits_for_the_next_tick_when_the_session_records_cannot_be_read(self) -> None:
+        settings = showrunners.ShowrunnerSettings(threshold_percent=90.0, repeat_minutes=1.0, stall_minutes=1.0,
+                                                  faults_to="director", always=[])
+        errors = io.StringIO()
+        state = self.root / "fault-state"
+        refused = OSError("cannot tell whether director is running: records unreadable")
+        with mock.patch.object(tmux_names, "FAULT_STATE_DIR", state), \
+                mock.patch.object(showrunners, "socket_for", side_effect=refused), \
+                redirect_stderr(errors):
+            tmux_names.fault("name taken", "old", "new", settings)
+        self.assertIn("tmux-names: cannot tell whether director is running", errors.getvalue())
+        self.assertEqual(list(state.iterdir()), [])
+
+    def test_a_fault_for_a_session_that_is_not_live_goes_to_every_running_showrunner_and_says_so(self) -> None:
+        settings = showrunners.ShowrunnerSettings(threshold_percent=90.0, repeat_minutes=1.0, stall_minutes=1.0,
+                                                  faults_to="director", always=[])
+        state = self.root / "fault-state"
+        runners = [showrunners.Showrunner(session="one", socket="/tmp/one.sock", slug="one", zone="UTC", doc="/d"),
+                   showrunners.Showrunner(session="", socket="", slug="stopped", zone="UTC", doc="/d")]
+        sent = subprocess.CompletedProcess[str]([], 0, "", "")
+        errors = io.StringIO()
+        with mock.patch.object(tmux_names, "FAULT_STATE_DIR", state), \
+                mock.patch.object(showrunners, "socket_for", return_value=None), \
+                mock.patch.object(showrunners, "registered_showrunners", return_value=runners), \
+                mock.patch.object(subprocess, "run", return_value=sent) as run:
+            tmux_names.fault("name taken", "old", "new", settings)
+            command = cast(list[str], run.call_args.args[0])
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(command[command.index("--to") + 1], "uds:/tmp/one.sock")
+            self.assertIn("director, which", command[-1])
+            self.assertIn("is not a live session, so every running showrunner is told.", command[-1])
+            self.assertEqual(len(list(state.iterdir())), 1)
+            # With no showrunner running either, the fault is printed and tried again at the next tick.
+            with mock.patch.object(showrunners, "registered_showrunners", return_value=[]), redirect_stderr(errors):
+                tmux_names.fault("name taken", "other", "new", settings)
+        self.assertIn("No showrunner is running to tell.", errors.getvalue())
+        self.assertEqual(len(list(state.iterdir())), 1)
 
     def test_live_sessions_require_the_tmux_server_socket_to_match(self) -> None:
         self.session("local", "%0")

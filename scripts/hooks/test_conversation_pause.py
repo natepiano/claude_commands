@@ -20,10 +20,11 @@ import conversation_pause
 LIBRARY = Path(__file__).with_name("conversation_pause.py")
 PROMPT_HOOK = Path(__file__).with_name("user-prompt-submit-conversation-pause.py")
 STOP_HOOK = Path(__file__).with_name("stop-conversation-pause.py")
+SETTINGS = LIBRARY.parent.parent.parent / "settings.json"
 SESSION = "session-1"
 NOW = 10_000
 QUESTION = (
-    "conversation-pause: the user has been quiet here for 5 minutes. Ask them this, "
+    "conversation-pause: the user has been quiet here for 15 minutes. Ask them this, "
     "word for word, and nothing else: Return to automatic updates? (yes / no) They "
     "return on their own in 5 minutes. Their yes or no is handled when they type it."
 )
@@ -31,6 +32,8 @@ RESUME = (
     '"$HOME/.claude/scripts/lib/py" '
     '"$HOME/.claude/scripts/hooks/conversation_pause.py" resume'
 )
+RETURN_SCHEDULE = "They return 20 minutes after my last reply; I ask you first at 15."
+ASK_AGAIN = "If you write again, I ask about them 15 minutes after my reply."
 PAUSE_CONTEXT = (
     "Automatic updates for this session are paused while the user talks to you: "
     "dailies, footer. Leave them off; the session asks the user before they return. "
@@ -49,6 +52,45 @@ NO_CONTEXT = (
     f"the user asks for them; then run: {RESUME}. Confirm it in one line. That no "
     "answers only this question."
 )
+
+
+class ConversationPauseRegistrationTests(unittest.TestCase):
+    def test_settings_registers_hooks_and_permission_once(self) -> None:
+        settings = cast(dict[str, object], json.loads(SETTINGS.read_text()))
+        hooks = cast(dict[str, list[dict[str, object]]], settings["hooks"])
+
+        def registered_commands(groups: list[dict[str, object]]) -> list[str]:
+            commands: list[str] = []
+            for group in groups:
+                registered = cast(list[dict[str, object]], group["hooks"])
+                commands.extend(
+                    command
+                    for hook in registered
+                    if isinstance(command := hook.get("command"), str)
+                )
+            return commands
+
+        prompt_command = (
+            '"$HOME/.claude/scripts/lib/py" '
+            '"$HOME/.claude/scripts/hooks/user-prompt-submit-conversation-pause.py"'
+        )
+        self.assertEqual(
+            registered_commands(hooks["UserPromptSubmit"]).count(prompt_command), 1
+        )
+
+        stop_command = (
+            '"$HOME/.claude/scripts/lib/py" '
+            '"$HOME/.claude/scripts/hooks/stop-conversation-pause.py"'
+        )
+        self.assertEqual(registered_commands(hooks["Stop"]).count(stop_command), 1)
+
+        resume_prefix = conversation_pause.RESUME_COMMAND.rsplit(" ", 1)[0]
+        self.assertEqual(
+            conversation_pause.KEEP_COMMAND.rsplit(" ", 1)[0], resume_prefix
+        )
+        permissions = cast(dict[str, object], settings["permissions"])
+        allow = cast(list[str], permissions["allow"])
+        self.assertEqual(allow.count(f"Bash({resume_prefix} *)"), 1)
 
 
 def cross_session(sender: str, text: str) -> str:
@@ -71,6 +113,15 @@ def asked_read(asked_at: int, replies_ended: int) -> dict[str, object]:
         "kind": "asked",
         "asked_at": asked_at,
         "reading": {"kind": "read", "replies_ended": replies_ended},
+    }
+
+
+def scheduled_wakeup(prompt: str) -> dict[str, object]:
+    return {
+        "id": "scheduled-1",
+        "schedule": "0 * * * *",
+        "recurring": True,
+        "prompt": prompt,
     }
 
 
@@ -262,6 +313,14 @@ print("SENT: delivered")
             json.loads((self.pause_root / f"{session_id}.json").read_text()),
         )
 
+    def scheduled_prompts_path(self, session_id: str = SESSION) -> Path:
+        return self.pause_root / "scheduled-prompts" / f"{session_id}.json"
+
+    def scheduled_prompts(self, session_id: str = SESSION) -> list[str]:
+        return cast(
+            list[str], json.loads(self.scheduled_prompts_path(session_id).read_text())
+        )
+
     def calls(self, path: Path) -> list[list[str]]:
         if not path.exists():
             return []
@@ -401,6 +460,12 @@ print("SENT: delivered")
         def unexpected_sender_read() -> frozenset[str]:
             self.fail("sender files were read for a non-cross-session prompt")
 
+        def unexpected_scheduled_prompt_read() -> tuple[str, ...]:
+            self.fail("scheduled prompts were read for a notice or cross-session prompt")
+
+        def no_scheduled_prompts() -> tuple[str, ...]:
+            return ()
+
         typed = (
             "hello",
             "   hello",
@@ -408,38 +473,56 @@ print("SENT: delivered")
             "/unit:report",
             "/compact",
             "From the user (via the showrunner): go on",
+            '<agent-message from="a1">done</agent-message>',
+            '<pasted_content id="1">code</pasted_content> why?',
+            "<div> why",
         )
         for prompt in typed:
             with self.subTest(prompt=prompt):
                 self.assertIs(
-                    conversation_pause.prompt_source(prompt, unexpected_sender_read),
+                    conversation_pause.prompt_source(
+                        prompt, unexpected_sender_read, no_scheduled_prompts
+                    ),
                     conversation_pause.PromptSource.TYPED,
                 )
         self.assertIs(
-            conversation_pause.prompt_source(cross_session("natedev", "go"), frozenset),
+            conversation_pause.prompt_source(
+                cross_session("natedev", "go"),
+                frozenset,
+                unexpected_scheduled_prompt_read,
+            ),
             conversation_pause.PromptSource.PEER,
         )
         for sender in ("stall-watch", "mac-test", "disk_floor"):
             with self.subTest(sender=sender):
                 self.assertIs(
-                    conversation_pause.prompt_source(cross_session(sender, "go"), frozenset),
+                    conversation_pause.prompt_source(
+                        cross_session(sender, "go"),
+                        frozenset,
+                        unexpected_scheduled_prompt_read,
+                    ),
                     conversation_pause.PromptSource.SCHEDULED,
                 )
         self.assertIs(
             conversation_pause.prompt_source(
                 cross_session("delegate-abc", "go"),
                 lambda: frozenset({"delegate-abc"}),
+                unexpected_scheduled_prompt_read,
             ),
             conversation_pause.PromptSource.SCHEDULED,
         )
         for prompt in (
             "<task-notification>done</task-notification>",
-            '<agent-message from="a1">done</agent-message>',
+            "<system-reminder>remember</system-reminder>",
             "",
         ):
             with self.subTest(prompt=prompt):
                 self.assertIs(
-                    conversation_pause.prompt_source(prompt, unexpected_sender_read),
+                    conversation_pause.prompt_source(
+                        prompt,
+                        unexpected_sender_read,
+                        unexpected_scheduled_prompt_read,
+                    ),
                     conversation_pause.PromptSource.NOTICE,
                 )
 
@@ -494,7 +577,7 @@ print("SENT: delivered")
         reply = cast(dict[str, object], json.loads(result.stdout))
         self.assertEqual(
             reply["systemMessage"],
-            "Automatic updates paused while we talk: status reports.",
+            f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
@@ -502,7 +585,9 @@ print("SENT: delivered")
         instance = self.create_instance("showrunner-demo")
         first = self.parsed_reply(self.run_prompt("hello", now=100))
         self.assertEqual(first, {
-            "systemMessage": "Automatic updates paused while we talk: dailies, footer.",
+            "systemMessage": (
+                f"Automatic updates paused while we talk: dailies, footer. {RETURN_SCHEDULE}"
+            ),
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
                 "additionalContext": PAUSE_CONTEXT,
@@ -538,7 +623,7 @@ print("SENT: delivered")
                 reply = self.parsed_reply(self.run_prompt("hello"))
                 self.assertEqual(
                     reply["systemMessage"],
-                    f"Automatic updates paused while we talk: {words}.",
+                    f"Automatic updates paused while we talk: {words}. {RETURN_SCHEDULE}",
                 )
                 (self.pause_root / f"{SESSION}.json").unlink()
                 (instance / "conf").unlink()
@@ -572,7 +657,7 @@ print("SENT: delivered")
         reply = self.parsed_reply(self.run_prompt("second", now=120))
         self.assertEqual(
             reply["systemMessage"],
-            "Automatic updates paused while we talk: build report.",
+            f"Automatic updates paused while we talk: build report. {RETURN_SCHEDULE}",
         )
         self.assertEqual(
             self.record()["instances"], ["delegate-abc", "report-builds"]
@@ -695,6 +780,93 @@ print("SENT: delivered")
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
 
+    def test_pasted_content_prompt_pauses_reports(self) -> None:
+        instance = self.create_instance("delegate-abc")
+        prompt = (
+            '<pasted_content id="one">display: flex</pasted_content id="one">\n'
+            "why does this not center?"
+        )
+
+        reply = self.parsed_reply(self.run_prompt(prompt))
+
+        self.assertEqual(
+            reply["systemMessage"],
+            f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
+        )
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+
+    def test_arbitrary_tag_opened_prompt_pauses_reports(self) -> None:
+        instance = self.create_instance("delegate-abc")
+
+        reply = self.parsed_reply(self.run_prompt("<div> why"))
+
+        self.assertEqual(
+            reply["systemMessage"],
+            f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
+        )
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+
+    def test_task_notification_and_system_reminder_do_not_pause_reports(self) -> None:
+        instance = self.create_instance("delegate-abc")
+        for prompt in (
+            "<task-notification>done</task-notification>",
+            "<system-reminder>remember</system-reminder>",
+        ):
+            with self.subTest(prompt=prompt):
+                result = self.run_prompt(prompt)
+                self.assertEqual(
+                    (result.returncode, result.stdout, result.stderr), (0, "", "")
+                )
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
+        self.assertFalse((self.escalate_root / "typed").exists())
+
+    def test_recorded_scheduled_prompt_does_not_pause_but_different_prompt_does(self) -> None:
+        instance = self.create_instance("delegate-abc")
+        recorded = self.run_stop(
+            extra={"session_crons": [scheduled_wakeup("  recurring status  ")]}
+        )
+        self.assertEqual(
+            (recorded.returncode, recorded.stdout, recorded.stderr), (0, "", "")
+        )
+
+        scheduled = self.run_prompt("recurring status")
+
+        self.assertEqual(
+            (scheduled.returncode, scheduled.stdout, scheduled.stderr), (0, "", "")
+        )
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertFalse((self.escalate_root / "typed").exists())
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
+
+        typed = self.parsed_reply(self.run_prompt("a different thought"))
+        self.assertEqual(
+            typed["systemMessage"],
+            f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
+        )
+        self.assertTrue((self.escalate_root / "typed").exists())
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+
+    def test_clipped_scheduled_prompt_matches_by_prefix(self) -> None:
+        instance = self.create_instance("delegate-abc")
+        recorded = self.run_stop(extra={
+            "session_crons": [
+                scheduled_wakeup("summarize this long plan… [+240 chars]")
+            ]
+        })
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+
+        scheduled = self.run_prompt(
+            "summarize this long plan and include the unresolved decisions"
+        )
+
+        self.assertEqual(
+            (scheduled.returncode, scheduled.stdout, scheduled.stderr), (0, "", "")
+        )
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertFalse((self.escalate_root / "typed").exists())
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
+
     def test_scheduled_notice_agent_and_typed_slash_prompts(self) -> None:
         instance = self.create_instance(
             "delegate-abc", sender="delegate-abc"
@@ -711,7 +883,7 @@ print("SENT: delivered")
         slash = self.parsed_reply(self.run_prompt("/unit:report"))
         self.assertEqual(
             slash["systemMessage"],
-            "Automatic updates paused while we talk: status reports.",
+            f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
@@ -958,6 +1130,87 @@ print("SENT: delivered")
         self.assertEqual((agent.returncode, agent.stdout, agent.stderr), (0, "", ""))
         self.assertEqual(self.record(), before)
 
+    def test_stop_hook_records_scheduled_prompts_without_pause_record(self) -> None:
+        result = self.run_stop(extra={
+            "session_crons": [
+                scheduled_wakeup("first scheduled prompt"),
+                scheduled_wakeup("second scheduled prompt"),
+            ]
+        })
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual(
+            self.scheduled_prompts(),
+            ["first scheduled prompt", "second scheduled prompt"],
+        )
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
+
+    def test_stop_hook_active_event_still_records_scheduled_prompts(self) -> None:
+        result = self.run_stop(extra={
+            "stop_hook_active": True,
+            "session_crons": [scheduled_wakeup("scheduled while stop hook is active")],
+        })
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual(
+            self.scheduled_prompts(), ["scheduled while stop hook is active"]
+        )
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
+
+    def test_stop_hook_empty_scheduled_list_removes_recorded_prompts(self) -> None:
+        created = self.run_stop(extra={
+            "session_crons": [scheduled_wakeup("scheduled prompt")]
+        })
+        self.assertEqual(created.returncode, 0, created.stderr)
+        path = self.scheduled_prompts_path()
+        self.assertTrue(path.exists())
+
+        removed = self.run_stop(extra={"session_crons": []})
+
+        self.assertEqual((removed.returncode, removed.stdout, removed.stderr), (0, "", ""))
+        self.assertFalse(path.exists())
+
+    def test_stop_payload_without_scheduled_list_leaves_recorded_prompts(self) -> None:
+        created = self.run_stop(extra={
+            "session_crons": [scheduled_wakeup("scheduled prompt")]
+        })
+        self.assertEqual(created.returncode, 0, created.stderr)
+
+        unchanged = self.run_stop()
+
+        self.assertEqual(
+            (unchanged.returncode, unchanged.stdout, unchanged.stderr), (0, "", "")
+        )
+        self.assertEqual(self.scheduled_prompts(), ["scheduled prompt"])
+
+    def test_tick_and_status_ignore_scheduled_prompt_files(self) -> None:
+        recorded = self.run_stop(extra={
+            "session_crons": [scheduled_wakeup("scheduled prompt")]
+        })
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+
+        status = self.run_cli("status")
+        tick = self.run_cli("tick")
+
+        self.assertEqual((status.returncode, status.stdout, status.stderr), (0, "not paused\n", ""))
+        self.assertEqual((tick.returncode, tick.stdout, tick.stderr), (0, "", ""))
+        self.assertEqual(self.calls(self.sessions_log), [])
+        self.assertTrue(self.scheduled_prompts_path().exists())
+
+    def test_tick_removes_scheduled_prompts_older_than_eight_days(self) -> None:
+        recorded = self.run_stop(extra={
+            "session_crons": [scheduled_wakeup("expired scheduled prompt")]
+        })
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        path = self.scheduled_prompts_path()
+        expired_at = NOW - conversation_pause.SCHEDULED_PROMPT_RETENTION_SECONDS - 1
+        os.utime(path, (expired_at, expired_at))
+
+        tick = self.run_cli("tick", now=NOW)
+
+        self.assertEqual((tick.returncode, tick.stdout, tick.stderr), (0, "", ""))
+        self.assertFalse(path.exists())
+
     def test_stop_hook_active_event_does_not_count_reply_twice(self) -> None:
         instance = self.create_instance("delegate-abc", enabled=False)
         _ = self.write_record(
@@ -981,12 +1234,12 @@ print("SENT: delivered")
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
 
-    def test_tick_waits_for_five_quiet_minutes_and_sends_question_once(self) -> None:
+    def test_tick_waits_for_fifteen_quiet_minutes_and_sends_question_once(self) -> None:
         _ = self.write_record(
             {"kind": "quiet", "user_wrote_at": 10, "reply_ended_at": 100},
             instances=("delegate-abc",),
         )
-        before = self.run_cli("tick", now=399)
+        before = self.run_cli("tick", now=999)
         self.assertEqual(before.returncode, 0, before.stderr)
         self.assertEqual(self.calls(self.send_log), [])
         self.assertEqual(
@@ -994,9 +1247,9 @@ print("SENT: delivered")
             {"kind": "quiet", "user_wrote_at": 10, "reply_ended_at": 100},
         )
 
-        at_five = self.run_cli("tick", now=400)
-        self.assertEqual(at_five.returncode, 0, at_five.stderr)
-        self.assertEqual(self.record()["phase"], asked_not_read(400))
+        at_fifteen = self.run_cli("tick", now=1_000)
+        self.assertEqual(at_fifteen.returncode, 0, at_fifteen.stderr)
+        self.assertEqual(self.record()["phase"], asked_not_read(1_000))
         self.assertEqual(self.calls(self.sessions_log)[-1], ["socket", f"session:{SESSION}"])
         self.assertEqual(self.calls(self.send_log), [[
             "--to", f"uds:{self.socket_path}",
@@ -1004,7 +1257,7 @@ print("SENT: delivered")
             "--key", f"conversation-pause-{SESSION}",
             "--text", QUESTION,
         ]])
-        after = self.run_cli("tick", now=450)
+        after = self.run_cli("tick", now=1_050)
         self.assertEqual(after.returncode, 0, after.stderr)
         self.assertEqual(len(self.calls(self.send_log)), 1)
 
@@ -1114,7 +1367,7 @@ print("SENT: delivered")
 
     def test_return_question_sender_is_recognized_when_text_changes(self) -> None:
         _ = self.write_record({"kind": "question_pending", "due_at": 100})
-        changed_question = QUESTION.replace("5 minutes", "six minutes", 1)
+        changed_question = QUESTION.replace("15 minutes", "six minutes", 1)
 
         delivered = self.run_prompt(
             cross_session("conversation-pause", changed_question),
@@ -1293,7 +1546,7 @@ print("SENT: delivered")
         )
         reply = self.parsed_reply(self.run_prompt("NO!"))
         self.assertEqual(reply, {
-            "systemMessage": "Automatic updates stay off.",
+            "systemMessage": f"Automatic updates stay off. {ASK_AGAIN}",
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
                 "additionalContext": NO_CONTEXT,
@@ -1355,7 +1608,7 @@ print("SENT: delivered")
                 else:
                     self.assertEqual(
                         answer["systemMessage"],
-                        "Automatic updates stay off.",
+                        f"Automatic updates stay off. {ASK_AGAIN}",
                     )
                     self.assertEqual(self.record()["phase"], {"kind": "kept_off"})
                     self.assertTrue(
@@ -1540,7 +1793,7 @@ print("SENT: delivered")
         _ = self.write_record({"kind": "returned", "returned_at": NOW - 60})
         reply = self.parsed_reply(self.run_prompt("no"))
         self.assertEqual(reply, {
-            "systemMessage": "Automatic updates are off again: status reports.",
+            "systemMessage": f"Automatic updates are off again: status reports. {ASK_AGAIN}",
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
                 "additionalContext": NO_CONTEXT,
@@ -1555,7 +1808,7 @@ print("SENT: delivered")
         reply = self.parsed_reply(self.run_prompt("new topic", now=200))
         self.assertEqual(
             reply["systemMessage"],
-            "Automatic updates paused while we talk: status reports.",
+            f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
         )
         self.assertEqual(
             self.record()["phase"],
@@ -1640,7 +1893,7 @@ print("SENT: delivered")
         reply = self.parsed_reply(self.run_prompt("no", now=410))
         self.assertEqual(
             reply["systemMessage"],
-            "Automatic updates are off again: status reports.",
+            f"Automatic updates are off again: status reports. {ASK_AGAIN}",
         )
         self.assertEqual(self.record()["phase"], {"kind": "kept_off"})
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
@@ -1811,16 +2064,16 @@ print("SENT: delivered")
             session_id="kept-session",
         )
         result = self.run_cli(
-            "tick", now=400, extra_env={"CONVERSATION_PAUSE_SESSIONS": str(failing)}
+            "tick", now=1_000, extra_env={"CONVERSATION_PAUSE_SESSIONS": str(failing)}
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self.record("quiet-session")["phase"],
-            {"kind": "question_pending", "due_at": 400},
+            {"kind": "question_pending", "due_at": 1_000},
         )
         self.assertEqual(
             self.record("asked-session")["phase"],
-            {"kind": "returned", "returned_at": 400},
+            {"kind": "returned", "returned_at": 1_000},
         )
         self.assertEqual(
             self.record("kept-session")["phase"], {"kind": "kept_off"}
@@ -1838,12 +2091,12 @@ print("SENT: delivered")
         self.assertTrue(watcher.exists())
 
         result = self.run_cli(
-            "tick", now=700, extra_env={"CONVERSATION_PAUSE_SESSIONS": str(failing)}
+            "tick", now=1_300, extra_env={"CONVERSATION_PAUSE_SESSIONS": str(failing)}
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self.record("quiet-session")["phase"],
-            {"kind": "returned", "returned_at": 700},
+            {"kind": "returned", "returned_at": 1_300},
         )
         self.assertTrue(
             (quiet_instance / "state").read_text().startswith("ENABLED=1\n")
@@ -1861,7 +2114,7 @@ print("SENT: delivered")
         )
         environment = {
             **self.environment,
-            "CONVERSATION_PAUSE_NOW_EPOCH": "400",
+            "CONVERSATION_PAUSE_NOW_EPOCH": "1000",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "missing-sessions"),
         }
         _ = environment.pop("CONVERSATION_PAUSE_SESSIONS")
@@ -1875,7 +2128,7 @@ print("SENT: delivered")
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
-            self.record()["phase"], {"kind": "question_pending", "due_at": 400}
+            self.record()["phase"], {"kind": "question_pending", "due_at": 1_000}
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
@@ -1920,7 +2173,7 @@ print("SENT: delivered")
             _ = review_path.write_text("{}\n")
         before = {slug: path.read_bytes() for slug, path in paths.items()}
 
-        held = self.run_cli("tick", now=400)
+        held = self.run_cli("tick", now=1_000)
         self.assertEqual(held.returncode, 0, held.stderr)
         self.assertEqual(
             {slug: path.read_bytes() for slug, path in paths.items()}, before
@@ -1933,15 +2186,15 @@ print("SENT: delivered")
 
         for review_path in review_paths:
             review_path.unlink()
-        advanced = self.run_cli("tick", now=400)
+        advanced = self.run_cli("tick", now=1_000)
         self.assertEqual(advanced.returncode, 0, advanced.stderr)
         self.assertEqual(
             self.record("asked-session")["phase"],
-            {"kind": "returned", "returned_at": 400},
+            {"kind": "returned", "returned_at": 1_000},
         )
         self.assertEqual(
             self.record("quiet-session")["phase"],
-            asked_not_read(400),
+            asked_not_read(1_000),
         )
         self.assertFalse(paths["returned"].exists())
         self.assertEqual(len(self.calls(self.send_log)), 1)
@@ -1996,7 +2249,8 @@ print("SENT: delivered")
         _ = self.write_record({"kind": "returned", "returned_at": 100})
         reply = self.parsed_reply(self.run_prompt("yes", now=400))
         self.assertEqual(
-            reply["systemMessage"], "Automatic updates paused while we talk: status reports."
+            reply["systemMessage"],
+            f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
         )
         self.assertEqual(
             self.record()["phase"],
