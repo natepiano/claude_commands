@@ -14,6 +14,8 @@ The user's words, 2026-10-08: "For later I want a command that fully shuts down 
 
 The user chose, 2026-10-09 14:5x PDT, the scope "both machines: every showrunner, unit director, seat and Codex server on natedev and the Mac first reaches a clean, pushed state, its update timers stop, and where it was is recorded; restart resumes each session where it was and restarts its timers; CI runners and system services keep running", adding in his words: "yes both machines - but also be aware that this command should be account aware - in the future if we can have machines (on machine or on different machines) running different accounts - we need to only e shutting down the account we've been asked to shutdown (we need a way to surface the account we are, easily)"
 
+The user's words, 2026-10-09 (via the showrunner), on the status line account field: "yes but can it be on a second line - a friend of mine showed his in multiple lines and i think that's a good approach - ideally it would also show the remaining % in the 5 hour and remaining % in the week as well". The same message gave the go to promote the `settings.json` status line change once it does this.
+
 Context (showrunner): a proposed, not yet approved, plan for sessions on different Claude/Codex accounts is at ~/.local/state/plan-backlog/2026-10-09-per-session-accounts.md; read it for how accounts are found today (scripts/whoami/agent_accounts.py follows CLAUDE_CONFIG_DIR and CODEX_HOME) and design the account filter and the "which account am I" surface so they fit it, without building that plan.
 
 ## Delegation Context
@@ -89,7 +91,7 @@ Context (showrunner): a proposed, not yet approved, plan for sessions on differe
 
 **Ruled out:** `shlex` parsing of `ps` output (the output is unquoted); defaulting to `~/.claude` when the environment is hidden (it would attribute an unknown process to the default account).
 
-### Phase 2 — What runs on an account  · status: todo
+### Phase 2 — What runs on an account  · status: done
 
 #### Work Order
 
@@ -154,7 +156,7 @@ def run_remote(args: list[str], stdin: str = "", timeout: float = 120) -> tuple[
 `run_remote` runs `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/shutdown/shutdown.py" <args>; printf "rc=%s\n" $?'`, parses the last `rc=` line as the status and returns the output above it; no `rc=` line, ssh's 255 or a timeout → status 255 ("unreachable").
 
 `scripts/shutdown/shutdown.py` (CLI; later phases add verbs):
-- `status [account] [--json] [--here]` — `account` is a note label (`claude 2`), a login, or absent for this process's Claude account (`account.py`). Prints the label and login on the first line, then per machine (this one, then the other through `run_remote` with `--here --json`): each session as `<kind> <name> · <host> · <status> · <branch> ahead N, M dirty`, Codex servers per session, timers, and the `unknown` list. An unreachable machine is one line, `mac: unreachable`, not a failure. Phase 3 adds the shutdown state to this output.
+- `status [account] [--json] [--here]` — `account` is a note label (`claude 2`), a login, or absent for this process's Claude account (`account.py`). Prints the label and login on the first line, then per machine (this one, then the other through `run_remote` with `--here --json`): each session as `<kind> <name> · <host> · <status> · <branch> ahead N, M dirty`, Codex servers per session, timers, and the `unknown` list. An unreachable machine is one line, `mac: unreachable`, not a failure. Phase 4 adds the shutdown state to this output.
 - `--here` limits any verb to this machine; the cross-machine call always passes it.
 
 `commands/shutdown.md` — new, `description:` "Shut down every Claude session of one account on natedev and the Mac safely and restart them later; show what runs on an account." This phase documents only `/shutdown status [account]`; later phases add the other verbs.
@@ -175,7 +177,40 @@ def run_remote(args: list[str], stdin: str = "", timeout: float = 120) -> tuple[
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` green; `basedpyright scripts/shutdown` clean; live: `shutdown.py status` on natedev lists the running showrunners, unit directors and top-level sessions with correct kinds and hosts and the Mac section (empty or listed), and changes nothing (notifier `ENABLED` values and session records identical before and after).
 
-### Phase 3 — Shutdown begins: timers stop and every session settles  · status: todo
+### Phase 3 — The account and its remaining quota on a second status line  · status: todo
+
+#### Work Order
+
+**Goal:** the status line gets a second line naming the session's Claude account and what is left of that account's 5-hour and weekly limits, so every session shows at a glance which account it runs on and how much room it has.
+
+**Spec:**
+
+- **Source of the numbers.** Claude Code's status line JSON on stdin already carries them: `rate_limits.five_hour` and `rate_limits.seven_day`, each `{used_percentage: number, resets_at: unix seconds}`, where `used_percentage` is 0–100 with one decimal (read in the 2.1.296 binary, 2026-10-09: `five_hour:{used_percentage:tDt(dt.five_hour.utilization),resets_at:dt.five_hour.resets_at}`, `tDt(e) = Math.round(e*1000)/10`). Each window is present only when Claude Code has it: a subscription login after its first reply; never for an API key. No file is read and no process is added: the status line stays sh plus jq.
+- `scripts/statusline/statusline.jq` prints two lines:
+  - Line 1: `<dirname> | <tokens with thousands separators> | <model [effort]>` — today's line without the account field.
+  - Line 2: the parts present, in this order, joined by ` | `: the account (`$ARGS.named.account // ""`, when non-empty), `5-hour <N>% left`, `weekly <M>% left`. `N` is `100 - rate_limits.five_hour.used_percentage`, floored and clamped to 0–100, so the line never shows more room than there is; `M` the same from `seven_day`.
+  - With no part present, the output is line 1 alone: no empty second line.
+  - Every shape of input works: no `--arg account`, no `rate_limits` key, `rate_limits: null`, either window `null` or missing, `used_percentage` missing.
+  - Example: `claude_commands | 182,340 | Opus 5.5 high` then `claude 2 | 5-hour 73% left | weekly 41% left`.
+  - The header comment's `Output:` line describes both lines.
+- The words `5-hour` and `weekly` match `/whoami`'s quota labels.
+- `settings.json` does not change: its `statusLine.command` already reads `account-label` and passes `--arg account`.
+- `commands/whoami.md` — the sentence naming the status line's last field now says the status line's second line shows the Claude account and its remaining 5-hour and weekly percentages.
+
+**Files:**
+- `scripts/statusline/statusline.jq` — the second line.
+- `commands/whoami.md` — the status line sentence.
+- `scripts/whoami/test_account.py` — status line cases.
+
+**Seats:** `1 writer + 1 tester` — one jq script; the tester writes the cases from the Spec's input shapes.
+- `impl` — `scripts/statusline/statusline.jq`, `commands/whoami.md`
+- `test` — `scripts/whoami/test_account.py`: the status line run through `jq -r --arg pwd … [--arg account …] -f scripts/statusline/statusline.jq` on JSON stdin: account and both windows → two lines exactly as the example; `used_percentage` 26.4 → `73% left`, 0 → `100% left`, 100 and 104 → `0% left`; only the account; only the windows; one window null; no `--arg account` and no `rate_limits` → line 1 alone with no trailing empty line; line 1 never carries the account
+
+**Constraints from prior phases:** Phase 1: `statusline.jq` binds `$ARGS.named.account // ""` and must keep working without `--arg account`, for a `settings.json` that predates the field; a refresh is two processes, sh plus jq, on purpose (the header comment); the status line tests live in `scripts/whoami/test_account.py`. The `settings.json` commit with the status line command and the `SessionStart` hook is promoted with this phase on the user's go (2026-10-09, via the showrunner); this phase does not change it.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/whoami -p 'test_*.py'` green; `jq -n -f scripts/statusline/statusline.jq --arg pwd x --arg account x` parses; live on natedev: a scratch `claude --model haiku` in tmux, launched with `--settings` whose `statusLine.command` is the shipped command pointed at this worktree's `statusline.jq`, shows both lines in `tmux capture-pane` after one reply, with the label from `account-label` and two percentages; the Mac's `jq` prints both lines for a captured status line JSON.
+
+### Phase 4 — Shutdown begins: timers stop and every session settles  · status: todo
 
 #### Work Order
 
@@ -195,8 +230,8 @@ class Entry(TypedDict):
     timers: list[TimerState]
     where: str | None                     # the session's own line, from `ready`
     ready_at: str | None
-    stopped_at: str | None                # Phase 4
-    restarted_at: str | None              # Phase 5
+    stopped_at: str | None                # Phase 5
+    restarted_at: str | None              # Phase 6
 
 class Record(TypedDict):
     login: str; label: str; machine: str
@@ -239,7 +274,7 @@ Settle — `scripts/shutdown/settle.py`, with the `shutdown.py` verbs:
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` and `python3 -m unittest scripts/hooks/test_conversation_pause.py` green; `basedpyright scripts/shutdown scripts/hooks/conversation_pause.py` clean; live on natedev, limited to two scratch sessions started for the check (a tmux-hosted `claude --model haiku` and a second one), through `--only`: `down`, both reply `ready` with their `where`, a notifier instance created for one of them goes from enabled to stopped, `status` shows both ready, `cancel` re-enables it and messages both; no other session or instance changes.
 
-### Phase 4 — Shutdown stops every session, seat server and window  · status: todo
+### Phase 5 — Shutdown stops every session, seat server and window  · status: todo
 
 #### Work Order
 
@@ -269,11 +304,11 @@ Settle — `scripts/shutdown/settle.py`, with the `shutdown.py` verbs:
 - `impl` — `scripts/shutdown/stop.py`, `scripts/shutdown/settle.py`, `scripts/shutdown/shutdown.py`, `scripts/delegate/remove_seats.py`, `commands/shutdown.md`
 - `test` — `scripts/shutdown/test_stop.py` (injected kill and liveness: order units → showrunners → top-level → requester; a busy entry is refused without `now` and stopped with it; a pid that survives two SIGTERMs is `failed to stop` and never SIGKILLed; `codex_mesh.py stop` called once per run folder after its unit; the Mac alert routes through `--machine natedev`); `scripts/delegate/test_remove_seats.py` (a run whose director is in a `down` record is live)
 
-**Constraints from prior phases:** Phase 2: `Session.host` (`unit` with `tmux_session` from the marks, `ghostty` with the parent chain), `run_dirs`, `codex_servers`. Phase 3: `record.py` (`Record`, `Entry` with `ready_at`, `stopped_at`; states; history), `settle.py` `conduct` loop, `begin`, `ready`, `cancel`, the settle messages and the holdout alert, `conversation_pause.release`.
+**Constraints from prior phases:** Phase 2: `Session.host` (`unit` with `tmux_session` from the marks, `ghostty` with the parent chain), `run_dirs`, `codex_servers`. Phase 4: `record.py` (`Record`, `Entry` with `ready_at`, `stopped_at`; states; history), `settle.py` `conduct` loop, `begin`, `ready`, `cancel`, the settle messages and the holdout alert, `conversation_pause.release`.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` and `python3 -m unittest scripts/delegate/test_remove_seats.py` green; `basedpyright scripts/shutdown scripts/delegate/remove_seats.py` clean; live, through `--only` on scratch sessions only: on natedev a tmux-hosted session and a Ghostty-hosted session (opened for the check on the current desktop), on the Mac a session in a nix tmux (`nix run nixpkgs#tmux`) — each settles, stops, leaves `~/.claude/sessions/`, its tmux session or window closes, the record says `down` on both machines, and the alert arrives; no other session changes.
 
-### Phase 5 — Restart resumes every session where it was  · status: todo
+### Phase 6 — Restart resumes every session where it was  · status: todo
 
 #### Work Order
 
@@ -306,11 +341,11 @@ Settle — `scripts/shutdown/settle.py`, with the `shutdown.py` verbs:
 - `impl` — `scripts/shutdown/restart.py`, `scripts/shutdown/shutdown.py`, `scripts/production/add_unit.py`, `commands/shutdown.md`
 - `test` — `scripts/shutdown/test_restart.py` (`--dry-run` argv per host kind on both platforms; an already-live session is skipped; timers start only after the session is live and only those recorded enabled; a session that never comes back leaves `partial` and a second run retries only it); `scripts/production/test_add_unit.py` (`--restart-note` prompt, `--session-name` in `-n`, `--remote-control`, tmux and scope, scope name unique, both refused without `--resume`)
 
-**Constraints from prior phases:** Phase 2: hosts and their fields (`unit`: `production`, `unit`, `doc`, `plan`, `tmux_session`; `ghostty`/`zed`: `desktop`; `tmux`: `tmux_session`; `terminal`; `unknown`), `Session.model`. Phase 3: `Record`/`Entry`/`TimerState` (`enabled`, `footer`), `where`, the history move. Phase 4: entries carry `stopped_at`; states `down` and `partial`; the down alert names `/shutdown restart` and the terminal line.
+**Constraints from prior phases:** Phase 2: hosts and their fields (`unit`: `production`, `unit`, `doc`, `plan`, `tmux_session`; `ghostty`/`zed`: `desktop`; `tmux`: `tmux_session`; `terminal`; `unknown`), `Session.model`. Phase 4: `Record`/`Entry`/`TimerState` (`enabled`, `footer`), `where`, the history move. Phase 5: entries carry `stopped_at`; states `down` and `partial`; the down alert names `/shutdown restart` and the terminal line.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` and `python3 -m unittest scripts/production/test_add_unit.py` green; `basedpyright scripts/shutdown scripts/production/add_unit.py` clean; live, continuing Phase 4's scratch shutdown: `restart --dry-run` prints one command per session, then `restart` brings back the natedev tmux session, the Ghostty session on its desktop and the Mac tmux session; each answers what it was doing before the shutdown; the scratch timer is enabled again; the record is in history; no other session changes.
+**Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` and `python3 -m unittest scripts/production/test_add_unit.py` green; `basedpyright scripts/shutdown scripts/production/add_unit.py` clean; live, continuing Phase 5's scratch shutdown: `restart --dry-run` prints one command per session, then `restart` brings back the natedev tmux session, the Ghostty session on its desktop and the Mac tmux session; each answers what it was doing before the shutdown; the scratch timer is enabled again; the record is in history; no other session changes.
 
-### Phase 6 — Nothing new starts on a down account  · status: todo
+### Phase 7 — Nothing new starts on a down account  · status: todo
 
 #### Work Order
 
@@ -336,6 +371,6 @@ Settle — `scripts/shutdown/settle.py`, with the `shutdown.py` verbs:
 - `impl` — `scripts/shutdown/shutdown.py`, `scripts/nightly_review/nightly_review.py`, `scripts/fix/fix-trigger.sh`, `scripts/production/add_unit.py`, `commands/shutdown.md`
 - `test` — `scripts/shutdown/test_shutdown_cli.py`, `scripts/nightly_review/test_nightly_review.py` (a down record gives `skipped: claude 2 is shut down …`), `scripts/production/test_add_unit.py` (refused while down, allowed with `--restart-note`)
 
-**Constraints from prior phases:** Phase 3: record states and the per-account record path under `SHUTDOWN_STATE_DIR`. Phase 5: `add_unit.py --restart-note` marks a restart launch.
+**Constraints from prior phases:** Phase 4: record states and the per-account record path under `SHUTDOWN_STATE_DIR`. Phase 6: `add_unit.py --restart-note` marks a restart launch.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'`, `python3 -m unittest scripts/nightly_review/test_nightly_review.py scripts/production/test_add_unit.py` green; `basedpyright scripts/shutdown scripts/nightly_review scripts/production/add_unit.py` clean; `bash -n scripts/fix/fix-trigger.sh`; live: with a scratch `down` record in a temp `SHUTDOWN_STATE_DIR`, `is-down` exits 0 and `fix-trigger.sh`'s guard exits before `fix.sh` (checked with `bash -x` and a stand-in `fix.sh`).
