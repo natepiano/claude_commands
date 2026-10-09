@@ -779,6 +779,22 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
         self.assertIn("unblocks: no gate", resumed.process.stdout)
 
+    def test_a_merge_killed_before_its_push_is_tested_before_a_rerun_pushes_it(self) -> None:
+        # Killed after the merge and before its tests finished: nothing proves the merge green.
+        sha = self.checkpoint()
+        before = self.git("rev-parse", "refs/heads/production", cwd=self.origin)
+        subject = f"Merge alpha-unit phase 2 ({sha[:7]}) into production"
+        _ = self.git("merge", "--no-ff", "-q", "-m", subject, sha, cwd=self.checkout)
+        _ = (self.state / "fail-checkpoint-test").touch()
+        red = self.run_checkpoint(sha)
+        self.assertEqual(red.process.returncode, 1, red.process.stderr + red.process.stdout)
+        self.assertIn("red: failed", red.process.stdout)
+        self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), before)
+        (self.state / "fail-checkpoint-test").unlink()
+        green = self.run_checkpoint(sha)
+        self.assertEqual(green.process.returncode, 0, green.process.stderr + green.process.stdout)
+        self.assertNotEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), before)
+
     def test_shrink_merges_only_plan_and_next_items_after_code_checkpoint(self) -> None:
         code = self.checkpoint()
         first = self.run_checkpoint(code)
