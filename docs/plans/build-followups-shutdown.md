@@ -14,6 +14,8 @@ The user's words, 2026-10-08: "For later I want a command that fully shuts down 
 
 The user chose, 2026-10-09 14:5x PDT, the scope "both machines: every showrunner, unit director, seat and Codex server on natedev and the Mac first reaches a clean, pushed state, its update timers stop, and where it was is recorded; restart resumes each session where it was and restarts its timers; CI runners and system services keep running", adding in his words: "yes both machines - but also be aware that this command should be account aware - in the future if we can have machines (on machine or on different machines) running different accounts - we need to only e shutting down the account we've been asked to shutdown (we need a way to surface the account we are, easily)"
 
+The user's words, 2026-10-09 (via the showrunner), on the status line account field: "yes but can it be on a second line - a friend of mine showed his in multiple lines and i think that's a good approach - ideally it would also show the remaining % in the 5 hour and remaining % in the week as well". The same message gave the go to promote the `settings.json` status line change once it does this.
+
 Context (showrunner): a proposed, not yet approved, plan for sessions on different Claude/Codex accounts is at ~/.local/state/plan-backlog/2026-10-09-per-session-accounts.md; read it for how accounts are found today (scripts/whoami/agent_accounts.py follows CLAUDE_CONFIG_DIR and CODEX_HOME) and design the account filter and the "which account am I" surface so they fit it, without building that plan.
 
 ## Delegation Context
@@ -28,7 +30,7 @@ Context (showrunner): a proposed, not yet approved, plan for sessions on differe
   - **Clean, pushed state.** The session and every seat it owns are idle (no turn running); no commit on its checkout's branch is ahead of its upstream; a showrunner also has no merge in flight and its merge branch pushed. Uncommitted edits stay on disk and are listed in the record. My call, stated so the user can overrule it: a commit mid-phase would put work-in-progress commits on unit branches, and pushing uncommitted work to a remote would publish it; the revert is one Spec line in the settle phase.
   - **Out of scope.** The user, 2026-10-09: "CI runners and system services keep running" — every systemd and launchd timer and service, the GitHub runners, steve, sccache, earlyoom, the session-notifier job and its machine-wide instances (`stall-watch`, `tmux-names`, `escalate`, `conversation-pause`). My calls, each a one-line revert: Codex TUI sessions and the Claude and ChatGPT/Codex desktop apps, with the Codex app's own `--managed-daemon` app-server (none is a Claude session, a seat or a mesh Codex server, the user's list).
 - **Key files:**
-  - `scripts/whoami/agent_accounts.py` — `claude_config_dir` 224, `claude_config_file` 228-232, `codex_home` 235, `claude_on_disk` 314-337 (reads `oauthAccount`), `codex_email_on_disk` 343-358 (decodes the `id_token` email). Both read the current environment only.
+  - `scripts/whoami/agent_accounts.py` — `claude_config_dir` 224, `claude_config_file` 228-236, `codex_home` 239, `claude_on_disk` 318-367 (reads `oauthAccount`), `codex_email_on_disk` 373-407 (decodes the `id_token` email). Both read the current environment only.
   - `scripts/whoami/agent_notes.py` — `AGENTS_DIR` 36, `Note` 42, `read_note` 60, `read_notes` 215; a note matches on `login:` (178). `scripts/whoami/whoami.py` — `render` prints `Account: <email>` (25-52). `scripts/whoami/test_agent_notes.py` — fixture for fake notes.
   - `scripts/statusline/statusline.jq` and `settings.json` `statusLine` (`exec jq -r --arg pwd "$PWD" -f …/statusline.jq`): two processes per refresh, on purpose (statusline.jq header). `settings.json` `hooks.SessionStart` holds three command hooks.
   - `scripts/message/sessions.py` — `SessionRecord` 15, `read_session` 34, `live_session` 72 (pid alive and socket present), `sessions_dir` 85 (`NOTIFIER_SESSIONS_DIR`), `live_sessions` 89. Record fields: `pid, sessionId, cwd, kind ("interactive" | "bg"), name, status ("idle" | "busy" | "shell"), tmux, messagingSocketPath, procStart, formerNames`.
@@ -42,7 +44,7 @@ Context (showrunner): a proposed, not yet approved, plan for sessions on differe
   - `scripts/message/send.py` — `--to <session name | session:<id> | user>`, `--from <sender>`, `--summary`, `--need note|decision|blocked` (to the user: Pushover), `--machine <host>` runs it on the other machine (475-499); `pending` prints and clears messages queued for the caller while it was down; `machine()` 143.
   - `/etc/nixos/modules/linux/agent-sessions-snapshot.py` and `agent-sessions-restore.py` (natedev only; read, never edited by this plan) — `agent-sessions-snapshot` rewrites `~/rust/hanadocs/agent sessions.md`: `## desktop: <name>` headings, one line `` `<dir>` · <terminal> · <name> `` per session and a fenced `cd <dir> && claude --resume <id> -n "<name>"`; restore 108-137: `kdotool set_desktop <n>` (numbers from `~/.config/kwinrc` `[Desktops]` `Name_<n>`), then `ghostty -e zsh -ic "<command>; exec zsh"`, 1.2 s apart, then back to the starting desktop.
   - `scripts/production/test_merge_checkpoint.py` 44-58 — a stand-in `ssh` on `PATH` that logs argv and prints the remote status as text.
-  - `scripts/nightly_review/nightly_review.py` — `quota_block` 62-70 and `launch` 89-95 (a skip reason becomes the `skipped:` line). `scripts/fix/fix-trigger.sh` — the scheduled entry to the fix pipeline; its `pgrep` guard (24-27) exits 0.
+  - `scripts/nightly_review/nightly_review.py` — `quota_block` 59-68 and `launch` 90-96 (a skip reason becomes the `skipped:` line). `scripts/fix/fix-trigger.sh` — the scheduled entry to the fix pipeline; its `pgrep` guard (28-30) exits 0.
   - `commands/codex_winddown.md`, `commands/build_hold.md` — models for a short command doc with verbs.
 - **Test lanes:** `scripts/whoami/` → `scripts/whoami/test_account.py` (new) · `scripts/shutdown/` → `scripts/shutdown/test_*.py` (new) · `scripts/hooks/test_conversation_pause.py` · `scripts/delegate/test_remove_seats.py` · `scripts/production/test_add_unit.py` · `scripts/nightly_review/test_nightly_review.py`. Tests sit beside the code and import their sibling by bare name.
 - **Build:** none; the code is interpreted.
@@ -66,60 +68,30 @@ Context (showrunner): a proposed, not yet approved, plan for sessions on differe
 
 ### Phase 1 — Which account am I  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** every session shows its account's label (`claude 2`) in the status line, `/whoami` names it, and one cheap command tells any script the account of itself or of a running process.
-
-**Spec:**
-
-New `scripts/whoami/account.py`:
-
-```python
-@dataclass(frozen=True)
-class Account:
-    tool: Literal["claude", "codex"]
-    login: str            # email, as read from disk
-    label: str            # hanadocs note stem, else the login
-
-def claude_account(config_dir: Path) -> Account | None   # None: not logged in or unreadable
-def codex_account(home: Path) -> Account | None
-def process_config_dir(pid: int) -> Path | None           # None: environment unreadable
-def account_of(pid: int) -> Account | None
-def label_for(tool: str, login: str) -> str
-def write_label(config_dir: Path, account: Account) -> None
-```
-
-- `claude_account(dir)`: reads `dir / ".claude.json"` when `dir` is not the default `~/.claude`, else `~/.claude.json` (the rule at `agent_accounts.py:228-232`, parameterized); login is `oauthAccount.emailAddress`.
-- `codex_account(home)`: the `id_token` email in `home / "auth.json"`. Refactor `agent_accounts.codex_email_on_disk` to take an optional `home: Path` (default `codex_home()`) and call it; do the same for the `.claude.json` path in `claude_on_disk`, so the file holds one reader each. Existing callers stay unchanged.
-- `process_config_dir(pid)`: on Linux read `/proc/<pid>/environ` (NUL-separated); on darwin parse `ps eww -o command= -p <pid>` for a `CLAUDE_CONFIG_DIR=` token. Unset → `~/.claude`. Unreadable → `None`, never the default.
-- `label_for`: the note in `AGENT_NOTES_DIR` (default `agent_notes.AGENTS_DIR`) whose stem starts with the tool and whose `login:` equals the login, ignoring case; else the login.
-- `write_label`: writes `<config dir>/account-label` (one line, the label) only when its content differs, atomically (temp file + rename).
-- CLI `account.py [--json] [--pid PID] [--write-label]`: no `--pid` reads this process's environment. Plain output is one line: `claude 2 (browses31_perks@icloud.com) · codex 2 (…)`; with `--pid`, the Claude account only; `--json` prints `{"claude": {"login", "label"} | null, "codex": … | null}`; `--write-label` also refreshes the label file of this process's config dir. Exit 0, or 1 when the Claude account cannot be read.
-
-Status line: `settings.json` `statusLine.command` becomes `read -r account 2>/dev/null < "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/account-label"; exec jq -r --arg pwd "$PWD" --arg account "$account" -f "$HOME/.claude/scripts/statusline/statusline.jq"` (`read` is a builtin, so it stays two processes; a missing file leaves `account` empty). `statusline.jq` appends ` | <account>` when `$account` is not empty; update its header's Called-as and Output lines.
-
-SessionStart: add one command hook to the first `SessionStart` group in `settings.json`: `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/whoami/account.py" --write-label >/dev/null 2>&1 || true`.
-
-`/whoami`: `whoami.py` `render` prints `Account: <label> — <email>` when a note matches, else `Account: <email>` (the Claude and the Codex block). `commands/whoami.md`: one sentence saying the status line's last field is the Claude account and `account.py` prints both.
+- `scripts/whoami/account.py` resolves the login behind a config directory or a process: frozen dataclass `Account(tool: Literal["claude", "codex"], login: str, label: str)`; `claude_account(config_dir: Path) -> Account | None`, `codex_account(home: Path) -> Account | None`, `process_config_dir(pid: int) -> Path | None`, `parse_darwin_config_dir(output: str, expected_uid: int) -> Path | None`, `account_of(pid: int) -> Account | None`, `label_for(tool: str, login: str) -> str`, `write_label(config_dir: Path, account: Account) -> None`.
+- `label_for` returns the stem of the note in `AGENT_NOTES_DIR` (default `agent_notes.AGENTS_DIR`) whose stem starts with the tool and whose `login:` equals the login, case-folded; else the login. `write_label` writes `<config dir>/account-label` (label plus newline) only when the content differs, through a temp file and `os.replace`. `process_config_dir` reads `/proc/<pid>/environ` on Linux and `ps eww -o uid=,command= -p <pid>` on darwin; an unset `CLAUDE_CONFIG_DIR` gives `~/.claude`, an unreadable environment gives `None`, never the default.
+- CLI `account.py [--json] [--pid PID] [--write-label]`: plain output `claude 2 (<email>) · codex 2 (<email>)`, with `unavailable` for a missing account; `--pid` reports the Claude account only (`codex` is `null` under `--json`); `--json` prints `{"claude": {"login", "label"} | null, "codex": … | null}`; `--write-label` refreshes the label file of this process's config dir, or deletes it when the Claude account is unreadable. Exit 1 when the Claude account cannot be read, else 0.
+- `agent_accounts.claude_on_disk(config_dir: Path | None = None)` and `codex_email_on_disk(home: Path | None = None)` take an optional directory; `claude_config_file(config_dir)` maps the default `~/.claude` to `~/.claude.json` and any other directory to `<dir>/.claude.json`. Both readers type-check the decoded JSON and report the account unreadable instead of raising.
+- The `statusLine` command reads `account-label` with the `read` builtin (two processes: sh and jq) and passes `--arg account`; `statusline.jq` binds `$ARGS.named.account // ""` and appends ` | <account>` when non-empty. A `SessionStart` hook runs `account.py --write-label`. `whoami.py` `render` prints `Account: <label> — <email>` when a note matches, else `Account: <email>`.
 
 **Files:**
-- `scripts/whoami/account.py` — new: the resolver, label cache and CLI.
-- `scripts/whoami/agent_accounts.py` — the two on-disk readers take an optional directory.
+- `scripts/whoami/account.py` — the resolver, label cache and CLI.
+- `scripts/whoami/agent_accounts.py` — the Claude and Codex on-disk readers, each taking an optional directory.
 - `scripts/whoami/whoami.py` — the label on the Account line.
-- `scripts/statusline/statusline.jq` — the account field.
-- `settings.json` — the status line command and one SessionStart hook (also touches; owner stalls-unit, run done).
-- `commands/whoami.md` — one sentence.
-- `scripts/whoami/test_account.py` — new.
+- `scripts/statusline/statusline.jq` — the trailing account field.
+- `settings.json` — the status line command and the `account.py --write-label` `SessionStart` hook.
+- `commands/whoami.md` — names the status line's last field and `account.py`.
+- `scripts/whoami/test_account.py` — resolver, darwin parser, label cache, CLI and status line tests.
 
-**Seats:** `1 writer + 1 tester` — one small module, so nothing splits among writers; the Spec fixes every signature, so the tester writes against it.
-- `impl` — `scripts/whoami/account.py`, `scripts/whoami/agent_accounts.py`, `scripts/whoami/whoami.py`, `scripts/statusline/statusline.jq`, `settings.json`, `commands/whoami.md`
-- `test` — `scripts/whoami/test_account.py`: a temp config dir with and without `CLAUDE_CONFIG_DIR`, a fake notes dir (`AGENT_NOTES_DIR`), a label that falls back to the login, a stand-in environ reader for `process_config_dir` (a set variable, unset, unreadable → `None`), `write_label` writes once and not again when unchanged, and the jq line with and without an account (`jq -n` on a fixed input)
+**Binds later work:** the `/shutdown` session inventory filters by `account.account_of(pid)`; `None` means unknown account, and that process is left alone. `account.parse_darwin_config_dir(output, expected_uid)` is the pure Mac parser over `ps eww -o uid=,command=` output: it returns `None` unless the uid matches and a `HOME=` token is present. macOS `ps eww` shows no environment for platform binaries (`/bin/zsh`, `/bin/sleep`) or other-uid processes yet exits 0, so the lookup returns `None` for them; Claude itself, not a platform binary, shows its environment. The label file is `<config dir>/account-label`; a missing file means no account field.
 
-**Constraints from prior phases:** none.
+**Gotchas:** `ps eww` output is unquoted argv followed by the environment, split on whitespace, so the last `CLAUDE_CONFIG_DIR=` token wins and a config dir path containing whitespace is truncated. `statusline.jq` must keep working without `--arg account`, for a `settings.json` that predates the account field. Running `account.py` on the Mac from a temp dir needs a full copy of `~/.claude/scripts`: `agent_notes` imports reach `codex_pacer`, `quota_alert` and `..production` relative imports.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/whoami -p 'test_*.py'` green; `basedpyright scripts/whoami` clean; live: `~/.claude/scripts/lib/py scripts/whoami/account.py` prints `claude 2 (…)` on natedev and over `ssh mac` (with `rc=0`); `account.py --pid <this session's pid>` prints the same; the status line of a new session ends in `| claude 2`.
+**Ruled out:** `shlex` parsing of `ps` output (the output is unquoted); defaulting to `~/.claude` when the environment is hidden (it would attribute an unknown process to the default account).
 
-### Phase 2 — What runs on an account  · status: todo
+### Phase 2 — What runs on an account  · status: done
 
 #### Work Order
 
@@ -184,7 +156,7 @@ def run_remote(args: list[str], stdin: str = "", timeout: float = 120) -> tuple[
 `run_remote` runs `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/shutdown/shutdown.py" <args>; printf "rc=%s\n" $?'`, parses the last `rc=` line as the status and returns the output above it; no `rc=` line, ssh's 255 or a timeout → status 255 ("unreachable").
 
 `scripts/shutdown/shutdown.py` (CLI; later phases add verbs):
-- `status [account] [--json] [--here]` — `account` is a note label (`claude 2`), a login, or absent for this process's Claude account (`account.py`). Prints the label and login on the first line, then per machine (this one, then the other through `run_remote` with `--here --json`): each session as `<kind> <name> · <host> · <status> · <branch> ahead N, M dirty`, Codex servers per session, timers, and the `unknown` list. An unreachable machine is one line, `mac: unreachable`, not a failure. Phase 3 adds the shutdown state to this output.
+- `status [account] [--json] [--here]` — `account` is a note label (`claude 2`), a login, or absent for this process's Claude account (`account.py`). Prints the label and login on the first line, then per machine (this one, then the other through `run_remote` with `--here --json`): each session as `<kind> <name> · <host> · <status> · <branch> ahead N, M dirty`, Codex servers per session, timers, and the `unknown` list. An unreachable machine is one line, `mac: unreachable`, not a failure. Phase 4 adds the shutdown state to this output.
 - `--here` limits any verb to this machine; the cross-machine call always passes it.
 
 `commands/shutdown.md` — new, `description:` "Shut down every Claude session of one account on natedev and the Mac safely and restart them later; show what runs on an account." This phase documents only `/shutdown status [account]`; later phases add the other verbs.
@@ -201,11 +173,44 @@ def run_remote(args: list[str], stdin: str = "", timeout: float = 120) -> tuple[
 - `impl` — `scripts/shutdown/inventory.py`, `scripts/shutdown/remote.py`, `scripts/shutdown/shutdown.py`, `commands/shutdown.md`, `pyrightconfig.json`
 - `test` — `scripts/shutdown/test_inventory.py`: fake sessions dir with two accounts (one session per account; the other account's session is never listed), an unreadable environment going to `unknown`, a showrunner from a fake notifier instance, a unit from `fake_tmux.py` marks, a seat matched to its owner through a `seats` ledger, a Codex server with a busy seat, a checkout ahead 2 with one dirty file, a snapshot file giving a desktop; `scripts/shutdown/test_remote.py`: stand-in `ssh` printing `rc=3` → 3, no `rc=` → 255
 
-**Constraints from prior phases:** Phase 1 built `scripts/whoami/account.py`: `account_of(pid) -> Account | None`, `claude_account(config_dir)`, `label_for(tool, login)`, `Account(tool, login, label)`; notes dir from `AGENT_NOTES_DIR`.
+**Constraints from prior phases:** Phase 1 built `scripts/whoami/account.py`: `account_of(pid) -> Account | None`, `claude_account(config_dir)`, `label_for(tool, login)`, `Account(tool, login, label)`; notes dir from `AGENT_NOTES_DIR`. On the Mac, `process_config_dir` runs `ps eww -o uid=,command= -p <pid>` and returns `None` for another uid or when no `HOME=` token shows (macOS hides the environment of platform binaries such as `/bin/zsh` and still exits 0); Claude's own binary shows its environment; the last `CLAUDE_CONFIG_DIR=` token wins; `parse_darwin_config_dir(output, expected_uid)` is the pure parser. The Mac's own `~/.claude` lacks Phase 1 until the production promotes, so a live Mac check before then runs from a temp copy of the whole `~/.claude/scripts` tree (the whoami imports reach `production/` by relative import). `settings.json` changes go in their own commit, and the checkpoint notice names each key.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` green; `basedpyright scripts/shutdown` clean; live: `shutdown.py status` on natedev lists the running showrunners, unit directors and top-level sessions with correct kinds and hosts and the Mac section (empty or listed), and changes nothing (notifier `ENABLED` values and session records identical before and after).
 
-### Phase 3 — Shutdown begins: timers stop and every session settles  · status: todo
+### Phase 3 — The account and its remaining quota on a second status line  · status: done
+
+#### Work Order
+
+**Goal:** the status line gets a second line naming the session's Claude account and what is left of that account's 5-hour and weekly limits, so every session shows at a glance which account it runs on and how much room it has.
+
+**Spec:**
+
+- **Source of the numbers.** Claude Code's status line JSON on stdin already carries them: `rate_limits.five_hour` and `rate_limits.seven_day`, each `{used_percentage: number, resets_at: unix seconds}`, where `used_percentage` is 0–100 with one decimal (read in the 2.1.296 binary, 2026-10-09: `five_hour:{used_percentage:tDt(dt.five_hour.utilization),resets_at:dt.five_hour.resets_at}`, `tDt(e) = Math.round(e*1000)/10`). Each window is present only when Claude Code has it: a subscription login after its first reply; never for an API key. No file is read and no process is added: the status line stays sh plus jq.
+- `scripts/statusline/statusline.jq` prints two lines:
+  - Line 1: `<dirname> | <tokens with thousands separators> | <model [effort]>` — today's line without the account field.
+  - Line 2: the parts present, in this order, joined by ` | `: the account (`$ARGS.named.account // ""`, when non-empty), `5-hour <N>% left`, `weekly <M>% left`. `N` is `100 - rate_limits.five_hour.used_percentage`, floored and clamped to 0–100, so the line never shows more room than there is; `M` the same from `seven_day`.
+  - With no part present, the output is line 1 alone: no empty second line.
+  - Every shape of input works: no `--arg account`, no `rate_limits` key, `rate_limits: null`, either window `null` or missing, `used_percentage` missing.
+  - Example: `claude_commands | 182,340 | Opus 5.5 high` then `claude 2 | 5-hour 73% left | weekly 41% left`.
+  - The header comment's `Output:` line describes both lines.
+- The words `5-hour` and `weekly` match `/whoami`'s quota labels.
+- `settings.json` does not change: its `statusLine.command` already reads `account-label` and passes `--arg account`.
+- `commands/whoami.md` — the sentence naming the status line's last field now says the status line's second line shows the Claude account and its remaining 5-hour and weekly percentages.
+
+**Files:**
+- `scripts/statusline/statusline.jq` — the second line.
+- `commands/whoami.md` — the status line sentence.
+- `scripts/whoami/test_account.py` — status line cases.
+
+**Seats:** `1 writer + 1 tester` — one jq script; the tester writes the cases from the Spec's input shapes.
+- `impl` — `scripts/statusline/statusline.jq`, `commands/whoami.md`
+- `test` — `scripts/whoami/test_account.py`: the status line run through `jq -r --arg pwd … [--arg account …] -f scripts/statusline/statusline.jq` on JSON stdin: account and both windows → two lines exactly as the example; `used_percentage` 26.4 → `73% left`, 0 → `100% left`, 100 and 104 → `0% left`; only the account; only the windows; one window null; a present `five_hour` or `seven_day` object with `used_percentage` missing → that window's part is omitted with no empty separator; no `--arg account` and no `rate_limits` → line 1 alone with no trailing empty line; line 1 never carries the account
+
+**Constraints from prior phases:** Phase 1: `statusline.jq` binds `$ARGS.named.account // ""` and must keep working without `--arg account`, for a `settings.json` that predates the field; a refresh is two processes, sh plus jq, on purpose (the header comment); the status line tests live in `scripts/whoami/test_account.py`. The `settings.json` commit with the status line command and the `SessionStart` hook is promoted with this phase on the user's go (2026-10-09, via the showrunner); this phase does not change it.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/whoami -p 'test_*.py'` green; `jq -n -f scripts/statusline/statusline.jq --arg pwd x --arg account x` parses; live on natedev: a scratch `claude --model haiku` in tmux, launched with `--settings` whose `statusLine.command` is the shipped command pointed at this worktree's `statusline.jq`, shows both lines in `tmux capture-pane` after one reply, with the label from `account-label` and two percentages; the Mac's `jq` prints both lines for a captured status line JSON.
+
+### Phase 4 — Shutdown begins: timers stop and every session settles  · status: todo
 
 #### Work Order
 
@@ -225,8 +230,8 @@ class Entry(TypedDict):
     timers: list[TimerState]
     where: str | None                     # the session's own line, from `ready`
     ready_at: str | None
-    stopped_at: str | None                # Phase 4
-    restarted_at: str | None              # Phase 5
+    stopped_at: str | None                # Phase 5
+    restarted_at: str | None              # Phase 6
 
 class Record(TypedDict):
     login: str; label: str; machine: str
@@ -258,7 +263,7 @@ Settle — `scripts/shutdown/settle.py`, with the `shutdown.py` verbs:
 - `scripts/shutdown/record.py`, `scripts/shutdown/settle.py` — new.
 - `scripts/shutdown/shutdown.py` — verbs `down`, `begin`, `conduct`, `ready`, `cancel`; `status` shows record state.
 - `scripts/hooks/conversation_pause.py` — `release(session_id)` (also touches; as-built owner enh-showrunner-unit).
-- `commands/shutdown.md`, `commands/message.md`.
+- `commands/shutdown.md`, `commands/message.md`
 - `scripts/shutdown/test_record.py`, `scripts/shutdown/test_settle.py` — new; `scripts/hooks/test_conversation_pause.py` — `release` cases.
 
 **Seats:** `1 writer + 1 tester` — the verbs share the record module, so one writer holds them; the record types and message rules are enough to test against.
@@ -269,7 +274,7 @@ Settle — `scripts/shutdown/settle.py`, with the `shutdown.py` verbs:
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` and `python3 -m unittest scripts/hooks/test_conversation_pause.py` green; `basedpyright scripts/shutdown scripts/hooks/conversation_pause.py` clean; live on natedev, limited to two scratch sessions started for the check (a tmux-hosted `claude --model haiku` and a second one), through `--only`: `down`, both reply `ready` with their `where`, a notifier instance created for one of them goes from enabled to stopped, `status` shows both ready, `cancel` re-enables it and messages both; no other session or instance changes.
 
-### Phase 4 — Shutdown stops every session, seat server and window  · status: todo
+### Phase 5 — Shutdown stops every session, seat server and window  · status: todo
 
 #### Work Order
 
@@ -292,18 +297,18 @@ Settle — `scripts/shutdown/settle.py`, with the `shutdown.py` verbs:
 - `scripts/shutdown/stop.py` — new.
 - `scripts/shutdown/settle.py`, `scripts/shutdown/shutdown.py` — `conduct` stops; verbs `stop`, `now`.
 - `scripts/delegate/remove_seats.py` — the shutdown rule (also touches; owner followups-unit, run done).
-- `commands/shutdown.md`.
+- `commands/shutdown.md`
 - `scripts/shutdown/test_stop.py` — new; `scripts/delegate/test_remove_seats.py` — the shutdown case.
 
 **Seats:** `1 writer + 1 tester` — the stop order lives in one module and the conductor; the tester works from the order and refusal rules above.
 - `impl` — `scripts/shutdown/stop.py`, `scripts/shutdown/settle.py`, `scripts/shutdown/shutdown.py`, `scripts/delegate/remove_seats.py`, `commands/shutdown.md`
 - `test` — `scripts/shutdown/test_stop.py` (injected kill and liveness: order units → showrunners → top-level → requester; a busy entry is refused without `now` and stopped with it; a pid that survives two SIGTERMs is `failed to stop` and never SIGKILLed; `codex_mesh.py stop` called once per run folder after its unit; the Mac alert routes through `--machine natedev`); `scripts/delegate/test_remove_seats.py` (a run whose director is in a `down` record is live)
 
-**Constraints from prior phases:** Phase 2: `Session.host` (`unit` with `tmux_session` from the marks, `ghostty` with the parent chain), `run_dirs`, `codex_servers`. Phase 3: `record.py` (`Record`, `Entry` with `ready_at`, `stopped_at`; states; history), `settle.py` `conduct` loop, `begin`, `ready`, `cancel`, the settle messages and the holdout alert, `conversation_pause.release`.
+**Constraints from prior phases:** Phase 2: `Session.host` (`unit` with `tmux_session` from the marks, `ghostty` with the parent chain), `run_dirs`, `codex_servers`. Phase 4: `record.py` (`Record`, `Entry` with `ready_at`, `stopped_at`; states; history), `settle.py` `conduct` loop, `begin`, `ready`, `cancel`, the settle messages and the holdout alert, `conversation_pause.release`.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` and `python3 -m unittest scripts/delegate/test_remove_seats.py` green; `basedpyright scripts/shutdown scripts/delegate/remove_seats.py` clean; live, through `--only` on scratch sessions only: on natedev a tmux-hosted session and a Ghostty-hosted session (opened for the check on the current desktop), on the Mac a session in a nix tmux (`nix run nixpkgs#tmux`) — each settles, stops, leaves `~/.claude/sessions/`, its tmux session or window closes, the record says `down` on both machines, and the alert arrives; no other session changes.
 
-### Phase 5 — Restart resumes every session where it was  · status: todo
+### Phase 6 — Restart resumes every session where it was  · status: todo
 
 #### Work Order
 
@@ -329,18 +334,18 @@ Settle — `scripts/shutdown/settle.py`, with the `shutdown.py` verbs:
 - `scripts/shutdown/restart.py` — new.
 - `scripts/shutdown/shutdown.py` — verbs `restart`, `up`.
 - `scripts/production/add_unit.py` — `--restart-note`, `--session-name`, the unique scope name (also touches; as-built owner enh-showrunner-unit).
-- `commands/shutdown.md`.
+- `commands/shutdown.md`
 - `scripts/shutdown/test_restart.py` — new; `scripts/production/test_add_unit.py` — the new flags and scope name.
 
 **Seats:** `1 writer + 1 tester` — one restart module plus one launcher change; the commands above are fixed enough to assert on.
 - `impl` — `scripts/shutdown/restart.py`, `scripts/shutdown/shutdown.py`, `scripts/production/add_unit.py`, `commands/shutdown.md`
 - `test` — `scripts/shutdown/test_restart.py` (`--dry-run` argv per host kind on both platforms; an already-live session is skipped; timers start only after the session is live and only those recorded enabled; a session that never comes back leaves `partial` and a second run retries only it); `scripts/production/test_add_unit.py` (`--restart-note` prompt, `--session-name` in `-n`, `--remote-control`, tmux and scope, scope name unique, both refused without `--resume`)
 
-**Constraints from prior phases:** Phase 2: hosts and their fields (`unit`: `production`, `unit`, `doc`, `plan`, `tmux_session`; `ghostty`/`zed`: `desktop`; `tmux`: `tmux_session`; `terminal`; `unknown`), `Session.model`. Phase 3: `Record`/`Entry`/`TimerState` (`enabled`, `footer`), `where`, the history move. Phase 4: entries carry `stopped_at`; states `down` and `partial`; the down alert names `/shutdown restart` and the terminal line.
+**Constraints from prior phases:** Phase 2: hosts and their fields (`unit`: `production`, `unit`, `doc`, `plan`, `tmux_session`; `ghostty`/`zed`: `desktop`; `tmux`: `tmux_session`; `terminal`; `unknown`), `Session.model`. Phase 4: `Record`/`Entry`/`TimerState` (`enabled`, `footer`), `where`, the history move. Phase 5: entries carry `stopped_at`; states `down` and `partial`; the down alert names `/shutdown restart` and the terminal line.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` and `python3 -m unittest scripts/production/test_add_unit.py` green; `basedpyright scripts/shutdown scripts/production/add_unit.py` clean; live, continuing Phase 4's scratch shutdown: `restart --dry-run` prints one command per session, then `restart` brings back the natedev tmux session, the Ghostty session on its desktop and the Mac tmux session; each answers what it was doing before the shutdown; the scratch timer is enabled again; the record is in history; no other session changes.
+**Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` and `python3 -m unittest scripts/production/test_add_unit.py` green; `basedpyright scripts/shutdown scripts/production/add_unit.py` clean; live, continuing Phase 5's scratch shutdown: `restart --dry-run` prints one command per session, then `restart` brings back the natedev tmux session, the Ghostty session on its desktop and the Mac tmux session; each answers what it was doing before the shutdown; the scratch timer is enabled again; the record is in history; no other session changes.
 
-### Phase 6 — Nothing new starts on a down account  · status: todo
+### Phase 7 — Nothing new starts on a down account  · status: todo
 
 #### Work Order
 
@@ -359,13 +364,13 @@ Settle — `scripts/shutdown/settle.py`, with the `shutdown.py` verbs:
 - `scripts/nightly_review/nightly_review.py` — `down_block` (also touches; no owner).
 - `scripts/fix/fix-trigger.sh` — one line (also touches; no owner).
 - `scripts/production/add_unit.py` — the refusal (also touches; as-built owner enh-showrunner-unit).
-- `commands/shutdown.md`.
+- `commands/shutdown.md`
 - `scripts/shutdown/test_shutdown_cli.py` — new (`is-down`); `scripts/nightly_review/test_nightly_review.py`, `scripts/production/test_add_unit.py` — the skip and the refusal.
 
 **Seats:** `1 writer + 1 tester` — four one-place checks; the tester writes each case from the rules above.
 - `impl` — `scripts/shutdown/shutdown.py`, `scripts/nightly_review/nightly_review.py`, `scripts/fix/fix-trigger.sh`, `scripts/production/add_unit.py`, `commands/shutdown.md`
 - `test` — `scripts/shutdown/test_shutdown_cli.py`, `scripts/nightly_review/test_nightly_review.py` (a down record gives `skipped: claude 2 is shut down …`), `scripts/production/test_add_unit.py` (refused while down, allowed with `--restart-note`)
 
-**Constraints from prior phases:** Phase 3: record states and the per-account record path under `SHUTDOWN_STATE_DIR`. Phase 5: `add_unit.py --restart-note` marks a restart launch.
+**Constraints from prior phases:** Phase 4: record states and the per-account record path under `SHUTDOWN_STATE_DIR`. Phase 6: `add_unit.py --restart-note` marks a restart launch.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'`, `python3 -m unittest scripts/nightly_review/test_nightly_review.py scripts/production/test_add_unit.py` green; `basedpyright scripts/shutdown scripts/nightly_review scripts/production/add_unit.py` clean; `bash -n scripts/fix/fix-trigger.sh`; live: with a scratch `down` record in a temp `SHUTDOWN_STATE_DIR`, `is-down` exits 0 and `fix-trigger.sh`'s guard exits before `fix.sh` (checked with `bash -x` and a stand-in `fix.sh`).
