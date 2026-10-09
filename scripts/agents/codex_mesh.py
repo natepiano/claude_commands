@@ -87,6 +87,9 @@ RESIDENT_POLL_SECS = 1.0
 RETRY_FAST_FAILURE_SECS = 120.0
 # The provider's words for an account with no allowance or credits left to spend.
 QUOTA_REFUSAL = "hit your usage limit"
+# What an app-server says when Codex was signed in again after it started: it holds the old token
+# and cannot refresh it. A server started now reads the current sign-in.
+STALE_SIGN_IN = "access token could not be refreshed"
 # agent_notes.py's `blocked` verb moves Codex work to Claude; one switch took 8 s
 # and one relay 9 s when measured, and the relays run in parallel.
 QUOTA_REPORT = Path(__file__).resolve().parent.parent / "whoami" / "agent_notes.py"
@@ -1038,15 +1041,19 @@ def _retry_warranted(outcome: RunOutcome, fresh_server: bool, resident: bool) ->
 
     Four conditions, each of them narrowing:
       * the failed server was inherited, so nothing has tested it this run;
-      * no thread exists, so repeating the prompt cannot repeat work;
-      * the failure arrived too fast to have reached the provider;
+      * no thread exists, so repeating the prompt cannot repeat work -- or the
+        thread's turn was refused for a stale sign-in, which the provider turns
+        away before any work, so a new thread repeats nothing either;
+      * the failure arrived too fast to have reached the provider, or to have
+        done work before the refusal;
       * and the delegate is not resident, where a caller is already holding the
         replies and a silent second attempt would arrive behind them.
     """
     return (
         not fresh_server
         and not resident
-        and isinstance(outcome, FailedBeforeThread)
+        and (isinstance(outcome, FailedBeforeThread)
+             or (isinstance(outcome, FailedWithThread) and STALE_SIGN_IN in outcome.failure))
         and outcome.seconds <= RETRY_FAST_FAILURE_SECS
     )
 
@@ -1141,11 +1148,12 @@ def command_start(args: argparse.Namespace) -> int:
     if _retry_warranted(outcome, fresh_server, resident):
         _ = _retire_server(session_dir, port)
         port, _fresh = ensure_server(session_dir)
-        assert isinstance(outcome, FailedBeforeThread)
-        elapsed = f"{outcome.seconds:.0f}s"
-        note = f"the inherited app-server failed in {elapsed} without reaching"
-        print(f"codex_mesh: {name}: {note} the provider; retrying on a new one",
-              file=sys.stderr)
+        assert isinstance(outcome, (FailedBeforeThread, FailedWithThread))
+        if isinstance(outcome, FailedWithThread):
+            note = "the inherited app-server holds a Codex sign-in that has since changed"
+        else:
+            note = f"the inherited app-server failed in {outcome.seconds:.0f}s without reaching the provider"
+        print(f"codex_mesh: {name}: {note}; retrying on a new one", file=sys.stderr)
         outcome = _run_delegate(args, port)
         tested = True
     if isinstance(outcome, (FailedBeforeThread, FailedWithThread)):

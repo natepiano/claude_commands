@@ -35,6 +35,8 @@ from scripts.agents import codex_mesh
 
 USAGE_LIMIT = "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage"
 CAPACITY = "Selected model is at capacity. Please try a different model."
+STALE_SIGN_IN = ("Your access token could not be refreshed because you have since logged out or signed in to "
+                 "another account. Please sign in again.")
 THREAD_ID = "thread-capacity-test"
 
 
@@ -1281,6 +1283,43 @@ class RetryDecisionTests(unittest.TestCase):
                 _attempt(thread_exists=True), fresh_server=False, resident=False
             )
         )
+
+    def test_a_sign_in_the_inherited_server_no_longer_holds_is_retried_with_a_thread(self) -> None:
+        # Codex was signed in again after the server started, so it cannot refresh its token. The
+        # provider refused the turn, so no work was done; a server started now reads the new sign-in.
+        self.assertTrue(
+            codex_mesh._retry_warranted(  # pyright: ignore[reportPrivateUsage]
+                codex_mesh.FailedWithThread(THREAD_ID, STALE_SIGN_IN, 1.0), fresh_server=False, resident=False
+            )
+        )
+
+    def test_a_stale_sign_in_on_a_fresh_server_or_after_work_is_final(self) -> None:
+        for outcome, fresh in ((codex_mesh.FailedWithThread(THREAD_ID, STALE_SIGN_IN, 1.0), True),
+                               (codex_mesh.FailedWithThread(
+                                   THREAD_ID, STALE_SIGN_IN, codex_mesh.RETRY_FAST_FAILURE_SECS + 1), False)):
+            with self.subTest(fresh=fresh, seconds=outcome.seconds):
+                self.assertFalse(
+                    codex_mesh._retry_warranted(  # pyright: ignore[reportPrivateUsage]
+                        outcome, fresh_server=fresh, resident=False
+                    )
+                )
+
+    def test_start_retries_a_stale_sign_in_on_a_new_server(self) -> None:
+        outcomes: list[codex_mesh.RunOutcome] = [
+            codex_mesh.FailedWithThread(THREAD_ID, STALE_SIGN_IN, 1.0), codex_mesh.RunCompleted()]
+        with tempfile.TemporaryDirectory() as scratch:
+            args = argparse.Namespace(session_dir=scratch, name="seat", resident=False,
+                                      log_file=str(Path(scratch) / "seat.log"))
+            errors = io.StringIO()
+            with patch.object(codex_mesh, "ensure_server", side_effect=[(4001, False), (4002, True)]), \
+                 patch.object(codex_mesh, "_retire_server", return_value=True) as retire, \
+                 patch.object(codex_mesh, "_run_delegate", side_effect=outcomes) as run, \
+                 contextlib.redirect_stderr(errors):
+                code = codex_mesh.command_start(args)
+        self.assertEqual(code, 0, errors.getvalue())
+        retire.assert_called_once_with(scratch, 4001)
+        self.assertEqual([call.args[1] for call in run.call_args_list], [4001, 4002])
+        self.assertIn("holds a Codex sign-in that has since changed", errors.getvalue())
 
     def test_a_slow_failure_reached_the_provider(self) -> None:
         # A cached answer comes back instantly; one that travelled does not.

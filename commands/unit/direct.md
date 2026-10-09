@@ -242,7 +242,8 @@ recorded in `${SESSION_DIR}/mesh_server.json` — a different path that can fail
 while `codex exec` answers. That disagreement is the wedged server's signature,
 not evidence delegates are back. The only valid probe is the dispatch itself.
 
-The launcher already tried. On a fast failure with no work done, `codex_mesh.py`
+The launcher already tried. On a fast failure with no work done, or a stale Codex
+sign-in (`access token could not be refreshed`) even after the thread exists, `codex_mesh.py`
 abandons the inherited server, starts one of its own and runs the seat again,
 printing `retrying on a new app-server` to the seat's log. So an error that
 reaches you has usually already been tested against a clean server and is real.
