@@ -385,7 +385,13 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   line through `send.py` to each session whose run-active marker names the run.
   The run's next dispatch starts a server that reads the current sign-in. A seat
   mid-turn finishes on the old server, which `send` and `steer` keep reaching
-  through the port in the seat's roster entry while its launcher lives; a
+  through the port in the seat's roster entry while its launcher lives. Every
+  launcher writes that port before it opens its thread, `follow` included; for
+  an entry without one, `_seat_port` asks each running server of the run,
+  retired ones first, which holds the thread (`thread/loaded/list`). A seat
+  whose launcher lives is never given a new server: a second server cannot open
+  a thread another still holds, so when none holds it the message fails and
+  nothing is left running. A
   resident seat moves itself between turns (`_move_resident`), carrying any
   queued messages into its first turn on the new server under its pending lock.
   A retired server is judged on its clients and running turns alone, since the

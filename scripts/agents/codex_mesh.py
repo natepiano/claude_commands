@@ -564,8 +564,11 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
         thread_id = _as_str(entry.get("thread_id"))
         previous_status = entry.get("previous_status")
         if live_turn and not finished:
-            roster[name] = {"thread_id": thread_id, "status": "running", "turn_id": live_turn,
-                            "launcher_pid": launcher_pid, "previous_status": previous_status}
+            restored: dict[str, object] = {"thread_id": thread_id, "status": "running", "turn_id": live_turn,
+                                           "launcher_pid": launcher_pid, "previous_status": previous_status}
+            if isinstance(port := entry.get("port"), int):
+                restored["port"] = port
+            roster[name] = restored
         else:
             roster[name] = {"thread_id": thread_id,
                             "status": previous_status if previous_status in FOLLOWABLE_STATES else "failed"}
@@ -624,11 +627,72 @@ def _server_availability(session_dir: str) -> ServerAvailability:
 
 def _seat_port(session_dir: str, record: ThreadRecord) -> int:
     """The server that reaches a seat: the one its launcher is attached to while that launcher
-    lives, which after a sign-in change can be one the run has retired; otherwise the run's own."""
+    lives, which after a sign-in change can be one the run has retired; otherwise the run's own.
+
+    A seat whose launcher lives is never given a new server. Its conversation stays open on the
+    server it is on, and a second server cannot open it while that one holds it.
+    """
     port, pid = record.get("port"), record.get("launcher_pid")
-    if isinstance(port, int) and isinstance(pid, int) and pid > 0 and _pid_alive(pid):
+    if not (isinstance(pid, int) and pid > 0 and _pid_alive(pid)):
+        return ensure_server(session_dir)[0]
+    if isinstance(port, int):
         return port
-    return ensure_server(session_dir)[0]
+    # A launcher that has not recorded its server yet, or one started before seats recorded it.
+    thread_id = record["thread_id"]
+    servers = _run_servers(session_dir)
+    for candidate in servers:
+        if _server_holds(candidate, thread_id):
+            return candidate
+    current = _record_port(session_dir)
+    if current in servers:
+        return current
+    raise SystemExit(f"codex_mesh: thread {thread_id}'s launcher {pid} is running, but no running app-server "
+                     + "of this run holds it; nothing was started and the message was not delivered")
+
+
+def _run_servers(session_dir: str) -> list[int]:
+    """Ports of the run's servers still running: those it retired, oldest first, then its current one."""
+    stored = _read_json_object(_session_path(session_dir, RETIRED_FILE)).get("servers")
+    records = [_as_dict(record) for record in (cast("list[object]", stored) if isinstance(stored, list) else [])]
+    records.append(_read_json_object(_session_path(session_dir, SERVER_FILE)))
+    ports: list[int] = []
+    for record in records:
+        port, pid = record.get("port"), record.get("pid")
+        if isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid) and port not in ports:
+            ports.append(port)
+    return ports
+
+
+def _server_holds(port: int, thread_id: str) -> bool:
+    try:
+        client = Client(port, f"seat-lookup-{os.getpid()}")
+    except (ConnectionError, OSError, SystemExit):
+        return False
+    try:
+        loaded = _as_dict(client.call("thread/loaded/list", {}).get("result")).get("data")
+        return isinstance(loaded, list) and thread_id in cast("list[object]", loaded)
+    except (ConnectionError, OSError, SystemExit):
+        return False
+    finally:
+        client.close()
+
+
+def _note_seat_port(session_dir: str, name: str, launcher_pid: int, port: int) -> None:
+    """Record the server a follow-up launcher attached to, while its claim is still its own."""
+    path = _session_path(session_dir, ROSTER_FILE)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _ = handle.seek(0)
+        roster = _as_dict(_loads(handle.read()))
+        entry = _as_dict(roster.get(name))
+        if entry.get("launcher_pid") != launcher_pid:
+            return
+        entry["port"] = port
+        roster[name] = entry
+        _ = handle.seek(0)
+        _ = handle.truncate()
+        _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
+        handle.flush()
 
 
 def _record_port(session_dir: str) -> int | None:
@@ -1285,6 +1349,7 @@ def command_follow(args: argparse.Namespace) -> int:
     live_turn = ""
     try:
         port, _fresh = ensure_server(session_dir)
+        _note_seat_port(session_dir, name, owner_pid, port)
         client = Client(port, name)
         _ = _require(client.call("thread/resume", {"threadId": thread_id}), "thread/resume")
         live = _read_live_turn(client, thread_id)
@@ -1443,7 +1508,7 @@ def _attach_and_run(
                     f"[{stamp}] mesh: dropped {dropped} held messages for thread {previous_thread} on relaunch\n"
                 )
         _update_roster(
-            session_dir, name, {"thread_id": thread_id, "status": "starting"}
+            session_dir, name, {"thread_id": thread_id, "status": "starting", "port": port}
         )
 
     return _stream_turn(args, client, port, session_dir, name, thread_id, prompt, timeout, opened)
