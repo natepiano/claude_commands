@@ -66,58 +66,28 @@ Context (showrunner): a proposed, not yet approved, plan for sessions on differe
 
 ### Phase 1 — Which account am I  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** every session shows its account's label (`claude 2`) in the status line, `/whoami` names it, and one cheap command tells any script the account of itself or of a running process.
-
-**Spec:**
-
-New `scripts/whoami/account.py`:
-
-```python
-@dataclass(frozen=True)
-class Account:
-    tool: Literal["claude", "codex"]
-    login: str            # email, as read from disk
-    label: str            # hanadocs note stem, else the login
-
-def claude_account(config_dir: Path) -> Account | None   # None: not logged in or unreadable
-def codex_account(home: Path) -> Account | None
-def process_config_dir(pid: int) -> Path | None           # None: environment unreadable
-def account_of(pid: int) -> Account | None
-def label_for(tool: str, login: str) -> str
-def write_label(config_dir: Path, account: Account) -> None
-```
-
-- `claude_account(dir)`: reads `dir / ".claude.json"` when `dir` is not the default `~/.claude`, else `~/.claude.json` (the rule at `agent_accounts.py:228-232`, parameterized); login is `oauthAccount.emailAddress`.
-- `codex_account(home)`: the `id_token` email in `home / "auth.json"`. Refactor `agent_accounts.codex_email_on_disk` to take an optional `home: Path` (default `codex_home()`) and call it; do the same for the `.claude.json` path in `claude_on_disk`, so the file holds one reader each. Existing callers stay unchanged.
-- `process_config_dir(pid)`: on Linux read `/proc/<pid>/environ` (NUL-separated); on darwin parse `ps eww -o command= -p <pid>` for a `CLAUDE_CONFIG_DIR=` token. Unset → `~/.claude`. Unreadable → `None`, never the default.
-- `label_for`: the note in `AGENT_NOTES_DIR` (default `agent_notes.AGENTS_DIR`) whose stem starts with the tool and whose `login:` equals the login, ignoring case; else the login.
-- `write_label`: writes `<config dir>/account-label` (one line, the label) only when its content differs, atomically (temp file + rename).
-- CLI `account.py [--json] [--pid PID] [--write-label]`: no `--pid` reads this process's environment. Plain output is one line: `claude 2 (browses31_perks@icloud.com) · codex 2 (…)`; with `--pid`, the Claude account only; `--json` prints `{"claude": {"login", "label"} | null, "codex": … | null}`; `--write-label` also refreshes the label file of this process's config dir. Exit 0, or 1 when the Claude account cannot be read.
-
-Status line: `settings.json` `statusLine.command` becomes `read -r account 2>/dev/null < "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/account-label"; exec jq -r --arg pwd "$PWD" --arg account "$account" -f "$HOME/.claude/scripts/statusline/statusline.jq"` (`read` is a builtin, so it stays two processes; a missing file leaves `account` empty). `statusline.jq` appends ` | <account>` when `$account` is not empty; update its header's Called-as and Output lines.
-
-SessionStart: add one command hook to the first `SessionStart` group in `settings.json`: `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/whoami/account.py" --write-label >/dev/null 2>&1 || true`.
-
-`/whoami`: `whoami.py` `render` prints `Account: <label> — <email>` when a note matches, else `Account: <email>` (the Claude and the Codex block). `commands/whoami.md`: one sentence saying the status line's last field is the Claude account and `account.py` prints both.
+- `scripts/whoami/account.py` resolves the login behind a config directory or a process: frozen dataclass `Account(tool: Literal["claude", "codex"], login: str, label: str)`; `claude_account(config_dir: Path) -> Account | None`, `codex_account(home: Path) -> Account | None`, `process_config_dir(pid: int) -> Path | None`, `parse_darwin_config_dir(output: str, expected_uid: int) -> Path | None`, `account_of(pid: int) -> Account | None`, `label_for(tool: str, login: str) -> str`, `write_label(config_dir: Path, account: Account) -> None`.
+- `label_for` returns the stem of the note in `AGENT_NOTES_DIR` (default `agent_notes.AGENTS_DIR`) whose stem starts with the tool and whose `login:` equals the login, case-folded; else the login. `write_label` writes `<config dir>/account-label` (label plus newline) only when the content differs, through a temp file and `os.replace`. `process_config_dir` reads `/proc/<pid>/environ` on Linux and `ps eww -o uid=,command= -p <pid>` on darwin; an unset `CLAUDE_CONFIG_DIR` gives `~/.claude`, an unreadable environment gives `None`, never the default.
+- CLI `account.py [--json] [--pid PID] [--write-label]`: plain output `claude 2 (<email>) · codex 2 (<email>)`, with `unavailable` for a missing account; `--pid` reports the Claude account only (`codex` is `null` under `--json`); `--json` prints `{"claude": {"login", "label"} | null, "codex": … | null}`; `--write-label` refreshes the label file of this process's config dir, or deletes it when the Claude account is unreadable. Exit 1 when the Claude account cannot be read, else 0.
+- `agent_accounts.claude_on_disk(config_dir: Path | None = None)` and `codex_email_on_disk(home: Path | None = None)` take an optional directory; `claude_config_file(config_dir)` maps the default `~/.claude` to `~/.claude.json` and any other directory to `<dir>/.claude.json`. Both readers type-check the decoded JSON and report the account unreadable instead of raising.
+- The `statusLine` command reads `account-label` with the `read` builtin (two processes: sh and jq) and passes `--arg account`; `statusline.jq` binds `$ARGS.named.account // ""` and appends ` | <account>` when non-empty. A `SessionStart` hook runs `account.py --write-label`. `whoami.py` `render` prints `Account: <label> — <email>` when a note matches, else `Account: <email>`.
 
 **Files:**
-- `scripts/whoami/account.py` — new: the resolver, label cache and CLI.
-- `scripts/whoami/agent_accounts.py` — the two on-disk readers take an optional directory.
+- `scripts/whoami/account.py` — the resolver, label cache and CLI.
+- `scripts/whoami/agent_accounts.py` — the Claude and Codex on-disk readers, each taking an optional directory.
 - `scripts/whoami/whoami.py` — the label on the Account line.
-- `scripts/statusline/statusline.jq` — the account field.
-- `settings.json` — the status line command and one SessionStart hook (also touches; owner stalls-unit, run done).
-- `commands/whoami.md` — one sentence.
-- `scripts/whoami/test_account.py` — new.
+- `scripts/statusline/statusline.jq` — the trailing account field.
+- `settings.json` — the status line command and the `account.py --write-label` `SessionStart` hook.
+- `commands/whoami.md` — names the status line's last field and `account.py`.
+- `scripts/whoami/test_account.py` — resolver, darwin parser, label cache, CLI and status line tests.
 
-**Seats:** `1 writer + 1 tester` — one small module, so nothing splits among writers; the Spec fixes every signature, so the tester writes against it.
-- `impl` — `scripts/whoami/account.py`, `scripts/whoami/agent_accounts.py`, `scripts/whoami/whoami.py`, `scripts/statusline/statusline.jq`, `settings.json`, `commands/whoami.md`
-- `test` — `scripts/whoami/test_account.py`: a temp config dir with and without `CLAUDE_CONFIG_DIR`, a fake notes dir (`AGENT_NOTES_DIR`), a label that falls back to the login, a stand-in environ reader for `process_config_dir` (a set variable, unset, unreadable → `None`), `write_label` writes once and not again when unchanged, and the jq line with and without an account (`jq -n` on a fixed input)
+**Binds later work:** the `/shutdown` session inventory filters by `account.account_of(pid)`; `None` means unknown account, and that process is left alone. `account.parse_darwin_config_dir(output, expected_uid)` is the pure Mac parser over `ps eww -o uid=,command=` output: it returns `None` unless the uid matches and a `HOME=` token is present. macOS `ps eww` shows no environment for platform binaries (`/bin/zsh`, `/bin/sleep`) or other-uid processes yet exits 0, so the lookup returns `None` for them; Claude itself, not a platform binary, shows its environment. The label file is `<config dir>/account-label`; a missing file means no account field.
 
-**Constraints from prior phases:** none.
+**Gotchas:** `ps eww` output is unquoted argv followed by the environment, split on whitespace, so the last `CLAUDE_CONFIG_DIR=` token wins and a config dir path containing whitespace is truncated. `statusline.jq` must keep working without `--arg account`, for a `settings.json` that predates the account field. Running `account.py` on the Mac from a temp dir needs a full copy of `~/.claude/scripts`: `agent_notes` imports reach `codex_pacer`, `quota_alert` and `..production` relative imports.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/whoami -p 'test_*.py'` green; `basedpyright scripts/whoami` clean; live: `~/.claude/scripts/lib/py scripts/whoami/account.py` prints `claude 2 (…)` on natedev and over `ssh mac` (with `rc=0`); `account.py --pid <this session's pid>` prints the same; the status line of a new session ends in `| claude 2`.
+**Ruled out:** `shlex` parsing of `ps` output (the output is unquoted); defaulting to `~/.claude` when the environment is hidden (it would attribute an unknown process to the default account).
 
 ### Phase 2 — What runs on an account  · status: todo
 
@@ -201,7 +171,7 @@ def run_remote(args: list[str], stdin: str = "", timeout: float = 120) -> tuple[
 - `impl` — `scripts/shutdown/inventory.py`, `scripts/shutdown/remote.py`, `scripts/shutdown/shutdown.py`, `commands/shutdown.md`, `pyrightconfig.json`
 - `test` — `scripts/shutdown/test_inventory.py`: fake sessions dir with two accounts (one session per account; the other account's session is never listed), an unreadable environment going to `unknown`, a showrunner from a fake notifier instance, a unit from `fake_tmux.py` marks, a seat matched to its owner through a `seats` ledger, a Codex server with a busy seat, a checkout ahead 2 with one dirty file, a snapshot file giving a desktop; `scripts/shutdown/test_remote.py`: stand-in `ssh` printing `rc=3` → 3, no `rc=` → 255
 
-**Constraints from prior phases:** Phase 1 built `scripts/whoami/account.py`: `account_of(pid) -> Account | None`, `claude_account(config_dir)`, `label_for(tool, login)`, `Account(tool, login, label)`; notes dir from `AGENT_NOTES_DIR`.
+**Constraints from prior phases:** Phase 1 built `scripts/whoami/account.py`: `account_of(pid) -> Account | None`, `claude_account(config_dir)`, `label_for(tool, login)`, `Account(tool, login, label)`; notes dir from `AGENT_NOTES_DIR`. On the Mac, `process_config_dir` runs `ps eww -o uid=,command= -p <pid>` and returns `None` for another uid or when no `HOME=` token shows (macOS hides the environment of platform binaries such as `/bin/zsh` and still exits 0); Claude's own binary shows its environment; the last `CLAUDE_CONFIG_DIR=` token wins; `parse_darwin_config_dir(output, expected_uid)` is the pure parser. The Mac's own `~/.claude` lacks Phase 1 until the production promotes, so a live Mac check before then runs from a temp copy of the whole `~/.claude/scripts` tree (the whoami imports reach `production/` by relative import). `settings.json` changes go in their own commit, and the checkpoint notice names each key.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` green; `basedpyright scripts/shutdown` clean; live: `shutdown.py status` on natedev lists the running showrunners, unit directors and top-level sessions with correct kinds and hosts and the Mac section (empty or listed), and changes nothing (notifier `ENABLED` values and session records identical before and after).
 
@@ -258,7 +228,7 @@ Settle — `scripts/shutdown/settle.py`, with the `shutdown.py` verbs:
 - `scripts/shutdown/record.py`, `scripts/shutdown/settle.py` — new.
 - `scripts/shutdown/shutdown.py` — verbs `down`, `begin`, `conduct`, `ready`, `cancel`; `status` shows record state.
 - `scripts/hooks/conversation_pause.py` — `release(session_id)` (also touches; as-built owner enh-showrunner-unit).
-- `commands/shutdown.md`, `commands/message.md`.
+- `commands/shutdown.md`, `commands/message.md`
 - `scripts/shutdown/test_record.py`, `scripts/shutdown/test_settle.py` — new; `scripts/hooks/test_conversation_pause.py` — `release` cases.
 
 **Seats:** `1 writer + 1 tester` — the verbs share the record module, so one writer holds them; the record types and message rules are enough to test against.
@@ -292,7 +262,7 @@ Settle — `scripts/shutdown/settle.py`, with the `shutdown.py` verbs:
 - `scripts/shutdown/stop.py` — new.
 - `scripts/shutdown/settle.py`, `scripts/shutdown/shutdown.py` — `conduct` stops; verbs `stop`, `now`.
 - `scripts/delegate/remove_seats.py` — the shutdown rule (also touches; owner followups-unit, run done).
-- `commands/shutdown.md`.
+- `commands/shutdown.md`
 - `scripts/shutdown/test_stop.py` — new; `scripts/delegate/test_remove_seats.py` — the shutdown case.
 
 **Seats:** `1 writer + 1 tester` — the stop order lives in one module and the conductor; the tester works from the order and refusal rules above.
@@ -329,7 +299,7 @@ Settle — `scripts/shutdown/settle.py`, with the `shutdown.py` verbs:
 - `scripts/shutdown/restart.py` — new.
 - `scripts/shutdown/shutdown.py` — verbs `restart`, `up`.
 - `scripts/production/add_unit.py` — `--restart-note`, `--session-name`, the unique scope name (also touches; as-built owner enh-showrunner-unit).
-- `commands/shutdown.md`.
+- `commands/shutdown.md`
 - `scripts/shutdown/test_restart.py` — new; `scripts/production/test_add_unit.py` — the new flags and scope name.
 
 **Seats:** `1 writer + 1 tester` — one restart module plus one launcher change; the commands above are fixed enough to assert on.
@@ -359,7 +329,7 @@ Settle — `scripts/shutdown/settle.py`, with the `shutdown.py` verbs:
 - `scripts/nightly_review/nightly_review.py` — `down_block` (also touches; no owner).
 - `scripts/fix/fix-trigger.sh` — one line (also touches; no owner).
 - `scripts/production/add_unit.py` — the refusal (also touches; as-built owner enh-showrunner-unit).
-- `commands/shutdown.md`.
+- `commands/shutdown.md`
 - `scripts/shutdown/test_shutdown_cli.py` — new (`is-down`); `scripts/nightly_review/test_nightly_review.py`, `scripts/production/test_add_unit.py` — the skip and the refusal.
 
 **Seats:** `1 writer + 1 tester` — four one-place checks; the tester writes each case from the rules above.
