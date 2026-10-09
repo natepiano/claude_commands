@@ -490,6 +490,23 @@ class MeshCommandTests(unittest.TestCase):
             result = codex_mesh.command_follow(args)
         return result, errors.getvalue()
 
+    def test_follow_records_its_server_before_it_reopens_the_thread(self) -> None:
+        # A message sent while the follow-up is starting reaches the seat through this port.
+        code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+        ports: list[object] = []
+        respond = self.server.respond
+
+        def watch(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/resume":
+                ports.append(self.seat_record().get("port"))
+            return respond(request)
+
+        self.server.respond = watch
+        code, errors = self.run_follow()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(ports, [self.server.port])
+
     def test_follow_reuses_a_done_thread_and_records_its_new_turn(self) -> None:
         code, errors = self.run_start()
         self.assertEqual((code, errors), (0, ""))
@@ -2156,6 +2173,37 @@ class ServerRecordTests(unittest.TestCase):
         roster = cast("dict[str, dict[str, object]]",
                       json.loads((self.session_dir / codex_mesh.ROSTER_FILE).read_text(encoding="utf-8")))
         self.assertNotIn("port", roster["seat"])
+
+    def attached_seat(self) -> codex_mesh.ThreadRecord:
+        """A running seat whose launcher lives and whose record names no server, as a launcher
+        started before seats recorded one leaves it."""
+        return {"thread_id": "t1", "turn_id": "u1", "status": "running", "launcher_pid": os.getpid()}
+
+    def test_a_seat_with_no_recorded_port_is_reached_on_the_retired_server_holding_it(self) -> None:
+        self.write_server(4321, self.sleeper())
+        _ = codex_mesh._retire_server(str(self.session_dir), 4321)  # pyright: ignore[reportPrivateUsage]
+        self.write_server(9876, self.sleeper())
+
+        def holds(port: int, _thread_id: str) -> bool:
+            return port == 4321
+
+        with patch.object(codex_mesh, "_server_holds", side_effect=holds), \
+                patch.object(codex_mesh, "ensure_server") as ensure:
+            port = codex_mesh._seat_port(str(self.session_dir), self.attached_seat())  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(port, 4321)
+        ensure.assert_not_called()
+
+    def test_a_seat_no_running_server_holds_fails_without_starting_one(self) -> None:
+        # The run's record was retired and its next server not yet started: a new one could not
+        # open a conversation the old one still holds, and would be left running.
+        self.write_server(4321, self.sleeper())
+        _ = codex_mesh._retire_server(str(self.session_dir), 4321)  # pyright: ignore[reportPrivateUsage]
+        with patch.object(codex_mesh, "_server_holds", return_value=False), \
+                patch.object(codex_mesh, "ensure_server") as ensure, \
+                self.assertRaises(SystemExit) as refused:
+            _ = codex_mesh._seat_port(str(self.session_dir), self.attached_seat())  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("nothing was started", str(refused.exception))
+        ensure.assert_not_called()
 
     def test_retiring_drops_the_record_and_keeps_the_pid_for_stop(self) -> None:
         pid = self.sleeper()
