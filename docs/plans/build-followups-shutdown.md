@@ -64,7 +64,7 @@ Context (showrunner): a proposed, not yet approved, plan for sessions on differe
 
 ## Phases
 
-### Phase 1 — Which account am I  · status: todo
+### Phase 1 — Which account am I  · status: done
 
 #### Work Order
 
