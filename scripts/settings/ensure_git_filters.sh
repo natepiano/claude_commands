@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-
-set -uo pipefail
-
 # Make this repo's git clean filters work on whatever machine it is sitting on.
 # Idempotent, quiet when everything is already in place, and safe to run from a
 # hook. SessionStart runs it, so a fresh clone repairs itself on first launch.
@@ -23,6 +20,8 @@ set -uo pipefail
 #      and snapshots settings.json's local-only keys for the smudge to restore
 #   3. a restore, snapshot, and index refresh right now, for anything that
 #      happened while the above was missing
+
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
