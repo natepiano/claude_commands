@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
 # Reconcile cargo-berth reservations when a session starts.
 #
 # This wrapper decides one thing: whether the engine can be reached. Everything a
