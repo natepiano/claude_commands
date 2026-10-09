@@ -33,6 +33,7 @@
 | model-study-unit | `docs/as-built/director-model-study.md` (run done; as-built 16e5ac6) | `/home/natepiano/worktrees/claude-build-followups-model-study` | `build-followups-model-study` | — | `docs/plans/build-followups-model-study.md`; `scripts/model_study/`; `docs/as-built/director-model-study-results.md` |
 | phase-tables-unit | docs/as-built/phase-tables.md | /home/natepiano/worktrees/claude-build-followups-phase-tables | build-followups-phase-tables | — | `scripts/delegate/phase_table.py`, `scripts/delegate/progress_history.py` and their tests; `commands/unit/eta.md`, `commands/unit/eta_breakdown.md`; `docs/as-built/plan-delegate-progress-history.md`; in its Phase 4 `scripts/production/dailies_input.py`, its test and `commands/showrunner/dailies.md` |
 | delegate-rename-unit | docs/as-built/agent-registry.md and docs/as-built/session-notifier.md (runs done 2026-10-08) | /home/natepiano/worktrees/claude-build-followups-delegate-rename | build-followups-delegate-rename | — | commands/unit/direct.md, the stub commands/unit/delegate.md, and the lines that name the command in commands/, skills/, docs/, scripts/ and config/ (README.md, delegate.conf, lint.conf, clippy.conf); not CLAUDE.md, not settings.json |
+| shutdown-unit | docs/plans/build-followups-shutdown.md | /home/natepiano/worktrees/claude-build-followups-shutdown | build-followups-shutdown | — | — |
 
 ## Hub files
 
