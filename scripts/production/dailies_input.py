@@ -65,6 +65,8 @@ class Activity(NamedTuple):
 
 
 Flag = FormWaiting | Decision | StillWaiting | Block | TicksFailing
+# What waits on the user: a form, a question on its first report, and the same question on every later one.
+WAITS_ON_USER = (FormWaiting, Decision, StillWaiting)
 SessionState = SessionGone | ClaudeNotRunning | Running
 
 
@@ -715,9 +717,9 @@ def run(args: argparse.Namespace) -> int:
     blocks = status_blocks(status_path, units)
     report("status", "ok", f"{len(blocks)} units read")
     # A unit whose run is finished has nothing to report: it needs no judgment entry and is left out,
-    # unless it shows a form or a decision, which the user still has to see.
+    # unless something in it waits on the user, who still has to see it.
     asking = {block.session for block in blocks
-              if any(isinstance(flag, (FormWaiting, Decision)) for flag in block.flags)}
+              if any(isinstance(flag, WAITS_ON_USER) for flag in block.flags)}
     finished = [unit.name for unit in units
                 if unit.run is unit_lookup.UnitState.RUN_FINISHED and unit.name not in asking]
     if finished:
@@ -768,7 +770,7 @@ def run(args: argparse.Namespace) -> int:
             raise DailiesFailure("build hold", f"{judgment_path}.units[{index}].build_hold: supplied by holder files")
         if holder_names and unit.session not in holder_names and unit.name not in holder_names:
             result["build_hold"] = True
-        if "needs_user" not in result and any(isinstance(flag, (FormWaiting, Decision, StillWaiting)) for flag in block.flags):
+        if "needs_user" not in result and any(isinstance(flag, WAITS_ON_USER) for flag in block.flags):
             result["needs_user"] = True
         phase = fields.get("phase")
         phase_text = phase if isinstance(phase, str) else ""

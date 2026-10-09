@@ -408,6 +408,17 @@ class DailiesInputTests(unittest.TestCase):
         self.assertIn("units[1].project: required", refused.stdout + refused.stderr)
         self.assertNotIn("left out", refused.stdout)
 
+    def test_a_finished_unit_whose_question_was_shown_before_keeps_its_place(self) -> None:
+        self.production_doc(beta=True)
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels",
+                          f"== {BETA}", f"STILL WAITING on you, {BETA}:  — gate: add-on review, item 1 of 2")
+        self.judgment_file()
+        self.finished_run(self.root / "beta")
+        refused = self.run_builder()
+        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        self.assertIn("units[1].project: required", refused.stdout + refused.stderr)
+        self.assertNotIn("left out", refused.stdout)
+
     def test_each_length_produces_input_the_renderer_accepts(self) -> None:
         for length in ("gantt", "simple", "page", "elaborate"):
             with self.subTest(length=length):
