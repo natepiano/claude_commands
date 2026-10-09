@@ -1478,7 +1478,7 @@ class MacTestCommandTests(unittest.TestCase):
         self.assertEqual(self.logged_arguments("gh"), [])
 
     def test_legacy_block_decodes_and_is_upgraded_during_settle(self) -> None:
-        since = "2026-10-07T12:00:00+00:00"
+        since = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0).isoformat()
         self.state_directory.mkdir(parents=True)
         _ = (self.state_directory / "block.json").write_text(
             json.dumps(

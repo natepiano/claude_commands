@@ -35,6 +35,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import math
 import os
 import secrets
 import subprocess
@@ -290,6 +291,14 @@ def optional_int(text: str) -> int | None:
         return None
 
 
+def optional_nonnegative_number(text: str) -> float | None:
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
+
+
 def write_call(started: float, fields: dict[str, object], record_id: str | None = None) -> None:
     """Append a call record: fields hold what the tool knows, this adds where, when and for whom.
 
@@ -331,6 +340,9 @@ def call(args: list[str]) -> None:
         "cached": cached == "1",
         "wait_s": optional_int(wait) or 0,
         "token_wait_s": optional_int(os.environ.get("BUILDLOG_TOKEN_WAIT_S", "0")) or 0,
+        "mac": os.environ.get("BUILDLOG_MAC", ""),
+        "mac_reason": os.environ.get("BUILDLOG_MAC_REASON", ""),
+        "mac_s": optional_nonnegative_number(os.environ.get("BUILDLOG_MAC_S", "")),
         "wall_s": optional_int(wall) or 0,
         "build_s": optional_int(build),
         "saved_s": optional_int(saved) or 0,
