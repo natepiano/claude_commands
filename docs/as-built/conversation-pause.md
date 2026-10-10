@@ -150,3 +150,5 @@ The direct Python callers are `ci_points.review_watch` with `--need decision`, `
 - The closed-phase report keeps final verification, documentation and other closing work visible without rewriting completed progress.
 - One user-message command centralizes urgency, remote delivery, logging, failure behavior and the phone channel.
 - Allowing stale as-built docs to be corrected keeps documentation aligned with shipped behavior wherever the contradiction is found.
+
+**On demand (2026-10-10).** Before a tick advances a pause, `_prune_unscheduled` drops each instance whose notifier folder is gone, and each footer whose `showrunner-<slug>` instance is gone, turning that footer back on. With nothing left it deletes the record and asks nothing, so a production switched to on demand is never asked "Return to automatic updates?". A pause that has already returned keeps its record for late answers.
