@@ -177,14 +177,22 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
 
-    def test_unstated_action_is_sent_with_warning_and_audited(self) -> None:
+    def test_unstated_action_is_refused_before_posting_and_logged(self) -> None:
         errors = io.StringIO()
         with redirect_stderr(errors):
-            code, form = self.run_send(["legacy title", "legacy body"])
-        self.assertEqual(code, 0)
-        self.assertEqual(form["message"], ["legacy body"])
-        self.assertIn("no --action or --no-action", errors.getvalue())
-        self.assert_log("0", "legacy title", "legacy body", "sent without an action line")
+            code, form = self.run_send(["--source", "legacy caller", "legacy title", "legacy body"])
+        self.assertEqual((code, form), (2, {}))
+        self.assertEqual(
+            errors.getvalue(),
+            f"pushover: refused before sending: no action stated. {FIX}\n",
+        )
+        self.assert_log(
+            "0",
+            "legacy title",
+            "legacy body",
+            "refused before sending: no action stated",
+            "legacy caller",
+        )
 
     def test_wrong_action_is_refused_before_posting_and_logged(self) -> None:
         errors = io.StringIO()

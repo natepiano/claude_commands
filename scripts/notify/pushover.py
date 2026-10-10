@@ -11,8 +11,9 @@ The keys are in KEYS_FILE (PUSHOVER_USER, PUSHOVER_TOKEN; 0600, filled in by the
 user). Nothing here prints them. (user, 2026-10-05) Each LOG_FILE JSON line
 holds the local time, source, priority, posted title and message, and outcome.
 
-Exit 0 sent, 1 Pushover refused it or could not be reached, 2 usage or keys
-missing.
+Messages without --action or --no-action are refused before sending. Exit 0
+sent, 1 Pushover refused it or could not be reached, 2 refused before sending,
+usage, or keys missing.
 """
 
 from __future__ import annotations
@@ -195,20 +196,16 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     if isinstance(action, ActionRefused):
         return refuse(source, priority, title, message, action.reason)
     if isinstance(action, ActionUnstated):
-        unstated = True
-        print("pushover: warning: no --action or --no-action; a message that states neither will be refused. "
-              + FIX, file=sys.stderr)
-    else:
-        if isinstance(action, ActionRequired) and len(action.text) > ACTION_TEXT_MAX:
-            return refuse(source, priority, title, message,
-                          f"--action may hold at most {ACTION_TEXT_MAX} characters")
-        match refused_at(action, int(priority)):
-            case ActionRefused(reason):
-                return refuse(source, priority, title, message, reason)
-            case ActionAllowed():
-                pass
-        unstated = False
-        message = posted_message(action, arguments["message"])
+        return refuse(source, priority, title, message, "no action stated")
+    if isinstance(action, ActionRequired) and len(action.text) > ACTION_TEXT_MAX:
+        return refuse(source, priority, title, message,
+                      f"--action may hold at most {ACTION_TEXT_MAX} characters")
+    match refused_at(action, int(priority)):
+        case ActionRefused(reason):
+            return refuse(source, priority, title, message, reason)
+        case ActionAllowed():
+            pass
+    message = posted_message(action, arguments["message"])
     keys = read_keys(keys_file)
     if keys is None:
         log(source, priority, title, message, "keys missing")
@@ -228,8 +225,7 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     reply = cast(Reply, cast(object, decoded)) if isinstance(decoded, dict) else Reply()
     if status == 200 and reply.get("status") == 1:
         receipt = reply.get("receipt")
-        outcome = (f"sent, receipt {receipt}" if receipt else "sent") if not unstated \
-            else "sent without an action line"
+        outcome = f"sent, receipt {receipt}" if receipt else "sent"
         log(source, priority, title, message, outcome)
         print(f"pushover: {outcome}")
         return 0
