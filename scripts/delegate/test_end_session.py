@@ -12,7 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest.mock import patch
 
 from scripts.delegate import remove_seats
@@ -105,11 +105,11 @@ class EndSessionTests(unittest.TestCase):
 
     def test_phase_cleanup_sweep_is_best_effort(self) -> None:
         failed = subprocess.CompletedProcess[str](["codex_mesh.py"], 2, "", "")
-        with patch.object(remove_seats.subprocess, "run", return_value=failed) as run, \
+        with patch.object(subprocess, "run", return_value=failed) as run, \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
             remove_seats.sweep_app_servers(self.root)
 
-        command = run.call_args.args[0]
+        command = cast("list[str]", run.call_args.args[0])
         self.assertEqual(
             command,
             [
