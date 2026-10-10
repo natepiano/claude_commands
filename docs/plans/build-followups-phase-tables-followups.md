@@ -61,65 +61,22 @@
 
 ### Phase 2 — The dailies count a phase's repair rounds from the run's records  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a dailies input built with no `eta.fixes` in the judgment carries, for a record-backed unit with a first stated ETA, the count of repair rounds started after that ETA was first stated.
-
-**Spec:**
-
-Why: after the dailies phase, `eta.fixes` is the one ETA number the showrunner still types (`commands/showrunner/dailies.md` 190: "Give `fixes` every report: the repair rounds started after the first ETA"); the recorder already holds each repair pass and the first stated ETA's time.
-
-Definition: a repair round of a phase instance is a `fix_pass` number of 1 or more on that instance's `pass_started` events (`phase_instance_id` matches). It started at the earliest `timestamp_epoch` among its `pass_started` events. It counts when that start is strictly later than the `timestamp_epoch` of the instance's first `eta_stated` event (the moment the first ETA was stated, not its `eta_at` target). Several seats of one round (a `fix` writer and a `review`, each with the same `fix_pass`) are one round. Round 0 never counts. Rounds started before the first statement do not count, even when later passes of the same round come after it.
-
-`scripts/delegate/phase_table.py`:
-
-- `FirstStatedEtaTarget` (80) becomes:
-
-  ```python
-  class FirstStatedEtaTarget(NamedTuple):
-      """The target promised by a phase instance's first stated ETA."""
-
-      time: datetime
-      repair_rounds: int
-  ```
-
-  `repair_rounds` is the count defined above. It lives on this state because the count exists only once an ETA was stated; `EtaNeverStated` carries none, and no optional field is added.
-- New helper `_repair_rounds_started_after(runs: list[list[dict[str, object]]], instance_id: str, stated_at: datetime) -> int`: walk every event of every run, keep `pass_started` events of `instance_id` whose `fix_pass` is an `int` (not `bool`) of 1 or more and whose `timestamp_epoch` reads through `_epoch`; take the earliest start per `fix_pass`; return how many of those starts are later than `stated_at`.
-- `_latest_stated_eta` (596) builds the first target from the first valid `eta_stated` event as `FirstStatedEtaTarget(time=stated.time, repair_rounds=_repair_rounds_started_after(runs, instance_id, stated.stated_at))`. `stated_at` of the first event is its `timestamp_epoch`, already read at 609.
-- `_json_record` (1005): `current` gains `repair_rounds_since_first_stated_eta`: the int when `first_stated` is a `FirstStatedEtaTarget`, else `null`. It sits beside `first_stated_eta_target` and is present whether or not `current.eta` is `null`.
-- `render` is unchanged: the note shows no repair-round count (a scope note authored here; the item asks only for the dailies).
-
-`scripts/production/dailies_input.py`:
-
-- Its `FirstStatedEtaTarget` (143) gains `repair_rounds: int`.
-- `unit_phase_state` (451–476): when `first_stated_eta_target` is not `null`, read `current.repair_rounds_since_first_stated_eta`; it must be an `int`, not a `bool`, of 0 or more, else `ValueError(f"{where}.current.repair_rounds_since_first_stated_eta: expected a whole number from 0")`, which `phase_tables` turns into `phase tables: unavailable — <reason>` like every other decode error. When the target is `null` the key is not read.
-- `record_eta_value` (650–651): beside `first`, set `result["fixes"] = phase.first_stated.repair_rounds`. `result.update(fields)` at 657 stays after it, so a judgment `fixes` wins. No other path sets `fixes`: the early returns for `EtaPassed`, `EtaNone` and an unavailable ETA carry no `time`, and the renderer accepts `fixes` only with a `time` (`dailies_render.py` 627). A judgment `time` or `none` still bypasses `record_eta_value` entirely (791–805), so the judgment then decides `fixes` as well.
-
-`commands/showrunner/dailies.md` line 190: replace `Give \`fixes\` every report: the repair rounds started after the first ETA.` with one sentence: a matching numbered open phase supplies `fixes` from the run record (the repair rounds started after its first stated ETA); otherwise give it every report; a judgment value wins.
-
-`docs/as-built/phase-tables.md`: `FirstStatedEtaTarget(time, repair_rounds)` in the record block and its **ETA** bullet with the round definition; `repair_rounds_since_first_stated_eta` in the `current` JSON line; in **Dailies side → Value**, `fixes` beside `first`.
+- A repair round of a phase instance is a `fix_pass` of 1 or more on that instance's `pass_started` events; it starts at the earliest `timestamp_epoch` among them, and counts only when that start is strictly later than the instance's first `eta_stated` moment (not its `eta_at` target). Seats sharing a `fix_pass` are one round; round 0 never counts; a round that started before the first statement does not count even when later passes follow it; a restatement does not reset the count.
+- `phase_table.py`: `FirstStatedEtaTarget(time: datetime, repair_rounds: int)`; `EtaNeverStated` carries no count. `_repair_rounds_started_after(runs: list[list[dict[str, object]]], instance_id: str, stated_at: datetime) -> int` computes it, and `_latest_stated_eta` fills it from the first valid `eta_stated` event's `stated_at`.
+- `_json_record` writes `current.repair_rounds_since_first_stated_eta` beside `first_stated_eta_target`: the int with a first stated ETA, else `null`, present even when `current.eta` is `null`. `render` shows no count.
+- `dailies_input.py`: its `FirstStatedEtaTarget(time, repair_rounds)` mirrors the record; `unit_phase_state` reads the key only when the target is not `null` and requires a non-`bool` `int` of 0 or more, else `ValueError("<where>.current.repair_rounds_since_first_stated_eta: expected a whole number from 0")`, surfaced as `phase tables: unavailable — <reason>`.
+- `record_eta_value` sets `result["fixes"]` beside `first`; the later `result.update(fields)` lets a judgment `fixes` win, and a judgment `time` or `none` bypasses the record, so the judgment then decides `fixes`. `EtaPassed`, `EtaNone` and an unavailable ETA carry no `fixes`.
 
 **Files:**
-- `scripts/delegate/phase_table.py` — `FirstStatedEtaTarget.repair_rounds`, `_repair_rounds_started_after`, the JSON key.
-- `scripts/delegate/test_phase_table.py` — round-count cases.
-- `scripts/production/dailies_input.py` — decode the count; `fixes` in a record-backed `eta`.
-- `scripts/production/test_dailies_input.py` — `fixes` cases; existing exact `eta` dicts that hold `first` gain `fixes`.
-- `commands/showrunner/dailies.md` — the `eta.first`, `eta.fixes` row.
-- `docs/as-built/phase-tables.md` — the state, the JSON key, the dailies value.
+- `scripts/delegate/phase_table.py` — the repair-round count and its JSON key.
+- `scripts/production/dailies_input.py` — decodes the count; `eta.fixes` in a record-backed `eta`.
+- `scripts/delegate/test_phase_table.py`, `scripts/production/test_dailies_input.py` — counting, equal-moment, validation and fill cases.
+- `commands/showrunner/dailies.md` — a matching numbered open phase supplies `fixes` from the record; otherwise the showrunner gives it; a judgment value wins.
+- `docs/as-built/phase-tables.md` — the state, the JSON key, `fixes` beside `first`.
 
-**Seats:** `1 writer + 1 tester` — the Spec fixes the definition, the JSON key and the input field, so the cases can be written before the code.
-- `impl` — `scripts/delegate/phase_table.py`, `scripts/production/dailies_input.py`, `commands/showrunner/dailies.md`, `docs/as-built/phase-tables.md`; hub: none.
-- `test` — writes from the Spec alone, beside the code:
-  - `scripts/delegate/test_phase_table.py` (`write_run`, `phase_event`, `show --json` through the CLI with `environment(at)`): one open instance with `pass_started` events `fix_pass` 1 before the first `eta_stated`, `fix_pass` 2 after it (a `fix` and a `review` pass), `fix_pass` 3 after it, a `fix_pass` 0 pass after it, and another instance's `fix_pass` 4 after it gives `current.repair_rounds_since_first_stated_eta` `2`; a restated ETA after round 3 leaves the count at `2` (it counts from the first statement); a round whose first pass precedes the statement and whose second pass follows it does not count; with no `eta_stated` the key is `null`; with a passed stated ETA and no progress report (`current.eta` `null`) the key still carries the count.
-  - `scripts/production/test_dailies_input.py`: `open_phase_record` gains `repair_rounds: int | None = 0`, written as `current.repair_rounds_since_first_stated_eta` (`null` when `first` is `None`); a record with `first` and `repair_rounds=2` and no judgment `fixes` builds `eta.fixes` `2`, and the built input passes the real renderer, whose drift text names `2 fix rounds added`; a judgment `fixes` of 5 wins over the record's 2; a judgment `time` keeps the record's count out; a record with `first` `None` builds no `fixes`; a malformed count (`-1`, `true`, `"2"`) gives `phase tables: unavailable` and the status-capture path; the exact dicts at 446–450 and 517–521 gain `"fixes": 0`.
-
-**Constraints from prior phases:** Phase 1 adds `archive` and `_archive_note` to `phase_table.py` and its CLI, and `prune` now archives instead of deleting; this phase does not touch them. From the phase-tables run: `OpenPhase.first_stated: FirstStatedEtaTarget | EtaNeverStated` is carried through the builder by `OpenPhaseInstance` and holds across a restatement and after the stated ETA passes; `_json_record` is the only JSON shape and nothing stores it; the dailies builder writes `first` only when the record gave the time, and its record times are converted to `Production.zone`.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/delegate -p 'test_phase_table.py'` green, with the round-count cases.
-- `python3 -m unittest discover -s scripts/production -p 'test_dailies_input.py'` green, with the `fixes` cases.
-- `basedpyright scripts/delegate/phase_table.py scripts/delegate/test_phase_table.py scripts/production/dailies_input.py scripts/production/test_dailies_input.py` reports `0 errors, 0 warnings`.
-- Observable: a dailies input built from a judgment with no `eta.fixes`, for a record-backed unit that stated an ETA and then started two repair rounds, carries `eta.fixes` `2`, and the rendered report reads `2 fix rounds added`.
+**Gotchas:** Repair starts go through `_moment` to datetimes, the same representation as `stated_at`; comparing a raw float epoch against the microsecond-rounded `stated_at` counts an equal-moment round as later.
 
 ## Source
 
