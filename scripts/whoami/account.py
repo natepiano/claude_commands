@@ -24,6 +24,14 @@ class Account:
     label: str
 
 
+class UnreadableAccount(Exception):
+    """The current process has no readable Claude login."""
+
+
+class UnknownAccountName(ValueError):
+    """Text does not identify a Claude note label or login."""
+
+
 class AccountIdentity(TypedDict):
     login: str
     label: str
@@ -60,6 +68,39 @@ def claude_account(config_dir: Path) -> Account | None:
     if report.email is None:
         return None
     return Account("claude", report.email, label_for("claude", report.email))
+
+
+def own_claude_account() -> Account:
+    """Return this process's Claude account or explain why it cannot be used."""
+    resolved = claude_account(claude_config_dir())
+    if resolved is None:
+        raise UnreadableAccount("this process's Claude account is unreadable")
+    return resolved
+
+
+def named_claude_account(text: str) -> Account:
+    """Resolve a Claude note label or accept an explicit login."""
+    notes_dir = Path(os.environ.get("AGENT_NOTES_DIR", str(AGENTS_DIR)))
+    folded = text.casefold()
+    for path in sorted(notes_dir.glob("*.md")):
+        stem = path.stem.casefold()
+        if not stem.startswith("claude") or stem != folded:
+            continue
+        note = read_note(path)
+        login = None if note is None else note.get("login")
+        if isinstance(login, str) and login:
+            return Account("claude", login, path.stem)
+    if (
+        "@" in text
+        and "/" not in text
+        and "\0" not in text
+        and not any(character.isspace() for character in text)
+        and not text.startswith(".")
+    ):
+        return Account("claude", text, label_for("claude", text))
+    raise UnknownAccountName(
+        f"unknown account {text}: give a note label such as claude 2, or a login"
+    )
 
 
 def codex_account(home: Path) -> Account | None:

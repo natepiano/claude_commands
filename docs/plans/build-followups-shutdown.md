@@ -132,7 +132,7 @@ Context (showrunner): a proposed, not yet approved, plan for sessions on differe
 
 **Gotchas:** `--arg account` stays optional — a `settings.json` without it still gets line 1 and both windows. `rate_limits` windows appear only for a subscription login, from the first reply on, never for an API key; Claude Code 2.1.296 sends integer percentages though the field allows one decimal, so `remaining` accepts any number.
 
-### Phase 4 — Shutdown's shared types, account names and record store  · status: todo
+### Phase 4 — Shutdown's shared types, account names and record store  · status: done
 
 #### Work Order
 
