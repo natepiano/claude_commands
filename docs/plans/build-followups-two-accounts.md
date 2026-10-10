@@ -1,6 +1,6 @@
 # Two accounts: showrunners on one Claude account, unit directors on another
 
-> **Status: PROPOSAL — waits on the user (G0).** Nothing live changes before G0 clears. The design: each account the user has gets its own config dir, `~/.claude1`, `~/.claude2` and `~/.claude3`. Each holds only that account's login, and everything else is a symlink into `~/.claude`. Unit directors launch with `CLAUDE_CONFIG_DIR` set to the unit account's dir. Showrunners and every other session stay on `~/.claude`'s own login, as today. When the unit account runs low, one command swaps every unit onto a spare account through `/shutdown`'s safe stop and resume. Phased, delegate-ready once approved.
+> **Status: PROPOSAL — the design is approved, and the start waits on the user (G0).** Nothing live changes before G0 clears. The design: each account the user has gets its own config dir, `~/.claude1`, `~/.claude2` and `~/.claude3`. Each holds only that account's login, and everything else is a symlink into `~/.claude`. Unit directors launch with `CLAUDE_CONFIG_DIR` set to the unit account's dir. Showrunners and every other session stay on `~/.claude`'s own login, as today. When the unit account runs low, one command swaps every unit onto a spare account through `/shutdown`'s safe stop and resume. Phased, delegate-ready once approved.
 
 > **As-built disposition: create**
 
@@ -63,11 +63,39 @@ Everything else is a symlink into `~/.claude`: `settings.json`, `CLAUDE.md`, `co
 - The Mac is out of scope: units launch only on natedev (`add_unit.py` uses `systemd-run` and tmux). Mac sessions stay on `~/.claude`.
 - A long-lived `CLAUDE_CODE_OAUTH_TOKEN` per launch is ruled out: such a token "can't establish Remote Control sessions", and every unit runs with `--remote-control`.
 
-**Questions only the user can answer:**
+**The user's answers** (2026-10-10, via the showrunner):
 
-1. Units on another account leave the phone's session list unless the app is signed into that account. Accept this, with showrunners relaying? Recommended: yes.
-2. Approve symlink farms instead of worktrees?
-3. At cutover (G2), which account do units start on? On today's numbers: `~/.claude` stays on claude 2 (55%, resets 10-15), units go to claude 3 (reset 10-10 09:00), and claude 1 (resets 10-12) is the mid-week spare.
+1. Units leaving the phone's Remote Control list, with showrunners relaying: "yes".
+2. Linked directories instead of worktrees: "linked directories are fine".
+3. "using claude 3 for units is also fine". `~/.claude` stays on claude 2, and claude 1 is the mid-week spare.
+
+The user also said: "i do't want you to start the separate accounts until i have a clear sense of what happens next". That is answered in What happens next, below, and G0 waits on their go.
+
+## What happens next
+
+Each step lists what changes live, what the user does, and how to undo it. Steps 1 and 3 are code only. Until step 4 sets the unit role, every launch works exactly as today, because no role means `~/.claude`.
+
+1. **Build the account tool (Phase 1). Nothing live changes.** `accounts.py` can create, check and report account dirs. Its tests run in temp dirs. It is merged to main but nothing calls it yet. The user does nothing.
+2. **Prove one account dir works (Phase 2). The first live step, about 15 minutes of the user's time.**
+   - The unit creates `~/.claude3`: links into `~/.claude`, plus a `.claude.json` seeded with folder trust and the `brp` MCP server.
+   - The user runs `CLAUDE_CONFIG_DIR=~/.claude3 claude` in a terminal and logs in as claude 3 (`rubrics.dogwood-1f@icloud.com`).
+   - The unit starts one throwaway session, `acct-probe`, on claude 3. It checks that the probe uses claude 3's login, that the probe and other sessions can message each other, and that `/shutdown` sees it on claude 3. It checks that a conversation resumes across accounts and that the links survive a `/model` change. The user checks where the probe appears in Remote Control on the phone.
+   - The probe is then stopped. Every existing session stays on claude 2, untouched.
+   - Undo: `rm -rf ~/.claude3`, which holds only links and claude 3's login.
+3. **Teach the tooling about a unit account (Phases 3–5). Code only; nothing live changes.**
+   - Unit launch and restart learn the unit account.
+   - The quota notes and alerts handle two accounts in use at once.
+   - `/accounts swap` is added.
+
+   All of it stays inert until step 4 sets the role. The user does nothing.
+4. **Cutover (Phase 6), at a time the user picks.**
+   - The user logs `~/.claude1` in as claude 1, the mid-week spare. That is one `/login`, the same as step 2.
+   - The unit sets the unit account to claude 3. Each running unit director is stopped safely, the same way `/shutdown` does it: it finishes its turn and pushes. Then each resumes on claude 3 with its conversation intact. New units start on claude 3.
+   - Showrunners, the user's own sessions, the nightly review and the fix pipeline stay on claude 2.
+   - What the user notices: unit status lines read claude 3, and units move from the phone's Remote Control list (claude 2) to claude 3's.
+   - Undo: `/accounts swap unit default`, which moves units back to claude 2 the same safe way.
+5. **During the week.** When claude 3 runs low, the quota alert says so and names `/accounts swap unit "claude 1"`. The user runs it, or tells the showrunner to. Units stop safely and come back on claude 1. Nothing switches by itself.
+6. **Day 7 (Phase 7).** A readout gives points per account per day and the times of any swaps. It also answers whether the showrunner account lasted the week.
 
 ## Delegation Context
 
@@ -143,8 +171,8 @@ Everything else is a symlink into `~/.claude`: `settings.json`, `CLAUDE.md`, `co
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
-| G0 | Phase 1 | the user | the user approves this proposal and answers questions 1–2 |
-| G1 | Phase 2, step 2 | the user | the user has run `CLAUDE_CONFIG_DIR=~/.claude<N> claude` once and finished `/login` for the spare account |
+| G0 | Phase 1 | the user | the user has read What happens next and says go (the design and questions 1–3 were answered 2026-10-10) |
+| G1 | Phase 2, step 2 | the user | the user has run `CLAUDE_CONFIG_DIR=~/.claude3 claude` once and finished `/login` as claude 3 |
 | G2 | Phase 6 | the user | the user picks the cutover time and the first unit account (question 3), and logs in the remaining dirs |
 | G3 | Phase 7 | the clock | 7 days after cutover |
 
@@ -195,7 +223,7 @@ Everything else is a symlink into `~/.claude`: `settings.json`, `CLAUDE.md`, `co
 
 **Acceptance gate:** tests pass and basedpyright is clean. `accounts.py status` on natedev prints only the `~/.claude` block and creates nothing (`ls -d ~/.claude?` before and after).
 
-### Phase 2 — Live proof with one spare account  · status: todo
+### Phase 2 — Live proof on claude 3  · status: todo
 
 #### Work Order
 
@@ -203,20 +231,20 @@ Everything else is a symlink into `~/.claude`: `settings.json`, `CLAUDE.md`, `co
 
 **Spec (director with the user; a writer only for fixes to `accounts.py`):**
 
-1. `accounts.py setup "<spare label>"` for an account `~/.claude` is not logged in to.
-2. **G1:** the user runs `CLAUDE_CONFIG_DIR=~/.claude<N> claude` in a terminal and completes `/login`. Then `accounts.py check` passes.
-3. Start a scratch session `CLAUDE_CONFIG_DIR=~/.claude<N> claude --remote-control acct-probe -n acct-probe` in tmux, cwd a scratch dir. Check, recording each result:
+1. `accounts.py setup "claude 3"` (the unit account the user chose; `~/.claude` is claude 2).
+2. **G1:** the user runs `CLAUDE_CONFIG_DIR=~/.claude3 claude` in a terminal and completes `/login`. Then `accounts.py check` passes.
+3. Start a scratch session `CLAUDE_CONFIG_DIR=~/.claude3 claude --remote-control acct-probe -n acct-probe` in tmux, cwd a scratch dir. Check, recording each result:
    - **(a) Logins.** `claude auth status` under each dir shows its own email, and `~/.claude/.credentials.json` mtime is unchanged.
-   - **(b) Registry and transcripts.** The probe's record is in `~/.claude/sessions/`, its transcript is under `~/.claude/projects/`, and its status line shows the spare label.
+   - **(b) Registry and transcripts.** The probe's record is in `~/.claude/sessions/`, its transcript is under `~/.claude/projects/`, and its status line shows claude 3.
    - **(c) Messaging.**
      - `ListAgents` and `SendMessage` reach the probe from this session, and its reply comes back.
      - `send.py --to acct-probe` delivers, and so does a `send.py` from the probe to this session.
      - `notify_when_idle` fires.
-   - **(d) Shutdown attribution.** `account.py --pid <probe pid>` names the spare account. `shutdown.py status "<spare label>"` lists the probe, and `shutdown.py status` for `~/.claude`'s account does not.
-   - **(e) Resume across accounts.** A scratch session started on `~/.claude`, then exited, resumes under `~/.claude<N>` with `--resume <id>` and keeps its history. The reverse works too.
-   - **(f) Symlinks survive writes.** In the probe run `/model` to change the model and back, and send a prompt. `~/.claude<N>/settings.json` and `history.jsonl` must still be links. If one was replaced, record it: Phase 3's launch check is then the defence, and `setup` repairs the link only after the user compares the two files.
+   - **(d) Shutdown attribution.** `account.py --pid <probe pid>` names claude 3. `shutdown.py status "claude 3"` lists the probe, and `shutdown.py status` for `~/.claude`'s account does not.
+   - **(e) Resume across accounts.** A scratch session started on `~/.claude`, then exited, resumes under `~/.claude3` with `--resume <id>` and keeps its history. The reverse works too.
+   - **(f) Symlinks survive writes.** In the probe run `/model` to change the model and back, and send a prompt. `~/.claude3/settings.json` and `history.jsonl` must still be links. If one was replaced, record it: Phase 3's launch check is then the defence, and `setup` repairs the link only after the user compares the two files.
    - **(g) Remote Control.** Find which claude.ai account lists `acct-probe`, and whether the phone, signed into the main account, can open it.
-4. Exit the probe and delete its scratch transcript dir. Leave `~/.claude<N>` in place; Phase 6 uses it.
+4. Exit the probe and delete its scratch transcript dir. Leave `~/.claude3` in place; Phase 6 uses it.
 
 If (b), (c) or (e) fails, stop and bring the failing check to the showrunner with a revised Phase 3. Those three are what the symlink design rests on.
 
@@ -313,7 +341,8 @@ If (b), (c) or (e) fails, stop and bring the failing check to the showrunner wit
   - the target is already the unit account
   - the current unit account holds a session that is not a unit (from `shutdown.py status <old> --json`)
 
-  Otherwise it runs `set-role unit <label>`, then `shutdown.py down <old label> --restart`. It prints the shutdown's output and `units come back on <label> when <old> is down`.
+  Otherwise it runs `set-role unit <label>`, then `shutdown.py down <old label> --restart`.
+- **`swap unit default` is the undo.** It moves every unit back to `~/.claude`'s login. The old account is the one the role names, and the target is the default dir. Naming `~/.claude`'s login by its label is still refused, with the hint `use default`. It prints the shutdown's output and `units come back on <label> when <old> is down`.
 - **`shutdown.py down --restart`** stores `then: restart` on the record. When `conduct` ends a stop in `down`, it runs `restart` for that account. Units relaunch through `add_unit.py` on the new role (Phase 3). A `stop partial` does not restart; the user is alerted as today.
 - **The requester.** `swap` runs from a session on another account, so the requester is not in the stopped inventory. `down` must not wait for that requester's `ready`. Test this.
 - **`commands/accounts.md`** — `/accounts [status | setup "claude N" | swap unit "claude N"]`. It runs the matching verb and shows its output unchanged. It states that switching the default account remains `/login` in a `~/.claude` session.
