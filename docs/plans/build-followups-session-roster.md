@@ -54,21 +54,22 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 - **Both machines by default.** Units run on both machines, and the showrunner tells the Mac's unit directors by hand today. `roster.py` lists both machines, and `broadcast.py` reaches both. `--here` limits either to this machine. A machine that does not answer gets one line saying so, and the rest still prints.
 - **Roles come from records, never from names.** Showrunner from its timer; unit director from the Units table and tmux mark, or from a run marker; worker from a seats ledger or a mesh roster; everything else is freestanding. A Codex worker's slot role comes from the roster's `role` field once model-study's Phase 1 lands, and reads `role unknown` before then.
 - **The message-to-user gate is a required field, not a model's reading** (Phase 2). Every send names its action with `--action` or says `--no-action`, and `pushover.py` refuses one that does neither. A field cannot be skipped by accident, costs no time, and never fails open the way a model call that times out would; tests check it without a network. The sender writes the action because only the sender knows it. One-phase revert to a model review if the user wants judgment on the wording too.
+- **The refusal runs right after Phase 3** (2026-10-10). natedev's generation 206 (`/etc/nixos` 9ef892a) passes `--action` or `--no-action` from `ups.nix` and `disk-floor.nix`, checked against the running system, so the phase that refuses a message with no action stated moved up from last to Phase 4, per its own resequence rule. Packaging only; one-line revert.
 - **Live checks never message a real session.** They use scratch recipients only: a scratch background Claude session, a scratch mesh thread in a scratch session directory, and a scratch daemon thread. All are removed after the check. Listing real sessions is read-only and allowed.
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills and scripts. This plan adds the session roster (Phase 1), a gate that makes every message to the user say what the user does (Phase 2), sends to any roster address or name (Phase 3), moves the process table into its own module (Phase 4), sends to roster groups (Phase 5), covers both machines (Phase 6), teaches Claude and Codex sessions which tool to use (Phase 7), and refuses a message to the user that states no action (Phase 8). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-shutdown` on branch `build-followups-shutdown` (unit `shutdown-unit` of production `build-followups`).
+- **Project:** `~/.claude` — Claude Code commands, skills and scripts. This plan adds the session roster (Phase 1), a gate that makes every message to the user say what the user does (Phase 2), sends to any roster address or name (Phase 3), refuses a message to the user that states no action (Phase 4), moves the process table into its own module (Phase 5), sends to roster groups (Phase 6), covers both machines (Phase 7), and teaches Claude and Codex sessions which tool to use (Phase 8). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-shutdown` on branch `build-followups-shutdown` (unit `shutdown-unit` of production `build-followups`).
 - **Project started:** 2026-10-10T16:30:07.804+00:00
 - **Stack:** Python 3.13 standard library only; bash, zsh; codex-cli 0.162.0 (daemon 0.162.1).
 - **Layout:**
-  - `scripts/message/roster.py` — the roster (new, Phase 1; unique addresses Phase 3; both machines Phase 6)
-  - `scripts/message/process_table.py` — the process table the roster, `broadcast.py` and wind-down read (Phase 4)
+  - `scripts/message/roster.py` — the roster (new, Phase 1; unique addresses Phase 3; both machines Phase 7)
+  - `scripts/message/process_table.py` — the process table the roster, `broadcast.py` and wind-down read (Phase 5)
   - `scripts/message/codex_daemon.py` — reads the shared Codex daemon's live sessions; queues to one (new, Phase 1; queue Phase 3)
-  - `scripts/notify/pushover.py`, `scripts/notify/user_action.py` — the message-to-user gate and its action types (Phase 2; refusal Phase 8)
-  - `scripts/message/send.py` — `--action` / `--no-action` for the user (Phase 2); any roster address or name (Phase 3); the other machine (Phase 6)
-  - `scripts/production/broadcast.py` — groups from the roster (Phase 5); both machines (Phase 6)
-  - `commands/message.md`, `commands/announce.md`, `commands/unit/announce.md`, `commands/showrunner/announce.md`, `commands/notify_top_level.md`, `codex/AGENTS-messaging.md`, `scripts/message/install_codex_agents.py` — instructions (Phase 7)
+  - `scripts/notify/pushover.py`, `scripts/notify/user_action.py` — the message-to-user gate and its action types (Phase 2; refusal Phase 4)
+  - `scripts/message/send.py` — `--action` / `--no-action` for the user (Phase 2); any roster address or name (Phase 3); the other machine (Phase 7)
+  - `scripts/production/broadcast.py` — groups from the roster (Phase 6); both machines (Phase 7)
+  - `commands/message.md`, `commands/announce.md`, `commands/unit/announce.md`, `commands/showrunner/announce.md`, `commands/notify_top_level.md`, `codex/AGENTS-messaging.md`, `scripts/message/install_codex_agents.py` — instructions (Phase 8)
 - **Key files (read, never edited here):** `scripts/agents/codex_mesh.py` (model-study: roster format, `send`), `scripts/delegate/remove_seats.py` (`live_runs`, `LIVE_HEARTBEAT_SECS`, the `seats` ledger), `scripts/delegate/prepare_session.sh` (the run marker), `scripts/production/showrunners.py`, `scripts/production/live_units.py`, `scripts/production/unit_lookup.py`, `scripts/shutdown/remote.py` (`other_machine`).
 - **Test lanes:** `scripts/message/test_*.py`, `scripts/production/test_*.py`, `scripts/notify/test_*.py`, `scripts/shutdown/test_*.py`.
 - **Test:** `python3 -m unittest discover -s scripts/message -p 'test_*.py'`; `python3 -m unittest discover -s scripts/production -p 'test_broadcast.py'`.
@@ -139,7 +140,7 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 **Ruled out:** a model reviewing message wording — the action is a required field.
 
-### Phase 3 — `send.py` reaches any session the roster lists · status: todo
+### Phase 3 — `send.py` reaches any session the roster lists · status: done
 
 #### Work Order
 
@@ -194,10 +195,32 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 **Acceptance gate:** the Test and Lint lines green, plus `python3 -m unittest discover -s scripts/notify -p 'test_*.py'`, `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` and basedpyright `scripts/notify scripts/shutdown` 0/0/0. Live, scratch recipients only:
 - a scratch mesh thread in a scratch session directory gets `send.py --to seat:<run id>/<seat name>`, and again by its bare seat name, without `--session-dir`;
-- a scratch daemon thread (started with `thread/start`, `ephemeral: true`, over the socket, then archived) gets `send.py --to codex:<id>` and shows the queued message in `thread/read` or its queue;
+- a scratch daemon thread (started with `thread/start`, `ephemeral: false` — the daemon refuses queued submissions to an ephemeral thread — over the socket, then archived) gets `send.py --to codex:<id>` and shows the queued message in `thread/read` or its queue;
 - an ambiguous name exits 2.
 
-### Phase 4 — Process listing gets its own module · status: todo
+### Phase 4 — A message with no action stated is refused · status: todo
+
+#### Work Order
+
+**Goal:** a message to the user that says neither its action nor that none is needed does not leave: Phase 2's transition warning becomes the refusal.
+
+**Spec:**
+- `pushover.py` refuses `ActionUnstated` like Phase 2's other cases: nothing sent, exit 2, the stderr line `pushover: refused before sending: no action stated. <FIX>`, and log outcome `refused before sending: no action stated`. The warning line and the `sent without an action line` outcome are removed.
+- Before dispatch, the unit director reads the pushover log since the Phase 2 checkpoint for `sent without an action line` entries. Each entry names its source; any source still in that list is updated in this phase when it is in this repo, or named to natedev when it is not.
+
+**Files:**
+- `scripts/notify/pushover.py`
+- `scripts/notify/test_pushover.py`
+
+**Seats:** `1 writer + 1 tester` — nothing splits.
+- `impl` — `pushover.py`.
+- `test` — `test_pushover.py`, from this Spec alone.
+
+**Constraints from prior phases:** Phase 2's `scripts/notify/user_action.py` (`parse_user_action` → `UserAction | ActionUnstated | ActionRefused`, `refused_at`, `first_line`, `FIX`), `pushover.py`'s `--source` and its log entries naming their source, and its refusal line and exit 2. Phase 3's `refused_at` returns `ActionAllowed | ActionRefused`, and `settle.py`'s `alert_user` always passes `--action`. `send.py --to user` and `escalate.py hold` already treat `ActionUnstated` as a usage error, so neither changes here.
+
+**Acceptance gate:** every `sent without an action line` source logged since checkpoint 39f9b69 is either migrated in this repo or confirmed by natedev as passing the flags; `pushover.py`'s docstring names exit 2 as a refusal; `python3 -m unittest discover -s scripts/notify -p 'test_*.py'` green; basedpyright `scripts/notify` 0/0/0; live: `pushover.py "t" "m"` exits 2 and logs the refusal with its source, with nothing sent.
+
+### Phase 5 — Process listing gets its own module · status: todo
 
 #### Work Order
 
@@ -235,7 +258,7 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 **Acceptance gate:** the Test and Lint lines green, `python3 -m unittest discover -s scripts/production -p 'test_codex_winddown.py'` included. `grep -n "import broadcast" scripts/message/roster.py` prints nothing. Live read-only: `roster.py` lists the same sessions as before the phase.
 
-### Phase 5 — `broadcast.py` takes its groups from the roster · status: todo
+### Phase 6 — `broadcast.py` takes its groups from the roster · status: todo
 
 #### Work Order
 
@@ -271,12 +294,12 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 **Constraints from prior phases:**
 - Phase 1's `RosterEntry` fields and `roster(environment) -> Roster` (`entries`, `problems`); `showrunner_address` and `director_address` are `session:<id>`.
 - Phase 3's addresses: `session:<id>`, `seat:<run id>/<seat name>`, `codex:<thread id>`, each unique; `RosterEntry.reach: Messageable(address) | CannotReceiveMessages(reason)`; link states `UnderShowrunner | NoShowrunner`, `UnderDirector | NoDirector`, `WorkerAssignment | NotAWorker`; `send.py --to <address>` reaches each, and exits 2 for a `CannotReceiveMessages` name or an ambiguous name. `--action`/`--no-action` on a non-user send is a usage error (Phase 2).
-- Phase 4's `process_table` module: `roster.py` no longer imports `broadcast`, so `broadcast.py` may import `roster`. `codex_winddown.py` still uses `broadcast.send` and `broadcast.MESSAGE`, which stay.
+- Phase 5's `process_table` module: `roster.py` no longer imports `broadcast`, so `broadcast.py` may import `roster`. `codex_winddown.py` still uses `broadcast.send` and `broadcast.MESSAGE`, which stay.
 - `/notify_top_level` reads `top_level.py`'s `uds:` addresses and hands them to SendMessage.
 
 **Acceptance gate:** the Test and Lint lines green, `test_top_level.py` included. A live dry check (`BROADCAST_SEND` pointed at a script that records its arguments) lists the recipients for each flag on natedev, with no message sent, and each flag's list equals the rows `roster.py --json` gives for that group at that moment. A group with no members (no showrunner registered, for one) lists none and says so.
 
-### Phase 6 — Both machines · status: todo
+### Phase 7 — Both machines · status: todo
 
 #### Work Order
 
@@ -311,13 +334,13 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 **Constraints from prior phases:**
 - Phase 3's addresses (`session:<id>`, `seat:<run id>/<seat name>`, `codex:<thread id>`), `RosterEntry.reach`, and `send.py`'s resolution order and exit codes: 0 sent, 1 queued for a Claude session, 2 a usage error, an ambiguous name, a session that cannot take messages, or a refusal, 3 failed.
-- Phase 4's `process_table` module; `roster.py` does not import `broadcast`.
-- Phase 5's groups (`--showrunners`, `--units`, `--agents`, `--workers` with `--of`, `--top-level`, `--all`), membership by `director_address` and `showrunner_address`, the sender left out by `session:` identity, roster problems printed while the rest sends, and `top_level.py`'s `<name>\tuds:<socket path>` lines.
+- Phase 5's `process_table` module; `roster.py` does not import `broadcast`.
+- Phase 6's groups (`--showrunners`, `--units`, `--agents`, `--workers` with `--of`, `--top-level`, `--all`), membership by `director_address` and `showrunner_address`, the sender left out by `session:` identity, roster problems printed while the rest sends, and `top_level.py`'s `<name>\tuds:<socket path>` lines.
 - `scripts/shutdown/remote.py` `other_machine()` maps `natedev` and `mac` to each other.
 
 **Acceptance gate:** the Test and Lint lines green. Live: `roster.py` on natedev lists the Mac's sessions; `roster.py --here` on the Mac exits 0 or 1 with no ssh. `broadcast.py`'s dry check covers both machines, each recipient once. One scratch background Claude session on the Mac receives `send.py --to <its name>` from natedev and is then removed.
 
-### Phase 7 — Claude and Codex sessions know which tool to use · status: todo
+### Phase 8 — Claude and Codex sessions know which tool to use · status: todo
 
 #### Work Order
 
@@ -331,7 +354,7 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
   - `broadcast.py` and its groups for many at once.
 
   The Sending bullet's `--codex --session-dir` wording becomes "by its `seat:` address or seat name".
-- `commands/announce.md`, `commands/unit/announce.md` and `commands/showrunner/announce.md` say the message reaches both machines and Codex workers. `commands/notify_top_level.md` keeps its steps and its `uds:` wording; Phase 5 kept `top_level.py`'s output.
+- `commands/announce.md`, `commands/unit/announce.md` and `commands/showrunner/announce.md` say the message reaches both machines and Codex workers. `commands/notify_top_level.md` keeps its steps and its `uds:` wording; Phase 6 kept `top_level.py`'s output.
 - `codex/AGENTS-messaging.md` (new, in this repo) is the Codex text, short:
   - list every session with `~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py`;
   - message one with `send.py --to <address> --from <your session name>`, a group with `broadcast.py`;
@@ -365,27 +388,3 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 - `roster.py` lists both machines unless `--here`; a machine not reached is one stderr line and exit 1; `--json` gives `{"entries": [...], "problems": [...]}`.
 
 **Acceptance gate:** the Test and Lint lines green; `commands/message.md` and `codex/AGENTS-messaging.md` both say what `REFUSED:` means and that it gets no fallback; the block installed on both machines, with the Mac's Rust rules unchanged (`diff` of the text outside the block is empty). Live: a scratch Codex daemon thread on natedev, asked to list every Claude session and its role, runs `roster.py`, and its answer matches `roster.py --json` at that moment, saying so when no showrunner is registered. Then it is archived.
-
-### Phase 8 — A message with no action stated is refused · status: todo
-
-**Blocked by:** natedev confirming that the rebuilt `/etc/nixos` generation's `ups.nix` and `disk-floor.nix` pass `--action` or `--no-action` to `pushover.py` (natedev makes the edit; the rebuild is the user's). Resequence earlier the moment natedev confirms.
-
-#### Work Order
-
-**Goal:** a message to the user that says neither its action nor that none is needed does not leave: Phase 2's transition warning becomes the refusal.
-
-**Spec:**
-- `pushover.py` refuses `ActionUnstated` like Phase 2's other cases: nothing sent, exit 2, the stderr line `pushover: refused before sending: no action stated. <FIX>`, and log outcome `refused before sending: no action stated`. The warning line and the `sent without an action line` outcome are removed.
-- Before dispatch, the unit director reads the pushover log since the Phase 2 checkpoint for `sent without an action line` entries. Each entry names its source; any source still in that list is updated in this phase when it is in this repo, or named to natedev when it is not.
-
-**Files:**
-- `scripts/notify/pushover.py`
-- `scripts/notify/test_pushover.py`
-
-**Seats:** `1 writer + 1 tester` — nothing splits.
-- `impl` — `pushover.py`.
-- `test` — `test_pushover.py`, from this Spec alone.
-
-**Constraints from prior phases:** Phase 2's `scripts/notify/user_action.py` (`parse_user_action` → `UserAction | ActionUnstated | ActionRefused`, `refused_at`, `first_line`, `FIX`), `pushover.py`'s `--source` and its log entries naming their source, and its refusal line and exit 2. `send.py --to user` and `escalate.py hold` already treat `ActionUnstated` as a usage error, so neither changes here.
-
-**Acceptance gate:** every `sent without an action line` source logged since checkpoint 39f9b69 is either migrated in this repo or confirmed by natedev as passing the flags; `pushover.py`'s docstring names exit 2 as a refusal; `python3 -m unittest discover -s scripts/notify -p 'test_*.py'` green; basedpyright `scripts/notify` 0/0/0; live: `pushover.py "t" "m"` exits 2 and logs the refusal with its source, with nothing sent.

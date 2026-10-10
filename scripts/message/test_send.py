@@ -9,7 +9,7 @@ import socket
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import timedelta
 from pathlib import Path
 from typing import cast, override
@@ -18,8 +18,10 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import send
+import codex_daemon
 import record as shutdown_record
 import restart
+import roster
 import settle
 from user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired
 
@@ -64,6 +66,9 @@ class SendTests(unittest.TestCase):
         (self.root / "sessions").mkdir()
         self.enterContext(mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
                                                        "CLAUDE_CODE_SESSION_ID": ""}))
+        _ = self.enterContext(
+            mock.patch.object(roster, "roster", return_value=roster.Roster([], []))
+        )
 
     def session(self, session_id: str, name: str, *former: str) -> None:
         """Record a live Claude session, or its rename: this test process stands in for it."""
@@ -227,6 +232,34 @@ class SendTests(unittest.TestCase):
         self.assertEqual(delivered.outcome, "sent")
         self.assertEqual(send.pending("recipient"), "")
 
+    def test_successful_keyed_send_by_roster_name_retires_queue_under_given_name(
+        self,
+    ) -> None:
+        self.outcome = send.Result("queued", "relay unavailable")
+        queued = send.send(send.parse([
+            "--to", "recipient", "--from", "shutdown", "--key", "shutdown-owner-id-1",
+            "--text", "settle first",
+        ]))
+        self.assertEqual(queued.outcome, "queued")
+
+        self.session("id-1", "recipient")
+        recipient = roster.RosterEntry(
+            "machine", "claude", "top-level", "recipient", "running",
+            roster.Messageable("session:id-1"), "/work", roster.NoShowrunner(),
+            roster.NoDirector(), roster.NotAWorker(),
+        )
+        self.outcome = send.Result("sent", "ok")
+        with mock.patch.object(
+            roster, "roster", return_value=roster.Roster([recipient], []),
+        ):
+            delivered = send.send(send.parse([
+                "--to", "recipient", "--from", "shutdown", "--key", "shutdown-owner-id-1",
+                "--text", "cancel instead",
+            ]))
+
+        self.assertEqual(delivered.outcome, "sent")
+        self.assertEqual(send.pending("recipient"), "")
+
     def test_retire_removes_only_the_shutdown_messages_for_one_address(self) -> None:
         key = "shutdown-owner-id-1"
         messages = (
@@ -351,7 +384,6 @@ class SendTests(unittest.TestCase):
                 "session:cancelled",
                 "old settle",
                 "Old unkeyed settle instruction: run /shutdown ready.",
-                action=NoActionRequired(),
             )
             self.assertEqual(old_cancel["kind"], "queued")
             settle._restore_record(cancelled)  # pyright: ignore[reportPrivateUsage]
@@ -366,7 +398,6 @@ class SendTests(unittest.TestCase):
                 "session:restarted",
                 "old settle",
                 "Old unkeyed settle instruction: run /shutdown ready.",
-                action=NoActionRequired(),
             )
             self.assertEqual(old_restart["kind"], "queued")
             restart._retire(restarted, restart_entry, dry_run=False)  # pyright: ignore[reportPrivateUsage]
@@ -382,16 +413,404 @@ class SendTests(unittest.TestCase):
             self.assertNotIn("settle instruction", restart_pending)
             self.assertIn("Restarted; continue.", restart_pending)
 
-    def test_session_name_still_relays_with_its_name(self) -> None:
+    def test_unique_claude_roster_name_delivers_to_its_session_address(self) -> None:
         self.session("id-1", "recipient")
+        recipient = roster.RosterEntry(
+            "machine", "claude", "top-level", "recipient", "running",
+            roster.Messageable("session:id-1"), "/work", roster.NoShowrunner(),
+            roster.NoDirector(), roster.NotAWorker(),
+        )
 
-        result = send.send(send.parse([
-            "--to", "recipient", "--from", "test", "--text", "hello by name",
-        ]))
+        with mock.patch.object(
+            roster, "roster", return_value=roster.Roster([recipient], []),
+        ):
+            result = send.send(send.parse([
+                "--to", "recipient", "--from", "test", "--text", "hello by name",
+            ]))
 
         self.assertEqual(result, send.Result("sent", "ok"))
         self.assertEqual(len(self.relayed), 1)
-        self.assertEqual(self.relayed[0].to, "recipient")
+        self.assertEqual(self.relayed[0].to, f"uds:{self.root / 'id-1.sock'}")
+        self.assertEqual(self.log()[0]["to"], "session:id-1")
+
+    def test_same_seat_name_in_two_runs_resolves_by_address_and_is_ambiguous_by_name(
+        self,
+    ) -> None:
+        first_address = "seat:11111111-1111-1111-1111-111111111111/shared"
+        second_address = "seat:22222222-2222-2222-2222-222222222222/shared"
+        first_dir = self.root / "11111111-1111-1111-1111-111111111111"
+        second_dir = self.root / "22222222-2222-2222-2222-222222222222"
+        entries = [
+            roster.RosterEntry(
+                "machine", "codex", "worker", "shared", "running",
+                roster.Messageable(first_address), "/work/one", roster.NoShowrunner(),
+                roster.NoDirector(), roster.WorkerAssignment("impl", str(first_dir)),
+            ),
+            roster.RosterEntry(
+                "machine", "codex", "worker", "shared", "running",
+                roster.Messageable(second_address), "/work/two", roster.NoShowrunner(),
+                roster.NoDirector(), roster.WorkerAssignment("test", str(second_dir)),
+            ),
+        ]
+        delivered: list[tuple[send.Message, str]] = []
+
+        def deliver(
+            message: send.Message, session_dir: str, timeout: float,
+        ) -> send.Result:
+            del timeout
+            delivered.append((message, session_dir))
+            return send.Result("sent", "queued on worker")
+
+        fixture = roster.Roster(entries, [])
+        with (
+            mock.patch.object(roster, "roster", return_value=fixture),
+            mock.patch.object(send, "codex", side_effect=deliver),
+        ):
+            for address in (first_address, second_address):
+                result = send.send(send.parse([
+                    "--to", address, "--from", "test", "--text", "hello",
+                ]))
+                self.assertEqual(result.outcome, "sent")
+
+            errors = io.StringIO()
+            with self.assertRaises(SystemExit) as raised, redirect_stderr(errors):
+                _ = send.main([
+                    "--to", "shared", "--from", "test", "--text", "hello",
+                ])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(
+            [(message.to, session_dir) for message, session_dir in delivered],
+            [("shared", str(first_dir)), ("shared", str(second_dir))],
+        )
+        self.assertIn("send.py: shared matches 2 sessions:", errors.getvalue())
+        self.assertIn(f"{first_address} (worker)", errors.getvalue())
+        self.assertIn(f"{second_address} (worker)", errors.getvalue())
+
+    def test_blind_reviewer_by_name_cannot_send_and_names_its_director(self) -> None:
+        reviewer = roster.RosterEntry(
+            "machine", "codex", "worker", "blind review", "reviewing",
+            roster.CannotReceiveMessages("blind reviewer"), "/review",
+            roster.UnderShowrunner("production", "runner", "session:runner"),
+            roster.UnderDirector("unit", "director", "session:director"),
+            roster.WorkerAssignment("review (adversary)", str(self.root / "run")),
+        )
+        errors = io.StringIO()
+        with (
+            mock.patch.object(
+                roster, "roster", return_value=roster.Roster([reviewer], []),
+            ),
+            mock.patch.object(send, "codex") as codex_send,
+            mock.patch.object(send, "relay") as claude_send,
+            mock.patch.object(codex_daemon, "queue") as daemon_send,
+            self.assertRaises(SystemExit) as raised,
+            redirect_stderr(errors),
+        ):
+            _ = send.main([
+                "--to", "blind review", "--from", "test", "--text", "hello",
+            ])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(
+            errors.getvalue(),
+            "send.py: blind review cannot take messages (blind reviewer); "
+            + "contact its unit director director or wait\n",
+        )
+        codex_send.assert_not_called()
+        claude_send.assert_not_called()
+        daemon_send.assert_not_called()
+
+    def test_nonmessageable_recipient_without_running_director_is_usage_error(
+        self,
+    ) -> None:
+        worker = roster.RosterEntry(
+            "machine", "codex", "worker", "paused worker", "waiting",
+            roster.CannotReceiveMessages("seat between turns"), "/work",
+            roster.UnderShowrunner("production", "runner", "session:runner"),
+            roster.NoDirector(),
+            roster.WorkerAssignment("impl", str(self.root / "run")),
+        )
+        errors = io.StringIO()
+        with (
+            mock.patch.object(
+                roster, "roster", return_value=roster.Roster([worker], []),
+            ),
+            mock.patch.object(send, "codex") as codex_send,
+            mock.patch.object(send, "relay") as claude_send,
+            mock.patch.object(codex_daemon, "queue") as daemon_send,
+            mock.patch.object(send, "enqueue") as enqueue,
+            self.assertRaises(SystemExit) as raised,
+            redirect_stderr(errors),
+        ):
+            _ = send.main([
+                "--to", "paused worker", "--from", "test", "--text", "hello",
+            ])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(
+            errors.getvalue(),
+            "send.py: paused worker cannot take messages (seat between turns); "
+            + "no unit director is running for it\n",
+        )
+        codex_send.assert_not_called()
+        claude_send.assert_not_called()
+        daemon_send.assert_not_called()
+        enqueue.assert_not_called()
+
+    def test_ambiguous_name_describes_a_recipient_that_cannot_take_messages(self) -> None:
+        entries = [
+            roster.RosterEntry(
+                "machine", "claude", "top-level", "duplicate", "running",
+                roster.Messageable("session:messageable"), "/work", roster.NoShowrunner(),
+                roster.NoDirector(), roster.NotAWorker(),
+            ),
+            roster.RosterEntry(
+                "machine", "codex", "worker", "duplicate", "reviewing",
+                roster.CannotReceiveMessages("blind reviewer"), "/review",
+                roster.UnderShowrunner("production", "runner", "session:runner"),
+                roster.UnderDirector("unit", "director", "session:director"),
+                roster.WorkerAssignment("review", str(self.root / "run")),
+            ),
+        ]
+        errors = io.StringIO()
+        with (
+            mock.patch.object(
+                roster, "roster", return_value=roster.Roster(entries, []),
+            ),
+            self.assertRaises(SystemExit) as raised,
+            redirect_stderr(errors),
+        ):
+            _ = send.main([
+                "--to", "duplicate", "--from", "test", "--text", "hello",
+            ])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("  session:messageable (top-level)\n", errors.getvalue())
+        self.assertIn(
+            "  (cannot take messages: blind reviewer) (worker)\n",
+            errors.getvalue(),
+        )
+
+    def test_roster_problem_is_printed_while_a_usable_seat_still_succeeds(self) -> None:
+        address = "seat:33333333-3333-3333-3333-333333333333/worker"
+        run = self.root / "33333333-3333-3333-3333-333333333333"
+        worker = roster.RosterEntry(
+            "machine", "codex", "worker", "worker", "running",
+            roster.Messageable(address), "/work", roster.NoShowrunner(),
+            roster.NoDirector(), roster.WorkerAssignment("impl", str(run)),
+        )
+        errors = io.StringIO()
+        delivered: list[tuple[send.Message, str]] = []
+
+        def deliver(
+            message: send.Message, session_dir: str, timeout: float,
+        ) -> send.Result:
+            del timeout
+            delivered.append((message, session_dir))
+            return send.Result("sent", "queued on worker")
+
+        with (
+            mock.patch.object(
+                roster, "roster",
+                return_value=roster.Roster([worker], ["one run was unreadable"]),
+            ),
+            mock.patch.object(send, "codex", side_effect=deliver),
+            redirect_stderr(errors),
+        ):
+            result = send.send(send.parse([
+                "--to", address, "--from", "test", "--text", "hello",
+            ]))
+
+        self.assertEqual(result, send.Result("sent", "queued on worker"))
+        self.assertEqual(errors.getvalue(), "send.py: roster: one run was unreadable\n")
+        self.assertEqual(
+            [(message.to, session_dir) for message, session_dir in delivered],
+            [("worker", str(run))],
+        )
+
+    def test_unique_seat_name_resolves_to_its_run(self) -> None:
+        address = "seat:55555555-5555-5555-5555-555555555555/only-worker"
+        run = self.root / "55555555-5555-5555-5555-555555555555"
+        worker = roster.RosterEntry(
+            "machine", "codex", "worker", "only-worker", "running",
+            roster.Messageable(address), "/work", roster.NoShowrunner(),
+            roster.NoDirector(), roster.WorkerAssignment("impl", str(run)),
+        )
+        delivered: list[tuple[send.Message, str]] = []
+
+        def deliver(
+            message: send.Message, session_dir: str, timeout: float,
+        ) -> send.Result:
+            del timeout
+            delivered.append((message, session_dir))
+            return send.Result("sent", "queued on worker")
+
+        with (
+            mock.patch.object(
+                roster, "roster", return_value=roster.Roster([worker], []),
+            ),
+            mock.patch.object(send, "codex", side_effect=deliver),
+        ):
+            result = send.send(send.parse([
+                "--to", "only-worker", "--from", "test", "--text", "hello",
+            ]))
+
+        self.assertEqual(result, send.Result("sent", "queued on worker"))
+        self.assertEqual(
+            [(message.to, session_dir) for message, session_dir in delivered],
+            [("only-worker", str(run))],
+        )
+
+    def test_unreadable_roster_keeps_bare_claude_fallback_but_seat_address_fails(
+        self,
+    ) -> None:
+        unavailable = roster.Roster([], ["cannot read the delegate root"])
+        bare_errors = io.StringIO()
+        with (
+            mock.patch.object(roster, "roster", return_value=unavailable),
+            redirect_stderr(bare_errors),
+        ):
+            bare = send.send(send.parse([
+                "--to", "unknown-claude", "--from", "test", "--text", "hello",
+            ]))
+
+        self.assertEqual(bare, send.Result("sent", "ok"))
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual(
+            bare_errors.getvalue(),
+            "send.py: roster: cannot read the delegate root\n",
+        )
+
+        seat_errors = io.StringIO()
+        with (
+            mock.patch.object(roster, "roster", return_value=unavailable),
+            mock.patch.object(send, "codex") as codex_send,
+            self.assertRaises(SystemExit) as raised,
+            redirect_stderr(seat_errors),
+        ):
+            _ = send.main([
+                "--to", "seat:missing/worker", "--from", "test", "--text", "hello",
+            ])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("send.py: roster: cannot read the delegate root", seat_errors.getvalue())
+        self.assertIn("seat:missing/worker", seat_errors.getvalue())
+        codex_send.assert_not_called()
+
+    def test_codex_thread_address_queues_without_reading_the_roster(self) -> None:
+        output = io.StringIO()
+        with (
+            mock.patch.object(roster, "roster") as read_roster,
+            mock.patch.object(
+                codex_daemon, "queue", return_value=codex_daemon.Queued(),
+            ) as queue,
+            redirect_stdout(output),
+        ):
+            code = send.main([
+                "--to", "codex:thread-one", "--from", "test", "--text", "hello",
+            ])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output.getvalue(), "SENT: queued on Codex session thread-one\n")
+        queue.assert_called_once_with("thread-one", "hello", timeout=send.TIMEOUT)
+        read_roster.assert_not_called()
+
+    def test_named_codex_session_uses_its_display_name_in_the_outcome(self) -> None:
+        session = roster.RosterEntry(
+            "machine", "codex", "freestanding", "Codex window", "idle",
+            roster.Messageable("codex:thread-window"), "/work",
+            roster.NoShowrunner(), roster.NoDirector(), roster.NotAWorker(),
+        )
+        with (
+            mock.patch.object(
+                roster, "roster", return_value=roster.Roster([session], []),
+            ),
+            mock.patch.object(
+                codex_daemon, "queue", return_value=codex_daemon.Queued(),
+            ) as queue,
+        ):
+            result = send.send(send.parse([
+                "--to", "Codex window", "--from", "test", "--text", "hello",
+            ]))
+
+        self.assertEqual(result, send.Result("sent", "queued on Codex session Codex window"))
+        queue.assert_called_once_with("thread-window", "hello", timeout=send.TIMEOUT)
+
+    def test_codex_queue_failure_and_timeout_are_failed_and_never_kept(self) -> None:
+        failures = (
+            (codex_daemon.QueueFailed("thread is closed"), "thread is closed"),
+            (codex_daemon.QueueTimedOut(0.5), "timed out after 0.5 s"),
+        )
+        for queue_result, detail in failures:
+            output = io.StringIO()
+            with self.subTest(queue_result=queue_result), mock.patch.object(
+                codex_daemon, "queue", return_value=queue_result,
+            ), redirect_stdout(output):
+                code = send.main([
+                    "--to", "codex:thread-one", "--from", "test", "--text", "hello",
+                ])
+            self.assertEqual(code, 3)
+            self.assertEqual(output.getvalue(), f"FAILED: {detail}\n")
+        self.assertEqual(send.pending("codex:thread-one"), "")
+
+    def test_roster_is_read_once_only_for_seat_addresses_and_bare_names(self) -> None:
+        address = "seat:44444444-4444-4444-4444-444444444444/worker"
+        worker = roster.RosterEntry(
+            "machine", "codex", "worker", "worker", "running",
+            roster.Messageable(address), "/work", roster.NoShowrunner(),
+            roster.NoDirector(), roster.WorkerAssignment("impl", str(self.root / "run")),
+        )
+        for recipient, expected_reads in (
+            (address, 1),
+            ("worker", 1),
+            ("codex:thread-one", 0),
+            ("session:claude-one", 0),
+            (f"uds:{self.root / 'claude.sock'}", 0),
+            ("user", 0),
+        ):
+            with self.subTest(recipient=recipient):
+                read_roster = mock.Mock(return_value=roster.Roster([worker], []))
+                options = ["--to", recipient, "--from", "test", "--text", "hello"]
+                if recipient == "user":
+                    options[4:4] = ["--summary", "note", "--no-action"]
+                with (
+                    mock.patch.object(roster, "roster", read_roster),
+                    mock.patch.object(
+                        send, "codex", return_value=send.Result("sent", "seat"),
+                    ),
+                    mock.patch.object(
+                        codex_daemon, "queue", return_value=codex_daemon.Queued(),
+                    ),
+                    mock.patch.object(
+                        send, "relay", return_value=send.Result("sent", "claude"),
+                    ),
+                    mock.patch.object(
+                        send, "user", return_value=send.Result("sent", "user"),
+                    ),
+                ):
+                    _ = send.send(send.parse(options))
+                self.assertEqual(read_roster.call_count, expected_reads)
+
+    def test_seat_address_with_action_is_a_usage_error(self) -> None:
+        errors = io.StringIO()
+        with self.assertRaises(SystemExit) as raised, redirect_stderr(errors):
+            _ = send.parse([
+                "--to", "seat:run/worker", "--action", "reply", "--text", "hello",
+            ])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("go with --to user", errors.getvalue())
+
+    def test_help_description_and_to_option_name_every_recipient_form(self) -> None:
+        output = io.StringIO()
+        with self.assertRaises(SystemExit) as raised, redirect_stdout(output):
+            _ = send.parse(["--help"])
+        self.assertEqual(raised.exception.code, 0)
+        help_text = " ".join(output.getvalue().split())
+        for recipient_form in (
+            "a roster name", "uds:<path>", "session:<id>",
+            "seat:<run id>/<seat name>", "codex:<thread id>", "user",
+        ):
+            self.assertGreaterEqual(help_text.count(recipient_form), 2)
 
     def test_codex_failure_is_failed_not_queued(self) -> None:
         with mock.patch.object(send, "run", return_value=(1, "", "codex_mesh: no delegate named 'bogus'")):

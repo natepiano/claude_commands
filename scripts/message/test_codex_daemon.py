@@ -8,6 +8,7 @@ import hashlib
 import json
 import socket
 import struct
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -264,6 +265,46 @@ class CodexDaemonTests(unittest.TestCase):
         self.assertEqual(
             codex_daemon.daemon_socket({"ROSTER_CODEX_SOCKET": str(chosen)}), chosen,
         )
+
+    def test_queue_runs_codex_for_one_thread(self) -> None:
+        self.assertEqual(codex_daemon.QUEUE_TIMEOUT_SECONDS, 30)
+        completed = subprocess.CompletedProcess(
+            ["codex", "queue"], 0, stdout="queued\n", stderr="",
+        )
+        with mock.patch.object(subprocess, "run", return_value=completed) as run:
+            result = codex_daemon.queue("thread-one", "please review", timeout=4.5)
+
+        self.assertEqual(result, codex_daemon.Queued())
+        run.assert_called_once_with(
+            [
+                "codex", "queue", "--thread", "thread-one",
+                "--message", "please review",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=4.5,
+            check=False,
+        )
+
+    def test_queue_reports_the_first_stderr_line_or_exit_status(self) -> None:
+        for stderr, expected in (
+            ("thread is closed\nmore detail\n", "thread is closed"),
+            ("", "exit 7"),
+        ):
+            with self.subTest(stderr=stderr):
+                completed = subprocess.CompletedProcess(
+                    ["codex", "queue"], 7, stdout="", stderr=stderr,
+                )
+                with mock.patch.object(subprocess, "run", return_value=completed):
+                    result = codex_daemon.queue("thread-one", "hello")
+                self.assertEqual(result, codex_daemon.QueueFailed(expected))
+
+    def test_queue_timeout_is_a_named_result(self) -> None:
+        timeout = subprocess.TimeoutExpired(["codex", "queue"], 0.25)
+        with mock.patch.object(subprocess, "run", side_effect=timeout):
+            result = codex_daemon.queue("thread-one", "hello", timeout=0.25)
+
+        self.assertEqual(result, codex_daemon.QueueTimedOut(0.25))
 
 
 if __name__ == "__main__":

@@ -61,7 +61,7 @@ from remote import other_machine, run_remote  # noqa: E402
 import sessions  # noqa: E402
 import settle  # noqa: E402
 import showrunner_footer  # noqa: E402
-from user_action import ActionRequired, NoActionRequired  # noqa: E402
+from user_action import ActionRequired  # noqa: E402
 
 
 ADD_UNIT = SCRIPTS / "production" / "add_unit.py"
@@ -753,7 +753,6 @@ def _send_restart_note(
         f"session:{session_id}",
         f"{record['label']} restarted",
         note,
-        action=NoActionRequired(),
         key=_message_key(record, session_id),
     )
 
