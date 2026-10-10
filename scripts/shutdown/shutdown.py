@@ -31,8 +31,19 @@ from inventory import (
     inventory,
     parse_inventory,
 )
-from record import InvalidRecord, Record, live_records, parse_records
+from record import (
+    InvalidRecord,
+    LiveRecord,
+    NoLiveRecord,
+    NoShutdown,
+    Record,
+    ShutdownInProgress,
+    find_live,
+    live_records,
+    parse_records,
+)
 from remote import other_machine, run_remote
+import settle
 
 
 class CommandLine(argparse.Namespace):
@@ -40,6 +51,10 @@ class CommandLine(argparse.Namespace):
     account: str | None = None
     as_json: bool = False
     here: bool = False
+    only: str | None = None
+    requested_by: str | None = None
+    message: list[str] | None = None
+    where: str = ""
 
 
 class UnreachableMachine(TypedDict):
@@ -56,6 +71,33 @@ class UnavailableMachine(TypedDict):
 
 MachineStatusReport = Inventory | UnreachableMachine | UnavailableMachine
 MachineRecordReport = Record | UnreachableMachine | UnavailableMachine
+
+
+class UnreadableShutdownRecord(TypedDict):
+    kind: Literal["unreadable"]
+    machine: str
+    reason: str
+
+
+class UnreachableShutdownRecord(TypedDict):
+    kind: Literal["unreachable"]
+    machine: str
+
+
+class UnavailableShutdownRecord(TypedDict):
+    kind: Literal["unavailable"]
+    machine: str
+    rc: int
+
+
+LocalShutdownRecordOutcome = LiveRecord | NoShutdown | UnreadableShutdownRecord
+RemoteShutdownRecordOutcome = (
+    LiveRecord
+    | NoShutdown
+    | UnreadableShutdownRecord
+    | UnreachableShutdownRecord
+    | UnavailableShutdownRecord
+)
 
 
 def _selected_account(requested: str | None) -> Account:
@@ -177,6 +219,71 @@ def _record_line(record: Record) -> str:
     )
 
 
+def _local_shutdown_record(
+    login: str, machine: str
+) -> LocalShutdownRecordOutcome:
+    try:
+        return find_live(login)
+    except InvalidRecord as error:
+        return {"kind": "unreadable", "machine": machine, "reason": str(error)}
+
+
+def _remote_shutdown_record(login: str) -> RemoteShutdownRecordOutcome:
+    machine = other_machine()
+    status, output = run_remote(["records", "--json", "--here"])
+    if status == 255:
+        return {"kind": "unreachable", "machine": machine}
+    if status != 0:
+        return {"kind": "unavailable", "machine": machine, "rc": status}
+    try:
+        records = parse_records(output)
+    except InvalidRecord as error:
+        return {"kind": "unreadable", "machine": machine, "reason": str(error)}
+    for record in records:
+        if record["login"] == login:
+            return {"kind": "live", "record": record}
+    return {"kind": "no shutdown"}
+
+
+def _shutdown_record_lines(
+    outcome: LocalShutdownRecordOutcome | RemoteShutdownRecordOutcome,
+) -> list[str]:
+    match outcome["kind"]:
+        case "live":
+            return settle.status_record_lines(outcome["record"])
+        case "no shutdown":
+            return []
+        case "unreachable":
+            return [
+                f"{outcome['machine']}: shutdown record not reached (unreachable)"
+            ]
+        case "unavailable":
+            return [
+                f"{outcome['machine']}: shutdown record not reached (unavailable, rc {outcome['rc']})"
+            ]
+        case "unreadable":
+            return [
+                f"{outcome['machine']}: shutdown record unreadable: {outcome['reason']}"
+            ]
+
+
+def _status_record_lines(
+    selected: Account, here: bool, local_machine: str
+) -> list[str]:
+    lines = _shutdown_record_lines(
+        _local_shutdown_record(selected.login, local_machine)
+    )
+    if not here:
+        lines.extend(_shutdown_record_lines(_remote_shutdown_record(selected.login)))
+    return lines
+
+
+def _only_ids(value: str | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    return tuple(dict.fromkeys(item for item in value.split(",") if item))
+
+
 def _records(here: bool) -> tuple[list[MachineRecordReport], list[str]]:
     local = live_records()
     reports: list[MachineRecordReport] = list(local)
@@ -208,8 +315,12 @@ def _records(here: bool) -> tuple[list[MachineRecordReport], list[str]]:
 def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(
-        dest="command", required=True, metavar="{status}"
+        dest="command", required=True, metavar="{down,status,cancel}"
     )
+    down = commands.add_parser("down", help="start a safe account shutdown")
+    _ = down.add_argument("account", nargs="?")
+    _ = down.add_argument("--here", action="store_true")
+    _ = down.add_argument("--only", help=argparse.SUPPRESS)
     status = commands.add_parser("status", help="show what runs for one Claude account")
     _ = status.add_argument("account", nargs="?")
     _ = status.add_argument("--json", action="store_true", dest="as_json")
@@ -217,6 +328,21 @@ def main(arguments: list[str] | None = None) -> int:
     records = commands.add_parser("records")
     _ = records.add_argument("--json", action="store_true", dest="as_json")
     _ = records.add_argument("--here", action="store_true")
+    begin = commands.add_parser("begin")
+    _ = begin.add_argument("account")
+    _ = begin.add_argument("--requested-by")
+    _ = begin.add_argument("--only", help=argparse.SUPPRESS)
+    refresh = commands.add_parser("refresh")
+    _ = refresh.add_argument("account")
+    _ = refresh.add_argument("--message", nargs="*")
+    conduct = commands.add_parser("conduct")
+    _ = conduct.add_argument("account")
+    _ = conduct.add_argument("--here", action="store_true")
+    ready = commands.add_parser("ready")
+    _ = ready.add_argument("--where", required=True)
+    cancel = commands.add_parser("cancel", help="undo a settling shutdown")
+    _ = cancel.add_argument("account", nargs="?")
+    _ = cancel.add_argument("--here", action="store_true")
     options = cast(CommandLine, parser.parse_args(arguments))
 
     if options.command == "records":
@@ -231,17 +357,55 @@ def main(arguments: list[str] | None = None) -> int:
             print("\n".join(lines))
         return 0
 
+    if options.command == "begin":
+        try:
+            _ = settle.begin(
+                options.account or "",
+                options.requested_by,
+                _only_ids(options.only),
+            )
+        except (ShutdownInProgress, ValueError, RuntimeError) as error:
+            print(f"shutdown: {error}", file=sys.stderr)
+            return 1
+        return 0
+
+    if options.command == "refresh":
+        try:
+            refreshed = settle.refresh(
+                options.account or "", options.message or ()
+            )
+        except (NoLiveRecord, ValueError, RuntimeError) as error:
+            print(f"shutdown: {error}", file=sys.stderr)
+            return 1
+        print(json.dumps([refreshed], sort_keys=True))
+        return 0
+
+    if options.command == "conduct":
+        return settle.conduct(options.account or "", options.here)
+
+    if options.command == "ready":
+        return settle.ready(options.where)
+
     try:
         selected = _selected_account(options.account)
     except (UnreadableAccount, UnknownAccountName) as error:
         print(f"shutdown: {error}", file=sys.stderr)
         return 2
+    if options.command == "down":
+        return settle.down(selected, options.here, _only_ids(options.only))
+    if options.command == "cancel":
+        return settle.cancel(selected, options.here)
     reports, lines = _status(selected, options.here)
     if options.as_json:
         print(json.dumps(reports[0] if options.here else reports, sort_keys=True))
     else:
         print(f"{selected.label} · {selected.login}")
         print("\n".join(lines))
+        record_lines = _status_record_lines(
+            selected, options.here, reports[0]["machine"]
+        )
+        if record_lines:
+            print("\n".join(record_lines))
     return 0
 
 

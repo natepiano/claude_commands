@@ -4,7 +4,7 @@
 Agents holding the SendMessage tool call it directly; scripts call this. The rules
 every message follows are /message (~/.claude/commands/message.md).
 
-  send.py --to NAME [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
+  send.py --to NAME|session:<id> [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
           [--machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
   send.py --to user --summary TITLE [--need note|decision|blocked] ...   the user
@@ -113,6 +113,17 @@ class Message(NamedTuple):
 class Result(NamedTuple):
     outcome: Outcome
     detail: str
+
+
+class RelayAttempt(NamedTuple):
+    message: Message
+
+
+class SessionIdWithoutLiveRecipient(NamedTuple):
+    address: str
+
+
+RelayPlan = RelayAttempt | SessionIdWithoutLiveRecipient
 
 
 class Options(NamedTuple):
@@ -452,6 +463,24 @@ def relay(message: Message, timeout: float) -> Result:
     return result
 
 
+def relay_plan(message: Message) -> RelayPlan:
+    """Resolve a session-id address locally while preserving the caller's message."""
+    if not message.to.startswith("session:"):
+        return RelayAttempt(message)
+    session = sessions.addressed(message.to, sessions.live_sessions())
+    if session is None:
+        return SessionIdWithoutLiveRecipient(message.to)
+    return RelayAttempt(
+        Message(
+            f"uds:{session['messagingSocketPath']}",
+            message.sender,
+            message.summary,
+            message.text,
+            message.key,
+        )
+    )
+
+
 def codex(message: Message, session_dir: str, timeout: float) -> Result:
     command = [sys.executable, str(CODEX_MESH), "send", "--session-dir", session_dir, "--to", message.to,
                "--message", message.text]
@@ -593,12 +622,20 @@ def send(options: Options) -> Result:
     elif options.session_dir is not None:
         result = codex(message, options.session_dir, options.timeout)
     else:
-        result = relay(message, options.timeout)
-        if result.outcome == "queued":
+        plan = relay_plan(message)
+        if isinstance(plan, SessionIdWithoutLiveRecipient):
+            result = Result(
+                "queued",
+                f"no live session answers to {plan.address}, so it is kept under that name",
+            )
             enqueue(message, result.detail, started)
-            if sessions.addressed(message.to, sessions.live_sessions()) is None:
-                result = Result("queued", f"{result.detail}; no live session answers to {message.to},"
-                                + " so it is kept under that name")
+        else:
+            result = relay(plan.message, options.timeout)
+            if result.outcome == "queued":
+                enqueue(message, result.detail, started)
+                if sessions.addressed(message.to, sessions.live_sessions()) is None:
+                    result = Result("queued", f"{result.detail}; no live session answers to {message.to},"
+                                    + " so it is kept under that name")
     log(message, result, started)
     return result
 

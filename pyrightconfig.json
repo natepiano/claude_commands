@@ -104,7 +104,8 @@
         "scripts/shutdown",
         "scripts/whoami",
         "scripts/message",
-        "scripts/production"
+        "scripts/production",
+        "scripts/hooks"
       ]
     },
     {

@@ -26,7 +26,7 @@ TOMBSTONE_SECONDS = 300
 SCHEDULED_PROMPT_RETENTION_SECONDS = 8 * 24 * 60 * 60
 WATCHER = "conversation-pause"
 JOB_SENDERS = frozenset({WATCHER, "stall-watch", "tmux-names", "quota_alert", "mac-test",
-                         "disk_floor"})
+                         "disk_floor", "shutdown"})
 QUESTION = (
     f"conversation-pause: the user has been quiet here for {QUIET_SECONDS // 60} minutes. "
     "Ask them this, word for word, and nothing else: Return to automatic updates? (yes / no) "
@@ -711,6 +711,15 @@ def _resume_locked(session_id: str) -> tuple[str, ...]:
 def resume(session_id: str) -> tuple[str, ...]:
     with record_lock():
         return _resume_locked(session_id)
+
+
+def release(session_id: str) -> RecordLookup:
+    """Remove and return a pause record without resuming what it paused."""
+    with record_lock():
+        current = _record(session_id)
+        if isinstance(current, PauseRecord):
+            record_path(session_id).unlink(missing_ok=True)
+        return current
 
 
 def mark_reply_ended(session_id: str, now: int) -> None:

@@ -1,13 +1,15 @@
 ---
-description: Shut down every Claude session of one account on natedev and the Mac safely and restart them later; show what runs on an account.
-argument-hint: "status [account]"
+description: Safely settle every Claude session of one account on natedev and the Mac, watch it, or cancel it.
+argument-hint: "[account] | --here [account] | status [account] | cancel [account]"
 ---
 
-`$ARGUMENTS` is `status [account]`. Run the matching line and show its output unchanged. This phase only reports; it changes no session, timer, or Codex server.
+Account: act on the account named in `$ARGUMENTS`, or otherwise this session's own account as `/whoami` reports it.
 
-```
-/shutdown status             show what runs for this session's Claude account on both machines
-/shutdown status <account>   show what runs for a note label or login on both machines
-```
+Run the matching command and lead the reply with that account's label:
 
-Run `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py status` with the optional account argument exactly as the user gave it. Do not add `--here`: status covers natedev and the Mac, and reports an unreachable machine without failing the local report.
+- `/shutdown [account]`: run `shutdown.py down [account]`. When it starts, run `shutdown.py ready --where "<what this session was doing before /shutdown>"`, report its output, and end the turn; this requesting session is stopped last.
+- `/shutdown --here [account]`: run `shutdown.py down [account] --here`. This is the way to shut down only this machine while the other is unreachable; then run `ready` and end the turn as above.
+- `/shutdown status [account]`: run `shutdown.py status [account]` and show its output unchanged.
+- `/shutdown cancel [account]`: run `shutdown.py cancel [account]` and show its output unchanged.
+
+Use the optional account exactly as given. A session on another account is never touched.
