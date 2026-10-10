@@ -8,7 +8,7 @@ stays there until its turn ends. `codex app-server` fixes that by hosting every
 delegate as a thread on one local websocket: any process that can open a socket
 can queue a message for a named delegate, or steer one mid-turn.
 
-The pieces this depends on, each verified against codex 0.150.1:
+The pieces this depends on, each verified against codex 0.162.0:
 
   * `initialize` must declare `capabilities.experimentalApi`. Without it the
     queue methods return -32600 with no hint that a flag is missing.
@@ -33,6 +33,9 @@ Verbs:
          turn is printed to stdout and delivered the same way, the thread
          keeps accepting `send`, and only `end` releases the block.
   follow Resume a finished named thread, start one turn, and block for that turn.
+  compact
+         Compact a finished named thread and print its context size before and
+         after compaction.
   send   Queue a message for a named delegate, delivered at its next turn.
   steer  Inject into a named delegate's running turn.
   end    Finish a resident delegate: drop its queued messages, interrupt its
@@ -70,6 +73,7 @@ from typing import Literal, NotRequired, TextIO, TypedDict, cast, final
 SERVER_FILE = "mesh_server.json"
 SERVER_LOG = "mesh_server.log"
 ROSTER_FILE = "mesh_roster.json"
+BOARD_HELPER = Path(__file__).resolve().parent.parent / "delegate" / "board.sh"
 # Servers dropped by _retire_server, kept so `stop` can still reap them. A
 # retired server is abandoned rather than signalled: it may still be finishing a
 # peer delegate's turn, and the end of the run is the only moment that knows
@@ -104,7 +108,9 @@ CAPACITY_BUDGET_SECS = 1200.0
 WAITING_CAPACITY = "waiting_capacity"
 CAPACITY_EXHAUSTED = "capacity_exhausted"
 LAUNCHER_ATTACHED_STATUSES = frozenset(("running", WAITING_CAPACITY))
-ENDABLE_STATUSES = LAUNCHER_ATTACHED_STATUSES | {CAPACITY_EXHAUSTED}
+ENDABLE_STATUSES = frozenset((
+    "starting", "running", "done", "failed", WAITING_CAPACITY, CAPACITY_EXHAUSTED,
+))
 
 
 class RpcMessage(TypedDict, total=False):
@@ -135,9 +141,30 @@ class ServerRestartRequired:
 ServerAvailability = LiveServer | ServerRestartRequired
 
 
+SeatRole = Literal["impl", "test", "fix", "review"]
+SEAT_ROLES = ("impl", "test", "fix", "review")
+
+
+@dataclass(frozen=True)
+class AssignedDelegateRole:
+    """A delegate-run thread whose current assignment belongs in the roster."""
+
+    role: SeatRole
+
+
+@dataclass(frozen=True)
+class RolelessThread:
+    """A mesh thread outside a delegate run, such as a consultation friend."""
+
+
+RosterRole = AssignedDelegateRole | RolelessThread
+
+
 class FollowableRecord(TypedDict):
     thread_id: str
     status: Literal["done", "failed"]
+    role: NotRequired[SeatRole]
+    context_tokens: NotRequired[int]
 
 
 # `port` is the app-server the seat's launcher is attached to. It stays the seat's way in while
@@ -148,6 +175,8 @@ class ActiveRecord(TypedDict):
     turn_id: str
     launcher_pid: NotRequired[int]
     port: NotRequired[int]
+    role: NotRequired[SeatRole]
+    context_tokens: NotRequired[int]
 
 
 class StartingRecord(TypedDict):
@@ -155,6 +184,8 @@ class StartingRecord(TypedDict):
     status: Literal["starting"]
     launcher_pid: NotRequired[int]
     port: NotRequired[int]
+    role: NotRequired[SeatRole]
+    context_tokens: NotRequired[int]
 
 
 class WaitingCapacityRecord(TypedDict):
@@ -162,15 +193,26 @@ class WaitingCapacityRecord(TypedDict):
     status: Literal["waiting_capacity"]
     launcher_pid: int
     port: NotRequired[int]
+    role: NotRequired[SeatRole]
+    context_tokens: NotRequired[int]
 
 
 class ExhaustedRecord(TypedDict):
     thread_id: str
     status: Literal["capacity_exhausted"]
+    role: NotRequired[SeatRole]
+    context_tokens: NotRequired[int]
+
+
+class EndedRecord(TypedDict):
+    thread_id: str
+    status: Literal["ended"]
+    role: NotRequired[SeatRole]
+    context_tokens: NotRequired[int]
 
 
 ThreadRecord = (FollowableRecord | ActiveRecord | StartingRecord |
-                WaitingCapacityRecord | ExhaustedRecord)
+                WaitingCapacityRecord | ExhaustedRecord | EndedRecord)
 
 
 FOLLOWABLE_STATES = frozenset(("done", "failed"))
@@ -207,12 +249,32 @@ class ExhaustedThread:
 
 
 @dataclass(frozen=True)
+class EndedThread:
+    thread_id: str
+
+
+@dataclass(frozen=True)
 class InvalidThread:
     reason: str
 
 
 RosterThread = (FollowableThread | ActiveThread | WaitingCapacityThread |
-                StartingThread | ExhaustedThread | InvalidThread)
+                StartingThread | ExhaustedThread | EndedThread | InvalidThread)
+
+
+@dataclass(frozen=True)
+class KnownContextSize:
+    """A context size reported by the app-server or saved in the roster."""
+
+    tokens: int
+
+
+@dataclass(frozen=True)
+class ContextSizeUnavailable:
+    """No trustworthy context size was present at this protocol boundary."""
+
+
+ContextSize = KnownContextSize | ContextSizeUnavailable
 
 
 def _roster_thread(value: object) -> RosterThread:
@@ -237,6 +299,8 @@ def _roster_thread(value: object) -> RosterThread:
         return StartingThread(thread_id, launcher_pid)
     if status == CAPACITY_EXHAUSTED:
         return ExhaustedThread(thread_id)
+    if status == "ended":
+        return EndedThread(thread_id)
     return InvalidThread(f"unknown status {status}")
 
 
@@ -282,8 +346,41 @@ def _as_str(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _roster_role(value: object) -> RosterRole:
+    role = _as_str(value)
+    if not role:
+        return RolelessThread()
+    if role not in SEAT_ROLES:
+        raise SystemExit(
+            f"codex_mesh: role must be impl, test, fix, or review; got '{role}'"
+        )
+    return AssignedDelegateRole(role)
+
+
+def _seat_role(args: argparse.Namespace) -> SeatRole:
+    role = _roster_role(_attr(args, "role"))
+    if isinstance(role, RolelessThread):
+        raise SystemExit("codex_mesh: this delegate action requires a role")
+    return role.role
+
+
 def _as_float(value: object, fallback: float) -> float:
     return float(value) if isinstance(value, (int, float)) else fallback
+
+
+def _context_size_from_record(value: object) -> ContextSize:
+    tokens = _as_dict(value).get("context_tokens")
+    if isinstance(tokens, int) and tokens >= 0:
+        return KnownContextSize(tokens)
+    return ContextSizeUnavailable()
+
+
+def _context_size_from_usage(params: dict[str, object]) -> ContextSize:
+    usage = _as_dict(_as_dict(params.get("tokenUsage")).get("last"))
+    tokens = usage.get("inputTokens")
+    if isinstance(tokens, int) and tokens >= 0:
+        return KnownContextSize(tokens)
+    return ContextSizeUnavailable()
 
 
 def _parse_frame(text: str) -> RpcMessage | None:
@@ -478,6 +575,19 @@ def _read_json_object(path: Path) -> dict[str, object]:
     return _as_dict(_loads(text))
 
 
+def _post_board_status(session_dir: str, name: str, message: str) -> None:
+    """Best-effort lifecycle narration under the seat's board slot."""
+    slot = name.rsplit("-", 1)[-1]
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+        _ = subprocess.run(
+            ["bash", str(BOARD_HELPER), "post", session_dir, slot, "status", message],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+
 def _update_roster(session_dir: str, name: str, record: ThreadRecord) -> None:
     path = _session_path(session_dir, ROSTER_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -488,6 +598,12 @@ def _update_roster(session_dir: str, name: str, record: ThreadRecord) -> None:
         roster = _as_dict(_loads(text)) if text.strip() else {}
         previous = _as_dict(roster.get(name))
         stored = dict(record)
+        context_tokens = record.get("context_tokens", previous.get("context_tokens"))
+        if isinstance(context_tokens, int) and context_tokens >= 0:
+            stored["context_tokens"] = context_tokens
+        role = record.get("role", previous.get("role"))
+        if isinstance(role, str) and role in SEAT_ROLES:
+            stored["role"] = role
         if record["status"] in ("starting", "running", WAITING_CAPACITY):
             pid = record.get("launcher_pid", previous.get("launcher_pid"))
             if isinstance(pid, int) and pid > 0:
@@ -495,12 +611,72 @@ def _update_roster(session_dir: str, name: str, record: ThreadRecord) -> None:
             port = record.get("port", previous.get("port"))
             if isinstance(port, int) and port > 0:
                 stored["port"] = port
+        if (
+            previous.get("status") == "ended"
+            and previous.get("thread_id") == record["thread_id"]
+            and record["status"] != "ended"
+        ):
+            stored = dict(previous)
+            if isinstance(context_tokens, int) and context_tokens >= 0:
+                stored["context_tokens"] = context_tokens
         roster[name] = stored
         _ = handle.seek(0)
         _ = handle.truncate()
         _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
         handle.flush()
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _set_roster_role(session_dir: str, name: str, role: SeatRole) -> None:
+    """Record the work assigned to an existing seat without changing its state."""
+    path = _session_path(session_dir, ROSTER_FILE)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _ = handle.seek(0)
+        roster = _as_dict(_loads(handle.read()))
+        entry = _as_dict(roster.get(name))
+        if entry:
+            entry["role"] = role
+            roster[name] = entry
+            _ = handle.seek(0)
+            _ = handle.truncate()
+            _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
+            handle.flush()
+
+
+def _mark_roster_ended(session_dir: str, name: str) -> None:
+    """Make one seat terminal while retaining its identity and metadata."""
+    path = _session_path(session_dir, ROSTER_FILE)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _ = handle.seek(0)
+        roster = _as_dict(_loads(handle.read()))
+        entry = _as_dict(roster.get(name))
+        if entry:
+            entry["status"] = "ended"
+            roster[name] = entry
+            _ = handle.seek(0)
+            _ = handle.truncate()
+            _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
+            handle.flush()
+
+
+def _mark_all_roster_ended(session_dir: str) -> None:
+    """Make every seat in this run terminal while retaining its metadata."""
+    path = _session_path(session_dir, ROSTER_FILE)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _ = handle.seek(0)
+        roster = _as_dict(_loads(handle.read()))
+        for name, value in roster.items():
+            entry = _as_dict(value)
+            if entry:
+                entry["status"] = "ended"
+                roster[name] = entry
+        _ = handle.seek(0)
+        _ = handle.truncate()
+        _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
+        handle.flush()
 
 
 def _lookup(session_dir: str, name: str) -> ThreadRecord:
@@ -522,14 +698,17 @@ def _roster_still_on_thread(session_dir: str, name: str, thread_id: str) -> bool
     return not isinstance(state, InvalidThread) and state.thread_id == thread_id
 
 
-def _claim_follow(session_dir: str, name: str, thread_id: str, launcher_pid: int) -> bool:
+def _claim_follow(
+    session_dir: str, name: str, thread_id: str, launcher_pid: int, role: SeatRole
+) -> bool:
     """Take a finished roster entry before another follow can take it."""
     path = _session_path(session_dir, ROSTER_FILE)
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
         roster = _as_dict(_loads(handle.read()))
-        current = _roster_thread(roster.get(name))
+        entry = _as_dict(roster.get(name))
+        current = _roster_thread(entry)
         stale = isinstance(current, (ActiveThread, StartingThread)) and (
             current.launcher_pid > 0 and not _pid_alive(current.launcher_pid)
         )
@@ -538,8 +717,20 @@ def _claim_follow(session_dir: str, name: str, thread_id: str, launcher_pid: int
         ) or current.thread_id != thread_id:
             return False
         previous_status = current.status if isinstance(current, FollowableThread) else "failed"
-        roster[name] = {"thread_id": thread_id, "status": "starting",
-                        "launcher_pid": launcher_pid, "previous_status": previous_status}
+        previous_role = _roster_role(entry.get("role"))
+        claimed = dict(entry)
+        _ = claimed.pop("turn_id", None)
+        _ = claimed.pop("previous_role", None)
+        if isinstance(previous_role, AssignedDelegateRole):
+            claimed["previous_role"] = previous_role.role
+        claimed.update({
+            "thread_id": thread_id,
+            "status": "starting",
+            "launcher_pid": launcher_pid,
+            "previous_status": previous_status,
+            "role": role,
+        })
+        roster[name] = claimed
         _ = handle.seek(0)
         _ = handle.truncate()
         _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
@@ -563,15 +754,31 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
             return
         thread_id = _as_str(entry.get("thread_id"))
         previous_status = entry.get("previous_status")
+        previous_role = _roster_role(entry.get("previous_role"))
+        restored = dict(entry)
+        if isinstance(previous_role, AssignedDelegateRole):
+            restored["role"] = previous_role.role
+        else:
+            _ = restored.pop("role", None)
         if live_turn and not finished:
-            restored: dict[str, object] = {"thread_id": thread_id, "status": "running", "turn_id": live_turn,
-                                           "launcher_pid": launcher_pid, "previous_status": previous_status}
-            if isinstance(port := entry.get("port"), int):
-                restored["port"] = port
+            restored.update({
+                "thread_id": thread_id,
+                "status": "running",
+                "turn_id": live_turn,
+                "launcher_pid": launcher_pid,
+            })
             roster[name] = restored
         else:
-            roster[name] = {"thread_id": thread_id,
-                            "status": previous_status if previous_status in FOLLOWABLE_STATES else "failed"}
+            _ = restored.pop("previous_status", None)
+            _ = restored.pop("previous_role", None)
+            _ = restored.pop("turn_id", None)
+            _ = restored.pop("launcher_pid", None)
+            _ = restored.pop("port", None)
+            restored.update({
+                "thread_id": thread_id,
+                "status": previous_status if previous_status in FOLLOWABLE_STATES else "failed",
+            })
+            roster[name] = restored
         _ = handle.seek(0)
         _ = handle.truncate()
         _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
@@ -1077,11 +1284,16 @@ class TurnRefusedForCapacity:
 
 
 @dataclass(frozen=True)
+class TurnContextWindowExceeded:
+    detail: str
+
+
+@dataclass(frozen=True)
 class TurnFailed:
     detail: str
 
 
-TurnOutcome = TurnCompleted | TurnRefusedForCapacity | TurnFailed
+TurnOutcome = TurnCompleted | TurnRefusedForCapacity | TurnContextWindowExceeded | TurnFailed
 
 
 @dataclass(frozen=True)
@@ -1173,6 +1385,10 @@ def _turn_outcome(method: str, params: dict[str, object]) -> TurnOutcome:
     error = _as_dict(turn.get("error")) if method == "turn/completed" else _as_dict(params.get("error"))
     detail = _as_str(error.get("message"))
     info = error.get("codexErrorInfo")
+    if info == "contextWindowExceeded" or (
+        isinstance(info, dict) and "contextWindowExceeded" in info
+    ):
+        return TurnContextWindowExceeded(detail or "context window exceeded")
     if info in ("serverOverloaded", "flexUnavailable") or (
         isinstance(info, dict) and ("serverOverloaded" in info or "flexUnavailable" in info)
     ) or "Selected model is at capacity" in detail:
@@ -1323,6 +1539,7 @@ def command_start(args: argparse.Namespace) -> int:
 def command_follow(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "to"))
+    role = _seat_role(args)
     claim_pid = _as_int(_attr(args, "claim_pid"))
     try:
         state = _lookup_state(session_dir, name)
@@ -1340,9 +1557,13 @@ def command_follow(args: argparse.Namespace) -> int:
             return 2
     assert not isinstance(state, InvalidThread)
     thread_id = state.thread_id
-    if not claim_pid and not _claim_follow(session_dir, name, thread_id, os.getpid()):
+    if not claim_pid and not _claim_follow(
+        session_dir, name, thread_id, os.getpid(), role
+    ):
         print(f"codex_mesh: {name} was already claimed", file=sys.stderr)
         return 2
+    if claim_pid:
+        _set_roster_role(session_dir, name, role)
     owner_pid = claim_pid or os.getpid()
     opened = time.time()
     client: Client | None = None
@@ -1385,6 +1606,116 @@ def command_follow(args: argparse.Namespace) -> int:
             client.close()
 
 
+def _compact_thread(client: Client, thread_id: str) -> KnownContextSize:
+    """Start compaction and return the usage update for its compact turn.
+
+    Codex 0.162.0 schemas retain `thread/compacted` but mark it deprecated in
+    favor of the `contextCompaction` item. Servers in the same release may send
+    either completion shape, so both identify the compact turn here.
+    """
+    _ = _require(
+        client.call("thread/compact/start", {"threadId": thread_id}),
+        "thread/compact/start",
+    )
+    deadline = time.time() + CALL_TIMEOUT_SECS
+    compacted_turn = ""
+    sizes_by_turn: dict[str, KnownContextSize] = {}
+    completed_turns: set[str] = set()
+    while time.time() < deadline:
+        frame = client.next_frame(deadline)
+        if frame is None:
+            continue
+        params = _as_dict(frame.get("params"))
+        if _as_str(params.get("threadId")) != thread_id:
+            continue
+        method = frame.get("method")
+        if method == "thread/tokenUsage/updated":
+            size = _context_size_from_usage(params)
+            usage_turn = _as_str(params.get("turnId"))
+            if isinstance(size, KnownContextSize) and usage_turn:
+                sizes_by_turn[usage_turn] = size
+        elif method == "thread/compacted":
+            compacted_turn = _as_str(params.get("turnId"))
+        elif method == "item/completed":
+            item = _as_dict(params.get("item"))
+            if _as_str(item.get("type")) == "contextCompaction":
+                compacted_turn = _as_str(params.get("turnId"))
+        elif method == "turn/completed":
+            completed = _as_str(_as_dict(params.get("turn")).get("id"))
+            if completed:
+                completed_turns.add(completed)
+        if (
+            compacted_turn
+            and compacted_turn in sizes_by_turn
+            and compacted_turn in completed_turns
+        ):
+            return sizes_by_turn[compacted_turn]
+    if compacted_turn and compacted_turn in sizes_by_turn:
+        raise SystemExit(
+            f"thread {thread_id}: compaction turn {compacted_turn} did not complete"
+        )
+    if compacted_turn:
+        raise SystemExit(
+            f"thread {thread_id}: compacted without a final token-usage update"
+        )
+    raise SystemExit(f"thread {thread_id}: no thread/compacted within {CALL_TIMEOUT_SECS}s")
+
+
+def command_compact(args: argparse.Namespace) -> int:
+    session_dir = _as_str(_attr(args, "session_dir"))
+    name = _as_str(_attr(args, "to"))
+    try:
+        record = _lookup(session_dir, name)
+        state = _roster_thread(record)
+    except SystemExit as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    if not isinstance(state, FollowableThread):
+        print(
+            f"codex_mesh: {name}: seat is running or otherwise busy; compact requires a finished seat",
+            file=sys.stderr,
+        )
+        return 2
+    before = _context_size_from_record(record)
+    if isinstance(before, ContextSizeUnavailable):
+        print(
+            f"codex_mesh: {name}: no recorded context size; compact refused",
+            file=sys.stderr,
+        )
+        return 2
+    client: Client | None = None
+    try:
+        port, _fresh = ensure_server(session_dir)
+        client = Client(port, f"compact-{name}")
+        _ = _require(
+            client.call("thread/resume", {"threadId": state.thread_id}),
+            "thread/resume",
+        )
+        live = _read_live_turn(client, state.thread_id)
+        if not isinstance(live, ThreadIdle):
+            reason = live.reason if isinstance(live, ThreadStateUnknown) else "thread has a live turn"
+            print(f"codex_mesh: {name}: {reason}; compact refused", file=sys.stderr)
+            return 2
+        after = _compact_thread(client, state.thread_id)
+        _update_roster(
+            session_dir,
+            name,
+            {
+                "thread_id": state.thread_id,
+                "status": state.status,
+                "context_tokens": after.tokens,
+            },
+        )
+        print(f"compacted {name}: {before.tokens} -> {after.tokens} tokens")
+        return 0
+    except (ConnectionError, OSError, SystemExit) as exc:
+        print(f"codex_mesh: {name}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if client is not None:
+            client.close()
+
+
 def _follow_refusal(session_dir: str, state: RosterThread) -> str:
     if isinstance(state, InvalidThread):
         return state.reason
@@ -1412,6 +1743,7 @@ def _follow_refusal(session_dir: str, state: RosterThread) -> str:
 def command_can_follow(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "to"))
+    role = _seat_role(args)
     try:
         state = _lookup_state(session_dir, name)
     except SystemExit as exc:
@@ -1424,7 +1756,7 @@ def command_can_follow(args: argparse.Namespace) -> int:
     claim_pid = _as_int(_attr(args, "claim_pid"))
     if claim_pid:
         assert not isinstance(state, InvalidThread)
-        if not _claim_follow(session_dir, name, state.thread_id, claim_pid):
+        if not _claim_follow(session_dir, name, state.thread_id, claim_pid, role):
             print(f"codex_mesh: {name} was already claimed", file=sys.stderr)
             return 2
     return 0
@@ -1507,9 +1839,15 @@ def _attach_and_run(
                 _ = log.write(
                     f"[{stamp}] mesh: dropped {dropped} held messages for thread {previous_thread} on relaunch\n"
                 )
-        _update_roster(
-            session_dir, name, {"thread_id": thread_id, "status": "starting", "port": port}
-        )
+        starting: StartingRecord = {
+            "thread_id": thread_id,
+            "status": "starting",
+            "port": port,
+        }
+        role = _roster_role(_attr(args, "role"))
+        if isinstance(role, AssignedDelegateRole):
+            starting["role"] = role.role
+        _update_roster(session_dir, name, starting)
 
     return _stream_turn(args, client, port, session_dir, name, thread_id, prompt, timeout, opened)
 
@@ -1545,6 +1883,7 @@ def _stream_turn(
     capacity_retries = 0
     resume_owed = False
     retry_waited = False
+    waiting_for_progress_after_overflow = False
     run_outcome: RunOutcome = RunCompleted()
     deadline = time.time() + timeout
     try:
@@ -1589,10 +1928,25 @@ def _stream_turn(
                         if follow:
                             followed_turn = live
                         _update_roster(session_dir, name, {"thread_id": thread_id, "turn_id": live, "status": "running"})
+                elif method == "thread/tokenUsage/updated":
+                    context_size = _context_size_from_usage(params)
+                    if isinstance(context_size, KnownContextSize):
+                        _update_roster(
+                            session_dir,
+                            name,
+                            {
+                                "thread_id": thread_id,
+                                "turn_id": turn_id,
+                                "status": "running",
+                                "context_tokens": context_size.tokens,
+                            },
+                        )
                 elif method == "item/completed":
                     item = _as_dict(params.get("item"))
                     _ = log.write(f"[{_now_stamp()}] {_describe_item(item)}\n")
                     log.flush()
+                    if _as_str(item.get("type")) != "contextCompaction":
+                        waiting_for_progress_after_overflow = False
                     if _as_str(item.get("type")) == "agentMessage":
                         text = _as_str(item.get("text"))
                         if text:
@@ -1602,6 +1956,35 @@ def _stream_turn(
                     if follow and notice_turn and followed_turn and notice_turn != followed_turn:
                         continue
                     turn_outcome = _turn_outcome(method, params)
+                    if isinstance(turn_outcome, TurnContextWindowExceeded):
+                        if waiting_for_progress_after_overflow:
+                            failure = (
+                                "context window filled twice in a row without progress; "
+                                "automatic continuation stopped"
+                            )
+                            _ = log.write(f"[{_now_stamp()}] {failure}\n")
+                            log.flush()
+                            break
+                        continuation = "Continue where you stopped."
+                        _post_board_status(
+                            session_dir,
+                            name,
+                            f'context window filled; sent "{continuation}"',
+                        )
+                        _ = log.write(
+                            f"[{_now_stamp()}] context window filled; starting one continuation turn\n"
+                        )
+                        log.flush()
+                        turn_id = _start_turn(client, args, thread_id, continuation)
+                        if follow:
+                            followed_turn = turn_id
+                        _update_roster(
+                            session_dir,
+                            name,
+                            {"thread_id": thread_id, "turn_id": turn_id, "status": "running"},
+                        )
+                        waiting_for_progress_after_overflow = True
+                        continue
                     if isinstance(turn_outcome, TurnRefusedForCapacity):
                         resume_owed = True
                         retry_waited = False
@@ -1633,6 +2016,7 @@ def _stream_turn(
                     else:
                         capacity_waited = 0.0
                         capacity_retries = 0
+                        waiting_for_progress_after_overflow = False
                     if resume_owed:
                         if isinstance(turn_outcome, TurnRefusedForCapacity) and not retry_waited:
                             remaining = CAPACITY_BUDGET_SECS - capacity_waited
@@ -1977,6 +2361,9 @@ def command_end(args: argparse.Namespace) -> int:
     target = _as_str(_attr(args, "to"))
     record = _lookup(session_dir, target)
     status = record.get("status", "unknown")
+    if status == "ended":
+        print(f"{target} is ended; nothing to end")
+        return 0
     if status not in ENDABLE_STATUSES:
         print(f"{target} is {status}; nothing to end")
         return 0
@@ -1984,6 +2371,7 @@ def command_end(args: argparse.Namespace) -> int:
         _end_marker_path(session_dir, target).touch()
         _ = pending_file.seek(0)
         _ = pending_file.truncate()
+    _mark_roster_ended(session_dir, target)
     availability = _server_availability(session_dir)
     dropped = 0
     if isinstance(availability, LiveServer):
@@ -2099,6 +2487,7 @@ def command_stop(args: argparse.Namespace) -> int:
     detached so it outlives each delegate, which means the end of the run is the
     only place that knows it is finished with."""
     session_dir = _as_str(_attr(args, "session_dir"))
+    _mark_all_roster_ended(session_dir)
     retired_path = _session_path(session_dir, RETIRED_FILE)
     stored = _read_json_object(retired_path).get("servers")
     retired = cast("list[object]", stored) if isinstance(stored, list) else []
@@ -2535,6 +2924,7 @@ def main(argv: list[str] | None = None) -> int:
     start = subparsers.add_parser("start", help="launch a delegate and block")
     _ = start.add_argument("--session-dir", required=True)
     _ = start.add_argument("--name", required=True)
+    _ = start.add_argument("--role", choices=SEAT_ROLES, default="")
     _ = start.add_argument("--cwd", required=True)
     _ = start.add_argument("--prompt-file", required=True)
     _ = start.add_argument("--summary-file", required=True)
@@ -2559,6 +2949,7 @@ def main(argv: list[str] | None = None) -> int:
     follow = subparsers.add_parser("follow", help="run one turn on a finished delegate")
     _ = follow.add_argument("--session-dir", required=True)
     _ = follow.add_argument("--to", required=True)
+    _ = follow.add_argument("--role", choices=SEAT_ROLES, required=True)
     _ = follow.add_argument("--claim-pid", type=int, default=0)
     _ = follow.add_argument("--message-file", required=True)
     _ = follow.add_argument("--summary-file", required=True)
@@ -2570,9 +2961,15 @@ def main(argv: list[str] | None = None) -> int:
     _ = follow.add_argument("--timeout", type=float, default=86400.0)
     follow.set_defaults(handler=command_follow)
 
+    compact = subparsers.add_parser("compact", help="compact a finished delegate")
+    _ = compact.add_argument("--session-dir", required=True)
+    _ = compact.add_argument("--to", required=True)
+    compact.set_defaults(handler=command_compact)
+
     can_follow = subparsers.add_parser("can-follow", help="check whether a seat can take a follow-up")
     _ = can_follow.add_argument("--session-dir", required=True)
     _ = can_follow.add_argument("--to", required=True)
+    _ = can_follow.add_argument("--role", choices=SEAT_ROLES, required=True)
     _ = can_follow.add_argument("--claim-pid", type=int, default=0)
     can_follow.set_defaults(handler=command_can_follow)
 

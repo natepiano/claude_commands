@@ -18,31 +18,41 @@ completes.
    phased plan; pass the original prompt only. Both run before the dispatch in
    step 4, never after it.
 3. `~/.claude/config/agents.conf` owns delegate family/model/effort, one row
-   per kind. Each seat's kind is its opening role from the Work Order's
-   `Seats:` field: `impl` for the `impl` slot, and for `test` whatever its
-   Seats line opens it as — `test` under the default opening. State the
-   opening in the dispatch update in ordinary words: "opening 2 writers: impl
-   on the hana side, test writing the catalyst side".
+   per kind. On a seat's first phase, its kind is its opening role from the Work
+   Order's `Seats:` field: `impl` for the `impl` slot, and for `test` whatever
+   its Seats line opens it as — `test` under the default opening. On later
+   phases, task and kind name the role assigned by that phase's Seats field.
+   State the assignment in the dispatch update in ordinary words: "opening 2
+   writers: …" on the first phase, "continuing 2 writers: …" later.
 4. Take the partition and the opening from Seats and write one prompt per slot
    under <WritePromptContract/>: `${SESSION_DIR}/implementation_prompt.md` for
    `impl` and `test_prompt.md` for `test`. Only when the field is absent, partition per <TeamFilePartition/>
-   yourself and say so in the dispatch update.
-5. Launch both in one message, `impl` first, each under <ToolingContract/>.
-   The fourth and sixth arguments are the seat's opening role, the same word in
-   both places; the default opening is:
+   yourself and say so in the dispatch update. Opening and follow-up prompts
+   both carry the inline Three Gods sentence and the Type Design Contract or
+   its allowed pointer.
+5. Apply <LongLivedSeats/>. For Codex, run
+   `python3 ~/.claude/scripts/agents/codex_mesh.py list --session-dir
+   "${SESSION_DIR}"`. Launch both in one message, `impl` first, each under
+   <ToolingContract/>. When the slot has an open seat, pass its full roster name
+   with `--to`; the phase prompt is its follow-up message. Omit `--to` only for
+   a slot with no reusable thread; the first use and any replacement after an
+   end, overflow failure, or retirement therefore receive an opening prompt
+   without `--to`. Later phases normally run:
 
    ```sh
-   implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
+   implement.sh --to "<full impl seat name>" \
+     "${SESSION_DIR}" "${WORKING_DIR}" \
      "${SESSION_DIR}/implementation_prompt.md" impl \
      "<responsibility>" impl "<activity>" 0 impl
-   implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
+   implement.sh --to "<full test seat name>" \
+     "${SESSION_DIR}" "${WORKING_DIR}" \
      "${SESSION_DIR}/test_prompt.md" test \
      "<responsibility>" test "<activity>" 0 test
    ```
 
-   A seat Seats opens in another role swaps both words and nothing else — the
-   `test` seat opening as a writer is
-   `implement.sh "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/test_prompt.md" impl "<responsibility>" impl "<activity>" 0 test`.
+   A seat assigned another role swaps both role words and nothing else — the
+   open `test` seat continuing as a writer is
+   `implement.sh --to "<full test seat name>" "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/test_prompt.md" impl "<responsibility>" impl "<activity>" 0 test`.
    Responsibility follows <ProgressContract/>. **Both seats carry a pass
    kind**, so a team phase records two passes and stops being attributed to one
    agent. The kind is the work the seat was assigned and nothing more — it names,

@@ -40,7 +40,7 @@ if [[ -f "${MARKER}" ]]; then
     "$PY" "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/remove_seats.py" \
       --session-dir "${SESSION_DIR}" || true
   fi
-  if [[ -n "${SESSION_DIR}" && -f "${SESSION_DIR}/mesh_server.json" ]]; then
+  if [[ -n "${SESSION_DIR}" && ( -f "${SESSION_DIR}/mesh_roster.json" || -f "${SESSION_DIR}/mesh_server.json" ) ]]; then
     "$PY" "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agents/codex_mesh.py" \
       stop --session-dir "${SESSION_DIR}" || true
   fi

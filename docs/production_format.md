@@ -34,8 +34,12 @@ must not drift from it:
   session the showrunner launches in tmux. It receives messages, decides, writes
   Work Orders, dispatches seats, runs gates, checkpoints and reports. It writes
   no implementation code.
-- **Seat** — a codex worker the unit director dispatches, as implementer or
-  reviewer.
+- **Seat** — a Codex worker thread the unit director dispatches. Implementation
+  seats open once per run, continue across phases and repairs in whatever role
+  is needed, attempt compaction above `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` but
+  continue after a failed attempt, press on after context overflow with
+  `Continue where you stopped.`, open anew only when no open seat can take the
+  work, and end at `end_session.sh`. Reviews still open their own threads.
 - **Merge branch** — the branch every unit's checkpoints merge into. cargo-berth
   calls it the trunk. In prose, call it by its branch name, because a unit may be
   named `trunk-unit`.

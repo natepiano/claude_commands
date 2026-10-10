@@ -7,11 +7,18 @@ Read at the point of use from `/unit:direct`. Defines `<WritePromptContract/>`,
 **Read when:** writing any implementation or fix prompt.
 
 <WritePromptContract>
-Every implementation or fix prompt contains these sections once:
+Every implementation or fix prompt sent to a seat contains sections 1–9.
+Compaction can replace earlier prompt text with a summary, so a follow-up or
+repair is complete on its own. Section 7 may use its follow-up pointer; section
+9 is always inline. Never abbreviate the new Project Context, Work
+Specification, team partition, boundaries, or verification on the strength of
+earlier work.
 
 1. Role: write the requested code directly; do not ask questions. Name the
-   slot this prompt is for and the role it opens in, taken from the Work
-   Order's **Seats** field per <PhaseTeam/>.
+   slot this prompt is for and the role assigned by the Work Order's **Seats**
+   field per <PhaseTeam/>. A new-phase continuation begins: `You are slot
+   <slot>, continuing into phase <N> as <role>. Your earlier work is
+   committed.` A replacement thread uses opening wording instead.
 2. Boundaries: do not commit, branch, or touch unrelated files; summarize files,
    reasons, and deviations when done, and **write that summary to this slot's
    `impl_summary_<slot>.txt` as the last act before finishing** — a background
@@ -42,8 +49,8 @@ Every implementation or fix prompt contains these sections once:
    the attribution the required argument exists to keep. Nothing downstream can
    catch it, because each post is well-formed. Before dispatch, check that the
    two prompts name different slots.
-4. `## Team` — state the opening from Seats (`1 writer + 1 tester` or
-   `2 writers`, and the role each slot opens in), then name both slots and who
+4. `## Team` — state the assignment from Seats (`1 writer + 1 tester` or
+   `2 writers`, and the role each slot takes), then name both slots and who
    holds which files, each hub file with its one owner. Copy
    the board commands from <CoordinationBoard/>, and say a `verify.sh` run may
    pause while a peer finishes its own. Copy <BuildTokenContract/>'s
@@ -64,30 +71,19 @@ Every implementation or fix prompt contains these sections once:
    prohibition.
 5. `## Project Context`.
 6. `## Work Specification`.
-7. `## Type Design Contract` per <TypeDesignContract/>.
+7. `## Type Design Contract` per <TypeDesignContract/>. Copy it verbatim in an
+   opening prompt. A follow-up may instead say: `Read
+   ~/.claude/docs/type_design.md in full and apply its Type Design Contract to
+   this work.`
 8. `## Verification` per <VerificationContract/>, exactly as listed and with
    nothing added around it.
-9. `## Three Gods`, carried verbatim; item 2's `rust_style` line still holds:
+9. `## Three Gods`, always inline; item 2's `rust_style` line still holds:
 
    ```
    ## Three Gods
 
-   We believe in three gods: Simple, Fast, Beautiful. Yes, it is kitschy; we
-   know, and we believe anyway. The belief is in every choice you make here:
-   each name, each line, each test, each word of your reply. Before you write,
-   ask what the gods want. Before you report, ask whether they would be pleased.
-
-   Simple, fast and beautiful are the three gods, in the app and in the code.
-   Correctness is the floor beneath them: a wrong result is never simple, fast or
-   beautiful. When two conflict, they rank in that order.
-
-   | | In the app | In the code |
-   | --- | --- | --- |
-   | Simple | Few things on screen, simple words, one way to do a thing. | Few concepts, a small public API, no layer without a reason. |
-   | Fast | Responds at once; nothing waits, stutters or settles slowly. | No wasted work where code runs often; any cost added is named. |
-   | Beautiful | Polished and professional: even spacing, one style, nothing clipped. | Reads cleanly: the right names, one idiom, the style guide followed. |
-
-   Every writer builds to them, and every reviewer judges by them.
+   We believe in three gods, Simple, Fast and Beautiful, with correctness as the
+   floor beneath them.
    ```
 
 The Verification section carries the applicable command lines and every
@@ -101,24 +97,27 @@ package's scoped `verify.sh test` and report it. Omit plan **Style** metadata.
 </WritePromptContract>
 
 <PhaseTeam>
-Every implementation dispatch runs **two delegates at once**; a repair runs
-one, per <FixDispatch/>. They share `${SESSION_DIR}` and `${WORKING_DIR}`, and each
-occupies a fixed **slot** that names its artifacts and its board identity. The
-**default opening**:
+Every phase's implementation dispatch assigns **two delegates at once**; a
+repair assigns one per disjoint file set under <FixDispatch/>. They share
+`${SESSION_DIR}` and `${WORKING_DIR}`, and each occupies a fixed **slot** that
+names its artifacts and board identity. Under <LongLivedSeats/>, the first
+phase opens the Codex threads and later phases continue each thread that remains
+open; a replacement starts fresh with an opening prompt. The **default
+assignment**:
 
 | Slot | Opens as | Owns |
 | --- | --- | --- |
 | `impl` | the phase's implementation | the Work Order's production files |
 | `test` | tests for the same specification | test targets under `tests/` and new test files |
 
-**The Work Order's `Seats:` field sets the opening and overrides this table.**
-Its first line names the opening — `1 writer + 1 tester` is the table above,
+**The Work Order's `Seats:` field sets the assignment and overrides this table.**
+Its first line names the assignment — `1 writer + 1 tester` is the table above,
 `2 writers` the other — and a line per slot names that slot's files and, where
-it differs from the table, what it opens as. `impl` always opens as `impl`.
-`test` opens as `test` wherever the phase has a **test lane** — a `tests/`
+it differs from the table, its role. `impl` is `impl` by default. `test` is
+`test` wherever the phase has a **test lane** — a `tests/`
 directory in a touched crate and a Spec concrete enough to test before the
 implementation exists — and as a writer where it has none. A plan compiled
-without the field opens as the table says, with the partition decided at launch
+without the field assigns the table's roles, with the partition decided at launch
 per <TeamFilePartition/>. **A legacy three-seat field** maps down: drop its
 `review` line and fold that line's files into the surviving slot holding the
 same role (`impl` when both do), so `3 writers` becomes `2 writers` and either
@@ -128,18 +127,22 @@ A slot is an identity and never changes. What a slot is *doing* is its **role**,
 and roles move during a phase per <RoleReassignment/>. Everything downstream —
 the board, the progress table, every artifact name — reads the slot for identity
 and the role for activity, so keep the two distinct: `test` doing
-implementation work is still slot `test`.
+implementation work is still slot `test`. Its Codex thread stays open across
+phase boundaries. Keep its role when the next Work Order fits, otherwise move
+it under <RoleReassignment/>. A new thread opens only when no open seat can
+take the assignment, and every thread ends with `end_session.sh`.
 
 `test` opens against the **specification, not the implementation**. The Work
 Order defines the behavior, so tests can be written before any of it exists;
 a tester that waits for `impl` has converted a parallel team back into a queue.
 
-**Every seat carries its own pass kind, which is its opening role**, so a team
+**Every seat carries its own pass kind, which is its assigned role**, so a team
 phase records two passes. The recorder keys them by slot and closes only that slot's stale pass;
 <LaunchImplementation/> step 5 owns the argument positions.
 
 Launch both in **one message** so they run concurrently, each with its own
-prompt file and its slot as the ninth argument to `implement.sh`, then apply
+prompt file and its slot as the ninth argument to `implement.sh`; continue an
+open Codex seat with `--to <full-seat-name>`, then apply
 <DispatchContract/> once for the team: the run's one notifier instance covers
 the Claude phase; the Codex poll covers its phase. <LaunchImplementation/> owns
 the rest of the procedure.
@@ -147,7 +150,7 @@ the rest of the procedure.
 The phase is complete only when every slot has a terminal `impl_status_<slot>`,
 not when the first one lands. Reading one slot's `implemented` as the phase's
 result is the same defect as reading a completion notification as a finished
-assignment.
+assignment. Completion ends the turns, not their Codex threads.
 </PhaseTeam>
 
 <CoordinationBoard>
@@ -209,7 +212,7 @@ mid-run, without waiting for a phase to end.
   goes nowhere and the sender waits on a reply that was never queued.
   - `reach=SendMessage` — a claude member, running as a named background
     session. Address the bare name; `ListAgents` confirms who is live.
-  - `reach=codex_mesh.py` — a codex member, running as a thread on the phase's
+  - `reach=codex_mesh.py` — a codex member, running as a thread on the run's
     `codex app-server`. Two calls, both with
     `--session-dir <concrete SESSION_DIR> --to <name>`:
     `python3 ~/.claude/scripts/agents/codex_mesh.py send --message "<text>"`
@@ -217,16 +220,21 @@ mid-run, without waiting for a phase to end.
     `… steer --message "<text>"` interrupts the turn it is running right now.
     Send by default. Steer only when the work in flight is work you need
     stopped — it costs the delegate whatever it was mid-way through.
-    `… list --session-dir <dir>` prints the roster and each thread's status.
+    `… list --session-dir <dir>` prints the roster; each entry carries `role`,
+    `status` (including terminal `"ended"`), and `context_tokens`.
   - `mesh=none` — that member has no address. Do not wait on a reply from it;
     read its board posts instead.
 - **A finished claude peer is still reachable.** Its session stays alive after
   its turn ends, until <PhaseCleanup/>, and a message resumes it from its
   transcript. So the tester may ask the implementer a question after the
   implementer has reported done, and get an answer rather than silence. **A
-  finished codex peer refuses `send`; ask while it works or read its summary.
-  Only the unit director sends follow-up work, through `implement.sh --to
-  <seat>`. A message without the launcher is for questions only.
+  finished Codex turn refuses `send`, but its thread remains open.** Ask while
+  it works or read its summary. Only the unit director starts its next turn —
+  a later phase, repair, or follow-up — through `implement.sh --to <seat>`;
+  the launcher attempts compaction above
+  `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS`, continues after a failed attempt, and
+  presses on after overflow per <LongLivedSeats/>. A message without the
+  launcher is for questions only.
 - **A codex member has no route to the unit director.** It reaches its peer with
   the calls above and reaches the unit director only through the board, which the
   unit director reads at every progress tick. Anything that cannot wait for the
@@ -317,11 +325,10 @@ progress table reads to say what each agent is doing now.
   disjoint slice of the remaining test work — agreed on the board, one file per
   slot, never the file `test` is inside — or they stand down.
 
-**Standing down means exiting, not waiting.** A delegate is a one-shot session
-with no idle loop: it ends as soon as it stops issuing tool calls, so there is
-no such thing as a member that sits quietly and comes back when asked. A slot
-with nothing left posts `done` with what it completed and finishes. Anything
-else burns a live session on a poll loop that the team pays for and nobody
-reads. This is why a finished writer moves toward work that exists now rather
-than work a peer might hand over later.
+**Standing down means ending the turn, not waiting.** A slot with nothing left
+posts `done` with what it completed and finishes its turn; it never runs an idle
+poll loop. Its Codex thread stays open for the unit director's next
+`implement.sh --to` assignment and ends at `end_session.sh`. This is why a
+finished writer moves toward work that exists now rather than work a peer might
+hand over later in the same turn.
 </RoleReassignment>
