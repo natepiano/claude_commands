@@ -40,97 +40,26 @@
 
 ### Phase 1 — A wrapped production's notes are archived  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `production_lifecycle.py wrap` moves every phase note the production generated, and `prune` moves every retired unit's note, to `<vault>/archive/<showrunner folder>/<production slug>/<file name>.md`, a folder the vault's Git exclusions do not cover, so the vault's own auto-commit keeps them. Hand-written notes and other productions' notes stay where they are, and a unit of another production with the same session name then gets a fresh note at its first report.
-
-**Spec:**
-
-Why: nothing moves a finished production's notes out of the way, so a later unit that takes the same session name under another production is refused at every report (`phase note target is not owned by …`), because the target belongs to another unit; and `prune`, which the dailies run, deletes a retired unit's note, so its phases are lost before the wrap. The user wants the phases kept in the vault's Git history (2026-10-09: "i think we can afford to keep that in the hanadocs obsidian repo"; the vault commits its changes on its own).
-
-Where the archive lives: `_vault_root()` (1319) is the showrunners folder, `PHASE_TABLE_VAULT` or `~/rust/hanadocs/showrunners`; the vault is its parent. `refresh` appends `showrunners/` to the vault checkout's `info/exclude` (`_ensure_showrunners_excluded`, 1233), so live notes never reach the vault's Git history. The archive root is `_vault_root().parent / "archive"` (`~/rust/hanadocs/archive/` by default): read on 2026-10-09, the vault's `.gitignore` (`.obsidian/`, `settings.local.json`), its `.git/info/exclude` (`.ok/obsidian_knife_cache.json`, `conf/obsidian_knife/obsidian knife output.md`, `.trash/`, `showrunners/`) and the global `~/.config/git/ignore` exclude no `archive/` path (`git check-ignore --no-index archive/x/show/note.md` exits 1), and no `archive/` folder exists yet. No step of this phase changes the vault's `.gitignore` or `info/exclude`.
-
-`scripts/delegate/phase_table.py`:
-
-- New private helper, the one move both callers use:
-
-  ```python
-  def _archive_note(candidate: Path, vault_root: Path, slug: str) -> Path:
-      """Move one generated phase note into the vault's archive and return its new path."""
-  ```
-
-  1. `folder = vault_root.parent / "archive" / candidate.parent.name / slug`; `target = folder / candidate.name`.
-  2. The move never replaces a file. Create the folder (`mkdir(parents=True, exist_ok=True)`), publish with `os.link(candidate, target)`, then `candidate.unlink()`. When `os.link` raises `FileExistsError`, try `<stem>-2.md`, `<stem>-3.md`, … in the same folder until one links; a slug reused by a later production therefore keeps both runs' notes. Any other `OSError`, from the `mkdir` (an `archive` path that is a plain file included), the link or the unlink, raises `Refusal(f"cannot archive phase note {candidate}: {error}")`; a failure on `unlink` after the link succeeded removes the new link before raising, so the note exists in exactly one place.
-  3. The note's bytes, mode and frontmatter are unchanged by the move.
-  4. After the unlink, remove `candidate.parent` when it is empty, by the rule `prune` uses today (1347–1357): a folder that still holds files stays, and an `rmdir` failure on an empty folder raises `Refusal(f"cannot remove empty phase note directory {candidate.parent}: {error}")`.
-- New public function, beside `prune`:
-
-  ```python
-  def archive(production_doc: Path) -> list[Path]:
-      """Move a production's generated phase notes into the vault's archive."""
-  ```
-
-  1. `production = read_production(production_doc)`; `vault_root = _vault_root()`. When `vault_root.parent` does not exist, return `[]` and touch nothing (the rule `refresh` follows at 1367).
-  2. For each `candidate` in `sorted(vault_root.glob("*/*.md"))` whose `_note_ownership(candidate)` is a `NoteOwnership` with `production == production.slug` — every unit of the production, live or retired row alike — call `_archive_note(candidate, vault_root, production.slug)`. Skip everything else: a `NoteWithoutPhaseTableOwnership` (hand-written, or `phase_table: true` with no `production` or `unit`) and another production's note are never read past their frontmatter and never moved.
-  3. Return the archived paths in the order moved.
-- `prune` (1326) keeps its selection (owned notes of the doc's slug whose `unit` is not a live Units row) and replaces its `unlink` and `rmdir` block (1341–1357) with `_archive_note(candidate, vault_root, production.slug)`. Its docstring becomes `Archive generated notes for units no longer live in a production.` It still returns `None` and its CLI still prints nothing. A failure prints the helper's `Refusal` line, which `dailies_input.prune_phase_tables` already turns into `phase tables: unavailable — <reason>`.
-- `refresh`'s `_remove_stale_notes` (1303) still removes the older copy of a note whose unit moved to another session or showrunner folder: the newer note carries the same phases, so nothing is lost there. It is not changed.
-- Archived notes sit outside `vault_root`, so `refresh`, `_remove_stale_notes`, `_most_recent_owned_note`, `prune` and `archive`, which all scan `vault_root.glob("*/*.md")`, never see them. Do not widen any of those globs; a comment on `_archive_note` says the archive's place outside the showrunners folder is what keeps it out of every scan and inside the vault's Git history.
-- CLI: `phase_table.py archive --production-doc <doc>` (a new subparser in `_build_parser`, `--production-doc` required, `type=Path`). `main` resolves the path (`expanduser().resolve()`), prints each archived path on its own line on stdout, and exits 0, also when nothing moved; a `Refusal` prints its one line on stderr and exits 1, as `prune` does.
-- After an archive, the first `refresh` of a unit of another production whose note name is the same in the same showrunner folder finds no file at the target and publishes a fresh note through the existing first-write path (`os.link`). `refresh` itself is unchanged.
-
-`scripts/production/production_lifecycle.py`:
-
-- Add `import sys` and a module constant `PHASE_TABLE = Path(__file__).resolve().parent.parent / "delegate" / "phase_table.py"` (the path `dailies_input.phase_table_path()` uses, with no env override: tests point `PHASE_TABLE_VAULT` at a temp vault instead).
-- In `wrap`'s running-production branch, right after the notifier removal is reported (389) and before the status line is set to `wrapped` (390):
-
-  ```python
-  archived = command("phase-notes", production.checkout, sys.executable, str(PHASE_TABLE),
-                     "archive", "--production-doc", str(production.doc))
-  count = len(archived.splitlines())
-  report("phase-notes", "ok", f"archived {count} phase note{'' if count == 1 else 's'}"
-         if count else "no phase notes to archive")
-  ```
-
-  The placement is after the update timer is removed, so `showrunners.current_name(slug)` already answers empty and no late `refresh` can write a new note into the showrunners folder (it refuses with `the showrunner of <slug> is not running` when no owned note is left there). It is before the doc is marked `wrapped`, so a failed archive (`phase-notes: failed — <stderr>`, exit 2) leaves the doc `running` and a rerun of `wrap` repeats the archive, which finds only the notes still unmoved. A doc already `wrapped` does not archive again. The lifecycle commits nothing in the vault: the vault's own auto-commit picks up the new `archive/` files and the removed notes need no commit, since `showrunners/` is excluded.
-
-Docs:
-
-- `commands/showrunner/produce.md` step 3 of `<Wrap/>` (880–886): add `archives the production's phase notes in the vault,` after `removes the update instance,`. One clause; nothing else in the hub file changes.
-- `commands/showrunner/dailies.md` (101): `failed removal of retired notes` becomes `a failed archive of retired notes`.
-- `docs/as-built/phase-tables.md`: add `phase_table.py archive --production-doc <doc>` to the command block and `archive(production_doc: Path) -> list[Path]` to the record block; in the file table (13), `writes, moves and archives the notes`; rewrite the `prune` half of **Moves and `prune`** (108) so `prune` archives each retired unit's note; a bullet under **The note** for the archive path (`<vault>/archive/<showrunner folder>/<slug>/<name>.md`, outside the excluded `showrunners/`, committed by the vault's auto-commit), the no-replace rule with `-2`, `-3` suffixes, and the placement that keeps archived notes out of every scan; replace the gotcha `Nothing removes the note of a production that has ended…` (184) with the archive at wrap; in the gotcha at 186, `prunes the real vault` becomes `archives retired notes in the real vault`.
-- `docs/as-built/showrunner-automation.md` (81): in the `wrap` bullet, add `phase_table.py archive` after `notifier.sh remove showrunner-<slug>`.
-
-Scope notes (authored here, not by the user): the archive is a flat folder per showrunner and production with no index note; Obsidian lists it as plain files. `refresh`'s removal of a moved unit's older copy stays a deletion (above).
+- `_archive_note(candidate: Path, vault_root: Path, slug: str) -> Path` moves one generated note to `<vault>/archive/<showrunner folder>/<slug>/<name>.md` (`<vault>` is `_vault_root().parent`) by `os.link` then `unlink`, never replacing a file: a taken name gets `<stem>-2.md`, `<stem>-3.md`, … An `OSError` from the `mkdir`, link or unlink becomes `Refusal("cannot archive phase note …")`; a failed unlink removes the new link first. It removes a showrunner folder the move left empty.
+- `archive(production_doc: Path) -> list[Path]` (CLI `phase_table.py archive --production-doc <doc>`, one archived path per stdout line, exit 0 also when nothing moved) archives every `NoteOwnership` note of the production's slug, live or retired unit alike; hand-written notes and other productions' notes stay. A missing vault parent returns `[]`.
+- `prune` archives each retired unit's note through `_archive_note` instead of deleting it; its failure surfaces in the dailies as `phase tables: unavailable — <reason>`.
+- `production_lifecycle.py wrap` runs a `phase-notes` step (`sys.executable` on `PHASE_TABLE`) after the notifier removal and before the doc is marked `wrapped`; it reports `archived N phase note(s)` or `no phase notes to archive`, and a failure exits 2 and leaves the doc `running`, so a rerun of `wrap` repeats the archive.
+- After an archive, a same-named unit of another production gets a fresh note at its first `refresh`.
 
 **Files:**
-- `scripts/delegate/phase_table.py` — `_archive_note`, `archive`, its subparser and its `main` branch; `prune` archives instead of deleting.
-- `scripts/delegate/test_phase_table.py` — archive cases; the three `test_prune_*` cases (2400–2459) assert the archived path instead of a deletion.
-- `scripts/production/production_lifecycle.py` — `import sys`, `PHASE_TABLE`, the `phase-notes` step in `wrap`.
-- `scripts/production/test_production_lifecycle.py` — `PHASE_TABLE_VAULT` in `setUp`'s env, wrap cases.
-- `commands/showrunner/produce.md` — one clause in the wrap step.
-- `commands/showrunner/dailies.md` — one clause at 101.
-- `docs/as-built/phase-tables.md` — the archive command, path rule, `prune` and gotchas.
-- `docs/as-built/showrunner-automation.md` — one clause in the wrap bullet.
-- `docs/plans/build-followups-phase-tables-next.md` — remove both items (**The dailies count a phase's repair rounds from the run's records** and **A wrapped production's notes are archived**; they now live in this plan), then delete the file, which holds nothing else.
+- `scripts/delegate/phase_table.py` — `_archive_note`, `archive`, its subparser; `prune` archives.
+- `scripts/production/production_lifecycle.py` — `PHASE_TABLE`, the `phase-notes` wrap step.
+- `scripts/delegate/test_phase_table.py`, `scripts/production/test_production_lifecycle.py` — archive, prune and wrap cases.
+- `commands/showrunner/produce.md`, `commands/showrunner/dailies.md`, `docs/as-built/phase-tables.md`, `docs/as-built/showrunner-automation.md` — the archive at wrap and in `prune`.
 
-**Seats:** `1 writer + 1 tester` — the tests sit in their own files and the Spec fixes the paths, the CLI and the step line.
-- `impl` — `scripts/delegate/phase_table.py`, `scripts/production/production_lifecycle.py`, `commands/showrunner/produce.md`, `commands/showrunner/dailies.md`, `docs/as-built/phase-tables.md`, `docs/as-built/showrunner-automation.md`, `docs/plans/build-followups-phase-tables-next.md`; hub: none.
-- `test` — writes from the Spec alone, beside the code, in temp dirs only (`PHASE_TABLE_VAULT` always under the test's temp root; never `~/rust/hanadocs`):
-  - `scripts/delegate/test_phase_table.py` (helpers `write_phase_note`, `write_units_production`, `environment`; run the CLI as `run_prune` does): (a) notes of two units of production `show` in two showrunner folders move to `<vault>/archive/<folder>/show/<name>.md`, where `<vault>` is the parent of `PHASE_TABLE_VAULT`, with identical bytes and mode; the CLI prints both paths and exits 0; each showrunner folder left empty is removed; (b) a hand-written `notes.md`, a `phase_table: true` note with no `production`, and production `other`'s note in the same folder are untouched, and that folder stays; (c) an existing `archive/<folder>/show/<name>.md` is kept and the moved note lands at `<name>-2.md`; (d) with `PHASE_TABLE_VAULT` under a parent that does not exist the command prints nothing and exits 0; (e) after archive, a `refresh` of production `other`'s unit whose note name equals the archived note's name, in the same showrunner folder (the setup of `test_refresh_refuses_to_replace_another_units_note`), exits 0 and writes a note owned by `other`; (f) `prune` for production `show` after archive leaves every archived note in place; (g) `prune` moves a retired unit's note to `<vault>/archive/<folder>/show/<name>.md` and leaves the live unit's note in its showrunner folder; (h) with the temp vault a `git init` repo, after a `refresh` and an `archive`, `git -C <vault> check-ignore archive/<folder>/show/<name>.md` exits 1, `git -C <vault> check-ignore showrunners/<folder>/x.md` exits 0, and the vault's `.gitignore` and `info/exclude` hold no `archive` line.
-  - `scripts/production/test_production_lifecycle.py`: add `PHASE_TABLE_VAULT` (`self.root / "vault" / "showrunners"`, parent created) to `self.env`; a wrap case like `test_wrap_without_ci_retires_units_removes_notifier_and_reports` with one note owned by `example`/`alpha-unit`, one by `other`/`alpha-unit` and one hand-written note in a showrunner folder asserts `phase-notes: ok — archived 1 phase note`, the moved file under `self.root / "vault" / "archive" / <folder> / "example"`, and the other two unchanged; a case where the archive fails (`self.root / "vault" / "archive"` is a plain file) asserts `phase-notes: failed`, exit 2, the note still in its showrunner folder and the doc still `running`.
+**Gotchas:**
+- The archive sits outside `showrunners/`, which keeps it out of every `vault_root.glob("*/*.md")` scan and inside the vault's Git history; widening those globs would pull archived notes back into `refresh`, `prune` and `archive`.
+- The `showrunners/` line in the vault's `info/exclude` is unanchored, so an archive path whose slug or showrunner folder is literally `showrunners` is ignored by Git too.
+- `refresh`'s `_remove_stale_notes` still deletes the older copy of a moved unit's note; the newer note carries the same phases.
 
-**Constraints from prior phases:** The phase-tables run (as-built `docs/as-built/phase-tables.md`) built `refresh`, `prune`, `_note_ownership`, `_ensure_showrunners_excluded` and the `*/*.md` scans this phase relies on; `showrunners.current_name(slug)` reads the showrunner's name from its update timer, which `wrap` removes. `scripts/production/showrunners.py` reads `NOTIFIER_STATE_DIR` and `NOTIFIER_SESSIONS_DIR` once, at import: a test that runs a script in a subprocess sets them in the child's environment. `phase_table.py` puts `scripts/production` on `sys.path` itself, so the lifecycle runs it as a plain script under `sys.executable` from any working directory.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/delegate -p 'test_phase_table.py'` green, with cases (a)–(h) and the three `test_prune_*` cases asserting archived paths.
-- `python3 -m unittest discover -s scripts/production -p 'test_production_lifecycle.py'` green, with the two wrap cases.
-- `python3 -m unittest discover -s scripts/production -p 'test_dailies_input.py'` green (its prune path now archives).
-- `basedpyright scripts/delegate/phase_table.py scripts/delegate/test_phase_table.py scripts/production/production_lifecycle.py scripts/production/test_production_lifecycle.py` reports `0 errors, 0 warnings`.
-- `docs/plans/build-followups-phase-tables-next.md` no longer exists.
-- Observable: in a temp Git vault, a wrapped production's generated notes and a pruned retired unit's note sit under `<vault>/archive/<showrunner>/<slug>/`, which `git check-ignore` does not exclude; hand-written notes are where they were; and a same-named unit of another production writes its note on its first report.
-
-### Phase 2 — The dailies count a phase's repair rounds from the run's records  · status: todo
+### Phase 2 — The dailies count a phase's repair rounds from the run's records  · status: done
 
 #### Work Order
 

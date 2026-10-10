@@ -144,6 +144,7 @@ class CurrentPhaseEtaUnavailable(NamedTuple):
 
 class FirstStatedEtaTarget(NamedTuple):
     time: datetime
+    repair_rounds: int
 
 
 class EtaNeverStated(NamedTuple):
@@ -472,10 +473,24 @@ def unit_phase_state(value: object, where: str, zone: ZoneInfo) -> UnitPhaseStat
     if not in_plan:
         return NoNumberedOpenPlanPhase(OpenPhaseOutsidePlan())
     first_value = current.get("first_stated_eta_target")
-    first_stated: FirstStatedEtaTarget | EtaNeverStated = (
-        EtaNeverStated() if first_value is None
-        else FirstStatedEtaTarget(record_time(first_value, f"{where}.current.first_stated_eta_target", zone))
-    )
+    first_stated: FirstStatedEtaTarget | EtaNeverStated
+    if first_value is None:
+        first_stated = EtaNeverStated()
+    else:
+        repair_rounds_path = f"{where}.current.repair_rounds_since_first_stated_eta"
+        repair_rounds = current.get("repair_rounds_since_first_stated_eta")
+        if (
+            isinstance(repair_rounds, bool)
+            or not isinstance(repair_rounds, int)
+            or repair_rounds < 0
+        ):
+            raise ValueError(
+                f"{repair_rounds_path}: expected a whole number from 0"
+            )
+        first_stated = FirstStatedEtaTarget(
+            record_time(first_value, f"{where}.current.first_stated_eta_target", zone),
+            repair_rounds,
+        )
     return NumberedOpenPlanPhase(
         int(phase),
         record_time(current.get("started"), f"{where}.current.started", zone),
@@ -651,6 +666,7 @@ def record_eta_value(
     result["percent"] = phase.percent.percent if isinstance(phase.percent, ReportedPhasePercent) else None
     if isinstance(phase.first_stated, FirstStatedEtaTarget):
         result["first"] = record_text(phase.first_stated.time)
+        result["fixes"] = phase.first_stated.repair_rounds
     if isinstance(eta, CurrentStatedPhaseEta):
         result["why"] = " ".join(eta.basis.split())
     else:

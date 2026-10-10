@@ -1818,6 +1818,120 @@ class PhaseTableTests(unittest.TestCase):
         self.assertNotIn("first", eta)
         self.assertIsNone(current["first_stated_eta_target"])
 
+    def test_json_counts_repair_rounds_from_the_first_eta_statement(self) -> None:
+        self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
+        _ = self.write_run(
+            "current",
+            900,
+            self.phase_event("phase_started", "1", "one", 1_000),
+            self.phase_event(
+                "pass_started", "1", "one", 1_010, pass_kind="fix", fix_pass=1
+            ),
+            self.phase_event(
+                "eta_stated",
+                "1",
+                "one",
+                1_050,
+                eta_at=1_500,
+                basis="first promise",
+            ),
+            self.phase_event(
+                "pass_started", "1", "one", 1_060, pass_kind="review", fix_pass=1
+            ),
+            self.phase_event(
+                "pass_started", "1", "one", 1_070, pass_kind="fix", fix_pass=2
+            ),
+            self.phase_event(
+                "pass_started", "1", "one", 1_080, pass_kind="review", fix_pass=2
+            ),
+            self.phase_event(
+                "pass_started", "1", "one", 1_090, pass_kind="fix", fix_pass=3
+            ),
+            self.phase_event(
+                "pass_started", "1", "one", 1_100, pass_kind="test", fix_pass=0
+            ),
+            self.phase_event(
+                "pass_started", "1", "other", 1_110, pass_kind="fix", fix_pass=4
+            ),
+            self.phase_event(
+                "eta_stated",
+                "1",
+                "one",
+                1_120,
+                eta_at=1_700,
+                basis="restated after repair",
+            ),
+        )
+        self.write_state(None)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "show",
+                "--session-dir",
+                str(self.session_dir),
+                "--zone",
+                "UTC",
+                "--json",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=self.environment(1_200),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        parsed = cast("dict[str, object]", json.loads(result.stdout))
+        current = cast("dict[str, object]", parsed["current"])
+        eta = cast("dict[str, object]", current["eta"])
+        self.assertEqual(
+            current["first_stated_eta_target"], "1970-01-01T00:25:00+00:00"
+        )
+        self.assertEqual(current["repair_rounds_since_first_stated_eta"], 2)
+        self.assertEqual(eta["time"], "1970-01-01T00:28:20+00:00")
+
+    def test_json_does_not_count_a_round_started_with_the_first_eta(self) -> None:
+        self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
+        stated = self.phase_event(
+            "eta_stated", "1", "one", 1_000, eta_at=1_500, basis="first promise"
+        )
+        repair = self.phase_event(
+            "pass_started", "1", "one", 1_000, pass_kind="fix", fix_pass=1
+        )
+        stated["timestamp_epoch"] = 1_000.0000004
+        repair["timestamp_epoch"] = 1_000.0000004
+        _ = self.write_run(
+            "current",
+            900,
+            self.phase_event("phase_started", "1", "one", 990),
+            stated,
+            repair,
+        )
+        self.write_state(None)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "show",
+                "--session-dir",
+                str(self.session_dir),
+                "--zone",
+                "UTC",
+                "--json",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=self.environment(1_200),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        parsed = cast("dict[str, object]", json.loads(result.stdout))
+        current = cast("dict[str, object]", parsed["current"])
+        self.assertEqual(current["repair_rounds_since_first_stated_eta"], 0)
+
     def test_json_keeps_first_stated_target_after_the_eta_passes(self) -> None:
         self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
         _ = self.write_run(
@@ -1831,6 +1945,9 @@ class PhaseTableTests(unittest.TestCase):
                 1_050,
                 eta_at=1_100,
                 basis="first promise",
+            ),
+            self.phase_event(
+                "pass_started", "1", "one", 1_070, pass_kind="fix", fix_pass=1
             ),
         )
         self.write_state(None)
@@ -1858,6 +1975,7 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual(
             current["first_stated_eta_target"], "1970-01-01T00:18:20+00:00"
         )
+        self.assertEqual(current["repair_rounds_since_first_stated_eta"], 1)
 
     def test_json_marks_an_open_phase_whose_eta_was_never_stated(self) -> None:
         self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
@@ -1889,6 +2007,7 @@ class PhaseTableTests(unittest.TestCase):
         current = cast("dict[str, object]", parsed["current"])
         self.assertIsNone(current["eta"])
         self.assertIsNone(current["first_stated_eta_target"])
+        self.assertIsNone(current["repair_rounds_since_first_stated_eta"])
 
     def test_production_json_resolves_each_plan_from_its_unit_worktree(
         self,

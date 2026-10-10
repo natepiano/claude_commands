@@ -287,6 +287,7 @@ class DailiesInputTests(unittest.TestCase):
         eta: dict[str, object] | None = None,
         has_eta: bool = True,
         first: str | None = "2026-10-07T00:30:00+00:00",
+        repair_rounds: int | None = 0,
         status: str = "running",
     ) -> None:
         current_eta: dict[str, object] | None = eta if eta is not None else {
@@ -312,6 +313,9 @@ class DailiesInputTests(unittest.TestCase):
                 "percent": percent,
                 "eta": current_eta,
                 "first_stated_eta_target": first,
+                "repair_rounds_since_first_stated_eta": (
+                    repair_rounds if first is not None else None
+                ),
             },
             "phases": [{
                 "phase": phase,
@@ -458,7 +462,7 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(self.unit()["eta"], {
             "time": "17:40", "earliest": "17:35", "latest": "17:55", "percent": 60,
             "first": "2026-10-06T17:30", "why": "checks and build remain",
-            "stated": "2026-10-06T16:45",
+            "fixes": 0, "stated": "2026-10-06T16:45",
         })
         self.assertEqual(self.phase_table_calls(), [
             ["prune", "--production-doc", str(self.doc)],
@@ -529,16 +533,29 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(self.unit()["eta"], {
             "time": "18:10", "earliest": "18:00", "latest": "18:25", "percent": 60,
             "first": "2026-10-06T17:30", "why": "it is now projected from 60% done",
-            "stated": "2026-10-06T16:50",
+            "fixes": 0, "stated": "2026-10-06T16:50",
         })
 
+    def test_record_supplies_repair_rounds_and_the_renderer_names_them(self) -> None:
+        self.open_phase_record(repair_rounds=2)
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+
+        built = self.run_builder("--length", "simple")
+
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        eta = cast(dict[str, object], self.unit()["eta"])
+        self.assertEqual(eta["fixes"], 2)
+        rendered = self.run_renderer(AT)
+        self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
+        self.assertIn("2 fix rounds added", rendered.stdout)
+
     def test_record_eta_each_judgment_field_wins_and_a_deciding_value_keeps_record_out(self) -> None:
-        self.open_phase_record()
+        self.open_phase_record(repair_rounds=2)
         self.status_lines(f"== {ALPHA}", "ETA 18:55")
         self.judgment_file(alpha={
             "started": "2026-10-06T09:12",
             "eta": {"earliest": "17:32", "percent": 72, "first": "2026-10-06T16:00",
-                    "why": "the showrunner knows why", "fixes": 3},
+                    "why": "the showrunner knows why", "fixes": 5},
         })
         filled = self.run_builder()
         self.assertEqual(filled.returncode, 0, filled.stdout + filled.stderr)
@@ -546,7 +563,7 @@ class DailiesInputTests(unittest.TestCase):
         eta = cast(dict[str, object], self.unit()["eta"])
         self.assertEqual((eta["time"], eta["earliest"], eta["latest"]), ("17:40", "17:32", "17:55"))
         self.assertEqual((eta["percent"], eta["first"], eta["why"], eta["fixes"]),
-                         (72, "2026-10-06T16:00", "the showrunner knows why", 3))
+                         (72, "2026-10-06T16:00", "the showrunner knows why", 5))
 
         self.judgment_file(alpha={"eta": {"none": "none measured"}})
         decided = self.run_builder()
@@ -632,7 +649,36 @@ class DailiesInputTests(unittest.TestCase):
         built = self.run_builder()
         self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
         self.assertEqual(self.unit()["eta"], {"none": "no ETA stated yet"})
+        self.assertNotIn("fixes", cast(dict[str, object], self.unit()["eta"]))
         self.assertNotIn("request /unit:eta:", built.stdout)
+
+    def test_malformed_record_repair_rounds_use_the_status_capture_path(self) -> None:
+        for malformed in (-1, True, "2"):
+            with self.subTest(malformed=malformed):
+                self.open_phase_record()
+                payload = cast(
+                    dict[str, dict[str, object]],
+                    json.loads(self.phase_table_json.read_text(encoding="utf-8")),
+                )
+                current = cast(dict[str, object], payload[ALPHA]["current"])
+                current["repair_rounds_since_first_stated_eta"] = malformed
+                _ = self.phase_table_json.write_text(
+                    json.dumps(payload) + "\n", encoding="utf-8"
+                )
+                self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 23:40")
+
+                built = self.run_builder()
+
+                self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+                self.assertIn(
+                    "phase tables: unavailable — "
+                    + "phase tables.alpha-unit.current."
+                    + "repair_rounds_since_first_stated_eta: "
+                    + "expected a whole number from 0",
+                    built.stdout,
+                )
+                eta = cast(dict[str, object], self.unit()["eta"])
+                self.assertEqual(eta["time"], "23:40")
 
     def test_nonmatching_record_keeps_the_screen_capture_path(self) -> None:
         self.open_phase_record(phase="3")
