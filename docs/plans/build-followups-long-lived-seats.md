@@ -80,33 +80,28 @@ natedev, 2026-10-10: rollout phases first, measurement last; measurement must no
 
 ### Phase 2 — Measure: Codex usage per phase, credits and account switches, before and after; overflow guard fix · status: done
 
-#### Work Order
+#### As-built
 
-**Blocked by:** G1, for the verdict run only (T_live 2026-10-10T18:17:00Z, natedev's go-live message to every unit director). The script and the credit logging are built right after Phase 1, ahead of the review phase, so the daily updates the user asked for (2026-10-10: "i want to get updates at least daily over the next 7 days") use it from go-live; the unit director runs it every day of the 7.
-
-**Goal:** a report says whether Codex usage per checkpointed phase fell after T_live, and by how much, with credits and account switches beside it.
-
-**Spec:**
-- `scripts/whoami/seat_usage.py --before <start> <T_live> --after <T_live> <end>` reads Codex rollouts on natedev and the Mac (`natemccoy@mac`, by `ssh`), and for each window prints: threads opened; weighted Codex usage (uncached 1 : cached 0.1 : output 8, the ratio of OpenAI's published prices for the seat model, read on the day and named in the output); the share spent before each thread's first edit; compactions; and phases checkpointed (commits whose subject starts `checkpoint(` on all branches of `~/.claude` and of the repositories the production rows name). The verdict line is weighted usage per checkpointed phase, before and after, with the change in percent.
-- Codex account switches per week from the readings log, with the baseline copy in `~/.local/state/usage-model/seats-baseline/` for the days the live log has dropped.
-- Credits: `agent_notes.py` adds `credits` to each Codex reading from this phase on; the report prints credits used per day where the log has them, and says the before window had no credit history.
-- natedev gets the verdict line and the table; NOTES.md gets the same.
-- **No orphaned app-servers (showrunner, 2026-10-10).** On natedev, 5 `codex app-server` processes up 1–2 days are named by no `mesh_server.json`, and the idle stop never reaches them. (1) Replacing a run's `mesh_server.json` (the `retrying on a new app-server` path, a sign-in retirement, or any new server for a run) stops the server the old record named, or lists it in `RETIRED_FILE` so the idle watcher stops it once its turns finish; it never leaves it running unowned. (2) `codex_mesh.py sweep --stop` also stops a `codex app-server --listen ws://` that no record under the sweep root names, and a recorded server whose run has ended (no run-active marker under `active/` names its folder and no roster seat is `running`), keeping the existing two-looks rule and never touching the `--listen unix://` daemon or a server another live record names. Something already scheduled runs it (find the existing sweep caller; if none runs it periodically, run it from `remove_seats.py` at phase end and from `end_session.sh`). (3) After the merge to main, a `sweep --stop` run clears the 5 orphans and the ended runs among the recorded servers; the unit director runs it and reports the counts to natedev.
-- **Overflow guard fix (carried from Phase 1's closure review).** `codex_mesh.py` clears the one-continuation overflow guard on any non-compaction `item/completed` (around line 1944), and the continuation's own `userMessage` item is one, so on a real server a second overflow with no work between is pressed on forever. Count only the seat's own work items as progress (not `userMessage`, not `contextCompaction`). Make the fake server in `test_codex_mesh.py` emit the submitted `userMessage` `item/completed` on every `turn/start`, as the real app-server does, and add a regression that fails on the old condition.
+- `scripts/whoami/seat_usage.py --before <start> <end> --after <start> <end>`, or `--daily [--t-live <time>]` (the 7 days before T_live 2026-10-10T18:17:00Z against T_live to now), reads Codex rollouts on natedev and the Mac (`natemccoy@mac`, by `ssh`). Per window it prints threads opened, weighted Codex usage (uncached input 1 · cached input 0.1 · output 8, named in the output), the share spent before each thread's first edit, compactions, and phases checkpointed (`checkpoint(` commits on all branches of `~/.claude` and the repositories the production rows name). The verdict line is weighted usage per checkpointed phase, before and after, with the change in percent; beside it are Codex account switches per week (readings log, plus the baseline copy in `~/.local/state/usage-model/seats-baseline/`) and credits used per day.
+- Missing data prints an explicit unavailable state (Mac unreachable, no switch history, insufficient credit history) instead of a number; these states appear in the daily update text.
+- `agent_notes.py` records `credits` with each Codex reading.
+- The overflow guard in `codex_mesh.py` counts only the seat's own work items as progress — not `userMessage`, not `contextCompaction` — so a second overflow with no work between is an error on a real server.
+- `codex_mesh.py sweep [--stop]` judges every `codex app-server --listen ws://` process by ownership (current, retired, unowned with or without a log): connected clients first, then the run-active marker, running seats, launchers, age and quiet time, then live conversations. It prints a verdict per server (`in use`, `unused`, `stopped`, `kept`), takes a second look under the owner's lock before stopping, and never touches the `--listen unix://` daemon. A failed server start terminates its process and drops its record.
+- `remove_seats.py` runs `sweep --stop` after a successful session listing; `end_session.sh` runs it after `stop`. A sweep failure never stops seat cleanup.
 
 **Files:**
-- `scripts/agents/codex_mesh.py`
-- `scripts/agents/test_codex_mesh.py`
-- `scripts/whoami/seat_usage.py`
-- `scripts/whoami/test_seat_usage.py`
-- `scripts/whoami/agent_notes.py`
-- `scripts/whoami/test_agent_notes.py`
+- `scripts/whoami/seat_usage.py` — the before/after report and `--daily`
+- `scripts/whoami/test_seat_usage.py` — report tests, unavailable states included
+- `scripts/whoami/agent_notes.py`, `scripts/whoami/test_agent_notes.py` — `credits` field
+- `scripts/agents/codex_mesh.py` — overflow guard, `sweep`, failed-start cleanup
+- `scripts/agents/test_codex_mesh.py` — the fake server emits the submitted `userMessage` `item/completed` on every `turn/start`, as the real app-server does; guard regression; sweep verdict tests
+- `scripts/delegate/remove_seats.py`, `scripts/delegate/end_session.sh` (and `test_remove_seats.py`, `test_end_session.py`) — sweep callers
 
-**Seats:** `2 writers` — `impl` fixes the overflow guard in `codex_mesh.py` and its tests, then reviews the report's tests; `test` writes `seat_usage.py`, the `agent_notes.py` credits field, and their tests.
+**Binds later work:** **Reviews go to open seats** narrows `seat_usage.py` `is_edit` so a quoted mention of `tools.apply_patch(` is not an edit, keeping the pattern for real `exec` calls.
 
-**Constraints from prior phases:** Phase 1: compaction is counted from the rollouts (`thread/compacted` / `contextCompaction` items), not the board; `implement.sh` posts a board line when it compacts a seat; the roster's `context_tokens` holds each seat's last known context size.
+**Gotchas:** real Codex edits arrive as `exec` custom tool calls whose JavaScript calls `tools.apply_patch(`, not as `apply_patch` tool calls; edit detection must match that call. A run with no run-active marker (ask-a-friend friends, a Codex-hosted director) keeps its server only while a client, launcher, running seat or under 30 minutes of activity exists; a stopped server comes back on the next use and its threads resume.
 
-**Acceptance gate:** the verification lines green; the report over the real windows exits 0 and prints every column.
+**Ruled out:** dropping the `tools.apply_patch(` pattern from edit detection — it is how real edits are logged.
 
 ### Phase 3 — Reviews go to open seats · status: todo
 
