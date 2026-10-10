@@ -201,7 +201,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 **Ruled out:** An `ACCOUNTS_HOME` override beside `HOME`, since a second home setting disagrees with `claude_on_disk`, which reads `~/.claude.json` via `Path.home()`.
 
-### Phase 2 — Units launch, resume and restart on the unit account  · status: todo
+### Phase 2 — Units launch, resume and restart on the unit account  · status: done
 
 #### Work Order
 

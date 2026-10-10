@@ -100,7 +100,10 @@ class RecordTests(unittest.TestCase):
             self.enterContext(
                 patch.dict(
                     os.environ,
-                    {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown")},
+                    {
+                        "HOME": str(self.root),
+                        "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
+                    },
                 )
             ),
         )
@@ -341,6 +344,40 @@ class RecordTests(unittest.TestCase):
         record.create(first)
 
         self.assertEqual(record.live_records(), [first, second])
+
+    def test_config_dir_is_saved_only_on_the_session_and_round_trips(self) -> None:
+        """F004: persistence keeps one authoritative directory on the session."""
+        live = shutdown_record()
+        config_dir = str(self.root / "account with spaces")
+        live["entries"][0]["session"]["config_dir"] = config_dir
+
+        record.create(live)
+
+        found = record.find_live(live["login"])
+        if found["kind"] != "live":
+            self.fail("expected a live shutdown record")
+        restored = found["record"]["entries"][0]
+        self.assertEqual(restored["session"].get("config_dir"), config_dir)
+        self.assertNotIn("config_dir", restored)
+        self.assertEqual(
+            record.parse_records(json.dumps([found["record"]])),
+            [found["record"]],
+        )
+
+    def test_obsolete_entry_config_dir_is_ignored_when_reading_records(self) -> None:
+        """F004: old entry-level directories never override the session snapshot."""
+        for obsolete_dir in (str(self.root / "old account"), 123):
+            with self.subTest(obsolete_dir=obsolete_dir):
+                live = shutdown_record()
+                config_dir = str(self.root / "current account")
+                live["entries"][0]["session"]["config_dir"] = config_dir
+                entry_values = cast(dict[str, object], cast(object, live["entries"][0]))
+                entry_values["config_dir"] = obsolete_dir
+
+                restored = record.parse_records(json.dumps([live]))[0]["entries"][0]
+
+                self.assertNotIn("config_dir", restored)
+                self.assertEqual(restored["session"].get("config_dir"), config_dir)
 
     def test_every_record_variant_round_trips(self) -> None:
         progresses: list[record.SessionProgress] = [

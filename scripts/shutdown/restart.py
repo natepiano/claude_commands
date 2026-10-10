@@ -354,6 +354,13 @@ def restart_note(
 
 
 def _resume_command(session: Session, prompt: str) -> str:
+    default_dir = str(Path.home() / ".claude")
+    config_dir = session.get("config_dir", default_dir)
+    prefix = (
+        f"CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} "
+        if config_dir != default_dir
+        else ""
+    )
     argv = [
         "claude",
         "--resume",
@@ -368,7 +375,7 @@ def _resume_command(session: Session, prompt: str) -> str:
         argv.extend(("--model", model["name"]))
     argv.extend(("--settings", '{"disableAgentView": true}', prompt))
     return (
-        f"cd {shlex.quote(session['cwd'])} && ENABLE_TOOL_SEARCH=true command "
+        f"cd {shlex.quote(session['cwd'])} && {prefix}ENABLE_TOOL_SEARCH=true command "
         f"{shlex.join(argv)}; exec zsh"
     )
 

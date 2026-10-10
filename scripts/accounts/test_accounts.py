@@ -505,6 +505,29 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(self.run_cli("role", "unit"), (0, "default\n", ""))
         self.assertEqual(self.run_cli("env", "unit"), (0, "\n", ""))
 
+    def test_account_prefix_keeps_the_selection_after_the_role_changes(self) -> None:
+        """F003: rendering a selected account never resolves the role again."""
+        accounts.set_role("unit", "claude 3")
+        selected = accounts.role_account("unit")
+        accounts.set_role("unit", "claude 1")
+
+        self.assertEqual(
+            accounts.account_prefix(selected),
+            f"CLAUDE_CONFIG_DIR={shlex.quote(str(self.home / '.claude3'))} ",
+        )
+        self.assertEqual(
+            accounts.launch_prefix("unit"),
+            f"CLAUDE_CONFIG_DIR={shlex.quote(str(self.home / '.claude1'))} ",
+        )
+
+    def test_default_account_prefix_is_empty_without_reading_role_configuration(self) -> None:
+        """F003: a default selection renders without another configuration lookup."""
+        config = accounts.accounts_config_file()
+        config.parent.mkdir()
+        _ = config.write_text("{invalid", encoding="utf-8")
+
+        self.assertEqual(accounts.account_prefix(accounts.DefaultAccount()), "")
+
     def test_paths_read_home_at_call_time_without_an_import_time_constant(self) -> None:
         later_home = self.root / "later home"
         _ = later_home.mkdir()

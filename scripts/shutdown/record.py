@@ -608,6 +608,8 @@ def _orchestration_stop_issue(
 
 def _entry(value: object, place: str) -> ShutdownSessionEntry:
     values = _mapping(value, place)
+    # Earlier records duplicated this session field on the entry.
+    _ = values.pop("config_dir", None)
     try:
         values["session"] = parse_session(
             _required(values, "session", place), f"{place}.session"

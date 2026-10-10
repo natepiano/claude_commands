@@ -409,12 +409,16 @@ def role_account(role: str) -> AccountSelection:
     return NamedAccount(label, account_dir(label))
 
 
-def launch_prefix(role: str) -> str:
-    """Return the shell assignment needed before launching this role."""
-    selected = role_account(role)
+def account_prefix(selected: AccountSelection) -> str:
+    """Return the shell assignment for an already selected account."""
     if isinstance(selected, DefaultAccount):
         return ""
     return f"CLAUDE_CONFIG_DIR={shlex.quote(str(selected.dir))} "
+
+
+def launch_prefix(role: str) -> str:
+    """Return the shell assignment needed before launching this role."""
+    return account_prefix(role_account(role))
 
 
 def _atomic_write(path: Path, contents: str) -> None:
