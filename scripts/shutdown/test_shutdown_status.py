@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
+from test_support import ShutdownSendLeaf, ShutdownTestCase
 import shutdown
 import record as record_store
 from account import UnreadableAccount
@@ -89,7 +90,7 @@ def complete_record(machine: str = "natedev") -> ShutdownRecord:
 
 
 @final
-class ShutdownStatusTests(unittest.TestCase):
+class ShutdownStatusTests(ShutdownTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -98,6 +99,7 @@ class ShutdownStatusTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.notes = self.root / "agents"
         self.notes.mkdir()
@@ -164,6 +166,7 @@ else:
         return result, standard_output.getvalue(), standard_error.getvalue()
 
     def run_plain_status_with_ssh(self) -> tuple[int, str, str]:
+        self.allow_leaf(ShutdownSendLeaf.RUN_REMOTE)
         standard_output = io.StringIO()
         standard_error = io.StringIO()
         with (

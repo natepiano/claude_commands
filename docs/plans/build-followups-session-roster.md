@@ -215,7 +215,7 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 **Ruled out:** a module-wide ban on wind-down calling `broadcast` — it copies the group send into wind-down.
 
-### Phase 6 — A shutdown test that reaches the real sender fails instead of sending · status: todo
+### Phase 6 — A shutdown test that reaches the real sender fails instead of sending · status: done
 
 #### Work Order
 

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
+from test_support import ShutdownTestCase
 import inventory
 import launch_permission
 import record
@@ -86,7 +87,7 @@ def shutdown_record(
 
 
 @final
-class ShutdownLaunchCliTests(unittest.TestCase):
+class ShutdownLaunchCliTests(ShutdownTestCase):
     root = Path()
     state = Path()
     home = Path()
@@ -94,6 +95,7 @@ class ShutdownLaunchCliTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.state = self.root / "shutdown"
         self.home = self.root / "home"

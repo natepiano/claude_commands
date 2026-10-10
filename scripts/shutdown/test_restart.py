@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Literal, cast, final, override
 from unittest.mock import patch
 
+from test_support import ShutdownSendLeaf, ShutdownTestCase
 import inventory
 import record
 import remote as remote_transport
@@ -267,13 +268,14 @@ class CommandRecorder:
 
 
 @final
-class RestartTests(unittest.TestCase):
+class RestartTests(ShutdownTestCase):
     root: Path = Path()
     state_root: Path = Path()
     account = Account("claude", LOGIN, LABEL)
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.state_root = self.root / "shutdown"
         environment_context: object = cast(
@@ -353,6 +355,7 @@ class RestartTests(unittest.TestCase):
     def test_restart_prompts_are_scheduled_before_showrunner_and_window_launches(
         self,
     ) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         restored_entries = [
             entry(showrunner("scheduled-showrunner")),
             entry(
@@ -459,6 +462,7 @@ class RestartTests(unittest.TestCase):
         )
 
     def test_unit_launch_leaves_prompt_recording_to_add_unit(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         restored = entry(unit("scheduled-unit"))
         saved = shutdown_record([restored])
         record.create(saved)
@@ -937,6 +941,7 @@ class RestartTests(unittest.TestCase):
                 self.assertEqual(self.stored_record(), before)
 
     def test_every_stop_partial_progress_is_resumed_whether_live_or_stopped(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         kinds: tuple[
             Literal[
                 "waiting",
@@ -1095,6 +1100,7 @@ class RestartTests(unittest.TestCase):
         ])
 
     def test_tmux_respawns_a_reusable_live_or_dead_pane(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         cases = [
             ("live", "kept\t700\t0\n"),
             ("dead", "kept\t\t1\n"),
@@ -1162,6 +1168,7 @@ class RestartTests(unittest.TestCase):
                     self.assertFalse(any(argv[:1] == ["pgrep"] for argv in probes))
 
     def test_tmux_respawns_recorded_pane_when_session_name_has_outer_spaces(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         commands = CommandRecorder()
         restored = top_level(
             "spaced",
@@ -1200,6 +1207,7 @@ class RestartTests(unittest.TestCase):
         )
 
     def test_tmux_falls_back_when_a_recorded_pane_is_in_use_or_gone(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         recorded = inventory.TmuxPane(kind="pane", pane_id="%7", pane_pid=700)
         fallbacks: list[
             tuple[
@@ -1313,6 +1321,7 @@ class RestartTests(unittest.TestCase):
                     self.assertEqual(pane_probed, pane["kind"] == "pane")
 
     def test_an_already_live_session_gets_its_note_timer_and_footer_without_a_launch(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         timers = [
             TimerRestore(
                 instance="showrunner-demo",
@@ -1733,6 +1742,7 @@ class RestartTests(unittest.TestCase):
         self.assertEqual(record.find_live(LOGIN)["kind"], "no shutdown")
 
     def test_manual_unit_holds_its_timer_and_seat_until_the_session_appears(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         timer = TimerRestore(
             instance="showrunner-demo",
             was_enabled=True,
@@ -1809,6 +1819,7 @@ class RestartTests(unittest.TestCase):
         self.assertEqual(shutdown.held_session_ids(), [])
 
     def test_output_and_alert_name_manual_failed_and_timer_work(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         timer = TimerRestore(
             instance="timer-one",
             was_enabled=True,
@@ -2075,6 +2086,7 @@ class RestartTests(unittest.TestCase):
         restore_timers.assert_not_called()
 
     def test_closed_session_with_pending_timers_is_fully_restarted(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         timers = [
             TimerRestore(
                 instance="pending-timer",
@@ -2243,6 +2255,7 @@ class RestartTests(unittest.TestCase):
         self.assertEqual(failed["reason"], "launcher refused")
 
     def test_unknown_host_is_manual_and_printed_again(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         record.create(shutdown_record([entry(top_level("mystery"))]))
         first = io.StringIO()
         second = io.StringIO()
@@ -2368,6 +2381,7 @@ class RestartTests(unittest.TestCase):
     def test_incomplete_restart_alert_emits_the_named_recovery_action(
         self,
     ) -> None:
+        self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
         sent: list[tuple[list[str], str]] = []
 
         def send(
@@ -2421,6 +2435,7 @@ class RestartTests(unittest.TestCase):
         self.assertIn(failure, body)
 
     def test_an_unreachable_other_machine_leaves_its_record_and_local_work_recovers(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         local_entry = entry(
             top_level("local", host=inventory.TerminalHost(kind="terminal"))
         )
