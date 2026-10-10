@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest.mock import patch
 
+from test_support import ShutdownSendLeaf, ShutdownTestCase
 import remote
 
 
@@ -20,7 +21,7 @@ class SshInvocation(TypedDict):
 
 
 @final
-class RemoteTests(unittest.TestCase):
+class RemoteTests(ShutdownTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -29,6 +30,7 @@ class RemoteTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.bin = self.root / "bin"
         self.bin.mkdir()
@@ -66,6 +68,7 @@ raise SystemExit(int(os.environ.get("SHUTDOWN_TEST_SSH_STATUS", "0")))
             self.enterContext(patch.dict(os.environ, environment, clear=True)),
         )
         del patch_dict_context
+        self.allow_leaf(ShutdownSendLeaf.RUN_REMOTE)
 
     def invocation(self) -> SshInvocation:
         decoded = cast(object, json.loads(self.log.read_text(encoding="utf-8")))

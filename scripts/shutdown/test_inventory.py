@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
+from test_support import ShutdownTestCase
 import inventory
 import account
 import fake_tmux
@@ -42,7 +43,7 @@ FAKE_TMUX = Path(__file__).parents[1] / "production" / "fake_tmux.py"
 
 
 @final
-class InventoryTests(unittest.TestCase):
+class InventoryTests(ShutdownTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -64,6 +65,7 @@ class InventoryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
         self.notes = self.root / "agents"
@@ -840,7 +842,7 @@ elif "comm=" in joined:
 
 
 @final
-class DarwinProcessStartTests(unittest.TestCase):
+class DarwinProcessStartTests(ShutdownTestCase):
     def test_darwin_start_is_read_in_the_locale_and_zone_claude_records(self) -> None:
         completed = subprocess.CompletedProcess(
             args=(), returncode=0, stdout="Fri Oct  9 23:24:25 2026\n"

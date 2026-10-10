@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast, final, override
 from unittest.mock import patch
 
+from test_support import ShutdownTestCase
 import inventory
 import record
 import remote as remote_transport
@@ -309,13 +310,14 @@ def stop_report(
 
 
 @final
-class StopTests(unittest.TestCase):
+class StopTests(ShutdownTestCase):
     root: Path = Path()
     state_root: Path = Path()
     account = Account("claude", LOGIN, LABEL)
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.state_root = self.root / "shutdown"
         environment_context: object = cast(
