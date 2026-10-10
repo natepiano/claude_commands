@@ -97,6 +97,18 @@ class SessionLookupTests(unittest.TestCase):
         self.assertEqual([record["sessionId"] for record in running], ["socketless", "reachable"])
         self.assertEqual([record["sessionId"] for record in live], ["reachable"])
 
+    def test_live_sessions_selects_records_through_the_live_session_predicate(self) -> None:
+        self.record("fixture.json", pid=2**29 + os.getpid(), socket_path=self.root / "absent.sock")
+        record = sessions.read_session(self.sessions / "fixture.json")
+        assert not isinstance(record, sessions.UnreadableSessionRecord)
+        self.assertFalse(sessions.running_session(record))
+        self.assertFalse(sessions.messaging_socket_exists(record))
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}), \
+                mock.patch.object(sessions, "live_session", return_value=True) as accepts:
+            live = sessions.live_sessions()
+        self.assertEqual(live, [record])
+        accepts.assert_called_once_with(record)
+
     def test_empty_readable_registry_returns_absent(self) -> None:
         result = self.run_cli("socket", "session:missing")
         self.assertEqual(

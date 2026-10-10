@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import sys
+from collections.abc import Iterator
 from enum import Enum
 from pathlib import Path
 from typing import TypedDict, cast
@@ -95,20 +96,31 @@ def sessions_dir() -> Path:
     return Path(os.environ.get("NOTIFIER_SESSIONS_DIR", str(Path.home() / ".claude/sessions")))
 
 
-def running_sessions() -> list[SessionRecord]:
-    """Every running record, newest first, including processes without sockets."""
+def _readable_records() -> Iterator[SessionRecord]:
     try:
         paths = [path for path in sessions_dir().iterdir() if path.suffix == ".json"]
     except OSError:
-        return []
-    reads = (read_session(path) for path in paths)
-    running = [read for read in reads if not isinstance(read, UnreadableSessionRecord) and running_session(read)]
-    return sorted(running, key=lambda record: record["updatedAt"], reverse=True)
+        return
+    for path in paths:
+        record = read_session(path)
+        if not isinstance(record, UnreadableSessionRecord):
+            yield record
+
+
+def running_sessions() -> list[SessionRecord]:
+    """Every running record, newest first, including processes without sockets."""
+    return sorted(
+        (record for record in _readable_records() if running_session(record)),
+        key=lambda record: record["updatedAt"], reverse=True,
+    )
 
 
 def live_sessions() -> list[SessionRecord]:
     """Every running record with a messaging socket, newest first."""
-    return [record for record in running_sessions() if messaging_socket_exists(record)]
+    return sorted(
+        (record for record in _readable_records() if live_session(record)),
+        key=lambda record: record["updatedAt"], reverse=True,
+    )
 
 
 def addressed(to: str, records: list[SessionRecord]) -> SessionRecord | None:

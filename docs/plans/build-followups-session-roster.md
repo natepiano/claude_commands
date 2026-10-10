@@ -281,7 +281,7 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 **Ruled out:** name matching for membership or sender exclusion; a `--json` field for `RosterEntry.session`.
 
-### Phase 8 — The shutdown inventory tests see their sessions again · status: todo
+### Phase 8 — The shutdown inventory tests see their sessions again · status: done
 
 #### Work Order
 
