@@ -7,6 +7,7 @@ appear as one scratch caller in each kind's table.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import sqlite3
@@ -82,8 +83,11 @@ class NoOffloadRecord:
     """A test call made without an offload result."""
 
 
+@dataclass(frozen=True)
 class LocalRunRequested:
     """A test call whose caller selected natedev."""
+
+    reason: str
 
 
 class RunnerResultUnavailable:
@@ -135,7 +139,6 @@ OffloadRecord = (
     | UnrecognizedOffloadRecord
 )
 NO_OFFLOAD_RECORD = NoOffloadRecord()
-LOCAL_RUN_REQUESTED = LocalRunRequested()
 RUNNER_RESULT_UNAVAILABLE = RunnerResultUnavailable()
 UNRECOGNIZED_OFFLOAD_RECORD = UnrecognizedOffloadRecord()
 
@@ -396,14 +399,18 @@ def offload_seconds(value: object) -> float | None:
     return seconds_value if math.isfinite(seconds_value) and seconds_value >= 0 else None
 
 
-def offload_record(mac: object, reason: object, seconds_value: object) -> OffloadRecord:
-    """Decode the three indexed offload columns into one result value."""
+def offload_record(
+    mac: object, reason: object, local_reason: object, seconds_value: object
+) -> OffloadRecord:
+    """Decode the four indexed offload columns into one result value."""
     if mac is None or mac == "":
         return NO_OFFLOAD_RECORD
     if not isinstance(mac, str) or not isinstance(reason, str | None):
         return UNRECOGNIZED_OFFLOAD_RECORD
     if mac == "declined" and reason == "local_flag" and seconds_value is None:
-        return LOCAL_RUN_REQUESTED
+        if not isinstance(local_reason, str | None):
+            return UNRECOGNIZED_OFFLOAD_RECORD
+        return LocalRunRequested(local_reason or "")
     if mac == "declined" and reason == "runner" and seconds_value is None:
         return RUNNER_RESULT_UNAVAILABLE
 
@@ -886,7 +893,7 @@ def test_builds_section(connection: sqlite3.Connection, day: str) -> list[str]:
 def reported_mac_calls(connection: sqlite3.Connection, day: str) -> list[ReportedMacCall]:
     rows = fetch(
         connection,
-        "SELECT id, started_at, package, worktree, command, status, mac, mac_reason, mac_s,"
+        "SELECT id, started_at, package, worktree, command, status, mac, mac_reason, local_reason, mac_s,"
         + f" {call_ran_on_natedev()} FROM calls WHERE ({ON_DAY}"
         + " OR (mac = 'declined' AND mac_reason = 'local_flag'"
         + " AND datetime(started_at, 'localtime') >= datetime(?, '+1 day')"
@@ -905,7 +912,7 @@ def reported_mac_calls(connection: sqlite3.Connection, day: str) -> list[Reporte
             str(command or ""),
             status == 0,
             bool(ran_on_natedev),
-            offload_record(mac, mac_reason, mac_s),
+            offload_record(mac, mac_reason, local_reason, mac_s),
         )
         for (
             call_id,
@@ -916,6 +923,7 @@ def reported_mac_calls(connection: sqlite3.Connection, day: str) -> list[Reporte
             status,
             mac,
             mac_reason,
+            local_reason,
             mac_s,
             ran_on_natedev,
         ) in rows
@@ -944,8 +952,10 @@ def package_natedev_tests(
     return packages
 
 
-def matched_local_failures(calls: Sequence[ReportedMacCall]) -> set[str]:
-    matched: set[str] = set()
+def matched_local_failures(
+    calls: Sequence[ReportedMacCall],
+) -> dict[str, LocalRunRequested]:
+    matched: dict[str, LocalRunRequested] = {}
     failures = [
         call
         for call in calls
@@ -970,7 +980,9 @@ def matched_local_failures(calls: Sequence[ReportedMacCall]) -> set[str]:
             and failure.command == local_call.command
         ]
         if candidates:
-            matched.add(max(candidates, key=lambda call: call.started_at).call_id)
+            matched[max(candidates, key=lambda call: call.started_at).call_id] = (
+                local_call.offload
+            )
     return matched
 
 
@@ -1088,8 +1100,20 @@ def mac_tests_section(connection: sqlite3.Connection, day: str) -> list[str]:
         matched_packages = sorted(
             {call.package for call in calls if call.call_id in matched_failures}
         )
+        reasons = list(
+            dict.fromkeys(
+                requested.reason
+                for requested in matched_failures.values()
+                if requested.reason
+            )
+        )
+        local_flag = "--local"
+        if reasons:
+            local_flag += " " + ", ".join(
+                json.dumps(reason, ensure_ascii=False) for reason in reasons
+            )
         section.append(
-            "Failed on the Mac, then passed on natedev with --local: "
+            f"Failed on the Mac, then passed on natedev with {local_flag}: "
             + f"{len(matched_failures)} ({', '.join(matched_packages)})"
         )
     if no_test_calls:

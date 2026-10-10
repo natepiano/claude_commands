@@ -30,7 +30,7 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
@@ -136,6 +136,11 @@ CALL_COLUMNS: list[Column] = [
     ("token_wait_s", "INTEGER", "seconds spent acquiring the cargo token, a wait that timed out included; 0 when verify.sh sought none"),
     ("mac", "TEXT", "passed, passed_filter, failed, lost or declined when Mac offload ran or was considered"),
     ("mac_reason", "TEXT", "why Mac offload declined or had no usable result"),
+    (
+        "local_reason",
+        "TEXT",
+        "verify.sh test --local: why the test must run on Linux; empty otherwise",
+    ),
     ("mac_s", "REAL", "seconds spent deciding or running on the Mac"),
     ("wall_s", "INTEGER", "seconds the run took"),
     ("build_s", "INTEGER", "cargo's own build seconds, NULL when unmeasured"),
