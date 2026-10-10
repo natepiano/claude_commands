@@ -59,6 +59,26 @@ def checkout() -> inventory.GitCheckout:
     )
 
 
+def tmux_host(tmux_session: str) -> inventory.TmuxHost:
+    return inventory.TmuxHost(
+        kind="tmux",
+        tmux_session=tmux_session,
+        pane=inventory.PaneNotRecorded(kind="not recorded"),
+    )
+
+
+def recorded_tmux_host(
+    tmux_session: str, pane_id: str, pane_pid: int
+) -> inventory.TmuxHost:
+    return inventory.TmuxHost(
+        kind="tmux",
+        tmux_session=tmux_session,
+        pane=inventory.TmuxPane(
+            kind="pane", pane_id=pane_id, pane_pid=pane_pid
+        ),
+    )
+
+
 def common_session(
     session_id: str,
     name: str | None = None,
@@ -112,7 +132,7 @@ def showrunner(
     return inventory.ShowrunnerSession(
         **common_session(session_id),
         kind="showrunner",
-        host=host or inventory.TmuxHost(kind="tmux", tmux_session=f"tmux-{session_id}"),
+        host=host or tmux_host(f"tmux-{session_id}"),
         production="demo",
         doc="/tmp/demo production.md",
     )
@@ -347,8 +367,8 @@ class RestartTests(unittest.TestCase):
             entry(
                 top_level(
                     "scheduled-tmux",
-                    host=inventory.TmuxHost(
-                        kind="tmux", tmux_session="scheduled-tmux-host"
+                    host=recorded_tmux_host(
+                        "scheduled-tmux-host", "%scheduled", 410
                     ),
                 )
             ),
@@ -393,15 +413,24 @@ class RestartTests(unittest.TestCase):
                 observed_launches.append(session_id)
             return subprocess.CompletedProcess(argv, 0, "", "")
 
+        def probe(
+            argv: list[str], *, capture_output: bool, text: bool, check: bool
+        ) -> subprocess.CompletedProcess[str]:
+            del capture_output, text, check
+            if argv[:2] == ["tmux", "display"]:
+                return subprocess.CompletedProcess(
+                    argv, 0, "scheduled-tmux-host\t410\t0\n", ""
+                )
+            if argv[:1] == ["pgrep"]:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
         with (
             patch.object(restart, "_run", run),
             patch.object(restart, "_live_session_ids", return_value=frozenset()),
             patch.object(restart, "wait_for_session", return_value=True),
             patch.object(settle, "record_time", return_value=RESTARTED),
-            patch(
-                "subprocess.run",
-                return_value=subprocess.CompletedProcess(["probe"], 1, "", ""),
-            ),
+            patch("subprocess.run", probe),
         ):
             self.assertEqual(restart.up(LOGIN), 0)
 
@@ -414,9 +443,7 @@ class RestartTests(unittest.TestCase):
         restored = entry(
             top_level(
                 "dry-scheduled",
-                host=inventory.TmuxHost(
-                    kind="tmux", tmux_session="dry-scheduled-host"
-                ),
+                host=tmux_host("dry-scheduled-host"),
             )
         )
         record.create(shutdown_record([restored]))
@@ -461,7 +488,7 @@ class RestartTests(unittest.TestCase):
             entry(top_level("terminal", host=inventory.TerminalHost(kind="terminal"))),
             entry(top_level(
                 "tmux",
-                host=inventory.TmuxHost(kind="tmux", tmux_session="kept tmux"),
+                host=recorded_tmux_host("kept tmux", "%dry", 420),
             )),
             entry(top_level("unknown")),
         ]
@@ -477,6 +504,12 @@ class RestartTests(unittest.TestCase):
             env: dict[str, str] | None = None,
         ) -> subprocess.CompletedProcess[str]:
             del capture_output, text, check, env
+            if argv[:2] == ["tmux", "display"]:
+                return subprocess.CompletedProcess(
+                    argv, 0, "kept tmux\t420\t0\n", ""
+                )
+            if argv[:1] == ["pgrep"]:
+                return subprocess.CompletedProcess(argv, 1, "", "")
             return subprocess.CompletedProcess(argv, 0, "", "")
 
         output = io.StringIO()
@@ -502,8 +535,23 @@ class RestartTests(unittest.TestCase):
         self.assertTrue(all("ghostty" in argv for argv in window_argvs))
         terminal = next(argv for argv in argvs if argv[:1] == ["open"])
         self.assertEqual(terminal[:4], ["open", "-na", "/Applications/Nix Apps/Ghostty.app", "--args"])
-        tmux = next(argv for argv in argvs if argv[:2] == ["tmux", "new-window"])
-        self.assertIn("=kept tmux:", tmux)
+        tmux = next(argv for argv in argvs if argv[:2] == ["tmux", "respawn-pane"])
+        self.assertIn("%dry", tmux)
+        self.assertIn(
+            [
+                "tmux",
+                "display",
+                "-p",
+                "-t",
+                "%dry",
+                "#{session_name}\t#{pane_pid}\t#{pane_dead}",
+            ],
+            argvs,
+        )
+        self.assertIn(
+            ["tmux", "has-session", "-t", "=kept tmux"], argvs
+        )
+        self.assertIn(["pgrep", "-P", "420"], argvs)
         self.assertTrue(any(line.startswith("manual restart unknown:") for line in lines))
         self.assertEqual(self.stored_record(), original)
         self.assertEqual(list(self.state_root.rglob("restart-note-*.txt")), [])
@@ -958,27 +1006,90 @@ class RestartTests(unittest.TestCase):
             "launch:requester", "wait:requester",
         ])
 
-    def test_tmux_uses_a_new_window_when_live_and_a_new_session_when_gone(self) -> None:
-        entries = [
-            entry(top_level(
-                "live-tmux",
-                host=inventory.TmuxHost(kind="tmux", tmux_session="still-there"),
-            )),
-            entry(top_level(
-                "gone-tmux",
-                host=inventory.TmuxHost(kind="tmux", tmux_session="gone"),
-            )),
+    def test_tmux_respawns_a_reusable_live_or_dead_pane(self) -> None:
+        cases = [
+            ("live", "kept\t700\t0\n"),
+            ("dead", "kept\t\t1\n"),
         ]
-        record.create(shutdown_record(entries, machine="Mac"))
+        for label, pane_status in cases:
+            with self.subTest(label=label):
+                commands = CommandRecorder()
+                probes: list[list[str]] = []
+                restored = top_level(
+                    label,
+                    cwd="/tmp/restored",
+                    host=recorded_tmux_host("kept", f"%{label}", 700),
+                )
+                record.create(
+                    shutdown_record([entry(restored)], machine="Mac")
+                )
+
+                def probe(
+                    argv: list[str], *, capture_output: bool, text: bool, check: bool
+                ) -> subprocess.CompletedProcess[str]:
+                    del capture_output, text, check
+                    probes.append(argv)
+                    if argv[:2] == ["tmux", "display"]:
+                        return subprocess.CompletedProcess(argv, 0, pane_status, "")
+                    if argv[:1] == ["pgrep"]:
+                        return subprocess.CompletedProcess(argv, 1, "", "")
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+
+                with (
+                    patch.object(restart, "_run", commands),
+                    patch.object(
+                        restart, "_live_session_ids", return_value=frozenset()
+                    ),
+                    patch.object(restart, "wait_for_session", return_value=True),
+                    patch("subprocess.run", probe),
+                    patch.object(settle, "record_time", return_value=RESTARTED),
+                ):
+                    self.assertEqual(restart.up(LOGIN), 0)
+
+                launches = [
+                    argv
+                    for argv in commands.calls
+                    if argv[:2] == ["tmux", "respawn-pane"]
+                ]
+                self.assertEqual(len(launches), 1)
+                self.assertEqual(
+                    launches[0][:-1],
+                    [
+                        "tmux",
+                        "respawn-pane",
+                        "-k",
+                        "-t",
+                        f"%{label}",
+                        "-c",
+                        "/tmp/restored",
+                        "zsh",
+                        "-ic",
+                    ],
+                )
+                self.assertIn(f"--resume {label}", launches[0][-1])
+                self.assertNotIn(
+                    ["tmux", "has-session", "-t", "=kept"], probes
+                )
+                if label == "dead":
+                    self.assertFalse(any(argv[:1] == ["pgrep"] for argv in probes))
+
+    def test_tmux_respawns_recorded_pane_when_session_name_has_outer_spaces(self) -> None:
         commands = CommandRecorder()
+        restored = top_level(
+            "spaced",
+            host=recorded_tmux_host(" work ", "%8", 700),
+        )
+        record.create(shutdown_record([entry(restored)], machine="Mac"))
 
         def probe(
             argv: list[str], *, capture_output: bool, text: bool, check: bool
         ) -> subprocess.CompletedProcess[str]:
             del capture_output, text, check
-            return subprocess.CompletedProcess(
-                argv, 0 if argv[-1] == "=still-there" else 1, "", ""
-            )
+            if argv[:2] == ["tmux", "display"]:
+                return subprocess.CompletedProcess(argv, 0, " work \t700\t0\n", "")
+            if argv[:1] == ["pgrep"]:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
 
         with (
             patch.object(restart, "_run", commands),
@@ -989,12 +1100,129 @@ class RestartTests(unittest.TestCase):
         ):
             self.assertEqual(restart.up(LOGIN), 0)
 
-        launches = [argv for argv in commands.calls if argv[:1] == ["tmux"]]
-        self.assertEqual(len(launches), 2)
-        new_window = next(argv for argv in launches if argv[1] == "new-window")
-        new_session = next(argv for argv in launches if argv[1] == "new-session")
-        self.assertIn("=still-there:", new_window)
-        self.assertEqual(new_session[new_session.index("-s") + 1], "gone")
+        self.assertEqual(
+            len(
+                [
+                    argv
+                    for argv in commands.calls
+                    if argv[:2] == ["tmux", "respawn-pane"]
+                ]
+            ),
+            1,
+        )
+
+    def test_tmux_falls_back_when_a_recorded_pane_is_in_use_or_gone(self) -> None:
+        recorded = inventory.TmuxPane(kind="pane", pane_id="%7", pane_pid=700)
+        fallbacks: list[
+            tuple[
+                str,
+                inventory.TmuxPane | inventory.PaneNotRecorded,
+                int,
+                str,
+                int,
+            ]
+        ] = [
+            ("child process", recorded, 0, "kept\t700\t0\n", 0),
+            ("different pane pid", recorded, 0, "kept\t701\t0\n", 1),
+            ("another session", recorded, 0, "moved\t700\t0\n", 1),
+            ("missing pane", recorded, 1, "", 1),
+            (
+                "pane not recorded",
+                inventory.PaneNotRecorded(kind="not recorded"),
+                1,
+                "",
+                1,
+            ),
+        ]
+        for label, pane, display_status, display_output, pgrep_status in fallbacks:
+            for session_survives in (True, False):
+                with self.subTest(label=label, session_survives=session_survives):
+                    commands = CommandRecorder()
+                    probes: list[list[str]] = []
+                    restored = top_level(
+                        "fallback",
+                        cwd="/tmp/fallback",
+                        host=inventory.TmuxHost(
+                            kind="tmux", tmux_session="kept", pane=pane
+                        ),
+                    )
+                    record.create(
+                        shutdown_record([entry(restored)], machine="Mac")
+                    )
+
+                    def probe(
+                        argv: list[str],
+                        *,
+                        capture_output: bool,
+                        text: bool,
+                        check: bool,
+                    ) -> subprocess.CompletedProcess[str]:
+                        del capture_output, text, check
+                        probes.append(argv)
+                        if argv[:2] == ["tmux", "display"]:
+                            return subprocess.CompletedProcess(
+                                argv, display_status, display_output, ""
+                            )
+                        if argv[:1] == ["pgrep"]:
+                            return subprocess.CompletedProcess(
+                                argv, pgrep_status, "", ""
+                            )
+                        return subprocess.CompletedProcess(
+                            argv, 0 if session_survives else 1, "", ""
+                        )
+
+                    with (
+                        patch.object(restart, "_run", commands),
+                        patch.object(
+                            restart,
+                            "_live_session_ids",
+                            return_value=frozenset(),
+                        ),
+                        patch.object(
+                            restart, "wait_for_session", return_value=True
+                        ),
+                        patch("subprocess.run", probe),
+                        patch.object(
+                            settle, "record_time", return_value=RESTARTED
+                        ),
+                    ):
+                        self.assertEqual(restart.up(LOGIN), 0)
+
+                    launch = next(
+                        argv
+                        for argv in commands.calls
+                        if argv[:1] == ["tmux"]
+                    )
+
+                    if session_survives:
+                        expected_prefix = [
+                            "tmux",
+                            "new-window",
+                            "-t",
+                            "=kept:",
+                            "-c",
+                            "/tmp/fallback",
+                            "zsh",
+                            "-ic",
+                        ]
+                    else:
+                        expected_prefix = [
+                            "tmux",
+                            "new-session",
+                            "-d",
+                            "-s",
+                            "kept",
+                            "-c",
+                            "/tmp/fallback",
+                            "zsh",
+                            "-ic",
+                        ]
+                    self.assertEqual(launch[:-1], expected_prefix)
+                    self.assertIn("--resume fallback", launch[-1])
+                    pane_probed = any(
+                        argv[:2] == ["tmux", "display"] for argv in probes
+                    )
+                    self.assertEqual(pane_probed, pane["kind"] == "pane")
 
     def test_an_already_live_session_gets_its_note_timer_and_footer_without_a_launch(self) -> None:
         timers = [

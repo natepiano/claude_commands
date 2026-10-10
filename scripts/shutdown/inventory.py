@@ -45,9 +45,20 @@ class UnitHost(TypedDict):
     plan: UnitPlan
 
 
+class TmuxPane(TypedDict):
+    kind: Literal["pane"]
+    pane_id: str
+    pane_pid: int
+
+
+class PaneNotRecorded(TypedDict):
+    kind: Literal["not recorded"]
+
+
 class TmuxHost(TypedDict):
     kind: Literal["tmux"]
     tmux_session: str
+    pane: TmuxPane | PaneNotRecorded
 
 
 class NamedDesktop(TypedDict):
@@ -320,6 +331,24 @@ def _parse_desktop(value: object, place: str) -> Desktop:
     raise InvalidInventory(f"{place}.kind is invalid")
 
 
+def _parse_tmux_pane(value: object, place: str) -> TmuxPane | PaneNotRecorded:
+    data = _wire_object(value, place)
+    kind = _wire_kind(data, place)
+    if kind == "pane":
+        return {
+            "kind": "pane",
+            "pane_id": _wire_string(
+                _wire_required(data, "pane_id", place), f"{place}.pane_id"
+            ),
+            "pane_pid": _wire_integer(
+                _wire_required(data, "pane_pid", place), f"{place}.pane_pid"
+            ),
+        }
+    if kind == "not recorded":
+        return {"kind": "not recorded"}
+    raise InvalidInventory(f"{place}.kind is invalid")
+
+
 def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
     data = _wire_object(value, place)
     kind = _wire_kind(data, place)
@@ -342,12 +371,18 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
             ),
         }
     if kind == "tmux":
+        pane: TmuxPane | PaneNotRecorded = (
+            _parse_tmux_pane(data["pane"], f"{place}.pane")
+            if "pane" in data
+            else {"kind": "not recorded"}
+        )
         return {
             "kind": "tmux",
             "tmux_session": _wire_string(
                 _wire_required(data, "tmux_session", place),
                 f"{place}.tmux_session",
             ),
+            "pane": pane,
         }
     if kind in {"ghostty", "zed"}:
         window = {
@@ -826,20 +861,41 @@ def _process_environment(pid: int) -> dict[str, str]:
     return {name: value for name, value in entries}
 
 
-def _tmux_session(pane: str) -> str:
+def _tmux_session(pane: str) -> tuple[str, TmuxPane | PaneNotRecorded]:
+    not_recorded: PaneNotRecorded = {"kind": "not recorded"}
     if not pane:
-        return ""
+        return "", not_recorded
     try:
         result = subprocess.run(
-            (unit_lookup.tmux_binary(), "display", "-p", "-t", pane, "#S"),
+            (
+                unit_lookup.tmux_binary(),
+                "display",
+                "-p",
+                "-t",
+                pane,
+                "#{session_name}\t#{pane_pid}",
+            ),
             capture_output=True,
             text=True,
             timeout=5,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
-        return ""
-    return result.stdout.strip() if result.returncode == 0 else ""
+        return "", not_recorded
+    if result.returncode != 0:
+        return "", not_recorded
+    session_name, separator, pane_pid_text = result.stdout.rstrip("\r\n").partition("\t")
+    if not session_name:
+        return "", not_recorded
+    if not separator:
+        return session_name, not_recorded
+    try:
+        pane_pid = int(pane_pid_text)
+    except ValueError:
+        return session_name, not_recorded
+    if pane_pid <= 0:
+        return session_name, not_recorded
+    return session_name, {"kind": "pane", "pane_id": pane, "pane_pid": pane_pid}
 
 
 def terminal_kind(command: str) -> Literal["ghostty", "zed", "terminal", "unknown"]:
@@ -975,10 +1031,14 @@ def _host(
 
     environment = _process_environment(session.get("pid", 0))
     pane = environment.get("TMUX_PANE", "")
-    tmux_session = _tmux_session(pane)
+    tmux_session, tmux_pane = _tmux_session(pane)
     if pane:
         return (
-            {"kind": "tmux", "tmux_session": tmux_session}
+            {
+                "kind": "tmux",
+                "tmux_session": tmux_session,
+                "pane": tmux_pane,
+            }
             if tmux_session
             else {"kind": "unknown"}
         )

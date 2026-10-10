@@ -157,7 +157,11 @@ def showrunner(
             codex_servers=codex_servers,
         ),
         kind="showrunner",
-        host=inventory.TmuxHost(kind="tmux", tmux_session=f"tmux-{session_id}"),
+        host=inventory.TmuxHost(
+            kind="tmux",
+            tmux_session=f"tmux-{session_id}",
+            pane=inventory.PaneNotRecorded(kind="not recorded"),
+        ),
         production="demo",
         doc="/tmp/demo.md",
     )

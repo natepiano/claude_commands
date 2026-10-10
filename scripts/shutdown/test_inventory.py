@@ -544,6 +544,104 @@ elif "comm=" in joined:
 
         self.assertEqual(unit["host"].get("tmux_session"), "unit-renamed")
 
+    def test_tmux_hosts_record_the_pane_or_an_explicit_absence(self) -> None:
+        def process_environment(pid: int) -> dict[str, str]:
+            if pid == self.director_pid:
+                return {"TMUX_PANE": "%8"}
+            if pid == DESKTOP_PID:
+                return {"TMUX_PANE": "%9"}
+            return {}
+
+        def tmux_details(
+            pane: str,
+        ) -> tuple[str, inventory.TmuxPane | inventory.PaneNotRecorded]:
+            if pane == "%8":
+                return "production work", {
+                    "kind": "pane",
+                    "pane_id": "%8",
+                    "pane_pid": 62_008,
+                }
+            if pane == "%9":
+                return "writing", {"kind": "not recorded"}
+            return "", {"kind": "not recorded"}
+
+        with (
+            patch("inventory._process_environment", side_effect=process_environment),
+            patch("inventory._tmux_session", side_effect=tmux_details),
+        ):
+            found = inventory.inventory(TARGET_LOGIN)
+
+        by_id = {session["session_id"]: session for session in found["sessions"]}
+        self.assertEqual(
+            by_id[DIRECTOR_ID]["host"],
+            {
+                "kind": "tmux",
+                "tmux_session": "production work",
+                "pane": {"kind": "pane", "pane_id": "%8", "pane_pid": 62_008},
+            },
+        )
+        self.assertEqual(
+            by_id[DESKTOP_ID]["host"],
+            {
+                "kind": "tmux",
+                "tmux_session": "writing",
+                "pane": {"kind": "not recorded"},
+            },
+        )
+
+    def test_tmux_discovery_reads_session_and_pane_pid_in_one_call(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=(), returncode=0, stdout="production work\t62008\n"
+        )
+        with (
+            patch.object(unit_lookup, "tmux_binary", return_value="/test/tmux"),
+            patch("inventory.subprocess.run", return_value=completed) as run,
+        ):
+            found = inventory._tmux_session("%8")  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(
+            found,
+            (
+                "production work",
+                {"kind": "pane", "pane_id": "%8", "pane_pid": 62_008},
+            ),
+        )
+        self.assertEqual(
+            run.call_args.args[0],
+            (
+                "/test/tmux",
+                "display",
+                "-p",
+                "-t",
+                "%8",
+                "#{session_name}\t#{pane_pid}",
+            ),
+        )
+
+    def test_tmux_discovery_preserves_spaces_in_session_name(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=(), returncode=0, stdout=" work \t62008\n"
+        )
+        with patch("inventory.subprocess.run", return_value=completed):
+            found = inventory._tmux_session("%8")  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(
+            found,
+            (
+                " work ",
+                {"kind": "pane", "pane_id": "%8", "pane_pid": 62_008},
+            ),
+        )
+
+    def test_tmux_discovery_keeps_session_when_pane_pid_is_unusable(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=(), returncode=0, stdout="writing\tnot-a-pid\n"
+        )
+        with patch("inventory.subprocess.run", return_value=completed):
+            found = inventory._tmux_session("%9")  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(found, ("writing", {"kind": "not recorded"}))
+
     def test_ghostty_host_carries_window_shell_between_terminal_and_claude(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
         director = next(
@@ -664,6 +762,50 @@ elif "comm=" in joined:
         decoded = inventory.parse_inventory(json.dumps(found))
 
         self.assertEqual(decoded, found)
+
+    def test_parse_inventory_treats_a_legacy_tmux_host_as_pane_not_recorded(self) -> None:
+        found = inventory.inventory(TARGET_LOGIN)
+        document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
+        session_values = cast(list[object], document["sessions"])
+        desktop = next(
+            cast(dict[str, object], value)
+            for value in session_values
+            if cast(dict[str, object], value)["session_id"] == DESKTOP_ID
+        )
+        desktop["host"] = {"kind": "tmux", "tmux_session": "legacy"}
+
+        decoded = inventory.parse_inventory(json.dumps(document))
+        parsed = next(
+            session
+            for session in decoded["sessions"]
+            if session["session_id"] == DESKTOP_ID
+        )
+
+        self.assertEqual(
+            parsed["host"],
+            {
+                "kind": "tmux",
+                "tmux_session": "legacy",
+                "pane": {"kind": "not recorded"},
+            },
+        )
+
+    def test_parse_inventory_validates_a_recorded_tmux_pane(self) -> None:
+        found = inventory.inventory(TARGET_LOGIN)
+        document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
+        session_values = cast(list[object], document["sessions"])
+        first = cast(dict[str, object], session_values[0])
+        first["host"] = {
+            "kind": "tmux",
+            "tmux_session": "work",
+            "pane": {"kind": "pane", "pane_id": "%2", "pane_pid": "invalid"},
+        }
+
+        with self.assertRaisesRegex(
+            inventory.InvalidInventory,
+            r"inventory\.sessions\[0\]\.host\.pane\.pane_pid must be an integer",
+        ):
+            _ = inventory.parse_inventory(json.dumps(document))
 
     def test_parse_inventory_rejects_unknown_kind_and_missing_variant_field(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
