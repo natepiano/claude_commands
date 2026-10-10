@@ -283,27 +283,19 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 ### Phase 8 — The shutdown inventory tests see their sessions again · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `sessions.live_sessions()` selects its records through `sessions.live_session` again, so the shutdown inventory tests, which fake `live_session`, see their sessions and the shutdown suite passes.
-
-**Spec:**
-- Phase 7 rebuilt `live_sessions()` as `running_sessions()` filtered by `messaging_socket_exists`, so it no longer calls `live_session`. `scripts/shutdown/test_inventory.py` patches `sessions.live_session` to accept fixture records whose pids are not running; 10 of its 20 tests now fail (they pass on `5e15669`). Production behavior is unchanged.
-- In `sessions.py`, one private reader yields every readable record. `running_sessions()` keeps the records `running_session` accepts and `live_sessions()` the records `live_session` accepts, each sorted newest `updatedAt` first. `live_session` stays `running_session(record) and messaging_socket_exists(record)`, so the pid check lives in `running_session` alone. No caller changes.
-- Regression test in `test_sessions.py`, named for the behavior it pins: with `sessions.live_session` patched to accept every record, `live_sessions()` returns a record whose pid is not running and which has no socket. It fails on the tree before the repair.
+`sessions._readable_records()` yields every readable registry record. `running_sessions()` keeps those `running_session` accepts and `live_sessions()` those `live_session` accepts, each newest `updatedAt` first. `live_session` is `running_session(record) and messaging_socket_exists(record)`, so the pid check lives in `running_session` alone. Production results are unchanged.
 
 **Files:**
-- `scripts/message/sessions.py`
-- `scripts/message/test_sessions.py`
+- `scripts/message/sessions.py` — the session registry readers
+- `scripts/message/test_sessions.py` — regression test that `live_sessions()` selects through a patched `live_session`
 
-**Seats:** `1 writer`.
-- `impl` — `sessions.py` and `test_sessions.py`; hub: `sessions.py`.
+**Binds later work:** a change to `running_session` keeps `_readable_records()` and per-predicate selection in both readers.
 
-**Constraints from prior phases:**
-- Phase 7's readers: `running_session(record)` (pid check only), `messaging_socket_exists(record)`, `live_session(record)` (both), `running_sessions()` (every running record, newest first; read by `roster.py` and `top_level.py`) and `live_sessions()` (running with a socket, newest first; read by `send.py`, `build_hold.py`, `codex_winddown.py`, `scripts/shutdown/inventory.py` and `restart.py`).
-- `scripts/shutdown/test_inventory.py` patches `sessions.live_session` and `unit_lookup.live_session`; it is not edited.
+**Gotchas:** `scripts/shutdown/test_inventory.py` fakes `sessions.live_session` to admit dead-pid fixtures, so `live_sessions()` must call that predicate per record. Suites outside the message package (build_hold, model_study rerun, shutdown) read `live_sessions()`.
 
-**Acceptance gate:** the Test and Lint lines green, the shutdown suite included (`test_inventory.py` 20 of 20), and `basedpyright scripts/shutdown` 0 errors, 0 warnings, 0 notes. No Pushover post during the run.
+**Ruled out:** `live_sessions()` as `running_sessions()` filtered by the socket check (hides the predicate from fakes).
 
 ### Phase 9 — A session with no messaging socket is listed only while its own process runs · status: todo
 
