@@ -6,10 +6,11 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest import mock
 
 import sessions
@@ -17,6 +18,9 @@ import sessions
 
 SCRIPT = Path(__file__).with_name("sessions.py")
 PY = Path(__file__).parents[1] / "lib" / "py"
+STAT_WITH_TRUNCATED_PROCESS_NAME = b"4242 (with ) spaces \xc3) " + b" ".join(
+    [b"S", *[b"0"] * 18, b"8675309", b"unused"]
+)
 
 
 class SessionLookupTests(unittest.TestCase):
@@ -39,6 +43,7 @@ class SessionLookupTests(unittest.TestCase):
     def record(
         self, filename: str, *, pid: int | None = None, name: str = "agent",
         session_id: str = "session-1", socket_path: Path | None = None, updated: int = 1,
+        proc_start: str = "",
     ) -> None:
         data = {
             "pid": os.getpid() if pid is None else pid,
@@ -46,6 +51,7 @@ class SessionLookupTests(unittest.TestCase):
             "sessionId": session_id,
             "messagingSocketPath": str(self.socket_path if socket_path is None else socket_path),
             "updatedAt": updated,
+            "procStart": proc_start,
         }
         _ = (self.sessions / filename).write_text(json.dumps(data))
 
@@ -83,12 +89,15 @@ class SessionLookupTests(unittest.TestCase):
             )
 
     def test_running_records_include_socketless_sessions_but_live_records_do_not(self) -> None:
+        started = sessions.process_start(os.getpid())
+        assert started is not None
         self.record("reachable.json", session_id="reachable", updated=10)
-        self.record("socketless.json", session_id="socketless", updated=20)
+        self.record("socketless.json", session_id="socketless", updated=20, proc_start=started)
         path = self.sessions / "socketless.json"
         record = sessions.read_session(path)
         assert not isinstance(record, sessions.UnreadableSessionRecord)
         record["messagingSocketPath"] = ""
+        self.assertEqual(record.get("procStart"), started)
         _ = path.write_text(json.dumps(record))
         self.record("dead.json", pid=2**29 + os.getpid(), updated=30)
         with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
@@ -108,6 +117,65 @@ class SessionLookupTests(unittest.TestCase):
             live = sessions.live_sessions()
         self.assertEqual(live, [record])
         accepts.assert_called_once_with(record)
+
+    def test_socketless_record_with_another_process_start_is_not_running(self) -> None:
+        self.record("reused.json", socket_path=self.root / "absent.sock", proc_start="another start")
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            self.assertEqual(sessions.running_sessions(), [])
+            self.assertEqual(sessions.live_sessions(), [])
+
+    def test_socketless_records_with_a_truncated_process_name_require_a_matching_start(self) -> None:
+        self.record(
+            "matching.json", session_id="matching", socket_path=self.root / "absent.sock",
+            proc_start="8675309",
+        )
+        self.record(
+            "different.json", session_id="different", socket_path=self.root / "absent.sock",
+            proc_start="another start",
+        )
+        stat_path = self.root / "stat"
+        _ = stat_path.write_bytes(STAT_WITH_TRUNCATED_PROCESS_NAME)
+
+        def path_for_stat(value: str) -> Path:
+            return stat_path if value == f"/proc/{os.getpid()}/stat" else Path(value)
+
+        with (
+            mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}),
+            mock.patch.object(sys, "platform", "linux"),
+            mock.patch.object(sessions, "Path", wraps=Path, side_effect=path_for_stat),
+        ):
+            for reader, expected in (
+                (sessions.running_sessions, ["matching"]), (sessions.live_sessions, []),
+            ):
+                with self.subTest(reader=reader.__name__):
+                    self.assertEqual([record["sessionId"] for record in reader()], expected)
+
+    def test_socketless_record_without_a_process_start_is_not_running(self) -> None:
+        self.record("missing-start.json", socket_path=self.root / "absent.sock")
+        path = self.sessions / "missing-start.json"
+        data = cast(dict[str, object], json.loads(path.read_text()))
+        del data["procStart"]
+        _ = path.write_text(json.dumps(data))
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            self.assertEqual(sessions.running_sessions(), [])
+
+    def test_socketless_record_with_an_empty_process_start_is_not_running(self) -> None:
+        self.record("empty-start.json", socket_path=self.root / "absent.sock")
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            self.assertEqual(sessions.running_sessions(), [])
+
+    def test_record_with_socket_and_no_process_start_stays_live_without_reading_the_start(self) -> None:
+        self.record("legacy.json")
+        path = self.sessions / "legacy.json"
+        data = cast(dict[str, object], json.loads(path.read_text()))
+        del data["procStart"]
+        _ = path.write_text(json.dumps(data))
+        record = sessions.read_session(path)
+        assert not isinstance(record, sessions.UnreadableSessionRecord)
+        self.assertEqual(record.get("procStart"), "")
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}), \
+                mock.patch.object(sessions, "process_start", side_effect=AssertionError("unexpected start read")):
+            self.assertEqual(sessions.live_sessions(), [record])
 
     def test_empty_readable_registry_returns_absent(self) -> None:
         result = self.run_cli("socket", "session:missing")
@@ -149,6 +217,62 @@ class SessionLookupTests(unittest.TestCase):
     def test_usage_errors(self) -> None:
         for args in ((), ("socket",), ("id",), ("unknown", "agent")):
             self.assertEqual(self.run_cli(*args).returncode, 2)
+
+
+class ProcessStartTests(unittest.TestCase):
+    def test_linux_start_survives_a_process_name_cut_inside_a_utf8_character(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        stat_path = root / "stat"
+        _ = stat_path.write_bytes(STAT_WITH_TRUNCATED_PROCESS_NAME)
+        with (
+            mock.patch.object(sys, "platform", "linux"),
+            mock.patch.object(sessions, "Path", return_value=stat_path) as path,
+        ):
+            self.assertEqual(sessions.process_start(4242), "8675309")
+        path.assert_called_once_with("/proc/4242/stat")
+
+    def test_linux_unreadable_or_malformed_stat_returns_an_unknown_start(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        stat_path = root / "stat"
+        stat_bytes = STAT_WITH_TRUNCATED_PROCESS_NAME.replace(b"\xc3", b"x")
+        with (
+            mock.patch.object(sys, "platform", "linux"),
+            mock.patch.object(sessions, "Path", return_value=stat_path),
+        ):
+            for contents in (
+                b"", b"4242 (name) S", stat_bytes.replace(b")", b""),
+                stat_bytes.replace(b"8675309", b"\xff"),
+                stat_bytes.replace(b"8675309", b"not-digits"),
+            ):
+                with self.subTest(contents=contents):
+                    _ = stat_path.write_bytes(contents)
+                    self.assertIsNone(sessions.process_start(4242))
+            stat_path.unlink()
+            self.assertIsNone(sessions.process_start(4242))
+
+    def test_darwin_start_is_read_in_the_locale_and_zone_claude_records(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=(), returncode=0, stdout="Fri Oct  9 23:24:25 2026\n"
+        )
+        with (
+            mock.patch.object(sys, "platform", "darwin"),
+            mock.patch.object(subprocess, "run", return_value=completed) as run,
+        ):
+            started = sessions.process_start(4242)
+
+        self.assertEqual(started, "Fri Oct  9 23:24:25 2026")
+        self.assertEqual(run.call_args.args[0], ("ps", "-o", "lstart=", "-p", "4242"))
+        environment = cast(dict[str, str], run.call_args.kwargs["env"])
+        self.assertEqual((environment["LC_ALL"], environment["TZ"]), ("C", "UTC"))
+
+    def test_linux_start_uses_field_twenty_two_after_the_process_name(self) -> None:
+        fields = [b"S", *[b"0"] * 18, b"8675309", b"unused"]
+        with (
+            mock.patch.object(sys, "platform", "linux"),
+            mock.patch.object(Path, "read_bytes", return_value=b"4242 (a process (with) spaces) " + b" ".join(fields)) as read,
+        ):
+            self.assertEqual(sessions.process_start(4242), "8675309")
+        read.assert_called_once_with()
 
 
 if __name__ == "__main__":

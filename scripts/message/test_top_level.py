@@ -255,6 +255,7 @@ class TopLevelRunningRecordTests(unittest.TestCase):
     directory: Path = Path()
     socket_path: Path = Path()
     child_pid: int = 0
+    process_starts: dict[int, str] = {}
 
     @override
     def setUp(self) -> None:
@@ -269,6 +270,7 @@ class TopLevelRunningRecordTests(unittest.TestCase):
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         ))
         self.child_pid = child.pid
+        self.process_starts = {}
         self.addCleanup(child.communicate, timeout=5)
         environment = cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "HOME": str(self.folder), "NOTIFIER_SESSIONS_DIR": str(self.directory),
@@ -280,10 +282,13 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(process_table, "snapshot", return_value={}))
         _ = self.enterContext(mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]))
 
-    def write_record(self, pid: int, *, socket_path: str, updated: int) -> None:
+    def write_record(self, pid: int, *, socket_path: str, updated: int, proc_start: str = "") -> None:
+        started = sessions.process_start(pid)
+        assert started is not None
+        self.process_starts[pid] = started
         record = sessions.SessionRecord(
             pid=pid, sessionId="shared-id", name="shared", messagingSocketPath=socket_path,
-            updatedAt=updated, tmux="", formerNames=[],
+            updatedAt=updated, tmux="", formerNames=[], procStart=proc_start or started,
         )
         _ = (self.directory / f"{pid}.json").write_text(json.dumps(record), encoding="utf-8")
 
@@ -291,10 +296,14 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         output, errors = io.StringIO(), io.StringIO()
         recorded: list[list[str]] = []
 
-        def record(command: list[str], **_options: object) -> subprocess.CompletedProcess[bytes]:
+        def record(
+            command: list[str] | tuple[str, ...], **_options: object,
+        ) -> subprocess.CompletedProcess[bytes] | subprocess.CompletedProcess[str]:
+            if command[:3] == ("ps", "-o", "lstart="):
+                return subprocess.CompletedProcess(command, 0, self.process_starts[int(command[-1])] + "\n", "")
             self.assertEqual(Path(command[1]).name, "build_hold.py")
             self.assertEqual(command[2], "record-recipient")
-            recorded.append(command)
+            recorded.append(list(command))
             return subprocess.CompletedProcess(command, 0, b"", b"")
 
         with mock.patch.object(subprocess, "run", new=record), redirect_stdout(output), redirect_stderr(errors):
@@ -307,6 +316,10 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         self.assertEqual(self.run_main(), (
             0, "", "not reachable: shared [shared-id] has no messaging socket\n", [],
         ))
+
+    def test_socketless_record_with_another_process_start_is_not_listed(self) -> None:
+        self.write_record(os.getpid(), socket_path="", updated=10, proc_start="another start")
+        self.assertEqual(self.run_main(), (0, "", "", []))
 
     def test_running_session_without_socket_is_reported_and_not_recorded(self) -> None:
         self.write_record(os.getpid(), socket_path="", updated=10)
