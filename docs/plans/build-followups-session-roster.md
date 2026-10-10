@@ -172,25 +172,19 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 ### Phase 4 — A message with no action stated is refused · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a message to the user that says neither its action nor that none is needed does not leave: Phase 2's transition warning becomes the refusal.
-
-**Spec:**
-- `pushover.py` refuses `ActionUnstated` like Phase 2's other cases: nothing sent, exit 2, the stderr line `pushover: refused before sending: no action stated. <FIX>`, and log outcome `refused before sending: no action stated`. The warning line and the `sent without an action line` outcome are removed.
-- Before dispatch, the unit director reads the pushover log since the Phase 2 checkpoint for `sent without an action line` entries. Each entry names its source; any source still in that list is updated in this phase when it is in this repo, or named to natedev when it is not. The log is `~/.local/state/notify/pushover.jsonl` (one JSON line per send, `outcome` and `source` fields); recheck with `grep -c 'sent without an action line' ~/.local/state/notify/pushover.jsonl` and read the matching lines' `source`. On 2026-10-10 it held no such entry since checkpoint 39f9b69. An in-repo source found at dispatch is added to **Files** before the seats start.
+- `pushover.py` refuses `ActionUnstated` (neither `--action` nor `--no-action`) through the same `refuse()` path as its other refusals: nothing sent, exit 2, stderr `pushover: refused before sending: no action stated. <FIX>`, and one log line with outcome `refused before sending: no action stated` and its source.
+- Every refusal comes before the keys file is read, in this order: `ActionRefused` from parsing, `ActionUnstated`, `--action` text over `ACTION_TEXT_MAX`, then `refused_at`. The transition warning and the `sent without an action line` outcome are gone; a send logs `sent` or `sent, receipt <r>`.
+- The module docstring says messages without `--action` or `--no-action` are refused before sending, and that exit 2 means refused before sending, usage, or keys missing.
 
 **Files:**
-- `scripts/notify/pushover.py`
-- `scripts/notify/test_pushover.py`
+- `scripts/notify/pushover.py` — the gate every user message ends in.
+- `scripts/notify/test_pushover.py` — `test_unstated_action_is_refused_before_posting_and_logged`.
 
-**Seats:** `1 writer + 1 tester` — nothing splits.
-- `impl` — `pushover.py`.
-- `test` — `test_pushover.py`, from this Spec alone.
+**Binds later work:** No message reaches the user without `--action` or `--no-action`. Callers see a refusal as exit 2 and the stderr line naming `FIX`; the recovery is to add the flag and resend, which the messaging instructions give as the meaning of `REFUSED:` (exit 2). No caller of the removed outcome remains: the log holds no `sent without an action line` entry since the phase that added the warning, and natedev's `ups.nix` and `disk-floor.nix` pass the flags.
 
-**Constraints from prior phases:** Phase 2's `scripts/notify/user_action.py` (`parse_user_action` → `UserAction | ActionUnstated | ActionRefused`, `refused_at`, `first_line`, `FIX`), `pushover.py`'s `--source` and its log entries naming their source, and its refusal line and exit 2. Phase 3's `refused_at` returns `ActionAllowed | ActionRefused`, and `settle.py`'s `alert_user` always passes `--action`. `send.py --to user` and `escalate.py hold` already treat `ActionUnstated` as a usage error, so neither changes here.
-
-**Acceptance gate:** every `sent without an action line` source logged since checkpoint 39f9b69 is either migrated in this repo or confirmed by natedev as passing the flags; `pushover.py`'s docstring names exit 2 as a refusal; `python3 -m unittest discover -s scripts/notify -p 'test_*.py'` green; basedpyright `scripts/notify` 0/0/0; live: `pushover.py "t" "m"` exits 2 and logs the refusal with its source, with nothing sent.
+**Gotchas:** A caller with no keys and no action flag gets the action refusal, not `keys missing`.
 
 ### Phase 5 — Process listing gets its own module · status: todo
 
