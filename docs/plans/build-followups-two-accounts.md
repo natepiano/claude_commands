@@ -181,54 +181,33 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 ### Phase 1 — Account dirs: build, check and report, without touching live dirs  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `accounts.py` can build and repair an account dir as a symlink farm, seed its `.claude.json`, say whether it is fit to launch on, and resolve a role to its dir. No live dir is created in this phase.
-
-**Spec:**
-
-`scripts/accounts/accounts.py`:
-
-- **Paths.** `HOME = Path(os.environ.get("ACCOUNTS_HOME", Path.home()))`. The main dir is `HOME/.claude`. Label `claude N` maps to `HOME/.claudeN`. Any other label is refused: `accounts: <label> is not a claude N label`.
-- **`SHARED`, the entries linked into the main dir:**
-  - files: `settings.json`, `CLAUDE.md`, `keybindings.json`, `history.jsonl`
-  - dirs: `commands`, `skills`, `agents`, `output-styles`, `plugins`, `projects`, `sessions`, `plans`, `todos`, `tasks`, `teams`, `file-history`, `shell-snapshots`, `session-env`, `paste-cache`, `uploads`
-
-  A comment states the rule: shared means Claude Code reads it as user content or as cross-session state, and anything else stays per account.
-- **`setup <label>`:**
-  - Creates the dir with mode 0700.
-  - For each `SHARED` entry present in the main dir, or one of `projects` and `sessions`, it makes `dir/<entry>` a symlink to the absolute main path. It leaves a correct link alone, replaces a wrong-target link, and refuses a real file or dir: `accounts: <dir>/<entry> is a real file; move it aside or merge it into ~/.claude`, exit 1 after doing the rest.
-  - Seeds `dir/.claude.json` only when it is absent, mode 0600, from `HOME/.claude.json`, keeping only these keys:
-    - top level: `hasCompletedOnboarding`, `lastOnboardingVersion`, `installMethod`, `autoUpdates`, `shiftEnterKeyBindingInstalled`, `mcpServers`, `remoteDialogSeen`, `hasUsedRemoteControl`, `hasSeenAutoModeEntryWarning`, `hasSeenAutoModeOutsideReadPrompt`, `hasResetAutoModeOptInForDefaultOffer`
-    - per `projects` entry: `hasTrustDialogAccepted`, `allowedTools`, `enabledMcpjsonServers`, `disabledMcpjsonServers`, `mcpServers`, `hasClaudeMdExternalIncludesApproved`, `hasClaudeMdExternalIncludesWarningShown`
-
-    `oauthAccount` and every cache stay out.
-  - Prints the login command `CLAUDE_CONFIG_DIR=<dir> claude`, then `/login`.
-- **`check <label>`:** exit 0 and silent when every present `SHARED` entry is a correct link and `claude_on_disk(dir)` reports a login. Otherwise it prints one line per problem and exits 1. The problems are: missing dir, missing link, wrong target, real file in place of a link, not logged in. Reuse `scripts/whoami/agent_accounts.claude_on_disk`.
-- **`status`:** one block for `~/.claude` and one per existing `~/.claudeN`. Each block shows the label and login (via `account.label_for`), the role it serves, the `check` problems, entries that are neither shared nor on the known per-account list (`unclassified: …`), and `mcpServers` names that differ from `~/.claude.json`.
-- **Roles.** The `config/accounts.json` shape is `{"unit": "claude N"}`; absent means the default account.
-  - `role_account(role) -> DefaultAccount | NamedAccount(label, dir)`.
-  - `launch_prefix(role) -> str` returns `CLAUDE_CONFIG_DIR=<shlex-quoted dir> ` or `""`.
-  - CLI `role <role>` prints the label, or `default`; `env <role>` prints the prefix.
-  - `set-role unit <label | default>` writes the file atomically and appends `{at, role, label}` to `~/.local/state/accounts/roles.jsonl`.
-  - Only `unit` is a role. Any other name is refused.
-- Add `/config/accounts.json` to `.gitignore` beside `config/showrunners.json`.
+- `scripts/accounts/accounts.py` builds an account dir `~/.claudeN` (label `claude N`; any other label is refused) as a symlink farm over the `SHARED` entries of `~/.claude` (user content and cross-session state; `projects` and `sessions` always linked). Each dir keeps its own `IDENTITY_ENTRIES`: `.credentials.json`, `.claude.json` and `account-label`. `.claude.json` is seeded once, 0600 with O_EXCL, from `~/.claude.json` filtered to `TOP_LEVEL_SEED_KEYS` and per-project `PROJECT_SEED_KEYS`; `oauthAccount` and caches stay out.
+- Every path comes from `Path.home()` at call time: `accounts_home()`, `main_config_dir()`, `account_dir(label)`, `accounts_config_file()` (`~/.claude/config/accounts.json`), `roles_history_file()` (`~/.local/state/accounts/roles.jsonl`).
+- `setup(label) -> list[str]` and `check(label) -> list[str]` return every problem, empty when fit. `setup` leaves a correct link, replaces a wrong-target link and refuses a real file where a shared link belongs. `check` reports missing dir, missing link, wrong target, real file and `not logged in`, reading login through `whoami.agent_accounts.claude_on_disk` (skipped when `.claude.json` is a link).
+- Roles: `config/accounts.json` is `{"unit": "claude N"}`; `unit` is the only role. `role_account("unit")` treats only an absent key as default and raises `AccountsError` on a non-string value. `set_role(role, label | "default")` writes `accounts.json` atomically, then appends `{at, role, label}` to `roles.jsonl`; a failed append restores the previous file.
+- `account_statuses()` / `status` report label, login, roles, check problems and `mcpServers` drift per dir, plus `unclassified` entries for named dirs only. CLI `main(argv) -> int`: `setup`, `check`, `status`, `role`, `env`, `set-role`.
+- whoami is imported by putting the repo root on `sys.path`, then `from scripts.whoami import account` and `from scripts.whoami.agent_accounts import claude_on_disk`.
 
 **Files:**
+- `scripts/accounts/accounts.py` — the account tool and CLI
+- `scripts/accounts/test_accounts.py` — 28 tests: `HOME` set to a temp dir, real symlinks, login and label lookups stubbed
+- `.gitignore` — ignores `/config/accounts.json`
 
-- `scripts/accounts/accounts.py` — new.
-- `scripts/accounts/test_accounts.py` — new: temp `ACCOUNTS_HOME`, real symlinks, each refusal, seed key filtering, `check` problems, role resolution.
-- `.gitignore` — add `/config/accounts.json`.
+**Binds later work:** `check(label) -> list[str]` (empty when fit; the launch check puts the first problem in its refusal); `role_account("unit") -> DefaultAccount | NamedAccount(label, dir)`; `launch_prefix("unit") -> str`, `CLAUDE_CONFIG_DIR=<quoted dir> ` or empty for the default account; `set_role`; `main(argv) -> int`. Paths come from `Path.home()`; tests set `HOME` to a temp dir. The symlink refusals for the account dir and identity files apply wherever an account dir is used, the `exec` command included. Import as `from scripts.accounts import accounts` after putting the repo root on `sys.path`. Role state is read by unit launch, quota burn and swap; role state and the setup/check refusals are documented in the user's guide.
 
-**Seats:** `1 writer + 1 tester`.
+**Gotchas:** With no `config/accounts.json` every role resolves to the default account and `launch_prefix` is empty, so launches are byte-identical to before. A symlinked account dir or identity file would silently share one login across accounts; `setup` and `check` refuse both.
 
-**Acceptance gate:** tests pass and basedpyright is clean. `accounts.py status` on natedev prints only the `~/.claude` block and creates nothing (`ls -d ~/.claude?` before and after).
+**Ruled out:** An `ACCOUNTS_HOME` override beside `HOME`, since a second home setting disagrees with `claude_on_disk`, which reads `~/.claude.json` via `Path.home()`.
 
 ### Phase 2 — Units launch, resume and restart on the unit account  · status: todo
 
 #### Work Order
 
 **Goal:** a unit director runs on the account `config/accounts.json` names for `unit`, on every path that starts one; any other session relaunches on the dir it ran in.
+
+**Constraints from prior phases:** Phase 1 shipped `scripts/accounts/accounts.py`. Every path comes from `Path.home()` at call time; there is no `ACCOUNTS_HOME`, and tests set `HOME` to a temp dir. `check(label) -> list[str]` returns every problem, empty when the account is fit, and already refuses an account dir that is a symlink and any symlinked identity file (`.credentials.json`, `.claude.json`, `account-label`). `role_account("unit") -> DefaultAccount | NamedAccount(label, dir)`, `launch_prefix("unit") -> str` (empty for the default account) and `main(argv) -> int`. Other scripts import it as `accounts.py` imports whoami: put the repo root on `sys.path`, then `from scripts.accounts import accounts`.
 
 **Spec:**
 
@@ -279,6 +258,8 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 **Goal:** the agent notes, alerts, `/whoami` and the nightly gate treat `~/.claude`'s account and the unit account as active together, and each alert names the account and its role.
 
+**Constraints from prior phases:** Phase 1 shipped `scripts/accounts/accounts.py`. Every path comes from `Path.home()` at call time; there is no `ACCOUNTS_HOME`, and tests set `HOME` to a temp dir. `check(label) -> list[str]` returns every problem, empty when the account is fit, and already refuses an account dir that is a symlink and any symlinked identity file (`.credentials.json`, `.claude.json`, `account-label`). `role_account("unit") -> DefaultAccount | NamedAccount(label, dir)`, `launch_prefix("unit") -> str` (empty for the default account) and `main(argv) -> int`. Other scripts import it as `accounts.py` imports whoami: put the repo root on `sys.path`, then `from scripts.accounts import accounts`.
+
 **Spec:**
 
 - **`agent_notes.update`** reads `claude_live` once for `~/.claude` and once per `~/.claudeN` that `accounts.check` passes. Each read runs with that dir's `CLAUDE_CONFIG_DIR` for `claude auth status` and with that dir's credentials.
@@ -323,6 +304,8 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 **Goal:** `/accounts swap unit "claude N"` moves every unit director onto account N: each one reaches a safe stop and resumes in place on N.
 
+**Constraints from prior phases:** Phase 1 shipped `scripts/accounts/accounts.py`. Every path comes from `Path.home()` at call time; there is no `ACCOUNTS_HOME`, and tests set `HOME` to a temp dir. `check(label) -> list[str]` returns every problem, empty when the account is fit, and already refuses an account dir that is a symlink and any symlinked identity file (`.credentials.json`, `.claude.json`, `account-label`). `role_account("unit") -> DefaultAccount | NamedAccount(label, dir)`, `launch_prefix("unit") -> str` (empty for the default account) and `main(argv) -> int`. Other scripts import it as `accounts.py` imports whoami: put the repo root on `sys.path`, then `from scripts.accounts import accounts`.
+
 **Spec:**
 
 - **`accounts.py swap unit <label>`** refuses when:
@@ -361,6 +344,8 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 #### Work Order
 
 **Goal:** the user can start a session on any account with one word, and has a guide that says how to start sessions, how to log in and out without moving `~/.claude` off its account, and how to see which account a session is on. Nothing here creates a dir or logs anything in.
+
+**Constraints from prior phases:** Phase 1 shipped `scripts/accounts/accounts.py`. Every path comes from `Path.home()` at call time; there is no `ACCOUNTS_HOME`, and tests set `HOME` to a temp dir. `check(label) -> list[str]` returns every problem, empty when the account is fit, and already refuses an account dir that is a symlink and any symlinked identity file (`.credentials.json`, `.claude.json`, `account-label`). `role_account("unit") -> DefaultAccount | NamedAccount(label, dir)`, `launch_prefix("unit") -> str` (empty for the default account) and `main(argv) -> int`. Other scripts import it as `accounts.py` imports whoami: put the repo root on `sys.path`, then `from scripts.accounts import accounts`.
 
 **Spec:**
 
