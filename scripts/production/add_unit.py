@@ -18,7 +18,6 @@ from zoneinfo import ZoneInfo
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "hooks"))
 
-import conversation_pause
 import unit_lookup
 
 
@@ -679,6 +678,10 @@ def launch_session(
 
 
 def record_scheduled_restore_prompt(session_id: str, prompt: str) -> None:
+    # Imported here, not at the top: live_units.py and update_registration.py
+    # import this module for its table readers from trees without scripts/hooks.
+    import conversation_pause
+
     try:
         recorded = conversation_pause.read_scheduled_prompts(session_id)
         conversation_pause.record_scheduled_prompts(session_id, (*recorded, prompt))
