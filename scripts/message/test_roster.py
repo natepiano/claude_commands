@@ -13,7 +13,7 @@ import tempfile
 import time
 import unittest
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
@@ -32,7 +32,7 @@ import showrunners
 ENTRY_FIELDS = {
     "machine", "kind", "role", "name", "status", "address", "cwd",
     "production", "showrunner", "showrunner_address", "unit", "director",
-    "director_address", "slot_role", "session_dir",
+    "director_address", "slot_role", "session_dir", "thread",
 }
 WORKER_SESSION_ID = "12345678-1234-5678-9abc-def012345678"
 
@@ -91,6 +91,7 @@ class RosterTests(unittest.TestCase):
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "CLAUDE_BIN": str(fake_codex),
             "CLAUDE_CODE_SESSION_ID": "sid-runner",
+            "CODEX_THREAD_ID": "",
             "NOTIFIER_SESSIONS_DIR": str(self.sessions),
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "SHOWRUNNERS_CONFIG": str(config),
@@ -101,6 +102,7 @@ class RosterTests(unittest.TestCase):
             "ROSTER_DELEGATE_ROOT": str(self.delegate),
             "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
             "ROSTER_PS_FIXTURE": str(self.ps_state),
+            "PROCESS_TABLE_PS": f"cat {self.ps_state}",
         }
         environment_patch = cast(
             AbstractContextManager[object],
@@ -133,16 +135,18 @@ class RosterTests(unittest.TestCase):
         tmux: str = "",
         updated: int = 1,
         pid: int | None = None,
+        with_socket: bool = True,
     ) -> None:
         socket_path = self.sessions / f"{file_name}.sock"
-        listener = socket.socket(socket.AF_UNIX)
-        listener.bind(str(socket_path))
-        self.addCleanup(listener.close)
+        if with_socket:
+            listener = socket.socket(socket.AF_UNIX)
+            listener.bind(str(socket_path))
+            self.addCleanup(listener.close)
         _ = (self.sessions / f"{file_name}.json").write_text(json.dumps({
             "pid": os.getpid() if pid is None else pid,
             "sessionId": session_id,
             "name": name,
-            "messagingSocketPath": str(socket_path),
+            "messagingSocketPath": str(socket_path) if with_socket else "",
             "updatedAt": updated,
             "tmux": tmux,
             "cwd": str(cwd),
@@ -239,6 +243,7 @@ class RosterTests(unittest.TestCase):
                 "launcher_pid": os.getpid(), "role": "review",
             },
             "alpha-ended": {"thread_id": "thread-ended", "status": "ended"},
+            "alpha-no-thread": {"status": "starting", "launcher_pid": os.getpid()},
         })
 
         solo_run = self.delegate / "solo-run"
@@ -352,6 +357,8 @@ class RosterTests(unittest.TestCase):
             machine="machine", kind=kind, role=role, name=name, status="running",
             reach=roster.Messageable(address), cwd=cwd, showrunner=showrunner_link,
             director=director_link, assignment=assignment,
+            session=(roster.ClaudeSession(address.removeprefix("session:"))
+                     if kind == "claude" and address.startswith("session:") else roster.NoClaudeSession()),
         )
 
     def test_every_role_and_status_is_returned_with_its_relationships(self) -> None:
@@ -365,6 +372,7 @@ class RosterTests(unittest.TestCase):
             showrunner=roster.RunsProduction("alpha"),
             director=roster.NoDirector(),
             assignment=roster.NotAWorker(),
+            session=roster.ClaudeSession("sid-runner"),
         ))
         self.assertEqual(entries["director"], roster.RosterEntry(
             machine=machine, kind="claude", role="unit director", name="director",
@@ -375,6 +383,7 @@ class RosterTests(unittest.TestCase):
             ),
             director=roster.DirectsUnit("unit-one"),
             assignment=roster.NotAWorker(),
+            session=roster.ClaudeSession("sid-director"),
         ))
         self.assertEqual(entries["claude-worker"].role, "worker")
         self.assertEqual(entries["claude-worker"].director, roster.UnderDirector(
@@ -460,6 +469,76 @@ class RosterTests(unittest.TestCase):
         self.assertTrue(orphan_worker.startswith("    "))
         self.assertTrue(any(line.strip() == "your Codex sessions" for line in lines))
         self.assertTrue(any("~/projects/unit-one" in line for line in lines))
+
+    def test_socketless_director_keeps_worker_links_and_json_addresses(self) -> None:
+        self._write_session(
+            "director-new", "director", "sid-director", self.home / "projects" / "unit-one",
+            updated=20, with_socket=False,
+        )
+        entries = self._entries()
+        self.assertEqual(entries["director"].reach, roster.CannotReceiveMessages("no messaging socket"))
+        for name in ("claude-worker", "alpha-impl", "adversary reviewer"):
+            with self.subTest(worker=name):
+                self.assertEqual(entries[name].director, roster.UnderDirector(
+                    "unit-one", "director", "session:sid-director",
+                ))
+        result, lines, errors = self._run_main("--json")
+        self.assertEqual((result, errors), (0, []))
+        document = cast(dict[str, object], json.loads("\n".join(lines)))
+        rows = cast(list[roster.SerializedRosterEntry], document["entries"])
+        by_name = {row["name"]: row for row in rows}
+        self.assertEqual(by_name["director"]["address"], "")
+        for name in ("claude-worker", "alpha-impl", "adversary reviewer"):
+            with self.subTest(serialized_worker=name):
+                self.assertEqual(by_name[name]["director_address"], "session:sid-director")
+
+    def test_socketless_director_nests_its_workers_in_full_and_filtered_text(self) -> None:
+        self._write_session(
+            "director-new", "director", "sid-director", self.home / "projects" / "unit-one",
+            updated=20, with_socket=False,
+        )
+        for arguments in ((), ("--kind", "codex")):
+            with self.subTest(arguments=arguments):
+                result, lines, errors = self._run_main(*arguments)
+                self.assertEqual((result, errors), (0, []))
+                directors = [line for line in lines if line.lstrip().startswith("unit director director")]
+                self.assertEqual(len(directors), 1)
+                director = directors[0]
+                workers = ("alpha-impl",) if arguments else ("alpha-impl", "claude-worker")
+                for name in workers:
+                    worker = next(line for line in lines if line.lstrip().startswith(f"worker {name}"))
+                    self.assertEqual(len(worker) - len(worker.lstrip()),
+                                     len(director) - len(director.lstrip()) + 2)
+                    self.assertLess(lines.index(director), lines.index(worker))
+                    self.assertEqual(sum(line.lstrip().startswith(f"worker {name}") for line in lines), 1)
+                self.assertIn(f"  director not running: {self.delegate / 'orphan-run'}", lines)
+                if arguments:
+                    self.assertIn("(context)", director)
+
+    def test_socketless_showrunner_nests_linked_directors_in_full_and_filtered_text(self) -> None:
+        entries = self._entries()
+        runner = replace(entries["runner"], reach=roster.CannotReceiveMessages("no messaging socket"))
+        fixture = roster.Roster([runner, entries["director"], entries["alpha-impl"]], [])
+        for arguments in ([], ["--kind", "codex"]):
+            with self.subTest(arguments=arguments):
+                output, errors = io.StringIO(), io.StringIO()
+                with mock.patch.object(roster, "roster", return_value=fixture), \
+                        redirect_stdout(output), redirect_stderr(errors):
+                    result = roster.main(arguments)
+                lines = output.getvalue().splitlines()
+                self.assertEqual((result, errors.getvalue()), (0, ""))
+                runners = [line for line in lines if line.lstrip().startswith("showrunner runner")]
+                self.assertEqual(len(runners), 1)
+                director = next(line for line in lines if line.lstrip().startswith("unit director director"))
+                worker = next(line for line in lines if line.lstrip().startswith("worker alpha-impl"))
+                self.assertEqual(len(director) - len(director.lstrip()),
+                                 len(runners[0]) - len(runners[0].lstrip()) + 2)
+                self.assertEqual(len(worker) - len(worker.lstrip()),
+                                 len(director) - len(director.lstrip()) + 2)
+                self.assertLess(lines.index(runners[0]), lines.index(director))
+                self.assertLess(lines.index(director), lines.index(worker))
+                if arguments:
+                    self.assertIn("(context)", runners[0])
 
     def test_background_id_prefix_places_claude_worker_in_its_run(self) -> None:
         worker = self._entries()["claude-worker"]
@@ -609,6 +688,41 @@ class RosterTests(unittest.TestCase):
             str(self.home / "projects" / "free"), "ready",
         ))
 
+    def test_running_session_without_socket_retains_identity_and_has_no_address(self) -> None:
+        self._write_session(
+            "socketless", "socketless", "sid-socketless", self.home / "projects" / "socketless",
+            with_socket=False,
+        )
+        entry = self._entries()["socketless"]
+        self.assertEqual(entry.reach, roster.CannotReceiveMessages("no messaging socket"))
+        self.assertEqual(entry.session, roster.ClaudeSession("sid-socketless"))
+        result, lines, errors = self._run_main("--json")
+        self.assertEqual((result, errors), (0, []))
+        document = cast(dict[str, object], json.loads("\n".join(lines)))
+        rows = cast(list[dict[str, object]], document["entries"])
+        row = next(row for row in rows if row["name"] == "socketless")
+        self.assertEqual(row["address"], "")
+        self.assertEqual(set(row), ENTRY_FIELDS)
+
+    def test_sender_uses_newest_claude_identity_even_without_a_socket(self) -> None:
+        self._write_session(
+            "free-socketless", "newest-free", "sid-free", self.home / "projects" / "resumed",
+            status="waiting", updated=20, with_socket=False,
+        )
+        entries = self._entries()
+        entry = entries["newest-free"]
+        self.assertNotIn("free-claude", entries)
+        self.assertEqual((entry.reach, entry.cwd, entry.status), (
+            roster.CannotReceiveMessages("no messaging socket"),
+            str(self.home / "projects" / "resumed"), "waiting",
+        ))
+        self.assertTrue(roster.is_sender(entry, roster.ClaudeSession("sid-free")))
+        self.assertFalse(roster.is_sender(entry, roster.ClaudeSession("sid-other")))
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-free"}):
+            result, lines, errors = self._run_main()
+        self.assertEqual((result, errors), (0, []))
+        self.assertTrue(any("newest-free (you)" in line for line in lines))
+
     def test_showrunner_socket_identity_beats_a_duplicate_display_name(self) -> None:
         self._write_session(
             "runner-imposter", "runner", "sid-imposter",
@@ -717,7 +831,10 @@ class RosterTests(unittest.TestCase):
         rows = cast(list[dict[str, object]], document["entries"])
         self.assertTrue(rows)
         self.assertTrue(all(set(row) == ENTRY_FIELDS for row in rows))
-        self.assertTrue(all(all(isinstance(value, str) for value in row.values()) for row in rows))
+        self.assertTrue(all(
+            all(isinstance(value, str) for key, value in row.items() if key != "thread")
+            for row in rows
+        ))
         by_name = {cast(str, row["name"]): row for row in rows}
         self.assertEqual(by_name["adversary reviewer"]["address"], "")
         for field in (
@@ -735,6 +852,57 @@ class RosterTests(unittest.TestCase):
         result_value = roster.Roster([], [])
         with self.assertRaises(FrozenInstanceError):
             result_value.entries = []  # pyright: ignore[reportAttributeAccessIssue]
+
+    def test_seat_and_daemon_threads_are_domain_states_and_json_ids(self) -> None:
+        entries = self._entries()
+        self.assertEqual(entries["alpha-impl"].thread, roster.CodexThread("thread-shared"))
+        self.assertEqual(entries["Codex window"].thread, roster.CodexThread("thread-window"))
+        for name in ("runner", "claude-worker", "alpha-no-thread"):
+            self.assertEqual(entries[name].thread, roster.NoCodexThread())
+        result, lines, errors = self._run_main("--json")
+        self.assertEqual((result, errors), (0, []))
+        document = cast(dict[str, object], json.loads("\n".join(lines)))
+        rows = cast(list[dict[str, object]], document["entries"])
+        by_name = {cast(str, row["name"]): row for row in rows}
+        self.assertEqual(by_name["alpha-impl"]["thread"], "thread-shared")
+        self.assertEqual(by_name["Codex window"]["thread"], "thread-window")
+        for name in ("runner", "claude-worker", "alpha-no-thread"):
+            self.assertIsNone(by_name[name]["thread"])
+
+    def test_codex_seat_identity_marks_the_seat_and_not_its_inherited_director(self) -> None:
+        with mock.patch.dict(os.environ, {
+            "CODEX_THREAD_ID": "thread-shared", "CLAUDE_CODE_SESSION_ID": "sid-director",
+        }):
+            result, lines, errors = self._run_main()
+        self.assertEqual((result, errors), (0, []))
+        self.assertEqual(len([line for line in lines if "(you)" in line]), 1)
+        self.assertTrue(any("worker alpha-impl (you)" in line for line in lines))
+        self.assertFalse(any("unit director director (you)" in line for line in lines))
+
+    def test_daemon_codex_identity_marks_its_own_window(self) -> None:
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "thread-window"}):
+            result, lines, errors = self._run_main()
+        self.assertEqual((result, errors), (0, []))
+        self.assertEqual(len([line for line in lines if "(you)" in line]), 1)
+        self.assertTrue(any("Codex window (you)" in line for line in lines))
+
+    def test_plain_shell_marks_no_session(self) -> None:
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}):
+            result, lines, errors = self._run_main()
+        self.assertEqual((result, errors), (0, []))
+        self.assertFalse(any("(you)" in line for line in lines))
+
+    def test_sender_identity_has_frozen_named_states_and_codex_precedence(self) -> None:
+        self.assertEqual(roster.sender_identity({}), roster.NoSession())
+        self.assertEqual(roster.sender_identity({"CLAUDE_CODE_SESSION_ID": "claude"}),
+                         roster.ClaudeSession("claude"))
+        identity = roster.sender_identity({
+            "CODEX_THREAD_ID": "codex", "CLAUDE_CODE_SESSION_ID": "inherited",
+        })
+        self.assertEqual(identity, roster.CodexThread("codex"))
+        assert isinstance(identity, roster.CodexThread)
+        with self.assertRaises(FrozenInstanceError):
+            identity.thread_id = "changed"  # pyright: ignore[reportAttributeAccessIssue]
 
     def test_tmux_fallback_places_director_but_never_ledger_worker_by_cwd(self) -> None:
         missing_tmux = self.root / "bin" / "missing-tmux"

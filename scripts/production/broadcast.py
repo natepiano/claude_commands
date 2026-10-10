@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Send every showrunner, unit director or other agent on this machine a message at once.
+"""Send roster groups a message, with one concurrent delivery per recipient.
 
-  broadcast.py --from NAME (--all TEXT | --showrunners TEXT | --units TEXT | --agents TEXT)...
+  broadcast.py --from NAME (--all TEXT | --showrunners TEXT | --units TEXT |
+                           --agents TEXT | [--of UNIT] --workers TEXT | --top-level TEXT)...
 
-Every recipient gets its own short-lived `send.py`, all started together, so a
-broadcast takes as long as its slowest delivery. `--all` gives every role one
-text, and a role's own flag after it gives that role its own version. Other
-agents are every other live Claude session, seats included, and every running
-Codex seat. Each message ends with who was sent it, so nobody passes it on. The
-sender is never a recipient. One session, or the user, is `send.py --to NAME`.
+Overlapping groups receive the text of the last selecting flag. The sender is
+left out by session or Codex thread identity. Every message names its groups so
+recipients know it was sent directly.
 """
 from __future__ import annotations
 
@@ -16,37 +14,70 @@ import os
 import subprocess
 import sys
 import time
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NamedTuple
 
-import showrunners
-from live_units import units_of
-
 MESSAGE = Path(__file__).resolve().parent.parent / "message"
 sys.path.insert(0, str(MESSAGE))
-from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
-from process_table import Process, is_codex_agent, snapshot  # noqa: E402
+import roster  # noqa: E402
 
 SEND = Path(os.environ.get("BROADCAST_SEND") or MESSAGE / "send.py")
-USAGE = "usage: broadcast.py --from <your session> (--all TEXT | --showrunners TEXT | --units TEXT | --agents TEXT)..."
+USAGE = ("usage: broadcast.py --from <your session> (--all TEXT | --showrunners TEXT | --units TEXT"
+         + " | --agents TEXT | [--of UNIT] --workers TEXT | --top-level TEXT)...")
 # One relay peaked at 272 MB when measured (2026-10-07), so this many together hold about 6.5 GB.
 AT_ONCE = 24
 
-Role = Literal["showrunner", "unit director", "agent"]
-Outcome = Literal["sent", "no live session", "NOT sent"]
 
-SAID: dict[Role, str] = {"showrunner": "showrunner", "unit director": "unit director", "agent": "other agent"}
-FLAGS: dict[str, tuple[Role, ...]] = {"--all": tuple(SAID), "--showrunners": ("showrunner",),
-                                      "--units": ("unit director",), "--agents": ("agent",)}
+@dataclass(frozen=True)
+class AllRoles:
+    """Every role in the roster."""
+
+
+@dataclass(frozen=True)
+class Showrunners:
+    """Every showrunner."""
+
+
+@dataclass(frozen=True)
+class UnitDirectors:
+    """Every unit director."""
+
+
+@dataclass(frozen=True)
+class Agents:
+    """Every worker and freestanding session, Claude or Codex."""
+
+
+@dataclass(frozen=True)
+class Workers:
+    """Every delegate worker."""
+
+
+@dataclass(frozen=True)
+class WorkersOfUnit:
+    address: str
+    unit: str
+
+
+@dataclass(frozen=True)
+class TopLevel:
+    """Claude sessions that receive top-level announcements."""
+
+
+BroadcastGroup = AllRoles | Showrunners | UnitDirectors | Agents | Workers | WorkersOfUnit | TopLevel
+Outcome = Literal["sent", "no live session", "NOT sent"]
+FLAGS: dict[str, BroadcastGroup] = {
+    "--all": AllRoles(), "--showrunners": Showrunners(), "--units": UnitDirectors(),
+    "--agents": Agents(), "--workers": Workers(), "--top-level": TopLevel(),
+}
 
 
 class Recipient(NamedTuple):
     session: str
-    role: Role
-    # A Codex seat's session directory; empty for a Claude session.
-    codex: str = ""
+    role: str
 
 
 class Delivery(NamedTuple):
@@ -55,64 +86,58 @@ class Delivery(NamedTuple):
     detail: str
 
 
-def live_sessions() -> dict[str, SessionRecord]:
-    """Each live named session, the newest record winning a shared name."""
-    newest: dict[str, SessionRecord] = {}
-    for path in showrunners.SESSIONS_DIR.glob("*.json"):
-        record = read_session(path)
-        if isinstance(record, UnreadableSessionRecord) or not record["name"] or not live_session(record):
-            continue
-        if record["name"] not in newest or record["updatedAt"] > newest[record["name"]]["updatedAt"]:
-            newest[record["name"]] = record
-    return newest
+def recipients() -> list[roster.RosterEntry]:
+    """Read the roster once, retaining readable rows when a source fails."""
+    result = roster.roster(os.environ)
+    for problem in result.problems:
+        print(f"broadcast: roster: {problem}", file=sys.stderr)
+    return result.entries
 
 
-def codex_seats(table: Mapping[int, Process]) -> list[Recipient]:
-    """Each running Codex seat, by the name and session directory its turn was started with."""
-    seats: dict[Recipient, None] = {}
-    for process in table.values():
-        words = process.arguments.split()
-        options = dict(zip(words, words[1:]))
-        name, directory = options.get("--name") or options.get("--to"), options.get("--session-dir")
-        if is_codex_agent(process) and name and directory:
-            seats[Recipient(name, "agent", directory)] = None
-    return list(seats)
-
-
-def unit_addresses(runner: showrunners.Showrunner) -> list[str]:
-    """What reaches each unit of the showrunner: its session name now, or its unit id when no Claude runs.
-
-    A unit id is no session's name, so the send reports that unit as having no live session.
-    """
-    try:
-        return [unit.name or unit.unit for unit in units_of(runner)]
-    except (OSError, ValueError) as error:
-        print(f"broadcast: the units of {runner['slug']} could not be listed: {error}", file=sys.stderr)
-        return []
-
-
-def recipients(live: Collection[str]) -> list[Recipient]:
-    """Every configured showrunner and unit director, then every other live session and running Codex seat."""
-    registered = showrunners.registered_showrunners()
-    # A showrunner that is not running has no name to look up: its production's slug stands for it,
-    # which is no session's name, so the send reports it as having no live session.
-    runners = [runner["session"] or runner["slug"] for runner in registered]
-    units = dict.fromkeys(unit for runner in registered for unit in unit_addresses(runner) if unit not in runners)
-    others = sorted(name for name in live if name not in runners and name not in units)
-    return [*(Recipient(name, "showrunner") for name in runners), *(Recipient(name, "unit director") for name in units),
-            *(Recipient(name, "agent") for name in others), *codex_seats(snapshot())]
+def selects(group: BroadcastGroup, entry: roster.RosterEntry) -> bool:
+    match group:
+        case AllRoles():
+            return True
+        case Showrunners():
+            return entry.role == "showrunner"
+        case UnitDirectors():
+            return entry.role == "unit director"
+        case Agents():
+            return entry.role in ("worker", "freestanding")
+        case Workers():
+            return entry.role == "worker"
+        case WorkersOfUnit(address):
+            return (entry.role == "worker" and isinstance(entry.director, roster.UnderDirector)
+                    and entry.director.address == address)
+        case TopLevel():
+            return roster.is_top_level(entry)
 
 
 def series(names: list[str], joiner: str) -> str:
     return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} {joiner} {names[-1]}"
 
 
-def ending(told: Collection[Role]) -> str:
-    """A message's last line: who was sent it, so nobody passes it on."""
-    inside = [name for role, name in SAID.items() if role in told]
-    outside = [name for role, name in SAID.items() if role not in told]
-    return (f"Every {series(inside, 'and')} on this machine was sent this directly"
-            + (f", and no {series(outside, 'or')}." if outside else "; do not pass it on."))
+def ending(told: Collection[BroadcastGroup]) -> str:
+    """A message's last line names the selected groups, which may overlap."""
+    names: list[str] = []
+    for group in told:
+        match group:
+            case AllRoles():
+                labels = ["showrunners", "unit directors", "agents"]
+            case Showrunners():
+                labels = ["showrunners"]
+            case UnitDirectors():
+                labels = ["unit directors"]
+            case Agents():
+                labels = ["agents"]
+            case Workers():
+                labels = ["workers"]
+            case WorkersOfUnit(unit=unit):
+                labels = [f"workers of {unit}"]
+            case TopLevel():
+                labels = ["top level"]
+        names.extend(label for label in labels if label not in names)
+    return f"Sent directly to {series(names, 'and')} on this machine; do not pass it on."
 
 
 def send(session: str, sender: str, text: str, *options: str) -> str:
@@ -122,20 +147,48 @@ def send(session: str, sender: str, text: str, *options: str) -> str:
     return "" if done.returncode == 0 else (done.stdout or done.stderr).strip() or f"exit {done.returncode}"
 
 
-def broadcast(sender: str, texts: Mapping[Role, str]) -> list[Delivery]:
-    """Send each role its text, every live recipient at once."""
-    live, last = live_sessions(), ending(texts)
-    chosen = [one for one in recipients(live) if one.role in texts and one.session != sender]
-    reached = [one for one in chosen if one.codex or one.session in live]
+def _unreachable(entry: roster.RosterEntry, reach: roster.CannotReceiveMessages) -> str:
+    match entry.director:
+        case roster.UnderDirector(name=director):
+            next_step = f"contact its unit director {director} or wait"
+        case _:
+            next_step = "no unit director is running for it"
+    return f"send.py: {entry.name} cannot take messages ({reach.reason}); {next_step}"
 
-    def deliver(one: Recipient) -> str:
-        return send(one.session, sender, f"{texts[one.role]}\n\n{last}",
-                    *(("--codex", "--session-dir", one.codex) if one.codex else ()))
+
+def _broadcast(
+    sender: str, texts: Mapping[BroadcastGroup, str], entries: Sequence[roster.RosterEntry],
+    identity: roster.SenderIdentity,
+) -> list[Delivery]:
+    if not texts:
+        return []
+    last = ending(texts)
+    chosen: list[tuple[roster.RosterEntry, str]] = []
+    for entry in entries:
+        if roster.is_sender(entry, identity):
+            continue
+        versions = [text for group, text in texts.items() if selects(group, entry)]
+        if versions:
+            chosen.append((entry, versions[-1]))
+
+    def deliver(chosen_entry: tuple[roster.RosterEntry, str]) -> Delivery:
+        entry, text = chosen_entry
+        recipient = Recipient(entry.name, entry.role)
+        match entry.reach:
+            case roster.CannotReceiveMessages():
+                return Delivery(recipient, "no live session", _unreachable(entry, entry.reach))
+            case roster.Messageable(address):
+                problem = send(address, sender, f"{text}\n\n{last}")
+                return Delivery(recipient, "NOT sent" if problem else "sent", problem)
 
     with ThreadPoolExecutor(max_workers=AT_ONCE) as pool:
-        problems = dict(zip(reached, pool.map(deliver, reached)))
-    return [Delivery(one, "no live session", "") if one not in problems
-            else Delivery(one, "NOT sent" if problems[one] else "sent", problems[one]) for one in chosen]
+        return list(pool.map(deliver, chosen))
+
+
+def broadcast(sender: str, texts: Mapping[BroadcastGroup, str]) -> list[Delivery]:
+    """Send the last matching group's text to each roster member once."""
+    identity = roster.sender_identity(os.environ)
+    return _broadcast(sender, texts, recipients(), identity)
 
 
 def report(deliveries: list[Delivery]) -> bool:
@@ -145,21 +198,80 @@ def report(deliveries: list[Delivery]) -> bool:
     return all(delivery.outcome != "NOT sent" for delivery in deliveries)
 
 
+def _unit_group(target: str, entries: Sequence[roster.RosterEntry]) -> WorkersOfUnit:
+    directors = [(entry, f"session:{entry.session.session_id}") for entry in entries
+                 if entry.role == "unit director" and isinstance(entry.session, roster.ClaudeSession)]
+    matches = [(entry, address) for entry, address in directors
+               if entry.name == target or address == target
+               or (isinstance(entry.director, roster.DirectsUnit) and entry.director.unit == target)]
+    if len(matches) != 1:
+        known = matches if matches else directors
+        descriptions = [f"  {entry.director.unit if isinstance(entry.director, roster.DirectsUnit) else entry.name}"
+                        + f" ({entry.name}): {address}"
+                        for entry, address in known]
+        reason = f"{target} matches more than one unit director:" if matches else f"unknown unit {target}; known units:"
+        raise ValueError("\n".join([reason, *descriptions]))
+    director, address = matches[0]
+    return WorkersOfUnit(address,
+                         director.director.unit if isinstance(director.director, roster.DirectsUnit) else director.name)
+
+
 def main(arguments: list[str]) -> int:
     flags = arguments[2::2]
-    if len(arguments) < 4 or len(arguments) % 2 or arguments[0] != "--from" or not FLAGS.keys() >= set(flags):
+    if (len(arguments) < 4 or len(arguments) % 2 or arguments[0] != "--from"
+            or not (FLAGS.keys() | {"--of"}) >= set(flags)
+            or not any(flag in FLAGS for flag in flags)):
         print(USAGE, file=sys.stderr)
         return 2
-    sender, texts = arguments[1], dict[Role, str]()
-    for flag, text in zip(flags, arguments[3::2]):
-        texts.update(dict.fromkeys(FLAGS[flag], text))
+    sender = arguments[1]
+    texts: dict[BroadcastGroup, str] = {}
+    started = time.monotonic()
+    identity = roster.sender_identity(os.environ)
+    entries = recipients()
+    workers: Workers | WorkersOfUnit = Workers()
+    scope_pending = False
     try:
-        started = time.monotonic()
-        deliveries = broadcast(sender, texts)
+        for flag, text in zip(flags, arguments[3::2]):
+            if flag == "--of":
+                workers = _unit_group(text, entries)
+                scope_pending = True
+                continue
+            group = workers if flag == "--workers" else FLAGS[flag]
+            if flag == "--workers":
+                scope_pending = False
+            _ = texts.pop(group, None)
+            texts[group] = text
+        if scope_pending:
+            print(USAGE, file=sys.stderr)
+            return 2
+    except ValueError as error:
+        print(f"broadcast: {error}", file=sys.stderr)
+        return 2
+    try:
+        deliveries = _broadcast(sender, texts, entries, identity)
     except ValueError as error:
         print(error, file=sys.stderr)
         return 1
     every = report(deliveries)
+    for group in texts:
+        if any(selects(group, entry) and not roster.is_sender(entry, identity) for entry in entries):
+            continue
+        match group:
+            case AllRoles():
+                name = "all roles"
+            case Showrunners():
+                name = "showrunners"
+            case UnitDirectors():
+                name = "unit directors"
+            case Agents():
+                name = "agents"
+            case Workers():
+                name = "workers"
+            case WorkersOfUnit(unit=unit):
+                name = f"workers of {unit}"
+            case TopLevel():
+                name = "top level"
+        print(f"{name} - none on this machine")
     print(f"{sum(delivery.outcome == 'sent' for delivery in deliveries)} sent in {time.monotonic() - started:.0f} s")
     return 0 if every else 1
 

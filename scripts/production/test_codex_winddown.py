@@ -32,6 +32,22 @@ with open(os.environ["LOG"], "a") as log:
 
 
 class CountTests(unittest.TestCase):
+    def test_announcement_uses_showrunner_and_unit_director_groups(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        with (
+            mock.patch.dict(os.environ, {"HOME": str(root)}, clear=True),
+            mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
+            mock.patch.object(codex_winddown, "clock", return_value="fixture time"),
+            mock.patch.object(broadcast, "broadcast", return_value=[]) as send_groups,
+            mock.patch.object(broadcast, "report", return_value=True) as report,
+        ):
+            self.assertTrue(codex_winddown.announce("fixture sender", "runner from {sender}", "unit from {sender}"))
+        send_groups.assert_called_once_with("fixture sender", {
+            broadcast.Showrunners(): "runner from fixture sender",
+            broadcast.UnitDirectors(): "unit from fixture sender",
+        })
+        report.assert_called_once_with([])
+
     def test_start_counts_the_newest_named_session_without_broadcast_session_lookup(self) -> None:
         state = Path(self.enterContext(tempfile.TemporaryDirectory()))
         older = SessionRecord(
@@ -185,11 +201,18 @@ class MessageTests(unittest.TestCase):
         _ = (self.root / "notifier.sh").write_text(NOTIFIER_STUB, encoding="utf-8")
         _ = (self.root / "send.py").write_text(SEND_STUB, encoding="utf-8")
         self.environment = {
-            **os.environ, "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json"),
+            "HOME": str(self.root), "PATH": os.environ.get("PATH", ""),
+            "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "",
+            "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json"),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"), "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CODEX_WINDDOWN_NOTIFIER": str(self.root / "notifier.sh"), "BROADCAST_SEND": str(self.root / "send.py"),
             "CODEX_WINDDOWN_STATE": str(self.root / "prompts"), "LOG": str(self.root / "log"),
             "PROCESS_TABLE_PS": f"cat {self.root / 'ps'}",
+            "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
+            "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
+            "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
+            "ROSTER_DELEGATE_ROOT": str(self.root / "delegate"),
+            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
         }
         self.set_processes()
 
@@ -203,14 +226,15 @@ class MessageTests(unittest.TestCase):
     def test_start_tells_each_role_its_version_and_starts_each_showrunners_count(self) -> None:
         done = self.run_script("start", "--from", "natedev")
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stdout.splitlines(), ["hana - showrunner - sent", "zz-gone - showrunner - no live session",
-                                                    "trunk - unit director - sent", "hana: counting every 2 minutes"])
+        lines = done.stdout.splitlines()
+        self.assertEqual(lines[-1], "hana: counting every 2 minutes")
+        self.assertCountEqual(lines[:-1], ["hana - showrunner - sent", "trunk - unit director - sent"])
         log = (self.root / "log").read_text(encoding="utf-8")
         for session in ("hana", "trunk"):
-            self.assertIn(f"send --to {session} --from natedev --text Codex wind-down, from the user", log)
+            self.assertIn(f"send --to session:id-{session} --from natedev --text Codex wind-down, from the user", log)
         self.assertEqual(log.count('a "Codex count" message arrives'), 1)
         self.assertEqual(log.count("You are encouraged to continue work on your own"), 1)
-        self.assertEqual(log.count("was sent this directly, and no other agent."), 2)
+        self.assertEqual(log.count("Sent directly to showrunners and unit directors on this machine; do not pass it on."), 2)
         self.assertIn("notifier new codex-count-hana --every 2 --to session:id-hana", log)
         prompt = (self.root / "prompts/codex-count-hana.txt").read_text(encoding="utf-8")
         self.assertIn(f"{SCRIPT} count hana`", prompt)
@@ -219,22 +243,21 @@ class MessageTests(unittest.TestCase):
         _ = self.run_script("start", "--from", "natedev")
         done = self.run_script("clear", "--from", "natedev")
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stdout.splitlines(), ["hana: count stopped", "hana - showrunner - sent",
-                                                    "zz-gone - showrunner - no live session",
-                                                    "trunk - unit director - sent"])
+        lines = done.stdout.splitlines()
+        self.assertEqual(lines[0], "hana: count stopped")
+        self.assertCountEqual(lines[1:], ["hana - showrunner - sent", "trunk - unit director - sent"])
         # Only the showrunners' own update timers are left: every count is gone.
         self.assertEqual(sorted(path.name for path in (self.root / "notifier").iterdir()),
                          ["showrunner-show", "showrunner-zz-gone"])
         log = (self.root / "log").read_text(encoding="utf-8")
-        self.assertIn("send --to hana --from natedev --text All clear, from the user", log)
+        self.assertIn("send --to session:id-hana --from natedev --text All clear, from the user", log)
         self.assertIn("Start using Codex again", log)
 
     def test_triage_needs_a_wind_down_and_carries_the_users_words(self) -> None:
         self.assertEqual(self.run_script("triage", "--from", "natedev").returncode, 1)
         _ = self.run_script("start", "--from", "natedev")
         done = self.run_script("triage", "--from", "natedev")
-        self.assertEqual(done.stdout.splitlines(), ["hana - showrunner - sent", "zz-gone - showrunner - no live session",
-                                                    "trunk - unit director - sent"])
+        self.assertCountEqual(done.stdout.splitlines(), ["hana - showrunner - sent", "trunk - unit director - sent"])
         self.assertIn("which ones can be stopped now and added to a resume list",
                       (self.root / "log").read_text(encoding="utf-8"))
 
