@@ -232,7 +232,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 **Ruled out:** a `config_dir` field on `ShutdownSessionEntry` (settle replaces the session snapshot, so a second copy goes stale); an explicit `CLAUDE_CONFIG_DIR` in `remove_seats.py` (inheritance already carries it).
 
-### Phase 3 — Quota with two active accounts  · status: todo
+### Phase 3 — Quota with two active accounts  · status: done
 
 #### Work Order
 

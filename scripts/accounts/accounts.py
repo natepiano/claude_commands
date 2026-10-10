@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -13,7 +14,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -21,8 +22,8 @@ SCRIPTS = REPOSITORY_ROOT / "scripts"
 sys.path.insert(0, str(REPOSITORY_ROOT))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
 
-from scripts.whoami import account as account  # noqa: E402
-from scripts.whoami.agent_accounts import claude_on_disk  # noqa: E402
+import account  # noqa: E402
+import agent_accounts  # noqa: E402
 
 
 # Shared means Claude Code reads the entry as user content or cross-session
@@ -139,6 +140,43 @@ class NamedAccount:
 AccountSelection = DefaultAccount | NamedAccount
 
 
+class QuotaReading(TypedDict):
+    account: str
+    at: str
+    remaining: float
+    credits: NotRequired[float]
+
+
+@dataclass(frozen=True)
+class WeeklyQuotaObservation:
+    """One account's remaining weekly allowance at an observed time."""
+
+    at: datetime
+    remaining: float
+
+
+@dataclass(frozen=True)
+class UnitRoleAssignment:
+    """The quota note identity that served unit directors from this time."""
+
+    at: datetime
+    label: str
+
+
+@dataclass(frozen=True)
+class AccountRoleBurn:
+    """Measured spend while an account served the named roles."""
+
+    label: str
+    roles: tuple[agent_accounts.ClaudeRole, ...]
+    points: float
+    observed_days: float
+
+    @property
+    def points_per_day(self) -> float:
+        return self.points / self.observed_days
+
+
 class AccountsError(ValueError):
     """A requested account operation is invalid or unsafe."""
 
@@ -163,6 +201,8 @@ class CommandLine(argparse.Namespace):
     action: str = ""
     label: str = ""
     role: str = ""
+    since: str = ""
+    until: str = ""
 
 
 @dataclass(frozen=True)
@@ -354,8 +394,7 @@ def _link_problems(destination: Path) -> list[str]:
 
 
 def _login_problem(config_dir: Path) -> list[str]:
-    report = claude_on_disk(config_dir)
-    if report.email is None:
+    if isinstance(account_identity(config_dir), agent_accounts.UnreadableClaudeAccount):
         return [f"accounts: {config_dir} is not logged in"]
     return []
 
@@ -419,6 +458,189 @@ def account_prefix(selected: AccountSelection) -> str:
 def launch_prefix(role: str) -> str:
     """Return the shell assignment needed before launching this role."""
     return account_prefix(role_account(role))
+
+
+def multiple_accounts_configured() -> bool:
+    """Whether account configuration or a named account opts into role displays."""
+    return accounts_config_file().exists() or bool(_existing_named_accounts())
+
+
+def checked_named_accounts() -> list[NamedAccount]:
+    """Every existing named account fit for a live reading or launch."""
+    return [named for named in _existing_named_accounts() if not check(named.label)]
+
+
+def account_identity(config_dir: Path) -> agent_accounts.KnownClaudeAccount | agent_accounts.UnreadableClaudeAccount:
+    """Convert the whoami identity boundary into an explicit readable state."""
+    identity = account.claude_account(config_dir)
+    if identity is None:
+        return agent_accounts.UnreadableClaudeAccount()
+    return agent_accounts.KnownClaudeAccount(identity.login, identity.label)
+
+
+def claude_account_selection() -> agent_accounts.ClaudeAccountSelection:
+    """Resolve role identities and fit named accounts once for this run."""
+    multiple = multiple_accounts_configured()
+    default = account_identity(main_config_dir())
+    selected = role_account("unit")
+    named_accounts: list[agent_accounts.CheckedNamedClaudeAccount] = []
+    for named in checked_named_accounts():
+        identity = account_identity(named.dir)
+        if isinstance(identity, agent_accounts.KnownClaudeAccount):
+            named_accounts.append(agent_accounts.CheckedNamedClaudeAccount(
+                named.label, named.dir, identity,
+            ))
+    unit: agent_accounts.KnownClaudeAccount | agent_accounts.UnreadableClaudeAccount = default
+    if isinstance(selected, NamedAccount):
+        unit = next(
+            (named.identity for named in named_accounts if named.directory == selected.dir),
+            agent_accounts.UnreadableClaudeAccount(),
+        )
+    return agent_accounts.ClaudeAccountSelection(default, unit, multiple, tuple(named_accounts))
+
+
+def readings_file() -> Path:
+    """The quota readings log, resolved from this call's HOME."""
+    return accounts_home() / ".local" / "state" / "agent-notes" / "readings.jsonl"
+
+
+def _iso_time(text: str, place: str) -> datetime:
+    try:
+        at = datetime.fromisoformat(text)
+    except ValueError as error:
+        raise AccountsError(f"accounts: {place} must be an ISO timestamp") from error
+    if at.tzinfo is None:
+        # Command-line and historical wall times use the user's zone.
+        from zoneinfo import ZoneInfo
+
+        at = at.replace(tzinfo=ZoneInfo("America/Los_Angeles"))
+    return at.astimezone(timezone.utc)
+
+
+def _quota_observations() -> dict[str, list[WeeklyQuotaObservation]]:
+    path = readings_file()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeError) as error:
+        raise AccountsError(f"accounts: could not read {path}: {error}") from error
+    observations: dict[str, dict[datetime, WeeklyQuotaObservation]] = {}
+    for line in lines:
+        try:
+            decoded = cast(object, json.loads(line))
+            if not isinstance(decoded, dict):
+                continue
+            values = cast(dict[str, object], decoded)
+            label, stamp, left = values.get("account"), values.get("at"), values.get("remaining")
+            if (
+                not isinstance(label, str) or not isinstance(stamp, str)
+                or isinstance(left, bool) or not isinstance(left, (int, float))
+                or not math.isfinite(left) or not 0 <= left <= 100
+            ):
+                continue
+            wire: QuotaReading = {"account": label, "at": stamp, "remaining": float(left)}
+            at = datetime.fromisoformat(wire["at"])
+            if at.tzinfo is None:
+                continue
+            at = at.astimezone(timezone.utc)
+            observations.setdefault(label, {})[at] = WeeklyQuotaObservation(at, wire["remaining"])
+        except (ValueError, TypeError):
+            continue
+    return {
+        label: sorted(found.values(), key=lambda observation: observation.at)
+        for label, found in observations.items()
+    }
+
+
+def _unit_role_history(default_label: str) -> list[UnitRoleAssignment]:
+    path = roles_history_file()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeError) as error:
+        raise AccountsError(f"accounts: could not read {path}: {error}") from error
+    history: list[UnitRoleAssignment] = []
+    note_labels: dict[str, str] = {"default": default_label}
+    for index, line in enumerate(lines, 1):
+        try:
+            decoded = cast(object, json.loads(line))
+            if not isinstance(decoded, dict):
+                raise ValueError("expected a JSON object")
+            values = cast(dict[str, object], decoded)
+            if values.get("role") != "unit":
+                raise ValueError("invalid role")
+            label, stamp = values.get("label"), values.get("at")
+            if not isinstance(label, str) or not isinstance(stamp, str):
+                raise ValueError("invalid label or timestamp")
+            if label != "default":
+                _ = account_dir(label)
+            wire = RoleChange(at=stamp, role="unit", label=label)
+            if label not in note_labels:
+                identity = account_identity(account_dir(label))
+                if isinstance(identity, agent_accounts.UnreadableClaudeAccount):
+                    raise ValueError(f"account identity for {label} is unreadable")
+                note_labels[label] = identity.label
+            history.append(UnitRoleAssignment(_iso_time(wire["at"], "role time"), note_labels[label]))
+        except (ValueError, TypeError) as error:
+            raise AccountsError(f"accounts: {path}:{index}: invalid role change: {error}") from error
+    return sorted(history, key=lambda assignment: assignment.at)
+
+
+def _historical_roles(
+    label: str, at: datetime, default_label: str, history: list[UnitRoleAssignment],
+    fallback_unit: str,
+) -> tuple[agent_accounts.ClaudeRole, ...]:
+    unit_label = default_label if history else fallback_unit
+    for assignment in history:
+        if assignment.at > at:
+            break
+        unit_label = assignment.label
+    roles: list[agent_accounts.ClaudeRole] = []
+    if label == default_label:
+        roles.append("showrunners")
+    if label == unit_label:
+        roles.append("unit directors")
+    return tuple(roles)
+
+
+def burn(since: datetime, until: datetime) -> list[AccountRoleBurn]:
+    """Spend per observed day, split at refills, window edges, and role changes.
+
+    Deltas between observations are spread uniformly within their interval.
+    A rise in remaining allowance starts a new span: no spend or observed time
+    is inferred across that refill. One observation alone gives no rate.
+    """
+    if since.tzinfo is None or until.tzinfo is None or until <= since:
+        raise AccountsError("accounts: burn requires an increasing, timezone-aware window")
+    selection = claude_account_selection()
+    default = selection.default_account
+    default_label = default.label if isinstance(default, agent_accounts.KnownClaudeAccount) else ""
+    history = _unit_role_history(default_label)
+    unit = selection.unit_account
+    fallback_unit = unit.label if isinstance(unit, agent_accounts.KnownClaudeAccount) else ""
+    totals: dict[tuple[str, tuple[agent_accounts.ClaudeRole, ...]], tuple[float, float]] = {}
+    for label, observations in _quota_observations().items():
+        for before, after in zip(observations, observations[1:]):
+            start, end = max(before.at, since), min(after.at, until)
+            if start >= end or after.remaining > before.remaining:
+                continue
+            seconds = (after.at - before.at).total_seconds()
+            rate = (before.remaining - after.remaining) / seconds
+            boundaries = [start, *(assignment.at for assignment in history if start < assignment.at < end), end]
+            for left, right in zip(boundaries, boundaries[1:]):
+                span = (right - left).total_seconds()
+                if span <= 0:
+                    continue
+                roles = _historical_roles(label, left, default_label, history, fallback_unit)
+                key = (label, roles)
+                points, observed_seconds = totals.get(key, (0.0, 0.0))
+                totals[key] = (points + rate * span, observed_seconds + span)
+    return [
+        AccountRoleBurn(label, roles, points, seconds / 86400)
+        for (label, roles), (points, seconds) in sorted(totals.items())
+    ]
 
 
 def _atomic_write(path: Path, contents: str) -> None:
@@ -575,11 +797,9 @@ def _status_for(
         is_named_account and (config_dir / ".claude.json").is_symlink()
     )
     if account_is_safe_to_inspect:
-        report = claude_on_disk(config_dir)
-        login = report.email or "unavailable"
-        account_label = (
-            account.label_for("claude", report.email) if report.email else "unavailable"
-        )
+        identity = account_identity(config_dir)
+        login = identity.login if isinstance(identity, agent_accounts.KnownClaudeAccount) else "unavailable"
+        account_label = identity.label if isinstance(identity, agent_accounts.KnownClaudeAccount) else "unavailable"
         config_file = (
             accounts_home() / ".claude.json"
             if config_dir == main_config_dir()
@@ -680,6 +900,9 @@ def _parser() -> argparse.ArgumentParser:
     set_role_command = commands.add_parser("set-role")
     _ = set_role_command.add_argument("role")
     _ = set_role_command.add_argument("label")
+    burn_command = commands.add_parser("burn")
+    _ = burn_command.add_argument("--since", required=True)
+    _ = burn_command.add_argument("--until", default="")
     return parser
 
 
@@ -711,6 +934,19 @@ def main(argv: list[str]) -> int:
             return 0
         if options.action == "set-role":
             set_role(options.role, options.label)
+            return 0
+        if options.action == "burn":
+            since = _iso_time(options.since, "--since")
+            until = _iso_time(options.until, "--until") if options.until else datetime.now(timezone.utc)
+            results = burn(since, until)
+            for result in results:
+                roles = ", ".join(result.roles) or ("spare" if result.label.startswith("claude ") else "unassigned")
+                print(
+                    f"{result.label} ({roles}): {result.points_per_day:g} points/day "
+                    + f"({result.points:g} points over {result.observed_days:g} observed days)"
+                )
+            if not results:
+                print("No paired quota readings in this window.")
             return 0
         raise AccountsError(f"accounts: unknown action {options.action}")
     except AccountsError as error:

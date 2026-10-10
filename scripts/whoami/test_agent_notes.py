@@ -1,16 +1,31 @@
 """Account attribution and stale-data behavior of the vault writer."""
 
+import asyncio
+import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
+import urllib.request
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest.mock import patch
 
 import agent_notes
-from agent_accounts import CodexRateLimits, Quota, Report, codex_credits, reset_credits
-from agent_notes import Note, apply, local_reset, read_note
+import note_file
+import agent_accounts
+import codex_pacer
+import five_hour
+import whoami
+from agent_accounts import (ClaudeDirectorySource, CodexRateLimits, Quota, Report,
+                            codex_credits, reset_credits)
+from agent_notes import apply, local_reset
+from note_file import Note, read_note
+from scripts.accounts import accounts
 
 
 class AgentNotesTests(unittest.TestCase):
@@ -25,6 +40,13 @@ class AgentNotesTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        home_context = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
+        })))
+        del home_context
+        _ = os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        _ = os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        _ = self.enterContext(patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl", create=True))
 
     def note(self, name: str, email: str, extra: str = "") -> Note:
@@ -35,6 +57,277 @@ class AgentNotesTests(unittest.TestCase):
         if note is None:
             self.fail(f"{name} did not parse as a note")
         return note
+
+    def account_dir(self, label: str, login: str, token: str) -> Path:
+        if label == "default":
+            directory = self.root / ".claude"
+            directory.mkdir(exist_ok=True)
+            config = self.root / ".claude.json"
+        else:
+            self.assertEqual(accounts.setup(label), [])
+            directory = accounts.account_dir(label)
+            config = directory / ".claude.json"
+        _ = config.write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
+        _ = (directory / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": token},
+        }))
+        return directory
+
+    def select_unit(self, label: str) -> None:
+        config = accounts.accounts_config_file()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        _ = config.write_text(json.dumps(accounts.AccountsConfiguration(unit=label)))
+
+    def test_update_reads_two_active_accounts_and_an_inactive_spare(self) -> None:
+        default = self.account_dir("default", "main@example.com", "main-fixture-token")
+        unit = self.account_dir("claude 3", "unit@example.com", "unit-fixture-token")
+        spare = self.account_dir("claude 1", "spare@example.com", "spare-fixture-token")
+        (self.root / ".claude9").mkdir()
+        self.select_unit("claude 3")
+        _ = self.note("claude 2.md", "main@example.com")
+        _ = self.note("claude 3.md", "unit@example.com")
+        _ = self.note("claude 1.md", "spare@example.com")
+        identities = {default: "main@example.com", unit: "unit@example.com", spare: "spare@example.com"}
+        tokens = {"Bearer main-fixture-token": 20, "Bearer unit-fixture-token": 96, "Bearer spare-fixture-token": 10}
+        observed: list[Path] = []
+
+        def status(command: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(command, ("fixture-claude", "auth", "status"))
+            environment = cast(dict[str, str], kwargs["env"])
+            directory = Path(environment.get("CLAUDE_CONFIG_DIR", str(default)))
+            observed.append(directory)
+            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
+            return subprocess.CompletedProcess(command, 0, json.dumps({
+                "loggedIn": True, "email": identities[directory], "authMethod": "claude.ai",
+            }), "")
+
+        def usage(request: urllib.request.Request, timeout: int) -> io.BytesIO:
+            self.assertEqual(timeout, 15)
+            return io.BytesIO(json.dumps({"seven_day": {
+                "utilization": tokens[request.get_header("Authorization") or ""],
+                "resets_at": self.future.isoformat(),
+            }}).encode())
+
+        with (
+            patch.object(agent_accounts, "executable", return_value="fixture-claude"),
+            patch.object(subprocess, "run", side_effect=status),
+            patch.object(urllib.request, "urlopen", side_effect=usage),
+            patch.object(agent_accounts, "codex_live", return_value=Report("Codex", problem="fixture")),
+            patch.object(five_hour, "watch", return_value=[]) as watch,
+            patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(spare), "CLAUDE_CODE_OAUTH_TOKEN": "inherited-token"}),
+        ):
+            _ = agent_notes.update()
+
+        self.assertCountEqual(observed, [default, unit, spare])
+        notes = {note.path.stem: note for note in note_file.read_notes()}
+        self.assertEqual({label: note.get("state") for label, note in notes.items()}, {
+            "claude 1": "inactive", "claude 2": "active", "claude 3": "active",
+        })
+        self.assertEqual({label: note.get("weekly_remaining_usage") for label, note in notes.items()}, {
+            "claude 1": "90", "claude 2": "80", "claude 3": "4",
+        })
+        readings = [cast(agent_notes.StoredReading, json.loads(line))
+                    for line in (self.root / "readings.jsonl").read_text().splitlines()]
+        self.assertCountEqual([(reading["account"], reading["remaining"]) for reading in readings],
+                              [("claude 2", 80), ("claude 3", 4), ("claude 1", 90)])
+        watched = cast(list[Report], watch.call_args.args[0])
+        self.assertEqual([(report.tool, report.email) for report in watched],
+                         [("Claude", "main@example.com"), ("Codex", None)])
+        self.assertEqual(watched[0].source, ClaudeDirectorySource(default))
+
+    def test_two_account_fixture_writes_two_readings(self) -> None:
+        _ = self.account_dir("default", "main@example.com", "main-token")
+        _ = self.account_dir("claude 3", "unit@example.com", "unit-token")
+        self.select_unit("claude 3")
+        _ = self.note("claude 2.md", "main@example.com")
+        _ = self.note("claude 3.md", "unit@example.com")
+        reports = [Report("Claude", email=email, quotas=[Quota("Weekly", used, self.future)])
+                   for email, used in (("main@example.com", 20), ("unit@example.com", 96))]
+        with (patch.object(agent_notes, "live_reports", return_value=reports),
+              patch.object(five_hour, "watch", return_value=[])):
+            _ = agent_notes.update()
+        self.assertEqual([note.get("state") for note in note_file.read_notes()], ["active", "active"])
+        self.assertEqual(len((self.root / "readings.jsonl").read_text().splitlines()), 2)
+
+    def test_role_swap_during_update_keeps_one_unit_login_active(self) -> None:
+        """F002: every note uses the same role selection for the entire update."""
+        _ = self.account_dir("default", "main@example.com", "main-token")
+        _ = self.account_dir("claude 1", "old-unit@example.com", "old-token")
+        _ = self.account_dir("claude 3", "new-unit@example.com", "new-token")
+        self.select_unit("claude 1")
+        for label, login in (("claude 1", "old-unit@example.com"),
+                             ("claude 2", "main@example.com"),
+                             ("claude 3", "new-unit@example.com")):
+            _ = self.note(f"{label}.md", login)
+        resolve = accounts.role_account
+
+        def swap_after_selection(role: str) -> accounts.AccountSelection:
+            selected = resolve(role)
+            self.select_unit("claude 3")
+            return selected
+
+        reports = [Report("Claude", email=login, quotas=[Quota("Weekly", 20, self.future)])
+                   for login in ("old-unit@example.com", "main@example.com", "new-unit@example.com")]
+        with (
+            patch.object(accounts, "role_account", side_effect=swap_after_selection) as selection,
+            patch.object(agent_notes, "live_reports", return_value=reports),
+            patch.object(five_hour, "watch", return_value=[]),
+        ):
+            _ = agent_notes.update()
+        selection.assert_called_once_with("unit")
+        self.assertEqual({note.path.stem: note.get("state") for note in note_file.read_notes()}, {
+            "claude 1": "active", "claude 2": "active", "claude 3": "inactive",
+        })
+
+    def test_five_hour_watch_uses_the_default_directory_independent_of_report_order(self) -> None:
+        """F005: order, shared logins and missing emails cannot select the named reading."""
+        default = self.account_dir("default", "shared@example.com", "main-token")
+        named = self.account_dir("claude 3", "shared@example.com", "named-token")
+        self.select_unit("claude 3")
+        _ = self.note("claude 2.md", "shared@example.com")
+        main = Report("Claude", email="shared@example.com", source=ClaudeDirectorySource(default))
+        unit = Report("Claude", email="shared@example.com", source=ClaudeDirectorySource(named))
+        codex = Report("Codex")
+        for main_email in ("shared@example.com", None):
+            main.email = main_email
+            with (
+                self.subTest(main_email=main_email),
+                patch.object(agent_notes, "live_reports", return_value=[unit, codex, main]),
+                patch.object(five_hour, "watch", return_value=[]) as watch,
+            ):
+                _ = agent_notes.update()
+            watched = cast(list[Report], watch.call_args.args[0])
+            self.assertEqual(watched, [codex, main])
+
+    def test_updater_and_alert_share_the_same_role_snapshot(self) -> None:
+        """F002: the timer entry point resolves roles once for writes and notices."""
+        _ = self.account_dir("default", "main@example.com", "main-token")
+        _ = self.account_dir("claude 3", "unit@example.com", "unit-token")
+        self.select_unit("claude 3")
+        _ = self.note("claude 2.md", "main@example.com")
+        _ = self.note("claude 3.md", "unit@example.com")
+        selection = accounts.claude_account_selection()
+        reports = [Report("Claude", email=login, quotas=[Quota("Weekly", 20, self.future)])
+                   for login in ("main@example.com", "unit@example.com")]
+        with (
+            patch.object(accounts, "claude_account_selection", return_value=selection) as resolve,
+            patch.object(agent_notes, "live_reports", return_value=reports) as collect,
+            patch.object(five_hour, "watch", return_value=[]),
+            patch.object(agent_notes, "alert", return_value=[]) as alert,
+            patch.object(codex_pacer, "tick", side_effect=ValueError("fixture")),
+            patch.object(sys, "argv", ["agent_notes.py"]),
+            redirect_stdout(io.StringIO()),
+        ):
+            agent_notes.main()
+        resolve.assert_called_once_with()
+        collect.assert_called_once_with(selection)
+        notice_roles = cast(object, alert.call_args.kwargs["selection"])
+        self.assertIs(notice_roles, selection)
+
+    def test_legacy_live_collection_keeps_the_original_call_and_note_states(self) -> None:
+        active = self.note("claude 2.md", "main@example.com")
+        spare = self.note("claude 3.md", "other@example.com")
+        report = Report("Claude", email="main@example.com", quotas=[Quota("Weekly", 20, self.future)])
+        with (patch.object(agent_accounts, "claude_live", return_value=report) as claude,
+              patch.object(agent_accounts, "codex_live", return_value=Report("Codex")),
+              patch.object(five_hour, "watch", return_value=[])):
+            _ = agent_notes.update()
+        claude.assert_called_once_with()
+        updated = {note.path.stem: note for note in note_file.read_notes()}
+        self.assertEqual(updated[active.path.stem].get("state"), "active")
+        self.assertEqual(updated[spare.path.stem].get("state"), "inactive")
+
+    def test_implicit_live_read_keeps_inherited_oauth_token_and_subprocess_environment(self) -> None:
+        with (
+            patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "fixture-inherited"}),
+            patch.object(agent_accounts, "executable", return_value="fixture-claude"),
+            patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, '{"loggedIn": true, "email": "main@example.com", "authMethod": "claude.ai"}', "")) as status,
+            patch.object(agent_accounts, "claude_credentials", side_effect=RuntimeError("unused")) as credentials,
+            patch.object(urllib.request, "urlopen", return_value=io.BytesIO(
+                json.dumps({"seven_day": {"utilization": 20, "resets_at": self.future.isoformat()}}).encode())) as usage,
+        ):
+            report = agent_accounts.claude_live()
+        self.assertEqual(report.weekly_remaining, 80)
+        credentials.assert_not_called()
+        self.assertNotIn("env", status.call_args.kwargs)
+        request = cast(urllib.request.Request, usage.call_args.args[0])
+        self.assertEqual(request.get_header("Authorization"), "Bearer fixture-inherited")
+        self.assertEqual(report.source, ClaudeDirectorySource(self.root / ".claude"))
+
+    def test_named_credentials_never_fall_back_to_the_default_keychain(self) -> None:
+        named = self.root / ".claude3"
+        named.mkdir()
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(agent_accounts, "command_json") as command):
+            with self.assertRaisesRegex(RuntimeError, "usage credentials unavailable"):
+                _ = agent_accounts.claude_credentials(named)
+        command.assert_not_called()
+
+    def test_explicit_default_credentials_use_the_keychain_even_from_a_named_shell(self) -> None:
+        with (patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / ".claude3")}),
+              patch.object(sys, "platform", "darwin"),
+              patch.object(agent_accounts, "command_json", return_value={"claudeAiOauth": {"accessToken": "fixture"}}) as command):
+            self.assertEqual(agent_accounts.claude_credentials(self.root / ".claude")
+                             .get("claudeAiOauth", {}).get("accessToken"), "fixture")
+        command.assert_called_once_with("security", "find-generic-password", "-s", "Claude Code-credentials", "-w")
+
+    def test_whoami_prints_both_active_roles_and_omits_the_spare(self) -> None:
+        _ = self.account_dir("default", "main@example.com", "main-token")
+        _ = self.account_dir("claude 3", "unit@example.com", "unit-token")
+        _ = self.account_dir("claude 1", "spare@example.com", "spare-token")
+        self.select_unit("claude 3")
+        _ = self.note("claude 2.md", "main@example.com")
+        _ = self.note("claude 3.md", "unit@example.com")
+        _ = self.note("claude 1.md", "spare@example.com")
+        output = io.StringIO()
+        with (patch.object(whoami, "live_reports", return_value=[
+            Report("Claude", email="main@example.com"), Report("Claude", email="unit@example.com"),
+            Report("Claude", email="spare@example.com"), Report("Codex", problem="fixture"),
+        ]), redirect_stdout(output)):
+            asyncio.run(whoami.main())
+        self.assertIn("Account: claude 2 (showrunners)", output.getvalue())
+        self.assertIn("Account: claude 3 (unit directors)", output.getvalue())
+        self.assertNotIn("spare@example.com", output.getvalue())
+
+    def test_whoami_filter_and_labels_share_one_role_selection_during_a_swap(self) -> None:
+        """F002: one display cannot switch unit accounts between filtering and rendering."""
+        _ = self.account_dir("default", "main@example.com", "main-token")
+        _ = self.account_dir("claude 1", "old-unit@example.com", "old-token")
+        _ = self.account_dir("claude 3", "new-unit@example.com", "new-token")
+        self.select_unit("claude 1")
+        for label, login in (("claude 1", "old-unit@example.com"),
+                             ("claude 2", "main@example.com"),
+                             ("claude 3", "new-unit@example.com")):
+            _ = self.note(f"{label}.md", login)
+        resolve = accounts.role_account
+
+        def swap_after_selection(role: str) -> accounts.AccountSelection:
+            selected = resolve(role)
+            self.select_unit("claude 3")
+            return selected
+
+        reports = [Report("Claude", email=login) for login in (
+            "old-unit@example.com", "main@example.com", "new-unit@example.com",
+        )]
+        output = io.StringIO()
+        with (
+            patch.object(accounts, "role_account", side_effect=swap_after_selection) as selection,
+            patch.object(whoami, "live_reports", return_value=reports),
+            redirect_stdout(output),
+        ):
+            asyncio.run(whoami.main())
+        selection.assert_called_once_with("unit")
+        self.assertIn("Account: claude 1 (unit directors)", output.getvalue())
+        self.assertIn("Account: claude 2 (showrunners)", output.getvalue())
+        self.assertNotIn("new-unit@example.com", output.getvalue())
+
+    def test_legacy_whoami_account_line_is_unchanged(self) -> None:
+        _ = self.note("claude 2.md", "main@example.com")
+        self.assertEqual(whoami.render(Report("Claude", email="main@example.com"),
+                                      accounts.claude_account_selection()), [
+            "Claude", "  Account: claude 2 — main@example.com", "  Plan: unavailable",
+        ])
 
     def test_live_percentage_is_written_only_to_matching_tool_and_email(self):
         active = self.note("claude 1.md", "a@example.com")

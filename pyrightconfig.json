@@ -10,6 +10,13 @@
   ],
   "executionEnvironments": [
     {
+      "root": "scripts/accounts",
+      "extraPaths": [
+        ".",
+        "scripts/whoami"
+      ]
+    },
+    {
       "root": "scripts/model_study",
       "extraPaths": [
         "scripts/model_study"
@@ -32,6 +39,7 @@
     {
       "root": "scripts/whoami",
       "extraPaths": [
+        ".",
         "scripts/whoami",
         "scripts/message",
         "scripts/notify"
@@ -40,6 +48,7 @@
     {
       "root": "scripts/nightly_review",
       "extraPaths": [
+        ".",
         "scripts/nightly_review",
         "scripts/shutdown",
         "scripts/whoami"
