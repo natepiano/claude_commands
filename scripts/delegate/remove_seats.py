@@ -29,6 +29,10 @@ covers a run with no marker, which prepare_session.sh skips outside a Claude
 session: a seat still working beats every minute.
 
 Only background sessions are ever removed, and never the session running this.
+After a successful Claude session listing, phase cleanup also asks codex_mesh to
+sweep unused app-servers under the real delegate root. That destructive sweep is
+best-effort and never runs when the listing failed and cleanup cannot account for
+its other effects.
 """
 
 from __future__ import annotations
@@ -51,6 +55,8 @@ LIVE_HEARTBEAT_SECS = 600
 CLAUDE_TIMEOUT_SECS = 30
 SHUTDOWN_TIMEOUT_SECS = 30
 SHUTDOWN = Path(__file__).resolve().parents[1] / "shutdown" / "shutdown.py"
+CODEX_MESH = Path(__file__).resolve().parents[1] / "agents" / "codex_mesh.py"
+SWEEP_TIMEOUT_SECS = 120
 
 # Seats launched before the ledger were named `<session dir basename>-<slot>`,
 # and the basename was a uuid, so the name alone says which run owns them.
@@ -144,6 +150,24 @@ def shutdown_command() -> list[str]:
     return [sys.executable, str(SHUTDOWN)]
 
 
+def sweep_app_servers(root: Path) -> None:
+    """Best-effort orphan cleanup after a phase releases its Claude seats."""
+    try:
+        result = subprocess.run(
+            [sys.executable, str(CODEX_MESH), "sweep", "--root", str(root), "--stop"],
+            timeout=SWEEP_TIMEOUT_SECS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"remove_seats: app-server sweep could not run: {error}", file=sys.stderr)
+        return
+    if result.returncode:
+        print(
+            f"remove_seats: app-server sweep exited {result.returncode}; seat cleanup continues.",
+            file=sys.stderr,
+        )
+
+
 def live_runs(root: Path, listed_sessions: set[str]) -> set[Path]:
     live: set[Path] = set()
     shutdown_state = shutdown_held_sessions()
@@ -223,6 +247,13 @@ def main() -> int:
     if rows is None:
         print("remove_seats: could not list sessions with `claude agents --json`; nothing removed.", file=sys.stderr)
         return 1
+
+    # --session-dir identifies phase cleanup. Restrict the automatic destructive
+    # sweep to the real delegate root; tests and callers inspecting another root
+    # must invoke codex_mesh.py themselves. List Claude sessions first so an
+    # early failure can truthfully promise that cleanup changed nothing.
+    if own_run is not None and root.resolve() == DEFAULT_ROOT.resolve():
+        sweep_app_servers(root)
 
     listed_sessions = {row.get("sessionId", "") for row in rows}
     targets = removal_targets(root, own_run, rows, live_runs(root, listed_sessions))

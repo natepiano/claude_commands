@@ -78,7 +78,7 @@ natedev, 2026-10-10: rollout phases first, measurement last; measurement must no
 
 **Ruled out:** dropping the second-overflow error — kept as a loop guard.
 
-### Phase 2 — Measure: Codex usage per phase, credits and account switches, before and after; overflow guard fix · status: todo
+### Phase 2 — Measure: Codex usage per phase, credits and account switches, before and after; overflow guard fix · status: done
 
 #### Work Order
 
@@ -119,6 +119,8 @@ natedev, 2026-10-10: rollout phases first, measurement last; measurement must no
 - Without `--to`, `review.sh` works as today; a run with no open seat (a solo review outside a run) still uses it.
 - The review prompt (<ReviewPromptContract/>, <BroadReviewPrompt/>, <ClosureReview/>) gains a role-switch opening: the seat is now a reviewer, edits nothing, reads the diff cold as if someone else wrote it, and, when it wrote the code, argues against its own choices as an adversary would.
 - `dual_review.md`, `run_phase_review.md` and `direct.md` (<DualReview/>, <EarlyReviewArm/>, <FixDispatch/>'s closure review) say which open seat takes which lens: the seat that did not write a file reviews it when one exists; the writer takes the adversary lens on its own work when the other seat is busy. The handoff post per <RoleReassignment/> names the move.
+- Seat management (user, 2026-10-10): reviewers are long-lived like writers. Moving any open seat to another role is allowed, mid-phase included, because all of a unit's seats work in the same area; `RoleReassignment` and <LongLivedSeats/> say so and drop any wording that keeps a busy seat from being reassigned. An extra seat when every open one is busy is allowed and kept for reuse (an idle seat costs no context). The unit director names each seat for its role — a new seat's slot name says what it does (`review`, `fix2`), never a bare number — and `direct.md` says so.
+- Carried from Phase 2's closure (minor): `seat_usage.py` `is_edit` counts a quoted mention such as `rg -F 'tools.apply_patch(' scripts` as an edit. Real Codex edits arrive as an `exec` custom tool call whose JavaScript calls `tools.apply_patch(` (647 of the last 30 rollouts' calls opened `const patch = "***`), so the pattern stays and is narrowed to a call outside a string literal. Tests pin the real `exec` shape as an edit and the quoted mention as not one; each must fail on the current code.
 
 **Files:**
 - `scripts/delegate/review.sh`
@@ -127,8 +129,10 @@ natedev, 2026-10-10: rollout phases first, measurement last; measurement must no
 - `docs/delegate/dual_review.md`
 - `docs/delegate/run_phase_review.md`
 - `docs/delegate/write_prompt_contract.md`
+- `scripts/whoami/seat_usage.py`
+- `scripts/whoami/test_seat_usage.py`
 
-**Seats:** `2 writers` — `impl` writes `review.sh` and its tests; `test` writes the skill text.
+**Seats:** `2 writers` — `impl` writes `review.sh` and its tests; `test` writes the skill text and the `is_edit` repair with its tests.
 
 **Constraints from prior phases:** Phase 1: `codex_mesh.py compact` waits for the compaction turn's `turn/completed` and refuses a running seat; `implement.sh --to` compacts under the seat-claim lock above `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (`config/delegate.conf`), best-effort; the roster records `role` (optional; roleless threads such as friends omit it), `context_tokens` and status `ended`; `can-follow` saves the prior role and a released claim restores it. Every prompt to a seat, follow-ups included, carries the inline Three Gods sentence and the Type Design Contract or its pointer (`write_prompt_contract.md` sections 7 and 9). A replacement thread under the same seat name gets an opening prompt.
 
