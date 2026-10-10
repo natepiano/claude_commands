@@ -100,29 +100,29 @@ While G1 holds, each time the unit director wakes it runs `width_trial.py report
 
 ### Phase 2 — The trial starts: each nextest step runs at 16 or 32 by block  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** every nextest step `invoke.sh` runs names its width: natedev alternates 16 and 32 by 100-minute block, the Mac runs 12, and a caller's own width is kept.
-
-**Spec:**
-
-`scripts/lint/invoke.sh`, beside `run_nextest`:
-- `LINT_TEST_WIDTH=trial` — the mode: `trial` (block parity), `physical`, `logical`. A comment names Phase 3 as the line that sets the verdict, and `width_trial.py`'s `BLOCK_S` as the twin of the block length.
-- `nextest_physical_cores [sysfs_root]` sets `LINT_PHYSICAL_CORES` once per shell: on Linux, the number of distinct `physical_package_id:core_id` pairs under `${1:-/sys/devices/system/cpu}/cpu[0-9]*/topology/`, read with `read` (no forks, no associative arrays); on darwin `sysctl -n hw.physicalcpu`. `nextest_logical_cores` sets `LINT_LOGICAL_CORES` once: `getconf _NPROCESSORS_ONLN`. A value that is empty or not a positive integer stays empty.
-- `nextest_width_arm EPOCH` prints nothing and sets `LINT_TEST_WIDTH_ARM` to `physical` when `(EPOCH / 6000) % 2 == 0`, else `logical`.
-- `run_nextest`: unless an argument is `--test-threads`, `--test-threads=*`, `-j` or `-j*`, or `NEXTEST_TEST_THREADS` is set: pick the arm (`trial`: `nextest_width_arm "${EPOCHSECONDS:-$(date +%s)}"`; otherwise the mode itself), take that core count, and when it is set run `cargo nextest run --test-threads <N> "$@"`. The flag goes before `"$@"`, since a caller's `--` hands what follows to the test binaries. Otherwise run as today.
+- `invoke.sh` holds the mode line `LINT_TEST_WIDTH=trial` (values `trial`, `physical`, `logical`) beside `run_nextest`; its comment names the modes and `width_trial.py`'s `BLOCK_S` as the block length's twin.
+- `nextest_physical_cores [sysfs_root]` sets `LINT_PHYSICAL_CORES` once per shell: on Linux the count of distinct `physical_package_id:core_id` pairs under `${1:-/sys/devices/system/cpu}/cpu[0-9]*/topology/`, read with `read`; on darwin `sysctl -n hw.physicalcpu`. `nextest_logical_cores` sets `LINT_LOGICAL_CORES` once from `getconf _NPROCESSORS_ONLN`. A value that is not a positive integer stays empty.
+- `nextest_width_arm EPOCH` sets `LINT_TEST_WIDTH_ARM` to `physical` when `(EPOCH / 6000) % 2 == 0`, else `logical`, and prints nothing.
+- `run_nextest` runs `cargo nextest run --test-threads <N> "$@"`, N from the mode's arm (`trial` reads `${EPOCHSECONDS:-$(date +%s)}`). It adds nothing when `NEXTEST_TEST_THREADS` is set, when an argument before `--` is `--test-threads`, `--test-threads=*`, `-j` or `-j*`, or when the core count is unreadable, and the status passes through unchanged. Arguments after `--` belong to the test binaries and never suppress the width.
+- natedev's arms are 16 and 32; the Mac reads 12 for both, and `bash -n` passes under its bash 3.2.
 
 **Files:**
-- `scripts/lint/invoke.sh` — the width functions and `run_nextest`.
-- `scripts/lint/test_nextest_width.py` — new.
+- `scripts/lint/invoke.sh` — the mode line, the width functions and `run_nextest`.
+- `scripts/lint/test_nextest_width.py` — core counts and their cache, arm boundaries, trial parity, fixed modes, caller overrides, `--` handling, status passthrough.
+- `scripts/delegate/test_verify_mac_offload.py` — the local run's argv carries the width pair.
 
-**Seats:** `1 writer + 1 tester` — one function group in one file; the tester writes from the rules above.
-- `impl` — `scripts/lint/invoke.sh`
-- `test` — `scripts/lint/test_nextest_width.py`, sourcing `invoke.sh` as `test_invoke_scope.py` does, with a stand-in `cargo` on `PATH` that prints its argv and `run` replaced by a function that prints its argv: a fake sysfs root with 4 CPUs on 2 cores gives 2; `nextest_width_arm` at 0, 5999, 6000 and 12000; `trial` at an even and an odd block gives `--test-threads 2` and the logical count; `physical` and `logical` modes; `-j 4`, `--test-threads=3` and `NEXTEST_TEST_THREADS=5` add nothing; a trailing `-- --nocapture` stays after the flag; an unreadable core count adds nothing and the status passes through
+**Binds later work:**
+- The verdict changes only the value on the mode line; `test_nextest_width.py` sets the mode in every case, so it passes under any default.
+- `memory_admit.test_threads(argv)` reads the first width in argv, so the width `invoke.sh` adds before the caller's arguments is the one each reservation, anon-peak record and the scorecard see.
+- T0 is when this phase's checkpoint reaches `~/.claude` main: the reflog entry that brings it in.
 
-**Constraints from prior phases:** Phase 1: `memory_admit.test_threads(argv)` reads `--test-threads N`, so each width keys its own reservation from the first step; each new width starts with no measured records and uses the index tier until it has five. `width_trial.py`'s `BLOCK_S = 6000`; arm names `physical` (16) and `logical` (32).
+**Gotchas:**
+- `~/rust/rust-template` is a cargo-generate template with no `Cargo.toml`; a live width check runs on a real crate such as `~/rust/cargo-liner` (at an even block it ran `--test-threads 16`, 4,679 tests passed, and its anon-peak record carried `test_threads` 16).
+- A step run outside `verify.sh` records `call_id` None; whole-hana runs all come through `verify.sh`.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/lint -p 'test_*.py'` green; `basedpyright scripts/lint/test_nextest_width.py` clean; `bash -n scripts/lint/invoke.sh`. Live on natedev: `bash -c 'source <worktree>/scripts/lint/invoke.sh; cd ~/rust/rust-template && run_nextest --workspace'` runs with `--test-threads 16` or `32` (the current block's), the build log step's argv shows it, and its `anon_peaks.jsonl` record carries `test_threads`; over `ssh mac` (prints `rc=`), `bash -n` on the worktree's file passes. After the showrunner fast-forwards it to main: T0 from the reflog, sent to natedev with G1's time, and the first organic hana nextest steps carry the flag.
+**Ruled out:** reading the last width in argv in `memory_admit` or `width_trial` — the first-width rule already reads `invoke.sh`'s flag and keeps the frozen hashes.
 
 ### Phase 3 — Readout: the verdict, and the width it sets  · status: todo
 
@@ -145,7 +145,7 @@ While G1 holds, each time the unit director wakes it runs `width_trial.py report
 
 **Seats:** `1 writer` — `impl` runs the scorecard, changes one line and reports.
 
-**Constraints from prior phases:** Phase 1: the scorecard and its frozen SHA-256 hashes — `scripts/buildlog/width_trial.py` `a35ac69482d24493fe2ad5a9e0e975376c5de4dc92650cccf47bb613b2282fc9`, `scripts/lint/memory_admit.py` `1ecd402ab4ee4f0d5df19716bb406d17aa0cf1e4864040faad67f623e95a486b` (Phase 1 As-built holds the `unset` baseline). The sample minimum counts only the `physical` and `logical` arms; steps without a width print as an `unset` column. `expected_peak` takes only records before its `now`, so R re-reads the same at any later time. Phase 2: T0, the mode variable `LINT_TEST_WIDTH` and its values.
+**Constraints from prior phases:** Phase 1: the scorecard and its frozen SHA-256 hashes — `scripts/buildlog/width_trial.py` `a35ac69482d24493fe2ad5a9e0e975376c5de4dc92650cccf47bb613b2282fc9`, `scripts/lint/memory_admit.py` `1ecd402ab4ee4f0d5df19716bb406d17aa0cf1e4864040faad67f623e95a486b` (Phase 1 As-built holds the `unset` baseline). The sample minimum counts only the `physical` and `logical` arms; steps without a width print as an `unset` column. `expected_peak` takes only records before its `now`, so R re-reads the same at any later time. Phase 2: T0 (filled in here from the reflog once the showrunner promotes Phase 2's checkpoint); the mode is the line `LINT_TEST_WIDTH=trial` in `invoke.sh`, values `trial`, `physical`, `logical`, and its comment names the modes and the `BLOCK_S` twin, so only the value changes. `test_nextest_width.py` sets `LINT_TEST_WIDTH` in every case, so it passes under any default. `invoke.sh` puts `--test-threads` before the caller's arguments and `memory_admit.test_threads` reads the first width, so the recorded width is always the one `invoke.sh` chose.
 
 **Acceptance gate:** the hashes match; the report exits 0; the As-built holds the full output, the action and its rule; for keep or revert, `bash -n scripts/lint/invoke.sh` and `python3 -m unittest discover -s scripts/lint -p 'test_nextest_width.py'` green with that mode.
 
