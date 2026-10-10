@@ -780,7 +780,11 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(result.returncode, 42, result.stdout)
         self.assertIn("nextest failed\n", result.stdout)
         self.assertIn("this ran on the Mac (macOS)", result.stdout)
-        self.assertIn("rerun with --local", result.stdout)
+        self.assertIn(
+            "only a test that must run on Linux may rerun with --local",
+            result.stdout,
+        )
+        self.assertNotIn("unrelated to your change", result.stdout)
         self.assertNotIn("mac_exit=42", result.stdout)
         self.assert_wire("failed", "")
         self.assertFalse((self.state_directory / "run.json").exists())
