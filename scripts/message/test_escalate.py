@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import override
+from typing import cast, override
+
+import escalate
+from user_action import ActionRequired, NoActionRequired
 
 SCRIPT = Path(__file__).with_name("escalate.py")
 NOTIFIER_STUB = 'print -r -- "notifier $*" >> "$LOG"\n'
@@ -40,7 +44,8 @@ class EscalateTests(unittest.TestCase):
                               capture_output=True, text=True, check=False)
 
     def hold(self, minutes: str = "0") -> subprocess.CompletedProcess[str]:
-        return self.run_script("hold", "disk", "--summary", "Disk", "--text", "Disk is full.", "--minutes", minutes)
+        return self.run_script("hold", "disk", "--summary", "Disk", "--text", "Disk is full.",
+                               "--action", "free disk space", "--minutes", minutes)
 
     def log(self) -> str:
         return (self.root / "log").read_text(encoding="utf-8")
@@ -64,7 +69,8 @@ class EscalateTests(unittest.TestCase):
         self.assertEqual(self.run_script("due").stdout, "disk: sent to the user\n")
         self.assertEqual(self.run_script("due").stdout, "")
         self.assertEqual(self.log().count(
-            "send --to user --from escalate --summary Disk --need decision --text Disk is full.\n"), 1)
+            "send --to user --from escalate --summary Disk --need decision --action free disk space "
+            + "--text Disk is full.\n"), 1)
         self.assertEqual(self.run_script("list").stdout, "disk - sent - Disk\n")
 
     def test_typing_in_a_terminal_after_the_hold_stops_it(self) -> None:
@@ -95,8 +101,56 @@ class EscalateTests(unittest.TestCase):
         _ = self.hold()
         self.assertEqual(self.run_script("due").stdout, "disk: sent to the user\n")
 
+    def test_no_action_is_only_valid_for_a_note(self) -> None:
+        with self.assertRaises(ValueError):
+            _ = escalate.hold("disk", "Disk", "full", NoActionRequired(), need="decision")
+        held = self.run_script("hold", "news", "--summary", "News", "--text", "Finished.",
+                               "--no-action", "--need", "note", "--minutes", "0")
+        self.assertEqual(held.returncode, 0)
+        self.assertEqual(self.run_script("due").stdout, "news: sent to the user\n")
+        self.assertIn("--need note --no-action --text Finished.", self.log())
+
+    def test_legacy_hold_is_not_delivered_and_the_next_hold_replaces_it(self) -> None:
+        path = self.root / "state" / "held" / "disk.json"
+        path.parent.mkdir(parents=True)
+        legacy = {"summary": "Old disk", "text": "Old text", "need": "decision", "held_at": 0.0,
+                  "minutes": 0, "outcome": "waiting"}
+        _ = path.write_text(json.dumps(legacy), encoding="utf-8")
+        self.assertEqual(self.run_script("due").stdout, "")
+        self.assertNotIn("send ", self.log())
+        self.assertEqual(self.run_script("list").stdout,
+                         "disk - waiting for a hold that states its action\n")
+
+        self.assertIn("disk: held", self.hold().stdout)
+        record = cast(dict[str, object], cast(object, json.loads(path.read_text(encoding="utf-8"))))
+        self.assertEqual(record["action"], {"kind": "required", "text": "free disk space"})
+        self.assertEqual(self.run_script("due").stdout, "disk: sent to the user\n")
+
+    def test_current_hold_is_not_replaced(self) -> None:
+        _ = self.hold("15")
+        path = self.root / "state" / "held" / "disk.json"
+        before = path.read_text(encoding="utf-8")
+        second = self.run_script("hold", "disk", "--summary", "Changed", "--text", "Changed.",
+                                 "--action", "do something else", "--minutes", "15")
+        self.assertEqual(second.stdout, "disk: already held\n")
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+
+    def test_written_action_reads_back_as_the_domain_type(self) -> None:
+        _ = self.hold("15")
+        held = escalate.read(self.root / "state" / "held" / "disk.json")
+        self.assertIsInstance(held, escalate.HeldMessage)
+        assert isinstance(held, escalate.HeldMessage)
+        self.assertEqual(held.action, ActionRequired("free disk space"))
+
+    def test_missing_or_wrong_action_explains_the_fix(self) -> None:
+        for action in ([], ["--action", "none"], ["--no-action"]):
+            done = self.run_script("hold", "disk", "--summary", "a", "--text", "b", *action)
+            self.assertEqual(done.returncode, 2)
+            self.assertIn("Say what the user does", done.stderr)
+
     def test_any_other_arguments_print_the_usage(self) -> None:
-        for arguments in ([], ["hold", "disk"], ["hold", "disk", "--summary", "a", "--text", "b", "--need", "loud"],
+        for arguments in ([], ["hold", "disk"],
+                          ["hold", "disk", "--summary", "a", "--text", "b", "--action", "fix it", "--need", "loud"],
                           ["hold", "bad key", "--summary", "a", "--text", "b"], ["close"], ["due", "now"]):
             done = self.run_script(*arguments)
             self.assertEqual(done.returncode, 2, arguments)

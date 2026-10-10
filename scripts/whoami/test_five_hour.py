@@ -15,6 +15,7 @@ from agent_accounts import CodexRateLimits, Quota, Report
 import escalate  # five_hour puts scripts/message on the path
 import quota_alert
 from quota_alert import Config, Showrunner
+from user_action import NoActionRequired
 
 RESETS = datetime(2026, 10, 7, 21, 20, tzinfo=timezone.utc)
 CONFIG = cast(Config, cast(object, {
@@ -63,24 +64,25 @@ class WatchTests(unittest.TestCase):
         self.assertTrue(self.sent[0][1].startswith(
             "5-hour limit: Claude has 18% of its 5-hour limit left; it resets at 14:20 PDT.\nTell the user"))
         held = escalate.read(escalate.held_path("five-hour-claude"))
-        assert held is not None
-        self.assertEqual((held["summary"], held["text"], held["minutes"], held["need"], held["outcome"]),
+        self.assertIsInstance(held, escalate.HeldMessage)
+        assert isinstance(held, escalate.HeldMessage)
+        self.assertEqual((held.summary, held.text, held.minutes, held.need, held.outcome, held.action),
                          ("Claude 5-hour limit", "Claude has 18% of its 5-hour limit left; it resets at 14:20 PDT.",
-                          15, "decision", "waiting"))
+                          15, "note", "waiting", NoActionRequired()))
         self.assertEqual(five_hour.watch([report("Claude", 90)]), [])
         self.assertEqual(len(self.sent), 2)
 
     def test_a_window_back_above_the_threshold_closes_the_hold_and_the_next_low_spell_is_new(self) -> None:
         _ = five_hour.watch([report("Codex", 95)])
         self.assertEqual(five_hour.watch([report("Codex", 3)]), ["5-hour limit: Codex is back above 20%"])
-        self.assertIsNone(escalate.read(escalate.held_path("five-hour-codex")))
+        self.assertIsInstance(escalate.read(escalate.held_path("five-hour-codex")), escalate.NoHeld)
         self.assertEqual(five_hour.watch([report("Codex", 3)]), [])
         self.assertEqual(len(five_hour.watch([report("Codex", 80)])), 2)
 
     def test_no_reading_changes_nothing(self) -> None:
         _ = five_hour.watch([report("Claude", 99)])
         self.assertEqual(five_hour.watch([report("Claude", None), Report("Codex", problem="Not logged in")]), [])
-        self.assertIsNotNone(escalate.read(escalate.held_path("five-hour-claude")))
+        self.assertIsInstance(escalate.read(escalate.held_path("five-hour-claude")), escalate.HeldMessage)
 
 
 class ReaderTests(unittest.TestCase):

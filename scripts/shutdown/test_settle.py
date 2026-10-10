@@ -24,12 +24,14 @@ import stop as stop_work
 import showrunner_footer
 import conversation_pause
 from account import Account
+from user_action import ActionRequired, NoActionRequired, UserAction
 
 
 LOGIN = "owner@example.com"
 LABEL = "claude 2"
 NOW = "2026-10-09T21:49:10+00:00"
 NOW_UTC = datetime(2026, 10, 9, 21, 49, 10, tzinfo=timezone.utc)
+NO_ACTION_REQUIRED = NoActionRequired()
 
 
 class SentCall(TypedDict):
@@ -412,7 +414,10 @@ print("rc=0")
         )
         return path
 
-    def test_alert_user_only_pages_for_an_account_wide_scope(self) -> None:
+    def test_alert_user_forwards_the_callers_action_for_account_wide_scope(
+        self,
+    ) -> None:
+        action = ActionRequired("Follow the alert text.")
         with patch.object(
             settle,
             "send_message",
@@ -422,6 +427,7 @@ print("rc=0")
                 record.AllAccountSessions(kind="all account sessions"),
                 "action needed",
                 "fix it",
+                action,
                 machine="natedev",
             )
             settle.alert_user(
@@ -430,12 +436,14 @@ print("rc=0")
                 ),
                 "scoped action needed",
                 "fix it",
+                action,
             )
 
         send.assert_called_once_with(
             "user",
             "action needed",
             "fix it",
+            action=action,
             need="decision",
             machine="natedev",
         )
@@ -486,7 +494,7 @@ print("rc=0")
 
         self.assertEqual(self.sent_calls(), [])
 
-    def test_partial_stop_reports_to_requester_and_pages_account_wide_user(
+    def test_partial_stop_alert_names_the_account_restart_action(
         self,
     ) -> None:
         claimed = empty_shutdown_record(
@@ -509,6 +517,11 @@ print("rc=0")
         )
         self.assertIn("--need", calls[0]["args"])
         self.assertIn("decision", calls[0]["args"])
+        action_index = calls[0]["args"].index("--action")
+        self.assertEqual(
+            calls[0]["args"][action_index + 1],
+            f"Run /shutdown restart on {LABEL}.",
+        )
         self.assertIn(f"shutdown-result-{LOGIN}", calls[1]["args"])
         self.assertIn(f"{LABEL}: stop partial", calls[1]["args"])
 
@@ -529,10 +542,11 @@ print("rc=0")
             _scope: record.ShutdownScope,
             _summary: str,
             _text: str,
+            action: ActionRequired,
             *,
             machine: str = "",
         ) -> None:
-            del machine
+            del action, machine
             events.append("user alert")
 
         def fail_requester_delivery(
@@ -540,11 +554,12 @@ print("rc=0")
             _summary: str,
             _text: str,
             *,
+            action: UserAction,
             need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del need, machine, key
+            del need, machine, key, action
             events.append("requester result")
             raise RuntimeError("requester delivery failed")
 
@@ -567,6 +582,7 @@ print("rc=0")
             "session:requester",
             f"{LABEL}: stop partial",
             ANY,
+            action=NO_ACTION_REQUIRED,
             key=f"shutdown-result-{LOGIN}",
         )
 
@@ -589,10 +605,11 @@ print("rc=0")
             _scope: record.ShutdownScope,
             _summary: str,
             _text: str,
+            action: ActionRequired,
             *,
             machine: str = "",
         ) -> None:
-            del machine
+            del action, machine
             events.append("user alert")
             raise RuntimeError("user alert failed")
 
@@ -601,11 +618,12 @@ print("rc=0")
             _summary: str,
             _text: str,
             *,
+            action: UserAction,
             need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del need, machine, key
+            del need, machine, key, action
             events.append("requester result")
             return settle.MessageSent(kind="sent")
 
@@ -630,6 +648,7 @@ print("rc=0")
             "session:requester",
             f"{LABEL}: stop partial",
             ANY,
+            action=NO_ACTION_REQUIRED,
             key=f"shutdown-result-{LOGIN}",
         )
 
@@ -2280,7 +2299,9 @@ print("rc=0")
         self.assertIn("/shutdown now", alert["text"])
         self.assertIn("/shutdown cancel", alert["text"])
 
-    def test_conduct_sends_first_holdout_alert_at_twenty_minutes(self) -> None:
+    def test_holdout_alert_names_the_now_or_cancel_action_at_twenty_minutes(
+        self,
+    ) -> None:
         report = machine_inventory([top_level("session", "Work")])
         with (
             patch.object(settle, "run_inventory", return_value=report),
@@ -2322,6 +2343,11 @@ print("rc=0")
         alert = self.sent_calls()[-1]
         self.assertIn("Shutdown of claude 2: 1 not ready", alert["args"])
         self.assertIn("decision", alert["args"])
+        action_index = alert["args"].index("--action")
+        self.assertEqual(
+            alert["args"][action_index + 1],
+            "Run /shutdown now to stop them anyway, or /shutdown cancel.",
+        )
         self.assertIn("natedev top-level Work: idle", alert["text"])
 
     def test_cancel_restores_only_recorded_enabled_states_and_names_peer(

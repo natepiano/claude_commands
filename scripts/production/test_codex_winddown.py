@@ -199,6 +199,7 @@ class MessageTests(unittest.TestCase):
             _ = self.run_script("count", "hana")
         log = (self.root / "log").read_text(encoding="utf-8")
         self.assertEqual(log.count("send --to user --from codex-winddown --summary Codex wind-down --need decision"
+                                   + " --action Reset Codex, then run /codex_winddown clear."
                                    + " --text No Codex agent is running on"), 1)
         self.set_processes(*agent)
         _ = self.run_script("count", "hana")

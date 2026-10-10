@@ -19,7 +19,9 @@ from agent_accounts import Report
 from quota_alert import PROTOCOL, load_config, recipients, relay, showrunners_now
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 import escalate  # noqa: E402
+from user_action import NoActionRequired  # noqa: E402
 
 # Percent of the 5-hour window left at which the user is told.
 THRESHOLD = 20
@@ -43,7 +45,14 @@ def watch(reports: list[Report]) -> list[str]:
         zone = ZoneInfo(next((runner["zone"] for runner in showrunners_now()), "UTC"))
         resets = f"; it resets at {window.resets_at.astimezone(zone):%H:%M %Z}" if window.resets_at else ""
         news = f"{report.tool} has {left:.0f}% of its 5-hour limit left{resets}."
-        if not escalate.hold(key, f"{report.tool} 5-hour limit", news, ESCALATE_MINUTES):
+        if not escalate.hold(
+            key,
+            f"{report.tool} 5-hour limit",
+            news,
+            NoActionRequired(),
+            ESCALATE_MINUTES,
+            need="note",
+        ):
             continue
         text = (f"5-hour limit: {news}\nTell the user in one line and change nothing else. They are sent it directly"
                 + f" unless they type in a terminal within {ESCALATE_MINUTES} minutes.\nProtocol: {PROTOCOL}")

@@ -21,6 +21,7 @@ import send
 import record as shutdown_record
 import restart
 import settle
+from user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired
 
 
 def stream(*events: dict[str, object]) -> str:
@@ -350,6 +351,7 @@ class SendTests(unittest.TestCase):
                 "session:cancelled",
                 "old settle",
                 "Old unkeyed settle instruction: run /shutdown ready.",
+                action=NoActionRequired(),
             )
             self.assertEqual(old_cancel["kind"], "queued")
             settle._restore_record(cancelled)  # pyright: ignore[reportPrivateUsage]
@@ -364,6 +366,7 @@ class SendTests(unittest.TestCase):
                 "session:restarted",
                 "old settle",
                 "Old unkeyed settle instruction: run /shutdown ready.",
+                action=NoActionRequired(),
             )
             self.assertEqual(old_restart["kind"], "queued")
             restart._retire(restarted, restart_entry, dry_run=False)  # pyright: ignore[reportPrivateUsage]
@@ -421,11 +424,13 @@ class SendTests(unittest.TestCase):
             commands.append(command)
             return (0, "", "") if len(commands) == 1 else (1, "", "refused")
 
-        told = ["--to", "user", "--from", "test", "--summary", "natedev: disk", "--need", "blocked", "--text", "full"]
+        told = ["--to", "user", "--from", "test", "--summary", "natedev: disk", "--need", "blocked",
+                "--action", "free disk space", "--text", "full"]
         with mock.patch.object(send, "run", channel):
             self.assertEqual(send.send(send.parse(told)), send.Result("sent", "to the user"))
             self.assertEqual(send.send(send.parse(told)).outcome, "failed")
-        self.assertEqual(commands[0][2:], ["--priority", "2", "natedev: disk", "full"])
+        self.assertEqual(commands[0][2:], ["--priority", "2", "--source", "test", "--action", "free disk space",
+                                           "natedev: disk", "full"])
         self.assertEqual(self.relayed, [])
         self.assertEqual(send.pending("user"), "")
         self.assertEqual([entry["to"] for entry in self.log()], ["user", "user"])
@@ -440,13 +445,58 @@ class SendTests(unittest.TestCase):
 
         with mock.patch.object(send, "run", remote_run):
             result = send.send(send.parse(["--to", "user", "--summary", "mac: login", "--need", "decision",
-                                           "--machine", "natedev", "--text", "hi"]))
+                                           "--action", "log in", "--machine", "natedev", "--text", "hi"]))
         self.assertEqual(result, send.Result("sent", "on natedev: to the user"))
         self.assertIn("--need decision", commands[0][-1])
+        self.assertIn("--action 'log in'", commands[0][-1])
+
+    def test_pushover_refusal_exits_2_and_keeps_nothing(self) -> None:
+        refused = f"pushover: {REFUSED_BEFORE_SENDING}: priority 2 requires --action"
+        output = io.StringIO()
+        arguments = ["--to", "user", "--from", "test", "--summary", "natedev: disk", "--no-action",
+                     "--text", "full"]
+        with mock.patch.object(send, "run", return_value=(2, "", refused)), redirect_stdout(output):
+            code = send.main(arguments)
+        self.assertEqual(code, 2)
+        self.assertEqual(output.getvalue(), f"REFUSED: {refused}\n")
+        self.assertEqual(send.pending("user"), "")
+        self.assertEqual(self.log()[0]["outcome"], "refused")
+
+    def test_pushover_exit_2_for_missing_keys_is_failed(self) -> None:
+        keys_missing = "pushover: PUSHOVER_USER and PUSHOVER_TOKEN must both be set in /missing/env"
+        output = io.StringIO()
+        arguments = ["--to", "user", "--from", "test", "--summary", "news", "--no-action", "--text", "done"]
+        with mock.patch.object(send, "run", return_value=(2, "", keys_missing)), redirect_stdout(output):
+            code = send.main(arguments)
+        self.assertEqual(code, 3)
+        self.assertEqual(output.getvalue(), f"FAILED: the user was not reached: {keys_missing}\n")
+        self.assertEqual(send.pending("user"), "")
+        self.assertEqual(self.log()[0]["outcome"], "failed")
+
+    def test_user_options_hold_one_typed_action(self) -> None:
+        required = send.parse(["--to", "user", "--summary", "choose", "--action", "pick one", "--text", "a or b"])
+        none = send.parse(["--to", "user", "--summary", "news", "--no-action", "--text", "done"])
+        self.assertEqual(required.action, ActionRequired("pick one"))
+        self.assertEqual(none.action, NoActionRequired())
+
+    def test_non_user_options_have_no_user_recipient_state(self) -> None:
+        options = send.parse(["--to", "natedev", "--text", "hello"])
+        self.assertEqual(options.action, send.NoUserRecipient())
+
+    def test_action_flags_are_only_for_user_messages(self) -> None:
+        for action in (["--no-action"], ["--action", "reply"]):
+            errors = io.StringIO()
+            with self.assertRaises(SystemExit) as raised, mock.patch("sys.stderr", errors):
+                _ = send.parse(["--to", "natedev", *action, "--text", "hello"])
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("go with --to user", errors.getvalue())
 
     def test_usage_errors_exit_2(self) -> None:
         for argv in (["--to", "x", "--repeat-minutes", "5", "--text", "t"], ["--to", "x", "--codex", "--text", "t"],
                      ["--to", "x", "--text", "  "], ["ack"], ["--to", "user", "--text", "t"],
+                     ["--to", "user", "--summary", "s", "--action", "none", "--text", "t"],
+                     ["--to", "user", "--summary", "s", "--action", "do it", "--no-action", "--text", "t"],
+                     ["--to", "user", "--summary", "s", "--need", "decision", "--no-action", "--text", "t"],
                      ["--to", "x", "--need", "decision", "--text", "t"]):
             with self.assertRaises(SystemExit) as raised, mock.patch("sys.stderr"):
                 _ = send.main(argv)

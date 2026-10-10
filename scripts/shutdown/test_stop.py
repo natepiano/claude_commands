@@ -25,6 +25,7 @@ import settle
 import shutdown
 import stop
 from account import Account
+from user_action import UserAction
 from record import (
     LiveShutdownRecord,
     PassiveSeatReadyToStop,
@@ -63,6 +64,7 @@ class AlertCall(TypedDict):
     need: str
     machine: str
     key: str
+    action: UserAction
 
 
 @final
@@ -1552,6 +1554,7 @@ class StopTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
+            action: UserAction,
             need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
@@ -1564,6 +1567,7 @@ class StopTests(unittest.TestCase):
                     need=need,
                     machine=machine,
                     key=key,
+                    action=action,
                 )
             )
             return settle.MessageSent(kind="sent")
@@ -1856,6 +1860,7 @@ class StopTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
+            action: UserAction,
             need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
@@ -1868,6 +1873,7 @@ class StopTests(unittest.TestCase):
                     need=need,
                     machine=machine,
                     key=key,
+                    action=action,
                 )
             )
             return settle.MessageSent(kind="sent")
@@ -1911,6 +1917,7 @@ class StopTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
+            action: UserAction,
             need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
@@ -1923,6 +1930,7 @@ class StopTests(unittest.TestCase):
                     need=need,
                     machine=machine,
                     key=key,
+                    action=action,
                 )
             )
             return settle.MessageSent(kind="sent")
@@ -1947,6 +1955,7 @@ class StopTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
+            action: UserAction,
             need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
@@ -1959,6 +1968,7 @@ class StopTests(unittest.TestCase):
                     need=need,
                     machine=machine,
                     key=key,
+                    action=action,
                 )
             )
             return settle.MessageSent(kind="sent")
