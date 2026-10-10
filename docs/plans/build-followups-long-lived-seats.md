@@ -30,15 +30,15 @@ natedev, 2026-10-10: rollout phases first, measurement last; measurement must no
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills and scripts. This plan makes seats outlive their phase (Phase 1), sends reviews to open seats (Phase 2), and measures the effect (Phase 3). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-model-study` on branch `build-followups-model-study` (unit `model-study-unit` of production `build-followups`).
+- **Project:** `~/.claude` — Claude Code commands, skills and scripts. This plan makes seats outlive their phase (Phase 1), measures the effect (Phase 2), and sends reviews to open seats (Phase 3). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-model-study` on branch `build-followups-model-study` (unit `model-study-unit` of production `build-followups`).
 - **Project started:** 2026-10-10T16:20:12+00:00
 - **Stack:** Python 3.13 standard library, bash, zsh; codex-cli 0.162.0 app-server.
 - **Layout:**
   - `scripts/agents/codex_mesh.py` — `compact` verb; context size on the roster; press-on after overflow (Phase 1)
   - `scripts/delegate/implement.sh` — reuse an open seat for a new phase; compact before new work (Phase 1)
-  - `scripts/delegate/review.sh` — `--to <seat>` review on an open seat, tree-unchanged check (Phase 2)
+  - `scripts/delegate/review.sh` — `--to <seat>` review on an open seat, tree-unchanged check (Phase 3)
   - `commands/unit/direct.md`, `commands/unit/delegate.md`, `commands/unit/report.md`, `docs/delegate/launch_implementation.md`, `docs/delegate/phase_end.md`, `docs/delegate/write_prompt_contract.md`, `docs/delegate/dual_review.md`, `docs/delegate/run_phase_review.md`, `docs/production_format.md` — the skill text (Phases 1 and 2)
-  - `scripts/whoami/seat_usage.py` — the measurement (Phase 3, new)
+  - `scripts/whoami/seat_usage.py` — the measurement (Phase 2, new)
 - **Verification:** `python3 -m unittest discover -s scripts/agents -p 'test_*.py'`, `python3 -m unittest discover -s scripts/delegate -p 'test_*.py'`, `python3 -m unittest discover -s scripts/whoami -p 'test_*.py'`; basedpyright 0 errors, 0 warnings, 0 notes on every changed Python file (it exits 3 on the missing `.venv` notice, which is expected); `bash -n` on changed shell scripts.
 - **Live checks** run a scratch session directory under the scratchpad with one small Codex thread; never a real unit's session, never `--to user`.
 
@@ -46,57 +46,76 @@ natedev, 2026-10-10: rollout phases first, measurement last; measurement must no
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
-| G1 | Phase 3 | Phase 2 merged to main and natedev has told every unit director on natedev and the Mac (T_live) | 7 days after T_live |
+| G1 | Phase 2 (verdict run only) | Phase 1 merged to main and natedev has told every unit director on natedev and the Mac (T_live) | 7 days after T_live |
 
 ## Phases
 
 ### Phase 1 — Seats stay open from phase to phase and compact between tasks · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** after a phase's checkpoint, the next phase's Work Order goes to the `impl` and `test` seats already open, compacted first when large; no new Codex thread opens for a phase while its seats are open.
-
-**Spec:**
-- `codex_mesh.py`:
-  - The roster records each thread's last context size (`last_token_usage.input_tokens` from the turn's final token count).
-  - New verb `compact --session-dir <dir> --to <seat>`: refuses a running seat; calls `thread/compact/start` on a finished one and waits for `thread/compacted`; prints the context size before and after.
-  - A turn that ends because the context window filled is followed at once, inside the same `start` or `follow`, with the message "Continue where you stopped." once per overflow; the board gets one line.
-- Roster fields for `shutdown-unit`'s session roster (`scripts/message/roster.py`, read-only reader; agreed 2026-10-10): `role` (`impl` | `test` | `fix` | `review`, written by the launcher on every `start` and `follow`); `status: "ended"` written by `end` for its seat and by `stop` for every seat on the run's servers (`running` and `done` keep their meanings); `context_tokens`. Sent to the `impl` seat as a follow-up once its first task finishes; Phase 2 adds `lens` while `role` is `review`.
-- The threshold is configuration, not code (user, 2026-10-10: "make sure it's configurable as a constant - not hard coded"): `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS=100000` in `config/delegate.conf`, read by the launcher the way it reads `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS`; a missing or non-positive value is an error that names the key. Sent with the roster fields as the follow-up.
-- `implement.sh --to <seat>` compacts the seat first when its recorded context is over `COMPACT_ABOVE_TOKENS` (100,000), then follows as today. The board gets one line with the sizes.
-- <LaunchImplementation/> step 5: when the run already has open `impl` and `test` seats (`codex_mesh.py list`), launch each with `--to <full seat name>` and the new phase's prompt as the follow-up message; open a new seat only for a slot with no open seat. The prompt says the seat is continuing in a new phase, names its role, and says its earlier work is committed.
-- `phase_end.md` step 5 and <PhaseCleanup/>: no longer "the next launch creates new seats"; Codex seats stay open until `end_session.sh`.
-- `direct.md`: a short <LongLivedSeats/> contract stating the decisions above (open once, same role when it fits, compaction, press-on, a new seat only when none can take the work), referenced from <LaunchImplementation/>, <FixDispatch/>, <PhaseCleanup/> and <CompactionContract/>. `delegate.md`, `docs/production_format.md` and `write_prompt_contract.md` (<PhaseTeam/>, the "a finished codex peer refuses send" paragraph) say the same where they describe a seat's life. `report.md`: the seat table names the phase a seat opened in when it is older than the current phase.
+- Codex seats stay open from phase to phase until `end_session.sh`. When the run has open `impl` and `test` seats (`codex_mesh.py list`), the next phase's prompt goes to each with `implement.sh --to <full seat name>`; a new seat opens only for a slot with no open seat. The prompt says the seat is continuing in a new phase, names its role, and says its earlier work is committed.
+- `codex_mesh.py compact --session-dir <dir> --to <seat>` refuses a running seat, calls `thread/compact/start` on a finished one, waits for the compaction turn's `turn/completed`, and prints `compacted <seat>: <before> -> <after> tokens`.
+- `implement.sh --to <seat>` compacts the seat first, under the seat-claim lock and best-effort, when its roster `context_tokens` exceeds `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (`config/delegate.conf`, `100000`; missing or non-positive is an error naming the key), then follows; the board gets one line with the sizes.
+- A turn that ends on `contextWindowExceeded` is pressed on once, inside the same `start` or `follow`, with "Continue where you stopped."; a second overflow with no progress is an error.
+- Roster fields: `role` (`impl` | `test` | `fix` | `review`; optional — roleless threads such as ask-a-friend friends omit it; `--role` is optional), `context_tokens` (`last_token_usage.input_tokens` from the turn's final token count), and `status: "ended"` written by `end` for its seat and by `stop` for every seat on the run's servers (`running` and `done` keep their meanings). `can-follow` saves the prior role and a released claim restores it.
+- `end_session.sh` runs `stop` whenever a roster or server record exists.
+- `direct.md` holds the <LongLivedSeats/> contract (open once, same role when it fits, compaction, press-on, a new seat only when none can take the work), referenced from <LaunchImplementation/>, <FixDispatch/>, <PhaseCleanup/> and <CompactionContract/>. `write_prompt_contract.md` requires every prompt to carry the Three Gods inline and Type Design verbatim, or by pointer in follow-ups. `report.md`'s seat table names the phase a seat opened in when it is older than the current phase.
 
 **Files:**
-- `scripts/agents/codex_mesh.py`
-- `scripts/agents/test_codex_mesh.py`
-- `scripts/delegate/implement.sh`
-- `scripts/delegate/test_implement_launcher.py`
-- `commands/unit/direct.md`
-- `commands/unit/delegate.md`
-- `commands/unit/report.md`
-- `docs/delegate/launch_implementation.md`
-- `docs/delegate/phase_end.md`
-- `docs/delegate/write_prompt_contract.md`
-- `docs/production_format.md`
-- `config/delegate.conf`
+- `scripts/agents/codex_mesh.py` — `compact` verb, roster fields, overflow press-on, role save/restore
+- `scripts/agents/test_codex_mesh.py` — tests for the above
+- `scripts/delegate/implement.sh` — `--to` compaction above the threshold
+- `scripts/delegate/test_implement_launcher.py` — launcher tests
+- `scripts/delegate/end_session.sh` — `stop` whenever a roster or server record exists
+- `scripts/delegate/test_end_session.py` — end-session tests
+- `config/delegate.conf` — `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS=100000`
+- `commands/unit/direct.md`, `commands/unit/delegate.md`, `commands/unit/report.md`, `docs/delegate/launch_implementation.md`, `docs/delegate/phase_end.md`, `docs/delegate/write_prompt_contract.md`, `docs/production_format.md` — seat-life text for long-lived seats
 
-**Seats:** `2 writers` — `impl` writes `codex_mesh.py` and `implement.sh` with their tests; `test` writes the skill text, then reads `impl`'s diff against it.
+**Binds later work:** `shutdown-unit`'s read-only roster reader (`scripts/message/roster.py`) consumes `role`, `context_tokens` and status `ended`. The review-reuse phase adds `lens` while `role` is `review` and inherits the role, claim and compaction rules above. **Measure: Codex usage per phase, credits and account switches, before and after; overflow guard fix** owns the overflow guard repair with its regression.
 
-**Acceptance gate:** the verification lines green; a live check in a scratch session: a thread opened with `start`, then `compact` on it (sizes printed, the second smaller), then `implement.sh --to` sending a second task to the same thread, with one thread on the roster at the end.
+**Gotchas:** the overflow guard is cleared by the continuation's own `userMessage` item, so the second-overflow error never fires live. Compaction completes on `turn/completed`, not `thread/compacted`.
 
-### Phase 2 — Reviews go to open seats · status: todo
+**Ruled out:** dropping the second-overflow error — kept as a loop guard.
+
+### Phase 2 — Measure: Codex usage per phase, credits and account switches, before and after; overflow guard fix · status: done
+
+#### As-built
+
+- `scripts/whoami/seat_usage.py --before <start> <end> --after <start> <end>`, or `--daily [--t-live <time>]` (the 7 days before T_live 2026-10-10T18:17:00Z against T_live to now), reads Codex rollouts on natedev and the Mac (`natemccoy@mac`, by `ssh`). Per window it prints threads opened, weighted Codex usage (uncached input 1 · cached input 0.1 · output 8, named in the output), the share spent before each thread's first edit, compactions, and phases checkpointed (`checkpoint(` commits on all branches of `~/.claude` and the repositories the production rows name). The verdict line is weighted usage per checkpointed phase, before and after, with the change in percent; beside it are Codex account switches per week (readings log, plus the baseline copy in `~/.local/state/usage-model/seats-baseline/`) and credits used per day.
+- Missing data prints an explicit unavailable state (Mac unreachable, no switch history, insufficient credit history) instead of a number; these states appear in the daily update text.
+- `agent_notes.py` records `credits` with each Codex reading.
+- The overflow guard in `codex_mesh.py` counts only the seat's own work items as progress — not `userMessage`, not `contextCompaction` — so a second overflow with no work between is an error on a real server.
+- `codex_mesh.py sweep [--stop]` judges every `codex app-server --listen ws://` process by ownership (current, retired, unowned with or without a log): connected clients first, then the run-active marker, running seats, launchers, age and quiet time, then live conversations. It prints a verdict per server (`in use`, `unused`, `stopped`, `kept`), takes a second look under the owner's lock before stopping, and never touches the `--listen unix://` daemon. A failed server start terminates its process and drops its record.
+- `remove_seats.py` runs `sweep --stop` after a successful session listing; `end_session.sh` runs it after `stop`. A sweep failure never stops seat cleanup.
+
+**Files:**
+- `scripts/whoami/seat_usage.py` — the before/after report and `--daily`
+- `scripts/whoami/test_seat_usage.py` — report tests, unavailable states included
+- `scripts/whoami/agent_notes.py`, `scripts/whoami/test_agent_notes.py` — `credits` field
+- `scripts/agents/codex_mesh.py` — overflow guard, `sweep`, failed-start cleanup
+- `scripts/agents/test_codex_mesh.py` — the fake server emits the submitted `userMessage` `item/completed` on every `turn/start`, as the real app-server does; guard regression; sweep verdict tests
+- `scripts/delegate/remove_seats.py`, `scripts/delegate/end_session.sh` (and `test_remove_seats.py`, `test_end_session.py`) — sweep callers
+
+**Binds later work:** **Reviews go to open seats** narrows `seat_usage.py` `is_edit` so a quoted mention of `tools.apply_patch(` is not an edit, keeping the pattern for real `exec` calls.
+
+**Gotchas:** real Codex edits arrive as `exec` custom tool calls whose JavaScript calls `tools.apply_patch(`, not as `apply_patch` tool calls; edit detection must match that call. A run with no run-active marker (ask-a-friend friends, a Codex-hosted director) keeps its server only while a client, launcher, running seat or under 30 minutes of activity exists; a stopped server comes back on the next use and its threads resume.
+
+**Ruled out:** dropping the `tools.apply_patch(` pattern from edit detection — it is how real edits are logged.
+
+### Phase 3 — Reviews go to open seats · status: todo
 
 #### Work Order
 
 **Goal:** a phase's broad review lenses and its closure reviews run on the seats already open, in a reviewing role, instead of new reviewer threads.
 
 **Spec:**
-- `review.sh --to <seat>` sends the review prompt as a follow-up to an open seat (compacting first, as Phase 1), records the pass under that seat, and writes the same findings files as today. After the turn, the working tree must be unchanged (`git status --porcelain` and the diff hash before and after); a change fails the review with `error` and names the seat.
+- `review.sh --to <seat>` sends the review prompt as a follow-up to an open seat (compacting first, as Phase 1 built), records the pass under that seat, and writes the same findings files as today. After the turn, the working tree must be unchanged (`git status --porcelain` and the diff hash before and after); a change fails the review with `error` and names the seat.
 - Without `--to`, `review.sh` works as today; a run with no open seat (a solo review outside a run) still uses it.
 - The review prompt (<ReviewPromptContract/>, <BroadReviewPrompt/>, <ClosureReview/>) gains a role-switch opening: the seat is now a reviewer, edits nothing, reads the diff cold as if someone else wrote it, and, when it wrote the code, argues against its own choices as an adversary would.
 - `dual_review.md`, `run_phase_review.md` and `direct.md` (<DualReview/>, <EarlyReviewArm/>, <FixDispatch/>'s closure review) say which open seat takes which lens: the seat that did not write a file reviews it when one exists; the writer takes the adversary lens on its own work when the other seat is busy. The handoff post per <RoleReassignment/> names the move.
+- Seat management (user, 2026-10-10): reviewers are long-lived like writers. Moving any open seat to another role is allowed, mid-phase included, because all of a unit's seats work in the same area; `RoleReassignment` and <LongLivedSeats/> say so and drop any wording that keeps a busy seat from being reassigned. An extra seat when every open one is busy is allowed and kept for reuse (an idle seat costs no context). The unit director names each seat for its role — a new seat's slot name says what it does (`review`, `fix2`), never a bare number — and `direct.md` says so.
+- Carried from Phase 2's closure (minor): `seat_usage.py` `is_edit` counts a quoted mention such as `rg -F 'tools.apply_patch(' scripts` as an edit. Real Codex edits arrive as an `exec` custom tool call whose JavaScript calls `tools.apply_patch(` (647 of the last 30 rollouts' calls opened `const patch = "***`), so the pattern stays and is narrowed to a call outside a string literal. Tests pin the real `exec` shape as an edit and the quoted mention as not one; each must fail on the current code.
 
 **Files:**
 - `scripts/delegate/review.sh`
@@ -105,35 +124,11 @@ natedev, 2026-10-10: rollout phases first, measurement last; measurement must no
 - `docs/delegate/dual_review.md`
 - `docs/delegate/run_phase_review.md`
 - `docs/delegate/write_prompt_contract.md`
-
-**Seats:** `2 writers` — `impl` writes `review.sh` and its tests; `test` writes the skill text.
-
-**Constraints from prior phases:** Phase 1: the `compact` verb, `COMPACT_ABOVE_TOKENS`, the reuse path in `implement.sh --to`.
-
-**Acceptance gate:** the verification lines green; a live check in a scratch session: an open seat takes a review with `review.sh --to`, writes findings, and a second review whose seat edits a scratch file fails with `error`.
-
-### Phase 3 — Measure: Codex usage per phase, credits and account switches, before and after · status: todo
-
-#### Work Order
-
-**Blocked by:** G1, for the verdict run only. The script and the credit logging are built right after Phase 1 so the daily updates the user asked for (2026-10-10: "i want to get updates at least daily over the next 7 days") use it from go-live; the unit director runs it every day of the 7.
-
-**Goal:** a report says whether Codex usage per checkpointed phase fell after T_live, and by how much, with credits and account switches beside it.
-
-**Spec:**
-- `scripts/whoami/seat_usage.py --before <start> <T_live> --after <T_live> <end>` reads Codex rollouts on natedev and the Mac (`natemccoy@mac`, by `ssh`), and for each window prints: threads opened; weighted Codex usage (uncached 1 : cached 0.1 : output 8, the ratio of OpenAI's published prices for the seat model, read on the day and named in the output); the share spent before each thread's first edit; compactions; and phases checkpointed (commits whose subject starts `checkpoint(` on all branches of `~/.claude` and of the repositories the production rows name). The verdict line is weighted usage per checkpointed phase, before and after, with the change in percent.
-- Codex account switches per week from the readings log, with the baseline copy in `~/.local/state/usage-model/seats-baseline/` for the days the live log has dropped.
-- Credits: `agent_notes.py` adds `credits` to each Codex reading from this phase on; the report prints credits used per day where the log has them, and says the before window had no credit history.
-- natedev gets the verdict line and the table; NOTES.md gets the same.
-
-**Files:**
 - `scripts/whoami/seat_usage.py`
 - `scripts/whoami/test_seat_usage.py`
-- `scripts/whoami/agent_notes.py`
-- `scripts/whoami/test_agent_notes.py`
 
-**Seats:** `1 writer` — `impl` writes the report and its tests.
+**Seats:** `2 writers` — `impl` writes `review.sh` and its tests; `test` writes the skill text and the `is_edit` repair with its tests.
 
-**Constraints from prior phases:** Phases 1 and 2: the board lines for compaction and press-on, which the report counts.
+**Constraints from prior phases:** Phase 1: `codex_mesh.py compact` waits for the compaction turn's `turn/completed` and refuses a running seat; `implement.sh --to` compacts under the seat-claim lock above `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (`config/delegate.conf`), best-effort; the roster records `role` (optional; roleless threads such as friends omit it), `context_tokens` and status `ended`; `can-follow` saves the prior role and a released claim restores it. Every prompt to a seat, follow-ups included, carries the inline Three Gods sentence and the Type Design Contract or its pointer (`write_prompt_contract.md` sections 7 and 9). A replacement thread under the same seat name gets an opening prompt.
 
-**Acceptance gate:** the verification lines green; the report over the real windows exits 0 and prints every column.
+**Acceptance gate:** the verification lines green; a live check in a scratch session: an open seat takes a review with `review.sh --to`, writes findings, and a second review whose seat edits a scratch file fails with `error`.

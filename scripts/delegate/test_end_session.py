@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import override
+from typing import cast, override
+from unittest.mock import patch
+
+from scripts.delegate import remove_seats
 
 
 END_SESSION = Path(__file__).with_name("end_session.sh")
@@ -89,11 +95,33 @@ class EndSessionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
         self.assertIn("remove_seats.py --session-dir", calls[0])
         self.assertIn("codex_mesh.py stop --session-dir", calls[1])
         self.assertIn(str(self.session_dir), calls[1])
+        self.assertIn("codex_mesh.py sweep --root", calls[2])
+        self.assertIn(f"{self.root} --stop", calls[2])
         self.assertFalse(self.marker.exists())
+
+    def test_phase_cleanup_sweep_is_best_effort(self) -> None:
+        failed = subprocess.CompletedProcess[str](["codex_mesh.py"], 2, "", "")
+        with patch.object(subprocess, "run", return_value=failed) as run, \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            remove_seats.sweep_app_servers(self.root)
+
+        command = cast("list[str]", run.call_args.args[0])
+        self.assertEqual(
+            command,
+            [
+                sys.executable,
+                os.fspath(remove_seats.CODEX_MESH),
+                "sweep",
+                "--root",
+                os.fspath(self.root),
+                "--stop",
+            ],
+        )
+        self.assertIn("seat cleanup continues", errors.getvalue())
 
 
 if __name__ == "__main__":

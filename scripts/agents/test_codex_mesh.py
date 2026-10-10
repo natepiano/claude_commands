@@ -281,11 +281,22 @@ class MeshCommandTests(unittest.TestCase):
             self.error_threads.discard(cast("str", params.get("threadId", THREAD_ID)))
             self.turn_starts += 1
             inputs = cast("list[dict[str, object]]", params.get("input", []))
-            self.turn_inputs.append(
-                cast("str", inputs[0].get("text", "")) if inputs else ""
-            )
+            submitted_text = cast("str", inputs[0].get("text", "")) if inputs else ""
+            self.turn_inputs.append(submitted_text)
             self.queued.clear()
             turn_id = f"turn-{self.turn_starts}"
+            turn_submission_frames = [
+                _reply(request, {"turn": {"id": turn_id}}),
+                _notice("item/completed", {
+                    "threadId": THREAD_ID,
+                    "turnId": turn_id,
+                    "item": {
+                        "id": f"user-message-{self.turn_starts}",
+                        "type": "userMessage",
+                        "content": [{"type": "inputText", "text": submitted_text}],
+                    },
+                }),
+            ]
             outcome = self.outcomes.pop(0) if self.outcomes else "completed"
             if outcome in {
                 "capacity", "capacity_final_queued", "capacity_queued",
@@ -294,10 +305,10 @@ class MeshCommandTests(unittest.TestCase):
             }:
                 self.error_threads.add(THREAD_ID)
             if outcome == "disconnect":
-                return [_reply(request, {"turn": {"id": turn_id}})]
+                return turn_submission_frames
             if outcome == "earlier_completed":
                 return [
-                    _reply(request, {"turn": {"id": turn_id}}),
+                    *turn_submission_frames,
                     _notice("turn/completed", {
                         "threadId": THREAD_ID, "turn": {"id": "earlier-turn"}
                     }),
@@ -307,21 +318,21 @@ class MeshCommandTests(unittest.TestCase):
                 ]
             if outcome == "earlier_only":
                 return [
-                    _reply(request, {"turn": {"id": turn_id}}),
+                    *turn_submission_frames,
                     _notice("turn/completed", {
                         "threadId": THREAD_ID, "turn": {"id": "earlier-turn"}
                     }),
                 ]
             if outcome == "completed_without_id":
                 return [
-                    _reply(request, {"turn": {"id": turn_id}}),
+                    *turn_submission_frames,
                     _notice("turn/completed", {"threadId": THREAD_ID, "turn": {}}),
                 ]
             if outcome == "completed_then_peer":
                 self.live_turn = "peer-turn"
                 self.announce_live_completion = True
                 return [
-                    _reply(request, {"turn": {"id": turn_id}}),
+                    *turn_submission_frames,
                     _notice("turn/completed", {
                         "threadId": THREAD_ID, "turn": {"id": turn_id}
                     }),
@@ -374,7 +385,7 @@ class MeshCommandTests(unittest.TestCase):
                     }},
                 )
             elif outcome == "progress_overflow":
-                frames = [_reply(request, {"turn": {"id": turn_id}})]
+                frames = turn_submission_frames.copy()
                 frames.append(_notice("item/completed", {
                     "threadId": THREAD_ID,
                     "turnId": turn_id,
@@ -400,7 +411,7 @@ class MeshCommandTests(unittest.TestCase):
                 self.live_turn = "peer-turn"
                 self.announce_live_completion = True
                 return [
-                    _reply(request, {"turn": {"id": turn_id}}),
+                    *turn_submission_frames,
                     _notice("turn/failed", {
                         "threadId": THREAD_ID, "error": {"message": "ordinary failure"}
                     }),
@@ -412,7 +423,7 @@ class MeshCommandTests(unittest.TestCase):
                 self.live_turn = "peer-turn"
                 self.announce_live_completion = True
                 return [
-                    _reply(request, {"turn": {"id": turn_id}}),
+                    *turn_submission_frames,
                     _notice("turn/failed", {
                         "threadId": THREAD_ID, "error": {"message": CAPACITY}
                     }),
@@ -422,7 +433,7 @@ class MeshCommandTests(unittest.TestCase):
                 ]
             elif outcome == "completed_then_capacity":
                 return [
-                    _reply(request, {"turn": {"id": turn_id}}),
+                    *turn_submission_frames,
                     _notice("turn/completed", {
                         "threadId": THREAD_ID, "turn": {"id": turn_id}
                     }),
@@ -437,7 +448,7 @@ class MeshCommandTests(unittest.TestCase):
                 finished = _notice(
                     "turn/completed", {"threadId": THREAD_ID, "turn": {"id": turn_id}}
                 )
-            frames = [_reply(request, {"turn": {"id": turn_id}})]
+            frames = turn_submission_frames.copy()
             if self.context_sizes:
                 frames.append(_notice("thread/tokenUsage/updated", {
                     "threadId": THREAD_ID,
@@ -769,7 +780,7 @@ class MeshCommandTests(unittest.TestCase):
         board = (self.session_dir / "board.log").read_text(encoding="utf-8")
         self.assertEqual(board.count("context window filled; sent"), 1)
 
-    def test_second_overflow_without_progress_stops_with_the_cause(self) -> None:
+    def test_continuation_user_message_does_not_clear_overflow_guard(self) -> None:
         self.outcomes = ["overflow", "overflow"]
 
         code, errors = self.run_start()
@@ -1831,8 +1842,17 @@ class SweepTests(unittest.TestCase):
     @staticmethod
     def facts(**changes: object) -> codex_mesh.ServerFacts:
         quiet = codex_mesh.SERVER_IDLE_SECS + 60
-        base = codex_mesh.ServerFacts(pid=10, port=4000, age_secs=quiet, clients=0, session_dir=Path("/run"),
-                                      folder_exists=True, marked_active=False, live_launchers=(), quiet_secs=quiet)
+        base = codex_mesh.ServerFacts(
+            pid=10,
+            port=4000,
+            age_secs=quiet,
+            clients=0,
+            ownership=codex_mesh.CurrentRunServer(Path("/run")),
+            folder_exists=True,
+            run_lifecycle=codex_mesh.UncheckedRunLifecycle(),
+            live_launchers=(),
+            quiet_secs=quiet,
+        )
         return dataclasses.replace(base, **changes)
 
     @staticmethod
@@ -1845,8 +1865,8 @@ class SweepTests(unittest.TestCase):
         deleted = self.verdict(self.facts(folder_exists=False, quiet_secs=None))
         self.assertIsInstance(deleted, codex_mesh.ServerUnused)
         self.assertIn("deleted", deleted.reason)
-        for change in ({"clients": 1}, {"marked_active": True}, {"live_launchers": ("impl",)},
-                       {"age_secs": 60.0}, {"quiet_secs": 60.0}):
+        for change in ({"clients": 1}, {"live_launchers": ("impl",)}, {"age_secs": 60.0},
+                       {"quiet_secs": 60.0}):
             self.assertIsInstance(self.verdict(self.facts(**change)), codex_mesh.ServerInUse, change)
         self.assertIsInstance(self.verdict(self.facts(), ("impl: ThreadLive",)), codex_mesh.ServerInUse)
         self.assertIsInstance(self.verdict(self.facts(folder_exists=False), ("t1: ThreadLive",)),
@@ -1855,22 +1875,57 @@ class SweepTests(unittest.TestCase):
     def test_a_retired_server_is_judged_only_on_its_clients_and_conversations(self) -> None:
         # Its run goes on using a newer server, so the run's marker, launchers and activity say
         # nothing about this one.
-        retired = self.facts(retired=True, marked_active=True, live_launchers=("impl",), age_secs=60.0,
-                             quiet_secs=60.0)
+        retired = self.facts(
+            ownership=codex_mesh.RetiredRunServer(Path("/run")),
+            run_lifecycle=codex_mesh.CheckedRunLifecycle(True, ("impl",)),
+            live_launchers=("impl",),
+            age_secs=60.0,
+            quiet_secs=60.0,
+        )
         unused = self.verdict(retired)
         self.assertIsInstance(unused, codex_mesh.ServerUnused)
         self.assertIn("retired", unused.reason)
         self.assertIsInstance(self.verdict(dataclasses.replace(retired, clients=1)), codex_mesh.ServerInUse)
         self.assertIsInstance(self.verdict(retired, ("impl: ThreadLive",)), codex_mesh.ServerInUse)
 
-    def test_a_server_whose_log_names_no_run_folder_is_never_called_unused(self) -> None:
-        self.assertIsInstance(self.verdict(self.facts(session_dir=None)), codex_mesh.ServerUnknown)
+    def test_an_old_unowned_server_is_unused_only_when_its_conversations_are_idle(self) -> None:
+        unowned = self.facts(ownership=codex_mesh.UnownedServerWithoutLog())
+        self.assertIsInstance(self.verdict(unowned), codex_mesh.ServerUnused)
+        self.assertIsInstance(
+            self.verdict(unowned, ("thread-1: ThreadLive",)), codex_mesh.ServerInUse
+        )
+        self.assertIsInstance(
+            self.verdict(dataclasses.replace(unowned, age_secs=10.0)), codex_mesh.ServerInUse
+        )
+
+    def test_current_server_without_a_marker_must_clear_every_live_and_idle_signal(self) -> None:
+        ended = self.facts(run_lifecycle=codex_mesh.CheckedRunLifecycle(False, ()))
+        self.assertIsInstance(self.verdict(ended), codex_mesh.ServerUnused)
+        for change in (
+            {"clients": 1},
+            {"live_launchers": ("friend",)},
+            {"age_secs": 60.0},
+            {"quiet_secs": 60.0},
+        ):
+            self.assertIsInstance(
+                self.verdict(dataclasses.replace(ended, **change)),
+                codex_mesh.ServerInUse,
+                change,
+            )
+        self.assertIsInstance(
+            self.verdict(ended, ("impl: ThreadLive",)), codex_mesh.ServerInUse
+        )
+        marked = self.facts(run_lifecycle=codex_mesh.CheckedRunLifecycle(True, ()))
+        self.assertIsInstance(self.verdict(marked), codex_mesh.ServerInUse)
+        running = self.facts(run_lifecycle=codex_mesh.CheckedRunLifecycle(False, ("impl",)))
+        self.assertIsInstance(self.verdict(running), codex_mesh.ServerInUse)
 
     def test_servers_and_connections_are_read_from_ps_and_ss(self) -> None:
         ps = ("  111 7200 codex app-server --listen ws://127.0.0.1:47165\n"
-              "  222   30 /nix/store/x/bin/codex app-server --listen ws://127.0.0.1:51009\n"
+              "  222   30 /nix/store/x/bin/codex app-server --listen ws://0.0.0.0:51009\n"
               "  333   99 zsh -c pgrep -af codex app-server --listen ws://127.0.0.1: | head\n"
-              "  444   99 codex app-server --listen stdio://\n")
+              "  444   99 codex app-server --listen unix:///tmp/codex.sock\n"
+              "  555   99 codex app-server daemon --listen ws://127.0.0.1:55555\n")
         ss = "0 0 127.0.0.1:47165 127.0.0.1:60000\n0 0 127.0.0.1:60000 127.0.0.1:47165\n0 0 [::1]:47165 [::1]:60001\n"
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, ps, "")):
             servers = codex_mesh._running_servers()  # pyright: ignore[reportPrivateUsage]
@@ -1878,6 +1933,31 @@ class SweepTests(unittest.TestCase):
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, ss, "")):
             counts = codex_mesh._client_counts()  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(counts, {47165: 2, 60000: 1})
+
+    def test_process_text_that_only_mentions_the_server_command_is_not_a_target(self) -> None:
+        ps = (
+            "  666 99 python3 worker.py codex app-server --listen ws://127.0.0.1:4444\n"
+        )
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, ps, ""),
+        ):
+            servers = codex_mesh._running_servers()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(servers, [])
+
+    def test_unix_daemon_and_app_server_helper_are_never_sweep_targets(self) -> None:
+        ps = (
+            "  444 99 codex app-server --listen unix:///tmp/codex.sock\n"
+            "  555 99 codex app-server daemon --listen ws://127.0.0.1:55555\n"
+        )
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, ps, ""),
+        ):
+            servers = codex_mesh._running_servers()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(servers, [])
 
     def test_the_run_folder_comes_from_the_servers_own_log_handle(self) -> None:
         folder = codex_mesh._server_folder  # pyright: ignore[reportPrivateUsage]
@@ -1889,6 +1969,17 @@ class SweepTests(unittest.TestCase):
             self.assertIsNone(folder(5))
         with patch.object(os, "readlink", side_effect=OSError("no such process")):
             self.assertIsNone(folder(5))
+
+    def test_judgment_preserves_the_explicit_unowned_without_log_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(codex_mesh, "_server_folder", return_value=None), \
+                patch.object(codex_mesh, "_busy_threads", return_value=()):
+            judgment = codex_mesh._judge(  # pyright: ignore[reportPrivateUsage]
+                Path(directory), 5, 4005, codex_mesh.SERVER_IDLE_SECS + 60, 0
+            )
+
+        self.assertIsInstance(judgment.verdict, codex_mesh.ServerUnused)
+        self.assertEqual(judgment.ownership, codex_mesh.UnownedServerWithoutLog())
 
     def test_a_run_folder_reports_its_marker_its_quiet_time_and_its_live_launchers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1962,7 +2053,9 @@ class SweepTests(unittest.TestCase):
         old = codex_mesh.SERVER_IDLE_SECS + 60
         asked: list[int] = []
 
-        def stopper(_root: Path, pid: int, _port: int, _folder: Path) -> bool:
+        def stopper(
+            _root: Path, pid: int, _port: int, _ownership: codex_mesh.ServerOwnership
+        ) -> bool:
             asked.append(pid)
             return stops
 
@@ -1975,27 +2068,96 @@ class SweepTests(unittest.TestCase):
                 patch.object(codex_mesh, "_stop_unused", side_effect=stopper), \
                 contextlib.redirect_stdout(io.StringIO()) as printed:
             self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root=directory, stop=stop)), 0)
-        # Only the server every other check cleared is asked about its conversations.
-        busy.assert_called_once_with(4002, {})
+        # Both recordless servers are old enough to be judged on their conversations.
+        self.assertEqual(
+            [entry.args for entry in busy.call_args_list],
+            [(4002, {}), (4003, {})],
+        )
         return [line.split("\t") for line in printed.getvalue().splitlines()], asked
 
     def test_the_report_lists_each_server_and_stops_nothing(self) -> None:
         rows, asked = self.sweep(stop=False)
-        self.assertEqual([row[2] for row in rows[:3]], ["in use", "unused", "unknown"])
-        self.assertEqual(rows[3], ["3 app-server(s), 1 unused; report only, nothing was stopped"])
+        self.assertEqual([row[2] for row in rows[:3]], ["in use", "unused", "unused"])
+        self.assertEqual(rows[3], ["3 app-server(s), 2 unused; report only, nothing was stopped"])
         self.assertEqual(asked, [])
 
-    def test_stop_reaches_only_the_unused_server(self) -> None:
+    def test_stop_reaches_each_old_unowned_server(self) -> None:
         rows, asked = self.sweep(stop=True)
-        self.assertEqual([row[2] for row in rows[:3]], ["in use", "stopped", "unknown"])
-        self.assertEqual(rows[3], ["3 app-server(s), 1 unused; 1 stopped"])
-        self.assertEqual(asked, [2])
+        self.assertEqual([row[2] for row in rows[:3]], ["in use", "stopped", "stopped"])
+        self.assertEqual(rows[3], ["3 app-server(s), 2 unused; 2 stopped"])
+        self.assertEqual(asked, [2, 3])
         rows, _asked = self.sweep(stop=True, stops=False)
-        self.assertEqual([row[2] for row in rows[:3]], ["in use", "kept", "unknown"])
-        self.assertEqual(rows[3], ["3 app-server(s), 1 unused; 0 stopped"])
+        self.assertEqual([row[2] for row in rows[:3]], ["in use", "kept", "kept"])
+        self.assertEqual(rows[3], ["3 app-server(s), 2 unused; 0 stopped"])
 
-    def second_look(self, folder: Path, running: list[tuple[int, int, float]], clients: dict[int, int],
-                    verdict: codex_mesh.SweepVerdict) -> tuple[bool, list[int]]:
+    def test_unowned_server_is_reaped_only_after_the_second_look(self) -> None:
+        old = codex_mesh.SERVER_IDLE_SECS + 60
+        reaped: list[int] = []
+
+        def reap(pid: int) -> bool:
+            reaped.append(pid)
+            return True
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(codex_mesh, "_running_servers", return_value=[(8, 4008, old)]), \
+                patch.object(codex_mesh, "_client_counts", return_value={}), \
+                patch.object(codex_mesh, "_server_folder", return_value=None), \
+                patch.object(codex_mesh, "_busy_threads", return_value=()), \
+                patch.object(codex_mesh, "_reap", side_effect=reap), \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            code = codex_mesh.command_sweep(argparse.Namespace(root=directory, stop=True))
+        self.assertEqual(code, 0)
+        self.assertEqual(reaped, [8])
+        self.assertIn("8\t4008\tstopped\tno current or retired server record", printed.getvalue())
+
+    def test_recorded_server_stops_when_ended_and_stays_for_each_live_signal(self) -> None:
+        old = codex_mesh.SERVER_IDLE_SECS + 60
+        for marker, running, expected in (
+            (False, False, "stopped"),
+            (True, False, "in use"),
+            (False, True, "in use"),
+        ):
+            with self.subTest(marker=marker, running=running), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                run = root / "run-a"
+                run.mkdir()
+                _ = (run / codex_mesh.SERVER_FILE).write_text(
+                    json.dumps({"pid": 9, "port": 4009}), encoding="utf-8"
+                )
+                _ = (run / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+                    "impl": {"thread_id": "thread-1", "status": "running" if running else "done"}
+                }), encoding="utf-8")
+                stale = time.time() - old
+                for activity in (codex_mesh.SERVER_FILE, codex_mesh.ROSTER_FILE):
+                    os.utime(run / activity, (stale, stale))
+                if marker:
+                    (root / "active").mkdir()
+                    _ = (root / "active" / "session-1").write_text(f"{run}\n", encoding="utf-8")
+                reaped: list[int] = []
+
+                def reap(pid: int) -> bool:
+                    reaped.append(pid)
+                    return True
+
+                with patch.object(codex_mesh, "_running_servers", return_value=[(9, 4009, old)]), \
+                        patch.object(codex_mesh, "_client_counts", return_value={}), \
+                        patch.object(codex_mesh, "_server_folder", return_value=run), \
+                        patch.object(codex_mesh, "_busy_threads", return_value=()), \
+                        patch.object(codex_mesh, "_reap", side_effect=reap), \
+                        contextlib.redirect_stdout(io.StringIO()) as printed:
+                    code = codex_mesh.command_sweep(argparse.Namespace(root=directory, stop=True))
+                self.assertEqual(code, 0)
+                self.assertEqual(printed.getvalue().splitlines()[0].split("\t")[2], expected)
+                self.assertEqual(reaped, [9] if expected == "stopped" else [])
+
+    def second_look(
+        self,
+        folder: Path,
+        running: list[tuple[int, int, float]],
+        clients: dict[int, int],
+        verdict: codex_mesh.SweepVerdict,
+        ownership: codex_mesh.ServerOwnership,
+    ) -> tuple[bool, list[int]]:
         """Whether `_stop_unused` stopped pid 2 on port 4002, and the pids it signalled."""
         reaped: list[int] = []
 
@@ -2005,9 +2167,15 @@ class SweepTests(unittest.TestCase):
 
         with patch.object(codex_mesh, "_running_servers", return_value=running), \
                 patch.object(codex_mesh, "_client_counts", return_value=clients), \
-                patch.object(codex_mesh, "_judge", return_value=(verdict, folder)) as judge, \
+                patch.object(
+                    codex_mesh,
+                    "_judge",
+                    return_value=codex_mesh.SweepJudgment(verdict, ownership),
+                ) as judge, \
                 patch.object(codex_mesh, "_reap", side_effect=reap):
-            stopped = codex_mesh._stop_unused(folder.parent, 2, 4002, folder)  # pyright: ignore[reportPrivateUsage]
+            stopped = codex_mesh._stop_unused(  # pyright: ignore[reportPrivateUsage]
+                folder.parent, 2, 4002, ownership
+            )
         if judge.called:
             self.assertEqual(judge.call_args.args[1:], (2, 4002, 9000.0, clients.get(4002, 0)))
         return stopped, reaped
@@ -2019,25 +2187,41 @@ class SweepTests(unittest.TestCase):
             run.mkdir()
             record = run / codex_mesh.SERVER_FILE
             _ = record.write_text(json.dumps({"pid": 2, "port": 4002}))
+            current = codex_mesh.CurrentRunServer(run)
             # The pid stopped running this server, or now runs it on another port: nothing is signalled.
-            self.assertEqual(self.second_look(run, [], {}, unused), (False, []))
-            self.assertEqual(self.second_look(run, [(2, 4999, 9000.0)], {}, unused), (False, []))
+            self.assertEqual(self.second_look(run, [], {}, unused, current), (False, []))
+            self.assertEqual(self.second_look(run, [(2, 4999, 9000.0)], {}, unused, current), (False, []))
             # A client arrived between the two looks.
-            self.assertEqual(self.second_look(run, [(2, 4002, 9000.0)], {4002: 1}, in_use), (False, []))
+            self.assertEqual(
+                self.second_look(run, [(2, 4002, 9000.0)], {4002: 1}, in_use, current),
+                (False, []),
+            )
             self.assertTrue(record.exists())
-            self.assertEqual(self.second_look(run, [(2, 4002, 9000.0)], {}, unused), (True, [2]))
+            self.assertEqual(
+                self.second_look(run, [(2, 4002, 9000.0)], {}, unused, current),
+                (True, [2]),
+            )
             self.assertFalse(record.exists())
             # A record that names a newer server is left for that server.
             _ = record.write_text(json.dumps({"pid": 7, "port": 4007}))
-            self.assertEqual(self.second_look(run, [(2, 4002, 9000.0)], {}, unused), (True, [2]))
+            self.assertEqual(
+                self.second_look(run, [(2, 4002, 9000.0)], {}, unused, current),
+                (True, [2]),
+            )
             self.assertTrue(record.exists())
             # A deleted run folder is not created again.
             gone = Path(directory) / "gone"
-            self.assertEqual(self.second_look(gone, [(2, 4002, 9000.0)], {}, unused), (True, [2]))
+            gone_owner = codex_mesh.UnownedServerWithLog(gone)
+            self.assertEqual(
+                self.second_look(gone, [(2, 4002, 9000.0)], {}, unused, gone_owner),
+                (True, [2]),
+            )
             self.assertFalse(gone.exists())
         with patch.object(codex_mesh, "_running_servers", side_effect=OSError("no ps")), \
                 patch.object(codex_mesh, "_reap") as reap:
-            self.assertFalse(codex_mesh._stop_unused(gone.parent, 2, 4002, gone))  # pyright: ignore[reportPrivateUsage]
+            self.assertFalse(codex_mesh._stop_unused(  # pyright: ignore[reportPrivateUsage]
+                gone.parent, 2, 4002, gone_owner
+            ))
         reap.assert_not_called()
 
     def idle_stop(self, folder: Path, running: list[tuple[int, int, float]] | OSError,
@@ -2050,7 +2234,13 @@ class SweepTests(unittest.TestCase):
 
         with patch.object(codex_mesh, "_running_servers", side_effect=[running]), \
                 patch.object(codex_mesh, "_client_counts", return_value={}), \
-                patch.object(codex_mesh, "_judge", return_value=(verdict, folder)) as judge, \
+                patch.object(
+                    codex_mesh,
+                    "_judge",
+                    return_value=codex_mesh.SweepJudgment(
+                        verdict, codex_mesh.CurrentRunServer(folder)
+                    ),
+                ) as judge, \
                 patch.object(codex_mesh, "_stop_unused", side_effect=stopper):
             result = codex_mesh.command_idle_stop(argparse.Namespace(session_dir=str(folder), pid=2, port=4002))
         if judge.called:
@@ -2088,31 +2278,100 @@ class SweepTests(unittest.TestCase):
             # The server no longer runs: the watcher is told to leave, and nothing is judged.
             self.assertEqual(self.idle_stop(run, [(2, 4999, 9000.0)], unused), (0, []))
             # Unused at both looks: stopped, with a line in the server's log saying why.
-            self.assertEqual(self.idle_stop(run, [(2, 4002, 9000.0)], unused), (0, [(None, 2, 4002, run)]))
+            self.assertEqual(
+                self.idle_stop(run, [(2, 4002, 9000.0)], unused),
+                (0, [(None, 2, 4002, codex_mesh.CurrentRunServer(run))]),
+            )
             self.assertIn("app-server 2 stopped itself: quiet for 1.0 h",
                           (run / codex_mesh.SERVER_LOG).read_text(encoding="utf-8"))
 
     def test_a_server_judging_itself_ignores_the_run_active_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            run = Path(directory)
+            root = Path(directory)
+            run = root / "run-a"
+            run.mkdir()
+            record = run / codex_mesh.SERVER_FILE
+            _ = record.write_text(json.dumps({"pid": 2, "port": 4002}))
+            old = time.time() - codex_mesh.SERVER_IDLE_SECS - 60
+            os.utime(record, (old, old))
             with patch.object(codex_mesh, "_server_folder", return_value=run), \
                     patch.object(codex_mesh, "_marked_active", return_value=True) as marked, \
                     patch.object(codex_mesh, "_busy_threads", return_value=()):
                 judge = codex_mesh._judge  # pyright: ignore[reportPrivateUsage]
-                self.assertIsInstance(judge(None, 2, 4002, 9000.0, 0)[0], codex_mesh.ServerUnused)
+                self.assertIsInstance(
+                    judge(None, 2, 4002, 9000.0, 0).verdict,
+                    codex_mesh.ServerUnused,
+                )
                 marked.assert_not_called()
-                self.assertIsInstance(judge(run, 2, 4002, 9000.0, 0)[0], codex_mesh.ServerInUse)
+                self.assertIsInstance(
+                    judge(root, 2, 4002, 9000.0, 0).verdict,
+                    codex_mesh.ServerInUse,
+                )
 
     def test_a_server_the_run_retired_is_read_as_retired(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            run = Path(directory)
+            root = Path(directory)
+            run = root / "run-a"
+            run.mkdir()
             _ = (run / codex_mesh.RETIRED_FILE).write_text(json.dumps({"servers": [{"port": 4002, "pid": 2}]}))
             with patch.object(codex_mesh, "_server_folder", return_value=run), \
                     patch.object(codex_mesh, "_marked_active", return_value=True), \
                     patch.object(codex_mesh, "_busy_threads", return_value=()):
                 judge = codex_mesh._judge  # pyright: ignore[reportPrivateUsage]
-                self.assertIsInstance(judge(run, 2, 4002, 60.0, 0)[0], codex_mesh.ServerUnused)
-                self.assertIsInstance(judge(run, 3, 4003, 60.0, 0)[0], codex_mesh.ServerInUse)
+                self.assertIsInstance(
+                    judge(root, 2, 4002, 60.0, 0).verdict,
+                    codex_mesh.ServerUnused,
+                )
+                self.assertIsInstance(
+                    judge(root, 3, 4003, 10.0, 0).verdict,
+                    codex_mesh.ServerInUse,
+                )
+
+    def test_any_live_current_record_protects_a_server_from_stale_duplicate_owners(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ended = root / "a-ended"
+            live = root / "z-live"
+            ended.mkdir()
+            live.mkdir()
+            for run in (ended, live):
+                _ = (run / codex_mesh.SERVER_FILE).write_text(
+                    json.dumps({"pid": 2, "port": 4002}), encoding="utf-8"
+                )
+            old = time.time() - codex_mesh.SERVER_IDLE_SECS - 60
+            os.utime(ended / codex_mesh.SERVER_FILE, (old, old))
+            (root / "active").mkdir()
+            _ = (root / "active" / "session-1").write_text(f"{live}\n", encoding="utf-8")
+            with patch.object(codex_mesh, "_server_folder", return_value=ended), \
+                    patch.object(codex_mesh, "_busy_threads", return_value=()):
+                judgment = codex_mesh._judge(  # pyright: ignore[reportPrivateUsage]
+                    root, 2, 4002, 9000.0, 0
+                )
+        self.assertIsInstance(judgment.verdict, codex_mesh.ServerInUse)
+        self.assertEqual(judgment.ownership, codex_mesh.CurrentRunServer(live))
+
+    def test_a_retired_owner_wins_over_an_ended_stale_current_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stale = root / "a-stale"
+            retired = root / "z-retired"
+            stale.mkdir()
+            retired.mkdir()
+            _ = (stale / codex_mesh.SERVER_FILE).write_text(
+                json.dumps({"pid": 2, "port": 4002}), encoding="utf-8"
+            )
+            _ = (retired / codex_mesh.RETIRED_FILE).write_text(
+                json.dumps({"servers": [{"pid": 2, "port": 4002}]}),
+                encoding="utf-8",
+            )
+            old = time.time() - codex_mesh.SERVER_IDLE_SECS - 60
+            os.utime(stale / codex_mesh.SERVER_FILE, (old, old))
+
+            ownership = codex_mesh._server_ownership(  # pyright: ignore[reportPrivateUsage]
+                root, 2, 4002, stale
+            )
+
+        self.assertEqual(ownership, codex_mesh.RetiredRunServer(retired))
 
     def test_stopping_a_retired_server_drops_it_from_the_retired_list(self) -> None:
         # `stop` signals every pid on that list at the run's end; one already stopped could by then
@@ -2122,7 +2381,13 @@ class SweepTests(unittest.TestCase):
             run.mkdir()
             retired = run / codex_mesh.RETIRED_FILE
             _ = retired.write_text(json.dumps({"servers": [{"port": 4002, "pid": 2}, {"port": 4009, "pid": 9}]}))
-            stopped = self.second_look(run, [(2, 4002, 9000.0)], {}, codex_mesh.ServerUnused("retired"))
+            stopped = self.second_look(
+                run,
+                [(2, 4002, 9000.0)],
+                {},
+                codex_mesh.ServerUnused("retired"),
+                codex_mesh.RetiredRunServer(run),
+            )
             self.assertEqual(stopped, (True, [2]))
             self.assertEqual(json.loads(retired.read_text()), {"servers": [{"port": 4009, "pid": 9}]})
 
@@ -2412,6 +2677,51 @@ class ServerRecordTests(unittest.TestCase):
         os.utime(record, (old, old))
         _ = codex_mesh.ensure_server(str(self.session_dir))
         self.assertGreater(record.stat().st_mtime, old + 3600)
+
+    def test_replacing_a_server_record_retires_the_old_live_server(self) -> None:
+        old_pid = self.sleeper()
+        self.write_server(4321, old_pid)
+        replacement: codex_mesh.ServerRecord = {"port": 9876, "pid": 99999999}
+
+        codex_mesh._record_started_server(  # pyright: ignore[reportPrivateUsage]
+            str(self.session_dir), replacement
+        )
+
+        current = cast(
+            "dict[str, object]",
+            cast("object", json.loads(
+                (self.session_dir / codex_mesh.SERVER_FILE).read_text(encoding="utf-8")
+            )),
+        )
+        self.assertEqual(current, replacement)
+        self.assertEqual(self.retired_ports(), [4321])
+        self.assertTrue(codex_mesh._pid_alive(old_pid))  # pyright: ignore[reportPrivateUsage]
+
+    def test_a_server_that_never_accepts_is_stopped_before_start_fails(self) -> None:
+        process = subprocess.Popen(["sleep", "30"])
+        self.spawned.append(process)
+        with patch.object(codex_mesh, "SERVER_START_TIMEOUT_SECS", 0), \
+                patch.object(codex_mesh, "_free_port", return_value=4321), \
+                patch.object(subprocess, "Popen", return_value=process):
+            with self.assertRaisesRegex(SystemExit, "did not accept connections"):
+                _ = codex_mesh._start_server(str(self.session_dir))  # pyright: ignore[reportPrivateUsage]
+
+        self.assertIsNotNone(process.poll())
+        self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+
+    def test_a_server_is_stopped_when_recording_its_start_fails(self) -> None:
+        process = subprocess.Popen(["sleep", "30"])
+        self.spawned.append(process)
+        probe = SimpleNamespace(close=lambda: None)
+        with patch.object(codex_mesh, "_free_port", return_value=4321), \
+                patch.object(subprocess, "Popen", return_value=process), \
+                patch.object(codex_mesh, "WebSocket", return_value=probe), \
+                patch.object(codex_mesh, "_record_started_server", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                _ = codex_mesh._start_server(str(self.session_dir))  # pyright: ignore[reportPrivateUsage]
+
+        self.assertIsNotNone(process.poll())
+        self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
 
     def watcher(self, pid: int) -> tuple[subprocess.Popen[bytes], Path]:
         """Start the real watcher with a stand-in for the Python that would run `idle-stop`."""
