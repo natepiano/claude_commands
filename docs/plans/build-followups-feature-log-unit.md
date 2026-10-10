@@ -15,7 +15,8 @@ feature log yes (the user to hana, 2026-10-10): build ~/rust/hanadocs/proposals/
 ## Delegation Context
 
 - **Project:** `~/.claude` config repo plus the hanadocs vault. This plan builds the design in `/home/natepiano/rust/hanadocs/proposals/feature-log.md` (the user, 2026-10-10: "feature log yes"). Worktree `/home/natepiano/worktrees/claude-build-followups-feature-log-unit`, branch `build-followups-feature-log-unit` (unit `feature-log-unit-unit`); name both in every dispatch.
-- **Stack:** Python 3.10+ standard library only (`argparse`, `fcntl`, `json`, `os`, `re`, `shlex`, `socket`, `subprocess`, `datetime`, `zoneinfo`, `unittest`); no YAML library is installed (`import yaml` fails under `scripts/lib/py`), so the script reads and writes frontmatter with its own line parser. Obsidian 1.14 Bases (`.base` YAML). Markdown command files, written per `commands/succinct_style.md`.
+- **Project started:** 2026-10-10T20:03:04.331+00:00
+- **Stack:** Python standard library only; the scripts stay importable on Python 3.10 (the floor `scripts/lib/py` accepts, which the Mac runs them under), and the tests run only on natedev's `python3` 3.13, so they may use 3.12 names such as `typing.override` as other tests here do (`argparse`, `fcntl`, `json`, `os`, `re`, `shlex`, `socket`, `subprocess`, `datetime`, `zoneinfo`, `unittest`); no YAML library is installed (`import yaml` fails under `scripts/lib/py`), so the script reads and writes frontmatter with its own line parser. Obsidian 1.14 Bases (`.base` YAML). Markdown command files, written per `commands/succinct_style.md`.
 - **Layout:**
   - `scripts/feature_log/` (new) — `feature_log.py`, `inventory.py`, `test_feature_log.py`, `test_inventory.py`.
   - `commands/showrunner/produce.md` (only `<ChangeReviewFeatureLog/>` and `<CloseChangeReview/>`), `commands/validate_and_push.md` (only `<FeatureLogCloseOut/>`), `commands/feature_log.md` (new), `commands/release.md` (changelog export only).
@@ -75,7 +76,7 @@ After Phase 2 reaches `~/.claude` main, the unit director tells the showrunner t
 
 ## Phases
 
-### Phase 1 — The vault holds six folders and seven Bases, and one script writes every note  · status: todo
+### Phase 1 — The vault holds six folders and seven Bases, and one script writes every note  · status: done
 
 #### Work Order
 
