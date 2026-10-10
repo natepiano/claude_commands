@@ -8,12 +8,15 @@ import fcntl
 import json
 import os
 import re
+import shlex
+import socket as socket
+import subprocess as subprocess
 import sys
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import Literal, NamedTuple, NoReturn, TypedDict, cast
+from typing import Callable, Literal, NamedTuple, NoReturn, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 
@@ -130,9 +133,20 @@ class Note(TypedDict):
     evidence: list[str]
 
 
-class FeatureLogEvent(TypedDict):
+class AddEvent(TypedDict):
     at: str
-    verb: Literal["add", "supersede", "amend"]
+    verb: Literal["add"]
+    project: str
+    title: str
+    kind: str
+    summary: str
+    release: list[str]
+    backfill: bool
+
+
+class SupersedeEvent(TypedDict):
+    at: str
+    verb: Literal["supersede"]
     project: str
     title: str
     kind: str
@@ -140,7 +154,75 @@ class FeatureLogEvent(TypedDict):
     release: list[str]
     backfill: bool
     old: list[str]
+
+
+class AmendEvent(TypedDict):
+    at: str
+    verb: Literal["amend"]
+    project: str
+    title: str
     fields: list[str]
+    backfill: bool
+
+
+FeatureLogEvent = AddEvent | SupersedeEvent | AmendEvent
+
+
+class ProposalArgs(TypedDict):
+    project: str
+    title: str
+    kind: str
+    summary: str
+    behavior: str
+    see: str
+    link: str
+    evidence: list[str]
+    crate: list[str]
+    area: str | None
+    completed: str
+    production: str | None
+    unit: list[str]
+    release: list[str]
+    backfill: bool
+    separate_result: bool
+    old: list[str]
+
+
+class OpenProposal(TypedDict):
+    row: str
+    verb: Literal["add", "supersede"]
+    args: ProposalArgs
+    status: Literal["open"]
+    at: str
+
+
+class LandedProposal(TypedDict):
+    row: str
+    verb: Literal["add", "supersede"]
+    args: ProposalArgs
+    status: Literal["landed"]
+    at: str
+    note: str
+
+
+class DroppedProposal(TypedDict):
+    row: str
+    verb: Literal["add", "supersede"]
+    args: ProposalArgs
+    status: Literal["dropped"]
+    at: str
+    verdict: str
+
+
+FeatureLogProposal = OpenProposal | LandedProposal | DroppedProposal
+
+
+class DigestCursor(TypedDict):
+    line: int
+    at: str
+
+
+SshRunner = Callable[[list[str]], int]
 
 
 class FeatureLogError(ValueError):
@@ -163,6 +245,11 @@ def state_dir() -> Path:
 def today() -> str:
     """Return the machine-local date used by the Obsidian Linter."""
     return date.today().isoformat()
+
+
+def _run_ssh(command: list[str]) -> int:
+    """Run a feature-log command on the vault host with inherited output."""
+    return subprocess.run(command, check=False).returncode
 
 
 FRONTMATTER_KEYS = frozenset(
@@ -207,6 +294,7 @@ SAFE_SCALAR_RE = re.compile(r"^[A-Za-z0-9][^:#\"'\n]*$")
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 VERSION_RE = re.compile(r"^(?:Unreleased|\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)$")
+REVIEW_ROW_RE = re.compile(r"^[AC]\d+$")
 BODY_SECTION_HEADINGS = frozenset({"## See it", "## Evidence"})
 UNSAFE_BARE_SCALAR_PREFIXES = frozenset("-?:,[]{}#&*!|>'\"%@`")
 
@@ -726,6 +814,19 @@ def _write_note(path: Path, note: Note) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        _ = temporary.write_text(
+            json.dumps(value, separators=(",", ":"), ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _event_time() -> str:
     return datetime.now(ZoneInfo("America/Los_Angeles")).replace(microsecond=0).isoformat()
 
@@ -737,17 +838,23 @@ def _append_event(event: FeatureLogEvent) -> None:
         _ = output.write(json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n")
 
 
-def _event(
-    verb: Literal["add", "supersede", "amend"],
-    note: Note,
-    *,
-    backfill: bool,
-    old: list[str],
-    fields: list[str],
-) -> FeatureLogEvent:
+def _add_event(note: Note, backfill: bool) -> AddEvent:
     return {
         "at": _event_time(),
-        "verb": verb,
+        "verb": "add",
+        "project": note["project"],
+        "title": note["title"],
+        "kind": note["kind"],
+        "summary": note["summary"],
+        "release": note["release"],
+        "backfill": backfill,
+    }
+
+
+def _supersede_event(note: Note, backfill: bool, old: list[str]) -> SupersedeEvent:
+    return {
+        "at": _event_time(),
+        "verb": "supersede",
         "project": note["project"],
         "title": note["title"],
         "kind": note["kind"],
@@ -755,8 +862,158 @@ def _event(
         "release": note["release"],
         "backfill": backfill,
         "old": old,
-        "fields": fields,
     }
+
+
+def _amend_event(note: Note, backfill: bool, fields: list[str]) -> AmendEvent:
+    return {
+        "at": _event_time(),
+        "verb": "amend",
+        "project": note["project"],
+        "title": note["title"],
+        "fields": fields,
+        "backfill": backfill,
+    }
+
+
+def _json_object(value: object, label: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise FeatureLogError(f"{label} must be a JSON object")
+    object_value = cast(dict[object, object], value)
+    if not all(isinstance(key, str) for key in object_value):
+        raise FeatureLogError(f"{label} must be a JSON object")
+    return cast(dict[str, object], object_value)
+
+
+def _json_string(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        raise FeatureLogError(f"{field} must be a string")
+    return value
+
+
+def _json_optional_string(value: object, field: str) -> str | None:
+    if value is None or isinstance(value, str):
+        return value
+    raise FeatureLogError(f"{field} must be a string or null")
+
+
+def _json_bool(value: object, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise FeatureLogError(f"{field} must be a boolean")
+    return value
+
+
+def _json_int(value: object, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise FeatureLogError(f"{field} must be an integer")
+    return value
+
+
+def _json_string_list(value: object, field: str) -> list[str]:
+    if not isinstance(value, list):
+        raise FeatureLogError(f"{field} must be a list of strings")
+    object_items = cast(list[object], value)
+    if not all(isinstance(item, str) for item in object_items):
+        raise FeatureLogError(f"{field} must be a list of strings")
+    return cast(list[str], object_items)
+
+
+def _require_json_keys(
+    value: dict[str, object], expected: frozenset[str], label: str
+) -> None:
+    if value.keys() != expected:
+        raise FeatureLogError(f"{label} has invalid fields")
+
+
+def _parse_event(line: str, line_number: int) -> FeatureLogEvent:
+    try:
+        decoded = cast(object, json.loads(line))
+    except json.JSONDecodeError as error:
+        raise FeatureLogError(f"events.jsonl line {line_number} is invalid JSON") from error
+    value = _json_object(decoded, f"events.jsonl line {line_number}")
+    verb = _json_string(value.get("verb"), "event verb")
+    if verb == "add":
+        _require_json_keys(
+            value,
+            frozenset(
+                {"at", "verb", "project", "title", "kind", "summary", "release", "backfill"}
+            ),
+            "add event",
+        )
+        return {
+            "at": _json_string(value.get("at"), "event at"),
+            "verb": "add",
+            "project": _json_string(value.get("project"), "event project"),
+            "title": _json_string(value.get("title"), "event title"),
+            "kind": _json_string(value.get("kind"), "event kind"),
+            "summary": _json_string(value.get("summary"), "event summary"),
+            "release": _json_string_list(value.get("release"), "event release"),
+            "backfill": _json_bool(value.get("backfill"), "event backfill"),
+        }
+    if verb == "supersede":
+        _require_json_keys(
+            value,
+            frozenset(
+                {
+                    "at",
+                    "verb",
+                    "project",
+                    "title",
+                    "kind",
+                    "summary",
+                    "release",
+                    "backfill",
+                    "old",
+                }
+            ),
+            "supersede event",
+        )
+        return {
+            "at": _json_string(value.get("at"), "event at"),
+            "verb": "supersede",
+            "project": _json_string(value.get("project"), "event project"),
+            "title": _json_string(value.get("title"), "event title"),
+            "kind": _json_string(value.get("kind"), "event kind"),
+            "summary": _json_string(value.get("summary"), "event summary"),
+            "release": _json_string_list(value.get("release"), "event release"),
+            "backfill": _json_bool(value.get("backfill"), "event backfill"),
+            "old": _json_string_list(value.get("old"), "event old"),
+        }
+    if verb == "amend":
+        _require_json_keys(
+            value,
+            frozenset({"at", "verb", "project", "title", "fields", "backfill"}),
+            "amend event",
+        )
+        return {
+            "at": _json_string(value.get("at"), "event at"),
+            "verb": "amend",
+            "project": _json_string(value.get("project"), "event project"),
+            "title": _json_string(value.get("title"), "event title"),
+            "fields": _json_string_list(value.get("fields"), "event fields"),
+            "backfill": _json_bool(value.get("backfill"), "event backfill"),
+        }
+    raise FeatureLogError(f"events.jsonl line {line_number} has unknown verb {verb}")
+
+
+def _read_events() -> list[FeatureLogEvent]:
+    path = state_dir() / "events.jsonl"
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise FeatureLogError(str(error)) from error
+    return [_parse_event(line, index) for index, line in enumerate(lines, start=1)]
+
+
+def _event_recorded(verb: str, project: str, title: str) -> bool:
+    return any(
+        event["verb"] == verb
+        and event["project"] == project
+        and event["title"] == title
+        for event in _read_events()
+    )
 
 
 def _project_notes(project: str) -> list[tuple[Path, Note]]:
@@ -829,30 +1086,30 @@ def _prepare_new(
     return True, note
 
 
+def _apply_add(note: Note, arguments: argparse.Namespace) -> list[str]:
+    path = _note_path(note)
+    backfill = cast(bool, arguments.backfill)
+    should_write, stored = _prepare_new(
+        note,
+        cast(bool, arguments.separate_result),
+        completed_date_was_defaulted=cast(str | None, arguments.completed) is None,
+        replacing_titles=frozenset(),
+    )
+    if not should_write:
+        if not _event_recorded("add", stored["project"], stored["title"]):
+            _append_event(_add_event(stored, backfill))
+        return [f"unchanged: {_relative(path)}"]
+    _write_note(path, stored)
+    _append_event(_add_event(stored, backfill))
+    return [f"added: {_relative(path)}"]
+
+
 def _run_add(arguments: argparse.Namespace) -> int:
     note = _new_note(arguments)
-    path = _note_path(note)
     with locked():
-        should_write, stored = _prepare_new(
-            note,
-            cast(bool, arguments.separate_result),
-            completed_date_was_defaulted=cast(str | None, arguments.completed) is None,
-            replacing_titles=frozenset(),
-        )
-        if not should_write:
-            print(f"unchanged: {_relative(path)}")
-            return 0
-        _write_note(path, stored)
-        _append_event(
-            _event(
-                "add",
-                stored,
-                backfill=cast(bool, arguments.backfill),
-                old=[],
-                fields=[],
-            )
-        )
-    print(f"added: {_relative(path)}")
+        outputs = _apply_add(note, arguments)
+    for output in outputs:
+        print(output)
     return 0
 
 
@@ -864,55 +1121,360 @@ def _updated_replacement(note: Note, replacement: str) -> Note:
     return updated
 
 
-def _run_supersede(arguments: argparse.Namespace) -> int:
-    note = _new_note(arguments)
+def _apply_supersede(note: Note, arguments: argparse.Namespace) -> list[str]:
     old_titles = [normalize_title(item) for item in cast(list[str], arguments.old)]
     old_titles = list(dict.fromkeys(old_titles))
     if note["title"] in old_titles:
         raise FeatureLogError("--old must not equal the new title")
     new_path = _note_path(note)
     outputs: list[str] = []
-    with locked():
-        write_new, stored = _prepare_new(
-            note,
-            cast(bool, arguments.separate_result),
-            completed_date_was_defaulted=cast(str | None, arguments.completed) is None,
-            replacing_titles=frozenset(old_titles),
-        )
-        replacements: list[tuple[Path, Note, str]] = []
-        for old_title in old_titles:
-            old_path = vault_dir() / "feature-log" / note["project"] / f"{old_title}.md"
-            if not old_path.exists():
-                raise FeatureLogError(f"old note {old_title} is not a live note of {note['project']}")
-            old_note = parse_note(old_path)
-            validate_note(old_note, note["project"])
-            if old_note["state"] == "live":
-                replacements.append(
-                    (old_path, _updated_replacement(old_note, note["title"]), old_title)
-                )
-            elif note["title"] not in old_note["replaced_by"]:
-                raise FeatureLogError(f"old note {old_title} is not live")
-
-        if write_new:
-            _write_note(new_path, stored)
-            outputs.append(f"added: {_relative(new_path)}")
-        else:
-            outputs.append(f"unchanged: {_relative(new_path)}")
-        for old_path, replacement, old_title in replacements:
-            _write_note(old_path, replacement)
-            outputs.append(f"superseded: {old_title} → {note['title']}")
-        if write_new or replacements:
-            _append_event(
-                _event(
-                    "supersede",
-                    stored,
-                    backfill=cast(bool, arguments.backfill),
-                    old=old_titles,
-                    fields=[],
-                )
+    backfill = cast(bool, arguments.backfill)
+    write_new, stored = _prepare_new(
+        note,
+        cast(bool, arguments.separate_result),
+        completed_date_was_defaulted=cast(str | None, arguments.completed) is None,
+        replacing_titles=frozenset(old_titles),
+    )
+    replacements: list[tuple[Path, Note, str]] = []
+    for old_title in old_titles:
+        old_path = vault_dir() / "feature-log" / note["project"] / f"{old_title}.md"
+        if not old_path.exists():
+            raise FeatureLogError(f"old note {old_title} is not a live note of {note['project']}")
+        old_note = parse_note(old_path)
+        validate_note(old_note, note["project"])
+        if old_note["state"] == "live":
+            replacements.append(
+                (old_path, _updated_replacement(old_note, note["title"]), old_title)
             )
+        elif note["title"] not in old_note["replaced_by"]:
+            raise FeatureLogError(f"old note {old_title} is not live")
+
+    if write_new:
+        _write_note(new_path, stored)
+        outputs.append(f"added: {_relative(new_path)}")
+    else:
+        outputs.append(f"unchanged: {_relative(new_path)}")
+    for old_path, replacement, old_title in replacements:
+        _write_note(old_path, replacement)
+        outputs.append(f"superseded: {old_title} → {note['title']}")
+    if write_new or replacements or not _event_recorded(
+        "supersede", stored["project"], stored["title"]
+    ):
+        _append_event(_supersede_event(stored, backfill, old_titles))
+    return outputs
+
+
+def _run_supersede(arguments: argparse.Namespace) -> int:
+    note = _new_note(arguments)
+    with locked():
+        outputs = _apply_supersede(note, arguments)
     for output in outputs:
         print(output)
+    return 0
+
+
+def _review_row(value: str) -> str:
+    if not REVIEW_ROW_RE.fullmatch(value):
+        raise FeatureLogError("review row must match A<number> or C<number>")
+    return value
+
+
+def _proposal_path(row: str) -> Path:
+    return state_dir() / "proposals" / f"{row}.json"
+
+
+def _proposal_args(note: Note, arguments: argparse.Namespace, old: list[str]) -> ProposalArgs:
+    return {
+        "project": note["project"],
+        "title": cast(str, arguments.title),
+        "kind": note["kind"],
+        "summary": note["summary"],
+        "behavior": note["behavior"],
+        "see": note["see"],
+        "link": note["link"],
+        "evidence": note["evidence"],
+        "crate": note["crate"],
+        "area": note["area"],
+        "completed": note["completed_date"],
+        "production": note["production"],
+        "unit": note["unit"],
+        "release": note["release"],
+        "backfill": cast(bool, arguments.backfill),
+        "separate_result": cast(bool, arguments.separate_result),
+        "old": old,
+    }
+
+
+def _parse_proposal_args(value: object) -> ProposalArgs:
+    arguments = _json_object(value, "proposal args")
+    _require_json_keys(
+        arguments,
+        frozenset(
+            {
+                "project",
+                "title",
+                "kind",
+                "summary",
+                "behavior",
+                "see",
+                "link",
+                "evidence",
+                "crate",
+                "area",
+                "completed",
+                "production",
+                "unit",
+                "release",
+                "backfill",
+                "separate_result",
+                "old",
+            }
+        ),
+        "proposal args",
+    )
+    return {
+        "project": _json_string(arguments.get("project"), "proposal project"),
+        "title": _json_string(arguments.get("title"), "proposal title"),
+        "kind": _json_string(arguments.get("kind"), "proposal kind"),
+        "summary": _json_string(arguments.get("summary"), "proposal summary"),
+        "behavior": _json_string(arguments.get("behavior"), "proposal behavior"),
+        "see": _json_string(arguments.get("see"), "proposal see"),
+        "link": _json_string(arguments.get("link"), "proposal link"),
+        "evidence": _json_string_list(arguments.get("evidence"), "proposal evidence"),
+        "crate": _json_string_list(arguments.get("crate"), "proposal crate"),
+        "area": _json_optional_string(arguments.get("area"), "proposal area"),
+        "completed": _json_string(arguments.get("completed"), "proposal completed"),
+        "production": _json_optional_string(
+            arguments.get("production"), "proposal production"
+        ),
+        "unit": _json_string_list(arguments.get("unit"), "proposal unit"),
+        "release": _json_string_list(arguments.get("release"), "proposal release"),
+        "backfill": _json_bool(arguments.get("backfill"), "proposal backfill"),
+        "separate_result": _json_bool(
+            arguments.get("separate_result"), "proposal separate_result"
+        ),
+        "old": _json_string_list(arguments.get("old"), "proposal old"),
+    }
+
+
+def _parse_proposal(value: object) -> FeatureLogProposal:
+    proposal = _json_object(value, "proposal")
+    status = _json_string(proposal.get("status"), "proposal status")
+    verb_value = _json_string(proposal.get("verb"), "proposal verb")
+    if verb_value not in {"add", "supersede"}:
+        raise FeatureLogError(f"proposal has unknown verb {verb_value}")
+    verb = cast(Literal["add", "supersede"], verb_value)
+    row = _review_row(_json_string(proposal.get("row"), "proposal row"))
+    arguments = _parse_proposal_args(proposal.get("args"))
+    at = _json_string(proposal.get("at"), "proposal at")
+    if status == "open":
+        _require_json_keys(
+            proposal,
+            frozenset({"row", "verb", "args", "status", "at"}),
+            "open proposal",
+        )
+        return {"row": row, "verb": verb, "args": arguments, "status": "open", "at": at}
+    if status == "landed":
+        _require_json_keys(
+            proposal,
+            frozenset({"row", "verb", "args", "status", "at", "note"}),
+            "landed proposal",
+        )
+        return {
+            "row": row,
+            "verb": verb,
+            "args": arguments,
+            "status": "landed",
+            "at": at,
+            "note": _json_string(proposal.get("note"), "proposal note"),
+        }
+    if status == "dropped":
+        _require_json_keys(
+            proposal,
+            frozenset({"row", "verb", "args", "status", "at", "verdict"}),
+            "dropped proposal",
+        )
+        return {
+            "row": row,
+            "verb": verb,
+            "args": arguments,
+            "status": "dropped",
+            "at": at,
+            "verdict": _json_string(proposal.get("verdict"), "proposal verdict"),
+        }
+    raise FeatureLogError(f"proposal has unknown status {status}")
+
+
+def _read_proposal(row: str) -> FeatureLogProposal | None:
+    path = _proposal_path(row)
+    if not path.exists():
+        return None
+    try:
+        decoded = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise FeatureLogError(f"cannot read proposal {row}: {error}") from error
+    proposal = _parse_proposal(decoded)
+    if proposal["row"] != row:
+        raise FeatureLogError(f"proposal {row} names row {proposal['row']}")
+    return proposal
+
+
+def _proposal_namespace(arguments: ProposalArgs) -> argparse.Namespace:
+    return argparse.Namespace(
+        project=arguments["project"],
+        title=arguments["title"],
+        kind=arguments["kind"],
+        summary=arguments["summary"],
+        behavior=arguments["behavior"],
+        see=arguments["see"],
+        link=arguments["link"],
+        evidence=[arguments["evidence"]],
+        crate=[arguments["crate"]] if arguments["crate"] else None,
+        area=arguments["area"],
+        completed=arguments["completed"],
+        production=arguments["production"],
+        unit=[arguments["unit"]] if arguments["unit"] else None,
+        release=[arguments["release"]] if arguments["release"] else None,
+        backfill=arguments["backfill"],
+        separate_result=arguments["separate_result"],
+        old=arguments["old"],
+    )
+
+
+def _require_new_note_arguments(arguments: argparse.Namespace) -> None:
+    missing = [
+        option
+        for attribute, option in (
+            ("project", "--project"),
+            ("title", "--title"),
+            ("kind", "--kind"),
+            ("summary", "--summary"),
+            ("behavior", "--behavior"),
+            ("see", "--see"),
+            ("link", "--link"),
+            ("evidence", "--evidence"),
+        )
+        if getattr(arguments, attribute, None) is None
+    ]
+    if missing:
+        raise FeatureLogError(f"the following arguments are required: {', '.join(missing)}")
+
+
+def _proposal_old_titles(arguments: argparse.Namespace) -> list[str]:
+    values = cast(list[str] | None, arguments.old)
+    return list(dict.fromkeys(normalize_title(value) for value in values or []))
+
+
+def _validate_proposal_old_notes(note: Note, old_titles: list[str]) -> None:
+    if note["title"] in old_titles:
+        raise FeatureLogError("--old must not equal the new title")
+    for old_title in old_titles:
+        path = vault_dir() / "feature-log" / note["project"] / f"{old_title}.md"
+        if not path.exists():
+            raise FeatureLogError(
+                f"old note {old_title} is not a live note of {note['project']}"
+            )
+        old_note = parse_note(path)
+        validate_note(old_note, note["project"])
+        if old_note["state"] != "live":
+            raise FeatureLogError(f"old note {old_title} is not live")
+
+
+def _run_propose(arguments: argparse.Namespace) -> int:
+    row = _review_row(cast(str, arguments.review))
+    _require_new_note_arguments(arguments)
+    old_titles = _proposal_old_titles(arguments)
+    verb: Literal["add", "supersede"] = "supersede" if old_titles else "add"
+    with locked():
+        existing = _read_proposal(row)
+        if existing is not None and existing["status"] != "open":
+            raise FeatureLogError(f"proposal {row} is already {existing['status']}")
+        completed_date_was_defaulted = cast(str | None, arguments.completed) is None
+        if existing is not None and completed_date_was_defaulted:
+            arguments.completed = existing["args"]["completed"]
+        note = _new_note(arguments)
+        _write_new, stored = _prepare_new(
+            note,
+            cast(bool, arguments.separate_result),
+            completed_date_was_defaulted=(
+                completed_date_was_defaulted and existing is None
+            ),
+            replacing_titles=frozenset(old_titles),
+        )
+        _validate_proposal_old_notes(stored, old_titles)
+        proposal: OpenProposal = {
+            "row": row,
+            "verb": verb,
+            "args": _proposal_args(stored, arguments, old_titles),
+            "status": "open",
+            "at": _event_time(),
+        }
+        _write_json(_proposal_path(row), proposal)
+    print(f"proposed: {row} ({verb} {stored['title']})")
+    return 0
+
+
+def _run_review_land(verb: Literal["add", "supersede"], row_value: str) -> int:
+    row = _review_row(row_value)
+    with locked():
+        proposal = _read_proposal(row)
+        if proposal is None:
+            raise FeatureLogError(f"no proposal for {row}; run propose first")
+        if proposal["verb"] != verb:
+            raise FeatureLogError(
+                f"proposal {row} uses {proposal['verb']}; run {proposal['verb']} --review {row}"
+            )
+        if proposal["status"] == "landed":
+            print(f"unchanged: [[{proposal['note']}]]")
+            return 0
+        if proposal["status"] == "dropped":
+            raise FeatureLogError(f"proposal {row} is already dropped")
+        saved_arguments = _proposal_namespace(proposal["args"])
+        note = _new_note(saved_arguments)
+        outputs = (
+            _apply_add(note, saved_arguments)
+            if verb == "add"
+            else _apply_supersede(note, saved_arguments)
+        )
+        landed: LandedProposal = {
+            "row": row,
+            "verb": verb,
+            "args": proposal["args"],
+            "status": "landed",
+            "at": _event_time(),
+            "note": note["title"],
+        }
+        _write_json(_proposal_path(row), landed)
+    for output in outputs:
+        print(output)
+    print(f"[[{note['title']}]]")
+    return 0
+
+
+def _run_drop(arguments: argparse.Namespace) -> int:
+    row = _review_row(cast(str, arguments.review))
+    verdict = cast(str, arguments.verdict).strip()
+    if not verdict or "\n" in verdict:
+        raise FeatureLogError("verdict must be one non-empty line")
+    with locked():
+        proposal = _read_proposal(row)
+        if proposal is None:
+            raise FeatureLogError(f"no proposal for {row}; run propose first")
+        if proposal["status"] == "dropped":
+            print(f"unchanged: {row}")
+            return 0
+        if proposal["status"] == "landed":
+            raise FeatureLogError(f"proposal {row} is already landed")
+        dropped: DroppedProposal = {
+            "row": row,
+            "verb": proposal["verb"],
+            "args": proposal["args"],
+            "status": "dropped",
+            "at": _event_time(),
+            "verdict": verdict,
+        }
+        _write_json(_proposal_path(row), dropped)
+    print(f"dropped: {row}")
     return 0
 
 
@@ -931,6 +1493,7 @@ def _run_amend(arguments: argparse.Namespace) -> int:
     evidence_additions = [
         item.strip() for item in _flatten(evidence_arguments)
     ]
+    backfill = cast(bool, arguments.backfill)
     if any(not item or "\n" in item for item in evidence_additions):
         raise FeatureLogError("evidence is empty")
     requested = any(
@@ -948,6 +1511,20 @@ def _run_amend(arguments: argparse.Namespace) -> int:
     )
     if not requested:
         raise FeatureLogError("amend requires at least one field")
+    requested_fields = [
+        name
+        for name, value in (
+            ("summary", summary_argument),
+            ("behavior", behavior_argument),
+            ("see", see_argument),
+            ("area", area_argument),
+            ("kind", kind_argument),
+            ("completed_date", completed_argument),
+            ("crate", crate_arguments),
+            ("evidence", evidence_arguments),
+        )
+        if value is not None
+    ]
     path = vault_dir() / "feature-log" / project / f"{title}.md"
     with locked():
         if not path.exists():
@@ -989,11 +1566,19 @@ def _run_amend(arguments: argparse.Namespace) -> int:
                     if release.partition("@")[0] in crates
                 ]
                 changed.append("crate")
-        if evidence_additions:
-            updated["evidence"] = [*updated["evidence"], *evidence_additions]
+        known_evidence = set(updated["evidence"])
+        new_evidence: list[str] = []
+        for item in evidence_additions:
+            if item not in known_evidence:
+                known_evidence.add(item)
+                new_evidence.append(item)
+        if new_evidence:
+            updated["evidence"] = [*updated["evidence"], *new_evidence]
             changed.append("evidence")
 
         if not changed:
+            if not _event_recorded("amend", note["project"], note["title"]):
+                _append_event(_amend_event(note, backfill, requested_fields))
             print(f"unchanged: {_relative(path)}")
             return 0
         updated["behavior"] = updated["behavior"].strip()
@@ -1001,15 +1586,7 @@ def _run_amend(arguments: argparse.Namespace) -> int:
         updated["date_modified"] = today()
         validate_note(updated, project)
         _write_note(path, updated)
-        _append_event(
-            _event(
-                "amend",
-                updated,
-                backfill=False,
-                old=[],
-                fields=changed,
-            )
-        )
+        _append_event(_amend_event(updated, backfill, changed))
     print(f"amended: {_relative(path)} ({', '.join(changed)})")
     return 0
 
@@ -1050,6 +1627,122 @@ def _run_live(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _read_digest_cursor() -> DigestCursor | None:
+    path = state_dir() / "digest.json"
+    if not path.exists():
+        return None
+    try:
+        decoded = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise FeatureLogError(f"cannot read digest cursor: {error}") from error
+    value = _json_object(decoded, "digest cursor")
+    _require_json_keys(value, frozenset({"line", "at"}), "digest cursor")
+    line = _json_int(value.get("line"), "digest cursor line")
+    if line < 0:
+        raise FeatureLogError("digest cursor line must not be negative")
+    return {
+        "line": line,
+        "at": _json_string(value.get("at"), "digest cursor at"),
+    }
+
+
+def _event_datetime(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise FeatureLogError(f"event time is invalid: {value}") from error
+    if parsed.tzinfo is None:
+        raise FeatureLogError(f"event time has no timezone: {value}")
+    return parsed.astimezone(ZoneInfo("America/Los_Angeles"))
+
+
+def _digest_time_label(value: str) -> str:
+    return _event_datetime(value).strftime("%Y-%m-%d %H:%M %Z")
+
+
+def _print_digest(selected: list[FeatureLogEvent], since_label: str) -> int:
+    visible = [event for event in selected if not event["backfill"]]
+    for project in PROJECTS:
+        project_events = [event for event in visible if event["project"] == project]
+        if not project_events:
+            continue
+        print(f"{project}:")
+        for event in project_events:
+            if event["verb"] == "add":
+                print(f"+ {event['title']} — {event['summary']}")
+            elif event["verb"] == "supersede":
+                for old in event["old"]:
+                    print(f"→ {old} ⇒ {event['title']}")
+            else:
+                print(f"~ {event['title']} ({', '.join(event['fields'])})")
+
+    if not visible:
+        print(f"feature log: nothing new since {since_label}")
+        return 0
+    print(f"{len(visible)} changes since {since_label}")
+    return 0
+
+
+def _run_digest(arguments: argparse.Namespace) -> int:
+    since = cast(str | None, arguments.since)
+    if since is not None:
+        _validate_date(since, "since")
+        events = _read_events()
+        boundary = datetime.fromisoformat(f"{since}T00:00:00").replace(
+            tzinfo=ZoneInfo("America/Los_Angeles")
+        )
+        selected = [event for event in events if _event_datetime(event["at"]) >= boundary]
+        return _print_digest(selected, boundary.strftime("%Y-%m-%d %H:%M %Z"))
+
+    with locked():
+        events = _read_events()
+        cursor = _read_digest_cursor()
+        start = min(cursor["line"], len(events)) if cursor is not None else 0
+        selected = events[start:]
+        if cursor is not None:
+            since_label = _digest_time_label(cursor["at"])
+        elif events:
+            since_label = _digest_time_label(events[0]["at"])
+        else:
+            since_label = _digest_time_label(_event_time())
+        cursor_value: DigestCursor = {"line": len(events), "at": _event_time()}
+        _write_json(state_dir() / "digest.json", cursor_value)
+    return _print_digest(selected, since_label)
+
+
+def _github_slug(remote: str) -> str | None:
+    value = remote.strip().rstrip("/")
+    for prefix in ("git@github.com:", "https://github.com/"):
+        if value.startswith(prefix):
+            slug = value[len(prefix) :]
+            if slug.endswith(".git"):
+                slug = slug[:-4]
+            return slug if slug.count("/") == 1 else None
+    return None
+
+
+def _project_of(path: str) -> str | None:
+    """Return the configured project for a checkout's origin, when known."""
+    result = subprocess.run(
+        ["git", "-C", path, "remote", "get-url", "origin"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    slug = _github_slug(result.stdout)
+    if slug is None:
+        return None
+    return next((project for project, spec in PROJECTS.items() if spec.repo == slug), None)
+
+
+def _run_project_of(arguments: argparse.Namespace) -> int:
+    project = _project_of(cast(str, arguments.path))
+    print(project or "none")
+    return 0
+
+
 def _run_check() -> int:
     errors: list[tuple[Path, str]] = []
     notes: dict[tuple[str, str], Note] = {}
@@ -1082,15 +1775,15 @@ class FeatureLogArgumentParser(argparse.ArgumentParser):
         raise FeatureLogError(message)
 
 
-def _add_new_note_arguments(parser: argparse.ArgumentParser) -> None:
-    _ = parser.add_argument("--project", required=True)
-    _ = parser.add_argument("--title", required=True)
-    _ = parser.add_argument("--kind", required=True)
-    _ = parser.add_argument("--summary", required=True)
-    _ = parser.add_argument("--behavior", required=True)
-    _ = parser.add_argument("--see", required=True)
-    _ = parser.add_argument("--link", required=True)
-    _ = parser.add_argument("--evidence", action="append", nargs="+", required=True)
+def _add_new_note_arguments(parser: argparse.ArgumentParser, *, required: bool) -> None:
+    _ = parser.add_argument("--project", required=required)
+    _ = parser.add_argument("--title", required=required)
+    _ = parser.add_argument("--kind", required=required)
+    _ = parser.add_argument("--summary", required=required)
+    _ = parser.add_argument("--behavior", required=required)
+    _ = parser.add_argument("--see", required=required)
+    _ = parser.add_argument("--link", required=required)
+    _ = parser.add_argument("--evidence", action="append", nargs="+", required=required)
     _ = parser.add_argument("--crate", action="append", nargs="+")
     _ = parser.add_argument("--area")
     _ = parser.add_argument("--completed")
@@ -1106,11 +1799,22 @@ def _parser() -> FeatureLogArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     add = subparsers.add_parser("add")
-    _add_new_note_arguments(add)
+    _ = add.add_argument("--review")
+    _add_new_note_arguments(add, required=False)
 
     supersede = subparsers.add_parser("supersede")
-    _ = supersede.add_argument("--old", action="append", required=True)
-    _add_new_note_arguments(supersede)
+    _ = supersede.add_argument("--review")
+    _ = supersede.add_argument("--old", action="append")
+    _add_new_note_arguments(supersede, required=False)
+
+    propose = subparsers.add_parser("propose")
+    _ = propose.add_argument("--review", required=True)
+    _ = propose.add_argument("--old", action="append")
+    _add_new_note_arguments(propose, required=True)
+
+    drop = subparsers.add_parser("drop")
+    _ = drop.add_argument("--review", required=True)
+    _ = drop.add_argument("--verdict", required=True)
 
     amend = subparsers.add_parser("amend")
     _ = amend.add_argument("--project", required=True)
@@ -1123,6 +1827,7 @@ def _parser() -> FeatureLogArgumentParser:
     _ = amend.add_argument("--completed")
     _ = amend.add_argument("--crate", action="append", nargs="+")
     _ = amend.add_argument("--evidence", action="append", nargs="+")
+    _ = amend.add_argument("--backfill", action="store_true")
 
     live = subparsers.add_parser("live")
     _ = live.add_argument("--project", required=True)
@@ -1131,22 +1836,56 @@ def _parser() -> FeatureLogArgumentParser:
     _ = live.add_argument("--kind")
     _ = live.add_argument("--grep")
 
+    digest = subparsers.add_parser("digest")
+    _ = digest.add_argument("--since")
+
+    project_of_parser = subparsers.add_parser("project-of")
+    _ = project_of_parser.add_argument("path", nargs="?", default=".")
+
     _ = subparsers.add_parser("check")
     return parser
 
 
-def main(argv: list[str]) -> int:
+def main(argv: list[str], ssh_runner: SshRunner = _run_ssh) -> int:
+    if (
+        (not argv or argv[0] != "project-of")
+        and socket.gethostname().split(".", 1)[0] != "natedev"
+        and "FEATURE_LOG_VAULT" not in os.environ
+    ):
+        remote_command = (
+            "~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py "
+            + shlex.join(argv)
+        )
+        return ssh_runner(["ssh", "natedev", remote_command])
     try:
         arguments = _parser().parse_args(argv)
         command = cast(str, arguments.command)
         if command == "add":
+            review = cast(str | None, arguments.review)
+            if review is not None:
+                return _run_review_land("add", review)
+            _require_new_note_arguments(arguments)
             return _run_add(arguments)
         if command == "supersede":
+            review = cast(str | None, arguments.review)
+            if review is not None:
+                return _run_review_land("supersede", review)
+            _require_new_note_arguments(arguments)
+            if cast(list[str] | None, arguments.old) is None:
+                raise FeatureLogError("the following arguments are required: --old")
             return _run_supersede(arguments)
+        if command == "propose":
+            return _run_propose(arguments)
+        if command == "drop":
+            return _run_drop(arguments)
         if command == "amend":
             return _run_amend(arguments)
         if command == "live":
             return _run_live(arguments)
+        if command == "digest":
+            return _run_digest(arguments)
+        if command == "project-of":
+            return _run_project_of(arguments)
         if command == "check":
             return _run_check()
         raise FeatureLogError(f"unknown command {command}")

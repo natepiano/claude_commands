@@ -137,6 +137,18 @@ the watch — keep ticking while any run is still moving. If it concludes red an
 default branch), say so plainly instead of guessing at a fix.
 </WatchCI>
 
+<FeatureLogCloseOut>
+After the commit lands on the default branch and all watched CI is green, run
+`~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py
+project-of .`.
+
+For `cargo-liner`, `bevy_brp`, `obsidian_knife`, or `nateroids`, check `live`
+for affected entries, then run `add` or `supersede`, or record `none — <reason>`.
+The close-out is incomplete until the script succeeds or the reason is
+recorded. Run this after `push_pr_branch_and_merge.sh` too. Print nothing for
+`hana`, `natedev`, or `none`.
+</FeatureLogCloseOut>
+
 On success, report a compact aligned summary in a fenced `text` block so columns survive rendering:
 
 ```text
@@ -148,7 +160,10 @@ Mend:             <mend summary>
 Push:             <push summary>
 Commit:           <short commit>
 GitHub CI:        <per repo: run id, conclusion, total elapsed — mirror on its own line>
+Feature log:      added <title> | superseded <old> → <title> | none — <reason>
 Final state:      <final branch state>
 ```
+
+Omit the `Feature log:` line for `hana`, `natedev`, or `none`.
 
 After the block, add one short sentence listing the validation steps that ran.
