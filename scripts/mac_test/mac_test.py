@@ -244,7 +244,6 @@ class MacTestConfig:
     ci_variable: str
     ci_workflow: str
     ci_job: str
-    ci_gate_job: str
     gh_timeout_s: float
     block_hours: float
     block_max_hours: float
@@ -329,7 +328,6 @@ def read_config() -> MacTestConfig:
         ci_variable=values.get("ci_variable", "MACOS_CI"),
         ci_workflow=values.get("ci_workflow", "ci.yml"),
         ci_job=values.get("ci_job", "macOS: Compile and Test"),
-        ci_gate_job=values.get("ci_gate_job", ""),
         gh_timeout_s=configured_number(values, "gh_timeout_s", 30.0),
         block_hours=configured_number(values, "block_hours", 4.0),
         block_max_hours=configured_number(values, "block_max_hours", 48.0),
@@ -813,19 +811,18 @@ def ci_activity(config: MacTestConfig) -> CiActivity:
         jobs = jobs_for_run(config, database_id)
         if isinstance(jobs, GhFailure):
             return CiUnknown(jobs.line)
+        mac_job_completed = False
         for raw_job in jobs:
             if not isinstance(raw_job, dict):
                 return CiUnknown("gh returned invalid JSON")
             job = cast(dict[str, object], raw_job)
-            name = job.get("name")
-            occupies_mac = name == config.ci_job or (
-                bool(config.ci_gate_job) and name == config.ci_gate_job
-            )
-            if (
-                occupies_mac
-                and job.get("status") != "completed"
-            ):
+            if job.get("name") != config.ci_job:
+                continue
+            if job.get("status") != "completed":
                 return CI_BUSY
+            mac_job_completed = True
+        if not mac_job_completed:
+            return CI_BUSY
     return CI_IDLE
 
 
@@ -1145,7 +1142,7 @@ def activate_block(
     ended_work = (
         block.waiting_on.what
         if isinstance(block.waiting_on, WaitingOnLocalRun)
-        else "CI's Mac job"
+        else "CI's hold on the Mac"
     )
     free_message: FreeMessage = (
         FreeMessageOwed(ended_work, now)
@@ -1380,8 +1377,9 @@ def block_state_line(
         )
     if isinstance(waiting, WaitingOnCiJob):
         return (
-            f"Block pending for {block.holder}: CI's Mac job is running. "
-            + "Nothing new starts there, and you get a message when it ends."
+            f"Block pending for {block.holder}: a CI run may still use the Mac. "
+            + "Nothing new starts there, and you get a message when CI no longer "
+            + "needs the Mac."
         )
     line = (
         waiting_problem.line
@@ -1544,7 +1542,7 @@ def pending_wait_text(waiting: WaitingOn) -> str:
     if isinstance(waiting, WaitingOnLocalRun):
         return "a test is running"
     if isinstance(waiting, WaitingOnCiJob):
-        return "CI's Mac job is running"
+        return "a CI run may still use the Mac"
     return "CI could not be checked"
 
 

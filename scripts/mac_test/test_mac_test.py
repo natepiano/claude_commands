@@ -21,7 +21,6 @@ import mac_test
 SCRIPT = Path(__file__).with_name("mac_test.py")
 LOCAL_ZONE = ZoneInfo("America/New_York")
 CI_JOB = "macOS: Compile and Test"
-CI_GATE_JOB = "macOS: Runner Availability"
 SKIPPED_REPORT_RUNS = 200
 # An unblock that reports this many runs starts the stand-in gh once for the
 # switch, once for the list and once for each run, one after another. A start
@@ -301,7 +300,6 @@ class MacTestCommandTests(unittest.TestCase):
             "ci_variable": "MACOS_CI",
             "ci_workflow": "ci.yml",
             "ci_job": CI_JOB,
-            "ci_gate_job": CI_GATE_JOB,
             "gh_timeout_s": "2",
             "block_hours": "4",
             "block_max_hours": "48",
@@ -701,72 +699,45 @@ class MacTestCommandTests(unittest.TestCase):
         self.assertFalse((self.state_directory / "block.json").exists())
         self.assertEqual(self.logged_arguments("gh"), [])
 
-    def test_in_progress_ci_gate_job_keeps_block_pending(self) -> None:
-        self.gh["queued"] = [{"databaseId": 40}]
-        self.gh["jobs"] = {
-            "40": [
-                {"name": CI_GATE_JOB, "status": "in_progress", "conclusion": ""}
-            ]
-        }
-        self.sync_gh()
-        result = self.command("block", "--holder", "alice", "--for", "rendering")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("CI's Mac job is running", result.stdout)
-        self.assertEqual(self.block_state()["waiting_on"], {"kind": "ci_job"})
-
-    def test_completed_ci_gate_and_mac_jobs_do_not_keep_block_pending(self) -> None:
-        completed_job_sets: list[list[GhJob]] = [
-            [
-                {"name": CI_GATE_JOB, "status": "completed", "conclusion": "success"},
-                {"name": CI_JOB, "status": "completed", "conclusion": "skipped"},
-            ],
-            [
-                {"name": CI_GATE_JOB, "status": "completed", "conclusion": "success"}
-            ],
-        ]
-        for jobs in completed_job_sets:
-            with self.subTest(jobs=jobs):
+    def test_queued_or_in_progress_run_without_mac_job_is_busy(self) -> None:
+        active_runs: tuple[tuple[str, list[GhRun], list[GhRun], int], ...] = (
+            ("queued", [{"databaseId": 40}], [], 40),
+            ("in_progress", [], [{"databaseId": 41}], 41),
+        )
+        for status, queued, in_progress, run_id in active_runs:
+            with self.subTest(status=status):
                 (self.state_directory / "block.json").unlink(missing_ok=True)
                 self.gh["variable"] = "true"
-                self.gh["queued"] = [{"databaseId": 42}]
-                self.gh["jobs"] = {"42": jobs}
+                self.gh["queued"] = queued
+                self.gh["in_progress"] = in_progress
+                self.gh["jobs"] = {str(run_id): []}
                 self.sync_gh()
+
                 result = self.command(
                     "block", "--holder", "alice", "--for", "rendering"
                 )
+
                 self.assertEqual(
                     result.returncode, 0, result.stdout + result.stderr
                 )
-                self.assertEqual(self.block_state()["state"], "active")
+                self.assertIn("a CI run may still use the Mac", result.stdout)
+                block = self.block_state()
+                self.assertEqual(block["state"], "pending")
+                self.assertEqual(block["waiting_on"], {"kind": "ci_job"})
 
-    def test_empty_ci_gate_job_only_counts_the_mac_job(self) -> None:
-        self.write_config(ci_gate_job="")
-        self.gh["queued"] = [{"databaseId": 43}]
+    def test_completed_skipped_mac_job_is_idle(self) -> None:
+        self.gh["queued"] = [{"databaseId": 42}]
         self.gh["jobs"] = {
-            "43": [
-                {"name": CI_GATE_JOB, "status": "in_progress", "conclusion": ""}
+            "42": [
+                {"name": CI_JOB, "status": "completed", "conclusion": "skipped"}
             ]
         }
         self.sync_gh()
-        gate_only = self.command(
-            "block", "--holder", "alice", "--for", "rendering"
-        )
-        self.assertEqual(
-            gate_only.returncode, 0, gate_only.stdout + gate_only.stderr
-        )
-        self.assertEqual(self.block_state()["state"], "active")
 
-        (self.state_directory / "block.json").unlink()
-        self.gh["variable"] = "true"
-        self.gh["jobs"] = {
-            "43": [{"name": CI_JOB, "status": "in_progress", "conclusion": ""}]
-        }
-        self.sync_gh()
-        mac_job = self.command(
-            "block", "--holder", "alice", "--for", "rendering"
-        )
-        self.assertEqual(mac_job.returncode, 0, mac_job.stdout + mac_job.stderr)
-        self.assertEqual(self.block_state()["waiting_on"], {"kind": "ci_job"})
+        result = self.command("block", "--holder", "alice", "--for", "rendering")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.block_state()["state"], "active")
 
     def test_busy_ci_keeps_block_pending_until_watch_sends_once(self) -> None:
         self.gh["queued"] = [{"databaseId": 41}]
@@ -779,8 +750,8 @@ class MacTestCommandTests(unittest.TestCase):
         self.assert_command(
             pending,
             0,
-            "Block pending for alice: CI's Mac job is running. Nothing new starts "
-            + "there, and you get a message when it ends.\n"
+            "Block pending for alice: a CI run may still use the Mac. Nothing new "
+            + "starts there, and you get a message when CI no longer needs the Mac.\n"
             + self.expiry_line(block),
         )
         self.assertEqual(block["state"], "pending")
@@ -797,7 +768,7 @@ class MacTestCommandTests(unittest.TestCase):
         self.assertEqual(active["state"], "active")
         deliveries = self.logged_arguments("send-delivered")
         self.assertEqual(len(deliveries), 1)
-        self.assertIn("CI's Mac job ended", deliveries[0][-1])
+        self.assertIn("CI's hold on the Mac ended", deliveries[0][-1])
 
         unblocked = self.command("unblock", "--holder", "alice")
         self.assertEqual(unblocked.returncode, 0, unblocked.stdout + unblocked.stderr)
@@ -1447,7 +1418,7 @@ class MacTestCommandTests(unittest.TestCase):
         )
         busy = self.command("status")
         self.assertIn(
-            "block pending for alice (CI's Mac job is running), "
+            "block pending for alice (a CI run may still use the Mac), "
             + f"lifts {self.local_time(cast(str, block['expires']), include_day=True)}: "
             + "release work\n",
             busy.stdout,
