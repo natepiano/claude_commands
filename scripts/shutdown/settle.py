@@ -338,6 +338,25 @@ def send_message(
     )
 
 
+def alert_user(
+    scope: ShutdownScope,
+    summary: str,
+    text: str,
+    *,
+    machine: str = "",
+) -> None:
+    """Ask the user to act for an account-wide shutdown."""
+    if scope["kind"] == "selected":
+        return
+    _ = send_message(
+        "user",
+        summary,
+        text,
+        need="decision",
+        machine=machine,
+    )
+
+
 def _notifier_enabled(instance: str) -> bool:
     root = Path(
         os.environ.get(
@@ -993,7 +1012,7 @@ def _send_holdout_alert(
     label = reports[0]["record"]["label"]
     text = "\n".join(lines)
     summary = f"Shutdown of {label}: {len(holdouts)} not ready"
-    _ = send_message("user", summary, text, need="decision")
+    alert_user(reports[0]["record"]["scope"], summary, text)
     requesters: set[str] = set()
     for report in reports:
         requested_by = report["record"]["requested_by"]
@@ -1242,20 +1261,18 @@ def stop_issue_text(issue: StopIssue) -> str:
             return f"{issue['machine']}: stop failed: {issue['reason']}"
 
 
-def send_stop_alert(
+def report_stop(
+    claimed: ShutdownRecord,
     reports: list[stop_work.StopReport],
     orchestration_issues: list[OrchestrationStopIssue],
     *,
-    label: str = "",
     failed_records: Iterable[ShutdownRecord] = (),
 ) -> None:
-    """Tell the user that shutdown finished or stopped partially."""
-    if not reports and not label:
-        return
+    """Report a completed stop to its requester and alert on partial stops."""
     partial = bool(orchestration_issues) or any(
         report["record"]["state"] == "stop partial" for report in reports
     )
-    account_label = reports[0]["record"]["label"] if reports else label
+    account_label = claimed["label"]
     summary = (
         f"{account_label}: stop partial"
         if partial
@@ -1286,10 +1303,31 @@ def send_stop_alert(
         f"/shutdown restart in any Claude session on {account_label}, or in a terminal "
         + "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart"
     )
+    text = "\n".join(lines)
+    requested_by = claimed["requested_by"]
+
+    def report_to_requester() -> None:
+        if requested_by["kind"] == "session":
+            _ = send_message(
+                f"session:{requested_by['session_id']}",
+                summary,
+                text,
+                key=f"shutdown-result-{claimed['login']}",
+            )
+
+    if not partial:
+        report_to_requester()
+        return
     route = "natedev" if _machine().casefold() == "mac" else ""
-    _ = send_message(
-        "user", summary, "\n".join(lines), need="note", machine=route
-    )
+    try:
+        alert_user(claimed["scope"], summary, text, machine=route)
+    except Exception as alert_error:
+        try:
+            report_to_requester()
+        finally:
+            raise alert_error
+    report_to_requester()
+
 
 def conduct(login: str, here: bool = False) -> int:
     """Coordinate both machines until every session has reached a safe stop."""
@@ -1316,20 +1354,20 @@ def conduct(login: str, here: bool = False) -> int:
                         "reason": claim["reason"],
                     }
                     stop_work.close_failed_stop(login, issue)
-                    send_stop_alert(
+                    report_stop(
+                        claimed["record"],
                         [],
                         [issue],
-                        label=reports[0]["record"]["label"],
                     )
                     return 0
             stopped, issues = _stop_machines(login, reports)
             failed_records = _failed_stop_records(
                 login, reports[0]["record"]["machine"], issues
             )
-            send_stop_alert(
+            report_stop(
+                claimed["record"],
                 stopped,
                 issues,
-                label=reports[0]["record"]["label"],
                 failed_records=failed_records,
             )
             return 0

@@ -62,6 +62,7 @@ class AlertCall(TypedDict):
     text: str
     need: str
     machine: str
+    key: str
 
 
 @final
@@ -1520,7 +1521,7 @@ class StopTests(unittest.TestCase):
 
         self.assertEqual(report["record"]["state"], "down")
 
-    def test_conduct_stops_other_machine_then_requesters_machine_and_alerts(
+    def test_conduct_stops_other_machine_then_reports_to_requesting_session(
         self,
     ) -> None:
         requester = top_level("requester", 101)
@@ -1551,8 +1552,9 @@ class StopTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
-            need: str = "",
+            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
+            key: str = "",
         ) -> settle.MessageDelivery:
             alerts.append(
                 AlertCall(
@@ -1561,6 +1563,7 @@ class StopTests(unittest.TestCase):
                     text=text,
                     need=need,
                     machine=machine,
+                    key=key,
                 )
             )
             return settle.MessageSent(kind="sent")
@@ -1589,9 +1592,10 @@ class StopTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(events, ["Mac", "natedev"])
         self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0]["recipient"], "user")
+        self.assertEqual(alerts[0]["recipient"], "session:requester")
         self.assertEqual(alerts[0]["summary"], f"{LABEL} is down")
         self.assertEqual(alerts[0]["need"], "note")
+        self.assertEqual(alerts[0]["key"], f"shutdown-result-{LOGIN}")
         self.assertIn("/shutdown restart", alerts[0]["text"])
 
     def test_conduct_claims_peer_with_conductor_force_before_any_stop(
@@ -1650,7 +1654,7 @@ class StopTests(unittest.TestCase):
             patch.object(settle, "claim_remote_stop", side_effect=claim_remote),
             patch.object(settle, "stop_remote", side_effect=remote_stop),
             patch.object(stop, "stop", side_effect=local_stop),
-            patch.object(settle, "send_stop_alert"),
+            patch.object(settle, "report_stop"),
         ):
             result = settle.conduct(LOGIN)
 
@@ -1733,7 +1737,7 @@ class StopTests(unittest.TestCase):
             patch.object(settle, "run_remote", side_effect=remote_command),
             patch.object(time, "sleep"),
             patch.object(stop, "stop", side_effect=local_stop),
-            patch.object(settle, "send_stop_alert") as alert,
+            patch.object(settle, "report_stop") as alert,
         ):
             result = settle.conduct(LOGIN)
 
@@ -1832,7 +1836,7 @@ class StopTests(unittest.TestCase):
         self.assertNotIn("Failed to stop", stdout.getvalue() + stderr.getvalue())
 
     def test_alert_counts_unattributed_sessions_as_left_running(self) -> None:
-        current = shutdown_record([], state="down")
+        current = shutdown_record([], state="stop partial")
         record.create(shutdown_record([], state="settling"))
         report = stop_report(
             current,
@@ -1852,8 +1856,9 @@ class StopTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
-            need: str = "",
+            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
+            key: str = "",
         ) -> settle.MessageDelivery:
             alerts.append(
                 AlertCall(
@@ -1862,6 +1867,7 @@ class StopTests(unittest.TestCase):
                     text=text,
                     need=need,
                     machine=machine,
+                    key=key,
                 )
             )
             return settle.MessageSent(kind="sent")
@@ -1892,10 +1898,12 @@ class StopTests(unittest.TestCase):
         self.assertNotIn("stopped unknown", alerts[0]["text"])
 
     def test_stop_alert_route_comes_from_the_conductor_machine(self) -> None:
-        natedev = stop_report(
-            shutdown_record([], machine="natedev", state="down")
+        natedev_record = shutdown_record(
+            [], machine="natedev", state="stop partial"
         )
-        mac = stop_report(shutdown_record([], machine="Mac", state="down"))
+        mac_record = shutdown_record([], machine="Mac", state="stop partial")
+        natedev = stop_report(natedev_record)
+        mac = stop_report(mac_record)
         alerts: list[AlertCall] = []
 
         def send_alert(
@@ -1903,8 +1911,9 @@ class StopTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
-            need: str = "",
+            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
+            key: str = "",
         ) -> settle.MessageDelivery:
             alerts.append(
                 AlertCall(
@@ -1913,15 +1922,16 @@ class StopTests(unittest.TestCase):
                     text=text,
                     need=need,
                     machine=machine,
+                    key=key,
                 )
             )
             return settle.MessageSent(kind="sent")
 
         with patch.object(settle, "send_message", side_effect=send_alert):
             with patch.object(settle, "_machine", return_value="Mac"):
-                settle.send_stop_alert([natedev, mac], [])
+                settle.report_stop(natedev_record, [natedev, mac], [])
             with patch.object(settle, "_machine", return_value="natedev"):
-                settle.send_stop_alert([mac, natedev], [])
+                settle.report_stop(mac_record, [mac, natedev], [])
 
         self.assertEqual(
             [alert["machine"] for alert in alerts], ["natedev", ""]
@@ -1937,8 +1947,9 @@ class StopTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
-            need: str = "",
+            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
+            key: str = "",
         ) -> settle.MessageDelivery:
             alerts.append(
                 AlertCall(
@@ -1947,6 +1958,7 @@ class StopTests(unittest.TestCase):
                     text=text,
                     need=need,
                     machine=machine,
+                    key=key,
                 )
             )
             return settle.MessageSent(kind="sent")

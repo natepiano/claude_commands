@@ -256,6 +256,54 @@ class SendTests(unittest.TestCase):
         self.assertIn("keep same address", same_address)
         self.assertIn("keep other address", send.pending("two"))
 
+    def test_keyed_shutdown_result_survives_restart_retire_and_replaces_older_result(
+        self,
+    ) -> None:
+        address = "session:id-1"
+        result_key = "shutdown-result-owner@example.com"
+        restart_key = "shutdown-owner@example.com-id-1"
+        messages = (
+            (result_key, "first stop result"),
+            (None, "old unkeyed stop result"),
+            (result_key, "latest stop result"),
+        )
+        for key, text in messages:
+            arguments = [
+                "--to",
+                address,
+                "--from",
+                "shutdown",
+                "--text",
+                text,
+            ]
+            if key is not None:
+                arguments[4:4] = ["--key", key]
+            self.assertEqual(
+                send.send(send.parse(arguments)).outcome,
+                "queued",
+            )
+
+        self.assertEqual(
+            send.main(
+                [
+                    "retire",
+                    "--to",
+                    address,
+                    "--from",
+                    "shutdown",
+                    "--key",
+                    restart_key,
+                ]
+            ),
+            0,
+        )
+
+        self.session("id-1", "returned")
+        pending = send.pending("returned")
+        self.assertNotIn("first stop result", pending)
+        self.assertNotIn("old unkeyed stop result", pending)
+        self.assertIn("latest stop result", pending)
+
     def test_real_cancel_and_restart_senders_retire_old_settle_instructions(self) -> None:
         real_send = Path(__file__).resolve().parent / "send.py"
         child_state = self.root / "child-state"

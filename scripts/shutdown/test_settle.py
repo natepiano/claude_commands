@@ -12,8 +12,8 @@ from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TypedDict, cast, final, override
-from unittest.mock import call, patch
+from typing import Literal, TypedDict, cast, final, override
+from unittest.mock import ANY, call, patch
 
 import inventory
 import record
@@ -412,6 +412,271 @@ print("rc=0")
         )
         return path
 
+    def test_alert_user_only_pages_for_an_account_wide_scope(self) -> None:
+        with patch.object(
+            settle,
+            "send_message",
+            return_value=settle.MessageSent(kind="sent"),
+        ) as send:
+            settle.alert_user(
+                record.AllAccountSessions(kind="all account sessions"),
+                "action needed",
+                "fix it",
+                machine="natedev",
+            )
+            settle.alert_user(
+                record.SelectedSessions(
+                    kind="selected", session_ids=["scratch"]
+                ),
+                "scoped action needed",
+                "fix it",
+            )
+
+        send.assert_called_once_with(
+            "user",
+            "action needed",
+            "fix it",
+            need="decision",
+            machine="natedev",
+        )
+
+    def test_clean_stop_reports_to_requesting_session_without_paging_user(
+        self,
+    ) -> None:
+        claimed = empty_shutdown_record(
+            "natedev", record.AllAccountSessions(kind="all account sessions")
+        )
+        claimed["requested_by"] = record.FromSession(
+            kind="session", session_id="requester"
+        )
+        stopped = empty_shutdown_record(
+            "natedev", record.AllAccountSessions(kind="all account sessions")
+        )
+        stopped["state"] = "down"
+
+        settle.report_stop(claimed, [completed_stop_report(stopped)], [])
+
+        calls = self.sent_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0]["args"],
+            [
+                "--to",
+                "session:requester",
+                "--from",
+                "shutdown",
+                "--summary",
+                f"{LABEL} is down",
+                "--key",
+                f"shutdown-result-{LOGIN}",
+            ],
+        )
+        self.assertIn("/shutdown restart", calls[0]["text"])
+
+    def test_clean_stop_requested_from_terminal_sends_nothing(self) -> None:
+        claimed = empty_shutdown_record(
+            "natedev", record.AllAccountSessions(kind="all account sessions")
+        )
+        stopped = empty_shutdown_record(
+            "natedev", record.AllAccountSessions(kind="all account sessions")
+        )
+        stopped["state"] = "down"
+
+        settle.report_stop(claimed, [completed_stop_report(stopped)], [])
+
+        self.assertEqual(self.sent_calls(), [])
+
+    def test_partial_stop_reports_to_requester_and_pages_account_wide_user(
+        self,
+    ) -> None:
+        claimed = empty_shutdown_record(
+            "natedev", record.AllAccountSessions(kind="all account sessions")
+        )
+        claimed["requested_by"] = record.FromSession(
+            kind="session", session_id="requester"
+        )
+        stopped = empty_shutdown_record(
+            "natedev", record.AllAccountSessions(kind="all account sessions")
+        )
+        stopped["state"] = "stop partial"
+
+        settle.report_stop(claimed, [completed_stop_report(stopped)], [])
+
+        calls = self.sent_calls()
+        self.assertEqual(
+            [call["args"][1] for call in calls],
+            ["user", "session:requester"],
+        )
+        self.assertIn("--need", calls[0]["args"])
+        self.assertIn("decision", calls[0]["args"])
+        self.assertIn(f"shutdown-result-{LOGIN}", calls[1]["args"])
+        self.assertIn(f"{LABEL}: stop partial", calls[1]["args"])
+
+    def test_partial_stop_pages_when_requester_delivery_fails(self) -> None:
+        claimed = empty_shutdown_record(
+            "natedev", record.AllAccountSessions(kind="all account sessions")
+        )
+        claimed["requested_by"] = record.FromSession(
+            kind="session", session_id="requester"
+        )
+        stopped = empty_shutdown_record(
+            "natedev", record.AllAccountSessions(kind="all account sessions")
+        )
+        stopped["state"] = "stop partial"
+        events: list[str] = []
+
+        def record_alert(
+            _scope: record.ShutdownScope,
+            _summary: str,
+            _text: str,
+            *,
+            machine: str = "",
+        ) -> None:
+            del machine
+            events.append("user alert")
+
+        def fail_requester_delivery(
+            _recipient: str,
+            _summary: str,
+            _text: str,
+            *,
+            need: Literal["note", "decision", "blocked"] = "note",
+            machine: str = "",
+            key: str = "",
+        ) -> settle.MessageDelivery:
+            del need, machine, key
+            events.append("requester result")
+            raise RuntimeError("requester delivery failed")
+
+        with (
+            patch.object(
+                settle, "alert_user", side_effect=record_alert
+            ) as alert,
+            patch.object(
+                settle,
+                "send_message",
+                side_effect=fail_requester_delivery,
+            ) as send,
+            self.assertRaisesRegex(RuntimeError, "requester delivery failed"),
+        ):
+            settle.report_stop(claimed, [completed_stop_report(stopped)], [])
+
+        self.assertEqual(events, ["user alert", "requester result"])
+        alert.assert_called_once()
+        send.assert_called_once_with(
+            "session:requester",
+            f"{LABEL}: stop partial",
+            ANY,
+            key=f"shutdown-result-{LOGIN}",
+        )
+
+    def test_partial_stop_reports_to_requester_when_user_alert_fails(
+        self,
+    ) -> None:
+        claimed = empty_shutdown_record(
+            "natedev", record.AllAccountSessions(kind="all account sessions")
+        )
+        claimed["requested_by"] = record.FromSession(
+            kind="session", session_id="requester"
+        )
+        stopped = empty_shutdown_record(
+            "natedev", record.AllAccountSessions(kind="all account sessions")
+        )
+        stopped["state"] = "stop partial"
+        events: list[str] = []
+
+        def fail_user_alert(
+            _scope: record.ShutdownScope,
+            _summary: str,
+            _text: str,
+            *,
+            machine: str = "",
+        ) -> None:
+            del machine
+            events.append("user alert")
+            raise RuntimeError("user alert failed")
+
+        def record_requester_delivery(
+            _recipient: str,
+            _summary: str,
+            _text: str,
+            *,
+            need: Literal["note", "decision", "blocked"] = "note",
+            machine: str = "",
+            key: str = "",
+        ) -> settle.MessageDelivery:
+            del need, machine, key
+            events.append("requester result")
+            return settle.MessageSent(kind="sent")
+
+        with (
+            patch.object(
+                settle,
+                "alert_user",
+                side_effect=fail_user_alert,
+            ) as alert,
+            patch.object(
+                settle,
+                "send_message",
+                side_effect=record_requester_delivery,
+            ) as send,
+            self.assertRaisesRegex(RuntimeError, "user alert failed"),
+        ):
+            settle.report_stop(claimed, [completed_stop_report(stopped)], [])
+
+        self.assertEqual(events, ["user alert", "requester result"])
+        alert.assert_called_once()
+        send.assert_called_once_with(
+            "session:requester",
+            f"{LABEL}: stop partial",
+            ANY,
+            key=f"shutdown-result-{LOGIN}",
+        )
+
+    def test_partial_scoped_stop_reports_only_to_requester(self) -> None:
+        scope = record.SelectedSessions(
+            kind="selected", session_ids=["requester"]
+        )
+        claimed = empty_shutdown_record("natedev", scope)
+        claimed["requested_by"] = record.FromSession(
+            kind="session", session_id="requester"
+        )
+        stopped = empty_shutdown_record("natedev", scope)
+        stopped["state"] = "stop partial"
+
+        settle.report_stop(claimed, [completed_stop_report(stopped)], [])
+
+        calls = self.sent_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["args"][1], "session:requester")
+
+    def test_scoped_holdout_reports_only_to_requester(self) -> None:
+        current = empty_shutdown_record(
+            "natedev",
+            record.SelectedSessions(kind="selected", session_ids=["requester"]),
+        )
+        current["requested_by"] = record.FromSession(
+            kind="session", session_id="requester"
+        )
+        report = settle.RefreshReport(
+            record=current,
+            verdicts=[
+                settle.EntryVerdict(
+                    session_id="requester",
+                    verdict=settle.Holdout(
+                        kind="holdout",
+                        line="natedev top-level requester: busy",
+                    ),
+                )
+            ],
+        )
+
+        settle._send_holdout_alert([report], {})  # pyright: ignore[reportPrivateUsage]
+
+        calls = self.sent_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["args"][1], "session:requester")
+
     def test_begin_stops_only_enabled_timers_in_the_account_set(self) -> None:
         selected = self.write_instance(
             "selected-report", "selected", enabled=True
@@ -740,7 +1005,7 @@ print("rc=0")
                     stop_work, "claim_stop_as_conductor", return_value=True
                 ) as claim,
                 patch.object(settle, "_stop_machines", return_value=([], [])) as stop,
-                patch.object(settle, "send_stop_alert") as alert,
+                patch.object(settle, "report_stop") as alert,
             ):
                 self.assertEqual(settle.conduct(LOGIN, here=True), 0)
         self.assertEqual(cycle.call_count, 2)
@@ -786,14 +1051,13 @@ print("rc=0")
         alerted = False
 
         def check_alert(
+            claimed: record.ShutdownRecord,
             _reports: list[stop_work.StopReport],
             issues: list[record.OrchestrationStopIssue],
-            *,
-            label: str = "",
         ) -> None:
             nonlocal alerted
             alerted = True
-            self.assertEqual(label, LABEL)
+            self.assertEqual(claimed["label"], LABEL)
             local_closed = self.found_record()
             self.assertEqual(local_closed["state"], "stop partial")
             self.assertEqual(local_closed["stop_issues"], issues)
@@ -822,7 +1086,7 @@ print("rc=0")
             ),
             patch.object(settle, "other_machine", return_value="Mac"),
             patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.object(settle, "send_stop_alert", side_effect=check_alert),
+            patch.object(settle, "report_stop", side_effect=check_alert),
             patch.object(settle, "stop_remote") as remote_stop,
             patch.object(stop_work, "stop") as local_stop,
         ):
@@ -881,13 +1145,13 @@ print("rc=0")
             )
 
         def check_alert(
+            claimed: record.ShutdownRecord,
             _reports: list[stop_work.StopReport],
             issues: list[record.OrchestrationStopIssue],
             *,
-            label: str = "",
             failed_records: list[record.ShutdownRecord],
         ) -> None:
-            self.assertEqual(label, LABEL)
+            self.assertEqual(claimed["label"], LABEL)
             self.assertEqual(
                 [failed["machine"] for failed in failed_records], ["natedev"]
             )
@@ -913,7 +1177,7 @@ print("rc=0")
             patch.object(settle, "stop_remote", side_effect=stop_peer),
             patch.object(stop_work, "stop", side_effect=OSError("inventory failed")),
             patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.object(settle, "send_stop_alert", side_effect=check_alert),
+            patch.object(settle, "report_stop", side_effect=check_alert),
         ):
             result = settle.conduct(LOGIN)
 
@@ -1060,13 +1324,13 @@ print("rc=0")
             return 6, ""
 
         def check_alert(
+            claimed: record.ShutdownRecord,
             _reports: list[stop_work.StopReport],
             issues: list[record.OrchestrationStopIssue],
             *,
-            label: str = "",
             failed_records: list[record.ShutdownRecord],
         ) -> None:
-            self.assertEqual(label, LABEL)
+            self.assertEqual(claimed["label"], LABEL)
             self.assertEqual(
                 [failed["machine"] for failed in failed_records], ["Mac"]
             )
@@ -1103,7 +1367,7 @@ print("rc=0")
             patch.object(stop_work, "stop", side_effect=stop_local),
             patch.object(settle, "run_remote", side_effect=close_peer),
             patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.object(settle, "send_stop_alert", side_effect=check_alert),
+            patch.object(settle, "report_stop", side_effect=check_alert),
         ):
             result = settle.conduct(LOGIN)
 
@@ -2057,6 +2321,7 @@ print("rc=0")
 
         alert = self.sent_calls()[-1]
         self.assertIn("Shutdown of claude 2: 1 not ready", alert["args"])
+        self.assertIn("decision", alert["args"])
         self.assertIn("natedev top-level Work: idle", alert["text"])
 
     def test_cancel_restores_only_recorded_enabled_states_and_names_peer(

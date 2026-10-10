@@ -37,10 +37,12 @@ from inventory import (  # noqa: E402
     WindowHost,
 )
 from record import (  # noqa: E402
+    AllAccountSessions,
     InvalidRecord,
     NoLiveRecord,
     PendingTimer,
     ShutdownRecord,
+    ShutdownScope,
     ShutdownSessionEntry,
     SessionLiveTimersPending,
     SessionNeedsManualRestart,
@@ -87,6 +89,45 @@ class RestartAccountNotDetermined(Exception):
 
 class ScheduledRestartPromptNotRecorded(Exception):
     """The launched restart prompt could not be marked as scheduled."""
+
+
+@dataclass(frozen=True)
+class AccountNamed:
+    """An account name was given at the command line."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class AccountNotNamed:
+    """The account must be inferred from the caller or restart records."""
+
+
+@dataclass(frozen=True)
+class AlertWhenNotBack:
+    """A failed restart should ask the user to act."""
+
+
+@dataclass(frozen=True)
+class NeverAlert:
+    """The restart is a silent live check."""
+
+
+@dataclass(frozen=True)
+class RestartScopeKnown:
+    """The shutdown scope was preserved before restart changed the record."""
+
+    scope: ShutdownScope
+
+
+@dataclass(frozen=True)
+class RestartScopeNotFoundLocally:
+    """No readable local scope was available; the peer has not been checked."""
+
+
+@dataclass(frozen=True)
+class RestartScopeUnavailable:
+    """Neither machine had a readable live shutdown scope."""
 
 
 @dataclass(frozen=True)
@@ -1194,19 +1235,68 @@ def _account_from_records() -> Account:
     raise RestartAccountNotDetermined("choose the account to restart")
 
 
-def _selected_account(requested: str | None) -> Account:
-    if requested is not None:
-        return named_claude_account(requested)
+def _selected_account(requested: AccountNamed | AccountNotNamed) -> Account:
+    match requested:
+        case AccountNamed(text):
+            return named_claude_account(text)
+        case AccountNotNamed():
+            try:
+                return own_claude_account()
+            except UnreadableAccount:
+                return _account_from_records()
+
+
+def _local_restart_scope(
+    login: str,
+) -> RestartScopeKnown | RestartScopeNotFoundLocally:
     try:
-        return own_claude_account()
-    except UnreadableAccount:
-        return _account_from_records()
+        found = find_live(login)
+    except (InvalidRecord, OSError, ValueError):
+        return RestartScopeNotFoundLocally()
+    if found["kind"] == "live":
+        return RestartScopeKnown(found["record"]["scope"])
+    return RestartScopeNotFoundLocally()
 
 
-def restart(requested: str | None = None, dry_run: bool = False) -> int:
+def _remote_restart_scope(
+    login: str,
+) -> RestartScopeKnown | RestartScopeUnavailable:
+    try:
+        remote = _remote_records()
+    except (
+        InvalidRecord,
+        OSError,
+        RuntimeError,
+        ValueError,
+        subprocess.SubprocessError,
+    ):
+        remote = RemoteMachineNotReached(
+            kind="machine not reached", machine=other_machine()
+        )
+    if remote["kind"] == "records read":
+        for remote_record in remote["records"]:
+            if remote_record["login"].casefold() == login.casefold():
+                return RestartScopeKnown(remote_record["scope"])
+    return RestartScopeUnavailable()
+
+
+def _alert_scope(
+    found: RestartScopeKnown | RestartScopeUnavailable,
+) -> ShutdownScope:
+    if isinstance(found, RestartScopeKnown):
+        return found.scope
+    return AllAccountSessions(kind="all account sessions")
+
+
+def restart(
+    account: AccountNamed | AccountNotNamed,
+    *,
+    dry_run: bool,
+    alerts: AlertWhenNotBack | NeverAlert,
+) -> int:
     """Resume an account's shutdown records on this and the other machine."""
     try:
-        account = _selected_account(requested)
+        selected = _selected_account(account)
     except UnknownAccountName as error:
         print(f"shutdown: {error}", file=sys.stderr)
         return 2
@@ -1217,8 +1307,14 @@ def restart(requested: str | None = None, dry_run: bool = False) -> int:
         print(f"shutdown: {error}", file=sys.stderr)
         return 1
 
+    local_scope: RestartScopeKnown | RestartScopeNotFoundLocally = (
+        RestartScopeNotFoundLocally()
+    )
+    if isinstance(alerts, AlertWhenNotBack) and not dry_run:
+        local_scope = _local_restart_scope(selected.login)
+
     try:
-        local = _up(account.login, dry_run)
+        local = _up(selected.login, dry_run)
     except (
         InvalidRecord,
         OSError,
@@ -1229,14 +1325,26 @@ def restart(requested: str | None = None, dry_run: bool = False) -> int:
         print(f"shutdown: restart failed: {error}", file=sys.stderr)
         local = MachineRestartResult(
             settle.local_machine(),
-            account.label,
+            selected.label,
             "partial",
             failed=1,
             failed_sessions=(
-                FailedSessionRestart(account.label, _error_reason(error)),
+                FailedSessionRestart(selected.label, _error_reason(error)),
             ),
         )
-    remote_args = ["up", account.login]
+    alert_scope: (
+        RestartScopeKnown
+        | RestartScopeNotFoundLocally
+        | RestartScopeUnavailable
+    ) = local_scope
+    if (
+        isinstance(alerts, AlertWhenNotBack)
+        and not dry_run
+        and local.status not in {"done", "nothing"}
+        and isinstance(alert_scope, RestartScopeNotFoundLocally)
+    ):
+        alert_scope = _remote_restart_scope(selected.login)
+    remote_args = ["up", selected.login]
     if dry_run:
         remote_args.append("--dry-run")
     status, output = run_remote(
@@ -1266,17 +1374,25 @@ def restart(requested: str | None = None, dry_run: bool = False) -> int:
             lines.append(remote_failure)
         if incomplete:
             lines.append(incomplete)
-        try:
-            _ = settle.send_message(
-                "user",
-                (
-                    f"{account.label} is back"
-                    if local.status in {"done", "nothing"} and status == 0
-                    else f"{account.label} is not fully back"
-                ),
-                "\n".join(lines),
-                need="note",
+        fully_back = (
+            local.status in {"done", "nothing"}
+            and status == 0
+            and not remote_failure
+            and not incomplete
+        )
+        if isinstance(alerts, AlertWhenNotBack) and not fully_back:
+            if isinstance(alert_scope, RestartScopeNotFoundLocally):
+                alert_scope = _remote_restart_scope(selected.login)
+            lines.append(
+                "Fix what is named above, then run /shutdown restart again; "
+                + "it brings back only what is left."
             )
-        except (OSError, RuntimeError, ValueError):
-            pass
+            try:
+                settle.alert_user(
+                    _alert_scope(alert_scope),
+                    f"{selected.label} is not fully back",
+                    "\n".join(lines),
+                )
+            except (OSError, RuntimeError, ValueError):
+                pass
     return 0 if local.exit_status == 0 and status in {0, 255} else 1

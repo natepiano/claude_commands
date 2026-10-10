@@ -61,6 +61,7 @@ class CommandLine(argparse.Namespace):
     force: str = ""
     reason: str = ""
     dry_run: bool = False
+    no_alert: bool = False
 
 
 class UnreachableMachine(TypedDict):
@@ -387,6 +388,9 @@ def main(arguments: list[str] | None = None) -> int:
     )
     _ = restart.add_argument("account", nargs="?")
     _ = restart.add_argument("--dry-run", action="store_true")
+    _ = restart.add_argument(
+        "--no-alert", action="store_true", help=argparse.SUPPRESS
+    )
     up = commands.add_parser("up")
     _ = up.add_argument("account")
     _ = up.add_argument("--dry-run", action="store_true")
@@ -407,7 +411,19 @@ def main(arguments: list[str] | None = None) -> int:
         return restart_work.up(options.account or "", options.dry_run)
 
     if options.command == "restart":
-        return restart_work.restart(options.account, options.dry_run)
+        requested: restart_work.AccountNamed | restart_work.AccountNotNamed = (
+            restart_work.AccountNamed(options.account)
+            if options.account is not None
+            else restart_work.AccountNotNamed()
+        )
+        alerts: restart_work.AlertWhenNotBack | restart_work.NeverAlert = (
+            restart_work.NeverAlert()
+            if options.no_alert
+            else restart_work.AlertWhenNotBack()
+        )
+        return restart_work.restart(
+            requested, dry_run=options.dry_run, alerts=alerts
+        )
 
     if options.command == "stop":
         try:
