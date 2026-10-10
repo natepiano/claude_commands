@@ -23,32 +23,53 @@ if [[ -z $session_dir ]]; then
   exit 1
 fi
 run_id=${session_dir:t}
-
-if (( $# == 2 )); then
-  if [[ $2 == off ]]; then
-    zsh "$REPO/scripts/message/notifier.sh" stop "delegate-$run_id" || exit $?
-    print -r -- "progress updates off: delegate-$run_id"
-  else
-    next_due=$(zsh "$REPO/scripts/message/notifier.sh" start "delegate-$run_id") || exit $?
-    print -r -- "progress updates on: delegate-$run_id $next_due"
-  fi
-  exit 0
-fi
+notifier=$REPO/scripts/message/notifier.sh
+instance=delegate-$run_id
 
 # The leading digits, as progress_timer.sh reads them, so a trailing comment
-# leaves the interval alone.
+# leaves the interval alone. PLAN_DELEGATE_PROGRESS_UPDATES=on-demand gives a
+# new run no schedule: /unit:report runs only when someone asks for it, and
+# `on` makes the schedule then.
 seconds=900
+updates=scheduled
 config=${PLAN_DELEGATE_CONFIG:-$HOME/.claude/config/delegate.conf}
 if [[ -r $config ]]; then
   while IFS= read -r line || [[ -n $line ]]; do
     [[ $line == (#b)PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=([0-9]##)(|[^0-9]*) ]] && seconds=$match[1]
+    [[ $line == (#b)PLAN_DELEGATE_PROGRESS_UPDATES=([a-z-]##)(|[^a-z-]*) ]] && updates=$match[1]
   done < "$config"
 fi
 minutes=$(( (seconds + 59) / 60 ))
 (( minutes >= 1 )) || minutes=1
 
-check_words=("$REPO/scripts/lib/py" "$REPO/scripts/hooks/delegate_run.py" check "$session_id" "$session_dir")
-check=${(j: :)${(q)check_words[@]}}
-exec zsh "$REPO/scripts/message/notifier.sh" new "delegate-$run_id" \
-  --to "session:$session_id" --every "$minutes" \
-  --command '/unit:report' --check "$check" --hold
+make_instance() {
+  local check_words=("$REPO/scripts/lib/py" "$REPO/scripts/hooks/delegate_run.py" check "$session_id" "$session_dir")
+  zsh "$notifier" new "$instance" \
+    --to "session:$session_id" --every "$minutes" \
+    --command '/unit:report' --check "${(j: :)${(q)check_words[@]}}" --hold
+}
+
+if (( $# == 2 )); then
+  if [[ $2 == off ]]; then
+    zsh "$notifier" stop "$instance" || exit $?
+    print -r -- "progress updates off: $instance"
+  elif zsh "$notifier" status "$instance" >/dev/null 2>&1; then
+    next_due=$(zsh "$notifier" start "$instance") || exit $?
+    print -r -- "progress updates on: $instance $next_due"
+  else
+    # An on-demand run has no instance until it is asked for one.
+    next_due=$(make_instance) || exit $?
+    print -r -- "progress updates on: $instance ${(M)${(f)next_due}:#next_due=*}"
+  fi
+  exit 0
+fi
+
+if [[ $updates == on-demand ]]; then
+  # A resumed run may still hold the schedule an earlier start made.
+  if zsh "$notifier" status "$instance" >/dev/null 2>&1; then
+    zsh "$notifier" stop "$instance" >/dev/null || exit $?
+  fi
+  print -r -- "progress updates on demand: $instance has no schedule; /unit:report on starts one"
+  exit 0
+fi
+make_instance

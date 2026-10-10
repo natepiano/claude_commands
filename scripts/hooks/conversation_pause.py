@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
@@ -917,6 +918,31 @@ def _review_slugs(record: PauseRecord) -> frozenset[str]:
     return frozenset(slugs)
 
 
+def _prune_unscheduled(record: PauseRecord) -> PauseRecord | None:
+    """Drop what no schedule runs any more; None when nothing paused is left to return.
+
+    A production switched to on demand loses its `showrunner-<slug>` instance while a pause
+    still names it, and its footer has no schedule to name. Asking to return such updates would
+    ask about nothing.
+    """
+    import showrunner_footer
+
+    root = notifier_root()
+    instances = tuple(name for name in record.instances if (root / name).is_dir())
+    footers = tuple(slug for slug in record.footers if (root / f"showrunner-{slug}").is_dir())
+    for slug in record.footers:
+        if slug not in footers:
+            with contextlib.suppress(OSError):
+                showrunner_footer.set_footer_state(slug, showrunner_footer.FooterState.ON)
+    if not instances and not footers:
+        return None
+    if (instances, footers) == (record.instances, record.footers):
+        return record
+    kept = replace(record, instances=instances, footers=footers)
+    write_record(kept)
+    return kept
+
+
 def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup, review_open: bool,
              questions: list[QuestionDelivery], actions: list[str]) -> None:
     if session is NotRunning.GONE:
@@ -926,6 +952,13 @@ def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup, 
         return
     if review_open:
         return
+    if not isinstance(record.phase, Returned):
+        kept = _prune_unscheduled(record)
+        if kept is None:
+            path.unlink(missing_ok=True)
+            actions.append(f"nothing scheduled to return: {record.session_id}")
+            return
+        record = kept
     phase = record.phase
     if isinstance(phase, Replying):
         if now - phase.user_wrote_at >= UNANSWERED_SECONDS:
