@@ -27,7 +27,9 @@ changed. User, 2026-10-03.
 
 While `/showrunner:produce` runs scheduled updates through `UPDATES`, a
 dailies the user runs takes the next tick's place. N is the
-production doc's **Updates** interval. Two steps do that:
+production doc's **Updates** interval. When that line reads `on demand`, no
+schedule runs: the builder touches no clock, the report names no next run,
+and step 2 below does nothing. Two steps do that:
 
 1. **Check every unit.** Save the status script's complete output before Gather:
    `zsh ~/.claude/scripts/production/unit_status.sh <scratchpad>/unit_status <ZONE> --production PRODUCTION_DOC > <scratchpad>/unit_status.txt`.

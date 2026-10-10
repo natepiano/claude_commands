@@ -1153,6 +1153,16 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(self.report()["next_run"], "17:55")
         self.assertIn("next_due=", (self.checkout / "production.log").read_text(encoding="utf-8"))
 
+    def test_on_demand_user_run_touches_no_clock_and_names_no_next_run(self) -> None:
+        doc = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(doc.replace("- **Updates:** every 15 minutes", "- **Updates:** on demand"),
+                                encoding="utf-8")
+        result = self.run_builder("--user-run")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.notifier_events(), [])
+        self.assertNotIn("next_run", self.report())
+        self.assertIn("clock: ok — on demand: no scheduled dailies", result.stdout)
+
     def test_scheduled_run_reads_notifier_status_without_restart(self) -> None:
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
