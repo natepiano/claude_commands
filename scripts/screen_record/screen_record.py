@@ -205,10 +205,11 @@ def record(window_id: str, title: str, seconds: int, display: str, path: Path) -
     # zerolatency stops x264 from queueing frames for lookahead and frame threads (dozens on
     # a 32-thread machine); on a loaded machine encoding that queue after -t outlasted the
     # outer timeout.
+    # draw_mouse 0: the desktop cursor is not part of the app, so it stays out of the clip.
     command = [
         "timeout", "--kill-after=5", str(duration),
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-        "-f", "x11grab", "-framerate", "60", "-window_id", str(int(window_id, 16)),
+        "-f", "x11grab", "-framerate", "60", "-draw_mouse", "0", "-window_id", str(int(window_id, 16)),
         "-i", display, "-t", str(seconds), "-fs", str(MAX_BYTES),
         "-vf", "crop=trunc(iw/2)*2:trunc(ih/2)*2",
         "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", "-crf", "18",

@@ -202,7 +202,8 @@ class ScreenRecordTests(unittest.TestCase):
         self.assertEqual(self.calls_for("timeout")[0][:3], ["--kill-after=5", "20", "ffmpeg"])
         ffmpeg = self.calls_for("ffmpeg")[0]
         expected = [
-            "-f", "x11grab", "-framerate", "60", "-window_id", "39845894", "-i", ":99",
+            "-f", "x11grab", "-framerate", "60", "-draw_mouse", "0",
+            "-window_id", "39845894", "-i", ":99",
             "-t", "5", "-fs", "500000000", "-vf", "crop=trunc(iw/2)*2:trunc(ih/2)*2",
             "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
             "-crf", "18", "-pix_fmt", "yuv420p",
@@ -210,6 +211,8 @@ class ScreenRecordTests(unittest.TestCase):
         self.assertEqual(ffmpeg[:5], ["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
         self.assertNotIn("-n", ffmpeg)
         self.assertEqual(ffmpeg[5:-1], expected)
+        self.assertEqual(ffmpeg[ffmpeg.index("-draw_mouse") + 1], "0")
+        self.assertLess(ffmpeg.index("-draw_mouse"), ffmpeg.index("-i"))
         self.assertEqual(ffmpeg[-1], str(clip))
 
     def test_same_label_runs_preserve_the_first_clip(self) -> None:
