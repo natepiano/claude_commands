@@ -113,12 +113,15 @@ default interval of a Claude unit's notifier instance. It is read by
 `scripts/delegate/unit_notifier.sh` and by the main agent per
 `<ProgressContract/>` in `commands/unit/direct.md`, not by `findings.py`.
 Claude units do not launch `progress_timer.sh`. A missing or non-numeric value
-makes the notifier use 900 seconds; Codex requires a positive integer.
+makes the notifier use 900 seconds; Codex requires a positive integer. It is
+3600, one hour (user, 2026-10-10). After changing it,
+`unit_notifier.sh --all` retimes every unit run's instance to the new value,
+or to `--all <minutes>`, and leaves each one on or off.
 
 `PLAN_DELEGATE_PROGRESS_UPDATES=on-demand` gives a new Claude unit run no
 notifier instance, so `/unit:report` runs only when someone asks for it;
 `/unit:report on` makes the instance then. `scheduled`, or no line, makes it
-at every run's start. It is on-demand on both machines (user, 2026-10-10).
+at every run's start. It is `scheduled` (user, 2026-10-10).
 
 `scripts/delegate/findings.py` reads the file at startup, so an edit applies to
 the next `findings.py gate` with nothing to restart. The file is authoritative:
