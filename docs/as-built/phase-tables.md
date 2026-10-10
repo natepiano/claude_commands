@@ -10,7 +10,7 @@ A phase table shows one unit's current phase with its ETA, and every plan phase 
 
 | File | Role |
 | --- | --- |
-| `scripts/delegate/phase_table.py` | Builds a `PhaseRecord` from run events, renders it as Markdown or JSON, and writes, moves and prunes the notes. It writes no event. |
+| `scripts/delegate/phase_table.py` | Builds a `PhaseRecord` from run events, renders it as Markdown or JSON, and writes, moves and archives the notes. It writes no event. |
 | `scripts/delegate/progress_history.py` | The recorder: the `eta` command, the `eta_stated` event, the note hook, and the public readers the table uses. |
 | `scripts/production/dailies_input.py` | Calls `prune` and `show --production-doc` once per build and fills each unit's start and ETA from its record. |
 | `commands/unit/report.md`, `commands/unit/eta.md`, `commands/unit/eta_breakdown.md` | Where a unit reports progress and records a stated ETA. |
@@ -21,6 +21,7 @@ phase_table.py show    --session-dir <dir> [--zone <IANA>] [--json]
 phase_table.py show    --production-doc <doc> --json
 phase_table.py refresh --session-dir <dir>
 phase_table.py prune   --production-doc <doc>
+phase_table.py archive --production-doc <doc>
 progress_history.py eta --session-dir <dir> --time <YYYY-MM-DDTHH:MM> [--earliest <YYYY-MM-DDTHH:MM> --latest <YYYY-MM-DDTHH:MM>] --basis <text>
 ```
 
@@ -36,6 +37,7 @@ show(session_dir: Path, zone: ZoneInfo, json_output: bool = False) -> str
 show_production(production_doc: Path) -> str
 refresh(session_dir: Path) -> None
 prune(production_doc: Path) -> None
+archive(production_doc: Path) -> list[Path]
 
 PhaseRecord(plan: Path, updated: datetime,
             current: OpenPhase | NoOpenPhase,
@@ -105,7 +107,8 @@ phases[]     {phase, title, status: "done" | "running" | "todo", start, finish, 
 - **Name.** `unit_lookup.marked_units(slug)[unit].claude.name` when that is a `LiveClaude` with a name; in every other case the unit id. `/` and NUL become `-`, and leading `.` characters are dropped.
 - **Content.** Frontmatter of exactly three keys in this order (`phase_table: true`, `production: <slug>`, `unit: <unit id>`), then `# <file name>`, then `render(record, zone)`. `NoteOwnership(production, unit)` is those keys; a later refresh recognises this unit's own notes by them.
 - **Publication.** A temp file in the target's directory, mode `0o644`. A target that carries this unit's keys is replaced with `os.replace`. A first write is published with `os.link`, so a file that appears at the target meanwhile is refused with `phase note appeared before publication: <path>`. A target with other keys or none is refused with `phase note target is not owned by <slug>/<unit>: <path>` and left unchanged. Before the write, when the vault root sits inside a Git checkout, `refresh` appends the vault root's path inside that checkout plus `/` (`showrunners/` for the default vault) to the checkout's `info/exclude`, once.
-- **Moves and `prune`.** After the write, every other `*.md` under `<vault root>/*/` with the same ownership is removed, with its folder when that leaves it empty; a renamed unit session or showrunner moves the note by this rule. `prune` removes every owned note under `<vault root>/*/` whose `production` is the doc's slug and whose `unit` is not a live Units row, with each folder it leaves empty.
+- **Archive.** `<vault>/archive/<showrunner folder>/<slug>/<name>.md`, outside the excluded `showrunners/` folder, so the vault's auto-commit records it. An existing target is never replaced: the next archive uses `-2`, then `-3`, and so on. Its placement keeps archived notes out of every live-note scan.
+- **Moves and `prune`.** After the write, every other `*.md` under `<vault root>/*/` with the same ownership is removed, with its folder when that leaves it empty; a renamed unit session or showrunner moves the note by this rule. `prune` archives every owned note under `<vault root>/*/` whose `production` is the doc's slug and whose `unit` is not a live Units row, removing each folder it leaves empty.
 
 ### Recorder side
 
@@ -158,7 +161,7 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - The events are the authority. The session state file supplies the plan path and nothing else; a phase in state with no `phase_started` event does not exist for the table.
 - Open means started and not finished in the events. It is never proof that the unit's session is alive, and each caller decides liveness: the dailies keep `StatusBlock.state` for it.
 - `refresh` never calls the recorder's CLI and never takes its session lock, which the recorder holds for the whole command the hook runs in.
-- A note is replaced or removed only when its frontmatter carries `phase_table: true`, a `production` and a `unit`. A hand-written file is never changed.
+- A note is moved, replaced or removed only when its frontmatter carries `phase_table: true`, a `production` and a `unit`. A hand-written file is never changed.
 - `_json_record` is the only JSON form, and nothing stores it. The first stated target has one place in it: `current.first_stated_eta_target`.
 - A state is a named type, never an optional field or a placeholder `datetime`.
 - Every time in a note and in the production JSON is in the production doc's **User zone**.
@@ -181,9 +184,9 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - `scripts/production/showrunners.py` reads its two directories once, at import. A test that runs `refresh` in a subprocess sets them in the child's environment; a test that calls `phase_table.main()` in process patches the module constants. `scripts/production/fake_showrunner.py` (`write_timer`, `write_session`) supplies the running showrunner a note needs.
 - `add_unit.py` imports its siblings by bare name, so `phase_table.py` puts `scripts/production` on `sys.path` before its `scripts.production` imports. The form type-checks with no ignore and runs from any working directory.
 - A vault on a file system without hard links refuses a note's first write with one line. A showrunner name of `.` or `..`, or one holding `/` or NUL, is refused.
-- Nothing removes the note of a production that has ended. A later unit that takes the same session name in the same folder under another production is refused at every report, because the target belongs to another unit.
+- `production_lifecycle.py wrap` archives every generated note owned by the production before marking its doc wrapped, so another production can reuse the session name and publish a fresh note.
 - The renderer reads a bare range end on the ETA's own day and moves it at most one day. An end more than a day from its ETA cannot be written, so both ends are left out.
-- `phase tables: unavailable` after a failed prune does not mean the records went unread. A live builder run prunes the real vault unless `PHASE_TABLE_VAULT` points elsewhere.
+- `phase tables: unavailable` after a failed prune does not mean the records went unread. A live builder run archives retired notes in the real vault unless `PHASE_TABLE_VAULT` points elsewhere.
 - The recorder's test suite takes two to four minutes (195 s measured); the table suite about six seconds.
 
 ## Why
