@@ -24,12 +24,12 @@ for _directory in (SCRIPTS / "production", SCRIPTS / "delegate"):
         sys.path.insert(0, str(_directory))
 
 import add_unit  # noqa: E402
-import broadcast  # noqa: E402
 import live_units  # noqa: E402
 import remove_seats  # noqa: E402
 import showrunners  # noqa: E402
 import unit_lookup  # noqa: E402
 import codex_daemon  # noqa: E402
+import process_table  # noqa: E402
 from sessions import SessionRecord, live_sessions  # noqa: E402
 
 Kind = Literal["claude", "codex"]
@@ -580,7 +580,7 @@ def _worker_status(status: str) -> str:
     }.get(status, status)
 
 
-def _process_cwds(table: Mapping[int, broadcast.Process]) -> dict[tuple[str, str], str]:
+def _process_cwds(table: Mapping[int, process_table.Process]) -> dict[tuple[str, str], str]:
     found: dict[tuple[str, str], str] = {}
     for process in table.values():
         try:
@@ -590,7 +590,7 @@ def _process_cwds(table: Mapping[int, broadcast.Process]) -> dict[tuple[str, str
         options = dict(zip(words, words[1:]))
         name = options.get("--name") or options.get("--to")
         directory = options.get("--session-dir")
-        if broadcast.is_codex_agent(process) and name and directory:
+        if process_table.is_codex_agent(process) and name and directory:
             found[(name, str(Path(directory).resolve()))] = options.get("--cwd", "")
     return found
 
@@ -679,7 +679,7 @@ def _claude_entries(
     return entries
 
 
-def _process_words(process: broadcast.Process) -> list[str]:
+def _process_words(process: process_table.Process) -> list[str]:
     try:
         return shlex.split(process.arguments)
     except ValueError:
@@ -687,7 +687,7 @@ def _process_words(process: broadcast.Process) -> list[str]:
 
 
 def _descends_from(
-    process: broadcast.Process, ancestor: int, table: Mapping[int, broadcast.Process]
+    process: process_table.Process, ancestor: int, table: Mapping[int, process_table.Process]
 ) -> bool:
     parent = process.parent
     visited: set[int] = set()
@@ -703,7 +703,7 @@ def _descends_from(
 
 
 def _reviewer_process(
-    launcher_pid: int, table: Mapping[int, broadcast.Process]
+    launcher_pid: int, table: Mapping[int, process_table.Process]
 ) -> _ReviewerProcessState:
     claude = _ReviewerProcessNotFound()
     for process in sorted(table.values(), key=lambda item: item.pid):
@@ -730,7 +730,7 @@ def _reviewer_cwd(process: _ReviewerProcessState, fallback: str) -> str:
 
 def _review_workers(
     machine: str, run: _LiveRun, place: _RunPlace,
-    table: Mapping[int, broadcast.Process], problems: list[str],
+    table: Mapping[int, process_table.Process], problems: list[str],
 ) -> list[RosterEntry]:
     entries: list[RosterEntry] = []
     try:
@@ -783,7 +783,7 @@ def _delegate_workers(
     problems: list[str],
 ) -> tuple[list[RosterEntry], set[str]]:
     try:
-        table = broadcast.processes()
+        table = process_table.snapshot()
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         _problem(problems, "process table", error)
         table = {}

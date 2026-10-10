@@ -13,7 +13,6 @@ sender is never a recipient. One session, or the user, is `send.py --to NAME`.
 from __future__ import annotations
 
 import os
-import shlex
 import subprocess
 import sys
 import time
@@ -28,9 +27,9 @@ from live_units import units_of
 MESSAGE = Path(__file__).resolve().parent.parent / "message"
 sys.path.insert(0, str(MESSAGE))
 from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
+from process_table import Process, is_codex_agent, snapshot  # noqa: E402
 
 SEND = Path(os.environ.get("BROADCAST_SEND") or MESSAGE / "send.py")
-PS = shlex.split(os.environ.get("BROADCAST_PS") or "ps -eo pid=,ppid=,comm=,args=")
 USAGE = "usage: broadcast.py --from <your session> (--all TEXT | --showrunners TEXT | --units TEXT | --agents TEXT)..."
 # One relay peaked at 272 MB when measured (2026-10-07), so this many together hold about 6.5 GB.
 AT_ONCE = 24
@@ -68,34 +67,6 @@ def live_sessions() -> dict[str, SessionRecord]:
     return newest
 
 
-class Process(NamedTuple):
-    pid: int
-    parent: int
-    command: str
-    arguments: str
-
-
-def processes() -> dict[int, Process]:
-    listing = subprocess.run(PS, capture_output=True, text=True, check=True)
-    table: dict[int, Process] = {}
-    for line in listing.stdout.splitlines():
-        fields = line.split(None, 3)
-        if len(fields) >= 3:
-            table[int(fields[0])] = Process(int(fields[0]), int(fields[1]), fields[2],
-                                            fields[3] if len(fields) > 3 else "")
-    return table
-
-
-def is_codex_agent(process: Process) -> bool:
-    words = process.arguments.split()
-    if process.command == "codex":
-        return words[1:2] == ["exec"]
-    if not process.command.startswith("python"):
-        return False
-    mesh = next((index for index, word in enumerate(words) if word.endswith("/codex_mesh.py")), None)
-    return mesh is not None and words[mesh + 1:mesh + 2] in (["start"], ["follow"])
-
-
 def codex_seats(table: Mapping[int, Process]) -> list[Recipient]:
     """Each running Codex seat, by the name and session directory its turn was started with."""
     seats: dict[Recipient, None] = {}
@@ -129,7 +100,7 @@ def recipients(live: Collection[str]) -> list[Recipient]:
     units = dict.fromkeys(unit for runner in registered for unit in unit_addresses(runner) if unit not in runners)
     others = sorted(name for name in live if name not in runners and name not in units)
     return [*(Recipient(name, "showrunner") for name in runners), *(Recipient(name, "unit director") for name in units),
-            *(Recipient(name, "agent") for name in others), *codex_seats(processes())]
+            *(Recipient(name, "agent") for name in others), *codex_seats(snapshot())]
 
 
 def series(names: list[str], joiner: str) -> str:

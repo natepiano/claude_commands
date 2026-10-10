@@ -10,12 +10,15 @@ import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
-from typing import override
+from typing import cast, override
 
 import broadcast
 import codex_winddown
 import fake_showrunner
-from broadcast import Process
+import showrunners
+from process_table import Process
+from sessions import SessionRecord
+from showrunners import Showrunner
 
 SCRIPT = Path(__file__).with_name("codex_winddown.py")
 MESH = "/run/current-system/sw/bin/python3 /home/u/.claude/scripts/delegate/../agents/codex_mesh.py"
@@ -29,17 +32,54 @@ with open(os.environ["LOG"], "a") as log:
 
 
 class CountTests(unittest.TestCase):
-    def test_a_mesh_turn_and_a_plain_exec_are_agents(self) -> None:
-        self.assertTrue(broadcast.is_codex_agent(Process(1, 0, "python3", f"{MESH} start --name a")))
-        self.assertTrue(broadcast.is_codex_agent(Process(1, 0, "python3", f"{MESH} follow --to a")))
-        self.assertTrue(broadcast.is_codex_agent(Process(1, 0, "codex", "codex exec --json")))
+    def test_start_counts_the_newest_named_session_without_broadcast_session_lookup(self) -> None:
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        older = SessionRecord(
+            pid=10,
+            sessionId="older",
+            name="hana",
+            messagingSocketPath="/tmp/older.sock",
+            updatedAt=1,
+            tmux="",
+            formerNames=[],
+        )
+        newer = SessionRecord(
+            pid=11,
+            sessionId="newer",
+            name="hana",
+            messagingSocketPath="/tmp/newer.sock",
+            updatedAt=2,
+            tmux="",
+            formerNames=[],
+        )
+        unnamed = SessionRecord(
+            pid=12,
+            sessionId="unnamed",
+            name="",
+            messagingSocketPath="/tmp/unnamed.sock",
+            updatedAt=3,
+            tmux="",
+            formerNames=[],
+        )
+        runner = Showrunner(session="hana", socket="/tmp/newer.sock", slug="show", zone="UTC", doc="doc.md")
 
-    def test_servers_wrappers_and_claude_seats_are_not_agents(self) -> None:
-        for command, arguments in (("codex", "codex app-server --listen ws://127.0.0.1:1"),
-                                   ("zsh", f"zsh -c {MESH} start --name a"),
-                                   ("python3", f"{MESH} can-follow --session-dir d"),
-                                   ("bash", "bash /home/u/.claude/scripts/agents/agent_bg.sh a")):
-            self.assertFalse(broadcast.is_codex_agent(Process(1, 0, command, arguments)), arguments)
+        with (
+            mock.patch.object(codex_winddown, "STATE", state),
+            mock.patch.object(codex_winddown, "announce", return_value=True),
+            mock.patch.object(codex_winddown, "live_sessions", return_value=[newer, older, unnamed]),
+            mock.patch.object(showrunners, "registered_showrunners", return_value=[runner]),
+            mock.patch.object(codex_winddown, "start_count", return_value=True) as start_count,
+            mock.patch.object(
+                broadcast,
+                "live_sessions",
+                side_effect=AssertionError("start must not read broadcast.live_sessions"),
+                create=True,
+            ),
+        ):
+            result = codex_winddown.start("natedev")
+
+        self.assertEqual(result, 0)
+        start_count.assert_called_once_with(newer)
 
     def test_an_agent_belongs_to_its_nearest_named_session(self) -> None:
         table = {10: Process(10, 1, "claude", "claude"), 20: Process(20, 10, "claude", "claude"),
@@ -50,22 +90,51 @@ class CountTests(unittest.TestCase):
 
     def test_the_list_is_every_unit_in_alphabetical_order(self) -> None:
         rows = codex_winddown.listed("hana", ["trunk", "Organon", "startup"], {"trunk": 1, "Organon": 2})
-        held: dict[str, codex_winddown.Projection] = {"Organon": 1300.0}
+        held: dict[str, codex_winddown.Projection] = {
+            "Organon": codex_winddown.CompletionExpectedAt(1300.0),
+        }
         self.assertEqual(codex_winddown.render("Codex agents, 13:31 PDT", rows, held, 1000.0),
                          "Codex agents, 13:31 PDT\n\n```\nOrganon - 2 - likely finishes in 5 minutes\n"
                          + "startup - 0\ntrunk - 1 - ETA Unmeasured\n```")
 
     def test_a_projection_reads_owed_unmeasured_or_minutes(self) -> None:
-        held: dict[str, codex_winddown.Projection] = {"owed": None, "blind": "unmeasured", "soon": 1001.0,
-                                                      "late": 999.0}
+        held: dict[str, codex_winddown.Projection] = {
+            "owed": codex_winddown.ProjectionAnswerOwed(),
+            "blind": codex_winddown.CompletionUnmeasured(),
+            "soon": codex_winddown.CompletionExpectedAt(1001.0),
+            "late": codex_winddown.CompletionExpectedAt(999.0),
+        }
         self.assertEqual([codex_winddown.projected(unit, held, 1000.0) for unit in ("owed", "blind", "soon", "late")],
                          ["asked, answer owed", "ETA Unmeasured", "likely finishes in 1 minute", "ETA Unmeasured"])
 
     def test_a_unit_is_asked_once_and_again_when_its_time_has_passed(self) -> None:
-        held: dict[str, codex_winddown.Projection] = {"owed": None, "blind": "unmeasured", "soon": 1001.0,
-                                                      "late": 999.0}
+        held: dict[str, codex_winddown.Projection] = {
+            "owed": codex_winddown.ProjectionAnswerOwed(),
+            "blind": codex_winddown.CompletionUnmeasured(),
+            "soon": codex_winddown.CompletionExpectedAt(1001.0),
+            "late": codex_winddown.CompletionExpectedAt(999.0),
+        }
         self.assertEqual([unit for unit in ("new", "owed", "blind", "soon", "late")
                           if codex_winddown.needs_asking(unit, held, 1000.0)], ["new", "late"])
+
+    def test_every_projection_state_saves_and_reloads_in_its_json_shape(self) -> None:
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        expected: dict[str, codex_winddown.Projection] = {
+            "timed": codex_winddown.CompletionExpectedAt(1300.0),
+            "blind": codex_winddown.CompletionUnmeasured(),
+            "owed": codex_winddown.ProjectionAnswerOwed(),
+        }
+        with mock.patch.object(codex_winddown, "STATE", state):
+            with codex_winddown.projections() as saved:
+                saved.update(expected)
+            serialized = cast(
+                object,
+                json.loads((state / codex_winddown.PROJECTIONS).read_text(encoding="utf-8")),
+            )
+            reloaded = codex_winddown.read_projections()
+
+        self.assertEqual(serialized, {"timed": 1300.0, "blind": "unmeasured", "owed": None})
+        self.assertEqual(reloaded, expected)
 
     def test_a_showrunner_lists_itself_only_with_agents_or_without_units(self) -> None:
         self.assertEqual(codex_winddown.listed("hana", ["trunk"], {"hana": 1}), {"trunk": 0, "hana": 1})
@@ -120,7 +189,7 @@ class MessageTests(unittest.TestCase):
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"), "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CODEX_WINDDOWN_NOTIFIER": str(self.root / "notifier.sh"), "BROADCAST_SEND": str(self.root / "send.py"),
             "CODEX_WINDDOWN_STATE": str(self.root / "prompts"), "LOG": str(self.root / "log"),
-            "BROADCAST_PS": f"cat {self.root / 'ps'}",
+            "PROCESS_TABLE_PS": f"cat {self.root / 'ps'}",
         }
         self.set_processes()
 
