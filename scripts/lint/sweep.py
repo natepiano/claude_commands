@@ -1102,7 +1102,12 @@ def send_floor_alert(message: str, channels: FloorAlertChannels) -> bool:
         ("message", [sys.executable, str(scripts / "message/send.py"), "--to", "natedev", "--from", "disk_floor", "--timeout", "30"]),
     ]
     if channels is FloorAlertChannels.NATEDEV_AND_PHONE:
-        commands.append(("phone", [sys.executable, str(scripts / "message/send.py"), "--to", "user", "--need", "note", "--summary", "natedev: disk under its floor", "--text", message]))
+        commands.append(("phone", [
+            sys.executable, str(scripts / "message/send.py"),
+            "--to", "user", "--need", "note",
+            "--action", "Free disk space outside build caches on natedev.",
+            "--summary", "natedev: disk under its floor", "--text", message,
+        ]))
     delivered = False
     for channel, command in commands:
         try:

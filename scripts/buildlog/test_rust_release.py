@@ -153,6 +153,7 @@ class RustReleaseTests(unittest.TestCase):
         )
         command = [
             "python3", str(sender), "--to", "user", "--need", "note",
+            "--action", "Tell natedev to bump Rust or wait.",
             "--summary", "Rust 1.100.0 out", "--text", "trial passed",
         ]
         real_run = subprocess.run

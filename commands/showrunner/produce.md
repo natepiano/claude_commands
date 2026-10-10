@@ -730,11 +730,15 @@ Phone alerts use the one message path, which reaches the phone through
 Pushover (user's pick, 2026-10-03), because the user often ignores ordinary
 push notifications:
 
-`python3 ~/.claude/scripts/message/send.py --to user --need note|decision|blocked --summary "Hana: <unit or topic>" --text "<message>"`
+`python3 ~/.claude/scripts/message/send.py --to user --need note|decision|blocked (--action "<what the user does>" | --no-action) --summary "Hana: <unit or topic>" --text "<message>"`
 
 On the Mac, add `--machine natedev`; the keys exist only on natedev. The
-message is the one action or fact, under 200 characters. Exit 0 means sent. On
-`FAILED` (exit 3), fall back to PushNotification and say so in the log. Never
+message is the one action or fact, under 200 characters. Every message says
+what the user does with `--action`, or says nothing is needed with
+`--no-action`. Emergency (`--need blocked`) is only for an action the user must
+take now. Exit 0 means sent. On `FAILED` (exit 3), fall back to PushNotification
+with the same `Action: <what the user does>` or `No action needed.` first line,
+and say so in the log. Never
 read or print `~/.config/pushover/env`. Every attempt is logged in
 `~/.local/state/message/log.jsonl`.
 

@@ -157,6 +157,7 @@ def send_release_text(title: str, message: str) -> bool:
     sender = Path(__file__).resolve().parents[1] / "message/send.py"
     result = subprocess.run(
         ["python3", str(sender), "--to", "user", "--need", "note",
+         "--action", "Tell natedev to bump Rust or wait.",
          "--summary", title, "--text", message],
         capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
     )

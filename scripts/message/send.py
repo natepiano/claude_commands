@@ -7,7 +7,8 @@ every message follows are /message (~/.claude/commands/message.md).
   send.py --to NAME|session:<id> [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
           [--machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
-  send.py --to user --summary TITLE [--need note|decision|blocked] ...   the user
+  send.py --to user --summary TITLE [--need note|decision|blocked]
+          (--action TEXT | --no-action) ...                              the user
   send.py ack KEY       later sends with KEY are skipped
   send.py reopen KEY    forget KEY: acknowledgement and repeat window
   send.py pending [NAME]  print and clear what is kept for this session, or for NAME's
@@ -46,6 +47,7 @@ message text as one JSON line in STATE/log.jsonl:
                  session answers to it, which the outcome says
   FAILED: why    not delivered and not kept: a Codex seat, which  exit 3
                  no queue reader reaches, the user, or ssh to HOST
+  REFUSED: why   rejected before delivery; not kept              exit 2
 Usage errors, an unreadable --file and an empty message exit 2. STATE is $XDG_STATE_HOME/message, or ~/.local/state/message.
 """
 
@@ -63,12 +65,16 @@ import subprocess
 import sys
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 import sessions  # noqa: E402
+from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
+                         UserAction, parse_user_action)  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message"
 CLAUDE = Path.home() / ".local" / "bin" / "claude"
@@ -84,10 +90,10 @@ PERMISSION_MODE = "auto"
 TIMEOUT = 40
 KILL_GRACE = 10
 
-Outcome = Literal["sent", "skipped", "queued", "failed"]
+Outcome = Literal["sent", "skipped", "queued", "failed", "refused"]
 Need = Literal["note", "decision", "blocked"]
 CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "1", "blocked": "2"}
-EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3}
+EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2}
 
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str})
@@ -153,6 +159,14 @@ class SessionIdWithoutLiveRecipient(NamedTuple):
 RelayPlan = RelayAttempt | SessionIdWithoutLiveRecipient
 
 
+@dataclass(frozen=True)
+class NoUserRecipient:
+    pass
+
+
+MessageUserAction = UserAction | NoUserRecipient
+
+
 class Options(NamedTuple):
     to: str
     sender: str | None
@@ -164,6 +178,7 @@ class Options(NamedTuple):
     session_dir: str | None
     timeout: float
     need: Need
+    action: MessageUserAction
     text: str | None
     file: str | None
 
@@ -596,13 +611,22 @@ def codex(message: Message, session_dir: str, timeout: float) -> Result:
     return Result("failed", f"codex_mesh.py send: {why}")
 
 
-def user(message: Message, need: Need, timeout: float) -> Result:
+def action_arguments(action: UserAction) -> list[str]:
+    if isinstance(action, ActionRequired):
+        return ["--action", action.text]
+    return ["--no-action"]
+
+
+def user(message: Message, need: Need, action: UserAction, timeout: float) -> Result:
     """Reach the user. The channel is this function's business alone."""
-    command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], message.summary, message.text]
+    command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], "--source", message.sender,
+               *action_arguments(action), message.summary, message.text]
     code, out, err = run(command, "", timeout)
     if code == 0:
         return Result("sent", "to the user")
     why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
+    if code == 2 and f"{REFUSED_BEFORE_SENDING}:" in err:
+        return Result("refused", why)
     return Result("failed", f"the user was not reached: {why}")
 
 
@@ -614,13 +638,16 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--key", message.key]
     if message.to == USER:
         forwarded += ["--need", options.need]
+        if isinstance(options.action, NoUserRecipient):
+            raise AssertionError("a user message must state its action")
+        forwarded += action_arguments(options.action)
     if options.session_dir is not None:
         forwarded += ["--codex", "--session-dir", options.session_dir]
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"{REMOTE} {shlex.join(forwarded)}"]
     code, out, err = run(command, message.text, options.timeout + KILL_GRACE + 30)
     line = (out.strip().splitlines() or [""])[-1]
     word, _, detail = line.partition(": ")
-    outcome = cast(Outcome, word.lower()) if word in ("SENT", "SKIPPED", "QUEUED", "FAILED") else None
+    outcome = cast(Outcome, word.lower()) if word in ("SENT", "SKIPPED", "QUEUED", "FAILED", "REFUSED") else None
     if outcome is None:
         why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
         return Result("failed", f"ssh {host}: {why}")
@@ -663,6 +690,8 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--summary", help="SendMessage's short label, default the first line; the title to `user`")
     _ = parser.add_argument("--need", choices=list(CHANNEL_PRIORITY), default="note",
                             help="to `user`: what they must do (default note: nothing)")
+    _ = parser.add_argument("--action", help="to `user`: what the user does")
+    _ = parser.add_argument("--no-action", action="store_true", help="to `user`: nothing is needed")
     _ = parser.add_argument("--key", help="names the message for --repeat-minutes, ack and the queue")
     _ = parser.add_argument("--repeat-minutes", type=float, help="skip a send with --key inside this window")
     _ = parser.add_argument("--machine", help="deliver from this ssh host instead (mac)")
@@ -673,16 +702,33 @@ def parse(argv: list[str]) -> Options:
     _ = body.add_argument("--text")
     _ = body.add_argument("--file")
     args = parser.parse_args(argv)
-    get = {name: attr(args, name) for name in Options._fields}
-    options = Options(to=as_str(get["to"]), sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
+    to = as_str(attr(args, "to"))
+    action_text = optional_str(attr(args, "action"))
+    no_action = attr(args, "no_action") is True
+    if to != USER:
+        if action_text is not None or no_action:
+            parser.error("--action and --no-action go with --to user")
+        action: MessageUserAction = NoUserRecipient()
+    else:
+        parsed_action = parse_user_action(action_text, no_action)
+        if isinstance(parsed_action, ActionRefused):
+            parser.error(f"{parsed_action.reason}. {FIX}")
+        if isinstance(parsed_action, ActionUnstated):
+            parser.error(FIX)
+        action = parsed_action
+    get = {name: attr(args, name) for name in Options._fields if name != "action"}
+    options = Options(to=to, sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
                       machine=optional_str(get["machine"]), codex=get["codex"] is True,
                       session_dir=optional_str(get["session_dir"]), timeout=optional_float(get["timeout"]) or TIMEOUT,
-                      need=cast(Need, get["need"]), text=optional_str(get["text"]), file=optional_str(get["file"]))
+                      need=cast(Need, get["need"]), action=action, text=optional_str(get["text"]),
+                      file=optional_str(get["file"]))
     if options.to == USER and (options.summary is None or options.codex):
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
         parser.error("--need goes with --to user")
+    if options.to == USER and options.need != "note" and not isinstance(options.action, ActionRequired):
+        parser.error(f"--need {options.need} requires --action. {FIX}")
     if options.codex != (options.session_dir is not None):
         parser.error("--codex and --session-dir go together")
     if options.repeat_minutes is not None and options.key is None:
@@ -742,7 +788,9 @@ def send(options: Options) -> Result:
     elif options.machine is not None:
         result = remote(message, options.machine, options)
     elif message.to == USER:
-        result = user(message, options.need, options.timeout)
+        if isinstance(options.action, NoUserRecipient):
+            raise AssertionError("a user message must state its action")
+        result = user(message, options.need, options.action, options.timeout)
     elif options.session_dir is not None:
         result = codex(message, options.session_dir, options.timeout)
     else:

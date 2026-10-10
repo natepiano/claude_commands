@@ -418,7 +418,8 @@ class CiPointsTests(unittest.TestCase):
         self.assert_step(second, "watch", True)
         self.assertNotIn("| phases merged | 12 |", second.stdout)
         self.assertEqual(self.calls("send.py"), [[
-            "--to", "user", "--need", "decision", "--summary", "Hana: review watch", "--text",
+            "--to", "user", "--need", "decision", "--action",
+            "Acknowledge the review watch in this session.", "--summary", "Hana: review watch", "--text",
             "12 of 12 phases: report ready, waiting for your acknowledgment; the table is in this session",
         ]])
         self.assertEqual(len(self.calls("review_regime.py")), 3)

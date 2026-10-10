@@ -41,6 +41,7 @@ from record import (
     TimerRestore,
     Where,
 )
+from user_action import ActionRequired, UserAction
 
 
 LOGIN = "owner@example.com"
@@ -995,11 +996,12 @@ class RestartTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
+            action: UserAction,
             need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del summary, need, machine, key
+            del summary, action, need, machine, key
             messages.append((recipient, text))
             return settle.MessageSent(kind="sent")
 
@@ -1071,11 +1073,12 @@ class RestartTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
+            action: UserAction,
             need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del recipient, summary, text, need, machine, key
+            del recipient, summary, text, action, need, machine, key
             return settle.MessageSent(kind="sent")
 
         with (
@@ -1342,11 +1345,12 @@ class RestartTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
+            action: UserAction,
             need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del recipient, summary, need, machine, key
+            del recipient, summary, action, need, machine, key
             notes.append(text)
             return settle.MessageSent(kind="sent")
 
@@ -1417,11 +1421,12 @@ class RestartTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
+            action: UserAction,
             need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del recipient, summary, need, machine, key
+            del recipient, summary, action, need, machine, key
             notes.append(text)
             return settle.MessageSent(kind="sent")
 
@@ -1476,11 +1481,12 @@ class RestartTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
+            action: UserAction,
             need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del recipient, summary, text, need, machine, key
+            del recipient, summary, text, action, need, machine, key
             return deliveries.pop(0)
 
         def start_timer(verb: str, instance: str) -> None:
@@ -1526,11 +1532,12 @@ class RestartTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
+            action: UserAction,
             need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del recipient, summary, text, need, machine, key
+            del recipient, summary, text, action, need, machine, key
             return settle.MessageQueued(kind="queued", reason="session socket absent")
 
         def start_timer(verb: str, instance: str) -> None:
@@ -1791,11 +1798,12 @@ class RestartTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
+            action: UserAction,
             need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del recipient, summary, need, machine, key
+            del recipient, summary, action, need, machine, key
             notes.append(text)
             return settle.MessageSent(kind="sent")
 
@@ -1835,10 +1843,11 @@ class RestartTests(unittest.TestCase):
             scope: record.ShutdownScope,
             summary: str,
             text: str,
+            action: ActionRequired,
             *,
             machine: str = "",
         ) -> None:
-            del machine
+            del action, machine
             self.assertEqual(scope["kind"], "all account sessions")
             alerts.append((summary, text))
 
@@ -1950,11 +1959,12 @@ class RestartTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
+            action: UserAction,
             need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del recipient, summary, need, machine, key
+            del recipient, summary, action, need, machine, key
             notes.append(text)
             return settle.MessageSent(kind="sent")
 
@@ -2371,19 +2381,23 @@ class RestartTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "Mac: restart failed: restore broke\n")
         self.assertEqual(errors.getvalue(), "")
 
-    def test_empty_remote_failure_is_printed_and_included_in_the_alert(self) -> None:
-        alerts: list[tuple[str, str]] = []
+    def test_incomplete_restart_alert_emits_the_named_recovery_action(
+        self,
+    ) -> None:
+        sent: list[tuple[list[str], str]] = []
 
-        def alert_user(
-            scope: record.ShutdownScope,
-            summary: str,
-            text: str,
+        def send(
+            argv: list[str],
             *,
-            machine: str = "",
-        ) -> None:
-            del machine
-            self.assertEqual(scope["kind"], "all account sessions")
-            alerts.append((summary, text))
+            input: str,
+            capture_output: bool,
+            text: bool,
+            check: bool,
+            timeout: int,
+        ) -> subprocess.CompletedProcess[str]:
+            del capture_output, text, check, timeout
+            sent.append((argv, input))
+            return subprocess.CompletedProcess(argv, 0, "", "")
 
         output = io.StringIO()
         with (
@@ -2397,7 +2411,8 @@ class RestartTests(unittest.TestCase):
             ),
             patch.object(restart, "run_remote", return_value=(2, "")),
             patch.object(restart, "other_machine", return_value="Mac"),
-            patch.object(settle, "alert_user", alert_user),
+            patch.object(settle, "_send_command", return_value=["fake-send"]),
+            patch.object(subprocess, "run", send),
             redirect_stdout(output),
         ):
             self.assertEqual(
@@ -2411,8 +2426,15 @@ class RestartTests(unittest.TestCase):
 
         failure = "Mac: restart failed (exit 2)"
         self.assertIn(failure, output.getvalue())
-        self.assertEqual(alerts[0][0], f"{LABEL} is not fully back")
-        self.assertIn(failure, alerts[0][1])
+        self.assertEqual(len(sent), 1)
+        args, body = sent[0]
+        action_index = args.index("--action")
+        self.assertEqual(
+            args[action_index + 1],
+            "Fix what is named, then run /shutdown restart again.",
+        )
+        self.assertIn(f"{LABEL} is not fully back", args)
+        self.assertIn(failure, body)
 
     def test_an_unreachable_other_machine_leaves_its_record_and_local_work_recovers(self) -> None:
         local_entry = entry(
@@ -2436,10 +2458,11 @@ class RestartTests(unittest.TestCase):
             scope: record.ShutdownScope,
             summary: str,
             text: str,
+            action: ActionRequired,
             *,
             machine: str = "",
         ) -> None:
-            del machine
+            del action, machine
             self.assertEqual(scope["kind"], "all account sessions")
             alerts.append((summary, text))
 
@@ -2492,10 +2515,11 @@ class RestartTests(unittest.TestCase):
             scope: record.ShutdownScope,
             summary: str,
             text: str,
+            action: ActionRequired,
             *,
             machine: str = "",
         ) -> None:
-            del text, machine
+            del text, action, machine
             scopes.append(scope)
             if scope["kind"] == "all account sessions":
                 user_alerts.append(summary)
@@ -2554,10 +2578,11 @@ class RestartTests(unittest.TestCase):
             scope: record.ShutdownScope,
             summary: str,
             text: str,
+            action: ActionRequired,
             *,
             machine: str = "",
         ) -> None:
-            del text, machine
+            del text, action, machine
             scopes.append(scope)
             if scope["kind"] == "all account sessions":
                 user_alerts.append(summary)
@@ -2607,10 +2632,11 @@ class RestartTests(unittest.TestCase):
             scope: record.ShutdownScope,
             summary: str,
             text: str,
+            action: ActionRequired,
             *,
             machine: str = "",
         ) -> None:
-            del summary, text, machine
+            del summary, text, action, machine
             scopes.append(scope)
 
         with (

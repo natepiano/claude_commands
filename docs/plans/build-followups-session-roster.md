@@ -113,7 +113,7 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 **Ruled out:** a session's role from its seat-name suffix — roles come from records only.
 
-### Phase 2 — Every message to the user says what the user does · status: todo
+### Phase 2 — Every message to the user says what the user does · status: done
 
 #### Work Order
 

@@ -593,7 +593,8 @@ raise SystemExit(int(os.environ[variable]))
         errors = io.StringIO()
         expected_commands = [
             [sys.executable, str(sender), "--to", "natedev", "--from", "disk_floor", "--timeout", "30"],
-            [sys.executable, str(sender), "--to", "user", "--need", "note", "--summary",
+            [sys.executable, str(sender), "--to", "user", "--need", "note", "--action",
+             "Free disk space outside build caches on natedev.", "--summary",
              "natedev: disk under its floor", "--text", "disk notice"],
         ]
         real_run = subprocess.run
