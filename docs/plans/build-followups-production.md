@@ -36,6 +36,7 @@
 | shutdown-unit | `docs/plans/build-followups-session-roster.md` (earlier run: `docs/as-built/shutdown-and-restart.md`) | /home/natepiano/worktrees/claude-build-followups-shutdown | build-followups-shutdown | — | `docs/plans/build-followups-session-roster.md`; `scripts/message/`; `scripts/production/broadcast.py`; `commands/message.md`; the announce commands; `commands/notify_top_level.md`; `codex/AGENTS-messaging.md`; `scripts/notify/pushover.py`; `commands/alert_user.md` |
 | test-threads-unit-unit | docs/plans/build-followups-test-threads-unit.md | /home/natepiano/worktrees/claude-build-followups-test-threads-unit | build-followups-test-threads-unit | — | scripts/delegate/verify.sh, scripts/delegate/invoke.sh, the memory gate (memory_admit.py, anon_peaks.jsonl) |
 | feature-log-unit-unit | docs/plans/build-followups-feature-log-unit.md | /home/natepiano/worktrees/claude-build-followups-feature-log-unit | build-followups-feature-log-unit | 15798 (Phase 8 app checks only) | scripts/feature_log/; commands/validate_and_push.md (<FeatureLogCloseOut/> only); commands/showrunner/produce.md (<ChangeReviewFeatureLog/> and <CloseChangeReview/> only); docs/plans/build-followups-feature-log.md |
+| two-accounts-unit | docs/plans/build-followups-two-accounts.md | /home/natepiano/worktrees/claude-build-followups-two-accounts | build-followups-two-accounts | — | docs/plans/build-followups-two-accounts.md |
 
 ## Hub files
 
