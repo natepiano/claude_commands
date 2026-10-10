@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
@@ -22,7 +21,7 @@ class FixTriggerShutdownTests(unittest.TestCase):
     root = Path()
     home = Path()
     state = Path()
-    environment: dict[str, str]
+    environment: dict[str, str] = {}
 
     @override
     def setUp(self) -> None:
@@ -141,8 +140,8 @@ raise SystemExit(0 if os.environ.get("PGRP_MATCH") == "1" else 1)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(
             result.stdout,
-            "fix-trigger: skipped: claude 2 is held by a shutdown "
-            "(down since 2026-10-09 14:49 PDT)\n",
+            "fix-trigger: skipped: claude 2 is held by a shutdown"
+            + " (down since 2026-10-09 14:49 PDT)\n",
         )
         self.assertEqual(result.stderr, "")
         self.assertFalse((self.state / "fix-ran").exists())
