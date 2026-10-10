@@ -883,6 +883,163 @@ class MacTestCommandTests(unittest.TestCase):
             self.assertEqual(delivery[delivery.index("--repeat-minutes") + 1], "60")
         self.assertEqual(len(self.logged_arguments("systemd-run")), 1)
 
+    def test_active_expired_block_with_failed_switch_back_status_names_stuck_lift(
+        self,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        block = self.write_block(
+            since=now - timedelta(hours=2),
+            expires=now - timedelta(minutes=1),
+            free_message={"kind": "not_needed"},
+        )
+        self.gh["failures"] = [
+            {"match": "variable set", "line": "gpg-agent is cold", "status": 1}
+        ]
+        self.sync_gh()
+
+        status = self.command("status")
+
+        self.assert_command(
+            status,
+            0,
+            "free\n"
+            + f"blocked by alice since {self.local_time(cast(str, block['since']), include_day=True)}, "
+            + f"lifts {self.local_time(cast(str, block['expires']), include_day=True)}: release work\n"
+            + "CI's Mac switch: off (this block)\n"
+            + "The block is past its time limit but could not lift: CI's Mac switch "
+            + "could not be turned back on (gpg-agent is cold). Run github-warmup, "
+            + "then unblock.\n",
+        )
+
+    def test_pending_expired_block_with_failed_switch_back_status_names_stuck_lift(
+        self,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        block = self.write_block(
+            since=now - timedelta(hours=2),
+            expires=now - timedelta(minutes=1),
+            state="pending",
+            waiting_on={"kind": "ci_job"},
+        )
+        self.gh["failures"] = [
+            {"match": "variable set", "line": "gpg-agent is cold", "status": 1}
+        ]
+        self.sync_gh()
+
+        status = self.command("status")
+
+        self.assert_command(
+            status,
+            0,
+            "free\n"
+            + "block pending for alice (a CI run may still use the Mac), "
+            + f"lifts {self.local_time(cast(str, block['expires']), include_day=True)}: release work\n"
+            + "CI's Mac switch: off (this block)\n"
+            + "The block is past its time limit but could not lift: CI's Mac switch "
+            + "could not be turned back on (gpg-agent is cold). Run github-warmup, "
+            + "then unblock.\n",
+        )
+
+    def test_unexpired_block_status_has_no_stuck_lift_line(self) -> None:
+        now = datetime.now(timezone.utc)
+        block = self.write_block(
+            since=now - timedelta(hours=1),
+            expires=now + timedelta(hours=1),
+            free_message={"kind": "not_needed"},
+        )
+
+        status = self.command("status")
+
+        self.assert_command(
+            status,
+            0,
+            "free\n"
+            + f"blocked by alice since {self.local_time(cast(str, block['since']), include_day=True)}, "
+            + f"lifts {self.local_time(cast(str, block['expires']), include_day=True)}: release work\n"
+            + "CI's Mac switch: off (this block)\n",
+        )
+
+    def test_failed_switch_off_on_new_block_status_has_no_stuck_lift_line(
+        self,
+    ) -> None:
+        self.gh["failures"] = [
+            {"match": "variable set", "line": "request lost", "status": 1}
+        ]
+        self.sync_gh()
+        blocked = self.command("block", "--holder", "alice", "--for", "rendering")
+        self.assertEqual(blocked.returncode, 2, blocked.stdout + blocked.stderr)
+        block = self.block_state()
+
+        status = self.command("status")
+
+        self.assert_command(
+            status,
+            0,
+            "free\n"
+            + f"blocked by alice since {self.local_time(cast(str, block['since']), include_day=True)}, "
+            + f"lifts {self.local_time(cast(str, block['expires']), include_day=True)}: rendering\n"
+            + "CI's Mac switch: still on (request lost)\n",
+        )
+
+    def test_immediately_expired_renewal_reports_switch_restore_failure(
+        self,
+    ) -> None:
+        _ = self.write_block(
+            free_message={"kind": "not_needed"},
+            ci="off_unconfirmed",
+        )
+        self.gh["failures"] = [
+            {"match": "variable set", "line": "cold signing agent", "status": 1}
+        ]
+        self.sync_gh()
+
+        renewed = self.command(
+            "block",
+            "--holder",
+            "alice",
+            "--for",
+            "renewed work",
+            "--hours",
+            "0.0000000001",
+        )
+
+        self.assertEqual(renewed.returncode, 2, renewed.stdout + renewed.stderr)
+        self.assertIn(
+            "CI can still use the Mac: cold signing agent. "
+            + "Run github-warmup, then block again.\n",
+            renewed.stdout,
+        )
+        self.assertNotIn("unknown error", renewed.stdout)
+
+    def test_failed_expired_lift_keeps_block_until_next_status_recovers(self) -> None:
+        now = datetime.now(timezone.utc)
+        block = self.write_block(
+            since=now - timedelta(hours=2),
+            expires=now - timedelta(minutes=1),
+            free_message={"kind": "not_needed"},
+        )
+        self.gh["failures"] = [
+            {"match": "variable set", "line": "authentication required", "status": 1}
+        ]
+        self.sync_gh()
+        stuck = self.command("status")
+        self.assertIn(
+            "The block is past its time limit but could not lift:", stuck.stdout
+        )
+        self.assertEqual(self.block_state(), block)
+
+        self.gh["failures"] = []
+        self.sync_gh()
+        recovered = self.command("status")
+
+        self.assert_command(
+            recovered,
+            0,
+            "free\nno block\nCI's Mac switch: on\n",
+        )
+        self.assertFalse((self.state_directory / "block.json").exists())
+        self.assertNotIn("could not lift", recovered.stdout)
+
     def test_unblock_lifts_owned_switch_when_repository_is_removed(self) -> None:
         self.write_config(ci_repo="")
         _ = self.write_block(free_message={"kind": "not_needed"})
