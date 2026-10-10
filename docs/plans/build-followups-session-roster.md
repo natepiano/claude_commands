@@ -170,7 +170,7 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 **Ruled out:** A transport-specific route state in `broadcast.py` (`send.py` already picks the transport); a `cannot take messages` line for a `seat:` address of a seat between turns (such a row has no address).
 
-### Phase 4 — A message with no action stated is refused · status: todo
+### Phase 4 — A message with no action stated is refused · status: done
 
 #### Work Order
 
