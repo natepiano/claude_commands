@@ -313,6 +313,7 @@ class WaitingTests(unittest.TestCase):
             port=add_unit.OmittedCell(),
             owns=add_unit.OmittedCell(),
             session=add_unit.NewSession(),
+            launch_kind=add_unit.NewWorkLaunch(),
             timeout=1.0,
         )
         with redirect_stdout(io.StringIO()):

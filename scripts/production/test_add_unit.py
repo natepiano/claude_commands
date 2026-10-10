@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import argparse
+import io
 import json
 import os
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import add_unit
 import unit_lookup
 from add_unit import cell_value, live_unit_table, plan_cell_is_retired, retired_units
@@ -270,6 +275,111 @@ class AddUnitTests(unittest.TestCase):
         return [cast(list[str], record["args"]) for record in self.events("tmux")
                 if cast(list[str], record["args"])[:1] == ["new-session"]]
 
+    def run_with_marked_unit(
+        self,
+        launch_kind: add_unit.NewWorkLaunch | add_unit.UnitRestoreLaunch,
+        claude: unit_lookup.Claude,
+    ) -> tuple[int, str, list[list[str]], int, int]:
+        request = add_unit.UnitLaunch(
+            production=add_unit.read_production(self.doc),
+            identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
+            branch="build-followups-alpha",
+            worktree=self.root / "project-alpha",
+            plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
+            port=add_unit.OmittedCell(),
+            owns=add_unit.OmittedCell(),
+            session=add_unit.ResumedSession("session-123", self.root / "prior-session"),
+            launch_kind=launch_kind,
+            timeout=1.0,
+        )
+        marked = unit_lookup.MarkedUnit("alpha-unit", "%7", "marked-tmux", claude)
+        ready = add_unit.ReadyToLaunch(
+            request,
+            add_unit.NoUnitRow(),
+            add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
+        )
+        commands: list[list[str]] = []
+        launches: list[str] = []
+
+        def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        error = io.StringIO()
+        with (
+            patch.object(add_unit, "launch_request", return_value=request),
+            patch.object(add_unit, "preflight", return_value=ready),
+            patch.object(unit_lookup, "tmux_binary", return_value="tmux"),
+            patch.object(add_unit, "launched_unit", return_value=marked),
+            patch.object(add_unit, "tmux_live", return_value=False),
+            patch.object(add_unit, "write_stub") as write_stub,
+            patch.object(add_unit, "append_row"),
+            patch.object(add_unit, "commit_unit"),
+            patch.object(add_unit, "ensure_worktree"),
+            patch.object(add_unit, "launch_session", side_effect=lambda *_args: launches.append("launched")),
+            patch.object(add_unit, "wait_for_remote_control", return_value=marked),
+            patch.object(add_unit, "record"),
+            patch.object(add_unit.subprocess, "run", side_effect=run),
+            redirect_stderr(error),
+        ):
+            result = add_unit.main(["--production", "unused", "alpha", "--plan", "unused"])
+        return result, error.getvalue(), commands, len(launches), write_stub.call_count
+
+    def test_restore_replaces_marked_tmux_without_running_claude(self) -> None:
+        launch_kind = add_unit.UnitRestoreLaunch(
+            "session-123", self.root / "restart-note", "recorded-name", "recorded-tmux"
+        )
+
+        result, error, commands, launches, writes = self.run_with_marked_unit(
+            launch_kind, unit_lookup.ClaudeNotRunning()
+        )
+
+        self.assertEqual(result, 0, error)
+        self.assertEqual(commands, [["tmux", "kill-session", "-t", "%7"]])
+        self.assertEqual(launches, 1)
+        self.assertEqual(writes, 1)
+
+    def test_restore_keeps_marked_tmux_with_live_claude(self) -> None:
+        launch_kind = add_unit.UnitRestoreLaunch(
+            "session-123", self.root / "restart-note", "recorded-name", "recorded-tmux"
+        )
+        live = unit_lookup.LiveClaude("recorded-name", "session-123", "/socket", 123)
+
+        result, error, commands, launches, writes = self.run_with_marked_unit(launch_kind, live)
+
+        self.assertEqual(result, 0, error)
+        self.assertEqual(commands, [])
+        self.assertEqual(launches, 0)
+        self.assertEqual(writes, 1)
+
+    def test_restore_refuses_marked_tmux_when_claude_state_is_unknown(self) -> None:
+        launch_kind = add_unit.UnitRestoreLaunch(
+            "session-123", self.root / "restart-note", "recorded-name", "recorded-tmux"
+        )
+
+        result, error, commands, launches, writes = self.run_with_marked_unit(
+            launch_kind, unit_lookup.ClaudeUnknown("session registry unreadable")
+        )
+
+        self.assertEqual(result, 2)
+        self.assertIn(
+            "cannot tell whether Claude runs in tmux session marked-tmux: session registry unreadable",
+            error,
+        )
+        self.assertEqual(commands, [])
+        self.assertEqual(launches, 0)
+        self.assertEqual(writes, 0)
+
+    def test_new_work_keeps_marked_tmux_without_running_claude(self) -> None:
+        result, error, commands, launches, writes = self.run_with_marked_unit(
+            add_unit.NewWorkLaunch(), unit_lookup.ClaudeNotRunning()
+        )
+
+        self.assertEqual(result, 0, error)
+        self.assertEqual(commands, [])
+        self.assertEqual(launches, 0)
+        self.assertEqual(writes, 1)
+
     def test_standby_launch_records_state_without_writing_a_plan(self) -> None:
         _ = self.successful("alpha", "--standby", "--port", "8123", "--owns", "src/alpha")
         worktree = self.root / "project-alpha"
@@ -338,8 +448,9 @@ class AddUnitTests(unittest.TestCase):
                          self.git("rev-parse", "build-followups"))
         launch = self.events("systemd-run")
         self.assertEqual(len(launch), 1)
-        self.assertEqual(cast(list[str], launch[0]["args"])[:3],
-                         ["--user", "--scope", "--unit=alpha"])
+        systemd_args = cast(list[str], launch[0]["args"])
+        self.assertEqual(systemd_args[:2], ["--user", "--scope"])
+        self.assertRegex(systemd_args[2], r"^--unit=alpha-[0-9]+$")
         self.assertEqual(launch[0]["claude_env"], [])
         tmux = next(record for record in self.events("tmux")
                     if cast(list[str], record["args"])[:1] == ["new-session"])
@@ -639,6 +750,116 @@ class AddUnitTests(unittest.TestCase):
         promoted_plan = self.root / "project-alpha/docs/plans/given.md"
         self.assertTrue(promoted_plan.exists())
         self.assertIn(f"Run /unit:direct {promoted_plan}", command)
+
+    def test_all_restore_flags_parse_as_a_unit_restore_and_other_launches_do_not(self) -> None:
+        note = self.root / "restart note.txt"
+        _ = note.write_text("resume here", encoding="utf-8")
+        common = {
+            "production": str(self.doc),
+            "name": "alpha",
+            "plan": "docs/plans/given.md",
+            "brief": None,
+            "standby": False,
+            "port": None,
+            "owns": None,
+            "timeout": 90.0,
+            "check": False,
+        }
+        restored = add_unit.launch_request(argparse.Namespace(
+            **common,
+            resume="session-123",
+            cwd=str(self.root / "prior-session"),
+            restart_note=str(note),
+            session_name="recorded name",
+            tmux_session="recorded tmux",
+        ))
+        ordinary_resume = add_unit.launch_request(argparse.Namespace(
+            **common,
+            resume="session-123",
+            cwd=str(self.root / "prior-session"),
+            restart_note=None,
+            session_name=None,
+            tmux_session=None,
+        ))
+        new_work = add_unit.launch_request(argparse.Namespace(
+            **common,
+            resume=None,
+            cwd=None,
+            restart_note=None,
+            session_name=None,
+            tmux_session=None,
+        ))
+
+        self.assertEqual(
+            restored.launch_kind,
+            add_unit.UnitRestoreLaunch(
+                "session-123", note, "recorded name", "recorded tmux"
+            ),
+        )
+        self.assertIsInstance(ordinary_resume.launch_kind, add_unit.NewWorkLaunch)
+        self.assertIsInstance(new_work.launch_kind, add_unit.NewWorkLaunch)
+
+    def test_restore_flags_are_atomic_and_require_resume(self) -> None:
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("resume here", encoding="utf-8")
+        for flags in (
+            ("--restart-note", str(note)),
+            ("--session-name", "recorded-name"),
+            ("--tmux-session", "recorded-tmux"),
+            (
+                "--restart-note", str(note),
+                "--session-name", "recorded-name",
+                "--tmux-session", "recorded-tmux",
+            ),
+        ):
+            with self.subTest(flags=flags):
+                result = self.cli("alpha", "--plan", "docs/plans/given.md", *flags)
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertEqual(self.events("systemd-run"), [])
+
+    def test_restore_note_recorded_names_and_unique_scope_drive_the_launch(self) -> None:
+        prior = self.root / "prior session"
+        prior.mkdir()
+        note = self.root / "restart note.txt"
+        restart_note = "Restarted with spaces, 'quotes', and $() unchanged."
+        _ = note.write_text(restart_note, encoding="utf-8")
+        recorded_session = "restored 'session' $()"
+        recorded_tmux = "restore $()"
+
+        _ = self.successful(
+            "alpha",
+            "--plan", "docs/plans/given.md",
+            "--resume", "session-123",
+            "--cwd", str(prior),
+            "--restart-note", str(note),
+            "--session-name", recorded_session,
+            "--tmux-session", recorded_tmux,
+        )
+
+        tmux = self.new_sessions()[0]
+        self.assertEqual(tmux[tmux.index("-s") + 1], recorded_tmux)
+        self.assertEqual(tmux[tmux.index("-c") + 1], str(prior))
+        has_targets = [cast(list[str], event["args"])[-1] for event in self.events("tmux")
+                       if cast(list[str], event["args"])[:1] == ["has-session"]]
+        self.assertTrue(has_targets)
+        self.assertEqual(set(has_targets), {f"={recorded_tmux}"})
+
+        command = tmux[-1]
+        encoded = command.split(" command ", 1)[1].rsplit("; exec zsh", 1)[0]
+        claude = shlex.split(encoded)
+        self.assertEqual(claude[claude.index("--remote-control") + 1], recorded_session)
+        self.assertEqual(claude[claude.index("-n") + 1], recorded_session)
+        self.assertIn("You are now alpha-unit in production build-followups", claude[-1])
+        self.assertTrue(claude[-1].endswith(restart_note), claude[-1])
+        self.assertNotIn("Run /unit:direct", claude[-1])
+
+        launches = self.events("systemd-run")
+        self.assertEqual(len(launches), 1)
+        systemd = cast(list[str], launches[0]["args"])
+        scope = next(argument for argument in systemd if argument.startswith("--unit="))
+        name, epoch = scope.removeprefix("--unit=").rsplit("-", 1)
+        self.assertEqual(name, "restore----")
+        self.assertGreater(int(epoch), 0)
 
     def test_brief_row_cannot_be_retried_as_plan_on_its_stub(self) -> None:
         _ = self.successful("alpha", "--brief", "Write a full plan")

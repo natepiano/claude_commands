@@ -45,6 +45,7 @@ from record import (
 )
 from remote import other_machine, run_remote
 import settle
+import restart as restart_work
 import stop as stop_work
 
 
@@ -59,6 +60,7 @@ class CommandLine(argparse.Namespace):
     where: str = ""
     force: str = ""
     reason: str = ""
+    dry_run: bool = False
 
 
 class UnreachableMachine(TypedDict):
@@ -339,7 +341,7 @@ def held_session_ids() -> list[str]:
 def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(
-        dest="command", required=True, metavar="{down,status,now,cancel}"
+        dest="command", required=True, metavar="{down,status,now,cancel,restart}"
     )
     down = commands.add_parser("down", help="start a safe account shutdown")
     _ = down.add_argument("account", nargs="?")
@@ -380,6 +382,14 @@ def main(arguments: list[str] | None = None) -> int:
     close_failed_stop = commands.add_parser("close-failed-stop")
     _ = close_failed_stop.add_argument("account")
     _ = close_failed_stop.add_argument("--reason", required=True)
+    restart = commands.add_parser(
+        "restart", help="bring back every session stopped for one account"
+    )
+    _ = restart.add_argument("account", nargs="?")
+    _ = restart.add_argument("--dry-run", action="store_true")
+    up = commands.add_parser("up")
+    _ = up.add_argument("account")
+    _ = up.add_argument("--dry-run", action="store_true")
     _ = commands.add_parser("held-sessions")
     options = cast(CommandLine, parser.parse_args(arguments))
 
@@ -392,6 +402,12 @@ def main(arguments: list[str] | None = None) -> int:
         if lines:
             print("\n".join(lines))
         return 0
+
+    if options.command == "up":
+        return restart_work.up(options.account or "", options.dry_run)
+
+    if options.command == "restart":
+        return restart_work.restart(options.account, options.dry_run)
 
     if options.command == "stop":
         try:

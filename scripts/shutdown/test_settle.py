@@ -13,7 +13,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict, cast, final, override
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import inventory
 import record
@@ -740,7 +740,14 @@ print("rc=0")
             ):
                 self.assertEqual(settle.conduct(LOGIN, here=True), 0)
         self.assertEqual(cycle.call_count, 2)
-        sleep.assert_called_once_with(settle.SETTLE_INTERVAL_SECONDS)
+        # `time.sleep` is patched process-wide, so a timed subprocess wait under load
+        # adds its own short polls; only the settle-interval sleeps belong to `conduct`.
+        settle_sleeps = [
+            sleep_call
+            for sleep_call in sleep.call_args_list
+            if sleep_call == call(settle.SETTLE_INTERVAL_SECONDS)
+        ]
+        self.assertEqual(settle_sleeps, [call(settle.SETTLE_INTERVAL_SECONDS)])
         claim.assert_called_once_with(LOGIN)
         stop.assert_called_once_with(LOGIN, [action_report])
         alert.assert_called_once()
@@ -1116,8 +1123,9 @@ print("rc=0")
 
         self.assertEqual(result, 0)
         calls = self.sent_calls()
-        self.assertEqual(len(calls), 1)
-        self.assertIn("cancelled by the user", calls[0]["text"])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["args"][0], "retire")
+        self.assertIn("cancelled by the user", calls[1]["text"])
 
     def test_ready_rechecks_an_ahead_checkout_and_accepts_after_push(self) -> None:
         ahead = machine_inventory([top_level("session", "Work", ahead=2)])
@@ -2104,8 +2112,9 @@ print("rc=0")
             record.find_live(LOGIN), record.NoShutdown(kind="no shutdown")
         )
         sent = self.sent_calls()
-        self.assertEqual(len(sent), 1)
-        self.assertIn("cancelled by the user", sent[0]["text"])
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[0]["args"][0], "retire")
+        self.assertIn("cancelled by the user", sent[1]["text"])
 
 
 if __name__ == "__main__":

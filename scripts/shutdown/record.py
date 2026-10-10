@@ -210,6 +210,11 @@ class SessionRestarted(TypedDict):
     at: str
 
 
+class SeatAvailableOnDemand(TypedDict):
+    kind: Literal["seat available on demand"]
+    at: str
+
+
 class SessionRestartFailed(TypedDict):
     kind: Literal["restart failed"]
     at: str
@@ -230,6 +235,7 @@ SessionProgress = (
     | ProcessIdentityLost
     | SessionStopFailed
     | SessionRestarted
+    | SeatAvailableOnDemand
     | SessionRestartFailed
     | SessionNeedsManualRestart
 )
@@ -318,6 +324,7 @@ _PROGRESS_WITH_TIME = frozenset(
         "process identity lost",
         "stop failed",
         "restarted",
+        "seat available on demand",
         "restart failed",
     }
 )

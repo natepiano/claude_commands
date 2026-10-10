@@ -49,6 +49,17 @@ class ResumedSession(NamedTuple):
     cwd: Path
 
 
+class NewWorkLaunch(NamedTuple):
+    pass
+
+
+class UnitRestoreLaunch(NamedTuple):
+    session_id: str
+    note: Path
+    session_name: str
+    tmux_session: str
+
+
 class DefaultEffort(NamedTuple):
     pass
 
@@ -97,6 +108,7 @@ class UnitLaunchConfiguration:
     port: OmittedCell | SuppliedCell
     owns: OmittedCell | SuppliedCell
     session: NewSession | ResumedSession
+    launch_kind: NewWorkLaunch | UnitRestoreLaunch
     timeout: float
 
     @property
@@ -224,12 +236,39 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
         plan = Standby()
     resumed = cast(str | None, args.resume)
     cwd = cast(str | None, args.cwd)
+    restart_note = cast(str | None, args.restart_note)
+    session_name = cast(str | None, args.session_name)
+    tmux_session = cast(str | None, args.tmux_session)
+    restart_values = (restart_note, session_name, tmux_session)
+    if any(value is not None for value in restart_values) and not all(
+        value is not None for value in restart_values
+    ):
+        raise Refusal(
+            "--restart-note, --session-name and --tmux-session must be given together"
+        )
+    if restart_note is not None and resumed is None:
+        raise Refusal("restart launch flags require --resume")
     if (resumed is None) != (cwd is None):
         raise Refusal("--resume and --cwd must be given together")
     if resumed is not None and not isinstance(plan, PlanGiven):
         raise Refusal("--resume requires --plan")
     session: NewSession | ResumedSession = (ResumedSession(resumed, Path(cwd).expanduser().resolve())
                                             if resumed is not None and cwd is not None else NewSession())
+    launch_kind: NewWorkLaunch | UnitRestoreLaunch
+    if (
+        resumed is not None
+        and restart_note is not None
+        and session_name is not None
+        and tmux_session is not None
+    ):
+        launch_kind = UnitRestoreLaunch(
+            resumed,
+            Path(restart_note).expanduser(),
+            session_name,
+            tmux_session,
+        )
+    else:
+        launch_kind = NewWorkLaunch()
     port = cast(int | None, args.port)
     timeout = cast(float, args.timeout)
     if port is not None and not 1 <= port <= 65535:
@@ -247,6 +286,7 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
         port=SuppliedCell(str(port)) if port is not None else OmittedCell(),
         owns=SuppliedCell(owns) if owns is not None else OmittedCell(),
         session=session,
+        launch_kind=launch_kind,
         timeout=timeout,
     )
 
@@ -466,6 +506,7 @@ def preflight(request: RequestedUnitLaunch) -> ReadyToLaunch:
         port=request.port,
         owns=request.owns,
         session=request.session,
+        launch_kind=request.launch_kind,
         timeout=request.timeout,
     )
     if isinstance(existing, ExistingUnitRow) and recorded_mode(launch, existing) != launch.mode_name:
@@ -581,9 +622,13 @@ def prompt_for(request: UnitLaunch) -> str:
     plan = request.plan_path.as_posix()
     if isinstance(request.session, ResumedSession):
         plan = str(request.worktree / request.plan_path)
-        return (f"You are now {request.identity.unit} in production {production.slug} (doc {doc}), under "
-                f"{showrunner}. Work only in your worktree {request.worktree}, "
-                f"branch {request.branch}, and name it in every Work Order. Run /unit:direct {plan}.")
+        identity = (f"You are now {request.identity.unit} in production {production.slug} (doc {doc}), under "
+                    f"{showrunner}. Work only in your worktree {request.worktree}, "
+                    f"branch {request.branch}, and name it in every Work Order.")
+        if isinstance(request.launch_kind, UnitRestoreLaunch):
+            note = request.launch_kind.note.read_text(encoding="utf-8").rstrip("\n")
+            return f"{identity} {note}"
+        return f"{identity} Run /unit:direct {plan}."
     if isinstance(request.plan, PlanGiven):
         return f"/unit:direct {plan}"
     return (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under "
@@ -604,13 +649,21 @@ def launch_session(request: UnitLaunch, tmux: str, director: DirectorAgent) -> N
         argv.extend(["--effort", director.effort.value])
     if isinstance(request.session, ResumedSession):
         argv.extend(["--resume", request.session.session_id])
-    argv.extend(["--remote-control", request.identity.session, "-n", request.identity.session,
+    session_name = (request.launch_kind.session_name
+                    if isinstance(request.launch_kind, UnitRestoreLaunch)
+                    else request.identity.session)
+    tmux_session = (request.launch_kind.tmux_session
+                    if isinstance(request.launch_kind, UnitRestoreLaunch)
+                    else request.identity.session)
+    argv.extend(["--remote-control", session_name, "-n", session_name,
                  "--settings", '{"disableAgentView": true}', prompt_for(request)])
     command = "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
     cwd = request.session.cwd if isinstance(request.session, ResumedSession) else request.worktree
     environment = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")}
-    _ = subprocess.run(["systemd-run", "--user", "--scope", f"--unit={request.identity.session}", tmux,
-                        "new-session", "-d", "-s", request.identity.session, "-c", str(cwd),
+    scope_name = re.sub(r"[^A-Za-z0-9_.-]", "-", tmux_session)
+    scope = f"--unit={scope_name}-{int(time.time())}"
+    _ = subprocess.run(["systemd-run", "--user", "--scope", scope, tmux,
+                        "new-session", "-d", "-s", tmux_session, "-c", str(cwd),
                         *(argument for name, value in marks.items() for argument in ("-e", f"{name}={value}")),
                         "zsh", "-ic", command],
                        env=environment, text=True, capture_output=True, check=True)
@@ -662,6 +715,9 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--timeout", type=float, default=90.0)
     _ = parser.add_argument("--resume")
     _ = parser.add_argument("--cwd")
+    _ = parser.add_argument("--restart-note")
+    _ = parser.add_argument("--session-name")
+    _ = parser.add_argument("--tmux-session")
     _ = parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -671,15 +727,32 @@ def main(argv: list[str]) -> int:
         if cast(bool, args.check):
             return 0
         tmux = unit_lookup.tmux_binary()
-        already_launched = launched_unit(request) is not None
-        if not already_launched and tmux_live(tmux, request.identity.session):
-            raise Refusal(f"tmux session {request.identity.session} is already live and is not marked as "
+        marked_unit = launched_unit(request)
+        if isinstance(request.launch_kind, UnitRestoreLaunch) and marked_unit is not None:
+            if isinstance(marked_unit.claude, unit_lookup.ClaudeUnknown):
+                raise Refusal(
+                    f"cannot tell whether Claude runs in tmux session {marked_unit.label}: "
+                    + marked_unit.claude.reason
+                )
+            if isinstance(marked_unit.claude, unit_lookup.ClaudeNotRunning):
+                _ = subprocess.run(
+                    [tmux, "kill-session", "-t", marked_unit.pane],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                marked_unit = None
+        tmux_session = (request.launch_kind.tmux_session
+                        if isinstance(request.launch_kind, UnitRestoreLaunch)
+                        else request.identity.session)
+        if marked_unit is None and tmux_live(tmux, tmux_session):
+            raise Refusal(f"tmux session {tmux_session} is already live and is not marked as "
                           + request.identity.unit)
         write_stub(request)
         append_row(request, ready.row)
         commit_unit(request)
         ensure_worktree(request)
-        if not already_launched:
+        if marked_unit is None:
             launch_session(request, tmux, ready.director)
         launched = wait_for_remote_control(request, tmux)
         record(request)

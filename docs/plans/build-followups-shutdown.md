@@ -312,7 +312,7 @@ StopIssue = SessionStopIssue | OrchestrationStopIssue
 - A computed time limit on the remote stop (`max(120, 60 + 20 × owners)`): a working stop is cut off only by a dead link.
 - Peer claim replay for the same timing only: a `now` landing on a peer already stopping must take effect, and only one conductor can claim, so a timing mismatch is never a second conductor.
 
-### Phase 8 — Restart resumes every session where it was  · status: todo
+### Phase 8 — Restart resumes every session where it was  · status: done
 
 #### Work Order
 
@@ -335,7 +335,7 @@ StopIssue = SessionStopIssue | OrchestrationStopIssue
 - Note, given to each session as its first prompt: "Restarted after /shutdown of <label> (stopped <time>, restarted <time>). Before it you wrote: <where text>. (When `where` is `not said`, that sentence is instead: It left no note of where it was; read your branch and plan before you continue.) First run `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py pending` for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting." Every time is `%Y-%m-%d %H:%M %Z` in America/Los_Angeles (`2026-10-09 14:49 PDT`, `2026-01-15 09:30 PST`), never a literal zone name.
 - **Commands are argv lists.** Every launcher (`add_unit.py`, `systemd-run`, `ghostty`, `open`, `tmux`, `kdotool`, `send.py`) runs from an argv list, never `shell=True`. The one shell string is the **resume command** a non-unit host runs under `zsh -ic`, passed as one argv item: `cd <shlex.quote(cwd)> && ENABLE_TOOL_SEARCH=true command <shlex.join(["claude", "--resume", <id>, "-n", <name>, "--remote-control", <name>, ("--model", <model name> only when `model` is `{"kind": "model"}`), "--settings", '{"disableAgentView": true}', <prompt>])>; exec zsh`, where the prompt is the note, or a showrunner's `/showrunner:produce <ShowrunnerSession.doc> resume`. Recorded paths, names, models and `where` text holding spaces, quotes or `$()` reach Claude unchanged.
 - Unit (`UnitSession`, `UnitHost`): `add_unit.py --production <doc> <unit name without -unit> --plan <plan path> --resume <id> --cwd <cwd> --session-name <recorded session name> --tmux-session <UnitHost.tmux_session> --restart-note <file>`. A unit whose plan is `no run record` becomes `manual restart`, its command printed for the user with `--plan <plan>` to fill in.
-- `scripts/production/add_unit.py` gains three flags that together make one restart launch: `--restart-note FILE --session-name NAME --tmux-session NAME`, given all three and only with `--resume`, parse into `UnitRestoreLaunch{session_id, note, session_name, tmux_session}` (it brings back a unit entry of a live shutdown record, which is its only authority to launch), every other launch into `NewWorkLaunch` (new work, which a shutdown blocks); any of them alone, or without `--resume`, is refused. Phase 9's shutdown exemption is granted to a `UnitRestoreLaunch` only, and only after it checks that session against the live record.
+- `scripts/production/add_unit.py` gains three flags that together make one restart launch: `--restart-note FILE --session-name NAME --tmux-session NAME`, given all three and only with `--resume`, parse into `UnitRestoreLaunch{session_id, note, session_name, tmux_session}` (it brings back a unit entry of a live shutdown record, which is its only authority to launch), every other launch into `NewWorkLaunch` (new work, which a shutdown blocks); any of them alone, or without `--resume`, is refused. Phase 10's shutdown exemption is granted to a `UnitRestoreLaunch` only, and only after it checks that session against the live record.
   - `--restart-note FILE`: `prompt_for` returns the identity sentence of the resumed prompt (584-586) followed by the note instead of `Run /unit:direct <plan>.`
   - `--session-name NAME`: the recorded Claude session name, used for `-n` and `--remote-control` in place of `identity.session`.
   - `--tmux-session NAME`: the recorded host tmux label, used for `tmux new-session -s` and for `main`'s `tmux_live` check (674-677) in place of `identity.session`.
@@ -372,7 +372,31 @@ StopIssue = SessionStopIssue | OrchestrationStopIssue
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` and `python3 -m unittest scripts/production/test_add_unit.py scripts/message/test_send.py` green; `basedpyright scripts/shutdown scripts/production/add_unit.py scripts/message/send.py` clean; live on natedev, after a `down --here --only` of scratch sessions as in Phase 6's gate: `restart --dry-run` prints one command per session, then `restart` brings back the tmux session and the Ghostty session on its desktop, and the Mac, which holds no record, answers `mac: no shutdown of <label> to restart` without failing the restart; each session answers what it was doing before the shutdown; the scratch timer is enabled again; the record is in history; no other session changes. Post-merge gate, run by this unit once the showrunner has merged the phase and `~/.claude` on both machines holds it, with its result in the next checkpoint notice: the same `down --only` and `restart` across both machines, the Mac nix-tmux scratch session included.
 
-### Phase 9 — Nothing new starts on a down account  · status: todo
+### Phase 9 — Restored units and showrunners keep their timers  · status: todo
+
+#### Work Order
+
+**Goal:** a unit or showrunner that `/shutdown restart` brings back keeps the timers restart turns on: its first prompt is recorded as expected, so its conversation-pause hook neither pauses those timers nor asks the user to turn them back on.
+
+**Spec:**
+- `conversation_pause.prompt_source` returns `SCHEDULED` for a prompt recorded for the session with `record_scheduled_prompts`; Phase 8 records the restart note before each tmux and window launch, where the note is the whole first prompt.
+- A showrunner's first prompt is `_showrunner_prompt(session)` (`/showrunner:produce <doc> resume`), not the note: `restart.py` records the prompt it launches, appending it to the session's recorded prompts as Phase 8 does, before the launch. Its note still arrives afterwards as a `shutdown` message.
+- A unit's first prompt is built by `add_unit.py` (`prompt_for`: the identity line, a space, then the note file's text). For a `UnitRestoreLaunch`, `add_unit.py` appends that exact prompt to the session's recorded prompts before `launch_session` starts `claude`, importing `conversation_pause` from `scripts/hooks` at run time as `settle.py` does; `pyrightconfig.json` gains `scripts/hooks` in the `scripts/production` environment's `extraPaths`. A failure to record refuses the launch with exit 1 and one stderr line naming why. `restart.py` stops recording the bare note for unit entries. `NewWorkLaunch` records nothing.
+- Prompts already recorded for the session are kept; a dry run records nothing.
+
+**Files:**
+- `scripts/shutdown/restart.py`, `scripts/shutdown/test_restart.py`
+- `scripts/production/add_unit.py`, `scripts/production/test_add_unit.py`
+- `pyrightconfig.json`
+
+**Seats:** `1 writer` — two recording calls and their tests.
+- `impl` — every file above.
+
+**Constraints from prior phases:** Phase 8: `restart.py` `_record_restart_note`, which appends to `conversation_pause.read_scheduled_prompts(session_id)` and fails the entry as `restart note not recorded: <reason>` without launching; `add_unit.py`'s `UnitRestoreLaunch{session_id, note, session_name, tmux_session}` and its restore prompt; `conversation_pause.record_scheduled_prompts`, which replaces the whole list, and the Stop hook, which rewrites it after each reply. Tests point the conversation-pause state root at a temp dir and start no `claude`.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` and `cd scripts/production && python3 -m unittest test_add_unit test_waiting` green; `basedpyright scripts/shutdown scripts/production/add_unit.py` clean; tests show, for a showrunner entry and for a unit restore, that the prompt the launch passes to `claude` is recorded for that session before the launch and that `conversation_pause.prompt_source` classes it `SCHEDULED`. Post-merge, with Phase 8's post-merge gate: a restarted unit's timers are still enabled one minute after its restart.
+
+### Phase 10 — Nothing new starts on a down account  · status: todo
 
 #### Work Order
 
