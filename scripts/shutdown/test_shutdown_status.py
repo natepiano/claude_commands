@@ -492,6 +492,72 @@ else:
             with self.subTest(line=line):
                 self.assertIn(line + "\n", output)
 
+    def test_restart_partial_status_says_what_is_left_and_how_to_finish(
+        self,
+    ) -> None:
+        partial = complete_record()
+        partial["state"] = "restart partial"
+        failed = complete_record()["entries"][0]
+        failed["session"]["name"] = "failed launch"
+        failed["progress"] = record_store.SessionRestartFailed(
+            kind="restart failed",
+            at="2026-10-09T21:49:10+00:00",
+            reason="window did not open",
+        )
+        pending = complete_record()["entries"][0]
+        pending["session"]["name"] = "pending timers"
+        pending["progress"] = cast(
+            record_store.SessionProgress,
+            cast(
+                object,
+                {
+                    "kind": "timers pending",
+                    "at": "2026-10-09T21:49:10+00:00",
+                    "timers": [
+                        {
+                            "instance": "showrunner-demo",
+                            "reason": "notifier unavailable",
+                        },
+                        {
+                            "instance": "unit-demo",
+                            "reason": "timer start failed",
+                        },
+                    ],
+                },
+            ),
+        )
+        manual = complete_record()["entries"][0]
+        manual["session"]["name"] = "manual session"
+        manual["progress"] = record_store.SessionNeedsManualRestart(
+            kind="manual restart", command="claude --resume session-id"
+        )
+        partial["entries"] = [failed, pending, manual]
+        record_store.create(partial)
+
+        output = io.StringIO()
+        with (
+            patch.object(shutdown, "inventory", return_value=empty_inventory()),
+            redirect_stdout(output),
+        ):
+            result = shutdown.main(["status", LOGIN, "--here"])
+
+        self.assertEqual(result, 0)
+        expected_lines = [
+            "natedev: shutdown restart partial",
+            "  failed launch: restart failed — window did not open",
+            "  pending timers: timers pending — showrunner-demo: notifier unavailable; unit-demo: timer start failed",
+            "  manual session: manual restart — run: claude --resume session-id",
+            "  run /shutdown restart again to finish",
+        ]
+        for line in expected_lines:
+            with self.subTest(line=line):
+                self.assertIn(line + "\n", output.getvalue())
+        self.assertTrue(
+            output.getvalue().endswith(
+                "  run /shutdown restart again to finish\n"
+            )
+        )
+
     def test_records_text_uses_los_angeles_time(self) -> None:
         output = io.StringIO()
         with (
