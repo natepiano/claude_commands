@@ -324,33 +324,20 @@ Real-code check, `objdump -d -C --no-show-raw-insn` counted per function, on two
 
 ### Phase 8 — The detector's scaling test holds under machine load · status: done
 
-#### Work Order
+#### As-built
 
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`, branch `build-followups-mul-add`. A showrunner follow-up (2026-10-09): the test turned an unrelated merge on `build-followups` red.
-
-**Goal:** `test_many_findings_scan_scales_with_file_length` in `scripts/hooks/test_mul_add.py` fails when the scan grows faster than linearly with file length, and never fails because the machine is busy.
-
-**Constraints from prior phases:**
-- `float_mul_add_findings(path)` keeps its signature and behavior; this phase changes the test only. `mul_add_lib.py` is not edited.
-- The test exists to catch a scan that goes quadratic in file length. Between 200 and 800 lines (4×), a linear scan takes about 4× as long and a quadratic one about 16×.
-
-**Spec:**
-1. Today the test times one scan of a 200-line file and one of an 800-line file with `time.perf_counter()` and asserts the second is under 7× the first. In a merge gate under load it failed with `0.1079 not less than 0.1048`, and it passes alone: one wall-clock sample per size lets a load spike on either sample decide the result.
-2. Time each size several times (at least 5) and compare the fastest run of each size, since load only ever adds time. Keep the 200 and 800 line files and the existing finding-count and last-line asserts.
-3. Set the bound so a linear scan passes with room under heavy load and a quadratic one still fails: compare the fastest 800-line time against 10× the fastest 200-line time, and say in a comment that linear is about 4× and quadratic about 16×.
-4. A count-based check is a valid alternative if it is simpler: count a unit of work the scanner does, if one is reachable from the test without changing `mul_add_lib.py`. Otherwise use spec items 2 and 3.
-
-**Acceptance:**
-- The test passes 20 times in a row while the machine runs a CPU load on every core, and alone.
-- Changing the bound check to compare against 4× the fastest 200-line time fails the test as expected. This is a scratch check, never committed, which proves the test still measures.
-- The whole `test_mul_add.py` suite passes; basedpyright reports 0 errors, 0 warnings, 0 notes on `test_mul_add.py`.
-
-**Verification:** `python3 -m unittest scripts/hooks/test_mul_add.py`; `basedpyright scripts/hooks/test_mul_add.py`; a load check run as `stress-ng --cpu 0 --timeout 120s &` (or one `yes > /dev/null &` per core, killed afterwards) beside 20 runs of `python3 -m unittest scripts.hooks.test_mul_add.MulAddHookTests.test_many_findings_scan_scales_with_file_length`.
+- `test_many_findings_scan_scales_with_file_length` in `scripts/hooks/test_mul_add.py` scans a 200-line and an 800-line file five times each with `time.perf_counter()`, keeps the fastest run of each size (load only ever adds time), and asserts the 800-line time is under 10× the 200-line time. Over 4× the lines a linear scan takes about 4× as long and a quadratic one about 16×, which the test's comment states. The finding-count and last-line asserts run on every sample.
+- `float_mul_add_findings(path)` and `mul_add_lib.py` are unchanged.
+- Measured at ship: 20 passes in a row under a CPU load on all 32 cores; a scratch 4× bound fails, so the test still measures; the `test_mul_add.py` suite passes and basedpyright reports 0 errors, 0 warnings and 0 notes.
 
 **Files:**
-- `scripts/hooks/test_mul_add.py` — the scaling test only
+- `scripts/hooks/test_mul_add.py` — the scaling test
 
-**Seats:** 1 writer — `impl`.
+**Gotchas:**
+- Running the test by its dotted name needs `PYTHONPATH=scripts/hooks`, since the test imports `mul_add_lib` as a sibling.
+
+**Ruled out:**
+- A count-based check — no unit of the scanner's work is reachable from the test without editing `mul_add_lib.py`.
 
 ### Phase 9 — Re-measure: long functions and multiply-adds out of hana's clippy failures · status: todo
 
