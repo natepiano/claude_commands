@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import conversation_pause
 
 
@@ -493,7 +495,7 @@ print("SENT: delivered")
             ),
             conversation_pause.PromptSource.PEER,
         )
-        for sender in ("stall-watch", "mac-test", "disk_floor"):
+        for sender in ("stall-watch", "mac-test", "disk_floor", "shutdown"):
             with self.subTest(sender=sender):
                 self.assertIs(
                     conversation_pause.prompt_source(
@@ -2262,6 +2264,52 @@ print("SENT: delivered")
         _ = self.write_record({"kind": "returned", "returned_at": 100})
         result = self.run_cli("status")
         self.assertEqual((result.returncode, result.stdout), (0, "not paused (returned)\n"))
+
+    def test_release_returns_record_and_later_tick_resumes_nothing(self) -> None:
+        instance = self.create_instance("delegate-abc", enabled=False)
+        watcher = self.create_instance("conversation-pause", run="tick")
+        path = self.write_record(
+            {"kind": "kept_off"},
+            instances=(instance.name,),
+            footers=("demo",),
+        )
+
+        with patch.dict(os.environ, self.environment, clear=True):
+            released = conversation_pause.release(SESSION)
+
+        self.assertEqual(
+            released,
+            conversation_pause.PauseRecord(
+                SESSION,
+                (instance.name,),
+                ("demo",),
+                conversation_pause.KeptOff(),
+            ),
+        )
+        self.assertFalse(path.exists())
+        self.assertEqual(self.calls(self.notifier_log), [])
+
+        result = self.run_cli("tick", now=NOW + 1)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertFalse(watcher.exists())
+        self.assertNotIn(
+            ["resume", instance.name],
+            self.calls(self.notifier_log),
+        )
+
+    def test_release_without_record_reports_absent(self) -> None:
+        with patch.dict(os.environ, self.environment, clear=True):
+            released = conversation_pause.release("never-paused")
+
+        self.assertIs(released, conversation_pause.NoPauseRecord.ABSENT)
+
+    def test_release_is_not_a_command_line_verb(self) -> None:
+        result = self.run_cli("release", SESSION)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, conversation_pause.USAGE + "\n")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -90,13 +91,45 @@ class ShutdownStatusTests(unittest.TestCase):
         super().__init__(methodName)
         self.root = Path()
         self.notes = Path()
+        self.state = Path()
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.notes = self.root / "agents"
         self.notes.mkdir()
-        environment = {**os.environ, "AGENT_NOTES_DIR": str(self.notes)}
+        self.state = self.root / "shutdown-state"
+        self.state.mkdir()
+        binary_root = self.root / "bin"
+        binary_root.mkdir()
+        ssh = binary_root / "ssh"
+        _ = ssh.write_text(
+            f"""#!{sys.executable}
+import os
+import sys
+
+command = sys.argv[-1]
+if " records --json --here" in command:
+    if os.environ.get("SHUTDOWN_STATUS_RECORD_TRANSPORT") == "255":
+        raise SystemExit(255)
+    print(os.environ.get("SHUTDOWN_STATUS_RECORD_OUTPUT", "[]"))
+    print("rc=" + os.environ.get("SHUTDOWN_STATUS_RECORD_RC", "0"))
+else:
+    print(os.environ["SHUTDOWN_STATUS_INVENTORY_OUTPUT"])
+    print("rc=0")
+""",
+            encoding="utf-8",
+        )
+        ssh.chmod(0o755)
+        environment = {
+            **os.environ,
+            "AGENT_NOTES_DIR": str(self.notes),
+            "PATH": str(binary_root) + os.pathsep + os.environ.get("PATH", ""),
+            "SHUTDOWN_STATE_DIR": str(self.state),
+            "SHUTDOWN_STATUS_INVENTORY_OUTPUT": json.dumps(
+                empty_inventory(machine="Mac")
+            ),
+        }
         environment_context: object = cast(
             object,
             self.enterContext(patch.dict(os.environ, environment, clear=True)),
@@ -125,6 +158,18 @@ class ShutdownStatusTests(unittest.TestCase):
             redirect_stderr(standard_error),
         ):
             result = shutdown.main(arguments)
+        return result, standard_output.getvalue(), standard_error.getvalue()
+
+    def run_plain_status_with_ssh(self) -> tuple[int, str, str]:
+        standard_output = io.StringIO()
+        standard_error = io.StringIO()
+        with (
+            patch.object(shutdown, "inventory", return_value=empty_inventory()),
+            patch.object(shutdown, "other_machine", return_value="Mac"),
+            redirect_stdout(standard_output),
+            redirect_stderr(standard_error),
+        ):
+            result = shutdown.main(["status", LOGIN])
         return result, standard_output.getvalue(), standard_error.getvalue()
 
     def test_empty_inventory_renders_no_sessions_for_the_account(self) -> None:
@@ -291,6 +336,76 @@ class ShutdownStatusTests(unittest.TestCase):
             "  unknown account · 1234 mystery · account unreadable\n",
             output.getvalue(),
         )
+
+    def test_malformed_local_shutdown_record_reports_unreadable_and_status_succeeds(
+        self,
+    ) -> None:
+        account_state = self.state / LOGIN.casefold()
+        account_state.mkdir()
+        record_path = account_state / "record.json"
+        _ = record_path.write_text("not json", encoding="utf-8")
+
+        output = io.StringIO()
+        with (
+            patch.object(shutdown, "inventory", return_value=empty_inventory()),
+            redirect_stdout(output),
+        ):
+            result = shutdown.main(["status", LOGIN, "--here"])
+
+        self.assertEqual(result, 0)
+        self.assertIn(
+            f"natedev: shutdown record unreadable: {record_path} is not valid JSON\n",
+            output.getvalue(),
+        )
+
+    def test_remote_shutdown_record_transport_failure_reports_unreachable(self) -> None:
+        os.environ["SHUTDOWN_STATUS_RECORD_TRANSPORT"] = "255"
+
+        result, output, error = self.run_plain_status_with_ssh()
+
+        self.assertEqual(result, 0)
+        self.assertIn(
+            "Mac: shutdown record not reached (unreachable)\n",
+            output,
+        )
+        self.assertEqual(error, "")
+
+    def test_remote_shutdown_record_failure_reports_unavailable_status(self) -> None:
+        os.environ["SHUTDOWN_STATUS_RECORD_RC"] = "7"
+        os.environ["SHUTDOWN_STATUS_RECORD_OUTPUT"] = "record command failed"
+
+        result, output, error = self.run_plain_status_with_ssh()
+
+        self.assertEqual(result, 0)
+        self.assertIn(
+            "Mac: shutdown record not reached (unavailable, rc 7)\n",
+            output,
+        )
+        self.assertEqual(error, "")
+
+    def test_unparseable_remote_shutdown_records_report_unreadable(self) -> None:
+        os.environ["SHUTDOWN_STATUS_RECORD_OUTPUT"] = "not json"
+
+        result, output, error = self.run_plain_status_with_ssh()
+
+        self.assertEqual(result, 0)
+        self.assertIn(
+            "Mac: shutdown record unreadable: records is not valid JSON\n",
+            output,
+        )
+        self.assertEqual(error, "")
+
+    def test_valid_remote_shutdown_record_renders_its_state(self) -> None:
+        os.environ["SHUTDOWN_STATUS_RECORD_OUTPUT"] = json.dumps(
+            [complete_record(machine="Mac")]
+        )
+
+        result, output, error = self.run_plain_status_with_ssh()
+
+        self.assertEqual(result, 0)
+        self.assertIn("Mac: shutdown settling\n", output)
+        self.assertIn("  shutdown: waiting\n", output)
+        self.assertEqual(error, "")
 
     def test_records_text_uses_los_angeles_time(self) -> None:
         output = io.StringIO()

@@ -82,7 +82,13 @@ class Sent(TypedDict):
     at: str
 
 
-SettleMessage = NotSent | Sent
+class Queued(TypedDict):
+    kind: Literal["queued"]
+    at: str
+    reason: str
+
+
+SettleMessage = NotSent | Sent | Queued
 
 
 class Said(TypedDict):
@@ -388,9 +394,11 @@ def _timer(value: object, place: str) -> TimerRestore:
 
 def _settle_message(value: object, place: str) -> SettleMessage:
     values = _mapping(value, place)
-    kind = _kind(values, place, frozenset({"not sent", "sent"}))
-    if kind == "sent":
+    kind = _kind(values, place, frozenset({"not sent", "sent", "queued"}))
+    if kind in {"sent", "queued"}:
         _ = _utc_time(_required(values, "at", place), f"{place}.at")
+    if kind == "queued":
+        _ = _string(_required(values, "reason", place), f"{place}.reason")
     return cast(SettleMessage, cast(object, values))
 
 

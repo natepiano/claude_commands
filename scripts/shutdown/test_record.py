@@ -291,6 +291,27 @@ class RecordTests(unittest.TestCase):
 
         self.assertEqual(record.parse_records(encoded), records)
 
+    def test_queued_settle_message_round_trips(self) -> None:
+        live = shutdown_record()
+        live["entries"][0]["settle_message"] = record.Queued(
+            kind="queued", at=NOW, reason="no live session"
+        )
+
+        self.assertEqual(record.parse_records(json.dumps([live])), [live])
+
+    def test_queued_settle_message_requires_a_reason(self) -> None:
+        live = shutdown_record()
+        malformed = cast(
+            dict[str, object], cast(object, live["entries"][0])
+        )
+        malformed["settle_message"] = {"kind": "queued", "at": NOW}
+
+        with self.assertRaisesRegex(
+            record.InvalidRecord,
+            r"records\[0\]\.entries\[0\]\.settle_message\.reason is missing",
+        ):
+            _ = record.parse_records(json.dumps([live]))
+
     def test_malformed_tag_names_its_field_path(self) -> None:
         malformed = cast(dict[str, object], cast(object, shutdown_record()))
         malformed["scope"] = {"kind": "some sessions"}

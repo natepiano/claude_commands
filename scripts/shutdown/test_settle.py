@@ -1,0 +1,1533 @@
+"""Behavioral tests for the account shutdown settle phase."""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import tempfile
+import time
+import unittest
+from collections.abc import Callable
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import TypedDict, cast, final, override
+from unittest.mock import patch
+
+import inventory
+import record
+import settle
+import shutdown
+import showrunner_footer
+import conversation_pause
+from account import Account
+
+
+LOGIN = "owner@example.com"
+LABEL = "claude 2"
+NOW = "2026-10-09T21:49:10+00:00"
+NOW_UTC = datetime(2026, 10, 9, 21, 49, 10, tzinfo=timezone.utc)
+
+
+class SentCall(TypedDict):
+    args: list[str]
+    text: str
+
+
+def checkout(*, ahead: int = 0, path: str = "/tmp/checkout") -> inventory.GitCheckout:
+    return inventory.GitCheckout(
+        kind="git",
+        path=path,
+        head=inventory.OnBranch(kind="branch", name="work"),
+        upstream=inventory.Tracking(kind="tracking", ahead=ahead),
+        dirty=[],
+    )
+
+
+def common_session(
+    session_id: str,
+    name: str,
+    *,
+    status: str = "idle",
+    ahead: int = 0,
+    timers: list[str] | None = None,
+    busy_seats: list[str] | None = None,
+) -> inventory.SessionFields:
+    return {
+        "session_id": session_id,
+        "pid": 10_000 + sum(ord(character) for character in session_id),
+        "proc_start": f"start-{session_id}",
+        "name": name,
+        "cwd": f"/tmp/{session_id}",
+        "status": status,
+        "model": inventory.NoReplyYet(kind="no reply yet"),
+        "checkout": checkout(ahead=ahead, path=f"/tmp/{session_id}"),
+        "run_dirs": [],
+        "codex_servers": (
+            [
+                inventory.CodexServer(
+                    run_dir=f"/tmp/run-{session_id}",
+                    pid=20_000,
+                    busy_seats=list(busy_seats or []),
+                )
+            ]
+            if busy_seats
+            else []
+        ),
+        "timers": list(timers or []),
+    }
+
+
+def top_level(
+    session_id: str,
+    name: str,
+    *,
+    status: str = "idle",
+    ahead: int = 0,
+    timers: list[str] | None = None,
+    busy_seats: list[str] | None = None,
+) -> inventory.TopLevelSession:
+    return inventory.TopLevelSession(
+        **common_session(
+            session_id,
+            name,
+            status=status,
+            ahead=ahead,
+            timers=timers,
+            busy_seats=busy_seats,
+        ),
+        kind="top-level",
+        host=inventory.UnknownHost(kind="unknown"),
+    )
+
+
+def unit(
+    session_id: str,
+    name: str,
+    *,
+    production: str = "demo",
+    status: str = "idle",
+    ahead: int = 0,
+) -> inventory.UnitSession:
+    return inventory.UnitSession(
+        **common_session(session_id, name, status=status, ahead=ahead),
+        kind="unit",
+        host=inventory.UnitHost(
+            kind="unit",
+            production=production,
+            unit=name,
+            doc=f"/tmp/{production}.md",
+            tmux_session=name,
+            plan=inventory.NoRunRecord(kind="no run record"),
+        ),
+    )
+
+
+def showrunner(
+    session_id: str,
+    name: str,
+    *,
+    production: str = "demo",
+) -> inventory.ShowrunnerSession:
+    return inventory.ShowrunnerSession(
+        **common_session(session_id, name),
+        kind="showrunner",
+        host=inventory.TmuxHost(kind="tmux", tmux_session=name),
+        production=production,
+        doc=f"/tmp/{production}.md",
+    )
+
+
+def seat(
+    session_id: str,
+    name: str,
+    *,
+    owner: str | None,
+    status: str = "idle",
+) -> inventory.SeatSession:
+    seat_owner: inventory.SeatOwner = (
+        inventory.DirectorOwner(kind="director", session_id=owner)
+        if owner is not None
+        else inventory.NoDirector(kind="no director")
+    )
+    return inventory.SeatSession(
+        **common_session(session_id, name, status=status),
+        kind="seat",
+        host=inventory.UnknownHost(kind="unknown"),
+        owner=seat_owner,
+    )
+
+
+def machine_inventory(
+    sessions: list[inventory.Session],
+    *,
+    machine: str = "natedev",
+    unattributed: list[inventory.UnattributedSession] | None = None,
+) -> inventory.Inventory:
+    return inventory.Inventory(
+        machine=machine,
+        login=LOGIN,
+        label=LABEL,
+        sessions=sessions,
+        unattributed=list(unattributed or []),
+    )
+
+
+def empty_shutdown_record(
+    machine: str,
+    scope: record.Scope,
+) -> record.Record:
+    return record.Record(
+        login=LOGIN,
+        label=LABEL,
+        machine=machine,
+        state="settling",
+        requested_at=NOW,
+        requested_by=record.FromTerminal(kind="terminal"),
+        scope=scope,
+        conductor=record.ConductorNotStarted(kind="not started"),
+        force="wait for ready",
+        entries=[],
+    )
+
+
+def empty_refresh_report(machine: str, scope: record.Scope) -> settle.RefreshReport:
+    return settle.RefreshReport(
+        record=empty_shutdown_record(machine, scope),
+        verdicts=[],
+    )
+
+
+@final
+class SettleTests(unittest.TestCase):
+    root: Path = Path()
+    state_root: Path = Path()
+    notifier_root: Path = Path()
+    pause_root: Path = Path()
+    send_log: Path = Path()
+    notifier_log: Path = Path()
+    notifier_stub: Path = Path()
+    send_stub: Path = Path()
+    ssh_stub: Path = Path()
+    account = Account("claude", LOGIN, LABEL)
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.state_root = self.root / "shutdown"
+        self.notifier_root = self.root / "notifier"
+        self.pause_root = self.root / "conversation-pause"
+        self.send_log = self.root / "send.jsonl"
+        self.notifier_log = self.root / "notifier.jsonl"
+        self.notifier_root.mkdir()
+        binary_root = self.root / "bin"
+        binary_root.mkdir()
+        self.notifier_stub = binary_root / "notifier"
+        _ = self.notifier_stub.write_text(
+            """#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+with Path(os.environ["SHUTDOWN_NOTIFIER_LOG"]).open("a") as output:
+    output.write(json.dumps(args) + "\\n")
+verb, instance = args
+state = Path(os.environ["NOTIFIER_STATE_DIR"]) / instance / "state"
+if state.exists() and verb in {"start", "stop"}:
+    enabled = "1" if verb == "start" else "0"
+    lines = state.read_text().splitlines()
+    state.write_text("\\n".join(
+        f"ENABLED={enabled}" if line.startswith("ENABLED=") else line
+        for line in lines
+    ) + "\\n")
+""",
+            encoding="utf-8",
+        )
+        self.notifier_stub.chmod(0o755)
+        self.send_stub = binary_root / "send"
+        _ = self.send_stub.write_text(
+            """#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+call = {"args": sys.argv[1:], "text": sys.stdin.read()}
+with Path(os.environ["SHUTDOWN_SEND_LOG"]).open("a") as output:
+    output.write(json.dumps(call) + "\\n")
+printed = os.environ.get("SHUTDOWN_SEND_OUTPUT", "")
+if printed:
+    print(printed)
+sys.exit(int(os.environ.get("SHUTDOWN_SEND_EXIT", "0")))
+""",
+            encoding="utf-8",
+        )
+        self.send_stub.chmod(0o755)
+        self.ssh_stub = binary_root / "ssh"
+        _ = self.ssh_stub.write_text(
+            """#!/usr/bin/env python3
+import os
+import sys
+
+mode = os.environ.get("FAKE_SSH_MODE", "unreachable")
+if mode == "unreachable":
+    sys.exit(255)
+if mode == "unavailable":
+    print("remote refused")
+    print("rc=7")
+    sys.exit(0)
+print(os.environ.get("FAKE_SSH_OUTPUT", ""))
+print("rc=0")
+""",
+            encoding="utf-8",
+        )
+        self.ssh_stub.chmod(0o755)
+        environment = {
+            **os.environ,
+            "HOME": str(self.root),
+            "PATH": f"{binary_root}{os.pathsep}{os.environ.get('PATH', '')}",
+            "SHUTDOWN_STATE_DIR": str(self.state_root),
+            "NOTIFIER_STATE_DIR": str(self.notifier_root),
+            "CONVERSATION_PAUSE_STATE_DIR": str(self.pause_root),
+            "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner"),
+            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "runs"),
+            "SHUTDOWN_DELEGATE_ROOT": str(self.root / "delegate"),
+            "AGENT_NOTES_DIR": str(self.root / "notes"),
+            "SHUTDOWN_NOTIFIER": str(self.notifier_stub),
+            "SHUTDOWN_NOTIFIER_LOG": str(self.notifier_log),
+            "SHUTDOWN_SEND": str(self.send_stub),
+            "SHUTDOWN_SEND_LOG": str(self.send_log),
+        }
+        environment_context: object = cast(
+            object,
+            self.enterContext(patch.dict(os.environ, environment, clear=True)),
+        )
+        del environment_context
+
+    def write_instance(
+        self,
+        name: str,
+        session_id: str,
+        *,
+        enabled: bool,
+    ) -> Path:
+        instance = self.notifier_root / name
+        instance.mkdir()
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:{session_id}\nEVERY=5\nCOMMAND=report\n",
+            encoding="utf-8",
+        )
+        _ = (instance / "state").write_text(
+            f"ENABLED={int(enabled)}\nNEXT_DUE=100\n",
+            encoding="utf-8",
+        )
+        return instance
+
+    def found_record(self) -> record.Record:
+        found = record.find_live(LOGIN)
+        self.assertEqual(found["kind"], "live")
+        if found["kind"] != "live":
+            self.fail("expected a live shutdown record")
+        return found["record"]
+
+    def logged_calls(self, path: Path) -> list[list[str]]:
+        if not path.exists():
+            return []
+        calls: list[list[str]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            value = cast(object, json.loads(line))
+            if not isinstance(value, list):
+                raise AssertionError("notifier log entry is not a list")
+            calls.append(cast(list[str], value))
+        return calls
+
+    def sent_calls(self) -> list[SentCall]:
+        if not self.send_log.exists():
+            return []
+        calls: list[SentCall] = []
+        for line in self.send_log.read_text(encoding="utf-8").splitlines():
+            value = cast(object, json.loads(line))
+            if not isinstance(value, dict):
+                raise AssertionError("send log entry is not an object")
+            fields = cast(dict[str, object], value)
+            args = fields.get("args")
+            text = fields.get("text")
+            if not isinstance(args, list) or not isinstance(text, str):
+                raise AssertionError("send log entry is invalid")
+            raw_args = cast(list[object], args)
+            if not all(isinstance(item, str) for item in raw_args):
+                raise AssertionError("send arguments are invalid")
+            calls.append(
+                SentCall(args=cast(list[str], cast(object, raw_args)), text=text)
+            )
+        return calls
+
+    def pause_record(
+        self,
+        session_id: str,
+        *,
+        instance: str | None = None,
+        footer: str | None = None,
+        kept_off: bool,
+    ) -> Path:
+        self.pause_root.mkdir(parents=True, exist_ok=True)
+        path = self.pause_root / f"{session_id}.json"
+        phase: dict[str, object] = (
+            {"kind": "kept_off"}
+            if kept_off
+            else {"kind": "replying", "user_wrote_at": 100}
+        )
+        _ = path.write_text(
+            json.dumps(
+                {
+                    "session_id": session_id,
+                    "instances": [instance] if instance is not None else [],
+                    "footers": [footer] if footer is not None else [],
+                    "phase": phase,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_begin_stops_only_enabled_timers_in_the_account_set(self) -> None:
+        selected = self.write_instance(
+            "selected-report", "selected", enabled=True
+        )
+        other_account = self.write_instance(
+            "other-account-report", "other-account", enabled=True
+        )
+        report = machine_inventory(
+            [top_level("selected", "Selected", timers=[selected.name])]
+        )
+
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            created = settle.begin(LOGIN)
+
+        self.assertEqual(created["state"], "settling")
+        self.assertTrue((selected / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue(
+            (other_account / "state").read_text().startswith("ENABLED=1\n")
+        )
+        self.assertEqual(
+            self.logged_calls(self.notifier_log),
+            [["stop", selected.name]],
+        )
+        self.assertEqual(
+            created["entries"][0]["timers"],
+            [
+                record.TimerRestore(
+                    instance=selected.name,
+                    was_enabled=True,
+                    footer=record.NoFooter(kind="no footer"),
+                )
+            ],
+        )
+
+    def test_cancel_keeps_a_released_kept_off_pause_off(self) -> None:
+        paused = self.write_instance("delegate-paused", "session", enabled=False)
+        pause_path = self.pause_record(
+            "session", instance=paused.name, kept_off=True
+        )
+        report = machine_inventory(
+            [top_level("session", "Paused", timers=[paused.name])]
+        )
+
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            created = settle.begin(LOGIN)
+            cancel_result = settle.cancel(self.account, here=True)
+
+        self.assertEqual(cancel_result, 0)
+        self.assertFalse(pause_path.exists())
+        self.assertEqual(created["entries"][0]["timers"][0]["was_enabled"], False)
+        self.assertTrue((paused / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertEqual(self.logged_calls(self.notifier_log), [])
+
+    def test_showrunner_message_waits_until_every_unit_is_ready(self) -> None:
+        runner = showrunner("runner", "Showrunner")
+        director = unit("unit", "Unit")
+        report = machine_inventory([runner, director])
+        remote = empty_refresh_report(
+            "Mac", record.AllAccountSessions(kind="all account sessions")
+        )
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.object(
+                settle,
+                "_remote_record",
+                return_value=settle.RemoteRefresh(kind="refresh", report=remote),
+            ),
+        ):
+            _ = settle.begin(LOGIN)
+            first_complete, _ = settle.conduct_cycle(LOGIN, {})
+
+            def mark_unit_ready(current: record.Record) -> None:
+                entry = next(
+                    item
+                    for item in current["entries"]
+                    if item["session"]["session_id"] == "unit"
+                )
+                entry["progress"] = record.Ready(kind="ready", at=NOW)
+
+            _ = record.update(LOGIN, mark_unit_ready)
+            second_complete, _ = settle.conduct_cycle(LOGIN, {})
+
+        self.assertFalse(first_complete)
+        self.assertFalse(second_complete)
+        recipients = [
+            call["args"][call["args"].index("--to") + 1]
+            for call in self.sent_calls()
+        ]
+        self.assertEqual(recipients, ["session:unit", "session:runner"])
+
+    def test_queued_settle_message_records_reason_and_status(self) -> None:
+        report = machine_inventory([top_level("session", "Work")])
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.dict(
+                os.environ,
+                {
+                    "SHUTDOWN_SEND_EXIT": "1",
+                    "SHUTDOWN_SEND_OUTPUT": "QUEUED: no live session",
+                },
+            ),
+        ):
+            _ = settle.begin(LOGIN)
+            refreshed = settle.refresh(LOGIN, ["session"])
+
+        entry = refreshed["record"]["entries"][0]
+        self.assertEqual(
+            entry["settle_message"],
+            record.Queued(
+                kind="queued", at=NOW, reason="no live session"
+            ),
+        )
+        self.assertIn(
+            "Work: waiting · message queued: no live session",
+            "\n".join(settle.status_record_lines(refreshed["record"])),
+        )
+
+    def test_queued_settle_message_retries_only_after_five_minutes(self) -> None:
+        report = machine_inventory([top_level("session", "Work")])
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            _ = settle.begin(LOGIN)
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.dict(
+                os.environ,
+                {
+                    "SHUTDOWN_SEND_EXIT": "1",
+                    "SHUTDOWN_SEND_OUTPUT": "QUEUED: no live session",
+                },
+            ),
+        ):
+            _ = settle.refresh(LOGIN, ["session"])
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(
+                settle,
+                "now_utc",
+                return_value=NOW_UTC + timedelta(seconds=299),
+            ),
+            patch.dict(
+                os.environ,
+                {"SHUTDOWN_SEND_EXIT": "0", "SHUTDOWN_SEND_OUTPUT": "SENT: Work"},
+            ),
+        ):
+            too_soon = settle.refresh(LOGIN, ["session"])
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(
+                settle,
+                "now_utc",
+                return_value=NOW_UTC + timedelta(seconds=300),
+            ),
+            patch.dict(
+                os.environ,
+                {"SHUTDOWN_SEND_EXIT": "0", "SHUTDOWN_SEND_OUTPUT": "SENT: Work"},
+            ),
+        ):
+            delivered = settle.refresh(LOGIN, ["session"])
+
+        self.assertEqual(
+            too_soon["record"]["entries"][0]["settle_message"]["kind"],
+            "queued",
+        )
+        self.assertEqual(
+            delivered["record"]["entries"][0]["settle_message"],
+            record.Sent(kind="sent", at="2026-10-09T21:54:10+00:00"),
+        )
+        self.assertEqual(len(self.sent_calls()), 2)
+
+    def test_conductor_reconsiders_a_queued_message_for_delivery(self) -> None:
+        report = machine_inventory([top_level("session", "Work")])
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            _ = settle.begin(LOGIN)
+
+        def mark_queued(current: record.Record) -> None:
+            current["entries"][0]["settle_message"] = record.Queued(
+                kind="queued", at=NOW, reason="no live session"
+            )
+
+        _ = record.update(LOGIN, mark_queued)
+        with (
+            patch.object(settle, "run_inventory", return_value=report) as inventories,
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            complete, _ = settle.conduct_cycle(LOGIN, {}, here=True)
+
+        self.assertFalse(complete)
+        self.assertEqual(inventories.call_count, 2)
+        self.assertEqual(self.sent_calls(), [])
+
+    def test_cancel_notifies_an_entry_with_a_queued_settle_message(self) -> None:
+        report = machine_inventory([top_level("session", "Work")])
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            _ = settle.begin(LOGIN)
+
+        def mark_queued(current: record.Record) -> None:
+            current["entries"][0]["settle_message"] = record.Queued(
+                kind="queued", at=NOW, reason="no live session"
+            )
+
+        _ = record.update(LOGIN, mark_queued)
+        result = settle.cancel(self.account, here=True)
+
+        self.assertEqual(result, 0)
+        calls = self.sent_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("cancelled by the user", calls[0]["text"])
+
+    def test_ready_rechecks_an_ahead_checkout_and_accepts_after_push(self) -> None:
+        ahead = machine_inventory([top_level("session", "Work", ahead=2)])
+        pushed = machine_inventory([top_level("session", "Work", ahead=0)])
+        errors = io.StringIO()
+        output = io.StringIO()
+        with (
+            patch.object(
+                settle,
+                "run_inventory",
+                side_effect=[ahead, ahead, pushed],
+            ),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "session"}),
+        ):
+            _ = settle.begin(LOGIN)
+            with redirect_stderr(errors):
+                refused = settle.ready("phase 5: push next")
+            with redirect_stdout(output):
+                accepted = settle.ready("phase 5: push next")
+
+        self.assertEqual(refused, 2)
+        self.assertEqual(accepted, 0)
+        self.assertEqual(errors.getvalue(), "push work first\n")
+        self.assertIn("ready for shutdown", output.getvalue())
+        current = self.found_record()
+        self.assertEqual(current["entries"][0]["progress"]["kind"], "ready")
+        self.assertEqual(
+            current["entries"][0]["where"],
+            record.Said(kind="said", text="phase 5: push next", at=NOW),
+        )
+
+    def test_showrunner_with_merge_in_progress_does_not_count_ready(self) -> None:
+        runner = showrunner("runner", "Showrunner")
+        report = machine_inventory([runner])
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            _ = settle.begin(LOGIN)
+
+        def mark_ready(current: record.Record) -> None:
+            current["entries"][0]["progress"] = record.Ready(
+                kind="ready", at=NOW
+            )
+
+        current = record.update(LOGIN, mark_ready)
+        remote = empty_refresh_report(
+            "Mac", record.AllAccountSessions(kind="all account sessions")
+        )
+        with (
+            patch.object(settle, "merge_in_progress", return_value=True),
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(
+                settle,
+                "_remote_record",
+                return_value=settle.RemoteRefresh(kind="refresh", report=remote),
+            ),
+        ):
+            counts_ready, _ = settle.conduct_cycle(LOGIN, {})
+
+        self.assertFalse(counts_ready)
+        self.assertEqual(current["entries"][0]["progress"]["kind"], "ready")
+
+    def test_remote_verdict_keeps_its_merge_and_form_holdout_without_local_tmux(
+        self,
+    ) -> None:
+        runner = showrunner("remote-runner", "Remote Showrunner")
+        remote_record = empty_shutdown_record(
+            "Mac", record.AllAccountSessions(kind="all account sessions")
+        )
+        remote_record["requested_by"] = record.FromSession(
+            kind="session", session_id="remote-runner"
+        )
+        remote_record["entries"] = [
+            record.Entry(
+                session=runner,
+                timers=[],
+                settle_message=record.NotSent(kind="not sent"),
+                where=record.NotSaid(kind="not said"),
+                progress=record.Ready(kind="ready", at=NOW),
+            )
+        ]
+        line = "Mac showrunner Remote Showrunner: idle, showing a form, merge in progress"
+        remote_report = settle.RefreshReport(
+            record=remote_record,
+            verdicts=[
+                settle.EntryVerdict(
+                    session_id="remote-runner",
+                    verdict=settle.Holdout(kind="holdout", line=line),
+                )
+            ],
+        )
+        tmux_log = self.root / "tmux-called"
+        tmux = self.root / "tmux"
+        _ = tmux.write_text(
+            f"#!/bin/sh\ntouch {tmux_log}\nprintf 'form\\n'\n",
+            encoding="utf-8",
+        )
+        tmux.chmod(0o755)
+        local = machine_inventory([])
+        with (
+            patch.object(settle, "run_inventory", return_value=local),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.object(
+                settle,
+                "_remote_record",
+                return_value=settle.RemoteRefresh(
+                    kind="refresh", report=remote_report
+                ),
+            ),
+            patch.dict(os.environ, {"SHUTDOWN_TMUX": str(tmux)}),
+        ):
+            _ = settle.begin(LOGIN)
+            complete, reports = settle.conduct_cycle(LOGIN, {})
+
+        self.assertFalse(complete)
+        self.assertEqual(
+            [
+                result["verdict"]["line"]
+                for report in reports
+                for result in report["verdicts"]
+                if result["verdict"]["kind"] == "holdout"
+            ],
+            [line],
+        )
+        self.assertFalse(tmux_log.exists())
+
+    def test_busy_seat_holds_then_becomes_passive_without_a_message(self) -> None:
+        owner = top_level("owner", "Owner")
+        busy = seat("seat", "Seat", owner="owner", status="busy")
+        idle = seat("seat", "Seat", owner="owner", status="idle")
+        busy_report = machine_inventory([owner, busy])
+        idle_report = machine_inventory([owner, idle])
+        with (
+            patch.object(
+                settle,
+                "run_inventory",
+                side_effect=[busy_report, busy_report, idle_report],
+            ),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            _ = settle.begin(LOGIN)
+
+            def mark_owner_ready(current: record.Record) -> None:
+                current["entries"][0]["progress"] = record.Ready(
+                    kind="ready", at=NOW
+                )
+
+            _ = record.update(LOGIN, mark_owner_ready)
+            held = settle.refresh(LOGIN)
+            ready = settle.refresh(LOGIN, ["owner", "seat"])
+
+        held_seat = next(
+            entry
+            for entry in held["record"]["entries"]
+            if entry["session"]["session_id"] == "seat"
+        )
+        ready_seat = next(
+            entry
+            for entry in ready["record"]["entries"]
+            if entry["session"]["session_id"] == "seat"
+        )
+        self.assertEqual(held_seat["progress"]["kind"], "waiting")
+        self.assertEqual(ready_seat["progress"]["kind"], "passive seat ready")
+        recipients = [
+            call["args"][call["args"].index("--to") + 1]
+            for call in self.sent_calls()
+        ]
+        self.assertEqual(recipients, ["session:owner"])
+
+    def test_unattributed_session_is_status_only(self) -> None:
+        timer = self.write_instance("unknown-report", "unknown", enabled=True)
+        report = machine_inventory(
+            [],
+            unattributed=[
+                inventory.UnattributedSession(
+                    pid=999,
+                    name="Unknown",
+                    reason="account unreadable",
+                )
+            ],
+        )
+        errors = io.StringIO()
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "unknown"}),
+        ):
+            created = settle.begin(LOGIN)
+            with redirect_stderr(errors):
+                ready_result = settle.ready("not attributable")
+
+        self.assertEqual(created["entries"], [])
+        self.assertEqual(ready_result, 1)
+        self.assertIn("no shutdown in progress", errors.getvalue())
+        self.assertTrue((timer / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertEqual(self.logged_calls(self.notifier_log), [])
+        self.assertEqual(self.sent_calls(), [])
+
+    def test_ready_refuses_a_session_missing_from_the_fresh_inventory(self) -> None:
+        original = top_level("session", "Work")
+        errors = io.StringIO()
+        with (
+            patch.object(
+                settle,
+                "run_inventory",
+                side_effect=[machine_inventory([original]), machine_inventory([])],
+            ),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "session"}),
+        ):
+            _ = settle.begin(LOGIN)
+            with redirect_stderr(errors):
+                result = settle.ready("done")
+
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            errors.getvalue(),
+            "this session is not in a fresh inventory of claude 2: not found\n",
+        )
+        self.assertEqual(
+            self.found_record()["entries"][0]["progress"]["kind"], "waiting"
+        )
+
+    def test_ready_refuses_an_unattributed_copy_of_the_session(self) -> None:
+        original = top_level("session", "Work")
+        unknown = machine_inventory(
+            [],
+            unattributed=[
+                inventory.UnattributedSession(
+                    pid=original["pid"],
+                    name="Work",
+                    reason="process start mismatch",
+                )
+            ],
+        )
+        errors = io.StringIO()
+        with (
+            patch.object(
+                settle,
+                "run_inventory",
+                side_effect=[machine_inventory([original]), unknown],
+            ),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "session"}),
+        ):
+            _ = settle.begin(LOGIN)
+            with redirect_stderr(errors):
+                result = settle.ready("done")
+
+        self.assertEqual(result, 2)
+        self.assertIn("process start mismatch", errors.getvalue())
+        self.assertEqual(
+            self.found_record()["entries"][0]["progress"]["kind"], "waiting"
+        )
+
+    def test_refresh_keeps_an_unattributed_entry_as_a_reasoned_holdout(self) -> None:
+        original = top_level("session", "Work")
+        unknown = machine_inventory(
+            [],
+            unattributed=[
+                inventory.UnattributedSession(
+                    pid=original["pid"],
+                    name="Work",
+                    reason="account unreadable",
+                )
+            ],
+        )
+        with (
+            patch.object(
+                settle,
+                "run_inventory",
+                side_effect=[machine_inventory([original]), unknown],
+            ),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            _ = settle.begin(LOGIN)
+            refreshed = settle.refresh(LOGIN, ["session"])
+
+        entry = refreshed["record"]["entries"][0]
+        self.assertEqual(entry["progress"]["kind"], "waiting")
+        self.assertEqual(entry["settle_message"]["kind"], "not sent")
+        self.assertEqual(
+            refreshed["verdicts"][0]["verdict"],
+            settle.Holdout(
+                kind="holdout",
+                line="natedev top-level Work: account unreadable",
+            ),
+        )
+
+    def test_refresh_marks_a_gone_entry_settled_and_conduct_completes(self) -> None:
+        original = top_level("session", "Work")
+        gone = machine_inventory([])
+        with (
+            patch.object(
+                settle,
+                "run_inventory",
+                side_effect=[machine_inventory([original]), gone, gone],
+            ),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            _ = settle.begin(LOGIN)
+            refreshed = settle.refresh(LOGIN)
+            complete, _ = settle.conduct_cycle(LOGIN, {}, here=True)
+
+        self.assertEqual(
+            refreshed["record"]["entries"][0]["progress"]["kind"],
+            "already gone",
+        )
+        self.assertEqual(
+            refreshed["verdicts"][0]["verdict"]["kind"], "counts ready"
+        )
+        self.assertTrue(complete)
+
+    def test_refresh_returns_a_reappearing_entry_to_waiting(self) -> None:
+        original = top_level("session", "Work")
+        present = machine_inventory([original])
+        with (
+            patch.object(
+                settle,
+                "run_inventory",
+                side_effect=[present, machine_inventory([]), present],
+            ),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            _ = settle.begin(LOGIN)
+            _ = settle.refresh(LOGIN)
+            returned = settle.refresh(LOGIN)
+
+        self.assertEqual(
+            returned["record"]["entries"][0]["progress"]["kind"], "waiting"
+        )
+
+    def test_seat_cannot_mark_itself_ready(self) -> None:
+        worker = seat("seat", "Seat", owner=None)
+        errors = io.StringIO()
+        with (
+            patch.object(settle, "run_inventory", return_value=machine_inventory([worker])),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "seat"}),
+        ):
+            _ = settle.begin(LOGIN)
+            with redirect_stderr(errors):
+                result = settle.ready("done")
+
+        self.assertEqual(result, 2)
+        self.assertIn("a seat is ready on its own", errors.getvalue())
+        self.assertEqual(
+            self.found_record()["entries"][0]["progress"]["kind"], "waiting"
+        )
+
+    def test_ordinary_ready_progress_never_settles_a_seat(self) -> None:
+        worker = seat("seat", "Seat", owner=None, status="busy")
+        report = machine_inventory([worker])
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            _ = settle.begin(LOGIN)
+
+            def mark_ordinary_ready(current: record.Record) -> None:
+                current["entries"][0]["progress"] = record.Ready(
+                    kind="ready", at=NOW
+                )
+
+            _ = record.update(LOGIN, mark_ordinary_ready)
+            refreshed = settle.refresh(LOGIN)
+
+        self.assertEqual(refreshed["verdicts"][0]["verdict"]["kind"], "holdout")
+
+    def test_begin_with_no_sessions_still_creates_settling_record(self) -> None:
+        report = machine_inventory([])
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            created = settle.begin(LOGIN)
+
+        self.assertEqual(created["state"], "settling")
+        self.assertEqual(created["entries"], [])
+        self.assertEqual(self.found_record(), created)
+
+    def test_begin_releases_a_pause_through_the_python_api(self) -> None:
+        report = machine_inventory([top_level("session", "Work")])
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.object(
+                conversation_pause,
+                "release",
+                return_value=conversation_pause.NoPauseRecord.ABSENT,
+            ) as release,
+        ):
+            _ = settle.begin(LOGIN)
+
+        release.assert_called_once_with("session")
+
+    def test_footer_only_pause_restores_footer_without_enabling_disabled_timer(
+        self,
+    ) -> None:
+        timer = self.write_instance("showrunner-demo", "session", enabled=False)
+        pause_path = self.pause_record(
+            "session", footer="demo", kept_off=False
+        )
+        showrunner_footer.set_footer_state("demo", showrunner_footer.FooterState.OFF)
+        report = machine_inventory([top_level("session", "Work")])
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            created = settle.begin(LOGIN)
+            result = settle.cancel(self.account, here=True)
+
+        restore = created["entries"][0]["timers"][0]
+        self.assertEqual(restore["instance"], timer.name)
+        self.assertFalse(restore["was_enabled"])
+        self.assertEqual(restore["footer"]["kind"], "footer")
+        self.assertEqual(result, 0)
+        self.assertFalse(pause_path.exists())
+        self.assertFalse((timer / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertIs(
+            showrunner_footer.footer_state("demo"), showrunner_footer.FooterState.ON
+        )
+
+    def test_kept_off_footer_only_pause_stays_off_after_cancel(self) -> None:
+        timer = self.write_instance("showrunner-demo", "session", enabled=False)
+        _ = self.pause_record("session", footer="demo", kept_off=True)
+        showrunner_footer.set_footer_state("demo", showrunner_footer.FooterState.OFF)
+        report = machine_inventory([top_level("session", "Work")])
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            created = settle.begin(LOGIN)
+            _ = settle.cancel(self.account, here=True)
+
+        restore = created["entries"][0]["timers"][0]
+        self.assertEqual(restore["instance"], timer.name)
+        self.assertEqual(restore["footer"]["kind"], "no footer")
+        self.assertIs(
+            showrunner_footer.footer_state("demo"), showrunner_footer.FooterState.OFF
+        )
+
+    def test_begin_records_all_timer_states_before_a_stop_failure_and_rolls_back(
+        self,
+    ) -> None:
+        first = self.write_instance("first", "session", enabled=True)
+        second = self.write_instance("second", "session", enabled=True)
+        report = machine_inventory(
+            [top_level("session", "Work", timers=[first.name, second.name])]
+        )
+        real_run_notifier = settle.run_notifier
+        stops = 0
+
+        def fail_second_stop(verb: str, instance: str) -> None:
+            nonlocal stops
+            if verb == "stop":
+                stops += 1
+                if stops == 2:
+                    raise RuntimeError("stop failed")
+            real_run_notifier(verb, instance)
+
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.object(settle, "run_notifier", side_effect=fail_second_stop),
+            self.assertRaisesRegex(RuntimeError, "stop failed"),
+        ):
+            _ = settle.begin(LOGIN)
+
+        self.assertTrue((first / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertTrue((second / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertEqual(
+            record.find_live(LOGIN), record.NoShutdown(kind="no shutdown")
+        )
+
+    def test_refresh_commits_timer_stops_before_cancel_can_restore_them(self) -> None:
+        original = top_level("session", "Work")
+        timer = self.write_instance("new-report", "new", enabled=True)
+        newcomer = top_level("new", "New", timers=[timer.name])
+        with (
+            patch.object(
+                settle,
+                "run_inventory",
+                return_value=machine_inventory([original]),
+            ),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            _ = settle.begin(LOGIN)
+
+        real_update = record.update
+        cancelled = False
+
+        def update_then_cancel(
+            login: str, change: Callable[[record.Record], None]
+        ) -> record.Record:
+            nonlocal cancelled
+            current = real_update(login, change)
+            if not cancelled:
+                cancelled = True
+                _ = settle.cancel(self.account, here=True)
+            return current
+
+        with (
+            patch.object(
+                settle,
+                "run_inventory",
+                return_value=machine_inventory([original, newcomer]),
+            ),
+            patch.object(settle, "update", side_effect=update_then_cancel),
+        ):
+            _ = settle.refresh(LOGIN)
+
+        self.assertTrue((timer / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertEqual(
+            record.find_live(LOGIN), record.NoShutdown(kind="no shutdown")
+        )
+
+    def test_refresh_persists_every_timer_before_raising_a_stop_failure(self) -> None:
+        original = top_level("session", "Work")
+        first = self.write_instance("first-new", "new", enabled=True)
+        second = self.write_instance("second-new", "new", enabled=True)
+        newcomer = top_level(
+            "new", "New", timers=[first.name, second.name]
+        )
+        with (
+            patch.object(
+                settle,
+                "run_inventory",
+                return_value=machine_inventory([original]),
+            ),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            _ = settle.begin(LOGIN)
+
+        real_run_notifier = settle.run_notifier
+        stops = 0
+
+        def fail_second_stop(verb: str, instance: str) -> None:
+            nonlocal stops
+            if verb == "stop":
+                stops += 1
+                if stops == 2:
+                    raise RuntimeError("stop failed")
+            real_run_notifier(verb, instance)
+
+        with (
+            patch.object(
+                settle,
+                "run_inventory",
+                return_value=machine_inventory([original, newcomer]),
+            ),
+            patch.object(settle, "run_notifier", side_effect=fail_second_stop),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop failed"):
+                _ = settle.refresh(LOGIN)
+            new_entry = next(
+                entry
+                for entry in self.found_record()["entries"]
+                if entry["session"]["session_id"] == "new"
+            )
+            self.assertEqual(
+                [timer["instance"] for timer in new_entry["timers"]],
+                [first.name, second.name],
+            )
+            self.assertTrue(
+                (first / "state").read_text().startswith("ENABLED=0\n")
+            )
+            _ = settle.cancel(self.account, here=True)
+
+        self.assertTrue((first / "state").read_text().startswith("ENABLED=1\n"))
+
+    def test_cancel_stops_conductor_before_reading_the_restoration_snapshot(
+        self,
+    ) -> None:
+        report = machine_inventory([top_level("session", "Work")])
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            _ = settle.begin(LOGIN)
+        order: list[str] = []
+        real_update = record.update
+
+        def ordered_update(
+            login: str, change: Callable[[record.Record], None]
+        ) -> record.Record:
+            order.append("snapshot")
+            return real_update(login, change)
+
+        def stopped(_conductor: record.Conductor) -> None:
+            order.append("stop")
+
+        def restored(_record: record.Record) -> None:
+            order.append("restore")
+
+        with (
+            patch.object(
+                settle, "_stop_conductor", side_effect=stopped
+            ),
+            patch.object(settle, "update", side_effect=ordered_update),
+            patch.object(
+                settle, "_restore_record", side_effect=restored
+            ),
+        ):
+            _ = settle.cancel(self.account, here=True)
+
+        self.assertEqual(order, ["stop", "snapshot", "restore"])
+
+    def test_refresh_after_cancel_flip_refuses_without_stopping_a_timer(self) -> None:
+        original = top_level("session", "Work")
+        newcomer = top_level("new", "New", timers=["new-timer"])
+        with (
+            patch.object(settle, "run_inventory", return_value=machine_inventory([original])),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            _ = settle.begin(LOGIN)
+
+        def flip(current: record.Record) -> None:
+            current["state"] = "cancelled"
+
+        _ = record.update(LOGIN, flip)
+        with (
+            patch.object(settle, "run_inventory", return_value=machine_inventory([newcomer])),
+            patch.object(settle, "run_notifier") as notifier,
+            self.assertRaises(record.NoLiveRecord),
+        ):
+            _ = settle.refresh(LOGIN)
+
+        notifier.assert_not_called()
+
+    def test_conduct_cycle_ends_cleanly_when_local_record_is_cancelled(self) -> None:
+        report = machine_inventory([top_level("session", "Work")])
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            _ = settle.begin(LOGIN)
+
+        def flip(current: record.Record) -> None:
+            current["state"] = "cancelled"
+
+        _ = record.update(LOGIN, flip)
+        complete, reports = settle.conduct_cycle(LOGIN, {}, here=True)
+
+        self.assertTrue(complete)
+        self.assertEqual(reports, [])
+
+    def test_selected_scope_excludes_new_unselected_sessions_on_refresh(self) -> None:
+        selected = top_level("selected", "Selected")
+        unselected = top_level("unselected", "Unselected")
+        seen_scopes: list[record.Scope] = []
+
+        def scoped_inventory(login: str, scope: record.Scope) -> inventory.Inventory:
+            self.assertEqual(login, LOGIN)
+            seen_scopes.append(scope)
+            wanted: frozenset[str] = (
+                frozenset(scope["session_ids"])
+                if scope["kind"] == "selected"
+                else frozenset[str]()
+            )
+            sessions: list[inventory.Session] = [selected, unselected]
+            if wanted:
+                sessions = [
+                    session
+                    for session in sessions
+                    if session["session_id"] in wanted
+                ]
+            return machine_inventory(sessions)
+
+        with (
+            patch.object(settle, "run_inventory", side_effect=scoped_inventory),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            result = shutdown.main(["begin", LOGIN, "--only", "selected"])
+            created = self.found_record()
+            refreshed = settle.refresh(LOGIN)
+
+        self.assertEqual(result, 0)
+        expected_scope = record.SelectedSessions(
+            kind="selected", session_ids=["selected"]
+        )
+        self.assertEqual(created["scope"], expected_scope)
+        self.assertEqual(seen_scopes, [expected_scope, expected_scope])
+        self.assertEqual(
+            [
+                entry["session"]["session_id"]
+                for entry in refreshed["record"]["entries"]
+            ],
+            ["selected"],
+        )
+
+    def test_down_refuses_unreachable_or_unavailable_peer_without_changes(
+        self,
+    ) -> None:
+        local = machine_inventory([])
+        for mode, expected in (
+            ("unreachable", "Mac is unreachable"),
+            ("unavailable", "Mac is unavailable (rc 7)"),
+        ):
+            with self.subTest(mode=mode):
+                errors = io.StringIO()
+                with (
+                    patch.object(settle, "_warm", return_value=True),
+                    patch.object(settle, "run_inventory", return_value=local),
+                    patch.object(settle, "other_machine", return_value="Mac"),
+                    patch.dict(os.environ, {"FAKE_SSH_MODE": mode}),
+                    redirect_stderr(errors),
+                ):
+                    result = settle.down(self.account)
+
+                self.assertEqual(result, 1)
+                self.assertIn(expected, errors.getvalue())
+                self.assertIn("nothing was shut down", errors.getvalue())
+                self.assertEqual(
+                    record.find_live(LOGIN), record.NoShutdown(kind="no shutdown")
+                )
+                self.assertEqual(self.logged_calls(self.notifier_log), [])
+
+    def test_down_names_the_account_on_its_first_output_line(self) -> None:
+        output = io.StringIO()
+        report = machine_inventory([])
+        with (
+            patch.object(settle, "_warm", return_value=True),
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "_launch_conductor"),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            redirect_stdout(output),
+        ):
+            result = settle.down(self.account, here=True)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            output.getvalue().splitlines()[0],
+            "Account: claude 2 (owner@example.com)",
+        )
+
+    def test_failed_conductor_launch_cancels_local_and_remote_records(self) -> None:
+        local = machine_inventory([], machine="natedev")
+        remote = machine_inventory([], machine="Mac")
+        remote_commands: list[list[str]] = []
+
+        def remote_command(arguments: list[str]) -> tuple[int, str]:
+            remote_commands.append(arguments)
+            return 0, ""
+
+        with (
+            patch.object(settle, "_warm", return_value=True),
+            patch.object(
+                settle,
+                "_preflight_inventories",
+                return_value=settle.PreflightReady(
+                    kind="ready", reports=[local, remote]
+                ),
+            ),
+            patch.object(
+                settle,
+                "_live_on_other",
+                return_value=settle.NoRemoteRecord(kind="no shutdown"),
+            ),
+            patch.object(settle, "run_inventory", return_value=local),
+            patch.object(settle, "run_remote", side_effect=remote_command),
+            patch.object(
+                settle,
+                "_launch_conductor",
+                side_effect=RuntimeError("launch failed"),
+            ),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            result = settle.down(self.account)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(
+            record.find_live(LOGIN), record.NoShutdown(kind="no shutdown")
+        )
+        self.assertIn(["cancel", LOGIN, "--here"], remote_commands)
+
+    def test_unreached_machine_keeps_conduct_settling_and_is_alerted(self) -> None:
+        report = machine_inventory([top_level("session", "Work")])
+        unreached: dict[str, datetime] = {}
+        failure = settle.RemoteUnreachable(kind="unreachable", machine="Mac")
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.object(settle, "_remote_record", return_value=failure),
+            patch.object(settle, "merge_in_progress", return_value=False),
+        ):
+            _ = settle.begin(LOGIN)
+            complete, records = settle.conduct_cycle(LOGIN, unreached)
+
+        self.assertFalse(complete)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(self.found_record()["state"], "settling")
+        self.assertEqual(unreached, {"Mac": NOW_UTC})
+
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(
+                settle,
+                "now_utc",
+                return_value=NOW_UTC + timedelta(minutes=20),
+            ),
+            patch.object(settle, "_remote_record", return_value=failure),
+            patch.object(settle, "merge_in_progress", return_value=False),
+            patch.object(time, "sleep", side_effect=StopIteration),
+            self.assertRaises(StopIteration),
+        ):
+            _ = settle.conduct(LOGIN)
+
+        alert = self.sent_calls()[-1]
+        self.assertIn("Mac: not reached since", alert["text"])
+        self.assertIn("/shutdown now", alert["text"])
+        self.assertIn("/shutdown cancel", alert["text"])
+
+    def test_conduct_sends_first_holdout_alert_at_twenty_minutes(self) -> None:
+        report = machine_inventory([top_level("session", "Work")])
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            live = settle.begin(LOGIN)
+        twenty_minutes_later = NOW_UTC + timedelta(minutes=20)
+
+        with (
+            patch.object(
+                settle,
+                "conduct_cycle",
+                return_value=(
+                    False,
+                    [
+                        settle.RefreshReport(
+                            record=live,
+                            verdicts=[
+                                settle.EntryVerdict(
+                                    session_id="session",
+                                    verdict=settle.Holdout(
+                                        kind="holdout",
+                                        line="natedev top-level Work: idle",
+                                    ),
+                                )
+                            ],
+                        )
+                    ],
+                ),
+            ),
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=twenty_minutes_later),
+            patch.object(settle, "merge_in_progress", return_value=False),
+            patch.object(time, "sleep", side_effect=StopIteration),
+            self.assertRaises(StopIteration),
+        ):
+            _ = settle.conduct(LOGIN)
+
+        alert = self.sent_calls()[-1]
+        self.assertIn("Shutdown of claude 2: 1 not ready", alert["args"])
+        self.assertIn("natedev top-level Work: idle", alert["text"])
+
+    def test_cancel_restores_only_recorded_enabled_states_and_names_peer(
+        self,
+    ) -> None:
+        enabled = self.write_instance("enabled", "session", enabled=True)
+        disabled = self.write_instance("disabled", "session", enabled=False)
+        report = machine_inventory(
+            [
+                top_level(
+                    "session",
+                    "Work",
+                    timers=[enabled.name, disabled.name],
+                )
+            ]
+        )
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            _ = settle.begin(LOGIN)
+
+        def message_was_sent(current: record.Record) -> None:
+            current["entries"][0]["settle_message"] = record.Sent(
+                kind="sent", at=NOW
+            )
+
+        _ = record.update(LOGIN, message_was_sent)
+        errors = io.StringIO()
+        with (
+            patch.object(settle, "run_remote", return_value=(255, "")),
+            patch.object(settle, "other_machine", return_value="Mac"),
+            redirect_stderr(errors),
+        ):
+            result = settle.cancel(self.account)
+
+        self.assertEqual(result, 1)
+        self.assertIn(
+            "Mac not reached: run /shutdown cancel there when it is back",
+            errors.getvalue(),
+        )
+        self.assertTrue((enabled / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertTrue((disabled / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertEqual(
+            self.logged_calls(self.notifier_log),
+            [["stop", enabled.name], ["start", enabled.name]],
+        )
+        self.assertEqual(
+            record.find_live(LOGIN), record.NoShutdown(kind="no shutdown")
+        )
+        sent = self.sent_calls()
+        self.assertEqual(len(sent), 1)
+        self.assertIn("cancelled by the user", sent[0]["text"])
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

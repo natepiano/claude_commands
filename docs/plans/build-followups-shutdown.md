@@ -159,7 +159,7 @@ Context (showrunner): a proposed, not yet approved, plan for sessions on differe
 
 **Ruled out:** `records` printing a `none` line when empty, and separating `--json` records from machine reports: an internal verb, and no consumer needs either.
 
-### Phase 5 — Shutdown begins: timers stop and every session settles  · status: todo
+### Phase 5 — Shutdown begins: timers stop and every session settles  · status: done
 
 #### Work Order
 
@@ -234,6 +234,7 @@ Settle — `scripts/shutdown/settle.py`, with the `shutdown.py` verbs:
 - `scripts/shutdown/inventory.py`: `_terminal_kind` (363-381) becomes public `terminal_kind`, for the re-walk.
 - `scripts/delegate/remove_seats.py` `live_runs` (103-117): a run folder named by `active/<id>` also counts as live when `<id>` is the session id of an entry in any `SHUTDOWN_STATE_DIR/*/record.json` whose state is `settling`, `stopping`, `down`, `stop partial`, `restarting` or `restart partial`, so another run's start never removes a shut-down unit's seats.
 - `commands/shutdown.md` — documents `/shutdown now` and what `down` means for each kind.
+- From Phase 5's live check: `settle._stop_conductor` captures the output of `systemctl --user stop` / `launchctl remove`, so `/shutdown cancel` after the conductor has already exited prints no `Failed to stop … not loaded` line. Test: `cancel` with a conductor unit that is already gone prints only cancel's own lines.
 
 **Files:**
 - `scripts/shutdown/stop.py` — new.

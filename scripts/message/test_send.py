@@ -174,6 +174,40 @@ class SendTests(unittest.TestCase):
         self.assertEqual(stopped.exception.code, 2)
         self.assertIn("anyone there", send.pending("bogus"))
 
+    def test_live_session_id_relays_to_its_socket_and_logs_the_requested_address(self) -> None:
+        self.session("id-1", "recipient")
+
+        result = send.send(send.parse([
+            "--to", "session:id-1", "--from", "test", "--text", "hello by id",
+        ]))
+
+        self.assertEqual(result, send.Result("sent", "ok"))
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual(self.relayed[0].to, f"uds:{self.root / 'id-1.sock'}")
+        self.assertEqual(self.relayed[0].text, "hello by id")
+        self.assertEqual(self.log()[0]["to"], "session:id-1")
+
+    def test_session_id_without_a_live_session_queues_without_relaying(self) -> None:
+        result = send.send(send.parse([
+            "--to", "session:gone", "--from", "test", "--text", "wait for me",
+        ]))
+
+        self.assertEqual(result.outcome, "queued")
+        self.assertIn("no live session answers to session:gone", result.detail)
+        self.assertEqual(self.relayed, [])
+        self.assertIn("wait for me", send.pending("session:gone"))
+
+    def test_session_name_still_relays_with_its_name(self) -> None:
+        self.session("id-1", "recipient")
+
+        result = send.send(send.parse([
+            "--to", "recipient", "--from", "test", "--text", "hello by name",
+        ]))
+
+        self.assertEqual(result, send.Result("sent", "ok"))
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual(self.relayed[0].to, "recipient")
+
     def test_codex_failure_is_failed_not_queued(self) -> None:
         with mock.patch.object(send, "run", return_value=(1, "", "codex_mesh: no delegate named 'bogus'")):
             result = self.send("--codex", "--session-dir", str(self.root), "--text", "hi")
