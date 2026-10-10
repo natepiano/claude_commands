@@ -210,6 +210,17 @@ class SessionRestarted(TypedDict):
     at: str
 
 
+class PendingTimer(TypedDict):
+    instance: str
+    reason: str
+
+
+class SessionLiveTimersPending(TypedDict):
+    kind: Literal["timers pending"]
+    at: str
+    timers: list[PendingTimer]
+
+
 class SeatAvailableOnDemand(TypedDict):
     kind: Literal["seat available on demand"]
     at: str
@@ -235,6 +246,7 @@ SessionProgress = (
     | ProcessIdentityLost
     | SessionStopFailed
     | SessionRestarted
+    | SessionLiveTimersPending
     | SeatAvailableOnDemand
     | SessionRestartFailed
     | SessionNeedsManualRestart
@@ -324,6 +336,7 @@ _PROGRESS_WITH_TIME = frozenset(
         "process identity lost",
         "stop failed",
         "restarted",
+        "timers pending",
         "seat available on demand",
         "restart failed",
     }
@@ -514,9 +527,24 @@ def _progress(value: object, place: str) -> SessionProgress:
         _ = _utc_time(_required(values, "at", place), f"{place}.at")
     if kind in {"stop failed", "restart failed"}:
         _ = _string(_required(values, "reason", place), f"{place}.reason")
+    elif kind == "timers pending":
+        timer_values = _items(
+            _required(values, "timers", place), f"{place}.timers"
+        )
+        values["timers"] = [
+            _pending_timer(timer, f"{place}.timers[{index}]")
+            for index, timer in enumerate(timer_values)
+        ]
     elif kind == "manual restart":
         _ = _string(_required(values, "command", place), f"{place}.command")
     return cast(SessionProgress, cast(object, values))
+
+
+def _pending_timer(value: object, place: str) -> PendingTimer:
+    values = _mapping(value, place)
+    _ = _string(_required(values, "instance", place), f"{place}.instance")
+    _ = _string(_required(values, "reason", place), f"{place}.reason")
+    return cast(PendingTimer, cast(object, values))
 
 
 def _stop_issue_fields(

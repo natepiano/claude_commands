@@ -349,9 +349,11 @@ class RestartTests(unittest.TestCase):
                 )
                 self.assertNotIn("finished the work.. First run", note)
 
-    def test_restart_notes_are_scheduled_before_tmux_window_and_unit_launches(self) -> None:
+    def test_restart_prompts_are_scheduled_before_showrunner_and_window_launches(
+        self,
+    ) -> None:
         restored_entries = [
-            entry(unit("scheduled-unit")),
+            entry(showrunner("scheduled-showrunner")),
             entry(
                 top_level(
                     "scheduled-window",
@@ -375,11 +377,13 @@ class RestartTests(unittest.TestCase):
         ]
         saved = shutdown_record(restored_entries)
         record.create(saved)
-        expected_notes: dict[str, str] = {}
+        expected_prompts: dict[str, str] = {}
         for restored in restored_entries:
             session_id = restored["session"]["session_id"]
-            expected_notes[session_id] = restart.restart_note(
-                saved, restored, RESTARTED
+            expected_prompts[session_id] = (
+                "/showrunner:produce /tmp/demo production.md resume"
+                if restored["session"]["kind"] == "showrunner"
+                else restart.restart_note(saved, restored, RESTARTED)
             )
             conversation_pause.record_scheduled_prompts(
                 session_id, (f"wakeup for {session_id}",)
@@ -392,25 +396,34 @@ class RestartTests(unittest.TestCase):
             del check
             if dry_run:
                 return None
-            command = shlex.join(argv)
-            for session_id, note in expected_notes.items():
-                if f"--resume {session_id}" not in command:
-                    continue
-                self.assertEqual(
-                    conversation_pause.read_scheduled_prompts(session_id),
-                    (f"wakeup for {session_id}", note),
-                )
-                self.assertIs(
-                    conversation_pause.prompt_source(
-                        note,
-                        lambda: frozenset(),
-                        lambda session_id=session_id: (
-                            conversation_pause.read_scheduled_prompts(session_id)
-                        ),
+            shell_command = argv[-1]
+            if not shell_command.endswith("; exec zsh"):
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            launched_argv = shlex.split(
+                shell_command.removesuffix("; exec zsh")
+            )
+            if "--resume" not in launched_argv:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            resume_index = launched_argv.index("--resume")
+            session_id = launched_argv[resume_index + 1]
+            prompt = expected_prompts[session_id]
+            launched_prompt = launched_argv[-1]
+            self.assertEqual(launched_prompt, prompt)
+            self.assertEqual(
+                conversation_pause.read_scheduled_prompts(session_id),
+                (f"wakeup for {session_id}", prompt),
+            )
+            self.assertIs(
+                conversation_pause.prompt_source(
+                    launched_prompt,
+                    lambda: frozenset(),
+                    lambda: conversation_pause.read_scheduled_prompts(
+                        session_id
                     ),
-                    conversation_pause.PromptSource.SCHEDULED,
-                )
-                observed_launches.append(session_id)
+                ),
+                conversation_pause.PromptSource.SCHEDULED,
+            )
+            observed_launches.append(session_id)
             return subprocess.CompletedProcess(argv, 0, "", "")
 
         def probe(
@@ -429,6 +442,11 @@ class RestartTests(unittest.TestCase):
             patch.object(restart, "_run", run),
             patch.object(restart, "_live_session_ids", return_value=frozenset()),
             patch.object(restart, "wait_for_session", return_value=True),
+            patch.object(
+                settle,
+                "send_message",
+                return_value=settle.MessageSent(kind="sent"),
+            ),
             patch.object(settle, "record_time", return_value=RESTARTED),
             patch("subprocess.run", probe),
         ):
@@ -436,8 +454,40 @@ class RestartTests(unittest.TestCase):
 
         self.assertCountEqual(
             observed_launches,
-            ["scheduled-unit", "scheduled-window", "scheduled-tmux"],
+            ["scheduled-showrunner", "scheduled-window", "scheduled-tmux"],
         )
+
+    def test_unit_launch_leaves_prompt_recording_to_add_unit(self) -> None:
+        restored = entry(unit("scheduled-unit"))
+        saved = shutdown_record([restored])
+        record.create(saved)
+        conversation_pause.record_scheduled_prompts(
+            "scheduled-unit", ("existing wakeup",)
+        )
+        observed_unit_launch = False
+
+        def run(
+            argv: list[str], *, dry_run: bool, check: bool = True
+        ) -> subprocess.CompletedProcess[str] | None:
+            nonlocal observed_unit_launch
+            del check
+            if any(part.endswith("add_unit.py") for part in argv):
+                observed_unit_launch = True
+                self.assertEqual(
+                    conversation_pause.read_scheduled_prompts("scheduled-unit"),
+                    ("existing wakeup",),
+                )
+            return None if dry_run else subprocess.CompletedProcess(argv, 0, "", "")
+
+        with (
+            patch.object(restart, "_run", run),
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(restart, "wait_for_session", return_value=True),
+            patch.object(settle, "record_time", return_value=RESTARTED),
+        ):
+            self.assertEqual(restart.up(LOGIN), 0)
+
+        self.assertTrue(observed_unit_launch)
 
     def test_dry_run_does_not_record_restart_notes(self) -> None:
         restored = entry(
@@ -708,7 +758,7 @@ class RestartTests(unittest.TestCase):
             desktop_state: restart.DesktopLaunchState,
             *,
             dry_run: bool,
-        ) -> tuple[restart.TimerNotStarted, ...]:
+        ) -> None:
             del restarted_at, desktop_state, dry_run
             session_id = current_entry["session"]["session_id"]
             processed.append(session_id)
@@ -721,7 +771,7 @@ class RestartTests(unittest.TestCase):
                 )
 
             _ = record.update(current["login"], finish)
-            return ()
+            return
 
         first_result: list[int] = []
 
@@ -963,13 +1013,13 @@ class RestartTests(unittest.TestCase):
             desktop_state: restart.DesktopLaunchState,
             *,
             dry_run: bool,
-        ) -> str | None:
+        ) -> restart.SessionLaunched | restart.ManualRestartRequired:
             del current, note, desktop_state, dry_run
             session_id = current_entry["session"]["session_id"]
             if session_id == "showrunner":
                 self.assertIn("unit", live)
             events.append(f"launch:{session_id}")
-            return None
+            return restart.SessionLaunched()
 
         def wait(session_id: str, timeout: float) -> bool:
             self.assertEqual(timeout, 90.0)
@@ -1289,6 +1339,81 @@ class RestartTests(unittest.TestCase):
         current = self.stored_record()
         self.assertEqual(current["entries"][0]["progress"]["kind"], "restarted")
 
+    def test_session_becoming_live_while_messages_retire_is_not_launched(
+        self,
+    ) -> None:
+        timer = TimerRestore(
+            instance="arriving-timer",
+            was_enabled=True,
+            footer=record.NoFooter(kind="no footer"),
+        )
+        restored = entry(
+            top_level(
+                "arriving", host=inventory.TerminalHost(kind="terminal")
+            ),
+            timers=[timer],
+        )
+        saved = shutdown_record([restored])
+        record.create(saved)
+        session_is_live = False
+        notes: list[str] = []
+        started: list[str] = []
+
+        def retire(
+            current: ShutdownRecord,
+            current_entry: ShutdownSessionEntry,
+            *,
+            dry_run: bool,
+        ) -> None:
+            nonlocal session_is_live
+            del current, current_entry
+            self.assertFalse(dry_run)
+            session_is_live = True
+
+        def live_session_ids() -> frozenset[str]:
+            return frozenset({"arriving"}) if session_is_live else frozenset()
+
+        def send_message(
+            recipient: str,
+            summary: str,
+            text: str,
+            *,
+            need: Literal["note", "decision", "blocked"] = "note",
+            machine: str = "",
+            key: str = "",
+        ) -> settle.MessageDelivery:
+            del recipient, summary, need, machine, key
+            notes.append(text)
+            return settle.MessageSent(kind="sent")
+
+        def start_timer(verb: str, instance: str) -> None:
+            self.assertEqual(verb, "start")
+            started.append(instance)
+
+        with (
+            patch.object(restart, "_retire", retire),
+            patch.object(restart, "_live_session_ids", live_session_ids),
+            patch.object(restart, "_launch_session") as launch,
+            patch.object(restart, "wait_for_session") as wait,
+            patch.object(settle, "send_message", send_message),
+            patch.object(settle, "run_notifier", start_timer),
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            patch.object(restart, "archive"),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(restart.up(LOGIN), 0)
+
+        launch.assert_not_called()
+        wait.assert_not_called()
+        self.assertEqual(
+            notes, [restart.restart_note(saved, restored, RESTARTED)]
+        )
+        self.assertEqual(started, ["arriving-timer"])
+        self.assertEqual(
+            self.stored_record()["entries"][0]["progress"]["kind"],
+            "restarted",
+        )
+
     def test_a_queued_live_restart_note_is_retried_before_timers_resume(self) -> None:
         timer = TimerRestore(
             instance="showrunner-demo",
@@ -1375,7 +1500,9 @@ class RestartTests(unittest.TestCase):
 
         with (
             patch.object(restart, "_retire"),
-            patch.object(restart, "_launch_session", return_value=None),
+            patch.object(
+                restart, "_launch_session", return_value=restart.SessionLaunched()
+            ),
             patch.object(restart, "_live_session_ids", return_value=frozenset()),
             patch.object(restart, "wait_for_session", return_value=True),
             patch.object(settle, "send_message", queued),
@@ -1425,10 +1552,10 @@ class RestartTests(unittest.TestCase):
             desktop_state: restart.DesktopLaunchState,
             *,
             dry_run: bool,
-        ) -> str | None:
+        ) -> restart.SessionLaunched | restart.ManualRestartRequired:
             del current, note, desktop_state, dry_run
             launched.append(current_entry["session"]["session_id"])
-            return None
+            return restart.SessionLaunched()
 
         with (
             patch.object(restart, "_retire", retire),
@@ -1509,7 +1636,7 @@ class RestartTests(unittest.TestCase):
             self.fail("expected restart failure")
         self.assertEqual(
             failed["reason"],
-            "restart note not recorded: prompt file unavailable",
+            "restart prompt not recorded: prompt file unavailable",
         )
 
     def test_a_session_that_does_not_return_is_the_only_one_retried(self) -> None:
@@ -1534,10 +1661,10 @@ class RestartTests(unittest.TestCase):
             desktop_state: restart.DesktopLaunchState,
             *,
             dry_run: bool,
-        ) -> str | None:
+        ) -> restart.SessionLaunched | restart.ManualRestartRequired:
             del current, note, desktop_state, dry_run
             launches.append(current_entry["session"]["session_id"])
-            return None
+            return restart.SessionLaunched()
 
         def wait(session_id: str, timeout: float) -> bool:
             del timeout
@@ -1714,9 +1841,136 @@ class RestartTests(unittest.TestCase):
         self.assertIn("manual restart manual:", alerts[0][1])
         self.assertIn("missing restart failed:", alerts[0][1])
         self.assertIn(timer_line, alerts[0][1])
+        current = self.stored_record()
+        self.assertEqual(current["state"], "restart partial")
         self.assertEqual(
-            self.stored_record()["entries"][3]["progress"]["kind"], "restarted"
+            current["entries"][2]["progress"],
+            record.SessionLiveTimersPending(
+                kind="timers pending",
+                at=RESTARTED,
+                timers=[
+                    record.PendingTimer(
+                        instance="timer-one", reason="notifier refused"
+                    )
+                ],
+            ),
         )
+        self.assertEqual(
+            current["entries"][3]["progress"]["kind"], "restarted"
+        )
+
+    def test_pending_timer_counts_live_session_then_retries_only_that_timer(
+        self,
+    ) -> None:
+        timers = [
+            TimerRestore(
+                instance="pending-timer",
+                was_enabled=True,
+                footer=record.ShowrunnerFooter(kind="footer", slug="pending"),
+            ),
+            TimerRestore(
+                instance="started-timer",
+                was_enabled=True,
+                footer=record.ShowrunnerFooter(kind="footer", slug="started"),
+            ),
+        ]
+        record.create(
+            shutdown_record(
+                [
+                    entry(
+                        top_level(
+                            "live", host=inventory.TerminalHost(kind="terminal")
+                        ),
+                        timers=timers,
+                    )
+                ]
+            )
+        )
+        notes: list[str] = []
+        starts: list[str] = []
+        footers: list[str] = []
+        output = io.StringIO()
+
+        def send_message(
+            recipient: str,
+            summary: str,
+            text: str,
+            *,
+            need: Literal["note", "decision", "blocked"] = "note",
+            machine: str = "",
+            key: str = "",
+        ) -> settle.MessageDelivery:
+            del recipient, summary, need, machine, key
+            notes.append(text)
+            return settle.MessageSent(kind="sent")
+
+        def start_timer(verb: str, instance: str) -> None:
+            self.assertEqual(verb, "start")
+            starts.append(instance)
+            if instance == "pending-timer" and starts.count(instance) == 1:
+                raise RuntimeError("notifier unavailable")
+
+        def footer(slug: str, state: object) -> None:
+            del state
+            footers.append(slug)
+
+        with (
+            patch.object(restart, "_retire") as retire,
+            patch.object(restart, "_launch_session") as launch,
+            patch.object(
+                restart, "_live_session_ids", return_value=frozenset({"live"})
+            ),
+            patch.object(settle, "send_message", send_message),
+            patch.object(settle, "run_notifier", start_timer),
+            patch.object(showrunner_footer, "set_footer_state", footer),
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(restart.up(LOGIN), 1)
+            current = self.stored_record()
+            self.assertEqual(current["state"], "restart partial")
+            self.assertEqual(
+                current["entries"][0]["progress"],
+                record.SessionLiveTimersPending(
+                    kind="timers pending",
+                    at=RESTARTED,
+                    timers=[
+                        record.PendingTimer(
+                            instance="pending-timer",
+                            reason="notifier unavailable",
+                        )
+                    ],
+                ),
+            )
+            self.assertEqual(
+                output.getvalue().splitlines(),
+                [
+                    "natedev: 1 restarted, 0 seats available on demand",
+                    "natedev: timer pending-timer of live not started: notifier unavailable",
+                ],
+            )
+
+            self.assertEqual(restart.up(LOGIN), 0)
+
+        launch.assert_not_called()
+        self.assertEqual(retire.call_count, 1)
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(
+            starts, ["pending-timer", "started-timer", "pending-timer"]
+        )
+        self.assertEqual(footers, ["pending", "started", "pending"])
+        self.assertEqual(record.find_live(LOGIN)["kind"], "no shutdown")
+        history = (
+            self.state_root
+            / LOGIN.casefold()
+            / "history"
+            / f"{STOPPED}.json"
+        )
+        archived = record.parse_records(f"[{history.read_text(encoding='utf-8')}]")[
+            0
+        ]
+        self.assertEqual(archived["state"], "up")
+        self.assertEqual(archived["entries"][0]["progress"]["kind"], "restarted")
 
     def test_unknown_host_is_manual_and_printed_again(self) -> None:
         record.create(shutdown_record([entry(top_level("mystery"))]))
@@ -1756,10 +2010,10 @@ class RestartTests(unittest.TestCase):
             desktop_state: restart.DesktopLaunchState,
             *,
             dry_run: bool,
-        ) -> str | None:
+        ) -> restart.SessionLaunched | restart.ManualRestartRequired:
             del current, note, desktop_state, dry_run
             launched.append(current_entry["session"]["session_id"])
-            return None
+            return restart.SessionLaunched()
 
         def wait(session_id: str, timeout: float) -> bool:
             del session_id, timeout
