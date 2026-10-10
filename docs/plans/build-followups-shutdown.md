@@ -348,38 +348,25 @@ StopIssue = SessionStopIssue | OrchestrationStopIssue
 
 ### Phase 9 — A restarted tmux session takes back the pane its shutdown left  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a tmux session that `/shutdown restart` brings back resumes in the pane it ran in before the shutdown when that pane is still there and idle, so shutdown and restart cycles never add windows to the user's tmux sessions; a pane the user has since put to other use is left alone.
-
-**Spec:**
-- `scripts/shutdown/inventory.py` `TmuxHost` (48-50) gains `pane: TmuxPane | PaneNotRecorded`:
-
-```python
-class TmuxPane(TypedDict):
-    kind: Literal["pane"]
-    pane_id: str     # tmux's %N id, the session process's TMUX_PANE
-    pane_pid: int    # the pane's first process (#{pane_pid}): the shell that ran claude, or claude itself
-
-class PaneNotRecorded(TypedDict):
-    kind: Literal["not recorded"]   # a record written before this phase, or tmux did not answer
-```
-
-  `_tmux_session(pane)` (829-842) becomes one `tmux display -p -t <pane> '#{session_name}<TAB>#{pane_pid}'` call (a literal tab, since session names may hold spaces) answering the session name and the pane pid; the host builder (976-982) fills `pane` from it, and `not recorded` when tmux answers nothing usable for the pid. The record parser's `tmux` branch (344-351) reads a missing `pane` as `not recorded`, so records written before this phase still parse; a present one is validated like every other field.
-- `scripts/shutdown/restart.py` `_tmux_launch` (415-): for `pane{pane_id, pane_pid}`, first probe `tmux display -p -t <pane_id> '#{session_name}<TAB>#{pane_pid}<TAB>#{pane_dead}'`. The pane is **reusable** when the probe succeeds, its session is the recorded `tmux_session`, and either it is dead (`#{pane_dead}` 1) or its pane pid is the recorded `pane_pid` and that process has no child process (`pgrep -P <pane_pid>` exits 1; `pgrep` is on both machines). A reusable pane gets `tmux respawn-pane -k -t <pane_id> -c <cwd> zsh -ic <command>`, and no window is opened. Anything else (the pane gone, in another session, a different pid, a process running under its shell, `not recorded`) keeps Phase 8's path: `new-window` in the surviving session, else `new-session`. The respawned pane keeps its id; its new first process is the `zsh -ic` that `exec zsh`s after claude, so the next shutdown records that pid and the next restart takes the same pane again.
-- `--dry-run` prints the pane probe beside the `has-session` probe and the argv it would run; the probes are read-only and still run. The restart note is recorded as a scheduled prompt before a respawn exactly as before every other launch.
+A tmux session that `/shutdown restart` brings back resumes in the pane it ran in when that pane is still there and idle, so shutdown and restart cycles add no windows to the user's tmux sessions; a pane put to other use is left alone.
+- **Recorded pane:** `TmuxHost` carries a required `pane: TmuxPane | PaneNotRecorded`. `TmuxPane{kind, pane_id, pane_pid}` (`kind: "pane"`) holds tmux's `%N` id, the session process's `TMUX_PANE`, and the pane's first process (`#{pane_pid}`); `PaneNotRecorded` (`kind: "not recorded"`) stands for an older record or a tmux that did not answer the pid. `_tmux_session(pane)` reads both with one `tmux display -p -t <pane> '#{session_name}\t#{pane_pid}'` (a literal tab); session names keep their spaces, only the line ending is stripped. The record parser reads a missing `pane` as `not recorded` and validates a present one like every other field.
+- **Reuse:** `_tmux_launch` probes `tmux display -p -t <pane_id> '#{session_name}\t#{pane_pid}\t#{pane_dead}'`. The pane is reusable when the probe succeeds, its session is the recorded `tmux_session`, and it is dead (`#{pane_dead}` 1) or its pane pid is the recorded `pane_pid` with no child process (`pgrep -P <pane_pid>` exits 1). A reusable pane gets `respawn-pane -k -t <pane_id> -c <cwd> zsh -ic <command>` and no window opens; anything else (pane gone, in another session, a different pid, a child under its shell, `not recorded`) gets `new-window` in the surviving session, else `new-session`.
+- **Cycle:** the respawned pane keeps its id, and its new first process is the `zsh -ic` that `exec zsh`s after claude, so the next shutdown records that pid and the next restart takes the same pane again. The restart note is recorded as a scheduled prompt before a respawn, as before every other launch. `--dry-run` runs the read-only probes and prints them beside the argv it would run.
 
 **Files:**
-- `scripts/shutdown/inventory.py`, `scripts/shutdown/test_inventory.py`
-- `scripts/shutdown/restart.py`, `scripts/shutdown/test_restart.py`
+- `scripts/shutdown/inventory.py` — `TmuxPane`, `PaneNotRecorded`, `_tmux_session`, the parser's `pane` branch.
+- `scripts/shutdown/restart.py` — `_recorded_pane`, `_pane_is_reusable`, `_respawn_pane_argv`, `_tmux_launch`.
+- `scripts/shutdown/test_inventory.py`, `scripts/shutdown/test_restart.py` — tests; `scripts/shutdown/test_stop.py`, `scripts/shutdown/test_settle.py` — fixtures carry `PaneNotRecorded`.
 
-**Seats:** `2 writers` — the recorded pane and the restart that takes it back meet only at the `TmuxPane` shape above.
-- `pane` — `scripts/shutdown/inventory.py`, `scripts/shutdown/test_inventory.py`
-- `restart` — `scripts/shutdown/restart.py`, `scripts/shutdown/test_restart.py`
+**Binds later work:** Restored sessions keep their timers relies on: a tmux session may come back in its recorded pane through `respawn-pane`, with the restart prompt recorded before it. Every `TmuxHost` built in code or tests names its `pane`.
 
-**Constraints from prior phases:** Phase 4: `TmuxHost{tmux_session}` inside `Session.host`, persisted in records through `inventory.parse_session`; `unit_lookup.tmux_binary()` is how the inventory finds tmux. Phase 6: `stop` kills only a unit's `UnitHost.tmux_session`, never a `TmuxHost` session; it stops the claude process, so a pane whose shell ran claude stays open with that shell idle. Phase 8: `_resume_command` (233-250) ends `; exec zsh`; `_tmux_launch` probes `has-session -t =<name>` and runs `new-window -t =<name>: -c <cwd> zsh -ic <command>` or `new-session`; `SHUTDOWN_TMUX` names the tmux binary in tests; `_record_restart_note` runs before each tmux launch and a failure to record launches nothing; `--dry-run` prints every argv.
+**Gotchas:**
+- The Mac has no tmux, so a `TmuxHost` exists only on natedev.
+- The dry run on the reusable-pane path also prints a `has-session` probe it does not use.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` green; `basedpyright scripts/shutdown` 0 errors, 0 warnings, 0 notes, run on that directory alone as the merge gate runs it. Tests show: an inventory of a session in a tmux pane records `pane{pane_id, pane_pid}`, and one whose tmux does not answer the pid records `not recorded`; a stored record with no `pane` parses as `not recorded`; restart with the recorded pane live in its session, the same pane pid and no child runs `respawn-pane -k -t <id> -c <cwd> zsh -ic <command>` and opens no window; a dead pane is respawned; a pane with a child process, a different pane pid, the pane now in another session, a missing pane and `not recorded` each get `new-window` when the session survives and `new-session` when it does not; the note is recorded before the respawn. Live on natedev: a scratch `tmux new-session -d -s shut9 zsh` with a scratch claude typed into it, `down --here --only` it and `restart` it twice: the tmux session still has exactly one window, the same pane, and the session answers what it was doing. Post-merge, with Phase 8's post-merge gate: the same two restarts from the merged `~/.claude`, inside a two-machine `down --only` and `restart`. The Mac has no tmux, so a `TmuxHost` exists only on natedev; the Mac's leg is its Ghostty scratch session, or its `mac: no shutdown of <label> to restart` answer when it holds no record.
+**Ruled out:** a `NotRequired` `pane` — a required field, with `PaneNotRecorded` in fixtures, keeps every host explicit.
 
 ### Phase 10 — Restored sessions keep their timers  · status: todo
 
@@ -389,8 +376,8 @@ class PaneNotRecorded(TypedDict):
 
 **Spec:**
 - `conversation_pause.prompt_source` returns `SCHEDULED` for a prompt recorded for the session with `record_scheduled_prompts`; Phase 8 records the restart note before each tmux and window launch, where the note is the whole first prompt.
-- `restart.py` names the recording for what it records: `_record_restart_note` (286) becomes `_record_scheduled_restart_prompt(session_id, prompt, *, dry_run)`, `RestartNoteNotRecorded` (79) becomes `ScheduledRestartPromptNotRecorded`, and the entry's failure reason reads `restart prompt not recorded: <reason>`. `_launch_session(...) -> str | None` (457) becomes `-> SessionLaunched | ManualRestartRequired` (frozen dataclasses; `ManualRestartRequired.command` is today's returned command), so no caller reads a bare `None` as "launched".
-- A showrunner's first prompt is `_showrunner_prompt(session)` (253, `/showrunner:produce <doc> resume`), not the note: `restart.py` records the prompt it launches, appending it to the session's recorded prompts as Phase 8 does, before the launch. Its note still arrives afterwards as a `shutdown` message.
+- `restart.py` names the recording for what it records: `_record_restart_note` (292) becomes `_record_scheduled_restart_prompt(session_id, prompt, *, dry_run)`, `RestartNoteNotRecorded` (85) becomes `ScheduledRestartPromptNotRecorded`, and the entry's failure reason reads `restart prompt not recorded: <reason>`. `_launch_session(...) -> str | None` (539) becomes `-> SessionLaunched | ManualRestartRequired` (frozen dataclasses; `ManualRestartRequired.command` is today's returned command), so no caller reads a bare `None` as "launched".
+- A showrunner's first prompt is `_showrunner_prompt(session)` (259, `/showrunner:produce <doc> resume`), not the note: `restart.py` records the prompt it launches, appending it to the session's recorded prompts as Phase 8 does, before the launch. Its note still arrives afterwards as a `shutdown` message.
 - A unit's first prompt is built by `add_unit.py` (`prompt_for`, 611-638: the identity line, a space, then the note file's text). For a `UnitRestoreLaunch`, `main` computes that prompt once, appends it to the session's recorded prompts, and passes the same string to `launch_session` (641-669, which gains a `prompt: str` parameter in place of calling `prompt_for` itself), so the recorded and launched prompts cannot differ. `add_unit.py` imports `conversation_pause` from `scripts/hooks` at run time as `settle.py` does; `pyrightconfig.json` gains `scripts/hooks` in the `scripts/production` environment's `extraPaths`. A failure to record refuses the launch with exit 1 and one stderr line naming why. `restart.py` stops recording the bare note for unit entries. `NewWorkLaunch` records nothing.
 - Prompts already recorded for the session are kept; a dry run records nothing.
 - **A timer that does not start.** `record.py` progress gains `timers pending`:
@@ -406,7 +393,7 @@ class SessionLiveTimersPending(TypedDict):
     timers: list[PendingTimer]     # recorded was_enabled timers that did not start
 ```
 
-  An entry whose session came back but one of whose `was_enabled` timers did not start (`TimerNotStarted`, 94-98) is `timers pending`, not `restarted`. `_finish_record` (832-) counts it as unfinished, as it counts `manual restart`: the record stays `restart partial`, is not archived, and the output and the alert list each pending timer with its reason. A later `restart` claims the record as usual, finds the session live, launches nothing, sends no second note, starts only the pending timers and their footers, and marks the entry `restarted`; a timer that fails again stays pending with the new reason.
+  An entry whose session came back but one of whose `was_enabled` timers did not start (`TimerNotStarted`, 101-104) is `timers pending`, not `restarted`. `_finish_record` (914-) counts it as unfinished, as it counts `manual restart`: the record stays `restart partial`, is not archived, and the output and the alert list each pending timer with its reason. A later `restart` claims the record as usual, finds the session live, launches nothing, sends no second note, starts only the pending timers and their footers, and marks the entry `restarted`; a timer that fails again stays pending with the new reason.
 
 **Files:**
 - `scripts/shutdown/restart.py`, `scripts/shutdown/test_restart.py`
@@ -418,7 +405,7 @@ class SessionLiveTimersPending(TypedDict):
 - `restart` — `scripts/shutdown/restart.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/record.py`, `scripts/shutdown/test_record.py`
 - `unit` — `scripts/production/add_unit.py`, `scripts/production/test_add_unit.py`, `pyrightconfig.json`
 
-**Constraints from prior phases:** Phase 8: `restart.py` `_record_restart_note`, which appends to `conversation_pause.read_scheduled_prompts(session_id)` and fails the entry without launching; `add_unit.py`'s `UnitRestoreLaunch{session_id, note, session_name, tmux_session}` and its restore prompt; `conversation_pause.record_scheduled_prompts`, which replaces the whole list, and the Stop hook, which rewrites it after each reply; `COMPLETE_PROGRESS` (62) is `restarted` and `seat available on demand`; an already-live session gets its recorded timers back without a launch; `restart partial` keeps run folders held through `held-sessions`. Tests point the conversation-pause state root at a temp dir and start no `claude`. Phase 9: a tmux session may come back in its recorded pane through `respawn-pane`, with the restart prompt recorded before it.
+**Constraints from prior phases:** Phase 8: `restart.py` `_record_restart_note`, which appends to `conversation_pause.read_scheduled_prompts(session_id)` and fails the entry without launching; `add_unit.py`'s `UnitRestoreLaunch{session_id, note, session_name, tmux_session}` and its restore prompt; `conversation_pause.record_scheduled_prompts`, which replaces the whole list, and the Stop hook, which rewrites it after each reply; `COMPLETE_PROGRESS` (68) is `restarted` and `seat available on demand`; an already-live session gets its recorded timers back without a launch; `restart partial` keeps run folders held through `held-sessions`. Tests point the conversation-pause state root at a temp dir and start no `claude`. Phase 9: a tmux session may come back in its recorded pane through `respawn-pane`, with the restart prompt recorded before it.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` and `cd scripts/production && python3 -m unittest test_add_unit test_waiting` green; `basedpyright scripts/shutdown` and `basedpyright scripts/production` each 0 errors, 0 warnings, 0 notes, each directory run alone as the merge gate runs it. Tests show, for a showrunner entry and for a unit restore, that the prompt the launch passes to `claude` is recorded for that session before the launch and that `conversation_pause.prompt_source` classes it `SCHEDULED`; for a unit, that the recorded and launched prompts are the same string; that a timer which fails to start leaves the entry `timers pending` and the record `restart partial` and listed in the alert, and that a second `restart` with the timer now starting launches nothing, sends no note, starts only that timer and archives the record `up`. Post-merge, with Phase 8's post-merge gate: a restarted unit's timers are still enabled one minute after its restart, and it has asked the user nothing.
 
