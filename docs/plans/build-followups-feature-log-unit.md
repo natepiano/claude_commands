@@ -35,7 +35,7 @@ feature log yes (the user to hana, 2026-10-10): build ~/rust/hanadocs/proposals/
   - `commands/showrunner/produce.md` — `<MergeCheckpoint>` 354-438 (step 3 design check 378-395; step 4 `merge_checkpoint.py` 396-417; step 6 after the push 426-437); the production log helper `update_registration.py log "<event>"` (`<Throughout>` 57-63). It has no change-review text yet; the rule lives in hana project memory (`~/.claude/projects/-home-natepiano-rust-hana/memory/change-review-list.md`).
   - `commands/validate_and_push.md` — `<WatchCI>` 36-138; all green 132-137; the `Validate And Push Complete` summary block 140-154; exit 2 hands off to `push_pr_branch_and_merge.sh` 17-32.
   - `/etc/nixos/README.md` — per-change loop 56-87: step 4 `rebuild` 80-84, step 5 "Verify the live effect and log it" 85-87; each activation is a line in `~/.local/state/rebuild/generations.log` (README 562-565), with a `-dirty` revision for a dirty tree.
-  - `commands/release.md` — STEP 4 477-510 (shows `## [Unreleased]` at 485; `finalize_changelogs.sh` at 508); `scripts/release/finalize_changelogs.sh` 5, 27-37.
+  - `commands/release.md` — the mode sequences 293-317 (STEP 4 runs `<FinalizeOnBase/>` in normal and isolated mode, `<FinalizeOnHotfixBranch/>` in hotfix mode; STEP 6 runs `<PublishPhases/>` in all three); `<FinalizeOnBase/>` 476-574 (shows `## [Unreleased]` at 485; `finalize_changelogs.sh` at 508); `<FinalizeOnHotfixBranch/>` 860-965 (shows `## [Unreleased]` at 869); `<PublishPhases/>` 589-725, where publishing happens and a dry run stops; `scripts/release/finalize_changelogs.sh` 5, 27-37.
   - `pyrightconfig.json` — one `executionEnvironments` entry per scripts directory.
 - **Test lanes:** `scripts/feature_log/` → `test_feature_log.py`, `test_inventory.py` (new; beside the code; each imports its sibling by bare name). The backfill phases have none.
 - **Build:** none; the code is interpreted.
@@ -57,20 +57,21 @@ feature log yes (the user to hana, 2026-10-10): build ~/rust/hanadocs/proposals/
   - Python: no `Any`, a `TypedDict` per JSON shape, no file-level ignores.
   - Times shown to the user are America/Los_Angeles.
 - **Backfill procedure (Phases 4–9; proposal "Backfill" and "Current-behavior check"):**
-  1. A seat works only the records it claims: `inventory.py next --project <p> --pool <pool> --claim <seat> [--kind <k>] [--limit 25]`, then `inventory.py show <id>` for a record's source text.
+  1. A seat works only the records it claims: `inventory.py next --project <p> --pool <pool> --claim <seat> [--kind <k>] [--path <prefix>…] [--limit 25]`, then `inventory.py show <id>` for a record's source text.
   2. Decide whether the record holds a user-visible result (proposal "What gets logged": the seven kinds). Refactor, test, build, CI and docs-only work is `internal` and gets no note.
-  3. Check current behavior at the ledger's frozen ref of the default branch (hana: `init/catalyst`): current docs and public interfaces first, then tests, then implementation; run it when practical. A behavior that no longer exists is `not-current`. A replaced behavior is written only in its current form.
-  4. Before writing, `feature_log.py live --project <p> [--crate <c>] [--area <a>] --grep <word>` finds the entries the result may affect. Still wholly true: mark the record `combined` into that entry and `amend --evidence` it. Replaced: `supersede --backfill`. New: `add --backfill`.
-  5. `--backfill` calls pass `--completed` (the date of the accepting merge, tag or commit) and `--link` (that commit). `--release crate@version` is passed only when exactly one existing changelog bullet maps to the entry; otherwise `release` stays `[]`. A summary for a published crate reads unchanged as a changelog bullet.
-  6. Mark every record: `inventory.py mark <id>… --as represented|combined --note "<title>"`, or `--as internal|not-current|unresolved --reason "<why>"`. `unresolved`: the sources cannot support a true summary, completion date and `See it`; no note is written.
-  7. The two seats of a phase claim disjoint records. A result found by both is written once by the first and `combined` by the second.
+  3. Check current behavior at the phase's audit ref: the tip of the accepted branch (hana: `~/rust/hana_catalyst` `init/catalyst`; the others `main`), read with `git rev-parse` when the phase starts and named in the phase report beside the ledger's frozen ref. The frozen ref decides which records exist; the audit ref decides what is true now. Current docs and public interfaces first, then tests, then implementation; run it when practical. A behavior that no longer exists is `not-current`. A replaced behavior is written only in its current form.
+  4. Before writing, `feature_log.py live --project <p> [--crate <c>] [--area <a>] --grep <word>` finds the entries the result may affect. Still wholly true: mark the record `combined` into that entry and `amend --backfill --evidence` it. Replaced: `supersede --backfill`. New: `add --backfill`. A live entry that already describes a newer form than the audit ref shows (live logging wrote it after the ref) is current truth: mark the record `combined` into it and write nothing.
+  5. `--backfill` calls pass `--completed` (the date of the accepting merge, tag or commit) and `--link` (that commit). A link a live entry already holds is refused unless that entry is the one being replaced (`supersede --old`) or the new result is a distinct one from the same commit (`--separate-result`). `--release crate@version` is passed only when exactly one existing changelog bullet maps to the entry; otherwise `release` stays `[]`. A summary for a published crate reads unchanged as a changelog bullet.
+  6. Mark every record: `inventory.py mark <id>… --seat <seat> --as represented|combined --note "<title>"`, or `--as internal|not-current|unresolved --reason "<why>"`. `unresolved`: the sources cannot support a true summary, completion date and `See it`; no note is written.
+  7. The two seats of a phase claim disjoint records, by project, `--kind` or `--path` prefix as the Work Order's **Seats** name them. A result found by both is written once by the first and `combined` by the second.
+  8. The phase's blind review is the audit (proposal "Current-behavior check"): its reviewers write no notes, compare the project's live entries (`feature_log.py live --project <p>`) with the current surface at the audit ref, and report each qualifying behavior that has no live entry.
 
 ## Gates
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
 | G1 | Phase 1's live Base check (its code and tests go ahead) | the user turns on Obsidian on natedev → Settings → General → Advanced → Command line interface | `obsidian-cli help` lists commands instead of the "not enabled" line |
-| G2 | Phase 10 | live logging has written a real `@Unreleased` entry: an `add` or `supersede` without `--backfill` for a published crate | `events.jsonl` holds an event with `"backfill": false` and a `release` value ending `@Unreleased` |
+| G2 | Phase 10 | live logging has written a real `@Unreleased` entry: an `add` or `supersede` without `--backfill` for a published crate | `events.jsonl` holds an `add` or `supersede` event with `"backfill": false` and a `release` value ending `@Unreleased` |
 
 After Phase 2 reaches `~/.claude` main, the unit director tells the showrunner that the `/showrunner:produce` step is live, so hana starts using it (the user's words in Source), and sends natedev the README step that Phase 2's Spec gives.
 
@@ -78,113 +79,35 @@ After Phase 2 reaches `~/.claude` main, the unit director tells the showrunner t
 
 ### Phase 1 — The vault holds six folders and seven Bases, and one script writes every note  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `feature_log.py add`, `supersede`, `amend`, `live` and `check` write and read feature notes with every mechanical field derived and every bad call refused, and the seven Bases show live and superseded entries per project.
-
-**Spec:**
-
-`scripts/feature_log/feature_log.py` (new). Paths: `VAULT = Path(os.environ.get("FEATURE_LOG_VAULT") or Path.home() / "rust/hanadocs")`; a note is `VAULT / "feature-log" / <project> / f"{title}.md"`; `STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "claude/feature-log"`. `today()` returns the machine's local date (the Linter's date); tests patch it.
-
-Projects (proposal "Storage", measured 2026-10-10), one constant table:
-
-```python
-class ProjectSpec(NamedTuple):
-    repo: str                    # GitHub slug for --link
-    crates: frozenset[str]       # workspace package names; empty for natedev
-    published: frozenset[str]    # crates confirmed on crates.io
-
-PROJECTS: dict[str, ProjectSpec] = {
-    "hana": ProjectSpec("natepiano/hana", frozenset({
-        "fairy_dust", "hana", "hana_animation", "hana_catalyst", "hana_clerestory", "hana_conduit",
-        "hana_diegetic", "hana_effects", "hana_kana", "hana_lading", "hana_lagrange", "hana_liminal",
-        "hana_metrics", "hana_mimesis_tools", "hana_organon", "hana_origami", "hana_prosody",
-        "hana_rigging", "hana_rigging_scripted", "hana_rubric", "hana_sdf", "hana_tool_macros",
-        "hana_tool_schema", "hana_tools", "hana_valence", "hana_video", "hana_works"}),
-        frozenset({"hana_clerestory", "hana_kana", "hana_lagrange", "hana_liminal", "hana_rigging", "hana_rubric"})),
-    "natedev": ProjectSpec("natepiano/nixos", frozenset(), frozenset()),
-    "cargo-liner": ProjectSpec("natepiano/cargo-liner", frozenset({
-        "cargo-berth", "cargo-berth-test-support", "cargo-handler", "cargo-mend", "cargo-port", "cargo-tile", "tui_pane"}),
-        frozenset({"cargo-mend", "cargo-port", "cargo-tile", "tui_pane"})),
-    "bevy_brp": ProjectSpec("natepiano/bevy_brp", frozenset({
-        "bevy_brp_extras", "bevy_brp_mcp", "bevy_brp_mcp_macros", "bevy_brp_test_apps", "test-app-a", "test-app-b"}),
-        frozenset({"bevy_brp_extras", "bevy_brp_mcp", "bevy_brp_mcp_macros"})),
-    "obsidian_knife": ProjectSpec("natepiano/obsidian_knife", frozenset({"obsidian_knife"}), frozenset()),
-    "nateroids": ProjectSpec("natepiano/nateroids", frozenset({"nateroids"}), frozenset()),
-}
-KINDS = ("feature", "fix", "change", "perf", "deprecation", "removal", "security")
-```
-
-A note's fields:
-
-```python
-class Note(TypedDict):
-    title: str                   # = file name without .md
-    project: str
-    kind: str
-    summary: str
-    area: str | None             # bare name; written "[[name]]"
-    completed_date: str          # YYYY-MM-DD
-    crate: list[str]
-    link: str                    # https://github.com/<repo>/commit/<40 hex>
-    production: str | None       # hana only
-    unit: list[str]              # hana only
-    release: list[str]           # "<crate>@Unreleased" | "<crate>@<version>"
-    replaced_by: list[str]       # titles of the replacing notes
-    state: Literal["live", "superseded"]
-    date_created: str
-    date_modified: str
-    behavior: str
-    see: str
-    evidence: list[str]
-```
-
-Written layout — the proposal's "Hana production example" byte for byte in its frontmatter: keys in ascending order (`area, completed_date, crate, date_created, date_modified, kind, link, production, project, release, replaced_by, return, state, summary, tags, unit`); `area`, `production` and `unit` only when set; an empty list as `[]`; `tags: [feature-log]`; any other non-empty list as block items `  - <item>` sorted ascending; links and dates as `"[[x]]"`; `return` = `"[[feature-log - <project>.base]]"` then `"[[feature-log.base]]"`; `link` bare; any other string bare when it matches `^[A-Za-z0-9][^:#"'\n]*$` without a trailing space, else `json.dumps` (a valid YAML double-quoted string). The body is the behavior paragraph, a blank line, `## See it`, a blank line, the check, a blank line, `## Evidence`, a blank line, one `- <line>` per evidence item, and a final newline.
-
-The parser reads only what this writer and the Linter produce: `key: value`, `key: "…"`, `key: '…'`, `key: [a, b]`, `key: []`, and `key:` followed by `  - item` lines. A duplicate key, an unknown key or any other form is an error.
-
-Subcommands (each prints one line per file it writes: `added: <vault-relative path>`, `superseded: <old> → <new>`, `amended: <path> (<fields>)`, `unchanged: <path>`):
-
-- `add --project P --title T --kind K --summary S --behavior B --see C --link L --evidence E [--evidence …] [--crate X …] [--area A] [--completed YYYY-MM-DD] [--production SLUG] [--unit U …] [--release X@V …] [--backfill] [--separate-result]`
-- `supersede --old T_OLD [--old …]` plus every `add` argument.
-- `amend --project P --title T` with any of `--summary --behavior --see --area --kind --completed`, `--crate X …` (replaces the list; release items of removed crates drop), `--evidence E …` (appends). It never changes the title, link, state or `replaced_by`.
-- `live --project P [--crate X] [--area A] [--kind K] [--grep TEXT]` — one line per live note, newest `completed_date` first: `<completed> <kind> <title> — <summary> [<crates>] (<area>)`. `--grep` matches title, summary and behavior, case-insensitive. This is how an agent "opens the project's live Base" (proposal "Current truth and replacement").
-- `check` — validates every note in the six folders: it parses, required keys are present, values have their forms, `state: live` has `replaced_by: []` and `superseded` has at least one, every `replaced_by` target exists in the same project, the file name equals the normalized title, and `tags` and `return` are exact. Prints `ok: <n> notes` (exit 0) or one `<path>: <reason>` per error (exit 1).
-
-Derived fields: the file name is the title lowercased, `-` turned into a space, every character outside `a-z0-9 _` dropped, runs of spaces collapsed and ends stripped (the `commands/issue.md:48` rule; `_` is kept for crate names). `--link` takes a 40-hex sha (expanded to `https://github.com/<repo>/commit/<sha>`) or that URL. `date_created` and `date_modified` are `today()`; `completed_date` defaults to it. `state: live`, `replaced_by: []`, `tags`, `return` and `project` are fixed. Without `--backfill`, `release` is `<crate>@Unreleased` for each `--crate` in the project's published set; with `--backfill`, only `--release` values. `--release` values are added to the derived ones.
-
-Rejections (exit 2, one stderr line `feature_log: <reason>`, nothing written): an unknown project or kind; a crate outside the project; no crate for a project other than natedev, or any crate for natedev; a release whose crate is not in `--crate` or not published, or whose version is neither `Unreleased` nor `\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?`; an empty summary, behavior, see or link, or no `--evidence`; a summary starting `- ` or holding a newline; `--production` or `--unit` outside hana; a title that normalizes to empty or to more than 50 characters; a file of that name in the project with a different link (make the title more specific); a live note in the project with this link under another title, unless `--separate-result` (one accepted change, several results); an `--old` that is not a live note of the project, or equals the new title.
-
-Repeats are safe: a note with the same title and link and the same fields prints `unchanged`; with other fields the call fails with `use amend`. A repeated `supersede` finishes any `--old` not yet superseded.
-
-`supersede` under one lock: writes the new note, then for each `--old` sets `state: superseded`, adds `[[<new title>]]` to `replaced_by` (sorted, no duplicates) and sets `date_modified`.
-
-Every write command takes an exclusive `fcntl.flock` on `STATE/lock`, writes each file as `.<name>.tmp` in its target folder and `os.replace`s it, creates folders on first use, and appends one line to `STATE/events.jsonl`: `{"at": "<ISO-8601>", "verb": "add|supersede|amend", "project", "title", "kind", "summary", "release": [...], "backfill": bool, "old": [...], "fields": [...]}` (`fields` names what an amend changed).
-
-Vault files (vault config, not notes; the impl seat writes them):
-
-- `feature-log/<project>/` for the six projects, empty.
-- `feature-log.base` with the proposal's "Bases" views: **Latest**, **By project**, **By crate**, **By kind**, **Superseded**. Every filter starts `file.hasTag("feature-log")`; the four live views add `state == "live"`, **Superseded** adds `state == "superseded"`. Live views show `file.name, summary, kind, crate, completed_date, project, area, link, production, unit`; **Superseded** shows `file.name, summary, kind, crate, completed_date, project, area, link, replaced_by, release`. Every view sorts `completed_date` DESC; the three "By" views group by `note.project`, `note.crate` and `note.kind` with the table view's group-by key, whose exact spelling the seat takes from `obsidian-cli help` (G1) or Obsidian's Bases documentation.
-- `feature-log - <project>.base` for each project: **Current** (`file.hasTag("feature-log")`, `project.contains(link("<project>"))`, `state == "live"`; `crate`, `area` and `kind` visible) and **Superseded** (`state == "superseded"`; shows `replaced_by`). The six files differ only in the project link.
-- No `columnSize`; Obsidian writes it when the user resizes a column.
-
-Live Base check (after G1), with `XDG_STATE_HOME` set to a temp dir so the state and events stay out of the real log: write through the script into the real vault `natedev` note `feature log check one`, supersede it with `feature log check two`, amend two's evidence, and write `hana` note `feature log check three` (each `--link` a 40-hex sha of zeros ending in its number). `obsidian-cli base:query` (syntax from `obsidian-cli help`) then shows: **Latest** and natedev **Current** list `two` and not `one`; natedev **Superseded** lists `one` with `replaced_by` `[[feature log check two]]`; hana **Current** lists only `three`; natedev **Current** does not list `three`. Then remove the three fixture files with `rm`: they are fixtures, not results. If an unresolved project link (`[[natedev]]`) fails `project.contains(link(…))`, every project Base filters on `file.inFolder("feature-log/<project>")` instead (my call: the folder is the project key; one line per file to revert).
+- `scripts/feature_log/feature_log.py` writes and reads feature notes through `add`, `supersede`, `amend`, `live` and `check`. `main(argv: list[str]) -> int` turns every `FeatureLogError` into exit 2 and one stderr line `feature_log: <reason>`, with nothing written. `PROJECTS: dict[str, ProjectSpec]` (`repo`, `crates`, `published`), `KINDS` and the `Note` TypedDict follow the proposal's "Storage" and "Frontmatter"; `Note` is the frontmatter boundary shape, so `area` and `production` are `str | None` to mirror whether the key is present.
+- Paths are functions that read the environment on each call: `vault_dir()` (`FEATURE_LOG_VAULT`, else `~/rust/hanadocs`) and `state_dir()` (`$XDG_STATE_HOME/claude/feature-log`, else `~/.local/state/claude/feature-log`). `today()` is the machine-local date. `locked()` is a public context manager holding an exclusive `fcntl.flock` on `state_dir() / "lock"`.
+- Every write runs under `locked()`, writes `.<name>.tmp` in the target folder and `os.replace`s it, then appends one `FeatureLogEvent` line (`at` in America/Los_Angeles, `verb`, `project`, `title`, `kind`, `summary`, `release`, `backfill`, `old`, `fields`) to `state_dir() / "events.jsonl"` through `_event(verb, note, *, backfill, old, fields)` and `_append_event(event)`.
+- Frontmatter has its own writer (`render_note`) and line parser (`parse_note`): ascending key order, `[]` for an empty list, block items otherwise, links and dates as `"[[x]]"`, and a string bare only when YAML reads it back unchanged (`SAFE_SCALAR_RE`, no leading character from `UNSAFE_BARE_SCALAR_PREFIXES`), else `json.dumps`. `behavior` and `see` may not hold a `## See it` or `## Evidence` line. Writes and `check` share `validate_note` and `normalize_title` (the `commands/issue.md:48` rule, 50 characters at most). `check` prints `ok: <n> notes`, or one `<path>: <reason>` per error with unreadable notes reported and no traceback.
+- `live --project P [--crate] [--area] [--kind] [--grep]` prints one line per live note, newest `completed_date` first: `<completed> <kind> <title> — <summary> [<crates>] (<area>)`; `--grep` matches title, summary and behavior, case-insensitive.
+- Repeats: `_same_repeat` compares a repeat with the stored note apart from `date_created` and `date_modified`, and apart from `completed_date` when the repeat omits `--completed`; equal prints `unchanged`, different fails with `use amend`. `_reject_duplicate_link` refuses a live note's link under another title unless `--separate-result`, and lets `supersede` reuse the link of its own `--old` notes (a retitle). A repeated `supersede` finishes any `--old` still live.
+- Vault (not in git): six empty `feature-log/<project>/` folders; `feature-log.base` with **Latest**, **By project**, **By crate**, **By kind** and **Superseded**, the "By" views grouped by `groupBy: {property: note.<prop>, direction: ASC}`; six `feature-log - <project>.base` with **Current** and **Superseded**, filtered on `project.contains(link("<project>"))`.
 
 **Files:**
-- `scripts/feature_log/feature_log.py` — new.
-- `scripts/feature_log/test_feature_log.py` — new.
-- `pyrightconfig.json` — a `{"root": "scripts/feature_log", "extraPaths": ["scripts/feature_log"]}` entry, only if basedpyright cannot resolve the test's import without it.
-- `/home/natepiano/rust/hanadocs/feature-log/` — the six project folders.
-- `/home/natepiano/rust/hanadocs/feature-log.base` — new.
-- `/home/natepiano/rust/hanadocs/feature-log - hana.base`, `/home/natepiano/rust/hanadocs/feature-log - natedev.base`, `/home/natepiano/rust/hanadocs/feature-log - cargo-liner.base`, `/home/natepiano/rust/hanadocs/feature-log - bevy_brp.base`, `/home/natepiano/rust/hanadocs/feature-log - obsidian_knife.base`, `/home/natepiano/rust/hanadocs/feature-log - nateroids.base` — new.
+- `scripts/feature_log/feature_log.py` — the only writer of feature notes: the CLI plus the importable `vault_dir`, `state_dir` and `locked`.
+- `scripts/feature_log/test_feature_log.py` — 28 tests on temp vault and state dirs: the proposal's exact layouts, every rejection, repeats, supersede after an interrupted run, amend, live and check.
+- `pyrightconfig.json` — an `executionEnvironments` entry for `scripts/feature_log`.
+- `/home/natepiano/rust/hanadocs/feature-log/`, `feature-log.base` and the six `feature-log - <project>.base` files — vault config, not committed.
 
-**Seats:** `1 writer + 1 tester` — one new script and its vault files; the Spec's layout and rejections are concrete enough to test before the code exists.
-- `impl` — `scripts/feature_log/feature_log.py`, the vault folders and Bases, `pyrightconfig.json`.
-- `test` — `scripts/feature_log/test_feature_log.py`: the exact frontmatter bytes of the proposal's two examples (Hana with `production` and `unit`; natedev with `crate: []`) and the body layout; every rejection above, each leaving the temp vault unchanged; derived release values with and without `--backfill`; file-name normalization and the 50-character limit; repeats print `unchanged`, a changed repeat fails; `--separate-result`; `supersede` and its repeat after an interrupted run (old note still live); `amend` field rules; `live` filters and order; `check` on a hand-broken fixture (missing key, unknown key, live with `replaced_by`, dangling `replaced_by`); no `.tmp` left behind; one `events.jsonl` line per write.
+**Binds later work:** `vault_dir()`, `state_dir()` and `locked()` are the import surface for the close-out, digest and ledger scripts; no later script reads a path constant. The close-outs and digest extend `_event`, `_append_event`, `_same_repeat` and `_reject_duplicate_link`. The link rule (one live note per link unless `--separate-result`; a `supersede` may reuse its `--old` link) is the one the Backfill procedure step 5 states.
 
-**Constraints from prior phases:** none.
+**Gotchas:**
+- The script stays importable on Python 3.10 (the Mac's `scripts/lib/py`); the tests run on natedev's 3.13.
+- A note is written before its event, so a kill between the two leaves a note with no event, and a retry prints `unchanged` without appending one; the close-outs' event repair on repeat closes this.
+- `obsidian-cli base:query` output flattens grouped views; a group check reads its JSON output.
+- An unresolved project link (`[[natedev]]`) still matches `project.contains(link("natedev"))`.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/feature_log -p 'test_*.py'` green; `basedpyright scripts/feature_log` clean. Live: `feature_log.py check` on the real vault prints `ok: 0 notes` before the fixtures and after their removal. After G1, the Live Base check above passes; the checkpoint notice carries the `obsidian-cli base:query` output for each view checked in place of shots.
+**Ruled out:**
+- Semantic types for `Note`'s `area` and `production`: `Note` mirrors key presence at the frontmatter boundary.
+- A recovery journal or operation id for the note-without-event gap: a repeat that appends the missing event is simpler.
+- `file.inFolder("feature-log/<project>")` filters in the project Bases: the link filter matches unresolved project links.
+- A tester seat or cross-audit seats in the backfill phases: `inventory.py next --path` makes path splits claimable by two writers, and each phase's blind review is the audit.
 
 ### Phase 2 — Hana, single-session and natedev close-outs write entries, and a digest reports them  · status: todo
 
@@ -196,11 +119,13 @@ Live Base check (after G1), with `XDG_STATE_HOME` set to a temp dir so the state
 
 `scripts/feature_log/feature_log.py` additions:
 
-- **One vault.** When the short host name (`socket.gethostname()` up to the first `.`) is not `natedev` and `FEATURE_LOG_VAULT` is unset, `main` runs `["ssh", "natedev", "~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py " + shlex.join(argv)]`, passes its output through and exits with its status (my call: natedev's vault is the one Obsidian has open, and the Mac clone is 25 days behind; one function to change if the user wants another home). The runner is a parameter, so tests assert the command without running `ssh`.
-- `propose --review ROW` with every `add` argument, plus `--old T …` when the result replaces live entries. `ROW` matches `^[AC]\d+$`. It runs every `add` / `supersede` validation, including the title, link and `--old` checks against the vault, writes no note, and saves `STATE/proposals/<ROW>.json`: `{"row", "verb": "add"|"supersede", "args": {…}, "status": "open", "at"}`. A repeat replaces an open proposal (the corrected-fields path); a landed or dropped one fails.
-- `add --review ROW` / `supersede --review ROW` land the open proposal with its saved arguments. The verb must match the proposal's (a mismatch fails, naming the right verb). Success sets `status: landed` and `note: <title>` and prints `[[<title>]]` for the Reviewed row. A landed proposal prints `unchanged`. No proposal fails with `no proposal for <ROW>; run propose first`.
-- `drop --review ROW --verdict TEXT` closes an open proposal without a note (`status: dropped`, `verdict`); a repeat prints `unchanged`.
-- `digest [--since YYYY-MM-DD]` prints the events after the cursor in `STATE/digest.json` (or from `--since`), grouped by project in the order of `PROJECTS`: `+ <title> — <summary>` for an add, `→ <old> ⇒ <new>` for a supersede, `~ <title> (<fields>)` for an amend; it ends `<n> changes since <date HH:MM PDT>` and advances the cursor (not with `--since`). With none: `feature log: nothing new since <…>`.
+- **One vault.** When the short host name (`socket.gethostname()` up to the first `.`) is not `natedev` and `FEATURE_LOG_VAULT` is unset, `main` runs `["ssh", "natedev", "~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py " + shlex.join(argv)]`, passes its output through and exits with its status (my call: natedev's vault is the one Obsidian has open, and the Mac clone is 25 days behind; one function to change if the user wants another home). `project-of` never forwards: it reads only the caller's checkout, so it runs where it is called. The runner is a parameter, so tests assert the command without running `ssh`.
+- **Events, one type per verb.** Phase 1 writes one `FeatureLogEvent` shape for every verb, with empty `old` and `fields` where they mean nothing. Replace it with one TypedDict per verb, discriminated by `verb` and holding only its own fields: `AddEvent` (`at`, `verb: "add"`, `project`, `title`, `kind`, `summary`, `release`, `backfill`), `SupersedeEvent` (the same with `verb: "supersede"` and `old`), `AmendEvent` (`at`, `verb: "amend"`, `project`, `title`, `fields`, `backfill`); `FeatureLogEvent` is their union, and the reader narrows on `verb`. `amend` gains `--backfill`, which its event records (Phase 1 always wrote `false`).
+- **Event repair (a Phase 1 defect).** A note is written before its event is appended, so a process killed between the two leaves a note with no event, and the retry prints `unchanged` without writing one. A repeat whose result is already fully written appends its event when `events.jsonl` holds no event of that verb, project and title, then prints `unchanged`.
+- `propose --review ROW` with every `add` argument, plus `--old T …` when the result replaces live entries. `ROW` matches `^[AC]\d+$`. It runs every `add` / `supersede` validation, including the title, link and `--old` checks against the vault, writes no note, and saves `state_dir()/"proposals"/<ROW>.json`. It saves `completed` resolved (today when not given), so a row landed on a later day keeps the merge's date. The file is one of three TypedDicts discriminated by `status`, each holding only its own fields: `OpenProposal` (`row`, `verb: "add"|"supersede"`, `args`, `status: "open"`, `at`), `LandedProposal` (the same with `status: "landed"` and `note`: the title), `DroppedProposal` (the same with `status: "dropped"` and `verdict`); `args` is a `ProposalArgs` TypedDict of the saved `add` arguments with `old`. A repeat replaces an open proposal (the corrected-fields path); a landed or dropped one fails.
+- `add --review ROW` / `supersede --review ROW` land the open proposal with its saved arguments. The verb must match the proposal's (a mismatch fails, naming the right verb). Success writes a `LandedProposal` and prints `[[<title>]]` for the Reviewed row. A landed proposal prints `unchanged`. No proposal fails with `no proposal for <ROW>; run propose first`.
+- `drop --review ROW --verdict TEXT` closes an open proposal without a note, writing a `DroppedProposal`; a repeat prints `unchanged`.
+- `digest [--since YYYY-MM-DD]` prints the events after the cursor (or from `--since`), grouped by project in the order of `PROJECTS`: `+ <title> — <summary>` for an add, `→ <old> ⇒ <new>` for a supersede, `~ <title> (<fields>)` for an amend. Events with `backfill: true` are not listed (the backfill phases report their own counts). The cursor in `state_dir()/"digest.json"` is `{"line": <events.jsonl lines consumed>, "at": "<time of that digest>"}`: a position, so events written in the same second are each listed once. It ends `<n> changes since <date HH:MM PDT>` and advances the cursor past every event read, backfill ones included (not with `--since`). With none: `feature log: nothing new since <…>`.
 - `project-of [PATH]` maps `git -C PATH remote get-url origin` (`git@github.com:<slug>` or `https://github.com/<slug>`, with or without `.git`) to the project whose `repo` is that slug and prints it, or `none`; exit 0 either way.
 
 `commands/showrunner/produce.md` (proposal "Hana units"), applied when the production's repository is a Hana checkout (`~/rust/hana` or `~/rust/hana_catalyst`):
@@ -215,7 +140,7 @@ Live Base check (after G1), with `XDG_STATE_HOME` set to a temp dir so the state
 natedev's README (sent to natedev to commit in `/etc/nixos`; this unit does not edit it): a sixth per-change-loop step after line 87 — **Feature log close-out.** After `rebuild` succeeded and the activated revision (the last line of `~/.local/state/rebuild/generations.log`, without `-dirty`) is on `origin/main`, the session that made the change runs `~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py add --project natedev …` (or `supersede`), or states `feature log: none — <reason>`, before it calls the change complete. `rebuild` and `update` never call the script; a failed activation, a dirty revision, `boot` and `test` never reach this step.
 
 **Files:**
-- `scripts/feature_log/feature_log.py` — forwarding, `propose`, `drop`, `--review`, `digest`, `project-of`.
+- `scripts/feature_log/feature_log.py` — forwarding, event types, `amend --backfill`, event repair, `propose`, `drop`, `--review`, `digest`, `project-of`.
 - `scripts/feature_log/test_feature_log.py` — their cases.
 - `commands/showrunner/produce.md` — `<ChangeReviewFeatureLog/>` and `<CloseChangeReview/>` (also touches; owner stalls-unit, run done).
 - `commands/validate_and_push.md` — `<FeatureLogCloseOut/>`.
@@ -223,11 +148,11 @@ natedev's README (sent to natedev to commit in `/etc/nixos`; this unit does not 
 
 **Seats:** `1 writer + 1 tester` — one script and three short command edits that follow it; the subcommand rules are concrete enough to test first.
 - `impl` — `scripts/feature_log/feature_log.py`, `commands/showrunner/produce.md`, `commands/validate_and_push.md`, `commands/feature_log.md`, and the README step's text in the phase report.
-- `test` — `scripts/feature_log/test_feature_log.py`: forwarding builds the `ssh natedev` command on another host and stays local on natedev or with `FEATURE_LOG_VAULT`; `propose` writes no note and refuses a landed row; `add --review` writes exactly one note and its repeat writes none; a verb mismatch fails; `drop` writes none; `digest` lists adds, supersedes and amends by project, advances its cursor, and prints the empty line; `project-of` maps both URL forms and prints `none` for an unknown slug.
+- `test` — `scripts/feature_log/test_feature_log.py`: forwarding builds the `ssh natedev` command on another host and stays local on natedev or with `FEATURE_LOG_VAULT`; `project-of` on another host runs locally and builds no `ssh` command; each verb writes only its own event fields, and `amend --backfill` records `backfill: true`; a note whose event was removed gets it back from an exact repeat, which still prints `unchanged`, and a second repeat appends nothing; `propose` writes no note and refuses a landed row; `add --review` writes exactly one note and its repeat writes none; a row proposed one day and landed the next keeps the proposal's completed date, and a replay on a third day prints `unchanged`; a verb mismatch fails; `drop` writes none; `digest` lists adds, supersedes and amends by project, lists two events from the same second once each, leaves out backfill events while its cursor passes them, advances its cursor, and prints the empty line; `project-of` maps both URL forms and prints `none` for an unknown slug.
 
-**Constraints from prior phases:** Phase 1 built `feature_log.py` with `add`, `supersede`, `amend`, `live`, `check`, the `STATE/lock`, and `STATE/events.jsonl` lines carrying `backfill`; `digest` reads those lines.
+**Constraints from prior phases:** Phase 1 built `feature_log.py` with `add`, `supersede`, `amend`, `live`, `check`; paths come from the public functions `vault_dir()` and `state_dir()` (read from the environment on every call; there are no `VAULT`/`STATE` constants), every write runs under the public `locked()` context manager (flock on `state_dir()/"lock"`), and each write appends a `state_dir()/"events.jsonl"` line. Phase 1's events share one `FeatureLogEvent` shape (`at`, `verb`, `project`, `title`, `kind`, `summary`, `release`, `backfill`, `old`, `fields`) built by `_event` and written by `_append_event` after `_write_note`; `_run_amend` always passes `backfill=False`. A repeat is decided by `_same_repeat` and prints `unchanged: <path>`; a link a live entry holds is refused by `_reject_duplicate_link` unless the holder is among `--old` or `--separate-result` is given. `main(argv) -> int` returns 2 with one `feature_log: <reason>` stderr line on a refusal. The script must stay importable on Python 3.10. No live `events.jsonl` exists yet, so the event shape changes with no migration.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/feature_log -p 'test_*.py'` green; `basedpyright scripts/feature_log` clean. Live, with `FEATURE_LOG_VAULT` and `XDG_STATE_HOME` on temp dirs: `propose --review C900` writes no note; `add --review C900` writes one and its repeat none; `propose --review C901` then `drop` writes none; `digest` lists only C900's entry. From the Mac, a copy of the worktree's `feature_log.py` run as `live --project natedev` forwards to natedev and prints its list.
+**Acceptance gate:** `python3 -m unittest discover -s scripts/feature_log -p 'test_*.py'` green; `basedpyright scripts/feature_log` clean. Live, with `FEATURE_LOG_VAULT` and `XDG_STATE_HOME` on temp dirs: `propose --review C900` writes no note; `add --review C900` writes one and its repeat none; `propose --review C901` then `drop` writes none; `digest` lists only C900's entry. From the Mac, a copy of the worktree's `feature_log.py` run as `live --project natedev` forwards to natedev and prints its list, and run as `project-of ~/rust/cargo-liner` prints `cargo-liner` without reaching natedev.
 
 ### Phase 3 — Every backfill source record sits in a frozen ledger  · status: todo
 
@@ -237,10 +162,34 @@ natedev's README (sent to natedev to commit in `/etc/nixos`; this unit does not 
 
 **Spec:**
 
-`scripts/feature_log/inventory.py` (new), read-only on every repository; the ledger is `STATE/backfill/<project>.jsonl`, written under `STATE/lock` by temp file and `os.replace`.
+`scripts/feature_log/inventory.py` (new), read-only on every repository; the ledger is `state_dir()/"backfill"/<project>.jsonl`, written inside `locked()` by temp file and `os.replace`.
+
+A record's claim and its outcome are tagged states, so no combination of loose optional fields can contradict itself:
 
 ```python
-class Record(TypedDict):
+class Unclaimed(TypedDict):
+    state: Literal["unclaimed"]
+
+class ClaimedBy(TypedDict):
+    state: Literal["claimed"]
+    seat: str
+
+ClaimState = Unclaimed | ClaimedBy
+
+class Undisposed(TypedDict):
+    state: Literal["undisposed"]
+
+class NoteOutcome(TypedDict):     # the record's result lives in a note
+    state: Literal["represented", "combined"]
+    note: str                     # the note's title
+
+class NoNoteOutcome(TypedDict):   # the record gets no note
+    state: Literal["internal", "not-current", "unresolved"]
+    reason: str
+
+ReviewOutcome = Undisposed | NoteOutcome | NoNoteOutcome
+
+class BackfillSourceRecord(TypedDict):
     id: str            # "<project>:<kind>:<key>"; key = sha, tag, "<path>#<phase heading>", "<path>", "<changelog path>@<version>#<n>"
     project: str
     repo: str          # absolute checkout path
@@ -250,10 +199,8 @@ class Record(TypedDict):
     title: str         # phase heading, file's first heading, bullet text, tag name, or subject
     date: str          # YYYY-MM-DD: commit or tag date; for a file record, the last commit touching it at ref
     source: str        # "<path>:<line>" or sha
-    owner: str | None
-    disposition: Literal["represented", "combined", "internal", "not-current", "unresolved"] | None
-    note: str | None
-    reason: str | None
+    claim: ClaimState
+    outcome: ReviewOutcome
 ```
 
 Sources, each read at the ref `collect` freezes (`git rev-parse <branch>`):
@@ -278,9 +225,9 @@ Pools (2026-10-10 counts from the proposal, which `collect` prints beside its ow
 
 CLI:
 - `collect --project P` — writes the ledger when absent and prints counts per pool and kind beside the proposal's; when the ledger exists it only prints them (a ledger is frozen once).
-- `next --project P --pool POOL [--kind K] [--claim SEAT] [--limit N]` — undisposed records that are unowned or owned by `SEAT`, oldest first: `<id> | <date> | <kind> | <title> | <source>`; `--claim` sets `owner` on the listed records.
+- `next --project P --pool POOL [--kind K] [--path PREFIX …] [--claim SEAT] [--limit N]` — undisposed records that are unclaimed or claimed by `SEAT`, oldest first: `<id> | <date> | <kind> | <title> | <source>`. `--path` (repeatable, any one matching) keeps records whose `source` path starts with a prefix; a sha source matches none. `--claim` sets `ClaimedBy(SEAT)` on the listed records. `--limit 0` lists them all.
 - `show ID` — the record and its source text: the phase block, the bullet with its version heading, or the commit message with `git show --stat`.
-- `mark ID… [--ids-from FILE] --as D (--note TITLE | --reason TEXT)` — `represented` and `combined` need `--note` naming a note that exists in the project's folder; the other three need `--reason`. Re-marking replaces the disposition.
+- `mark ID… [--ids-from FILE] [--seat SEAT] --as D (--note TITLE | --reason TEXT)` — `represented` and `combined` need `--note` naming a note that exists in the project's folder; the other three need `--reason`. A record claimed by a seat other than `--seat` is refused, naming its seat. Re-marking replaces the outcome.
 - `status --project P [--pool POOL]` — counts per disposition and undisposed, and the notes the ledger names; exit 1 while any record is undisposed.
 
 **Files:**
@@ -289,9 +236,9 @@ CLI:
 
 **Seats:** `1 writer + 1 tester` — one new script; its record kinds and commands are concrete enough to test first.
 - `impl` — `scripts/feature_log/inventory.py`.
-- `test` — `scripts/feature_log/test_inventory.py`, on temp git repos it builds: each record kind (a phase block under its heading, an as-built file without blocks, changelog bullets per version and Unreleased, tags, first-parent merges, non-merge commits); a range excludes `origin/main`; `collect` twice leaves the ledger byte-identical; `next --claim` hides one seat's records from the other; `mark` refuses a missing note or reason; `status` exits 1 until all are marked.
+- `test` — `scripts/feature_log/test_inventory.py`, on temp git repos it builds: each record kind (a phase block under its heading, an as-built file without blocks, changelog bullets per version and Unreleased, tags, first-parent merges, non-merge commits); a range excludes `origin/main`; `collect` twice leaves the ledger byte-identical; `next --claim` hides one seat's records from the other; `next --path` keeps only records under its prefixes; `mark` refuses a missing note or reason and a record another seat claimed; no record holds both a note and a reason; `status` exits 1 until all are marked.
 
-**Constraints from prior phases:** Phase 1: notes live at `VAULT/feature-log/<project>/<title>.md`; `STATE` and its `lock` come from `feature_log.py` (import its `VAULT`, `STATE` and `locked`). Phase 2: none bind this phase.
+**Constraints from prior phases:** Phase 1: notes live at `vault_dir()/"feature-log"/<project>/<title>.md`; import `vault_dir`, `state_dir` and `locked` from `feature_log` (functions read per call; `locked()` is the flock on `state_dir()/"lock"`). Phase 2: none bind this phase.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/feature_log -p 'test_*.py'` green; `basedpyright scripts/feature_log` clean. Live: `collect` for all six projects; the phase report gives each pool's count beside the proposal's, with the frozen refs, and names the cause of each difference (commits since 2026-10-10).
 
@@ -306,13 +253,13 @@ CLI:
 **Files:**
 - `/home/natepiano/rust/hanadocs/feature-log/hana/` — notes, through `feature_log.py` only.
 
-**Seats:** `2 writers` — split by source file: records from as-built files sorting before the median path go to `impl`, the rest to `test`.
-- `impl` — claims as `a`: the first half of the files.
-- `test` — opens as impl; claims as `b`: the second half.
+**Seats:** `2 writers` — split by source path, so each phase block's file stays with one seat: sort hana's structured source files by path and give each seat the directory prefixes holding about half the records. Phase 3's phase review writes the two prefix lists here from the frozen ledger.
+- `impl` — claims as `a` with `--path` for the first prefix list.
+- `test` — opens as impl; claims as `b` with `--path` for the second prefix list.
 
 **Constraints from prior phases:** Phase 1: `feature_log.py add|supersede|amend|live|check`, `--backfill` (no derived `@Unreleased`), `--separate-result`. Phase 3: `inventory.py next|show|mark|status` and the frozen hana ledger.
 
-**Acceptance gate:** `inventory.py status --project hana --pool structured` exits 0; `feature_log.py check` prints `ok`. A review seat that wrote no note in this phase audits hana's live entries (`feature_log.py live --project hana`) against the current surface above and finds no uncovered qualifying behavior in it. The phase report gives the note count and the count per disposition.
+**Acceptance gate:** `inventory.py status --project hana --pool structured` exits 0; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits hana's live entries (`feature_log.py live --project hana`) against the current surface above and finds no uncovered qualifying behavior in it. The phase report gives the note count and the count per disposition.
 
 ### Phase 5 — cargo-liner's as-built files and changelogs are in the log  · status: todo
 
@@ -326,12 +273,12 @@ CLI:
 - `/home/natepiano/rust/hanadocs/feature-log/cargo-liner/` — notes, through `feature_log.py` only.
 
 **Seats:** `2 writers` — split by crate, by record path.
-- `impl` — claims as `a`: `cargo-mend`, `cargo-port`, `tui_pane` records.
-- `test` — opens as impl; claims as `b`: `cargo-berth`, `cargo-tile`, `cargo-handler`, tags and workspace-level records.
+- `impl` — claims as `a`: `--path crates/cargo-mend --path crates/cargo-port --path crates/tui_pane`.
+- `test` — opens as impl; claims as `b`: `--path crates/cargo-berth --path crates/cargo-tile --path crates/cargo-handler --path docs` (the as-built and phase records), then `--kind tag`.
 
 **Constraints from prior phases:** Phase 1: `feature_log.py` verbs and `--backfill`; published cargo-liner crates are `cargo-mend`, `cargo-port`, `cargo-tile`, `tui_pane`. Phase 3: the frozen cargo-liner ledger.
 
-**Acceptance gate:** `inventory.py status --project cargo-liner --pool structured` exits 0; `feature_log.py check` prints `ok`. A review seat that wrote no note in this phase audits cargo-liner's live entries against the current surface above and finds no uncovered qualifying behavior in it. The phase report gives the note count and the count per disposition.
+**Acceptance gate:** `inventory.py status --project cargo-liner --pool structured` exits 0; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits cargo-liner's live entries against the current surface above and finds no uncovered qualifying behavior in it. The phase report gives the note count and the count per disposition.
 
 ### Phase 6 — bevy_brp's structured records and nateroids' as-built files are in the log  · status: todo
 
@@ -346,12 +293,12 @@ CLI:
 - `/home/natepiano/rust/hanadocs/feature-log/nateroids/` — notes, through `feature_log.py` only.
 
 **Seats:** `2 writers` — split by changelog.
-- `impl` — claims as `a`: bevy_brp as-built records and `mcp/CHANGELOG.md` bullets.
-- `test` — opens as impl; claims as `b`: `extras/CHANGELOG.md` and `mcp_macros/CHANGELOG.md` bullets, bevy_brp tags, and nateroids' structured pool.
+- `impl` — claims as `a`: bevy_brp `--path docs --path mcp/CHANGELOG.md` (as-built records and `mcp` bullets).
+- `test` — opens as impl; claims as `b`: bevy_brp `--path extras/CHANGELOG.md --path mcp_macros/CHANGELOG.md`, then bevy_brp `--kind tag`, then nateroids' structured pool.
 
 **Constraints from prior phases:** Phase 1: published bevy_brp crates are `bevy_brp_extras`, `bevy_brp_mcp`, `bevy_brp_mcp_macros`. Phase 3: the frozen bevy_brp and nateroids ledgers.
 
-**Acceptance gate:** `inventory.py status --project bevy_brp --pool structured` and `--project nateroids --pool structured` exit 0; `feature_log.py check` prints `ok`. A review seat that wrote no note in this phase audits bevy_brp's live entries against the current surface above and finds no uncovered qualifying behavior in it. The phase report gives the note count and the count per disposition for each project.
+**Acceptance gate:** `inventory.py status --project bevy_brp --pool structured` and `--project nateroids --pool structured` exit 0; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits bevy_brp's live entries against the current surface above and finds no uncovered qualifying behavior in it. The phase report gives the note count and the count per disposition for each project.
 
 ### Phase 7 — natedev and obsidian_knife are logged from their commits  · status: todo
 
@@ -371,7 +318,7 @@ CLI:
 
 **Constraints from prior phases:** Phase 1: natedev notes take no `--crate`; obsidian_knife's one crate is `obsidian_knife`, unpublished. Phase 3: the frozen natedev and obsidian_knife ledgers.
 
-**Acceptance gate:** `inventory.py status` exits 0 for both projects; `feature_log.py check` prints `ok`. A review seat that wrote no note in this phase audits each project's live entries against its current surface and finds no qualifying behavior without one live entry. The phase report gives the note count, the count per disposition, and the measured review time.
+**Acceptance gate:** `inventory.py status` exits 0 for both projects; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits each project's live entries against its current surface and finds no qualifying behavior without one live entry. The phase report gives the note count, the count per disposition, and the measured review time.
 
 ### Phase 8 — nateroids' commits and Hana's merges are logged, and both audits finish  · status: todo
 
@@ -379,7 +326,7 @@ CLI:
 
 **Goal:** every record of nateroids' and hana's commit pools has a disposition, and both projects' current surfaces have one live entry per qualifying behavior, checked in the running apps.
 
-**Spec:** Delegation Context → Backfill procedure, for `--pool commits` of both. nateroids: review the 553 subjects and combine commits by playable result. hana: the 124 `main` merges and 285 `init/catalyst` merges, looking only for results no phase record covered (Phase 4). Current surfaces: hana — as-built docs, player controls, tool definitions, public crate READMEs and APIs, and the running app; nateroids — as-built docs, controls, playable behavior, README, and a play check. Visible behavior that docs, definitions and tests leave unsettled is checked in one batched run of each app, launched with the BRP tools on the unit's port 15798 (production doc 31df9c1) from a detached worktree at the ledger's frozen ref.
+**Spec:** Delegation Context → Backfill procedure, for `--pool commits` of both. nateroids: review the 553 subjects and combine commits by playable result. hana: the 124 `main` merges and 285 `init/catalyst` merges, looking only for results no phase record covered (Phase 4). Current surfaces: hana — as-built docs, player controls, tool definitions, public crate READMEs and APIs, and the running app; nateroids — as-built docs, controls, playable behavior, README, and a play check. Visible behavior that docs, definitions and tests leave unsettled is checked in one batched run of each app, launched with the BRP tools on the unit's port 15798 (production doc 31df9c1) from a detached worktree at the phase's audit ref (Backfill procedure step 3).
 
 **Files:**
 - `/home/natepiano/rust/hanadocs/feature-log/hana/` — notes, through `feature_log.py` only.
@@ -391,7 +338,7 @@ CLI:
 
 **Constraints from prior phases:** Phase 4 logged hana's structured pool; Phase 6 seeded nateroids from its as-built files. Phase 3: the frozen ledgers.
 
-**Acceptance gate:** `inventory.py status` exits 0 for both projects; `feature_log.py check` prints `ok`. A review seat that wrote no note in this phase audits each project's live entries against its current surface, including the running app, and finds no qualifying behavior without one live entry. The phase report gives the note count, the count per disposition, and the measured review time.
+**Acceptance gate:** `inventory.py status` exits 0 for both projects; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits each project's live entries against its current surface, using the running-app check above, and finds no qualifying behavior without one live entry. The phase report gives the note count, the count per disposition, and the measured review time.
 
 ### Phase 9 — cargo-liner's and bevy_brp's commits are dispositioned, and both audits finish  · status: todo
 
@@ -411,7 +358,7 @@ CLI:
 
 **Constraints from prior phases:** Phase 5 and Phase 6 logged the structured pools of both projects. Phase 3: the frozen ledgers.
 
-**Acceptance gate:** `inventory.py status` exits 0 for both projects; `feature_log.py check` prints `ok`. A review seat that wrote no note in this phase audits each project's live entries against its current surface and finds no qualifying behavior without one live entry. The phase report gives the note count, the count per disposition, the measured review time, and the backfill's total notes across the six projects.
+**Acceptance gate:** `inventory.py status` exits 0 for both projects; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits each project's live entries against its current surface and finds no qualifying behavior without one live entry. The phase report gives the note count, the count per disposition, the measured review time, and the backfill's total notes across the six projects.
 
 ### Phase 10 — A published crate's changelog section comes from the log  · status: todo
 
@@ -424,19 +371,20 @@ CLI:
 **Spec:** (proposal "Changelog generation")
 
 - `changelog --crate X --version V` (V a version or `Unreleased`): selects every note, live or superseded, whose `crate` holds X and whose `release` holds `X@V`; prints `## [V]`, then one `### <heading>` per non-empty heading in the order Added, Changed, Deprecated, Removed, Fixed, Security (`feature` → Added, `fix` → Fixed, `change` and `perf` → Changed, `deprecation` → Deprecated, `removal` → Removed, `security` → Security), each followed by `- <summary>` lines sorted by summary. An unpublished crate fails with exit 2 and prints nothing.
-- `changelog --crate X --version Unreleased --compare PATH` — compares that output with the `## [Unreleased]` section of the CHANGELOG at PATH (bullet sets per heading); prints `match` (exit 0) or the differences (exit 1).
-- `release --crate X --version V` — replaces `X@Unreleased` with `X@V` in every live note holding it, and drops `X@Unreleased` from superseded notes (my call: a behavior replaced before a release never shipped, so the generator needs no state filter); appends one `release` event; a repeat prints `unchanged`. `digest` shows a release event as `= X@V (<n> notes)`.
-- `commands/release.md` STEP 4 (at 485, beside the `## [Unreleased]` display): for each published crate being released, run `changelog --compare` and show `match` or the differences to the release owner, who reconciles them with `amend` or in the changelog before finalizing. After the crate is published, run `release --crate <crate> --version <version>`. A crate whose output differs is reported, not blocked (the proposal: connect a crate's release path only after its output matches).
+- `changelog --crate X --version Unreleased --compare PATH` — compares that output with the `## [Unreleased]` section of the CHANGELOG at PATH (bullet sets per heading); prints `match` (exit 0) or the differences (exit 1). PATH is read on the calling host: where `main` forwards to natedev, it forwards `changelog` without `--compare` and compares the returned section locally.
+- `release --crate X --version V` — replaces `X@Unreleased` with `X@V` in every live note holding it, and drops `X@Unreleased` from superseded notes (my call: a behavior replaced before a release never shipped, so the generator needs no state filter); appends one `ReleaseEvent` (`at`, `verb: "release"`, `project`, `crate`, `version`, `titles`: the notes it changed), which joins the `FeatureLogEvent` union; a repeat prints `unchanged`. `digest` shows a release event as `= X@V (<n> notes)`.
+- `commands/release.md`, in both changelog-finalizing blocks — `<FinalizeOnBase/>` (at 485) and `<FinalizeOnHotfixBranch/>` (at 869), beside the `## [Unreleased]` display: for each published crate being released, run `changelog --compare` and show `match` or the differences to the release owner, who reconciles them with `amend` or in the changelog before finalizing. A crate whose output differs is reported, not blocked (the proposal: connect a crate's release path only after its output matches).
+- `commands/release.md`, a stamp step after `<PublishPhases/>` in all three mode sequences (293-317), skipped on a dry run: for each crate STEP 6 published, `release --crate <crate> --version ${VERSION}`. It runs only after publishing succeeded, so a failed or dry-run release stamps nothing.
 
 **Files:**
 - `scripts/feature_log/feature_log.py` — `changelog`, `release`.
 - `scripts/feature_log/test_feature_log.py` — their cases.
-- `commands/release.md` — STEP 4 lines (no owner in the production).
+- `commands/release.md` — `<FinalizeOnBase/>`, `<FinalizeOnHotfixBranch/>`, and the stamp step after `<PublishPhases/>` (no owner in the production).
 
 **Seats:** `1 writer + 1 tester` — one script change and one command step; the heading map and selection rules are concrete enough to test first.
 - `impl` — `scripts/feature_log/feature_log.py`, `commands/release.md`.
-- `test` — `scripts/feature_log/test_feature_log.py`: fixture notes covering every kind, a result shared by two crates, a superseded entry with a released version (kept) and one with `@Unreleased` (dropped by `release`), and an unpublished crate (no output); the proposal's cargo-mend 0.23.0 example prints exactly its section; `--compare` matches and differs; `release` and its repeat.
+- `test` — `scripts/feature_log/test_feature_log.py`: fixture notes covering every kind, a result shared by two crates, a superseded entry with a released version (kept) and one with `@Unreleased` (dropped by `release`), and an unpublished crate (no output); the proposal's cargo-mend 0.23.0 example prints exactly its section; `--compare` matches and differs, and on another host forwards `changelog` without `--compare` and compares locally; `release` and its repeat; `digest` shows the release event.
 
-**Constraints from prior phases:** Phase 1: notes carry `release` values `crate@Unreleased` (derived without `--backfill`) or `crate@version`; `events.jsonl` lines carry `release` and `backfill`. Phase 2: `digest` reads events. Phases 4–9: backfilled notes carry a historical version only on an exact changelog-bullet match.
+**Constraints from prior phases:** Phase 1: notes carry `release` values `crate@Unreleased` (derived without `--backfill`) or `crate@version`. Phase 2: `FeatureLogEvent` is a union of per-verb TypedDicts discriminated by `verb`; `digest` reads events by line position and leaves out backfill events; every verb except `project-of` forwards to natedev from another host. Phases 4–9: backfilled notes carry a historical version only on an exact changelog-bullet match.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/feature_log -p 'test_*.py'` green; `basedpyright scripts/feature_log` clean. Live: `changelog --compare` against each published crate's current `CHANGELOG.md`; the phase report names the crates that match and the differences of the rest.
