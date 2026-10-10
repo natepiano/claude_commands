@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# After a tool call, now and then print a short random acknowledgement.
+#
 # there's a bug when we use this pre-tool use which would be better
 # that it shows the output twice which we definitely don't want
 # so for now we're just doing this post tool - such a drag

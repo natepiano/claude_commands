@@ -35,10 +35,13 @@ class CommandFixture(TypedDict):
     probe_lines: list[str]
     rsync_status: int
     run_lines: list[RemoteLine]
-    run_status_line: str | None
+    run_status_reported: bool
+    run_status_line: str
     run_delay_s: float
     hold_after_first_line: bool
     cleanup_status: int
+    cleanup_delay_s: float
+    hold_cleanup: bool
 
 
 class CommandEvent(TypedDict):
@@ -91,6 +94,11 @@ if command != "ssh":
 remote = arguments[-1]
 if "pkill -f" in remote:
     (root / "cleanup-called").write_text("called\n", encoding="utf-8")
+    time.sleep(float(fixture["cleanup_delay_s"]))
+    if fixture["hold_cleanup"]:
+        (root / "cleanup-started").write_text("started\n", encoding="utf-8")
+        while not (root / "continue-cleanup").exists():
+            time.sleep(0.01)
     raise SystemExit(int(fixture["cleanup_status"]))
 if "lint nextest" in remote:
     (root / "run-started").write_text("started\n", encoding="utf-8")
@@ -103,9 +111,8 @@ if "lint nextest" in remote:
             while not (root / "continue-run").exists():
                 time.sleep(0.01)
         time.sleep(0.02)
-    status_line = fixture["run_status_line"]
-    if status_line is not None:
-        print(status_line, flush=True)
+    if fixture["run_status_reported"]:
+        print(fixture["run_status_line"], flush=True)
     raise SystemExit(0)
 
 (root / "probe-started").write_text("started\n", encoding="utf-8")
@@ -163,10 +170,13 @@ class OffloadCommandTests(unittest.TestCase):
             "probe_lines": [],
             "rsync_status": 0,
             "run_lines": [],
+            "run_status_reported": True,
             "run_status_line": "mac_exit=0",
             "run_delay_s": 0.0,
             "hold_after_first_line": False,
             "cleanup_status": 0,
+            "cleanup_delay_s": 0.0,
+            "hold_cleanup": False,
         }
 
     @override
@@ -222,10 +232,13 @@ class OffloadCommandTests(unittest.TestCase):
             ],
             "rsync_status": 0,
             "run_lines": [],
+            "run_status_reported": True,
             "run_status_line": "mac_exit=0",
             "run_delay_s": 0.0,
             "hold_after_first_line": False,
             "cleanup_status": 0,
+            "cleanup_delay_s": 0.0,
+            "hold_cleanup": False,
         }
         self.sync_config()
         self.sync_fixture()
@@ -290,27 +303,40 @@ class OffloadCommandTests(unittest.TestCase):
         )
 
     def start_command(
-        self, *nextest_arguments: str, script: Path = SCRIPT
+        self,
+        *nextest_arguments: str,
+        script: Path = SCRIPT,
+        extra: dict[str, str] | None = None,
+        ignore_interrupt: bool = False,
     ) -> subprocess.Popen[str]:
         self.result_path.unlink(missing_ok=True)
+        arguments = [
+            sys.executable,
+            str(script),
+            "run",
+            "--repo-root",
+            str(self.repository),
+            "--package",
+            "hana",
+            "--call-id",
+            "call-signal",
+            "--result",
+            str(self.result_path),
+            "--",
+            *nextest_arguments,
+        ]
+        if ignore_interrupt:
+            arguments = [
+                "/bin/sh",
+                "-c",
+                'trap "" INT; exec "$@"',
+                "offload-with-ignored-interrupt",
+                *arguments,
+            ]
         return subprocess.Popen(
-            [
-                sys.executable,
-                str(script),
-                "run",
-                "--repo-root",
-                str(self.repository),
-                "--package",
-                "hana",
-                "--call-id",
-                "call-signal",
-                "--result",
-                str(self.result_path),
-                "--",
-                *nextest_arguments,
-            ],
+            arguments,
             cwd=self.root,
-            env=self.environment,
+            env={**self.environment, **(extra or {})},
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -663,7 +689,7 @@ class OffloadCommandTests(unittest.TestCase):
             ["~/.claude/scripts/lint/lint", "nextest", *words],
         )
         self.assertIn("PATH=$HOME/.cargo/bin:$PATH", remote_words)
-        self.assertIn("BUILDLOG_CALLER=verify", remote_words)
+        self.assertIn("BUILDLOG_CALLER=verify-mac", remote_words)
         self.assertIn("BUILDLOG_CALL_ID=call-17", remote_words)
         self.assertIn("BUILDLOG_SYNC=1", remote_words)
         self.assertIn("LINT_SWEEP_BUDGET_GIB=64", remote_words)
@@ -759,20 +785,63 @@ class OffloadCommandTests(unittest.TestCase):
         self.assert_wire("failed", "")
         self.assertFalse((self.state_directory / "run.json").exists())
 
-    def test_missing_run_status_is_lost_and_releases_claim(self) -> None:
+    def test_no_test_status_runs_on_natedev_instead(self) -> None:
+        self.fixture["run_status_line"] = "mac_exit=4"
+        self.sync_fixture()
+
+        result = self.command()
+
+        self.assertEqual(result.returncode, 75, result.stdout)
+        self.assertIn(
+            "mac_test: no test matched on the Mac; running on natedev instead\n",
+            result.stdout,
+        )
+        self.assertNotIn("mac_exit=4", result.stdout)
+        self.assert_wire("declined", "no_tests")
+        self.assertFalse((self.state_directory / "run.json").exists())
+
+    def test_nextest_failure_status_remains_a_mac_failure(self) -> None:
+        self.fixture["run_status_line"] = "mac_exit=1"
+        self.sync_fixture()
+
+        result = self.command()
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assert_wire("failed", "")
+
+    def test_lost_run_time_includes_remote_cleanup(self) -> None:
         self.fixture["run_lines"] = [
             {"stream": "stdout", "text": "partial output"}
         ]
-        self.fixture["run_status_line"] = None
+        self.fixture["run_status_reported"] = False
+        cleanup_seconds = 1.0
+        self.fixture["cleanup_delay_s"] = cleanup_seconds
         self.sync_fixture()
+        command_started = time.monotonic()
         result = self.command()
+        command_seconds = time.monotonic() - command_started
         self.assertEqual(result.returncode, 75, result.stdout)
         self.assertIn("partial output\n", result.stdout)
         self.assertIn(
-            "mac_test: lost the Mac run; running on natedev\n", result.stdout
+            "mac_test: the link to the Mac dropped; running on natedev instead\n",
+            result.stdout,
         )
-        self.assert_wire("lost", "")
+        wire = self.wire_result()
+        self.assertEqual(wire["mac"], "lost")
+        self.assertEqual(wire["reason"], "")
+        recorded_seconds = float(wire["seconds"])
+        self.assertGreaterEqual(recorded_seconds, cleanup_seconds)
+        self.assertLess(command_seconds - recorded_seconds, cleanup_seconds)
         self.assertFalse((self.state_directory / "run.json").exists())
+        cleanup_events = [
+            event
+            for event in self.events_for("ssh")
+            if "pkill -f" in event["args"][-1]
+        ]
+        self.assertEqual(len(cleanup_events), 1, self.events())
+        cleanup = cleanup_events[0]
+        self.assertTrue(cleanup["claimed"], cleanup)
+        self.assertIn(".local/state/mac-test/mirror/hana", cleanup["args"][-1])
 
     def test_run_signals_request_remote_cleanup_and_release_claim(self) -> None:
         self.fixture["run_delay_s"] = 30.0
@@ -817,6 +886,80 @@ class OffloadCommandTests(unittest.TestCase):
                 self.assertIn("pkill -f", cleanup)
                 self.assertIn(".local/state/mac-test/mirror/hana", cleanup)
                 self.assert_claimed_commands()
+
+    def test_second_signal_during_cleanup_keeps_first_status_and_releases(self) -> None:
+        self.fixture["run_delay_s"] = 30.0
+        self.fixture["hold_cleanup"] = True
+        self.sync_fixture()
+        process = self.start_command("--workspace")
+        try:
+            self.wait_for_path(self.stub_directory / "run-started")
+            process.send_signal(signal.SIGTERM)
+            self.wait_for_path(self.stub_directory / "cleanup-started")
+            process.send_signal(signal.SIGHUP)
+            _ = (self.stub_directory / "continue-cleanup").write_text(
+                "continue\n", encoding="utf-8"
+            )
+            output, _ = process.communicate(timeout=15)
+        except BaseException:
+            process.kill()
+            _ = (self.stub_directory / "continue-cleanup").write_text(
+                "continue\n", encoding="utf-8"
+            )
+            _ = process.communicate(timeout=5)
+            raise
+
+        self.assertEqual(process.returncode, 128 + signal.SIGTERM, output)
+        self.assertTrue((self.stub_directory / "cleanup-called").exists())
+        self.assertFalse((self.state_directory / "run.json").exists())
+
+    def test_ignored_interrupt_becomes_default_before_claim(self) -> None:
+        startup = self.root / "interrupt-startup"
+        startup.mkdir()
+        marker = self.stub_directory / "interrupt-is-default"
+        gate = self.stub_directory / "continue-after-interrupt-default"
+        _ = (startup / "sitecustomize.py").write_text(
+            "from __future__ import annotations\n"
+            + "import os\n"
+            + "from pathlib import Path\n"
+            + "import signal\n"
+            + "import time\n"
+            + "original_signal = signal.signal\n"
+            + "def observed_signal(signal_number: int, handler: object) -> object:\n"
+            + "    previous = original_signal(signal_number, handler)\n"
+            + "    if signal_number == signal.SIGINT and handler == signal.SIG_DFL:\n"
+            + "        Path(os.environ['TEST_INTERRUPT_DEFAULT_MARKER']).write_text(\n"
+            + "            'ready\\n', encoding='utf-8'\n"
+            + "        )\n"
+            + "        gate = Path(os.environ['TEST_INTERRUPT_DEFAULT_GATE'])\n"
+            + "        while not gate.exists():\n"
+            + "            time.sleep(0.01)\n"
+            + "    return previous\n"
+            + "signal.signal = observed_signal\n",
+            encoding="utf-8",
+        )
+        process = self.start_command(
+            extra={
+                "PYTHONPATH": str(startup),
+                "TEST_INTERRUPT_DEFAULT_MARKER": str(marker),
+                "TEST_INTERRUPT_DEFAULT_GATE": str(gate),
+            },
+            ignore_interrupt=True,
+        )
+        try:
+            self.wait_for_path(marker)
+            process.send_signal(signal.SIGINT)
+            output, _ = process.communicate(timeout=15)
+        except BaseException:
+            process.kill()
+            _ = gate.write_text("continue\n", encoding="utf-8")
+            _ = process.communicate(timeout=5)
+            raise
+
+        self.assertEqual(process.returncode, -signal.SIGINT, output)
+        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertEqual(self.events(), [])
+        self.assertFalse(self.result_path.exists())
 
     def test_unwritable_result_destination_returns_internal_error(self) -> None:
         self.config["offload"] = "off"

@@ -374,9 +374,10 @@ def ancestry(request: MergeRequest) -> bool:
     return already
 
 
-def changed_paths(request: MergeRequest) -> tuple[str, ...]:
+def changed_paths(request: MergeRequest, base: str = "") -> tuple[str, ...]:
+    """The paths the checkpoint changes from `base`, by default the merge branch's tip."""
     output = good(git(request.production.checkout, "diff", "--name-only",
-                      f"{request.production.merge_branch}...{request.commit}"), "scope")
+                      f"{base or request.production.merge_branch}...{request.commit}"), "scope")
     return tuple(line for line in output.splitlines() if line)
 
 
@@ -772,26 +773,31 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
 def run(request: MergeRequest) -> int:
     try:
         already = ancestry(request)
-        paths: tuple[str, ...] = ()
         tests_green = "no tests" if isinstance(request.kind, ShrinkCommit) else "merge tests"
+        pushed = pushed_state(request) if already else NotYetPushed()
         if not already:
             paths = changed_paths(request)
             scope(request, paths)
             conflicts(request)
             other_units(request, paths)
             merge_head = merge(request)
+        else:
+            merge_head = merged_checkpoint(request)
+            # A run killed between its merge and its push left a merge nothing has tested.
+            steps = ("scope", "conflicts", "other units", "merge")
+            if isinstance(pushed, PushedTip):
+                steps += ("test", "red")
+            for step in steps:
+                report(step, "ok", "checkpoint already merged; resuming promotion")
+            paths = changed_paths(request, f"{merge_head}^1")
+        if isinstance(pushed, NotYetPushed):
             try:
                 tests_green = tests(request, paths, merge_head)
             except (OSError, ValueError) as error:
                 undo_unpushed_merge(request, merge_head)
                 raise Stop("red", "failed", str(error),
                            "repair the test logging failure and send a new checkpoint") from error
-        else:
-            merge_head = merged_checkpoint(request)
-            for step in ("scope", "conflicts", "other units", "merge", "test", "red"):
-                report(step, "ok", "checkpoint already merged; resuming promotion")
-        first_code_merge = not already and isinstance(request.kind, CodeCheckpoint)
-        pushed = pushed_state(request) if already else NotYetPushed()
+        first_code_merge = isinstance(pushed, NotYetPushed) and isinstance(request.kind, CodeCheckpoint)
         if isinstance(pushed, PushedTip):
             tip = pushed.tip
             report("push", "ok", f"{request.production.merge_branch} already pushed at {tip}")

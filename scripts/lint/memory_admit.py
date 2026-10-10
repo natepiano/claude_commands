@@ -64,6 +64,8 @@ class Reservation(TypedDict):
     worktree: str
     admitted_at: str
     sidecar: str
+    test_threads: int | None
+    call_id: str | None
 
 
 @dataclass(frozen=True)
@@ -130,15 +132,38 @@ def percentile(values: list[int]) -> int:
     return values[(90 * len(values) + 99) // 100 - 1]
 
 
-def expected_peak(repo: str, step: str, host: str, now: datetime, root: Path) -> ExpectedPeak:
-    cutoff = (now - timedelta(days=HISTORY_DAYS)).isoformat().replace("+00:00", "Z")
+def test_threads(argv: list[str]) -> int | None:
+    """Return nextest's explicitly requested test width, when it is numeric."""
+    for index, argument in enumerate(argv):
+        value: str | None = None
+        if argument in ("--test-threads", "-j"):
+            if index + 1 < len(argv):
+                value = argv[index + 1]
+        elif argument.startswith("--test-threads="):
+            value = argument.removeprefix("--test-threads=")
+        elif argument.startswith("-j") and len(argument) > 2:
+            value = argument[2:]
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+def expected_peak(repo: str, step: str, host: str, now: datetime, root: Path,
+                  test_threads: int | None = None) -> ExpectedPeak:
+    cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
+    before = store.utc_iso(now.timestamp())
     measured: list[int] = []
     try:
         with (root / "admission/anon_peaks.jsonl").open() as lines:
             for line in lines:
                 try:
                     item = cast(dict[str, object], json.loads(line))
-                    if (item.get("host"), item.get("repo"), item.get("step")) == (host, repo, step) and str(item.get("ended_at", "")) >= cutoff:
+                    if ((item.get("host"), item.get("repo"), item.get("step")) == (host, repo, step)
+                            and item.get("test_threads") == test_threads
+                            and cutoff <= str(item.get("ended_at", "")) < before):
                         peak = item.get("anon_peak_bytes")
                         if isinstance(peak, int) and peak > 0:
                             measured.append(peak)
@@ -155,8 +180,8 @@ def expected_peak(repo: str, step: str, host: str, now: datetime, root: Path) ->
         try:
             rows = cast(list[tuple[int]], connection.execute(
                 "SELECT peak_mem_bytes FROM steps WHERE host = ? AND repo = ? AND step = ? "
-                + "AND started_at >= ? AND peak_mem_bytes > 0",
-                (host, repo, step, cutoff),
+                + "AND started_at >= ? AND started_at < ? AND peak_mem_bytes > 0",
+                (host, repo, step, cutoff, before),
             ).fetchall())
             peaks = [int(value) for (value,) in rows]
         finally:
@@ -236,11 +261,12 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], force: bool = 
           profile: StepProfile | None = None) -> CheckResult:
     root = root if root is not None else store.root()
     now = now if now is not None else datetime.now(UTC)
+    width = test_threads(argv)
     if profile is None:
         repo, worktree = git_identity(argv, os.getcwd())
         step = parse.step_name(argv) if argv else "build"
         host = store.host_name()
-        peak = expected_peak(repo, step, host, now, root) if repo else ExpectedPeak(FALLBACK, "fallback", 0)
+        peak = expected_peak(repo, step, host, now, root, width) if repo else ExpectedPeak(FALLBACK, "fallback", 0)
         profile = StepProfile(repo, step, worktree, peak)
     repo, step, worktree, peak = profile.repo, profile.step, profile.worktree, profile.peak
     if not argv and not (root / "admission").exists():
@@ -260,7 +286,9 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], force: bool = 
                 path = directory / f"{pid}-{start}-{time.time_ns()}.reservation"
                 row: Reservation = {"pid": pid, "start_time": start, "need": peak.bytes,
                                     "repo": repo, "step": step, "worktree": worktree,
-                                    "admitted_at": store.utc_iso(now.timestamp()), "sidecar": sidecar}
+                                    "admitted_at": store.utc_iso(now.timestamp()), "sidecar": sidecar,
+                                    "test_threads": width,
+                                    "call_id": os.environ.get("BUILDLOG_CALL_ID") or None}
                 _ = path.write_text(json.dumps(row, separators=(",", ":")))
                 reservation = Reserved(path)
             else:
@@ -284,6 +312,7 @@ def release(path: Path, status: int, root: Path | None = None) -> None:
                 store.append_line(directory / "anon_peaks.jsonl", {
                     "host": store.host_name(), "repo": row["repo"], "step": row["step"],
                     "worktree": row["worktree"], "anon_peak_bytes": peak, "status": status,
+                    "test_threads": row.get("test_threads"), "call_id": row.get("call_id"),
                     "ended_at": store.utc_iso(time.time()),
                 })
         except (OSError, ValueError):

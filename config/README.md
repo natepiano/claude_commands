@@ -55,10 +55,10 @@ the SKIPPED line), or run it as the `/lint_config` CLI.
 
 Controls Mac test offload and the `/mac_test` block command. It names the CI
 repository, workflow, job and repository variable; bounds each `gh` call;
-names the earlier job that reads the CI switch; sets the default and maximum
-block lifetime; and sets the expiry-warning window. Offload settings name the
-SSH host and connection and probe time limits, the unreachable retry delay,
-the free-space and load limits, default and repository memory budgets,
+sets the default and maximum block lifetime; and sets the expiry-warning
+window. Offload settings name the SSH host and connection and probe time
+limits, the unreachable retry delay, the free-space and load limits, default
+and repository size limits for each Mac mirror's build folder,
 Linux-only packages, and Mac nextest exclusions. A repository needs a
 `linux_only.<repo>` key, even when its value is empty, before tests can run on
 the Mac. An empty `ci_repo` disables CI calls. `MAC_TEST_CONFIG` selects a

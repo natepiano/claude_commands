@@ -74,6 +74,13 @@ class FailedOnMac:
 
 
 @dataclass(frozen=True)
+class NoTestMatchedOnMac:
+    """A completed Mac run whose filter selected no test."""
+
+    seconds: float
+
+
+@dataclass(frozen=True)
 class LostMacRun:
     """A Mac run whose final test status was not received."""
 
@@ -88,7 +95,9 @@ class DeclinedMacRun:
     seconds: float
 
 
-MacOffloadResult = PassedOnMac | FailedOnMac | LostMacRun | DeclinedMacRun
+MacOffloadResult = (
+    PassedOnMac | FailedOnMac | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun
+)
 
 
 @dataclass(frozen=True)
@@ -117,7 +126,7 @@ class OffloadConfig:
     unreachable_backoff_s: float
     free_floor_gib: float
     max_load: float
-    default_budget_gib: str
+    default_target_budget_gib: str
     values: dict[str, str]
 
 
@@ -387,7 +396,7 @@ def read_config() -> OffloadConfig:
         ),
         free_floor_gib=positive_number(values, "free_floor_gib", 60.0),
         max_load=positive_number(values, "max_load", 6.0),
-        default_budget_gib=values.get("mac_budget_gib", "24"),
+        default_target_budget_gib=values.get("mac_budget_gib", "24"),
         values=values,
     )
 
@@ -419,6 +428,11 @@ def write_result(result: MacOffloadResult, destination: ResultDestination) -> in
         mac = "passed"
         reason = ""
         status = 0
+    elif isinstance(result, NoTestMatchedOnMac):
+        mac = "declined"
+        reason = "no_tests"
+        status = 75
+        print("mac_test: no test matched on the Mac; running on natedev instead")
     elif isinstance(result, FailedOnMac):
         mac = "failed"
         reason = ""
@@ -432,7 +446,7 @@ def write_result(result: MacOffloadResult, destination: ResultDestination) -> in
         mac = "lost"
         reason = ""
         status = 75
-        print("mac_test: lost the Mac run; running on natedev")
+        print("mac_test: the link to the Mac dropped; running on natedev instead")
     else:
         mac = "declined"
         reason = result.reason
@@ -682,7 +696,7 @@ def remote_test_command(
     repository: KnownRepository,
 ) -> str:
     budget = config.values.get(
-        f"mac_budget_gib.{repository.name}", config.default_budget_gib
+        f"mac_budget_gib.{repository.name}", config.default_target_budget_gib
     )
     words = nextest_words_with_skip(
         request.nextest_words,
@@ -692,7 +706,7 @@ def remote_test_command(
     return (
         f"cd {shlex.quote(remote_mirror(repository))} && "
         'PATH="$HOME/.cargo/bin:$PATH" '
-        "BUILDLOG_CALLER=verify "
+        "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_CALL_ID={shlex.quote(request.call_id)} "
         "BUILDLOG_SYNC=1 "
         f"LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "
@@ -753,9 +767,12 @@ def claimed_run(
         )
         seconds = elapsed_seconds(started)
         if isinstance(remote_status, MissingMacStatus):
-            return LostMacRun(seconds)
+            end_remote_work(config, repository)
+            return LostMacRun(elapsed_seconds(started))
         if remote_status.status == 0:
             return PassedOnMac(seconds)
+        if remote_status.status == 4:
+            return NoTestMatchedOnMac(seconds)
         return FailedOnMac(remote_status.status, seconds)
     except OffloadInterrupted:
         end_remote_work(config, repository)
@@ -810,6 +827,9 @@ def interrupt_handlers(controller: ProcessController) -> Generator[None, None, N
 
     def stop_for_signal(signal_number: int, frame: FrameType | None) -> None:
         _ = frame
+        _ = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        _ = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        _ = signal.signal(signal.SIGHUP, signal.SIG_IGN)
         controller.stop()
         raise OffloadInterrupted(signal_number)
 
@@ -850,8 +870,17 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
     )
 
 
+def restore_ignored_interrupt_default(arguments: CliArguments) -> None:
+    if (
+        arguments.command == "run"
+        and signal.getsignal(signal.SIGINT) == signal.SIG_IGN
+    ):
+        _ = signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
 def main() -> int:
     arguments = parser().parse_args(namespace=CliArguments())
+    restore_ignored_interrupt_default(arguments)
     request = request_from_arguments(arguments)
     config = read_config()
     controller = ProcessController()

@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
 # Report cargo-berth drift for a Bash call after the fact.
 #
 # This wrapper decides one thing: whether the engine can be reached. Everything a

@@ -242,7 +242,8 @@ recorded in `${SESSION_DIR}/mesh_server.json` — a different path that can fail
 while `codex exec` answers. That disagreement is the wedged server's signature,
 not evidence delegates are back. The only valid probe is the dispatch itself.
 
-The launcher already tried. On a fast failure with no work done, `codex_mesh.py`
+The launcher already tried. On a fast failure with no work done, or a stale Codex
+sign-in (`access token could not be refreshed`) even after the thread exists, `codex_mesh.py`
 abandons the inherited server, starts one of its own and runs the seat again,
 printing `retrying on a new app-server` to the seat's log. So an error that
 reaches you has usually already been tested against a clean server and is real.
@@ -250,6 +251,10 @@ Read the log for that line before doing anything by hand: present, the retry
 happened and the failure survived it; absent, the launcher held back — the seat
 had already done work, or the failure took too long to be local — and the
 paragraphs above are yours to apply.
+
+A new Codex sign-in moves the run by itself. A message from `codex-sign-in` names
+the server it retired; the next dispatch starts on a new one, a seat mid-turn
+finishes first, and nothing is owed in reply.
 
 Recovering by hand, in that case only. Check that no peer run claims the
 recorded pid or port before signalling anything —
@@ -365,6 +370,7 @@ Rust delegates run only exact prompt lines using
 | package tests | `bash ~/.claude/scripts/delegate/verify.sh test <package>` |
 | one integration target alone | `bash ~/.claude/scripts/delegate/verify.sh test <package> <test>` |
 | only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/delegate/verify.sh test <package> --filter <name> [--filter <name> …]` |
+| a Mac failure that looks unrelated to the change, run on natedev | `bash ~/.claude/scripts/delegate/verify.sh test <package> --local` |
 | mend fix, format, scoped clippy, rustdoc | `bash ~/.claude/scripts/delegate/verify.sh lint <package>` |
 | checkpoint format | `bash ~/.claude/scripts/delegate/verify.sh fmt <package>` |
 | changed example | `bash ~/.claude/scripts/delegate/verify.sh example <package> <name>` |

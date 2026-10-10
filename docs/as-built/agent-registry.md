@@ -200,14 +200,16 @@ out of the run-active marker: the server is detached on purpose so it outlives
 each delegate, so the end of the run is the only point that knows nobody needs
 it. That is also why it reaps `mesh_retired.json` as well as the live record —
 a server the retry below abandoned is left running, since it may still be
-finishing a peer delegate's turn.
+finishing a peer delegate's turn. Its watcher stops it sooner once no client and
+no running turn is left on it, and drops it from that list, so `stop` never
+signals a pid that has since gone to another process.
 
 **Recovering from a wedged app-server.** A stuck server answers every thread
 that attaches with a provider message it cached earlier — no round trip — so a
 usage limit that was real hours ago is replayed word for word to work that would
 have succeeded. Reading the message cannot tell that from a live refusal; the
 launcher settles it by running the work again on a server it starts itself,
-which has cached nothing. `command_start` retries once, through `_retry_warranted`, when all of these hold: the run ended `FailedBeforeThread` (no thread exists, so repeating the prompt cannot repeat edits), the server was inherited rather than started by this call, the failure arrived within `RETRY_FAST_FAILURE_SECS` (120), and the delegate is not resident. A run that failed after `thread/start` is `FailedWithThread` and is never retried, since its prompt may already have done work. `_retire_server`
+which has cached nothing. `command_start` retries once, through `_retry_warranted`, when all of these hold: the run ended `FailedBeforeThread` (no thread exists, so repeating the prompt cannot repeat edits), the server was inherited rather than started by this call, the failure arrived within `RETRY_FAST_FAILURE_SECS` (120), and the delegate is not resident. A run that failed after `thread/start` is `FailedWithThread` and is not retried, since its prompt may already have done work, with one exception: a failure whose text holds `STALE_SIGN_IN` (`access token could not be refreshed`). That is an inherited server holding a Codex sign-in that changed after it started; the provider turned the turn away before any work, so a new thread repeats nothing, and a server started now reads the current sign-in. The other three conditions still apply, and the seat log says `the inherited app-server holds a Codex sign-in that has since changed; retrying on a new one`. `_retire_server`
 drops the record only when it still names the server that failed, so seats
 racing the same recovery replace one server between them rather than one each.
 Same failure on the fresh server means the provider really did refuse, and it is
@@ -368,6 +370,38 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   seats, which no end step covers, and work that went on in a run folder after
   its run had closed, where a later dispatch started a server no end step
   followed.
+- A Codex sign-in change moves every run to a new app-server (user
+  2026-10-09: "when we login a new codex session while one is held, we need a
+  way to automatically switch them over and clean up old ones"). An app-server
+  reads `$CODEX_HOME/auth.json` once, at start; after a new sign-in it holds a
+  token it cannot refresh and fails each turn with `access token could not be
+  refreshed`. `codex_mesh.py signin-changed` runs the moment that file changes,
+  from a path watch the NixOS config installs (a systemd user path unit on
+  Linux, a launchd agent on the Mac). It reads only the file's change time,
+  never its contents. For each run folder under `/tmp/claude/delegate` whose
+  recorded server started before that time (`ps -o etime`, the same on both
+  systems), it retires the record, stops the old server at once if nothing uses
+  it or leaves it a watcher, writes a line to `mesh_server.log`, and sends that
+  line through `send.py` to each session whose run-active marker names the run.
+  The run's next dispatch starts a server that reads the current sign-in. A seat
+  mid-turn finishes on the old server, which `send` and `steer` keep reaching
+  through the port in the seat's roster entry while its launcher lives. Every
+  launcher writes that port before it opens its thread, `follow` included; for
+  an entry without one, `_seat_port` asks each running server of the run,
+  retired ones first, which holds the thread (`thread/loaded/list`). A seat
+  whose launcher lives is never given a new server: a second server cannot open
+  a thread another still holds, so when none holds it the message fails and
+  nothing is left running. A
+  resident seat moves itself between turns (`_move_resident`), carrying any
+  queued messages into its first turn on the new server under its pending lock.
+  A retired server is judged on its clients and running turns alone, since the
+  run's marker, launchers and activity belong to the newer server; its watcher
+  asks at every wake rather than waiting for the record to go quiet.
+  `ensure_server` makes the same check at each launch for a change the watch
+  missed. Any write to the file counts, a token refresh by another Codex process
+  included: that costs a server restart and a notice, never work. Running it
+  twice for one change moves nothing the second time. On the Mac the old server
+  is stopped by `end_session.sh`, as above.
 - A codex delegate's launcher ends with its last turn, and `send` then refuses it
   though the thread persists. Unlike a claude delegate, whose
   background session stays resumable, a finished codex peer cannot be messaged;

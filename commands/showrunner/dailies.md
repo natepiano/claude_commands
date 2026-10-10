@@ -63,7 +63,7 @@ Read the current state, not memory, and check what you state the way
    that has not changed since the builder first saw it is never requested and
    stays as stated, unless a new one was already asked for before the hold:
    that one is not brought back. A unit whose run has finished and that shows
-   no form and no decision needs no entry: the builder leaves it out of the report and
+   no form and no open question needs no entry: the builder leaves it out of the report and
    names it in a `left out` line. Supply the phase, started time, current update, and ETA
    numbers from the unit's plan and reports. Text after `❯` may be a prompt
    suggestion, not the user's draft:

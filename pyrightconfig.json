@@ -99,6 +99,16 @@
       ]
     },
     {
+      "root": "scripts/shutdown",
+      "extraPaths": [
+        "scripts/shutdown",
+        "scripts/whoami",
+        "scripts/message",
+        "scripts/production",
+        "scripts/hooks"
+      ]
+    },
+    {
       "root": "."
     }
   ]

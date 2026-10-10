@@ -183,6 +183,10 @@
           },
           {
             "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/whoami/account.py\" --write-label >/dev/null 2>&1 || true"
+          },
+          {
+            "type": "command",
             "command": "\"$HOME/.claude/scripts/settings/ensure_git_filters.sh\""
           },
           {
@@ -236,7 +240,7 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "exec jq -r --arg pwd \"$PWD\" -f \"$HOME/.claude/scripts/statusline/statusline.jq\""
+    "command": "read -r account 2>/dev/null < \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/account-label\"; exec jq -r --arg pwd \"$PWD\" --arg account \"$account\" -f \"$HOME/.claude/scripts/statusline/statusline.jq\""
   },
   "enabledPlugins": {
     "rust-analyzer-lsp@claude-plugins-official": false
