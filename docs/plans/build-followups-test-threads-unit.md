@@ -98,7 +98,7 @@ While G1 holds, each time the unit director wakes it runs `width_trial.py report
 
 **Ruled out:** removing hana records at install — the per-width key keeps the baseline and gives each arm its own reservation.
 
-### Phase 2 — The trial starts: each nextest step runs at 16 or 32 by block  · status: todo
+### Phase 2 — The trial starts: each nextest step runs at 16 or 32 by block  · status: done
 
 #### Work Order
 

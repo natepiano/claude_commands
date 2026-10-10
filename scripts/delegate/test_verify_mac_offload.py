@@ -414,9 +414,11 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.assertEqual(len(local), 1)
         runner_arguments = runners[0]["args"]
         self.assertEqual(runner_arguments[0], "run")
+        self.assertEqual(local[0]["args"][2], "--test-threads")
+        self.assertGreater(int(local[0]["args"][3]), 0)
         self.assertEqual(
             runner_arguments[runner_arguments.index("--") + 1 :],
-            local[0]["args"][2:],
+            local[0]["args"][4:],
         )
         self.assertIn("--filter-run", runner_arguments)
         self.assertNotIn("--no-cache", runner_arguments)
