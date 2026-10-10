@@ -385,7 +385,7 @@ A tmux session that `/shutdown restart` brings back resumes in the pane it ran i
 
 **Ruled out:** renaming `PendingTimer` with its progress type — its name holds for its whole lifetime.
 
-### Phase 11 — The phone rings only when the user must act  · status: todo
+### Phase 11 — The phone rings only when the user must act  · status: done
 
 #### Work Order
 
