@@ -42,7 +42,7 @@ KEEP_COMMAND = (
     '"$HOME/.claude/scripts/lib/py" '
     '"$HOME/.claude/scripts/hooks/conversation_pause.py" keep'
 )
-NOTICE_TAG = re.compile(r"^<(?:task-notification|system-reminder)(?:\s|>)")
+NOTICE_TAG = re.compile(r"^<(?:task-notification|system-reminder|agent-message)(?:\s|>)")
 CROSS_SESSION_TAG = re.compile(r"^<cross-session-message\b[^>]*>")
 FROM_NAME = re.compile(r'\bfrom-name="([^"]*)"')
 CLIPPED_PROMPT_MARKER = re.compile(r"… \[\+\d+ chars\]")

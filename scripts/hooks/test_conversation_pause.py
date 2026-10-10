@@ -475,7 +475,6 @@ print("SENT: delivered")
             "/unit:report",
             "/compact",
             "From the user (via the showrunner): go on",
-            '<agent-message from="a1">done</agent-message>',
             '<pasted_content id="1">code</pasted_content> why?',
             "<div> why",
         )
@@ -516,6 +515,7 @@ print("SENT: delivered")
         for prompt in (
             "<task-notification>done</task-notification>",
             "<system-reminder>remember</system-reminder>",
+            '<agent-message from="a1">done</agent-message>',
             "",
         ):
             with self.subTest(prompt=prompt):
@@ -814,6 +814,22 @@ print("SENT: delivered")
             "<task-notification>done</task-notification>",
             "<system-reminder>remember</system-reminder>",
         ):
+            with self.subTest(prompt=prompt):
+                result = self.run_prompt(prompt)
+                self.assertEqual(
+                    (result.returncode, result.stdout, result.stderr), (0, "", "")
+                )
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
+        self.assertFalse((self.escalate_root / "typed").exists())
+
+    def test_subagent_hand_back_does_not_pause_reports(self) -> None:
+        instance = self.create_instance("showrunner-demo")
+        hand_back = (
+            '<agent-message from="a715bbb613f1bc07c">\n'
+            "[Subagent hand-back] fixed the recorder</agent-message>"
+        )
+        for prompt in (hand_back, f"Another Claude session sent a message:\n{hand_back}"):
             with self.subTest(prompt=prompt):
                 result = self.run_prompt(prompt)
                 self.assertEqual(
