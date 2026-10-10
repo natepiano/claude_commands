@@ -72,73 +72,31 @@ While G1 holds, each time the unit director wakes it runs `width_trial.py report
 
 ### Phase 1 — The gate's records name their width and call, and the scorecard is frozen  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** the memory gate keys its reservation by test width and records each peak with its width and call id, with no change in behavior while no step names a width. `width_trial.py report` prints the trial's scorecard, and its pre-change baseline is recorded with the script's hash.
-
-**Spec:**
-
-`scripts/lint/memory_admit.py`:
-- `def test_threads(argv: list[str]) -> int | None`: the integer after `--test-threads` or `-j`, or in `--test-threads=N` / `-jN`; `None` when absent or not an integer (`num-cpus`).
-- `Reservation` gains `test_threads: int | None` and `call_id: str | None` (`os.environ.get("BUILDLOG_CALL_ID") or None`), both set in `check` from its argv and environment on every admit.
-- `expected_peak(repo, step, host, now, root, test_threads: int | None = None)`: the measured tier keeps a record only when `item.get("test_threads") == test_threads` as well (old records have no field, so they match `None`). The index tier and fallback are unchanged. `check` passes `test_threads(argv)`.
-- `release` writes `"test_threads"` and `"call_id"` into the `anon_peaks.jsonl` record.
-- `main`'s output line is unchanged.
-
-`scripts/buildlog/width_trial.py` (new), CLI `report --since <ISO-8601> --until <ISO-8601>` (each with an offset; `--until now` allowed). Reads `store.root()`'s index (`?mode=ro` URI) and `admission/anon_peaks.jsonl`; imports `memory_admit` (sys.path insert of `scripts/lint`, as `memory_admit.py` inserts `scripts/buildlog`) for `expected_peak` and `percentile`. It computes every metric in Delegation Context → Trial design exactly as defined there:
-
-```python
-BLOCK_S = 6000          # invoke.sh's switchback block; keep the two equal
-WASHOUT_S = 900
-WIDTHS = {16: "physical", 32: "logical"}   # natedev; any other width prints as its number
-
-class Step(TypedDict):
-    request: float; block: int; width: int | None; whole_hana: bool; hana: bool
-    wait: float; exec_s: float | None; failed: bool; call_id: str | None; step_id: str
-class Interval(NamedTuple): low: float; high: float
-def load_steps(index: Path, since: float, until: float, host: str) -> list[Step]
-def anon_by_call(path: Path, host: str) -> dict[str, int]          # call_id -> anon peak (nextest records)
-def block_bootstrap(arms: tuple[list[Step], list[Step]], stat: Callable[[list[Step]], float | None],
-                    combine: Callable[[float, float], float], rng: random.Random, n: int = 2000) -> Interval
-def verdict(w: Metric, t: Metric, f: Metric) -> Literal["keep", "revert", "trade-off", "no verdict"]
-```
-
-Output, plain text, every time in PDT, numbers to 2 decimals (GiB), whole seconds or 1 decimal (%):
-```
-Width trial natedev 2026-10-09 21:04 PDT – 2026-10-12 21:04 PDT (72.0 h) · width_trial.py sha256 1a2b3c4d5e6f
-arm       blocks  hana steps  whole-hana runs
-physical  22      1,402       260
-logical   21      1,388       255
-sample: ok
-metric                                     physical  logical  ratio   90% interval   rule                        result
-W memory wait per hana test step (s)       41.0      120.3    0.34    0.22–0.51      ≤ 0.50, high < 1.00         proven
-P whole-hana anon peak p50 (GiB)           5.80      11.10    0.52    0.49–0.55      physical ≤ 6.50             met
-R gate reservation, hana nextest (GiB)     8.91      11.35    —       —              physical ≤ 9.00             met
-T whole-hana exec p50 (s)                  215       205      1.05    0.98–1.12      fails > 1.11 and low > 1    pass
-F whole-hana failed runs (%)               47.1      48.0     −0.9pt  −7.0–5.2pt     fails > +5pt and low > 0    pass
-  timed-out tests per 100 whole-hana runs  0.4       0.8
-  memory wait per gated step, all natedev  22.0      51.0
-verdict: keep — W proven; T and F pass
-```
-- With one arm (or only `unset`), it prints that arm's rows and values, `—` where a value needs the other arm or `call_id`, and `verdict: no verdict — needs both arms`. A short sample prints `sample: short — <arm> has <n> whole-hana runs (< 60)` or `… <n> blocks (< 15)`.
-- The header's hash is SHA-256 of the script's own bytes (first 12 hex digits).
-- Exit 0 on a report, 2 on a usage error.
-
-`docs/as-built/build-memory-admission.md` — "The memory gate" `need` bullet (32) and the release sentence (57): the measured tier also matches the step's `--test-threads` (none matches none), and each record carries `test_threads` and `call_id`.
+- `memory_admit.test_threads(argv) -> int | None` reads `--test-threads N`, `--test-threads=N`, `-j N`, `-jN`; absent or non-integer (`num-cpus`) is `None`.
+- `expected_peak(repo, step, host, now, root, test_threads=None)` matches width exactly in both tiers (measured: `anon_peaks.jsonl` records with equal `test_threads`, unlabeled records matching `None`; index: steps whose argv width is equal) and reads only history before `now` (measured `ended_at < now`, index `started_at < now`), so R reads the same at any later time. `check` passes `test_threads(argv)`.
+- `check` writes `test_threads` and `call_id` (`BUILDLOG_CALL_ID`, else `None`) into each reservation row; `release` copies both into the `anon_peaks.jsonl` record. The gate's printed line is unchanged.
+- `width_trial.py report --since --until` (ISO-8601 with offset; until accepts `now`) prints the pre-registered scorecard: arms `physical` (16) / `logical` (32) / `unset` (any other width or none); `BLOCK_S` 6000 with a 900 s washout applied to W only; W/P/R/T/F with 90% block-bootstrap intervals (2,000 resamples, seed 20261009); the sample line; reported-only rows (timed-out per 100, all-steps gated wait); verdict `keep` / `revert` / `trade-off` / `no verdict`. The header carries the script's own sha256 (first 12 hex). Exit 0 on a report, 2 on a usage error.
+- `Metric = ComparedMetric(physical, logical, comparison, interval) | UncomparedMetric(physical, logical, reason)`, reason one of needs both arms, zero denominator, no resamples. A one-arm window prints `—` where a value needs the other arm and `verdict: no verdict — needs both arms`.
+- The sample minimum (60 whole-hana runs, 15 blocks) counts only the physical and logical arms when either is present. W and the all-steps wait skip NULL `mem_wait_s`; the all-steps row counts only gated steps (`cargo [+tc] fmt` and `*/sweep.py` exempt, as in `invoke.sh`). P pairs each attempt of a call with its own anon peak by end time when the counts match; a retried call missing a peak gives no P for any attempt.
 
 **Files:**
-- `scripts/lint/memory_admit.py` — the width key and the two record fields.
-- `scripts/buildlog/width_trial.py` — new.
-- `docs/as-built/build-memory-admission.md` — two sentences (also touches; owner build-report-unit).
-- `scripts/lint/test_memory_admit.py` — width cases; `scripts/buildlog/test_width_trial.py` — new.
+- `scripts/lint/memory_admit.py` — width parsing, per-width `expected_peak` bounded before `now`, `test_threads`/`call_id` in reservations and anon peaks.
+- `scripts/buildlog/width_trial.py` — the frozen scorecard.
+- `scripts/lint/test_memory_admit.py`, `scripts/buildlog/test_width_trial.py` — tests for both.
+- `docs/as-built/build-memory-admission.md` — `need` and release name width matching and the two record fields.
 
-**Seats:** `1 writer + 1 tester` — one small gate change and one new script, nothing to split; the Trial design and the signatures above are enough to test against.
-- `impl` — `scripts/lint/memory_admit.py`, `scripts/buildlog/width_trial.py`, `docs/as-built/build-memory-admission.md`
-- `test` — `scripts/lint/test_memory_admit.py`: `test_threads` parses all four forms and `num-cpus`; five records at width 16 and five unlabeled give different measured needs for `16` and `None`; `release` writes both fields with `BUILDLOG_CALL_ID` set. `scripts/buildlog/test_width_trial.py`: a temp `BUILDLOG_DIR` index and `anon_peaks.jsonl` built from known steps in known blocks; each metric's value; a step in a block's first 900 s left out of W only; the `call_id` join; the same seed gives the same interval twice; each verdict branch (proven, partial, none, a failed T, a failed F with W proven → `trade-off`); a one-arm window prints `no verdict`; a short sample line.
+**Binds later work:**
+- Pre-registration sha256 that the readout checks: `width_trial.py` a35ac69482d24493fe2ad5a9e0e975376c5de4dc92650cccf47bb613b2282fc9, `memory_admit.py` 1ecd402ab4ee4f0d5df19716bb406d17aa0cf1e4864040faad67f623e95a486b.
+- Baseline the readout compares against: window 2026-10-07 00:00 – 2026-10-09 17:33 PDT, unset arm only: 39 blocks, 3,551 hana steps, 344 whole-hana runs; W 101.8 s, P —, R 11.51 GiB, T 211 s, F 48.5%, timed-out 5.2 per 100, all-steps gated wait 53.4 s; no verdict.
+- `test_threads(argv)` keys each width's reservation, so the trial's width labels give each arm its own measured history, which the rollout check reads for R; `BLOCK_S` equals `invoke.sh`'s switchback block.
 
-**Constraints from prior phases:** none.
+**Gotchas:**
+- `verify.sh` retries a memory-killed step once under the same `BUILDLOG_CALL_ID`, so `call_id` alone does not identify one attempt.
+- `invoke.sh`'s memory-gate exempt set and `width_trial._uses_memory_gate` must stay in step.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/lint -p 'test_*.py'` and `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` green; `basedpyright scripts/lint/memory_admit.py scripts/buildlog/width_trial.py scripts/lint/test_memory_admit.py scripts/buildlog/test_width_trial.py` clean. Live: `~/.claude/scripts/lib/py scripts/buildlog/width_trial.py report --since 2026-10-07T00:00-07:00 --until now` prints the `unset` arm (W, T, F, R; P `—`). The As-built records that output with the SHA-256 of `width_trial.py` and `memory_admit.py`, the pre-registration Phase 3 checks.
+**Ruled out:** removing hana records at install — the per-width key keeps the baseline and gives each arm its own reservation.
 
 ### Phase 2 — The trial starts: each nextest step runs at 16 or 32 by block  · status: todo
 
@@ -187,7 +145,7 @@ verdict: keep — W proven; T and F pass
 
 **Seats:** `1 writer` — `impl` runs the scorecard, changes one line and reports.
 
-**Constraints from prior phases:** Phase 1: the scorecard, the frozen hashes and the `unset` baseline. Phase 2: T0, the mode variable `LINT_TEST_WIDTH` and its values.
+**Constraints from prior phases:** Phase 1: the scorecard and its frozen SHA-256 hashes — `scripts/buildlog/width_trial.py` `a35ac69482d24493fe2ad5a9e0e975376c5de4dc92650cccf47bb613b2282fc9`, `scripts/lint/memory_admit.py` `1ecd402ab4ee4f0d5df19716bb406d17aa0cf1e4864040faad67f623e95a486b` (Phase 1 As-built holds the `unset` baseline). The sample minimum counts only the `physical` and `logical` arms; steps without a width print as an `unset` column. `expected_peak` takes only records before its `now`, so R re-reads the same at any later time. Phase 2: T0, the mode variable `LINT_TEST_WIDTH` and its values.
 
 **Acceptance gate:** the hashes match; the report exits 0; the As-built holds the full output, the action and its rule; for keep or revert, `bash -n scripts/lint/invoke.sh` and `python3 -m unittest discover -s scripts/lint -p 'test_nextest_width.py'` green with that mode.
 
