@@ -33,17 +33,19 @@ from inventory import (
 )
 from record import (
     InvalidRecord,
-    LiveRecord,
+    LiveShutdownRecord,
     NoLiveRecord,
     NoShutdown,
-    Record,
+    ShutdownRecord,
     ShutdownInProgress,
+    StopTiming,
     find_live,
     live_records,
     parse_records,
 )
 from remote import other_machine, run_remote
 import settle
+import stop as stop_work
 
 
 class CommandLine(argparse.Namespace):
@@ -55,6 +57,7 @@ class CommandLine(argparse.Namespace):
     requested_by: str | None = None
     message: list[str] | None = None
     where: str = ""
+    force: str = ""
 
 
 class UnreachableMachine(TypedDict):
@@ -70,7 +73,7 @@ class UnavailableMachine(TypedDict):
 
 
 MachineStatusReport = Inventory | UnreachableMachine | UnavailableMachine
-MachineRecordReport = Record | UnreachableMachine | UnavailableMachine
+MachineRecordReport = ShutdownRecord | UnreachableMachine | UnavailableMachine
 
 
 class UnreadableShutdownRecord(TypedDict):
@@ -90,9 +93,9 @@ class UnavailableShutdownRecord(TypedDict):
     rc: int
 
 
-LocalShutdownRecordOutcome = LiveRecord | NoShutdown | UnreadableShutdownRecord
+LocalShutdownRecordOutcome = LiveShutdownRecord | NoShutdown | UnreadableShutdownRecord
 RemoteShutdownRecordOutcome = (
-    LiveRecord
+    LiveShutdownRecord
     | NoShutdown
     | UnreadableShutdownRecord
     | UnreachableShutdownRecord
@@ -212,7 +215,7 @@ def _local_time(value: str) -> str:
     )
 
 
-def _record_line(record: Record) -> str:
+def _record_line(record: ShutdownRecord) -> str:
     return (
         f"{record['machine']} {record['label']} {record['state']} "
         f"since {_local_time(record['requested_at'])}"
@@ -312,10 +315,30 @@ def _records(here: bool) -> tuple[list[MachineRecordReport], list[str]]:
     return reports, lines
 
 
+def held_session_ids() -> list[str]:
+    """Return sessions whose run folders must survive shutdown and restart."""
+    held_states = {
+        "settling",
+        "stopping",
+        "down",
+        "stop partial",
+        "restarting",
+        "restart partial",
+    }
+    return sorted(
+        {
+            entry["session"]["session_id"]
+            for record in live_records()
+            if record["state"] in held_states
+            for entry in record["entries"]
+        }
+    )
+
+
 def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(
-        dest="command", required=True, metavar="{down,status,cancel}"
+        dest="command", required=True, metavar="{down,status,now,cancel}"
     )
     down = commands.add_parser("down", help="start a safe account shutdown")
     _ = down.add_argument("account", nargs="?")
@@ -343,7 +366,41 @@ def main(arguments: list[str] | None = None) -> int:
     cancel = commands.add_parser("cancel", help="undo a settling shutdown")
     _ = cancel.add_argument("account", nargs="?")
     _ = cancel.add_argument("--here", action="store_true")
+    now = commands.add_parser("now", help="stop without waiting for idle sessions")
+    _ = now.add_argument("account", nargs="?")
+    _ = now.add_argument("--here", action="store_true", help=argparse.SUPPRESS)
+    stop = commands.add_parser("stop")
+    _ = stop.add_argument("account")
+    claim_stop = commands.add_parser("claim-stop")
+    _ = claim_stop.add_argument("account")
+    _ = claim_stop.add_argument(
+        "--force", required=True, choices=("wait for ready", "now")
+    )
+    _ = commands.add_parser("held-sessions")
     options = cast(CommandLine, parser.parse_args(arguments))
+
+    if options.command == "held-sessions":
+        try:
+            lines = held_session_ids()
+        except (InvalidRecord, OSError, ValueError) as error:
+            print(f"shutdown: {error}", file=sys.stderr)
+            return 3
+        if lines:
+            print("\n".join(lines))
+        return 0
+
+    if options.command == "stop":
+        try:
+            report = stop_work.stop(options.account or "")
+        except (NoLiveRecord, InvalidRecord, OSError, RuntimeError, ValueError) as error:
+            print(f"shutdown: {error}", file=sys.stderr)
+            return 1
+        print(json.dumps(report, sort_keys=True))
+        return 0
+
+    if options.command == "claim-stop":
+        force = cast(StopTiming, options.force)
+        return 0 if stop_work.claim_stop(options.account or "", force) else 1
 
     if options.command == "records":
         try:
@@ -393,6 +450,8 @@ def main(arguments: list[str] | None = None) -> int:
         return 2
     if options.command == "down":
         return settle.down(selected, options.here, _only_ids(options.only))
+    if options.command == "now":
+        return settle.now(selected, options.here)
     if options.command == "cancel":
         return settle.cancel(selected, options.here)
     reports, lines = _status(selected, options.here)

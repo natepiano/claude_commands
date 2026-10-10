@@ -176,9 +176,9 @@ def machine_inventory(
 
 def empty_shutdown_record(
     machine: str,
-    scope: record.Scope,
-) -> record.Record:
-    return record.Record(
+    scope: record.ShutdownScope,
+) -> record.ShutdownRecord:
+    return record.ShutdownRecord(
         login=LOGIN,
         label=LABEL,
         machine=machine,
@@ -192,7 +192,7 @@ def empty_shutdown_record(
     )
 
 
-def empty_refresh_report(machine: str, scope: record.Scope) -> settle.RefreshReport:
+def empty_refresh_report(machine: str, scope: record.ShutdownScope) -> settle.RefreshReport:
     return settle.RefreshReport(
         record=empty_shutdown_record(machine, scope),
         verdicts=[],
@@ -326,7 +326,7 @@ print("rc=0")
         )
         return instance
 
-    def found_record(self) -> record.Record:
+    def found_record(self) -> record.ShutdownRecord:
         found = record.find_live(LOGIN)
         self.assertEqual(found["kind"], "live")
         if found["kind"] != "live":
@@ -452,6 +452,34 @@ print("rc=0")
         self.assertTrue((paused / "state").read_text().startswith("ENABLED=0\n"))
         self.assertEqual(self.logged_calls(self.notifier_log), [])
 
+    def test_cancel_asks_the_conductor_machine_before_touching_local_state(
+        self,
+    ) -> None:
+        local = empty_shutdown_record(
+            "natedev", record.AllAccountSessions(kind="all account sessions")
+        )
+        record.create(local)
+        stopping_line = (
+            f"shutdown of {LABEL} is already stopping; "
+            + "/shutdown restart brings it back once it is down"
+        )
+        output = io.StringIO()
+
+        with (
+            patch.object(
+                settle, "run_remote", return_value=(1, stopping_line)
+            ) as remote,
+            patch.object(settle, "_cancel_local") as cancel_local,
+            redirect_stdout(output),
+        ):
+            result = settle.cancel(self.account)
+
+        self.assertEqual(result, 1)
+        remote.assert_called_once_with(["cancel", LOGIN, "--here"])
+        cancel_local.assert_not_called()
+        self.assertEqual(self.found_record()["state"], "settling")
+        self.assertEqual(output.getvalue(), stopping_line + "\n")
+
     def test_showrunner_message_waits_until_every_unit_is_ready(self) -> None:
         runner = showrunner("runner", "Showrunner")
         director = unit("unit", "Unit")
@@ -469,21 +497,21 @@ print("rc=0")
             ),
         ):
             _ = settle.begin(LOGIN)
-            first_complete, _ = settle.conduct_cycle(LOGIN, {})
+            first_outcome = settle.conduct_cycle(LOGIN, {})
 
-            def mark_unit_ready(current: record.Record) -> None:
+            def mark_unit_ready(current: record.ShutdownRecord) -> None:
                 entry = next(
                     item
                     for item in current["entries"]
                     if item["session"]["session_id"] == "unit"
                 )
-                entry["progress"] = record.Ready(kind="ready", at=NOW)
+                entry["progress"] = record.SessionReadyToStop(kind="ready", at=NOW)
 
             _ = record.update(LOGIN, mark_unit_ready)
-            second_complete, _ = settle.conduct_cycle(LOGIN, {})
+            second_outcome = settle.conduct_cycle(LOGIN, {})
 
-        self.assertFalse(first_complete)
-        self.assertFalse(second_complete)
+        self.assertEqual(first_outcome["kind"], "settlement pending")
+        self.assertEqual(second_outcome["kind"], "settlement pending")
         recipients = [
             call["args"][call["args"].index("--to") + 1]
             for call in self.sent_calls()
@@ -509,7 +537,7 @@ print("rc=0")
         entry = refreshed["record"]["entries"][0]
         self.assertEqual(
             entry["settle_message"],
-            record.Queued(
+            record.SettleMessageQueued(
                 kind="queued", at=NOW, reason="no live session"
             ),
         )
@@ -570,7 +598,7 @@ print("rc=0")
         )
         self.assertEqual(
             delivered["record"]["entries"][0]["settle_message"],
-            record.Sent(kind="sent", at="2026-10-09T21:54:10+00:00"),
+            record.SettleMessageSent(kind="sent", at="2026-10-09T21:54:10+00:00"),
         )
         self.assertEqual(len(self.sent_calls()), 2)
 
@@ -582,8 +610,8 @@ print("rc=0")
         ):
             _ = settle.begin(LOGIN)
 
-        def mark_queued(current: record.Record) -> None:
-            current["entries"][0]["settle_message"] = record.Queued(
+        def mark_queued(current: record.ShutdownRecord) -> None:
+            current["entries"][0]["settle_message"] = record.SettleMessageQueued(
                 kind="queued", at=NOW, reason="no live session"
             )
 
@@ -592,11 +620,27 @@ print("rc=0")
             patch.object(settle, "run_inventory", return_value=report) as inventories,
             patch.object(settle, "now_utc", return_value=NOW_UTC),
         ):
-            complete, _ = settle.conduct_cycle(LOGIN, {}, here=True)
+            outcome = settle.conduct_cycle(LOGIN, {}, here=True)
 
-        self.assertFalse(complete)
+        self.assertEqual(outcome["kind"], "settlement pending")
         self.assertEqual(inventories.call_count, 2)
         self.assertEqual(self.sent_calls(), [])
+
+    def test_remote_stop_uses_owner_scaled_timeout_and_a_tagged_failure(
+        self,
+    ) -> None:
+        with patch.object(
+            settle, "run_remote", return_value=(7, "stop failed")
+        ) as remote:
+            outcome = settle.stop_remote(LOGIN, owner_count=7)
+
+        self.assertEqual(
+            outcome,
+            settle.RemoteStopFailed(
+                kind="failed", reason="mac: stop failed (rc 7)"
+            ),
+        )
+        remote.assert_called_once_with(["stop", LOGIN], timeout=200.0)
 
     def test_cancel_notifies_an_entry_with_a_queued_settle_message(self) -> None:
         report = machine_inventory([top_level("session", "Work")])
@@ -606,8 +650,8 @@ print("rc=0")
         ):
             _ = settle.begin(LOGIN)
 
-        def mark_queued(current: record.Record) -> None:
-            current["entries"][0]["settle_message"] = record.Queued(
+        def mark_queued(current: record.ShutdownRecord) -> None:
+            current["entries"][0]["settle_message"] = record.SettleMessageQueued(
                 kind="queued", at=NOW, reason="no live session"
             )
 
@@ -647,7 +691,7 @@ print("rc=0")
         self.assertEqual(current["entries"][0]["progress"]["kind"], "ready")
         self.assertEqual(
             current["entries"][0]["where"],
-            record.Said(kind="said", text="phase 5: push next", at=NOW),
+            record.WhereSaid(kind="said", text="phase 5: push next", at=NOW),
         )
 
     def test_showrunner_with_merge_in_progress_does_not_count_ready(self) -> None:
@@ -659,8 +703,8 @@ print("rc=0")
         ):
             _ = settle.begin(LOGIN)
 
-        def mark_ready(current: record.Record) -> None:
-            current["entries"][0]["progress"] = record.Ready(
+        def mark_ready(current: record.ShutdownRecord) -> None:
+            current["entries"][0]["progress"] = record.SessionReadyToStop(
                 kind="ready", at=NOW
             )
 
@@ -677,9 +721,9 @@ print("rc=0")
                 return_value=settle.RemoteRefresh(kind="refresh", report=remote),
             ),
         ):
-            counts_ready, _ = settle.conduct_cycle(LOGIN, {})
+            outcome = settle.conduct_cycle(LOGIN, {})
 
-        self.assertFalse(counts_ready)
+        self.assertEqual(outcome["kind"], "settlement pending")
         self.assertEqual(current["entries"][0]["progress"]["kind"], "ready")
 
     def test_remote_verdict_keeps_its_merge_and_form_holdout_without_local_tmux(
@@ -693,12 +737,12 @@ print("rc=0")
             kind="session", session_id="remote-runner"
         )
         remote_record["entries"] = [
-            record.Entry(
+            record.ShutdownSessionEntry(
                 session=runner,
                 timers=[],
-                settle_message=record.NotSent(kind="not sent"),
-                where=record.NotSaid(kind="not said"),
-                progress=record.Ready(kind="ready", at=NOW),
+                settle_message=record.SettleMessageNotSent(kind="not sent"),
+                where=record.WhereNotSaid(kind="not said"),
+                progress=record.SessionReadyToStop(kind="ready", at=NOW),
             )
         ]
         line = "Mac showrunner Remote Showrunner: idle, showing a form, merge in progress"
@@ -732,16 +776,18 @@ print("rc=0")
             patch.dict(os.environ, {"SHUTDOWN_TMUX": str(tmux)}),
         ):
             _ = settle.begin(LOGIN)
-            complete, reports = settle.conduct_cycle(LOGIN, {})
+            outcome = settle.conduct_cycle(LOGIN, {})
 
-        self.assertFalse(complete)
+        self.assertEqual(outcome["kind"], "settlement pending")
+        pending = cast(settle.SettlementPending, outcome)
+        holdout_lines: list[str] = []
+        for report in pending["reports"]:
+            for result in report["verdicts"]:
+                verdict = result["verdict"]
+                if verdict["kind"] == "holdout":
+                    holdout_lines.append(verdict["line"])
         self.assertEqual(
-            [
-                result["verdict"]["line"]
-                for report in reports
-                for result in report["verdicts"]
-                if result["verdict"]["kind"] == "holdout"
-            ],
+            holdout_lines,
             [line],
         )
         self.assertFalse(tmux_log.exists())
@@ -762,8 +808,8 @@ print("rc=0")
         ):
             _ = settle.begin(LOGIN)
 
-            def mark_owner_ready(current: record.Record) -> None:
-                current["entries"][0]["progress"] = record.Ready(
+            def mark_owner_ready(current: record.ShutdownRecord) -> None:
+                current["entries"][0]["progress"] = record.SessionReadyToStop(
                     kind="ready", at=NOW
                 )
 
@@ -922,7 +968,7 @@ print("rc=0")
         ):
             _ = settle.begin(LOGIN)
             refreshed = settle.refresh(LOGIN)
-            complete, _ = settle.conduct_cycle(LOGIN, {}, here=True)
+            outcome = settle.conduct_cycle(LOGIN, {}, here=True)
 
         self.assertEqual(
             refreshed["record"]["entries"][0]["progress"]["kind"],
@@ -931,7 +977,7 @@ print("rc=0")
         self.assertEqual(
             refreshed["verdicts"][0]["verdict"]["kind"], "counts ready"
         )
-        self.assertTrue(complete)
+        self.assertEqual(outcome["kind"], "ready to stop")
 
     def test_refresh_returns_a_reappearing_entry_to_waiting(self) -> None:
         original = top_level("session", "Work")
@@ -979,8 +1025,8 @@ print("rc=0")
         ):
             _ = settle.begin(LOGIN)
 
-            def mark_ordinary_ready(current: record.Record) -> None:
-                current["entries"][0]["progress"] = record.Ready(
+            def mark_ordinary_ready(current: record.ShutdownRecord) -> None:
+                current["entries"][0]["progress"] = record.SessionReadyToStop(
                     kind="ready", at=NOW
                 )
 
@@ -1001,6 +1047,74 @@ print("rc=0")
         self.assertEqual(created["entries"], [])
         self.assertEqual(self.found_record(), created)
 
+    def test_now_reports_forced_and_peer_with_nothing_to_force(self) -> None:
+        current = empty_shutdown_record(
+            "natedev", record.AllAccountSessions(kind="all account sessions")
+        )
+        record.create(current)
+        output = io.StringIO()
+
+        with (
+            patch.object(settle, "_machine", return_value="natedev"),
+            patch.object(
+                settle,
+                "run_remote",
+                return_value=(0, "Mac: no shutdown in progress"),
+            ),
+            redirect_stdout(output),
+        ):
+            result = settle.now(self.account)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            output.getvalue(),
+            "natedev: stopping now\nMac: no shutdown in progress\n",
+        )
+
+    def test_now_with_nothing_to_force_on_either_machine_exits_one(self) -> None:
+        output = io.StringIO()
+
+        with (
+            patch.object(settle, "_machine", return_value="natedev"),
+            patch.object(
+                settle,
+                "run_remote",
+                return_value=(0, "Mac: no shutdown in progress"),
+            ),
+            redirect_stdout(output),
+        ):
+            result = settle.now(self.account)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(
+            output.getvalue(),
+            "natedev: no shutdown in progress\n"
+            + "Mac: no shutdown in progress\n",
+        )
+
+    def test_now_reports_an_unreached_peer_and_exits_one(self) -> None:
+        current = empty_shutdown_record(
+            "natedev", record.AllAccountSessions(kind="all account sessions")
+        )
+        record.create(current)
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        with (
+            patch.object(settle, "_machine", return_value="natedev"),
+            patch.object(settle, "other_machine", return_value="Mac"),
+            patch.object(settle, "run_remote", return_value=(255, "")),
+            redirect_stdout(output),
+            redirect_stderr(errors),
+        ):
+            result = settle.now(self.account)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "natedev: stopping now\n")
+        self.assertEqual(
+            errors.getvalue(),
+            "Mac not reached: run /shutdown now there when it is back\n",
+        )
     def test_begin_releases_a_pause_through_the_python_api(self) -> None:
         report = machine_inventory([top_level("session", "Work")])
         with (
@@ -1113,8 +1227,8 @@ print("rc=0")
         cancelled = False
 
         def update_then_cancel(
-            login: str, change: Callable[[record.Record], None]
-        ) -> record.Record:
+            login: str, change: Callable[[record.ShutdownRecord], None]
+        ) -> record.ShutdownRecord:
             nonlocal cancelled
             current = real_update(login, change)
             if not cancelled:
@@ -1204,15 +1318,15 @@ print("rc=0")
         real_update = record.update
 
         def ordered_update(
-            login: str, change: Callable[[record.Record], None]
-        ) -> record.Record:
+            login: str, change: Callable[[record.ShutdownRecord], None]
+        ) -> record.ShutdownRecord:
             order.append("snapshot")
             return real_update(login, change)
 
         def stopped(_conductor: record.Conductor) -> None:
             order.append("stop")
 
-        def restored(_record: record.Record) -> None:
+        def restored(_record: record.ShutdownRecord) -> None:
             order.append("restore")
 
         with (
@@ -1237,7 +1351,7 @@ print("rc=0")
         ):
             _ = settle.begin(LOGIN)
 
-        def flip(current: record.Record) -> None:
+        def flip(current: record.ShutdownRecord) -> None:
             current["state"] = "cancelled"
 
         _ = record.update(LOGIN, flip)
@@ -1258,21 +1372,20 @@ print("rc=0")
         ):
             _ = settle.begin(LOGIN)
 
-        def flip(current: record.Record) -> None:
+        def flip(current: record.ShutdownRecord) -> None:
             current["state"] = "cancelled"
 
         _ = record.update(LOGIN, flip)
-        complete, reports = settle.conduct_cycle(LOGIN, {}, here=True)
+        outcome = settle.conduct_cycle(LOGIN, {}, here=True)
 
-        self.assertTrue(complete)
-        self.assertEqual(reports, [])
+        self.assertEqual(outcome["kind"], "settlement ended")
 
     def test_selected_scope_excludes_new_unselected_sessions_on_refresh(self) -> None:
         selected = top_level("selected", "Selected")
         unselected = top_level("unselected", "Unselected")
-        seen_scopes: list[record.Scope] = []
+        seen_scopes: list[record.ShutdownScope] = []
 
-        def scoped_inventory(login: str, scope: record.Scope) -> inventory.Inventory:
+        def scoped_inventory(login: str, scope: record.ShutdownScope) -> inventory.Inventory:
             self.assertEqual(login, LOGIN)
             seen_scopes.append(scope)
             wanted: frozenset[str] = (
@@ -1407,10 +1520,11 @@ print("rc=0")
             patch.object(settle, "merge_in_progress", return_value=False),
         ):
             _ = settle.begin(LOGIN)
-            complete, records = settle.conduct_cycle(LOGIN, unreached)
+            outcome = settle.conduct_cycle(LOGIN, unreached)
 
-        self.assertFalse(complete)
-        self.assertEqual(len(records), 1)
+        self.assertEqual(outcome["kind"], "settlement pending")
+        pending = cast(settle.SettlementPending, outcome)
+        self.assertEqual(len(pending["reports"]), 1)
         self.assertEqual(self.found_record()["state"], "settling")
         self.assertEqual(unreached, {"Mac": NOW_UTC})
 
@@ -1446,9 +1560,9 @@ print("rc=0")
             patch.object(
                 settle,
                 "conduct_cycle",
-                return_value=(
-                    False,
-                    [
+                return_value=settle.SettlementPending(
+                    kind="settlement pending",
+                    reports=[
                         settle.RefreshReport(
                             record=live,
                             verdicts=[
@@ -1496,16 +1610,24 @@ print("rc=0")
         ):
             _ = settle.begin(LOGIN)
 
-        def message_was_sent(current: record.Record) -> None:
-            current["entries"][0]["settle_message"] = record.Sent(
+        def message_was_sent(current: record.ShutdownRecord) -> None:
+            current["entries"][0]["settle_message"] = record.SettleMessageSent(
                 kind="sent", at=NOW
             )
 
         _ = record.update(LOGIN, message_was_sent)
+
+        def start_conductor(current: record.ShutdownRecord) -> None:
+            current["conductor"] = record.SystemdConductor(
+                kind="systemd", unit="shutdown-test"
+            )
+
+        _ = record.update(LOGIN, start_conductor)
         errors = io.StringIO()
         with (
             patch.object(settle, "run_remote", return_value=(255, "")),
             patch.object(settle, "other_machine", return_value="Mac"),
+            patch.object(settle, "_stop_conductor"),
             redirect_stderr(errors),
         ):
             result = settle.cancel(self.account)

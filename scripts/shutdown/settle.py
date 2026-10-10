@@ -25,13 +25,14 @@ import conversation_pause
 from inventory import Inventory, Session, inventory, parse_inventory
 from record import (
     Conductor,
-    Entry,
+    ShutdownSessionEntry,
     NoFooter,
     NoLiveRecord,
-    Record,
-    Scope,
+    ShutdownRecord,
+    ShutdownScope,
     ShowrunnerFooter,
     ShutdownInProgress,
+    StopTiming,
     TimerRestore,
     archive,
     create,
@@ -42,6 +43,7 @@ from record import (
 )
 from remote import other_machine, run_remote
 import showrunner_footer
+import stop as stop_work
 
 SHUTDOWN = Path(__file__).resolve().parent / "shutdown.py"
 NOTIFIER = SCRIPTS / "message" / "notifier.sh"
@@ -84,7 +86,7 @@ class EntryVerdict(TypedDict):
 
 
 class RefreshReport(TypedDict):
-    record: Record
+    record: ShutdownRecord
     verdicts: list[EntryVerdict]
 
 
@@ -118,7 +120,7 @@ PreflightOutcome = PreflightReady | RemoteFailure
 
 class RemoteRecordFound(TypedDict):
     kind: Literal["live"]
-    record: Record
+    record: ShutdownRecord
 
 
 class NoRemoteRecord(TypedDict):
@@ -138,6 +140,49 @@ class MessageQueued(TypedDict):
 
 
 MessageDelivery = MessageSent | MessageQueued
+
+
+class SettlementPending(TypedDict):
+    kind: Literal["settlement pending"]
+    reports: list[RefreshReport]
+
+
+class ReadyToStop(TypedDict):
+    kind: Literal["ready to stop"]
+    reports: list[RefreshReport]
+
+
+class SettlementEnded(TypedDict):
+    kind: Literal["settlement ended"]
+    reason: str
+
+
+ConductCycleOutcome = SettlementPending | ReadyToStop | SettlementEnded
+
+
+class RemoteStopped(TypedDict):
+    kind: Literal["stopped"]
+    report: stop_work.StopReport
+
+
+class RemoteStopFailed(TypedDict):
+    kind: Literal["failed"]
+    reason: str
+
+
+RemoteStopOutcome = RemoteStopped | RemoteStopFailed
+
+
+class RemoteStopClaimed(TypedDict):
+    kind: Literal["claimed"]
+
+
+class RemoteStopClaimFailed(TypedDict):
+    kind: Literal["failed"]
+    reason: str
+
+
+RemoteStopClaimOutcome = RemoteStopClaimed | RemoteStopClaimFailed
 
 
 def now_utc() -> datetime:
@@ -160,20 +205,20 @@ def _machine() -> str:
     return name or ("mac" if sys.platform == "darwin" else "natedev")
 
 
-def _scope(only: Iterable[str]) -> Scope:
+def _scope(only: Iterable[str]) -> ShutdownScope:
     session_ids = list(dict.fromkeys(item for item in only if item))
     if session_ids:
         return {"kind": "selected", "session_ids": session_ids}
     return {"kind": "all account sessions"}
 
 
-def _only(scope: Scope) -> frozenset[str]:
+def _only(scope: ShutdownScope) -> frozenset[str]:
     if scope["kind"] == "selected":
         return frozenset(scope["session_ids"])
     return frozenset()
 
 
-def run_inventory(login: str, scope: Scope) -> Inventory:
+def run_inventory(login: str, scope: ShutdownScope) -> Inventory:
     """Inventory one account under the shutdown record's immutable scope."""
     return inventory(login, _only(scope))
 
@@ -209,6 +254,7 @@ def send_message(
     text: str,
     *,
     need: Literal["note", "decision", "blocked"] = "note",
+    machine: str = "",
 ) -> MessageDelivery:
     command = [
         *_send_command(),
@@ -221,6 +267,8 @@ def send_message(
     ]
     if recipient == "user":
         command.extend(("--need", need))
+    if machine:
+        command.extend(("--machine", machine))
     result = subprocess.run(
         command,
         input=text,
@@ -326,7 +374,7 @@ def _stop_recorded_timers(timers: Iterable[TimerRestore]) -> None:
             run_notifier("stop", timer["instance"])
 
 
-def _entry(session: Session) -> Entry:
+def _entry(session: Session) -> ShutdownSessionEntry:
     return {
         "session": session,
         "timers": [],
@@ -340,12 +388,12 @@ def begin(
     login: str,
     requested_by: str | None = None,
     only: Iterable[str] = (),
-) -> Record:
+) -> ShutdownRecord:
     """Create one machine's settling record and stop only its recorded timers."""
     scope = _scope(only)
     report = run_inventory(login, scope)
     requested_at = _timestamp()
-    record: Record = {
+    record: ShutdownRecord = {
         "login": login,
         "label": report["label"],
         "machine": report["machine"],
@@ -368,7 +416,7 @@ def begin(
             timers = _session_timer_snapshot(original["session"])
             stop_failures: list[Exception] = []
 
-            def save_timers(current: Record, *, wanted: str = session_id) -> None:
+            def save_timers(current: ShutdownRecord, *, wanted: str = session_id) -> None:
                 entry = next(
                     item
                     for item in current["entries"]
@@ -434,7 +482,7 @@ def _blocker(session: Session) -> ReadinessCheck:
     return {"kind": "clear"}
 
 
-def _counts_ready(entry: Entry, current: Session) -> bool:
+def _counts_ready(entry: ShutdownSessionEntry, current: Session) -> bool:
     progress = entry["progress"]["kind"]
     if progress in {"already gone", "stopped", "process identity lost"}:
         return True
@@ -447,7 +495,7 @@ def _unattributed_reasons(report: Inventory) -> dict[int, str]:
     return {item["pid"]: item["reason"] for item in report["unattributed"]}
 
 
-def _refresh_entries(record: Record, report: Inventory) -> list[TimerRestore]:
+def _refresh_entries(record: ShutdownRecord, report: Inventory) -> list[TimerRestore]:
     current = {session["session_id"]: session for session in report["sessions"]}
     unattributed = _unattributed_reasons(report)
     entries = {
@@ -516,7 +564,7 @@ def _refresh_entries(record: Record, report: Inventory) -> list[TimerRestore]:
     return timers_to_stop
 
 
-def _settle_text(record: Record, session: Session) -> str:
+def _settle_text(record: ShutdownRecord, session: Session) -> str:
     opening = (
         f"Shutdown of account {record['label']} requested by the user with /shutdown "
         f"({_pacific(record['requested_at'])}). "
@@ -547,7 +595,7 @@ def _settle_text(record: Record, session: Session) -> str:
     )
 
 
-def _send_settle_message(record: Record, entry: Entry) -> None:
+def _send_settle_message(record: ShutdownRecord, entry: ShutdownSessionEntry) -> None:
     session = entry["session"]
     delivery = send_message(
         f"session:{session['session_id']}",
@@ -565,7 +613,7 @@ def _send_settle_message(record: Record, entry: Entry) -> None:
         }
 
 
-def _settle_message_due(entry: Entry, current: datetime) -> bool:
+def _settle_message_due(entry: ShutdownSessionEntry, current: datetime) -> bool:
     message = entry["settle_message"]
     if message["kind"] == "not sent":
         return True
@@ -575,7 +623,7 @@ def _settle_message_due(entry: Entry, current: datetime) -> bool:
     return current - queued_at >= timedelta(seconds=SETTLE_RETRY_SECONDS)
 
 
-def _readiness_verdicts(record: Record, report: Inventory) -> list[EntryVerdict]:
+def _readiness_verdicts(record: ShutdownRecord, report: Inventory) -> list[EntryVerdict]:
     current = {session["session_id"]: session for session in report["sessions"]}
     unattributed = _unattributed_reasons(report)
     verdicts: list[EntryVerdict] = []
@@ -626,7 +674,7 @@ def refresh(login: str, message: Iterable[str] = ()) -> RefreshReport:
     timers_to_stop: list[TimerRestore] = []
     stop_failures: list[Exception] = []
 
-    def apply(current: Record) -> None:
+    def apply(current: ShutdownRecord) -> None:
         if current["state"] != "settling":
             return
         timers_to_stop.extend(_refresh_entries(current, report))
@@ -687,7 +735,7 @@ def ready(where: str) -> int:
             at = _timestamp()
             accepted = False
 
-            def mark_ready(current: Record) -> None:
+            def mark_ready(current: ShutdownRecord) -> None:
                 nonlocal accepted
                 if current["state"] != "settling":
                     return
@@ -844,7 +892,7 @@ def _showing_form(session: Session) -> bool:
 
 
 def _holdout_line(
-    record: Record,
+    record: ShutdownRecord,
     session: Session,
 ) -> str:
     details = [session["status"]]
@@ -911,12 +959,12 @@ def _send_holdout_alert(
 
 def conduct_cycle(
     login: str, unreached_since: dict[str, datetime], here: bool = False
-) -> tuple[bool, list[RefreshReport]]:
-    """Run one deterministic conductor pass; return whether all work is ready."""
+) -> ConductCycleOutcome:
+    """Run one deterministic conductor pass and tag the next conductor action."""
     try:
         local = refresh(login)
-    except NoLiveRecord:
-        return True, []
+    except NoLiveRecord as error:
+        return {"kind": "settlement ended", "reason": str(error)}
     reports = [local]
     if not here:
         outcome = _remote_record(login)
@@ -947,26 +995,197 @@ def conduct_cycle(
                 reports[1] = outcome["report"]
 
     if unreached_since:
-        return False, reports
-    return (
-        all(
-            result["verdict"]["kind"] == "counts ready"
-            for report in reports
-            for result in report["verdicts"]
-        ),
+        return {"kind": "settlement pending", "reports": reports}
+    ready = all(
+        result["verdict"]["kind"] == "counts ready"
+        for report in reports
+        for result in report["verdicts"]
+    )
+    force_now = local["record"]["force"] == "now"
+    if ready or force_now:
+        return {"kind": "ready to stop", "reports": reports}
+    return {"kind": "settlement pending", "reports": reports}
+
+
+def _requesting_machine(reports: list[RefreshReport]) -> str:
+    for report in reports:
+        record = report["record"]
+        origin = record["requested_by"]
+        if origin["kind"] != "session":
+            continue
+        if any(
+            entry["session"]["session_id"] == origin["session_id"]
+            for entry in record["entries"]
+        ):
+            return record["machine"]
+    return reports[0]["record"]["machine"] if reports else ""
+
+
+def _stop_timeout(owner_count: int) -> float:
+    return max(120.0, 60.0 + owner_count * 20.0)
+
+
+def stop_remote(login: str, owner_count: int = 0) -> RemoteStopOutcome:
+    """Stop the other machine and return its validated stop report."""
+    while True:
+        status, output = run_remote(
+            ["stop", login], timeout=_stop_timeout(owner_count)
+        )
+        if status != 255:
+            break
+        time.sleep(SETTLE_INTERVAL_SECONDS)
+    if status != 0:
+        return {
+            "kind": "failed",
+            "reason": f"{other_machine()}: stop failed (rc {status})",
+        }
+    try:
+        return {"kind": "stopped", "report": stop_work.parse_stop_report(output)}
+    except (TypeError, ValueError) as error:
+        return {
+            "kind": "failed",
+            "reason": f"{other_machine()}: stop report unreadable: {error}",
+        }
+
+
+def claim_remote_stop(login: str, force: StopTiming) -> RemoteStopClaimOutcome:
+    """Put the peer record in stopping before either machine touches a session."""
+    while True:
+        status, _ = run_remote(["claim-stop", login, "--force", force])
+        if status != 255:
+            break
+        time.sleep(SETTLE_INTERVAL_SECONDS)
+    if status == 0:
+        return {"kind": "claimed"}
+    return {
+        "kind": "failed",
+        "reason": f"{other_machine()}: stop claim failed (rc {status})",
+    }
+
+
+def _stop_machines(
+    login: str, reports: list[RefreshReport]
+) -> tuple[list[stop_work.StopReport], list[str]]:
+    local_machine = reports[0]["record"]["machine"]
+    requester_machine = _requesting_machine(reports)
+    ordered = sorted(
         reports,
+        key=lambda report: report["record"]["machine"] == requester_machine,
+    )
+    stopped: list[stop_work.StopReport] = []
+    failures: list[str] = []
+    for report in ordered:
+        machine = report["record"]["machine"]
+        if machine == local_machine:
+            try:
+                stopped.append(stop_work.stop(login))
+            except Exception as error:
+                reason = str(error) or error.__class__.__name__
+                failures.append(f"{machine}: stop failed: {reason}")
+            continue
+        owner_count = sum(
+            entry["session"]["kind"] != "seat"
+            for entry in report["record"]["entries"]
+        )
+        remote = stop_remote(login, owner_count)
+        if remote["kind"] == "failed":
+            failures.append(remote["reason"])
+        else:
+            stopped.append(remote["report"])
+    return stopped, failures
+
+
+def _count_text(counts: dict[str, int]) -> str:
+    order = ("unit", "showrunner", "top-level", "seat")
+    parts = [f"{counts[kind]} {kind}" for kind in order if counts.get(kind, 0)]
+    return ", ".join(parts) if parts else "0 sessions"
+
+
+def _unattributed_line(report: stop_work.StopReport) -> str:
+    unattributed = report["unattributed"]
+    if not unattributed:
+        return ""
+    reason_counts: dict[str, int] = {}
+    for item in unattributed:
+        reason = item["reason"]
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    details = ", ".join(
+        f"{count} {reason}" for reason, count in sorted(reason_counts.items())
+    )
+    return (
+        "left running, not attributed to "
+        f"{report['record']['label']}: {len(unattributed)} ({details})"
     )
 
+
+def send_stop_alert(
+    reports: list[stop_work.StopReport],
+    orchestration_failures: list[str],
+    *,
+    label: str = "",
+) -> None:
+    """Tell the user that shutdown finished or stopped partially."""
+    if not reports and not label:
+        return
+    partial = bool(orchestration_failures) or any(
+        report["record"]["state"] == "stop partial" for report in reports
+    )
+    account_label = reports[0]["record"]["label"] if reports else label
+    summary = (
+        f"{account_label}: stop partial"
+        if partial
+        else f"{account_label} is down"
+    )
+    lines: list[str] = []
+    for report in reports:
+        lines.append(
+            f"{report['record']['machine']}: {_count_text(report['counts'])}"
+        )
+        lines.extend(f"  {failure}" for failure in report["failures"])
+        lines.extend(f"  {resource}" for resource in report["left_running"])
+        unattributed = _unattributed_line(report)
+        if unattributed:
+            lines.append(f"  {unattributed}")
+    lines.extend(f"  {failure}" for failure in orchestration_failures)
+    lines.append(
+        f"/shutdown restart in any Claude session on {account_label}, or in a terminal "
+        + "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart"
+    )
+    route = "natedev" if _machine().casefold() == "mac" else ""
+    _ = send_message(
+        "user", summary, "\n".join(lines), need="note", machine=route
+    )
 
 def conduct(login: str, here: bool = False) -> int:
     """Coordinate both machines until every session has reached a safe stop."""
     unreached_since: dict[str, datetime] = {}
     last_alert = datetime.min.replace(tzinfo=timezone.utc)
     while True:
-        complete, reports = conduct_cycle(login, unreached_since, here)
-        if not reports:
+        outcome = conduct_cycle(login, unreached_since, here)
+        if outcome["kind"] == "settlement ended":
             return 0
-        if complete:
+        reports = outcome["reports"]
+        if outcome["kind"] == "ready to stop":
+            if not stop_work.claim_stop(login):
+                return 0
+            claimed = find_live(login)
+            if claimed["kind"] == "no shutdown":
+                return 0
+            if not here:
+                claim = claim_remote_stop(login, claimed["record"]["force"])
+                if claim["kind"] == "failed":
+                    send_stop_alert(
+                        [],
+                        [claim["reason"]],
+                        label=reports[0]["record"]["label"],
+                    )
+                    return 0
+            stopped, failures = _stop_machines(login, reports)
+            send_stop_alert(
+                stopped,
+                failures,
+                label=reports[0]["record"]["label"],
+            )
             return 0
         requested_at = datetime.fromisoformat(
             reports[0]["record"]["requested_at"]
@@ -981,7 +1200,7 @@ def conduct(login: str, here: bool = False) -> int:
         time.sleep(SETTLE_INTERVAL_SECONDS)
 
 
-def _restore_record(record: Record) -> None:
+def _restore_record(record: ShutdownRecord) -> None:
     for entry in record["entries"]:
         for timer in entry["timers"]:
             if timer["was_enabled"]:
@@ -998,49 +1217,120 @@ def _restore_record(record: Record) -> None:
 
 
 def _stop_conductor(conductor: Conductor) -> None:
-    if conductor["kind"] == "systemd":
-        _ = subprocess.run(
-            ("systemctl", "--user", "stop", conductor["unit"]),
-            check=False,
-            timeout=15,
-        )
-    elif conductor["kind"] == "launchd":
-        _ = subprocess.run(
-            ("launchctl", "remove", conductor["label"]),
-            check=False,
-            timeout=15,
-        )
+    stop_work.stop_conductor(conductor)
 
 
-def _cancel_local(login: str) -> bool:
-    found = find_live(login)
-    if found["kind"] == "no shutdown":
-        return False
-    _stop_conductor(found["record"]["conductor"])
+CancelLocalResult = Literal["cancelled", "already stopping", "ended"]
 
-    def mark_cancelled(current: Record) -> None:
-        current["state"] = "cancelled"
 
-    cancelled = update(login, mark_cancelled)
+def _cancel_local(login: str) -> CancelLocalResult:
+    claim = stop_work.claim_cancel(login)
+    if claim["kind"] == "already stopping":
+        return "already stopping"
+    if claim["kind"] == "ended":
+        return "ended"
+    _stop_conductor(claim["record"]["conductor"])
+
+    def snapshot(_current: ShutdownRecord) -> None:
+        return
+
+    cancelled = update(login, snapshot)
     _restore_record(cancelled)
     archive(login)
-    return True
+    return "cancelled"
+
+
+def _local_conductor_started(login: str) -> bool:
+    try:
+        found = find_live(login)
+    except NoLiveRecord:
+        return False
+    return (
+        found["kind"] == "live"
+        and found["record"]["conductor"]["kind"] != "not started"
+    )
+
+
+def _already_stopping(account: Account) -> int:
+    print(
+        f"shutdown of {account.label} is already stopping; "
+        + "/shutdown restart brings it back once it is down"
+    )
+    return 1
 
 
 def cancel(account: Account, here: bool = False) -> int:
     """Undo a settling shutdown everywhere reachable and archive its records."""
-    _ = _cancel_local(account.login)
     if here:
+        local = _cancel_local(account.login)
+        if local == "already stopping":
+            return _already_stopping(account)
         return 0
-    status, _ = run_remote(["cancel", account.login, "--here"])
+
+    local_first = _local_conductor_started(account.login)
+    if local_first:
+        local = _cancel_local(account.login)
+        if local == "already stopping":
+            return _already_stopping(account)
+        if local == "ended":
+            return 0
+
+    status, output = run_remote(["cancel", account.login, "--here"])
     if status != 0:
+        if status == 1 and "already stopping" in output:
+            print(output)
+            return 1
         machine = other_machine()
         print(
             f"{machine} not reached: run /shutdown cancel there when it is back",
             file=sys.stderr,
         )
         return 1
+    if not local_first:
+        local = _cancel_local(account.login)
+        if local == "already stopping":
+            return _already_stopping(account)
     return 0
+
+
+def _force_now_local(login: str) -> bool:
+    changed = False
+
+    def force(current: ShutdownRecord) -> None:
+        nonlocal changed
+        if current["state"] in {"settling", "stopping"}:
+            current["force"] = "now"
+            changed = True
+
+    try:
+        _ = update(login, force)
+    except NoLiveRecord:
+        return False
+    return changed
+
+
+def now(account: Account, here: bool = False) -> int:
+    """Force every reachable machine's settling shutdown to stop immediately."""
+    changed = _force_now_local(account.login)
+    machine = _machine()
+    print(
+        f"{machine}: stopping now"
+        if changed
+        else f"{machine}: no shutdown in progress"
+    )
+    if here:
+        return 0
+    status, output = run_remote(["now", account.login, "--here"])
+    if status != 0:
+        print(
+            f"{other_machine()} not reached: run /shutdown now there when it is back",
+            file=sys.stderr,
+        )
+        return 1
+    remote_line = output.strip() or f"{other_machine()}: no shutdown in progress"
+    print(remote_line)
+    remote_changed = remote_line.endswith(": stopping now")
+    return 0 if changed or remote_changed else 1
 
 
 def _inventory_text(report: Inventory) -> str:
@@ -1072,7 +1362,7 @@ def _failure_text(failure: RemoteFailure) -> str:
 
 
 def _preflight_inventories(
-    account: Account, here: bool, scope: Scope
+    account: Account, here: bool, scope: ShutdownScope
 ) -> PreflightOutcome:
     reports = [run_inventory(account.login, scope)]
     if here:
@@ -1146,7 +1436,7 @@ def _launch_conductor(login: str, label: str, here: bool) -> None:
     if result.returncode != 0:
         raise RuntimeError(f"could not start shutdown conductor {service}")
 
-    def save(current: Record) -> None:
+    def save(current: ShutdownRecord) -> None:
         current["conductor"] = conductor
 
     _ = update(login, save)
@@ -1227,7 +1517,7 @@ def down(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
     return 0
 
 
-def status_record_lines(record: Record) -> list[str]:
+def status_record_lines(record: ShutdownRecord) -> list[str]:
     """Render the settling state appended to user-facing status output."""
     lines = [f"{record['machine']}: shutdown {record['state']}"]
     if record["scope"]["kind"] == "selected":
