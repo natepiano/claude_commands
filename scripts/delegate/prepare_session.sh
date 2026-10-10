@@ -36,7 +36,7 @@ if [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
   # Pinned: an inherited test override would send the notifier to another marker.
   if notifier_output="$(PLAN_DELEGATE_ACTIVE_DIR="${ACTIVE_DIR}" zsh "${SCRIPT_DIR}/unit_notifier.sh" "${CLAUDE_CODE_SESSION_ID}" 2>&1)"; then
     while IFS= read -r line; do
-      if [[ "${line}" == next_due=* ]]; then
+      if [[ "${line}" == next_due=* || "${line}" == "progress updates on demand:"* ]]; then
         printf '%s\n' "${line}"
       fi
     done <<< "${notifier_output}"

@@ -258,6 +258,9 @@ The command writes `PROMPT_FILE`,
 retargets `UPDATES` with `NOTIFIER new` without moving its clock, creates
 stall-watch and tmux-names only when absent, and prints `next_due`. Use the
 reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
+When the doc's Updates line reads `on demand`, it makes no `UPDATES` instance
+and removes one left from before, prints `on demand: no scheduled dailies`,
+and no scheduled update comes: a dailies runs only when the user asks for one.
 
 The prompt:
 
@@ -297,7 +300,8 @@ compacting on every tick doubled the compaction rate and saved no tokens,
 because a unit director re-reads its files at
 once and passes 150K again within 12-20 minutes.)
 
-**Every scheduled update is a `/showrunner:dailies gantt` report**, never a
+**Every scheduled update is a `/showrunner:dailies gantt` report** (none come
+when the Updates line reads `on demand`), never a
 one-unit note: every unit is checked on every tick and has its row in the chart.
 Above the chart a `gantt` dailies prints only what needs the user and one line for
 each thing that changed; the user asks for `simple` to see every unit's section.

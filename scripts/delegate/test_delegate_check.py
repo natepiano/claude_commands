@@ -171,12 +171,46 @@ class DelegateCheckTests(unittest.TestCase):
                 self.assertIn("usage: unit_notifier.sh", result.stderr)
         self.assertFalse(self.state_dir.exists())
 
-    def test_unit_notifier_on_passes_missing_instance_failure_through(self) -> None:
+    def test_unit_notifier_on_makes_the_instance_a_run_never_had(self) -> None:
         self.write_marker()
         result = self.run_unit_notifier("on")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn(f"no such instance: delegate-{self.session_dir.name}", result.stderr)
-        self.assertFalse(self.state_dir.exists())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.startswith(
+            f"progress updates on: delegate-{self.session_dir.name} next_due="
+        ), result.stdout)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        conf = (self.state_dir / f"delegate-{self.session_dir.name}" / "conf").read_text(encoding="utf-8")
+        self.assertIn("COMMAND=/unit:report", conf.splitlines())
+
+    def on_demand(self) -> None:
+        _ = self.config_file.write_text(
+            "PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=900\nPLAN_DELEGATE_PROGRESS_UPDATES=on-demand # asked for\n",
+            encoding="utf-8",
+        )
+
+    def test_unit_notifier_on_demand_makes_no_schedule(self) -> None:
+        self.write_marker()
+        self.on_demand()
+        result = self.run_unit_notifier()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            f"progress updates on demand: delegate-{self.session_dir.name} has no schedule; "
+            + "/unit:report on starts one"
+        ])
+        self.assertFalse((self.state_dir / f"delegate-{self.session_dir.name}").exists())
+
+    def test_unit_notifier_on_demand_stops_the_schedule_a_resumed_run_holds(self) -> None:
+        self.write_marker()
+        created = self.run_unit_notifier()
+        self.assertEqual(created.returncode, 0, created.stderr)
+        self.on_demand()
+        resumed = self.run_unit_notifier()
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        state = self.state_dir / f"delegate-{self.session_dir.name}" / "state"
+        self.assertIn("ENABLED=0", state.read_text(encoding="utf-8").splitlines())
+        started = self.run_unit_notifier("on")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertIn("ENABLED=1", state.read_text(encoding="utf-8").splitlines())
 
 
 if __name__ == "__main__":

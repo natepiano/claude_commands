@@ -19,6 +19,7 @@ from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_render import (InputError, StateRefused, as_list, as_map, check_render_state,
                             local_now, parse_range_end, parse_report, parse_time)
 from merge_checkpoint import NoMerge, git, merge_branch_history
+from update_registration import RegistrationFailure, UpdatesOnDemand, update_schedule
 from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
@@ -872,16 +873,24 @@ def run(args: argparse.Namespace) -> int:
         production.log.parent.mkdir(parents=True, exist_ok=True)
         with production.log.open("a", encoding="utf-8"):
             pass
-    action = "restart" if user_run else "status"
-    clock = command(notifier, action, instance)
-    if clock.returncode:
-        raise DailiesFailure("clock", clock.stderr.strip() or clock.stdout.strip())
-    result["next_run"] = next_due(clock.stdout, now, production.zone)
-    if user_run:
-        production.log.parent.mkdir(parents=True, exist_ok=True)
-        with production.log.open("a", encoding="utf-8") as log:
-            _ = log.write(next(line for line in clock.stdout.splitlines() if line.startswith("next_due=")) + "\n")
-    report("clock", "ok", str(result["next_run"]))
+    try:
+        on_demand = isinstance(update_schedule(lines), UpdatesOnDemand)
+    except RegistrationFailure as failure:
+        raise DailiesFailure("clock", str(failure)) from failure
+    if on_demand:
+        # No schedule runs, so there is no clock to restart and the report names no next run.
+        report("clock", "ok", "on demand: no scheduled dailies")
+    else:
+        action = "restart" if user_run else "status"
+        clock = command(notifier, action, instance)
+        if clock.returncode:
+            raise DailiesFailure("clock", clock.stderr.strip() or clock.stdout.strip())
+        result["next_run"] = next_due(clock.stdout, now, production.zone)
+        if user_run:
+            production.log.parent.mkdir(parents=True, exist_ok=True)
+            with production.log.open("a", encoding="utf-8") as log:
+                _ = log.write(next(line for line in clock.stdout.splitlines() if line.startswith("next_due=")) + "\n")
+        report("clock", "ok", str(result["next_run"]))
     validate_report(result, holders_path, judgment_path)
     report("judgment", "ok", f"{len(units_out)} units accepted")
     def merge_eta_records(fresh: JsonMap) -> tuple[str, ...]:

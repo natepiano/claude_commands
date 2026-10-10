@@ -36,6 +36,8 @@ if args[0] == "status":
 elif args[0] == "new":
     instance.touch()
     print("next_due=1791334500 (2026-10-06 17:55 PDT)")
+elif args[0] == "remove":
+    instance.unlink(missing_ok=True)
 else:
     raise SystemExit(2)
 '''
@@ -165,6 +167,26 @@ class RegistrationTests(unittest.TestCase):
                          ["session:current-session-id", "session:resume-session-id", "session:resume-session-id"])
         for instance in ("stall-watch", "tmux-names"):
             self.assertEqual(len([call for call in calls if call[:2] == ["new", instance]]), 1)
+
+    def test_on_demand_registers_no_dailies_schedule_and_removes_an_old_one(self) -> None:
+        first = self.run_command("register")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        doc = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(doc.replace("- **Updates:** every 15 minutes", "- **Updates:** on demand"),
+                                encoding="utf-8")
+        _ = self.git("commit", "-qam", "dailies on demand")
+        before = len(self.notifier_calls())
+        resumed = self.run_command("register")
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertIn("register: ok — showrunner-example on demand: no scheduled dailies", resumed.stdout)
+        calls = self.notifier_calls()[before:]
+        self.assertNotIn(["new", "showrunner-example"], [call[:2] for call in calls])
+        self.assertIn(["remove", "showrunner-example"], calls)
+        self.assertFalse((self.state / "instance-showrunner-example").exists())
+        again = self.run_command("register")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual([call[0] for call in self.notifier_calls()[before + len(calls):]],
+                         ["status", "status", "status"])
 
     def test_register_requires_the_environment_session_id(self) -> None:
         without_id = {key: value for key, value in self.env.items() if key != "CLAUDE_CODE_SESSION_ID"}

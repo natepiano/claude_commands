@@ -66,8 +66,9 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Showrunner checkout:** <path, on the merge branch>
 - **Log:** <repo-relative path> — git-excluded; one line per event
 - **User zone:** <IANA zone> — every time the showrunner reports is in this zone plus UTC
-- **Updates:** every <N> minutes (default 15); each update reports every unit in full;
-  the update timer reads N from this line, and `/showrunner:interval` changes it
+- **Updates:** every <N> minutes (default 15), or `on demand`; each update reports every
+  unit in full; the update timer reads N from this line, `on demand` runs no timer and a
+  dailies runs only when the user asks, and `/showrunner:interval` changes it
 - **Merge tests:** <packages tested on every merge besides the changed ones, e.g. the
   app crate>; omit if none
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>

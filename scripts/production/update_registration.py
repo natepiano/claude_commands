@@ -90,13 +90,24 @@ def instance(name: str) -> InstancePresent | InstanceAbsent:
     raise RegistrationFailure("notifier", result.stderr.strip() or result.stdout.strip() or f"status exit {result.returncode}")
 
 
-def update_interval(lines: list[str]) -> tuple[int, bool]:
+class ScheduledUpdates(NamedTuple):
+    minutes: int
+    aligned: bool
+
+
+class UpdatesOnDemand(NamedTuple):
+    """The doc's Updates line reads `on demand`: a dailies runs only when the user asks for one."""
+
+
+def update_schedule(lines: list[str]) -> ScheduledUpdates | UpdatesOnDemand:
     line = next((line for line in lines if line.startswith("- **Updates:**")), "")
+    if re.search(r"\bon demand\b", line):
+        return UpdatesOnDemand()
     match = re.search(r"every (\d+) minutes", line)
     minutes = int(match.group(1)) if match else 15
     if minutes <= 0:
         raise RegistrationFailure("prompt", "Updates interval must be positive")
-    return minutes, "on the hour" in line
+    return ScheduledUpdates(minutes, "on the hour" in line)
 
 
 def scheduled_prompt(minutes: int, zone: str, doc: Path) -> str:
@@ -118,8 +129,9 @@ def register(production: Production) -> None:
     if not session_id:
         raise RegistrationFailure("register", "CLAUDE_CODE_SESSION_ID is required")
     lines = production.doc.read_text(encoding="utf-8").splitlines()
-    minutes, aligned = update_interval(lines)
-    prompt = scheduled_prompt(minutes, str(production.zone), production.doc)
+    schedule = update_schedule(lines)
+    prompt = (scheduled_prompt(schedule.minutes, str(production.zone), production.doc)
+              if isinstance(schedule, ScheduledUpdates) else "")
     relative = production.doc.relative_to(production.checkout)
     dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
     if dirty:
@@ -127,18 +139,25 @@ def register(production: Production) -> None:
     # Nothing registers the showrunner by name: its update timer, made below, is its one record.
     state_root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
     prompt_file = state_root / production.slug / "prompt.txt"
-    prompt_file.parent.mkdir(parents=True, exist_ok=True)
-    if not prompt_file.exists() or prompt_file.read_text(encoding="utf-8") != prompt:
-        _ = prompt_file.write_text(prompt, encoding="utf-8")
     updates = f"showrunner-{production.slug}"
-    check = f"zsh {Path.home()}/.claude/scripts/production/production_check.sh {production.doc}"
-    _ = notifier(["new", updates, "--to", f"session:{session_id}", "--every", str(minutes),
-              "--prompt-file", str(prompt_file), "--from", f"showrunner-timer-{production.slug}",
-              "--check", check, *(["--aligned"] if aligned else [])])
+    if isinstance(schedule, ScheduledUpdates):
+        prompt_file.parent.mkdir(parents=True, exist_ok=True)
+        if not prompt_file.exists() or prompt_file.read_text(encoding="utf-8") != prompt:
+            _ = prompt_file.write_text(prompt, encoding="utf-8")
+        check = f"zsh {Path.home()}/.claude/scripts/production/production_check.sh {production.doc}"
+        _ = notifier(["new", updates, "--to", f"session:{session_id}", "--every", str(schedule.minutes),
+                  "--prompt-file", str(prompt_file), "--from", f"showrunner-timer-{production.slug}",
+                  "--check", check, *(["--aligned"] if schedule.aligned else [])])
+    elif isinstance(instance(updates), InstancePresent):
+        # A schedule from before the doc said on demand would keep sending the prompt.
+        _ = notifier(["remove", updates])
     for name, script in (("stall-watch", "stall_watch.py"), ("tmux-names", "tmux_names.py")):
         if isinstance(instance(name), InstanceAbsent):
             run = f"{Path.home()}/.claude/scripts/lib/py {Path.home()}/.claude/scripts/production/{script}"
             _ = notifier(["new", name, "--every", "1", "--run", run])
+    if isinstance(schedule, UpdatesOnDemand):
+        report("register", "ok", f"{updates} on demand: no scheduled dailies")
+        return
     status = instance(updates)
     if isinstance(status, InstanceAbsent):
         raise RegistrationFailure("register", f"{updates} missing after new")
