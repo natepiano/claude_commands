@@ -100,6 +100,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 ## Delegation Context
 
 - **Project:** `~/.claude` config repo. Worktree `/home/natepiano/worktrees/claude-build-followups-two-accounts`, branch `build-followups-two-accounts` (unit `two-accounts-unit`); name both in every dispatch.
+- **Project started:** 2026-10-10T21:07:53.634+00:00
 - **Stack:** Python 3 standard library, checked by basedpyright. zsh launch strings. Claude Code 2.1.296.
 - **Layout:** new `scripts/accounts/` (`accounts.py`, `test_accounts.py`) · `scripts/production/` · `scripts/shutdown/` · `scripts/whoami/` · `scripts/message/` · new `commands/accounts.md` · `settings.json` · `docs/quota_alerts.md` · `docs/as-built/shutdown-and-restart.md`. Outside the repo, live, written only in Phases 6 and 7: `~/.claude1`, `~/.claude2`, `~/.claude3`, and `config/accounts.json` (gitignored like `config/showrunners.json`).
 - **Key files:**
@@ -178,7 +179,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 ## Phases
 
-### Phase 1 — Account dirs: build, check and report, without touching live dirs  · status: todo
+### Phase 1 — Account dirs: build, check and report, without touching live dirs  · status: done
 
 #### Work Order
 
@@ -217,7 +218,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 - `scripts/accounts/accounts.py` — new.
 - `scripts/accounts/test_accounts.py` — new: temp `ACCOUNTS_HOME`, real symlinks, each refusal, seed key filtering, `check` problems, role resolution.
-- `.gitignore`.
+- `.gitignore` — add `/config/accounts.json`.
 
 **Seats:** `1 writer + 1 tester`.
 
@@ -250,10 +251,19 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 **Files:**
 
-- `scripts/production/add_unit.py`, `scripts/production/test_add_unit.py`.
-- `scripts/shutdown/inventory.py`, `record.py`, `restart.py` and their tests.
-- `scripts/delegate/remove_seats.py`.
-- `commands/showrunner/produce.md`, `settings.json`, `docs/as-built/shutdown-and-restart.md`.
+- `scripts/production/add_unit.py` — launch on the unit account.
+- `scripts/production/test_add_unit.py` — launch prefix and account check.
+- `scripts/shutdown/inventory.py` — `config_dir` per entry.
+- `scripts/shutdown/record.py` — `config_dir` in the record.
+- `scripts/shutdown/restart.py` — prefix non-unit resumes.
+- `scripts/shutdown/test_inventory.py` — `config_dir` capture.
+- `scripts/shutdown/test_record.py` — record round trip.
+- `scripts/shutdown/test_restart.py` — resume prefix.
+- `scripts/delegate/remove_seats.py` — owner's config dir.
+- `scripts/delegate/test_remove_seats.py` — owner's config dir.
+- `commands/showrunner/produce.md` — manual resume line.
+- `settings.json` — Edit allow and sandbox allowWrite for the account dirs.
+- `docs/as-built/shutdown-and-restart.md` — `config_dir` and the unit account.
 
 **Seats:** `2 writers + 1 tester` — `launch`: `add_unit.py`, `produce.md`, `settings.json`; `shutdown`: `inventory.py`, `record.py`, `restart.py`, `remove_seats.py`, the as-built.
 
@@ -286,10 +296,19 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 **Files:**
 
-- `scripts/whoami/agent_accounts.py`, `agent_notes.py`, `quota_alert.py`, `whoami.py`, `run_out.py` and their tests.
-- `scripts/nightly_review/nightly_review.py`.
-- `scripts/accounts/accounts.py` and `test_accounts.py` (`burn`).
-- `docs/quota_alerts.md`.
+- `scripts/whoami/agent_accounts.py` — optional `config_dir`.
+- `scripts/whoami/agent_notes.py` — read every account dir.
+- `scripts/whoami/quota_alert.py` — label and role in the alert.
+- `scripts/whoami/whoami.py` — both active accounts.
+- `scripts/whoami/run_out.py` — both active accounts.
+- `scripts/whoami/test_agent_notes.py` — two active accounts.
+- `scripts/whoami/test_quota_alert.py` — unit-account alert.
+- `scripts/whoami/test_run_out.py` — both active accounts.
+- `scripts/nightly_review/nightly_review.py` — quota gate on two accounts.
+- `scripts/nightly_review/test_nightly_review.py` — quota gate on two accounts.
+- `scripts/accounts/accounts.py` — `burn`.
+- `scripts/accounts/test_accounts.py` — `burn`.
+- `docs/quota_alerts.md` — two active accounts.
 
 **Seats:** `2 writers + 1 tester` — `notes`: `agent_accounts.py`, `agent_notes.py`, `nightly_review.py`, `run_out.py`, `whoami.py`; `alerts`: `quota_alert.py`, `docs/quota_alerts.md`, `accounts.py burn`.
 
@@ -319,7 +338,16 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 - **`commands/accounts.md`** — `/accounts [status | setup "claude N" | swap unit "claude N"]`. It runs the matching verb and shows its output unchanged. It states that switching the default account remains `/login` in a `~/.claude` session.
 - `docs/as-built/shutdown-and-restart.md`: `--restart`.
 
-**Files:** `scripts/accounts/accounts.py`, `test_accounts.py`; `scripts/shutdown/shutdown.py`, `record.py` and tests; `commands/accounts.md`; `docs/as-built/shutdown-and-restart.md`.
+**Files:**
+
+- `scripts/accounts/accounts.py` — `swap`.
+- `scripts/accounts/test_accounts.py` — each swap refusal and the dry run.
+- `scripts/shutdown/shutdown.py` — `--restart` stores `then: restart`; `conduct` restarts after `down`.
+- `scripts/shutdown/record.py` — `then` field.
+- `scripts/shutdown/test_shutdown_cli.py` — `down --restart`.
+- `scripts/shutdown/test_record.py` — `then` round trip.
+- `commands/accounts.md` — new.
+- `docs/as-built/shutdown-and-restart.md` — swap.
 
 **Seats:** `1 writer + 1 tester`.
 
@@ -373,7 +401,13 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
   - **Setting up a new dir:** `/accounts setup "claude N"`, then `claudeN` and `/login`.
 - `commands/accounts.md` points to the guide.
 
-**Files:** `scripts/accounts/accounts.py`, `test_accounts.py` (`exec` with `os.execvpe` stubbed: each refusal, env set and removed, the default-login case); `docs/accounts.md` (new); `commands/accounts.md`; this plan (the alias text, as sent to natedev).
+**Files:**
+
+- `scripts/accounts/accounts.py` — `exec` and the login-matches-note rule in `check`.
+- `scripts/accounts/test_accounts.py` — `exec` with `os.execvpe` stubbed: each refusal, env set and removed, the default-login case.
+- `docs/accounts.md` — new: the user's guide.
+- `commands/accounts.md` — points to the guide.
+- `docs/plans/build-followups-two-accounts.md` — the alias text, as sent to natedev.
 
 **Seats:** `1 writer + 1 tester`.
 
