@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 from contextlib import closing
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import override
@@ -566,47 +567,96 @@ class ReportTests(unittest.TestCase):
 
     def test_offload_columns_become_domain_values(self) -> None:
         self.assertIsInstance(
-            report.offload_record(None, None, None), report.NoOffloadRecord
+            report.offload_record(
+                mac=None, reason=None, seconds_value=None, local_reason=None
+            ),
+            report.NoOffloadRecord,
         )
         self.assertIsInstance(
-            report.offload_record("", "", None), report.NoOffloadRecord
+            report.offload_record(
+                mac="", reason="", seconds_value=None, local_reason=""
+            ),
+            report.NoOffloadRecord,
         )
-        self.assertIsInstance(
-            report.offload_record("declined", "local_flag", None),
-            report.LocalRunRequested,
+        requested = report.offload_record(
+            mac="declined",
+            reason="local_flag",
+            seconds_value=None,
+            local_reason="needs Linux filesystem semantics",
         )
+        self.assertEqual(
+            requested,
+            report.LocalRunRequested("needs Linux filesystem semantics"),
+        )
+        with self.assertRaises(FrozenInstanceError):
+            setattr(requested, "reason", "changed")
+        old_requested = report.offload_record(
+            mac="declined",
+            reason="local_flag",
+            seconds_value=None,
+            local_reason=None,
+        )
+        self.assertEqual(old_requested, report.LocalRunRequested(""))
         self.assertIsInstance(
-            report.offload_record("declined", "runner", None),
+            report.offload_record(
+                mac="declined",
+                reason="runner",
+                seconds_value=None,
+                local_reason="",
+            ),
             report.RunnerResultUnavailable,
         )
 
-        decline = report.offload_record("declined", "busy", 2.5)
+        decline = report.offload_record(
+            mac="declined",
+            reason="busy",
+            seconds_value=2.5,
+            local_reason="",
+        )
         self.assertIsInstance(decline, report.OffloadDeclined)
         if isinstance(decline, report.OffloadDeclined):
             self.assertEqual(decline.reason, "busy")
             self.assertEqual(decline.seconds, 2.5)
 
-        completed = report.offload_record("passed_filter", "", 3.5)
+        completed = report.offload_record(
+            mac="passed_filter", reason="", seconds_value=3.5, local_reason=""
+        )
         self.assertIsInstance(completed, report.MacRunCompleted)
         if isinstance(completed, report.MacRunCompleted):
             self.assertEqual(completed.outcome, "passed_filter")
             self.assertEqual(completed.seconds, 3.5)
 
-        lost = report.offload_record("lost", "", 4.5)
+        lost = report.offload_record(
+            mac="lost", reason="", seconds_value=4.5, local_reason=""
+        )
         self.assertIsInstance(lost, report.MacRunLost)
         if isinstance(lost, report.MacRunLost):
             self.assertEqual(lost.seconds, 4.5)
 
-        no_test = report.offload_record("declined", "no_tests", 5.5)
+        no_test = report.offload_record(
+            mac="declined",
+            reason="no_tests",
+            seconds_value=5.5,
+            local_reason="",
+        )
         self.assertIsInstance(no_test, report.MacRunMatchedNoTest)
         if isinstance(no_test, report.MacRunMatchedNoTest):
             self.assertEqual(no_test.seconds, 5.5)
 
     def test_invalid_offload_records_become_unrecognized(self) -> None:
         values = (
-            report.offload_record("declined", "new_reason", 1.0),
-            report.offload_record("passed", "", None),
-            report.offload_record("new_word", "", 1.0),
+            report.offload_record(
+                mac="declined",
+                reason="new_reason",
+                seconds_value=1.0,
+                local_reason="",
+            ),
+            report.offload_record(
+                mac="passed", reason="", seconds_value=None, local_reason=""
+            ),
+            report.offload_record(
+                mac="new_word", reason="", seconds_value=1.0, local_reason=""
+            ),
         )
         for value in values:
             with self.subTest(value=value):
@@ -797,7 +847,8 @@ class ReportTests(unittest.TestCase):
         self.assertLess(lines.index("### Test builds (temporary)"), start)
         self.assertLess(start, lines.index("### Tests per edit"))
 
-    def test_local_pass_pairs_only_the_nearest_matching_failure(self) -> None:
+    def test_local_pass_pairs_only_nearest_failure_and_reports_its_reason(self) -> None:
+        reason = "uses Linux filesystem semantics"
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("first", started_at="2026-10-02T12:00:00Z", mac="failed", mac_reason="", mac_s=10.0,
@@ -805,16 +856,37 @@ class ReportTests(unittest.TestCase):
             call("nearest", started_at="2026-10-02T12:05:00Z", mac="failed", mac_reason="", mac_s=10.0,
                  status=1, outcome="failed"),
             call("local", started_at="2026-10-02T12:10:00Z", mac="declined", mac_reason="local_flag",
-                 mac_s=None, status=0),
+                 local_reason=reason, mac_s=None, status=0),
             self.nextest_step("local-step", "local"),
         )
         section = self.mac_tests_lines()
-        self.assertIn(
-            "Failed on the Mac, then passed on natedev with --local: 1 (hana)",
-            section,
+        paired = next(
+            line
+            for line in section
+            if line.startswith("Failed on the Mac, then passed on natedev with --local")
         )
+        quoted_reason = f'"{reason}"'
+        self.assertIn(quoted_reason, paired)
+        self.assertLess(paired.index("--local"), paired.index(quoted_reason))
+        self.assertIn("1 (hana)", paired)
         avoided = next(line for line in section if line.startswith("natedev runs avoided:"))
         self.assertIn("natedev runs avoided: 1", avoided)
+
+    def test_local_pass_reason_with_double_quotes_is_escaped(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("failed", started_at="2026-10-02T12:05:00Z", mac="failed", mac_reason="", mac_s=10.0,
+                 status=1, outcome="failed"),
+            call("local", started_at="2026-10-02T12:10:00Z", mac="declined", mac_reason="local_flag",
+                 local_reason='needs a "quoted" mount', mac_s=None, status=0),
+            self.nextest_step("local-step", "local"),
+        )
+        paired = next(
+            line
+            for line in self.mac_tests_lines()
+            if line.startswith("Failed on the Mac, then passed on natedev with --local")
+        )
+        self.assertIn('--local "needs a \\"quoted\\" mount": 1 (hana)', paired)
 
     def test_next_day_local_pass_pairs_with_late_mac_failure(self) -> None:
         failed_at = datetime(2026, 10, 2, 23, 50).astimezone().isoformat()

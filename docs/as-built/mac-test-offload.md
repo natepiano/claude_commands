@@ -35,10 +35,10 @@ A pending or active block is one footer item after the build-hold lines: `Mac bl
 
 ### `verify.sh test` — `scripts/delegate/verify.sh`
 
-- `--local` sets `LOCAL_ONLY` and records `declined` / `local_flag`. Otherwise, when the runner exists, `try_mac_test()` runs between the first cache lookup and the cargo token: `"$PY" "$MAC_RUNNER" run --repo-root <top level> --package <pkg> --call-id "$BUILDLOG_CALL_ID" --result <temp file> [--filter-run] -- "${NEXTEST_ARGS[@]}"` (`compose_nextest_args()` builds the words; `VERIFY_MAC_RUNNER` substitutes the runner in tests).
+- `--local "<why>"` sets `LOCAL_ONLY` and records `declined` / `local_flag`, with the reason exported as `BUILDLOG_LOCAL_REASON`. It takes the next argument as a required reason and exits 2 before any work when that is missing, blank or starts with `--`; the reason never enters `tree_key` or the cargo words. Use it only for a test that must run on Linux. Otherwise, when the runner exists, `try_mac_test()` runs between the first cache lookup and the cargo token: `"$PY" "$MAC_RUNNER" run --repo-root <top level> --package <pkg> --call-id "$BUILDLOG_CALL_ID" --result <temp file> [--filter-run] -- "${NEXTEST_ARGS[@]}"` (`compose_nextest_args()` builds the words; `VERIFY_MAC_RUNNER` substitutes the runner in tests).
 - `declined` and `lost` run on natedev. No usable result is recorded as `declined` / `runner` and runs on natedev. A full `passed` is confirmed by the natedev run in the same call (`verify.sh: passed on the Mac (macOS); now confirming on natedev, which is the gate.`). A `passed` on a `--filter` run records `passed_filter` and exits 0 with nothing run on natedev. `failed` records the call and exits with the runner's status.
 - A signal is forwarded to the runner (`forward_mac_runner_signal()`) and waited for; the exit is 128 plus the signal, with no call record.
-- Each call record carries `mac`, `mac_reason`, `mac_s` from `BUILDLOG_MAC`, `BUILDLOG_MAC_REASON`, `BUILDLOG_MAC_S`.
+- Each call record carries `mac`, `mac_reason`, `local_reason`, `mac_s` from `BUILDLOG_MAC`, `BUILDLOG_MAC_REASON`, `BUILDLOG_LOCAL_REASON`, `BUILDLOG_MAC_S`.
 
 ### The showrunner's Mac build — `scripts/production/mac_run.sh`
 
@@ -50,7 +50,7 @@ It claims the Mac after its reach probe (`mac_test.py claim --pid $$ --what "mac
 
 ### Build log and report — `scripts/buildlog/`
 
-- The index is at schema 11. `calls` carries `mac` (`passed`, `passed_filter`, `failed`, `lost`, `declined`), `mac_reason` and `mac_s`. The Mac's steps carry `caller = 'verify-mac'` (set by the remote command) and reach natedev's index through `buildlog sync`.
+- The index is at schema 12. `calls` carries `mac` (`passed`, `passed_filter`, `failed`, `lost`, `declined`), `mac_reason`, `local_reason` and `mac_s`. The report decodes a flagged run as `LocalRunRequested(reason)` and shows its reasons, JSON-quoted, on the "Failed on the Mac, then passed on natedev with --local" line. The Mac's steps carry `caller = 'verify-mac'` (set by the remote command) and reach natedev's index through `buildlog sync`.
 - `COUNTED_FAILURE` (`status != 0 AND NOT (caller IS 'verify-mac' AND step IS 'nextest' AND status = 4)`) drives `step_days.failed` and the `failures` view, so a Mac "no tests to run" keeps raw status 4 without counting as a failure.
 - `report.py` keeps the Mac's steps out of natedev's tables (`natedev_step_predicate`), leaves out a call whose `mac` is `failed` or `passed_filter` (`natedev_call_predicate`), and decodes each call through `offload_record(mac, reason, seconds_value)`. `mac_tests_section(connection, day)` prints `Tests on the Mac`: `Package | Tried | Failed on the Mac | Passed there | Mac p50 | natedev p50 | Stayed local`, the natedev runs avoided, and `No test matched on the Mac:`.
 
