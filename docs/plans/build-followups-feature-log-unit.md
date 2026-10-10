@@ -133,91 +133,34 @@ After Phase 2 reaches `~/.claude` main, the unit director tells the showrunner t
 
 ### Phase 3 — Every backfill source record sits in a frozen ledger  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `inventory.py collect` freezes each project's measured source pools (proposal "Backfill" table) into one ledger per project, and `next`, `show`, `mark` and `status` give each record exactly one disposition.
-
-**Spec:**
-
-`scripts/feature_log/inventory.py` (new), read-only on every repository; the ledger is `state_dir()/"backfill"/<project>.jsonl`, written inside `locked()` by temp file and `os.replace`.
-
-A record's claim and its outcome are tagged states, so no combination of loose optional fields can contradict itself:
-
-```python
-class Unclaimed(TypedDict):
-    state: Literal["unclaimed"]
-
-class ClaimedBy(TypedDict):
-    state: Literal["claimed"]
-    seat: str
-
-ClaimState = Unclaimed | ClaimedBy
-
-class Undisposed(TypedDict):
-    state: Literal["undisposed"]
-
-class NoteOutcome(TypedDict):     # the record's result lives in a note
-    state: Literal["represented", "combined"]
-    note: str                     # the note's title
-
-class NoNoteOutcome(TypedDict):   # the record gets no note
-    state: Literal["internal", "not-current", "unresolved"]
-    reason: str
-
-ReviewOutcome = Undisposed | NoteOutcome | NoNoteOutcome
-
-class BackfillSourceRecord(TypedDict):
-    id: str            # "<project>:<kind>:<key>"; key = sha, tag, "<path>#<phase heading>", "<path>", "<changelog path>@<version>#<n>"
-    project: str
-    repo: str          # absolute checkout path
-    ref: str           # the 40-hex commit frozen by collect
-    kind: Literal["phase", "asbuilt", "changelog", "tag", "merge", "commit"]
-    pool: Literal["structured", "commits"]
-    title: str         # phase heading, file's first heading, bullet text, tag name, or subject
-    date: str          # YYYY-MM-DD: commit or tag date; for a file record, the last commit touching it at ref
-    source: str        # "<path>:<line>" or sha
-    claim: ClaimState
-    outcome: ReviewOutcome
-```
-
-Sources, each read at the ref `collect` freezes (`git rev-parse <branch>`):
-
-- **phase** — every `#### As-built` block in a tracked `docs/**/*.md` (`git ls-tree -r --name-only <ref> -- docs`); its title is the nearest `### Phase …` heading above it.
-- **asbuilt** — a tracked `docs/**/as-built/*.md` holding no `#### As-built` block (one that holds blocks yields only its phase records).
-- **changelog** — each top-level `- ` line under a `## [<version>]` or `## [Unreleased]` heading of the project's changelogs.
-- **tag** — `git tag --merged <ref>`.
-- **merge** — `git rev-list --first-parent --merges <range>`.
-- **commit** — `git rev-list --no-merges <range>`.
-
-Pools (2026-10-10 counts from the proposal, which `collect` prints beside its own):
-
-| Project | structured | commits |
-| --- | --- | --- |
-| hana | `~/rust/hana_catalyst` `init/catalyst`: phase + asbuilt (200 phase records in 58 files) | `~/rust/hana` `main` merges (124) and `~/rust/hana_catalyst` `origin/main..init/catalyst` merges (285), one record per sha |
-| natedev | — | `/etc/nixos` `main`: commits (973), merges (1), tags (1) |
-| cargo-liner | `main`: asbuilt + phase (15 files, 11 records), changelog in `crates/*/CHANGELOG.md` (755 bullets), tags (30) | `main`: commits (2,156), merges (76) |
-| bevy_brp | `main`: asbuilt + phase (4 files), changelog in `mcp/CHANGELOG.md`, `mcp_macros/CHANGELOG.md`, `extras/CHANGELOG.md` (205 bullets), tags (25) | `main`: commits (2,558), merges (12) |
-| obsidian_knife | — | `main`: commits (562), merges (2) |
-| nateroids | `main`: asbuilt + phase (2 files) | `main`: commits (553), merges (2) |
-
-CLI:
-- `collect --project P` — writes the ledger when absent and prints counts per pool and kind beside the proposal's; when the ledger exists it only prints them (a ledger is frozen once).
-- `next --project P --pool POOL [--kind K] [--path PREFIX …] [--claim SEAT] [--limit N]` — undisposed records that are unclaimed or claimed by `SEAT`, oldest first: `<id> | <date> | <kind> | <title> | <source>`. `--path` (repeatable, any one matching) keeps records whose `source` path starts with a prefix; a sha source matches none. `--claim` sets `ClaimedBy(SEAT)` on the listed records. `--limit 0` lists them all.
-- `show ID` — the record and its source text: the phase block, the bullet with its version heading, or the commit message with `git show --stat`.
-- `mark ID… [--ids-from FILE] [--seat SEAT] --as D (--note TITLE | --reason TEXT)` — `represented` and `combined` need `--note` naming a note that exists in the project's folder; the other three need `--reason`. A record claimed by a seat other than `--seat` is refused, naming its seat. Re-marking replaces the outcome.
-- `status --project P [--pool POOL]` — counts per disposition and undisposed, and the notes the ledger names; exit 1 while any record is undisposed.
+- **Ledger:** `inventory.py` reads every repository read-only (git runs with `GIT_OPTIONAL_LOCKS=0`) and keeps one ledger per project at `state_dir()/"backfill"/<project>.jsonl`, one JSON object per line with sorted keys, written inside `locked()` through `.<name>.tmp`, `fsync` and `os.replace`.
+- **Record types:** `BackfillSourceRecord` holds `id` (`<project>:<kind>:<key>`), `project`, `repo` (absolute), `ref` (40-hex frozen tip), `kind: RecordKind` (`phase`, `asbuilt`, `changelog`, `tag`, `merge`, `commit`), `pool: Pool` (`structured`, `commits`), `title`, `date` (`YYYY-MM-DD`), `source` (`<path>:<line>` or a sha), `claim: ClaimState = Unclaimed | ClaimedBy` (`seat`) and `outcome: ReviewOutcome = Undisposed | NoteOutcome | NoNoteOutcome`. `NoteOutcome` (`represented`, `combined`) carries `note`; `NoNoteOutcome` (`internal`, `not-current`, `unresolved`) carries `reason`; no record holds both. Every ledger read checks the exact field set, each tagged state, nonempty claim and outcome text, the ref and date shape, and unique ids.
+- **Source table:** `SOURCES: SourceTable = dict[str, ProjectSources]`; `ProjectSources(sources, proposal_counts)`; `RepositorySource = DocumentSource | ChangelogSource | TagSource | HistorySource`; `HistorySource.history` is `EntireHistory()` or `AfterRef(excluded_ref)`. `ProposalCounts = dict[Pool, dict[ProposalCategory, int]]` labels phase and asbuilt counts apart. `main(argv, sources=SOURCES) -> int` takes the table as a parameter.
+- **Document sources,** read at the frozen branch tip: `phase` is each `#### As-built` block outside fenced code in a `docs/**/*.md` listed by `git ls-tree -r -z --name-only <ref> -- docs`, titled by the nearest `### Phase …` heading above it (none above refuses `collect`), key `<path>#<heading>`. `asbuilt` is a file whose parent directory is named `as-built` and holds no block, titled by its first heading, key `<path>`. `changelog` is each top-level `- ` line under a `## [<version>]` heading (`[Unreleased]` included), key `<path>@<version>#<n>`, files picked by globs matched component by component with equal component counts. A file record's date is the last commit touching it at the ref. All selected file text comes through one `git cat-file --batch -z` process; a missing blob, non-UTF-8 text or a short reply refuses `collect`.
+- **History sources:** `tag` is `for-each-ref --merged=<ref> refs/tags` with the peeled sha as source, its pool set per source (natedev's sits in `commits`); `merge` is `git log --first-parent --merges` and `commit` is `git log --no-merges`, over the whole history or `<excluded>..<ref>`. A merge or commit sha seen in two sources keeps its first record; any other duplicate id refuses `collect`. Records sort by `(date, id)`.
+- **`collect --project P`:** with a ledger present, reads it under the lock and only prints. Otherwise collects outside the lock, then writes under it only if the ledger is still absent (a concurrent first `collect` wins). Prints each pool and kind beside the proposal's figure (`not measured` for a category the proposal never measured), the structured pool's documents and files, and one `ref: <repo> <sha>` line per frozen tip.
+- **`next --project P --pool POOL [--kind K] [--path PREFIX…] [--claim SEAT] [--limit N]`:** undisposed records unclaimed or claimed by `SEAT`, oldest first, as `<id> | <date> | <kind> | <title> | <source>`. `--path` repeats and takes several prefixes; a record matches when the path part of its `source` starts with any one, and a sha source matches none. `--claim` sets `ClaimedBy(SEAT)` on the listed records under the lock. `--limit` defaults to 25; `0` lists all.
+- **`show ID`:** the record as one JSON line, then its source text at the frozen ref: the phase block, the bullet under its version heading, the whole as-built file, or `git show --stat` for a tag, merge or commit.
+- **`mark ID… [--ids-from FILE] [--seat SEAT] --as D (--note TITLE | --reason TEXT)`:** `represented` and `combined` need `--note` naming an existing `vault_dir()/"feature-log"/<project>/<TITLE>.md`; `internal`, `not-current` and `unresolved` need `--reason`. A record claimed by a seat other than `--seat` is refused, naming that seat. IDs may span projects; every ID is checked before any write, so a refusal changes nothing. Re-marking replaces the outcome.
+- **`status --project P [--pool POOL]`:** `--pool` resolves at the argparse boundary into a `tuple[Pool, ...]` (both pools when omitted); prints counts for undisposed and each disposition, then the notes the ledger names.
+- **Exit codes:** `0` on success; `1` from `status` while any selected record is undisposed; `2` for every refusal (argument error, `InventoryError`, `OSError`, source text that no longer parses to the record), with `inventory: <reason>` on stderr.
 
 **Files:**
-- `scripts/feature_log/inventory.py` — new.
-- `scripts/feature_log/test_inventory.py` — new.
+- `scripts/feature_log/inventory.py` — source table, ledger and the five verbs.
+- `scripts/feature_log/test_inventory.py` — tests on temp git repos: each record kind, an excluded range, a repeat `collect` leaving the ledger byte-identical, seat claims, path prefixes, `mark` refusals and `status` exit codes.
 
-**Seats:** `1 writer + 1 tester` — one new script; its record kinds and commands are concrete enough to test first.
-- `impl` — `scripts/feature_log/inventory.py`.
-- `test` — `scripts/feature_log/test_inventory.py`, on temp git repos it builds: each record kind (a phase block under its heading, an as-built file without blocks, changelog bullets per version and Unreleased, tags, first-parent merges, non-merge commits); a range excludes `origin/main`; `collect` twice leaves the ledger byte-identical; `next --claim` hides one seat's records from the other; `next --path` keeps only records under its prefixes; `mark` refuses a missing note or reason and a record another seat claimed; no record holds both a note and a reason; `status` exits 1 until all are marked.
+**Binds later work:**
+- Ledgers are frozen as of 2026-10-10 at hana `ce51498` + hana_catalyst `2408021`, `/etc/nixos` `9d99e9e`, cargo-liner `9301628`, bevy_brp `e65064e`, obsidian_knife `5df4349`, nateroids `c7d6a51`; `collect` only prints once a ledger exists.
+- Hana's structured pool holds 261 records (203 phase across 14 plan docs, 58 asbuilt) and splits 125 / 136 by source path prefix. Counts above the proposal's are work landed after its measurement (hana +3 phase, +7 hana_catalyst merges; natedev +3 commits).
+- `next --path` matches a prefix of the record's source path; `next --claim <seat>` claims under the lock, after which another seat's `next` skips those records and its `mark` is refused.
+- `mark` dispositions: `represented` and `combined` with `--note` (the note must already exist), `internal`, `not-current` and `unresolved` with `--reason`.
+- `status` exits 1 while any record is undisposed and 0 once every record carries a disposition.
 
-**Constraints from prior phases:** Phase 1: notes live at `vault_dir()/"feature-log"/<project>/<title>.md`; import `vault_dir`, `state_dir` and `locked` from `feature_log` (functions read per call; `locked()` is the flock on `state_dir()/"lock"`). Phase 2: none bind this phase.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/feature_log -p 'test_*.py'` green; `basedpyright scripts/feature_log` clean. Live: `collect` for all six projects; the phase report gives each pool's count beside the proposal's, with the frozen refs, and names the cause of each difference (commits since 2026-10-10).
+**Gotchas:**
+- `git ls-tree` without `-z` quotes non-ASCII paths, which then silently fall out of path filters; `fnmatch` `*` crosses `/`, so a whole-path changelog glob matches nested files.
+- The proposal's hana "58 files" are as-built files and its "200 records" are phase records, which live in plan docs rather than those files; at the proposal's measured ref the counts are exactly 200 and 58.
 
 ### Phase 4 — Hana's structured phase records are in the log  · status: todo
 
@@ -230,11 +173,11 @@ CLI:
 **Files:**
 - `/home/natepiano/rust/hanadocs/feature-log/hana/` — notes, through `feature_log.py` only.
 
-**Seats:** `2 writers` — split by source path, so each phase block's file stays with one seat: sort hana's structured source files by path and give each seat the directory prefixes holding about half the records. Phase 3's phase review writes the two prefix lists here from the frozen ledger.
-- `impl` — claims as `a` with `--path` for the first prefix list.
-- `test` — opens as impl; claims as `b` with `--path` for the second prefix list.
+**Seats:** `2 writers` — split by source path, so each phase block's file stays with one seat: sort hana's structured source files by path and give each seat the directory prefixes holding about half the records (hana's frozen ledger: 261 structured records).
+- `impl` — claims as `a` (125 records): `--path docs/hana/tool-based-ui --path docs/hana/frame-time-plan.md --path docs/hana/demo-plan.md --path docs/hana/palette-toggles-plan.md`.
+- `test` — opens as impl; claims as `b` (136 records): `--path docs/hana/as-built/ --path docs/hana/hana-organon-design.md --path docs/as-built/ --path docs/fairy_dust/ --path docs/hana_catalyst/ --path docs/hana_clerestory/ --path docs/hana_diegetic/ --path docs/hana_kana/ --path docs/hana_lagrange/ --path docs/hana_rigging/ --path docs/hana_rubric/ --path docs/hana_valence/ --path docs/plans/`.
 
-**Constraints from prior phases:** Phase 1: `feature_log.py add|supersede|amend|live|check`, `--backfill` (no derived `@Unreleased`), `--separate-result`. Phase 3: `inventory.py next|show|mark|status` and the frozen hana ledger. Phase 2: off natedev every `feature_log.py` call forwards to natedev over ssh unless `FEATURE_LOG_VAULT` is set; `amend --evidence` skips evidence already stored, so a repeated amend prints `unchanged`; `amend --backfill` records `backfill: true`.
+**Constraints from prior phases:** Phase 1: `feature_log.py add|supersede|amend|live|check`, `--backfill` (no derived `@Unreleased`), `--separate-result`. Phase 3: `inventory.py next|show|mark|status` and the frozen hana ledger. Phase 2: off natedev every `feature_log.py` call forwards to natedev over ssh unless `FEATURE_LOG_VAULT` is set; `amend --evidence` skips evidence already stored, so a repeated amend prints `unchanged`; `amend --backfill` records `backfill: true`. Phase 3 (as built): every ledger is frozen (`collect` now only prints) at hana `ce51498` + hana_catalyst `2408021`, `/etc/nixos` `9d99e9e`, cargo-liner `9301628`, bevy_brp `e65064e`, obsidian_knife `5df4349`, nateroids `c7d6a51`; counts above the proposal are work landed after its 2026-10-10 measurement; `next --path` matches a prefix of the record's source path.
 
 **Acceptance gate:** `inventory.py status --project hana --pool structured` exits 0; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits hana's live entries (`feature_log.py live --project hana`) against the current surface above and finds no uncovered qualifying behavior in it. The phase report gives the note count and the count per disposition.
 
@@ -253,7 +196,7 @@ CLI:
 - `impl` — claims as `a`: `--path crates/cargo-mend --path crates/cargo-port --path crates/tui_pane`.
 - `test` — opens as impl; claims as `b`: `--path crates/cargo-berth --path crates/cargo-tile --path crates/cargo-handler --path docs` (the as-built and phase records), then `--kind tag`.
 
-**Constraints from prior phases:** Phase 1: `feature_log.py` verbs and `--backfill`; published cargo-liner crates are `cargo-mend`, `cargo-port`, `cargo-tile`, `tui_pane`. Phase 3: the frozen cargo-liner ledger. Phase 2: off natedev every `feature_log.py` call forwards to natedev over ssh unless `FEATURE_LOG_VAULT` is set; `amend --evidence` skips evidence already stored, so a repeated amend prints `unchanged`; `amend --backfill` records `backfill: true`.
+**Constraints from prior phases:** Phase 1: `feature_log.py` verbs and `--backfill`; published cargo-liner crates are `cargo-mend`, `cargo-port`, `cargo-tile`, `tui_pane`. Phase 3: the frozen cargo-liner ledger. Phase 2: off natedev every `feature_log.py` call forwards to natedev over ssh unless `FEATURE_LOG_VAULT` is set; `amend --evidence` skips evidence already stored, so a repeated amend prints `unchanged`; `amend --backfill` records `backfill: true`. Phase 3 (as built): every ledger is frozen (`collect` now only prints) at hana `ce51498` + hana_catalyst `2408021`, `/etc/nixos` `9d99e9e`, cargo-liner `9301628`, bevy_brp `e65064e`, obsidian_knife `5df4349`, nateroids `c7d6a51`; counts above the proposal are work landed after its 2026-10-10 measurement; `next --path` matches a prefix of the record's source path.
 
 **Acceptance gate:** `inventory.py status --project cargo-liner --pool structured` exits 0; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits cargo-liner's live entries against the current surface above and finds no uncovered qualifying behavior in it. The phase report gives the note count and the count per disposition.
 
@@ -273,7 +216,7 @@ CLI:
 - `impl` — claims as `a`: bevy_brp `--path docs --path mcp/CHANGELOG.md` (as-built records and `mcp` bullets).
 - `test` — opens as impl; claims as `b`: bevy_brp `--path extras/CHANGELOG.md --path mcp_macros/CHANGELOG.md`, then bevy_brp `--kind tag`, then nateroids' structured pool.
 
-**Constraints from prior phases:** Phase 1: published bevy_brp crates are `bevy_brp_extras`, `bevy_brp_mcp`, `bevy_brp_mcp_macros`. Phase 3: the frozen bevy_brp and nateroids ledgers. Phase 2: off natedev every `feature_log.py` call forwards to natedev over ssh unless `FEATURE_LOG_VAULT` is set; `amend --evidence` skips evidence already stored, so a repeated amend prints `unchanged`; `amend --backfill` records `backfill: true`.
+**Constraints from prior phases:** Phase 1: published bevy_brp crates are `bevy_brp_extras`, `bevy_brp_mcp`, `bevy_brp_mcp_macros`. Phase 3: the frozen bevy_brp and nateroids ledgers. Phase 2: off natedev every `feature_log.py` call forwards to natedev over ssh unless `FEATURE_LOG_VAULT` is set; `amend --evidence` skips evidence already stored, so a repeated amend prints `unchanged`; `amend --backfill` records `backfill: true`. Phase 3 (as built): every ledger is frozen (`collect` now only prints) at hana `ce51498` + hana_catalyst `2408021`, `/etc/nixos` `9d99e9e`, cargo-liner `9301628`, bevy_brp `e65064e`, obsidian_knife `5df4349`, nateroids `c7d6a51`; counts above the proposal are work landed after its 2026-10-10 measurement; `next --path` matches a prefix of the record's source path.
 
 **Acceptance gate:** `inventory.py status --project bevy_brp --pool structured` and `--project nateroids --pool structured` exit 0; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits bevy_brp's live entries against the current surface above and finds no uncovered qualifying behavior in it. The phase report gives the note count and the count per disposition for each project.
 
@@ -293,7 +236,7 @@ CLI:
 - `impl` — claims as `a`: natedev.
 - `test` — opens as impl; claims as `b`: obsidian_knife.
 
-**Constraints from prior phases:** Phase 1: natedev notes take no `--crate`; obsidian_knife's one crate is `obsidian_knife`, unpublished. Phase 3: the frozen natedev and obsidian_knife ledgers. Phase 2: off natedev every `feature_log.py` call forwards to natedev over ssh unless `FEATURE_LOG_VAULT` is set; `amend --evidence` skips evidence already stored, so a repeated amend prints `unchanged`; `amend --backfill` records `backfill: true`.
+**Constraints from prior phases:** Phase 1: natedev notes take no `--crate`; obsidian_knife's one crate is `obsidian_knife`, unpublished. Phase 3: the frozen natedev and obsidian_knife ledgers. Phase 2: off natedev every `feature_log.py` call forwards to natedev over ssh unless `FEATURE_LOG_VAULT` is set; `amend --evidence` skips evidence already stored, so a repeated amend prints `unchanged`; `amend --backfill` records `backfill: true`. Phase 3 (as built): every ledger is frozen (`collect` now only prints) at hana `ce51498` + hana_catalyst `2408021`, `/etc/nixos` `9d99e9e`, cargo-liner `9301628`, bevy_brp `e65064e`, obsidian_knife `5df4349`, nateroids `c7d6a51`; counts above the proposal are work landed after its 2026-10-10 measurement; `next --path` matches a prefix of the record's source path.
 
 **Acceptance gate:** `inventory.py status` exits 0 for both projects; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits each project's live entries against its current surface and finds no qualifying behavior without one live entry. The phase report gives the note count, the count per disposition, and the measured review time.
 
@@ -313,7 +256,7 @@ CLI:
 - `impl` — claims as `a`: hana.
 - `test` — opens as impl; claims as `b`: nateroids.
 
-**Constraints from prior phases:** Phase 4 logged hana's structured pool; Phase 6 seeded nateroids from its as-built files. Phase 3: the frozen ledgers.
+**Constraints from prior phases:** Phase 4 logged hana's structured pool; Phase 6 seeded nateroids from its as-built files. Phase 3: the frozen ledgers. Phase 3 (as built): every ledger is frozen (`collect` now only prints) at hana `ce51498` + hana_catalyst `2408021`, `/etc/nixos` `9d99e9e`, cargo-liner `9301628`, bevy_brp `e65064e`, obsidian_knife `5df4349`, nateroids `c7d6a51`; counts above the proposal are work landed after its 2026-10-10 measurement; `next --path` matches a prefix of the record's source path.
 
 **Acceptance gate:** `inventory.py status` exits 0 for both projects; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits each project's live entries against its current surface, using the running-app check above, and finds no qualifying behavior without one live entry. The phase report gives the note count, the count per disposition, and the measured review time.
 
@@ -333,7 +276,7 @@ CLI:
 - `impl` — claims as `a`: cargo-liner.
 - `test` — opens as impl; claims as `b`: bevy_brp.
 
-**Constraints from prior phases:** Phase 5 and Phase 6 logged the structured pools of both projects. Phase 3: the frozen ledgers.
+**Constraints from prior phases:** Phase 5 and Phase 6 logged the structured pools of both projects. Phase 3: the frozen ledgers. Phase 3 (as built): every ledger is frozen (`collect` now only prints) at hana `ce51498` + hana_catalyst `2408021`, `/etc/nixos` `9d99e9e`, cargo-liner `9301628`, bevy_brp `e65064e`, obsidian_knife `5df4349`, nateroids `c7d6a51`; counts above the proposal are work landed after its 2026-10-10 measurement; `next --path` matches a prefix of the record's source path.
 
 **Acceptance gate:** `inventory.py status` exits 0 for both projects; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits each project's live entries against its current surface and finds no qualifying behavior without one live entry. The phase report gives the note count, the count per disposition, the measured review time, and the backfill's total notes across the six projects.
 
