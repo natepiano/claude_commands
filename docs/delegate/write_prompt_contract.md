@@ -4,7 +4,7 @@ Read at the point of use from `/unit:direct`. Defines `<WritePromptContract/>`,
 `<PhaseTeam/>`, `<CoordinationBoard/>`, `<PhaseMesh/>`, `<BuildTokenContract/>`,
 `<TeamFilePartition/>`, and `<RoleReassignment/>` in full.
 
-**Read when:** writing any implementation or fix prompt.
+**Read when:** writing any implementation, fix, or review prompt.
 
 <WritePromptContract>
 Every implementation or fix prompt sent to a seat contains sections 1–9.
@@ -13,6 +13,9 @@ repair is complete on its own. Section 7 may use its follow-up pointer; section
 9 is always inline. Never abbreviate the new Project Context, Work
 Specification, team partition, boundaries, or verification on the strength of
 earlier work.
+
+Every review prompt carries sections 7 and 9 the same way, plus the role-switch
+opening in <ReviewPromptContract/>.
 
 1. Role: write the requested code directly; do not ask questions. Name the
    slot this prompt is for and the role assigned by the Work Order's **Seats**
@@ -38,7 +41,7 @@ earlier work.
    Use short present-tense text and never read the heartbeat file. Role
    changes: **before the first tool call in a new role** — taking a slice of
    the test work, standing down — run
-   `bash ~/.claude/scripts/delegate/board.sh role <concrete SESSION_DIR> <slot> <impl|fix|test> "<why>"`,
+   `bash ~/.claude/scripts/delegate/board.sh role <concrete SESSION_DIR> <slot> <impl|fix|test|review> "<why>"`,
    written out with the real path and this slot's name. A `status` sentence
    saying the same thing does not count: the table reads the `role=` field,
    and a move that is not posted is a row the run never shows.
@@ -129,8 +132,10 @@ the board, the progress table, every artifact name — reads the slot for identi
 and the role for activity, so keep the two distinct: `test` doing
 implementation work is still slot `test`. Its Codex thread stays open across
 phase boundaries. Keep its role when the next Work Order fits, otherwise move
-it under <RoleReassignment/>. A new thread opens only when no open seat can
-take the assignment, and every thread ends with `end_session.sh`.
+it under <RoleReassignment/>. Open another thread only when no open seat can
+take the assignment, including when every open seat is busy; name its slot for
+its work (`review`, `fix2`), keep it for reuse, and end it only with
+`end_session.sh`.
 
 `test` opens against the **specification, not the implementation**. The Work
 Order defines the behavior, so tests can be written before any of it exists;
@@ -175,7 +180,7 @@ cannot relay. Each `register` line says which case holds, in its `mesh=` field.
   numbered; keep the last number as the cursor. Read after acquiring a token,
   and whenever you need what a peer has recorded rather than what it would say
   if asked — the role it holds now, whether it has posted `done`.
-- `board.sh role <session_dir> <slot> <impl|fix|test> [note]` — **call this
+- `board.sh role <session_dir> <slot> <impl|fix|test|review> [note]` — **call this
   the moment your slot starts doing something other than what it is named
   for.** A slot is a fixed identity and its role is not: a writer that takes a
   slice of the remaining test work is doing `test`. The launcher stamps the opening role, so
@@ -313,22 +318,20 @@ not exist is not worth inventing; a partition that is wrong costs the phase.
 </TeamFilePartition>
 
 <RoleReassignment>
-Roles move; slots do not. Every move is a board `handoff` post naming the slot,
-the role it is leaving, and the role it is taking, because that post is what the
-progress table reads to say what each agent is doing now.
+Roles move; slots do not. Any open seat may take any role, mid-phase included,
+because every seat in a unit works in the same area. Before dispatch, post a
+board `handoff` naming the slot, the role it leaves, and the role it takes; the
+new prompt has that seat run `board.sh role` before its first tool call.
 
-- **`test` is never recruited away** while tests for the phase are unwritten.
-  It is the only slot whose absence cannot be recovered later in the phase, and
-  a phase that ships untested is not cheaper, only later. A `test` seat that
-  Seats opened as a writer has no tests to protect and moves like any writer.
-- **When writing finishes before testing**, a writer does not idle. It takes a
-  disjoint slice of the remaining test work — agreed on the board, one file per
-  slot, never the file `test` is inside — or they stand down.
+A busy turn does not reserve its seat's next role. Reassign it when that turn
+ends; when the new work must run concurrently and every open seat is busy, open
+an extra seat named for its work (`review`, `fix2`) and keep it for reuse. Never
+abandon unwritten tests: assign them to an open seat or open one.
 
 **Standing down means ending the turn, not waiting.** A slot with nothing left
 posts `done` with what it completed and finishes its turn; it never runs an idle
 poll loop. Its Codex thread stays open for the unit director's next
-`implement.sh --to` assignment and ends at `end_session.sh`. This is why a
-finished writer moves toward work that exists now rather than work a peer might
-hand over later in the same turn.
+launcher `--to` assignment and ends at `end_session.sh`. This is why a finished
+seat moves toward work that exists now rather than work a peer might hand over
+later in the same turn.
 </RoleReassignment>

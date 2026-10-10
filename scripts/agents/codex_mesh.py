@@ -2231,6 +2231,9 @@ def _start_turn(
     inputs: list[dict[str, str]] = [{"type": "text", "text": message}]
     inputs.extend({"type": "text", "text": item} for item in pending)
     params: dict[str, object] = {"threadId": thread_id, "input": inputs}
+    model = _as_str(_attr(args, "model"))
+    if model:
+        params["model"] = model
     effort = _as_str(_attr(args, "effort"))
     if effort:
         params["effort"] = effort

@@ -103,7 +103,7 @@ natedev, 2026-10-10: rollout phases first, measurement last; measurement must no
 
 **Ruled out:** dropping the `tools.apply_patch(` pattern from edit detection — it is how real edits are logged.
 
-### Phase 3 — Reviews go to open seats · status: todo
+### Phase 3 — Reviews go to open seats · status: done
 
 #### Work Order
 

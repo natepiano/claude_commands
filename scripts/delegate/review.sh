@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# review.sh — Invoke the configured delegate agent for a read-only review.
+# review.sh — Invoke the configured delegate agent for a review.
 #
-# Usage: review.sh <session_dir> [working_dir] [prompt_file] [task]
+# Usage: review.sh [--to <seat> | --slot <new-slot>] <session_dir>
+#                  [working_dir] [prompt_file] [task]
 #                  [role_description] [pass_activity] [pass_index] [lens]
 #                  [early_ready_file]
+#   --to reuses an open Codex seat. --slot opens a role-named Codex seat for
+#   this review and leaves its thread open for later `--to` dispatches.
 #   role_description — 1-2 lines describing this review's responsibility,
 #   written as a header block into the shared heartbeat log
 #   pass_activity — short user-facing description for the progress header
@@ -38,10 +41,10 @@
 #   <session_dir>/heartbeat.log        — shared with implement.sh: role header at
 #                                        start + [wrapper] beats every 60s, each
 #                                        carrying an activity digest decoded from
-#                                        the reviewer's streamed log. No [agent]
-#                                        lines — the reviewer's read-only sandbox
-#                                        cannot write files; its prompt-instructed
-#                                        narration arrives via the digest instead.
+#                                        the reviewer's streamed log. Fresh
+#                                        reviewers are read-only; seated reviewers
+#                                        are checked for an unchanged tree after
+#                                        their turn.
 #   <session_dir>/review_awake         — seconds the beat loop has counted for
 #                                        this dispatch, which excludes time the
 #                                        machine was suspended; stamped on the
@@ -50,6 +53,19 @@
 #                                        exceed the pass it is recorded on.
 
 set -euo pipefail
+
+FOLLOW_TO=""
+NEW_SLOT=""
+case "${1:-}" in
+  --to)
+    FOLLOW_TO="${2:?Usage: review.sh --to <seat> <session_dir> ...}"
+    shift 2
+    ;;
+  --slot)
+    NEW_SLOT="${2:?Usage: review.sh --slot <new-slot> <session_dir> ...}"
+    shift 2
+    ;;
+esac
 
 SESSION_DIR="${1:?Usage: review.sh <session_dir> [working_dir] [prompt_file] [task] [role_description]}"
 WORKING_DIR="${2:-$(pwd)}"
@@ -69,17 +85,36 @@ esac
 # A closed set, like the pass kinds: an unrecognized lens would suffix artifacts
 # nobody reads and record a pass under a seat no column renders, both silently.
 case "${LENS}" in
-  '') TEAM_SLOT='' ;;
-  adversary) TEAM_SLOT=test ;;
-  contract) TEAM_SLOT=impl ;;
+  '') LENS_SLOT='' ;;
+  adversary) LENS_SLOT=test ;;
+  contract) LENS_SLOT=impl ;;
   # No writer sits in `review` since the three-seat team was folded into two,
   # so the third lens takes it and its pass never closes a writer's window.
-  craft) TEAM_SLOT=review ;;
+  craft) LENS_SLOT=review ;;
   *)
     echo "ERROR: unknown review lens '${LENS}' (adversary, contract, craft)" >&2
     exit 2
     ;;
 esac
+
+# A seated pass belongs to the chair that actually ran it, not to the lens's
+# historical default chair. Seat names end in their semantic slot (`impl`,
+# `test`, `review`, `fix2`); solo reviewers retain the lens mapping above.
+if [[ -n "${FOLLOW_TO}" ]]; then
+  TEAM_SLOT="${FOLLOW_TO##*-}"
+  if [[ ! "${TEAM_SLOT}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]]; then
+    echo "ERROR: cannot derive a valid team slot from review seat '${FOLLOW_TO}'." >&2
+    exit 2
+  fi
+elif [[ -n "${NEW_SLOT}" ]]; then
+  TEAM_SLOT="${NEW_SLOT}"
+  if [[ ! "${TEAM_SLOT}" =~ ^[A-Za-z][A-Za-z0-9_]{0,31}$ ]]; then
+    echo "ERROR: new review slot must be role-named and use 1-32 alphanumeric/_ characters; got '${NEW_SLOT}'." >&2
+    exit 2
+  fi
+else
+  TEAM_SLOT="${LENS_SLOT}"
+fi
 
 SUFFIX="${LENS:+_${LENS}}"
 # What the shared heartbeat log tags this reviewer's beats with. Three lenses
@@ -93,6 +128,13 @@ BEAT_TAG="${SUBTASK}${LENS:+:${LENS}}"
 export PLAN_DELEGATE_TEAM_ROLE="${TEAM_SLOT}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${FOLLOW_TO}" ]]; then
+  REVIEW_SEAT="${FOLLOW_TO}"
+elif [[ -n "${NEW_SLOT}" ]]; then
+  REVIEW_SEAT="$(bash "${SCRIPT_DIR}/seat_name.sh" "${WORKING_DIR}" "${NEW_SLOT}" review)"
+else
+  REVIEW_SEAT=""
+fi
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
@@ -101,11 +143,8 @@ PY="${SCRIPT_DIR}/../lib/py"
 FINDINGS_FILE="${SESSION_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
 STATUS_FILE="${SESSION_DIR}/review_status${SUFFIX}"
 LOG_FILE="${SESSION_DIR}/review_agent_${PASS_INDEX}${SUFFIX}.log"
+REPLY_FILE="${SESSION_DIR}/review_reply_${PASS_INDEX}${SUFFIX}.$$.txt"
 
-# Every reader of the unnumbered paths — the unit director's mid-run preemption
-# read, the heartbeat digest — keeps working while the per-pass history is kept.
-ln -sfn "review_findings_${PASS_INDEX}${SUFFIX}.txt" "${SESSION_DIR}/review_findings${SUFFIX}.txt"
-ln -sfn "review_agent_${PASS_INDEX}${SUFFIX}.log" "${SESSION_DIR}/review_agent${SUFFIX}.log"
 AGENT_FILE="${SESSION_DIR}/review_agent${SUFFIX}"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
 BOARD_HELPER="${SCRIPT_DIR}/board.sh"
@@ -114,6 +153,22 @@ AWAKE_FILE="${SESSION_DIR}/review_awake${SUFFIX}"
 PROGRESS_HELPER="${SCRIPT_DIR}/progress_history.py"
 PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 HEARTBEAT_INTERVAL_SECS=60
+
+initialize_review_artifacts() {
+  # Every reader of the unnumbered paths — the unit director's mid-run
+  # preemption read, the heartbeat digest — keeps working while the per-pass
+  # history is kept.
+  ln -sfn "review_findings_${PASS_INDEX}${SUFFIX}.txt" "${SESSION_DIR}/review_findings${SUFFIX}.txt"
+  ln -sfn "review_agent_${PASS_INDEX}${SUFFIX}.log" "${SESSION_DIR}/review_agent${SUFFIX}.log"
+  rm -f "${AWAKE_FILE}" "${REPLY_FILE}"
+  if [[ -n "${REVIEW_SEAT}" ]]; then
+    : > "${FINDINGS_FILE}"
+  fi
+  echo "reviewing" > "${STATUS_FILE}"
+  # Only meaningful while an early launch is showing in the progress report,
+  # and read there only if written after the review was armed.
+  echo "$$" > "${SESSION_DIR}/review_pid${SUFFIX}"
+}
 
 # -1 says the beat loop counted nothing, which a review shorter than one
 # interval always does. The previous review's file is removed before this one
@@ -132,31 +187,256 @@ awake_seconds() {
 # words of the delegate that sat there while the code was being written, aged by
 # however long the review has run -- a line describing the wrong agent, which
 # reads as a stalled one. A lone reviewer holds no seat and posts nothing.
-# A blind reviewer is a fresh read-only session with no peers and no address, so
-# every line says `mesh=none`: nothing can reach it and nothing should wait to.
+# A fresh blind reviewer has no peers and no address, so its line says
+# `mesh=none`. A seated review names the reused mesh address instead.
 board_post() {
   [[ -n "${TEAM_SLOT}" ]] || return 0
   bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${TEAM_SLOT}" "$1" "$2" || true
 }
 
-rm -f "${AWAKE_FILE}"
-echo "reviewing" > "${STATUS_FILE}"
-# Only meaningful while an early launch is showing in the progress report, and
-# read there only if it was written after the review was armed — so it is
-# written on every run, before anything can fail, not in the early branch alone.
-echo "$$" > "${SESSION_DIR}/review_pid${SUFFIX}"
+# Preserve the old launcher's observable failure path: a solo review creates
+# its artifacts before agent resolution. A seated review claims first, so a
+# busy-seat refusal cannot overwrite another review's status or findings.
+if [[ -z "${REVIEW_SEAT}" ]]; then
+  initialize_review_artifacts
+fi
 
 source "${SCRIPT_DIR}/../agents/agents_config.sh"
 if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
-  echo "error" > "${STATUS_FILE}"
+  if [[ -z "${REVIEW_SEAT}" ]]; then
+    echo "error" > "${STATUS_FILE}"
+  fi
   exit 1
+fi
+
+# implement.sh anchors a durable Codex identity to the implementation model
+# configured when that seat first opens. A seat opened by review.sh must use
+# the same anchor even though this turn runs the review model; otherwise the
+# first role switch back to implementation rejects its own retained thread.
+DURABLE_SEAT_MODEL="${AGENT_MODEL}"
+if [[ -n "${NEW_SLOT}" ]]; then
+  IMPLEMENTATION_PAIR="$(_agents_registry_get "delegate.${AGENT_FAMILY}" implementation)"
+  if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
+    IMPLEMENTATION_PAIR="$(_agents_registry_get "delegate.${AGENT_FAMILY}" impl)"
+  fi
+  if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
+    echo "ERROR: cannot record review seat ${REVIEW_SEAT}: no implementation model is configured." >&2
+    exit 2
+  fi
+  DURABLE_SEAT_MODEL="${IMPLEMENTATION_PAIR%%:*}"
+fi
+
+claim_follow() {
+  "$PY" - "${SESSION_DIR}" "${FOLLOW_TO}" "${SCRIPT_DIR}/../agents/codex_mesh.py" \
+    "${BOARD_HELPER}" "${COMPACT_ABOVE_TOKENS}" <<'PY'
+import fcntl
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+root_text, name, mesh_script, board_helper, compact_above_text = sys.argv[1:]
+root = Path(root_text)
+compact_above = int(compact_above_text)
+
+def read_roster():
+    try:
+        value = json.loads((root / "mesh_roster.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+def post(message):
+    subprocess.run(
+        ["bash", board_helper, "post", root_text, name.rsplit("-", 1)[-1],
+         "status", message],
+        capture_output=True,
+        text=True,
+    )
+
+with (root / "impl_seat_claim.lock").open("a+") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    entry = read_roster().get(name, {})
+    context_tokens = entry.get("context_tokens", 0) if isinstance(entry, dict) else 0
+    if isinstance(context_tokens, int) and context_tokens > compact_above:
+        compact = subprocess.run(
+            [sys.executable, mesh_script, "compact", "--session-dir", root_text,
+             "--to", name],
+            capture_output=True,
+            text=True,
+        )
+        if compact.returncode == 0:
+            post(f"launcher: {compact.stdout.strip() or f'compacted {name}'}")
+        else:
+            detail = (compact.stderr.strip() or compact.stdout.strip()
+                      or f"exit {compact.returncode}").splitlines()[-1]
+            post(f"launcher: compaction failed for {name}: {detail}; continuing follow-up")
+    checked = subprocess.run(
+        [sys.executable, mesh_script, "can-follow", "--session-dir", root_text,
+         "--to", name, "--claim-pid", os.environ["FOLLOW_LAUNCHER_PID"],
+         "--role", "review"],
+        capture_output=True,
+        text=True,
+    )
+    if checked.returncode != 0:
+        print(checked.stderr.strip() or f"{name} is busy or not followable", file=sys.stderr)
+        raise SystemExit(checked.returncode)
+PY
+}
+
+cleanup_mesh_review() {
+  if [[ -n "${FOLLOW_TO}" ]]; then
+    "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" release-follow \
+      --session-dir "${SESSION_DIR}" --to "${FOLLOW_TO}" \
+      --claim-pid "${FOLLOW_LAUNCHER_PID}" >/dev/null 2>&1 || true
+  fi
+  rm -f "${REPLY_FILE}"
+}
+
+tree_status() {
+  git -C "${WORKING_DIR}" status --porcelain
+}
+
+tree_diff_hash() {
+  git -C "${WORKING_DIR}" diff HEAD |
+    "$PY" -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
+}
+
+tree_head() {
+  git -C "${WORKING_DIR}" rev-parse HEAD
+}
+
+tree_untracked_hash() {
+  "$PY" -c '
+import hashlib
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+names = subprocess.check_output(
+    ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"]
+).split(b"\0")
+digest = hashlib.sha256()
+for raw_name in names:
+    if not raw_name:
+        continue
+    path = root / os.fsdecode(raw_name)
+    digest.update(len(raw_name).to_bytes(8, "big"))
+    digest.update(raw_name)
+    if path.is_symlink():
+        content = os.fsencode(os.readlink(path))
+        digest.update(b"symlink\0")
+        digest.update(content)
+    else:
+        digest.update(b"file\0")
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+print(digest.hexdigest())
+' "${WORKING_DIR}"
+}
+
+tree_paths() {
+  {
+    git -C "${WORKING_DIR}" diff HEAD --name-only
+    git -C "${WORKING_DIR}" ls-files --others --exclude-standard
+  } | LC_ALL=C sort -u
+}
+
+capture_tree_baseline() {
+  TREE_HEAD_BEFORE="$(tree_head)"
+  TREE_STATUS_BEFORE="$(tree_status)"
+  TREE_DIFF_HASH_BEFORE="$(tree_diff_hash)"
+  TREE_UNTRACKED_HASH_BEFORE="$(tree_untracked_hash)"
+  TREE_PATHS_BEFORE="$(tree_paths)"
+  TREE_BASELINE_READY=1
+}
+
+record_new_seat_identity() {
+  "$PY" - "${SESSION_DIR}" "${TEAM_SLOT}" "${REVIEW_SEAT}" \
+    "${AGENT_FAMILY}" "${DURABLE_SEAT_MODEL}" <<'PY'
+import fcntl
+import json
+import sys
+from pathlib import Path
+
+root_text, slot, name, family, model = sys.argv[1:]
+root = Path(root_text)
+with (root / "impl_seat_claim.lock").open("a+") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        roster = json.loads((root / "mesh_roster.json").read_text())
+    except (OSError, ValueError):
+        roster = {}
+    entry = roster.get(name, {}) if isinstance(roster, dict) else {}
+    seat_id = entry.get("thread_id", "") if isinstance(entry, dict) else ""
+    if not isinstance(seat_id, str) or not seat_id:
+        raise SystemExit(1)
+    identity = {
+        "name": name,
+        "slot": slot,
+        "family": family,
+        "model": model,
+        "seat_id": seat_id,
+    }
+    (root / f"impl_seat_{slot}.json").write_text(json.dumps(identity))
+PY
+}
+
+TREE_BASELINE_READY=0
+TREE_HEAD_BEFORE=""
+TREE_STATUS_BEFORE=""
+TREE_DIFF_HASH_BEFORE=""
+TREE_UNTRACKED_HASH_BEFORE=""
+TREE_PATHS_BEFORE=""
+
+if [[ -n "${REVIEW_SEAT}" ]]; then
+  CODEX_MESH="${PLAN_DELEGATE_CODEX_MESH:-$(_agents_registry_get delegate.options codex_mesh)}"
+  if [[ "${AGENT_FAMILY}" != "codex" || "${CODEX_MESH}" != "1" ]]; then
+    echo "ERROR: review seat ${REVIEW_SEAT} is not available through the Codex mesh." >&2
+    exit 2
+  fi
+  if [[ -n "${FOLLOW_TO}" ]]; then
+    DELEGATE_CONFIG="${PLAN_DELEGATE_CONFIG:-${HOME}/.claude/config/delegate.conf}"
+    COMPACT_ABOVE_TOKENS=""
+    if [[ -r "${DELEGATE_CONFIG}" ]]; then
+      COMPACT_ABOVE_TOKENS="$(sed -n \
+        's/^PLAN_DELEGATE_COMPACT_ABOVE_TOKENS=\([0-9][0-9]*\).*$/\1/p' \
+        "${DELEGATE_CONFIG}" | tail -n 1)"
+    fi
+    if [[ ! "${COMPACT_ABOVE_TOKENS}" =~ ^[0-9]+$ ]] || (( COMPACT_ABOVE_TOKENS <= 0 )); then
+      echo "ERROR: PLAN_DELEGATE_COMPACT_ABOVE_TOKENS in ${DELEGATE_CONFIG} must be a positive integer." >&2
+      exit 2
+    fi
+    export FOLLOW_LAUNCHER_PID="$$"
+    claim_follow
+  fi
+  trap cleanup_mesh_review EXIT
+  if [[ -z "${EARLY_READY_FILE}" || -e "${EARLY_READY_FILE}" ]]; then
+    capture_tree_baseline
+  fi
+  initialize_review_artifacts
 fi
 
 printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
   "${TASK}" "${AGENT_FAMILY}" "${AGENT_MODEL}" "${AGENT_EFFORT}" > "${AGENT_FILE}"
 
+if [[ -n "${REVIEW_SEAT}" ]]; then
+  MESH_FIELD="mesh=${REVIEW_SEAT}; reach=codex_mesh.py"
+  if [[ -n "${FOLLOW_TO}" ]]; then
+    LAUNCH_NOTE="follow-up to ${REVIEW_SEAT}"
+  else
+    LAUNCH_NOTE="new seat ${REVIEW_SEAT}"
+  fi
+else
+  MESH_FIELD="mesh=none"
+  LAUNCH_NOTE="up"
+fi
 board_post register \
-  "${LENS} review up (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); mesh=none; role=review; status in review_status${SUFFIX}"
+  "${LENS} review ${LAUNCH_NOTE} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); ${MESH_FIELD}; role=review; status in review_status${SUFFIX}"
 
 PASS_STARTED=0
 record_pass_start() {
@@ -184,14 +464,30 @@ fi
 
 bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset})" "${ROLE_DESC}" || true
 
-bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
-  "${TASK}" readonly "${WORKING_DIR}" "${PROMPT_FILE}" "${FINDINGS_FILE}" "${LOG_FILE}" &
+if [[ -n "${FOLLOW_TO}" ]]; then
+  "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" follow \
+    --session-dir "${SESSION_DIR}" --to "${FOLLOW_TO}" \
+    --claim-pid "${FOLLOW_LAUNCHER_PID}" --role review \
+    --message-file "${PROMPT_FILE}" --summary-file "${FINDINGS_FILE}" \
+    --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
+    --model "${AGENT_MODEL}" --effort "${AGENT_EFFORT:-}" \
+    --service-tier "${AGENT_SERVICE_TIER:-}" &
+elif [[ -n "${NEW_SLOT}" ]]; then
+  "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" start \
+    --session-dir "${SESSION_DIR}" --name "${REVIEW_SEAT}" --role review \
+    --cwd "${WORKING_DIR}" --prompt-file "${PROMPT_FILE}" \
+    --summary-file "${FINDINGS_FILE}" --reply-file "${REPLY_FILE}" \
+    --log-file "${LOG_FILE}" --model "${AGENT_MODEL}" \
+    --effort "${AGENT_EFFORT:-}" --service-tier "${AGENT_SERVICE_TIER:-}" &
+else
+  bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
+    "${TASK}" readonly "${WORKING_DIR}" "${PROMPT_FILE}" "${FINDINGS_FILE}" "${LOG_FILE}" &
+fi
 AGENT_PID=$!
 
-# The reviewer's read-only sandbox cannot write [agent] lines, but it is not
-# blind: the wrapper beat carries an activity digest decoded from the
-# reviewer's own streamed log (the tool it is running, the file it is reading,
-# its prompt-instructed narration lines).
+# The wrapper beat carries an activity digest decoded from the reviewer's own
+# streamed log (the tool it is running, the file it is reading, and its
+# prompt-instructed narration lines).
 bash "${SCRIPT_DIR}/../agents/heartbeat_watch.sh" \
   "${HEARTBEAT_FILE}" "${BEAT_TAG}" "${AGENT_PID}" "${LOG_FILE}" "${HEARTBEAT_INTERVAL_SECS}" \
   "${AWAKE_FILE}" &
@@ -203,6 +499,9 @@ if [[ -n "${EARLY_READY_FILE}" ]]; then
   while kill -0 "${AGENT_PID}" 2>/dev/null && [[ ! -e "${EARLY_READY_FILE}" ]]; do
     sleep 5
   done
+  if [[ -e "${EARLY_READY_FILE}" && "${TREE_BASELINE_READY}" -eq 0 ]]; then
+    capture_tree_baseline
+  fi
   if [[ -e "${EARLY_READY_FILE}" ]] && kill -0 "${AGENT_PID}" 2>/dev/null; then
     if ! record_pass_start; then
       echo "ERROR: unable to record the early review pass start." >&2
@@ -219,10 +518,41 @@ fi
 AGENT_CODE=0
 wait "${AGENT_PID}" || AGENT_CODE=$?
 
+if [[ -n "${NEW_SLOT}" ]] && ! record_new_seat_identity; then
+  echo "ERROR: review seat ${REVIEW_SEAT} has no durable seat identity." >&2
+  AGENT_CODE=1
+fi
+
 kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 
-if [[ "${AGENT_CODE}" -eq 0 ]]; then
+TREE_CHANGED=0
+CHANGED_PATHS=""
+if [[ -n "${REVIEW_SEAT}" && "${TREE_BASELINE_READY}" -eq 1 ]]; then
+  TREE_HEAD_AFTER="$(tree_head)"
+  TREE_STATUS_AFTER="$(tree_status)"
+  TREE_DIFF_HASH_AFTER="$(tree_diff_hash)"
+  TREE_UNTRACKED_HASH_AFTER="$(tree_untracked_hash)"
+  TREE_PATHS_AFTER="$(tree_paths)"
+  if [[ "${TREE_HEAD_BEFORE}" != "${TREE_HEAD_AFTER}" || \
+        "${TREE_STATUS_BEFORE}" != "${TREE_STATUS_AFTER}" || \
+        "${TREE_DIFF_HASH_BEFORE}" != "${TREE_DIFF_HASH_AFTER}" || \
+        "${TREE_UNTRACKED_HASH_BEFORE}" != "${TREE_UNTRACKED_HASH_AFTER}" ]]; then
+    TREE_CHANGED=1
+    HEAD_CHANGED_PATHS=""
+    if [[ "${TREE_HEAD_BEFORE}" != "${TREE_HEAD_AFTER}" ]]; then
+      HEAD_CHANGED_PATHS="$(git -C "${WORKING_DIR}" diff --name-only \
+        "${TREE_HEAD_BEFORE}" "${TREE_HEAD_AFTER}" 2>/dev/null || true)"
+    fi
+    CHANGED_PATHS="$(printf '%s\n%s\n%s\n' \
+      "${TREE_PATHS_BEFORE}" "${TREE_PATHS_AFTER}" "${HEAD_CHANGED_PATHS}" |
+      sed '/^$/d' | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+    [[ -n "${CHANGED_PATHS}" ]] || CHANGED_PATHS="working tree state changed"
+    echo "ERROR: review seat ${REVIEW_SEAT} changed the working tree: ${CHANGED_PATHS}" >&2
+  fi
+fi
+
+if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
   echo "reviewed" > "${STATUS_FILE}"
   # A completed early review is a real pass only once the sentinel exists: the
   # worker can beat the 5s poll to the finish, leaving the start unrecorded
@@ -259,6 +589,13 @@ else
       --session-dir "${SESSION_DIR}" --status error \
       --agent-awake-seconds "$(awake_seconds)" \
       || echo "ERROR: unable to record the review pass error." >&2
+  fi
+  if [[ "${TREE_CHANGED}" -eq 1 ]]; then
+    bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper \
+      "${BEAT_TAG} review seat ${REVIEW_SEAT} changed the working tree: ${CHANGED_PATHS}" || true
+    board_post blocked \
+      "launcher: review seat ${REVIEW_SEAT} changed the working tree: ${CHANGED_PATHS}; findings kept in review_findings_${PASS_INDEX}${SUFFIX}.txt"
+    exit 1
   fi
   bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent exited with code ${AGENT_CODE}" || true
   board_post blocked \

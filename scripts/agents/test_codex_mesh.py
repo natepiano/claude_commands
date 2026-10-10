@@ -638,6 +638,17 @@ class MeshCommandTests(unittest.TestCase):
         self.assertIn("Repair the open finding", str(starts[1]["params"]))
         self.assertEqual(self.seat_record()["status"], "done")
 
+    def test_follow_overrides_the_model_for_the_reassigned_role(self) -> None:
+        code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+
+        code, errors = self.run_follow(role="review")
+
+        self.assertEqual((code, errors), (0, ""))
+        starts = self.methods("turn/start")
+        follow_params = cast("dict[str, object]", starts[1]["params"])
+        self.assertEqual(follow_params["model"], "gpt-test")
+
     def test_start_records_the_assigned_role(self) -> None:
         code, errors = self.run_start()
 
