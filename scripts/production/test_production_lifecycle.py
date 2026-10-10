@@ -54,6 +54,7 @@ class LifecycleTests(unittest.TestCase):
         self.log = Path()
         self.state = Path()
         self.home = Path()
+        self.phase_table_vault = Path()
         self.env: dict[str, str] = {}
 
     @override
@@ -67,8 +68,10 @@ class LifecycleTests(unittest.TestCase):
         self.log = self.checkout / "production.log"
         self.state = self.root / "state"
         self.home = self.root / "home"
+        self.phase_table_vault = self.root / "vault" / "showrunners"
         self.state.mkdir()
         self.home.mkdir()
+        self.phase_table_vault.parent.mkdir()
         bin_path = self.root / "bin"
         bin_path.mkdir()
         for name in ("tmux", "claude", "systemd-run", "ssh", "nix", "gh", "zsh", "cargo-berth"):
@@ -85,7 +88,8 @@ class LifecycleTests(unittest.TestCase):
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
                     "SHOWRUNNER_SESSION": "environment-showrunner",
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"),
-                    "NOTIFIER_SESSIONS_DIR": str(self.state / "sessions")}
+                    "NOTIFIER_SESSIONS_DIR": str(self.state / "sessions"),
+                    "PHASE_TABLE_VAULT": str(self.phase_table_vault)}
         self.checkout.mkdir()
         _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
         _ = self.git("init", "-b", "main", cwd=self.checkout)
@@ -200,6 +204,25 @@ class LifecycleTests(unittest.TestCase):
 
     def calls(self) -> str:
         return (self.state / "calls").read_text() if (self.state / "calls").exists() else ""
+
+    def write_phase_note(self, name: str, production: str, unit: str) -> Path:
+        note = self.phase_table_vault / "showrunner" / f"{name}.md"
+        self.write(
+            note,
+            "\n".join(
+                (
+                    "---",
+                    "phase_table: true",
+                    f"production: {production}",
+                    f"unit: {unit}",
+                    "---",
+                    "",
+                    f"# {name}",
+                    "",
+                )
+            ),
+        )
+        return note
 
     def test_load_holds_checkout_on_other_branch(self) -> None:
         self.running()
@@ -642,6 +665,52 @@ class LifecycleTests(unittest.TestCase):
         self.assertNotIn("showrunners.py", calls)
         self.assertNotIn("gh ", calls)
         self.assertNotIn("ssh ", calls)
+
+    def test_wrap_archives_owned_phase_note_and_keeps_other_files(self) -> None:
+        self.running()
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.git("push", "origin", "production")
+        owned = self.write_phase_note("alpha", "example", "alpha-unit")
+        owned_bytes = owned.read_bytes()
+        other = self.write_phase_note("other", "other", "alpha-unit")
+        other_bytes = other.read_bytes()
+        handwritten = self.phase_table_vault / "showrunner" / "notes.md"
+        self.write(handwritten, "kept by a person\n")
+
+        result = self.run_lifecycle("wrap", "--no-ci")
+
+        archived = (
+            self.phase_table_vault.parent
+            / "archive"
+            / "showrunner"
+            / "example"
+            / "alpha.md"
+        )
+        self.assert_step(result, "ok")
+        self.assertIn("phase-notes: ok — archived 1 phase note", result.stdout)
+        self.assertFalse(owned.exists())
+        self.assertEqual(archived.read_bytes(), owned_bytes)
+        self.assertEqual(other.read_bytes(), other_bytes)
+        self.assertEqual(handwritten.read_text(encoding="utf-8"), "kept by a person\n")
+
+    def test_wrap_stays_running_when_phase_note_archive_fails(self) -> None:
+        self.running()
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.git("push", "origin", "production")
+        note = self.write_phase_note("alpha", "example", "alpha-unit")
+        archive = self.phase_table_vault.parent / "archive"
+        self.write(archive, "blocks the archive directory\n")
+
+        result = self.run_lifecycle("wrap", "--no-ci")
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r"(?m)^phase-notes: failed — .+")
+        self.assertIn("cannot archive phase note", result.stdout)
+        self.assertTrue(note.is_file())
+        self.assertIn("**Status: PRODUCTION — running.**", self.doc.read_text())
+        self.assertIn("notifier.sh remove", self.calls())
 
 
 if __name__ == "__main__":

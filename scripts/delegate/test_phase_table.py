@@ -255,6 +255,23 @@ class PhaseTableTests(unittest.TestCase):
             env=self.environment(),
         )
 
+    def run_archive(
+        self, production: Path
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "archive",
+                "--production-doc",
+                str(production),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=self.environment(),
+        )
+
     def write_phase_note(
         self,
         folder: str,
@@ -2397,7 +2414,261 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual(unreadable_show.returncode, 1)
         self.assertIn(str(missing_plan), unreadable_show.stderr)
 
-    def test_prune_removes_retired_notes_across_showrunner_directories(
+    def test_archive_moves_owned_notes_with_bytes_and_modes_unchanged(
+        self,
+    ) -> None:
+        production = self.write_units_production()
+        first = self.write_phase_note("runner-one", "alpha", "show", "alpha-unit")
+        second = self.write_phase_note("runner-two", "beta", "show", "beta-unit")
+        first_bytes = (
+            b"---\nphase_table: true\nproduction: show\nunit: alpha-unit\n---\n"
+            b"# Alpha\n\nFirst table.\n"
+        )
+        second_bytes = (
+            b"---\nphase_table: true\nproduction: show\nunit: beta-unit\n---\n"
+            b"# Beta\n\nSecond table.\n"
+        )
+        _ = first.write_bytes(first_bytes)
+        _ = second.write_bytes(second_bytes)
+        first.chmod(0o640)
+        second.chmod(0o600)
+        first_target = (
+            self.vault_root.parent / "archive" / "runner-one" / "show" / "alpha.md"
+        )
+        second_target = (
+            self.vault_root.parent / "archive" / "runner-two" / "show" / "beta.md"
+        )
+
+        result = self.run_archive(production)
+
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertCountEqual(
+            result.stdout.splitlines(),
+            (str(first_target), str(second_target)),
+        )
+        self.assertEqual(first_target.read_bytes(), first_bytes)
+        self.assertEqual(second_target.read_bytes(), second_bytes)
+        self.assertEqual(first_target.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(second_target.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(first.parent.exists())
+        self.assertFalse(second.parent.exists())
+
+    def test_archive_leaves_notes_it_does_not_own_untouched(self) -> None:
+        production = self.write_units_production()
+        folder = self.vault_root / "showrunner"
+        folder.mkdir(parents=True)
+        handwritten = folder / "notes.md"
+        _ = handwritten.write_text("kept by a person\n", encoding="utf-8")
+        missing_production = folder / "missing-production.md"
+        _ = missing_production.write_text(
+            "---\nphase_table: true\nunit: table-unit\n---\nkept\n",
+            encoding="utf-8",
+        )
+        missing_unit = folder / "missing-unit.md"
+        _ = missing_unit.write_text(
+            "---\nphase_table: true\nproduction: show\n---\nkept\n",
+            encoding="utf-8",
+        )
+        other = self.write_phase_note(
+            "showrunner", "other", "other", "table-unit"
+        )
+        before = {
+            path: path.read_bytes()
+            for path in (handwritten, missing_production, missing_unit, other)
+        }
+
+        result = self.run_archive(production)
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertTrue(folder.is_dir())
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content)
+
+    def test_archive_keeps_existing_target_and_adds_numeric_suffix(self) -> None:
+        production = self.write_units_production()
+        source = self.write_phase_note("showrunner", "table", "show", "table-unit")
+        source_bytes = source.read_bytes() + b"source\n"
+        _ = source.write_bytes(source_bytes)
+        target = (
+            self.vault_root.parent
+            / "archive"
+            / "showrunner"
+            / "show"
+            / "table.md"
+        )
+        target.parent.mkdir(parents=True)
+        existing_bytes = b"existing archive\n"
+        _ = target.write_bytes(existing_bytes)
+
+        result = self.run_archive(production)
+
+        suffixed = target.with_name("table-2.md")
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(result.stdout, f"{suffixed}\n")
+        self.assertEqual(target.read_bytes(), existing_bytes)
+        self.assertEqual(suffixed.read_bytes(), source_bytes)
+        self.assertFalse(source.exists())
+
+    def test_archive_with_missing_vault_parent_does_nothing(self) -> None:
+        production = self.write_units_production()
+        missing_parent = self.root / "missing-vault"
+        self.vault_root = missing_parent / "showrunners"
+
+        result = self.run_archive(production)
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertFalse(missing_parent.exists())
+
+    def test_refresh_reuses_name_after_other_productions_note_is_archived(
+        self,
+    ) -> None:
+        self.write_production_plan(register_showrunner=False)
+        self.mark_unit("table")
+        source = self.write_phase_note("showrunner", "table", "show", "table-unit")
+        source_bytes = source.read_bytes()
+
+        archive_result = self.run_archive(
+            self.working_dir / "docs" / "show-production.md"
+        )
+
+        archived = (
+            self.vault_root.parent
+            / "archive"
+            / "showrunner"
+            / "show"
+            / "table.md"
+        )
+        self.assertEqual(archive_result.returncode, 0)
+        self.assertTrue(archived.is_file())
+        self.assertFalse(source.exists())
+
+        other_production = self.working_dir / "docs" / "other-production.md"
+        _ = other_production.write_text(
+            plan_text(
+                "# Production — other",
+                "",
+                "## Production Context",
+                "",
+                "- **Merge branch:** main",
+                f"- **Showrunner checkout:** {self.working_dir}",
+                "- **Log:** docs/other.log",
+                "- **User zone:** UTC",
+                "",
+                "## Units",
+            ),
+            encoding="utf-8",
+        )
+        self.write_plan(
+            plan_text(
+                "# Delivery plan",
+                "",
+                "> **Production: other** — unit `table-unit`; production doc `docs/other-production.md`",
+                "",
+                "### Phase 1 — Current delivery  · status: todo",
+            )
+        )
+        marked: fake_tmux.FakeSession = {
+            "label": "table-tmux",
+            "panes": ["%1"],
+            "env": {
+                "SHOWRUNNER_UNIT": "other",
+                "SHOWRUNNER_UNIT_ID": "table-unit",
+            },
+        }
+        fake_tmux.write(self.tmux_state, {"$1": marked})
+        session_id = "other-showrunner"
+        _ = fake_showrunner.write_timer(
+            self.notifier_dir,
+            "other",
+            session_id,
+            "UTC",
+            other_production,
+        )
+        held = fake_showrunner.write_session(
+            self.sessions_dir,
+            "showrunner",
+            session_id,
+        )
+        self.addCleanup(held.close)
+
+        refresh_result = self.run_refresh()
+
+        refreshed = self.vault_root / "showrunner" / "table.md"
+        self.assertEqual(
+            (refresh_result.returncode, refresh_result.stdout, refresh_result.stderr),
+            (0, "", ""),
+        )
+        refreshed_text = refreshed.read_text(encoding="utf-8")
+        self.assertIn("production: other\n", refreshed_text)
+        self.assertIn("unit: table-unit\n", refreshed_text)
+        self.assertEqual(archived.read_bytes(), source_bytes)
+
+    def test_prune_leaves_archived_notes_in_place(self) -> None:
+        production = self.write_units_production()
+        _ = self.write_phase_note("showrunner", "retired", "show", "retired-unit")
+        archive_result = self.run_archive(production)
+        self.assertEqual(archive_result.returncode, 0)
+        archived = (
+            self.vault_root.parent
+            / "archive"
+            / "showrunner"
+            / "show"
+            / "retired.md"
+        )
+        archived_bytes = archived.read_bytes()
+
+        prune_result = self.run_prune(production)
+
+        self.assertEqual(
+            (prune_result.returncode, prune_result.stdout, prune_result.stderr),
+            (0, "", ""),
+        )
+        self.assertEqual(archived.read_bytes(), archived_bytes)
+
+    def test_refresh_and_archive_keep_archive_visible_to_git(self) -> None:
+        vault = self.vault_root.parent
+        _ = subprocess.run(
+            ["git", "init", "-q", str(vault)],
+            check=True,
+            capture_output=True,
+        )
+        self.write_production_plan()
+        self.mark_unit("x")
+        refresh_result = self.run_refresh()
+        source = self.vault_root / "showrunner" / "x.md"
+        archive_result = self.run_archive(
+            self.working_dir / "docs" / "show-production.md"
+        )
+        archived = vault / "archive" / "showrunner" / "show" / "x.md"
+
+        archived_ignore = subprocess.run(
+            ["git", "-C", str(vault), "check-ignore", "archive/showrunner/show/x.md"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        source_ignore = subprocess.run(
+            ["git", "-C", str(vault), "check-ignore", "showrunners/showrunner/x.md"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        gitignore = vault / ".gitignore"
+        exclude = vault / ".git" / "info" / "exclude"
+
+        self.assertEqual(refresh_result.returncode, 0)
+        self.assertEqual(archive_result.returncode, 0)
+        self.assertFalse(source.exists())
+        self.assertTrue(archived.is_file())
+        self.assertEqual(archived_ignore.returncode, 1)
+        self.assertEqual(source_ignore.returncode, 0)
+        self.assertNotIn(
+            "archive",
+            gitignore.read_text(encoding="utf-8") if gitignore.exists() else "",
+        )
+        self.assertNotIn("archive", exclude.read_text(encoding="utf-8"))
+
+    def test_prune_archives_retired_notes_across_showrunner_directories(
         self,
     ) -> None:
         live_worktree = self.make_live_worktree("live-prune-worktree")
@@ -2429,12 +2700,30 @@ class PhaseTableTests(unittest.TestCase):
         self.assertFalse(retired_one.exists())
         self.assertFalse(retired_one.parent.exists())
         self.assertFalse(retired_two.exists())
+        self.assertTrue(
+            (
+                self.vault_root.parent
+                / "archive"
+                / "old-one"
+                / "show"
+                / "retired-one.md"
+            ).is_file()
+        )
+        self.assertTrue(
+            (
+                self.vault_root.parent
+                / "archive"
+                / "old-two"
+                / "show"
+                / "retired-two.md"
+            ).is_file()
+        )
         self.assertTrue(other_production.is_file())
         self.assertEqual(
             handwritten.read_text(encoding="utf-8"), "kept by a person\n"
         )
 
-    def test_prune_with_only_retired_rows_removes_every_production_note(
+    def test_prune_with_only_retired_rows_archives_every_production_note(
         self,
     ) -> None:
         production = self.write_units_production(
@@ -2455,6 +2744,24 @@ class PhaseTableTests(unittest.TestCase):
         self.assertFalse(second.exists())
         self.assertFalse(first.parent.exists())
         self.assertFalse(second.parent.exists())
+        self.assertTrue(
+            (
+                self.vault_root.parent
+                / "archive"
+                / "showrunner-one"
+                / "show"
+                / "first.md"
+            ).is_file()
+        )
+        self.assertTrue(
+            (
+                self.vault_root.parent
+                / "archive"
+                / "showrunner-two"
+                / "show"
+                / "second.md"
+            ).is_file()
+        )
 
     def test_prune_leaves_handwritten_notes_untouched(self) -> None:
         production = self.write_units_production()

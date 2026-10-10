@@ -884,8 +884,9 @@ When every unit's final-gate and as-built checkpoints are merged:
    --close-out-done "<item>"` (repeat the last flag for every item), or pass
    `--no-ci` when CI does not apply. The command holds on an unfinished close-out item,
    a dirty worktree, or an unmerged branch. It promotes main, retires the unit
-   worktrees and branches, removes the update instance, wraps and pushes the
-   doc, and prints the final report. Leave tmux sessions for the user to close.
+   worktrees and branches, removes the update instance, archives the production's
+   phase notes in the vault, wraps and pushes the doc, and prints the final report.
+   Leave tmux sessions for the user to close.
 </Wrap>
 
 ---

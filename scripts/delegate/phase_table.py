@@ -1323,8 +1323,70 @@ def _vault_root() -> Path:
     ).expanduser()
 
 
+def _archive_note(candidate: Path, vault_root: Path, slug: str) -> Path:
+    """Move one generated phase note into the vault's archive and return its new path."""
+    # Outside showrunners, the archive stays out of every scan and in the vault's Git history.
+    folder = vault_root.parent / "archive" / candidate.parent.name / slug
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise Refusal(f"cannot archive phase note {candidate}: {error}") from error
+
+    target = folder / candidate.name
+    suffix = 2
+    while True:
+        try:
+            os.link(candidate, target)
+            break
+        except FileExistsError:
+            target = folder / f"{candidate.stem}-{suffix}.md"
+            suffix += 1
+        except OSError as error:
+            raise Refusal(f"cannot archive phase note {candidate}: {error}") from error
+
+    try:
+        candidate.unlink()
+    except OSError as error:
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+        raise Refusal(f"cannot archive phase note {candidate}: {error}") from error
+
+    try:
+        candidate.parent.rmdir()
+    except OSError as error:
+        try:
+            if any(candidate.parent.iterdir()):
+                return target
+        except OSError:
+            pass
+        raise Refusal(
+            f"cannot remove empty phase note directory {candidate.parent}: {error}"
+        ) from error
+    return target
+
+
+def archive(production_doc: Path) -> list[Path]:
+    """Move a production's generated phase notes into the vault's archive."""
+    production = read_production(production_doc)
+    vault_root = _vault_root()
+    if not vault_root.parent.exists():
+        return []
+    archived: list[Path] = []
+    for candidate in sorted(vault_root.glob("*/*.md")):
+        ownership = _note_ownership(candidate)
+        if (
+            not isinstance(ownership, NoteOwnership)
+            or ownership.production != production.slug
+        ):
+            continue
+        archived.append(_archive_note(candidate, vault_root, production.slug))
+    return archived
+
+
 def prune(production_doc: Path) -> None:
-    """Remove generated notes for units no longer live in a production."""
+    """Archive generated notes for units no longer live in a production."""
     production = read_production(production_doc)
     live_units = {
         unit_plan.unit for unit_plan in _production_unit_plans(production)
@@ -1338,23 +1400,7 @@ def prune(production_doc: Path) -> None:
             or ownership.unit in live_units
         ):
             continue
-        try:
-            candidate.unlink()
-        except OSError as error:
-            raise Refusal(
-                f"cannot remove retired phase note {candidate}: {error}"
-            ) from error
-        try:
-            candidate.parent.rmdir()
-        except OSError as error:
-            try:
-                if any(candidate.parent.iterdir()):
-                    continue
-            except OSError:
-                pass
-            raise Refusal(
-                f"cannot remove empty phase note directory {candidate.parent}: {error}"
-            ) from error
+        _ = _archive_note(candidate, vault_root, production.slug)
 
 
 def refresh(session_dir: Path) -> None:
@@ -1432,6 +1478,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = refresh_parser.add_argument("--session-dir", type=Path, required=True)
     prune_parser = commands.add_parser("prune")
     _ = prune_parser.add_argument("--production-doc", type=Path, required=True)
+    archive_parser = commands.add_parser("archive")
+    _ = archive_parser.add_argument("--production-doc", type=Path, required=True)
     return parser
 
 
@@ -1454,6 +1502,12 @@ def main() -> int:
             if production_doc is None:
                 raise Refusal("prune requires a production document")
             prune(production_doc.expanduser().resolve())
+            return 0
+        if command == "archive":
+            if production_doc is None:
+                raise Refusal("archive requires a production document")
+            for archived_path in archive(production_doc.expanduser().resolve()):
+                print(archived_path)
             return 0
         if production_doc is not None:
             output = show_production(production_doc.expanduser().resolve())
