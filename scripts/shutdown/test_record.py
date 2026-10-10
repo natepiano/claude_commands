@@ -246,6 +246,15 @@ class RecordTests(unittest.TestCase):
             record.ProcessIdentityLost(kind="process identity lost", at=NOW),
             record.SessionStopFailed(kind="stop failed", at=NOW, reason="permission denied"),
             record.SessionRestarted(kind="restarted", at=NOW),
+            record.SessionLiveTimersPending(
+                kind="timers pending",
+                at=NOW,
+                timers=[
+                    record.PendingTimer(
+                        instance="showrunner-demo", reason="notifier unavailable"
+                    )
+                ],
+            ),
             record.SessionRestartFailed(
                 kind="restart failed", at=NOW, reason="window did not open"
             ),

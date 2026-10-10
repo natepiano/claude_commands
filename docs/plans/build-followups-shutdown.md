@@ -368,7 +368,7 @@ A tmux session that `/shutdown restart` brings back resumes in the pane it ran i
 
 **Ruled out:** a `NotRequired` `pane` — a required field, with `PaneNotRecorded` in fixtures, keeps every host explicit.
 
-### Phase 10 — Restored sessions keep their timers  · status: todo
+### Phase 10 — Restored sessions keep their timers  · status: done
 
 #### Work Order
 

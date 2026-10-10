@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import add_unit
+import conversation_pause
 import unit_lookup
 from add_unit import cell_value, live_unit_table, plan_cell_is_retired, retired_units
 
@@ -91,6 +92,7 @@ class AddUnitTests(unittest.TestCase):
         self.state = Path()
         self.bin = Path()
         self.agent_config = Path()
+        self.pause_state = Path()
         self.env: dict[str, str] = {}
 
     @override
@@ -129,6 +131,7 @@ class AddUnitTests(unittest.TestCase):
             _ = command.write_text(STUB, encoding="utf-8")
             _ = command.chmod(0o755)
         self.agent_config = self.root / "agents.conf"
+        self.pause_state = self.root / "conversation-pause"
         codex_config = self.root / "codex.toml"
         codex_cache = self.root / "models.json"
         sync_state = self.root / "catalog-sync-success"
@@ -139,6 +142,7 @@ class AddUnitTests(unittest.TestCase):
                     "STUB_STATE": str(self.state), "STUB_TMUX": str(self.bin / "tmux"),
                     "UNIT_LOOKUP_TMUX": str(self.bin / "tmux"), "TMUX_PANE": "",
                     "SHOWRUNNERS_CONFIG": str(self.config), "CLAUDE_TEST_SECRET": "must-not-leak",
+                    "CONVERSATION_PAUSE_STATE_DIR": str(self.pause_state),
                     "AGENTS_CONFIG_FILE": str(self.agent_config),
                     "CODEX_CONFIG_FILE": str(codex_config),
                     "CODEX_MODELS_CACHE_FILE": str(codex_cache),
@@ -194,6 +198,10 @@ class AddUnitTests(unittest.TestCase):
         launches = self.events("systemd-run")
         self.assertEqual(len(launches), 1)
         return cast(list[str], launches[0]["args"])[-1]
+
+    def recorded_prompts(self, session_id: str) -> tuple[str, ...]:
+        with patch.dict(os.environ, self.env):
+            return conversation_pause.read_scheduled_prompts(session_id)
 
     def assert_director_flags(self, model: str, effort: str | None) -> None:
         command = self.launch_command()
@@ -301,12 +309,29 @@ class AddUnitTests(unittest.TestCase):
         commands: list[list[str]] = []
         launches: list[str] = []
 
+        if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
+            _ = launch_kind.note.write_text("Resume this unit.", encoding="utf-8")
+
         def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
             commands.append(command)
             return subprocess.CompletedProcess(command, 0, "", "")
 
-        def launch(*_args: object) -> None:
-            launches.append("launched")
+        def launch(
+            _request: add_unit.UnitLaunch,
+            _tmux: str,
+            _director: add_unit.DirectorAgent,
+            prompt: str,
+        ) -> None:
+            if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
+                recorded = self.recorded_prompts(launch_kind.session_id)
+                self.assertEqual(recorded[-1], prompt)
+                self.assertIs(
+                    conversation_pause.prompt_source(
+                        prompt, frozenset, lambda: recorded
+                    ),
+                    conversation_pause.PromptSource.SCHEDULED,
+                )
+            launches.append(prompt)
 
         error = io.StringIO()
         with (
@@ -323,6 +348,7 @@ class AddUnitTests(unittest.TestCase):
             patch.object(add_unit, "wait_for_remote_control", return_value=marked),
             patch.object(add_unit, "record"),
             patch.object(subprocess, "run", side_effect=run),
+            patch.dict(os.environ, self.env),
             redirect_stderr(error),
         ):
             result = add_unit.main(["--production", "unused", "alpha", "--plan", "unused"])
@@ -341,6 +367,27 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(commands, [["tmux", "kill-session", "-t", "%7"]])
         self.assertEqual(launches, 1)
         self.assertEqual(writes, 1)
+
+    def test_restore_recording_failure_uses_one_stderr_line_and_does_not_launch(self) -> None:
+        launch_kind = add_unit.UnitRestoreLaunch(
+            "session-123", self.root / "restart-note", "recorded-name", "recorded-tmux"
+        )
+
+        with patch.object(
+            conversation_pause,
+            "record_scheduled_prompts",
+            side_effect=OSError("first line\nsecond line"),
+        ):
+            result, error, _commands, launches, _writes = self.run_with_marked_unit(
+                launch_kind, unit_lookup.ClaudeNotRunning()
+            )
+
+        self.assertEqual(result, 1)
+        self.assertEqual(
+            error,
+            "add_unit: restart prompt not recorded: first line\n",
+        )
+        self.assertEqual(launches, 0)
 
     def test_restore_keeps_marked_tmux_with_live_claude(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
@@ -828,6 +875,11 @@ class AddUnitTests(unittest.TestCase):
         _ = note.write_text(restart_note, encoding="utf-8")
         recorded_session = "restored 'session' $()"
         recorded_tmux = "restore $()"
+        existing_prompt = "Keep this previously scheduled prompt."
+        with patch.dict(os.environ, self.env):
+            conversation_pause.record_scheduled_prompts(
+                "session-123", (existing_prompt,)
+            )
 
         _ = self.successful(
             "alpha",
@@ -855,6 +907,14 @@ class AddUnitTests(unittest.TestCase):
         self.assertIn("You are now alpha-unit in production build-followups", claude[-1])
         self.assertTrue(claude[-1].endswith(restart_note), claude[-1])
         self.assertNotIn("Run /unit:direct", claude[-1])
+        recorded = self.recorded_prompts("session-123")
+        self.assertEqual(recorded, (existing_prompt, claude[-1]))
+        self.assertIs(
+            conversation_pause.prompt_source(
+                claude[-1], frozenset, lambda: recorded
+            ),
+            conversation_pause.PromptSource.SCHEDULED,
+        )
 
         launches = self.events("systemd-run")
         self.assertEqual(len(launches), 1)
@@ -863,6 +923,33 @@ class AddUnitTests(unittest.TestCase):
         name, epoch = scope.removeprefix("--unit=").rsplit("-", 1)
         self.assertEqual(name, "restore----")
         self.assertGreater(int(epoch), 0)
+
+    def test_restore_refuses_launch_when_prompt_cannot_be_recorded(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+        _ = self.pause_state.write_text("not a directory", encoding="utf-8")
+
+        result = self.cli(
+            "alpha",
+            "--plan", "docs/plans/given.md",
+            "--resume", "session-123",
+            "--cwd", str(prior),
+            "--restart-note", str(note),
+            "--session-name", "recorded-name",
+            "--tmux-session", "recorded-tmux",
+        )
+
+        self.assertEqual(result.returncode, 1, (result.stdout, result.stderr))
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn("add_unit: restart prompt not recorded:", result.stderr)
+        self.assertEqual(self.events("systemd-run"), [])
+
+    def test_new_work_records_no_scheduled_prompt(self) -> None:
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+
+        self.assertFalse(self.pause_state.exists())
 
     def test_brief_row_cannot_be_retried_as_plan_on_its_stub(self) -> None:
         _ = self.successful("alpha", "--brief", "Write a full plan")

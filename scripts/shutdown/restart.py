@@ -39,13 +39,16 @@ from inventory import (  # noqa: E402
 from record import (  # noqa: E402
     InvalidRecord,
     NoLiveRecord,
+    PendingTimer,
     ShutdownRecord,
     ShutdownSessionEntry,
+    SessionLiveTimersPending,
     SessionNeedsManualRestart,
     SessionProgress,
     SessionRestarted,
     SessionRestartFailed,
     SeatAvailableOnDemand,
+    TimerRestore,
     archive,
     find_live,
     live_records,
@@ -82,8 +85,20 @@ class RestartAccountNotDetermined(Exception):
     """No single account can be chosen safely from restart records."""
 
 
-class RestartNoteNotRecorded(Exception):
-    """The restart note could not be marked as a scheduled prompt."""
+class ScheduledRestartPromptNotRecorded(Exception):
+    """The launched restart prompt could not be marked as scheduled."""
+
+
+@dataclass(frozen=True)
+class SessionLaunched:
+    """The recorded session launch was started."""
+
+
+@dataclass(frozen=True)
+class ManualRestartRequired:
+    """The recorded session needs a person to run its resume command."""
+
+    command: str
 
 
 @dataclass(frozen=True)
@@ -289,14 +304,16 @@ def _write_note(path: Path, note: str, dry_run: bool) -> None:
         raise
 
 
-def _record_restart_note(session_id: str, note: str, *, dry_run: bool) -> None:
+def _record_scheduled_restart_prompt(
+    session_id: str, prompt: str, *, dry_run: bool
+) -> None:
     if dry_run:
         return
     try:
         recorded = conversation_pause.read_scheduled_prompts(session_id)
-        conversation_pause.record_scheduled_prompts(session_id, (*recorded, note))
+        conversation_pause.record_scheduled_prompts(session_id, (*recorded, prompt))
     except (OSError, RuntimeError, ValueError) as error:
-        raise RestartNoteNotRecorded(_error_reason(error)) from error
+        raise ScheduledRestartPromptNotRecorded(_error_reason(error)) from error
 
 
 def _unit_argv(
@@ -543,8 +560,8 @@ def _launch_session(
     desktop_state: DesktopLaunchState,
     *,
     dry_run: bool,
-) -> str | None:
-    """Launch an entry, or return the command that needs a person."""
+) -> SessionLaunched | ManualRestartRequired:
+    """Launch an entry or return its explicit manual-restart requirement."""
     session = entry["session"]
     host = session["host"]
     if session["kind"] == "unit":
@@ -552,22 +569,25 @@ def _launch_session(
             raise ValueError("unit session has no unit host")
         if host["plan"]["kind"] == "no run record":
             _write_note(_note_path(record, session["session_id"]), note, dry_run)
-            return shlex.join(_unit_argv(record, entry, missing_plan=True))
+            return ManualRestartRequired(
+                shlex.join(_unit_argv(record, entry, missing_plan=True))
+            )
         note_path = _note_path(record, session["session_id"])
-        _record_restart_note(session["session_id"], note, dry_run=dry_run)
         _write_note(note_path, note, dry_run)
         try:
             _ = _run(_unit_argv(record, entry), dry_run=dry_run)
         finally:
             if not dry_run:
                 note_path.unlink(missing_ok=True)
-        return None
+        return SessionLaunched()
 
     prompt = _showrunner_prompt(session) if session["kind"] == "showrunner" else note
     command = _resume_command(session, prompt)
     if host["kind"] == "unknown":
-        return command
-    _record_restart_note(session["session_id"], note, dry_run=dry_run)
+        return ManualRestartRequired(command)
+    _record_scheduled_restart_prompt(
+        session["session_id"], prompt, dry_run=dry_run
+    )
     match host["kind"]:
         case "ghostty" | "zed":
             _window_launch(command, session, desktop_state, dry_run=dry_run)
@@ -590,7 +610,7 @@ def _launch_session(
             _tmux_launch(command, session, dry_run=dry_run)
         case "unit":
             raise ValueError("non-unit session has a unit host")
-    return None
+    return SessionLaunched()
 
 
 def _message_key(record: ShutdownRecord, session_id: str) -> str:
@@ -636,10 +656,10 @@ def _send_restart_note(
 
 
 def _restore_timers(
-    entry: ShutdownSessionEntry, *, dry_run: bool
-) -> tuple[TimerNotStarted, ...]:
-    failures: list[TimerNotStarted] = []
-    for timer in entry["timers"]:
+    timers: list[TimerRestore], *, dry_run: bool
+) -> tuple[PendingTimer, ...]:
+    failures: list[PendingTimer] = []
+    for timer in timers:
         if timer["was_enabled"]:
             if dry_run:
                 override = os.environ.get("SHUTDOWN_NOTIFIER")
@@ -650,10 +670,9 @@ def _restore_timers(
                     settle.run_notifier("start", timer["instance"])
                 except (OSError, RuntimeError, subprocess.SubprocessError) as error:
                     failures.append(
-                        TimerNotStarted(
-                            entry["session"]["name"],
-                            timer["instance"],
-                            _error_reason(error),
+                        PendingTimer(
+                            instance=timer["instance"],
+                            reason=_error_reason(error),
                         )
                     )
         footer = timer["footer"]
@@ -662,6 +681,18 @@ def _restore_timers(
                 footer["slug"], showrunner_footer.FooterState.ON
             )
     return tuple(failures)
+
+
+def _pending_timer_restores(
+    entry: ShutdownSessionEntry, pending: list[PendingTimer]
+) -> list[TimerRestore]:
+    timers_by_instance = {timer["instance"]: timer for timer in entry["timers"]}
+    try:
+        return [timers_by_instance[timer["instance"]] for timer in pending]
+    except KeyError as error:
+        raise ValueError(
+            f"pending timer {error.args[0]} is missing from the restart record"
+        ) from error
 
 
 def _set_entry_progress(
@@ -675,6 +706,25 @@ def _set_entry_progress(
         raise ValueError(f"shutdown entry {session_id} disappeared")
 
     return update(login, change)
+
+
+def _record_timer_restore_progress(
+    record: ShutdownRecord,
+    entry: ShutdownSessionEntry,
+    failures: tuple[PendingTimer, ...],
+) -> None:
+    if failures:
+        progress: SessionProgress = SessionLiveTimersPending(
+            kind="timers pending",
+            at=settle.record_time(),
+            timers=list(failures),
+        )
+    else:
+        progress = SessionRestarted(kind="restarted", at=settle.record_time())
+    entry["progress"] = progress
+    _ = _set_entry_progress(
+        record["login"], entry["session"]["session_id"], progress
+    )
 
 
 def _entry_order(record: ShutdownRecord, entry: ShutdownSessionEntry) -> tuple[int, str]:
@@ -766,12 +816,20 @@ def _process_session_entry(
     desktop_state: DesktopLaunchState,
     *,
     dry_run: bool,
-) -> tuple[TimerNotStarted, ...]:
+) -> None:
     progress = entry["progress"]
     if progress["kind"] in COMPLETE_PROGRESS:
-        return ()
+        return
     session = entry["session"]
     session_id = session["session_id"]
+    if progress["kind"] == "timers pending":
+        if session_id not in _live_session_ids():
+            return
+        timers = _pending_timer_restores(entry, progress["timers"])
+        failures = _restore_timers(timers, dry_run=dry_run)
+        if not dry_run:
+            _record_timer_restore_progress(record, entry, failures)
+        return
     try:
         _retire(record, entry, dry_run=dry_run)
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
@@ -781,54 +839,51 @@ def _process_session_entry(
                 entry,
                 f"queued shutdown messages not retired: {_error_reason(error)}",
             )
-        return ()
-    note = restart_note(record, entry, restarted_at)
+        return
     was_live = session_id in _live_session_ids()
+    note = restart_note(record, entry, restarted_at)
     if was_live:
         if progress["kind"] != "manual restart" and not _restart_note_delivered(
             record, entry, note, dry_run=dry_run
         ):
-            return ()
-        timer_failures = _restore_timers(entry, dry_run=dry_run)
+            return
+        timer_failures = _restore_timers(entry["timers"], dry_run=dry_run)
         if not dry_run:
-            entry["progress"] = SessionRestarted(
-                kind="restarted", at=settle.record_time()
-            )
-            _ = _set_entry_progress(record["login"], session_id, entry["progress"])
-        return timer_failures
+            _record_timer_restore_progress(record, entry, timer_failures)
+        return
 
     if progress["kind"] == "manual restart":
         if dry_run:
             print(f"manual restart {session['name']}: {progress['command']}")
-        return ()
+        return
 
     try:
-        manual = _launch_session(
+        launch = _launch_session(
             record, entry, note, desktop_state, dry_run=dry_run
         )
-    except RestartNoteNotRecorded as error:
+    except ScheduledRestartPromptNotRecorded as error:
         if not dry_run:
             _mark_restart_failed(
                 record,
                 entry,
-                f"restart note not recorded: {_error_reason(error)}",
+                f"restart prompt not recorded: {_error_reason(error)}",
             )
-        return ()
+        return
     except (OSError, subprocess.CalledProcessError, subprocess.SubprocessError) as error:
         if not dry_run:
             _mark_restart_failed(record, entry, _error_reason(error))
-        return ()
-    if manual is not None:
+        return
+    if isinstance(launch, ManualRestartRequired):
         if dry_run:
-            print(f"manual restart {session['name']}: {manual}")
+            print(f"manual restart {session['name']}: {launch.command}")
         if not dry_run:
             entry["progress"] = SessionNeedsManualRestart(
-                kind="manual restart", command=manual
+                kind="manual restart", command=launch.command
             )
             _ = _set_entry_progress(record["login"], session_id, entry["progress"])
-        return ()
+        return
     if dry_run:
-        return ()
+        return
     if not wait_for_session(session_id, SESSION_WAIT_SECONDS):
         entry["progress"] = SessionRestartFailed(
             kind="restart failed",
@@ -836,16 +891,12 @@ def _process_session_entry(
             reason=f"session not live after {SESSION_WAIT_SECONDS:g} seconds",
         )
         _ = _set_entry_progress(record["login"], session_id, entry["progress"])
-        return ()
+        return
     if session["kind"] == "showrunner":
         if not _restart_note_delivered(record, entry, note, dry_run=False):
-            return ()
-    timer_failures = _restore_timers(entry, dry_run=False)
-    entry["progress"] = SessionRestarted(
-        kind="restarted", at=settle.record_time()
-    )
-    _ = _set_entry_progress(record["login"], session_id, entry["progress"])
-    return timer_failures
+            return
+    timer_failures = _restore_timers(entry["timers"], dry_run=False)
+    _record_timer_restore_progress(record, entry, timer_failures)
 
 
 def _process_seats(
@@ -911,16 +962,14 @@ def _process_seats(
         )
 
 
-def _finish_record(
-    record: ShutdownRecord,
-    timers_not_started: tuple[TimerNotStarted, ...],
-) -> MachineRestartResult:
+def _finish_record(record: ShutdownRecord) -> MachineRestartResult:
     latest = find_live(record["login"])
     if latest["kind"] == "no shutdown":
         return MachineRestartResult(record["machine"], record["label"], "nothing")
     current = latest["record"]
     restarted = sum(
-        entry["progress"]["kind"] == "restarted" for entry in current["entries"]
+        entry["progress"]["kind"] in {"restarted", "timers pending"}
+        for entry in current["entries"]
     )
     seats = sum(
         entry["progress"]["kind"] == "seat available on demand"
@@ -947,6 +996,7 @@ def _finish_record(
         archive(record["login"])
     failed_sessions: list[FailedSessionRestart] = []
     manual_sessions: list[ManualSessionRestart] = []
+    timers_not_started: list[TimerNotStarted] = []
     for entry in current["entries"]:
         progress = entry["progress"]
         if progress["kind"] == "restart failed":
@@ -957,17 +1007,24 @@ def _finish_record(
             manual_sessions.append(
                 ManualSessionRestart(entry["session"]["name"], progress["command"])
             )
+        elif progress["kind"] == "timers pending":
+            timers_not_started.extend(
+                TimerNotStarted(
+                    entry["session"]["name"], timer["instance"], timer["reason"]
+                )
+                for timer in progress["timers"]
+            )
     return MachineRestartResult(
         current["machine"],
         current["label"],
-        "done" if complete and not timers_not_started else "partial",
+        "done" if complete else "partial",
         restarted,
         seats,
         manual,
         failed,
         tuple(failed_sessions),
         tuple(manual_sessions),
-        timers_not_started,
+        tuple(timers_not_started),
     )
 
 
@@ -1063,26 +1120,23 @@ def _up(login: str, dry_run: bool) -> MachineRestartResult:
 
     desktop_state = DesktopLaunchState()
     restarted_at = settle.record_time()
-    timers_not_started: list[TimerNotStarted] = []
     try:
         entries = sorted(record["entries"], key=lambda entry: _entry_order(record, entry))
         for entry in entries:
             if entry["session"]["kind"] != "seat":
-                timers_not_started.extend(
-                    _process_session_entry(
-                        record,
-                        entry,
-                        restarted_at,
-                        desktop_state,
-                        dry_run=dry_run,
-                    )
+                _process_session_entry(
+                    record,
+                    entry,
+                    restarted_at,
+                    desktop_state,
+                    dry_run=dry_run,
                 )
         _process_seats(record, dry_run=dry_run)
         if dry_run:
             return MachineRestartResult(
                 record["machine"], record["label"], "done"
             )
-        result = _finish_record(record, tuple(timers_not_started))
+        result = _finish_record(record)
         _print_result(result)
         return result
     except BaseException:

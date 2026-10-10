@@ -15,6 +15,10 @@ from pathlib import Path
 from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo
 
+SCRIPTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPTS / "hooks"))
+
+import conversation_pause
 import unit_lookup
 
 
@@ -638,7 +642,12 @@ def prompt_for(request: UnitLaunch) -> str:
             f"approval before you run /unit:direct {plan}.")
 
 
-def launch_session(request: UnitLaunch, tmux: str, director: DirectorAgent) -> None:
+def launch_session(
+    request: UnitLaunch,
+    tmux: str,
+    director: DirectorAgent,
+    prompt: str,
+) -> None:
     """Start the unit's session in a tmux session marked as this unit of this production.
 
     The marks are what finds the unit afterwards; its name is only what it is called at launch.
@@ -656,7 +665,7 @@ def launch_session(request: UnitLaunch, tmux: str, director: DirectorAgent) -> N
                     if isinstance(request.launch_kind, UnitRestoreLaunch)
                     else request.identity.session)
     argv.extend(["--remote-control", session_name, "-n", session_name,
-                 "--settings", '{"disableAgentView": true}', prompt_for(request)])
+                 "--settings", '{"disableAgentView": true}', prompt])
     command = "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
     cwd = request.session.cwd if isinstance(request.session, ResumedSession) else request.worktree
     environment = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")}
@@ -667,6 +676,16 @@ def launch_session(request: UnitLaunch, tmux: str, director: DirectorAgent) -> N
                         *(argument for name, value in marks.items() for argument in ("-e", f"{name}={value}")),
                         "zsh", "-ic", command],
                        env=environment, text=True, capture_output=True, check=True)
+
+
+def record_scheduled_restore_prompt(session_id: str, prompt: str) -> None:
+    try:
+        recorded = conversation_pause.read_scheduled_prompts(session_id)
+        conversation_pause.record_scheduled_prompts(session_id, (*recorded, prompt))
+    except (OSError, RuntimeError, ValueError) as error:
+        detail = str(error).strip()
+        reason = detail.splitlines()[0] if detail else type(error).__name__
+        raise RuntimeError(f"restart prompt not recorded: {reason}") from error
 
 
 def launched_unit(request: UnitLaunch) -> unit_lookup.MarkedUnit | None:
@@ -753,7 +772,10 @@ def main(argv: list[str]) -> int:
         commit_unit(request)
         ensure_worktree(request)
         if marked_unit is None:
-            launch_session(request, tmux, ready.director)
+            prompt = prompt_for(request)
+            if isinstance(request.launch_kind, UnitRestoreLaunch):
+                record_scheduled_restore_prompt(request.launch_kind.session_id, prompt)
+            launch_session(request, tmux, ready.director, prompt)
         launched = wait_for_remote_control(request, tmux)
         record(request)
         print(f"{request.identity.unit} started: tmux attach -t {launched.label}")
