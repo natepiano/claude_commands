@@ -131,7 +131,7 @@ After Phase 2 reaches `~/.claude` main, the unit director tells the showrunner t
 
 **Gotchas:** duplicate-link refusal fires at landing, not at `propose` (no note exists until then), so produce.md's recipe passes `--separate-result` on every row when one merge has several results. A test or tool run off natedev without `FEATURE_LOG_VAULT` reaches natedev's live vault.
 
-### Phase 3 — Every backfill source record sits in a frozen ledger  · status: todo
+### Phase 3 — Every backfill source record sits in a frozen ledger  · status: done
 
 #### Work Order
 
