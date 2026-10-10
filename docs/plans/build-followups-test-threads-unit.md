@@ -15,6 +15,7 @@ User, 2026-10-09 16:4x PDT, approving the nightly 2026-10-08 rust main proposal 
 ## Delegation Context
 
 - **Project:** `~/.claude` config repo: the scripts every Claude session runs. This plan labels each nextest step's width, keys the memory gate by width, adds the trial scorecard `scripts/buildlog/width_trial.py`, runs the trial and acts on its verdict. Worktree `/home/natepiano/worktrees/claude-build-followups-test-threads-unit`, branch `build-followups-test-threads-unit` (unit `test-threads-unit-unit`); name both in every dispatch.
+- **Project started:** 2026-10-10T00:02:20.467+00:00
 - **Stack:** bash (`scripts/lint/invoke.sh` is sourced by `verify.sh`, the `lint` CLI and `pre_release_checks.sh` under `set -euo pipefail`; the Mac runs bash 3.2: no `EPOCHSECONDS`, no associative arrays, `${arr[@]+"${arr[@]}"}` for empty arrays); Python 3 standard library (`sqlite3`, `json`, `random`, `statistics`, `hashlib`, `argparse`, `unittest`), checked by basedpyright.
 - **Layout:** `scripts/lint/` (`invoke.sh`, `memory_gate.sh`, `memory_admit.py`, their tests) · `scripts/buildlog/` (`store.py`, the new `width_trial.py` and `test_width_trial.py`) · `docs/as-built/build-memory-admission.md` (the gate's record) · outside the repo, read-only: `~/.local/state/buildlog/index.sqlite`, `~/.local/state/buildlog/admission/anon_peaks.jsonl`; edited at verdicts only: `~/.local/state/nightly-review/ledger.md` line 25.
 - **Key files:**
@@ -69,7 +70,7 @@ While G1 holds, each time the unit director wakes it runs `width_trial.py report
 
 ## Phases
 
-### Phase 1 — The gate's records name their width and call, and the scorecard is frozen  · status: todo
+### Phase 1 — The gate's records name their width and call, and the scorecard is frozen  · status: done
 
 #### Work Order
 

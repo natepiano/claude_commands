@@ -22,6 +22,7 @@ store = gate.store
 
 GIB = gate.GIB
 NOW = datetime(2026, 10, 6, 22, 0, tzinfo=UTC)
+HISTORY_AT = NOW - timedelta(seconds=1)
 INVOKE = Path(__file__).with_name("invoke.sh")
 MEMORY_GATE = Path(__file__).with_name("memory_gate.sh")
 
@@ -56,19 +57,27 @@ class HistoryTests(unittest.TestCase):
         self.host = "test-host"
 
     def add_measured(self, count: int, *, host: str = "test-host", repo: str = "hana",
-                     at: datetime = NOW) -> None:
+                     at: datetime = HISTORY_AT, test_threads: int | None = None,
+                     start_gib: int = 1) -> None:
         with (self.admission / "anon_peaks.jsonl").open("a") as out:
             for index in range(count):
-                _ = out.write(json.dumps({"host": host, "repo": repo, "step": "nextest",
-                                          "ended_at": store.utc_iso(at.timestamp()),
-                                          "anon_peak_bytes": (index + 1) * GIB}) + "\n")
+                record: dict[str, object] = {
+                    "host": host,
+                    "repo": repo,
+                    "step": "nextest",
+                    "ended_at": store.utc_iso(at.timestamp()),
+                    "anon_peak_bytes": (start_gib + index) * GIB,
+                }
+                if test_threads is not None:
+                    record["test_threads"] = test_threads
+                _ = out.write(json.dumps(record) + "\n")
 
-    def add_index(self) -> None:
+    def add_index(self, *, at: datetime = HISTORY_AT) -> None:
         with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
             _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, peak_mem_bytes INTEGER)")
             for index in range(5):
                 _ = db.execute("INSERT INTO steps VALUES (?, ?, ?, ?, ?)",
-                               (self.host, "hana", "nextest", store.utc_iso(NOW.timestamp()), (index + 1) * GIB))
+                               (self.host, "hana", "nextest", store.utc_iso(at.timestamp()), (index + 1) * GIB))
 
     def peak(self) -> gate.ExpectedPeak:
         return gate.expected_peak("hana", "nextest", self.host, NOW, self.root)
@@ -91,6 +100,52 @@ class HistoryTests(unittest.TestCase):
         self.add_index()
         self.assertEqual(self.peak().source, "buildlog")
 
+    def test_measured_history_is_keyed_by_test_width(self) -> None:
+        self.add_measured(5, test_threads=16)
+        self.add_measured(5, start_gib=6)
+        self.assertEqual(
+            gate.expected_peak("hana", "nextest", self.host, NOW, self.root, test_threads=16),
+            gate.ExpectedPeak(5 * GIB, "measured", 5),
+        )
+        self.assertEqual(
+            gate.expected_peak("hana", "nextest", self.host, NOW, self.root),
+            gate.ExpectedPeak(10 * GIB, "measured", 5),
+        )
+
+    def test_future_measured_records_do_not_override_prior_index_history(self) -> None:
+        """F002: a historical report excludes measured records beyond its end."""
+        self.add_index()
+        self.add_measured(5, at=NOW + timedelta(seconds=1), start_gib=10)
+        self.assertEqual(self.peak(), gate.ExpectedPeak(int(5 * GIB * gate.ANON_SHARE), "buildlog", 5))
+
+    def test_future_index_rows_do_not_supply_buildlog_history(self) -> None:
+        """F002: a historical report excludes index rows beyond its end."""
+        self.add_index(at=NOW + timedelta(seconds=1))
+        self.assertEqual(self.peak(), gate.ExpectedPeak(gate.FALLBACK, "fallback", 0))
+
+
+class TestThreadParsingTests(unittest.TestCase):
+    def test_all_integer_forms_are_recognized(self) -> None:
+        cases = (
+            (["cargo", "nextest", "run", "--test-threads", "16"], 16),
+            (["cargo", "nextest", "run", "--test-threads=32"], 32),
+            (["cargo", "nextest", "run", "-j", "12"], 12),
+            (["cargo", "nextest", "run", "-j8"], 8),
+        )
+        for argv, expected in cases:
+            with self.subTest(argv=argv):
+                self.assertEqual(gate.test_threads(argv), expected)
+
+    def test_absent_or_non_integer_width_is_unset(self) -> None:
+        for argv in (
+            ["cargo", "nextest", "run"],
+            ["cargo", "nextest", "run", "--test-threads", "num-cpus"],
+            ["cargo", "nextest", "run", "--test-threads=num-cpus"],
+            ["cargo", "nextest", "run", "-jnum-cpus"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(gate.test_threads(argv))
+
 
 class LedgerTests(unittest.TestCase):
     root: Path = Path()
@@ -106,18 +161,20 @@ class LedgerTests(unittest.TestCase):
         _ = self.meminfo.write_text("MemAvailable: 12582912 kB\n")
         self.pid = os.getpid()
 
-    def check(self, available: int, *, force: bool = False, sidecar: str = "") -> tuple[gate.AdmissionDecision, Path | None]:
+    def check(self, available: int, *, force: bool = False, sidecar: str = "",
+              argv: list[str] | None = None) -> tuple[gate.AdmissionDecision, Path | None]:
         self.write_meminfo(available)
-        return self.admit(force=force, sidecar=sidecar)
+        return self.admit(force=force, sidecar=sidecar, argv=argv)
 
     def write_meminfo(self, available: int) -> None:
         _ = self.meminfo.write_text(f"MemAvailable: {available // 1024} kB\n")
 
-    def admit(self, *, force: bool = False, sidecar: str = "") -> tuple[gate.AdmissionDecision, Path | None]:
+    def admit(self, *, force: bool = False, sidecar: str = "",
+              argv: list[str] | None = None) -> tuple[gate.AdmissionDecision, Path | None]:
         with patch.object(gate, "git_identity", return_value=("hana", "test-worktree")), \
              patch.object(store, "host_name", return_value="test-host"):
             result = gate.check(
-                self.meminfo, self.pid, sidecar, ["cargo", "nextest"], force, self.root, NOW
+                self.meminfo, self.pid, sidecar, argv or ["cargo", "nextest"], force, self.root, NOW
             )
         path = result.reservation.path if isinstance(result.reservation, gate.Reserved) else None
         return result.decision, path
@@ -142,7 +199,12 @@ class LedgerTests(unittest.TestCase):
         scope.mkdir()
         _ = (scope / "memory.stat").write_text(f"anon {8 * GIB}\nfile 1\n")
         _ = self.sidecar.write_text(str(scope) + "\n")
-        _, path = self.check(12 * GIB, sidecar=str(self.sidecar))
+        with patch.dict(os.environ, {"BUILDLOG_CALL_ID": "call-width-16"}):
+            _, path = self.check(
+                12 * GIB,
+                sidecar=str(self.sidecar),
+                argv=["cargo", "nextest", "run", "--test-threads", "16"],
+            )
         assert path is not None
         result, _ = self.check(12 * GIB)
         self.assertEqual(result.promised, 4 * GIB)
@@ -153,6 +215,7 @@ class LedgerTests(unittest.TestCase):
         self.assertFalse(self.sidecar.exists())
         line = cast(dict[str, object], json.loads((self.root / "admission/anon_peaks.jsonl").read_text()))
         self.assertEqual((line["anon_peak_bytes"], line["status"]), (8 * GIB, 7))
+        self.assertEqual((line["test_threads"], line["call_id"]), (16, "call-width-16"))
 
     def test_unscoped_step_writes_no_peak(self) -> None:
         _, path = self.check(12 * GIB)
@@ -167,7 +230,8 @@ class LedgerTests(unittest.TestCase):
             path = directory / f"{pid}.reservation"
             row: gate.Reservation = {"pid": pid, "start_time": start, "need": 12 * GIB,
                                      "repo": "hana", "step": "nextest", "worktree": "old",
-                                     "admitted_at": "", "sidecar": ""}
+                                     "admitted_at": "", "sidecar": "", "test_threads": None,
+                                     "call_id": None}
             _ = path.write_text(json.dumps(row))
         decision, _ = self.check(12 * GIB)
         self.assertEqual(decision.state, "admit")
