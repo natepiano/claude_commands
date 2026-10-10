@@ -33,7 +33,7 @@ The user, via natedev, 2026-10-06 08:2x PDT, deciding the nightly review's `subo
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts; this plan proves FMA's runtime gain and records a `suboptimal_flops` baseline (Phase 1), puts the flag on the nightly release check (Phase 2), adds a PostToolUse hook that blocks Claude edits leaving a float multiply-add (Phase 3), extends the fn-length hook to Codex seats (Phase 4, moved from `stalls-unit`), extends the mul_add hook to Codex seats (Phase 5), widens the detector (Phase 6), makes a Codex seat's buildlog rows carry its own thread id (Phase 7, a showrunner follow-up), and re-measures (Phase 8). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add` on branch `build-followups-mul-add` (unit `mul_add-unit` of production `build-followups`).
+- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts; this plan proves FMA's runtime gain and records a `suboptimal_flops` baseline (Phase 1), puts the flag on the nightly release check (Phase 2), adds a PostToolUse hook that blocks Claude edits leaving a float multiply-add (Phase 3), extends the fn-length hook to Codex seats (Phase 4, moved from `stalls-unit`), extends the mul_add hook to Codex seats (Phase 5), widens the detector (Phase 6), makes a Codex seat's buildlog rows carry its own thread id (Phase 7, a showrunner follow-up), makes the detector's scaling test hold under load (Phase 8, a showrunner follow-up), and re-measures (Phase 9). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add` on branch `build-followups-mul-add` (unit `mul_add-unit` of production `build-followups`).
 - **Project started:** 2026-10-06T15:33:51+00:00
 - **Stack:** Python 3.13, standard library only; Rust 1.99.0 (`rustc`, `objdump`) for the Phase 1 proof only, compiled in the scratchpad, never in a repository.
 - **Layout:**
@@ -68,7 +68,7 @@ The user, via natedev, 2026-10-06 08:2x PDT, deciding the nightly review's `subo
 | G1 | Phase 2 | natedev's `~/.cargo/config.toml` carries `-C target-cpu=x86-64-v3` (user rebuild) and hana `origin/main` `ci.yml` carries it | natedev tells the unit both are live |
 | G2 | Phase 3 | `stalls-unit` fn-length Claude hook phase merged | natedev sends its merge hash |
 | G3 | Phase 5 | this unit's Phase 4 (fn-length Codex hook) merged, then installed and smoked on both machines | natedev sends its merge hash; the install and smoke pass |
-| G4 | Phase 8 | 96 hours after T_detector (Phase 6's As-built) | the clock |
+| G4 | Phase 9 | 96 hours after T_detector (Phase 6's As-built) | the clock |
 
 ## Phases
 
@@ -277,8 +277,22 @@ Real-code check, `objdump -d -C --no-show-raw-insn` counted per function, on two
 **Binds later work:**
 - The detector the re-measure measures is this one.
 - Go-live is the unit director's step after the merge and the pulls: a Claude edit and a Codex patch, each on natedev and on the Mac, leave `const K: f32 = 2.0; fn f(x: f32, c: f32) -> f32 { c + x * K }` in a scratch crate with `src/lib.rs` denying `nursery`, and each shows `x.mul_add(K, c)` plus a `blocks.jsonl` line naming the agent. T_detector (PDT) is the end of the last of the four, sent to natedev; the re-measure's window opens there.
-- Done so far: natedev's Claude edit ended 2026-10-06 18:22:53 PDT and its Codex patch 18:22:54 PDT, each showing the block and a log line. The Mac's two runs wait for its pull and need the user at a Mac terminal (its Claude login is not reachable over ssh), so run its Claude proof last and the re-measure's controls straight after it.
-- T_detector: pending
+- Go-live ran as specified, and each of its four runs showed `x.mul_add(K, c)` and a log line naming the agent: natedev's Claude edit ended 2026-10-06 18:22:53 PDT and its Codex patch 18:22:54, the Mac's Codex patch 18:48:17, the Mac's Claude edit 22:44:05. The Mac's Claude login sits in a login keychain that stays locked over ssh, so its run went through a Terminal window opened in the logged-in session, with the full login `PATH` set; two earlier launches never reached the hook, one without `cargo-berth` on `PATH` and one without `claude`.
+- T_detector: 2026-10-06 22:44:05 PDT, the end of the Mac Claude run, the last of the four go-live runs. W runs to 2026-10-10 22:44:05 PDT (01:44:05 EDT on 2026-10-11).
+- The eight controls ran right after it, each showing its hook's block and a log line naming the agent, all inside W (log times UTC):
+
+  | Machine | Agent | Hook | Run (PDT) | Log line |
+  | --- | --- | --- | --- | --- |
+  | Mac | Claude | mul_add | 22:44:05–22:44:12 | 05:44:09Z |
+  | Mac | Claude | fn-length | 22:44:12–22:44:25 | 05:44:22Z |
+  | Mac | Codex | mul_add | 22:45:37–22:45:53 | 05:45:48Z |
+  | Mac | Codex | fn-length | 22:45:53–22:46:59 | 05:46:33Z |
+  | natedev | Claude | mul_add | 22:45:05–22:45:12 | 05:45:09Z |
+  | natedev | Claude | fn-length | 22:45:12–22:45:24 | 05:45:20Z |
+  | natedev | Codex | mul_add | 22:45:24–22:45:50 | 05:45:45Z |
+  | natedev | Codex | fn-length | 22:45:50–22:46:22 | 05:46:17Z |
+
+  The mul_add blocks read `write x.mul_add(0.5, 1.0) for x * 0.5 + 1.0 (clippy::suboptimal_flops)` at `src/lib.rs` line 1 for Claude, 5 for natedev's Codex and 4 for the Mac's. The fn-length blocks read `fn long_sum at src/lib.rs:N is 101 lines (limit 100): split it now.` with N 1 for Claude and 5 for Codex; the Mac's Codex split the function afterwards, and its log line records the 101-line version. The control rows carry these `cwd` values, so the re-measure leaves them out of its rates: on natedev `…/scratchpad/ctl_after/{claude/muladd, claude/fnlen, codex_muladd, codex_fnlen}`, on the Mac `~/controls-muladd/{muladd, fnlen}`, `~/ctl-codex-muladd` and `~/ctl-codex-fnlen`; the go-live rows carry `…/scratchpad/golive/{claude_crate, codex_crate}` and `~/golive-claude`, `~/golive-codex`.
 
 **Gotchas:**
 - `detect.py` builds stub crates with no `src/lib.rs`, so Phase 5's reader exempts them and every position reads uncaught; use `detect_root.py`, which adds an empty `src/lib.rs`.
@@ -303,12 +317,42 @@ Real-code check, `objdump -d -C --no-show-raw-insn` counted per function, on two
 - `scripts/buildlog/test_record.py` — the three-case test
 
 **Binds later work:**
-- Rows a Codex seat recorded before this change merged name the director's Claude session; rows after it name the seat's thread. It is live on natedev from 2026-10-06 19:24:53 PDT and on the Mac from its next pull of `~/.claude`. The re-measure states which rows of its window came after, and does not compare a Codex seat's `loop.py` gaps across that line.
+- Rows a Codex seat recorded before this change merged name the director's Claude session; rows after it name the seat's thread. It is live on natedev from 2026-10-06 19:24:53 PDT and on the Mac from 19:55:47 PDT, when it pulled `~/.claude`. The re-measure states which rows of its window came after, and does not compare a Codex seat's `loop.py` gaps across that line.
 
 **Ruled out:**
 - Rewriting rows already recorded — the change fixes the precedence only.
 
-### Phase 8 — Re-measure: long functions and multiply-adds out of hana's clippy failures · status: todo
+### Phase 8 — The detector's scaling test holds under machine load · status: done
+
+#### Work Order
+
+Work only in worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`, branch `build-followups-mul-add`. A showrunner follow-up (2026-10-09): the test turned an unrelated merge on `build-followups` red.
+
+**Goal:** `test_many_findings_scan_scales_with_file_length` in `scripts/hooks/test_mul_add.py` fails when the scan grows faster than linearly with file length, and never fails because the machine is busy.
+
+**Constraints from prior phases:**
+- `float_mul_add_findings(path)` keeps its signature and behavior; this phase changes the test only. `mul_add_lib.py` is not edited.
+- The test exists to catch a scan that goes quadratic in file length. Between 200 and 800 lines (4×), a linear scan takes about 4× as long and a quadratic one about 16×.
+
+**Spec:**
+1. Today the test times one scan of a 200-line file and one of an 800-line file with `time.perf_counter()` and asserts the second is under 7× the first. In a merge gate under load it failed with `0.1079 not less than 0.1048`, and it passes alone: one wall-clock sample per size lets a load spike on either sample decide the result.
+2. Time each size several times (at least 5) and compare the fastest run of each size, since load only ever adds time. Keep the 200 and 800 line files and the existing finding-count and last-line asserts.
+3. Set the bound so a linear scan passes with room under heavy load and a quadratic one still fails: compare the fastest 800-line time against 10× the fastest 200-line time, and say in a comment that linear is about 4× and quadratic about 16×.
+4. A count-based check is a valid alternative if it is simpler: count a unit of work the scanner does, if one is reachable from the test without changing `mul_add_lib.py`. Otherwise use spec items 2 and 3.
+
+**Acceptance:**
+- The test passes 20 times in a row while the machine runs a CPU load on every core, and alone.
+- Changing the bound check to compare against 4× the fastest 200-line time fails the test as expected. This is a scratch check, never committed, which proves the test still measures.
+- The whole `test_mul_add.py` suite passes; basedpyright reports 0 errors, 0 warnings, 0 notes on `test_mul_add.py`.
+
+**Verification:** `python3 -m unittest scripts/hooks/test_mul_add.py`; `basedpyright scripts/hooks/test_mul_add.py`; a load check run as `stress-ng --cpu 0 --timeout 120s &` (or one `yes > /dev/null &` per core, killed afterwards) beside 20 runs of `python3 -m unittest scripts.hooks.test_mul_add.MulAddHookTests.test_many_findings_scan_scales_with_file_length`.
+
+**Files:**
+- `scripts/hooks/test_mul_add.py` — the scaling test only
+
+**Seats:** 1 writer — `impl`.
+
+### Phase 9 — Re-measure: long functions and multiply-adds out of hana's clippy failures · status: todo
 
 #### Work Order
 
