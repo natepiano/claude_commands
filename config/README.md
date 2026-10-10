@@ -131,6 +131,21 @@ exit 2 before running the command. `PLAN_DELEGATE_CONFIG` overrides the path,
 which is how `test_findings.py` supplies its own limits rather than this
 machine's.
 
+## dailies.conf
+
+The counts each production's dailies show on one line above the chart, in
+every length: `counts: nightly queue 8 · proposals 3`. A line is
+`<production slug>.<label>=lines <file> <regex>`, which counts the file's lines
+matching the regex, or `<production slug>.<label>=files <glob>`, which counts
+the matching files. The slug is the production doc's file name less
+`-production.md`. `~` expands, and a hyphen in the label reads as a space.
+`scripts/production/dailies_counts.py` reads it each time the dailies input is
+built, so an edit applies to the next dailies. A missing file shows as `not
+found`. A bad line leaves out the counts line, and the builder prints
+`counts: unavailable — dailies.conf line <n>: …`. `DAILIES_COUNTS_CONFIG`
+overrides the path. Today it holds build-followups' nightly review queue and
+plan backlog, and tool-based-ui's hanadocs proposals (user, 2026-10-10).
+
 ## cargo-fmt-exclusions.json
 
 List of crate names to exclude from `cargo fmt` checks. Used when running formatting on external/third-party crates where we don't want to modify their style.

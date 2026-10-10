@@ -1163,6 +1163,26 @@ class DailiesInputTests(unittest.TestCase):
         self.assertNotIn("next_run", self.report())
         self.assertIn("clock: ok — on demand: no scheduled dailies", result.stdout)
 
+    def test_counts_configured_for_the_production_go_in_the_input(self) -> None:
+        config = self.home / ".claude/config/dailies.conf"
+        config.parent.mkdir(parents=True)
+        _ = (self.home / "ledger.md").write_text("- a — proposed\n- b — declined\n", encoding="utf-8")
+        _ = config.write_text("example.nightly-queue=lines ~/ledger.md — proposed$\nother.queue=files ~/*.md\n",
+                              encoding="utf-8")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.report()["counts"], [{"label": "nightly queue", "count": 1}])
+        self.assertIn("counts: ok — 1 from dailies.conf", result.stdout)
+
+    def test_a_bad_counts_line_leaves_the_counts_out_and_says_why(self) -> None:
+        config = self.home / ".claude/config/dailies.conf"
+        config.parent.mkdir(parents=True)
+        _ = config.write_text("example.queue=words ~/ledger.md\n", encoding="utf-8")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("counts", self.report())
+        self.assertIn("counts: unavailable — dailies.conf line 1: the count kind is lines or files", result.stdout)
+
     def test_scheduled_run_reads_notifier_status_without_restart(self) -> None:
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

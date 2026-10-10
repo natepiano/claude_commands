@@ -259,6 +259,14 @@ MacBlockFooterState = NoMacBlock | PendingMacBlock | ActiveMacBlock | Unreadable
 
 
 @dataclass(frozen=True)
+class ProductionCount:
+    """One count config/dailies.conf names for this production; `None` when its source is missing."""
+
+    label: str
+    number: int | None
+
+
+@dataclass(frozen=True)
 class Report:
     length: str
     chart: str
@@ -268,6 +276,7 @@ class Report:
     mac_block: MacBlockFooterState
     units: list[Unit]
     topics: list[Topic]
+    counts: list[ProductionCount]
 
 
 @dataclass(frozen=True)
@@ -937,7 +946,7 @@ def parse_report(value: object, chart: str) -> Report:
     fields = as_map(value, "input")
     if "build_hold" in fields:
         raise InputError("input.build_hold: remove this field; holds are read from the holder files")
-    check_keys(fields, {"length", "zone", "next_run", "units", "topics"}, "input")
+    check_keys(fields, {"length", "zone", "next_run", "units", "topics", "counts"}, "input")
     length = text(fields, "length", "input")
     if length not in LENGTHS:
         raise InputError(f"input.length: must be one of {', '.join(LENGTHS)}")
@@ -959,7 +968,25 @@ def parse_report(value: object, chart: str) -> Report:
         for unit in units:
             if unit.build_hold and unit.unit in holder_names:
                 raise InputError(f"units.build_hold: {unit.unit} holds the build hold itself; remove its marker")
-    return Report(length, chart, zone, next_run, hold, mac_block, units, topics)
+    counts = [parse_count(item, f"counts[{index}]") for index, item in enumerate(as_list(fields.get("counts"), "input.counts"))]
+    return Report(length, chart, zone, next_run, hold, mac_block, units, topics, counts)
+
+
+def parse_count(value: object, where: str) -> ProductionCount:
+    fields = as_map(value, where)
+    check_keys(fields, {"label", "count", "not_found"}, where)
+    label = text(fields, "label", where)
+    number = fields.get("count")
+    if fields.get("not_found") is True and number is None:
+        return ProductionCount(label, None)
+    if not isinstance(number, int) or isinstance(number, bool) or number < 0:
+        raise InputError(f"{where}.count: a whole number of 0 or more, or `not_found: true`")
+    return ProductionCount(label, number)
+
+
+def counts_line(counts: list[ProductionCount]) -> str:
+    return "counts: " + " · ".join(
+        f"{count.label} {'not found' if count.number is None else count.number}" for count in counts)
 
 
 def load_state(path: Path | None) -> dict[str, LastUnitReport]:
@@ -1503,6 +1530,8 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
         earliest = parse_range_end(spread.earliest, now, moment, earliest=True) if spread else moment
         latest = parse_range_end(spread.latest, now, moment, earliest=False) if spread else moment
         rows.append(Row(unit.label, Estimate(unit.started, moment, earliest, latest), unit.build_hold, plan))
+    if report.counts:
+        lines.extend([counts_line(report.counts), ""])
     lines.extend(["```", *draw(now, rows, CHART_STYLES[report.chart]), "```", ""])
     needed = any(unit.needed for unit in report.units) or any(topic.needed for topic in report.topics)
     zone = ZoneInfo(report.zone)

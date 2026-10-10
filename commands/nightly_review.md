@@ -35,5 +35,5 @@ Pick the single change with the largest measurable gain for its cost, and measur
 **Also found:** <up to three one-line runners-up>
 ```
 
-Then `SendMessage` natedev, first line `Nightly proposal ready: DIR/<mode>.md`, second line the title; if natedev is not listed, skip it, the morning hook finds the file. Stay open: the user may attach to ask about it.
+Then `SendMessage` natedev, first line `Nightly proposal ready: DIR/<mode>.md`, second line the title; if natedev is not listed, skip it; `/nightly_next` reads every night's reports. Stay open: the user may attach to ask about it.
 </Proposal>

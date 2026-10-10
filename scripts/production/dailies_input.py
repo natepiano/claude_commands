@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 import unit_lookup
 from add_unit import Refusal, cell_value, live_unit_table, read_production, unit_table
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
+from dailies_counts import CountsFailure, production_counts
 from dailies_render import (InputError, StateRefused, as_list, as_map, check_render_state,
                             local_now, parse_range_end, parse_report, parse_time)
 from merge_checkpoint import NoMerge, git, merge_branch_history
@@ -880,6 +881,15 @@ def run(args: argparse.Namespace) -> int:
                            "eta": str(merge.get("eta") or "no ETA stated yet"), "needs_user": bool(merge.get("needs_user", False))})
     report("merge branch", "ok", "pushed" if pushed else "not pushed")
     result: JsonMap = {"length": length, "zone": str(production.zone), "units": units_out, "topics": topics_out}
+    # A bad config line costs only the counts line, never the report.
+    try:
+        counts = production_counts(production.slug)
+    except CountsFailure as failure:
+        report("counts", "unavailable", str(failure))
+    else:
+        if counts:
+            result["counts"] = counts
+            report("counts", "ok", f"{len(counts)} from dailies.conf")
     validate_report(result, holders_path, judgment_path)
     checked = check_render_state(result, render_state, at)
     if isinstance(checked, StateRefused):
