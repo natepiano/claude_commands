@@ -145,7 +145,7 @@ a reachable failure.
 - **Both timer absolutes** (`<ProgressContract/>` 666-669 and 803-812). They read as one rule twice and prevent opposite defects: running work with no wake-up, and satisfying the Stop hook by re-arming without giving the report already owed. The hook blocks once and cannot compose a report.
 - **The phase-count story at both sites.** `progress_history.py` corrects the percentage only when called; it cannot stop a *later* report from counting by hand. `<RemainingWorkOutlook/>` runs after phase completion when no live progress call exists — a cross-reference there is not equivalent.
 - **Token self-deadlock and premature-green.** `verify.sh` cannot stop a delegate acquiring the token first, and cannot know whether the peer owning a package has posted `done`.
-- **Provider and transport fallbacks.** `codex_mesh=0` is still supported; Claude `--bg` has no reply redirect, so the summary-as-last-act rule is live; a finished Claude session resumes and a finished Codex thread does not.
+- **Provider and transport fallbacks.** `codex_mesh=0` is still supported; Claude `--bg` has no reply redirect, so the summary-as-last-act rule is live; a finished Claude session resumes and a finished Codex thread stays open for `implement.sh --to` follow-ups.
 - **Every literal block**: the four reservation JSON records, the commit-message template, exact authorization strings, `<BroadReviewPrompt/>`, the result template, report tables. Scripts do not reconstruct these; rewording an authorization string changes which reply advances the run.
 - **The "Not this / This" progress example** (775-792). The imported guide states the rule; this pair is the only thing that demonstrates turning "edge" and "ancestry" into what the user actually receives.
 

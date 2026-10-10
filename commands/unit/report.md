@@ -157,6 +157,11 @@ Everything below is the contract.
    whether it is moving, waiting, or done. Build it from the seat's board lines
    since the last cursor plus the Work Order, and hold these rules:
 
+   - Track the opening phase of the current Codex thread, not the seat name. If
+     that phase is older, begin `Details` with `Opened in phase <id>;`; omit it
+     when the thread opened in the current phase. A replacement thread under
+     the same seat name starts fresh and holds only its own opening prompt, so
+     the dispatch that creates it is an opening prompt, not a follow-up.
    - Read the full board line, never the recorder's 72-character cut. A line
      ending in `…` has lost its information and must never reach the user.
    - Name work by what it changes for the phase — the Work Order item, the

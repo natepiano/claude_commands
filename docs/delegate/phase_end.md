@@ -29,12 +29,13 @@ Run these steps in order for each completed loop or verbose phase:
 4. **Add-on check.** Run <ConsiderNextItems/>.
 5. **Worker cleanup and completion.** Run the worker half of <PhaseCleanup/>:
    `remove_seats.py`, helpers, launchers, and apps. Run it before the next
-   launch, which creates new seats. Then run <RecordPhaseCompletion/>, including
-   `finish-phase` and deletion of the inactive reservation state file before
-   the next phase writes its own.
+   launch. Per <LongLivedSeats/>, Codex turns finish but their threads remain
+   open until `end_session.sh`; Claude seats keep their existing cleanup. Then
+   run <RecordPhaseCompletion/>, including `finish-phase` and deletion of the
+   inactive reservation state file before the next phase writes its own.
 6. **Next launch.** In loop mode or an active auto window with a next phase,
    run <NextPhase/> through that phase's <LaunchImplementation/>. The review has
-   settled its Work Order; the new seats do not edit the plan doc.
+   settled its Work Order; the phase's seats do not edit the plan doc.
 7. **Shrink beside the seats.** Open a `progress_history.py` activity labelled
    `shrink`. In an enrolled repository, make the shrink's first plan-doc
    write with the Edit tool, so the edit hook claims the plan doc for the

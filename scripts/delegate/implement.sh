@@ -166,6 +166,17 @@ PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 FINDINGS_HELPER="${SCRIPT_DIR}/findings.py"
 FINDINGS_STATE="${SESSION_DIR}/findings_state.json"
 HEARTBEAT_INTERVAL_SECS=60
+DELEGATE_CONFIG="${PLAN_DELEGATE_CONFIG:-${HOME}/.claude/config/delegate.conf}"
+COMPACT_ABOVE_TOKENS=""
+if [[ -r "${DELEGATE_CONFIG}" ]]; then
+  COMPACT_ABOVE_TOKENS="$(sed -n \
+    's/^PLAN_DELEGATE_COMPACT_ABOVE_TOKENS=\([0-9][0-9]*\).*$/\1/p' \
+    "${DELEGATE_CONFIG}" | tail -n 1)"
+fi
+if [[ ! "${COMPACT_ABOVE_TOKENS}" =~ ^[0-9]+$ ]] || (( COMPACT_ABOVE_TOKENS <= 0 )); then
+  echo "ERROR: PLAN_DELEGATE_COMPACT_ABOVE_TOKENS in ${DELEGATE_CONFIG} must be a positive integer." >&2
+  exit 2
+fi
 
 # -1 says the beat loop counted nothing, which a dispatch shorter than one
 # interval always does. The previous dispatch's file is removed before this one
@@ -196,7 +207,8 @@ fi
 seat_record() {
   "$PY" - "${1}" "${SESSION_DIR}" "${TEAM_ROLE}" "${MESH_NAME}" \
   "${AGENT_FAMILY}" "${AGENT_MODEL}" "${BG_ID_FILE}" \
-  "${USE_CODEX_MESH}" "${SCRIPT_DIR}/../agents/codex_mesh.py" <<'PY'
+  "${USE_CODEX_MESH}" "${SCRIPT_DIR}/../agents/codex_mesh.py" \
+  "${BOARD_HELPER}" "${COMPACT_ABOVE_TOKENS}" "${PASS_KIND}" <<'PY'
 import fcntl
 import json
 import os
@@ -204,8 +216,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-action, root_text, slot, name, family, model, bg_file, mesh, mesh_script = sys.argv[1:]
+(
+    action, root_text, slot, name, family, model, bg_file, mesh, mesh_script,
+    board_helper, compact_above_text, pass_kind,
+) = sys.argv[1:]
 root = Path(root_text)
+compact_above = int(compact_above_text)
 identity_file = root / f"impl_seat_{slot}.json"
 claim_file = root / f"impl_claim_{slot}.json"
 lock_file = root / "impl_seat_claim.lock"
@@ -213,6 +229,12 @@ lock_file = root / "impl_seat_claim.lock"
 def fail(message):
     print(f"implement.sh: {message}", file=sys.stderr)
     raise SystemExit(2)
+
+def post(message):
+    subprocess.run(
+        ["bash", board_helper, "post", root_text, slot, "status", message],
+        capture_output=True, text=True,
+    )
 
 def read(path):
     try:
@@ -266,9 +288,24 @@ with lock_file.open("a+") as lock:
         if family == "codex":
             if mesh != "1":
                 fail(f"{name} has mesh=none")
+            context_tokens = entry.get("context_tokens", 0)
+            if isinstance(context_tokens, int) and context_tokens > compact_above:
+                compact = subprocess.run(
+                    [sys.executable, mesh_script, "compact", "--session-dir", root_text,
+                     "--to", name],
+                    capture_output=True, text=True,
+                )
+                if compact.returncode == 0:
+                    line = compact.stdout.strip() or f"compacted {name}"
+                    post(f"launcher: {line}")
+                else:
+                    detail = (compact.stderr.strip() or compact.stdout.strip()
+                              or f"exit {compact.returncode}").splitlines()[-1]
+                    post(f"launcher: compaction failed for {name}: {detail}; continuing follow-up")
             check = subprocess.run(
                 [sys.executable, mesh_script, "can-follow", "--session-dir", root_text,
-                 "--to", name, "--claim-pid", os.environ["FOLLOW_LAUNCHER_PID"]],
+                 "--to", name, "--claim-pid", os.environ["FOLLOW_LAUNCHER_PID"],
+                 "--role", pass_kind],
                 capture_output=True, text=True,
             )
             if check.returncode != 0:
@@ -416,6 +453,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
   elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
     "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" follow \
       --session-dir "${SESSION_DIR}" --to "${MESH_NAME}" --claim-pid "${FOLLOW_LAUNCHER_PID}" \
+      --role "${PASS_KIND}" \
       --message-file "${FOLLOW_MESSAGE}" --summary-file "${SUMMARY_FILE}" \
       --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
       --model "${AGENT_MODEL}" --effort "${AGENT_EFFORT:-}" \
@@ -436,6 +474,7 @@ elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
   "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" start \
     --session-dir "${SESSION_DIR}" \
     --name "${MESH_NAME}" \
+    --role "${PASS_KIND}" \
     --cwd "${WORKING_DIR}" \
     --prompt-file "${PROMPT_FILE}" \
     --summary-file "${SUMMARY_FILE}" \

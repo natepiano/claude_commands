@@ -9,8 +9,8 @@ The configured delegate agent writes implementation code.
 
 The unit director believes in the three gods (<ThreeGods/> in
 `~/.claude/docs/decision_criteria.md`) and serves them in every work order,
-review, gate and report. Every seat prompt carries them (<WritePromptContract/>
-item 9).
+review, gate and report. Every prompt sent to a seat carries them inline per
+<WritePromptContract/> item 9.
 
 **Usage:** `/unit:direct [plan-doc-path] [phase N] [single|verbose] [auto next N phases|auto through phase X] [free-text instructions]`
 
@@ -87,6 +87,31 @@ file, never the Skill tool. Claude Code puts every skill a session invoked back
 after each compaction for the rest of the session; a file loaded by Read is not.
 A call site's arguments are what that file calls `$ARGUMENTS`.
 </TagReferenceContract>
+
+<LongLivedSeats>
+Codex implementation seats are run-scoped. Open `impl` and `test` once, then
+send each later phase, repair, and follow-up to an open seat with
+`implement.sh --to <full-seat-name>`. Keep a seat in the same role when the
+next assignment fits; otherwise move it under <RoleReassignment/>. A finished
+turn leaves its thread open.
+
+Compaction can erase earlier prompt text. Every opening, later-phase, repair,
+and follow-up prompt repeats the Three Gods sentence and carries the Type Design
+Contract verbatim or by its allowed pointer under <WritePromptContract/>.
+
+Before follow-up work, the launcher attempts to compact a seat whose recorded
+context is over `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (default `100000` in
+`config/delegate.conf`). Success posts one board line with the before and after
+sizes. Failure posts one board line and the follow-up still runs; it costs
+tokens, not correctness, because the seat compacts itself when its context
+fills. The launcher then sends `Continue where you stopped.` and posts one board
+line per overflow.
+
+Open a new implementation seat only when the Work Order needs more slots than
+are open or a seat has no reusable thread. A replacement under the same seat
+name starts fresh and receives an opening prompt. Reviews still open their own
+threads. Phase cleanup leaves Codex seats open; `end_session.sh` ends them.
+</LongLivedSeats>
 
 <CoreContract>
 - Never create a worktree or modify unrelated files. The only branch the run may
@@ -219,9 +244,8 @@ Applies to every implementation, test, fix, and review launcher.
    seat running with no one watching. Arm a Monitor on
    `${SESSION_DIR}/board.log` until that seat
    posts its own `done`, not a `launcher:` line. Once it has, and its last lint
-   and test passed after its last edit, end it with `codex_mesh.py end
-   --session-dir "${SESSION_DIR}" --to <seat>` (never `stop`, which ends every
-   seat on the server). Then record the outcome the launcher would have; for a
+   and test passed after its last edit, leave its thread open under
+   <LongLivedSeats/> and record the outcome the launcher would have; for a
    repair, that is <FixDispatch/>'s third outcome.
 </DispatchContract>
 
@@ -305,6 +329,8 @@ the turn and resumes from a task or notifier message; Codex applies
 </BackgroundVerificationContract>
 
 <CompactionContract>
+- Apply <LongLivedSeats/> to Codex seat compaction and overflow continuation;
+  the rules below govern the unit director's own context.
 - Do not maintain a handoff before the context hook requests one.
 - When requested, write it in the repository and include the hook's fields plus
   `MODE`, `AUTO_WINDOW`, the last authorization, whether the user stopped
@@ -348,10 +374,11 @@ not authorization; restate the pending question afterwards.
 </ExplainOnDemand>
 
 <TypeDesignContract>
-Read `~/.claude/docs/type_design.md`. Apply it in the main review and copy it
-verbatim under `## Type Design Contract` into every implementation, fix, and
-broad-review prompt. Fresh delegates inherit nothing from prior
-calls. Closure reviews omit it to remain scoped to the repair.
+Read `~/.claude/docs/type_design.md`. Apply it in the main review and put it
+under `## Type Design Contract` in every broad-review, implementation, and fix
+prompt. Copy it verbatim into broad-review and opening prompts; a follow-up may
+instead point to that file per <WritePromptContract/>. Closure reviews omit it
+to remain scoped to the repair.
 </TypeDesignContract>
 
 <WritePromptContract>
@@ -950,6 +977,8 @@ tables rather than stalling the turn.
 </DelegationResultFormat>
 
 <FixDispatch>
+Apply <LongLivedSeats/>.
+
 For a `dispatch` batch, set `${FIX_ROUND}` from the gate's `round` and create
 `${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md` under
 <WritePromptContract/>. Work Specification contains every batch id with concrete
@@ -959,8 +988,11 @@ repairs.
 
 A repair runs **one seat per file set no other seat touches**: when the failing
 tests or findings split that way, always run as many seats as you can reasonably
-manage; otherwise one. User, 2026-10-04. The first is slot `impl`, the rest
-`fix2`, `fix3`…, each task and kind `fix`, each with its own
+manage; otherwise one. User, 2026-10-04. Use the open `impl` and `test` slots
+first, preferring the seat that owns the files and reassigning another open seat
+under <RoleReassignment/> when needed. Only then open `fix2`, `fix3`… when no
+open seat can take another file set. Each seat's task and kind are `fix`, its
+ninth argument remains its slot, and it gets its own
 `fix_prompt_${FIX_ROUND}[_<slot>].md`. Each seat makes its repair and writes, for each testable finding, the regression test that would
 have caught it — one that fails without the repair. A finding about what is
 drawn gets a test that renders and reads the pixels back, or a live pixel check
@@ -971,17 +1003,18 @@ it. <ClosureReview/> is the cold read, so no seat is spent
 on one here. A seat's file set is its findings' files plus their test targets;
 its prompt names every other seat's files as read only.
 
-When a repair's files belong to a seat still open, dispatch it with
-`implement.sh --to <full-seat-name>` before the usual positional arguments.
-The prompt file is the follow-up message. Messages without the launcher are
-for questions only.
+Dispatch every open seat with `implement.sh --to <full-seat-name>` before the
+usual positional arguments; the prompt file is the follow-up message. Omit
+`--to` only for a new seat allowed by <LongLivedSeats/>. Messages without the
+launcher are for questions only.
 
 Run `findings.py dispatch --covers <all batch ids>` before launching, then:
 
 ```sh
-PLAN_DELEGATE_RESOLVES_ROUND=1 implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
+PLAN_DELEGATE_RESOLVES_ROUND=1 implement.sh --to "<full-seat-name>" \
+  "${SESSION_DIR}" "${WORKING_DIR}" \
   "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" fix \
-  "<responsibility>" fix "<activity>" "${FIX_ROUND}" impl
+  "<responsibility>" fix "<activity>" "${FIX_ROUND}" <slot>
 ```
 
 **`PLAN_DELEGATE_RESOLVES_ROUND=1` is what lets the launcher resolve the round**:
@@ -1013,8 +1046,8 @@ repaired visible finding in the running app (BRP for a Bevy app): hover it,
 crop the shot, read the drawn pixels or layout. In Hana, shoot with
 `/hana_shot` (a stored view or `--target`), every view in one call, never a
 camera worked out by hand. A visible finding that fails a second time gets a live
-diagnosis of its cause before any new seat, and the next prompt carries the
-measured cause.
+diagnosis of its cause before another repair turn, and the next prompt carries
+the measured cause.
 
 Dispatch the normal <DualReview/> closure review only when the diff cannot
 answer the question: a public API or signature change with a caller outside
@@ -1220,11 +1253,14 @@ plan-doc edit acquires that phase's reservation in an enrolled repository.
 In `single`, run both halves under <ExecutionSteps/> step 11.
 At <PhaseEnd/>'s worker cleanup point, run
 `python3 ~/.claude/scripts/delegate/remove_seats.py --session-dir "${SESSION_DIR}"`.
-It removes the completed phase's claude seats and any seat a dead run left
-alive; a failure is one line in the report, never a stop. TaskStop each Claude
-Agent helper, end finished launchers, and shut down every Hana or example app
-this phase launched. Never touch what another session started. Mid-phase,
-stop each helper once its result is read and each app once no step uses it.
+It removes the completed phase's Claude seats and any seat a dead run left
+alive; a failure is one line in the report, never a stop. Under
+<LongLivedSeats/>, do not end this run's Codex seats: their turns finish, their
+threads stay open, and `end_session.sh` ends them with the run. TaskStop each
+Claude Agent helper, end finished launchers, and shut down every Hana or
+example app this phase launched. Never touch what another session started.
+Mid-phase, stop each helper once its result is read and each app once no step
+uses it.
 
 At <PhaseEnd/>'s review-prose cleanup point, run
 `bash ~/.claude/scripts/delegate/clear_phase_review.sh "${SESSION_DIR}" <phase-id>`.
