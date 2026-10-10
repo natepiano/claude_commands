@@ -29,8 +29,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, cast
 
-from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated, UserAction,
-                         first_line, parse_user_action, refused_at)
+from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
+                         ActionUnstated, UserAction, first_line, parse_user_action, refused_at)
 
 API_URL = "https://api.pushover.net/1/messages.json"
 KEYS_FILE = Path.home() / ".config" / "pushover" / "env"
@@ -202,9 +202,11 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
         if isinstance(action, ActionRequired) and len(action.text) > ACTION_TEXT_MAX:
             return refuse(source, priority, title, message,
                           f"--action may hold at most {ACTION_TEXT_MAX} characters")
-        refusal = refused_at(action, int(priority))
-        if refusal is not None:
-            return refuse(source, priority, title, message, refusal.reason)
+        match refused_at(action, int(priority)):
+            case ActionRefused(reason):
+                return refuse(source, priority, title, message, reason)
+            case ActionAllowed():
+                pass
         unstated = False
         message = posted_message(action, arguments["message"])
     keys = read_keys(keys_file)

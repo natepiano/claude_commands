@@ -17,8 +17,8 @@ from typing import cast, override
 from unittest import mock
 
 import pushover
-from user_action import (FIX, ActionRefused, ActionRequired, ActionUnstated, NoActionRequired,
-                         first_line, parse_user_action, refused_at)
+from user_action import (FIX, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,
+                         NoActionRequired, first_line, parse_user_action, refused_at)
 
 
 class UserActionTests(unittest.TestCase):
@@ -33,14 +33,14 @@ class UserActionTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsInstance(parse_user_action(text, False), ActionRefused)
 
-    def test_only_normal_priority_may_need_no_action(self) -> None:
+    def test_action_policy_returns_named_allowed_and_refused_states(self) -> None:
         none = NoActionRequired()
         required = ActionRequired("reset Codex")
-        self.assertIsNone(refused_at(none, 0))
+        self.assertEqual(refused_at(none, 0), ActionAllowed())
         self.assertIsInstance(refused_at(none, 1), ActionRefused)
         self.assertIsInstance(refused_at(none, 2), ActionRefused)
         for priority in (0, 1, 2):
-            self.assertIsNone(refused_at(required, priority))
+            self.assertEqual(refused_at(required, priority), ActionAllowed())
 
     def test_first_line_states_the_action(self) -> None:
         self.assertEqual(first_line(ActionRequired("choose a branch")), "Action: choose a branch")

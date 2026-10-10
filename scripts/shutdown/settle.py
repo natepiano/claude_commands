@@ -47,7 +47,7 @@ from record import (
 from remote import other_machine, run_remote
 import showrunner_footer
 import stop as stop_work
-from user_action import ActionRequired, NoActionRequired, UserAction
+from user_action import ActionRequired
 
 SHUTDOWN = Path(__file__).resolve().parent / "shutdown.py"
 NOTIFIER = SCRIPTS / "message" / "notifier.sh"
@@ -56,7 +56,6 @@ SETTLE_INTERVAL_SECONDS = 15
 SETTLE_RETRY_SECONDS = 300
 FIRST_HOLDOUT_ALERT = timedelta(minutes=20)
 REPEAT_HOLDOUT_ALERT = timedelta(minutes=60)
-_NO_ACTION_REQUIRED = NoActionRequired()
 
 
 class RemoteUnavailable(TypedDict):
@@ -290,35 +289,9 @@ def run_notifier(verb: str, instance: str) -> None:
         )
 
 
-def send_message(
-    recipient: str,
-    summary: str,
-    text: str,
-    *,
-    action: UserAction,
-    need: Literal["note", "decision", "blocked"] = "note",
-    machine: str = "",
-    key: str = "",
+def _deliver_message(
+    command: list[str], recipient: str, text: str
 ) -> MessageDelivery:
-    command = [
-        *_send_command(),
-        "--to",
-        recipient,
-        "--from",
-        "shutdown",
-        "--summary",
-        summary,
-    ]
-    if key:
-        command.extend(("--key", key))
-    if recipient == "user":
-        command.extend(("--need", need))
-        if isinstance(action, ActionRequired):
-            command.extend(("--action", action.text))
-        else:
-            command.append("--no-action")
-    if machine:
-        command.extend(("--machine", machine))
     result = subprocess.run(
         command,
         input=text,
@@ -345,6 +318,33 @@ def send_message(
     )
 
 
+def send_message(
+    recipient: str,
+    summary: str,
+    text: str,
+    *,
+    machine: str = "",
+    key: str = "",
+) -> MessageDelivery:
+    """Send a shutdown message to a session, never to the user."""
+    if recipient == "user":
+        raise ValueError("user messages require alert_user")
+    command = [
+        *_send_command(),
+        "--to",
+        recipient,
+        "--from",
+        "shutdown",
+        "--summary",
+        summary,
+    ]
+    if key:
+        command.extend(("--key", key))
+    if machine:
+        command.extend(("--machine", machine))
+    return _deliver_message(command, recipient, text)
+
+
 def alert_user(
     scope: ShutdownScope,
     summary: str,
@@ -356,14 +356,22 @@ def alert_user(
     """Ask the user to act for an account-wide shutdown."""
     if scope["kind"] == "selected":
         return
-    _ = send_message(
+    command = [
+        *_send_command(),
+        "--to",
         "user",
+        "--from",
+        "shutdown",
+        "--summary",
         summary,
-        text,
-        action=action,
-        need="decision",
-        machine=machine,
-    )
+        "--need",
+        "decision",
+        "--action",
+        action.text,
+    ]
+    if machine:
+        command.extend(("--machine", machine))
+    _ = _deliver_message(command, "user", text)
 
 
 def _notifier_enabled(instance: str) -> bool:
@@ -674,7 +682,6 @@ def _send_settle_message(record: ShutdownRecord, entry: ShutdownSessionEntry) ->
         f"session:{session['session_id']}",
         f"Shutdown of {record['label']}: reach a safe stop",
         _settle_text(record, session),
-        action=_NO_ACTION_REQUIRED,
         key=f"shutdown-{record['login']}-{session['session_id']}",
     )
     at = record_time()
@@ -1040,7 +1047,6 @@ def _send_holdout_alert(
             f"session:{session_id}",
             summary,
             text,
-            action=_NO_ACTION_REQUIRED,
         )
 
 
@@ -1334,7 +1340,6 @@ def report_stop(
                 f"session:{requested_by['session_id']}",
                 summary,
                 text,
-                action=_NO_ACTION_REQUIRED,
                 key=f"shutdown-result-{claimed['login']}",
             )
 
@@ -1429,7 +1434,6 @@ def _restore_record(record: ShutdownRecord) -> None:
                 f"session:{entry['session']['session_id']}",
                 f"Shutdown of {record['label']} cancelled",
                 f"Shutdown of {record['label']} cancelled by the user: continue where you were.",
-                action=_NO_ACTION_REQUIRED,
                 key=(
                     f"shutdown-{record['login']}-"
                     f"{entry['session']['session_id']}"

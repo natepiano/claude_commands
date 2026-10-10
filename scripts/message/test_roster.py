@@ -234,6 +234,10 @@ class RosterTests(unittest.TestCase):
                 "thread_id": "thread-lens", "turn_id": "turn-2", "status": "running",
                 "launcher_pid": os.getpid(), "role": "review", "lens": "adversary",
             },
+            "alpha-review-plain": {
+                "thread_id": "thread-review", "turn_id": "turn-3", "status": "running",
+                "launcher_pid": os.getpid(), "role": "review",
+            },
             "alpha-ended": {"thread_id": "thread-ended", "status": "ended"},
         })
 
@@ -249,6 +253,7 @@ class RosterTests(unittest.TestCase):
                 "thread_id": "thread-orphan", "turn_id": "turn-orphan", "status": "running",
                 "launcher_pid": os.getpid(),
             },
+            "orphan-fix": {"thread_id": "thread-orphan-fix", "status": "done"},
         })
         (orphan_run / "heartbeat.log").touch()
 
@@ -282,6 +287,12 @@ class RosterTests(unittest.TestCase):
             "reviewed\n", encoding="utf-8"
         )
         _ = (self.director_run / "review_pid_contract").write_text(
+            f"{os.getpid()}\n", encoding="utf-8"
+        )
+        _ = (self.director_run / "review_status").write_text(
+            "reviewing\n", encoding="utf-8"
+        )
+        _ = (self.director_run / "review_pid").write_text(
             f"{os.getpid()}\n", encoding="utf-8"
         )
         _ = self.ps_state.write_text(
@@ -323,12 +334,24 @@ class RosterTests(unittest.TestCase):
         unit: str = "", director: str = "", director_address: str = "",
         session_dir: str = "",
     ) -> roster.RosterEntry:
+        showrunner_link: roster.ShowrunnerRelationship = (
+            roster.UnderShowrunner("production", showrunner, showrunner_address)
+            if showrunner else roster.NoShowrunner()
+        )
+        director_link: roster.DirectorRelationship = (
+            roster.UnderDirector(unit, director, director_address)
+            if director else roster.NoDirector()
+        )
+        if role == "unit director" and unit:
+            director_link = roster.DirectsUnit(unit)
+        assignment: roster.Assignment = (
+            roster.WorkerAssignment("impl", session_dir)
+            if role == "worker" else roster.NotAWorker()
+        )
         return roster.RosterEntry(
             machine="machine", kind=kind, role=role, name=name, status="running",
-            address=address, cwd=cwd, production="production", showrunner=showrunner,
-            showrunner_address=showrunner_address, unit=unit, director=director,
-            director_address=director_address,
-            slot_role="impl" if role == "worker" else "", session_dir=session_dir,
+            reach=roster.Messageable(address), cwd=cwd, showrunner=showrunner_link,
+            director=director_link, assignment=assignment,
         )
 
     def test_every_role_and_status_is_returned_with_its_relationships(self) -> None:
@@ -337,25 +360,31 @@ class RosterTests(unittest.TestCase):
 
         self.assertEqual(entries["runner"], roster.RosterEntry(
             machine=machine, kind="claude", role="showrunner", name="runner",
-            status="ready", address="session:sid-runner",
-            cwd=str(self.home / "projects" / "runner"), production="alpha",
-            showrunner="", showrunner_address="", unit="", director="",
-            director_address="", slot_role="", session_dir="",
+            status="ready", reach=roster.Messageable("session:sid-runner"),
+            cwd=str(self.home / "projects" / "runner"),
+            showrunner=roster.RunsProduction("alpha"),
+            director=roster.NoDirector(),
+            assignment=roster.NotAWorker(),
         ))
         self.assertEqual(entries["director"], roster.RosterEntry(
             machine=machine, kind="claude", role="unit director", name="director",
-            status="working", address="session:sid-director",
-            cwd=str(self.home / "projects" / "unit-one"), production="alpha",
-            showrunner="runner", showrunner_address="session:sid-runner", unit="unit-one",
-            director="", director_address="", slot_role="", session_dir="",
+            status="working", reach=roster.Messageable("session:sid-director"),
+            cwd=str(self.home / "projects" / "unit-one"),
+            showrunner=roster.UnderShowrunner(
+                "alpha", "runner", "session:sid-runner",
+            ),
+            director=roster.DirectsUnit("unit-one"),
+            assignment=roster.NotAWorker(),
         ))
         self.assertEqual(entries["claude-worker"].role, "worker")
-        self.assertEqual(entries["claude-worker"].director, "director")
-        self.assertEqual(entries["claude-worker"].director_address, "session:sid-director")
-        self.assertEqual(entries["claude-worker"].slot_role, "test")
-        self.assertEqual(entries["claude-worker"].session_dir, str(self.director_run))
+        self.assertEqual(entries["claude-worker"].director, roster.UnderDirector(
+            "unit-one", "director", "session:sid-director",
+        ))
+        self.assertEqual(entries["claude-worker"].assignment, roster.WorkerAssignment(
+            "test", str(self.director_run),
+        ))
         self.assertEqual(entries["solo-director"].role, "unit director")
-        self.assertEqual(entries["solo-director"].production, "")
+        self.assertEqual(entries["solo-director"].showrunner, roster.NoShowrunner())
         self.assertEqual(entries["free-claude"].role, "freestanding")
         self.assertNotIn("old-free-name", entries)
 
@@ -371,23 +400,47 @@ class RosterTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(entries[name].status, status)
                 self.assertEqual(entries[name].role, "worker")
-                self.assertEqual(entries[name].director, "director")
-                self.assertEqual(entries[name].production, "alpha")
-                self.assertEqual(entries[name].showrunner, "runner")
-                self.assertEqual(entries[name].unit, "unit-one")
-                self.assertEqual(entries[name].address, name)
-        self.assertEqual(entries["alpha-research"].slot_role, "review (adversary)")
-        self.assertEqual(entries["alpha-impl"].slot_role, "role unknown")
-        self.assertEqual(entries["adversary reviewer"].slot_role, "review (adversary)")
-        self.assertEqual(entries["adversary reviewer"].address, "")
+                self.assertEqual(entries[name].director, roster.UnderDirector(
+                    "unit-one", "director", "session:sid-director",
+                ))
+                self.assertEqual(entries[name].showrunner, roster.UnderShowrunner(
+                    "alpha", "runner", "session:sid-runner",
+                ))
+                expected_reach: roster.MessageReach = (
+                    roster.Messageable(f"seat:director-run/{name}")
+                    if name in ("alpha-impl", "alpha-wait")
+                    else roster.CannotReceiveMessages(
+                        "between turns; its unit director resumes it"
+                    )
+                )
+                self.assertEqual(entries[name].reach, expected_reach)
+        self.assertEqual(
+            entries["alpha-research"].assignment,
+            roster.WorkerAssignment("review (adversary)", str(self.director_run)),
+        )
+        self.assertEqual(
+            entries["alpha-impl"].assignment,
+            roster.WorkerAssignment("no role", str(self.director_run)),
+        )
+        self.assertEqual(
+            entries["adversary reviewer"].assignment,
+            roster.WorkerAssignment("review (adversary)", str(self.director_run)),
+        )
+        self.assertEqual(
+            entries["adversary reviewer"].reach,
+            roster.CannotReceiveMessages("blind reviewer"),
+        )
         self.assertNotIn("contract reviewer", entries)
-        self.assertEqual(entries["orphan-impl"].director, "")
+        self.assertEqual(entries["orphan-impl"].director, roster.NoDirector())
         self.assertNotIn("alpha-ended", entries)
         self.assertNotIn("dead-impl", entries)
         self.assertNotIn("stale-impl", entries)
 
         self.assertEqual(entries["Codex window"].role, "freestanding")
-        self.assertEqual(entries["Codex window"].address, "codex:thread-window")
+        self.assertEqual(
+            entries["Codex window"].reach,
+            roster.Messageable("codex:thread-window"),
+        )
         self.assertNotIn("worker duplicate", entries)
 
     def test_text_nests_workers_and_marks_this_session(self) -> None:
@@ -412,16 +465,138 @@ class RosterTests(unittest.TestCase):
         worker = self._entries()["claude-worker"]
         self.assertTrue(WORKER_SESSION_ID.startswith("12345678"))
         self.assertEqual(
-            (worker.role, worker.director, worker.director_address, worker.session_dir),
-            ("worker", "director", "session:sid-director", str(self.director_run)),
+            (worker.role, worker.director, worker.assignment),
+            (
+                "worker",
+                roster.UnderDirector("unit-one", "director", "session:sid-director"),
+                roster.WorkerAssignment("test", str(self.director_run)),
+            ),
         )
 
     def test_codex_review_lens_uses_role_and_lens_fields(self) -> None:
         entry = self._entries()["alpha-research"]
-        self.assertEqual(entry.slot_role, "review (adversary)")
+        self.assertEqual(
+            entry.assignment,
+            roster.WorkerAssignment("review (adversary)", str(self.director_run)),
+        )
 
-    def test_codex_worker_without_recorded_role_is_unknown(self) -> None:
-        self.assertEqual(self._entries()["alpha-impl"].slot_role, "role unknown")
+    def test_codex_review_without_lens_uses_its_role(self) -> None:
+        entry = self._entries()["alpha-review-plain"]
+        self.assertEqual(
+            entry.assignment,
+            roster.WorkerAssignment("review", str(self.director_run)),
+        )
+
+    def test_codex_worker_without_recorded_role_has_no_role(self) -> None:
+        self.assertEqual(
+            self._entries()["alpha-impl"].assignment,
+            roster.WorkerAssignment("no role", str(self.director_run)),
+        )
+
+    def test_own_production_and_unit_are_not_links_to_blank_sessions(self) -> None:
+        entries = self._entries()
+
+        self.assertEqual(entries["runner"].showrunner, roster.RunsProduction("alpha"))
+        self.assertEqual(entries["director"].director, roster.DirectsUnit("unit-one"))
+        self.assertNotIsInstance(entries["runner"].showrunner, roster.UnderShowrunner)
+        self.assertNotIsInstance(entries["director"].director, roster.UnderDirector)
+        for entry in entries.values():
+            if isinstance(entry.showrunner, roster.UnderShowrunner):
+                self.assertTrue(entry.showrunner.name)
+                self.assertTrue(entry.showrunner.address)
+            if isinstance(entry.director, roster.UnderDirector):
+                self.assertTrue(entry.director.name)
+                self.assertTrue(entry.director.address)
+
+        result, lines, errors = self._run_main("--json")
+        self.assertEqual((result, errors), (0, []))
+        document = cast(dict[str, object], json.loads("\n".join(lines)))
+        rows = cast(list[dict[str, object]], document["entries"])
+        by_name = {cast(str, row["name"]): row for row in rows}
+        self.assertEqual(
+            (
+                by_name["runner"]["production"],
+                by_name["runner"]["showrunner"],
+                by_name["runner"]["showrunner_address"],
+            ),
+            ("alpha", "", ""),
+        )
+        self.assertEqual(
+            (
+                by_name["director"]["unit"],
+                by_name["director"]["director"],
+                by_name["director"]["director_address"],
+            ),
+            ("unit-one", "", ""),
+        )
+
+    def test_seat_between_turns_cannot_receive_messages(self) -> None:
+        entry = self._entries()["alpha-fix"]
+
+        self.assertEqual(entry.status, "idle")
+        self.assertEqual(
+            entry.reach,
+            roster.CannotReceiveMessages(
+                "between turns; its unit director resumes it"
+            ),
+        )
+
+        result, lines, errors = self._run_main("--json")
+        self.assertEqual((result, errors), (0, []))
+        document = cast(dict[str, object], json.loads("\n".join(lines)))
+        rows = cast(list[dict[str, object]], document["entries"])
+        by_name = {cast(str, row["name"]): row for row in rows}
+        self.assertEqual(by_name["alpha-fix"]["address"], "")
+
+    def test_seat_between_turns_without_running_director_says_so(self) -> None:
+        entry = self._entries()["orphan-fix"]
+
+        self.assertEqual(entry.status, "idle")
+        self.assertEqual(entry.director, roster.NoDirector())
+        self.assertEqual(
+            entry.reach,
+            roster.CannotReceiveMessages(
+                "between turns; no unit director is running"
+            ),
+        )
+
+        result, lines, errors = self._run_main("--json")
+        self.assertEqual((result, errors), (0, []))
+        document = cast(dict[str, object], json.loads("\n".join(lines)))
+        rows = cast(list[dict[str, object]], document["entries"])
+        by_name = {cast(str, row["name"]): row for row in rows}
+        self.assertEqual(by_name["orphan-fix"]["address"], "")
+
+    def test_same_seat_name_in_two_live_runs_has_two_unique_addresses(self) -> None:
+        second_run = self.delegate / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        self._write_mesh(second_run, {
+            "alpha-impl": {
+                "thread_id": "thread-other-run", "turn_id": "turn-other-run",
+                "status": "running", "launcher_pid": os.getpid(), "role": "impl",
+            },
+        })
+        (second_run / "heartbeat.log").touch()
+
+        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+            found = roster.roster(os.environ)
+
+        duplicate_seats = [entry for entry in found.entries if entry.name == "alpha-impl"]
+        self.assertEqual(len(duplicate_seats), 2)
+        self.assertEqual(
+            {entry.reach for entry in duplicate_seats},
+            {
+                roster.Messageable("seat:director-run/alpha-impl"),
+                roster.Messageable(
+                    "seat:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/alpha-impl"
+                ),
+            },
+        )
+        addresses = [
+            entry.reach.address
+            for entry in found.entries
+            if isinstance(entry.reach, roster.Messageable)
+        ]
+        self.assertEqual(len(addresses), len(set(addresses)))
 
     def test_newer_dead_record_does_not_supply_live_session_details(self) -> None:
         dead_cwd = self.home / "projects" / "dead-resume"
@@ -441,8 +616,14 @@ class RosterTests(unittest.TestCase):
         )
         with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
             entries = roster.roster(os.environ).entries
-        real = next(entry for entry in entries if entry.address == "session:sid-runner")
-        imposter = next(entry for entry in entries if entry.address == "session:sid-imposter")
+        real = next(
+            entry for entry in entries
+            if entry.reach == roster.Messageable("session:sid-runner")
+        )
+        imposter = next(
+            entry for entry in entries
+            if entry.reach == roster.Messageable("session:sid-imposter")
+        )
         self.assertEqual((real.role, imposter.role), ("showrunner", "freestanding"))
 
     def test_duplicate_display_names_keep_each_hierarchy_on_its_identity(self) -> None:
@@ -454,21 +635,21 @@ class RosterTests(unittest.TestCase):
         )
         director_a = self._entry(
             "same-director", "unit director", "session:director-a",
-            showrunner="same-runner", showrunner_address=runner_a.address, unit="unit-a",
+            showrunner="same-runner", showrunner_address="session:runner-a", unit="unit-a",
         )
         director_b = self._entry(
             "same-director", "unit director", "session:director-b",
-            showrunner="same-runner", showrunner_address=runner_b.address, unit="unit-b",
+            showrunner="same-runner", showrunner_address="session:runner-b", unit="unit-b",
         )
         worker_a = self._entry(
             "worker-a", "worker", "worker-a", kind="codex",
-            showrunner="same-runner", showrunner_address=runner_a.address,
-            unit="unit-a", director="same-director", director_address=director_a.address,
+            showrunner="same-runner", showrunner_address="session:runner-a",
+            unit="unit-a", director="same-director", director_address="session:director-a",
         )
         worker_b = self._entry(
             "worker-b", "worker", "worker-b", kind="codex",
-            showrunner="same-runner", showrunner_address=runner_b.address,
-            unit="unit-b", director="same-director", director_address=director_b.address,
+            showrunner="same-runner", showrunner_address="session:runner-b",
+            unit="unit-b", director="same-director", director_address="session:director-b",
         )
         output, errors = io.StringIO(), io.StringIO()
         fixture = roster.Roster(
@@ -497,8 +678,20 @@ class RosterTests(unittest.TestCase):
             entries = self._entries()
         reviewer = entries["adversary reviewer"]
         self.assertEqual(
-            (reviewer.kind, reviewer.role, reviewer.slot_role, reviewer.address, reviewer.cwd),
-            ("codex", "worker", "review (adversary)", "", "/review/cwd"),
+            (reviewer.kind, reviewer.role, reviewer.assignment, reviewer.reach, reviewer.cwd),
+            (
+                "codex", "worker",
+                roster.WorkerAssignment("review (adversary)", str(self.director_run)),
+                roster.CannotReceiveMessages("blind reviewer"), "/review/cwd",
+            ),
+        )
+        blind_reviewer = entries["blind reviewer"]
+        self.assertEqual(
+            (blind_reviewer.assignment, blind_reviewer.reach),
+            (
+                roster.WorkerAssignment("review", str(self.director_run)),
+                roster.CannotReceiveMessages("blind reviewer"),
+            ),
         )
         self.assertNotIn("contract reviewer", entries)
 
@@ -525,8 +718,18 @@ class RosterTests(unittest.TestCase):
         self.assertTrue(rows)
         self.assertTrue(all(set(row) == ENTRY_FIELDS for row in rows))
         self.assertTrue(all(all(isinstance(value, str) for value in row.values()) for row in rows))
+        by_name = {cast(str, row["name"]): row for row in rows}
+        self.assertEqual(by_name["adversary reviewer"]["address"], "")
+        for field in (
+            "production", "showrunner", "showrunner_address", "unit", "director",
+            "director_address", "slot_role", "session_dir",
+        ):
+            self.assertEqual(by_name["free-claude"][field], "")
 
-        entry = roster.RosterEntry(*("" for _field in ENTRY_FIELDS))
+        entry = roster.RosterEntry(
+            "", "", "", "", "", roster.Messageable(""), "",
+            roster.NoShowrunner(), roster.NoDirector(), roster.NotAWorker(),
+        )
         with self.assertRaises(FrozenInstanceError):
             entry.name = "changed"  # pyright: ignore[reportAttributeAccessIssue]
         result_value = roster.Roster([], [])
@@ -545,12 +748,18 @@ class RosterTests(unittest.TestCase):
         director = next(entry for entry in found.entries if entry.name == "director")
         worker_entry = next(entry for entry in found.entries if entry.name == "claude-worker")
         self.assertEqual(
-            (director.role, director.production, director.showrunner, director.unit),
-            ("unit director", "alpha", "runner", "unit-one"),
+            (director.role, director.showrunner),
+            (
+                "unit director",
+                roster.UnderShowrunner("alpha", "runner", "session:sid-runner"),
+            ),
         )
         self.assertEqual(
-            (worker_entry.role, worker_entry.director, worker_entry.unit),
-            ("worker", "director", "unit-one"),
+            (worker_entry.role, worker_entry.director),
+            (
+                "worker",
+                roster.UnderDirector("unit-one", "director", "session:sid-director"),
+            ),
         )
         self.assertTrue(any("tmux" in problem.lower() for problem in found.problems))
 

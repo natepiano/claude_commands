@@ -438,8 +438,8 @@ def write_result(result: MacOffloadResult, destination: ResultDestination) -> in
         reason = ""
         status = result.status
         print(
-            "mac_test: this ran on the Mac (macOS). A failure that looks "
-            + "unrelated to your change may be a macOS difference; rerun with "
+            "mac_test: this ran on the Mac (macOS). Treat the failure as real "
+            + "and fix it; only a test that must run on Linux may rerun with "
             + "--local to run it on natedev."
         )
     elif isinstance(result, LostMacRun):

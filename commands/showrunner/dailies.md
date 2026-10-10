@@ -176,6 +176,7 @@ The builder's output, which the renderer consumes:
 | `length` | `gantt`, `simple`, `page` or `elaborate`, from the argument. |
 | `zone` | `ZONE`, as an IANA name. |
 | `next_run` | The next scheduled run, `HH:MM` in `ZONE`, after any restart. Leave it out when no schedule runs. |
+| `counts` | The builder's, from `~/.claude/config/dailies.conf`: each `label` with its `count`, or `not_found: true` when its file is missing. Leave it to the builder; a production with no lines there has none. |
 | `unit` | The Units table's unit id, never the session's current name. The builder joins on this id. |
 | `name` | The plan the unit runs, when its session name does not say it (a lane that took on another plan): `hana_organon`. Defaults to `unit`. |
 | `label` | The timeline row name, at most 8 characters. Defaults to the unit name without `-unit`. |
@@ -225,7 +226,10 @@ unless it names another plan's document. User, 2026-10-02.
 ### What the renderer writes
 
 - **First line:** the length and the time in `ZONE`: `**Dailies (Simple)**, 19:05 PDT`.
-- **`gantt`:** the first line, the chart and the last lines, and above the chart only two things. A subject
+- **Counts:** the production's own counts from `dailies.conf`, on one line just above the chart in every
+  length, `gantt` included: `counts: nightly queue 8 · proposals 3`. A count whose file is missing reads
+  `not found`. None configured, no line. User, 2026-10-10.
+- **`gantt`:** the first line, the counts line, the chart and the last lines, and above the chart only two other things. A subject
   that needs the user keeps its full section. A unit that changed since the last report gets one line for each
   change: `- <unit>: now on <phase>`, `- <unit>: checkpoint not merged, because ...` or `checkpoint no longer
   held`, `- <unit>: eta ...` when the ETA moved 15 minutes or more, and `- <unit>: no longer in the report`.

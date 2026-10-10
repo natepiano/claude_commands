@@ -1210,6 +1210,21 @@ class AddUnitTests(unittest.TestCase):
         self.assertIsInstance(ordinary_resume.launch_kind, add_unit.NewWorkLaunch)
         self.assertIsInstance(new_work.launch_kind, add_unit.NewWorkLaunch)
 
+    def test_a_name_ending_in_unit_launches_as_the_name_without_it(self) -> None:
+        def request(name: str) -> tuple[str, str, Path, str]:
+            launched = add_unit.launch_request(argparse.Namespace(
+                production=str(self.doc), name=name, plan="docs/plans/given.md", brief=None,
+                standby=False, port=None, owns=None, timeout=90.0, check=False, resume=None,
+                cwd=None, restart_note=None, session_name=None, tmux_session=None,
+            ))
+            return launched.unit, launched.branch, launched.worktree, launched.requested_name
+
+        expected = request("feature-log")
+        self.assertEqual(expected[0], "feature-log-unit")
+        self.assertEqual(request("feature-log-unit"), expected)
+        self.assertEqual(request("feature_log_unit"), request("feature_log"))
+        self.assertEqual(request("unit")[0], "unit-unit")
+
     def test_restore_flags_are_atomic_and_require_resume(self) -> None:
         note = self.root / "restart-note.txt"
         _ = note.write_text("resume here", encoding="utf-8")
