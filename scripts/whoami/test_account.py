@@ -117,6 +117,50 @@ class AccountTests(unittest.TestCase):
 
         self.assertEqual(label, "unlisted@example.com")
 
+    def test_named_claude_account_resolves_label_and_login(self) -> None:
+        self.write_note("claude 2.md", "person@example.com")
+        with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.notes)}):
+            by_label = account.named_claude_account("CLAUDE 2")
+            by_login = account.named_claude_account("other@example.com")
+
+        self.assertEqual(
+            by_label,
+            account.Account("claude", "person@example.com", "claude 2"),
+        )
+        self.assertEqual(
+            by_login,
+            account.Account("claude", "other@example.com", "other@example.com"),
+        )
+
+    def test_named_claude_account_rejects_unknown_name(self) -> None:
+        with (
+            patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.notes)}),
+            self.assertRaisesRegex(
+                account.UnknownAccountName,
+                "unknown account claude2: give a note label such as claude 2, or a login",
+            ),
+        ):
+            _ = account.named_claude_account("claude2")
+
+    def test_named_claude_account_rejects_path_containing_at_sign(self) -> None:
+        with (
+            patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.notes)}),
+            self.assertRaises(account.UnknownAccountName),
+        ):
+            _ = account.named_claude_account("/tmp/x@example.com")
+
+    def test_own_claude_account_raises_when_login_is_unreadable(self) -> None:
+        config_dir = self.root / "empty-config"
+        config_dir.mkdir()
+        with (
+            patch.object(account, "claude_config_dir", return_value=config_dir),
+            self.assertRaisesRegex(
+                account.UnreadableAccount,
+                "this process's Claude account is unreadable",
+            ),
+        ):
+            _ = account.own_claude_account()
+
     def test_process_config_dir_reads_set_variable_from_linux_process_environment(self) -> None:
         environ = b"USER=test\0CLAUDE_CONFIG_DIR=/tmp/claude-two\0PATH=/usr/bin\0"
 

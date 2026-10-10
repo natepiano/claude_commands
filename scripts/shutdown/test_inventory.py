@@ -438,17 +438,32 @@ elif "comm=" in joined:
         by_id = {session["session_id"]: session for session in found["sessions"]}
         self.assertEqual(set(by_id), {DIRECTOR_ID, UNIT_ID, SEAT_ID, DESKTOP_ID})
         self.assertNotIn(OTHER_ID, by_id)
-        self.assertEqual(found["unknown"], [f"{UNKNOWN_PID} hidden-account"])
+        self.assertEqual(
+            found["unattributed"],
+            [
+                {
+                    "pid": UNKNOWN_PID,
+                    "name": "hidden-account",
+                    "reason": "account unreadable",
+                }
+            ],
+        )
 
-        director = by_id[DIRECTOR_ID]
+        director = cast(inventory.ShowrunnerSession, by_id[DIRECTOR_ID])
         self.assertEqual(director["kind"], "showrunner")
         self.assertEqual(director["status"], "idle")
-        self.assertEqual(director["model"], "director-model")
+        self.assertEqual(
+            director["model"], {"kind": "model", "name": "director-model"}
+        )
         self.assertEqual(director["timers"], ["showrunner-build-followups"])
         self.assertEqual(director["host"]["kind"], "ghostty")
-        self.assertEqual(director["host"].get("desktop"), "Production")
         self.assertEqual(
-            director["host"].get("doc"), str(self.root / "build-followups-production.md")
+            director["host"].get("desktop"),
+            {"kind": "named", "name": "Production"},
+        )
+        self.assertEqual(director["production"], "build-followups")
+        self.assertEqual(
+            director["doc"], str(self.root / "build-followups-production.md")
         )
         self.assertEqual(director["run_dirs"], [str(self.delegate / "phase-two")])
         self.assertEqual(
@@ -462,9 +477,11 @@ elif "comm=" in joined:
             ],
         )
 
-        unit = by_id[UNIT_ID]
+        unit = cast(inventory.UnitSession, by_id[UNIT_ID])
         self.assertEqual(unit["kind"], "unit")
-        self.assertEqual(unit["model"], "unit-model")
+        self.assertEqual(
+            unit["model"], {"kind": "model", "name": "unit-model"}
+        )
         self.assertEqual(unit["timers"], ["unit-reminder"])
         self.assertEqual(
             unit["host"],
@@ -473,30 +490,32 @@ elif "comm=" in joined:
                 "production": "build-followups",
                 "unit": "shutdown-unit",
                 "doc": str(self.root / "build-followups-production.md"),
-                "plan": "docs/shutdown-plan.md",
+                "plan": {"kind": "plan", "path": "docs/shutdown-plan.md"},
                 "tmux_session": "unit-renamed",
             },
         )
         self.assertEqual(
             unit["checkout"],
             {
+                "kind": "git",
                 "path": str(self.checkout),
-                "branch": "shutdown-unit",
-                "head": self.head,
-                "ahead": 2,
+                "head": {"kind": "branch", "name": "shutdown-unit"},
+                "upstream": {"kind": "tracking", "ahead": 2},
                 "dirty": ["dirty.txt"],
             },
         )
 
-        seat = by_id[SEAT_ID]
+        seat = cast(inventory.SeatSession, by_id[SEAT_ID])
         self.assertEqual(seat["kind"], "seat")
-        self.assertEqual(seat["owner"], DIRECTOR_ID)
+        self.assertEqual(
+            seat["owner"], {"kind": "director", "session_id": DIRECTOR_ID}
+        )
         self.assertEqual(by_id[DESKTOP_ID]["kind"], "top-level")
         self.assertEqual(
-            by_id[DESKTOP_ID]["host"],
+            cast(inventory.TopLevelSession, by_id[DESKTOP_ID])["host"],
             {
                 "kind": "ghostty",
-                "desktop": "Writing",
+                "desktop": {"kind": "named", "name": "Writing"},
                 "window_shell": DESKTOP_SHELL_PID,
             },
         )
@@ -514,7 +533,10 @@ elif "comm=" in joined:
         )
 
         self.assertEqual(director["host"]["kind"], "ghostty")
-        self.assertEqual(director["host"].get("desktop"), "Production")
+        self.assertEqual(
+            director["host"].get("desktop"),
+            {"kind": "named", "name": "Production"},
+        )
 
     def test_unit_host_carries_live_tmux_session_name(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
@@ -566,7 +588,14 @@ elif "comm=" in joined:
             found = inventory.inventory(TARGET_LOGIN)
 
         self.assertNotIn(DESKTOP_ID, {session["session_id"] for session in found["sessions"]})
-        self.assertIn(f"{DESKTOP_PID} notes", found["unknown"])
+        self.assertIn(
+            {
+                "pid": DESKTOP_PID,
+                "name": "notes",
+                "reason": "process start mismatch",
+            },
+            found["unattributed"],
+        )
 
     def test_live_seat_keeps_owner_after_director_exits(self) -> None:
         (self.records / f"{self.director_pid}.json").unlink()
@@ -574,15 +603,98 @@ elif "comm=" in joined:
         found = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID}))
 
         self.assertEqual(
-            [(session["session_id"], session["owner"]) for session in found["sessions"]],
-            [(SEAT_ID, DIRECTOR_ID)],
+            [
+                (session["session_id"], session["owner"])
+                for session in found["sessions"]
+                if session["kind"] == "seat"
+            ],
+            [(SEAT_ID, {"kind": "director", "session_id": DIRECTOR_ID})],
         )
 
     def test_newest_unit_plan_is_selected_by_started_time_not_write_order(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
         unit = next(session for session in found["sessions"] if session["session_id"] == UNIT_ID)
 
-        self.assertEqual(unit["host"].get("plan"), "docs/shutdown-plan.md")
+        self.assertEqual(
+            unit["host"].get("plan"),
+            {"kind": "plan", "path": "docs/shutdown-plan.md"},
+        )
+
+    def test_absent_values_are_explicit_variants(self) -> None:
+        for path in (self.history / "runs").glob("*.jsonl"):
+            path.unlink()
+        (self.delegate / "phase-two" / "seats").unlink()
+        transcript = (
+            self.home / ".claude" / "projects" / "fixture" / f"{DESKTOP_ID}.jsonl"
+        )
+        transcript.unlink()
+
+        found = inventory.inventory(TARGET_LOGIN)
+        by_id = {session["session_id"]: session for session in found["sessions"]}
+
+        unit = cast(inventory.UnitSession, by_id[UNIT_ID])
+        seat = cast(inventory.SeatSession, by_id[SEAT_ID])
+        self.assertEqual(unit["host"]["plan"], {"kind": "no run record"})
+        self.assertEqual(by_id[DESKTOP_ID]["model"], {"kind": "no reply yet"})
+        self.assertEqual(seat["owner"], {"kind": "no director"})
+        self.assertEqual(
+            by_id[DIRECTOR_ID]["checkout"], {"kind": "not a checkout"}
+        )
+
+    def test_detached_head_and_missing_upstream_are_explicit(self) -> None:
+        _ = self.git("checkout", "--detach")
+
+        found = inventory.inventory(TARGET_LOGIN)
+        unit = next(session for session in found["sessions"] if session["session_id"] == UNIT_ID)
+
+        self.assertEqual(
+            unit["checkout"],
+            {
+                "kind": "git",
+                "path": str(self.checkout),
+                "head": {"kind": "detached", "commit": self.head},
+                "upstream": {"kind": "no upstream"},
+                "dirty": ["dirty.txt"],
+            },
+        )
+
+    def test_parse_inventory_accepts_inventory_output(self) -> None:
+        found = inventory.inventory(TARGET_LOGIN)
+
+        decoded = inventory.parse_inventory(json.dumps(found))
+
+        self.assertEqual(decoded, found)
+
+    def test_parse_inventory_rejects_unknown_kind_and_missing_variant_field(self) -> None:
+        found = inventory.inventory(TARGET_LOGIN)
+        document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
+        session_values = cast(list[object], document["sessions"])
+        first = cast(dict[str, object], session_values[0])
+        first["host"] = {"kind": "spaceship"}
+        with self.assertRaisesRegex(
+            inventory.InvalidInventory,
+            r"inventory\.sessions\[0\]\.host\.kind is invalid",
+        ):
+            _ = inventory.parse_inventory(json.dumps(document))
+
+        document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
+        session_values = cast(list[object], document["sessions"])
+        window_host: dict[str, object] | None = None
+        for item in session_values:
+            session_data = cast(dict[str, object], item)
+            host_data = cast(dict[str, object], session_data["host"])
+            if host_data["kind"] == "ghostty":
+                window_host = host_data
+                break
+        self.assertIsNotNone(window_host)
+        assert window_host is not None
+        host = window_host
+        del host["window_shell"]
+        with self.assertRaisesRegex(
+            inventory.InvalidInventory,
+            r"inventory\.sessions\[0\]\.host\.window_shell is missing",
+        ):
+            _ = inventory.parse_inventory(json.dumps(document))
 
 
 @final

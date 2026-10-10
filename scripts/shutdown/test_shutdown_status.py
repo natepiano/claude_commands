@@ -13,7 +13,9 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 import shutdown
+from account import UnreadableAccount
 from inventory import Inventory
+from record import Record
 
 
 LOGIN = "owner@example.com"
@@ -25,7 +27,7 @@ def empty_inventory(machine: str = "natedev") -> Inventory:
         "login": LOGIN,
         "label": "claude 2",
         "sessions": [],
-        "unknown": [],
+        "unattributed": [],
     }
 
 
@@ -33,24 +35,53 @@ def complete_session(*, host: object) -> dict[str, object]:
     return {
         "session_id": "11111111-1111-1111-1111-111111111111",
         "pid": 1234,
+        "proc_start": "process-start",
         "name": "shutdown",
         "cwd": "/tmp/checkout",
         "kind": "top-level",
         "status": "idle",
         "host": host,
-        "model": "opus",
+        "model": {"kind": "model", "name": "opus"},
         "checkout": {
+            "kind": "git",
             "path": "/tmp/checkout",
-            "branch": "main",
-            "head": "abc123",
-            "ahead": 0,
+            "head": {"kind": "branch", "name": "main"},
+            "upstream": {"kind": "tracking", "ahead": 0},
             "dirty": [],
         },
         "run_dirs": [],
         "codex_servers": [],
         "timers": [],
-        "owner": None,
     }
+
+
+def complete_record(machine: str = "natedev") -> Record:
+    return cast(
+        Record,
+        cast(
+            object,
+            {
+                "login": LOGIN,
+                "label": "claude 2",
+                "machine": machine,
+                "state": "settling",
+                "requested_at": "2026-10-09T21:49:10+00:00",
+                "requested_by": {"kind": "terminal"},
+                "scope": {"kind": "all account sessions"},
+                "conductor": {"kind": "not started"},
+                "force": "wait for ready",
+                "entries": [
+                    {
+                        "session": complete_session(host={"kind": "unknown"}),
+                        "timers": [],
+                        "settle_message": {"kind": "not sent"},
+                        "where": {"kind": "not said"},
+                        "progress": {"kind": "waiting"},
+                    }
+                ],
+            },
+        ),
+    )
 
 
 @final
@@ -167,7 +198,32 @@ class ShutdownStatusTests(unittest.TestCase):
             "shutdown: unknown account claude2: give a note label such as claude 2, or a login\n",
         )
 
-    def test_remote_inventory_missing_unknown_is_unavailable_with_reason(self) -> None:
+    def test_unreadable_own_account_exits_two(self) -> None:
+        errors = io.StringIO()
+        with (
+            redirect_stderr(errors),
+            patch.object(
+                shutdown,
+                "own_claude_account",
+                side_effect=UnreadableAccount(
+                    "this process's Claude account is unreadable"
+                ),
+            ),
+            patch.object(
+                shutdown,
+                "inventory",
+                side_effect=AssertionError("inventory must not run"),
+            ),
+        ):
+            result = shutdown.main(["status", "--here"])
+
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            errors.getvalue(),
+            "shutdown: this process's Claude account is unreadable\n",
+        )
+
+    def test_remote_inventory_missing_unattributed_is_unavailable_with_reason(self) -> None:
         response = json.dumps(
             {
                 "machine": "Mac",
@@ -183,7 +239,7 @@ class ShutdownStatusTests(unittest.TestCase):
             "machine": "Mac",
             "status": "unavailable",
             "rc": 0,
-            "reason": "inventory is missing unknown",
+            "reason": "inventory.unattributed is missing",
         }
         self.assertEqual(result, 0)
         self.assertEqual(
@@ -199,7 +255,7 @@ class ShutdownStatusTests(unittest.TestCase):
                 "login": LOGIN,
                 "label": "claude 2",
                 "sessions": [complete_session(host={"kind": 7})],
-                "unknown": [],
+                "unattributed": [],
             }
         )
 
@@ -217,6 +273,72 @@ class ShutdownStatusTests(unittest.TestCase):
             json.dumps([empty_inventory(), expected], sort_keys=True) + "\n",
         )
         self.assertEqual(error, "")
+
+    def test_unattributed_session_renders_its_reason(self) -> None:
+        report = empty_inventory()
+        report["unattributed"] = [
+            {"pid": 1234, "name": "mystery", "reason": "account unreadable"}
+        ]
+        output = io.StringIO()
+        with (
+            patch.object(shutdown, "inventory", return_value=report),
+            redirect_stdout(output),
+        ):
+            result = shutdown.main(["status", LOGIN, "--here"])
+
+        self.assertEqual(result, 0)
+        self.assertIn(
+            "  unknown account · 1234 mystery · account unreadable\n",
+            output.getvalue(),
+        )
+
+    def test_records_text_uses_los_angeles_time(self) -> None:
+        output = io.StringIO()
+        with (
+            patch.object(shutdown, "live_records", return_value=[complete_record()]),
+            redirect_stdout(output),
+        ):
+            result = shutdown.main(["records", "--here"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            output.getvalue(),
+            "natedev claude 2 settling since 2026-10-09 14:49:10 PDT\n",
+        )
+
+    def test_records_json_here_prints_local_records(self) -> None:
+        record = complete_record()
+        output = io.StringIO()
+        with (
+            patch.object(shutdown, "live_records", return_value=[record]),
+            redirect_stdout(output),
+        ):
+            result = shutdown.main(["records", "--json", "--here"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue()), [record])
+
+    def test_help_hides_internal_records_while_records_still_runs(self) -> None:
+        help_output = io.StringIO()
+        with (
+            redirect_stdout(help_output),
+            self.assertRaises(SystemExit) as exit_context,
+        ):
+            _ = shutdown.main(["--help"])
+
+        self.assertEqual(exit_context.exception.code, 0)
+        self.assertNotIn("records", help_output.getvalue())
+        self.assertNotIn("SUPPRESS", help_output.getvalue())
+
+        records_output = io.StringIO()
+        with (
+            patch.object(shutdown, "live_records", return_value=[]),
+            redirect_stdout(records_output),
+        ):
+            result = shutdown.main(["records", "--here"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(records_output.getvalue(), "")
 
     def test_reachable_remote_failure_is_unavailable_not_unreachable(self) -> None:
         result, output, error = self.run_status(3, "remote inventory failed")
