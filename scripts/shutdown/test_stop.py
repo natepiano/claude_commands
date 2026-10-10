@@ -25,7 +25,7 @@ import settle
 import shutdown
 import stop
 from account import Account
-from user_action import UserAction
+from user_action import ActionRequired
 from record import (
     LiveShutdownRecord,
     PassiveSeatReadyToStop,
@@ -61,10 +61,8 @@ class AlertCall(TypedDict):
     recipient: str
     summary: str
     text: str
-    need: str
     machine: str
     key: str
-    action: UserAction
 
 
 @final
@@ -1554,8 +1552,6 @@ class StopTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
-            action: UserAction,
-            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
@@ -1564,10 +1560,8 @@ class StopTests(unittest.TestCase):
                     recipient=recipient,
                     summary=summary,
                     text=text,
-                    need=need,
                     machine=machine,
                     key=key,
-                    action=action,
                 )
             )
             return settle.MessageSent(kind="sent")
@@ -1598,7 +1592,6 @@ class StopTests(unittest.TestCase):
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts[0]["recipient"], "session:requester")
         self.assertEqual(alerts[0]["summary"], f"{LABEL} is down")
-        self.assertEqual(alerts[0]["need"], "note")
         self.assertEqual(alerts[0]["key"], f"shutdown-result-{LOGIN}")
         self.assertIn("/shutdown restart", alerts[0]["text"])
 
@@ -1856,27 +1849,23 @@ class StopTests(unittest.TestCase):
         alerts: list[AlertCall] = []
 
         def send_alert(
-            recipient: str,
+            scope: record.ShutdownScope,
             summary: str,
             text: str,
+            action: ActionRequired,
             *,
-            action: UserAction,
-            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
-            key: str = "",
-        ) -> settle.MessageDelivery:
+        ) -> None:
+            del scope, action
             alerts.append(
                 AlertCall(
-                    recipient=recipient,
+                    recipient="user",
                     summary=summary,
                     text=text,
-                    need=need,
                     machine=machine,
-                    key=key,
-                    action=action,
+                    key="",
                 )
             )
-            return settle.MessageSent(kind="sent")
 
         with (
             patch.object(
@@ -1891,7 +1880,7 @@ class StopTests(unittest.TestCase):
             patch.object(
                 settle, "_stop_machines", return_value=([report], [])
             ),
-            patch.object(settle, "send_message", side_effect=send_alert),
+            patch.object(settle, "alert_user", side_effect=send_alert),
         ):
             self.assertEqual(settle.conduct(LOGIN, here=True), 0)
 
@@ -1913,29 +1902,25 @@ class StopTests(unittest.TestCase):
         alerts: list[AlertCall] = []
 
         def send_alert(
-            recipient: str,
+            scope: record.ShutdownScope,
             summary: str,
             text: str,
+            action: ActionRequired,
             *,
-            action: UserAction,
-            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
-            key: str = "",
-        ) -> settle.MessageDelivery:
+        ) -> None:
+            del scope, action
             alerts.append(
                 AlertCall(
-                    recipient=recipient,
+                    recipient="user",
                     summary=summary,
                     text=text,
-                    need=need,
                     machine=machine,
-                    key=key,
-                    action=action,
+                    key="",
                 )
             )
-            return settle.MessageSent(kind="sent")
 
-        with patch.object(settle, "send_message", side_effect=send_alert):
+        with patch.object(settle, "alert_user", side_effect=send_alert):
             with patch.object(settle, "_machine", return_value="Mac"):
                 settle.report_stop(natedev_record, [natedev, mac], [])
             with patch.object(settle, "_machine", return_value="natedev"):
@@ -1951,27 +1936,23 @@ class StopTests(unittest.TestCase):
         alerts: list[AlertCall] = []
 
         def send_alert(
-            recipient: str,
+            scope: record.ShutdownScope,
             summary: str,
             text: str,
+            action: ActionRequired,
             *,
-            action: UserAction,
-            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
-            key: str = "",
-        ) -> settle.MessageDelivery:
+        ) -> None:
+            del scope, action
             alerts.append(
                 AlertCall(
-                    recipient=recipient,
+                    recipient="user",
                     summary=summary,
                     text=text,
-                    need=need,
                     machine=machine,
-                    key=key,
-                    action=action,
+                    key="",
                 )
             )
-            return settle.MessageSent(kind="sent")
 
         with (
             patch.object(
@@ -1982,7 +1963,7 @@ class StopTests(unittest.TestCase):
                 ),
             ),
             patch.object(stop, "stop", side_effect=OSError("inventory failed")),
-            patch.object(settle, "send_message", side_effect=send_alert),
+            patch.object(settle, "alert_user", side_effect=send_alert),
             patch.object(settle, "_machine", return_value="natedev"),
         ):
             result = settle.conduct(LOGIN, here=True)

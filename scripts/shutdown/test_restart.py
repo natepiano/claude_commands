@@ -41,7 +41,7 @@ from record import (
     TimerRestore,
     Where,
 )
-from user_action import ActionRequired, UserAction
+from user_action import ActionRequired
 
 
 LOGIN = "owner@example.com"
@@ -996,12 +996,10 @@ class RestartTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
-            action: UserAction,
-            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del summary, action, need, machine, key
+            del summary, machine, key
             messages.append((recipient, text))
             return settle.MessageSent(kind="sent")
 
@@ -1073,12 +1071,10 @@ class RestartTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
-            action: UserAction,
-            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del recipient, summary, text, action, need, machine, key
+            del recipient, summary, text, machine, key
             return settle.MessageSent(kind="sent")
 
         with (
@@ -1345,12 +1341,10 @@ class RestartTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
-            action: UserAction,
-            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del recipient, summary, action, need, machine, key
+            del recipient, summary, machine, key
             notes.append(text)
             return settle.MessageSent(kind="sent")
 
@@ -1421,12 +1415,10 @@ class RestartTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
-            action: UserAction,
-            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del recipient, summary, action, need, machine, key
+            del recipient, summary, machine, key
             notes.append(text)
             return settle.MessageSent(kind="sent")
 
@@ -1481,12 +1473,10 @@ class RestartTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
-            action: UserAction,
-            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del recipient, summary, text, action, need, machine, key
+            del recipient, summary, text, machine, key
             return deliveries.pop(0)
 
         def start_timer(verb: str, instance: str) -> None:
@@ -1532,12 +1522,10 @@ class RestartTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
-            action: UserAction,
-            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del recipient, summary, text, action, need, machine, key
+            del recipient, summary, text, machine, key
             return settle.MessageQueued(kind="queued", reason="session socket absent")
 
         def start_timer(verb: str, instance: str) -> None:
@@ -1798,12 +1786,10 @@ class RestartTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
-            action: UserAction,
-            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del recipient, summary, action, need, machine, key
+            del recipient, summary, machine, key
             notes.append(text)
             return settle.MessageSent(kind="sent")
 
@@ -1959,12 +1945,10 @@ class RestartTests(unittest.TestCase):
             summary: str,
             text: str,
             *,
-            action: UserAction,
-            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del recipient, summary, action, need, machine, key
+            del recipient, summary, machine, key
             notes.append(text)
             return settle.MessageSent(kind="sent")
 

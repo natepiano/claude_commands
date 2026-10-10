@@ -4,7 +4,8 @@
 Agents holding the SendMessage tool call it directly; scripts call this. The rules
 every message follows are /message (~/.claude/commands/message.md).
 
-  send.py --to NAME|session:<id> [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
+  send.py --to NAME|uds:<path>|session:<id>|seat:<run>/<seat>|codex:<thread>
+          [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
           [--machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
   send.py --to user --summary TITLE [--need note|decision|blocked]
@@ -23,8 +24,10 @@ removed, so it never passes for the session that ran this. It is named --from,
 which is the sender name the recipient sees. Delivery is read from the
 SendMessage tool result in the relay's stream, never from what the model says;
 the last stream per recipient stays in STATE/relay/<to>.jsonl.
-`--codex` queues the text on a codex_mesh.py thread instead, and `--machine`
-runs this script on HOST over ssh, where ~/.claude is this repo.
+`seat:` addresses queue through codex_mesh.py; `codex:` addresses queue through
+the shared Codex daemon. A unique roster name resolves to either. `--codex`
+with `--session-dir` still selects codex_mesh.py directly. `--machine` runs
+this script on HOST over ssh, where ~/.claude is this repo.
 
 `--to user` reaches the user wherever they are; `--summary` is the title. `--need`
 says what they must do: `note` nothing, `decision` decide while work goes on,
@@ -45,8 +48,8 @@ message text as one JSON line in STATE/log.jsonl:
                  recipient's Claude session id, so a rename loses
                  nothing; under the name as given when no live
                  session answers to it, which the outcome says
-  FAILED: why    not delivered and not kept: a Codex seat, which  exit 3
-                 no queue reader reaches, the user, or ssh to HOST
+  FAILED: why    not delivered and not kept: a Codex recipient,   exit 3
+                 the user, or ssh to HOST
   REFUSED: why   rejected before delivery; not kept              exit 2
 Usage errors, an unreadable --file and an empty message exit 2. STATE is $XDG_STATE_HOME/message, or ~/.local/state/message.
 """
@@ -73,6 +76,8 @@ from typing import Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 import sessions  # noqa: E402
+import codex_daemon  # noqa: E402
+import roster  # noqa: E402
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
                          UserAction, parse_user_action)  # noqa: E402
 
@@ -165,6 +170,41 @@ class NoUserRecipient:
 
 
 MessageUserAction = UserAction | NoUserRecipient
+
+
+@dataclass(frozen=True)
+class ClaudeRecipient:
+    address: str
+
+
+@dataclass(frozen=True)
+class CodexSeatRecipient:
+    address: str
+    name: str
+    session_dir: str
+
+
+@dataclass(frozen=True)
+class CodexSessionRecipient:
+    address: str
+    thread_id: str
+    name: str
+
+
+SessionRecipient = ClaudeRecipient | CodexSeatRecipient | CodexSessionRecipient
+
+
+@dataclass(frozen=True)
+class UserDelivery:
+    """Deliver through the user-notification gate."""
+
+
+@dataclass(frozen=True)
+class RemoteDelivery:
+    host: str
+
+
+DeliveryRoute = SessionRecipient | UserDelivery | RemoteDelivery
 
 
 class Options(NamedTuple):
@@ -448,6 +488,84 @@ def pending(to: str | None) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _print_roster_problems(problems: list[str]) -> None:
+    for problem in problems:
+        print(f"send.py: roster: {problem}", file=sys.stderr)
+
+
+def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
+    if not isinstance(entry.reach, roster.Messageable):
+        raise AssertionError("a messageable recipient needs an address")
+    address = entry.reach.address
+    if address.startswith("seat:"):
+        if not isinstance(entry.assignment, roster.WorkerAssignment):
+            usage_error(f"{address} is not assigned to a Codex seat")
+        return CodexSeatRecipient(address, entry.name, entry.assignment.session_dir)
+    if address.startswith("codex:"):
+        return CodexSessionRecipient(
+            address,
+            address.removeprefix("codex:"),
+            entry.name,
+        )
+    return ClaudeRecipient(address)
+
+
+def _cannot_receive_message(entry: roster.RosterEntry) -> NoReturn:
+    if not isinstance(entry.reach, roster.CannotReceiveMessages):
+        raise AssertionError("a non-messageable recipient needs a reason")
+    match entry.director:
+        case roster.UnderDirector(name=director):
+            next_step = f"contact its unit director {director} or wait"
+        case _:
+            next_step = "no unit director is running for it"
+    usage_error(f"{entry.name} cannot take messages ({entry.reach.reason}); {next_step}")
+
+
+def _ambiguous_name(name: str, entries: list[roster.RosterEntry]) -> NoReturn:
+    lines = [f"{name} matches {len(entries)} sessions:"]
+    for entry in entries:
+        recipient = (
+            entry.reach.address
+            if isinstance(entry.reach, roster.Messageable)
+            else f"(cannot take messages: {entry.reach.reason})"
+        )
+        lines.append(f"  {recipient} ({entry.role})")
+    usage_error("\n".join(lines))
+
+
+def resolve_recipient(to: str) -> SessionRecipient:
+    """Resolve one local non-user target, reading the roster only when needed."""
+    if to.startswith("uds:") or to.startswith("session:"):
+        return ClaudeRecipient(to)
+    if to.startswith("codex:"):
+        thread_id = to.removeprefix("codex:")
+        if not thread_id:
+            usage_error("codex: needs a thread id")
+        return CodexSessionRecipient(to, thread_id, thread_id)
+
+    result = roster.roster(os.environ)
+    _print_roster_problems(result.problems)
+    if to.startswith("seat:"):
+        matches = [
+            entry
+            for entry in result.entries
+            if isinstance(entry.reach, roster.Messageable) and entry.reach.address == to
+        ]
+        if len(matches) != 1:
+            usage_error(f"no roster session has address {to}")
+        return _messageable_recipient(matches[0])
+
+    matches = [entry for entry in result.entries if entry.name == to]
+    if not matches:
+        return ClaudeRecipient(to)
+    if len(matches) > 1:
+        _ambiguous_name(to, matches)
+    entry = matches[0]
+    if isinstance(entry.reach, roster.CannotReceiveMessages):
+        _cannot_receive_message(entry)
+    return _messageable_recipient(entry)
+
+
 def run(command: list[str], stdin: str, timeout: float, env: dict[str, str] | None = None,
         cwd: Path | None = None) -> tuple[int | None, str, str]:
     """Run command; (exit code or None on timeout, stdout, stderr).
@@ -611,6 +729,19 @@ def codex(message: Message, session_dir: str, timeout: float) -> Result:
     return Result("failed", f"codex_mesh.py send: {why}")
 
 
+def codex_session(
+    message: Message,
+    recipient: CodexSessionRecipient,
+    timeout: float,
+) -> Result:
+    queued = codex_daemon.queue(recipient.thread_id, message.text, timeout=timeout)
+    if isinstance(queued, codex_daemon.Queued):
+        return Result("sent", f"queued on Codex session {recipient.name}")
+    if isinstance(queued, codex_daemon.QueueTimedOut):
+        return Result("failed", f"timed out after {queued.seconds:g} s")
+    return Result("failed", queued.reason)
+
+
 def action_arguments(action: UserAction) -> list[str]:
     if isinstance(action, ActionRequired):
         return ["--action", action.text]
@@ -683,9 +814,20 @@ def optional_float(value: object) -> float | None:
 
 def parse(argv: list[str]) -> Options:
     parser = argparse.ArgumentParser(prog="send.py",
-                                     description="Send one message to a Claude session, a Codex seat or the user.",
+                                     description=(
+                                         "Send one message to a roster name, uds:<path>, "
+                                         "session:<id>, seat:<run id>/<seat name>, "
+                                         "codex:<thread id>, or user."
+                                     ),
                                      epilog="Also: send.py ack KEY | reopen KEY | pending [NAME]")
-    _ = parser.add_argument("--to", required=True, help="the recipient's name as ListAgents prints it, or `user`")
+    _ = parser.add_argument(
+        "--to",
+        required=True,
+        help=(
+            "a roster name, uds:<path>, session:<id>, "
+            "seat:<run id>/<seat name>, codex:<thread id>, or user"
+        ),
+    )
     _ = parser.add_argument("--from", dest="sender", help="the sender name the recipient sees")
     _ = parser.add_argument("--summary", help="SendMessage's short label, default the first line; the title to `user`")
     _ = parser.add_argument("--need", choices=list(CHANNEL_PRIORITY), default="note",
@@ -779,20 +921,38 @@ def send(options: Options) -> Result:
         usage_error("the message is empty")
     first = text.strip().splitlines()[0]
     summary = options.summary or (first if len(first) <= 60 else first[:59] + "…")
-    message = Message(options.to, options.sender or default_sender(), summary, text, options.key)
+    if options.machine is not None:
+        route: DeliveryRoute = RemoteDelivery(options.machine)
+    elif options.to == USER:
+        route = UserDelivery()
+    elif options.session_dir is not None:
+        route = CodexSeatRecipient(options.to, options.to, options.session_dir)
+    else:
+        route = resolve_recipient(options.to)
+    destination = route.address if isinstance(route, SessionRecipient) else options.to
+    message = Message(destination, options.sender or default_sender(), summary, text, options.key)
     started = now()
     window = None if options.repeat_minutes is None else timedelta(minutes=options.repeat_minutes)
     skip = claim(message, window, started)
     if skip is not None:
         result = Result("skipped", skip)
-    elif options.machine is not None:
-        result = remote(message, options.machine, options)
-    elif message.to == USER:
+    elif isinstance(route, RemoteDelivery):
+        result = remote(message, route.host, options)
+    elif isinstance(route, UserDelivery):
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
         result = user(message, options.need, options.action, options.timeout)
-    elif options.session_dir is not None:
-        result = codex(message, options.session_dir, options.timeout)
+    elif isinstance(route, CodexSeatRecipient):
+        transport = Message(
+            route.name,
+            message.sender,
+            message.summary,
+            message.text,
+            message.key,
+        )
+        result = codex(transport, route.session_dir, options.timeout)
+    elif isinstance(route, CodexSessionRecipient):
+        result = codex_session(message, route, options.timeout)
     else:
         plan = relay_plan(message)
         if isinstance(plan, SessionIdWithoutLiveRecipient):
@@ -809,7 +969,8 @@ def send(options: Options) -> Result:
                     result = Result("queued", f"{result.detail}; no live session answers to {message.to},"
                                     + " so it is kept under that name")
     if result.outcome == "sent" and message.key is not None:
-        _ = remove_queued_key(message.to, message.key)
+        for recipient in dict.fromkeys((message.to, options.to)):
+            _ = remove_queued_key(recipient, message.key)
     log(message, result, started)
     return result
 

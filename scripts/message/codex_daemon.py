@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read the shared Codex app-server daemon's loaded sessions without changing them."""
+"""Read the shared Codex daemon's live sessions and queue a message to one."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import os
 import socket
 import struct
+import subprocess
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import cast, final
 
 TIMEOUT_SECONDS = 5.0
+QUEUE_TIMEOUT_SECONDS = 30
 _clock = time.monotonic
 
 
@@ -29,6 +31,24 @@ class DaemonSession:
 @dataclass(frozen=True)
 class DaemonUnreadable:
     reason: str
+
+
+@dataclass(frozen=True)
+class Queued:
+    """Codex accepted the message for the requested thread."""
+
+
+@dataclass(frozen=True)
+class QueueFailed:
+    reason: str
+
+
+@dataclass(frozen=True)
+class QueueTimedOut:
+    seconds: float
+
+
+QueueResult = Queued | QueueFailed | QueueTimedOut
 
 
 @dataclass(frozen=True)
@@ -264,3 +284,28 @@ def loaded_sessions(socket_path: Path) -> list[DaemonSession] | DaemonUnreadable
     finally:
         if client is not None:
             client.close()
+
+
+def queue(
+    thread_id: str,
+    text: str,
+    timeout: float = QUEUE_TIMEOUT_SECONDS,
+) -> QueueResult:
+    """Queue text to a loaded Codex thread through the Codex CLI."""
+    try:
+        completed = subprocess.run(
+            ["codex", "queue", "--thread", thread_id, "--message", text],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return QueueTimedOut(timeout)
+    except OSError as error:
+        reason = str(error).splitlines()[0] if str(error).splitlines() else type(error).__name__
+        return QueueFailed(reason)
+    if completed.returncode == 0:
+        return Queued()
+    reason = next((line.strip() for line in completed.stderr.splitlines() if line.strip()), "")
+    return QueueFailed(reason or f"exit {completed.returncode}")

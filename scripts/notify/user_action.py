@@ -38,6 +38,11 @@ class ActionRefused:
     reason: str
 
 
+@dataclass(frozen=True)
+class ActionAllowed:
+    pass
+
+
 def parse_user_action(action: str | None, no_action: bool) -> UserAction | ActionUnstated | ActionRefused:
     """Turn the two command-line forms into one explicit action state."""
     if action is not None and no_action:
@@ -52,11 +57,11 @@ def parse_user_action(action: str | None, no_action: bool) -> UserAction | Actio
     return ActionRequired(text)
 
 
-def refused_at(action: UserAction, priority: int) -> ActionRefused | None:
+def refused_at(action: UserAction, priority: int) -> ActionAllowed | ActionRefused:
     """Refuse action-free high or emergency alerts; emergency means act now."""
     if isinstance(action, NoActionRequired) and priority > 0:
         return ActionRefused(f"priority {priority} requires --action")
-    return None
+    return ActionAllowed()
 
 
 def first_line(action: UserAction) -> str:

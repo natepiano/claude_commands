@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
@@ -35,6 +35,84 @@ from sessions import SessionRecord, live_sessions  # noqa: E402
 Kind = Literal["claude", "codex"]
 Role = Literal["showrunner", "unit director", "worker", "freestanding"]
 KNOWN_SLOT_ROLES = frozenset(("impl", "test", "fix", "review"))
+MESSAGEABLE_SEAT_STATUSES = frozenset(("running", "waiting_capacity"))
+
+
+@dataclass(frozen=True)
+class Messageable:
+    address: str
+
+
+@dataclass(frozen=True)
+class CannotReceiveMessages:
+    reason: str
+
+
+MessageReach = Messageable | CannotReceiveMessages
+
+
+@dataclass(frozen=True)
+class UnderShowrunner:
+    production: str
+    name: str
+    address: str
+
+
+@dataclass(frozen=True)
+class RunsProduction:
+    production: str
+
+
+@dataclass(frozen=True)
+class ProductionWithoutRunningShowrunner:
+    production: str
+
+
+@dataclass(frozen=True)
+class NoShowrunner:
+    """This session has no showrunner link."""
+
+
+ShowrunnerRelationship = (
+    RunsProduction
+    | UnderShowrunner
+    | ProductionWithoutRunningShowrunner
+    | NoShowrunner
+)
+
+
+@dataclass(frozen=True)
+class UnderDirector:
+    unit: str
+    name: str
+    address: str
+
+
+@dataclass(frozen=True)
+class DirectsUnit:
+    unit: str
+
+
+@dataclass(frozen=True)
+class NoDirector:
+    """This session has no unit-director link."""
+
+
+DirectorRelationship = DirectsUnit | UnderDirector | NoDirector
+
+
+@dataclass(frozen=True)
+class WorkerAssignment:
+    slot_role: str
+    session_dir: str
+
+
+@dataclass(frozen=True)
+class NotAWorker:
+    """This session is not assigned to a delegate worker seat."""
+
+
+Assignment = WorkerAssignment | NotAWorker
 
 
 @dataclass(frozen=True)
@@ -44,16 +122,11 @@ class RosterEntry:
     role: str
     name: str
     status: str
-    address: str
+    reach: MessageReach
     cwd: str
-    production: str
-    showrunner: str
-    showrunner_address: str
-    unit: str
-    director: str
-    director_address: str
-    slot_role: str
-    session_dir: str
+    showrunner: ShowrunnerRelationship
+    director: DirectorRelationship
+    assignment: Assignment
 
 
 @dataclass(frozen=True)
@@ -62,12 +135,74 @@ class Roster:
     problems: list[str]
 
 
+def _address(entry: RosterEntry) -> str:
+    return entry.reach.address if isinstance(entry.reach, Messageable) else ""
+
+
+def _production(entry: RosterEntry) -> str:
+    if isinstance(
+        entry.showrunner,
+        (RunsProduction, UnderShowrunner, ProductionWithoutRunningShowrunner),
+    ):
+        return entry.showrunner.production
+    return ""
+
+
+def _showrunner_name(entry: RosterEntry) -> str:
+    return entry.showrunner.name if isinstance(entry.showrunner, UnderShowrunner) else ""
+
+
+def _showrunner_address(entry: RosterEntry) -> str:
+    return entry.showrunner.address if isinstance(entry.showrunner, UnderShowrunner) else ""
+
+
+def _unit(entry: RosterEntry) -> str:
+    if isinstance(entry.director, (DirectsUnit, UnderDirector)):
+        return entry.director.unit
+    return ""
+
+
+def _director_name(entry: RosterEntry) -> str:
+    return entry.director.name if isinstance(entry.director, UnderDirector) else ""
+
+
+def _director_address(entry: RosterEntry) -> str:
+    return entry.director.address if isinstance(entry.director, UnderDirector) else ""
+
+
+def _slot_role_for(entry: RosterEntry) -> str:
+    return entry.assignment.slot_role if isinstance(entry.assignment, WorkerAssignment) else ""
+
+
+def _session_dir(entry: RosterEntry) -> str:
+    return entry.assignment.session_dir if isinstance(entry.assignment, WorkerAssignment) else ""
+
+
+def _serialized_entry(entry: RosterEntry) -> dict[str, str]:
+    """Flatten domain states at the JSON compatibility boundary."""
+    return {
+        "machine": entry.machine,
+        "kind": entry.kind,
+        "role": entry.role,
+        "name": entry.name,
+        "status": entry.status,
+        "address": _address(entry),
+        "cwd": entry.cwd,
+        "production": _production(entry),
+        "showrunner": _showrunner_name(entry),
+        "showrunner_address": _showrunner_address(entry),
+        "unit": _unit(entry),
+        "director": _director_name(entry),
+        "director_address": _director_address(entry),
+        "slot_role": _slot_role_for(entry),
+        "session_dir": _session_dir(entry),
+    }
+
+
 @dataclass(frozen=True)
 class _ProductionPlace:
-    production: str
-    showrunner: str
-    showrunner_address: str
-    unit: str
+    showrunner: UnderShowrunner | ProductionWithoutRunningShowrunner
+    director: DirectsUnit
 
 
 @dataclass(frozen=True)
@@ -103,12 +238,8 @@ class _WorkerPlace:
 
 @dataclass(frozen=True)
 class _RunPlace:
-    director: str
-    director_address: str
-    unit: str
-    production: str
-    showrunner: str
-    showrunner_address: str
+    director: DirectorRelationship
+    showrunner: ShowrunnerRelationship
     cwd: str
 
 
@@ -258,6 +389,11 @@ def _production_places(
     for runner in registered:
         doc = Path(runner["doc"])
         runner_address = addresses.get(runner["slug"], "")
+        showrunner: UnderShowrunner | ProductionWithoutRunningShowrunner = (
+            UnderShowrunner(runner["slug"], runner["session"], runner_address)
+            if runner["session"] and runner_address
+            else ProductionWithoutRunningShowrunner(runner["slug"])
+        )
         try:
             units = live_units.production_units(doc)
         except (OSError, ValueError) as error:
@@ -279,7 +415,8 @@ def _production_places(
                         _ = places.setdefault(
                             record["sessionId"],
                             _ProductionPlace(
-                                runner["slug"], runner["session"], runner_address, unit
+                                showrunner,
+                                DirectsUnit(unit),
                             ),
                         )
             continue
@@ -290,7 +427,8 @@ def _production_places(
                 _ = places.setdefault(
                     claude.session_id,
                     _ProductionPlace(
-                        runner["slug"], runner["session"], runner_address, unit.unit
+                        showrunner,
+                        DirectsUnit(unit.unit),
                     ),
                 )
     return places
@@ -358,6 +496,8 @@ def _slot_role(name: str) -> str:
 
 def _codex_slot_role(record: _MeshSeat) -> str:
     role = _as_string(record.get("role"))
+    if not role:
+        return "no role"
     if role not in KNOWN_SLOT_ROLES:
         return "role unknown"
     lens = _as_string(record.get("lens"))
@@ -377,22 +517,31 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _run_place(
-    run: _LiveRun, claude_entries: Mapping[str, RosterEntry]
+    run: _LiveRun,
+    claude_entries: Mapping[str, RosterEntry],
+    production_places: Mapping[str, _ProductionPlace],
 ) -> _RunPlace:
     if isinstance(run.director, _NoRunningDirector):
-        return _RunPlace("", "", "", "", "", "", "")
+        return _RunPlace(NoDirector(), NoShowrunner(), "")
     director = claude_entries.get(run.director.session_id)
     if director is None:
-        return _RunPlace("", "", "", "", "", "", "")
+        return _RunPlace(NoDirector(), NoShowrunner(), "")
+    place = production_places.get(run.director.session_id)
+    unit = place.director.unit if place is not None else ""
+    director_link = UnderDirector(unit, director.name, _address(director))
     return _RunPlace(
-        director=director.name,
-        director_address=director.address,
-        unit=director.unit,
-        production=director.production,
-        showrunner=director.showrunner,
-        showrunner_address=director.showrunner_address,
+        director=director_link,
+        showrunner=place.showrunner if place is not None else NoShowrunner(),
         cwd=director.cwd,
     )
+
+
+def _between_turns_reason(director: DirectorRelationship) -> str:
+    match director:
+        case UnderDirector():
+            return "between turns; its unit director resumes it"
+        case _:
+            return "between turns; no unit director is running"
 
 
 def _mesh_records(run: _LiveRun, problems: list[str]) -> dict[str, _MeshSeat]:
@@ -475,46 +624,57 @@ def _claude_entries(
     records_by_id = {record["sessionId"]: record for record in records}
     for record in records:
         session_id = record["sessionId"]
-        production = showrunner = showrunner_address = unit = ""
-        director = director_address = slot_role = session_dir = ""
+        showrunner: ShowrunnerRelationship = NoShowrunner()
+        director: DirectorRelationship = NoDirector()
+        assignment: Assignment = NotAWorker()
         if session_id in runner_ids:
             role: Role = "showrunner"
-            production = runner_ids[session_id]["slug"]
+            showrunner = RunsProduction(runner_ids[session_id]["slug"])
         elif session_id in production_places:
             role = "unit director"
             place = production_places[session_id]
-            production = place.production
             showrunner = place.showrunner
-            showrunner_address = place.showrunner_address
-            unit = place.unit
+            director = place.director
         elif session_id in marker_directors:
             role = "unit director"
         elif session_id in workers:
             role = "worker"
             worker = workers[session_id]
-            session_dir = str(worker.run.path)
+            assignment = WorkerAssignment(
+                _slot_role(worker.seat_name or record["name"]),
+                str(worker.run.path),
+            )
             run_director = worker.run.director
             director_entry = (
                 records_by_id.get(run_director.session_id)
                 if isinstance(run_director, _DirectorSession) else None
             )
             if director_entry is not None and isinstance(run_director, _DirectorSession):
-                director = director_entry["name"]
-                director_address = f"session:{run_director.session_id}"
                 director_place = production_places.get(run_director.session_id)
                 if director_place is not None:
-                    production = director_place.production
                     showrunner = director_place.showrunner
-                    showrunner_address = director_place.showrunner_address
-                    unit = director_place.unit
-            slot_role = _slot_role(worker.seat_name or record["name"])
+                    unit = director_place.director.unit
+                else:
+                    unit = ""
+                director = UnderDirector(
+                    unit,
+                    director_entry["name"],
+                    f"session:{run_director.session_id}",
+                )
         else:
             role = "freestanding"
         detail = details[session_id]
         entries[session_id] = RosterEntry(
-            machine, "claude", role, record["name"], detail.status,
-            f"session:{session_id}", detail.cwd, production, showrunner,
-            showrunner_address, unit, director, director_address, slot_role, session_dir,
+            machine=machine,
+            kind="claude",
+            role=role,
+            name=record["name"],
+            status=detail.status,
+            reach=Messageable(f"session:{session_id}"),
+            cwd=detail.cwd,
+            showrunner=showrunner,
+            director=director,
+            assignment=assignment,
         )
     return entries
 
@@ -603,16 +763,23 @@ def _review_workers(
         name = f"{lens} reviewer" if lens else "blind reviewer"
         slot_role = f"review ({lens})" if lens else "review"
         entries.append(RosterEntry(
-            machine, kind, "worker", name, "running", "",
-            _reviewer_cwd(process, place.cwd), place.production, place.showrunner,
-            place.showrunner_address, place.unit, place.director, place.director_address,
-            slot_role, str(run.path),
+            machine=machine,
+            kind=kind,
+            role="worker",
+            name=name,
+            status="running",
+            reach=CannotReceiveMessages("blind reviewer"),
+            cwd=_reviewer_cwd(process, place.cwd),
+            showrunner=place.showrunner,
+            director=place.director,
+            assignment=WorkerAssignment(slot_role, str(run.path)),
         ))
     return entries
 
 
 def _delegate_workers(
     machine: str, runs: list[_LiveRun], claude_entries: Mapping[str, RosterEntry],
+    production_places: Mapping[str, _ProductionPlace],
     problems: list[str],
 ) -> tuple[list[RosterEntry], set[str]]:
     try:
@@ -625,7 +792,7 @@ def _delegate_workers(
     worker_threads: set[str] = set()
     for run in runs:
         server_alive = _server_alive(run, problems)
-        place = _run_place(run, claude_entries)
+        place = _run_place(run, claude_entries, production_places)
         for name, record in sorted(_mesh_records(run, problems).items()):
             status = _as_string(record.get("status"))
             if status == "ended":
@@ -648,10 +815,20 @@ def _delegate_workers(
                 or place.cwd
             )
             entries.append(RosterEntry(
-                machine, "codex", "worker", name, _worker_status(status), name,
-                cwd, place.production, place.showrunner, place.showrunner_address,
-                place.unit, place.director, place.director_address,
-                _codex_slot_role(record), run_path,
+                machine=machine,
+                kind="codex",
+                role="worker",
+                name=name,
+                status=_worker_status(status),
+                reach=(
+                    Messageable(f"seat:{run.path.name}/{name}")
+                    if status in MESSAGEABLE_SEAT_STATUSES
+                    else CannotReceiveMessages(_between_turns_reason(place.director))
+                ),
+                cwd=cwd,
+                showrunner=place.showrunner,
+                director=place.director,
+                assignment=WorkerAssignment(_codex_slot_role(record), run_path),
             ))
         entries.extend(_review_workers(machine, run, place, table, problems))
     return entries, worker_threads
@@ -673,7 +850,9 @@ def roster(environment: Mapping[str, str]) -> Roster:
     claude = _claude_entries(
         machine, records, details, runner_ids, production_places, runs, workers
     )
-    delegate_workers, worker_threads = _delegate_workers(machine, runs, claude, problems)
+    delegate_workers, worker_threads = _delegate_workers(
+        machine, runs, claude, production_places, problems
+    )
     daemon = codex_daemon.loaded_sessions(codex_daemon.daemon_socket(environment))
     codex_sessions: list[RosterEntry] = []
     if isinstance(daemon, codex_daemon.DaemonUnreadable):
@@ -681,9 +860,16 @@ def roster(environment: Mapping[str, str]) -> Roster:
     else:
         codex_sessions = [
             RosterEntry(
-                machine, "codex", "freestanding", session.name, session.status,
-                f"codex:{session.thread_id}", session.cwd,
-                "", "", "", "", "", "", "", "",
+                machine=machine,
+                kind="codex",
+                role="freestanding",
+                name=session.name,
+                status=session.status,
+                reach=Messageable(f"codex:{session.thread_id}"),
+                cwd=session.cwd,
+                showrunner=NoShowrunner(),
+                director=NoDirector(),
+                assignment=NotAWorker(),
             )
             for session in daemon
             if session.thread_id not in worker_threads
@@ -707,9 +893,10 @@ def _entry_line(entry: RosterEntry, *, you: bool, context: bool) -> str:
         name += " (context)"
     details = [entry.kind, entry.status]
     if entry.role == "worker":
-        details.append(entry.slot_role)
-    if entry.unit:
-        details.append(entry.unit)
+        details.append(_slot_role_for(entry))
+    unit = _unit(entry)
+    if unit:
+        details.append(unit)
     cwd = _home_shortened(entry.cwd)
     if cwd:
         details.append(cwd)
@@ -728,9 +915,9 @@ def _chosen_entries(
             (
                 entry
                 for entry in entries
-                if worker.director_address
+                if _director_address(worker)
                 and entry.role == "unit director"
-                and entry.address == worker.director_address
+                and _address(entry) == _director_address(worker)
             ),
             None,
         )
@@ -740,9 +927,9 @@ def _chosen_entries(
             (
                 entry
                 for entry in entries
-                if worker.showrunner_address
+                if _showrunner_address(worker)
                 and entry.role == "showrunner"
-                and entry.address == worker.showrunner_address
+                and _address(entry) == _showrunner_address(worker)
             ),
             None,
         )
@@ -765,14 +952,14 @@ def _print_text(
         def emit(entry: RosterEntry, depth: int) -> None:
             print("  " * depth + _entry_line(
                 entry,
-                you=entry.kind == "claude" and entry.address == f"session:{current_session}",
+                you=entry.kind == "claude" and _address(entry) == f"session:{current_session}",
                 context=entry in contexts,
             ))
             printed.add(entry)
 
         runners = sorted(
             (entry for entry in rows if entry.role == "showrunner"),
-            key=lambda entry: (entry.name, entry.address),
+            key=lambda entry: (entry.name, _address(entry)),
         )
         for runner in runners:
             emit(runner, 1)
@@ -780,9 +967,9 @@ def _print_text(
                 (
                     entry for entry in rows
                     if entry.role == "unit director"
-                    and entry.showrunner_address == runner.address
+                    and _showrunner_address(entry) == _address(runner)
                 ),
-                key=lambda entry: (entry.unit, entry.name),
+                key=lambda entry: (_unit(entry), entry.name),
             )
             for director in directors:
                 emit(director, 2)
@@ -790,9 +977,9 @@ def _print_text(
                     (
                         entry for entry in rows
                         if entry.role == "worker"
-                        and entry.director_address == director.address
+                        and _director_address(entry) == _address(director)
                     ),
-                    key=lambda entry: (entry.slot_role, entry.name),
+                    key=lambda entry: (_slot_role_for(entry), entry.name),
                 ):
                     emit(worker, 3)
         independent = sorted(
@@ -800,7 +987,7 @@ def _print_text(
                 entry for entry in rows
                 if entry.role == "unit director" and entry not in printed
             ),
-            key=lambda entry: (entry.unit, entry.name),
+            key=lambda entry: (_unit(entry), entry.name),
         )
         for director in independent:
             emit(director, 1)
@@ -808,17 +995,17 @@ def _print_text(
                 (
                     entry for entry in rows
                     if entry.role == "worker"
-                    and entry.director_address == director.address
+                    and _director_address(entry) == _address(director)
                 ),
-                key=lambda entry: (entry.slot_role, entry.name),
+                key=lambda entry: (_slot_role_for(entry), entry.name),
             ):
                 emit(worker, 2)
         orphan_groups: dict[str, list[RosterEntry]] = {}
         for worker in (entry for entry in rows if entry.role == "worker" and entry not in printed):
-            orphan_groups.setdefault(worker.session_dir, []).append(worker)
+            orphan_groups.setdefault(_session_dir(worker), []).append(worker)
         for session_dir, workers in sorted(orphan_groups.items()):
             print(f"  director not running: {session_dir}")
-            for worker in sorted(workers, key=lambda entry: (entry.slot_role, entry.name)):
+            for worker in sorted(workers, key=lambda entry: (_slot_role_for(entry), entry.name)):
                 emit(worker, 2)
         for entry in sorted(
             (entry for entry in rows if entry.kind == "claude" and entry.role == "freestanding"),
@@ -845,7 +1032,10 @@ def main(argv: list[str]) -> int:
     kind = raw_kind if raw_kind in ("claude", "codex") else None
     entries, contexts = _chosen_entries(result.entries, kind)
     if getattr(arguments, "as_json", False) is True:
-        print(json.dumps({"entries": [asdict(entry) for entry in entries], "problems": result.problems}))
+        print(json.dumps({
+            "entries": [_serialized_entry(entry) for entry in entries],
+            "problems": result.problems,
+        }))
     else:
         _print_text(entries, contexts, os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
     for problem in result.problems:

@@ -11,8 +11,9 @@ import unittest
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
+from inspect import Parameter, signature
 from pathlib import Path
-from typing import Literal, TypedDict, cast, final, override
+from typing import TypedDict, cast, final, override
 from unittest.mock import ANY, call, patch
 
 import inventory
@@ -24,14 +25,13 @@ import stop as stop_work
 import showrunner_footer
 import conversation_pause
 from account import Account
-from user_action import ActionRequired, NoActionRequired, UserAction
+from user_action import ActionRequired
 
 
 LOGIN = "owner@example.com"
 LABEL = "claude 2"
 NOW = "2026-10-09T21:49:10+00:00"
 NOW_UTC = datetime(2026, 10, 9, 21, 49, 10, tzinfo=timezone.utc)
-NO_ACTION_REQUIRED = NoActionRequired()
 
 
 class SentCall(TypedDict):
@@ -420,9 +420,9 @@ print("rc=0")
         action = ActionRequired("Follow the alert text.")
         with patch.object(
             settle,
-            "send_message",
+            "_deliver_message",
             return_value=settle.MessageSent(kind="sent"),
-        ) as send:
+        ) as deliver:
             settle.alert_user(
                 record.AllAccountSessions(kind="all account sessions"),
                 "action needed",
@@ -439,14 +439,36 @@ print("rc=0")
                 action,
             )
 
-        send.assert_called_once_with(
+        deliver.assert_called_once_with(
+            [
+                ANY,
+                "--to",
+                "user",
+                "--from",
+                "shutdown",
+                "--summary",
+                "action needed",
+                "--need",
+                "decision",
+                "--action",
+                action.text,
+                "--machine",
+                "natedev",
+            ],
             "user",
-            "action needed",
             "fix it",
-            action=action,
-            need="decision",
-            machine="natedev",
         )
+
+    def test_session_send_has_no_user_action_and_rejects_user_recipient(
+        self,
+    ) -> None:
+        self.assertNotIn("action", signature(settle.send_message).parameters)
+        with self.assertRaisesRegex(ValueError, "user messages require alert_user"):
+            _ = settle.send_message("user", "summary", "text")
+
+    def test_user_alert_cannot_omit_its_action(self) -> None:
+        action = signature(settle.alert_user).parameters["action"]
+        self.assertIs(cast(object, action.default), Parameter.empty)
 
     def test_clean_stop_reports_to_requesting_session_without_paging_user(
         self,
@@ -554,12 +576,10 @@ print("rc=0")
             _summary: str,
             _text: str,
             *,
-            action: UserAction,
-            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del need, machine, key, action
+            del machine, key
             events.append("requester result")
             raise RuntimeError("requester delivery failed")
 
@@ -582,7 +602,6 @@ print("rc=0")
             "session:requester",
             f"{LABEL}: stop partial",
             ANY,
-            action=NO_ACTION_REQUIRED,
             key=f"shutdown-result-{LOGIN}",
         )
 
@@ -618,12 +637,10 @@ print("rc=0")
             _summary: str,
             _text: str,
             *,
-            action: UserAction,
-            need: Literal["note", "decision", "blocked"] = "note",
             machine: str = "",
             key: str = "",
         ) -> settle.MessageDelivery:
-            del need, machine, key, action
+            del machine, key
             events.append("requester result")
             return settle.MessageSent(kind="sent")
 
@@ -648,7 +665,6 @@ print("rc=0")
             "session:requester",
             f"{LABEL}: stop partial",
             ANY,
-            action=NO_ACTION_REQUIRED,
             key=f"shutdown-result-{LOGIN}",
         )
 
