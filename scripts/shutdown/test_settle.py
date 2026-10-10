@@ -135,7 +135,11 @@ def showrunner(
     return inventory.ShowrunnerSession(
         **common_session(session_id, name),
         kind="showrunner",
-        host=inventory.TmuxHost(kind="tmux", tmux_session=name),
+        host=inventory.TmuxHost(
+            kind="tmux",
+            tmux_session=name,
+            pane=inventory.PaneNotRecorded(kind="not recorded"),
+        ),
         production=production,
         doc=f"/tmp/{production}.md",
     )
