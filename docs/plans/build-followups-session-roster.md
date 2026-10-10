@@ -248,7 +248,7 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 **Ruled out:** guarding calls that end or start sessions (`stop.py`'s `systemctl` / `launchctl` / `tmux kill-session` / `codex_mesh.py stop` and signals, `restart._add_unit_command`, the launches in `restart._run`) or the read-only `git`, `ps`, `tmux capture-pane` and `github-warm-status` probes — none delivers a message.
 
-### Phase 7 — `broadcast.py` takes its groups from the roster · status: todo
+### Phase 7 — `broadcast.py` takes its groups from the roster · status: done
 
 #### Work Order
 

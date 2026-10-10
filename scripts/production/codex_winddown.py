@@ -306,8 +306,10 @@ def announce(sender: str, showrunner: str, unit: str) -> bool:
     zones = {runner["session"]: runner["zone"] for runner in showrunners.registered_showrunners()}
     named = {"sender": sender, "time": clock(zones.get(sender) or next(iter(zones.values()), "UTC")),
              "minutes": EVERY_MINUTES}
-    return broadcast.report(broadcast.broadcast(sender, {"showrunner": showrunner.format(**named),
-                                                          "unit director": unit.format(**named)}))
+    return broadcast.report(broadcast.broadcast(sender, {
+        broadcast.Showrunners(): showrunner.format(**named),
+        broadcast.UnitDirectors(): unit.format(**named),
+    }))
 
 
 def start_count(record: SessionRecord) -> bool:

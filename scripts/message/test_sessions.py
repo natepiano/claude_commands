@@ -10,6 +10,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import override
+from unittest import mock
+
+import sessions
 
 
 SCRIPT = Path(__file__).with_name("sessions.py")
@@ -78,6 +81,21 @@ class SessionLookupTests(unittest.TestCase):
             self.assertEqual(
                 (result.returncode, result.stdout, result.stderr), (1, "", "")
             )
+
+    def test_running_records_include_socketless_sessions_but_live_records_do_not(self) -> None:
+        self.record("reachable.json", session_id="reachable", updated=10)
+        self.record("socketless.json", session_id="socketless", updated=20)
+        path = self.sessions / "socketless.json"
+        record = sessions.read_session(path)
+        assert not isinstance(record, sessions.UnreadableSessionRecord)
+        record["messagingSocketPath"] = ""
+        _ = path.write_text(json.dumps(record))
+        self.record("dead.json", pid=2**29 + os.getpid(), updated=30)
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            running = sessions.running_sessions()
+            live = sessions.live_sessions()
+        self.assertEqual([record["sessionId"] for record in running], ["socketless", "reachable"])
+        self.assertEqual([record["sessionId"] for record in live], ["reachable"])
 
     def test_empty_readable_registry_returns_absent(self) -> None:
         result = self.run_cli("socket", "session:missing")

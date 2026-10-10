@@ -30,12 +30,49 @@ import showrunners  # noqa: E402
 import unit_lookup  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
-from sessions import SessionRecord, live_sessions  # noqa: E402
+from sessions import SessionRecord, messaging_socket_exists, running_sessions  # noqa: E402
 
 Kind = Literal["claude", "codex"]
 Role = Literal["showrunner", "unit director", "worker", "freestanding"]
 KNOWN_SLOT_ROLES = frozenset(("impl", "test", "fix", "review"))
 MESSAGEABLE_SEAT_STATUSES = frozenset(("running", "waiting_capacity"))
+
+
+@dataclass(frozen=True)
+class CodexThread:
+    thread_id: str
+
+
+@dataclass(frozen=True)
+class ClaudeSession:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class NoSession:
+    """The sender runs in a shell outside a Claude or Codex session."""
+
+
+SenderIdentity = CodexThread | ClaudeSession | NoSession
+
+
+@dataclass(frozen=True)
+class NoCodexThread:
+    """This row has no Codex thread identity."""
+
+
+@dataclass(frozen=True)
+class NoClaudeSession:
+    """This row has no Claude session identity."""
+
+
+def sender_identity(environment: Mapping[str, str]) -> SenderIdentity:
+    """A Codex shell can inherit its launching Claude session's id."""
+    if thread_id := environment.get("CODEX_THREAD_ID", ""):
+        return CodexThread(thread_id)
+    if session_id := environment.get("CLAUDE_CODE_SESSION_ID", ""):
+        return ClaudeSession(session_id)
+    return NoSession()
 
 
 @dataclass(frozen=True)
@@ -127,6 +164,8 @@ class RosterEntry:
     showrunner: ShowrunnerRelationship
     director: DirectorRelationship
     assignment: Assignment
+    thread: CodexThread | NoCodexThread = NoCodexThread()
+    session: ClaudeSession | NoClaudeSession = NoClaudeSession()
 
 
 @dataclass(frozen=True)
@@ -135,8 +174,31 @@ class Roster:
     problems: list[str]
 
 
+def is_sender(entry: RosterEntry, identity: SenderIdentity) -> bool:
+    match identity:
+        case CodexThread():
+            return entry.kind == "codex" and entry.thread == identity
+        case ClaudeSession():
+            return entry.session == identity
+        case NoSession():
+            return False
+
+
+def is_top_level(entry: RosterEntry) -> bool:
+    return (
+        entry.kind == "claude"
+        and entry.role != "worker"
+        and not (entry.role == "unit director" and isinstance(entry.showrunner, UnderShowrunner))
+    )
+
+
 def _address(entry: RosterEntry) -> str:
     return entry.reach.address if isinstance(entry.reach, Messageable) else ""
+
+
+def _session_address(entry: RosterEntry) -> str:
+    """Hierarchy links keep their Claude identity even without a messaging socket."""
+    return f"session:{entry.session.session_id}" if isinstance(entry.session, ClaudeSession) else ""
 
 
 def _production(entry: RosterEntry) -> str:
@@ -178,7 +240,26 @@ def _session_dir(entry: RosterEntry) -> str:
     return entry.assignment.session_dir if isinstance(entry.assignment, WorkerAssignment) else ""
 
 
-def _serialized_entry(entry: RosterEntry) -> dict[str, str]:
+class SerializedRosterEntry(TypedDict):
+    machine: str
+    kind: str
+    role: str
+    name: str
+    status: str
+    address: str
+    cwd: str
+    production: str
+    showrunner: str
+    showrunner_address: str
+    unit: str
+    director: str
+    director_address: str
+    slot_role: str
+    session_dir: str
+    thread: str | None
+
+
+def _serialized_entry(entry: RosterEntry) -> SerializedRosterEntry:
     """Flatten domain states at the JSON compatibility boundary."""
     return {
         "machine": entry.machine,
@@ -196,6 +277,7 @@ def _serialized_entry(entry: RosterEntry) -> dict[str, str]:
         "director_address": _director_address(entry),
         "slot_role": _slot_role_for(entry),
         "session_dir": _session_dir(entry),
+        "thread": entry.thread.thread_id if isinstance(entry.thread, CodexThread) else None,
     }
 
 
@@ -286,7 +368,7 @@ def _problem(problems: list[str], source: str, error: BaseException | str) -> No
 
 def _newest_sessions() -> list[SessionRecord]:
     newest: dict[str, SessionRecord] = {}
-    for record in live_sessions():
+    for record in running_sessions():
         _ = newest.setdefault(record["sessionId"], record)
     return list(newest.values())
 
@@ -528,7 +610,7 @@ def _run_place(
         return _RunPlace(NoDirector(), NoShowrunner(), "")
     place = production_places.get(run.director.session_id)
     unit = place.director.unit if place is not None else ""
-    director_link = UnderDirector(unit, director.name, _address(director))
+    director_link = UnderDirector(unit, director.name, _session_address(director))
     return _RunPlace(
         director=director_link,
         showrunner=place.showrunner if place is not None else NoShowrunner(),
@@ -670,11 +752,16 @@ def _claude_entries(
             role=role,
             name=record["name"],
             status=detail.status,
-            reach=Messageable(f"session:{session_id}"),
+            reach=(
+                Messageable(f"session:{session_id}")
+                if messaging_socket_exists(record)
+                else CannotReceiveMessages("no messaging socket")
+            ),
             cwd=detail.cwd,
             showrunner=showrunner,
             director=director,
             assignment=assignment,
+            session=ClaudeSession(session_id),
         )
     return entries
 
@@ -829,6 +916,7 @@ def _delegate_workers(
                 showrunner=place.showrunner,
                 director=place.director,
                 assignment=WorkerAssignment(_codex_slot_role(record), run_path),
+                thread=CodexThread(thread_id) if thread_id else NoCodexThread(),
             ))
         entries.extend(_review_workers(machine, run, place, table, problems))
     return entries, worker_threads
@@ -870,6 +958,7 @@ def roster(environment: Mapping[str, str]) -> Roster:
                 showrunner=NoShowrunner(),
                 director=NoDirector(),
                 assignment=NotAWorker(),
+                thread=CodexThread(session.thread_id),
             )
             for session in daemon
             if session.thread_id not in worker_threads
@@ -917,7 +1006,7 @@ def _chosen_entries(
                 for entry in entries
                 if _director_address(worker)
                 and entry.role == "unit director"
-                and _address(entry) == _director_address(worker)
+                and _session_address(entry) == _director_address(worker)
             ),
             None,
         )
@@ -929,7 +1018,7 @@ def _chosen_entries(
                 for entry in entries
                 if _showrunner_address(worker)
                 and entry.role == "showrunner"
-                and _address(entry) == _showrunner_address(worker)
+                and _session_address(entry) == _showrunner_address(worker)
             ),
             None,
         )
@@ -939,7 +1028,7 @@ def _chosen_entries(
 
 
 def _print_text(
-    entries: list[RosterEntry], contexts: set[RosterEntry], current_session: str
+    entries: list[RosterEntry], contexts: set[RosterEntry], identity: SenderIdentity
 ) -> None:
     by_machine: dict[str, list[RosterEntry]] = {}
     for entry in entries:
@@ -952,14 +1041,14 @@ def _print_text(
         def emit(entry: RosterEntry, depth: int) -> None:
             print("  " * depth + _entry_line(
                 entry,
-                you=entry.kind == "claude" and _address(entry) == f"session:{current_session}",
+                you=is_sender(entry, identity),
                 context=entry in contexts,
             ))
             printed.add(entry)
 
         runners = sorted(
             (entry for entry in rows if entry.role == "showrunner"),
-            key=lambda entry: (entry.name, _address(entry)),
+            key=lambda entry: (entry.name, _session_address(entry)),
         )
         for runner in runners:
             emit(runner, 1)
@@ -967,7 +1056,7 @@ def _print_text(
                 (
                     entry for entry in rows
                     if entry.role == "unit director"
-                    and _showrunner_address(entry) == _address(runner)
+                    and _showrunner_address(entry) == _session_address(runner)
                 ),
                 key=lambda entry: (_unit(entry), entry.name),
             )
@@ -977,7 +1066,7 @@ def _print_text(
                     (
                         entry for entry in rows
                         if entry.role == "worker"
-                        and _director_address(entry) == _address(director)
+                        and _director_address(entry) == _session_address(director)
                     ),
                     key=lambda entry: (_slot_role_for(entry), entry.name),
                 ):
@@ -995,7 +1084,7 @@ def _print_text(
                 (
                     entry for entry in rows
                     if entry.role == "worker"
-                    and _director_address(entry) == _address(director)
+                    and _director_address(entry) == _session_address(director)
                 ),
                 key=lambda entry: (_slot_role_for(entry), entry.name),
             ):
@@ -1037,7 +1126,7 @@ def main(argv: list[str]) -> int:
             "problems": result.problems,
         }))
     else:
-        _print_text(entries, contexts, os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+        _print_text(entries, contexts, sender_identity(os.environ))
     for problem in result.problems:
         print(f"could not read: {problem}", file=sys.stderr)
     return 1 if result.problems else 0
