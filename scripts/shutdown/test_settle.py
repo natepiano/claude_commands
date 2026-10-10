@@ -17,8 +17,10 @@ from unittest.mock import patch
 
 import inventory
 import record
+import remote
 import settle
 import shutdown
+import stop as stop_work
 import showrunner_footer
 import conversation_pause
 from account import Account
@@ -189,6 +191,7 @@ def empty_shutdown_record(
         conductor=record.ConductorNotStarted(kind="not started"),
         force="wait for ready",
         entries=[],
+        stop_issues=[],
     )
 
 
@@ -196,6 +199,18 @@ def empty_refresh_report(machine: str, scope: record.ShutdownScope) -> settle.Re
     return settle.RefreshReport(
         record=empty_shutdown_record(machine, scope),
         verdicts=[],
+    )
+
+
+def completed_stop_report(current: record.ShutdownRecord) -> stop_work.StopReport:
+    counts: dict[str, int] = {}
+    for entry in current["entries"]:
+        kind = entry["session"]["kind"]
+        counts[kind] = counts.get(kind, 0) + 1
+    return stop_work.StopReport(
+        record=current,
+        unattributed=[],
+        counts=counts,
     )
 
 
@@ -626,21 +641,462 @@ print("rc=0")
         self.assertEqual(inventories.call_count, 2)
         self.assertEqual(self.sent_calls(), [])
 
-    def test_remote_stop_uses_owner_scaled_timeout_and_a_tagged_failure(
-        self,
-    ) -> None:
-        with patch.object(
-            settle, "run_remote", return_value=(7, "stop failed")
-        ) as remote:
-            outcome = settle.stop_remote(LOGIN, owner_count=7)
+    def test_remote_stop_waits_past_the_old_owner_timeout_in_one_call(self) -> None:
+        remote_record = empty_shutdown_record(
+            "Mac", record.AllAccountSessions(kind="all account sessions")
+        )
+        remote_record["state"] = "down"
+        elapsed_seconds = 0
+        calls: list[remote.RemoteCallLimit] = []
+
+        def delayed_remote(
+            arguments: list[str],
+            stdin: str = "",
+            limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT,
+        ) -> tuple[int, str]:
+            nonlocal elapsed_seconds
+            self.assertEqual(arguments, ["stop", LOGIN])
+            self.assertEqual(stdin, "")
+            calls.append(limit)
+            elapsed_seconds = 201
+            return (
+                0,
+                json.dumps(
+                    {
+                        "record": remote_record,
+                        "unattributed": [],
+                        "counts": {},
+                    }
+                ),
+            )
+
+        with patch.object(settle, "run_remote", side_effect=delayed_remote):
+            outcome = settle.stop_remote(LOGIN)
+
+        self.assertGreater(elapsed_seconds, max(120, 60 + 20 * 7))
+        self.assertEqual(
+            calls, [remote.WhileLinkAlive(kind="while link alive")]
+        )
+        self.assertEqual(outcome["kind"], "stopped")
+
+    def test_conductor_decisions_drive_poll_stop_and_exit_actions(self) -> None:
+        scope = record.AllAccountSessions(kind="all account sessions")
+        session = top_level("work", "Work")
+        with (
+            patch.dict(
+                os.environ,
+                {"SHUTDOWN_STATE_DIR": str(self.root / "decision-pending")},
+            ),
+            patch.object(
+                settle, "run_inventory", return_value=machine_inventory([session])
+            ),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            _ = settle.begin(LOGIN)
+            pending = settle.conduct_cycle(LOGIN, {}, here=True)
+
+        with (
+            patch.dict(
+                os.environ,
+                {"SHUTDOWN_STATE_DIR": str(self.root / "decision-ready")},
+            ),
+            patch.object(
+                settle, "run_inventory", return_value=machine_inventory([])
+            ),
+        ):
+            record.create(empty_shutdown_record("natedev", scope))
+            ready = settle.conduct_cycle(LOGIN, {}, here=True)
+
+        with patch.dict(
+            os.environ,
+            {"SHUTDOWN_STATE_DIR": str(self.root / "decision-ended")},
+        ):
+            ended = settle.conduct_cycle(LOGIN, {}, here=True)
 
         self.assertEqual(
-            outcome,
-            settle.RemoteStopFailed(
-                kind="failed", reason="mac: stop failed (rc 7)"
-            ),
+            [pending["kind"], ready["kind"], ended["kind"]],
+            ["settlement pending", "ready to stop", "settlement ended"],
         )
-        remote.assert_called_once_with(["stop", LOGIN], timeout=200.0)
+
+        action_root = self.root / "decision-actions"
+        action_record = empty_shutdown_record("natedev", scope)
+        action_report = settle.RefreshReport(record=action_record, verdicts=[])
+        decisions: list[settle.ConductorDecision] = [
+            settle.SettlementPending(
+                kind="settlement pending", reports=[action_report]
+            ),
+            settle.ReadyToStop(kind="ready to stop", reports=[action_report]),
+        ]
+        with patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(action_root)}):
+            record.create(action_record)
+            with (
+                patch.object(settle, "conduct_cycle", side_effect=decisions) as cycle,
+                patch.object(time, "sleep") as sleep,
+                patch.object(
+                    stop_work, "claim_stop_as_conductor", return_value=True
+                ) as claim,
+                patch.object(settle, "_stop_machines", return_value=([], [])) as stop,
+                patch.object(settle, "send_stop_alert") as alert,
+            ):
+                self.assertEqual(settle.conduct(LOGIN, here=True), 0)
+        self.assertEqual(cycle.call_count, 2)
+        sleep.assert_called_once_with(settle.SETTLE_INTERVAL_SECONDS)
+        claim.assert_called_once_with(LOGIN)
+        stop.assert_called_once_with(LOGIN, [action_report])
+        alert.assert_called_once()
+
+        with (
+            patch.object(
+                settle,
+                "conduct_cycle",
+                return_value=settle.SettlementEnded(
+                    kind="settlement ended", reason="cancelled"
+                ),
+            ),
+            patch.object(stop_work, "claim_stop_as_conductor") as ended_claim,
+        ):
+            self.assertEqual(settle.conduct(LOGIN, here=True), 0)
+        ended_claim.assert_not_called()
+
+    def test_peer_claim_failure_closes_local_before_alert_without_stopping(
+        self,
+    ) -> None:
+        scope = record.AllAccountSessions(kind="all account sessions")
+        local = empty_shutdown_record("natedev", scope)
+        remote_record = empty_shutdown_record("Mac", scope)
+        remote_root = self.root / "peer-claim-remote"
+        record.create(local)
+        with patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}):
+            record.create(remote_record)
+        reports = [
+            settle.RefreshReport(record=local, verdicts=[]),
+            settle.RefreshReport(record=remote_record, verdicts=[]),
+        ]
+        alerted = False
+
+        def check_alert(
+            _reports: list[stop_work.StopReport],
+            issues: list[record.OrchestrationStopIssue],
+            *,
+            label: str = "",
+        ) -> None:
+            nonlocal alerted
+            alerted = True
+            self.assertEqual(label, LABEL)
+            local_closed = self.found_record()
+            self.assertEqual(local_closed["state"], "stop partial")
+            self.assertEqual(local_closed["stop_issues"], issues)
+            with patch.dict(
+                os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
+            ):
+                peer = record.find_live(LOGIN)
+            self.assertEqual(peer["kind"], "live")
+            if peer["kind"] == "live":
+                self.assertEqual(peer["record"]["state"], "settling")
+
+        with (
+            patch.object(
+                settle,
+                "conduct_cycle",
+                return_value=settle.ReadyToStop(
+                    kind="ready to stop", reports=reports
+                ),
+            ),
+            patch.object(
+                settle,
+                "claim_remote_stop",
+                return_value=settle.RemoteStopClaimFailed(
+                    kind="failed", reason="rc 4"
+                ),
+            ),
+            patch.object(settle, "other_machine", return_value="Mac"),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.object(settle, "send_stop_alert", side_effect=check_alert),
+            patch.object(settle, "stop_remote") as remote_stop,
+            patch.object(stop_work, "stop") as local_stop,
+        ):
+            result = settle.conduct(LOGIN)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(alerted)
+        remote_stop.assert_not_called()
+        local_stop.assert_not_called()
+        self.assertEqual(
+            self.found_record()["stop_issues"],
+            [
+                record.StopClaimFailed(
+                    kind="stop claim failed",
+                    at=NOW,
+                    machine="Mac",
+                    reason="rc 4",
+                )
+            ],
+        )
+
+    def test_local_stop_exception_closes_local_after_peer_finishes_before_alert(
+        self,
+    ) -> None:
+        scope = record.AllAccountSessions(kind="all account sessions")
+        local = empty_shutdown_record("natedev", scope)
+        remote_record = empty_shutdown_record("Mac", scope)
+        remote_root = self.root / "local-failure-remote"
+        record.create(local)
+        with patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}):
+            record.create(remote_record)
+        reports = [
+            settle.RefreshReport(record=local, verdicts=[]),
+            settle.RefreshReport(record=remote_record, verdicts=[]),
+        ]
+
+        def claim_peer(
+            _login: str, timing: record.StopTiming
+        ) -> settle.RemoteStopClaimOutcome:
+            with patch.dict(
+                os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
+            ):
+                self.assertTrue(stop_work.claim_stop_as_peer(LOGIN, timing))
+            return settle.RemoteStopClaimed(kind="claimed")
+
+        def stop_peer(_login: str) -> settle.RemoteStopOutcome:
+            def finish(current: record.ShutdownRecord) -> None:
+                current["state"] = "down"
+
+            with patch.dict(
+                os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
+            ):
+                finished = record.update(LOGIN, finish)
+            return settle.RemoteStopped(
+                kind="stopped", report=completed_stop_report(finished)
+            )
+
+        def check_alert(
+            _reports: list[stop_work.StopReport],
+            issues: list[record.OrchestrationStopIssue],
+            *,
+            label: str = "",
+            failed_records: list[record.ShutdownRecord],
+        ) -> None:
+            self.assertEqual(label, LABEL)
+            self.assertEqual(
+                [failed["machine"] for failed in failed_records], ["natedev"]
+            )
+            self.assertEqual(self.found_record()["stop_issues"], issues)
+            self.assertEqual(self.found_record()["state"], "stop partial")
+            with patch.dict(
+                os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
+            ):
+                peer = record.find_live(LOGIN)
+            self.assertEqual(peer["kind"], "live")
+            if peer["kind"] == "live":
+                self.assertEqual(peer["record"]["state"], "down")
+
+        with (
+            patch.object(
+                settle,
+                "conduct_cycle",
+                return_value=settle.ReadyToStop(
+                    kind="ready to stop", reports=reports
+                ),
+            ),
+            patch.object(settle, "claim_remote_stop", side_effect=claim_peer),
+            patch.object(settle, "stop_remote", side_effect=stop_peer),
+            patch.object(stop_work, "stop", side_effect=OSError("inventory failed")),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.object(settle, "send_stop_alert", side_effect=check_alert),
+        ):
+            result = settle.conduct(LOGIN)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            self.found_record()["stop_issues"],
+            [
+                record.MachineStopFailed(
+                    kind="machine stop failed",
+                    at=NOW,
+                    machine="natedev",
+                    reason="inventory failed",
+                )
+            ],
+        )
+
+    def test_local_stop_exception_alert_includes_persisted_session_issue(
+        self,
+    ) -> None:
+        scope = record.AllAccountSessions(kind="all account sessions")
+        local = empty_shutdown_record("natedev", scope)
+        local["entries"] = [
+            record.ShutdownSessionEntry(
+                session=top_level("work", "Work"),
+                timers=[],
+                settle_message=record.SettleMessageNotSent(kind="not sent"),
+                where=record.WhereNotSaid(kind="not said"),
+                progress=record.SessionWaiting(kind="waiting"),
+                stop_issues=[],
+            )
+        ]
+        record.create(local)
+        report = settle.RefreshReport(record=local, verdicts=[])
+
+        def fail_after_persisting_issue(_login: str) -> stop_work.StopReport:
+            def save_issue(current: record.ShutdownRecord) -> None:
+                current["entries"][0]["stop_issues"] = [
+                    record.NotReadyToStop(
+                        kind="not ready to stop",
+                        at=NOW,
+                        status="idle",
+                        progress="waiting",
+                    )
+                ]
+
+            _ = record.update(LOGIN, save_issue)
+            raise OSError("inventory failed")
+
+        with (
+            patch.object(
+                settle,
+                "conduct_cycle",
+                return_value=settle.ReadyToStop(
+                    kind="ready to stop", reports=[report]
+                ),
+            ),
+            patch.object(stop_work, "stop", side_effect=fail_after_persisting_issue),
+            patch.object(settle, "record_time", return_value=NOW),
+        ):
+            self.assertEqual(settle.conduct(LOGIN, here=True), 0)
+
+        alert = self.sent_calls()[0]["text"]
+        self.assertIn("natedev:\n  Work: not stopped: idle, waiting", alert)
+        self.assertIn("natedev: stop failed: inventory failed", alert)
+
+    def test_close_failed_stop_uses_shared_record_time(self) -> None:
+        current = empty_shutdown_record(
+            "natedev", record.AllAccountSessions(kind="all account sessions")
+        )
+        current["state"] = "stopping"
+        record.create(current)
+        timestamp = "2026-10-10T01:02:03+00:00"
+
+        with (
+            patch.object(settle, "record_time", return_value=timestamp) as clock,
+            patch.object(settle, "local_machine", return_value="natedev"),
+        ):
+            self.assertEqual(
+                shutdown.main(
+                    ["close-failed-stop", LOGIN, "--reason", "inventory failed"]
+                ),
+                0,
+            )
+
+        clock.assert_called_once_with()
+        self.assertEqual(self.found_record()["stop_issues"][0]["at"], timestamp)
+
+    def test_remote_stop_failure_closes_both_and_records_failed_close_status(
+        self,
+    ) -> None:
+        scope = record.AllAccountSessions(kind="all account sessions")
+        local = empty_shutdown_record("natedev", scope)
+        remote_record = empty_shutdown_record("Mac", scope)
+        remote_root = self.root / "remote-failure-peer"
+        record.create(local)
+        with patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}):
+            record.create(remote_record)
+        reports = [
+            settle.RefreshReport(record=local, verdicts=[]),
+            settle.RefreshReport(record=remote_record, verdicts=[]),
+        ]
+
+        def claim_peer(_login: str, timing: record.StopTiming) -> settle.RemoteStopClaimOutcome:
+            with patch.dict(
+                os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
+            ):
+                self.assertTrue(stop_work.claim_stop_as_peer(LOGIN, timing))
+            return settle.RemoteStopClaimed(kind="claimed")
+
+        def stop_local(_login: str) -> stop_work.StopReport:
+            def finish(current: record.ShutdownRecord) -> None:
+                current["state"] = "down"
+
+            return completed_stop_report(record.update(LOGIN, finish))
+
+        def close_peer(
+            arguments: list[str],
+            stdin: str = "",
+            limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT,
+        ) -> tuple[int, str]:
+            self.assertEqual(stdin, "")
+            self.assertEqual(limit, remote.STANDARD_TIME_LIMIT)
+            if arguments == ["records", "--json", "--here"]:
+                with patch.dict(
+                    os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
+                ):
+                    peer = record.find_live(LOGIN)
+                self.assertEqual(peer["kind"], "live")
+                if peer["kind"] != "live":
+                    self.fail("expected peer shutdown record")
+                return 0, json.dumps([peer["record"]])
+            self.assertEqual(
+                arguments,
+                ["close-failed-stop", LOGIN, "--reason", "rc 9"],
+            )
+            with (
+                patch.dict(
+                    os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
+                ),
+                patch.object(settle, "local_machine", return_value="Mac"),
+                patch.object(settle, "now_utc", return_value=NOW_UTC),
+            ):
+                self.assertEqual(shutdown.main(arguments), 0)
+            return 6, ""
+
+        def check_alert(
+            _reports: list[stop_work.StopReport],
+            issues: list[record.OrchestrationStopIssue],
+            *,
+            label: str = "",
+            failed_records: list[record.ShutdownRecord],
+        ) -> None:
+            self.assertEqual(label, LABEL)
+            self.assertEqual(
+                [failed["machine"] for failed in failed_records], ["Mac"]
+            )
+            local_closed = self.found_record()
+            self.assertEqual(local_closed["state"], "stop partial")
+            self.assertEqual(local_closed["stop_issues"], issues)
+            self.assertEqual(
+                issues[0]["reason"],
+                "rc 9; its record could not be closed (rc 6)",
+            )
+            with patch.dict(
+                os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
+            ):
+                peer = record.find_live(LOGIN)
+            self.assertEqual(peer["kind"], "live")
+            if peer["kind"] == "live":
+                self.assertEqual(peer["record"]["state"], "stop partial")
+                self.assertEqual(peer["record"]["stop_issues"][0]["reason"], "rc 9")
+
+        with (
+            patch.object(
+                settle,
+                "conduct_cycle",
+                return_value=settle.ReadyToStop(
+                    kind="ready to stop", reports=reports
+                ),
+            ),
+            patch.object(settle, "claim_remote_stop", side_effect=claim_peer),
+            patch.object(
+                settle,
+                "stop_remote",
+                return_value=settle.RemoteStopFailed(kind="failed", reason="rc 9"),
+            ),
+            patch.object(stop_work, "stop", side_effect=stop_local),
+            patch.object(settle, "run_remote", side_effect=close_peer),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.object(settle, "send_stop_alert", side_effect=check_alert),
+        ):
+            result = settle.conduct(LOGIN)
+
+        self.assertEqual(result, 0)
 
     def test_cancel_notifies_an_entry_with_a_queued_settle_message(self) -> None:
         report = machine_inventory([top_level("session", "Work")])
@@ -743,6 +1199,7 @@ print("rc=0")
                 settle_message=record.SettleMessageNotSent(kind="not sent"),
                 where=record.WhereNotSaid(kind="not said"),
                 progress=record.SessionReadyToStop(kind="ready", at=NOW),
+                stop_issues=[],
             )
         ]
         line = "Mac showrunner Remote Showrunner: idle, showing a form, merge in progress"

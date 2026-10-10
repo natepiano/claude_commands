@@ -25,6 +25,8 @@ import conversation_pause
 from inventory import Inventory, Session, inventory, parse_inventory
 from record import (
     Conductor,
+    MachineStopFailed,
+    OrchestrationStopIssue,
     ShutdownSessionEntry,
     NoFooter,
     NoLiveRecord,
@@ -32,6 +34,7 @@ from record import (
     ShutdownScope,
     ShowrunnerFooter,
     ShutdownInProgress,
+    StopIssue,
     StopTiming,
     TimerRestore,
     archive,
@@ -157,7 +160,7 @@ class SettlementEnded(TypedDict):
     reason: str
 
 
-ConductCycleOutcome = SettlementPending | ReadyToStop | SettlementEnded
+ConductorDecision = SettlementPending | ReadyToStop | SettlementEnded
 
 
 class RemoteStopped(TypedDict):
@@ -190,7 +193,8 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
 
 
-def _timestamp() -> str:
+def record_time() -> str:
+    """Return a canonical timestamp for a shutdown record field."""
     return now_utc().isoformat(timespec="seconds")
 
 
@@ -203,6 +207,11 @@ def _pacific(value: str) -> str:
 def _machine() -> str:
     name = socket.gethostname().split(".", 1)[0]
     return name or ("mac" if sys.platform == "darwin" else "natedev")
+
+
+def local_machine() -> str:
+    """Return this machine's shutdown-record name."""
+    return _machine()
 
 
 def _scope(only: Iterable[str]) -> ShutdownScope:
@@ -381,6 +390,7 @@ def _entry(session: Session) -> ShutdownSessionEntry:
         "settle_message": {"kind": "not sent"},
         "where": {"kind": "not said"},
         "progress": {"kind": "waiting"},
+        "stop_issues": [],
     }
 
 
@@ -392,7 +402,7 @@ def begin(
     """Create one machine's settling record and stop only its recorded timers."""
     scope = _scope(only)
     report = run_inventory(login, scope)
-    requested_at = _timestamp()
+    requested_at = record_time()
     record: ShutdownRecord = {
         "login": login,
         "label": report["label"],
@@ -408,6 +418,7 @@ def begin(
         "conductor": {"kind": "not started"},
         "force": "wait for ready",
         "entries": [_entry(session) for session in report["sessions"]],
+        "stop_issues": [],
     }
     create(record)
     try:
@@ -521,7 +532,7 @@ def _refresh_entries(record: ShutdownRecord, report: Inventory) -> list[TimerRes
         if session["session_id"] in current or session["pid"] in unattributed:
             continue
         if entry["progress"]["kind"] != "already gone":
-            entry["progress"] = {"kind": "already gone", "at": _timestamp()}
+            entry["progress"] = {"kind": "already gone", "at": record_time()}
 
     entries = {
         entry["session"]["session_id"]: entry for entry in record["entries"]
@@ -557,7 +568,7 @@ def _refresh_entries(record: ShutdownRecord, report: Inventory) -> list[TimerRes
             if entry["progress"]["kind"] != "passive seat ready":
                 entry["progress"] = {
                     "kind": "passive seat ready",
-                    "at": _timestamp(),
+                    "at": record_time(),
                 }
         elif entry["progress"]["kind"] == "passive seat ready":
             entry["progress"] = {"kind": "waiting"}
@@ -602,7 +613,7 @@ def _send_settle_message(record: ShutdownRecord, entry: ShutdownSessionEntry) ->
         f"Shutdown of {record['label']}: reach a safe stop",
         _settle_text(record, session),
     )
-    at = _timestamp()
+    at = record_time()
     if delivery["kind"] == "sent":
         entry["settle_message"] = {"kind": "sent", "at": at}
     else:
@@ -732,7 +743,7 @@ def ready(where: str) -> int:
             if blocker["kind"] == "blocked":
                 print(blocker["reason"], file=sys.stderr)
                 return 2
-            at = _timestamp()
+            at = record_time()
             accepted = False
 
             def mark_ready(current: ShutdownRecord) -> None:
@@ -959,7 +970,7 @@ def _send_holdout_alert(
 
 def conduct_cycle(
     login: str, unreached_since: dict[str, datetime], here: bool = False
-) -> ConductCycleOutcome:
+) -> ConductorDecision:
     """Run one deterministic conductor pass and tag the next conductor action."""
     try:
         local = refresh(login)
@@ -1021,15 +1032,11 @@ def _requesting_machine(reports: list[RefreshReport]) -> str:
     return reports[0]["record"]["machine"] if reports else ""
 
 
-def _stop_timeout(owner_count: int) -> float:
-    return max(120.0, 60.0 + owner_count * 20.0)
-
-
-def stop_remote(login: str, owner_count: int = 0) -> RemoteStopOutcome:
+def stop_remote(login: str) -> RemoteStopOutcome:
     """Stop the other machine and return its validated stop report."""
     while True:
         status, output = run_remote(
-            ["stop", login], timeout=_stop_timeout(owner_count)
+            ["stop", login], limit={"kind": "while link alive"}
         )
         if status != 255:
             break
@@ -1037,14 +1044,14 @@ def stop_remote(login: str, owner_count: int = 0) -> RemoteStopOutcome:
     if status != 0:
         return {
             "kind": "failed",
-            "reason": f"{other_machine()}: stop failed (rc {status})",
+            "reason": f"rc {status}",
         }
     try:
         return {"kind": "stopped", "report": stop_work.parse_stop_report(output)}
     except (TypeError, ValueError) as error:
         return {
             "kind": "failed",
-            "reason": f"{other_machine()}: stop report unreadable: {error}",
+            "reason": f"stop report unreadable: {error}",
         }
 
 
@@ -1059,40 +1066,98 @@ def claim_remote_stop(login: str, force: StopTiming) -> RemoteStopClaimOutcome:
         return {"kind": "claimed"}
     return {
         "kind": "failed",
-        "reason": f"{other_machine()}: stop claim failed (rc {status})",
+        "reason": f"rc {status}",
     }
+
+
+def _close_remote_failed_stop(login: str, reason: str) -> str:
+    while True:
+        status, _ = run_remote(
+            ["close-failed-stop", login, "--reason", reason]
+        )
+        if status != 255:
+            break
+        time.sleep(SETTLE_INTERVAL_SECONDS)
+    if status != 0:
+        return f"{reason}; its record could not be closed (rc {status})"
+    return reason
 
 
 def _stop_machines(
     login: str, reports: list[RefreshReport]
-) -> tuple[list[stop_work.StopReport], list[str]]:
-    local_machine = reports[0]["record"]["machine"]
+) -> tuple[list[stop_work.StopReport], list[OrchestrationStopIssue]]:
+    this_machine = reports[0]["record"]["machine"]
     requester_machine = _requesting_machine(reports)
     ordered = sorted(
         reports,
         key=lambda report: report["record"]["machine"] == requester_machine,
     )
     stopped: list[stop_work.StopReport] = []
-    failures: list[str] = []
+    issues: list[MachineStopFailed] = []
     for report in ordered:
         machine = report["record"]["machine"]
-        if machine == local_machine:
+        if machine == this_machine:
             try:
                 stopped.append(stop_work.stop(login))
             except Exception as error:
                 reason = str(error) or error.__class__.__name__
-                failures.append(f"{machine}: stop failed: {reason}")
+                issues.append(
+                    MachineStopFailed(
+                        kind="machine stop failed",
+                        at=record_time(),
+                        machine=machine,
+                        reason=reason,
+                    )
+                )
             continue
-        owner_count = sum(
-            entry["session"]["kind"] != "seat"
-            for entry in report["record"]["entries"]
-        )
-        remote = stop_remote(login, owner_count)
+        remote = stop_remote(login)
         if remote["kind"] == "failed":
-            failures.append(remote["reason"])
+            issues.append(
+                MachineStopFailed(
+                    kind="machine stop failed",
+                    at=record_time(),
+                    machine=machine,
+                    reason=remote["reason"],
+                )
+            )
         else:
             stopped.append(remote["report"])
-    return stopped, failures
+    closed: list[OrchestrationStopIssue] = []
+    for issue in issues:
+        reason = issue["reason"]
+        if issue["machine"] != this_machine:
+            reason = _close_remote_failed_stop(login, reason)
+        closed_issue = MachineStopFailed(
+            kind="machine stop failed",
+            at=issue["at"],
+            machine=issue["machine"],
+            reason=reason,
+        )
+        stop_work.close_failed_stop(login, closed_issue)
+        closed.append(closed_issue)
+    return stopped, closed
+
+
+def _failed_stop_records(
+    login: str,
+    this_machine: str,
+    issues: list[OrchestrationStopIssue],
+) -> list[ShutdownRecord]:
+    failed_machines = {
+        issue["machine"]
+        for issue in issues
+        if issue["kind"] == "machine stop failed"
+    }
+    failed: list[ShutdownRecord] = []
+    if this_machine in failed_machines:
+        found = find_live(login)
+        if found["kind"] == "live":
+            failed.append(found["record"])
+    if any(machine != this_machine for machine in failed_machines):
+        peer = _live_on_other(login)
+        if peer["kind"] == "live" and peer["record"]["machine"] in failed_machines:
+            failed.append(peer["record"])
+    return failed
 
 
 def _count_text(counts: dict[str, int]) -> str:
@@ -1118,16 +1183,41 @@ def _unattributed_line(report: stop_work.StopReport) -> str:
     )
 
 
+def stop_issue_text(issue: StopIssue) -> str:
+    """Render one persisted stop issue for status and the final alert."""
+    match issue["kind"]:
+        case "not ready to stop":
+            return f"not stopped: {issue['status']}, {issue['progress']}"
+        case "still running":
+            return f"still running: {issue['reason']}"
+        case "account unreadable":
+            return "not stopped: account unreadable"
+        case "seat still live":
+            return "not stopped: owner or seat still live"
+        case "codex server left running":
+            return f"Codex server {issue['run_dir']} left running: {issue['cause']}"
+        case "unit tmux session left running":
+            return (
+                f"tmux session {issue['tmux_session']} left running: "
+                f"{issue['cause']}"
+            )
+        case "stop claim failed":
+            return f"{issue['machine']}: stop claim failed: {issue['reason']}"
+        case "machine stop failed":
+            return f"{issue['machine']}: stop failed: {issue['reason']}"
+
+
 def send_stop_alert(
     reports: list[stop_work.StopReport],
-    orchestration_failures: list[str],
+    orchestration_issues: list[OrchestrationStopIssue],
     *,
     label: str = "",
+    failed_records: Iterable[ShutdownRecord] = (),
 ) -> None:
     """Tell the user that shutdown finished or stopped partially."""
     if not reports and not label:
         return
-    partial = bool(orchestration_failures) or any(
+    partial = bool(orchestration_issues) or any(
         report["record"]["state"] == "stop partial" for report in reports
     )
     account_label = reports[0]["record"]["label"] if reports else label
@@ -1141,12 +1231,22 @@ def send_stop_alert(
         lines.append(
             f"{report['record']['machine']}: {_count_text(report['counts'])}"
         )
-        lines.extend(f"  {failure}" for failure in report["failures"])
-        lines.extend(f"  {resource}" for resource in report["left_running"])
+        for entry in report["record"]["entries"]:
+            lines.extend(
+                f"  {entry['session']['name']}: {stop_issue_text(issue)}"
+                for issue in entry["stop_issues"]
+            )
         unattributed = _unattributed_line(report)
         if unattributed:
             lines.append(f"  {unattributed}")
-    lines.extend(f"  {failure}" for failure in orchestration_failures)
+    for record in failed_records:
+        lines.append(f"{record['machine']}:")
+        for entry in record["entries"]:
+            lines.extend(
+                f"  {entry['session']['name']}: {stop_issue_text(issue)}"
+                for issue in entry["stop_issues"]
+            )
+    lines.extend(f"  {stop_issue_text(issue)}" for issue in orchestration_issues)
     lines.append(
         f"/shutdown restart in any Claude session on {account_label}, or in a terminal "
         + "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart"
@@ -1166,7 +1266,7 @@ def conduct(login: str, here: bool = False) -> int:
             return 0
         reports = outcome["reports"]
         if outcome["kind"] == "ready to stop":
-            if not stop_work.claim_stop(login):
+            if not stop_work.claim_stop_as_conductor(login):
                 return 0
             claimed = find_live(login)
             if claimed["kind"] == "no shutdown":
@@ -1174,17 +1274,28 @@ def conduct(login: str, here: bool = False) -> int:
             if not here:
                 claim = claim_remote_stop(login, claimed["record"]["force"])
                 if claim["kind"] == "failed":
+                    issue: OrchestrationStopIssue = {
+                        "kind": "stop claim failed",
+                        "at": record_time(),
+                        "machine": other_machine(),
+                        "reason": claim["reason"],
+                    }
+                    stop_work.close_failed_stop(login, issue)
                     send_stop_alert(
                         [],
-                        [claim["reason"]],
+                        [issue],
                         label=reports[0]["record"]["label"],
                     )
                     return 0
-            stopped, failures = _stop_machines(login, reports)
+            stopped, issues = _stop_machines(login, reports)
+            failed_records = _failed_stop_records(
+                login, reports[0]["record"]["machine"], issues
+            )
             send_stop_alert(
                 stopped,
-                failures,
+                issues,
                 label=reports[0]["record"]["label"],
+                failed_records=failed_records,
             )
             return 0
         requested_at = datetime.fromisoformat(
@@ -1534,4 +1645,8 @@ def status_record_lines(record: ShutdownRecord) -> list[str]:
         else:
             message = ""
         lines.append(f"  {entry['session']['name']}: {progress}{message}")
+        lines.extend(
+            f"    {stop_issue_text(issue)}" for issue in entry["stop_issues"]
+        )
+    lines.extend(f"  {stop_issue_text(issue)}" for issue in record["stop_issues"])
     return lines

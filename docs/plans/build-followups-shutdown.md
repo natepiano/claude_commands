@@ -221,7 +221,7 @@ Context (showrunner): a proposed, not yet approved, plan for sessions on differe
 
 **Gotchas:** `record.archive` accepts only `cancelled` or `up`, so a scratch `down` stays the live record until restart exists; a live check moves it into `history/` by hand. `send.py --to user` logs the text's first line as the summary; the title goes to the user channel. Ghostty launched while the KDE session is locked starts no shell. Not yet run live: the Ghostty window close, every Mac leg (`claim-stop`, remote `stop`, the `--machine natedev` route) and Phase 5's two-machine `cancel`.
 
-### Phase 7 — A stop that fails or runs long still ends in a known state  · status: todo
+### Phase 7 — A stop that fails or runs long still ends in a known state  · status: done
 
 #### Work Order
 

@@ -22,13 +22,17 @@ import sessions
 from inventory import Inventory, Session, UnattributedSession, terminal_kind
 from record import (
     Conductor,
+    OrchestrationStopIssue,
     NoLiveRecord,
+    NotReadyToStop,
+    SessionStopIssue,
     ShutdownRecord,
     ShutdownScope,
     ShutdownSessionEntry,
     StopTiming,
     find_live,
     parse_records,
+    stop_lock,
     update,
 )
 
@@ -48,10 +52,21 @@ Sleeper = Callable[[float], None]
 
 class StopReport(TypedDict):
     record: ShutdownRecord
-    failures: list[str]
-    left_running: list[str]
     unattributed: list[UnattributedSession]
     counts: dict[str, int]
+
+
+class StopUnderway(TypedDict):
+    kind: Literal["stop underway"]
+    record: ShutdownRecord
+
+
+class StopFinished(TypedDict):
+    kind: Literal["stop finished"]
+    record: ShutdownRecord
+
+
+EnterStoppingOutcome = StopUnderway | StopFinished
 
 
 class CancelClaimed(TypedDict):
@@ -156,22 +171,36 @@ def stop_conductor(
         _ = launchctl(["remove", conductor["label"]])
 
 
-def claim_stop(login: str, force: StopTiming | None = None) -> bool:
-    """Atomically win or replay the settling-to-stopping transition."""
+def claim_stop_as_conductor(login: str) -> bool:
+    """Claim a settling record while preserving its requested stop timing."""
     claimed = False
 
     def claim(current: ShutdownRecord) -> None:
         nonlocal claimed
         if current["state"] == "settling":
             current["state"] = "stopping"
-            if force is not None:
-                current["force"] = force
             claimed = True
-        elif (
-            force is not None
-            and current["state"] == "stopping"
-            and current["force"] == force
-        ):
+
+    try:
+        _ = update(login, claim)
+    except NoLiveRecord:
+        return False
+    return claimed
+
+
+def claim_stop_as_peer(login: str, timing: StopTiming) -> bool:
+    """Claim a peer record, replaying it without undoing a now upgrade."""
+    claimed = False
+
+    def claim(current: ShutdownRecord) -> None:
+        nonlocal claimed
+        if current["state"] == "settling":
+            current["state"] = "stopping"
+            current["force"] = timing
+            claimed = True
+        elif current["state"] == "stopping":
+            if timing == "now":
+                current["force"] = "now"
             claimed = True
 
     try:
@@ -205,21 +234,49 @@ def claim_cancel(login: str) -> CancelClaim:
     return {"kind": "ended"}
 
 
-def _enter_stopping(login: str) -> ShutdownRecord:
+def _enter_stopping(login: str) -> EnterStoppingOutcome:
     accepted = False
+    finished = False
 
     def enter(current: ShutdownRecord) -> None:
-        nonlocal accepted
+        nonlocal accepted, finished
         if current["state"] == "settling":
             current["state"] = "stopping"
             accepted = True
         elif current["state"] == "stopping":
             accepted = True
+        elif current["state"] in {"down", "stop partial"}:
+            accepted = True
+            finished = True
 
     record = update(login, enter)
     if not accepted:
         raise NoLiveRecord(f"shutdown for {login} is no longer settling")
-    return record
+    if finished:
+        return {"kind": "stop finished", "record": record}
+    return {"kind": "stop underway", "record": record}
+
+
+def close_failed_stop(login: str, issue: OrchestrationStopIssue) -> None:
+    """Close a claimed stop and persist the orchestration failure that ended it."""
+    with stop_lock(login):
+
+        def close(current: ShutdownRecord) -> None:
+            if current["state"] in {"stopping", "down", "stop partial"}:
+                duplicate = any(
+                    existing["kind"] == issue["kind"]
+                    and existing["machine"] == issue["machine"]
+                    and existing["reason"] == issue["reason"]
+                    for existing in current["stop_issues"]
+                )
+                if not duplicate:
+                    current["stop_issues"].append(issue)
+                current["state"] = "stop partial"
+
+        try:
+            _ = update(login, close)
+        except NoLiveRecord:
+            return
 
 
 def _timestamp(clock: Clock) -> str:
@@ -266,13 +323,14 @@ def _fresh_session(stored: Session, report: Inventory) -> FreshSession:
     return {"kind": "session absent"}
 
 
-def _set_progress(
+def _set_stop_outcome(
     login: str,
     session_id: str,
     progress: Literal[
         "stopped", "already gone", "process identity lost", "stop failed"
     ],
     clock: Clock,
+    issues: list[SessionStopIssue],
     reason: str = "",
 ) -> ShutdownRecord:
     def change(current: ShutdownRecord) -> None:
@@ -294,8 +352,19 @@ def _set_progress(
             entry["progress"] = {"kind": "already gone", "at": at}
         else:
             entry["progress"] = {"kind": "process identity lost", "at": at}
+        entry["stop_issues"] = issues
 
     return update(login, change)
+
+
+def _replace_stop_issues(
+    login: str, session_id: str, issues: list[SessionStopIssue]
+) -> ShutdownRecord:
+    def replace(current: ShutdownRecord) -> None:
+        entry = _record_entry(current, session_id)
+        entry["stop_issues"] = issues
+
+    return update(login, replace)
 
 
 def _wait_for_exit(
@@ -369,33 +438,46 @@ def _stop_codex_servers(
     *,
     codex_mesh: CommandRunner,
     is_alive: LivenessCheck,
-) -> list[str]:
-    failures: list[str] = []
+    clock: Clock,
+) -> list[SessionStopIssue]:
+    issues: list[SessionStopIssue] = []
     for run_dir in _run_directories(session):
         server_pids = _mesh_server_pids(run_dir)
         status = codex_mesh(["stop", "--session-dir", run_dir])
         if status != 0 or any(is_alive(pid) for pid in server_pids):
-            failures.append(
-                f"{session['kind']} {session['name']}: Codex server {run_dir} did not stop"
+            issues.append(
+                {
+                    "kind": "codex server left running",
+                    "at": _timestamp(clock),
+                    "run_dir": run_dir,
+                    "cause": "stop not confirmed",
+                }
             )
-    return failures
+    return issues
 
 
-def _stop_unit_tmux(session: Session, tmux: CommandRunner) -> list[str]:
+def _stop_unit_tmux(
+    session: Session, tmux: CommandRunner, clock: Clock
+) -> list[SessionStopIssue]:
     if session["kind"] != "unit":
         return []
     tmux_session = session["host"]["tmux_session"]
     target = f"={tmux_session}"
-    failure = f"unit {session['name']}: tmux session {tmux_session} did not stop"
+    issue: SessionStopIssue = {
+        "kind": "unit tmux session left running",
+        "at": _timestamp(clock),
+        "tmux_session": tmux_session,
+        "cause": "stop not confirmed",
+    }
     try:
         killed = tmux(["kill-session", "-t", target])
         if killed is None:
-            return [failure]
+            return [issue]
         remaining = tmux(["has-session", "-t", target])
     except (OSError, subprocess.TimeoutExpired):
-        return [failure]
+        return [issue]
     if remaining is None or remaining == 0:
-        return [failure]
+        return [issue]
     return []
 
 
@@ -445,11 +527,45 @@ def _close_ghostty_window(
         pass
 
 
-def _resource_left_running(session: Session) -> list[str]:
-    resources = [f"Codex server {run_dir}" for run_dir in _run_directories(session)]
+def _stop_owner_resources(
+    session: Session,
+    *,
+    kill: KillProcess,
+    is_alive: LivenessCheck,
+    codex_mesh: CommandRunner,
+    tmux: CommandRunner,
+    clock: Clock,
+) -> list[SessionStopIssue]:
+    _close_ghostty_window(session, kill=kill, is_alive=is_alive)
+    issues = _stop_codex_servers(
+        session, codex_mesh=codex_mesh, is_alive=is_alive, clock=clock
+    )
+    issues.extend(_stop_unit_tmux(session, tmux, clock))
+    return issues
+
+
+def _owner_identity_lost_issues(
+    session: Session, clock: Clock
+) -> list[SessionStopIssue]:
+    issues: list[SessionStopIssue] = [
+        {
+            "kind": "codex server left running",
+            "at": _timestamp(clock),
+            "run_dir": run_dir,
+            "cause": "owner identity lost",
+        }
+        for run_dir in _run_directories(session)
+    ]
     if session["kind"] == "unit":
-        resources.append(f"tmux session {session['host']['tmux_session']}")
-    return [f"{item} left running" for item in resources]
+        issues.append(
+            {
+                "kind": "unit tmux session left running",
+                "at": _timestamp(clock),
+                "tmux_session": session["host"]["tmux_session"],
+                "cause": "owner identity lost",
+            }
+        )
+    return issues
 
 
 def _ready_to_stop(entry: ShutdownSessionEntry, current: Session) -> bool:
@@ -496,46 +612,98 @@ def _stop_owner(
     codex_mesh: CommandRunner,
     tmux: CommandRunner,
     sleep: Sleeper,
-) -> tuple[list[str], list[str]]:
+) -> None:
     stored = entry["session"]
     report = fresh_inventory(login, _scope_for(login))
     match = _fresh_session(stored, report)
     if match["kind"] == "session identity lost":
-        _ = _set_progress(
-            login, stored["session_id"], "process identity lost", clock
+        _ = _set_stop_outcome(
+            login,
+            stored["session_id"],
+            "process identity lost",
+            clock,
+            _owner_identity_lost_issues(stored, clock),
         )
-        return [], _resource_left_running(stored)
+        return
     if match["kind"] == "session account unreadable":
-        return [f"{stored['kind']} {stored['name']}: account unreadable"], []
-    if match["kind"] == "session absent":
-        _ = _set_progress(login, stored["session_id"], "already gone", clock)
-        failures = _stop_codex_servers(
-            stored, codex_mesh=codex_mesh, is_alive=is_alive
+        _ = _replace_stop_issues(
+            login,
+            stored["session_id"],
+            [{"kind": "account unreadable", "at": _timestamp(clock)}],
         )
-        failures.extend(_stop_unit_tmux(stored, tmux))
-        return failures, []
+        return
+    if match["kind"] == "session absent":
+        issues = _stop_owner_resources(
+            stored,
+            kill=kill,
+            is_alive=is_alive,
+            codex_mesh=codex_mesh,
+            tmux=tmux,
+            clock=clock,
+        )
+        _ = _set_stop_outcome(
+            login, stored["session_id"], "already gone", clock, issues
+        )
+        return
 
     current = match["session"]
     if not force_now and not _ready_to_stop(entry, current):
-        return [f"{stored['kind']} {stored['name']}: not ready and idle"], []
+        match entry["progress"]["kind"]:
+            case "waiting":
+                not_ready_progress: Literal[
+                    "waiting", "ready", "passive seat ready"
+                ] = "waiting"
+            case "ready":
+                not_ready_progress = "ready"
+            case "passive seat ready":
+                not_ready_progress = "passive seat ready"
+            case _:
+                return
+        issue = NotReadyToStop(
+            kind="not ready to stop",
+            at=_timestamp(clock),
+            status=current["status"],
+            progress=not_ready_progress,
+        )
+        _ = _replace_stop_issues(login, stored["session_id"], [issue])
+        return
     if force_now:
         _end_busy_codex_seats(current, codex_mesh)
     try:
         kill(stored["pid"], signal.SIGTERM)
     except ProcessLookupError:
-        _ = _set_progress(login, stored["session_id"], "already gone", clock)
-        failures = _stop_codex_servers(
-            stored, codex_mesh=codex_mesh, is_alive=is_alive
+        issues = _stop_owner_resources(
+            stored,
+            kill=kill,
+            is_alive=is_alive,
+            codex_mesh=codex_mesh,
+            tmux=tmux,
+            clock=clock,
         )
-        failures.extend(_stop_unit_tmux(stored, tmux))
-        return failures, []
+        _ = _set_stop_outcome(
+            login, stored["session_id"], "already gone", clock, issues
+        )
+        return
     except OSError as error:
         reason = str(error) or error.__class__.__name__
-        _ = _set_progress(
-            login, stored["session_id"], "stop failed", clock, reason
+        issues: list[SessionStopIssue] = [
+            {
+                "kind": "still running",
+                "at": _timestamp(clock),
+                "reason": reason,
+            }
+        ]
+        _ = _set_stop_outcome(
+            login,
+            stored["session_id"],
+            "stop failed",
+            clock,
+            issues,
+            reason,
         )
-        return [f"{stored['kind']} {stored['name']}: {reason}"], []
+        return
 
+    stopped_progress: Literal["stopped", "already gone"] = "stopped"
     if not _wait_for_exit(
         stored["pid"],
         is_alive=is_alive,
@@ -546,33 +714,46 @@ def _stop_owner(
         second_report = fresh_inventory(login, _scope_for(login))
         second = _fresh_session(stored, second_report)
         if second["kind"] == "session identity lost":
-            _ = _set_progress(
-                login, stored["session_id"], "process identity lost", clock
+            _ = _set_stop_outcome(
+                login,
+                stored["session_id"],
+                "process identity lost",
+                clock,
+                _owner_identity_lost_issues(stored, clock),
             )
-            return [], _resource_left_running(stored)
+            return
         if second["kind"] == "session account unreadable":
-            return [f"{stored['kind']} {stored['name']}: account unreadable"], []
-        if second["kind"] == "session absent":
-            _ = _set_progress(
-                login, stored["session_id"], "already gone", clock
+            _ = _replace_stop_issues(
+                login,
+                stored["session_id"],
+                [{"kind": "account unreadable", "at": _timestamp(clock)}],
             )
+            return
+        if second["kind"] == "session absent":
+            stopped_progress = "already gone"
         else:
             try:
                 kill(stored["pid"], signal.SIGTERM)
             except ProcessLookupError:
-                _ = _set_progress(
-                    login, stored["session_id"], "already gone", clock
-                )
+                stopped_progress = "already gone"
             except OSError as error:
                 reason = str(error) or error.__class__.__name__
-                _ = _set_progress(
+                issues = [
+                    {
+                        "kind": "still running",
+                        "at": _timestamp(clock),
+                        "reason": reason,
+                    }
+                ]
+                _ = _set_stop_outcome(
                     login,
                     stored["session_id"],
                     "stop failed",
                     clock,
+                    issues,
                     reason,
                 )
-                return [f"{stored['kind']} {stored['name']}: {reason}"], []
+                return
             else:
                 if not _wait_for_exit(
                     stored["pid"],
@@ -582,24 +763,34 @@ def _stop_owner(
                     sleep=sleep,
                 ):
                     reason = "alive after two SIGTERMs"
-                    _ = _set_progress(
+                    issues = [
+                        {
+                            "kind": "still running",
+                            "at": _timestamp(clock),
+                            "reason": reason,
+                        }
+                    ]
+                    _ = _set_stop_outcome(
                         login,
                         stored["session_id"],
                         "stop failed",
                         clock,
+                        issues,
                         reason,
                     )
-                    return [f"{stored['kind']} {stored['name']}: {reason}"], []
-                _ = _set_progress(login, stored["session_id"], "stopped", clock)
-    else:
-        _ = _set_progress(login, stored["session_id"], "stopped", clock)
+                    return
 
-    _close_ghostty_window(stored, kill=kill, is_alive=is_alive)
-    failures = _stop_codex_servers(
-        stored, codex_mesh=codex_mesh, is_alive=is_alive
+    issues = _stop_owner_resources(
+        stored,
+        kill=kill,
+        is_alive=is_alive,
+        codex_mesh=codex_mesh,
+        tmux=tmux,
+        clock=clock,
     )
-    failures.extend(_stop_unit_tmux(stored, tmux))
-    return failures, []
+    _ = _set_stop_outcome(
+        login, stored["session_id"], stopped_progress, clock, issues
+    )
 
 
 def _scope_for(login: str) -> ShutdownScope:
@@ -614,18 +805,17 @@ def _stop_seats(
     *,
     fresh_inventory: FreshInventory,
     clock: Clock,
-) -> list[str]:
+) -> None:
     found = find_live(login)
     if found["kind"] == "no shutdown":
         raise NoLiveRecord(f"no live shutdown for {login}")
     record = found["record"]
     report = fresh_inventory(login, record["scope"])
     live = {item["session_id"]: item for item in report["sessions"]}
-    unattributed = {item["pid"] for item in report["unattributed"]}
+    unattributed = {item["pid"]: item["reason"] for item in report["unattributed"]}
     entries = {
         item["session"]["session_id"]: item for item in record["entries"]
     }
-    failures: list[str] = []
     for entry in record["entries"]:
         session = entry["session"]
         if session["kind"] != "seat":
@@ -636,6 +826,13 @@ def _stop_seats(
             "process identity lost",
             "stop failed",
         }:
+            continue
+        if unattributed.get(session["pid"]) == "account unreadable":
+            _ = _replace_stop_issues(
+                login,
+                session["session_id"],
+                [{"kind": "account unreadable", "at": _timestamp(clock)}],
+            )
             continue
         owner = session["owner"]
         owner_stopped = False
@@ -651,22 +848,33 @@ def _stop_seats(
                 }
                 owner_absent = (
                     owner["session_id"] not in live
-                    and owner_entry["session"]["pid"] not in unattributed
-                    and owner_entry["progress"]["kind"] != "process identity lost"
+                    and unattributed.get(owner_entry["session"]["pid"])
+                    != "account unreadable"
                 )
         seat_live = (
             session["session_id"] in live or session["pid"] in unattributed
         )
         if owner_stopped or (owner_absent and not seat_live):
-            _ = _set_progress(login, session["session_id"], "stopped", clock)
+            _ = _set_stop_outcome(
+                login, session["session_id"], "stopped", clock, []
+            )
         else:
-            failures.append(f"seat {session['name']}: owner or seat is still live")
-    return failures
+            _ = _replace_stop_issues(
+                login,
+                session["session_id"],
+                [{"kind": "seat still live", "at": _timestamp(clock)}],
+            )
 
 
-def _finish(
-    login: str, failures: list[str]
-) -> ShutdownRecord:
+def _issue_allows_down(issue: SessionStopIssue) -> bool:
+    if issue["kind"] == "codex server left running":
+        return issue["cause"] == "owner identity lost"
+    if issue["kind"] == "unit tmux session left running":
+        return issue["cause"] == "owner identity lost"
+    return False
+
+
+def _finish(login: str) -> ShutdownRecord:
     def finish(current: ShutdownRecord) -> None:
         terminal = {
             "stopped",
@@ -676,9 +884,33 @@ def _finish(
         complete = all(
             entry["progress"]["kind"] in terminal for entry in current["entries"]
         )
-        current["state"] = "down" if complete and not failures else "stop partial"
+        only_identity_lost = all(
+            _issue_allows_down(issue)
+            for entry in current["entries"]
+            for issue in entry["stop_issues"]
+        )
+        current["state"] = (
+            "down"
+            if complete and only_identity_lost and not current["stop_issues"]
+            else "stop partial"
+        )
 
     return update(login, finish)
+
+
+def _stop_report(
+    record: ShutdownRecord, fresh_inventory: FreshInventory
+) -> StopReport:
+    final_inventory = fresh_inventory(record["login"], record["scope"])
+    counts: dict[str, int] = {}
+    for entry in record["entries"]:
+        kind = entry["session"]["kind"]
+        counts[kind] = counts.get(kind, 0) + 1
+    return {
+        "record": record,
+        "unattributed": list(final_inventory["unattributed"]),
+        "counts": counts,
+    }
 
 
 def stop(
@@ -694,60 +926,41 @@ def stop(
     sleep: Sleeper = time.sleep,
 ) -> StopReport:
     """Stop one machine's record in safe order with all live effects injectable."""
-    record = _enter_stopping(login)
-    failures: list[str] = []
-    left_running: list[str] = []
-    for session_id in _entry_order(record):
-        current = find_live(login)
-        if current["kind"] == "no shutdown":
-            raise NoLiveRecord(f"no live shutdown for {login}")
-        entry = _record_entry(current["record"], session_id)
-        progress = entry["progress"]
-        if progress["kind"] == "stop failed":
-            failures.append(
-                f"{entry['session']['kind']} {entry['session']['name']}: "
-                + progress["reason"]
+    with stop_lock(login):
+        entered = _enter_stopping(login)
+        record = entered["record"]
+        if entered["kind"] == "stop finished":
+            return _stop_report(record, fresh_inventory)
+        for session_id in _entry_order(record):
+            current = find_live(login)
+            if current["kind"] == "no shutdown":
+                raise NoLiveRecord(f"no live shutdown for {login}")
+            entry = _record_entry(current["record"], session_id)
+            progress = entry["progress"]
+            if progress["kind"] in {
+                "stopped",
+                "already gone",
+                "process identity lost",
+                "stop failed",
+            }:
+                continue
+            if entry["session"]["kind"] == "seat":
+                continue
+            _stop_owner(
+                login,
+                entry,
+                force_now=current["record"]["force"] == "now",
+                kill=kill,
+                is_alive=is_alive,
+                session_record_exists=session_record_exists,
+                fresh_inventory=fresh_inventory,
+                clock=clock,
+                codex_mesh=codex_mesh,
+                tmux=tmux,
+                sleep=sleep,
             )
-            continue
-        if progress["kind"] == "process identity lost":
-            left_running.extend(_resource_left_running(entry["session"]))
-            continue
-        if progress["kind"] in {"stopped", "already gone"}:
-            continue
-        if entry["session"]["kind"] == "seat":
-            continue
-        entry_failures, entry_left_running = _stop_owner(
-            login,
-            entry,
-            force_now=current["record"]["force"] == "now",
-            kill=kill,
-            is_alive=is_alive,
-            session_record_exists=session_record_exists,
-            fresh_inventory=fresh_inventory,
-            clock=clock,
-            codex_mesh=codex_mesh,
-            tmux=tmux,
-            sleep=sleep,
-        )
-        failures.extend(entry_failures)
-        left_running.extend(entry_left_running)
-    failures.extend(
         _stop_seats(login, fresh_inventory=fresh_inventory, clock=clock)
-    )
-    final = _finish(login, failures)
-    final_inventory = fresh_inventory(login, final["scope"])
-    counts: dict[str, int] = {}
-    for entry in final["entries"]:
-        kind = entry["session"]["kind"]
-        counts[kind] = counts.get(kind, 0) + 1
-    unattributed = list(final_inventory["unattributed"])
-    return {
-        "record": final,
-        "failures": failures,
-        "left_running": left_running,
-        "unattributed": unattributed,
-        "counts": counts,
-    }
+        return _stop_report(_finish(login), fresh_inventory)
 
 
 def parse_stop_report(text: str) -> StopReport:
@@ -760,15 +973,6 @@ def parse_stop_report(text: str) -> StopReport:
         raise ValueError("stop report is not an object")
     fields = cast(dict[str, object], value)
     record = parse_records(json.dumps([fields.get("record")]))[0]
-
-    def strings(name: str) -> list[str]:
-        raw = fields.get(name)
-        if not isinstance(raw, list):
-            raise ValueError(f"stop report {name} is not a string list")
-        items = cast(list[object], raw)
-        if not all(isinstance(item, str) for item in items):
-            raise ValueError(f"stop report {name} is not a string list")
-        return [cast(str, item) for item in items]
 
     raw_counts = fields.get("counts")
     if not isinstance(raw_counts, dict):
@@ -808,8 +1012,6 @@ def parse_stop_report(text: str) -> StopReport:
         )
     return {
         "record": record,
-        "failures": strings("failures"),
-        "left_running": strings("left_running"),
         "unattributed": unattributed,
         "counts": counts,
     }

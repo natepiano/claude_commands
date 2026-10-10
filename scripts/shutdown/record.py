@@ -56,6 +56,72 @@ class ConductorNotStarted(TypedDict):
 
 Conductor = SystemdConductor | LaunchdConductor | ConductorNotStarted
 StopTiming = Literal["wait for ready", "now"]
+StopLeftRunningCause = Literal["stop not confirmed", "owner identity lost"]
+
+
+class NotReadyToStop(TypedDict):
+    kind: Literal["not ready to stop"]
+    at: str
+    status: str
+    progress: Literal["waiting", "ready", "passive seat ready"]
+
+
+class StillRunningAfterStop(TypedDict):
+    kind: Literal["still running"]
+    at: str
+    reason: str
+
+
+class AccountUnreadableAtStop(TypedDict):
+    kind: Literal["account unreadable"]
+    at: str
+
+
+class SeatStillLive(TypedDict):
+    kind: Literal["seat still live"]
+    at: str
+
+
+class CodexServerLeftRunning(TypedDict):
+    kind: Literal["codex server left running"]
+    at: str
+    run_dir: str
+    cause: StopLeftRunningCause
+
+
+class UnitTmuxLeftRunning(TypedDict):
+    kind: Literal["unit tmux session left running"]
+    at: str
+    tmux_session: str
+    cause: StopLeftRunningCause
+
+
+SessionStopIssue = (
+    NotReadyToStop
+    | StillRunningAfterStop
+    | AccountUnreadableAtStop
+    | SeatStillLive
+    | CodexServerLeftRunning
+    | UnitTmuxLeftRunning
+)
+
+
+class StopClaimFailed(TypedDict):
+    kind: Literal["stop claim failed"]
+    at: str
+    machine: str
+    reason: str
+
+
+class MachineStopFailed(TypedDict):
+    kind: Literal["machine stop failed"]
+    at: str
+    machine: str
+    reason: str
+
+
+OrchestrationStopIssue = StopClaimFailed | MachineStopFailed
+StopIssue = SessionStopIssue | OrchestrationStopIssue
 
 
 class ShowrunnerFooter(TypedDict):
@@ -175,6 +241,7 @@ class ShutdownSessionEntry(TypedDict):
     settle_message: SettleMessage
     where: Where
     progress: SessionProgress
+    stop_issues: list[SessionStopIssue]
 
 
 ShutdownState = Literal[
@@ -200,6 +267,7 @@ class ShutdownRecord(TypedDict):
     conductor: Conductor
     force: StopTiming
     entries: list[ShutdownSessionEntry]
+    stop_issues: list[OrchestrationStopIssue]
 
 
 class LiveShutdownRecord(TypedDict):
@@ -287,6 +355,19 @@ def _account_lock(login: str, *, create_directory: bool) -> Generator[Path, None
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def stop_lock(login: str) -> Generator[None, None, None]:
+    """Serialize complete stop attempts without blocking ordinary record reads."""
+    directory = _account_directory(login)
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "stop.lock").open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _mapping(value: object, place: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise InvalidRecord(f"{place} must be an object")
@@ -337,7 +418,11 @@ def _utc_time(value: object, place: str) -> str:
         parsed = datetime.fromisoformat(text)
     except ValueError as error:
         raise InvalidRecord(f"{place} must be an ISO-8601 UTC time") from error
-    if parsed.isoformat() != text or parsed.utcoffset() != timedelta(0):
+    if (
+        parsed.microsecond != 0
+        or parsed.isoformat(timespec="seconds") != text
+        or parsed.utcoffset() != timedelta(0)
+    ):
         raise InvalidRecord(f"{place} must be an ISO-8601 UTC time")
     return text
 
@@ -427,6 +512,67 @@ def _progress(value: object, place: str) -> SessionProgress:
     return cast(SessionProgress, cast(object, values))
 
 
+def _stop_issue_fields(
+    value: object, place: str, expected: frozenset[str]
+) -> tuple[dict[str, object], str]:
+    values = _mapping(value, place)
+    kind = _kind(values, place, expected)
+    _ = _utc_time(_required(values, "at", place), f"{place}.at")
+    return values, kind
+
+
+def _session_stop_issue(value: object, place: str) -> SessionStopIssue:
+    values, kind = _stop_issue_fields(
+        value,
+        place,
+        frozenset(
+            {
+                "not ready to stop",
+                "still running",
+                "account unreadable",
+                "seat still live",
+                "codex server left running",
+                "unit tmux session left running",
+            }
+        ),
+    )
+    if kind == "not ready to stop":
+        _ = _string(_required(values, "status", place), f"{place}.status")
+        progress = _string(
+            _required(values, "progress", place), f"{place}.progress"
+        )
+        if progress not in {"waiting", "ready", "passive seat ready"}:
+            raise InvalidRecord(f"{place}.progress is invalid")
+    elif kind == "still running":
+        _ = _string(_required(values, "reason", place), f"{place}.reason")
+    elif kind == "codex server left running":
+        _ = _string(_required(values, "run_dir", place), f"{place}.run_dir")
+        cause = _string(_required(values, "cause", place), f"{place}.cause")
+        if cause not in {"stop not confirmed", "owner identity lost"}:
+            raise InvalidRecord(f"{place}.cause is invalid")
+    elif kind == "unit tmux session left running":
+        _ = _string(
+            _required(values, "tmux_session", place), f"{place}.tmux_session"
+        )
+        cause = _string(_required(values, "cause", place), f"{place}.cause")
+        if cause not in {"stop not confirmed", "owner identity lost"}:
+            raise InvalidRecord(f"{place}.cause is invalid")
+    return cast(SessionStopIssue, cast(object, values))
+
+
+def _orchestration_stop_issue(
+    value: object, place: str
+) -> OrchestrationStopIssue:
+    values, _ = _stop_issue_fields(
+        value,
+        place,
+        frozenset({"stop claim failed", "machine stop failed"}),
+    )
+    _ = _string(_required(values, "machine", place), f"{place}.machine")
+    _ = _string(_required(values, "reason", place), f"{place}.reason")
+    return cast(OrchestrationStopIssue, cast(object, values))
+
+
 def _entry(value: object, place: str) -> ShutdownSessionEntry:
     values = _mapping(value, place)
     try:
@@ -449,6 +595,11 @@ def _entry(value: object, place: str) -> ShutdownSessionEntry:
     values["progress"] = _progress(
         _required(values, "progress", place), f"{place}.progress"
     )
+    stop_issue_values = _items(values.get("stop_issues", []), f"{place}.stop_issues")
+    values["stop_issues"] = [
+        _session_stop_issue(issue, f"{place}.stop_issues[{index}]")
+        for index, issue in enumerate(stop_issue_values)
+    ]
     return cast(ShutdownSessionEntry, cast(object, values))
 
 
@@ -481,6 +632,11 @@ def _record(value: object, place: str) -> ShutdownRecord:
     values["entries"] = [
         _entry(entry, f"{place}.entries[{index}]")
         for index, entry in enumerate(entry_values)
+    ]
+    stop_issue_values = _items(values.get("stop_issues", []), f"{place}.stop_issues")
+    values["stop_issues"] = [
+        _orchestration_stop_issue(issue, f"{place}.stop_issues[{index}]")
+        for index, issue in enumerate(stop_issue_values)
     ]
     return cast(ShutdownRecord, cast(object, values))
 

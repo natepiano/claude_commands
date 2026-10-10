@@ -57,6 +57,7 @@ def entry(
         settle_message=settle_message or record.SettleMessageNotSent(kind="not sent"),
         where=where or record.WhereNotSaid(kind="not said"),
         progress=progress or record.SessionWaiting(kind="waiting"),
+        stop_issues=[],
     )
 
 
@@ -78,6 +79,7 @@ def shutdown_record(
         conductor=record.ConductorNotStarted(kind="not started"),
         force="wait for ready",
         entries=[entry(progress)],
+        stop_issues=[],
     )
 
 
@@ -290,6 +292,102 @@ class RecordTests(unittest.TestCase):
         encoded = json.dumps(records)
 
         self.assertEqual(record.parse_records(encoded), records)
+
+    def test_every_stop_issue_variant_round_trips(self) -> None:
+        live = shutdown_record()
+        session_issues: list[record.SessionStopIssue] = [
+            record.NotReadyToStop(
+                kind="not ready to stop",
+                at=NOW,
+                status="busy",
+                progress="waiting",
+            ),
+            record.StillRunningAfterStop(
+                kind="still running",
+                at=NOW,
+                reason="alive after two SIGTERMs",
+            ),
+            record.AccountUnreadableAtStop(kind="account unreadable", at=NOW),
+            record.SeatStillLive(kind="seat still live", at=NOW),
+            record.CodexServerLeftRunning(
+                kind="codex server left running",
+                at=NOW,
+                run_dir="/tmp/run",
+                cause="stop not confirmed",
+            ),
+            record.UnitTmuxLeftRunning(
+                kind="unit tmux session left running",
+                at=NOW,
+                tmux_session="demo-unit",
+                cause="owner identity lost",
+            ),
+        ]
+        orchestration_issues: list[record.OrchestrationStopIssue] = [
+            record.StopClaimFailed(
+                kind="stop claim failed",
+                at=NOW,
+                machine="Mac",
+                reason="claim-stop failed (rc 3)",
+            ),
+            record.MachineStopFailed(
+                kind="machine stop failed",
+                at=NOW,
+                machine="natedev",
+                reason="inventory failed",
+            ),
+        ]
+        live["entries"][0]["stop_issues"] = session_issues
+        live["stop_issues"] = orchestration_issues
+
+        self.assertEqual(record.parse_records(json.dumps([live])), [live])
+
+    def test_stop_issue_parser_refuses_unknown_tags_and_noncanonical_time(
+        self,
+    ) -> None:
+        malformed_issues: list[dict[str, object]] = [
+            {"kind": "not a stop issue", "at": NOW},
+            {
+                "kind": "codex server left running",
+                "at": NOW,
+                "run_dir": "/tmp/run",
+                "cause": "maybe stopped",
+            },
+            {
+                "kind": "not ready to stop",
+                "at": NOW,
+                "status": "busy",
+                "progress": "refused",
+            },
+            {
+                "kind": "still running",
+                "at": "2026-10-09T21:49:10Z",
+                "reason": "alive after two SIGTERMs",
+            },
+        ]
+
+        for issue in malformed_issues:
+            with self.subTest(issue=issue):
+                live = shutdown_record()
+                entry_values = cast(
+                    dict[str, object], cast(object, live["entries"][0])
+                )
+                entry_values["stop_issues"] = [issue]
+                with self.assertRaises(record.InvalidRecord):
+                    _ = record.parse_records(json.dumps([live]))
+
+    def test_missing_stop_issue_fields_read_as_empty_lists(self) -> None:
+        live = shutdown_record()
+        entry_values = cast(
+            dict[str, object], cast(object, live["entries"][0])
+        )
+        record_values = cast(dict[str, object], cast(object, live))
+        del entry_values["stop_issues"]
+        del record_values["stop_issues"]
+
+        parsed = record.parse_records(json.dumps([live]))[0]
+
+        self.assertEqual(parsed["entries"][0]["stop_issues"], [])
+        self.assertEqual(parsed["stop_issues"], [])
 
     def test_queued_settle_message_round_trips(self) -> None:
         live = shutdown_record()
