@@ -109,7 +109,7 @@ After Phase 2 reaches `~/.claude` main, the unit director tells the showrunner t
 - `file.inFolder("feature-log/<project>")` filters in the project Bases: the link filter matches unresolved project links.
 - A tester seat or cross-audit seats in the backfill phases: `inventory.py next --path` makes path splits claimable by two writers, and each phase's blind review is the audit.
 
-### Phase 2 — Hana, single-session and natedev close-outs write entries, and a digest reports them  · status: todo
+### Phase 2 — Hana, single-session and natedev close-outs write entries, and a digest reports them  · status: done
 
 #### Work Order
 

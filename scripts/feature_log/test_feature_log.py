@@ -8,10 +8,14 @@ import fcntl
 from io import StringIO
 import json
 import os
+import shlex
+import socket
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import NamedTuple, TypedDict, cast, override
+from typing import Literal, NamedTuple, Protocol, TypedDict, cast, final, override
 from unittest.mock import patch
 
 import feature_log
@@ -19,6 +23,7 @@ from feature_log import locked, state_dir, vault_dir
 
 
 TODAY = "2026-10-10"
+EVENT_TIME = "2026-10-10T12:34:56-07:00"
 SHA_ONE = "0000000000000000000000000000000000000001"
 SHA_TWO = "0000000000000000000000000000000000000002"
 SHA_THREE = "0000000000000000000000000000000000000003"
@@ -98,9 +103,20 @@ class CliResult(NamedTuple):
     stderr: str
 
 
-class EventRecord(TypedDict):
+class AddEvent(TypedDict):
     at: str
-    verb: str
+    verb: Literal["add"]
+    project: str
+    title: str
+    kind: str
+    summary: str
+    release: list[str]
+    backfill: bool
+
+
+class SupersedeEvent(TypedDict):
+    at: str
+    verb: Literal["supersede"]
     project: str
     title: str
     kind: str
@@ -108,7 +124,121 @@ class EventRecord(TypedDict):
     release: list[str]
     backfill: bool
     old: list[str]
+
+
+class AmendEvent(TypedDict):
+    at: str
+    verb: Literal["amend"]
+    project: str
+    title: str
     fields: list[str]
+    backfill: bool
+
+
+FeatureLogEvent = AddEvent | SupersedeEvent | AmendEvent
+
+
+class ProposalArguments(TypedDict):
+    project: str
+    title: str
+    kind: str
+    summary: str
+    behavior: str
+    see: str
+    link: str
+    evidence: list[str]
+    crate: list[str]
+    area: str | None
+    completed: str
+    production: str | None
+    unit: list[str]
+    release: list[str]
+    backfill: bool
+    separate_result: bool
+    old: list[str]
+
+
+class OpenProposal(TypedDict):
+    row: str
+    verb: Literal["add", "supersede"]
+    args: ProposalArguments
+    status: Literal["open"]
+    at: str
+
+
+class LandedProposal(TypedDict):
+    row: str
+    verb: Literal["add", "supersede"]
+    args: ProposalArguments
+    status: Literal["landed"]
+    at: str
+    note: str
+
+
+class DroppedProposal(TypedDict):
+    row: str
+    verb: Literal["add", "supersede"]
+    args: ProposalArguments
+    status: Literal["dropped"]
+    at: str
+    verdict: str
+
+
+FeatureLogProposal = OpenProposal | LandedProposal | DroppedProposal
+
+
+class DigestCursor(TypedDict):
+    line: int
+    at: str
+
+
+class SshRunner(Protocol):
+    def __call__(self, command: list[str]) -> int: ...
+
+
+class CliInvocation(Protocol):
+    def __call__(self) -> int: ...
+
+
+@final
+class RecordingSshRunner:
+    def __init__(
+        self,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+        returncode: int = 0,
+    ) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+        self.commands: list[list[str]] = []
+
+    def __call__(self, command: list[str]) -> int:
+        self.commands.append(command.copy())
+        print(self.stdout, end="")
+        if self.stderr:
+            print(self.stderr, end="", file=sys.stderr)
+        return self.returncode
+
+
+@final
+class RecordingGitRunner:
+    def __init__(self, stdout: str) -> None:
+        self.stdout = stdout
+        self.commands: list[list[str]] = []
+
+    def __call__(
+        self, command: list[str], **options: object
+    ) -> subprocess.CompletedProcess[str]:
+        del options
+        self.commands.append(command.copy())
+        return subprocess.CompletedProcess[str](
+            command,
+            0,
+            stdout=self.stdout,
+            stderr="",
+        )
 
 
 class FeatureLogTests(unittest.TestCase):
@@ -135,14 +265,27 @@ class FeatureLogTests(unittest.TestCase):
             ),
         )
         _ = self.enterContext(patch.object(feature_log, "today", return_value=TODAY))
+        _ = self.enterContext(
+            patch.object(feature_log, "_event_time", return_value=EVENT_TIME)
+        )
 
     def cli(self, arguments: list[str]) -> CliResult:
+        return self.capture_cli(lambda: feature_log.main(arguments))
+
+    def cli_with_runner(
+        self, arguments: list[str], runner: SshRunner
+    ) -> CliResult:
+        return self.capture_cli(
+            lambda: feature_log.main(arguments, ssh_runner=runner)
+        )
+
+    def capture_cli(self, invocation: CliInvocation) -> CliResult:
         stdout = StringIO()
         stderr = StringIO()
         status = 0
         with redirect_stdout(stdout), redirect_stderr(stderr):
             try:
-                returned = feature_log.main(arguments)
+                returned = invocation()
                 status = returned
             except SystemExit as error:
                 if not isinstance(error.code, int):
@@ -186,6 +329,20 @@ class FeatureLogTests(unittest.TestCase):
             arguments.extend(("--evidence", line))
         return arguments
 
+    def proposal_arguments(
+        self,
+        row: str,
+        add_arguments: list[str],
+        *,
+        old: tuple[str, ...] = (),
+    ) -> list[str]:
+        arguments = add_arguments.copy()
+        arguments[0] = "propose"
+        arguments[1:1] = ["--review", row]
+        for title in old:
+            arguments.extend(("--old", title))
+        return arguments
+
     def note(self, project: str, title: str) -> Path:
         return self.vault / "feature-log" / project / f"{title}.md"
 
@@ -198,11 +355,27 @@ class FeatureLogTests(unittest.TestCase):
             snapshot[relative] = b"<directory>" if path.is_dir() else path.read_bytes()
         return snapshot
 
-    def events(self) -> list[EventRecord]:
+    def events(self) -> list[FeatureLogEvent]:
         path = self.state / "events.jsonl"
         if not path.exists():
             return []
-        return [cast(EventRecord, json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines()]
+        return [
+            cast(FeatureLogEvent, json.loads(line))
+            for line in path.read_text(encoding="utf-8").splitlines()
+        ]
+
+    def write_events(self, events: list[FeatureLogEvent]) -> None:
+        self.state.mkdir(parents=True, exist_ok=True)
+        contents = "".join(json.dumps(event) + "\n" for event in events)
+        _ = (self.state / "events.jsonl").write_text(contents, encoding="utf-8")
+
+    def proposal(self, row: str) -> FeatureLogProposal:
+        path = self.state / "proposals" / f"{row}.json"
+        return cast(FeatureLogProposal, json.loads(path.read_text(encoding="utf-8")))
+
+    def digest_cursor(self) -> DigestCursor:
+        path = self.state / "digest.json"
+        return cast(DigestCursor, json.loads(path.read_text(encoding="utf-8")))
 
     def assert_rejected(self, arguments: list[str], reason: str) -> None:
         before_vault = self.vault_snapshot()
@@ -249,6 +422,95 @@ class FeatureLogTests(unittest.TestCase):
             with lock_path.open("a+", encoding="utf-8") as contender:
                 fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(contender.fileno(), fcntl.LOCK_UN)
+
+    def test_non_natedev_host_forwards_to_the_one_vault(self) -> None:
+        arguments = ["live", "--project", "natedev", "--grep", "two words"]
+        runner = RecordingSshRunner(
+            stdout="remote list\n",
+            stderr="remote warning\n",
+            returncode=7,
+        )
+        with patch.dict(os.environ, {}, clear=False):
+            _ = os.environ.pop("FEATURE_LOG_VAULT")
+            with patch.object(
+                socket, "gethostname", return_value="macbook.local"
+            ):
+                result = self.cli_with_runner(arguments, runner)
+
+        remote = (
+            "~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py "
+            + shlex.join(arguments)
+        )
+        self.assertEqual(runner.commands, [["ssh", "natedev", remote]])
+        self.assertEqual(result, CliResult(7, "remote list\n", "remote warning\n"))
+
+    def test_natedev_and_explicit_vault_calls_stay_local(self) -> None:
+        natedev_runner = RecordingSshRunner(returncode=99)
+        with patch.dict(os.environ, {}, clear=False):
+            _ = os.environ.pop("FEATURE_LOG_VAULT")
+            with (
+                patch.object(
+                    socket,
+                    "gethostname",
+                    return_value="natedev.example",
+                ),
+                patch.object(feature_log, "vault_dir", return_value=self.vault),
+            ):
+                natedev_result = self.cli_with_runner(
+                    ["live", "--project", "natedev"], natedev_runner
+                )
+        self.assertEqual(natedev_result, CliResult(0, "", ""))
+        self.assertEqual(natedev_runner.commands, [])
+
+        explicit_runner = RecordingSshRunner(returncode=99)
+        with (
+            patch.object(
+                socket,
+                "gethostname",
+                return_value="macbook.example",
+            ),
+            patch.object(feature_log, "vault_dir", return_value=self.vault),
+        ):
+            explicit_result = self.cli_with_runner(
+                ["live", "--project", "natedev"], explicit_runner
+            )
+        self.assertEqual(explicit_result, CliResult(0, "", ""))
+        self.assertEqual(explicit_runner.commands, [])
+
+    def test_project_of_never_forwards_and_maps_supported_origin_forms(self) -> None:
+        cases = (
+            ("git@github.com:natepiano/cargo-liner.git\n", "cargo-liner"),
+            ("https://github.com/natepiano/bevy_brp\n", "bevy_brp"),
+            ("https://github.com/someone/unknown.git\n", "none"),
+        )
+        checkout = self.root / "checkout"
+        for origin, expected in cases:
+            with self.subTest(origin):
+                ssh_runner = RecordingSshRunner(returncode=99)
+                git_runner = RecordingGitRunner(origin)
+                with patch.dict(os.environ, {}, clear=False):
+                    _ = os.environ.pop("FEATURE_LOG_VAULT")
+                    with (
+                        patch.object(
+                            socket,
+                            "gethostname",
+                            return_value="macbook.example",
+                        ),
+                        patch.object(
+                            subprocess,
+                            "run",
+                            side_effect=git_runner,
+                        ),
+                    ):
+                        result = self.cli_with_runner(
+                            ["project-of", str(checkout)], ssh_runner
+                        )
+                self.assertEqual(result, CliResult(0, f"{expected}\n", ""))
+                self.assertEqual(ssh_runner.commands, [])
+                self.assertEqual(
+                    git_runner.commands,
+                    [["git", "-C", str(checkout), "remote", "get-url", "origin"]],
+                )
 
     def test_hana_production_example_is_written_byte_for_byte(self) -> None:
         arguments = self.add_arguments(
@@ -650,6 +912,8 @@ class FeatureLogTests(unittest.TestCase):
 
         event = self.events()[-1]
         self.assertEqual(event["verb"], "amend")
+        if event["verb"] != "amend":
+            self.fail("amend wrote the wrong event variant")
         self.assertCountEqual(
             event["fields"],
             ["area", "behavior", "completed_date", "crate", "evidence", "kind", "see", "summary"],
@@ -943,7 +1207,7 @@ class FeatureLogTests(unittest.TestCase):
         self.assertIn("feature-log/hana/invalid utf8.md:", result.stdout)
         self.assertIn("utf-8", result.stdout)
 
-    def test_each_mutating_command_appends_one_complete_event(self) -> None:
+    def test_each_mutating_command_writes_only_its_event_fields(self) -> None:
         add = self.add_arguments(
             title="Event Old",
             kind="fix",
@@ -953,27 +1217,30 @@ class FeatureLogTests(unittest.TestCase):
         self.assertEqual(self.cli(add).status, 0)
         added = self.events()
         self.assertEqual(len(added), 1)
+        add_event = added[0]
+        self.assertEqual(add_event["verb"], "add")
+        if add_event["verb"] != "add":
+            self.fail("add wrote the wrong event variant")
         self.assertEqual(
+            set(add_event),
             {
-                "verb": added[0]["verb"],
-                "project": added[0]["project"],
-                "title": added[0]["title"],
-                "kind": added[0]["kind"],
-                "summary": added[0]["summary"],
-            },
-            {
-                "verb": "add",
-                "project": "hana",
-                "title": "event old",
-                "kind": "fix",
-                "summary": "The event old result works.",
+                "at",
+                "verb",
+                "project",
+                "title",
+                "kind",
+                "summary",
+                "release",
+                "backfill",
             },
         )
-        self.assertEqual(added[0]["release"], ["hana_lagrange@Unreleased"])
-        self.assertFalse(added[0]["backfill"])
-        self.assertEqual(added[0]["old"], [])
-        self.assertEqual(added[0]["fields"], [])
-        self.assertNotEqual(added[0]["at"], "")
+        self.assertEqual(add_event["at"], EVENT_TIME)
+        self.assertEqual(add_event["project"], "hana")
+        self.assertEqual(add_event["title"], "event old")
+        self.assertEqual(add_event["kind"], "fix")
+        self.assertEqual(add_event["summary"], "The event old result works.")
+        self.assertEqual(add_event["release"], ["hana_lagrange@Unreleased"])
+        self.assertFalse(add_event["backfill"])
 
         amend = [
             "amend",
@@ -983,10 +1250,21 @@ class FeatureLogTests(unittest.TestCase):
             "Event Old",
             "--summary",
             "The amended event works.",
+            "--backfill",
         ]
         self.assertEqual(self.cli(amend).status, 0)
-        self.assertEqual(len(self.events()), 2)
-        self.assertEqual(self.events()[-1]["fields"], ["summary"])
+        amended = self.events()
+        self.assertEqual(len(amended), 2)
+        amend_event = amended[-1]
+        self.assertEqual(amend_event["verb"], "amend")
+        if amend_event["verb"] != "amend":
+            self.fail("amend wrote the wrong event variant")
+        self.assertEqual(
+            set(amend_event),
+            {"at", "verb", "project", "title", "fields", "backfill"},
+        )
+        self.assertEqual(amend_event["fields"], ["summary"])
+        self.assertTrue(amend_event["backfill"])
 
         supersede = self.add_arguments(title="Event New", link=SHA_TWO)
         supersede[0] = "supersede"
@@ -994,8 +1272,570 @@ class FeatureLogTests(unittest.TestCase):
         self.assertEqual(self.cli(supersede).status, 0)
         events = self.events()
         self.assertEqual(len(events), 3)
-        self.assertEqual(events[-1]["verb"], "supersede")
-        self.assertEqual(events[-1]["old"], ["event old"])
+        supersede_event = events[-1]
+        self.assertEqual(supersede_event["verb"], "supersede")
+        if supersede_event["verb"] != "supersede":
+            self.fail("supersede wrote the wrong event variant")
+        self.assertEqual(
+            set(supersede_event),
+            {
+                "at",
+                "verb",
+                "project",
+                "title",
+                "kind",
+                "summary",
+                "release",
+                "backfill",
+                "old",
+            },
+        )
+        self.assertEqual(supersede_event["old"], ["event old"])
+
+    def test_exact_repeat_repairs_one_missing_event_only_once(self) -> None:
+        arguments = self.add_arguments(title="Repair My Event")
+        self.assertEqual(self.cli(arguments).status, 0)
+        path = self.note("hana", "repair my event")
+        original = path.read_bytes()
+        (self.state / "events.jsonl").unlink()
+
+        repaired = self.cli(arguments)
+
+        self.assertEqual(
+            repaired,
+            CliResult(
+                0,
+                "unchanged: feature-log/hana/repair my event.md\n",
+                "",
+            ),
+        )
+        self.assertEqual(path.read_bytes(), original)
+        repaired_events = self.events()
+        self.assertEqual(len(repaired_events), 1)
+        self.assertEqual(repaired_events[0]["verb"], "add")
+
+        repeated = self.cli(arguments)
+
+        self.assertEqual(repeated.status, 0)
+        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_repeated_evidence_amend_repairs_event_without_duplicating_evidence(
+        self,
+    ) -> None:
+        add = self.add_arguments(title="Repair Evidence Event")
+        self.assertEqual(self.cli(add).status, 0)
+        evidence = "Observed in the repaired runtime."
+        amend = [
+            "amend",
+            "--project",
+            "hana",
+            "--title",
+            "Repair Evidence Event",
+            "--evidence",
+            evidence,
+        ]
+        self.assertEqual(self.cli(amend).status, 0)
+        self.write_events(
+            [event for event in self.events() if event["verb"] != "amend"]
+        )
+        path = self.note("hana", "repair evidence event")
+        note_before = path.read_bytes()
+
+        repaired = self.cli(amend)
+
+        self.assertEqual(
+            repaired,
+            CliResult(
+                0,
+                "unchanged: feature-log/hana/repair evidence event.md\n",
+                "",
+            ),
+        )
+        self.assertEqual(path.read_bytes(), note_before)
+        repaired_note = feature_log.parse_note(path)
+        self.assertEqual(repaired_note["evidence"].count(evidence), 1)
+        repaired_events = self.events()
+        self.assertEqual(
+            sum(event["verb"] == "amend" for event in repaired_events),
+            1,
+        )
+
+        events_before = (self.state / "events.jsonl").read_bytes()
+        repeated = self.cli(amend)
+
+        self.assertEqual(repeated, repaired)
+        self.assertEqual(path.read_bytes(), note_before)
+        self.assertEqual((self.state / "events.jsonl").read_bytes(), events_before)
+
+        new_evidence = "Confirmed by a second behavioral check."
+        mixed = amend + ["--evidence", new_evidence]
+        amended = self.cli(mixed)
+
+        self.assertEqual(
+            amended,
+            CliResult(
+                0,
+                "amended: feature-log/hana/repair evidence event.md (evidence)\n",
+                "",
+            ),
+        )
+        mixed_note = feature_log.parse_note(path)
+        self.assertEqual(mixed_note["evidence"].count(evidence), 1)
+        self.assertEqual(mixed_note["evidence"].count(new_evidence), 1)
+        self.assertLess(
+            mixed_note["evidence"].index(evidence),
+            mixed_note["evidence"].index(new_evidence),
+        )
+        last_event = self.events()[-1]
+        self.assertEqual(last_event["verb"], "amend")
+        if last_event["verb"] != "amend":
+            self.fail("evidence amend wrote the wrong event variant")
+        self.assertEqual(last_event["fields"], ["evidence"])
+
+    def test_propose_writes_no_note_and_replaces_an_open_proposal(self) -> None:
+        first = self.proposal_arguments(
+            "C900",
+            self.add_arguments(
+                title="Proposed Result",
+                summary="The first proposed summary.",
+            ),
+        )
+
+        result = self.cli(first)
+
+        self.assertEqual(result.status, 0)
+        self.assertEqual(self.vault_snapshot(), {})
+        self.assertEqual(self.events(), [])
+        proposal = self.proposal("C900")
+        self.assertEqual(proposal["status"], "open")
+        if proposal["status"] != "open":
+            self.fail("propose did not create an open proposal")
+        self.assertEqual(set(proposal), {"row", "verb", "args", "status", "at"})
+        self.assertEqual(proposal["row"], "C900")
+        self.assertEqual(proposal["verb"], "add")
+        self.assertEqual(proposal["at"], EVENT_TIME)
+        self.assertEqual(proposal["args"]["title"], "Proposed Result")
+        self.assertEqual(proposal["args"]["completed"], TODAY)
+        self.assertEqual(proposal["args"]["old"], [])
+
+        corrected = self.proposal_arguments(
+            "C900",
+            self.add_arguments(
+                title="Proposed Result",
+                summary="The corrected proposed summary.",
+            ),
+        )
+        self.assertEqual(self.cli(corrected).status, 0)
+
+        replacement = self.proposal("C900")
+        self.assertEqual(replacement["status"], "open")
+        self.assertEqual(
+            replacement["args"]["summary"],
+            "The corrected proposed summary.",
+        )
+        self.assertEqual(self.vault_snapshot(), {})
+        self.assertEqual(self.events(), [])
+
+    def test_corrected_open_proposal_preserves_or_explicitly_replaces_date(self) -> None:
+        implicit = self.proposal_arguments(
+            "C904",
+            self.add_arguments(
+                title="Implicit Proposal Date",
+                summary="The initial implicit-date summary.",
+                link=SHA_ONE,
+            ),
+        )
+        with patch.object(feature_log, "today", return_value="2026-10-01"):
+            self.assertEqual(self.cli(implicit).status, 0)
+
+        implicit_correction = self.proposal_arguments(
+            "C904",
+            self.add_arguments(
+                title="Implicit Proposal Date",
+                summary="The corrected implicit-date summary.",
+                link=SHA_ONE,
+            ),
+        )
+        with patch.object(feature_log, "today", return_value="2026-10-02"):
+            self.assertEqual(self.cli(implicit_correction).status, 0)
+        self.assertEqual(self.proposal("C904")["args"]["completed"], "2026-10-01")
+
+        with patch.object(feature_log, "today", return_value="2026-10-03"):
+            self.assertEqual(self.cli(["add", "--review", "C904"]).status, 0)
+        implicit_contents = self.note(
+            "hana", "implicit proposal date"
+        ).read_text(encoding="utf-8")
+        self.assertIn('completed_date: "[[2026-10-01]]"\n', implicit_contents)
+
+        explicit = self.proposal_arguments(
+            "C905",
+            self.add_arguments(
+                title="Explicit Proposal Date",
+                summary="The initial explicit-date summary.",
+                link=SHA_TWO,
+            ),
+        )
+        with patch.object(feature_log, "today", return_value="2026-10-01"):
+            self.assertEqual(self.cli(explicit).status, 0)
+
+        explicit_correction = self.proposal_arguments(
+            "C905",
+            self.add_arguments(
+                title="Explicit Proposal Date",
+                summary="The corrected explicit-date summary.",
+                link=SHA_TWO,
+            ),
+        )
+        explicit_correction.extend(("--completed", "2026-09-30"))
+        with patch.object(feature_log, "today", return_value="2026-10-02"):
+            self.assertEqual(self.cli(explicit_correction).status, 0)
+        self.assertEqual(self.proposal("C905")["args"]["completed"], "2026-09-30")
+
+        with patch.object(feature_log, "today", return_value="2026-10-03"):
+            self.assertEqual(self.cli(["add", "--review", "C905"]).status, 0)
+        explicit_contents = self.note(
+            "hana", "explicit proposal date"
+        ).read_text(encoding="utf-8")
+        self.assertIn('completed_date: "[[2026-09-30]]"\n', explicit_contents)
+
+    def test_propose_validates_review_row_and_old_note(self) -> None:
+        invalid_row = self.proposal_arguments(
+            "review-1", self.add_arguments(title="Invalid Row")
+        )
+        self.assert_rejected(invalid_row, "review")
+        missing_old = self.proposal_arguments(
+            "A12",
+            self.add_arguments(title="Replacement Proposal", link=SHA_TWO),
+            old=("Missing Result",),
+        )
+        self.assert_rejected(missing_old, "live")
+        self.assertFalse((self.state / "proposals/review-1.json").exists())
+        self.assertFalse((self.state / "proposals/A12.json").exists())
+
+    def test_add_review_lands_once_and_keeps_the_proposed_date(self) -> None:
+        arguments = self.proposal_arguments(
+            "C900",
+            self.add_arguments(title="Reviewed Result"),
+        )
+        with patch.object(feature_log, "today", return_value="2026-10-01"):
+            self.assertEqual(self.cli(arguments).status, 0)
+
+        with patch.object(feature_log, "today", return_value="2026-10-02"):
+            landed = self.cli(["add", "--review", "C900"])
+
+        self.assertEqual(landed.status, 0)
+        self.assertIn("[[reviewed result]]\n", landed.stdout)
+        notes = list((self.vault / "feature-log/hana").glob("*.md"))
+        self.assertEqual(notes, [self.note("hana", "reviewed result")])
+        contents = notes[0].read_text(encoding="utf-8")
+        self.assertIn('completed_date: "[[2026-10-01]]"\n', contents)
+        self.assertEqual(len(self.events()), 1)
+        proposal = self.proposal("C900")
+        self.assertEqual(proposal["status"], "landed")
+        if proposal["status"] != "landed":
+            self.fail("add --review did not land its proposal")
+        self.assertEqual(
+            set(proposal),
+            {"row", "verb", "args", "status", "at", "note"},
+        )
+        self.assertEqual(proposal["note"], "reviewed result")
+
+        note_before = notes[0].read_bytes()
+        proposal_path = self.state / "proposals/C900.json"
+        proposal_before = proposal_path.read_bytes()
+        events_before = (self.state / "events.jsonl").read_bytes()
+        with patch.object(feature_log, "today", return_value="2026-10-03"):
+            repeated = self.cli(["add", "--review", "C900"])
+
+        self.assertEqual(repeated.status, 0)
+        self.assertIn("unchanged", repeated.stdout)
+        self.assertEqual(notes[0].read_bytes(), note_before)
+        self.assertEqual(proposal_path.read_bytes(), proposal_before)
+        self.assertEqual((self.state / "events.jsonl").read_bytes(), events_before)
+
+        refused = self.cli(arguments)
+        self.assertEqual(refused.status, 2)
+        self.assertIn("landed", refused.stderr)
+        self.assertEqual(proposal_path.read_bytes(), proposal_before)
+
+    def test_review_requires_a_proposal_and_the_matching_verb(self) -> None:
+        missing = self.cli(["add", "--review", "A999"])
+        self.assertEqual(
+            missing,
+            CliResult(
+                2,
+                "",
+                "feature_log: no proposal for A999; run propose first\n",
+            ),
+        )
+
+        self.assertEqual(
+            self.cli(self.add_arguments(title="Verb Old", link=SHA_ONE)).status,
+            0,
+        )
+        supersede_proposal = self.proposal_arguments(
+            "C902",
+            self.add_arguments(title="Verb New", link=SHA_TWO),
+            old=("Verb Old",),
+        )
+        self.assertEqual(self.cli(supersede_proposal).status, 0)
+        self.assert_rejected(["add", "--review", "C902"], "supersede")
+
+        landed = self.cli(["supersede", "--review", "C902"])
+
+        self.assertEqual(landed.status, 0)
+        self.assertIn("[[verb new]]", landed.stdout)
+        old_contents = self.note("hana", "verb old").read_text(encoding="utf-8")
+        self.assertIn("state: superseded\n", old_contents)
+        self.assertIn('  - "[[verb new]]"\n', old_contents)
+        self.assertEqual(self.proposal("C902")["status"], "landed")
+
+        add_proposal = self.proposal_arguments(
+            "C903",
+            self.add_arguments(title="Add Only", link=SHA_THREE),
+        )
+        self.assertEqual(self.cli(add_proposal).status, 0)
+        self.assert_rejected(["supersede", "--review", "C903"], "add")
+
+    def test_same_merge_results_require_separate_result_to_land_together(self) -> None:
+        first = self.proposal_arguments(
+            "C906",
+            self.add_arguments(title="Shared Merge First", link=SHA_ONE),
+        )
+        first.append("--separate-result")
+        second = self.proposal_arguments(
+            "C907",
+            self.add_arguments(title="Shared Merge Second", link=SHA_ONE),
+        )
+        second.append("--separate-result")
+        self.assertEqual(self.cli(first).status, 0)
+        self.assertEqual(self.cli(second).status, 0)
+
+        first_landed = self.cli(["add", "--review", "C906"])
+        second_landed = self.cli(["add", "--review", "C907"])
+
+        self.assertEqual(first_landed.status, 0)
+        self.assertEqual(second_landed.status, 0)
+        self.assertTrue(self.note("hana", "shared merge first").is_file())
+        self.assertTrue(self.note("hana", "shared merge second").is_file())
+
+        unmarked_first = self.proposal_arguments(
+            "C908",
+            self.add_arguments(title="Unmarked Merge First", link=SHA_TWO),
+        )
+        unmarked_second = self.proposal_arguments(
+            "C909",
+            self.add_arguments(title="Unmarked Merge Second", link=SHA_TWO),
+        )
+        self.assertEqual(self.cli(unmarked_first).status, 0)
+        self.assertEqual(self.cli(unmarked_second).status, 0)
+        self.assertEqual(self.cli(["add", "--review", "C908"]).status, 0)
+
+        refused = self.cli(["add", "--review", "C909"])
+
+        self.assertEqual(refused.status, 2)
+        self.assertIn("--separate-result", refused.stderr)
+        self.assertFalse(self.note("hana", "unmarked merge second").exists())
+
+    def test_drop_closes_an_open_proposal_without_a_note(self) -> None:
+        arguments = self.proposal_arguments(
+            "A901", self.add_arguments(title="Dropped Result")
+        )
+        self.assertEqual(self.cli(arguments).status, 0)
+
+        dropped = self.cli(
+            ["drop", "--review", "A901", "--verdict", "defect: still broken"]
+        )
+
+        self.assertEqual(dropped.status, 0)
+        self.assertEqual(self.vault_snapshot(), {})
+        self.assertEqual(self.events(), [])
+        proposal = self.proposal("A901")
+        self.assertEqual(proposal["status"], "dropped")
+        if proposal["status"] != "dropped":
+            self.fail("drop did not close the proposal")
+        self.assertEqual(
+            set(proposal),
+            {"row", "verb", "args", "status", "at", "verdict"},
+        )
+        self.assertEqual(proposal["verdict"], "defect: still broken")
+        proposal_path = self.state / "proposals/A901.json"
+        before = proposal_path.read_bytes()
+
+        repeated = self.cli(
+            ["drop", "--review", "A901", "--verdict", "defect: still broken"]
+        )
+
+        self.assertEqual(repeated.status, 0)
+        self.assertIn("unchanged", repeated.stdout)
+        self.assertEqual(proposal_path.read_bytes(), before)
+        refused = self.cli(arguments)
+        self.assertEqual(refused.status, 2)
+        self.assertIn("dropped", refused.stderr)
+
+    def test_digest_groups_each_live_event_and_advances_past_backfill(self) -> None:
+        cargo_add: AddEvent = {
+            "at": EVENT_TIME,
+            "verb": "add",
+            "project": "cargo-liner",
+            "title": "cargo result",
+            "kind": "feature",
+            "summary": "Cargo result summary.",
+            "release": ["cargo-mend@Unreleased"],
+            "backfill": False,
+        }
+        hana_add: AddEvent = {
+            "at": EVENT_TIME,
+            "verb": "add",
+            "project": "hana",
+            "title": "hana result",
+            "kind": "feature",
+            "summary": "Hana result summary.",
+            "release": [],
+            "backfill": False,
+        }
+        hana_supersede: SupersedeEvent = {
+            "at": EVENT_TIME,
+            "verb": "supersede",
+            "project": "hana",
+            "title": "hana replacement",
+            "kind": "change",
+            "summary": "Hana replacement summary.",
+            "release": [],
+            "backfill": False,
+            "old": ["old hana result"],
+        }
+        hana_amend: AmendEvent = {
+            "at": EVENT_TIME,
+            "verb": "amend",
+            "project": "hana",
+            "title": "hana replacement",
+            "fields": ["evidence", "summary"],
+            "backfill": False,
+        }
+        hidden_backfill: AddEvent = {
+            "at": EVENT_TIME,
+            "verb": "add",
+            "project": "bevy_brp",
+            "title": "hidden backfill",
+            "kind": "fix",
+            "summary": "This must stay hidden.",
+            "release": [],
+            "backfill": True,
+        }
+        self.write_events(
+            [cargo_add, hana_add, hana_supersede, hana_amend, hidden_backfill]
+        )
+
+        result = self.cli(["digest"])
+
+        self.assertEqual(result.status, 0)
+        self.assertIn("hana", result.stdout)
+        self.assertIn("cargo-liner", result.stdout)
+        self.assertIn("+ hana result — Hana result summary.", result.stdout)
+        self.assertIn("→ old hana result ⇒ hana replacement", result.stdout)
+        self.assertIn("~ hana replacement (evidence, summary)", result.stdout)
+        self.assertIn("+ cargo result — Cargo result summary.", result.stdout)
+        self.assertNotIn("hidden backfill", result.stdout)
+        self.assertLess(
+            result.stdout.index("+ hana result"),
+            result.stdout.index("+ cargo result"),
+        )
+        self.assertEqual(result.stdout.count("+ hana result"), 1)
+        self.assertEqual(result.stdout.count("→ old hana result"), 1)
+        self.assertRegex(result.stdout, r"4 changes since .+\n$")
+        self.assertEqual(
+            self.digest_cursor(),
+            DigestCursor(line=5, at=EVENT_TIME),
+        )
+
+        empty = self.cli(["digest"])
+
+        self.assertEqual(
+            empty,
+            CliResult(
+                0,
+                "feature log: nothing new since 2026-10-10 12:34 PDT\n",
+                "",
+            ),
+        )
+        self.assertEqual(self.digest_cursor()["line"], 5)
+
+    def test_cursor_advancing_digest_waits_for_the_feature_log_lock(self) -> None:
+        event: AddEvent = {
+            "at": EVENT_TIME,
+            "verb": "add",
+            "project": "hana",
+            "title": "locked digest result",
+            "kind": "feature",
+            "summary": "The digest waits for its cursor lock.",
+            "release": [],
+            "backfill": False,
+        }
+        self.write_events([event])
+        lock_path = self.state / "lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as held_lock:
+            fcntl.flock(held_lock.fileno(), fcntl.LOCK_EX)
+            process: subprocess.Popen[str] = subprocess.Popen(
+                [
+                    sys.executable,
+                    "scripts/feature_log/feature_log.py",
+                    "digest",
+                ],
+                cwd=Path(__file__).resolve().parents[2],
+                env=os.environ.copy(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    _ = process.wait(timeout=0.5)
+            finally:
+                fcntl.flock(held_lock.fileno(), fcntl.LOCK_UN)
+
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            _ = process.communicate(timeout=5)
+            raise
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertIn("+ locked digest result", stdout)
+        self.assertEqual(self.digest_cursor()["line"], 1)
+
+    def test_digest_since_filters_without_advancing_the_cursor(self) -> None:
+        old: AddEvent = {
+            "at": "2026-10-09T23:59:00-07:00",
+            "verb": "add",
+            "project": "hana",
+            "title": "old event",
+            "kind": "feature",
+            "summary": "Old summary.",
+            "release": [],
+            "backfill": False,
+        }
+        current: AddEvent = {
+            "at": "2026-10-10T00:00:00-07:00",
+            "verb": "add",
+            "project": "hana",
+            "title": "current event",
+            "kind": "feature",
+            "summary": "Current summary.",
+            "release": [],
+            "backfill": False,
+        }
+        self.write_events([old, current])
+
+        result = self.cli(["digest", "--since", "2026-10-10"])
+
+        self.assertEqual(result.status, 0)
+        self.assertNotIn("old event", result.stdout)
+        self.assertIn("+ current event — Current summary.", result.stdout)
+        self.assertIn("1 changes since 2026-10-10 00:00 PDT", result.stdout)
+        self.assertFalse((self.state / "digest.json").exists())
 
 
 if __name__ == "__main__":
