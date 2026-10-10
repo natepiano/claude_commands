@@ -14,6 +14,7 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 import shutdown
+import record as record_store
 from account import UnreadableAccount
 from inventory import Inventory
 from record import ShutdownRecord
@@ -78,8 +79,10 @@ def complete_record(machine: str = "natedev") -> ShutdownRecord:
                         "settle_message": {"kind": "not sent"},
                         "where": {"kind": "not said"},
                         "progress": {"kind": "waiting"},
+                        "stop_issues": [],
                     }
                 ],
+                "stop_issues": [],
             },
         ),
     )
@@ -406,6 +409,88 @@ else:
         self.assertIn("Mac: shutdown settling\n", output)
         self.assertIn("  shutdown: waiting\n", output)
         self.assertEqual(error, "")
+
+    def test_status_renders_local_and_remote_stop_issues_under_their_records(
+        self,
+    ) -> None:
+        at = "2026-10-09T21:49:10+00:00"
+        local = complete_record()
+        local["state"] = "stop partial"
+        local["entries"][0]["stop_issues"] = [
+            record_store.NotReadyToStop(
+                kind="not ready to stop",
+                at=at,
+                status="busy",
+                progress="ready",
+            ),
+            record_store.StillRunningAfterStop(
+                kind="still running",
+                at=at,
+                reason="alive after two SIGTERMs",
+            ),
+            record_store.AccountUnreadableAtStop(
+                kind="account unreadable", at=at
+            ),
+            record_store.SeatStillLive(kind="seat still live", at=at),
+        ]
+        local["stop_issues"] = [
+            record_store.StopClaimFailed(
+                kind="stop claim failed",
+                at=at,
+                machine="Mac",
+                reason="claim-stop failed (rc 3)",
+            )
+        ]
+        remote_record = complete_record(machine="Mac")
+        remote_record["state"] = "stop partial"
+        remote_record["entries"][0]["stop_issues"] = [
+            record_store.CodexServerLeftRunning(
+                kind="codex server left running",
+                at=at,
+                run_dir="/tmp/run",
+                cause="stop not confirmed",
+            ),
+            record_store.UnitTmuxLeftRunning(
+                kind="unit tmux session left running",
+                at=at,
+                tmux_session="demo-unit",
+                cause="owner identity lost",
+            ),
+        ]
+        remote_record["stop_issues"] = [
+            record_store.MachineStopFailed(
+                kind="machine stop failed",
+                at=at,
+                machine="Mac",
+                reason="stop report unreadable",
+            )
+        ]
+        record_store.create(local)
+        os.environ["SHUTDOWN_STATUS_RECORD_OUTPUT"] = json.dumps(
+            [remote_record]
+        )
+
+        result, output, error = self.run_plain_status_with_ssh()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(error, "")
+        expected_lines = [
+            "natedev: shutdown stop partial",
+            "  shutdown: waiting",
+            "    not stopped: busy, ready",
+            "    still running: alive after two SIGTERMs",
+            "    not stopped: account unreadable",
+            "    not stopped: owner or seat still live",
+            "  Mac: stop claim failed: claim-stop failed (rc 3)",
+            "Mac: shutdown stop partial",
+            "  shutdown: waiting",
+            "    Codex server /tmp/run left running: stop not confirmed",
+            "    tmux session demo-unit left running: owner identity lost",
+            "  Mac: stop failed: stop report unreadable",
+        ]
+        for line in expected_lines:
+            with self.subTest(line=line):
+                self.assertIn(line + "\n", output)
 
     def test_records_text_uses_los_angeles_time(self) -> None:
         output = io.StringIO()

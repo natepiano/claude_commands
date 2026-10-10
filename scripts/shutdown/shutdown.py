@@ -58,6 +58,7 @@ class CommandLine(argparse.Namespace):
     message: list[str] | None = None
     where: str = ""
     force: str = ""
+    reason: str = ""
 
 
 class UnreachableMachine(TypedDict):
@@ -376,6 +377,9 @@ def main(arguments: list[str] | None = None) -> int:
     _ = claim_stop.add_argument(
         "--force", required=True, choices=("wait for ready", "now")
     )
+    close_failed_stop = commands.add_parser("close-failed-stop")
+    _ = close_failed_stop.add_argument("account")
+    _ = close_failed_stop.add_argument("--reason", required=True)
     _ = commands.add_parser("held-sessions")
     options = cast(CommandLine, parser.parse_args(arguments))
 
@@ -400,7 +404,19 @@ def main(arguments: list[str] | None = None) -> int:
 
     if options.command == "claim-stop":
         force = cast(StopTiming, options.force)
-        return 0 if stop_work.claim_stop(options.account or "", force) else 1
+        return 0 if stop_work.claim_stop_as_peer(options.account or "", force) else 1
+
+    if options.command == "close-failed-stop":
+        stop_work.close_failed_stop(
+            options.account or "",
+            {
+                "kind": "machine stop failed",
+                "at": settle.record_time(),
+                "machine": settle.local_machine(),
+                "reason": options.reason,
+            },
+        )
+        return 0
 
     if options.command == "records":
         try:

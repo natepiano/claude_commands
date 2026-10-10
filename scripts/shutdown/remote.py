@@ -6,6 +6,20 @@ from __future__ import annotations
 import shlex
 import subprocess
 import sys
+from typing import Literal, TypedDict
+
+
+class TimeLimit(TypedDict):
+    kind: Literal["time limit"]
+    seconds: float
+
+
+class WhileLinkAlive(TypedDict):
+    kind: Literal["while link alive"]
+
+
+RemoteCallLimit = TimeLimit | WhileLinkAlive
+STANDARD_TIME_LIMIT: TimeLimit = {"kind": "time limit", "seconds": 120.0}
 
 
 def other_machine() -> str:
@@ -14,7 +28,9 @@ def other_machine() -> str:
 
 
 def run_remote(
-    args: list[str], stdin: str = "", timeout: float = 120
+    args: list[str],
+    stdin: str = "",
+    limit: RemoteCallLimit = STANDARD_TIME_LIMIT,
 ) -> tuple[int, str]:
     """Run shutdown.py remotely, trusting its explicit trailer rather than ssh's status."""
     arguments = " ".join(shlex.quote(argument) for argument in args)
@@ -23,22 +39,35 @@ def run_remote(
         remote_command += f" {arguments}"
     remote_command += '; printf "rc=%s\\n" $?'
     try:
-        completed = subprocess.run(
-            (
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                other_machine(),
-                remote_command,
-            ),
-            input=stdin,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        command = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+        ]
+        if limit["kind"] == "while link alive":
+            command.extend(
+                ("-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4")
+            )
+        command.extend((other_machine(), remote_command))
+        if limit["kind"] == "time limit":
+            completed = subprocess.run(
+                command,
+                input=stdin,
+                capture_output=True,
+                text=True,
+                timeout=limit["seconds"],
+                check=False,
+            )
+        else:
+            completed = subprocess.run(
+                command,
+                input=stdin,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
     except subprocess.TimeoutExpired:
         return 255, ""
     except OSError:
