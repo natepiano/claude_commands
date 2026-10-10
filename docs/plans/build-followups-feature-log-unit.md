@@ -162,7 +162,7 @@ After Phase 2 reaches `~/.claude` main, the unit director tells the showrunner t
 - `git ls-tree` without `-z` quotes non-ASCII paths, which then silently fall out of path filters; `fnmatch` `*` crosses `/`, so a whole-path changelog glob matches nested files.
 - The proposal's hana "58 files" are as-built files and its "200 records" are phase records, which live in plan docs rather than those files; at the proposal's measured ref the counts are exactly 200 and 58.
 
-### Phase 4 — Hana's structured phase records are in the log  · status: todo
+### Phase 4 — Hana's structured phase records are in the log  · status: done
 
 #### Work Order
 
