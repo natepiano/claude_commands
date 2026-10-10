@@ -132,15 +132,21 @@ thread has an id, and that id is the delegate's address:
 
 ```
 codex_mesh.py serve  --session-dir <dir>                      # start/reuse, print port
-codex_mesh.py start  --session-dir --name --cwd --prompt-file \
+codex_mesh.py start  --session-dir --name [--role] --cwd --prompt-file \
                      --summary-file --log-file [--reply-file --model --effort \
                      --service-tier --sandbox --timeout --resident]
+codex_mesh.py follow --session-dir --to <name> --role ...     # one more turn on a finished seat
+codex_mesh.py compact --session-dir --to <name>
 codex_mesh.py send   --session-dir --to <name> (--message <text> | --message-file <path>)
 codex_mesh.py steer  --session-dir --to <name> (--message <text> | --message-file <path>)
 codex_mesh.py end    --session-dir --to <name>
 codex_mesh.py list   --session-dir                            # roster: name, status, thread id
 codex_mesh.py stop   --session-dir
+codex_mesh.py sweep  [--root <dir>] [--stop]
 ```
+
+`follow`, `compact`, `can-follow`, `release-follow`, the roster's `role` and
+`context_tokens`, and overflow press-on are described in `long-lived-seats.md`.
 
 `serve` spawns `codex app-server --listen ws://127.0.0.1:<free port>` detached
 (`start_new_session=True`) and records `{port, pid}` in
@@ -155,9 +161,9 @@ so no `--ws-auth` token.
 
 `start` connects, calls `thread/start` then `turn/start`, writes the delegate's
 entry into `<session_dir>/mesh_roster.json`
-(`{name: {thread_id, turn_id, status, launcher_pid?}}`, `launcher_pid` on a
+(`{name: {thread_id, turn_id, status, launcher_pid?, port?, role?, context_tokens?}}`, `launcher_pid` on a
 `waiting_capacity` entry and on a follow-up's `starting` and `running` entries,
-which also carry `previous_status`; every read-modify-write under `fcntl.LOCK_EX`, because
+which also carry `previous_status` and `previous_role`; every read-modify-write under `fcntl.LOCK_EX`, because
 the delegates register concurrently), and **blocks until its last turn ends**,
 translating the notification stream into the log file (`agent:`, `exec:`,
 `edit:`, `thinking`) that `heartbeat_watch.sh` narrates. On a `turn/completed`
@@ -184,18 +190,19 @@ it calls `thread/queue/add`, and the message lands at the start of the target's
 **next** turn; to a `waiting_capacity` seat it stores the message in
 `<seat>.pending.json` under an `flock`, for the resume turn. It refuses a
 `capacity_exhausted` seat or one being ended (exit 2), and any other status
-(`done`, `failed`) with `<seat> is <status>, not running; read its summary file`
+(`starting`, `done`, `failed`, `ended`) with `<seat> is <status>, not running; read its summary file`
 (exit 1): the thread outlives the launcher, so the server would start a turn for
 a late message with nothing streaming it and nothing writing the summary.
 `steer` needs a `running` seat; it calls `turn/steer` with the roster's
-`expectedTurnId` and interrupts the turn in flight. `end` accepts `running`,
-`waiting_capacity` and `capacity_exhausted` (`ENDABLE_STATUSES`): it drops the
-thread's queued messages, interrupts any live turn, and leaves the marker the
-`start` loop polls for. Any other status prints `<seat> is <status>; nothing to
-end` and exits 0.
+`expectedTurnId` and interrupts the turn in flight. `end` accepts `starting`,
+`running`, `done`, `failed`, `waiting_capacity` and `capacity_exhausted`
+(`ENDABLE_STATUSES`): it drops the thread's queued messages, leaves the marker
+the `start` loop polls for, sets the seat's roster status to `ended`, and
+interrupts any live turn. Any other status, `ended` included, prints `<seat> is
+<status>; nothing to end` and exits 0.
 
-`stop` SIGTERMs each recorded pid (SIGKILL after 5 s) and removes the server
-file. `scripts/delegate/end_session.sh` calls it, reading the session directory
+`stop` sets every roster seat to `ended`, SIGTERMs each recorded pid (SIGKILL
+after 5 s) and removes the server file. `scripts/delegate/end_session.sh` calls it, reading the session directory
 out of the run-active marker: the server is detached on purpose so it outlives
 each delegate, so the end of the run is the only point that knows nobody needs
 it. That is also why it reaps `mesh_retired.json` as well as the live record —
@@ -269,12 +276,12 @@ A thin dispatcher over the resolver:
 | `config/README.md` | The `## agents.conf` section: three-layer schema, `/agent` as the editor, sync behavior. |
 | `scripts/agents/agents_config.sh` | Resolver + editors + freshness-gated sync trigger. |
 | `scripts/agents/agent_exec.sh` | Family dispatch launcher, dry-run hook. |
-| `scripts/agents/codex_mesh.py` | Addressable codex launcher: the default for codex `/unit:direct` seats and the path for `/ask_a_friend`'s codex friend (`start --resident`). One app-server per session, one thread per delegate, `send`/`steer`/`end`/`list`/`stop`, `follow`/`can-follow`/`release-follow` (a new turn on a finished seat's thread, for `implement.sh --to`), and a capacity backoff that resumes the same thread. |
+| `scripts/agents/codex_mesh.py` | Addressable codex launcher: the default for codex `/unit:direct` seats and the path for `/ask_a_friend`'s codex friend (`start --resident`). One app-server per session, one thread per delegate, `send`/`steer`/`end`/`list`/`stop`, `follow`/`can-follow`/`release-follow` (a new turn on a finished seat's thread, for `implement.sh --to` and `review.sh --to`), `compact`, `sweep`, and a capacity backoff that resumes the same thread. |
 | `scripts/agents/agent_admin.sh` | `/agent` backend. |
 | `scripts/agents/sync_codex_catalog.sh` + `.plist` | `[codex.agents]` materialization, staleness warnings. |
 | `scripts/agents/heartbeat.sh`, `heartbeat_watch.sh` | Liveness log helpers used by the delegate wrappers (role header block, 60 s beats with an activity digest decoded from the agent log). |
 | `scripts/agents/test_agents_config.sh`, `test_agent_exec.sh`, `test_sync_codex_catalog.sh` | Self-contained fixture-conf suites (`mktemp -d`, temp `AGENTS_CONFIG_FILE`, print a "…passed" line, nonzero on failure). |
-| `scripts/delegate/implement.sh` / `review.sh` | `/unit:direct`'s launchers. The implementation launcher adds a **required** pass kind as its 6th argument, optional activity and fix-count arguments, and a **required** `team_role` as its 9th (`impl` or `test`; the legacy `review` writer seat is still accepted): a phase runs a two-seat team and a repair its one `impl` seat, so one artifact layout covers both rather than a solo set and a team set. The role suffixes every artifact (`impl_status_<role>`, `impl_summary_<role>.txt`, `impl_agent_<role>.log`, `impl_agent_<role>`, `impl_awake_<role>`), tags the wrapper beats `<subtask>:<role>`, names the slot this dispatch posts under on the board, and is exported to the agent as `PLAN_DELEGATE_TEAM_ROLE` beside `PLAN_DELEGATE_BOARD_DIR`. Every member records its own progress pass: `state["pass"]` holds one record per seat, and `start-pass` closes only a stale pass of the same seat, so three concurrent recorders no longer leave the ledger describing whichever finished last. The launcher also stamps `role=<name>` on its `register` line, which is what fills the progress table's per-slot columns before any agent posts. The kind is checked against the four words at the argument, because an empty one used to be tolerated: the launcher skipped `start-pass`, ran its agent normally, and left the seat's previous pass standing -- so a repair round dispatched with the kind on `impl` alone produced a phase whose ledger held one live window and two records closed `error` an hour before, and refused every progress call once that one window closed. Nothing in the sequence looked like a launch fault; a register line with no `role=` field is the signature. The reviewer adds optional pass activity, a `pass_index` (7th arg, default 1), and a `lens` (8th, before the early-ready sentinel that follows it). Both write status, provenance, agent logs, and shared heartbeat data; when durable progress state exists, they also record the resolved called model/effort and pass outcome through `progress_history.py`. `review.sh` writes `review_findings_<N>.txt` / `review_agent_<N>.log` per pass and `ln -sfn`s the unnumbered names to the current one, so a run that failed to converge can be read back round by round while existing readers keep working. A phase's broad review runs three reviewers at once under one lens each (`adversary`, `contract`, `craft`), so the lens suffixes every one of those names plus `review_status`, `review_pid`, `review_agent`, and `review_awake`; empty is the single-reviewer layout a closure review and `commands/plan/phase_review.md` still run. The lens also selects the seat the pass records under — `test`, `impl`, `review` respectively, a fixed address rather than a judgment; the `review` seat renders as an `Agent 3` column only when a shown stage seated it — which `review.sh` exports as `PLAN_DELEGATE_TEAM_ROLE`, empty lens included, so a lone reviewer cannot inherit a seat from its environment and close a live pass there so three concurrent reviewers key three pass records instead of each closing the last as interrupted, and posts as a `register` line so the progress note stops attributing the previous occupant's words to the seat. `arm-review` takes a matching `--lens`, because the marker watches the status and pid files the launcher it precedes will write. |
+| `scripts/delegate/implement.sh` / `review.sh` | `/unit:direct`'s launchers. The implementation launcher adds a **required** pass kind as its 6th argument, optional activity and fix-count arguments, and a **required** `team_role` as its 9th (the seat's slot: `impl`, `test`, or a role-named extra slot such as `review` or `fix2`, matching `^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`): a phase runs a two-seat team and a repair its one `impl` seat, so one artifact layout covers both rather than a solo set and a team set. The role suffixes every artifact (`impl_status_<role>`, `impl_summary_<role>.txt`, `impl_agent_<role>.log`, `impl_agent_<role>`, `impl_awake_<role>`), tags the wrapper beats `<subtask>:<role>`, names the slot this dispatch posts under on the board, and is exported to the agent as `PLAN_DELEGATE_TEAM_ROLE` beside `PLAN_DELEGATE_BOARD_DIR`. Every member records its own progress pass: `state["pass"]` holds one record per seat, and `start-pass` closes only a stale pass of the same seat, so three concurrent recorders no longer leave the ledger describing whichever finished last. The launcher also stamps `role=<name>` on its `register` line, which is what fills the progress table's per-slot columns before any agent posts. The kind is checked against the four words at the argument, because an empty one used to be tolerated: the launcher skipped `start-pass`, ran its agent normally, and left the seat's previous pass standing -- so a repair round dispatched with the kind on `impl` alone produced a phase whose ledger held one live window and two records closed `error` an hour before, and refused every progress call once that one window closed. Nothing in the sequence looked like a launch fault; a register line with no `role=` field is the signature. The reviewer takes an optional leading `--to <seat>` or `--slot <name>` (`long-lived-seats.md`), optional pass activity, a `pass_index` (7th arg, default 1), and a `lens` (8th, before the early-ready sentinel that follows it). Both write status, provenance, agent logs, and shared heartbeat data; when durable progress state exists, they also record the resolved called model/effort and pass outcome through `progress_history.py`. `review.sh` writes `review_findings_<N>.txt` / `review_agent_<N>.log` per pass and `ln -sfn`s the unnumbered names to the current one, so a run that failed to converge can be read back round by round while existing readers keep working. A phase's broad review runs three reviewers at once under one lens each (`adversary`, `contract`, `craft`), so the lens suffixes every one of those names plus `review_status`, `review_pid`, `review_agent`, and `review_awake`; empty is the single-reviewer layout a closure review and `commands/plan/phase_review.md` still run. A review on an open seat (`review.sh --to <seat>`) records under that seat's slot, the seat name's last hyphen segment, and one that opens a role-named seat (`--slot <name>`) records under that name; only a review outside a run, with neither flag, takes its seat from the lens — `test`, `impl`, `review` respectively; the `review` seat renders as an `Agent 3` column only when a shown stage seated it, and each extra seat (`review2`, `fix2`, …) gets its own `Agent N` column. That slot is what `review.sh` exports as `PLAN_DELEGATE_TEAM_ROLE`, empty lens included, so a lone reviewer cannot inherit a seat from its environment and close a live pass there so three concurrent reviewers key three pass records instead of each closing the last as interrupted, and posts as a `register` line so the progress note stops attributing the previous occupant's words to the seat. `arm-review` takes a matching `--lens`, because the marker watches the status and pid files the launcher it precedes will write. |
 | `scripts/delegate/board.sh` | The phase team's coordination substrate: an append-only `board.log` plus `mkdir`-atomic tokens under `locks/`, shared by every member writing into one session directory. Commands are `post` / `read` / `acquire` / `release` / `renew` / `role` / `roles` / `locks`. A file rather than messages because one append *is* the broadcast to every peer and the wrapper, where N-1 addressed sends can each half-fail; because it outlives the turn that wrote it, so a member resumed hours later reads the whole history; and because a message channel cannot make anything mutually exclusive, which the `mkdir` tokens can. Post kinds are a closed set (`register`, `claim`, `release`, `status`, `blocked`, `handoff`, `done`) so a peer can scan for what concerns it — `ask` and `answer` are deliberately absent, since a question to a peer is a message (`SendMessage`, or `codex_mesh.py` for a codex member) and two ways to ask one question means one of them goes unread; `read --since N` numbers every line before filtering, so a cursor counts board positions and stays valid across different filters. `role` is the only writer of `handoff`, and those lines are how `progress_history.py` learns which role each slot holds now. |
 | `scripts/delegate/progress_history.py` | Cross-agent append-only plan-delegate event recorder and aggregator. Durable per-run JSONL lives under `~/.local/state/plan-delegate/runs/`; live state remains in the session directory. `start-run` alone resolves and records the project clock from the supplied plan, matching worktree/branch history, or the run start. It renders separate project and phase progress sections with independent unchanged timers and unambiguous `HH:MM:SS` durations, and calibrates phase estimates from completed-phase history. `progress` requires `--cap-stage` on dual-layout calls and clamps the calibrated percentage to that stage's ceiling; `start-phase --work-order-file` records Work Order size metrics. |
 | `scripts/delegate/findings.py` | The delegate fix loop's convergence test — what replaced the fix-pass counter. Stable finding IDs (`F001…`) with states `open` / `fixed_pending_review` / `accepted`, held in `findings_state.json` beside the progress state and reset automatically when the active phase's `instance_id` changes. `gate` returns `converged` / `dispatch` / `stop`, gating on blocker+minor in round 1 and blocker only afterwards (nits never gate); `dispatch --covers` refuses a partial batch so one fix round repairs everything gating together. Stops on: a finding that failed to close twice, a finding reopened twice, two rounds with no decrease in the gating-open count, or a 10-round runaway backstop. Appends `finding_opened` / `finding_batch_dispatched` / `finding_verdict` / `finding_gate` to the same durable run JSONL. |
@@ -312,20 +319,21 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   changes only whether the delegate has an address, never which agent runs or at
   what effort. Anything else that needs a codex agent still goes through
   `agent_exec`.
-- Every delegate in one phase shares one app-server, and its pid file is the only
+- Every delegate in one run shares one app-server, and its pid file is the only
   record of it. A launch path that starts a server without writing
   `mesh_server.json` leaks a process that nothing will reap.
 - Provenance files are four lines: `task=`, `family=`, `agent=`, `effort=`.
 - The session app-server is deliberately detached, so it outlives each delegate
-  and a peer can still reach a thread between turns. `end_session.sh` is the only
-  thing that reaps it (`codex_mesh.py stop`, from the session directory recorded
-  in the run-active marker); a launcher that killed it would break the mesh it
-  exists to provide.
+  and a peer can still reach a thread between turns, and so the run's seats stay
+  open across phases. No launcher stops it: `end_session.sh` reaps it at run end
+  (`codex_mesh.py stop`, from the session directory recorded in the run-active
+  marker, then `sweep --stop`), and before that only the sweep and the server's
+  own idle watcher stop it, once nothing uses it. A launcher that killed it would
+  break the mesh it exists to provide.
 - A server nothing stops stays up for good: one started outside a `/unit:direct` run
   (`/ask_a_friend`, a seat launched by hand), one whose run ended without
   `end_session.sh`, and one whose run folder was deleted. `codex_mesh.py sweep`
-  reports them and stops nothing; `sweep --stop` stops the ones it calls unused
-  (user 2026-10-08, after a notice to every showrunner and unit director). It reads each server's run folder from the
+  reports them and stops nothing; `sweep --stop` stops the ones it calls unused. It reads each server's run folder from the
   server's own stderr handle (`/proc/<pid>/fd/2` is that folder's
   `mesh_server.log`), which survives a rewritten `mesh_server.json` and a
   deleted folder. A server is `in use` on any one of: a client connected to its
@@ -336,8 +344,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   `thread/read` on each loaded and each roster thread), so a turn left running
   by a launcher killed at its time limit is seen with no client and no roster.
   Anything that cannot be read counts as in use, and a server whose log names no
-  run folder is `unknown`. Measured 2026-10-08 on natedev: 66 servers, 42
-  unused (11 with a deleted folder), 24 in use. A stale run-active marker keeps
+  run folder is `unknown`. A stale run-active marker keeps
   its server `in use`: the sweep does not yet check that the marker's session is
   alive, as `remove_seats.py` does. Under `--stop` each unused server gets a
   second look at the moment before it is signalled, under its run folder's
@@ -345,9 +352,11 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   own. The second look must find the same pid still serving the same port and
   must again say unused; then `_reap` stops it and `mesh_server.json` is removed
   if it names that pid. A deleted run folder is not created again for the lock.
-  Nothing runs the sweep on a schedule; it stays as a hand tool.
-- A codex app-server stops itself once nothing uses it (user 2026-10-08:
-  "i would rather have them be self-cleaning than have a sweep job").
+  Nothing runs the sweep on a schedule. `remove_seats.py` runs `sweep --stop`
+  at phase end (after a successful Claude session listing, under the real
+  delegate root only) and `end_session.sh` runs it at run end; a sweep failure
+  prints one line and never stops seat cleanup.
+- A codex app-server stops itself once nothing uses it.
   `ensure_server` starts a watcher with each server: a detached shell that wakes
   every `WATCH_WAKE_SECS` (5 minutes) and looks at the change time of
   `mesh_server.json`, which `ensure_server` touches on every use. Only when that
@@ -357,22 +366,16 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   and touches the record. The marker is left out because a stopped server comes
   back at the next use: `follow` starts one and sends `thread/resume`, and `send`
   now reopens a thread the server has not loaded (`_load_thread`; a new server
-  accepts a queued message for an unloaded thread and never runs it). Measured
-  2026-10-08: a seat told a word, its server stopped, a follow on a new server
-  answered with the word. A stopped server leaves no `mesh_server.json` and one
+  accepts a queued message for an unloaded thread and never runs it). A stopped server leaves no `mesh_server.json` and one
   line in `mesh_server.log` saying why. Cost: a shell and a `sleep` per server
   (under 1 MB of their own memory against a mean 38 MB per app-server), one
   `find` per wake, and one short Python run about twice an hour while the server
   is in use. The connection count needs `ss` and the run folder needs `/proc`,
   so on the Mac a server is kept as before and `end_session.sh` stops it.
-  `end_session.sh`, `end_friend.sh` and `stop` still stop a server at once. What
-  left servers behind before: run folders a director named itself for extra
-  seats, which no end step covers, and work that went on in a run folder after
-  its run had closed, where a later dispatch started a server no end step
-  followed.
-- A Codex sign-in change moves every run to a new app-server (user
-  2026-10-09: "when we login a new codex session while one is held, we need a
-  way to automatically switch them over and clean up old ones"). An app-server
+  `end_session.sh`, `end_friend.sh` and `stop` still stop a server at once. The
+  watcher is what reaps a server whose run folder no end step covers, such as
+  work that went on in a run folder after its run had closed.
+- A Codex sign-in change moves every run to a new app-server. An app-server
   reads `$CODEX_HOME/auth.json` once, at start; after a new sign-in it holds a
   token it cannot refresh and fails each turn with `access token could not be
   refreshed`. `codex_mesh.py signin-changed` runs the moment that file changes,
@@ -405,8 +408,8 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - A codex delegate's launcher ends with its last turn, and `send` then refuses it
   though the thread persists. Unlike a claude delegate, whose
   background session stays resumable, a finished codex peer cannot be messaged;
-  only the unit director's `implement.sh --to <seat>` (`codex_mesh.py follow`) gives it new work —
-  `<PhaseMesh/>` in `commands/unit/direct.md` states this, and the register
+  only the unit director's `implement.sh --to <seat>` or `review.sh --to <seat>` (`codex_mesh.py follow`) gives it new work —
+  `<PhaseMesh/>` in `docs/delegate/write_prompt_contract.md` states this, and the register
   line's `reach=` field is what tells a peer which of the two it is addressing.
 - The fix pipeline runs unattended every 10 minutes on both machines from the `nate.jobs.style-fix` job in `/etc/nixos/modules/common/style-fix.nix` (`intervalSeconds = 600`, no idle gate; see `fix-pipeline.md`). `agents_config.sh`, `agent_assignments.sh`, the three stage scripts, and `fix_report_parse.py` must never be left broken, and the resolver must keep working under `/bin/bash` (3.2).
 - `/unit:direct` is itself implemented by `scripts/delegate/*`, so any rename or signature change to those launchers must land together with the `commands/unit/direct.md` call-site edits in one change.
@@ -445,7 +448,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   acknowledgement says nothing about delivery — do not use it as a reachability
   test.
 - **A finished codex delegate takes no messages.** Its thread persists, but `send` refuses
-  it once `start` returns (`implement.sh --to` reaches it through `follow`), unlike a claude background session, which a message resumes from its transcript. The
+  it once `start` returns (`implement.sh --to` and `review.sh --to` reach it through `follow`), unlike a claude background session, which a message resumes from its transcript. The
   exception is a thread started `--resident` (ask_a_friend's friend): it stays
   `running` across turns, prints each reply as it lands, and ends only on
   `codex_mesh.py end`. `send`
@@ -456,7 +459,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - **`AGENT_EXEC_EXTRA_ARGS` is whitespace-split with no quote interpretation.** Flag+value pairs (`--add-dir /path`) work; no single argument may contain a space — no prompt preambles, no `--settings` JSON.
 - **`AGENT_EXEC_DRY_RUN=1`** is the testing hook: `%q`-quoted argv plus redirection suffix, with a `cd <dir> && ` prefix on the claude branch. Match smoke checks on substrings (`--full-auto`, `--sandbox read-only`, `-m <agent>`, the effort word), never whole lines — the codex effort token renders with escaped quotes (`model_reasoning_effort=\"high\"`).
 - **awk gotchas.** `function` is a reserved awk word — pass it as `-v fn=`. `awk -v` decodes backslash escapes, so a value containing `\n` / `\t` would corrupt the row; user-supplied values go through `ENVIRON["…"]`.
-- **`codex --sandbox read-only` panics** codex's system-configuration crate on macOS in some contexts, which is why ask_a_friend's conceptually read-only consult ran `write` (`--full-auto`) while it went through `agent_exec`; today the friend is a mesh thread (`codex_mesh.py start --resident`) and never touches `--sandbox read-only`. The delegate reviewer's `--sandbox read-only` usage is proven and stays. Codex launched from a Claude Code session needs `dangerouslyDisableSandbox: true` (and usually `run_in_background: true`).
+- **`codex --sandbox read-only` panics** codex's system-configuration crate on macOS in some contexts, which is why ask_a_friend's conceptually read-only consult ran `write` (`--full-auto`) while it went through `agent_exec`; today the friend is a mesh thread (`codex_mesh.py start --resident`) and never touches `--sandbox read-only`. The delegate reviewer's `--sandbox read-only` usage is proven and stays, for a review outside a run; a review inside a run goes to an open seat and runs on that thread's own sandbox. Codex launched from a Claude Code session needs `dangerouslyDisableSandbox: true` (and usually `run_in_background: true`).
 - **The cli aliases run fast from the registry.** `cli_agent.sh` once hardcoded `-c service_tier="fast"` after `agents_codex_args`, which would have overridden any `/agent cli <tier>`; the hardcode is gone and each machine's `[cli.options]` carries `codex_service_tier=fast` instead.
 - **Last-writer-wins on conf rewrites.** The source-time sync and the `/agent` editors both rewrite the file with tmp + `mv` and no locking; interleaved writers can silently revert each other's change but never corrupt the file.
 - **claude-family output needs `python3`.** The claude branch logs stream-JSON and extracts the final result event into the output file; without `python3` the output file would be empty even though the log is complete. Claude-family `readonly` reviewers running the style loader script under `--permission-mode plan --print` is untested — a family switch may silently degrade style loading.

@@ -304,7 +304,7 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
   - A hook on `brp_launch` to record launches, or recording from inside bevy_brp_mcp: the collector reads transcripts instead. Appending launches to the host's monthly file: the per-launch file makes the record id the dedupe.
   - Keying the example guard on the target's `test` setting or advising `test = true`: examples carry no tests (user, 2026-10-04).
   - Withholding the phone push when a removal failed, or cutting a path's last component to fit 1,024 characters.
-  - Queuing a message to an out-of-retries Codex thread (it opens a turn nothing streams); changing the service tier on capacity; adding `failed` to `ENDABLE_STATUSES`.
+  - Queuing a message to an out-of-retries Codex thread (it opens a turn nothing streams); changing the service tier on capacity.
   - The dailies renderer importing the note code from `scripts/whoami`: it parses the flat frontmatter itself and imports only `run_out`.
 
 ## Not built
