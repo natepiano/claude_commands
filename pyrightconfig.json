@@ -47,6 +47,8 @@
       "root": "scripts/message",
       "extraPaths": [
         "scripts/message",
+        "scripts/production",
+        "scripts/delegate",
         "scripts/shutdown"
       ]
     },
