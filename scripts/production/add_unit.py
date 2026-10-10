@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "hooks"))
+sys.path.insert(0, str(SCRIPTS / "shutdown"))
 
 import unit_lookup
 
@@ -148,6 +149,18 @@ class ReadyToLaunch(NamedTuple):
     launch: UnitLaunch
     row: NoUnitRow | ExistingUnitRow
     director: DirectorAgent
+
+
+@dataclass(frozen=True)
+class MarkedUnitFound:
+    """The unit already has a tmux session carrying its marks."""
+
+    unit: unit_lookup.MarkedUnit
+
+
+@dataclass(frozen=True)
+class NoMarkedUnit:
+    """No tmux session carries the requested unit's marks."""
 
 
 class Refusal(Exception):
@@ -667,7 +680,7 @@ def launch_session(
                  "--settings", '{"disableAgentView": true}', prompt])
     command = "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
     cwd = request.session.cwd if isinstance(request.session, ResumedSession) else request.worktree
-    environment = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")}
+    environment = launch_environment()
     scope_name = re.sub(r"[^A-Za-z0-9_.-]", "-", tmux_session)
     scope = f"--unit={scope_name}-{int(time.time())}"
     _ = subprocess.run(["systemd-run", "--user", "--scope", scope, tmux,
@@ -675,6 +688,15 @@ def launch_session(
                         *(argument for name, value in marks.items() for argument in ("-e", f"{name}={value}")),
                         "zsh", "-ic", command],
                        env=environment, text=True, capture_output=True, check=True)
+
+
+def launch_environment() -> dict[str, str]:
+    """The environment inherited by a unit's Claude process."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("CLAUDE_")
+    }
 
 
 def record_scheduled_restore_prompt(session_id: str, prompt: str) -> None:
@@ -691,15 +713,19 @@ def record_scheduled_restore_prompt(session_id: str, prompt: str) -> None:
         raise RuntimeError(f"restart prompt not recorded: {reason}") from error
 
 
-def launched_unit(request: UnitLaunch) -> unit_lookup.MarkedUnit | None:
+def launched_unit(request: UnitLaunch) -> MarkedUnitFound | NoMarkedUnit:
     """The unit's tmux session, found by its mark."""
-    return unit_lookup.marked_units(request.production.slug).get(request.identity.unit)
+    unit = unit_lookup.marked_units(request.production.slug).get(
+        request.identity.unit
+    )
+    return NoMarkedUnit() if unit is None else MarkedUnitFound(unit)
 
 
 def wait_for_remote_control(request: UnitLaunch, tmux: str) -> unit_lookup.MarkedUnit:
-    launched = launched_unit(request)
-    if launched is None:
+    found = launched_unit(request)
+    if isinstance(found, NoMarkedUnit):
         raise RuntimeError(f"{request.identity.unit}: no tmux session carries its mark")
+    launched = found.unit
     deadline = time.monotonic() + request.timeout
     pane = ""
     while True:
@@ -744,41 +770,88 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     try:
         request = launch_request(args)
-        ready = preflight(request)
-        request = ready.launch
-        if cast(bool, args.check):
-            return 0
-        tmux = unit_lookup.tmux_binary()
-        marked_unit = launched_unit(request)
-        if isinstance(request.launch_kind, UnitRestoreLaunch) and marked_unit is not None:
-            if isinstance(marked_unit.claude, unit_lookup.ClaudeUnknown):
+        # Imported only on the launch path: table readers import add_unit from
+        # copied trees that do not include scripts/shutdown.
+        import launch_permission
+
+        barrier = launch_permission.launch_barrier()
+        try:
+            _ = barrier.__enter__()
+        except OSError as error:
+            raise Refusal(
+                f"shutdown state unreadable: launch barrier: {error}"
+            ) from error
+        try:
+            purpose: launch_permission.LaunchPurpose = (
+                launch_permission.ShutdownUnitRestoreLaunchPurpose(
+                    request.launch_kind.session_id
+                )
+                if isinstance(request.launch_kind, UnitRestoreLaunch)
+                else launch_permission.NewWorkLaunchPurpose()
+            )
+            permission = launch_permission.launch_permission(
+                launch_environment(), purpose
+            )
+            if isinstance(permission, launch_permission.BlockedByShutdown):
                 raise Refusal(
-                    f"cannot tell whether Claude runs in tmux session {marked_unit.label}: "
-                    + marked_unit.claude.reason
+                    f"{permission.reason}; /shutdown restart first"
                 )
-            if isinstance(marked_unit.claude, unit_lookup.ClaudeNotRunning):
-                _ = subprocess.run(
-                    [tmux, "kill-session", "-t", marked_unit.pane],
-                    capture_output=True,
-                    text=True,
-                    check=True,
+            if isinstance(
+                permission, launch_permission.ShutdownStateUnreadable
+            ):
+                raise Refusal(
+                    f"shutdown state unreadable: {permission.detail}"
                 )
-                marked_unit = None
-        tmux_session = (request.launch_kind.tmux_session
-                        if isinstance(request.launch_kind, UnitRestoreLaunch)
-                        else request.identity.session)
-        if marked_unit is None and tmux_live(tmux, tmux_session):
-            raise Refusal(f"tmux session {tmux_session} is already live and is not marked as "
-                          + request.identity.unit)
-        write_stub(request)
-        append_row(request, ready.row)
-        commit_unit(request)
-        ensure_worktree(request)
-        if marked_unit is None:
-            prompt = prompt_for(request)
-            if isinstance(request.launch_kind, UnitRestoreLaunch):
-                record_scheduled_restore_prompt(request.launch_kind.session_id, prompt)
-            launch_session(request, tmux, ready.director, prompt)
+
+            ready = preflight(request)
+            request = ready.launch
+            if cast(bool, args.check):
+                return 0
+            tmux = unit_lookup.tmux_binary()
+            marked_unit = launched_unit(request)
+            if (
+                isinstance(request.launch_kind, UnitRestoreLaunch)
+                and isinstance(marked_unit, MarkedUnitFound)
+            ):
+                unit = marked_unit.unit
+                if isinstance(unit.claude, unit_lookup.ClaudeUnknown):
+                    raise Refusal(
+                        f"cannot tell whether Claude runs in tmux session {unit.label}: "
+                        + unit.claude.reason
+                    )
+                if isinstance(unit.claude, unit_lookup.ClaudeNotRunning):
+                    _ = subprocess.run(
+                        [tmux, "kill-session", "-t", unit.pane],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    marked_unit = NoMarkedUnit()
+            tmux_session = (
+                request.launch_kind.tmux_session
+                if isinstance(request.launch_kind, UnitRestoreLaunch)
+                else request.identity.session
+            )
+            if isinstance(marked_unit, NoMarkedUnit) and tmux_live(
+                tmux, tmux_session
+            ):
+                raise Refusal(
+                    f"tmux session {tmux_session} is already live and is not marked as "
+                    + request.identity.unit
+                )
+            write_stub(request)
+            append_row(request, ready.row)
+            commit_unit(request)
+            ensure_worktree(request)
+            if isinstance(marked_unit, NoMarkedUnit):
+                prompt = prompt_for(request)
+                if isinstance(request.launch_kind, UnitRestoreLaunch):
+                    record_scheduled_restore_prompt(
+                        request.launch_kind.session_id, prompt
+                    )
+                launch_session(request, tmux, ready.director, prompt)
+        finally:
+            _ = barrier.__exit__(None, None, None)
         launched = wait_for_remote_control(request, tmux)
         record(request)
         print(f"{request.identity.unit} started: tmux attach -t {launched.label}")

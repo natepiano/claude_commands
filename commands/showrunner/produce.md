@@ -233,6 +233,7 @@ confirm the block remains and no compaction is running. Type `/compact` into its
 
 **Resume.** To bring back a unit director whose session ended, use
    `claude --resume <session-id> <flags> --remote-control <session> -n <session>`, which keeps its link and its place in the list.
+   First run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/shutdown/shutdown.py launch-blocked --restart-of <session-id>`. Continue only when it exits 1. On any other exit, do not resume and tell the user its line; exit 0 means the account is held by a shutdown, and `/shutdown restart` brings the unit back.
    Get `<flags>` first, from `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve production.director || exit 1; [[ "$AGENT_FAMILY" == claude ]] || { echo "unit directors launch only on claude; production.director resolves to $AGENT_FAMILY ($AGENT_MODEL)" >&2; exit 1; }; agents_claude_args'`, which prints `--model <model> [--effort <effort>]`. If it exits nonzero, stop and tell the user its line; never run `claude --resume` without the flags.
 </LaunchUnits>
 

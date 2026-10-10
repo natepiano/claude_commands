@@ -5,7 +5,10 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import cast, final, override
@@ -116,6 +119,109 @@ class RecordTests(unittest.TestCase):
         with self.assertRaises(record.ShutdownInProgress) as raised:
             record.create(second)
         self.assertEqual(raised.exception.live, first)
+
+    def test_missing_account_directory_is_no_shutdown(self) -> None:
+        self.assertEqual(
+            record.find_live("missing@example.com"),
+            record.NoShutdown(kind="no shutdown"),
+        )
+
+    def test_missing_record_file_is_no_shutdown(self) -> None:
+        account_directory = self.root / "shutdown" / "empty@example.com"
+        account_directory.mkdir(parents=True)
+
+        self.assertEqual(
+            record.find_live("empty@example.com"),
+            record.NoShutdown(kind="no shutdown"),
+        )
+
+    def test_non_directory_account_paths_are_invalid_records(self) -> None:
+        state_root = self.root / "shutdown"
+        state_root.mkdir()
+        regular_file = state_root / "file@example.com"
+        _ = regular_file.write_text("not a directory", encoding="utf-8")
+        dangling_link = state_root / "dangling@example.com"
+        dangling_link.symlink_to(state_root / "missing-target")
+        looping_link = state_root / "loop@example.com"
+        looping_link.symlink_to(looping_link)
+
+        for login in (
+            "file@example.com",
+            "dangling@example.com",
+            "loop@example.com",
+        ):
+            with self.subTest(login=login), self.assertRaises(record.InvalidRecord):
+                _ = record.find_live(login)
+
+    def test_record_path_must_be_a_regular_file(self) -> None:
+        account_directory = self.root / "shutdown" / "owner@example.com"
+        (account_directory / "record.json").mkdir(parents=True)
+
+        with self.assertRaises(record.InvalidRecord):
+            _ = record.find_live("owner@example.com")
+
+    def test_broken_account_lock_is_an_invalid_record(self) -> None:
+        account_directory = self.root / "shutdown" / "owner@example.com"
+        lock_path = account_directory / "lock"
+        lock_path.mkdir(parents=True)
+
+        with self.assertRaises(record.InvalidRecord) as raised:
+            _ = record.find_live("owner@example.com")
+
+        self.assertIn(str(lock_path), str(raised.exception))
+        self.assertIn("Is a directory", str(raised.exception))
+
+    def test_create_waits_for_launch_barrier_held_by_another_process(self) -> None:
+        helper = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from launch_permission import launch_barrier\n"
+                    "import sys\n"
+                    "with launch_barrier():\n"
+                    " print('locked', flush=True)\n"
+                    " sys.stdin.readline()\n"
+                ),
+            ],
+            cwd=Path(__file__).parent,
+            env=dict(os.environ),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(helper.__exit__, None, None, None)
+        self.addCleanup(helper.kill)
+        self.assertIsNotNone(helper.stdout)
+        if helper.stdout is None:
+            self.fail("barrier helper has no stdout")
+        self.assertEqual(helper.stdout.readline(), "locked\n")
+
+        created = threading.Event()
+        failure: list[BaseException] = []
+
+        def create_record() -> None:
+            try:
+                record.create(shutdown_record())
+            except BaseException as error:
+                failure.append(error)
+            finally:
+                created.set()
+
+        creator = threading.Thread(target=create_record)
+        creator.start()
+        self.assertFalse(created.wait(0.2), "create returned while launch barrier was held")
+        self.assertIsNotNone(helper.stdin)
+        if helper.stdin is None:
+            self.fail("barrier helper has no stdin")
+        _ = helper.stdin.write("release\n")
+        helper.stdin.flush()
+        self.assertEqual(helper.wait(timeout=5), 0, helper.stderr.read() if helper.stderr else "")
+        self.assertTrue(created.wait(5), "create did not continue after barrier release")
+        creator.join(timeout=5)
+        self.assertEqual(failure, [])
+        self.assertEqual(record.find_live("owner@example.com")["kind"], "live")
 
     def test_update_holds_the_account_lock_while_changing_record(self) -> None:
         live = shutdown_record()

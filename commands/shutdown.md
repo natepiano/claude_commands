@@ -18,6 +18,8 @@ Use the optional account exactly as given. A session on another account is never
 
 Your phone hears from a shutdown only when you must act: a stop left something running, sessions are not ready to stop, or a restart is not fully back; the session that asked always gets the stop result, including after its own restart.
 
+While an account is shut down or restarting on a machine, or its shutdown state cannot be read, the nightly review and fix pipeline skip their runs there and no unit launches except by restart.
+
 `down` means every attributable session is resumably stopped: units also lose their exact tmux session, each non-seat owner's Codex server is stopped, and Ghostty windows close when Ghostty still owns them. Showrunners and top-level sessions resume through `/shutdown restart`. Seats keep their job and transcript but no process; their next message respawns them. `stop partial` keeps what was left running and why on the record, and `/shutdown status` shows it under each machine. A stop runs to its end; a second stop on the same machine waits for it. Unknown-account and process-identity-mismatch sessions are listed as left running.
 
 From a terminal, the same restart is:

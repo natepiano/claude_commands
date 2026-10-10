@@ -30,4 +30,5 @@ if pgrep -f "$FIX_ORCHESTRATOR_PATH" >/dev/null 2>&1; then
 fi
 
 export FIX_SCHEDULED=1
-exec "$FIX_ORCHESTRATOR_PATH"
+exec "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/shutdown/launch_permission.py" \
+    exec-new-work --name fix-trigger -- "$FIX_ORCHESTRATOR_PATH"

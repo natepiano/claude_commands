@@ -39,6 +39,7 @@
       "root": "scripts/nightly_review",
       "extraPaths": [
         "scripts/nightly_review",
+        "scripts/shutdown",
         "scripts/whoami"
       ]
     },
@@ -90,6 +91,7 @@
         "scripts/hooks",
         "scripts/mac_test",
         "scripts/message",
+        "scripts/shutdown",
         "scripts/whoami"
       ]
     },

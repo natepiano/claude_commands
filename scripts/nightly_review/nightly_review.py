@@ -22,11 +22,21 @@ import shlex
 import subprocess
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date, datetime, time
 from pathlib import Path
 
 # The quota readers live with the agent notes, one directory over.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
+SCRIPTS = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(SCRIPTS / "whoami"))
+sys.path.insert(0, str(SCRIPTS / "shutdown"))
+from launch_permission import (  # noqa: E402
+    BlockedByShutdown,
+    NewWorkLaunchPurpose,
+    ShutdownStateUnreadable,
+    launch_barrier,
+    launch_permission,
+)
 from quota_alert import ahead, current_session, remaining  # noqa: E402
 
 ROOT = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "nightly-review"
@@ -35,6 +45,21 @@ SETTINGS = Path(__file__).with_name("settings.json")
 MIN_REMAINING = 10.0
 OFFER_FROM = time(5)
 OWNER = "natedev"
+
+
+@dataclass(frozen=True)
+class QuotaClear:
+    """The active Claude account has enough weekly quota to launch work."""
+
+
+@dataclass(frozen=True)
+class QuotaBelowFloor:
+    """Tonight's run must wait for weekly quota."""
+
+    reason: str
+
+
+QuotaPermission = QuotaClear | QuotaBelowFloor
 
 
 def night_dir(day: date) -> Path:
@@ -56,16 +81,20 @@ def running(mode: str) -> bool:
     return tmux("has-session", "-t", f"={session(mode)}").returncode == 0
 
 
-def quota_block() -> str | None:
-    """Why tonight is skipped, or None to run."""
+def quota_permission() -> QuotaPermission:
+    """Whether the active Claude account has enough weekly quota to run."""
     from agent_notes import read_notes
 
     for note in read_notes():
         left = remaining(note)
         if (note.tool == "claude" and note.get("state") == "active" and left is not None
                 and left < MIN_REMAINING and ahead(note.get("resets"))):
-            return f"{note.path.stem} has {left:g}% of its weekly usage left, under the {MIN_REMAINING:g}% floor"
-    return None
+            reason = (
+                f"{note.path.stem} has {left:g}% of its weekly usage left, under "
+                + f"the {MIN_REMAINING:g}% floor"
+            )
+            return QuotaBelowFloor(reason)
+    return QuotaClear()
 
 
 def start(mode: str) -> str:
@@ -90,8 +119,31 @@ def start(mode: str) -> str:
 def launch(today: date) -> list[str]:
     directory = night_dir(today)
     directory.mkdir(parents=True, exist_ok=True)
-    reason = quota_block()
-    lines = [f"skipped: {reason}"] if reason else [start(mode) for mode in MODES]
+    barrier = launch_barrier()
+    try:
+        _ = barrier.__enter__()
+    except OSError as error:
+        lines = [
+            f"skipped: shutdown state unreadable: launch barrier: {error}"
+        ]
+    else:
+        try:
+            permission = launch_permission(os.environ, NewWorkLaunchPurpose())
+            if isinstance(permission, BlockedByShutdown):
+                lines = [f"skipped: {permission.reason}"]
+            elif isinstance(permission, ShutdownStateUnreadable):
+                lines = [
+                    f"skipped: shutdown state unreadable: {permission.detail}"
+                ]
+            else:
+                quota = quota_permission()
+                lines = (
+                    [f"skipped: {quota.reason}"]
+                    if isinstance(quota, QuotaBelowFloor)
+                    else [start(mode) for mode in MODES]
+                )
+        finally:
+            _ = barrier.__exit__(None, None, None)
     _ = (directory / "launch.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return lines
 
