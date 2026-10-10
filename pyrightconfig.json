@@ -45,7 +45,8 @@
     {
       "root": "scripts/message",
       "extraPaths": [
-        "scripts/message"
+        "scripts/message",
+        "scripts/shutdown"
       ]
     },
     {

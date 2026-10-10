@@ -242,6 +242,37 @@ def _send_command() -> list[str]:
     return [override] if override else [sys.executable, str(SEND)]
 
 
+def retire_command(login: str, session_id: str) -> list[str]:
+    """Build the one command that removes obsolete shutdown messages."""
+    return [
+        *_send_command(),
+        "retire",
+        "--to",
+        f"session:{session_id}",
+        "--from",
+        "shutdown",
+        "--key",
+        f"shutdown-{login}-{session_id}",
+    ]
+
+
+def _retire_shutdown_messages(login: str, session_id: str) -> None:
+    result = subprocess.run(
+        retire_command(login, session_id),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        reason = (result.stderr or result.stdout).splitlines()
+        raise RuntimeError(
+            reason[0]
+            if reason
+            else f"retire for session:{session_id} exited {result.returncode}"
+        )
+
+
 def run_notifier(verb: str, instance: str) -> None:
     result = subprocess.run(
         [*_notifier_command(), verb, instance],
@@ -264,6 +295,7 @@ def send_message(
     *,
     need: Literal["note", "decision", "blocked"] = "note",
     machine: str = "",
+    key: str = "",
 ) -> MessageDelivery:
     command = [
         *_send_command(),
@@ -274,6 +306,8 @@ def send_message(
         "--summary",
         summary,
     ]
+    if key:
+        command.extend(("--key", key))
     if recipient == "user":
         command.extend(("--need", need))
     if machine:
@@ -612,6 +646,7 @@ def _send_settle_message(record: ShutdownRecord, entry: ShutdownSessionEntry) ->
         f"session:{session['session_id']}",
         f"Shutdown of {record['label']}: reach a safe stop",
         _settle_text(record, session),
+        key=f"shutdown-{record['login']}-{session['session_id']}",
     )
     at = record_time()
     if delivery["kind"] == "sent":
@@ -1319,11 +1354,18 @@ def _restore_record(record: ShutdownRecord) -> None:
             footer = timer["footer"]
             if footer["kind"] == "footer":
                 _restore_footer(footer["slug"])
+        _retire_shutdown_messages(
+            record["login"], entry["session"]["session_id"]
+        )
         if entry["settle_message"]["kind"] in {"sent", "queued"}:
             _ = send_message(
                 f"session:{entry['session']['session_id']}",
                 f"Shutdown of {record['label']} cancelled",
                 f"Shutdown of {record['label']} cancelled by the user: continue where you were.",
+                key=(
+                    f"shutdown-{record['login']}-"
+                    f"{entry['session']['session_id']}"
+                ),
             )
 
 

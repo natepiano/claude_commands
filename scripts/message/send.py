@@ -11,6 +11,8 @@ every message follows are /message (~/.claude/commands/message.md).
   send.py ack KEY       later sends with KEY are skipped
   send.py reopen KEY    forget KEY: acknowledgement and repeat window
   send.py pending [NAME]  print and clear what is kept for this session, or for NAME's
+  send.py retire --to ADDRESS --from SENDER --key KEY
+                          remove obsolete queued messages for ADDRESS
 
 Delivery. The session-to-session channel is a tool, not a command, so a Claude
 recipient is reached through a headless `claude -p` relay whose one job is a
@@ -89,8 +91,33 @@ EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3}
 
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str})
-Queued = TypedDict("Queued", {"time": str, "from": str, "to": str, "key": str | None, "summary": str,
-                              "text": str, "reason": str})
+KeyedMessage = TypedDict(
+    "KeyedMessage",
+    {
+        "time": str,
+        "from": str,
+        "to": str,
+        "key": str,
+        "summary": str,
+        "text": str,
+        "reason": str,
+    },
+)
+UnkeyedMessage = TypedDict(
+    "UnkeyedMessage",
+    {
+        "time": str,
+        "from": str,
+        "to": str,
+        "key": None,
+        "summary": str,
+        "text": str,
+        "reason": str,
+    },
+)
+
+
+QueuedMessage = KeyedMessage | UnkeyedMessage
 
 
 class KeyState(TypedDict):
@@ -222,27 +249,105 @@ def queue_for(to: str) -> Path:
     Under the Claude session id of the live session `to` means, so the session finds it whatever it
     is called later. Under `to` itself when no live session answers to it: there is no id to look up.
     """
+    if to.startswith("session:") and len(to) > len("session:"):
+        return queue_path(f"session-{to.removeprefix('session:')}")
     session = sessions.addressed(to, sessions.live_sessions())
     return queue_path(session_key(session) if session is not None else to)
 
 
-def read_queue(path: Path) -> list[Queued]:
+def _queued_message(value: object) -> QueuedMessage | None:
+    values = as_dict(value)
+    string_fields = ("time", "from", "to", "summary", "text", "reason")
+    if not all(isinstance(values.get(field), str) for field in string_fields):
+        return None
+    key = values.get("key")
+    if key is None:
+        return cast(UnkeyedMessage, cast(object, values))
+    if isinstance(key, str):
+        return cast(KeyedMessage, cast(object, values))
+    return None
+
+
+def read_queue(path: Path) -> list[QueuedMessage]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
         return []
-    return [cast("Queued", cast("object", entry)) for line in lines if isinstance(entry := loads(line), dict)]
+    messages = (_queued_message(loads(line)) for line in lines)
+    return [message for message in messages if message is not None]
 
 
 def enqueue(message: Message, reason: str, at: datetime) -> None:
     """Keep a message that did not arrive; a later one with the same key replaces it."""
     path = queue_for(message.to)
-    entry: Queued = {"time": at.isoformat(), "from": message.sender, "to": message.to, "key": message.key,
-                     "summary": message.summary, "text": message.text, "reason": reason}
+    if message.key is None:
+        entry: QueuedMessage = UnkeyedMessage(
+            time=at.isoformat(),
+            to=message.to,
+            key=None,
+            summary=message.summary,
+            text=message.text,
+            reason=reason,
+            **{"from": message.sender},
+        )
+    else:
+        entry = KeyedMessage(
+            time=at.isoformat(),
+            to=message.to,
+            key=message.key,
+            summary=message.summary,
+            text=message.text,
+            reason=reason,
+            **{"from": message.sender},
+        )
     with locked():
         path.parent.mkdir(parents=True, exist_ok=True)
         kept = [old for old in read_queue(path) if message.key is None or old["key"] != message.key]
         write_atomic(path, "".join(json.dumps(item) + "\n" for item in [*kept, entry]))
+
+
+def _rewrite_queue(path: Path, kept: list[QueuedMessage]) -> None:
+    if kept:
+        write_atomic(path, "".join(json.dumps(item) + "\n" for item in kept))
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _queue_paths_for_address(to: str) -> list[Path]:
+    return list(dict.fromkeys((queue_for(to), queue_path(to))))
+
+
+def remove_queued_key(to: str, key: str) -> int:
+    """Remove a delivered keyed message's queued predecessor."""
+    paths = _queue_paths_for_address(to)
+    removed = 0
+    with locked():
+        for path in paths:
+            entries = read_queue(path)
+            kept = [entry for entry in entries if entry["key"] != key]
+            _rewrite_queue(path, kept)
+            removed += len(entries) - len(kept)
+    return removed
+
+
+def retire(to: str, sender: str, key: str) -> int:
+    """Remove obsolete shutdown messages queued for one address."""
+    paths = _queue_paths_for_address(to)
+    removed = 0
+    with locked():
+        for path in paths:
+            entries = read_queue(path)
+            kept = [
+                entry
+                for entry in entries
+                if not (
+                    entry["key"] == key
+                    or (entry["key"] is None and entry["from"] == sender)
+                )
+            ]
+            _rewrite_queue(path, kept)
+            removed += len(entries) - len(kept)
+    return removed
 
 
 def log(message: Message, result: Result, at: datetime) -> None:
@@ -585,6 +690,25 @@ def parse(argv: list[str]) -> Options:
     return options
 
 
+class RetireRequest(NamedTuple):
+    to: str
+    sender: str
+    key: str
+
+
+def parse_retire(argv: list[str]) -> RetireRequest:
+    parser = argparse.ArgumentParser(prog="send.py retire")
+    _ = parser.add_argument("--to", required=True)
+    _ = parser.add_argument("--from", dest="sender", required=True)
+    _ = parser.add_argument("--key", required=True)
+    args = parser.parse_args(argv)
+    return RetireRequest(
+        as_str(attr(args, "to")),
+        as_str(attr(args, "sender")),
+        as_str(attr(args, "key")),
+    )
+
+
 def usage_error(text: str) -> NoReturn:
     print(f"send.py: {text}", file=sys.stderr)
     sys.exit(2)
@@ -636,12 +760,18 @@ def send(options: Options) -> Result:
                 if sessions.addressed(message.to, sessions.live_sessions()) is None:
                     result = Result("queued", f"{result.detail}; no live session answers to {message.to},"
                                     + " so it is kept under that name")
+    if result.outcome == "sent" and message.key is not None:
+        _ = remove_queued_key(message.to, message.key)
     log(message, result, started)
     return result
 
 
 def main(argv: list[str]) -> int:
     match argv:
+        case ["retire", *arguments]:
+            request = parse_retire(arguments)
+            removed = retire(request.to, request.sender, request.key)
+            print(f"retired {removed} queued message{'s' if removed != 1 else ''}")
         case ["ack", key]:
             print(acknowledge(key))
         case ["reopen", key]:

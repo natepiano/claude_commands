@@ -2,17 +2,25 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import socket
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import timedelta
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import send
+import record as shutdown_record
+import restart
+import settle
 
 
 def stream(*events: dict[str, object]) -> str:
@@ -195,7 +203,133 @@ class SendTests(unittest.TestCase):
         self.assertEqual(result.outcome, "queued")
         self.assertIn("no live session answers to session:gone", result.detail)
         self.assertEqual(self.relayed, [])
-        self.assertIn("wait for me", send.pending("session:gone"))
+        self.session("gone", "returned")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "gone"}):
+            self.assertIn("wait for me", send.pending(None))
+            self.assertEqual(send.pending(None), "")
+
+    def test_a_delivered_keyed_send_retires_its_queued_copy(self) -> None:
+        self.session("id-1", "recipient")
+        self.outcome = send.Result("queued", "relay unavailable")
+        first = send.send(send.parse([
+            "--to", "session:id-1", "--from", "shutdown", "--key", "shutdown-owner-id-1",
+            "--text", "settle first",
+        ]))
+        self.assertEqual(first.outcome, "queued")
+
+        self.outcome = send.Result("sent", "ok")
+        delivered = send.send(send.parse([
+            "--to", "session:id-1", "--from", "shutdown", "--key", "shutdown-owner-id-1",
+            "--text", "cancel instead",
+        ]))
+
+        self.assertEqual(delivered.outcome, "sent")
+        self.assertEqual(send.pending("recipient"), "")
+
+    def test_retire_removes_only_the_shutdown_messages_for_one_address(self) -> None:
+        key = "shutdown-owner-id-1"
+        messages = (
+            ("session:id-1", "shutdown", key, "keyed settle"),
+            ("session:id-1", "shutdown", None, "old unkeyed cancel"),
+            ("session:id-1", "showrunner", None, "keep same address"),
+            ("session:id-2", "shutdown", key, "keep other address"),
+        )
+        for address, sender, message_key, text in messages:
+            argv = ["--to", address, "--from", sender, "--text", text]
+            if message_key is not None:
+                argv[4:4] = ["--key", message_key]
+            self.assertEqual(send.send(send.parse(argv)).outcome, "queued")
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = send.main([
+                "retire", "--to", "session:id-1", "--from", "shutdown", "--key", key,
+            ])
+
+        self.assertEqual(code, 0)
+        self.assertIn("2", output.getvalue())
+        self.session("id-1", "one")
+        self.session("id-2", "two")
+        same_address = send.pending("one")
+        self.assertNotIn("settle", same_address)
+        self.assertNotIn("cancel", same_address)
+        self.assertIn("keep same address", same_address)
+        self.assertIn("keep other address", send.pending("two"))
+
+    def test_real_cancel_and_restart_senders_retire_old_settle_instructions(self) -> None:
+        real_send = Path(__file__).resolve().parent / "send.py"
+        child_state = self.root / "child-state"
+
+        def shutdown_fixture(
+            session_id: str,
+        ) -> tuple[shutdown_record.ShutdownRecord, shutdown_record.ShutdownSessionEntry]:
+            session = cast(
+                object,
+                {"session_id": session_id, "name": session_id, "kind": "top-level"},
+            )
+            current_entry = cast(
+                shutdown_record.ShutdownSessionEntry,
+                cast(object, {
+                    "session": session,
+                    "timers": [],
+                    "settle_message": shutdown_record.SettleMessageNotSent(kind="not sent"),
+                }),
+            )
+            current = cast(
+                shutdown_record.ShutdownRecord,
+                cast(object, {
+                    "login": "owner@example.com",
+                    "label": "claude 2",
+                    "requested_at": "2026-10-09T21:49:10+00:00",
+                    "entries": [current_entry],
+                }),
+            )
+            return current, current_entry
+
+        with (
+            mock.patch.object(send, "STATE", child_state / "message"),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "XDG_STATE_HOME": str(child_state),
+                    "SHUTDOWN_SEND": str(real_send),
+                },
+            ),
+        ):
+            cancelled, cancel_entry = shutdown_fixture("cancelled")
+            settle._send_settle_message(cancelled, cancel_entry)  # pyright: ignore[reportPrivateUsage]
+            old_cancel = settle.send_message(
+                "session:cancelled",
+                "old settle",
+                "Old unkeyed settle instruction: run /shutdown ready.",
+            )
+            self.assertEqual(old_cancel["kind"], "queued")
+            settle._restore_record(cancelled)  # pyright: ignore[reportPrivateUsage]
+            self.session("cancelled", "cancel-recipient")
+            cancel_pending = send.pending("cancel-recipient")
+            self.assertNotIn("settle instruction", cancel_pending)
+            self.assertIn("cancelled by the user", cancel_pending)
+
+            restarted, restart_entry = shutdown_fixture("restarted")
+            settle._send_settle_message(restarted, restart_entry)  # pyright: ignore[reportPrivateUsage]
+            old_restart = settle.send_message(
+                "session:restarted",
+                "old settle",
+                "Old unkeyed settle instruction: run /shutdown ready.",
+            )
+            self.assertEqual(old_restart["kind"], "queued")
+            restart._retire(restarted, restart_entry, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+            delivery = restart._send_restart_note(  # pyright: ignore[reportPrivateUsage]
+                restarted,
+                restart_entry,
+                "Restarted; continue.",
+                dry_run=False,
+            )
+            self.assertEqual(delivery["kind"], "queued")
+            self.session("restarted", "restart-recipient")
+            restart_pending = send.pending("restart-recipient")
+            self.assertNotIn("settle instruction", restart_pending)
+            self.assertIn("Restarted; continue.", restart_pending)
 
     def test_session_name_still_relays_with_its_name(self) -> None:
         self.session("id-1", "recipient")
