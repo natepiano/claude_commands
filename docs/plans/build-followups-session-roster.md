@@ -217,58 +217,36 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 ### Phase 6 — A shutdown test that reaches the real sender fails instead of sending · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a shutdown test whose fake has gone stale fails, naming the real send leaf it reached and the recipient, and nothing reaches a session, the other machine or the user's phone.
-
-**Spec:**
-- **Why (fact).** 2026-10-10 11:43 PDT: a seat split the shutdown sender and ran `scripts/shutdown/test_stop.py` before updating its patches. Two tests still faking the old sender reached the real path (`settle.alert_user` → `settle._deliver_message` → a `send.py --to user` subprocess → Pushover) and posted their fixture alerts ("claude 2: stop partial") to the user's phone. Each test fakes its own send, and nothing catches a fake that has gone stale.
-- **The real send leaves in `scripts/shutdown/*.py`**, each the last call before a process that delivers to a session, the other machine or the user. Each stub names the leaf and the recipient shown here:
-  - `settle._deliver_message(command, recipient, text)` — runs `send.py` (`settle._send_command()`: `SHUTDOWN_SEND`, else `scripts/message/send.py`). `settle.send_message` (sessions, `--machine` included) and `settle.alert_user` (`--to user`, ending in `pushover.py`) both end here, and `restart._send_restart_note` and `restart.py`'s "is not fully back" alert reach it through them. Recipient: `recipient`.
-  - `settle._retire_shutdown_messages(login, session_id)` — runs `send.py retire --to session:<id>` (`settle.retire_command`). Recipient: `session:<session_id>`.
-  - `restart._retire(record, entry, *, dry_run)` — runs the same `send.py retire` through `restart._run`. Recipient: `session:<entry["session"]["session_id"]>`. A dry run only prints the command, so the stub passes `dry_run=True` through to the real function.
-  - `remote.run_remote(args, stdin="", limit=STANDARD_TIME_LIMIT)` — runs `shutdown.py <args>` on `remote.other_machine()` over ssh, where that machine's own leaves send. `settle`, `restart` and `shutdown` import it by name, so the stub replaces all four bindings: `remote.run_remote`, `settle.run_remote`, `restart.run_remote`, `shutdown.run_remote`. Recipient: `<other machine>: shutdown.py <args>`.
-  - `settle._launch_conductor(login, label, here)` — starts a detached `shutdown.py conduct <login>` under `systemd-run --user` or `launchctl submit`, which messages sessions and alerts the user outside the test process, where no stub reaches. Recipient: `conductor for <login>`.
-  - `settle.run_notifier(verb, instance)` — runs the progress notifier (`settle._notifier_command()`: `SHUTDOWN_NOTIFIER`, else `unit_notifier.sh`) with `start` or `stop`. `start` turns a real timer back on, and its later ticks message sessions outside the test process. `settle.py` and `restart.py` reach it as `settle.run_notifier`. Recipient: `notifier <instance>`.
-  - Not leaves: `stop.py`'s `systemctl` / `launchctl` / `tmux kill-session` / `codex_mesh.py stop` and signals (they end sessions), `restart._add_unit_command` and the session launches in `restart._run` (they start sessions), and the read-only `git`, `ps`, `tmux capture-pane` and `github-warm-status` probes.
-- **`scripts/shutdown/test_support.py`** (new, standard library only) defines `class ShutdownSendLeaf(StrEnum)`, one member per leaf above whose value is its dotted name (`DELIVER_MESSAGE = "settle._deliver_message"`, `RETIRE_SHUTDOWN_MESSAGES`, `RESTART_RETIRE = "restart._retire"`, `RUN_REMOTE = "remote.run_remote"`, `LAUNCH_CONDUCTOR`, `RUN_NOTIFIER`), and `class ShutdownTestCase(unittest.TestCase)`:
-  - `setUp` replaces every leaf above with a stub. A reached stub raises `AssertionError("shutdown test reached real send leaf <dotted name> for <recipient>; fake the step above it, or allow_leaf(ShutdownSendLeaf.<member>) and fake the subprocess beneath it")`, so nothing starts, and records the hit. A cleanup registered in `setUp` fails the test for any recorded hit, so a caller that catches the error (`settle.py` wraps `alert_user` and `stop_work.stop` in `except Exception`) still fails the test.
-  - `allow_leaf(leaf: ShutdownSendLeaf) -> None` restores the real function for that leaf for the rest of the test (`ShutdownSendLeaf.RUN_REMOTE` restores all four bindings). Text becomes a leaf only through `ShutdownSendLeaf("<dotted name>")`, which raises `ValueError` for an unknown name. Called in a subclass's `setUp` after `super().setUp()`, it covers that class; called in a test body, that test.
-  - A test that patches a leaf itself (`patch.object(settle, "_deliver_message", ...)`) replaces the stub for that patch's span and needs no `allow_leaf`.
-  - `discover` imports `test_support.py` as a test module; `ShutdownTestCase` has no `test_*` methods, so it adds no tests.
-- **Every `TestCase` in `scripts/shutdown/test_*.py` derives from `ShutdownTestCase`**, and each `setUp` calls `super().setUp()` first: `InventoryTests` and `DarwinProcessStartTests` (`test_inventory.py`), `RecordTests`, `RemoteTests`, `RestartTests`, `SettleTests`, `ShutdownLaunchCliTests`, `ShutdownStatusTests`, `StopTests`.
-  - A test that exercises a leaf on purpose calls `allow_leaf` and fakes the subprocess beneath: `RemoteTests` allows `remote.run_remote` (its fake `ssh` on `PATH`); `SettleTests` allows `settle._deliver_message` and `settle._retire_shutdown_messages` (the `SHUTDOWN_SEND` stub script its `setUp` sets) and `settle.run_notifier` (its `SHUTDOWN_NOTIFIER` stub); `RestartTests` patches `settle.run_notifier` itself where it reaches it; `RestartTests` allows `restart._retire` only in the tests that record `retire` commands through a `restart._run` fake.
-  - A test the guard fails has a stale fake: it gets a fake of the step it meant to fake, or `allow_leaf` with the subprocess beneath faked. No test is deleted, skipped or weakened.
-  - `test_shutdown_cli.py`'s child processes (`shutdown.py launch-blocked`, `launch_permission.py exec-new-work`) run outside the guard; neither reaches a leaf.
-- **Proof test** `scripts/shutdown/test_send_guard.py` (new). Each case defines its `ShutdownTestCase` subclass inside the test method (a module-level one would be discovered and run on its own), runs it into a `unittest.TestResult()`, and asserts on the result. The failing cases patch `subprocess.run` and `subprocess.Popen` to record calls and assert there are none.
-  - `settle.alert_user(record.AllAccountSessions(kind="all account sessions"), "summary", "text", ActionRequired("act"))` with no fake: the test fails (`result.wasSuccessful()` is false) and its failure text names `settle._deliver_message` and `user`; no subprocess call. An uncaught hit is reported by the stub and again by the cleanup, so the case does not assert a failure count. `alert_user` returns before sending for a `selected` scope, so the account-wide scope is the one that reaches the leaf.
-  - The same call inside `try: … except Exception: pass` still fails the test.
-  - `settle.send_message("session:x", …)` and `settle._retire_shutdown_messages(login, "x")` each fail naming `session:x`; each of `remote.run_remote`, `settle.run_remote`, `restart.run_remote` and `shutdown.run_remote` fails naming the other machine; `settle._launch_conductor` fails naming the login; `settle.run_notifier("start", "x")` fails naming `notifier x`; `restart._retire(…, dry_run=False)` fails and `dry_run=True` passes.
-  - `allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)` with `SHUTDOWN_SEND` pointed at a script that records its arguments: the call reaches the script and the case passes.
-  - `ShutdownSendLeaf("no.such_leaf")` raises `ValueError`.
+- `scripts/shutdown/test_support.py` defines `class ShutdownSendLeaf(StrEnum)`, one member per real send leaf in `scripts/shutdown/*.py` (the last call before a process that delivers to a session, the other machine or the user), valued at its dotted name. The recipient each stub names follows the dash:
+  - `DELIVER_MESSAGE = "settle._deliver_message"` — runs `send.py`; `settle.send_message`, `settle.alert_user` and `restart.py`'s note and alert all end here — the `recipient` argument.
+  - `RETIRE_SHUTDOWN_MESSAGES = "settle._retire_shutdown_messages"` — `send.py retire` — `session:<session_id>`.
+  - `RESTART_RETIRE = "restart._retire"` — the same retire through `restart._run` — `session:<session_id>`. A `dry_run=True` call passes through to the real function, which only prints.
+  - `RUN_REMOTE = "remote.run_remote"` — `shutdown.py <args>` over ssh — `<other machine>: shutdown.py <args>`.
+  - `LAUNCH_CONDUCTOR = "settle._launch_conductor"` — a detached `shutdown.py conduct <login>` — `conductor for <login>`.
+  - `RUN_NOTIFIER = "settle.run_notifier"` — the progress notifier's `start` / `stop` — `notifier <instance>`.
+- `class ShutdownTestCase(unittest.TestCase)`: `setUp` patches every binding in `_REAL_LEAF_BINDINGS` with a stub. A reached stub records the hit and raises `AssertionError("shutdown test reached real send leaf <dotted name> for <recipient>; fake the step above it, or allow_leaf(ShutdownSendLeaf.<member>) and fake the subprocess beneath it")`, so no process starts. A cleanup registered in `setUp` fails the test for any recorded hit, so a caller that catches the error (`settle.py`'s `except Exception` around `alert_user` and `stop_work.stop`) still fails it.
+- `allow_leaf(leaf: ShutdownSendLeaf) -> None` restores the real function for the rest of the test; called in a subclass `setUp` after `super().setUp()`, it covers the class. It raises `TypeError` for anything but a `ShutdownSendLeaf`; text becomes a leaf only through `ShutdownSendLeaf("<dotted name>")`, which raises `ValueError` for an unknown name. A test that patches a leaf itself replaces the stub for that patch's span and needs no `allow_leaf`.
+- Every `TestCase` in `scripts/shutdown/test_*.py` derives from `ShutdownTestCase` and calls `super().setUp()` first. `SettleTests` allows `DELIVER_MESSAGE`, `RETIRE_SHUTDOWN_MESSAGES` and `RUN_NOTIFIER` class-wide (its `SHUTDOWN_SEND` and `SHUTDOWN_NOTIFIER` stub scripts); `RemoteTests` allows `RUN_REMOTE` class-wide (a fake `ssh` on `PATH`); single tests in `RestartTests`, `SettleTests` and `ShutdownStatusTests` allow the one leaf they reach over a faked subprocess.
 
 **Files:**
-- `scripts/shutdown/test_support.py` — new: `ShutdownSendLeaf`, `ShutdownTestCase`, the leaf stubs, `allow_leaf`.
-- `scripts/shutdown/test_send_guard.py` — new: the proof test.
-- `scripts/shutdown/test_inventory.py`
-- `scripts/shutdown/test_record.py`
-- `scripts/shutdown/test_remote.py` — allows `remote.run_remote`.
-- `scripts/shutdown/test_restart.py` — allows `restart._retire` where it records `retire` through `restart._run`.
-- `scripts/shutdown/test_settle.py` — allows `settle._deliver_message` and `settle._retire_shutdown_messages` under its `SHUTDOWN_SEND` stub, and `settle.run_notifier` under its `SHUTDOWN_NOTIFIER` stub.
-- `scripts/shutdown/test_shutdown_cli.py`
-- `scripts/shutdown/test_shutdown_status.py`
-- `scripts/shutdown/test_stop.py`
+- `scripts/shutdown/test_support.py` — `ShutdownSendLeaf`, `ShutdownTestCase`, the leaf stubs, `_REAL_LEAF_BINDINGS`, `allow_leaf`.
+- `scripts/shutdown/test_send_guard.py` — each leaf blocked with no `subprocess.run` / `Popen` call, a caught error still failing, `dry_run=True` passing, `allow_leaf` in a test and in `setUp`, a test's own patch, `RUN_REMOTE` restoring all four bindings, an unknown leaf name refused.
+- `scripts/shutdown/test_inventory.py`, `test_record.py`, `test_remote.py`, `test_restart.py`, `test_settle.py`, `test_shutdown_cli.py`, `test_shutdown_status.py`, `test_stop.py` — derive from `ShutdownTestCase`.
 
-**Seats:** `1 writer + 1 tester`.
-- `impl` — `test_support.py` and the eight test-module conversions; hub: `test_support.py` (the base every shutdown test derives from).
-- `test` — `test_send_guard.py`, from the Spec alone.
+**Binds later work:** A new `TestCase` in `scripts/shutdown/` derives from `ShutdownTestCase` and calls `super().setUp()` first.
 
-**Constraints from prior phases:**
-- Phase 3's `settle.alert_user(scope, summary, text, action: ActionRequired, *, machine="")` always passes `--action` (with `--need decision`) and returns without sending for a `selected` scope; `settle.send_message(recipient, summary, text, *, machine="", key="") -> MessageDelivery` refuses `user` with `ValueError`. Both build their command from `settle._send_command()` and run it in `settle._deliver_message`.
-- Phase 4's `pushover.py` refuses only a message with no action stated, so a real `alert_user` from a test is sent, not refused.
-- Phase 2: every `test_*.py` fakes the post or subprocess and never reads the real keys file.
+**Gotchas:**
+- `settle`, `restart` and `shutdown` import `run_remote` by name, so `RUN_REMOTE` stubs and restores four bindings: `remote.run_remote`, `settle.run_remote`, `restart.run_remote`, `shutdown.run_remote`. A new module that imports `run_remote` by name, or a new send leaf, needs an entry in `_REAL_LEAF_BINDINGS` and a stub in `setUp`, or it goes unguarded.
+- `_REAL_LEAF_BINDINGS` holds the real functions captured when `test_support` is imported, so `allow_leaf` restores them even inside a case nested in another guarded case.
+- An uncaught hit is reported twice (the stub's error, then the cleanup's failure); assert the outcome, not a failure count.
+- A proof case defines its `ShutdownTestCase` subclass inside the test method and runs it into a `unittest.TestResult()`; a module-level subclass would be discovered and run on its own. `ShutdownTestCase` has no `test_*` methods, so `discover` importing `test_support.py` adds no tests.
+- `alert_user` returns before sending for a `selected` scope; only an account-wide scope (`record.AllAccountSessions`) reaches `DELIVER_MESSAGE`.
+- `test_shutdown_cli.py`'s child processes (`shutdown.py launch-blocked`, `launch_permission.py exec-new-work`) run outside the guard; neither reaches a leaf.
+- `test_settle.py`'s fake send script reads stdin on every call, `retire` included, so with an open stdin its rollback tests each wait out the 60 s retire timeout.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` green, `test_send_guard.py` included. `basedpyright scripts/shutdown` reports 0 errors, 0 warnings, 0 notes (exit 3 is the missing `.venv` notice and expected). Note the line count of `~/.local/state/notify/pushover.jsonl` before the suite run; every line added by the end of the run names a sender outside the suite in its `source`, so none came from a shutdown test's fixture. Never read `~/.config/pushover/env`.
+**Ruled out:** guarding calls that end or start sessions (`stop.py`'s `systemctl` / `launchctl` / `tmux kill-session` / `codex_mesh.py stop` and signals, `restart._add_unit_command`, the launches in `restart._run`) or the read-only `git`, `ps`, `tmux capture-pane` and `github-warm-status` probes — none delivers a message.
 
 ### Phase 7 — `broadcast.py` takes its groups from the roster · status: todo
 
