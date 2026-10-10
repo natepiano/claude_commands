@@ -297,29 +297,29 @@ class SendTests(unittest.TestCase):
             ),
         ):
             cancelled, cancel_entry = shutdown_fixture("cancelled")
-            settle._send_settle_message(cancelled, cancel_entry)
+            settle._send_settle_message(cancelled, cancel_entry)  # pyright: ignore[reportPrivateUsage]
             old_cancel = settle.send_message(
                 "session:cancelled",
                 "old settle",
                 "Old unkeyed settle instruction: run /shutdown ready.",
             )
             self.assertEqual(old_cancel["kind"], "queued")
-            settle._restore_record(cancelled)
+            settle._restore_record(cancelled)  # pyright: ignore[reportPrivateUsage]
             self.session("cancelled", "cancel-recipient")
             cancel_pending = send.pending("cancel-recipient")
             self.assertNotIn("settle instruction", cancel_pending)
             self.assertIn("cancelled by the user", cancel_pending)
 
             restarted, restart_entry = shutdown_fixture("restarted")
-            settle._send_settle_message(restarted, restart_entry)
+            settle._send_settle_message(restarted, restart_entry)  # pyright: ignore[reportPrivateUsage]
             old_restart = settle.send_message(
                 "session:restarted",
                 "old settle",
                 "Old unkeyed settle instruction: run /shutdown ready.",
             )
             self.assertEqual(old_restart["kind"], "queued")
-            restart._retire(restarted, restart_entry, dry_run=False)
-            delivery = restart._send_restart_note(
+            restart._retire(restarted, restart_entry, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+            delivery = restart._send_restart_note(  # pyright: ignore[reportPrivateUsage]
                 restarted,
                 restart_entry,
                 "Restarted; continue.",

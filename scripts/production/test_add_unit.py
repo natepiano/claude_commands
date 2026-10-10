@@ -305,6 +305,9 @@ class AddUnitTests(unittest.TestCase):
             commands.append(command)
             return subprocess.CompletedProcess(command, 0, "", "")
 
+        def launch(*_args: object) -> None:
+            launches.append("launched")
+
         error = io.StringIO()
         with (
             patch.object(add_unit, "launch_request", return_value=request),
@@ -316,10 +319,10 @@ class AddUnitTests(unittest.TestCase):
             patch.object(add_unit, "append_row"),
             patch.object(add_unit, "commit_unit"),
             patch.object(add_unit, "ensure_worktree"),
-            patch.object(add_unit, "launch_session", side_effect=lambda *_args: launches.append("launched")),
+            patch.object(add_unit, "launch_session", side_effect=launch),
             patch.object(add_unit, "wait_for_remote_control", return_value=marked),
             patch.object(add_unit, "record"),
-            patch.object(add_unit.subprocess, "run", side_effect=run),
+            patch.object(subprocess, "run", side_effect=run),
             redirect_stderr(error),
         ):
             result = add_unit.main(["--production", "unused", "alpha", "--plan", "unused"])
