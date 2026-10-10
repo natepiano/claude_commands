@@ -59,7 +59,7 @@
 - The `showrunners/` line in the vault's `info/exclude` is unanchored, so an archive path whose slug or showrunner folder is literally `showrunners` is ignored by Git too.
 - `refresh`'s `_remove_stale_notes` still deletes the older copy of a moved unit's note; the newer note carries the same phases.
 
-### Phase 2 — The dailies count a phase's repair rounds from the run's records  · status: todo
+### Phase 2 — The dailies count a phase's repair rounds from the run's records  · status: done
 
 #### Work Order
 

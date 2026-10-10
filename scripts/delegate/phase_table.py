@@ -81,6 +81,7 @@ class FirstStatedEtaTarget(NamedTuple):
     """The target promised by a phase instance's first stated ETA."""
 
     time: datetime
+    repair_rounds: int
 
 
 class EtaNeverStated(NamedTuple):
@@ -593,6 +594,29 @@ def _reported_eta(
     )
 
 
+def _repair_rounds_started_after(
+    runs: list[list[dict[str, object]]],
+    instance_id: str,
+    stated_at: datetime,
+) -> int:
+    starts: dict[int, datetime] = {}
+    for events in runs:
+        for event in events:
+            fix_pass = event.get("fix_pass")
+            if (
+                _text(event.get("event_type")) != "pass_started"
+                or _text(event.get("phase_instance_id")) != instance_id
+                or isinstance(fix_pass, bool)
+                or not isinstance(fix_pass, int)
+                or fix_pass < 1
+            ):
+                continue
+            started = _moment(event.get("timestamp_epoch"))
+            if started is not None and (fix_pass not in starts or started < starts[fix_pass]):
+                starts[fix_pass] = started
+    return sum(started > stated_at for started in starts.values())
+
+
 def _latest_stated_eta(
     runs: list[list[dict[str, object]]], instance_id: str
 ) -> LatestStatedEtaEvent | NoStatedEtaEvent:
@@ -623,7 +647,10 @@ def _latest_stated_eta(
                 basis=_text(event.get("basis")),
             )
             if isinstance(first, EtaNeverStated):
-                first = FirstStatedEtaTarget(time=stated.time)
+                first = FirstStatedEtaTarget(
+                    time=stated.time,
+                    repair_rounds=_repair_rounds_started_after(runs, instance_id, stated.stated_at),
+                )
             latest = stated
     if isinstance(latest, NoStatedEtaEvent) or isinstance(first, EtaNeverStated):
         return NoStatedEtaEvent()
@@ -1011,8 +1038,10 @@ def _json_record(record: PhaseRecord, zone: ZoneInfo) -> dict[str, object]:
         if isinstance(current.progress, ReportedPhaseProgress):
             percent = current.progress.percent
         first_stated_eta_target: str | None = None
+        repair_rounds_since_first_stated_eta: int | None = None
         if isinstance(current.first_stated, FirstStatedEtaTarget):
             first_stated_eta_target = _iso(current.first_stated.time, zone)
+            repair_rounds_since_first_stated_eta = current.first_stated.repair_rounds
         if isinstance(current.eta, ProjectedEta):
             eta = current.eta
             eta_json = {
@@ -1048,6 +1077,7 @@ def _json_record(record: PhaseRecord, zone: ZoneInfo) -> dict[str, object]:
             "percent": percent,
             "eta": eta_json,
             "first_stated_eta_target": first_stated_eta_target,
+            "repair_rounds_since_first_stated_eta": repair_rounds_since_first_stated_eta,
         }
     plan_finish: str | None = None
     if isinstance(record.plan_finish, FinishedAt | PredictedFinish):
