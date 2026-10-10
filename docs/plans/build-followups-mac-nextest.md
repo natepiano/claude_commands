@@ -249,7 +249,7 @@
 
 **Ruled out:** a row for a package whose only Mac words are `local_flag` or `runner` (it would show nothing); marking a Mac step by a missing call record (natedev steps can lack one too).
 
-### Phase 8 — Live on the Mac, then switched on  · status: todo
+### Phase 8 — Live on the Mac, then switched on  · status: done
 
 #### Work Order
 

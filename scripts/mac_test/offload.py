@@ -767,7 +767,8 @@ def claimed_run(
         )
         seconds = elapsed_seconds(started)
         if isinstance(remote_status, MissingMacStatus):
-            return LostMacRun(seconds)
+            end_remote_work(config, repository)
+            return LostMacRun(elapsed_seconds(started))
         if remote_status.status == 0:
             return PassedOnMac(seconds)
         if remote_status.status == 4:
