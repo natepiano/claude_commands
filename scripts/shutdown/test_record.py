@@ -38,14 +38,14 @@ def session(number: int = 1) -> inventory.TopLevelSession:
 
 
 def entry(
-    progress: record.Progress | None = None,
+    progress: record.SessionProgress | None = None,
     *,
     number: int = 1,
     timer_footer: record.ShowrunnerFooter | record.NoFooter | None = None,
     settle_message: record.SettleMessage | None = None,
     where: record.Where | None = None,
-) -> record.Entry:
-    return record.Entry(
+) -> record.ShutdownSessionEntry:
+    return record.ShutdownSessionEntry(
         session=session(number),
         timers=[
             record.TimerRestore(
@@ -54,20 +54,20 @@ def entry(
                 footer=timer_footer or record.NoFooter(kind="no footer"),
             )
         ],
-        settle_message=settle_message or record.NotSent(kind="not sent"),
-        where=where or record.NotSaid(kind="not said"),
-        progress=progress or record.Waiting(kind="waiting"),
+        settle_message=settle_message or record.SettleMessageNotSent(kind="not sent"),
+        where=where or record.WhereNotSaid(kind="not said"),
+        progress=progress or record.SessionWaiting(kind="waiting"),
     )
 
 
 def shutdown_record(
     login: str = "owner@example.com",
     *,
-    state: record.RecordState = "settling",
-    progress: record.Progress | None = None,
+    state: record.ShutdownState = "settling",
+    progress: record.SessionProgress | None = None,
     requested_at: str = NOW,
-) -> record.Record:
-    return record.Record(
+) -> record.ShutdownRecord:
+    return record.ShutdownRecord(
         login=login,
         label=login.split("@", 1)[0],
         machine="natedev",
@@ -109,7 +109,7 @@ class RecordTests(unittest.TestCase):
 
         self.assertEqual(
             record.find_live("OWNER@example.COM"),
-            record.LiveRecord(kind="live", record=first),
+            record.LiveShutdownRecord(kind="live", record=first),
         )
         with self.assertRaises(record.ShutdownInProgress) as raised:
             record.create(second)
@@ -120,7 +120,7 @@ class RecordTests(unittest.TestCase):
         record.create(live)
         lock_path = self.root / "shutdown" / live["login"] / "lock"
 
-        def change(current: record.Record) -> None:
+        def change(current: record.ShutdownRecord) -> None:
             with lock_path.open("a+", encoding="utf-8") as contender:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(
@@ -146,7 +146,7 @@ class RecordTests(unittest.TestCase):
             ".hidden@example.com",
         ]
 
-        def leave_unchanged(current: record.Record) -> None:
+        def leave_unchanged(current: record.ShutdownRecord) -> None:
             del current
 
         for login in unsafe_logins:
@@ -172,28 +172,28 @@ class RecordTests(unittest.TestCase):
         original = shutdown_record("alpha@example.com")
         record.create(original)
 
-        def change_login(current: record.Record) -> None:
+        def change_login(current: record.ShutdownRecord) -> None:
             current["login"] = "beta@example.com"
 
         with self.assertRaises(ValueError):
             _ = record.update(original["login"], change_login)
         self.assertEqual(
             record.find_live(original["login"]),
-            record.LiveRecord(kind="live", record=original),
+            record.LiveShutdownRecord(kind="live", record=original),
         )
         self.assertEqual(
             record.find_live("beta@example.com"),
             record.NoShutdown(kind="no shutdown"),
         )
 
-        def change_machine(current: record.Record) -> None:
+        def change_machine(current: record.ShutdownRecord) -> None:
             current["machine"] = "Mac"
 
         with self.assertRaises(ValueError):
             _ = record.update(original["login"], change_machine)
         self.assertEqual(
             record.find_live(original["login"]),
-            record.LiveRecord(kind="live", record=original),
+            record.LiveShutdownRecord(kind="live", record=original),
         )
 
     def test_archive_requires_terminal_state_and_moves_the_record(self) -> None:
@@ -204,7 +204,7 @@ class RecordTests(unittest.TestCase):
             record.archive(live["login"])
         self.assertEqual(record.find_live(live["login"])["kind"], "live")
 
-        def cancel(current: record.Record) -> None:
+        def cancel(current: record.ShutdownRecord) -> None:
             current["state"] = "cancelled"
 
         _ = record.update(live["login"], cancel)
@@ -235,21 +235,21 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(record.live_records(), [first, second])
 
     def test_every_record_variant_round_trips(self) -> None:
-        progresses: list[record.Progress] = [
-            record.Waiting(kind="waiting"),
-            record.Ready(kind="ready", at=NOW),
-            record.PassiveSeatReady(kind="passive seat ready", at=NOW),
-            record.Stopped(kind="stopped", at=NOW),
-            record.AlreadyGone(kind="already gone", at=NOW),
+        progresses: list[record.SessionProgress] = [
+            record.SessionWaiting(kind="waiting"),
+            record.SessionReadyToStop(kind="ready", at=NOW),
+            record.PassiveSeatReadyToStop(kind="passive seat ready", at=NOW),
+            record.SessionStopped(kind="stopped", at=NOW),
+            record.SessionAlreadyGone(kind="already gone", at=NOW),
             record.ProcessIdentityLost(kind="process identity lost", at=NOW),
-            record.StopFailed(kind="stop failed", at=NOW, reason="permission denied"),
-            record.Restarted(kind="restarted", at=NOW),
-            record.RestartFailed(
+            record.SessionStopFailed(kind="stop failed", at=NOW, reason="permission denied"),
+            record.SessionRestarted(kind="restarted", at=NOW),
+            record.SessionRestartFailed(
                 kind="restart failed", at=NOW, reason="window did not open"
             ),
-            record.ManualRestart(kind="manual restart", command="claude --resume id"),
+            record.SessionNeedsManualRestart(kind="manual restart", command="claude --resume id"),
         ]
-        states: list[record.RecordState] = [
+        states: list[record.ShutdownState] = [
             "settling",
             "stopping",
             "down",
@@ -280,8 +280,8 @@ class RecordTests(unittest.TestCase):
         records[0]["entries"][0] = entry(
             progresses[0],
             timer_footer=record.ShowrunnerFooter(kind="footer", slug="production"),
-            settle_message=record.Sent(kind="sent", at=NOW),
-            where=record.Said(kind="said", text="ready here", at=NOW),
+            settle_message=record.SettleMessageSent(kind="sent", at=NOW),
+            where=record.WhereSaid(kind="said", text="ready here", at=NOW),
         )
         records[1]["conductor"] = record.LaunchdConductor(
             kind="launchd", label="shutdown-owner"
@@ -293,7 +293,7 @@ class RecordTests(unittest.TestCase):
 
     def test_queued_settle_message_round_trips(self) -> None:
         live = shutdown_record()
-        live["entries"][0]["settle_message"] = record.Queued(
+        live["entries"][0]["settle_message"] = record.SettleMessageQueued(
             kind="queued", at=NOW, reason="no live session"
         )
 

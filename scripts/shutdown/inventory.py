@@ -842,7 +842,7 @@ def _tmux_session(pane: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def _terminal_kind(command: str) -> Literal["ghostty", "zed", "terminal", "unknown"]:
+def terminal_kind(command: str) -> Literal["ghostty", "zed", "terminal", "unknown"]:
     name = Path(command).name.casefold().removeprefix(".")
     matched = ""
     for terminal in ("zed-editor", "ghostty", "zed", "terminal"):
@@ -888,7 +888,7 @@ def _terminal_host(pid: int, desktop: Desktop) -> SessionHost:
             parent = int(fields[0])
         except ValueError:
             break
-        terminal = _terminal_kind(fields[1])
+        terminal = terminal_kind(fields[1])
         if terminal != "unknown":
             if terminal in {"ghostty", "zed"} and child > 0:
                 window = {

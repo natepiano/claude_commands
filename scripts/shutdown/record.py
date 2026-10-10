@@ -25,7 +25,7 @@ class SelectedSessions(TypedDict):
     session_ids: list[str]
 
 
-Scope = AllAccountSessions | SelectedSessions
+ShutdownScope = AllAccountSessions | SelectedSessions
 
 
 class FromSession(TypedDict):
@@ -55,7 +55,7 @@ class ConductorNotStarted(TypedDict):
 
 
 Conductor = SystemdConductor | LaunchdConductor | ConductorNotStarted
-Force = Literal["wait for ready", "now"]
+StopTiming = Literal["wait for ready", "now"]
 
 
 class ShowrunnerFooter(TypedDict):
@@ -73,57 +73,57 @@ class TimerRestore(TypedDict):
     footer: ShowrunnerFooter | NoFooter
 
 
-class NotSent(TypedDict):
+class SettleMessageNotSent(TypedDict):
     kind: Literal["not sent"]
 
 
-class Sent(TypedDict):
+class SettleMessageSent(TypedDict):
     kind: Literal["sent"]
     at: str
 
 
-class Queued(TypedDict):
+class SettleMessageQueued(TypedDict):
     kind: Literal["queued"]
     at: str
     reason: str
 
 
-SettleMessage = NotSent | Sent | Queued
+SettleMessage = SettleMessageNotSent | SettleMessageSent | SettleMessageQueued
 
 
-class Said(TypedDict):
+class WhereSaid(TypedDict):
     kind: Literal["said"]
     text: str
     at: str
 
 
-class NotSaid(TypedDict):
+class WhereNotSaid(TypedDict):
     kind: Literal["not said"]
 
 
-Where = Said | NotSaid
+Where = WhereSaid | WhereNotSaid
 
 
-class Waiting(TypedDict):
+class SessionWaiting(TypedDict):
     kind: Literal["waiting"]
 
 
-class Ready(TypedDict):
+class SessionReadyToStop(TypedDict):
     kind: Literal["ready"]
     at: str
 
 
-class PassiveSeatReady(TypedDict):
+class PassiveSeatReadyToStop(TypedDict):
     kind: Literal["passive seat ready"]
     at: str
 
 
-class Stopped(TypedDict):
+class SessionStopped(TypedDict):
     kind: Literal["stopped"]
     at: str
 
 
-class AlreadyGone(TypedDict):
+class SessionAlreadyGone(TypedDict):
     kind: Literal["already gone"]
     at: str
 
@@ -133,51 +133,51 @@ class ProcessIdentityLost(TypedDict):
     at: str
 
 
-class StopFailed(TypedDict):
+class SessionStopFailed(TypedDict):
     kind: Literal["stop failed"]
     at: str
     reason: str
 
 
-class Restarted(TypedDict):
+class SessionRestarted(TypedDict):
     kind: Literal["restarted"]
     at: str
 
 
-class RestartFailed(TypedDict):
+class SessionRestartFailed(TypedDict):
     kind: Literal["restart failed"]
     at: str
     reason: str
 
 
-class ManualRestart(TypedDict):
+class SessionNeedsManualRestart(TypedDict):
     kind: Literal["manual restart"]
     command: str
 
 
-Progress = (
-    Waiting
-    | Ready
-    | PassiveSeatReady
-    | Stopped
-    | AlreadyGone
+SessionProgress = (
+    SessionWaiting
+    | SessionReadyToStop
+    | PassiveSeatReadyToStop
+    | SessionStopped
+    | SessionAlreadyGone
     | ProcessIdentityLost
-    | StopFailed
-    | Restarted
-    | RestartFailed
-    | ManualRestart
+    | SessionStopFailed
+    | SessionRestarted
+    | SessionRestartFailed
+    | SessionNeedsManualRestart
 )
 
 
-class Entry(TypedDict):
+class ShutdownSessionEntry(TypedDict):
     session: Session
     timers: list[TimerRestore]
     settle_message: SettleMessage
     where: Where
-    progress: Progress
+    progress: SessionProgress
 
 
-RecordState = Literal[
+ShutdownState = Literal[
     "settling",
     "stopping",
     "down",
@@ -189,22 +189,22 @@ RecordState = Literal[
 ]
 
 
-class Record(TypedDict):
+class ShutdownRecord(TypedDict):
     login: str
     label: str
     machine: str
-    state: RecordState
+    state: ShutdownState
     requested_at: str
     requested_by: RequestOrigin
-    scope: Scope
+    scope: ShutdownScope
     conductor: Conductor
-    force: Force
-    entries: list[Entry]
+    force: StopTiming
+    entries: list[ShutdownSessionEntry]
 
 
-class LiveRecord(TypedDict):
+class LiveShutdownRecord(TypedDict):
     kind: Literal["live"]
-    record: Record
+    record: ShutdownRecord
 
 
 class NoShutdown(TypedDict):
@@ -214,9 +214,9 @@ class NoShutdown(TypedDict):
 class ShutdownInProgress(Exception):
     """Raised when an account already has a live shutdown record."""
 
-    live: Record
+    live: ShutdownRecord
 
-    def __init__(self, live: Record) -> None:
+    def __init__(self, live: ShutdownRecord) -> None:
         self.live = live
         super().__init__(f"shutdown already in progress for {live['label']}")
 
@@ -342,14 +342,14 @@ def _utc_time(value: object, place: str) -> str:
     return text
 
 
-def _scope(value: object, place: str) -> Scope:
+def _scope(value: object, place: str) -> ShutdownScope:
     values = _mapping(value, place)
     kind = _kind(values, place, frozenset({"all account sessions", "selected"}))
     if kind == "selected":
         _ = _strings(
             _required(values, "session_ids", place), f"{place}.session_ids"
         )
-    return cast(Scope, cast(object, values))
+    return cast(ShutdownScope, cast(object, values))
 
 
 def _request_origin(value: object, place: str) -> RequestOrigin:
@@ -411,7 +411,7 @@ def _where(value: object, place: str) -> Where:
     return cast(Where, cast(object, values))
 
 
-def _progress(value: object, place: str) -> Progress:
+def _progress(value: object, place: str) -> SessionProgress:
     values = _mapping(value, place)
     kind = _kind(
         values,
@@ -424,10 +424,10 @@ def _progress(value: object, place: str) -> Progress:
         _ = _string(_required(values, "reason", place), f"{place}.reason")
     elif kind == "manual restart":
         _ = _string(_required(values, "command", place), f"{place}.command")
-    return cast(Progress, cast(object, values))
+    return cast(SessionProgress, cast(object, values))
 
 
-def _entry(value: object, place: str) -> Entry:
+def _entry(value: object, place: str) -> ShutdownSessionEntry:
     values = _mapping(value, place)
     try:
         values["session"] = parse_session(
@@ -449,10 +449,10 @@ def _entry(value: object, place: str) -> Entry:
     values["progress"] = _progress(
         _required(values, "progress", place), f"{place}.progress"
     )
-    return cast(Entry, cast(object, values))
+    return cast(ShutdownSessionEntry, cast(object, values))
 
 
-def _record(value: object, place: str) -> Record:
+def _record(value: object, place: str) -> ShutdownRecord:
     values = _mapping(value, place)
     login = _string(_required(values, "login", place), f"{place}.login")
     try:
@@ -482,10 +482,10 @@ def _record(value: object, place: str) -> Record:
         _entry(entry, f"{place}.entries[{index}]")
         for index, entry in enumerate(entry_values)
     ]
-    return cast(Record, cast(object, values))
+    return cast(ShutdownRecord, cast(object, values))
 
 
-def parse_records(text: str) -> list[Record]:
+def parse_records(text: str) -> list[ShutdownRecord]:
     """Decode and validate a JSON list of shutdown records."""
     try:
         value = cast(object, json.loads(text))
@@ -495,7 +495,7 @@ def parse_records(text: str) -> list[Record]:
     return [_record(item, f"records[{index}]") for index, item in enumerate(values)]
 
 
-def _read_record(path: Path) -> Record:
+def _read_record(path: Path) -> ShutdownRecord:
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
@@ -507,7 +507,7 @@ def _read_record(path: Path) -> Record:
     return _record(value, str(path))
 
 
-def _write_record(path: Path, record: Record) -> None:
+def _write_record(path: Path, record: ShutdownRecord) -> None:
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".record.", suffix=".tmp", dir=path.parent
     )
@@ -524,7 +524,7 @@ def _write_record(path: Path, record: Record) -> None:
         raise
 
 
-def find_live(login: str) -> LiveRecord | NoShutdown:
+def find_live(login: str) -> LiveShutdownRecord | NoShutdown:
     """Return the live shutdown for an account, if one exists."""
     directory = _account_directory(login)
     if not directory.is_dir():
@@ -533,10 +533,10 @@ def find_live(login: str) -> LiveRecord | NoShutdown:
         path = directory / "record.json"
         if not path.exists():
             return NoShutdown(kind="no shutdown")
-        return LiveRecord(kind="live", record=_read_record(path))
+        return LiveShutdownRecord(kind="live", record=_read_record(path))
 
 
-def create(record: Record) -> None:
+def create(record: ShutdownRecord) -> None:
     """Create the account's only live record."""
     checked = _record(record, "record")
     with _account_lock(checked["login"], create_directory=True) as directory:
@@ -546,7 +546,7 @@ def create(record: Record) -> None:
         _write_record(path, checked)
 
 
-def update(login: str, change: Callable[[Record], None]) -> Record:
+def update(login: str, change: Callable[[ShutdownRecord], None]) -> ShutdownRecord:
     """Change and atomically replace one live record while holding its lock."""
     directory = _account_directory(login)
     if not directory.is_dir():
@@ -586,12 +586,12 @@ def archive(login: str) -> None:
         os.replace(path, history / f"{record['requested_at']}.json")
 
 
-def live_records() -> list[Record]:
+def live_records() -> list[ShutdownRecord]:
     """Return all live records on this machine, ordered by account login."""
     root = _state_root()
     if not root.is_dir():
         return []
-    records: list[Record] = []
+    records: list[ShutdownRecord] = []
     for directory in root.iterdir():
         if not directory.is_dir():
             continue

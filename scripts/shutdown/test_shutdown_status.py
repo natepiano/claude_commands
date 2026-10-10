@@ -16,7 +16,7 @@ from unittest.mock import patch
 import shutdown
 from account import UnreadableAccount
 from inventory import Inventory
-from record import Record
+from record import ShutdownRecord
 
 
 LOGIN = "owner@example.com"
@@ -56,9 +56,9 @@ def complete_session(*, host: object) -> dict[str, object]:
     }
 
 
-def complete_record(machine: str = "natedev") -> Record:
+def complete_record(machine: str = "natedev") -> ShutdownRecord:
     return cast(
-        Record,
+        ShutdownRecord,
         cast(
             object,
             {

@@ -12,6 +12,9 @@ import time
 import unittest
 from pathlib import Path
 from typing import override
+from unittest.mock import patch
+
+from scripts.delegate import remove_seats
 
 SCRIPT = Path(__file__).parent / "remove_seats.py"
 
@@ -42,6 +45,7 @@ class RemoveSeatsTest(unittest.TestCase):
     removed: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     rows: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     claude: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    state_root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
     def setUp(self) -> None:
@@ -52,6 +56,7 @@ class RemoveSeatsTest(unittest.TestCase):
         self.removed = base / "removed"
         self.rows = base / "rows.json"
         self.claude = base / "claude"
+        self.state_root = base / "shutdown"
         _ = self.claude.write_text(STUB_CLAUDE, encoding="utf-8")
         self.claude.chmod(0o755)
 
@@ -73,19 +78,73 @@ class RemoveSeatsTest(unittest.TestCase):
         listed = [*rows, {"id": "aaaaaaaa", "sessionId": ORCHESTRATOR, "kind": "interactive", "name": "me"}]
         _ = self.rows.write_text(json.dumps(listed), encoding="utf-8")
 
-    def remove_seats(self, session_dir: Path | None = None, caller: str = "") -> tuple[int, list[str]]:
+    def write_shutdown_record(self, session_id: str, state: str) -> None:
+        account = self.state_root / "owner@example.com"
+        account.mkdir(parents=True)
+        record: dict[str, object] = {
+            "login": "owner@example.com",
+            "label": "claude 2",
+            "machine": "natedev",
+            "state": state,
+            "requested_at": "2026-10-09T21:49:10+00:00",
+            "requested_by": {"kind": "terminal"},
+            "scope": {"kind": "all account sessions"},
+            "conductor": {"kind": "not started"},
+            "force": "wait for ready",
+            "entries": [
+                {
+                    "session": {
+                        "kind": "top-level",
+                        "session_id": session_id,
+                        "pid": 1000,
+                        "proc_start": "start-director",
+                        "name": "director",
+                        "cwd": "/tmp/director",
+                        "status": "idle",
+                        "model": {"kind": "no reply yet"},
+                        "checkout": {"kind": "not a checkout"},
+                        "run_dirs": [],
+                        "codex_servers": [],
+                        "timers": [],
+                        "host": {"kind": "unknown"},
+                    },
+                    "timers": [],
+                    "settle_message": {"kind": "not sent"},
+                    "where": {"kind": "not said"},
+                    "progress": {"kind": "waiting"},
+                }
+            ],
+        }
+        _ = (account / "record.json").write_text(
+            json.dumps(record), encoding="utf-8"
+        )
+
+    def run_remove_seats(
+        self, session_dir: Path | None = None, caller: str = ""
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         environment = os.environ.copy()
         environment.update(
             CLAUDE_BIN=str(self.claude),
             STUB_ROWS=str(self.rows),
             STUB_REMOVED=str(self.removed),
             CLAUDE_CODE_SESSION_ID=caller,
+            SHUTDOWN_STATE_DIR=str(self.state_root),
         )
         command = [sys.executable, str(SCRIPT), "--delegate-root", str(self.root)]
         if session_dir is not None:
             command += ["--session-dir", str(session_dir)]
-        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False)
-        removed = self.removed.read_text(encoding="utf-8").split() if self.removed.exists() else []
+        result = subprocess.run(
+            command, env=environment, capture_output=True, text=True, check=False
+        )
+        removed = (
+            self.removed.read_text(encoding="utf-8").split()
+            if self.removed.exists()
+            else []
+        )
+        return result, sorted(removed)
+
+    def remove_seats(self, session_dir: Path | None = None, caller: str = "") -> tuple[int, list[str]]:
+        result, removed = self.run_remove_seats(session_dir, caller)
         return result.returncode, sorted(removed)
 
     def test_own_run_goes_even_while_live(self) -> None:
@@ -132,6 +191,73 @@ class RemoveSeatsTest(unittest.TestCase):
     def test_failed_listing_removes_nothing(self) -> None:
         _ = self.run_dir("ended", ["end1"])
         self.assertEqual(self.remove_seats(), (1, []))
+
+    def test_shutdown_query_returns_named_held_sessions(self) -> None:
+        completed = subprocess.CompletedProcess[str](
+            ["shutdown", "held-sessions"], 0, "first\n\nsecond\n", ""
+        )
+        with patch.object(subprocess, "run", return_value=completed):
+            result = remove_seats.shutdown_held_sessions()
+
+        self.assertEqual(
+            result,
+            {"kind": "held sessions", "session_ids": {"first", "second"}},
+        )
+
+    def test_shutdown_query_failure_names_unreadable_state(self) -> None:
+        completed = subprocess.CompletedProcess[str](
+            ["shutdown", "held-sessions"], 2, "", "bad state\n"
+        )
+        with patch.object(subprocess, "run", return_value=completed):
+            result = remove_seats.shutdown_held_sessions()
+
+        self.assertEqual(
+            result,
+            {
+                "kind": "shutdown state unreadable",
+                "reason": "held-sessions exited 2: bad state",
+            },
+        )
+
+    def test_environment_cannot_replace_shutdown_command(self) -> None:
+        with patch.dict(
+            os.environ, {"REMOVE_SEATS_SHUTDOWN_COMMAND": "/tmp/not-shutdown"}
+        ):
+            command = remove_seats.shutdown_command()
+
+        self.assertEqual(
+            command, [sys.executable, str(remove_seats.SHUTDOWN)]
+        )
+
+    def test_down_shutdown_record_keeps_its_directors_run(self) -> None:
+        _ = self.run_dir("held", ["held1"], orchestrator=GONE_ORCHESTRATOR)
+        self.write_shutdown_record(GONE_ORCHESTRATOR, "down")
+        self.list_rows([row("held1", "held-test")])
+
+        self.assertEqual(self.remove_seats(), (0, []))
+
+    def test_restarting_shutdown_record_keeps_its_directors_run(self) -> None:
+        _ = self.run_dir("held", ["held1"], orchestrator=GONE_ORCHESTRATOR)
+        self.write_shutdown_record(GONE_ORCHESTRATOR, "restarting")
+        self.list_rows([row("held1", "held-test")])
+
+        self.assertEqual(self.remove_seats(), (0, []))
+
+    def test_unreadable_shutdown_state_keeps_every_active_run(self) -> None:
+        _ = self.run_dir("first", ["first1"], orchestrator=GONE_ORCHESTRATOR)
+        _ = self.run_dir("second", ["second1"], orchestrator=LEGACY_DEAD)
+        account = self.state_root / "owner@example.com"
+        account.mkdir(parents=True)
+        _ = (account / "record.json").write_text("{broken", encoding="utf-8")
+        self.list_rows(
+            [row("first1", "first-test"), row("second1", "second-test")]
+        )
+
+        result, removed = self.run_remove_seats()
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(removed, [])
+        self.assertIn("shutdown state could not be read", result.stderr)
 
 
 if __name__ == "__main__":
