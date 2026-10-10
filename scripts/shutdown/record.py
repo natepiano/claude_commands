@@ -215,7 +215,7 @@ class PendingTimer(TypedDict):
     reason: str
 
 
-class SessionLiveTimersPending(TypedDict):
+class SessionRestoredTimersPending(TypedDict):
     kind: Literal["timers pending"]
     at: str
     timers: list[PendingTimer]
@@ -246,7 +246,7 @@ SessionProgress = (
     | ProcessIdentityLost
     | SessionStopFailed
     | SessionRestarted
-    | SessionLiveTimersPending
+    | SessionRestoredTimersPending
     | SeatAvailableOnDemand
     | SessionRestartFailed
     | SessionNeedsManualRestart

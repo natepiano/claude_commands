@@ -409,7 +409,7 @@ A tmux session that `/shutdown restart` brings back resumes in the pane it ran i
 
 **Ruled out:** the requester result before the user alert — a failed requester send would skip a must-act alert; `need="note"` for a partial stop or not-back restart — `send.py` defines `note` as nothing to do; an unkeyed requester result — `retire` removes it before the restarted session reads it.
 
-### Phase 12 — An unfinished restart shows what is left, and the next restart finishes it  · status: todo
+### Phase 12 — An unfinished restart shows what is left, and the next restart finishes it  · status: done
 
 #### Work Order
 

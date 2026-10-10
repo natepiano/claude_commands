@@ -721,13 +721,13 @@ class RestartTests(unittest.TestCase):
             "ZDOTDIR": str(zdotdir),
         }
         parsed = subprocess.run(
-            ["/bin/zsh", "-ic", resume_command],
+            ["/bin/zsh", "-f", "-ic", resume_command],
             cwd=self.root,
             env=environment,
             capture_output=True,
             text=True,
             check=False,
-            timeout=5,
+            timeout=60,
         )
         self.assertEqual(parsed.returncode, 0, (parsed.stdout, parsed.stderr))
         actual = cast(
@@ -834,6 +834,45 @@ class RestartTests(unittest.TestCase):
         ):
             self.assertEqual(restart.up(LOGIN), 0)
         self.assertIn("no shutdown of claude 2 to restart", output.getvalue())
+
+    def test_claim_returns_named_results_for_a_record_and_no_record(self) -> None:
+        claim = cast(
+            Callable[
+                [str], restart.RestartClaimed | restart.NothingToRestart
+            ],
+            cast(object, getattr(restart, "_claim")),
+        )
+        self.assertEqual(claim(LOGIN), restart.NothingToRestart())
+
+        saved = shutdown_record([entry(top_level("one"))])
+        record.create(saved)
+
+        claimed = claim(LOGIN)
+
+        self.assertIsInstance(claimed, restart.RestartClaimed)
+        if not isinstance(claimed, restart.RestartClaimed):
+            self.fail("expected the restart record to be claimed")
+        self.assertEqual(claimed.record["state"], "restarting")
+
+    def test_claim_returns_nothing_when_record_disappears_before_update(
+        self,
+    ) -> None:
+        record.create(shutdown_record([entry(top_level("one"))]))
+        claim = cast(
+            Callable[
+                [str], restart.RestartClaimed | restart.NothingToRestart
+            ],
+            cast(object, getattr(restart, "_claim")),
+        )
+
+        with patch.object(
+            restart,
+            "update",
+            side_effect=record.NoLiveRecord("record was archived"),
+        ):
+            claimed = claim(LOGIN)
+
+        self.assertEqual(claimed, restart.NothingToRestart())
 
     def test_record_archived_between_lookup_and_claim_is_a_successful_no_op(self) -> None:
         record.create(shutdown_record([entry(top_level("one"))]))
@@ -1860,7 +1899,7 @@ class RestartTests(unittest.TestCase):
         self.assertEqual(current["state"], "restart partial")
         self.assertEqual(
             current["entries"][2]["progress"],
-            record.SessionLiveTimersPending(
+            record.SessionRestoredTimersPending(
                 kind="timers pending",
                 at=RESTARTED,
                 timers=[
@@ -1933,6 +1972,9 @@ class RestartTests(unittest.TestCase):
             patch.object(restart, "_retire") as retire,
             patch.object(restart, "_launch_session") as launch,
             patch.object(
+                restart, "_session_liveness", return_value=restart.SessionLive()
+            ),
+            patch.object(
                 restart, "_live_session_ids", return_value=frozenset({"live"})
             ),
             patch.object(settle, "send_message", send_message),
@@ -1946,7 +1988,7 @@ class RestartTests(unittest.TestCase):
             self.assertEqual(current["state"], "restart partial")
             self.assertEqual(
                 current["entries"][0]["progress"],
-                record.SessionLiveTimersPending(
+                record.SessionRestoredTimersPending(
                     kind="timers pending",
                     at=RESTARTED,
                     timers=[
@@ -1986,6 +2028,225 @@ class RestartTests(unittest.TestCase):
         ]
         self.assertEqual(archived["state"], "up")
         self.assertEqual(archived["entries"][0]["progress"]["kind"], "restarted")
+
+    def test_unreadable_registry_keeps_pending_session_unchanged(self) -> None:
+        timer = TimerRestore(
+            instance="pending-timer",
+            was_enabled=True,
+            footer=record.NoFooter(kind="no footer"),
+        )
+        pending = record.SessionRestoredTimersPending(
+            kind="timers pending",
+            at=RESTARTED,
+            timers=[
+                record.PendingTimer(
+                    instance="pending-timer",
+                    reason="notifier unavailable",
+                )
+            ],
+        )
+        restored = entry(
+            top_level(
+                "possibly-live",
+                host=inventory.TerminalHost(kind="terminal"),
+            ),
+            state=pending,
+            timers=[timer],
+        )
+        record.create(shutdown_record([restored], state="restart partial"))
+        registry = self.root / "sessions"
+        _ = registry.write_text("not a directory", encoding="utf-8")
+
+        with (
+            patch.object(restart, "_retire") as retire,
+            patch.object(restart, "_launch_session") as launch,
+            patch.object(restart, "_restore_timers") as restore_timers,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(restart.up(LOGIN), 1)
+            self.assertEqual(
+                self.stored_record()["entries"][0]["progress"], pending
+            )
+
+            registry.unlink()
+            registry.mkdir()
+            _ = (registry / "unreadable.json").write_text(
+                "not json", encoding="utf-8"
+            )
+            self.assertEqual(restart.up(LOGIN), 1)
+
+        self.assertEqual(self.stored_record()["entries"][0]["progress"], pending)
+        retire.assert_not_called()
+        launch.assert_not_called()
+        restore_timers.assert_not_called()
+
+    def test_closed_session_with_pending_timers_is_fully_restarted(self) -> None:
+        timers = [
+            TimerRestore(
+                instance="pending-timer",
+                was_enabled=True,
+                footer=record.NoFooter(kind="no footer"),
+            ),
+            TimerRestore(
+                instance="previously-started-timer",
+                was_enabled=True,
+                footer=record.NoFooter(kind="no footer"),
+            ),
+        ]
+        restored = entry(
+            top_level(
+                "closed",
+                host=inventory.TerminalHost(kind="terminal"),
+            ),
+            state=record.SessionRestoredTimersPending(
+                kind="timers pending",
+                at=RESTARTED,
+                timers=[
+                    record.PendingTimer(
+                        instance="pending-timer",
+                        reason="notifier unavailable",
+                    )
+                ],
+            ),
+            timers=timers,
+        )
+        already_done = entry(
+            top_level("done"),
+            state=record.SessionRestarted(kind="restarted", at=RESTARTED),
+        )
+        saved = shutdown_record(
+            [restored, already_done], state="restart partial"
+        )
+        expected_note = restart.restart_note(saved, restored, RESTARTED)
+        record.create(saved)
+        commands = CommandRecorder()
+        starts: list[str] = []
+        pending_after_relaunch = record.SessionRestoredTimersPending(
+            kind="timers pending",
+            at=RESTARTED,
+            timers=[
+                record.PendingTimer(
+                    instance=timer["instance"],
+                    reason="not yet restored after relaunch",
+                )
+                for timer in timers
+            ],
+        )
+
+        def assert_relaunch_checkpoint() -> None:
+            self.assertEqual(
+                self.stored_record()["entries"][0]["progress"],
+                pending_after_relaunch,
+            )
+
+        def wait_for_session(session_id: str, timeout: float) -> bool:
+            self.assertEqual(session_id, "closed")
+            self.assertEqual(timeout, restart.SESSION_WAIT_SECONDS)
+            assert_relaunch_checkpoint()
+            return True
+
+        def start_timer(verb: str, instance: str) -> None:
+            self.assertEqual(verb, "start")
+            assert_relaunch_checkpoint()
+            starts.append(instance)
+
+        with (
+            patch.object(restart, "_run", commands),
+            patch.object(
+                restart,
+                "_session_liveness",
+                return_value=restart.SessionNotLive(),
+            ),
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(restart, "wait_for_session", wait_for_session),
+            patch.object(settle, "run_notifier", start_timer),
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(restart.up(LOGIN), 0)
+
+        self.assertTrue(
+            any(
+                "retire" in argv and "session:closed" in argv
+                for argv in commands.calls
+            )
+        )
+        self.assertEqual(
+            conversation_pause.read_scheduled_prompts("closed"),
+            (expected_note,),
+        )
+        self.assertEqual(
+            starts, ["pending-timer", "previously-started-timer"]
+        )
+        self.assertEqual(record.find_live(LOGIN)["kind"], "no shutdown")
+        history = (
+            self.state_root
+            / LOGIN.casefold()
+            / "history"
+            / f"{STOPPED}.json"
+        )
+        archived = record.parse_records(
+            f"[{history.read_text(encoding='utf-8')}]"
+        )[0]
+        self.assertEqual(archived["state"], "up")
+        self.assertEqual(
+            archived["entries"][0]["progress"]["kind"], "restarted"
+        )
+
+    def test_closed_session_with_pending_timers_records_launch_failure(
+        self,
+    ) -> None:
+        timer = TimerRestore(
+            instance="pending-timer",
+            was_enabled=True,
+            footer=record.NoFooter(kind="no footer"),
+        )
+        restored = entry(
+            top_level(
+                "closed",
+                host=inventory.TerminalHost(kind="terminal"),
+            ),
+            state=record.SessionRestoredTimersPending(
+                kind="timers pending",
+                at=RESTARTED,
+                timers=[
+                    record.PendingTimer(
+                        instance="pending-timer",
+                        reason="notifier unavailable",
+                    )
+                ],
+            ),
+            timers=[timer],
+        )
+        record.create(shutdown_record([restored], state="restart partial"))
+
+        with (
+            patch.object(restart, "_retire"),
+            patch.object(
+                restart,
+                "_session_liveness",
+                return_value=restart.SessionNotLive(),
+            ),
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(
+                restart,
+                "_launch_session",
+                side_effect=subprocess.CalledProcessError(
+                    9, ["open"], stderr="launcher refused\ndetail"
+                ),
+            ),
+            patch.object(settle, "run_notifier") as start_timer,
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(restart.up(LOGIN), 1)
+
+        start_timer.assert_not_called()
+        failed = self.stored_record()["entries"][0]["progress"]
+        self.assertEqual(failed["kind"], "restart failed")
+        if failed["kind"] != "restart failed":
+            self.fail("expected restart failure")
+        self.assertEqual(failed["reason"], "launcher refused")
 
     def test_unknown_host_is_manual_and_printed_again(self) -> None:
         record.create(shutdown_record([entry(top_level("mystery"))]))

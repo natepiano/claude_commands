@@ -1714,9 +1714,20 @@ def status_record_lines(record: ShutdownRecord) -> list[str]:
     if record["scope"]["kind"] == "selected":
         lines.append("  selected: " + ", ".join(record["scope"]["session_ids"]))
     for entry in record["entries"]:
-        progress = entry["progress"]["kind"]
+        entry_progress = entry["progress"]
+        progress = entry_progress["kind"]
         if progress == "ready" and entry["where"]["kind"] == "said":
             progress += f" ({entry['where']['text']})"
+        if entry_progress["kind"] == "restart failed":
+            progress += f" — {entry_progress['reason']}"
+        elif entry_progress["kind"] == "timers pending":
+            timers = "; ".join(
+                f"{timer['instance']}: {timer['reason']}"
+                for timer in entry_progress["timers"]
+            )
+            progress += f" — {timers}"
+        elif entry_progress["kind"] == "manual restart":
+            progress += f" — run: {entry_progress['command']}"
         settle_message = entry["settle_message"]
         if settle_message["kind"] == "sent":
             message = " · message sent"
@@ -1729,4 +1740,6 @@ def status_record_lines(record: ShutdownRecord) -> list[str]:
             f"    {stop_issue_text(issue)}" for issue in entry["stop_issues"]
         )
     lines.extend(f"  {stop_issue_text(issue)}" for issue in record["stop_issues"])
+    if record["state"] == "restart partial":
+        lines.append("  run /shutdown restart again to finish")
     return lines

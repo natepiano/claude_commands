@@ -246,7 +246,7 @@ class RecordTests(unittest.TestCase):
             record.ProcessIdentityLost(kind="process identity lost", at=NOW),
             record.SessionStopFailed(kind="stop failed", at=NOW, reason="permission denied"),
             record.SessionRestarted(kind="restarted", at=NOW),
-            record.SessionLiveTimersPending(
+            record.SessionRestoredTimersPending(
                 kind="timers pending",
                 at=NOW,
                 timers=[

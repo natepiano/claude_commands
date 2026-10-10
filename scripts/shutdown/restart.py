@@ -44,7 +44,7 @@ from record import (  # noqa: E402
     ShutdownRecord,
     ShutdownScope,
     ShutdownSessionEntry,
-    SessionLiveTimersPending,
+    SessionRestoredTimersPending,
     SessionNeedsManualRestart,
     SessionProgress,
     SessionRestarted,
@@ -111,6 +111,35 @@ class AlertWhenNotBack:
 @dataclass(frozen=True)
 class NeverAlert:
     """The restart is a silent live check."""
+
+
+@dataclass(frozen=True)
+class RestartClaimed:
+    """The live shutdown record is exclusively claimed for restart."""
+
+    record: ShutdownRecord
+
+
+@dataclass(frozen=True)
+class NothingToRestart:
+    """No live shutdown record remains to claim."""
+
+
+@dataclass(frozen=True)
+class SessionLive:
+    """The session registry positively identifies the session as live."""
+
+
+@dataclass(frozen=True)
+class SessionNotLive:
+    """A readable session registry contains no live record for the session."""
+
+
+@dataclass(frozen=True)
+class SessionLivenessUnknown:
+    """The session registry cannot safely establish whether the session is live."""
+
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -246,6 +275,37 @@ def _run(argv: list[str], *, dry_run: bool, check: bool = True) -> subprocess.Co
 
 def _live_session_ids() -> frozenset[str]:
     return frozenset(item["sessionId"] for item in sessions.live_sessions())
+
+
+def _session_liveness(
+    session_id: str,
+) -> SessionLive | SessionNotLive | SessionLivenessUnknown:
+    try:
+        paths = [
+            path
+            for path in sessions.sessions_dir().iterdir()
+            if path.suffix == ".json"
+        ]
+    except OSError as error:
+        return SessionLivenessUnknown(
+            f"session registry unreadable: {_error_reason(error)}"
+        )
+
+    unreadable_records: list[str] = []
+    for path in paths:
+        registered = sessions.read_session(path)
+        if isinstance(registered, sessions.UnreadableSessionRecord):
+            unreadable_records.append(path.name)
+            continue
+        if registered["sessionId"] == session_id and sessions.live_session(
+            registered
+        ):
+            return SessionLive()
+    if unreadable_records:
+        return SessionLivenessUnknown(
+            "unreadable session registry record: " + unreadable_records[0]
+        )
+    return SessionNotLive()
 
 
 def wait_for_session(session_id: str, timeout: float) -> bool:
@@ -755,16 +815,46 @@ def _record_timer_restore_progress(
     failures: tuple[PendingTimer, ...],
 ) -> None:
     if failures:
-        progress: SessionProgress = SessionLiveTimersPending(
-            kind="timers pending",
-            at=settle.record_time(),
-            timers=list(failures),
-        )
-    else:
-        progress = SessionRestarted(kind="restarted", at=settle.record_time())
+        _record_pending_timers(record, entry, failures)
+        return
+    progress: SessionProgress = SessionRestarted(
+        kind="restarted", at=settle.record_time()
+    )
     entry["progress"] = progress
     _ = _set_entry_progress(
         record["login"], entry["session"]["session_id"], progress
+    )
+
+
+def _record_pending_timers(
+    record: ShutdownRecord,
+    entry: ShutdownSessionEntry,
+    pending: tuple[PendingTimer, ...],
+) -> None:
+    progress: SessionProgress = SessionRestoredTimersPending(
+        kind="timers pending",
+        at=settle.record_time(),
+        timers=list(pending),
+    )
+    entry["progress"] = progress
+    _ = _set_entry_progress(
+        record["login"], entry["session"]["session_id"], progress
+    )
+
+
+def _record_relaunched_timers_pending(
+    record: ShutdownRecord, entry: ShutdownSessionEntry
+) -> None:
+    _record_pending_timers(
+        record,
+        entry,
+        tuple(
+            PendingTimer(
+                instance=timer["instance"],
+                reason="not yet restored after relaunch",
+            )
+            for timer in entry["timers"]
+        ),
     )
 
 
@@ -782,10 +872,10 @@ def _entry_order(record: ShutdownRecord, entry: ShutdownSessionEntry) -> tuple[i
     )
 
 
-def _claim(login: str) -> ShutdownRecord | None:
+def _claim(login: str) -> RestartClaimed | NothingToRestart:
     found = find_live(login)
     if found["kind"] == "no shutdown":
-        return None
+        return NothingToRestart()
 
     def change(record: ShutdownRecord) -> None:
         if record["state"] not in RESTARTABLE_STATES:
@@ -793,9 +883,9 @@ def _claim(login: str) -> ShutdownRecord | None:
         record["state"] = "restarting"
 
     try:
-        return update(login, change)
+        return RestartClaimed(update(login, change))
     except NoLiveRecord:
-        return None
+        return NothingToRestart()
 
 
 def _move_to_partial(login: str) -> None:
@@ -863,14 +953,20 @@ def _process_session_entry(
         return
     session = entry["session"]
     session_id = session["session_id"]
+    relaunching_pending_timers = False
     if progress["kind"] == "timers pending":
-        if session_id not in _live_session_ids():
-            return
-        timers = _pending_timer_restores(entry, progress["timers"])
-        failures = _restore_timers(timers, dry_run=dry_run)
-        if not dry_run:
-            _record_timer_restore_progress(record, entry, failures)
-        return
+        relaunching_pending_timers = True
+        match _session_liveness(session_id):
+            case SessionLive():
+                timers = _pending_timer_restores(entry, progress["timers"])
+                failures = _restore_timers(timers, dry_run=dry_run)
+                if not dry_run:
+                    _record_timer_restore_progress(record, entry, failures)
+                return
+            case SessionLivenessUnknown():
+                return
+            case SessionNotLive():
+                pass
     try:
         _retire(record, entry, dry_run=dry_run)
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
@@ -925,6 +1021,8 @@ def _process_session_entry(
         return
     if dry_run:
         return
+    if relaunching_pending_timers:
+        _record_relaunched_timers_pending(record, entry)
     if not wait_for_session(session_id, SESSION_WAIT_SECONDS):
         entry["progress"] = SessionRestartFailed(
             kind="restart failed",
@@ -1154,10 +1252,16 @@ def _up(login: str, dry_run: bool) -> MachineRestartResult:
             )
             _print_result(result)
             return result
-        if claimed is None:
-            print(f"{machine}: no shutdown of {existing['label']} to restart")
-            return MachineRestartResult(machine, existing["label"], "nothing")
-        record = claimed
+        match claimed:
+            case NothingToRestart():
+                print(
+                    f"{machine}: no shutdown of {existing['label']} to restart"
+                )
+                return MachineRestartResult(
+                    machine, existing["label"], "nothing"
+                )
+            case RestartClaimed(record=claimed_record):
+                record = claimed_record
 
     desktop_state = DesktopLaunchState()
     restarted_at = settle.record_time()
