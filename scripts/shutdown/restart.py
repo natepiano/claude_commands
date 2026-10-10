@@ -18,7 +18,7 @@ from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "production", "hooks"):
+for dependency in ("whoami", "message", "notify", "production", "hooks"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 from account import (  # noqa: E402
@@ -61,6 +61,7 @@ from remote import other_machine, run_remote  # noqa: E402
 import sessions  # noqa: E402
 import settle  # noqa: E402
 import showrunner_footer  # noqa: E402
+from user_action import ActionRequired, NoActionRequired  # noqa: E402
 
 
 ADD_UNIT = SCRIPTS / "production" / "add_unit.py"
@@ -752,6 +753,7 @@ def _send_restart_note(
         f"session:{session_id}",
         f"{record['label']} restarted",
         note,
+        action=NoActionRequired(),
         key=_message_key(record, session_id),
     )
 
@@ -1496,6 +1498,9 @@ def restart(
                     _alert_scope(alert_scope),
                     f"{selected.label} is not fully back",
                     "\n".join(lines),
+                    ActionRequired(
+                        "Fix what is named, then run /shutdown restart again."
+                    ),
                 )
             except (OSError, RuntimeError, ValueError):
                 pass

@@ -233,6 +233,7 @@ def review_watch(production: Production, state_dir: Path) -> WatchFirstAlert | W
         notice = f"{line}; the table is in this session"
         send = Path.home() / ".claude/scripts/message/send.py"
         _ = required(command("watch", sys.executable, str(send), "--to", "user", "--need", "decision",
+                             "--action", "Acknowledge the review watch in this session.",
                              "--summary", "Hana: review watch", "--text", notice), "watch")
         moment = datetime.now(production.zone).strftime("%H:%M %Z")
         production.log.parent.mkdir(parents=True, exist_ok=True)

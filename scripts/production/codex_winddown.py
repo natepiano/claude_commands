@@ -206,7 +206,11 @@ def announce_quiet(running: int) -> None:
     except FileExistsError:
         return
     text = f"No Codex agent is running on {socket.gethostname()}. Reset when ready, then /codex_winddown clear."
-    _ = broadcast.send("user", "codex-winddown", text, "--summary", "Codex wind-down", "--need", "decision")
+    _ = broadcast.send(
+        "user", "codex-winddown", text,
+        "--summary", "Codex wind-down", "--need", "decision",
+        "--action", "Reset Codex, then run /codex_winddown clear.",
+    )
 
 
 def count(session: str) -> int:

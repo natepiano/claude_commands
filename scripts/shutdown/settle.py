@@ -17,7 +17,7 @@ from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "production", "hooks"):
+for dependency in ("whoami", "message", "notify", "production", "hooks"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 from account import Account
@@ -47,6 +47,7 @@ from record import (
 from remote import other_machine, run_remote
 import showrunner_footer
 import stop as stop_work
+from user_action import ActionRequired, NoActionRequired, UserAction
 
 SHUTDOWN = Path(__file__).resolve().parent / "shutdown.py"
 NOTIFIER = SCRIPTS / "message" / "notifier.sh"
@@ -55,6 +56,7 @@ SETTLE_INTERVAL_SECONDS = 15
 SETTLE_RETRY_SECONDS = 300
 FIRST_HOLDOUT_ALERT = timedelta(minutes=20)
 REPEAT_HOLDOUT_ALERT = timedelta(minutes=60)
+_NO_ACTION_REQUIRED = NoActionRequired()
 
 
 class RemoteUnavailable(TypedDict):
@@ -293,6 +295,7 @@ def send_message(
     summary: str,
     text: str,
     *,
+    action: UserAction,
     need: Literal["note", "decision", "blocked"] = "note",
     machine: str = "",
     key: str = "",
@@ -310,6 +313,10 @@ def send_message(
         command.extend(("--key", key))
     if recipient == "user":
         command.extend(("--need", need))
+        if isinstance(action, ActionRequired):
+            command.extend(("--action", action.text))
+        else:
+            command.append("--no-action")
     if machine:
         command.extend(("--machine", machine))
     result = subprocess.run(
@@ -342,6 +349,7 @@ def alert_user(
     scope: ShutdownScope,
     summary: str,
     text: str,
+    action: ActionRequired,
     *,
     machine: str = "",
 ) -> None:
@@ -352,6 +360,7 @@ def alert_user(
         "user",
         summary,
         text,
+        action=action,
         need="decision",
         machine=machine,
     )
@@ -665,6 +674,7 @@ def _send_settle_message(record: ShutdownRecord, entry: ShutdownSessionEntry) ->
         f"session:{session['session_id']}",
         f"Shutdown of {record['label']}: reach a safe stop",
         _settle_text(record, session),
+        action=_NO_ACTION_REQUIRED,
         key=f"shutdown-{record['login']}-{session['session_id']}",
     )
     at = record_time()
@@ -1012,14 +1022,26 @@ def _send_holdout_alert(
     label = reports[0]["record"]["label"]
     text = "\n".join(lines)
     summary = f"Shutdown of {label}: {len(holdouts)} not ready"
-    alert_user(reports[0]["record"]["scope"], summary, text)
+    alert_user(
+        reports[0]["record"]["scope"],
+        summary,
+        text,
+        ActionRequired(
+            "Run /shutdown now to stop them anyway, or /shutdown cancel."
+        ),
+    )
     requesters: set[str] = set()
     for report in reports:
         requested_by = report["record"]["requested_by"]
         if requested_by["kind"] == "session":
             requesters.add(requested_by["session_id"])
     for session_id in sorted(requesters):
-        _ = send_message(f"session:{session_id}", summary, text)
+        _ = send_message(
+            f"session:{session_id}",
+            summary,
+            text,
+            action=_NO_ACTION_REQUIRED,
+        )
 
 
 def conduct_cycle(
@@ -1312,6 +1334,7 @@ def report_stop(
                 f"session:{requested_by['session_id']}",
                 summary,
                 text,
+                action=_NO_ACTION_REQUIRED,
                 key=f"shutdown-result-{claimed['login']}",
             )
 
@@ -1320,7 +1343,13 @@ def report_stop(
         return
     route = "natedev" if _machine().casefold() == "mac" else ""
     try:
-        alert_user(claimed["scope"], summary, text, machine=route)
+        alert_user(
+            claimed["scope"],
+            summary,
+            text,
+            ActionRequired(f"Run /shutdown restart on {account_label}."),
+            machine=route,
+        )
     except Exception as alert_error:
         try:
             report_to_requester()
@@ -1400,6 +1429,7 @@ def _restore_record(record: ShutdownRecord) -> None:
                 f"session:{entry['session']['session_id']}",
                 f"Shutdown of {record['label']} cancelled",
                 f"Shutdown of {record['label']} cancelled by the user: continue where you were.",
+                action=_NO_ACTION_REQUIRED,
                 key=(
                     f"shutdown-{record['login']}-"
                     f"{entry['session']['session_id']}"

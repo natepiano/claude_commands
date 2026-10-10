@@ -1270,7 +1270,8 @@ class DailiesInputTests(unittest.TestCase):
         calls = self.watch_events(events)
         self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
         self.assertEqual([row for row in calls if row[0] == "send.py"], [[
-            "send.py", "--to", "user", "--need", "decision", "--summary", "Hana: review watch", "--text",
+            "send.py", "--to", "user", "--need", "decision", "--action",
+            "Acknowledge the review watch in this session.", "--summary", "Hana: review watch", "--text",
             "12 of 12 phases: report ready, waiting for your acknowledgment; the table is in this session",
         ]])
         self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
@@ -1288,7 +1289,8 @@ class DailiesInputTests(unittest.TestCase):
         calls = self.watch_events(events)
         self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
         self.assertEqual([row for row in calls if row[0] == "send.py"], [[
-            "send.py", "--to", "user", "--need", "decision", "--summary", "Hana: review watch", "--text",
+            "send.py", "--to", "user", "--need", "decision", "--action",
+            "Acknowledge the review watch in this session.", "--summary", "Hana: review watch", "--text",
             "12 of 12 phases: report ready, waiting for your acknowledgment; the table is in this session",
         ]])
         self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
