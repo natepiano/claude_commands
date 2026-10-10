@@ -1,4 +1,8 @@
-# two-accounts
+# Two accounts: showrunners on one Claude account, unit directors on another
+
+> **Status: PROPOSAL — waits on the user (G0).** Nothing live changes before G0 clears. The design: each account the user has gets its own config dir, `~/.claude1`, `~/.claude2` and `~/.claude3`. Each holds only that account's login, and everything else is a symlink into `~/.claude`. Unit directors launch with `CLAUDE_CONFIG_DIR` set to the unit account's dir. Showrunners and every other session stay on `~/.claude`'s own login, as today. When the unit account runs low, one command swaps every unit onto a spare account through `/shutdown`'s safe stop and resume. Phased, delegate-ready once approved.
+
+> **As-built disposition: create**
 
 > **Production: build-followups** — unit `two-accounts-unit`; production doc `docs/plans/build-followups-production.md`
 
@@ -7,3 +11,353 @@
 2026-10-10 13:23 PDT
 
 Investigate and propose a plan only; change nothing live (the user, 2026-10-10 13:2x PDT): "task either an existing unit dir or a new unit dir to investigate how we can do this. my goal would be to run showrunners in one account and unit directors in another - as there are more unit dirs than show runners it might allow showrunners to burn their weekly allowance slower and we can swap out unit directors maybe a little more frequently - or maybe they both can make it all the way through the week if we do it this way - just keeping two accounts continually acive / i don't want you to do it yet - i want you to investigate it - including maybe we have a second worktree for the second account so that we can keep them up to date / i think the ~.claude would be main always but then we could have ~/.claude1, ~/.claude2, ~/.claude3 as worktrees corresponding to each account that i actually have - and they can just merge changes to main as we make them - / but have someone go figure this out and propose a plan" Mechanism found: CLAUDE_CONFIG_DIR per account (https://code.claude.com/docs/en/authentication.md, Log in with multiple accounts); each dir has its own login, settings and history. Account switching today: scripts/whoami/.
+
+## Proposal
+
+Investigated 2026-10-10 by two-accounts-unit. Nothing was changed.
+
+**How it works.** `CLAUDE_CONFIG_DIR=<dir> claude` runs a session with that dir's login. On Linux the login is `<dir>/.credentials.json`. On the Mac each dir gets its own Keychain entry. The dir also holds its own `.claude.json`, and "all settings, session history, and plugins" live under it (Claude Code docs, env-vars and authentication pages). Two sessions with different dirs run side by side on different accounts.
+
+**Account dirs are symlink farms, not git worktrees** (my call; the user suggested worktrees). `~/.claudeN` holds only what belongs to account N:
+
+- its login
+- its `.claude.json`
+- its status-line label
+- its Remote Control daemon state
+
+Everything else is a symlink into `~/.claude`: `settings.json`, `CLAUDE.md`, `commands/`, `skills/`, `plugins/`, `projects/` (transcripts and memory), `sessions/` (the live session registry), and the rest of the shared list in Phase 1. Reasons:
+
+- **Nothing to keep up to date.** A symlink always shows `~/.claude` main, so no merge into three worktrees ever runs. A worktree's `commands/` and `settings.json` would lag main until merged, while hooks still run main's `scripts/` (every hook path is `$HOME/.claude/scripts/...`). Sessions would then run one commit's skills against another commit's scripts.
+- **The whole toolchain keeps working.** About 30 scripts read the session registry and transcripts at a hardcoded `~/.claude/sessions` and `~/.claude/projects`. These include `send.py`, `/shutdown`'s inventory, `unit_lookup`, `showrunners.py`, the stall watch, build-log launches and the conversation-pause hook, which would delete a live session's pause record when it cannot see it. With shared `sessions/` and `projects/`, a session on account N writes where all of them already look.
+- **Memory stays one store,** and a session's transcript is visible from every account. That is what lets a unit director move to another account with `claude --resume`.
+
+**Will two accounts last the week?** These are measured numbers, not a forecast:
+
+- **Burn rate today, one account carrying everything:**
+
+  | Account | Measured burn | Per day |
+  | --- | --- | --- |
+  | claude 1 | 58 → 1 in 45 h | ≈ 30 points |
+  | claude 3 | 98 → 0 in 46 h | ≈ 51 points |
+  | claude 2 | 100 → 55 in 30 h, still running | ≈ 36 points |
+
+  (`~/.local/state/agent-notes/readings.jsonl`.) At this load one account lasts 2–3 days. A week needs about 250–350 points, and three accounts hold 300.
+- **Who spends it:** over the last 7 days, sessions in unit worktrees produced about 70% of output tokens. Showrunners, top-level sessions and the nightly sessions produced about 30%. This comes from transcripts, classified by working directory, give or take 10 points. The input and cache-write shares are close to those.
+- **So:**
+  - The showrunner account spends about 11–15 points a day and **should last the week alone.**
+  - The unit account spends about 25–35 a day and **lasts 3–4 days**: units swap once mid-week onto the third account, and those two together just about cover the week.
+  - Two accounts stay active at all times, as the user wants. The split does not add capacity; it decides which sessions stop when an account runs out. Showrunners never do, and only units move.
+
+**What changes for the user:** nothing when starting sessions by hand. `~/.claude`'s login is the showrunner account, and `/login` there switches it as today. Units launch on the unit account by themselves. When the unit account runs low, the quota alert names the spare account with the most left and the one command, `/accounts swap unit "claude N"`. Each account is logged in once in its own dir, by the user, at setup.
+
+**Costs:**
+
+- **Remote Control is per account.** A unit director on account N shows in account N's claude.ai session list, not the one the phone is signed into. Showrunners stay visible on the main account and relay as today. Phase 2 checks this live.
+- **`.claude.json` is per dir.** A new dir is seeded with project trust, onboarding flags and the user-scope MCP servers (today `brp`), so launches never stop at a dialog. An MCP server added later to one dir does not reach the others; `/accounts status` reports the difference.
+- **Claude Code may replace a symlinked file when it writes it,** for example `settings.json` after `/model`. Phase 2 tests this; the launch check catches a replaced link either way.
+
+**Calls I made (each a one-line revert):**
+
+- Showrunners, top-level sessions, the nightly review, the fix pipeline and the `send.py` relay stay on `~/.claude`'s login. Only units get a role account, because they spend about 70% and they are the sessions that can be stopped safely and resumed.
+- A swap reuses `/shutdown`'s safe stop and resume instead of moving each unit at its next checkpoint.
+- The Mac is out of scope: units launch only on natedev (`add_unit.py` uses `systemd-run` and tmux). Mac sessions stay on `~/.claude`.
+- A long-lived `CLAUDE_CODE_OAUTH_TOKEN` per launch is ruled out: such a token "can't establish Remote Control sessions", and every unit runs with `--remote-control`.
+
+**Questions only the user can answer:**
+
+1. Units on another account leave the phone's session list unless the app is signed into that account. Accept this, with showrunners relaying? Recommended: yes.
+2. Approve symlink farms instead of worktrees?
+3. At cutover (G2), which account do units start on? On today's numbers: `~/.claude` stays on claude 2 (55%, resets 10-15), units go to claude 3 (reset 10-10 09:00), and claude 1 (resets 10-12) is the mid-week spare.
+
+## Delegation Context
+
+- **Project:** `~/.claude` config repo. Worktree `/home/natepiano/worktrees/claude-build-followups-two-accounts`, branch `build-followups-two-accounts` (unit `two-accounts-unit`); name both in every dispatch.
+- **Stack:** Python 3 standard library, checked by basedpyright. zsh launch strings. Claude Code 2.1.296.
+- **Layout:** new `scripts/accounts/` (`accounts.py`, `test_accounts.py`) · `scripts/production/` · `scripts/shutdown/` · `scripts/whoami/` · `scripts/message/` · new `commands/accounts.md` · `settings.json` · `docs/quota_alerts.md` · `docs/as-built/shutdown-and-restart.md`. Outside the repo, live, written only in Phases 2 and 6: `~/.claude1`, `~/.claude2`, `~/.claude3`, and `config/accounts.json` (gitignored like `config/showrunners.json`).
+- **Key files:**
+  - `scripts/whoami/agent_accounts.py`:
+    - `claude_config_dir()` 224: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
+    - `claude_config_file()` 228-236: `~/.claude.json` only for `~/.claude`, else `<dir>/.claude.json`.
+    - `claude_credentials()` 246-254: on darwin it reads the Keychain only without `CLAUDE_CONFIG_DIR`.
+    - `claude_live()` 280-316: `claude auth status`, then `/api/oauth/usage` with the dir's access token.
+    - `claude_on_disk(config_dir)` 318.
+    - `live_reports()` 557.
+  - `scripts/whoami/account.py`:
+    - `process_config_dir(pid)` 118-159 reads `/proc/<pid>/environ`, or `ps eww` on darwin.
+    - `account_of(pid)`.
+    - `write_label` writes `<dir>/account-label`; the SessionStart hook at `settings.json` 186 runs it.
+  - `scripts/whoami/agent_notes.py`: `apply` 188-245 marks the env's own account `active` and every other account `inactive`; `update` 255-270. `quota_alert.py` 247-254 and 653 act on `state: active`; `current_session()` reads the registry at 82 and 666. `run_out.py`. `whoami.py`.
+  - `scripts/production/add_unit.py`:
+    - `launch_session` 660-693 builds `ENABLE_TOOL_SEARCH=true command claude …; exec zsh` and runs it under `systemd-run --user --scope … tmux new-session … zsh -ic`.
+    - `launch_environment` 696-702 strips every `CLAUDE_*` variable.
+    - The launch check is near 796.
+    - tmux gives a new session the server's environment, not the client's, so a variable reaches `claude` only inside the command string or through `-e`.
+  - `scripts/shutdown/restart.py`:
+    - `_run` 262-273 strips `CLAUDE_*`.
+    - The resume command is built at 355-373.
+    - Units relaunch through `add_unit.py --resume` at 430-455.
+    - The record stores no config dir.
+  - `scripts/shutdown/inventory.py`: 1178 lists `~/.claude/sessions`, then filters by `account_of`; 1103 reads `~/.claude/projects` for the last model. `record.py` holds the record types. `shutdown.py` holds the verbs and `conduct`.
+  - `scripts/message/sessions.py` 85-86: `sessions_dir()` is `$NOTIFIER_SESSIONS_DIR` or `~/.claude/sessions`. `send.py` 670-701: the relay is a headless `claude -p` with `CLAUDE_*` stripped, so it runs on `~/.claude`'s account.
+  - `scripts/delegate/remove_seats.py` 98-259 and `scripts/delegate/implement.sh` 316: `claude agents --json` and `claude rm` act on the caller's config dir.
+  - `commands/showrunner/produce.md` 235-237: a manual unit resume runs `claude --resume` from the showrunner's own shell.
+  - `settings.json`:
+    - 43 allows `Edit(~/.claude/**)`.
+    - 263-265 sandbox `filesystem.allowWrite` lists `~/.claude`.
+    - 243 is the status line, which reads `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/account-label`.
+  - `scripts/nightly_review/nightly_review.py`: the quota gate at 84-97 assumes one active Claude note; the launch is at 109-116.
+  - `docs/as-built/shutdown-and-restart.md`, `docs/quota_alerts.md`: the protocols this plan extends.
+- **Test lanes:** `scripts/accounts/test_accounts.py` (new), `scripts/production/test_add_unit.py`, `scripts/shutdown/test_*.py`, `scripts/whoami/test_*.py`. Tests sit beside the code and import their sibling by bare name.
+- **Build:** none; the code is interpreted.
+- **Test:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` for each touched dir, from the worktree root.
+- **Lint:** `basedpyright <files>`: a pass ends `0 errors, 0 warnings, 0 notes`. Lint once after the seat's edits; on failure, fix what it names and lint once more.
+- **Facts (checked 2026-10-10):**
+  - **Session records** (`~/.claude/sessions/<pid>.json`) carry `messagingSocketPath` `/run/user/1000/cc-socks/<pid>.sock`. That is the XDG runtime dir, not the config dir. They also carry `peerFeatures` including `reply_across_default_dirs`. A `<pid>.<sha>.key` sits beside each record.
+  - **`~/.claude.json`:**
+    - `oauthAccount` (identity).
+    - `projects`, 33 entries holding `hasTrustDialogAccepted`, `allowedTools`, `enabledMcpjsonServers`, `disabledMcpjsonServers`, `mcpServers` and `hasClaudeMdExternalIncludesApproved`. Worktrees under `~/worktrees` inherit trust from the `/home/natepiano` entry.
+    - Top-level `mcpServers` `{brp}`.
+    - `hasCompletedOnboarding` and `lastOnboardingVersion`.
+  - **Accounts:**
+
+    | Note | Login | Resets |
+    | --- | --- | --- |
+    | `claude 1` | `foyer_penal0c@icloud.com` | 10-12 02:00 |
+    | `claude 2` | `browses31_perks@icloud.com` | 10-15 07:00 |
+    | `claude 3` | `rubrics.dogwood-1f@icloud.com` | 10-10 09:00 |
+
+    The notes are in `~/rust/hanadocs/agents/`. `~/.claude` is logged in as claude 2.
+  - **Not created in `~/.claude`:** `keybindings.json`, `agents/` and `output-styles/`. The farm links only entries that exist, plus the dirs Claude Code creates.
+  - **Burn rates and role split:** as in the Proposal. The 7-day split came from a one-off script in this session's scratchpad (`role_tokens.py`). After cutover each role has its own account, so `accounts.py burn` reads the split from per-account readings and needs no transcript scan.
+- **Invariants:**
+  - **No variable means the default account.** Absent `CLAUDE_CONFIG_DIR` means `~/.claude` and its login. A launch on the default account sets nothing.
+  - **No copies of shared content.** In an account dir, every shared entry is a symlink into `~/.claude`. Setup never replaces a real file or dir; it reports it.
+  - **Identity stays per dir.** `.credentials.json`, `.claude.json`, `account-label`, `daemon/`, `daemon-auth-*`, `jobs/`, `backups/`, `.oauth_refresh.lock*`, and anything not on the shared list are never linked.
+  - **Unknown means not this account** (shutdown as-built): an unreadable environment never defaults to `~/.claude`.
+  - **Account isolation from the shutdown as-built holds.** A command for account A never stops or messages a session on account B.
+  - **Tests never touch live dirs.** They never touch `~/.claude*` or `~/.claude.json`: `HOME` points at a temp dir.
+  - Python: no `Any`, a `TypedDict` per JSON shape, no file-level ignores.
+  - Times shown to the user are America/Los_Angeles.
+
+## Gates
+
+| Gate | Waiting | Waits on | Clears when |
+| --- | --- | --- | --- |
+| G0 | Phase 1 | the user | the user approves this proposal and answers questions 1–2 |
+| G1 | Phase 2, step 2 | the user | the user has run `CLAUDE_CONFIG_DIR=~/.claude<N> claude` once and finished `/login` for the spare account |
+| G2 | Phase 6 | the user | the user picks the cutover time and the first unit account (question 3), and logs in the remaining dirs |
+| G3 | Phase 7 | the clock | 7 days after cutover |
+
+## Phases
+
+### Phase 1 — Account dirs: build, check and report, without touching live dirs  · status: todo
+
+#### Work Order
+
+**Goal:** `accounts.py` can build and repair an account dir as a symlink farm, seed its `.claude.json`, say whether it is fit to launch on, and resolve a role to its dir. No live dir is created in this phase.
+
+**Spec:**
+
+`scripts/accounts/accounts.py`:
+
+- **Paths.** `HOME = Path(os.environ.get("ACCOUNTS_HOME", Path.home()))`. The main dir is `HOME/.claude`. Label `claude N` maps to `HOME/.claudeN`. Any other label is refused: `accounts: <label> is not a claude N label`.
+- **`SHARED`, the entries linked into the main dir:**
+  - files: `settings.json`, `CLAUDE.md`, `keybindings.json`, `history.jsonl`
+  - dirs: `commands`, `skills`, `agents`, `output-styles`, `plugins`, `projects`, `sessions`, `plans`, `todos`, `tasks`, `teams`, `file-history`, `shell-snapshots`, `session-env`, `paste-cache`, `uploads`
+
+  A comment states the rule: shared means Claude Code reads it as user content or as cross-session state, and anything else stays per account.
+- **`setup <label>`:**
+  - Creates the dir with mode 0700.
+  - For each `SHARED` entry present in the main dir, or one of `projects` and `sessions`, it makes `dir/<entry>` a symlink to the absolute main path. It leaves a correct link alone, replaces a wrong-target link, and refuses a real file or dir: `accounts: <dir>/<entry> is a real file; move it aside or merge it into ~/.claude`, exit 1 after doing the rest.
+  - Seeds `dir/.claude.json` only when it is absent, mode 0600, from `HOME/.claude.json`, keeping only these keys:
+    - top level: `hasCompletedOnboarding`, `lastOnboardingVersion`, `installMethod`, `autoUpdates`, `shiftEnterKeyBindingInstalled`, `mcpServers`, `remoteDialogSeen`, `hasUsedRemoteControl`, `hasSeenAutoModeEntryWarning`, `hasSeenAutoModeOutsideReadPrompt`, `hasResetAutoModeOptInForDefaultOffer`
+    - per `projects` entry: `hasTrustDialogAccepted`, `allowedTools`, `enabledMcpjsonServers`, `disabledMcpjsonServers`, `mcpServers`, `hasClaudeMdExternalIncludesApproved`, `hasClaudeMdExternalIncludesWarningShown`
+
+    `oauthAccount` and every cache stay out.
+  - Prints the login command `CLAUDE_CONFIG_DIR=<dir> claude`, then `/login`.
+- **`check <label>`:** exit 0 and silent when every present `SHARED` entry is a correct link and `claude_on_disk(dir)` reports a login. Otherwise it prints one line per problem and exits 1. The problems are: missing dir, missing link, wrong target, real file in place of a link, not logged in. Reuse `scripts/whoami/agent_accounts.claude_on_disk`.
+- **`status`:** one block for `~/.claude` and one per existing `~/.claudeN`. Each block shows the label and login (via `account.label_for`), the role it serves, the `check` problems, entries that are neither shared nor on the known per-account list (`unclassified: …`), and `mcpServers` names that differ from `~/.claude.json`.
+- **Roles.** The `config/accounts.json` shape is `{"unit": "claude N"}`; absent means the default account.
+  - `role_account(role) -> DefaultAccount | NamedAccount(label, dir)`.
+  - `launch_prefix(role) -> str` returns `CLAUDE_CONFIG_DIR=<shlex-quoted dir> ` or `""`.
+  - CLI `role <role>` prints the label, or `default`; `env <role>` prints the prefix.
+  - `set-role unit <label | default>` writes the file atomically and appends `{at, role, label}` to `~/.local/state/accounts/roles.jsonl`.
+  - Only `unit` is a role. Any other name is refused.
+- Add `/config/accounts.json` to `.gitignore` beside `config/showrunners.json`.
+
+**Files:**
+
+- `scripts/accounts/accounts.py` — new.
+- `scripts/accounts/test_accounts.py` — new: temp `ACCOUNTS_HOME`, real symlinks, each refusal, seed key filtering, `check` problems, role resolution.
+- `.gitignore`.
+
+**Seats:** `1 writer + 1 tester`.
+
+**Acceptance gate:** tests pass and basedpyright is clean. `accounts.py status` on natedev prints only the `~/.claude` block and creates nothing (`ls -d ~/.claude?` before and after).
+
+### Phase 2 — Live proof with one spare account  · status: todo
+
+#### Work Order
+
+**Goal:** before any launcher changes, prove on natedev that a session in a farm dir runs on its own account and is seen by the existing toolchain. Record the result of each check here.
+
+**Spec (director with the user; a writer only for fixes to `accounts.py`):**
+
+1. `accounts.py setup "<spare label>"` for an account `~/.claude` is not logged in to.
+2. **G1:** the user runs `CLAUDE_CONFIG_DIR=~/.claude<N> claude` in a terminal and completes `/login`. Then `accounts.py check` passes.
+3. Start a scratch session `CLAUDE_CONFIG_DIR=~/.claude<N> claude --remote-control acct-probe -n acct-probe` in tmux, cwd a scratch dir. Check, recording each result:
+   - **(a) Logins.** `claude auth status` under each dir shows its own email, and `~/.claude/.credentials.json` mtime is unchanged.
+   - **(b) Registry and transcripts.** The probe's record is in `~/.claude/sessions/`, its transcript is under `~/.claude/projects/`, and its status line shows the spare label.
+   - **(c) Messaging.**
+     - `ListAgents` and `SendMessage` reach the probe from this session, and its reply comes back.
+     - `send.py --to acct-probe` delivers, and so does a `send.py` from the probe to this session.
+     - `notify_when_idle` fires.
+   - **(d) Shutdown attribution.** `account.py --pid <probe pid>` names the spare account. `shutdown.py status "<spare label>"` lists the probe, and `shutdown.py status` for `~/.claude`'s account does not.
+   - **(e) Resume across accounts.** A scratch session started on `~/.claude`, then exited, resumes under `~/.claude<N>` with `--resume <id>` and keeps its history. The reverse works too.
+   - **(f) Symlinks survive writes.** In the probe run `/model` to change the model and back, and send a prompt. `~/.claude<N>/settings.json` and `history.jsonl` must still be links. If one was replaced, record it: Phase 3's launch check is then the defence, and `setup` repairs the link only after the user compares the two files.
+   - **(g) Remote Control.** Find which claude.ai account lists `acct-probe`, and whether the phone, signed into the main account, can open it.
+4. Exit the probe and delete its scratch transcript dir. Leave `~/.claude<N>` in place; Phase 6 uses it.
+
+If (b), (c) or (e) fails, stop and bring the failing check to the showrunner with a revised Phase 3. Those three are what the symlink design rests on.
+
+**Files:** this plan (results); `scripts/accounts/accounts.py` only for defects found.
+
+**Acceptance gate:** (a)–(e) pass, and (f) and (g) are recorded.
+
+### Phase 3 — Units launch, resume and restart on the unit account  · status: todo
+
+#### Work Order
+
+**Goal:** a unit director runs on the account `config/accounts.json` names for `unit`, on every path that starts one; any other session relaunches on the dir it ran in.
+
+**Spec:**
+
+- `add_unit.py launch_session`:
+  - The command string becomes `<accounts.launch_prefix("unit")>ENABLE_TOOL_SEARCH=true command claude …`. The prefix goes in the string so tmux passes it whatever its server's environment.
+  - Before `launch_permission`, a named unit account must pass `accounts.check`. Otherwise refuse with exit 2: `add_unit: unit account <label>: <first problem>; /accounts status`.
+  - `launch_environment` keeps stripping `CLAUDE_*`.
+- `commands/showrunner/produce.md` 235-237: the manual unit resume puts the output of `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py env unit` before `claude --resume`.
+- **shutdown:**
+  - Inventory records each session's config dir as `process_config_dir(pid)`, rendered as a string, absent meaning `~/.claude`, in a new `config_dir` field of the entry in `record.py`.
+  - `restart.py` puts `CLAUDE_CONFIG_DIR=<dir> ` before `ENABLE_TOOL_SEARCH=true` for a non-unit entry whose recorded dir is not `~/.claude`.
+  - Units keep relaunching through `add_unit.py`, which applies the current role. That is how a swap moves them.
+  - `remove_seats.py`, and the shutdown path that ends Claude seats, runs `claude agents` and `claude rm` with the owning session's `CLAUDE_CONFIG_DIR`.
+- `settings.json`:
+  - `Edit(~/.claude1/**)`, `Edit(~/.claude2/**)` and `Edit(~/.claude3/**)` beside `Edit(~/.claude/**)`.
+  - `~/.claude1`, `~/.claude2` and `~/.claude3` in sandbox `allowWrite`.
+
+  A session on account N writes memory at `~/.claudeN/projects/…`.
+- `docs/as-built/shutdown-and-restart.md`: the config dir on the record and the restart rule.
+
+**Files:**
+
+- `scripts/production/add_unit.py`, `scripts/production/test_add_unit.py`.
+- `scripts/shutdown/inventory.py`, `record.py`, `restart.py` and their tests.
+- `scripts/delegate/remove_seats.py`.
+- `commands/showrunner/produce.md`, `settings.json`, `docs/as-built/shutdown-and-restart.md`.
+
+**Seats:** `2 writers + 1 tester` — `launch`: `add_unit.py`, `produce.md`, `settings.json`; `shutdown`: `inventory.py`, `record.py`, `restart.py`, `remove_seats.py`, the as-built.
+
+**Acceptance gate:**
+
+- Tests pass and basedpyright is clean.
+- `add_unit.py` with `--dry-run`, or the test harness, shows the prefix for a named unit account and none for the default.
+- `restart.py --dry-run` on a fixture record shows `CLAUDE_CONFIG_DIR` for a non-default entry.
+
+### Phase 4 — Quota with two active accounts  · status: todo
+
+#### Work Order
+
+**Goal:** the agent notes, alerts, `/whoami` and the nightly gate treat `~/.claude`'s account and the unit account as active together, and each alert names the account and its role.
+
+**Spec:**
+
+- **`agent_notes.update`** reads `claude_live` once for `~/.claude` and once per `~/.claudeN` that `accounts.check` passes. Each read runs with that dir's `CLAUDE_CONFIG_DIR` for `claude auth status` and with that dir's credentials.
+  - `state: active` is set for the default login and for the unit account; every other note is `inactive`.
+  - A spare dir's fresh reading is still written to its note and to `readings.jsonl`.
+  - `claude_live` and `claude_credentials` take an optional `config_dir`; with `None` they behave as today.
+- **`quota_alert`:**
+  - The first line names the label and role, for example `Quota alert: claude 3 (unit directors) at 4%`.
+  - A unit-account alert adds `swap: /accounts swap unit "<spare label with most remaining>"`, or `no spare account has more left` when none does.
+  - Recovery and acknowledgement are per account.
+- `docs/quota_alerts.md`: a notice for an account means that only sessions on that account start no new Claude work. The showrunner relays a unit-account notice to its units.
+- **`nightly_review.py`:** the quota gate reads the note of the account nightly runs on, which is `~/.claude`'s.
+- **`whoami.py`:** prints each active Claude account with its role. **`run_out.py`:** projects each active account.
+- **`accounts.py burn --since <ISO> [--until]`:** per account, the points spent per day from `readings.jsonl`. Each account is labelled with the role it served, from `roles.jsonl` plus `~/.claude`'s login. A weekly reset inside the window counts as a new span, not as negative spend. This is what Phase 7 reads.
+
+**Files:**
+
+- `scripts/whoami/agent_accounts.py`, `agent_notes.py`, `quota_alert.py`, `whoami.py`, `run_out.py` and their tests.
+- `scripts/nightly_review/nightly_review.py`.
+- `scripts/accounts/accounts.py` and `test_accounts.py` (`burn`).
+- `docs/quota_alerts.md`.
+
+**Seats:** `2 writers + 1 tester` — `notes`: `agent_accounts.py`, `agent_notes.py`, `nightly_review.py`, `run_out.py`, `whoami.py`; `alerts`: `quota_alert.py`, `docs/quota_alerts.md`, `accounts.py burn`.
+
+**Acceptance gate:**
+
+- Tests pass and basedpyright is clean.
+- With a fixture of two logged-in dirs, `update` marks both active and writes two readings.
+
+### Phase 5 — One-command swap of the unit account  · status: todo
+
+#### Work Order
+
+**Goal:** `/accounts swap unit "claude N"` moves every unit director onto account N: each one reaches a safe stop and resumes in place on N.
+
+**Spec:**
+
+- **`accounts.py swap unit <label>`** refuses when:
+  - the target fails `check`
+  - the target is `~/.claude`'s login
+  - the target is already the unit account
+  - the current unit account holds a session that is not a unit (from `shutdown.py status <old> --json`)
+
+  Otherwise it runs `set-role unit <label>`, then `shutdown.py down <old label> --restart`. It prints the shutdown's output and `units come back on <label> when <old> is down`.
+- **`shutdown.py down --restart`** stores `then: restart` on the record. When `conduct` ends a stop in `down`, it runs `restart` for that account. Units relaunch through `add_unit.py` on the new role (Phase 3). A `stop partial` does not restart; the user is alerted as today.
+- **The requester.** `swap` runs from a session on another account, so the requester is not in the stopped inventory. `down` must not wait for that requester's `ready`. Test this.
+- **`commands/accounts.md`** — `/accounts [status | setup "claude N" | swap unit "claude N"]`. It runs the matching verb and shows its output unchanged. It states that switching the default account remains `/login` in a `~/.claude` session.
+- `docs/as-built/shutdown-and-restart.md`: `--restart`.
+
+**Files:** `scripts/accounts/accounts.py`, `test_accounts.py`; `scripts/shutdown/shutdown.py`, `record.py` and tests; `commands/accounts.md`; `docs/as-built/shutdown-and-restart.md`.
+
+**Seats:** `1 writer + 1 tester`.
+
+**Acceptance gate:**
+
+- Tests pass and basedpyright is clean.
+- `swap --dry-run` prints the role write and the `down … --restart` argv.
+
+### Phase 6 — Cutover  · status: todo · gated by G2
+
+#### Work Order
+
+**Goal:** units run on the chosen unit account, showrunners on `~/.claude`'s account, and every spare dir is logged in.
+
+**Spec (director with the user):**
+
+1. `accounts.py setup` for each account the user has, except the one `~/.claude` is logged in to. The Phase 2 dir already exists.
+2. The user logs in each new dir (G2).
+3. `accounts.py status`: every dir passes `check`.
+4. `accounts.py set-role unit "<label>"`. Running units move with `/accounts swap unit "<label>"`: units already running on `~/.claude` are moved by `/shutdown` of the default account's units only, using `shutdown.py down <default> --only <unit session ids> --restart`. Units launched after this point start on the unit account.
+5. Confirm each unit's status line label and `shutdown.py status "<label>"`. Confirm the showrunner reaches each unit by message.
+6. Record the cutover time T0 here.
+
+**Acceptance gate:** every unit director's process shows the unit account (`account.py --pid`), and every showrunner and top-level session shows `~/.claude`'s.
+
+### Phase 7 — One-week readout  · status: todo · gated by G3
+
+#### Work Order
+
+**Goal:** answer the user's question with a week of data: did the showrunner account last the week, and how many unit swaps did it take?
+
+**Spec:** run `accounts.py burn --since <T0> --until <T0 + 7 d>`. Report to the showrunner:
+
+- points per account per day
+- the role split
+- each swap's time
+- whether the default account went below `threshold_percent`
+
+Recommend whether any change is needed, for example moving the nightly review to the unit role.
+
+**Acceptance gate:** the readout is in this plan and has been sent to the showrunner.
