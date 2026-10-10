@@ -19,7 +19,7 @@ message_arrived(
 ) -> HookReply
 ```
 
-`PromptSource` is `TYPED`, `PEER`, `SCHEDULED` or `NOTICE`. Every typed prompt pauses its own session. A peer message also pauses a unit director, but not a showrunner, whose routine unit traffic would otherwise keep dailies off. Scheduled prompts, notifier senders, task notices and system reminders do not pause anything. The Stop hook records `session_crons[].prompt`; the prompt hook recognizes the next scheduled prompt by exact text or its recorded clipped prefix. These records expire after `SCHEDULED_PROMPT_RETENTION_SECONDS`, eight days.
+`PromptSource` is `TYPED`, `PEER`, `SCHEDULED` or `NOTICE`. Every typed prompt pauses its own session. A peer message also pauses a unit director, but not a showrunner, whose routine unit traffic would otherwise keep dailies off. Scheduled prompts, notifier senders, task notices and system reminders do not pause anything; `JOB_SENDERS` includes `shutdown`, so `/shutdown` messages never pause a session. `/shutdown restart` and `add_unit.py` record a restored session's first prompt with `record_scheduled_prompts` before launch, so it is read as scheduled. The Stop hook records `session_crons[].prompt`; the prompt hook recognizes the next scheduled prompt by exact text or its recorded clipped prefix. These records expire after `SCHEDULED_PROMPT_RETENTION_SECONDS`, eight days.
 
 `scripts/hooks/user-prompt-submit-conversation-pause.py` classifies the prompt, stamps typed activity through `escalate.typed()`, and calls `message_arrived`. `scripts/hooks/stop-conversation-pause.py` calls:
 
@@ -39,6 +39,8 @@ PauseRecord(
     phase: PausePhase,
 )
 ```
+
+`release(session_id) -> PauseRecord | NoPauseRecord` deletes a session's record under `record_lock()` and returns it without resuming anything; `/shutdown` calls it so the tick does not restore a stopped session's instances, and records what the pause had switched off itself.
 
 `PausePhase` is `Replying | Quiet | QuestionPending | Asked | KeptOff | Returned`. `Asked` contains `QuestionNotRead | QuestionRead(replies_ended)`. The record lists only notifier instances and footers that this pause switched off.
 
@@ -108,7 +110,7 @@ scripts/message/send.py --to user \
 
 `send.py` owns the user channel and maps `note`, `decision` and `blocked` to priorities 0, 1 and 2. Callers do not invoke `scripts/notify/pushover.py` themselves. On the Mac they add `--machine natedev`.
 
-The direct Python callers are `ci_points.review_watch` with `--need decision`, `rust_release.send_release_text(title, message)` with `--need note`, and the phone branch of `sweep.send_floor_alert` with `--need note`. The showrunner, build-report and fix instructions use the same command.
+The direct Python callers are `ci_points.review_watch` with `--need decision`, `rust_release.send_release_text(title, message)` with `--need note`, the phone branch of `sweep.send_floor_alert` with `--need note`, and `settle.alert_user` (the only phone path in `scripts/shutdown/`) with `--need decision`. The showrunner, build-report and fix instructions use the same command.
 
 ## Invariants
 

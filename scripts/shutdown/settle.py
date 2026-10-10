@@ -189,7 +189,7 @@ RemoteStopClaimOutcome = RemoteStopClaimed | RemoteStopClaimFailed
 
 
 def now_utc() -> datetime:
-    """Return canonical wall time; tests replace this one clock seam."""
+    """Return canonical wall time; tests patch this one function to fix the clock."""
     return datetime.now(timezone.utc).replace(microsecond=0)
 
 

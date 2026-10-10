@@ -23,6 +23,7 @@ The session notifier sends a message to a live Claude session on a schedule: the
 | `scripts/production/update_registration.py` | `register` writes `PROMPT_FILE`, creates or retargets the showrunner instance, and creates the `stall-watch` and `tmux-names` run-only instances when absent. |
 | `scripts/production/dailies_input.py` | `--user-run` restarts the showrunner instance for a dailies the user runs. |
 | `scripts/production/production_lifecycle.py` | `wrap` removes the showrunner instance. |
+| `scripts/shutdown/settle.py`, `scripts/shutdown/restart.py` | `/shutdown` runs `stop` on each enabled instance targeting a session it stops; `/shutdown cancel` and `/shutdown restart` run `start` on those. Never `remove`. |
 | `commands/showrunner/{produce,dailies,interval}.md` | Call those commands; `/showrunner:interval` retimes the showrunner instance. |
 | `commands/unit/direct.md` `<ProgressContract>`, `commands/unit/report.md`, `commands/unit/interval.md` | How a unit treats its ticks, and `/unit:interval`. |
 | `config/delegate.conf` | `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS`, the unit interval. |
