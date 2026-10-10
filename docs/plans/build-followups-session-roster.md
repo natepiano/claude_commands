@@ -56,26 +56,29 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 - **The message-to-user gate is a required field, not a model's reading** (Phase 2). Every send names its action with `--action` or says `--no-action`, and `pushover.py` refuses one that does neither. A field cannot be skipped by accident, costs no time, and never fails open the way a model call that times out would; tests check it without a network. The sender writes the action because only the sender knows it. One-phase revert to a model review if the user wants judgment on the wording too.
 - **The refusal runs right after Phase 3** (2026-10-10). natedev's generation 206 (`/etc/nixos` 9ef892a) passes `--action` or `--no-action` from `ups.nix` and `disk-floor.nix`, checked against the running system, so the phase that refuses a message with no action stated moved up from last to Phase 4, per its own resequence rule. Packaging only; one-line revert.
 - **Live checks never message a real session.** They use scratch recipients only: a scratch background Claude session, a scratch mesh thread in a scratch session directory, and a scratch daemon thread. All are removed after the check. Listing real sessions is read-only and allowed.
+- **Shutdown tests can never reach the user's phone** (2026-10-10). The user approved a guard after two fixture alerts reached their phone from a test whose fake had gone stale; it runs as Phase 6, right after the process-table move.
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills and scripts. This plan adds the session roster (Phase 1), a gate that makes every message to the user say what the user does (Phase 2), sends to any roster address or name (Phase 3), refuses a message to the user that states no action (Phase 4), moves the process table into its own module (Phase 5), sends to roster groups (Phase 6), covers both machines (Phase 7), and teaches Claude and Codex sessions which tool to use (Phase 8). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-shutdown` on branch `build-followups-shutdown` (unit `shutdown-unit` of production `build-followups`).
+- **Project:** `~/.claude` — Claude Code commands, skills and scripts. This plan adds the session roster (Phase 1), a gate that makes every message to the user say what the user does (Phase 2), sends to any roster address or name (Phase 3), refuses a message to the user that states no action (Phase 4), moves the process table into its own module (Phase 5), makes a shutdown test that reaches a real send fail instead of sending (Phase 6), sends to roster groups (Phase 7), covers both machines (Phase 8), and teaches Claude and Codex sessions which tool to use (Phase 9). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-shutdown` on branch `build-followups-shutdown` (unit `shutdown-unit` of production `build-followups`).
 - **Project started:** 2026-10-10T16:30:07.804+00:00
 - **Stack:** Python 3.13 standard library only; bash, zsh; codex-cli 0.162.0 (daemon 0.162.1).
 - **Layout:**
-  - `scripts/message/roster.py` — the roster (new, Phase 1; unique addresses Phase 3; both machines Phase 7)
+  - `scripts/message/roster.py` — the roster (new, Phase 1; unique addresses Phase 3; both machines Phase 8)
   - `scripts/message/process_table.py` — the process table the roster, `broadcast.py` and wind-down read (Phase 5)
   - `scripts/message/codex_daemon.py` — reads the shared Codex daemon's live sessions; queues to one (new, Phase 1; queue Phase 3)
   - `scripts/notify/pushover.py`, `scripts/notify/user_action.py` — the message-to-user gate and its action types (Phase 2; refusal Phase 4)
-  - `scripts/message/send.py` — `--action` / `--no-action` for the user (Phase 2); any roster address or name (Phase 3); the other machine (Phase 7)
-  - `scripts/production/broadcast.py` — groups from the roster (Phase 6); both machines (Phase 7)
-  - `commands/message.md`, `commands/announce.md`, `commands/unit/announce.md`, `commands/showrunner/announce.md`, `commands/notify_top_level.md`, `codex/AGENTS-messaging.md`, `scripts/message/install_codex_agents.py` — instructions (Phase 8)
+  - `scripts/message/send.py` — `--action` / `--no-action` for the user (Phase 2); any roster address or name (Phase 3); the other machine (Phase 8)
+  - `scripts/production/broadcast.py` — groups from the roster (Phase 7); both machines (Phase 8)
+  - `scripts/shutdown/test_support.py` — the base every shutdown test derives from; stubs every real send leaf (new, Phase 6)
+  - `commands/message.md`, `commands/announce.md`, `commands/unit/announce.md`, `commands/showrunner/announce.md`, `commands/notify_top_level.md`, `codex/AGENTS-messaging.md`, `scripts/message/install_codex_agents.py` — instructions (Phase 9)
 - **Key files (read, never edited here):** `scripts/agents/codex_mesh.py` (model-study: roster format, `send`), `scripts/delegate/remove_seats.py` (`live_runs`, `LIVE_HEARTBEAT_SECS`, the `seats` ledger), `scripts/delegate/prepare_session.sh` (the run marker), `scripts/production/showrunners.py`, `scripts/production/live_units.py`, `scripts/production/unit_lookup.py`, `scripts/shutdown/remote.py` (`other_machine`).
 - **Test lanes:** `scripts/message/test_*.py`, `scripts/production/test_*.py`, `scripts/notify/test_*.py`, `scripts/shutdown/test_*.py`.
 - **Test:** `python3 -m unittest discover -s scripts/message -p 'test_*.py'`; `python3 -m unittest discover -s scripts/production -p 'test_broadcast.py'`.
 - **Lint:** `basedpyright scripts/message` and `basedpyright scripts/production` report 0 errors, 0 warnings, 0 notes (exit 3 is the missing `.venv` notice and expected); `bash -n` on changed shell scripts.
 - **Invariants:**
   - Tests are hermetic. They use temp directories for sessions, the delegate root and the notifier state, fake `tmux`, `ps`, `ssh` and `codex`, and a fake daemon socket. They never reach the real daemon, a real session, `send.py`'s relay, `pushover.py` or the other machine.
+  - From Phase 6, every shutdown `TestCase` derives from `test_support.ShutdownTestCase`, which fails a test that reaches a real send leaf.
   - Everything an agent reads in the roster is plain words. No pids or ports in the text form; the `--json` form carries what a script needs.
   - A source that cannot be read becomes one line on stderr naming it, and the rest of the roster still prints.
 
@@ -186,7 +189,7 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 **Gotchas:** A caller with no keys and no action flag gets the action refusal, not `keys missing`.
 
-### Phase 5 — Process listing gets its own module · status: todo
+### Phase 5 — Process listing gets its own module · status: done
 
 #### Work Order
 
@@ -224,7 +227,61 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 **Acceptance gate:** the Test and Lint lines green, `python3 -m unittest discover -s scripts/production -p 'test_codex_winddown.py'` included. `grep -n "import broadcast" scripts/message/roster.py` prints nothing. Live read-only: `roster.py` lists the same sessions as before the phase.
 
-### Phase 6 — `broadcast.py` takes its groups from the roster · status: todo
+### Phase 6 — A shutdown test that reaches the real sender fails instead of sending · status: todo
+
+#### Work Order
+
+**Goal:** a shutdown test whose fake has gone stale fails, naming the real send leaf it reached and the recipient, and nothing reaches a session, the other machine or the user's phone.
+
+**Spec:**
+- **Why (fact).** 2026-10-10 11:43 PDT: a seat split the shutdown sender and ran `scripts/shutdown/test_stop.py` before updating its patches. Two tests still faking the old sender reached the real path (`settle.alert_user` → `settle._deliver_message` → a `send.py --to user` subprocess → Pushover) and posted their fixture alerts ("claude 2: stop partial") to the user's phone. Each test fakes its own send, and nothing catches a fake that has gone stale.
+- **The real send leaves in `scripts/shutdown/*.py`**, each the last call before a process that delivers to a session, the other machine or the user. Each stub names the leaf and the recipient shown here:
+  - `settle._deliver_message(command, recipient, text)` — runs `send.py` (`settle._send_command()`: `SHUTDOWN_SEND`, else `scripts/message/send.py`). `settle.send_message` (sessions, `--machine` included) and `settle.alert_user` (`--to user`, ending in `pushover.py`) both end here, and `restart._send_restart_note` and `restart.py`'s "is not fully back" alert reach it through them. Recipient: `recipient`.
+  - `settle._retire_shutdown_messages(login, session_id)` — runs `send.py retire --to session:<id>` (`settle.retire_command`). Recipient: `session:<session_id>`.
+  - `restart._retire(record, entry, *, dry_run)` — runs the same `send.py retire` through `restart._run`. Recipient: `session:<entry["session"]["session_id"]>`. A dry run only prints the command, so the stub passes `dry_run=True` through to the real function.
+  - `remote.run_remote(args, stdin="", limit=STANDARD_TIME_LIMIT)` — runs `shutdown.py <args>` on `remote.other_machine()` over ssh, where that machine's own leaves send. `settle`, `restart` and `shutdown` import it by name, so the stub replaces all four bindings: `remote.run_remote`, `settle.run_remote`, `restart.run_remote`, `shutdown.run_remote`. Recipient: `<other machine>: shutdown.py <args>`.
+  - `settle._launch_conductor(login, label, here)` — starts a detached `shutdown.py conduct <login>` under `systemd-run --user` or `launchctl submit`, which messages sessions and alerts the user outside the test process, where no stub reaches. Recipient: `conductor for <login>`.
+  - Not leaves: `settle.run_notifier` (turns a timer on or off; sends nothing itself), `stop.py`'s `systemctl` / `launchctl` / `tmux kill-session` / `codex_mesh.py stop` and signals (they end sessions), `restart._add_unit_command` and the session launches in `restart._run` (they start sessions), and the read-only `git`, `ps`, `tmux capture-pane` and `github-warm-status` probes.
+- **`scripts/shutdown/test_support.py`** (new, standard library only) defines `class ShutdownTestCase(unittest.TestCase)`:
+  - `setUp` replaces every leaf above with a stub. A reached stub raises `AssertionError("shutdown test reached real send leaf <leaf> for <recipient>; fake the step above it, or allow_leaf(\"<leaf>\") and fake the subprocess beneath it")`, so nothing starts, and records the hit. A cleanup registered in `setUp` fails the test for any recorded hit, so a caller that catches the error (`settle.py` wraps `alert_user` and `stop_work.stop` in `except Exception`) still fails the test.
+  - `allow_leaf(leaf: str) -> None` restores the real function for that leaf for the rest of the test, by the dotted name listed above (`"remote.run_remote"` restores all four bindings). An unknown name raises `ValueError` listing the known leaves. Called in a subclass's `setUp` after `super().setUp()`, it covers that class; called in a test body, that test.
+  - A test that patches a leaf itself (`patch.object(settle, "_deliver_message", ...)`) replaces the stub for that patch's span and needs no `allow_leaf`.
+  - `discover` imports `test_support.py` as a test module; `ShutdownTestCase` has no `test_*` methods, so it adds no tests.
+- **Every `TestCase` in `scripts/shutdown/test_*.py` derives from `ShutdownTestCase`**, and each `setUp` calls `super().setUp()` first: `InventoryTests` and `DarwinProcessStartTests` (`test_inventory.py`), `RecordTests`, `RemoteTests`, `RestartTests`, `SettleTests`, `ShutdownLaunchCliTests`, `ShutdownStatusTests`, `StopTests`.
+  - A test that exercises a leaf on purpose calls `allow_leaf` and fakes the subprocess beneath: `RemoteTests` allows `remote.run_remote` (its fake `ssh` on `PATH`); `SettleTests` allows `settle._deliver_message` and `settle._retire_shutdown_messages` (the `SHUTDOWN_SEND` stub script its `setUp` sets); `RestartTests` allows `restart._retire` only in the tests that record `retire` commands through a `restart._run` fake.
+  - A test the guard fails has a stale fake: it gets a fake of the step it meant to fake, or `allow_leaf` with the subprocess beneath faked. No test is deleted, skipped or weakened.
+  - `test_shutdown_cli.py`'s child processes (`shutdown.py launch-blocked`, `launch_permission.py exec-new-work`) run outside the guard; neither reaches a leaf.
+- **Proof test** `scripts/shutdown/test_send_guard.py` (new). Each case defines its `ShutdownTestCase` subclass inside the test method (a module-level one would be discovered and run on its own), runs it into a `unittest.TestResult()`, and asserts on the result. The failing cases patch `subprocess.run` and `subprocess.Popen` to record calls and assert there are none.
+  - `settle.alert_user(record.AllAccountSessions(kind="all account sessions"), "summary", "text", ActionRequired("act"))` with no fake: one failure whose message names `settle._deliver_message` and `user`; no subprocess call. `alert_user` returns before sending for a `selected` scope, so the account-wide scope is the one that reaches the leaf.
+  - The same call inside `try: … except Exception: pass` still fails the test.
+  - `settle.send_message("session:x", …)` and `settle._retire_shutdown_messages(login, "x")` each fail naming `session:x`; each of `remote.run_remote`, `settle.run_remote`, `restart.run_remote` and `shutdown.run_remote` fails naming the other machine; `settle._launch_conductor` fails naming the login; `restart._retire(…, dry_run=False)` fails and `dry_run=True` passes.
+  - `allow_leaf("settle._deliver_message")` with `SHUTDOWN_SEND` pointed at a script that records its arguments: the call reaches the script and the case passes.
+  - `allow_leaf("no.such_leaf")` raises `ValueError`.
+
+**Files:**
+- `scripts/shutdown/test_support.py` — new: `ShutdownTestCase`, the leaf stubs, `allow_leaf`.
+- `scripts/shutdown/test_send_guard.py` — new: the proof test.
+- `scripts/shutdown/test_inventory.py`
+- `scripts/shutdown/test_record.py`
+- `scripts/shutdown/test_remote.py` — allows `remote.run_remote`.
+- `scripts/shutdown/test_restart.py` — allows `restart._retire` where it records `retire` through `restart._run`.
+- `scripts/shutdown/test_settle.py` — allows `settle._deliver_message` and `settle._retire_shutdown_messages` under its `SHUTDOWN_SEND` stub.
+- `scripts/shutdown/test_shutdown_cli.py`
+- `scripts/shutdown/test_shutdown_status.py`
+- `scripts/shutdown/test_stop.py`
+
+**Seats:** `1 writer + 1 tester`.
+- `impl` — `test_support.py` and the eight test-module conversions; hub: `test_support.py` (the base every shutdown test derives from).
+- `test` — `test_send_guard.py`, from the Spec alone.
+
+**Constraints from prior phases:**
+- Phase 3's `settle.alert_user(scope, summary, text, action: ActionRequired, *, machine="")` always passes `--action` (with `--need decision`) and returns without sending for a `selected` scope; `settle.send_message(recipient, summary, text, *, machine="", key="") -> MessageDelivery` refuses `user` with `ValueError`. Both build their command from `settle._send_command()` and run it in `settle._deliver_message`.
+- Phase 4's `pushover.py` refuses only a message with no action stated, so a real `alert_user` from a test is sent, not refused.
+- Phase 2: every `test_*.py` fakes the post or subprocess and never reads the real keys file.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` green, `test_send_guard.py` included. `basedpyright scripts/shutdown` reports 0 errors, 0 warnings, 0 notes (exit 3 is the missing `.venv` notice and expected). The line count of `~/.local/state/notify/pushover.jsonl` is the same before and after the suite run; a line another sender wrote in that window names itself in its `source`. Never read `~/.config/pushover/env`.
+
+### Phase 7 — `broadcast.py` takes its groups from the roster · status: todo
 
 #### Work Order
 
@@ -260,12 +317,12 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 **Constraints from prior phases:**
 - Phase 3's `RosterEntry`: `machine`, `kind`, `role`, `name`, `status`, `reach: Messageable | CannotReceiveMessages`, `cwd`, `showrunner: RunsProduction | UnderShowrunner | ProductionWithoutRunningShowrunner | NoShowrunner`, `director: DirectsUnit | UnderDirector | NoDirector`, `assignment: WorkerAssignment | NotAWorker`; `roster(environment) -> Roster` (`entries`, `problems`). Link addresses are `session:<id>`; match on the variants, never on flat JSON fields.
 - Phase 3's addresses: `session:<id>`, `seat:<run id>/<seat name>`, `codex:<thread id>`, each unique; `RosterEntry.reach: Messageable(address) | CannotReceiveMessages(reason)`; link states `UnderShowrunner | NoShowrunner`, `UnderDirector | NoDirector`, `WorkerAssignment | NotAWorker`; `send.py --to <address>` reaches each, and exits 2 for a `CannotReceiveMessages` name or an ambiguous name. `--action`/`--no-action` on a non-user send is a usage error (Phase 2).
-- Phase 5's `process_table` module: `roster.py` no longer imports `broadcast`, so `broadcast.py` may import `roster`. `codex_winddown.py` still uses `broadcast.send` and `broadcast.MESSAGE`, which stay.
+- Phase 5's `process_table` module: `roster.py` no longer imports `broadcast`, so `broadcast.py` may import `roster`. `codex_winddown.py` reads sessions through `sessions.live_sessions()` and still uses `broadcast.send`, `broadcast.MESSAGE`, and, for its announcement to every showrunner and unit director, `broadcast.broadcast(sender, {"showrunner": text, "unit director": text})` and `broadcast.report(deliveries)`. All four stay working; if a role key or either signature changes, `codex_winddown.py` and `test_codex_winddown.py` change with it in this phase.
 - `/notify_top_level` reads `top_level.py`'s `uds:` addresses and hands them to SendMessage.
 
 **Acceptance gate:** the Test and Lint lines green, `test_top_level.py` included. A live dry check (`BROADCAST_SEND` pointed at a script that records its arguments) lists the recipients for each flag on natedev, with no message sent, and each flag's list equals the rows `roster.py --json` gives for that group at that moment. A group with no members (no showrunner registered, for one) lists none and says so.
 
-### Phase 7 — Both machines · status: todo
+### Phase 8 — Both machines · status: todo
 
 #### Work Order
 
@@ -307,12 +364,12 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 **Constraints from prior phases:**
 - Phase 3's addresses (`session:<id>`, `seat:<run id>/<seat name>`, `codex:<thread id>`), `RosterEntry.reach`, and `send.py`'s resolution order and exit codes: 0 sent, 1 queued for a Claude session, 2 a usage error, an ambiguous name, a session that cannot take messages, or a refusal, 3 failed.
 - Phase 5's `process_table` module; `roster.py` does not import `broadcast`.
-- Phase 6's groups (`--showrunners`, `--units`, `--agents`, `--workers` with `--of`, `--top-level`, `--all`), membership by `UnderDirector` / `UnderShowrunner` addresses, the sender left out by `session:` identity, roster problems printed while the rest sends, and `top_level.py`'s `<name>\tuds:<socket path>` lines.
+- Phase 7's groups (`--showrunners`, `--units`, `--agents`, `--workers` with `--of`, `--top-level`, `--all`), membership by `UnderDirector` / `UnderShowrunner` addresses, the sender left out by `session:` identity, roster problems printed while the rest sends, and `top_level.py`'s `<name>\tuds:<socket path>` lines.
 - `scripts/shutdown/remote.py` `other_machine()` maps `natedev` and `mac` to each other.
 
 **Acceptance gate:** the Test and Lint lines green. Live: `roster.py` on natedev lists the Mac's sessions; `roster.py --here` on the Mac exits 0 or 1 with no ssh. `broadcast.py`'s dry check copies a recorder that records its arguments to the same scratch path on both machines and sets `BROADCAST_SEND` to it; both recorders capture their machine's recipients, each recipient once across the two, no message is sent, and the closing line names both machines. One scratch background Claude session on the Mac receives `send.py --to <its name>` from natedev and is then removed.
 
-### Phase 8 — Claude and Codex sessions know which tool to use · status: todo
+### Phase 9 — Claude and Codex sessions know which tool to use · status: todo
 
 #### Work Order
 
@@ -326,7 +383,7 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
   - `broadcast.py` and its groups for many at once.
 
   The Sending bullet's `--codex --session-dir` wording becomes "by its `seat:` address or seat name". The section also says what each refusal means and what to do, in the same words as `codex/AGENTS-messaging.md` below.
-- `commands/announce.md`, `commands/unit/announce.md` and `commands/showrunner/announce.md` say the message reaches both machines and Codex workers. `commands/notify_top_level.md` keeps its steps and its `uds:` wording; Phase 6 kept `top_level.py`'s output.
+- `commands/announce.md`, `commands/unit/announce.md` and `commands/showrunner/announce.md` say the message reaches both machines and Codex workers. `commands/notify_top_level.md` keeps its steps and its `uds:` wording; Phase 7 kept `top_level.py`'s output.
 - `codex/AGENTS-messaging.md` (new, in this repo) is the Codex text, short:
   - list every session with `~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py`;
   - message one with `send.py --to <address> --from <your session name>`, a group with `broadcast.py`;

@@ -19,15 +19,17 @@ import time
 from collections import Counter
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Final, Literal, cast
 from zoneinfo import ZoneInfo
 
 import broadcast
+import process_table
 import showrunners
 from live_units import live_unit_names
-from sessions import SessionRecord
+from sessions import SessionRecord, live_sessions
 
 NOTIFIER = Path(os.environ.get("CODEX_WINDDOWN_NOTIFIER") or broadcast.MESSAGE / "notifier.sh")
 STATE = Path(os.environ.get("CODEX_WINDDOWN_STATE") or Path.home() / ".local/state/codex-winddown")
@@ -40,9 +42,24 @@ UNMEASURED: Final = "unmeasured"
 USAGE = ("usage: codex_winddown.py status | count <showrunner session> | eta <unit session> <minutes|unmeasured>"
          + " | (start | triage | clear) --from <your session>")
 
-# A unit's answer to "when does your last Codex agent finish": None while the
-# answer is owed, UNMEASURED, or the finish time as an epoch.
-Projection = float | Literal["unmeasured"] | None
+
+@dataclass(frozen=True)
+class CompletionExpectedAt:
+    epoch_seconds: float
+
+
+@dataclass(frozen=True)
+class CompletionUnmeasured:
+    """The unit cannot estimate when its last Codex agent will finish."""
+
+
+@dataclass(frozen=True)
+class ProjectionAnswerOwed:
+    """The unit has been asked for a completion projection but has not answered."""
+
+
+Projection = CompletionExpectedAt | CompletionUnmeasured | ProjectionAnswerOwed
+_StoredProjection = float | Literal["unmeasured"] | None
 
 WIND_DOWN = (
     "Codex wind-down, from the user (/codex_winddown start in {sender}, {time}): let every running"
@@ -89,9 +106,13 @@ UNIT_CLEAR = (
 )
 
 
-def owner(process: broadcast.Process, table: Mapping[int, broadcast.Process], names: Mapping[int, str]) -> str:
+def owner(
+    process: process_table.Process,
+    table: Mapping[int, process_table.Process],
+    names: Mapping[int, str],
+) -> str:
     seen: set[int] = set()
-    current: broadcast.Process | None = process
+    current: process_table.Process | None = process
     while current is not None and current.pid not in seen:
         if current.pid in names:
             return names[current.pid]
@@ -100,14 +121,14 @@ def owner(process: broadcast.Process, table: Mapping[int, broadcast.Process], na
     return NO_SESSION
 
 
-def agent_counts(table: Mapping[int, broadcast.Process], names: Mapping[int, str]) -> Counter[str]:
+def agent_counts(table: Mapping[int, process_table.Process], names: Mapping[int, str]) -> Counter[str]:
     return Counter(owner(process, table, names) for process in table.values()
-                   if broadcast.is_codex_agent(process))
+                   if process_table.is_codex_agent(process))
 
 
 def current_counts() -> Counter[str]:
-    names = {record["pid"]: name for name, record in broadcast.live_sessions().items()}
-    return agent_counts(broadcast.processes(), names)
+    names = {record["pid"]: record["name"] for record in live_sessions() if record["name"]}
+    return agent_counts(process_table.snapshot(), names)
 
 
 def listed(session: str, units: list[str], counts: Mapping[str, int]) -> dict[str, int]:
@@ -126,12 +147,22 @@ def read_projections() -> dict[str, Projection]:
     kept: dict[str, Projection] = {}
     for unit, answer in (cast(dict[str, object], raw) if isinstance(raw, dict) else {}).items():
         if answer is None:
-            kept[unit] = None
+            kept[unit] = ProjectionAnswerOwed()
         elif answer == UNMEASURED:
-            kept[unit] = UNMEASURED
+            kept[unit] = CompletionUnmeasured()
         elif isinstance(answer, (int, float)) and not isinstance(answer, bool):
-            kept[unit] = float(answer)
+            kept[unit] = CompletionExpectedAt(float(answer))
     return kept
+
+
+def _stored_projection(projection: Projection) -> _StoredProjection:
+    match projection:
+        case CompletionExpectedAt(epoch_seconds):
+            return epoch_seconds
+        case CompletionUnmeasured():
+            return UNMEASURED
+        case ProjectionAnswerOwed():
+            return None
 
 
 @contextmanager
@@ -143,20 +174,24 @@ def projections() -> Generator[dict[str, Projection]]:
         held = read_projections()
         yield held
         temporary = STATE / f"{PROJECTIONS}.tmp"
-        _ = temporary.write_text(json.dumps(held), encoding="utf-8")
+        stored = {unit: _stored_projection(projection) for unit, projection in held.items()}
+        _ = temporary.write_text(json.dumps(stored), encoding="utf-8")
         _ = temporary.replace(STATE / PROJECTIONS)
 
 
 def projected(unit: str, held: Mapping[str, Projection], now: float) -> str:
     if unit not in held:
         return "ETA Unmeasured"
-    answer = held[unit]
-    if answer is None:
-        return "asked, answer owed"
-    if isinstance(answer, str) or answer <= now:
-        return "ETA Unmeasured"
-    minutes = math.ceil((answer - now) / 60)
-    return f"likely finishes in {minutes} minute{'' if minutes == 1 else 's'}"
+    match held[unit]:
+        case ProjectionAnswerOwed():
+            return "asked, answer owed"
+        case CompletionUnmeasured():
+            return "ETA Unmeasured"
+        case CompletionExpectedAt(epoch_seconds) if epoch_seconds <= now:
+            return "ETA Unmeasured"
+        case CompletionExpectedAt(epoch_seconds):
+            minutes = math.ceil((epoch_seconds - now) / 60)
+            return f"likely finishes in {minutes} minute{'' if minutes == 1 else 's'}"
 
 
 def render(heading: str, rows: Mapping[str, int], held: Mapping[str, Projection], now: float) -> str:
@@ -170,8 +205,13 @@ def clock(zone: str) -> str:
 
 
 def needs_asking(unit: str, held: Mapping[str, Projection], now: float) -> bool:
-    answer = held.get(unit, 0.0)
-    return isinstance(answer, float) and answer <= now
+    if unit not in held:
+        return True
+    match held[unit]:
+        case CompletionExpectedAt(epoch_seconds):
+            return epoch_seconds <= now
+        case CompletionUnmeasured() | ProjectionAnswerOwed():
+            return False
 
 
 def ask(showrunner: str, unit: str, agents: int) -> bool:
@@ -188,7 +228,8 @@ def refresh(showrunner: str, units: list[str], rows: Mapping[str, int], now: flo
         finished = [unit for unit in units if not rows[unit] and unit in saved]
         for unit in finished:
             del saved[unit]
-        saved.update(dict.fromkeys(asked))
+        for unit in asked:
+            saved[unit] = ProjectionAnswerOwed()
         current = dict(saved)
     for unit in finished:
         _ = broadcast.send(unit, showrunner, AT_ZERO.format(showrunner=showrunner))
@@ -232,7 +273,11 @@ def record_eta(unit: str, answer: str) -> int:
         print(USAGE, file=sys.stderr)
         return 2
     with projections() as held:
-        held[unit] = UNMEASURED if answer == UNMEASURED else time.time() + 60 * int(answer)
+        held[unit] = (
+            CompletionUnmeasured()
+            if answer == UNMEASURED
+            else CompletionExpectedAt(time.time() + 60 * int(answer))
+        )
     print(f"{unit}: recorded")
     return 0
 
@@ -280,7 +325,10 @@ def start(sender: str) -> int:
     for name in (PROJECTIONS, QUIET):
         (STATE / name).unlink(missing_ok=True)
     every = announce(sender, WIND_DOWN, UNIT_WIND_DOWN)
-    live = broadcast.live_sessions()
+    live: dict[str, SessionRecord] = {}
+    for record in live_sessions():
+        if record["name"]:
+            _ = live.setdefault(record["name"], record)
     for runner in showrunners.registered_showrunners():
         if runner["session"] in live:
             counting = start_count(live[runner["session"]])

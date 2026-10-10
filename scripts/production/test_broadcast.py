@@ -76,7 +76,7 @@ class BroadcastTests(unittest.TestCase):
             **os.environ, "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json"),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"), "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "BROADCAST_SEND": str(self.root / "send.py"), "LOG": str(self.root / "log"), "TOGETHER": "2",
-            "BROADCAST_PS": f"cat {self.root / 'ps'}",
+            "PROCESS_TABLE_PS": f"cat {self.root / 'ps'}",
             "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
             "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
         }

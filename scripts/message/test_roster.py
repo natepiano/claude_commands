@@ -22,8 +22,8 @@ SCRIPTS = Path(__file__).parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
 sys.path.insert(0, str(SCRIPTS / "delegate"))
 
-import broadcast
 import codex_daemon
+import process_table
 import remove_seats
 import roster
 import showrunners
@@ -118,7 +118,7 @@ class RosterTests(unittest.TestCase):
             return_value={"kind": "held sessions", "session_ids": set()},
         ))
         _ = self.enterContext(mock.patch.object(
-            broadcast, "PS", ["ps", "-eo", "pid=,ppid=,comm=,args="],
+            process_table, "PS", ["ps", "-eo", "pid=,ppid=,comm=,args="],
         ))
         self._build_complete_roster()
 
@@ -775,7 +775,7 @@ class RosterTests(unittest.TestCase):
 
     def test_unreadable_process_table_is_a_problem_not_a_crash(self) -> None:
         failure = subprocess.CalledProcessError(2, ["ps"])
-        with mock.patch.object(broadcast, "processes", side_effect=failure), \
+        with mock.patch.object(process_table, "snapshot", side_effect=failure), \
                 mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
             found = roster.roster(os.environ)
         self.assertTrue(found.entries)
