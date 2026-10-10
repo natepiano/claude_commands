@@ -203,54 +203,34 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 ### Phase 2 — Units launch, resume and restart on the unit account  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a unit director runs on the account `config/accounts.json` names for `unit`, on every path that starts one; any other session relaunches on the dir it ran in.
-
-**Constraints from prior phases:** Phase 1 shipped `scripts/accounts/accounts.py`. Every path comes from `Path.home()` at call time; there is no `ACCOUNTS_HOME`, and tests set `HOME` to a temp dir. `check(label) -> list[str]` returns every problem, empty when the account is fit, and already refuses an account dir that is a symlink and any symlinked identity file (`.credentials.json`, `.claude.json`, `account-label`). `role_account("unit") -> DefaultAccount | NamedAccount(label, dir)`, `launch_prefix("unit") -> str` (empty for the default account) and `main(argv) -> int`. Other scripts import it as `accounts.py` imports whoami: put the repo root on `sys.path`, then `from scripts.accounts import accounts`.
-
-**Spec:**
-
-- `add_unit.py launch_session`:
-  - The command string becomes `<accounts.launch_prefix("unit")>ENABLE_TOOL_SEARCH=true command claude …`. The prefix goes in the string so tmux passes it whatever its server's environment.
-  - Before `launch_permission`, a named unit account must pass `accounts.check`. Otherwise refuse with exit 2: `add_unit: unit account <label>: <first problem>; /accounts status`.
-  - `launch_environment` keeps stripping `CLAUDE_*`.
-- `commands/showrunner/produce.md` 235-237: the manual unit resume puts the output of `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py env unit` before `claude --resume`.
-- **shutdown:**
-  - Inventory records each session's config dir as `process_config_dir(pid)`, rendered as a string, absent meaning `~/.claude`, in a new `config_dir` field of the entry in `record.py`.
-  - `restart.py` puts `CLAUDE_CONFIG_DIR=<dir> ` before `ENABLE_TOOL_SEARCH=true` for a non-unit entry whose recorded dir is not `~/.claude`.
-  - Units keep relaunching through `add_unit.py`, which applies the current role. That is how a swap moves them.
-  - `remove_seats.py`, and the shutdown path that ends Claude seats, runs `claude agents` and `claude rm` with the owning session's `CLAUDE_CONFIG_DIR`.
-- `settings.json` (a change to `~/.claude/settings.json` reaches main only with the user's go: the checkpoint notice names it):
-  - `Edit(~/.claude1/**)`, `Edit(~/.claude2/**)` and `Edit(~/.claude3/**)` beside `Edit(~/.claude/**)`.
-  - `~/.claude1`, `~/.claude2` and `~/.claude3` in sandbox `allowWrite`.
-
-  A session on account N writes memory at `~/.claudeN/projects/…`.
-- `docs/as-built/shutdown-and-restart.md`: the config dir on the record and the restart rule.
+- `scripts/production/add_unit.py` resolves `accounts.role_account("unit")` once per launch and passes the selection to `launch_session`. A named account must pass `accounts.check(label)`, else exit 2: `add_unit: unit account <label>: <first problem>; /accounts status`. The launch guard (`launch_permission`) runs with `CLAUDE_CONFIG_DIR` set to that account's dir; `launch_environment` strips `CLAUDE_*`. The tmux command string is `accounts.account_prefix(selected) + "ENABLE_TOOL_SEARCH=true command claude …"`, so tmux passes the prefix whatever its server's environment. With no `config/accounts.json` the prefix is empty and the guard env is unchanged.
+- `accounts.account_prefix(selected: AccountSelection) -> str` renders the env prefix for a selection (empty for the default account); `launch_prefix(role)` is `account_prefix(role_account(role))`.
+- The manual unit resume in `commands/showrunner/produce.md` runs `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py env unit` first, stops on a nonzero exit, and puts its output verbatim before both `shutdown.py launch-blocked --restart-of <id>` and `claude --resume <id> …`; no `eval`.
+- Shutdown inventory reads each session's account and config dir together at one boundary (`AttributedSessionConfiguration`) and stores the dir as `config_dir` on the session snapshot, absent meaning `~/.claude`; an unreadable environment leaves the session unattributed. `ShutdownSessionEntry` has no `config_dir`, and an entry-level key from an older record is ignored on read. `restart.py` puts `CLAUDE_CONFIG_DIR=<quoted dir> ` before `ENABLE_TOOL_SEARCH=true` for a non-unit resume whose dir is not `~/.claude`; units relaunch through `add_unit.py` on the current role.
+- Claude seats inherit the owner's `CLAUDE_CONFIG_DIR`; `remove_seats.py` sets none, and its tests pin the inheritance.
+- `settings.json` allows `Edit(~/.claude1/**)`…`Edit(~/.claude3/**)` beside `Edit(~/.claude/**)` and lists `~/.claude1`…`~/.claude3` in sandbox `allowWrite`, since a session on account N writes memory under `~/.claudeN/projects/…`. This change reaches main only with the user's go.
 
 **Files:**
+- `scripts/accounts/accounts.py` — `account_prefix`.
+- `scripts/production/add_unit.py` — unit-account check, guard env, launch prefix; puts the repo root on `sys.path`.
+- `scripts/production/test_add_unit.py` — prefix, refusal, held named account, role change after readiness, manual resume.
+- `scripts/shutdown/inventory.py` — `config_dir` capture on the session snapshot.
+- `scripts/shutdown/record.py` — ignores an obsolete entry-level `config_dir`.
+- `scripts/shutdown/restart.py` — prefix for non-unit resumes.
+- `scripts/shutdown/test_inventory.py`, `test_record.py`, `test_restart.py` — capture, round trip, prefix.
+- `scripts/delegate/test_remove_seats.py` — owner's dir inherited.
+- `commands/showrunner/produce.md` — manual unit resume.
+- `settings.json` — Edit allow and sandbox `allowWrite` for the account dirs.
+- `pyrightconfig.json` — the scripts/production environment adds `"."` so `scripts.accounts` resolves.
+- `docs/as-built/shutdown-and-restart.md` — config dir on the snapshot and the restart rule.
 
-- `scripts/production/add_unit.py` — launch on the unit account.
-- `scripts/production/test_add_unit.py` — launch prefix and account check.
-- `scripts/shutdown/inventory.py` — `config_dir` per entry.
-- `scripts/shutdown/record.py` — `config_dir` in the record.
-- `scripts/shutdown/restart.py` — prefix non-unit resumes.
-- `scripts/shutdown/test_inventory.py` — `config_dir` capture.
-- `scripts/shutdown/test_record.py` — record round trip.
-- `scripts/shutdown/test_restart.py` — resume prefix.
-- `scripts/delegate/remove_seats.py` — owner's config dir.
-- `scripts/delegate/test_remove_seats.py` — owner's config dir.
-- `commands/showrunner/produce.md` — manual resume line.
-- `settings.json` — Edit allow and sandbox allowWrite for the account dirs.
-- `docs/as-built/shutdown-and-restart.md` — `config_dir` and the unit account.
+**Binds later work:** add_unit resolves the unit role once per launch, refuses a named account failing `accounts.check` with exit 2 `add_unit: unit account <label>: <first problem>; /accounts status`, and asks the launch guard on that account's dir, so after a role change a unit relaunched through add_unit lands on and is judged against the new account (the swap of the unit account relies on this). A rule added to `accounts.check` reaches the unit launch with no change to add_unit. `account_prefix(selected)` and the `accounts.py env <role>` verb render the account prefix for any launch, including an `exec` verb. Restart restores a non-unit session on its recorded `config_dir`. `shutdown.py launch-blocked` with no account argument judges the default account (`CLAUDE_*` stripped), so a swap-time shutdown check passes the target dir. The add_unit refusal is user-actionable; the user's guide covers it under "When a unit will not start".
 
-**Seats:** `2 writers + 1 tester` — `launch`: `add_unit.py`, `produce.md`, `settings.json`; `shutdown`: `inventory.py`, `record.py`, `restart.py`, `remove_seats.py`, the as-built.
+**Gotchas:** a check about a named account through `shutdown.py launch-blocked` must name the account or set its dir, or it judges the default one; a held named unit account refuses with `…; /shutdown restart first`. Code that imports `scripts.accounts` from `scripts/production` needs the repo root on `sys.path`.
 
-**Acceptance gate:**
-
-- Tests pass and basedpyright is clean.
-- `add_unit.py` with `--dry-run`, or the test harness, shows the prefix for a named unit account and none for the default.
-- `restart.py --dry-run` on a fixture record shows `CLAUDE_CONFIG_DIR` for a non-default entry.
+**Ruled out:** a `config_dir` field on `ShutdownSessionEntry` (settle replaces the session snapshot, so a second copy goes stale); an explicit `CLAUDE_CONFIG_DIR` in `remove_seats.py` (inheritance already carries it).
 
 ### Phase 3 — Quota with two active accounts  · status: todo
 
@@ -304,7 +284,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 **Goal:** `/accounts swap unit "claude N"` moves every unit director onto account N: each one reaches a safe stop and resumes in place on N.
 
-**Constraints from prior phases:** Phase 1 shipped `scripts/accounts/accounts.py`. Every path comes from `Path.home()` at call time; there is no `ACCOUNTS_HOME`, and tests set `HOME` to a temp dir. `check(label) -> list[str]` returns every problem, empty when the account is fit, and already refuses an account dir that is a symlink and any symlinked identity file (`.credentials.json`, `.claude.json`, `account-label`). `role_account("unit") -> DefaultAccount | NamedAccount(label, dir)`, `launch_prefix("unit") -> str` (empty for the default account) and `main(argv) -> int`. Other scripts import it as `accounts.py` imports whoami: put the repo root on `sys.path`, then `from scripts.accounts import accounts`.
+**Constraints from prior phases:** Phase 1 shipped `scripts/accounts/accounts.py`. Every path comes from `Path.home()` at call time; there is no `ACCOUNTS_HOME`, and tests set `HOME` to a temp dir. `check(label) -> list[str]` returns every problem, empty when the account is fit, and already refuses an account dir that is a symlink and any symlinked identity file (`.credentials.json`, `.claude.json`, `account-label`). `role_account("unit") -> DefaultAccount | NamedAccount(label, dir)`, `launch_prefix("unit") -> str` (empty for the default account) and `main(argv) -> int`. Other scripts import it as `accounts.py` imports whoami: put the repo root on `sys.path`, then `from scripts.accounts import accounts`. Phase 2 shipped the unit launch. `add_unit.py` resolves `accounts.role_account("unit")` once per launch, refuses a named account that fails `accounts.check` with exit 2 (`add_unit: unit account <label>: <first problem>; /accounts status`), asks shutdown's launch guard with `CLAUDE_CONFIG_DIR` set to that account's dir, and launches with `accounts.account_prefix(selected)` before `ENABLE_TOOL_SEARCH=true`. So after `set-role unit <label>`, a unit that `restart` relaunches through `add_unit.py` lands on the new account and is judged against it, not against the old account that is going down. A shutdown record keeps each session's dir as `config_dir` on the session snapshot (absent means `~/.claude`), not as a field of the record entry, and `restart.py` puts `CLAUDE_CONFIG_DIR=<dir> ` before a non-unit resume. `shutdown.py launch-blocked` with no account argument runs with `CLAUDE_*` stripped and judges the default account, so any shutdown check about a named account names that account.
 
 **Spec:**
 
@@ -332,7 +312,9 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 - `commands/accounts.md` — new.
 - `docs/as-built/shutdown-and-restart.md` — swap.
 
-**Seats:** `1 writer + 1 tester`.
+**Seats:** `2 writers`, each writing its own tests; they meet only at the `shutdown.py down <label> --restart` argv.
+- `swap`: `accounts.py`, `test_accounts.py`, `commands/accounts.md`.
+- `restart`: `shutdown.py`, `record.py`, `test_shutdown_cli.py`, `test_record.py`, the as-built.
 
 **Acceptance gate:**
 
@@ -345,7 +327,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 **Goal:** the user can start a session on any account with one word, and has a guide that says how to start sessions, how to log in and out without moving `~/.claude` off its account, and how to see which account a session is on. Nothing here creates a dir or logs anything in.
 
-**Constraints from prior phases:** Phase 1 shipped `scripts/accounts/accounts.py`. Every path comes from `Path.home()` at call time; there is no `ACCOUNTS_HOME`, and tests set `HOME` to a temp dir. `check(label) -> list[str]` returns every problem, empty when the account is fit, and already refuses an account dir that is a symlink and any symlinked identity file (`.credentials.json`, `.claude.json`, `account-label`). `role_account("unit") -> DefaultAccount | NamedAccount(label, dir)`, `launch_prefix("unit") -> str` (empty for the default account) and `main(argv) -> int`. Other scripts import it as `accounts.py` imports whoami: put the repo root on `sys.path`, then `from scripts.accounts import accounts`.
+**Constraints from prior phases:** Phase 1 shipped `scripts/accounts/accounts.py`. Every path comes from `Path.home()` at call time; there is no `ACCOUNTS_HOME`, and tests set `HOME` to a temp dir. `check(label) -> list[str]` returns every problem, empty when the account is fit, and already refuses an account dir that is a symlink and any symlinked identity file (`.credentials.json`, `.claude.json`, `account-label`). `role_account("unit") -> DefaultAccount | NamedAccount(label, dir)`, `launch_prefix("unit") -> str` (empty for the default account) and `main(argv) -> int`. Other scripts import it as `accounts.py` imports whoami: put the repo root on `sys.path`, then `from scripts.accounts import accounts`. Phase 2 shipped `accounts.account_prefix(selected) -> str`: `CLAUDE_CONFIG_DIR=<quoted dir> `, or empty for `DefaultAccount`. `launch_prefix(role)` is `account_prefix(role_account(role))`, and the `env <role>` verb prints it. `add_unit.py` already calls `accounts.check(label)` before every unit launch, so a rule added to `check` reaches the unit launch with no change to `add_unit.py`; its refusal reads `add_unit: unit account <label>: <first problem>; /accounts status`. The manual unit resume in `commands/showrunner/produce.md` runs `accounts.py env unit` first and stops on a nonzero exit.
 
 **Spec:**
 
@@ -384,6 +366,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
     - After any login, `/accounts status` must show every dir matching its label.
   - **Swapping the unit account:** `/accounts swap unit "claude N"`, what the user sees during it, and the undo `/accounts swap unit default`.
   - **Setting up a new dir:** `/accounts setup "claude N"`, then `claudeN` and `/login`.
+  - **When a unit will not start:** a showrunner's launch refuses with `add_unit: unit account <label>: <problem>; /accounts status`. Run `/accounts status`, fix what it names (most often `claudeN` and `/login` as claude N), then launch again.
 - `commands/accounts.md` points to the guide.
 
 **Files:**
@@ -394,7 +377,9 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 - `commands/accounts.md` — points to the guide.
 - `docs/plans/build-followups-two-accounts.md` — the alias text, as sent to natedev.
 
-**Seats:** `1 writer + 1 tester`.
+**Seats:** `2 writers`, each writing its own tests; the guide quotes `exec`'s refusals from this Spec.
+- `exec`: `accounts.py`, `test_accounts.py`.
+- `guide`: `docs/accounts.md`, `commands/accounts.md`. The alias text in this plan is the director's.
 
 **Acceptance gate:**
 
