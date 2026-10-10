@@ -105,30 +105,25 @@ natedev, 2026-10-10: rollout phases first, measurement last; measurement must no
 
 ### Phase 3 — Reviews go to open seats · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a phase's broad review lenses and its closure reviews run on the seats already open, in a reviewing role, instead of new reviewer threads.
-
-**Spec:**
-- `review.sh --to <seat>` sends the review prompt as a follow-up to an open seat (compacting first, as Phase 1 built), records the pass under that seat, and writes the same findings files as today. After the turn, the working tree must be unchanged (`git status --porcelain` and the diff hash before and after); a change fails the review with `error` and names the seat.
-- Without `--to`, `review.sh` works as today; a run with no open seat (a solo review outside a run) still uses it.
-- The review prompt (<ReviewPromptContract/>, <BroadReviewPrompt/>, <ClosureReview/>) gains a role-switch opening: the seat is now a reviewer, edits nothing, reads the diff cold as if someone else wrote it, and, when it wrote the code, argues against its own choices as an adversary would.
-- `dual_review.md`, `run_phase_review.md` and `direct.md` (<DualReview/>, <EarlyReviewArm/>, <FixDispatch/>'s closure review) say which open seat takes which lens: the seat that did not write a file reviews it when one exists; the writer takes the adversary lens on its own work when the other seat is busy. The handoff post per <RoleReassignment/> names the move.
-- Seat management (user, 2026-10-10): reviewers are long-lived like writers. Moving any open seat to another role is allowed, mid-phase included, because all of a unit's seats work in the same area; `RoleReassignment` and <LongLivedSeats/> say so and drop any wording that keeps a busy seat from being reassigned. An extra seat when every open one is busy is allowed and kept for reuse (an idle seat costs no context). The unit director names each seat for its role — a new seat's slot name says what it does (`review`, `fix2`), never a bare number — and `direct.md` says so.
-- Carried from Phase 2's closure (minor): `seat_usage.py` `is_edit` counts a quoted mention such as `rg -F 'tools.apply_patch(' scripts` as an edit. Real Codex edits arrive as an `exec` custom tool call whose JavaScript calls `tools.apply_patch(` (647 of the last 30 rollouts' calls opened `const patch = "***`), so the pattern stays and is narrowed to a call outside a string literal. Tests pin the real `exec` shape as an edit and the quoted mention as not one; each must fail on the current code.
+- `review.sh --to <seat>` sends the review prompt as a follow-up to an open Codex seat: under `impl_seat_claim.lock` it compacts the seat above `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (best-effort, one board line), claims it with `can-follow --role review` (a busy seat is refused before any review artifact is written), and on release restores the prior role. It writes the same findings, status and log files as a fresh reviewer; the pass is recorded under the seat's slot, the artifacts stay keyed by lens.
+- `review.sh --slot <role-name>` opens a new role-named seat for the review and keeps it open for later `--to`. It writes `impl_seat_<slot>.json` anchored to the configured implementation model, so `implement.sh --to` can later give the seat implementation or repair work. Slot names match `^[A-Za-z][A-Za-z0-9_]{0,31}$`.
+- A seated review must leave the tree unchanged: `HEAD`, `git status --porcelain`, a hash of `git diff HEAD` and a content hash of every untracked file are compared before and after the turn; any change ends the review `error` with `ERROR: review seat <seat> changed the working tree: <paths>`. An early seated review takes its baseline when the early-ready sentinel appears.
+- Without `--to` or `--slot`, `review.sh` runs the fresh read-only reviewer; only a review outside a run uses it.
+- `codex_mesh.py` passes the configured `model` on `turn/start`, so a follow-up runs the model of the role it was reassigned to.
+- `progress_history.py` gives extra seats (`review2`, `fix2`) their own `Agent N` columns after `impl`/`test`, in first-seen order.
+- `seat_usage.py` counts `apply_patch(` / `tools.apply_patch(` as an edit only outside JavaScript string literals and template text; `${...}` expressions stay visible.
+- Every review prompt opens with a role switch: the seat is now a reviewer, edits nothing, reads the diff cold, and argues against its own choices when it wrote the code. It also carries the `board.sh role ... review` first call, the inline Three Gods sentence and the Type Design Contract (verbatim for a new seat, pointer for a follow-up).
+- Seat selection (`direct.md`, `dual_review.md`, `run_phase_review.md`, `write_prompt_contract.md`, `commands/plan/phase_review.md`): each lens gets a different open seat, preferring one that did not write the files; a writer may take the `adversary` lens on its own work when the others are busy. Roles move, slots do not — any open seat may take any role, mid-phase included, after a board `handoff`. When every open seat is busy, a role-named extra seat (`review`, then `review2`; `fix2`) opens with `--slot` and stays until `end_session.sh`. The early review arm tracks its seat in `EARLY_REVIEW_SLOT`; the closure review and the phase-review architect go to an open seat with `--to`.
 
 **Files:**
-- `scripts/delegate/review.sh`
-- `scripts/delegate/test_review_launcher.py`
-- `commands/unit/direct.md`
-- `docs/delegate/dual_review.md`
-- `docs/delegate/run_phase_review.md`
-- `docs/delegate/write_prompt_contract.md`
-- `scripts/whoami/seat_usage.py`
-- `scripts/whoami/test_seat_usage.py`
+- `scripts/delegate/review.sh`, `scripts/delegate/test_review_launcher.py` — `--to`/`--slot`, claim and compaction, tree guard, seat identity
+- `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py` — `model` on `turn/start`
+- `scripts/delegate/progress_history.py`, `scripts/delegate/test_progress_history.py` — extra seat columns
+- `scripts/whoami/seat_usage.py`, `scripts/whoami/test_seat_usage.py` — edit detection outside string literals
+- `commands/unit/direct.md`, `commands/plan/phase_review.md`, `docs/delegate/dual_review.md`, `docs/delegate/run_phase_review.md`, `docs/delegate/write_prompt_contract.md` — review seat selection, role-switch opening, `--to`/`--slot` calls
 
-**Seats:** `2 writers` — `impl` writes `review.sh` and its tests; `test` writes the skill text and the `is_edit` repair with its tests.
+**Gotchas:** `--to` derives the slot from the seat name's last hyphen segment, so `--slot` refuses hyphens. A seat opened by `review.sh` records its identity with the implementation model, not the review model, or `implement.sh --to` refuses it. A launcher compaction line reads `<before> -> 0 tokens`: the compaction turn reports 0 input tokens, and the roster shows 0 until the seat's next turn.
 
-**Constraints from prior phases:** Phase 1: `codex_mesh.py compact` waits for the compaction turn's `turn/completed` and refuses a running seat; `implement.sh --to` compacts under the seat-claim lock above `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (`config/delegate.conf`), best-effort; the roster records `role` (optional; roleless threads such as friends omit it), `context_tokens` and status `ended`; `can-follow` saves the prior role and a released claim restores it. Every prompt to a seat, follow-ups included, carries the inline Three Gods sentence and the Type Design Contract or its pointer (`write_prompt_contract.md` sections 7 and 9). A replacement thread under the same seat name gets an opening prompt.
-
-**Acceptance gate:** the verification lines green; a live check in a scratch session: an open seat takes a review with `review.sh --to`, writes findings, and a second review whose seat edits a scratch file fails with `error`.
+**Ruled out:** resolving a hyphenated `--slot` from its recorded identity — refusing hyphens is simpler.
