@@ -6,6 +6,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import stat
 import tempfile
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 from inventory import Session, parse_session
+from launch_permission import launch_barrier, shutdown_state_root
 
 
 class AllAccountSessions(TypedDict):
@@ -344,11 +346,7 @@ _PROGRESS_WITH_TIME = frozenset(
 
 
 def _state_root() -> Path:
-    return Path(
-        os.environ.get(
-            "SHUTDOWN_STATE_DIR", str(Path.home() / ".local/state/shutdown")
-        )
-    )
+    return shutdown_state_root()
 
 
 def _safe_login(login: str) -> str:
@@ -698,6 +696,33 @@ def _read_record(path: Path) -> ShutdownRecord:
     return _record(value, str(path))
 
 
+def _entry_kind(mode: int) -> str:
+    if stat.S_ISREG(mode):
+        return "a regular file"
+    if stat.S_ISDIR(mode):
+        return "a directory"
+    if stat.S_ISLNK(mode):
+        return "a symbolic link"
+    if stat.S_ISFIFO(mode):
+        return "a FIFO"
+    if stat.S_ISSOCK(mode):
+        return "a socket"
+    if stat.S_ISCHR(mode):
+        return "a character device"
+    if stat.S_ISBLK(mode):
+        return "a block device"
+    return "an unknown filesystem entry"
+
+
+def _lstat(path: Path) -> os.stat_result | None:
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise InvalidRecord(f"{path} cannot be inspected: {error}") from error
+
+
 def _write_record(path: Path, record: ShutdownRecord) -> None:
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".record.", suffix=".tmp", dir=path.parent
@@ -718,23 +743,44 @@ def _write_record(path: Path, record: ShutdownRecord) -> None:
 def find_live(login: str) -> LiveShutdownRecord | NoShutdown:
     """Return the live shutdown for an account, if one exists."""
     directory = _account_directory(login)
-    if not directory.is_dir():
+    directory_status = _lstat(directory)
+    if directory_status is None:
         return NoShutdown(kind="no shutdown")
-    with _account_lock(login, create_directory=False):
+    if not stat.S_ISDIR(directory_status.st_mode):
+        raise InvalidRecord(
+            f"{directory} must be a directory; found {_entry_kind(directory_status.st_mode)}"
+        )
+    account_lock = _account_lock(login, create_directory=False)
+    try:
+        _ = account_lock.__enter__()
+    except OSError as error:
+        lock_path = directory / "lock"
+        raise InvalidRecord(
+            f"{lock_path} cannot be opened or locked: {error}"
+        ) from error
+    try:
         path = directory / "record.json"
-        if not path.exists():
+        record_status = _lstat(path)
+        if record_status is None:
             return NoShutdown(kind="no shutdown")
+        if not stat.S_ISREG(record_status.st_mode):
+            raise InvalidRecord(
+                f"{path} must be a regular file; found {_entry_kind(record_status.st_mode)}"
+            )
         return LiveShutdownRecord(kind="live", record=_read_record(path))
+    finally:
+        _ = account_lock.__exit__(None, None, None)
 
 
 def create(record: ShutdownRecord) -> None:
     """Create the account's only live record."""
     checked = _record(record, "record")
-    with _account_lock(checked["login"], create_directory=True) as directory:
-        path = directory / "record.json"
-        if path.exists():
-            raise ShutdownInProgress(_read_record(path))
-        _write_record(path, checked)
+    with launch_barrier():
+        with _account_lock(checked["login"], create_directory=True) as directory:
+            path = directory / "record.json"
+            if path.exists():
+                raise ShutdownInProgress(_read_record(path))
+            _write_record(path, checked)
 
 
 def update(login: str, change: Callable[[ShutdownRecord], None]) -> ShutdownRecord:

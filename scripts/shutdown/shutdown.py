@@ -31,6 +31,11 @@ from inventory import (
     inventory,
     parse_inventory,
 )
+from launch_permission import (
+    LaunchPurpose,
+    NewWorkLaunchPurpose,
+    ShutdownUnitRestoreLaunchPurpose,
+)
 from record import (
     InvalidRecord,
     LiveShutdownRecord,
@@ -62,6 +67,7 @@ class CommandLine(argparse.Namespace):
     reason: str = ""
     dry_run: bool = False
     no_alert: bool = False
+    restart_of: str | None = None
 
 
 class UnreachableMachine(TypedDict):
@@ -219,6 +225,69 @@ def _local_time(value: str) -> str:
     )
 
 
+def _shutdown_hold_time(value: str) -> str:
+    return datetime.fromisoformat(value).astimezone(
+        ZoneInfo("America/Los_Angeles")
+    ).strftime("%Y-%m-%d %H:%M %Z")
+
+
+def _restore_launch_allowed(
+    record: ShutdownRecord, purpose: ShutdownUnitRestoreLaunchPurpose
+) -> bool:
+    for entry in record["entries"]:
+        session = entry["session"]
+        if (
+            session["session_id"] != purpose.session_id
+            or session["kind"] != "unit"
+        ):
+            continue
+        progress = entry["progress"]["kind"]
+        if record["state"] == "restarting":
+            return progress not in {
+                "restarted",
+                "seat available on demand",
+                "manual restart",
+            }
+        if record["state"] == "restart partial":
+            return progress == "manual restart"
+        return False
+    return False
+
+
+def launch_blocked(selected: Account, purpose: LaunchPurpose) -> int:
+    """Report whether shutdown state holds one local launch."""
+    try:
+        found = find_live(selected.login)
+    except (InvalidRecord, OSError, ValueError) as error:
+        print(f"shutdown state unreadable: {error}", file=sys.stderr)
+        return 3
+    if found["kind"] == "no shutdown":
+        return 1
+    record = found["record"]
+    if record["state"] in {"cancelled", "up"}:
+        state = record["state"]
+        print(
+            f"shutdown state unreadable: live record in state {state} was not archived",
+            file=sys.stderr,
+        )
+        return 3
+    if isinstance(purpose, ShutdownUnitRestoreLaunchPurpose) and _restore_launch_allowed(
+        record, purpose
+    ):
+        return 1
+    hold_time = _shutdown_hold_time(record["requested_at"])
+    print(f"{record['label']} is held by a shutdown ({record['state']} since {hold_time})")
+    return 0
+
+
+def _unexpected_launch_blocked_error(error: Exception) -> int:
+    print(
+        f"shutdown state unreadable: {type(error).__name__}: {error}",
+        file=sys.stderr,
+    )
+    return 3
+
+
 def _record_line(record: ShutdownRecord) -> str:
     return (
         f"{record['machine']} {record['label']} {record['state']} "
@@ -342,7 +411,9 @@ def held_session_ids() -> list[str]:
 def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(
-        dest="command", required=True, metavar="{down,status,now,cancel,restart}"
+        dest="command",
+        required=True,
+        metavar="{down,status,now,cancel,restart,launch-blocked}",
     )
     down = commands.add_parser("down", help="start a safe account shutdown")
     _ = down.add_argument("account", nargs="?")
@@ -391,6 +462,9 @@ def main(arguments: list[str] | None = None) -> int:
     _ = restart.add_argument(
         "--no-alert", action="store_true", help=argparse.SUPPRESS
     )
+    launch_blocked_command = commands.add_parser("launch-blocked")
+    _ = launch_blocked_command.add_argument("account", nargs="?")
+    _ = launch_blocked_command.add_argument("--restart-of")
     up = commands.add_parser("up")
     _ = up.add_argument("account")
     _ = up.add_argument("--dry-run", action="store_true")
@@ -406,6 +480,24 @@ def main(arguments: list[str] | None = None) -> int:
         if lines:
             print("\n".join(lines))
         return 0
+
+    if options.command == "launch-blocked":
+        try:
+            selected = _selected_account(options.account)
+        except (UnreadableAccount, UnknownAccountName) as error:
+            print(f"shutdown: {error}", file=sys.stderr)
+            return 2
+        except Exception as error:
+            return _unexpected_launch_blocked_error(error)
+        try:
+            purpose: LaunchPurpose = (
+                ShutdownUnitRestoreLaunchPurpose(options.restart_of)
+                if options.restart_of is not None
+                else NewWorkLaunchPurpose()
+            )
+            return launch_blocked(selected, purpose)
+        except Exception as error:
+            return _unexpected_launch_blocked_error(error)
 
     if options.command == "up":
         return restart_work.up(options.account or "", options.dry_run)

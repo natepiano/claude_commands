@@ -436,7 +436,7 @@ A tmux session that `/shutdown restart` brings back resumes in the pane it ran i
 
 **Ruled out:** treating an unreadable registry as a closed session — it relaunches a session that may still be running; a longer zsh timeout alone — it hides the startup cost instead of removing it.
 
-### Phase 13 — Nothing new starts on a down account  · status: todo
+### Phase 13 — Nothing new starts on a down account  · status: done
 
 #### Work Order
 
