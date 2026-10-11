@@ -324,81 +324,165 @@ Real-code check, `objdump -d -C --no-show-raw-insn` counted per function, on two
 
 ### Phase 8 — The detector's scaling test holds under machine load · status: done
 
-#### Work Order
+#### As-built
 
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`, branch `build-followups-mul-add`. A showrunner follow-up (2026-10-09): the test turned an unrelated merge on `build-followups` red.
-
-**Goal:** `test_many_findings_scan_scales_with_file_length` in `scripts/hooks/test_mul_add.py` fails when the scan grows faster than linearly with file length, and never fails because the machine is busy.
-
-**Constraints from prior phases:**
-- `float_mul_add_findings(path)` keeps its signature and behavior; this phase changes the test only. `mul_add_lib.py` is not edited.
-- The test exists to catch a scan that goes quadratic in file length. Between 200 and 800 lines (4×), a linear scan takes about 4× as long and a quadratic one about 16×.
-
-**Spec:**
-1. Today the test times one scan of a 200-line file and one of an 800-line file with `time.perf_counter()` and asserts the second is under 7× the first. In a merge gate under load it failed with `0.1079 not less than 0.1048`, and it passes alone: one wall-clock sample per size lets a load spike on either sample decide the result.
-2. Time each size several times (at least 5) and compare the fastest run of each size, since load only ever adds time. Keep the 200 and 800 line files and the existing finding-count and last-line asserts.
-3. Set the bound so a linear scan passes with room under heavy load and a quadratic one still fails: compare the fastest 800-line time against 10× the fastest 200-line time, and say in a comment that linear is about 4× and quadratic about 16×.
-4. A count-based check is a valid alternative if it is simpler: count a unit of work the scanner does, if one is reachable from the test without changing `mul_add_lib.py`. Otherwise use spec items 2 and 3.
-
-**Acceptance:**
-- The test passes 20 times in a row while the machine runs a CPU load on every core, and alone.
-- Changing the bound check to compare against 4× the fastest 200-line time fails the test as expected. This is a scratch check, never committed, which proves the test still measures.
-- The whole `test_mul_add.py` suite passes; basedpyright reports 0 errors, 0 warnings, 0 notes on `test_mul_add.py`.
-
-**Verification:** `python3 -m unittest scripts/hooks/test_mul_add.py`; `basedpyright scripts/hooks/test_mul_add.py`; a load check run as `stress-ng --cpu 0 --timeout 120s &` (or one `yes > /dev/null &` per core, killed afterwards) beside 20 runs of `python3 -m unittest scripts.hooks.test_mul_add.MulAddHookTests.test_many_findings_scan_scales_with_file_length`.
+- `test_many_findings_scan_scales_with_file_length` in `scripts/hooks/test_mul_add.py` scans a 200-line and an 800-line file five times each with `time.perf_counter()`, keeps the fastest run of each size (load only ever adds time), and asserts the 800-line time is under 10× the 200-line time. Over 4× the lines a linear scan takes about 4× as long and a quadratic one about 16×, which the test's comment states. The finding-count and last-line asserts run on every sample.
+- `float_mul_add_findings(path)` and `mul_add_lib.py` are unchanged.
+- Measured at ship: 20 passes in a row under a CPU load on all 32 cores; a scratch 4× bound fails, so the test still measures; the `test_mul_add.py` suite passes and basedpyright reports 0 errors, 0 warnings and 0 notes.
 
 **Files:**
-- `scripts/hooks/test_mul_add.py` — the scaling test only
+- `scripts/hooks/test_mul_add.py` — the scaling test
 
-**Seats:** 1 writer — `impl`.
+**Gotchas:**
+- Running the test by its dotted name needs `PYTHONPATH=scripts/hooks`, since the test imports `mul_add_lib` as a sibling.
 
-### Phase 9 — Re-measure: long functions and multiply-adds out of hana's clippy failures · status: todo
+**Ruled out:**
+- A count-based check — no unit of the scanner's work is reachable from the test without editing `mul_add_lib.py`.
 
-#### Work Order
+### Phase 9 — Re-measure: long functions and multiply-adds out of hana's clippy failures · status: done
 
-**Blocked by:** G4.
+#### As-built
 
-Work only in worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`, branch `build-followups-mul-add`. State every time in PDT.
+Re-measured on natedev at 2026-10-10 22:59:12 PDT. W is the same 96-hour, start-inclusive/end-exclusive window for both lints: **2026-10-06 22:44:05 PDT to 2026-10-10 22:44:05 PDT**. It opens at Phase 6's last go-live run, so the detector is Phase 6's and both hooks cover Claude and Codex on both machines throughout W. The earlier Phase 5 controls and all go-live/control scratch crates are excluded from the hana rates.
 
-**Goal:** one table, `too_many_lines` and `suboptimal_flops` side by side, before and after both hooks, with a verdict per lint (user, item 4).
+**Verdicts: neither lint meets all three success conditions.** `suboptimal_flops` fails both rate and seat-time conditions; `too_many_lines` passes seat time but narrowly fails the failure-rate condition. Both lints pass all four machine/agent controls. The 75% thresholds remain unchanged.
 
-**Constraints from prior phases:**
-- **The detector measured is Phase 6's.** It reads `let x = if … else …` as a plain binding, counts a file `const`/`static` typed `f32`/`f64` as a float, and lets a field chain's last field decide its type; on the 291 historical positions (stubs given a `src/lib.rs`) it catches 37, against 32 for Phase 5's. That is stub recall, not reach in a real file: a stub drops the file's own declarations, and the detector reads them. A product with no float literal also needs its field chain's last field absent from the names the file declares with a non-float type, and a file-level `const`/`static` name declared non-float anywhere at file level stays non-float, so a real file can lose a finding its stub shows. W opens at T_detector (Phase 6's As-built), the end of the last go-live run on both agents and both machines, so it never holds the detector Phase 5 shipped. The controls made inside the first window (2026-10-06, after T_codex_mul_add) are not part of this one.
-- **The detector's reach is narrower than "holds a float literal".** A literal proves a product only when the other operand is not excluded. Excluded: a non-float annotation, a pattern or closure binding, a reference, a vector, or a non-float file const. A named field must be declared `f32`/`f64` in the same file (Phase 6: the last field of a chain decides). Phase 3 ran Phase 3's detector on the 291 historical positions, each inside a stub function, and it flagged 35 (12.0%). That is a lower bound, since a stub drops the file's own declarations. So the 75% threshold for `suboptimal_flops` depends on how far the real files reach.
-- The control edit must declare its operand in the same function: `fn f(x: f32) -> f32 { x * 0.5 + 1.0 }`. An untyped `x` is not proved.
-- `float_mul_add_findings(path)` returns `(scope, [])` unless the scope reads `enabled`: the file must sit at its own path in its package, with a `Cargo.toml` that warns or denies `nursery` or `suboptimal_flops` and its target's root present and not `#![no_std]`. `build.rs`, a file outside `src/`, `tests/`, `examples/` and `benches/`, and a `src/` file with neither `lib.rs` nor `main.rs` read `exempt` and return nothing. So run it inside a checkout of the commit (`git archive` into the scratchpad, or a scratch worktree), never on a file copied out alone; a stub function goes in a scratch crate that has `src/lib.rs`.
-- mul_add `blocks.jsonl` records are written once every file of the edit is scanned, just before the block prints, one per finding, so a record proves the hook found the expression and the block text proves delivery; `file` is the resolved absolute path, and a Codex record carries `"agent": "codex"`, `"tool": "apply_patch"`.
-- The fn-length hook (the fn-length plan's Phase 3, as built) never measures functions inside a `macro_rules!` or `name! { … }` body, skips `cfg(test)` modules in a package-root `examples/` target, and appends to `~/.local/state/fn-length-hook/blocks.jsonl` silently on failure.
-- The scripts and the buildlog are read-only (user, 2026-10-06). Saved run output stays under a few GB: read each run and delete it before the next.
-- Phase 7 changes what a Codex seat's rows carry as `session`: rows recorded before its merge name the director's Claude session, rows after it the seat's thread. `loop.py` groups failed calls by seat and session, so state in the As-built which of W's rows came after that merge, and do not compare a Codex seat's loop gaps across it.
+| Measure | `suboptimal_flops` before | `suboptimal_flops` W | `too_many_lines` before | `too_many_lines` W |
+| --- | ---: | ---: | ---: | ---: |
+| Failed steps per 100 hana clippy steps | 7.916 | **8.125819** (62/763); limit ≤ 1.979: **FAIL** | 13.3 | **3.538663** (27/763); limit ≤ 3.3: **FAIL** |
+| Sole-cause failed steps per 100 | 2.573 | **1.572739** (12/763) | 4.9 | **0.393185** (3/763) |
+| Sole-cause seat hours per day | 0.402 | **0.576189**; limit ≤ 0.100: **FAIL** | 1.07 | **0.115689**; limit ≤ 0.27: **PASS** |
+| Controls: Claude and Codex, natedev and Mac | — | **4/4 PASS**; record and delivered block text for each | — | **4/4 PASS**; record and delivered block text for each |
+| Global verdict | — | **FAIL**; confirmed detector reach 0/763, snippet-only reach 3/763 = **0.393185 per 100** | — | **FAIL** |
 
-**Spec:**
-- **Before measuring:** confirm Phase 1's three script hashes and `tml_lengths.py` `18754c36c8c545928a082e3bded49c688f029221b917b0f1e6c164028e4b6522`; a mismatch stops the phase. This phase is the production's one re-measure: the fn-length plan dropped its own (showrunner, 2026-10-06), so it carries both lints.
-- **Measurements:**
-  - The window W is fixed: T_detector to T_detector + 96 h, the same bounds for both lints. Both hooks are live for both agents on both machines throughout it, since the fn-length Codex hook (Phase 4) and Phase 6's detector are live from T_detector.
-  - Run, in the background with `set -o pipefail`, through the bounded copies below: for `suboptimal_flops` Phase 1's `cost.py 4 suboptimal_flops`, `loop.py 4 suboptimal_flops` and `clippy_fail_lints.py 4`; for `too_many_lines` `cost.py 4 too_many_lines`, `loop.py 4 too_many_lines`, `clippy_fail_lints.py 4` and `tml_lengths.py 4` (only when `clippy_fail_lints.py` reports at least one too_many_lines failure; it indexes an empty result, so with none record zero lengths instead); and Phase 1's totals query. The scripts select a rolling `now`-based start, so run copies in the scratchpad whose only change from the hashed originals bounds `started_at` by W's start and end; show that diff. The totals query takes the same bounds. Seat time per day divides by the span from W's first hana clippy step to W's end.
-  - Derive the three numbers per lint. Compare them with Phase 1 here and with the fn-length plan's Phase 1.
-- **`suboptimal_flops` baseline, unrounded:**
-  - failed steps: 7.916 per 100 (limit ≤ 1.979);
-  - sole-cause steps: 2.573 per 100;
-  - sole-cause seat time: 0.402 h a day (limit ≤ 0.100).
-- **`too_many_lines` baseline** (the fn-length plan's Phase 1, run 2026-10-06 08:17 PDT, span 3.96 days):
-  - failed steps: 13.3 per 100 (limit ≤ 3.3);
-  - sole-cause steps: 4.9 per 100;
-  - sole-cause seat time: 1.07 h a day (limit ≤ 0.27).
-- **Control:** Phase 6's go-live step makes the controls at W's start, right after T_detector: a Claude edit and a Codex patch per hook, on natedev and the Mac, the multiply-add one leaving `fn f(x: f32) -> f32 { x * 0.5 + 1.0 }` in a crate denying `nursery`. Here, verify each is in its hook's `blocks.jsonl` inside W with its agent (the Mac's read over `ssh mac`). A failed control means a hook did not fire, and that lint's rates say nothing about it; a block with no log line leaves the control unproven, since a failed log append is silent, and a log line with no block reason in the agent's output leaves it unproven too, since the record is written before the block prints. Each control run keeps the hook's block text with its start and end time, and Phase 6's go-live runs are the model. The control proves the hooks fire, rather than that no qualifying edit happened. Match residuals on each block record's time, path, line and expression.
-- **Success per lint:**
-  - failed steps per 100 ≤ 25% of its baseline;
-  - sole-cause seat time per day ≤ 25% of its baseline;
-  - the control: each hook's `blocks.jsonl` holds at least one `claude` and one `codex` line inside the window, on natedev and the Mac.
-- **Residuals for `suboptimal_flops`:** for each diagnostic in the window, record whether a block for that file precedes it. Split them by whether the detector flags the expression: run `float_mul_add_findings` on the file as `git show <sha>:<file>` gives it, only when the line the step log quotes for the diagnostic is that file's line at the diagnostic's line number; the buildlog's `sha` names HEAD and many steps share one while their `tree_key` differs with uncommitted edits, so the commit is not an exact snapshot. Any other diagnostic is counted on the snippet inside a stub function and reported separately as a lower bound. Report the failed steps per 100 the detector reaches beside each global verdict. The 75% thresholds stay as set.
-- **Residuals for `too_many_lines`:** for each diagnostic in W's failed steps (file and line from the step log), read the step log and the buildlog row read-only and match it to a fn-length `blocks.jsonl` record earlier than the step's start with the same file, whose `functions` array holds an entry with the diagnostic's function name; compare the record's `file` with the step's worktree as the root, since the record's `cwd` is the editor's directory and may sit below the worktree. Matched: the hook fired and the agent linted before splitting. Unmatched: an edit the hook did not see (a shell edit, rustfmt growth past the limit, or a person), a function inside a `macro_rules!` body (never measured), or `unknown` when the logs cannot say. Report each count and the five most frequent files.
-- **FMA in CI:** report whether hana `origin/main`'s `.github/workflows/ci.yml` carries `-C target-cpu=x86-64-v3` (`git -C ~/rust/hana show origin/main:.github/workflows/ci.yml`). Phase 2's real-code check found it only on `init/catalyst`.
-- **Write-up:** put the table and verdicts in the As-built, and send natedev the verdict lines, the CI flag's state included.
+The multiply-add failure rate rose 2.650570% and its seat time rose 43.330585% against Phase 1. Long-function failures fell 73.393510% and seat time fell 89.187976% against the fn-length plan's Phase 1 (2026-10-06 08:17 PDT; span 3.96 days). Sole-cause rates have no separate success threshold.
 
-**Files:**
-- `docs/plans/build-followups-mul-add.md` — the As-built.
+**Denominator and cost.** The read-only totals query found **763** hana clippy steps, **250** failed. All 250 have retained logs and an error diagnostic: **0** missing logs, **0** without diagnostics. W's first hana clippy step is **2026-10-06 22:44:37.901 PDT**; its span to W's end is **345,567.099 seconds = 3.9996192013888887 days**, the divisor for seat hours per day.
 
-**Seats:** 1 writer — `impl` runs the commands and reports.
+- `suboptimal_flops`: **159** diagnostics, all multiply-add messages, across **62** failed steps; **116** src-path and **43** test/example-path diagnostics. Of the associated calls, **61** are `lint` and **1** `example`. **12** sole-cause steps/calls, none lacking a call record; failed-call wall **2,574 s = 0.715 h**, median **186 s**, clippy-step wall **757.327 s**. **11** next lint calls within the **1,800 s** cap; gap median **305.703 s**, p75 **1,053.247 s**, total **5,722.331 s = 1.589536389 h**; **10** passed, **1** failed again, **1** had no follow-up within the cap. Seat cost **8,296.331 s = 2.304536389 h**, divided by the measured span. Unrounded script-derived daily cost is **0.576188950233001 h**.
+- `too_many_lines`: **27** diagnostics in **27** failed steps; **21** src-path and **6** test/example-path diagnostics, all associated with `lint` calls. **3** sole-cause steps/calls, none lacking a call record; failed-call wall **860 s = 0.238888889 h**, median **213 s**, clippy-step wall **387.049 s**. All **3** have a follow-up within **1,800 s**; gap median **244.217 s**, p75 **351.503 s**, total **805.758 s = 0.223821667 h**; **2** passed, **1** failed again, **0** lack follow-up. Seat cost **1,665.758 s = 0.462710556 h**, divided by the measured span. Unrounded daily cost is **0.11568865241783369 h**.
+- `tml_lengths.py`: **10** distinct file:line functions after collapsing repeated steps; lengths p25 **101**, median **103**, p75 **105**, p90/max **1,872**. **1** over each of **150**, **200**, and **300** lines; **4/10** in test files by path. It ran because the lint census was nonzero.
 
-**Acceptance gate:** all hashes match, every command exits 0, and the As-built states for each lint whether each success condition is met, with its number, plus the residual counts for both lints, the detector's reach split and the CI flag's state.
+**Controls.** The eight live `blocks.jsonl` records were read locally and over `ssh mac`, then matched to the saved start/end and actual block reason in `scratchpad/ctl_after/{natedev_controls.txt,mac_claude_golive_and_controls.txt,mac_codex_controls.txt}`. All runs below are on **2026-10-06**, and every displayed time is **PDT**. Each multiply-add record says `x * 0.5 + 1.0`; delivered feedback says `write x.mul_add(0.5, 1.0) ... (clippy::suboptimal_flops)`. Each fn-length record names `long_sum`, **101** lines, limit **100**, with delivered `split it now` feedback. Each Codex record names `agent: codex`, `tool: apply_patch`; each Claude record names `agent: claude`, `tool: Write`.
+
+| Machine | Agent | Hook | Saved run start–end (PDT) | Live record time (PDT) | Line | Proven |
+| --- | --- | --- | --- | --- | ---: | --- |
+| natedev | Claude | mul_add | 22:45:05–22:45:12 | 22:45:09.493604 | 1 | yes |
+| natedev | Codex | mul_add | 22:45:24–22:45:50 | 22:45:45.017466 | 5 | yes |
+| Mac | Claude | mul_add | 22:44:05–22:44:12 | 22:44:09.000212 | 1 | yes |
+| Mac | Codex | mul_add | 22:45:37–22:45:53 | 22:45:48.760633 | 4 | yes |
+| natedev | Claude | fn-length | 22:45:12–22:45:24 | 22:45:20.848400 | 1 | yes |
+| natedev | Codex | fn-length | 22:45:50–22:46:22 | 22:46:17.834045 | 5 | yes |
+| Mac | Claude | fn-length | 22:44:12–22:44:25 | 22:44:22.078640 | 1 | yes |
+| Mac | Codex | fn-length | 22:45:53–22:46:59 | 22:46:33.666409 | 5 | yes |
+
+Inside W the live logs contain **12** natedev mul_add records (**1** Claude, **11** Codex), **312** natedev fn-length records (**7** Claude, **305** Codex), and **2** Mac records per hook (**1** Claude and **1** Codex each). These are all-project log counts, not hana intervention rates. The Mac Codex fn-length control split the function after its proven block; the original 101-line version remains in the record.
+
+**Multiply-add residuals and detector reach.** Every one of the **159** diagnostics has a per-step record in the scratch ledger, with original buildlog row, quoted source, resolved worktree-relative path, preceding blocks, and detector result. There are **37** normalized files (**39** printed path spellings), **44** HEAD shas and **59** tree keys among the **62** steps. **14** diagnostics in **8** steps have an earlier block for the same file; **145** do not. Matching the preceding block's time, absolute file, line and expression gives **0** exact matches and **159** unmatched diagnostics. An earlier block elsewhere in the file does not prove that this expression was blocked.
+
+| Residual scan | Diagnostics | Detector flags this expression | Does not flag | Scope |
+| --- | ---: | ---: | ---: | --- |
+| Commit file, diagnostic line and all printed source lines match | 40 | 0 | 40 | 33 enabled, 7 exempt |
+| Printed snippet in a stub function, HEAD line differs | 105 | 4 | 101 | snippet-only lower-bound classification |
+| Printed snippet in a stub function, file absent at HEAD | 14 | 0 | 14 | snippet-only lower-bound classification |
+| All snippet-only scans | 119 | 4 | 115 | all enabled; empty `src/lib.rs` present |
+| Total | 159 | 4 snippet-only | 155 | 0 unscannable |
+
+The **40** real-file scans used the file from `git show <sha>:<file>` at its own path inside a `git archive` checkout of that commit, with its actual package/workspace declarations and roots. The **7** exempt diagnostics are in `crates/hana/tests/camera_panel_rear_lifecycle/mod.rs` (**3**), `crates/hana_organon/tests/arc_chooser/mod.rs` (**2**), `crates/hana/tests/demo_moments/cable_pixels.rs` (**1**), and `crates/hana/tests/open_assembly_card/mod.rs` (**1**). The stub fallback adds no invented parameter types or file declarations; **3** snippets required delimiter balancing, **1** is truncated in the step log, and no scan remained unbalanced.
+
+The four snippet hits are `crates/hana_origami/tests/unfold/app.rs:1546`, `0.1125 - 0.5 * meters_per_pixel` (**2** diagnostics in **2** steps), and `crates/hana_diegetic/tests/slider_face.rs:671`, `(full_right - full_left) - 2.0 * (half_right - half_left)`, plus line **701**, `(end_right - end_left) - 0.6 * (full_right - full_left)` (**2** diagnostics in **1** step). None has a preceding matching block. Thus confirmed real-file reached failures are **0/763 = 0 per 100**, and separately the snippet-only lower-bound classification reaches **3/763 = 0.3931847968545216 per 100**. The latter does not prove actual file reach: omitted declarations can supply types or veto a stub hit. HEAD is not the build's uncommitted tree; no live hana working-tree source was read and no mismatching diagnostic was promoted to a real-file result. The global thresholds and FAIL verdict remain in force.
+
+**Long-function residuals.** Resolved absolute `record.file` was compared with each diagnostic's step worktree plus its normalized file path, not with the editor's `cwd`. An earlier block must name the diagnostic's function in `functions`. **5/27** diagnostics matched: the hook fired and a later lint still found that function long. **22/27** are `unknown`; **0** are proven shell/person/rustfmt edits unseen by the hook, and **0** are proven macro-body exclusions. Of the unknowns, **19** have a matching commit line and no enclosing macro body; **3** lack a matching HEAD source (**2** absent files and **1** different line). The retained step logs and rows do not identify the editing mechanism, so unmatched does not itself mean the hook failed.
+
+| Matched function | Normalized file | Failed diagnostics | Latest earlier block (PDT) | Failed step start (PDT) |
+| --- | --- | ---: | --- | --- |
+| `format_operator_row` | `crates/hana/src/status_panel/display.rs` | 1 | 2026-10-07 02:55:28.436529 | 2026-10-07 03:43:05.579 |
+| `route_semantic_input` | `crates/hana_diegetic/src/widgets/interaction/input/routing.rs` | 1 | 2026-10-08 07:00:03.361745 | 2026-10-08 13:38:58.821 |
+| `build_drawing` | `crates/hana_origami/src/tool.rs` | 2 | 2026-10-10 12:45:19.471249 | 2026-10-10 16:17:37.731 and 16:17:41.064 |
+| `assert_add_camera_palette_icon` | `crates/hana/tests/control_panel/mod.rs` | 1 | 2026-10-10 21:02:15.369876 | 2026-10-10 21:17:34.105 |
+
+The five most frequent normalized residual files are `crates/hana/src/tool/geometry.rs` (**14**), `crates/hana/tests/open_assembly_card/mod.rs` (**3**), `crates/hana/src/selection/select_on_spawn.rs` (**2**), `crates/hana_origami/src/tool.rs` (**2**), and `crates/hana/src/status_panel/display.rs` (**1**, tied with five other files). These five account for **22/27** diagnostics.
+
+**Session-change boundary and sample coverage.** The queried natedev index has **13,048** hana step rows and **9,145** hana call rows inside W, all after Phase 7's **2026-10-06 19:24:53 PDT** natedev and **19:55:47 PDT** Mac go-live times; the timestamp audit found **0** pre-change rows. Its earliest hana step is **2026-10-06 22:44:35.271 PDT**, earliest hana call **22:46:26.014 PDT**. The Mac's read-only index contains an older replicated subset of **291** W clippy steps (**118** failed), from **2026-10-06 22:44:37.901 PDT** through **2026-10-08 09:32:37.976 PDT**, also entirely after both change times. All W rows present in either index originate on natedev; no Mac-origin W clippy row is present. The Mac subset was not added to the denominator. Loop comparisons use only W-started calls and cannot cross the session-change line. This measures the available indexed sample; it does not independently prove that no unindexed Mac run exists.
+
+**FMA in CI.** `git -C ~/rust/hana show origin/main:.github/workflows/ci.yml`, at local `origin/main` **`ce51498c50b1fc79b44bcc50dcd083e205929467`**, does **not** carry `-C target-cpu=x86-64-v3`. Its Linux target rustflags remain `-C link-arg=-fuse-ld=mold`. The director sent natedev both verdicts, with this missing flag, at 2026-10-10 23:14 PDT.
+
+**Reproduction and verification.** Before measuring, all four SHA-256 hashes matched:
+
+| Read-only original script | SHA-256 |
+| --- | --- |
+| `cost.py` | `c2de20870ab2de9b5438e469c565d25c48185438ab42dd77807d817655b5d4fa` |
+| `loop.py` | `a775765b96311a783c8d6af8cdc925071b89b4ac423ae8ffa75b88fe81bf9abf` |
+| `clippy_fail_lints.py` | `e178642d9bb1690562c132d824256198cc8f6e622b779b94ca76abbc75e841ce` |
+| `tml_lengths.py` | `18754c36c8c545928a082e3bded49c688f029221b917b0f1e6c164028e4b6522` |
+
+The only changes in the four scratch copies are their `started_at` bounds and corresponding SQL arguments, including `loop.py`'s follow-up call query. SQL `datetime` normalizes the recorded fractional timestamps and explicit **PDT** (`-07:00`) bounds. The full original-versus-copy diff is saved as `p9/bounded.diff` and shown below. The totals query uses the same bounds:
+
+```sql
+select count(*), sum(status!=0), min(started_at)
+from steps
+where repo='hana' and step='clippy'
+  and datetime(started_at)>=datetime(?)
+  and datetime(started_at)<datetime(?)
+```
+
+Each final requested command exited **0**, ran in the background under `set -o pipefail`, and had its output read and deleted before the next: `cost.py 4 suboptimal_flops`, `loop.py 4 suboptimal_flops`, `clippy_fail_lints.py 4`; `cost.py 4 too_many_lines`, `loop.py 4 too_many_lines`, `clippy_fail_lints.py 4`, `tml_lengths.py 4`; and the bounded totals query. `ssh mac`, the CI read, valid `git show` reads, all **18** complete-commit archives, and the final residual scan also exited **0**. Across both lints the source ledger covers **186** diagnostics and **51** HEAD shas. One checkout existed at a time, at most **197,287,777 bytes** (under **0.20 GB**), and each was deleted before the next. A preliminary search exited **127** after a shell `path` variable affected PATH; a first scratch residual helper exited **1** on an incorrect `macro_before` call. Both were corrected. A closeout-only arithmetic assertion also exited **1** because equivalent rate formulas differed by one floating-point rounding unit; its corrected tolerance check passed. The scripts, hooks and buildlog remained read-only, and all final required runs passed.
+
+Scratch evidence is under `/tmp/claude-1000/-home-natepiano-worktrees-claude-build-followups-mul-add/69dc3a91-6876-4d57-adc3-5e921cb38ff1/scratchpad/p9/`: `measurements.json` (unrounded results), `totals.json`, `controls.json`, `hook_records.json`, `residuals_scanned.json` (every diagnostic and match), `archive_stats.json`, and the bounded script copies/diff. The only repository content change is this Phase 9 section. **Boundary exception:** the initial `git status` refreshed worktree Git index metadata at **2026-10-10 22:47:06.442395 PDT**; later status reads used `GIT_OPTIONAL_LOCKS=0`. No staged content change, commit, branch operation, hook/config edit, build or test run was made. Required board posts also append outside the repository to the phase board.
+
+```diff
+--- original/cost.py
++++ p9/cost.py
+@@ -13,8 +13,8 @@
+ db = sqlite3.connect(f"file:{root}/index.sqlite?mode=ro", uri=True)
+ rows = db.execute(
+     """select s.id, s.log, s.call_id, c.wall_s, c.verb, c.seat, s.started_at, s.duration_s from steps s left join calls c on c.id = s.call_id
+-       where s.repo='hana' and s.step='clippy' and s.status!=0 and s.started_at>=datetime('now', ?)""",
+-    (f"-{days} days",),
++       where s.repo='hana' and s.step='clippy' and s.status!=0 and datetime(s.started_at)>=datetime(?) and datetime(s.started_at)<datetime(?)""",
++    ('2026-10-06T22:44:05-07:00', '2026-10-10T22:44:05-07:00'),
+ ).fetchall()
+ LINT = re.compile(r"(?:#\[(?:deny|forbid)\((\S+?)\)\]|rust-clippy/[^#\s]*#(\w+)|`-D (\S+?)`|implied by `-D (\S+?)`)")
+ CODE = re.compile(r"^error\[(E\d{4})\]")
+--- original/loop.py
++++ p9/loop.py
+@@ -37,11 +37,11 @@
+         out.add(name)
+     return out
+ steps = db.execute("""select s.call_id, s.log from steps s where s.repo='hana' and s.step='clippy' and s.status!=0
+-    and s.log is not null and s.call_id is not null and s.started_at>=datetime('now', ?)""", (f"-{days} days",)).fetchall()
++    and s.log is not null and s.call_id is not null and datetime(s.started_at)>=datetime(?) and datetime(s.started_at)<datetime(?)""", ('2026-10-06T22:44:05-07:00', '2026-10-10T22:44:05-07:00')).fetchall()
+ sole = {cid for cid, log in steps if (ls := lints(log)) and ls <= target}
+ calls = db.execute("""select id, started_at, ended_at, worktree, coalesce(seat,''), coalesce(session,''), outcome, wall_s
+-    from calls where repo='hana' and tool='verify.sh' and verb='lint' and started_at>=datetime('now', ?) order by started_at""",
+-    (f"-{int(days)+1} days",)).fetchall()
++    from calls where repo='hana' and tool='verify.sh' and verb='lint' and datetime(started_at)>=datetime(?) and datetime(started_at)<datetime(?) order by started_at""",
++    ('2026-10-06T22:44:05-07:00', '2026-10-10T22:44:05-07:00')).fetchall()
+ gaps: list[float] = []; passed = 0; again = 0; none = 0; walls: list[float] = []
+ for i, (cid, st, en, wt, seat, sess, out, wall) in enumerate(calls):
+     if cid not in sole or not en:
+--- original/clippy_fail_lints.py
++++ p9/clippy_fail_lints.py
+@@ -13,8 +13,8 @@
+ root = Path.home() / ".local/state/buildlog"
+ db = sqlite3.connect(f"file:{root}/index.sqlite?mode=ro", uri=True)
+ rows = db.execute(
+-    "select id, log from steps where repo='hana' and step=? and status!=0 and started_at>=datetime('now', ?)",
+-    (step, f"-{days} days"),
++    "select id, log from steps where repo='hana' and step=? and status!=0 and datetime(started_at)>=datetime(?) and datetime(started_at)<datetime(?)",
++    (step, '2026-10-06T22:44:05-07:00', '2026-10-10T22:44:05-07:00'),
+ ).fetchall()
+ LINT = re.compile(r"(?:#\[(?:deny|forbid)\((\S+?)\)\]|rust-clippy/[^#\s]*#(\w+)|`-D (\S+?)`|implied by `-D (\S+?)`)")
+ CODE = re.compile(r"^error\[(E\d{4})\]")
+--- original/tml_lengths.py
++++ p9/tml_lengths.py
+@@ -10,7 +10,7 @@
+ MSG = re.compile(r"^error: this function has too many lines \((\d+)/(\d+)\)")
+ LOC = re.compile(r"^\s*--> (\S+?):(\d+):")
+ seen: dict[str, int] = {}
+-for (log,) in db.execute("select log from steps where repo='hana' and step='clippy' and status!=0 and log is not null and started_at>=datetime('now', ?)", (f"-{days} days",)):
++for (log,) in db.execute("select log from steps where repo='hana' and step='clippy' and status!=0 and log is not null and datetime(started_at)>=datetime(?) and datetime(started_at)<datetime(?)", ('2026-10-06T22:44:05-07:00', '2026-10-10T22:44:05-07:00')):
+     lines = gzip.open(root / log, "rt", errors="replace").read().splitlines()
+     for i, line in enumerate(lines):
+         m = MSG.match(line)
+```
