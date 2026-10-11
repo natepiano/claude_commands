@@ -156,7 +156,9 @@ class SupersedeEvent(TypedDict):
     old: list[str]
 
 
-class AmendEvent(TypedDict):
+class LegacyAmendEvent(TypedDict):
+    """An amendment journaled before provenance snapshots were supported."""
+
     at: str
     verb: Literal["amend"]
     project: str
@@ -165,7 +167,35 @@ class AmendEvent(TypedDict):
     backfill: bool
 
 
-FeatureLogEvent = AddEvent | SupersedeEvent | AmendEvent
+class AmendEvent(TypedDict):
+    at: str
+    verb: Literal["amend"]
+    project: str
+    title: str
+    fields: list[str]
+    backfill: bool
+    old_link: str
+    new_link: str
+    old_completed: str
+    new_completed: str
+    releases_added: list[str]
+
+
+FeatureLogEvent = AddEvent | SupersedeEvent | LegacyAmendEvent | AmendEvent
+
+
+class KeepAcceptingProvenance(NamedTuple):
+    """Preserve the note's accepting commit and completion date."""
+
+
+class CorrectAcceptingProvenance(NamedTuple):
+    """Replace the accepting commit together with its completion date."""
+
+    link: str
+    completed: str
+
+
+AcceptingProvenanceAmendment = KeepAcceptingProvenance | CorrectAcceptingProvenance
 
 
 class ProposalArgs(TypedDict):
@@ -293,7 +323,9 @@ FIELD_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):(?: (.*))?$")
 SAFE_SCALAR_RE = re.compile(r"^[A-Za-z0-9][^:#\"'\n]*$")
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-VERSION_RE = re.compile(r"^(?:Unreleased|\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)$")
+VERSION_RE = re.compile(
+    r"^(?:Unreleased|\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$"
+)
 REVIEW_ROW_RE = re.compile(r"^[AC]\d+$")
 BODY_SECTION_HEADINGS = frozenset({"## See it", "## Evidence"})
 UNSAFE_BARE_SCALAR_PREFIXES = frozenset("-?:,[]{}#&*!|>'\"%@`")
@@ -865,14 +897,21 @@ def _supersede_event(note: Note, backfill: bool, old: list[str]) -> SupersedeEve
     }
 
 
-def _amend_event(note: Note, backfill: bool, fields: list[str]) -> AmendEvent:
+def _amend_event(
+    old: Note, updated: Note, backfill: bool, fields: list[str]
+) -> AmendEvent:
     return {
         "at": _event_time(),
         "verb": "amend",
-        "project": note["project"],
-        "title": note["title"],
+        "project": updated["project"],
+        "title": updated["title"],
         "fields": fields,
         "backfill": backfill,
+        "old_link": old["link"],
+        "new_link": updated["link"],
+        "old_completed": old["completed_date"],
+        "new_completed": updated["completed_date"],
+        "releases_added": sorted(set(updated["release"]) - set(old["release"])),
     }
 
 
@@ -980,9 +1019,19 @@ def _parse_event(line: str, line_number: int) -> FeatureLogEvent:
             "old": _json_string_list(value.get("old"), "event old"),
         }
     if verb == "amend":
+        legacy_keys = frozenset({"at", "verb", "project", "title", "fields", "backfill"})
+        if value.keys() == legacy_keys:
+            return {
+                "at": _json_string(value.get("at"), "event at"),
+                "verb": "amend",
+                "project": _json_string(value.get("project"), "event project"),
+                "title": _json_string(value.get("title"), "event title"),
+                "fields": _json_string_list(value.get("fields"), "event fields"),
+                "backfill": _json_bool(value.get("backfill"), "event backfill"),
+            }
         _require_json_keys(
             value,
-            frozenset({"at", "verb", "project", "title", "fields", "backfill"}),
+            legacy_keys | {"old_link", "new_link", "old_completed", "new_completed", "releases_added"},
             "amend event",
         )
         return {
@@ -992,6 +1041,11 @@ def _parse_event(line: str, line_number: int) -> FeatureLogEvent:
             "title": _json_string(value.get("title"), "event title"),
             "fields": _json_string_list(value.get("fields"), "event fields"),
             "backfill": _json_bool(value.get("backfill"), "event backfill"),
+            "old_link": _json_string(value.get("old_link"), "event old_link"),
+            "new_link": _json_string(value.get("new_link"), "event new_link"),
+            "old_completed": _json_string(value.get("old_completed"), "event old_completed"),
+            "new_completed": _json_string(value.get("new_completed"), "event new_completed"),
+            "releases_added": _json_string_list(value.get("releases_added"), "event releases_added"),
         }
     raise FeatureLogError(f"events.jsonl line {line_number} has unknown verb {verb}")
 
@@ -1014,6 +1068,20 @@ def _event_recorded(verb: str, project: str, title: str) -> bool:
         and event["title"] == title
         for event in _read_events()
     )
+
+
+def _journal_accepting_correction(event: AmendEvent) -> None:
+    """Keep one journal entry when retrying an unwritten accepting correction."""
+    for previous in reversed(_read_events()):
+        if (
+            previous["verb"] == "amend"
+            and previous["project"] == event["project"]
+            and previous["title"] == event["title"]
+        ):
+            if previous == {**event, "at": previous["at"]}:
+                return
+            break
+    _append_event(event)
 
 
 def _project_notes(project: str) -> list[tuple[Path, Note]]:
@@ -1478,6 +1546,23 @@ def _run_drop(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _amend_provenance(
+    arguments: argparse.Namespace, project: str, backfill: bool
+) -> AcceptingProvenanceAmendment:
+    link = cast(str | None, arguments.link)
+    completed = cast(str | None, arguments.completed)
+    if cast(bool, arguments.separate_result) and link is None:
+        raise FeatureLogError("--separate-result requires --link")
+    if link is None and completed is None:
+        return KeepAcceptingProvenance()
+    if not backfill:
+        raise FeatureLogError("--link and --completed require --backfill")
+    if link is None or completed is None:
+        raise FeatureLogError("--link and --completed must be provided together")
+    _validate_date(completed, "completed")
+    return CorrectAcceptingProvenance(_canonical_link(project, link), completed)
+
+
 def _run_amend(arguments: argparse.Namespace) -> int:
     project = cast(str, arguments.project)
     _ = _validate_project(project)
@@ -1487,30 +1572,19 @@ def _run_amend(arguments: argparse.Namespace) -> int:
     see_argument = cast(str | None, arguments.see)
     area_argument = cast(str | None, arguments.area)
     kind_argument = cast(str | None, arguments.kind)
-    completed_argument = cast(str | None, arguments.completed)
     crate_arguments = cast(list[list[str]] | None, arguments.crate)
     evidence_arguments = cast(list[list[str]] | None, arguments.evidence)
     evidence_additions = [
         item.strip() for item in _flatten(evidence_arguments)
     ]
     backfill = cast(bool, arguments.backfill)
+    provenance = _amend_provenance(arguments, project, backfill)
+    release_additions = _flatten(cast(list[list[str]] | None, arguments.release))
+    separate_result = cast(bool, arguments.separate_result)
+    if release_additions and not backfill:
+        raise FeatureLogError("--release requires --backfill")
     if any(not item or "\n" in item for item in evidence_additions):
         raise FeatureLogError("evidence is empty")
-    requested = any(
-        value is not None
-        for value in (
-            summary_argument,
-            behavior_argument,
-            see_argument,
-            area_argument,
-            kind_argument,
-            completed_argument,
-            crate_arguments,
-            evidence_arguments,
-        )
-    )
-    if not requested:
-        raise FeatureLogError("amend requires at least one field")
     requested_fields = [
         name
         for name, value in (
@@ -1519,12 +1593,17 @@ def _run_amend(arguments: argparse.Namespace) -> int:
             ("see", see_argument),
             ("area", area_argument),
             ("kind", kind_argument),
-            ("completed_date", completed_argument),
             ("crate", crate_arguments),
             ("evidence", evidence_arguments),
         )
         if value is not None
     ]
+    if isinstance(provenance, CorrectAcceptingProvenance):
+        requested_fields.extend(("link", "completed_date"))
+    if release_additions:
+        requested_fields.append("release")
+    if not requested_fields:
+        raise FeatureLogError("amend requires at least one field")
     path = vault_dir() / "feature-log" / project / f"{title}.md"
     with locked():
         if not path.exists():
@@ -1549,12 +1628,14 @@ def _run_amend(arguments: argparse.Namespace) -> int:
         if kind_argument is not None and updated["kind"] != kind_argument:
             updated["kind"] = kind_argument
             changed.append("kind")
-        if (
-            completed_argument is not None
-            and updated["completed_date"] != completed_argument
-        ):
-            updated["completed_date"] = completed_argument
-            changed.append("completed_date")
+        if isinstance(provenance, CorrectAcceptingProvenance):
+            if updated["link"] != provenance.link:
+                updated["link"] = provenance.link
+                changed.append("link")
+            if updated["completed_date"] != provenance.completed:
+                updated["completed_date"] = provenance.completed
+                changed.append("completed_date")
+            _reject_duplicate_link(updated, path, separate_result, frozenset())
 
         if crate_arguments is not None:
             crates = _validate_crates(project, _flatten(crate_arguments))
@@ -1566,6 +1647,13 @@ def _run_amend(arguments: argparse.Namespace) -> int:
                     if release.partition("@")[0] in crates
                 ]
                 changed.append("crate")
+        historical_releases = _validate_release_values(project, updated["crate"], release_additions)
+        if any(release.partition("@")[2] == "Unreleased" for release in historical_releases):
+            raise FeatureLogError("--release requires an exact historical version, not Unreleased")
+        releases = sorted(set(updated["release"]) | set(historical_releases))
+        if releases != updated["release"]:
+            updated["release"] = releases
+            changed.append("release")
         known_evidence = set(updated["evidence"])
         new_evidence: list[str] = []
         for item in evidence_additions:
@@ -1578,15 +1666,24 @@ def _run_amend(arguments: argparse.Namespace) -> int:
 
         if not changed:
             if not _event_recorded("amend", note["project"], note["title"]):
-                _append_event(_amend_event(note, backfill, requested_fields))
+                _append_event(_amend_event(note, note, backfill, requested_fields))
             print(f"unchanged: {_relative(path)}")
             return 0
         updated["behavior"] = updated["behavior"].strip()
         updated["see"] = updated["see"].strip()
         updated["date_modified"] = today()
         validate_note(updated, project)
-        _write_note(path, updated)
-        _append_event(_amend_event(updated, backfill, changed))
+        event = _amend_event(note, updated, backfill, changed)
+        if (
+            event["old_link"] != event["new_link"]
+            or event["old_completed"] != event["new_completed"]
+            or event["releases_added"]
+        ):
+            _journal_accepting_correction(event)
+            _write_note(path, updated)
+        else:
+            _write_note(path, updated)
+            _append_event(event)
     print(f"amended: {_relative(path)} ({', '.join(changed)})")
     return 0
 
@@ -1622,7 +1719,7 @@ def _run_live(arguments: argparse.Namespace) -> int:
     for note in matches:
         crates = ", ".join(note["crate"])
         area_text = f" ({note['area']})" if note["area"] is not None else ""
-        output = f"{note['completed_date']} {note['kind']} {note['title']} — {note['summary']} [{crates}]{area_text}"
+        output = f"{note['completed_date']} {note['kind']} {note['title']} — {note['summary']} [{crates}]{area_text} {note['link']}"
         print(output)
     return 0
 
@@ -1824,10 +1921,13 @@ def _parser() -> FeatureLogArgumentParser:
     _ = amend.add_argument("--see")
     _ = amend.add_argument("--area")
     _ = amend.add_argument("--kind")
+    _ = amend.add_argument("--link")
     _ = amend.add_argument("--completed")
+    _ = amend.add_argument("--release", action="append", nargs="+")
     _ = amend.add_argument("--crate", action="append", nargs="+")
     _ = amend.add_argument("--evidence", action="append", nargs="+")
     _ = amend.add_argument("--backfill", action="store_true")
+    _ = amend.add_argument("--separate-result", action="store_true")
 
     live = subparsers.add_parser("live")
     _ = live.add_argument("--project", required=True)

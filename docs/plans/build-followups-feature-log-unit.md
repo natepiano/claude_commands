@@ -188,7 +188,7 @@ After Phase 2 reaches `~/.claude` main, the unit director tells the showrunner t
 - Several results can share one accepting link, so a second note on the same link needs `--separate-result`.
 - Behaviors from commit-only work (no phase block, no as-built file) have no structured record; only the surface audit finds them.
 
-### Phase 5 — A backfilled note's link, date and release can be corrected  · status: todo
+### Phase 5 — A backfilled note's link, date and release can be corrected  · status: done
 
 #### Work Order
 
