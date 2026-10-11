@@ -288,93 +288,32 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 ### Phase 5 — Starting sessions by account, and the user's guide  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** the user can start a session on any account with one word, and has a guide that says how to start sessions, how to log in and out without moving `~/.claude` off its account, and how to see which account a session is on. Nothing here creates a dir or logs anything in.
-
-**Constraints from prior phases:** Phase 1 shipped `scripts/accounts/accounts.py`. Every path comes from `Path.home()` at call time; there is no `ACCOUNTS_HOME`, and tests set `HOME` to a temp dir. `check(label) -> list[str]` returns every problem, empty when the account is fit, and already refuses an account dir that is a symlink and any symlinked identity file (`.credentials.json`, `.claude.json`, `account-label`). `role_account("unit") -> DefaultAccount | NamedAccount(label, dir)`, `launch_prefix("unit") -> str` (empty for the default account) and `main(argv) -> int`. Other scripts import it by putting the repo root on `sys.path`, then `from scripts.accounts import accounts`. Phase 2 shipped `accounts.account_prefix(selected) -> str`: `CLAUDE_CONFIG_DIR=<quoted dir> `, or empty for `DefaultAccount`. `launch_prefix(role)` is `account_prefix(role_account(role))`, and the `env <role>` verb prints it. `add_unit.py` already calls `accounts.check(label)` before every unit launch, so a rule added to `check` reaches the unit launch with no change to `add_unit.py`; its refusal reads `add_unit: unit account <label>: <first problem>; /accounts status`. The manual unit resume in `commands/showrunner/produce.md` runs `accounts.py env unit` first and stops on a nonzero exit.
-
-Phase 3 shipped quota with two active accounts. `accounts.py` imports the whoami modules top-level (`import account`, `import agent_accounts`, with `scripts/whoami` on `sys.path`); `pyrightconfig.json` has a `scripts/accounts` execution environment with `extraPaths` `[".", "scripts/whoami"]`. The account value types live in `scripts/whoami/agent_accounts.py`: `KnownClaudeAccount(login, label)`, `UnreadableClaudeAccount`, `CheckedNamedClaudeAccount(label, directory, identity)` and the frozen `ClaudeAccountSelection(default_account, unit_account, multiple_accounts, named_accounts)`. `accounts.claude_account_selection()` builds it once per operation from `checked_named_accounts()` (the named dirs that pass `check`) and `account_identity(dir)` (the dir's login and its quota note label, or `UnreadableClaudeAccount` when the dir is logged out or its files cannot be read). So `check` decides which named dirs feed live readings, role activity and quota's spare ranking, and whether the unit account resolves. `multiple_accounts` comes from `multiple_accounts_configured()`: `config/accounts.json` exists or a named dir exists, whatever `check` says. `check` today reports `accounts: <dir> is not logged in` for any `UnreadableClaudeAccount`. `account.py` with no arguments prints the calling session's account (from `CLAUDE_CONFIG_DIR`); `whoami.py` in multi-account mode prints each account that holds a role, with its role, and omits spares, so it does not say which account the calling session is on. A low-quota acknowledgement holds across swaps: an account made spare and then selected again stays quiet until its own recovery or reset. `account.py`, `agent_accounts.py` and `note_file.py` never import `scripts.accounts`, lazily or under `TYPE_CHECKING`. Lint by directory, never a file list, because only that finds an import cycle.
-
-Phase 4 shipped `swap(role, label, *, dry_run=False) -> SwapDryRun | SwapStarted | SwapRolledBack` and the `swap` verb. Swap resolves `ClaudeAccountSelection` once. It inspects and stops the old login by its note label, writes the new unit role before `down`, and restores the exact previous configuration when `down` returns nonzero. It prints shutdown's output unchanged, then `units come back on <target note label> when <old note label> is down`, or `unit account unchanged: still <old note label>` on rollback. Its refusals, each before any write:
-- `accounts: current unit account identity is unreadable`
-- `accounts: default account identity is unreadable`
-- `accounts: <label> is the default account; use default`
-- `accounts: <note label> is already the unit account`
-- the target's first `check` problem
-- `accounts: cannot swap <old>: <machine> <kind> <name> would not move`
-- `accounts: cannot swap <old>: <machine> unattributed session <name> (pid <pid>)`
-
-Only local (natedev) units and their director-owned seats move; any session in the peer machine's inventory refuses. So a change to `check` reaches swap's target refusal and its current-unit resolution (a unit dir failing `check` makes `unit_account` unreadable). Swap runs `status` and `down` without `--here`, so it needs the Mac reachable even when the Mac holds nothing on the old account (its empty record completes without stopping anything). A Mac outage at the inventory refuses with the role unchanged; a refused `down` restores the old role; after shutdown starts, its status and any recovery notice are the evidence, not the start line. `/accounts swap` takes no `--here`.
-
-`shutdown.py down <old note label> --restart` stores restart intent at `begin`, before the conductor starts, and resumes only after a complete stop. The requester of a complete stop gets `The sessions restart automatically: units on the unit account, other sessions on the account they ran on.`. A partial-stop notice keeps the manual `/shutdown restart` guidance and adds `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py down '<old note label>' --restart`; its action is `Run <that command>.`. Rerunning that command reuses the saved sessions, timers and scope, prints `shutdown of <label> resumed; /shutdown status to watch`, refuses a different `--only` with `shutdown: retry must keep the original --only scope`, and refuses a peer record that is not ready with `shutdown: peer is not ready to retry stopping; nothing was shut down`. A peer record that cannot be read after a complete stop alerts `<label>: automatic restart skipped` with `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart '<old note label>'`, even for a `--only` shutdown; other partial or incomplete outcomes of a `--only` shutdown send no phone alert. A session's dir is stored on the record entry's `session.config_dir` (absent means `~/.claude`): non-unit resumes keep it, and units relaunch through `add_unit.py` on the current unit role. `set-role` refuses an unreadable identity and stores the note label as `account_label` on the new `RoleChange`; older records without it keep the legacy resolution. `commands/accounts.md` already exists: it dispatches `status`, `setup` and `swap`, and states the `default` undo and `/login`.
-
-**Spec:**
-
-- **`accounts.py exec <claude N | unit> [claude args…]`** resolves the target and then `os.execvpe("claude", …)`.
-  - `claude N` that is `~/.claude`'s login runs plain `claude`, with `CLAUDE_CONFIG_DIR` removed. So `claude2` today is the same session as `claude`.
-  - Any other `claude N` runs with `CLAUDE_CONFIG_DIR=~/.claudeN`.
-  - `unit` follows the role, and with no role runs plain `claude`.
-  - It refuses with exit 2, without starting `claude`, when:
-    - the dir does not exist: `accounts: ~/.claudeN is not set up; /accounts setup "claude N" first`
-    - a link is broken
-    - the dir is logged in as another account: `accounts: ~/.claudeN is logged in as <login>, not claude N; see Log out and in in ~/.claude/docs/accounts.md`
-
-    A dir that is set up but logged out is allowed, so the login itself can run through `exec`. A dir whose identity files exist but cannot be read is not logged out: it refuses with its problem. Give the boundary one frozen tagged readiness value, `AccountDirectoryReadiness`, with explicit states ready, logged out, wrong login, not set up, broken links and unreadable, that `exec` and `check` both read: `exec` starts on ready and logged out, `check` passes only ready. Convert missing, malformed and unreadable identity or note results into these states at the filesystem boundary; do not forward `account_identity`'s `UnreadableClaudeAccount`, which joins a logout and a read failure. When several problems coexist, `check` still reports all of them.
-- **`check` gains the login match.** A dir whose login is not the `login:` of its `claude N` note is a problem, and so is a dir with no `claude N` note. Compare the dir's actual login with `login:` in the requested label's note, not the requested label with `account_identity(...).label`. `status` shows it, and so do the unit launch (Phase 2) and `swap` (Phase 4). Because `check` feeds the selection, a mismatched dir also drops out of `named_accounts` (no live reading, no spare ranking), a mismatched unit dir makes `unit_account` an `UnreadableClaudeAccount`, and `multiple_accounts` stays true. `account_identity` keeps reporting the dir's actual login, so `status` can say `logged in as <login>, not claude N`.
-- **Shell aliases.** The text below goes to natedev, who commits it to `/etc/nixos` `modules/linux/shell.nix` under `programs.zsh.shellAliases`; the rebuild is the user's. Units run only on natedev, so the Mac gets none.
-
-  ```nix
-  claude1 = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec 'claude 1'";
-  claude2 = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec 'claude 2'";
-  claude3 = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec 'claude 3'";
-  claude-unit = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec unit";
-  ```
-
-  Plain `claude` is unchanged: it is `~/.claude`'s account, where showrunners and the user's own sessions run. Until cutover, every alias either runs plain `claude` or refuses, so committing them starts nothing.
-- **`docs/accounts.md`, the user's guide.** Short, task-first, every command copyable:
-  - **Which account am I on:** the status line's second row shows the label, and `~/.claude/scripts/lib/py ~/.claude/scripts/whoami/account.py` prints it. `/whoami` shows each account in use with its role (showrunners, unit directors), not which one this session is on; `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py status` shows every dir and its login.
-  - **Starting a session:**
-    - `claude` for showrunners and the user's own work.
-    - `claude-unit` for a session on the unit account.
-    - `claude1`, `claude2` and `claude3` for a named account.
-    - Units started by showrunners pick their account themselves.
-  - **Log out and in** (each dir holds one login, and `/login` or `/logout` inside a session changes it for every session on that dir):
-    - To switch `~/.claude`'s account, as today: `/login` in a `claude` session. Do not run it in a `claude-unit` or `claudeN` session.
-    - To renew or fix account N: `claudeN`, then `/login` as claude N. `exec` refuses a dir logged in as the wrong account, so start that one directly with `CLAUDE_CONFIG_DIR=~/.claudeN claude`, then `/logout` and `/login` as claude N.
-    - Never `/logout` in a unit director's session: every unit on that account stops working.
-    - After any login, `/accounts status` must show every dir matching its label.
-  - **Swapping the unit account:** `/accounts swap unit "claude N"`, and the undo `/accounts swap unit default`. Quote the messages from the Constraints above.
-    - Run it from a session on another account, normally plain `claude`, or from a terminal. It shows shutdown's output and `units come back on <target> when <old> is down`. That line means the request was accepted, not that it finished: watch `/shutdown status`, then check the resumed units' account labels. The requester then gets `The sessions restart automatically: units on the unit account, other sessions on the account they ran on.`.
-    - Before writing a role, swap refuses and names the cause: a session that would not move, an unattributed session, an unreadable current or undo account, an account that is already the unit account, a default account that needs `use default`, or the target's first `check` problem. Fix account readiness with `/accounts status`; close ordinary sessions on the outgoing unit account before retrying a session refusal. A session on the Mac refuses, because units move only on natedev. Swap needs the Mac reachable; a Mac outage refuses with the role unchanged.
-    - `unit account unchanged: still <old>`: the shutdown refused and the old role is back. Fix the printed refusal and run the same swap again.
-    - A shutdown that ends `stop partial` keeps the new role and restarts nothing. The alert's runnable `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py down '<old>' --restart` stops the rest and then resumes the saved set; the alert also keeps the manual `/shutdown restart` line. The retry prints `shutdown of <old> resumed; /shutdown status to watch` and keeps its saved scope; a different `--only` is refused.
-    - `<old>: automatic restart skipped`: the peer record could not be read. Restore access to it, then run the alert's `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart '<old>'`. Recovery commands name the old account, even though the role now names the target.
-    - Undo is `/accounts swap unit default`. Moving units off the default account, which showrunners share, is not a swap (swap refuses showrunners and top-level sessions): it is the cutover's selected-unit procedure.
-  - **Setting up a new dir:** `/accounts setup "claude N"`, then `claudeN` and `/login`.
-  - **Low-quota alerts:** acknowledging an account's low-quota alert keeps it quiet across swaps: made spare and then selected again, it stays quiet until its own quota recovers or resets.
-  - **When a unit will not start:** a showrunner's launch refuses with `add_unit: unit account <label>: <problem>; /accounts status`. Run `/accounts status`, fix what it names (most often `claudeN` and `/login` as claude N), then launch again.
-- `commands/accounts.md` points to the guide.
+- `accounts.py exec <claude N | unit> [claude args…]` (`exec_account(label, arguments) -> None`) discards `CLAUDE_CODE_OAUTH_TOKEN` in every branch, then calls `os.execvpe("claude", ["claude", *arguments], env)`. A `claude N` whose note `login:` equals `~/.claude`'s login, and `unit` with no role, run plain `claude` with `CLAUDE_CONFIG_DIR` removed; any other target runs with `CLAUDE_CONFIG_DIR=~/.claudeN`. It starts on ready or logged out (so `/login` runs through it); otherwise it exits 2 without starting `claude` and prints the first problem, among them `accounts: ~/.claudeN is not set up; /accounts setup "claude N" first` and `accounts: ~/.claudeN is logged in as <login>, not claude N; see Log out and in in ~/.claude/docs/accounts.md`.
+- `account_directory_readiness(label) -> AccountDirectoryReadiness` returns one frozen tagged value: `AccountDirectoryReady(login)`, `AccountDirectoryLoggedOut`, `AccountDirectoryWrongLogin(login)`, `AccountDirectoryNotSetUp`, `AccountDirectoryBrokenLinks` or `AccountDirectoryUnreadable`, each carrying every coexisting problem. It reads the dir's `.claude.json` (`ClaudeDirectoryLogin | ClaudeDirectoryLoggedOut | UnreadableClaudeDirectoryIdentity`) and the label's note (`ExpectedClaudeLogin | MissingClaudeAccountNote | UnreadableClaudeAccountNote`) at the filesystem boundary. `exec` and `check` both read it; `check(label)` returns its problems, so only ready passes.
+- `check` requires the dir's login to match `login:` in the requested label's note (case-insensitive); a dir with no `claude N` note is a problem. Through the selection, a mismatched dir leaves `named_accounts`, a mismatched unit dir makes `unit_account` an `UnreadableClaudeAccount` (unit launch and swap refuse), and `multiple_accounts` stays true; `account_identity` still reports the dir's actual login.
+- `setup` creates the missing always-linked shared targets (`projects`, `sessions`) under `~/.claude` before linking; `_link_problems` inspects a named entry even when its optional source is gone and reports a dangling expected link as `accounts: <path> is broken`. `note_file.read_note` returns None for a non-UTF-8 note.
+- Aliases `claude1`, `claude2`, `claude3` and `claude-unit`, each `"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec 'claude N'"` (`exec unit` for `claude-unit`). The alias text lives in natedev's `/etc/nixos` `modules/linux/shell.nix` under `programs.zsh.shellAliases`; committing and rebuilding are outside this repo, and the Mac has none. Plain `claude` stays `~/.claude`'s account.
+- `docs/accounts.md` covers which account a session is on, starting a session (aliases and the alias-free `accounts.py exec` form), Log out and in, swapping the unit account with every refusal and recovery line, setting up a dir, low-quota alerts, and a unit that will not start.
 
 **Files:**
+- `scripts/accounts/accounts.py` — `exec_account`, the readiness types and `account_directory_readiness`, login-matching `check`, `setup`'s shared-target creation.
+- `scripts/accounts/test_accounts.py` — exec refusals, env set and removed, token discard; check login match and its selection effects; swap's wrong-login refusals; setup repair.
+- `scripts/whoami/note_file.py`, `scripts/whoami/test_note_file.py` — a non-UTF-8 note reads as None.
+- `scripts/whoami/test_agent_notes.py` — the shared-login fixture carries the requested label's note.
+- `scripts/shutdown/test_shutdown_cli.py` — the fail-closed launch test injects a resolver `RuntimeError`.
+- `docs/accounts.md` — the user's guide; `commands/accounts.md` — dispatch plus a pointer to the guide.
 
-- `scripts/accounts/accounts.py` — `exec` and the login-matches-note rule in `check`.
-- `scripts/accounts/test_accounts.py` — `exec` with `os.execvpe` stubbed: each refusal, env set and removed, the default-login case, a logged-out dir allowed apart from an unreadable one refused. `check` with a mismatched login and with no `claude N` note: the dir leaves `named_accounts`, a mismatched unit dir makes `unit_account` unreadable, and `multiple_accounts` stays true. A wrong-login target refuses swap before any role or history write, and a wrong-login current unit makes swap refuse with its unreadable current identity. Update the existing swap and burn fixtures that omit the requested label's note or rename it before selecting an account: keep a valid shared-login fixture (the requested label's note present, a different note label resolved) proving the shutdown argv still uses the resolved note label; keep burn's logout and re-login regression with the account fit at swap time and its identity changed afterwards; keep legacy burn attribution for records without `account_label`.
-- `docs/accounts.md` — new: the user's guide.
-- `commands/accounts.md` — points to the guide.
-- `docs/plans/build-followups-two-accounts.md` — the alias text, as sent to natedev.
+**Binds later work:** a named dir's session starts through `claudeN` / `accounts.py exec 'claude N'`, which drops an inherited OAuth token, refuses a wrong login and passes claude's arguments through. The guide's "Log out and in" is the login procedure: `claudeN`, then `/login` as claude N; a dir on the wrong login starts with `CLAUDE_CONFIG_DIR=~/.claudeN claude`, then `/logout` and `/login`. `setup` may create missing shared targets under `~/.claude`.
 
-**Seats:** `2 writers`, each writing its own tests; the guide quotes `exec`'s refusals from this Spec.
-- `exec`: `accounts.py`, `test_accounts.py`.
-- `guide`: `docs/accounts.md`, `commands/accounts.md`. The alias text in this plan is the director's. Before writing the account-display and acknowledgement statements, the seat reads the regressions that pin them: `scripts/whoami/test_agent_notes.py` (multi-account display) and `scripts/whoami/test_quota_alert.py` (acknowledgement across a swap).
+**Gotchas:**
+- A raw `CLAUDE_CONFIG_DIR=~/.claudeN claude` keeps an inherited `CLAUDE_CODE_OAUTH_TOKEN`, which wins over the dir's login; `exec` discards it.
+- A dir whose identity files exist but cannot be read is not logged out: its readiness is unreadable and `exec` refuses.
+- `exec` skips the dir entirely when the note's login is `~/.claude`'s, so `claude2` runs plain `claude` even with no `~/.claude2`.
+- `/login` or `/logout` inside a session changes the login for every session on that dir; `/logout` in a unit director's session stops every unit on that account.
 
-**Acceptance gate:**
-
-- Tests pass, and `basedpyright scripts/accounts scripts/whoami scripts/nightly_review scripts/shutdown scripts/production` reports 0 errors, 0 warnings, 0 notes (it exits 3 only for the missing `.venv`).
-- With a temp `HOME`, temp notes, readings and state paths, `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_OAUTH_TOKEN` unset, and `os.execvpe` stubbed, a fixture with the default claude 2 identity and no named dirs shows `exec 'claude 3' --version` exiting 2 with the setup line, and `exec 'claude 2' --version` passing its arguments to `claude` with `CLAUDE_CONFIG_DIR` removed.
-- The director's smoke on natedev, read-only and before any dir exists: `accounts.py exec 'claude 3' --version` refuses with the setup line, and `accounts.py exec 'claude 2' --version` prints Claude Code's version. No dir, login or role is created.
-- The guide seat checks the guide's accepted-request, refusal, rollback, complete-stop, partial-stop and retry, and skipped-restart text against `scripts/accounts/test_accounts.py`, `scripts/shutdown/test_settle.py` and `scripts/shutdown/test_stop.py`. Every recovery command names the old note label and carries the runnable `~/.claude/scripts/lib/py` prefix. `commands/accounts.md` keeps its dispatch and output behavior and gains only the guide pointer. This is a source-and-document comparison; no live command runs.
-- natedev has the alias text.
+**Ruled out:** comparing the requested label with `account_identity(...).label` (the dir's login is compared with the note's `login:`); forwarding `account_identity`'s `UnreadableClaudeAccount` into readiness, which joins a logout and a read failure; fixing the non-UTF-8 note crash in `accounts.py` instead of `note_file.read_note`.
 
 ### Phase 6 — Live proof on claude 3  · status: todo · gated by G1
 
@@ -382,13 +321,13 @@ Only local (natedev) units and their director-owned seats move; any session in t
 
 **Goal:** before cutover, prove on natedev that a session in a farm dir runs on its own account and is seen by the existing toolchain. Record the result of each check here.
 
-**Constraints from prior phases:** Phase 4 supports `shutdown.py down <note label> --here --only <comma-separated session ids> --restart`; `--here` starts and resumes only this machine's record. A non-unit scratch session resumes on its stored `session.config_dir`, so this proof sets no unit role and moves no existing unit. Exit 0 from `down` means the stop was accepted, not that the resume finished: `shutdown.py status` and the resumed process are the evidence. A partial stop's printed retry omits `--here`; a local proof adds it.
+**Constraints from prior phases:** Phase 4 supports `shutdown.py down <note label> --here --only <comma-separated session ids> --restart`; `--here` starts and resumes only this machine's record. A non-unit scratch session resumes on its stored `session.config_dir`, so this proof sets no unit role and moves no existing unit. Exit 0 from `down` means the stop was accepted, not that the resume finished: `shutdown.py status` and the resumed process are the evidence. A partial stop's printed retry omits `--here`; a local proof adds it. Phase 5 shipped `accounts.py exec <claude N | unit> [claude args…]` and the `claudeN` aliases (on natedev after the user's rebuild; otherwise `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec 'claude N'`). `exec` discards an inherited `CLAUDE_CODE_OAUTH_TOKEN`, which a raw `CLAUDE_CONFIG_DIR=~/.claudeN claude` keeps and which would override the dir's login; it starts a logged-out dir, refuses one logged in as another account, and passes claude's own arguments through. `check` now also requires the dir's login to match `login:` in its `claude N` note and reports a dangling expected link as broken; `setup` creates missing shared targets (`projects`, `sessions`) under `~/.claude` before linking. The login procedure is the guide's "Log out and in" (`~/.claude/docs/accounts.md`).
 
 **Spec:** the director runs it with the user; a writer joins only for fixes to `accounts.py`.
 
 1. `accounts.py setup "claude 3"` (the unit account the user chose; `~/.claude` is claude 2).
-2. The user runs `CLAUDE_CONFIG_DIR=~/.claude3 claude` in a terminal and completes `/login`. Then `accounts.py check "claude 3"` passes.
-3. Start a scratch session `CLAUDE_CONFIG_DIR=~/.claude3 claude --remote-control acct-probe -n acct-probe` in tmux, cwd a scratch dir. Check, recording each result:
+2. The user runs `claude3` (or `accounts.py exec 'claude 3'`) in a terminal and completes `/login` as claude 3. Then `accounts.py check "claude 3"` passes.
+3. Start a scratch session `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec 'claude 3' --remote-control acct-probe -n acct-probe` in tmux, cwd a scratch dir. Check, recording each result:
    - **(a) Logins.** `claude auth status` under each dir shows its own email, and `~/.claude/.credentials.json` mtime is unchanged.
    - **(b) Registry and transcripts.** The probe's record is in `~/.claude/sessions/`, its transcript is under `~/.claude/projects/`, and its status line shows claude 3.
    - **(c) Messaging.**
@@ -424,7 +363,7 @@ If (b), (c) or (e) fails, stop and bring the failing check to the showrunner wit
 **Spec:** the director runs it with the user.
 
 1. `accounts.py setup` for each account the user has, except the one `~/.claude` is logged in to. The Phase 6 dir already exists.
-2. The user logs in each new dir (G2).
+2. The user logs in each new dir (G2): `claudeN` (or `accounts.py exec 'claude N'`), then `/login` as claude N, per the guide's "Log out and in".
 3. `accounts.py status`: every dir passes `check`.
 4. Pause new unit dispatches and let launches in flight finish (`add_unit.py` fixes its account before it spawns). Record the previous unit role and the default login's note label, confirm the target passes `check`, and run `accounts.py set-role unit "<label>"`. Collect the natedev unit directors' session ids on the default account; inventory brings their owned seats along. With no such units, skip the shutdown. Otherwise run `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py down '<default note label>' --here --only '<non-empty comma-separated unit session ids>' --restart`. `--here` keeps the Mac out, since units run only on natedev. Never send an empty `--only`: it means every session on the account.
    - A nonzero exit from this `down` stopped nothing: restore the previous role with `accounts.py set-role unit '<previous role>'`, fix the refusal, and repeat the cutover; record no T0.
