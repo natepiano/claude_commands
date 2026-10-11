@@ -18,7 +18,7 @@
   - `scripts/agents/codex_mesh.py` — opens and follows Codex seats; writes `role` on a new thread (~line 1895) and on a follow-up claim (~line 721).
   - `scripts/delegate/review.sh` — reviews; knows the lens; dispatches through `codex_mesh.py` with `--role review` (~line 278).
   - `scripts/production/update_registration.py` — `register` runs at every showrunner start and resume.
-  - `scripts/whoami/seat_usage.py` — today's Codex rollout parser (reused in Phase 3).
+  - `scripts/whoami/seat_usage.py` — today's Codex rollout parser (reused in Phase 4).
 - **Test lanes:** `scripts/usage/test_*.py`, `scripts/agents/test_codex_mesh.py`; run with `python3 -m unittest` from the repo root (pytest is not installed).
 - **Build:** none.
 - **Test:** `python3 -m unittest scripts.usage.test_agents_log scripts.agents.test_codex_mesh` (per phase, the modules it names).
@@ -43,7 +43,7 @@ Today, each question needs its own scratch script (`seat_usage.py`, `api_cost.py
   - the showrunner (production doc, `SHOWRUNNER_UNIT` tmux marker);
   - unit directors (the active marker, and the run's session directory);
   - Claude workers (the `seats` ledger in the run directory);
-  - Codex seats (`role` and `lens` per dispatch in `mesh_roster.json`, and the `handoff` posts on the board);
+  - Codex seats (`role` per dispatch in `mesh_roster.json`, the lens only in `agents.jsonl`, and the `handoff` posts on the board);
   - reviewers (`review.sh` status files);
   - subagents (the parent session that spawned them).
   58 finished run directories survive in `~/.local/state/usage-model/delegate-archive/`.
@@ -65,73 +65,75 @@ Today, each question needs its own scratch script (`seat_usage.py`, `api_cost.py
 
 ### Phase 1 — Every agent the delegate tooling starts records its role · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** every unit director, showrunner, Claude worker and Codex seat (with its role and lens on every dispatch) appends one line to `agents.jsonl` when its role is assigned, and the 58 archived runs plus the live ones are backfilled.
-
-**Spec:**
-- New `scripts/usage/agents_log.py`:
-  - `state_dir() -> Path`: `USAGE_STATE_DIR` when set, else `~/.local/state/usage-model`; the log is `<state_dir>/agents.jsonl`.
-  - `append(agent_id: str, role: Role, lens: Lens | None, at: datetime, approximate: bool = False) -> None`: one JSON line `{"id", "role", "at"}` plus `"lens"` only when given and `"approximate": true` only for backfill. `at` is ISO-8601 UTC with seconds. Writes under an exclusive `fcntl.flock` on the open file, so concurrent appends never interleave.
-  - `Role` is a closed set: `showrunner`, `director`, `impl`, `test`, `fix`, `review`, `worker`. `Lens`: `adversary`, `contract`, `craft`, `ux`. Model each as a `Literal` alias validated at the CLI boundary; an unknown value is a usage error (exit 2).
-  - `assignments(path) -> dict[str, tuple[Assignment, ...]]`, `Assignment(at, role, lens, approximate)` frozen dataclass, each tuple sorted by `at`; malformed lines are skipped and counted in a returned `problems` tuple (return a `RoleLog(assignments, problems)`).
-  - `role_at(log: RoleLog, agent_id: str, at: datetime) -> Assignment | Unassigned`: the latest assignment at or before `at`; `Unassigned()` frozen dataclass otherwise.
-  - CLI: `append --id <id> --role <role> [--lens <lens>]` (time is now); `backfill [--archive DIR] [--live DIR]`; `show [--id <id>]` prints the assignments as a Markdown table.
-  - On any write failure the CLI prints `agents_log: <reason>` to stderr and exits 0, so no launcher fails because of it.
-- `backfill` reads each run directory under `~/.local/state/usage-model/delegate-archive/` and `/tmp/claude/delegate/` (skipping `active/`):
-  - `mesh_roster.json`: each seat's `thread_id` with its `role` (and `previous_role` as an earlier assignment when present), stamped with the roster file's mtime, `approximate: true`;
-  - the `seats` ledger (`<session id>\t<name>`): role `worker`, stamped with the ledger's mtime, `approximate: true`;
-  - the run's director: the active marker naming this run directory when present, else nothing (the director is recovered in Phase 3 from transcripts' `cwd`);
-  - review lens: the newest `review_agent_[<N>_]<lens>.log` naming the seat gives its lens; with no such log, no lens (never one inferred from the seat name).
-  Backfill writes nothing for an id that already has an exact (non-approximate) line, and is idempotent: a line already present for the same (id, role, lens) is not written again. A bad roster or ledger loses only its own rows; an append after a truncated tail starts a new line.
-  - A claim released back to its previous role records that role again.
-- Writers, each one line, each `|| true` in shell (or caught in Python) so a failure never stops the caller:
-  - `prepare_session.sh`: `agents_log.py append --id "$CLAUDE_CODE_SESSION_ID" --role director` when the id is set.
-  - `update_registration.py register`: `append(<CLAUDE_CODE_SESSION_ID>, "showrunner", None, now)`; import from `scripts/usage/agents_log.py`.
-  - `agent_bg.sh`: after it appends to the `seats` ledger, `append --id <session id> --role worker`.
-  - `codex_mesh.py`: on a new thread and on every follow-up claim, `append(thread_id, role, lens, now)` when the role is assigned. Add an optional `--lens` argument to the dispatch subcommands; it is written only to `agents.jsonl`, never to `mesh_roster.json`.
-  - `review.sh`: pass its lens to `codex_mesh.py` with `--lens` when it has one.
-- Out of scope: a review outside a run (`codex exec` through `agent_exec.sh`) records nothing; its thread reads as unassigned.
+- `scripts/usage/agents_log.py` keeps `<state_dir>/agents.jsonl`, `state_dir()` being `USAGE_STATE_DIR` when set, else `~/.local/state/usage-model`. Each line is `{"id", "role", "at"}`, plus `"lens"` when known and `"approximate": true` for backfill. `Role` and `Lens` are `Literal` aliases checked at the CLI (unknown value exits 2).
+- `append(agent_id, role, lens, at, approximate=False)` writes under an exclusive `fcntl.flock` and starts a new line after a truncated tail. `assignments(path) -> RoleLog(assignments, problems)` skips and counts any malformed line, deep nesting included, and never raises. `role_at(log, agent_id, at) -> Assignment | Unassigned` returns the latest assignment at or before `at`.
+- CLI `append`, `backfill [--archive] [--live]`, `show [--id]`; a write failure prints one `agents_log:` stderr line and exits 0.
+- Writers: `prepare_session.sh` records `director`, `update_registration.py register` records `showrunner`, `agent_bg.sh` records `worker`. `codex_mesh.py` records the seat's role and `--lens` on a new thread and on a follow-up claim. It records the previous role again when a claim is released. `review.sh` passes `--lens`. The lens lives only in `agents.jsonl`, never in `mesh_roster.json`.
+- `backfill` reads each run directory's `mesh_roster.json` (`role`, and `previous_role` as an earlier line) and `seats` ledger (`worker`), stamped with the file's mtime and `approximate: true`. A roster and its ledger are read separately, so one bad file loses only its own rows. It skips any id that already has an exact line and never repeats an (id, role, lens) line. A review lens comes only from the newest `review_agent_[<N>_]<lens>.log` naming the seat; with no such log, no lens.
 
 **Files:**
-- `scripts/usage/__init__.py` — new, empty.
-- `scripts/usage/agents_log.py` — new: writer, reader, backfill, CLI.
-- `scripts/usage/test_agents_log.py` — new.
-- `scripts/delegate/prepare_session.sh` — director line.
-- `scripts/production/update_registration.py` — showrunner line (natedev's file; reviewed at merge).
-- `scripts/production/test_update_registration.py` — the copied command carries `scripts/usage`; registration records the showrunner.
-- `scripts/agents/agent_bg.sh` — worker line.
-- `scripts/agents/codex_mesh.py` — seat line on dispatch; `--lens`.
-- `scripts/agents/test_codex_mesh.py` — dispatch writes the line with role and lens; follow-up writes a second line; no roster `lens` key.
-- `scripts/delegate/review.sh` — passes `--lens`.
+- `scripts/usage/agents_log.py`, `scripts/usage/__init__.py` — the log: writer, reader, backfill, CLI.
+- `scripts/usage/test_agents_log.py`, `scripts/agents/test_codex_mesh.py`, `scripts/production/test_update_registration.py` — tests; the registration test copies `scripts/usage`.
+- `scripts/delegate/prepare_session.sh`, `scripts/production/update_registration.py`, `scripts/agents/agent_bg.sh`, `scripts/agents/codex_mesh.py`, `scripts/delegate/review.sh` — the writers.
 
-**Seats:** `1 writer + 1 tester` — the writers' edits are one line each beside the new module, so nothing splits.
-- `impl` — `agents_log.py`, `__init__.py`, the five writer sites; hub: `scripts/usage/agents_log.py` (every caller imports or runs it).
-- `test` — `scripts/usage/test_agents_log.py` and the `test_codex_mesh.py` additions, from this Spec alone: append and read back; concurrent appends from several processes produce whole lines; unknown role is exit 2; malformed line counted as a problem; `role_at` before, between and after assignments; backfill over a fixture archive (a roster with `previous_role`, a seats ledger, a `review_status_adversary`) and a rerun adds nothing; a failed write exits 0 with the stderr line; every test sets `USAGE_STATE_DIR` to a temp dir.
+**Binds later work:** `assignments(Path) -> RoleLog` and `role_at` are the attribution API, with `approximate` marking estimated lines and a nullable lens. A Claude worker's id is the 8-hex prefix of its transcript uuid. Recording never fails its caller.
 
-**Constraints from prior phases:** none. `mesh_roster.json` entries carry `role` (`impl`, `test`, `fix`, `review`) and on a follow-up `previous_role`; no launcher writes `lens` into the roster (long-lived seats as-built, `docs/as-built/long-lived-seats.md`).
+**Gotchas:** the delegate archive keeps no `mesh_roster.json` or `seats` ledger, so archived runs backfill nothing. Older review logs do not name the seat, so their lens stays unrecorded. A review outside a run (`agent_exec.sh`) records nothing.
 
-**Acceptance gate:** `python3 -m unittest scripts.usage.test_agents_log scripts.agents.test_codex_mesh scripts.delegate.test_end_session scripts.production.test_update_registration` green; basedpyright 0/0/0 on `scripts/usage scripts/agents/codex_mesh.py scripts/production/update_registration.py scripts/production/test_update_registration.py`; `bash -n` clean on the three shell scripts. Live, with `USAGE_STATE_DIR` pointed at a scratch dir: `agents_log.py backfill` places every live run's roster threads that carry a role (print the count), and `show` lists them. The archive keeps no `mesh_roster.json` or `seats` ledger, so archived runs recover nothing and have no coverage to measure (found in review 2026-10-11).
+**Ruled out:** a lens inferred from the seat name (any seat runs any lens); the lens in `mesh_roster.json`.
 
-### Phase 2 — Every other Claude session records itself · status: todo
+### Phase 2 — Every other Claude session can record itself · status: todo
 
-- A SessionStart hook records interactive sessions and subagents with role `interactive` (or `subagent`, with its parent), unless Phase 1 already recorded that id.
-- This phase carries the `settings.json` change, and nothing else goes in its checkpoint: the showrunner's gate refuses settings diffs, and the user approves this one before main, so the other phases keep merging.
-- Done when a new Claude session appears in `agents.jsonl` within a second of starting.
+#### Work Order
 
-### Phase 3 — One store of every model turn · status: todo
+**Goal:** a hook script, tested but not yet registered, that records every Claude session no delegate writer has claimed as `interactive`, and every subagent as `subagent`, exactly once per agent.
+
+**Spec:**
+- `scripts/usage/agents_log.py`:
+  - `Role` gains `interactive` and `subagent`, in the `Literal` alias, the CLI's choices and the reader's validation together.
+  - New `register_default(agent_id: str, role: Role, at: datetime) -> bool`: under the same exclusive `fcntl.flock` that `append` takes, reads the log and appends `{"id", "role", "at"}` only when no line already names this agent. A line names it when its id equals `agent_id`, or when its id is 8 hex characters and a prefix of `agent_id` (an `agent_bg.sh` worker). Returns whether it wrote. The read-check-write is one locked step, so two deliveries at once write one line. A malformed or truncated line is skipped (and does not block the write); the partial-tail rule of `append` applies.
+  - CLI: `register --id <id> --role <role>`; usage errors exit 2, write failures print `agents_log: <reason>` and exit 0, as `append`.
+- New `scripts/hooks/session-start-agents-log.py`: reads the hook payload (JSON) from stdin. When it carries a non-empty `agent_id`, registers that id as `subagent`; otherwise registers `session_id` as `interactive`. Parent session is not stored: a subagent's transcript sits at `<parent transcript stem>/subagents/agent-<agent_id>.jsonl` (`scripts/hooks/context_usage.py` `resolve_transcript`), so the collector derives it. Unparseable input, a missing id or any failure: one stderr line, exit 0, never blocks the session. Imports `agents_log` from `scripts/usage` by path, as `update_registration.py` does. Event-agnostic, so Phase 3 can register it for `SessionStart` and, after a live check, whichever event delivers a subagent's `agent_id`.
+- Ordering is settled by `role_at`, not by the hook: hook first, then a delegate writer, gives `interactive` then the delegate role, and the delegate role governs from its line on; writer first means the hook writes nothing. Resume, compaction, clear and repeated delivery for an id already present write nothing.
+- No `settings.json` change in this phase.
+
+**Files:**
+- `scripts/usage/agents_log.py` — two roles; `register_default`; `register` CLI.
+- `scripts/hooks/session-start-agents-log.py` — new: the hook.
+- `scripts/usage/test_agents_log.py` — `register_default` and the new roles.
+- `scripts/usage/test_session_start_hook.py` — new: drives the hook as a subprocess with fixture payloads.
+
+**Seats:** `1 writer + 1 tester`.
+- `impl` — `agents_log.py` and the hook; hub: `scripts/usage/agents_log.py`.
+- `test` — `test_agents_log.py` additions and `test_session_start_hook.py`, from this Spec alone: interactive and subagent payloads each write one line with the right role; hook then writer and writer then hook, read through `role_at`, each give the delegate role after the writer's line; a worker's 8-hex id suppresses the hook's line for the full uuid it prefixes, and an unrelated 8-hex id does not; repeated delivery (startup, resume, compact) writes one line; concurrent `register_default` from several processes writes one line; bad JSON and a missing id exit 0 with a stderr line and write nothing; the new roles are accepted by `append`, `show` and the reader; every test sets `USAGE_STATE_DIR` to a temp dir.
+
+**Constraints from prior phases:** `agents.jsonl` lines are `{"id","role","at"}` plus optional `"lens"` and `"approximate": true`; `append` locks the open file and starts a new line after a truncated tail; the reader skips and counts malformed lines and never raises; worker ids are 8-hex prefixes of their transcript uuids (142/142 measured); recording never fails its caller (Phase 1 as built).
+
+**Acceptance gate:** `python3 -m unittest scripts.usage.test_agents_log scripts.usage.test_session_start_hook scripts.agents.test_codex_mesh scripts.production.test_update_registration` green; basedpyright 0/0/0 on `scripts/usage scripts/hooks/session-start-agents-log.py`; `settings.json` unchanged. Live, with `USAGE_STATE_DIR` at a scratch dir: piping a SessionStart payload for this session's id writes one `interactive` line, a second pipe writes none, and the hook returns in under a second.
+
+### Phase 3 — Every other Claude session records itself · status: todo
+
+- The `settings.json` change only: register Phase 2's hook for `SessionStart`, and for the event that carries a subagent's `agent_id` once a live check shows which one does. The showrunner's gate refuses settings diffs, and the user approves this one before main, so the other phases keep merging.
+- Done when a new Claude session and a new subagent each appear in `agents.jsonl` within a second of starting.
+
+### Phase 4 — One store of every model turn · status: todo
 
 - `scripts/usage/collect.py` reads Claude transcripts and Codex rollouts on both machines into `usage.db`, one row per model turn: time, machine, agent id, model, effort, the token classes, and whether it was a compaction or came before the agent's first edit.
-- Each turn is matched to the role in force at its time.
-- Runs incrementally.
-- Done when a rerun adds nothing, and a day's totals match `seat_usage.py` and `api_cost.py` for the same window.
+- Each turn is matched to the role in force at its time, through `agents_log.assignments` and `role_at`, keeping their malformed-line diagnostics. Identity comes from the source (family and machine), never the id's form: a Claude worker matches its transcript uuid by a unique 8-hex prefix (an ambiguous prefix stays unresolved); a subagent is scoped to its parent; a historical director comes from the run's `main_agent.session_id` in `progress_history.py` events, never from `cwd` alone. Archived Codex turns with no evidence stay unassigned.
+- Attribution is an explicit state per turn: recorded, estimated (from an `approximate` line) or unassigned; a review lens is known, unrecorded or not applicable. Nullable values stay at the storage boundary.
+- Owns the per-turn model and effort parser, a dated weight table per model (raw token classes kept apart from weighting), and the normalized compaction events Phase 5 consumes.
+- Runs incrementally with transactional cursors, handling an incomplete tail; a change to `agents.jsonl` re-attributes the affected turns even when transcripts are unchanged.
+- Done when a rerun adds nothing; a late assignment corrects an earlier unassigned turn without duplicating it; checked-in Claude and Codex fixtures give their expected raw totals; and mixed-model, changed-effort and weight-date-boundary tests pass (from review 2026-10-11; replaces the `api_cost.py` comparison, which is not in this checkout).
 
-### Phase 4 — Outcomes in the same store · status: todo
+### Phase 5 — Outcomes in the same store · status: todo
 
-- Collect checkpoints, phases, findings, review rounds and passes, compactions and account readings, keyed by unit, run and time, so usage can be divided by work done.
+- Collect checkpoints, phases, findings, review rounds and passes, and account readings, keyed by machine, run, phase and pass instance and source event, with an explicit checkpoint mapping, so usage can be divided by work done. Compactions come from Phase 4's events. Accounts come from `accounts.py` after two-accounts 4a02a1c merges.
+- Reruns are idempotent, and a fixture joining several findings or passes to one stretch of work does not multiply its usage.
 - Done when "weighted usage per checkpoint, by role and model, per day" is one query.
 
-### Phase 5 — Metrics as named queries · status: todo
+### Phase 6 — Metrics as named queries · status: todo
 
 - `usage_report.py`, with an initial set:
   - weighted usage per day and per checkpoint;
@@ -144,11 +146,13 @@ Today, each question needs its own scratch script (`seat_usage.py`, `api_cost.py
   - account switches;
   - all of them by role × model × unit.
 - `seat_usage.py` becomes a thin view over the store, and its tests keep passing.
-- Done when the day 1 long-lived-seats readout can be reproduced from the store, and a new metric takes one entry.
+- Every report shows attribution coverage, the estimated-turn share, unassigned usage and unrecorded review lenses, and takes an exact-evidence-only filter.
+- Done when the day 1 long-lived-seats readout is reproduced from a named input fixture to a named expected output under a stated weight version, and a new metric takes one entry.
 
-### Phase 6 — Kept up to date by itself · status: todo
+### Phase 7 — Kept up to date by itself · status: todo
 
 - An hourly timer on natedev runs the collector, including the Mac's logs over ssh.
 - If the timer needs a declared systemd unit, its text goes to natedev, who commits it in `/etc/nixos`; the rebuild is the user's.
 - The daily efficacy update and the showrunner's dailies read from the store, never from raw logs.
-- Done when the store is never more than an hour behind, with no agent involved.
+- Each source keeps its own last-success watermark: an unreachable Mac leaves its rows stale and marked so in the daily readout (`seat_usage.py --daily`) and the dailies (`dailies_render.py`), while local sources keep updating; the backlog fills when it is back.
+- Done when every reachable source is never more than an hour behind, with no agent involved, and a simulated Mac outage shows as partial coverage and then recovers.
