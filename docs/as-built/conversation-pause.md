@@ -104,13 +104,14 @@ Every repository phone alert calls:
 ```text
 scripts/message/send.py --to user \
   --need note|decision|blocked \
+  (--action "<what the user does>" | --no-action) \
   --summary "<title>" \
   --text "<message>"
 ```
 
-`send.py` owns the user channel and maps `note`, `decision` and `blocked` to priorities 0, 1 and 2. Callers do not invoke `scripts/notify/pushover.py` themselves. On the Mac they add `--machine natedev`.
+`send.py` owns the user channel and maps `note`, `decision` and `blocked` to priorities 0, 1 and 2. A user message names the user's action or says none is needed: without `--action` or `--no-action` `send.py` exits 2 with a usage error, and `decision` and `blocked` require `--action`. The gate itself is `scripts/notify/pushover.py` (`docs/as-built/session-roster.md`, "Messages to the user"); callers do not invoke it themselves. On the Mac they add `--machine natedev`.
 
-The direct Python callers are `ci_points.review_watch` with `--need decision`, `rust_release.send_release_text(title, message)` with `--need note`, the phone branch of `sweep.send_floor_alert` with `--need note`, and `settle.alert_user` (the only phone path in `scripts/shutdown/`) with `--need decision`. The showrunner, build-report and fix instructions use the same command.
+The direct Python callers are `ci_points.review_watch` (`--need decision --action "Acknowledge the review watch in this session."`), `rust_release.send_release_text(title, message)` (`--need note --action "Tell natedev to bump Rust or wait."`), the phone branch of `sweep.send_floor_alert` (`--need note --action "Free disk space outside build caches on natedev."`), `codex_winddown` through `broadcast.send` (`--need decision --action "Reset Codex, then run /codex_winddown clear."`), `escalate.py`'s held messages (the hold's own `--need` and action), and `settle.alert_user` (the only phone path in `scripts/shutdown/`; `--need decision --action <its ActionRequired text>`). The showrunner, build-report and fix instructions use the same command.
 
 ## Invariants
 
@@ -125,7 +126,7 @@ The direct Python callers are `ci_points.review_watch` with `--need decision`, `
 - Both hooks have a five-second budget, print at most one error line, and exit 0 so a prompt or reply cannot fail because the pause failed.
 - `unit_lookup.run_state`, not prose in a production row, is authoritative for whether the stall watch monitors a unit.
 - Correcting an as-built doc that contradicts the code is always allowed; cross-unit notice rules still apply.
-- Every scripted phone alert enters `scripts/message/send.py --to user`; channel choice stays inside `send.py`.
+- Every scripted phone alert enters `scripts/message/send.py --to user` with `--action` or `--no-action`; channel choice stays inside `send.py`.
 
 ## Gotchas
 
@@ -138,7 +139,7 @@ The direct Python callers are `ci_points.review_watch` with `--need decision`, `
 - A message after `KeptOff` begins another conversation cycle. When that exchange becomes quiet, the question can return.
 - An unreadable session record means "unknown," not "ended." A registry-list failure also prevents dead-session cleanup for that tick.
 - `progress` still restarts the unit notifier on the closed-phase reporting path. Its tables are read-only, but the next report time moves.
-- `send.py` prints `FAILED: ...` on stdout and exits 3 for an undelivered user alert. Callers reporting the cause must inspect stdout as well as stderr.
+- `send.py` prints `FAILED: ...` on stdout and exits 3 for an undelivered user alert, and `REFUSED: ...` with exit 2 when `pushover.py` refused it before sending. Callers reporting the cause must inspect stdout as well as stderr.
 
 ## Why
 

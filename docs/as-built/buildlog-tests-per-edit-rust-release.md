@@ -88,7 +88,7 @@ Otherwise `waiting_reason()` returns the first failing reason (`build hold activ
 - Any other nonzero step gives `TrialFailed` with the step name and `first_error()`. That is the first stderr line containing "error", else the first rendered line of a JSON compiler error, else the first stdout line containing "error", else the first non-empty line, else `exit N`. An `OSError` or `SubprocessError` (a timeout included) gives `TrialFailed` with the step and the exception's first line.
 - Finished and failed trials record `target_gib` and `mend_target_gib`, the summed file sizes of `<clone>/target` and `<clone>/mend-target`, to calibrate the headroom.
 
-**Text.** In quiet hours, after the gate or the trial, a version whose text is not yet sent gets one. `send_release_text()` runs `python3 scripts/message/send.py --to user --need note --summary <title> --text <message>` (30 s). Success is exit 0. Title `Rust 1.100.0 out`; message `Rust 1.100.0 out: <result>. Tell natedev bump or wait.` `trial_text()` gives the result:
+**Text.** In quiet hours, after the gate or the trial, a version whose text is not yet sent gets one. `send_release_text()` runs `python3 scripts/message/send.py --to user --need note --action "Tell natedev to bump Rust or wait." --summary <title> --text <message>` (30 s). Success is exit 0. Title `Rust 1.100.0 out`; message `Rust 1.100.0 out: <result>. Tell natedev bump or wait.` `trial_text()` gives the result:
 - finished: `7 new warnings in 3 crates, cargo-mend builds`, with `, 1 error in 1 crate` before the mend part when there are errors;
 - waiting: `trial waiting: 513 GiB free, needs 550`;
 - failed: `trial failed: clippy: <first error>`.
