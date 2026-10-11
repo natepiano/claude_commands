@@ -277,7 +277,7 @@ After Phase 2 reaches `~/.claude` main, the unit director tells the showrunner t
 - Notes describe the code, and the code differs from the obvious reading: obsidian_knife's phantom-link alias lookup keys on the missing target's name (case-insensitive) and keeps the display label; an image hashing error passes through `.ok()?` in `image_processing.rs` and omits that image instead of stopping analysis.
 - `agent-sessions-snapshot --help` ignores the flag and runs a snapshot, regenerating the vault's generated agent-session pages; a command's source is read before the command runs.
 
-### Phase 9 — nateroids' commits and Hana's merges are logged, and both audits finish  · status: todo
+### Phase 9 — nateroids' commits and Hana's merges are logged, and both audits finish  · status: done
 
 #### Work Order
 
