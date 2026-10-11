@@ -231,7 +231,7 @@ After Phase 2 reaches `~/.claude` main, the unit director tells the showrunner t
 - Changelogs omit CLI verbs and flags and some public API, so coverage needs each crate's argument definitions and public API read beside its changelogs.
 - One `live --grep` refusal ("missing opening frontmatter delimiter") did not reproduce; note temp files (`.<name>.tmp`) are never globbed.
 
-### Phase 7 — bevy_brp's structured records and nateroids' as-built files are in the log  · status: todo
+### Phase 7 — bevy_brp's structured records and nateroids' as-built files are in the log  · status: done
 
 #### Work Order
 
