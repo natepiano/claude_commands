@@ -67,9 +67,12 @@ import sys
 import time
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, NotRequired, TextIO, TypedDict, cast, final
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.usage import agents_log
 
 SERVER_FILE = "mesh_server.json"
 SERVER_LOG = "mesh_server.log"
@@ -363,6 +366,26 @@ def _seat_role(args: argparse.Namespace) -> SeatRole:
     if isinstance(role, RolelessThread):
         raise SystemExit("codex_mesh: this delegate action requires a role")
     return role.role
+
+
+def _dispatch_lens(args: argparse.Namespace) -> agents_log.Lens | None:
+    lens = _attr(args, "lens")
+    return cast(agents_log.Lens, lens) if lens else None
+
+
+def _record_assignment(thread_id: str, role: SeatRole, lens: agents_log.Lens | None,
+                       only_if_changed: bool = False) -> None:
+    try:
+        now = datetime.now(timezone.utc)
+        if only_if_changed:
+            log = agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
+            current = agents_log.role_at(log, thread_id, now)
+            if isinstance(current, agents_log.Assignment) and current.role == role and current.lens == lens:
+                return
+        agents_log.append(thread_id, role, lens, now)
+    except Exception as exc:
+        # Recording must never interrupt dispatch.
+        print("agents_log: " + " ".join(str(exc).splitlines()), file=sys.stderr)
 
 
 def _as_float(value: object, fallback: float) -> float:
@@ -700,7 +723,8 @@ def _roster_still_on_thread(session_dir: str, name: str, thread_id: str) -> bool
 
 
 def _claim_follow(
-    session_dir: str, name: str, thread_id: str, launcher_pid: int, role: SeatRole
+    session_dir: str, name: str, thread_id: str, launcher_pid: int, role: SeatRole,
+    lens: agents_log.Lens | None = None,
 ) -> bool:
     """Take a finished roster entry before another follow can take it."""
     path = _session_path(session_dir, ROSTER_FILE)
@@ -736,6 +760,7 @@ def _claim_follow(
         _ = handle.truncate()
         _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
         handle.flush()
+        _record_assignment(thread_id, role, lens)
         return True
 
 
@@ -784,6 +809,8 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
         _ = handle.truncate()
         _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
         handle.flush()
+        if isinstance(previous_role, AssignedDelegateRole) and entry.get("role") != previous_role.role:
+            _record_assignment(thread_id, previous_role.role, None)
 
 
 def _wait_for_claimed_peer(client: Client, thread_id: str, turn_id: str,
@@ -1606,12 +1633,13 @@ def command_follow(args: argparse.Namespace) -> int:
     assert not isinstance(state, InvalidThread)
     thread_id = state.thread_id
     if not claim_pid and not _claim_follow(
-        session_dir, name, thread_id, os.getpid(), role
+        session_dir, name, thread_id, os.getpid(), role, _dispatch_lens(args)
     ):
         print(f"codex_mesh: {name} was already claimed", file=sys.stderr)
         return 2
     if claim_pid:
         _set_roster_role(session_dir, name, role)
+        _record_assignment(thread_id, role, _dispatch_lens(args), only_if_changed=True)
     owner_pid = claim_pid or os.getpid()
     opened = time.time()
     client: Client | None = None
@@ -1804,7 +1832,7 @@ def command_can_follow(args: argparse.Namespace) -> int:
     claim_pid = _as_int(_attr(args, "claim_pid"))
     if claim_pid:
         assert not isinstance(state, InvalidThread)
-        if not _claim_follow(session_dir, name, state.thread_id, claim_pid, role):
+        if not _claim_follow(session_dir, name, state.thread_id, claim_pid, role, _dispatch_lens(args)):
             print(f"codex_mesh: {name} was already claimed", file=sys.stderr)
             return 2
     return 0
@@ -1896,6 +1924,8 @@ def _attach_and_run(
         if isinstance(role, AssignedDelegateRole):
             starting["role"] = role.role
         _update_roster(session_dir, name, starting)
+        if isinstance(role, AssignedDelegateRole):
+            _record_assignment(thread_id, role.role, _dispatch_lens(args))
 
     return _stream_turn(args, client, port, session_dir, name, thread_id, prompt, timeout, opened)
 
@@ -3135,6 +3165,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = start.add_argument("--session-dir", required=True)
     _ = start.add_argument("--name", required=True)
     _ = start.add_argument("--role", choices=SEAT_ROLES, default="")
+    _ = start.add_argument("--lens", choices=agents_log.LENSES)
     _ = start.add_argument("--cwd", required=True)
     _ = start.add_argument("--prompt-file", required=True)
     _ = start.add_argument("--summary-file", required=True)
@@ -3160,6 +3191,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = follow.add_argument("--session-dir", required=True)
     _ = follow.add_argument("--to", required=True)
     _ = follow.add_argument("--role", choices=SEAT_ROLES, required=True)
+    _ = follow.add_argument("--lens", choices=agents_log.LENSES)
     _ = follow.add_argument("--claim-pid", type=int, default=0)
     _ = follow.add_argument("--message-file", required=True)
     _ = follow.add_argument("--summary-file", required=True)
@@ -3180,6 +3212,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = can_follow.add_argument("--session-dir", required=True)
     _ = can_follow.add_argument("--to", required=True)
     _ = can_follow.add_argument("--role", choices=SEAT_ROLES, required=True)
+    _ = can_follow.add_argument("--lens", choices=agents_log.LENSES)
     _ = can_follow.add_argument("--claim-pid", type=int, default=0)
     can_follow.set_defaults(handler=command_can_follow)
 

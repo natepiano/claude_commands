@@ -242,6 +242,7 @@ printf '%s\n' "${BG_ID}" > "${ID_FILE}"
 if [[ -n "${LEDGER}" ]]; then
   printf '%s\t%s\n' "${BG_ID}" "${MESH_NAME}" >> "${LEDGER}"
 fi
+"$PY" "$(dirname "${BASH_SOURCE[0]}")/../usage/agents_log.py" append --id "${BG_ID}" --role worker || true
 if [[ "${DETACH}" == "1" ]]; then
   echo "launched ${MESH_NAME} (${BG_ID})"
   exit 0

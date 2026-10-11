@@ -8,7 +8,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 
@@ -21,6 +21,12 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
     from showrunner_footer import FooterState, footer_state
 from dailies_render import footer_main, read_outstanding
+
+if TYPE_CHECKING:
+    from ..usage import agents_log
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.usage import agents_log
 
 
 class InstancePresent(NamedTuple):
@@ -128,6 +134,11 @@ def register(production: Production) -> None:
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     if not session_id:
         raise RegistrationFailure("register", "CLAUDE_CODE_SESSION_ID is required")
+    try:
+        agents_log.append(session_id, "showrunner", None, datetime.now(timezone.utc))
+    except Exception as exc:
+        # Recording must never interrupt registration.
+        print("agents_log: " + " ".join(str(exc).splitlines()), file=sys.stderr)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     schedule = update_schedule(lines)
     prompt = (scheduled_prompt(schedule.minutes, str(production.zone), production.doc)
