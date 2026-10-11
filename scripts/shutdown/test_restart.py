@@ -285,6 +285,7 @@ class RestartTests(ShutdownTestCase):
                     os.environ,
                     {
                         **os.environ,
+                        "HOME": str(self.root),
                         "SHUTDOWN_STATE_DIR": str(self.state_root),
                         "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
                         "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
@@ -611,6 +612,96 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(self.stored_record(), original)
         self.assertEqual(list(self.state_root.rglob("restart-note-*.txt")), [])
 
+    def test_dry_run_uses_recorded_dir_for_each_non_unit_host(self) -> None:
+        config_dir = str(self.root / "account with 'quotes' and $()")
+        restored_entries = [
+            entry(showrunner("named-showrunner")),
+            entry(top_level("named-tmux", host=tmux_host("named-tmux-host"))),
+            entry(top_level("named-terminal", host=inventory.TerminalHost(kind="terminal"))),
+            entry(top_level("named-window", host=inventory.WindowHost(
+                kind="ghostty", window_shell=10,
+                desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"),
+            ))),
+            entry(top_level("named-manual")),
+            entry(unit("named-unit")),
+        ]
+        for restored in restored_entries:
+            restored["session"]["config_dir"] = config_dir
+        saved = shutdown_record(restored_entries)
+        record.create(saved)
+        commands = CommandRecorder()
+        output = io.StringIO()
+        with (
+            patch.object(restart, "_run", commands),
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
+
+        resume_commands = [argv[-1] for argv in commands.calls if "-ic" in argv]
+        self.assertEqual(len(resume_commands), 4)
+        for command in resume_commands:
+            self.assertIn(
+                f"&& CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} ENABLE_TOOL_SEARCH=true command claude",
+                command,
+            )
+        self.assertIn(
+            f"CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} ENABLE_TOOL_SEARCH=true command claude",
+            output.getvalue().split("manual restart named-manual:", 1)[1],
+        )
+        unit_argv = next(
+            argv for argv in commands.calls
+            if any(part.endswith("add_unit.py") for part in argv)
+        )
+        self.assertNotIn(config_dir, unit_argv)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", shlex.join(unit_argv))
+        self.assertEqual(self.stored_record(), saved)
+
+    def test_replaced_session_snapshot_resumes_from_its_current_config_dir(self) -> None:
+        """F004: settling can replace the snapshot without retaining an old directory."""
+        old_dir = str(self.root / "previous account")
+        new_dir = str(self.root / "current account with 'quotes'")
+        restored = entry(top_level("moved-session"))
+        restored["session"]["config_dir"] = old_dir
+        record.create(shutdown_record([restored]))
+        replacement = top_level("moved-session")
+        replacement["config_dir"] = new_dir
+
+        def replace_session(current: ShutdownRecord) -> None:
+            current["entries"][0]["session"] = replacement
+
+        _ = record.update(LOGIN, replace_session)
+        output = io.StringIO()
+        with (
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
+
+        command = output.getvalue().split("manual restart moved-session:", 1)[1]
+        self.assertIn(
+            f"CLAUDE_CONFIG_DIR={shlex.quote(new_dir)} ENABLE_TOOL_SEARCH=true command claude",
+            command,
+        )
+        self.assertNotIn(old_dir, command)
+
+    def test_default_and_legacy_resume_commands_are_byte_identical(self) -> None:
+        restored = entry(top_level("default-command"))
+        expected = (
+            "cd /tmp/default-command && ENABLE_TOOL_SEARCH=true command "
+            "claude --resume default-command -n default-command --remote-control "
+            "default-command --settings '{\"disableAgentView\": true}' prompt; exec zsh"
+        )
+        resume_command = cast(
+            Callable[[inventory.Session, str], str],
+            getattr(restart, "_resume_command"),
+        )
+        self.assertEqual(resume_command(restored["session"], "prompt"), expected)
+        restored["session"]["config_dir"] = str(Path.home() / ".claude")
+        self.assertEqual(resume_command(restored["session"], "prompt"), expected)
+
     def test_window_dry_run_reads_and_restores_the_starting_desktop(self) -> None:
         restored = entry(top_level(
             "window",
@@ -679,6 +770,8 @@ class RestartTests(ShutdownTestCase):
             ),
             where=record.WhereSaid(kind="said", text=where, at=STOPPED),
         )
+        config_dir = str(self.root / "account with 'quotes' and $()")
+        restored["session"]["config_dir"] = config_dir
         saved = shutdown_record([restored])
         record.create(saved)
         output = io.StringIO()
@@ -708,6 +801,7 @@ class RestartTests(ShutdownTestCase):
                 "import json, os, sys",
                 "from pathlib import Path",
                 "Path(os.environ['ARGV_LOG']).write_text(json.dumps(sys.argv[1:]))",
+                "Path(os.environ['CONFIG_LOG']).write_text(os.environ['CLAUDE_CONFIG_DIR'])",
                 "",
             )),
             encoding="utf-8",
@@ -721,6 +815,8 @@ class RestartTests(ShutdownTestCase):
         environment = {
             **os.environ,
             "ARGV_LOG": str(argv_log),
+            "CONFIG_LOG": str(self.root / "claude-config-dir"),
+            "CLAUDE_CONFIG_DIR": "/another-account-in-the-shell",
             "HOME": str(self.root),
             "PATH": f"{binary}:/usr/bin:/bin",
             "ZDOTDIR": str(zdotdir),
@@ -735,6 +831,10 @@ class RestartTests(ShutdownTestCase):
             timeout=60,
         )
         self.assertEqual(parsed.returncode, 0, (parsed.stdout, parsed.stderr))
+        self.assertEqual(
+            (self.root / "claude-config-dir").read_text(encoding="utf-8"),
+            config_dir,
+        )
         actual = cast(
             list[str],
             cast(object, json.loads(argv_log.read_text(encoding="utf-8"))),

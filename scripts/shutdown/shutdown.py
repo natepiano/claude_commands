@@ -44,6 +44,8 @@ from record import (
     ShutdownRecord,
     ShutdownInProgress,
     StopTiming,
+    ShutdownContinuation,
+    continuation,
     find_live,
     live_records,
     parse_records,
@@ -68,6 +70,8 @@ class CommandLine(argparse.Namespace):
     dry_run: bool = False
     no_alert: bool = False
     restart_of: str | None = None
+    restart: bool = False
+    then: ShutdownContinuation = "stop"
 
 
 class UnreachableMachine(TypedDict):
@@ -419,6 +423,7 @@ def main(arguments: list[str] | None = None) -> int:
     _ = down.add_argument("account", nargs="?")
     _ = down.add_argument("--here", action="store_true")
     _ = down.add_argument("--only", help=argparse.SUPPRESS)
+    _ = down.add_argument("--restart", action="store_true")
     status = commands.add_parser("status", help="show what runs for one Claude account")
     _ = status.add_argument("account", nargs="?")
     _ = status.add_argument("--json", action="store_true", dest="as_json")
@@ -430,6 +435,9 @@ def main(arguments: list[str] | None = None) -> int:
     _ = begin.add_argument("account")
     _ = begin.add_argument("--requested-by")
     _ = begin.add_argument("--only", help=argparse.SUPPRESS)
+    _ = begin.add_argument("--then", choices=("stop", "restart"), default="stop")
+    retry_stop = commands.add_parser("retry-stop")
+    _ = retry_stop.add_argument("account")
     refresh = commands.add_parser("refresh")
     _ = refresh.add_argument("account")
     _ = refresh.add_argument("--message", nargs="*")
@@ -560,6 +568,7 @@ def main(arguments: list[str] | None = None) -> int:
                 options.account or "",
                 options.requested_by,
                 _only_ids(options.only),
+                then=options.then,
             )
         except (ShutdownInProgress, ValueError, RuntimeError) as error:
             print(f"shutdown: {error}", file=sys.stderr)
@@ -577,8 +586,48 @@ def main(arguments: list[str] | None = None) -> int:
         print(json.dumps([refreshed], sort_keys=True))
         return 0
 
+    if options.command == "retry-stop":
+        try:
+            settle.retry_stop(options.account or "")
+        except (NoLiveRecord, InvalidRecord, OSError, ValueError) as error:
+            print(f"shutdown: {error}", file=sys.stderr)
+            return 1
+        return 0
+
     if options.command == "conduct":
-        return settle.conduct(options.account or "", options.here)
+        login = options.account or ""
+        result = settle.conduct(login, options.here)
+        try:
+            found = find_live(login)
+            if (
+                found["kind"] != "live"
+                or found["record"]["state"] != "down"
+                or continuation(found["record"]) != "restart"
+            ):
+                return result
+            if not options.here:
+                peer = _remote_shutdown_record(login)
+                if peer["kind"] in {"unreachable", "unavailable", "unreadable"}:
+                    settle.report_restart_skipped(
+                        found["record"], "\n".join(_shutdown_record_lines(peer)),
+                    )
+                    return result
+                if (
+                    peer["kind"] != "live"
+                    or peer["record"]["state"] != "down"
+                    or continuation(peer["record"]) != "restart"
+                ):
+                    return result
+        except (InvalidRecord, OSError, ValueError) as error:
+            print(f"shutdown: {error}", file=sys.stderr)
+            return 1
+        if options.here:
+            return restart_work.up(login)
+        return restart_work.restart(
+            restart_work.AccountNamed(login),
+            dry_run=False,
+            alerts=restart_work.AlertWhenNotBack(),
+        )
 
     if options.command == "ready":
         return settle.ready(options.where)
@@ -589,6 +638,10 @@ def main(arguments: list[str] | None = None) -> int:
         print(f"shutdown: {error}", file=sys.stderr)
         return 2
     if options.command == "down":
+        if options.restart:
+            return settle.down(
+                selected, options.here, _only_ids(options.only), then="restart"
+            )
         return settle.down(selected, options.here, _only_ids(options.only))
     if options.command == "now":
         return settle.now(selected, options.here)

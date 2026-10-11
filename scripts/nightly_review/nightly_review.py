@@ -25,6 +25,7 @@ from pathlib import Path
 
 # The quota readers live with the agent notes, one directory over.
 SCRIPTS = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(SCRIPTS.parent))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
 sys.path.insert(0, str(SCRIPTS / "shutdown"))
 from launch_permission import (  # noqa: E402
@@ -34,6 +35,8 @@ from launch_permission import (  # noqa: E402
     launch_barrier,
     launch_permission,
 )
+from agent_accounts import ClaudeAccountSelection  # noqa: E402
+import note_file  # noqa: E402
 from quota_alert import ahead, remaining  # noqa: E402
 
 ROOT = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "nightly-review"
@@ -77,12 +80,20 @@ def running(mode: str) -> bool:
 
 
 def quota_permission() -> QuotaPermission:
-    """Whether the active Claude account has enough weekly quota to run."""
-    from agent_notes import read_notes
+    from scripts.accounts import accounts
 
-    for note in read_notes():
+    return quota_for_selection(accounts.claude_account_selection())
+
+
+def quota_for_selection(selection: ClaudeAccountSelection) -> QuotaPermission:
+    """Whether the default Claude login has enough weekly quota to run."""
+    for note in note_file.read_notes():
         left = remaining(note)
-        if (note.tool == "claude" and note.get("state") == "active" and left is not None
+        launch_account = (
+            selection.is_default_login(note.get("login") or "")
+            if selection.multiple_accounts else note.get("state") == "active"
+        )
+        if (note.tool == "claude" and launch_account and left is not None
                 and left < MIN_REMAINING and ahead(note.get("resets"))):
             reason = (
                 f"{note.path.stem} has {left:g}% of its weekly usage left, under "
@@ -93,6 +104,12 @@ def quota_permission() -> QuotaPermission:
 
 
 def start(mode: str) -> str:
+    from scripts.accounts import accounts
+
+    return start_for_selection(mode, accounts.claude_account_selection())
+
+
+def start_for_selection(mode: str, selection: ClaudeAccountSelection) -> str:
     name = session(mode)
     if running(mode):
         if tmux("list-clients", "-t", f"={name}").stdout.strip():
@@ -104,14 +121,31 @@ def start(mode: str) -> str:
     claude = shlex.join(["claude", "--remote-control", name, "-n", name, "--add-dir", str(Path.home() / ".claude"),
                          "--settings", str(SETTINGS), f"/nightly_review {mode}"])
     # A scope of its own, so a tmux server this starts outlives the timer's oneshot unit.
-    started = subprocess.run(
-        ["systemd-run", "--user", "--scope", "--quiet", "--collect", "tmux", "new-session", "-d", "-s", name,
-         "-c", str(MODES[mode]), "zsh", "-ic", f"ENABLE_TOOL_SEARCH=true command {claude}; exec zsh"],
-        capture_output=True, text=True, check=False)
+    command = f"ENABLE_TOOL_SEARCH=true command {claude}; exec zsh"
+    if selection.multiple_accounts:
+        # tmux may supply a named account from its server environment. Clear
+        # both authentication selectors inside the command before Claude runs.
+        command = "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN; " + command
+    argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "tmux", "new-session", "-d", "-s", name,
+            "-c", str(MODES[mode]), "zsh", "-ic", command]
+    if selection.multiple_accounts:
+        started = subprocess.run(argv, capture_output=True, text=True, check=False,
+                                 env=launch_environment(selection))
+    else:
+        started = subprocess.run(argv, capture_output=True, text=True, check=False)
     return f"{name}: started" if started.returncode == 0 else f"{name}: failed to start: {started.stderr.strip()}"
 
 
+def launch_environment(selection: ClaudeAccountSelection) -> dict[str, str]:
+    """The default account's launch environment, retaining legacy inheritance."""
+    return {key: value for key, value in os.environ.items()
+            if not selection.multiple_accounts or not key.startswith("CLAUDE_")}
+
+
 def launch(today: date) -> list[str]:
+    from scripts.accounts import accounts
+
+    selection = accounts.claude_account_selection()
     directory = night_dir(today)
     directory.mkdir(parents=True, exist_ok=True)
     barrier = launch_barrier()
@@ -123,7 +157,7 @@ def launch(today: date) -> list[str]:
         ]
     else:
         try:
-            permission = launch_permission(os.environ, NewWorkLaunchPurpose())
+            permission = launch_permission(launch_environment(selection), NewWorkLaunchPurpose())
             if isinstance(permission, BlockedByShutdown):
                 lines = [f"skipped: {permission.reason}"]
             elif isinstance(permission, ShutdownStateUnreadable):
@@ -131,11 +165,11 @@ def launch(today: date) -> list[str]:
                     f"skipped: shutdown state unreadable: {permission.detail}"
                 ]
             else:
-                quota = quota_permission()
+                quota = quota_for_selection(selection)
                 lines = (
                     [f"skipped: {quota.reason}"]
                     if isinstance(quota, QuotaBelowFloor)
-                    else [start(mode) for mode in MODES]
+                    else [start_for_selection(mode, selection) for mode in MODES]
                 )
         finally:
             _ = barrier.__exit__(None, None, None)

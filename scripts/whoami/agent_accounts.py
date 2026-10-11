@@ -34,8 +34,60 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo
+
+ClaudeRole = Literal["showrunners", "unit directors"]
+
+
+@dataclass(frozen=True)
+class KnownClaudeAccount:
+    """The login and note label stored for a readable Claude directory."""
+
+    login: str
+    label: str
+
+
+@dataclass(frozen=True)
+class UnreadableClaudeAccount:
+    """A directory with no readable logged-in Claude identity."""
+
+
+@dataclass(frozen=True)
+class CheckedNamedClaudeAccount:
+    """A named directory fit to read, with its resolved login and note label."""
+
+    label: str
+    directory: Path
+    identity: KnownClaudeAccount
+
+
+@dataclass(frozen=True)
+class ClaudeAccountSelection:
+    """One run's role identities and fit named directories, fixed across role changes."""
+
+    default_account: KnownClaudeAccount | UnreadableClaudeAccount
+    unit_account: KnownClaudeAccount | UnreadableClaudeAccount
+    multiple_accounts: bool
+    named_accounts: tuple[CheckedNamedClaudeAccount, ...]
+
+    def is_default_login(self, login: str) -> bool:
+        return (
+            isinstance(self.default_account, KnownClaudeAccount)
+            and login.casefold() == self.default_account.login.casefold()
+        )
+
+    def roles_for_login(self, login: str) -> tuple[ClaudeRole, ...]:
+        roles: list[ClaudeRole] = []
+        if self.is_default_login(login):
+            roles.append("showrunners")
+        if (
+            isinstance(self.unit_account, KnownClaudeAccount)
+            and login.casefold() == self.unit_account.login.casefold()
+        ):
+            roles.append("unit directors")
+        return tuple(roles)
+
 
 WEEK_MINUTES = 7 * 24 * 60
 FIVE_HOUR_MINUTES = 5 * 60
@@ -55,6 +107,18 @@ class Quota:
         return max(0, min(100, 100 - self.used_percent))
 
 
+@dataclass(frozen=True)
+class ClaudeDirectorySource:
+    """A Claude reading obtained using this account directory."""
+
+    directory: Path
+
+
+@dataclass(frozen=True)
+class AccountSourceUnspecified:
+    """The report does not identify a Claude account directory."""
+
+
 @dataclass
 class Report:
     """One tool's account. `problem` replaces the account lines; `quota_problem` follows them."""
@@ -72,6 +136,7 @@ class Report:
     # Codex credits that carry work past the weekly allowance: whole credits, "unlimited", or "null"
     # when the rate limits were read and report none. None means they were not read.
     credit_balance: str | None = None
+    source: ClaudeDirectorySource | AccountSourceUnspecified = field(default_factory=AccountSourceUnspecified)
 
     @property
     def weekly_reset(self) -> datetime | None:
@@ -214,8 +279,12 @@ def executable(name: str) -> str:
     return name
 
 
-def command_json(*args: str) -> object:
-    result = subprocess.run((executable(args[0]), *args[1:]), capture_output=True, text=True, timeout=15)
+def command_json(*args: str, environment: dict[str, str] | None = None) -> object:
+    command = (executable(args[0]), *args[1:])
+    if environment is None:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+    else:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=15, env=environment)
     if result.returncode:
         raise RuntimeError("account command failed")
     return cast(object, json.loads(result.stdout))
@@ -243,12 +312,15 @@ def codex_home() -> Path:
 # --- Claude ------------------------------------------------------------------
 
 
-def claude_credentials() -> ClaudeCredentials:
-    path = claude_config_dir() / ".credentials.json"
+def claude_credentials(config_dir: Path | None = None) -> ClaudeCredentials:
+    path = (claude_config_dir() if config_dir is None else config_dir) / ".credentials.json"
     if path.exists():
         return cast(ClaudeCredentials, json.loads(path.read_text()))
     # Claude Code uses the macOS login keychain for its default configuration.
-    if sys.platform == "darwin" and "CLAUDE_CONFIG_DIR" not in os.environ:
+    if sys.platform == "darwin" and (
+        config_dir == Path.home() / ".claude"
+        or (config_dir is None and "CLAUDE_CONFIG_DIR" not in os.environ)
+    ):
         return cast(ClaudeCredentials, command_json(
             "security", "find-generic-password", "-s", "Claude Code-credentials", "-w"))
     raise RuntimeError("usage credentials unavailable")
@@ -277,10 +349,19 @@ def claude_five_hour(usage: dict[str, object]) -> Quota | None:
     return Quota("5-hour", window.get("utilization"), parse_reset(window.get("resets_at")))
 
 
-def claude_live() -> Report:
-    report = Report("Claude")
+def claude_live(config_dir: Path | None = None) -> Report:
+    report = Report("Claude", source=ClaudeDirectorySource(
+        claude_config_dir() if config_dir is None else config_dir,
+    ))
     try:
-        account = cast(ClaudeAuthStatus, command_json("claude", "auth", "status"))
+        if config_dir is None:
+            status = command_json("claude", "auth", "status")
+        else:
+            environment = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")}
+            if config_dir != Path.home() / ".claude":
+                environment["CLAUDE_CONFIG_DIR"] = str(config_dir)
+            status = command_json("claude", "auth", "status", environment=environment)
+        account = cast(ClaudeAuthStatus, status)
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
         report.problem = "Account unavailable (claude auth status failed)"
         return report
@@ -293,8 +374,9 @@ def claude_live() -> Report:
         report.quota_problem = "Weekly quota: unavailable for this authentication method"
         return report
     try:
-        token = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-                 or claude_credentials().get("claudeAiOauth", {}).get("accessToken"))
+        token = ((os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") if config_dir is None else None)
+                 or (claude_credentials() if config_dir is None else claude_credentials(config_dir))
+                 .get("claudeAiOauth", {}).get("accessToken"))
         if not token:
             raise RuntimeError("usage credentials unavailable")
         request = urllib.request.Request(
@@ -554,6 +636,12 @@ def reset_credits(report: Report, summary: object) -> None:
     report.limit_reset_expirations.sort()
 
 
-async def live_reports() -> list[Report]:
-    """The same live account and usage reads for /whoami and the snapshot timer."""
-    return list(await asyncio.gather(asyncio.to_thread(claude_live), codex_live()))
+async def live_reports(selection: ClaudeAccountSelection) -> list[Report]:
+    """Live Claude directories and the Codex account, fetched concurrently."""
+    if not selection.multiple_accounts:
+        return list(await asyncio.gather(asyncio.to_thread(claude_live), codex_live()))
+    directories = [Path.home() / ".claude", *(named.directory for named in selection.named_accounts)]
+    return list(await asyncio.gather(
+        *(asyncio.to_thread(claude_live, directory) for directory in directories),
+        codex_live(),
+    ))

@@ -11,7 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest.mock import patch
 
 from scripts.delegate import remove_seats
@@ -22,6 +22,7 @@ SCRIPT = Path(__file__).parent / "remove_seats.py"
 # rows file makes the listing fail, the way an unreachable daemon would.
 STUB_CLAUDE = """#!/usr/bin/env bash
 set -euo pipefail
+printf '%s\\t%s\\n' "$1" "${CLAUDE_CONFIG_DIR-<unset>}" >> "${STUB_ACCOUNTS}"
 case "$1" in
   agents) cat "${STUB_ROWS}" ;;
   rm) printf '%s\\n' "$2" >> "${STUB_REMOVED}" ;;
@@ -46,6 +47,7 @@ class RemoveSeatsTest(unittest.TestCase):
     rows: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     claude: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     state_root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    account_log: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
     def setUp(self) -> None:
@@ -57,6 +59,13 @@ class RemoveSeatsTest(unittest.TestCase):
         self.rows = base / "rows.json"
         self.claude = base / "claude"
         self.state_root = base / "shutdown"
+        self.account_log = base / "accounts.jsonl"
+        environment_context: object = cast(
+            object,
+            self.enterContext(patch.dict(os.environ, {"HOME": str(base)})),
+        )
+        del environment_context
+        _ = os.environ.pop("CLAUDE_CONFIG_DIR", None)
         _ = self.claude.write_text(STUB_CLAUDE, encoding="utf-8")
         self.claude.chmod(0o755)
 
@@ -127,6 +136,7 @@ class RemoveSeatsTest(unittest.TestCase):
             CLAUDE_BIN=str(self.claude),
             STUB_ROWS=str(self.rows),
             STUB_REMOVED=str(self.removed),
+            STUB_ACCOUNTS=str(self.account_log),
             CLAUDE_CODE_SESSION_ID=caller,
             SHUTDOWN_STATE_DIR=str(self.state_root),
         )
@@ -146,6 +156,28 @@ class RemoveSeatsTest(unittest.TestCase):
     def remove_seats(self, session_dir: Path | None = None, caller: str = "") -> tuple[int, list[str]]:
         result, removed = self.run_remove_seats(session_dir, caller)
         return result.returncode, sorted(removed)
+
+    def test_named_owner_config_dir_is_inherited_by_listing_and_removal(self) -> None:
+        """F006: both commands inherit the owning session's account directory."""
+        own = self.run_dir("own", ["own1"], orchestrator=ORCHESTRATOR)
+        self.list_rows([row("own1", "p-impl")])
+        config_dir = str(Path.home() / "account with 'quotes' and $()")
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": config_dir}):
+            self.assertEqual(self.remove_seats(own), (0, ["own1"]))
+        self.assertEqual(
+            self.account_log.read_text(encoding="utf-8").splitlines(),
+            [f"agents\t{config_dir}", f"rm\t{config_dir}"],
+        )
+
+    def test_default_owner_leaves_config_dir_unset_for_listing_and_removal(self) -> None:
+        """F006: a default owner passes no account-directory assignment."""
+        own = self.run_dir("own", ["own1"], orchestrator=ORCHESTRATOR)
+        self.list_rows([row("own1", "p-impl")])
+        self.assertEqual(self.remove_seats(own), (0, ["own1"]))
+        self.assertEqual(
+            self.account_log.read_text(encoding="utf-8").splitlines(),
+            ["agents\t<unset>", "rm\t<unset>"],
+        )
 
     def test_own_run_goes_even_while_live(self) -> None:
         own = self.run_dir("own", ["own1", "own2"], orchestrator=ORCHESTRATOR)

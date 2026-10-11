@@ -19,7 +19,9 @@ from test_support import ShutdownTestCase
 import inventory
 import launch_permission
 import record
+import restart as restart_work
 import shutdown
+import settle
 from account import Account
 
 
@@ -169,6 +171,82 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             timeout=10,
         )
 
+    def test_down_restart_passes_the_selected_scope_and_intent(self) -> None:
+        selected = Account("claude", LOGIN, LABEL)
+        with (
+            patch.object(shutdown, "named_claude_account", return_value=selected),
+            patch.object(settle, "down", return_value=0) as down,
+        ):
+            self.assertEqual(shutdown.main([
+                "down", LABEL, "--restart", "--only", "unit-a,unit-b,unit-a", "--here",
+            ]), 0)
+        down.assert_called_once_with(
+            selected, True, ("unit-a", "unit-b"), then="restart"
+        )
+
+    def test_down_without_restart_keeps_the_existing_dispatch(self) -> None:
+        selected = Account("claude", LOGIN, LABEL)
+        with (
+            patch.object(shutdown, "named_claude_account", return_value=selected),
+            patch.object(settle, "down", return_value=0) as down,
+        ):
+            self.assertEqual(shutdown.main(["down", LABEL]), 0)
+        down.assert_called_once_with(selected, False, ())
+
+    def test_begin_accepts_the_remote_restart_intent(self) -> None:
+        with patch.object(settle, "begin") as begin:
+            self.assertEqual(shutdown.main([
+                "begin", LOGIN, "--requested-by", "outside", "--only", "unit-a",
+                "--then", "restart",
+            ]), 0)
+        begin.assert_called_once_with(LOGIN, "outside", ("unit-a",), then="restart")
+
+    def test_selected_restart_record_never_includes_unselected_sessions(self) -> None:
+        selected = unit_session("unit-a")
+        unselected = unit_session("unit-b")
+        sessions = [selected, unselected]
+        seen_scopes: list[record.ShutdownScope] = []
+
+        def scoped_inventory(login: str, scope: record.ShutdownScope) -> inventory.Inventory:
+            self.assertEqual(login, LOGIN)
+            seen_scopes.append(scope)
+            wanted = scope["session_ids"] if scope["kind"] == "selected" else []
+            return inventory.Inventory(
+                machine="natedev", login=LOGIN, label=LABEL,
+                sessions=[item for item in sessions if not wanted or item["session_id"] in wanted],
+                unattributed=[],
+            )
+
+        def finish(login: str, here: bool) -> int:
+            self.assertEqual((login, here), (LOGIN, True))
+            def stopped(current: record.ShutdownRecord) -> None:
+                current["state"] = "down"
+            _ = record.update(login, stopped)
+            return 0
+
+        def resume(login: str) -> int:
+            found = record.find_live(login)
+            if found["kind"] != "live":
+                self.fail("expected the selected shutdown record")
+            self.assertEqual([item["session"]["session_id"] for item in found["record"]["entries"]], ["unit-a"])
+            self.assertEqual(found["record"]["scope"], record.SelectedSessions(kind="selected", session_ids=["unit-a"]))
+            return 0
+
+        with (
+            patch.object(shutdown, "named_claude_account", return_value=Account("claude", LOGIN, LABEL)),
+            patch.object(settle, "_warm", return_value=True),
+            patch.object(settle, "run_inventory", side_effect=scoped_inventory),
+            patch.object(settle, "_session_timer_snapshot", return_value=[]),
+            patch.object(settle, "_launch_conductor"),
+            patch.object(settle, "conduct", side_effect=finish),
+            patch.object(restart_work, "up", side_effect=resume) as up,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "unit-a", "--restart"]), 0)
+            self.assertEqual(shutdown.main(["conduct", LOGIN, "--here"]), 0)
+        up.assert_called_once_with(LOGIN)
+        self.assertTrue(all(scope == record.SelectedSessions(kind="selected", session_ids=["unit-a"]) for scope in seen_scopes))
+
     def test_launch_blocked_holds_all_six_shutdown_states(self) -> None:
         for state in (
             "settling",
@@ -253,30 +331,26 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(error.count("shutdown state unreadable: "), 1)
 
     def test_launch_blocked_fails_closed_when_account_resolution_crashes(self) -> None:
-        self.write_record(shutdown_record("down"))
-        notes = Path(self.environment["AGENT_NOTES_DIR"])
-        _ = (notes / f"{LABEL}.md").write_bytes(b"\xff")
+        output = io.StringIO()
+        error = io.StringIO()
+        with (
+            patch.object(
+                shutdown,
+                "_selected_account",
+                side_effect=RuntimeError("fixture resolver failed"),
+            ) as resolve,
+            redirect_stdout(output),
+            redirect_stderr(error),
+        ):
+            status = shutdown.main(["launch-blocked", LOGIN])
 
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(Path(__file__).with_name("shutdown.py")),
-                "launch-blocked",
-                LOGIN,
-            ],
-            env=self.environment,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=10,
-        )
-
-        self.assertEqual(result.returncode, 3)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(len(result.stderr.splitlines()), 1)
+        resolve.assert_called_once_with(LOGIN)
+        self.assertEqual(status, 3)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(len(error.getvalue().splitlines()), 1)
         self.assertTrue(
-            result.stderr.startswith("shutdown state unreadable: UnicodeDecodeError: "),
-            result.stderr,
+            error.getvalue().startswith("shutdown state unreadable: RuntimeError: "),
+            error.getvalue(),
         )
 
     def test_restart_permission_matches_record_state_and_progress(self) -> None:
