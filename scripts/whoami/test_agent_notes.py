@@ -185,6 +185,7 @@ class AgentNotesTests(unittest.TestCase):
         named = self.account_dir("claude 3", "shared@example.com", "named-token")
         self.select_unit("claude 3")
         _ = self.note("claude 2.md", "shared@example.com")
+        _ = self.note("claude 3.md", "shared@example.com")
         main = Report("Claude", email="shared@example.com", source=ClaudeDirectorySource(default))
         unit = Report("Claude", email="shared@example.com", source=ClaudeDirectorySource(named))
         codex = Report("Codex")

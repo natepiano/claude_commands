@@ -286,7 +286,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 **Ruled out:** writing the unit role on both machines (units launch only on natedev; peer units refuse instead); a `--here` option on swap (it would change swap's scope; the cutover runs `down --here --only` directly).
 
-### Phase 5 — Starting sessions by account, and the user's guide  · status: todo
+### Phase 5 — Starting sessions by account, and the user's guide  · status: done
 
 #### Work Order
 

@@ -128,9 +128,17 @@ class AccountsTests(unittest.TestCase):
         _ = account_dir.mkdir(mode=0o700)
         for entry in EXPECTED_SHARED:
             source = self.main_dir / entry
-            if entry not in {"projects", "sessions"}:
-                _ = source.mkdir()
+            _ = source.mkdir(exist_ok=True)
             _ = (account_dir / entry).symlink_to(source)
+
+    def write_note(self, label: str, login: str) -> None:
+        path = Path(os.environ["AGENT_NOTES_DIR"]) / f"{label}.md"
+        _ = path.write_text(f"---\nlogin: {login}\n---\n", encoding="utf-8")
+
+    def write_identity(self, label: str, login: str) -> None:
+        _ = (accounts.account_dir(label) / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": login}}), encoding="utf-8",
+        )
 
     def logged_in(self) -> account.Account:
         return account.Account("claude", "owner@example.invalid", "claude 2")
@@ -138,10 +146,13 @@ class AccountsTests(unittest.TestCase):
     def login_directory(self, label: str, login: str, *, default: bool = False, note_label: str = "") -> None:
         config = self.home / ".claude.json" if default else accounts.account_dir(label) / ".claude.json"
         if not default:
+            for name in ("projects", "sessions"):
+                (self.main_dir / name).mkdir(exist_ok=True)
             self.assertEqual(accounts.setup(label), [])
         _ = config.write_text(json.dumps({"oauthAccount": {"emailAddress": login}}), encoding="utf-8")
-        notes = Path(os.environ["AGENT_NOTES_DIR"])
-        _ = (notes / f"{note_label or label}.md").write_text(f"---\nlogin: {login}\n---\n", encoding="utf-8")
+        self.write_note(label, login)
+        if note_label:
+            self.write_note(note_label, login)
 
     def write_readings(self, readings: list[accounts.QuotaReading]) -> None:
         log = accounts.readings_file()
@@ -157,6 +168,360 @@ class AccountsTests(unittest.TestCase):
         config = accounts.accounts_config_file()
         config.parent.mkdir(parents=True, exist_ok=True)
         _ = config.write_text(json.dumps(accounts.AccountsConfiguration(unit=label)), encoding="utf-8")
+
+    def test_exec_default_login_without_named_dirs_preserves_arguments_and_removes_config_override(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        before = set(self.home.iterdir())
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "inherited")}), patch.object(os, "execvpe") as launch:
+            result = self.run_cli("exec", "claude 2", "--version", "--", "quoted argument")
+        self.assertEqual(result, (0, "", ""))
+        environment = dict(os.environ)
+        launch.assert_called_once_with("claude", ["claude", "--version", "--", "quoted argument"], environment)
+        self.assertEqual(set(self.home.iterdir()), before)
+        self.assertFalse(accounts.accounts_config_file().exists())
+        self.assertFalse(accounts.roles_history_file().exists())
+
+    def test_exec_missing_directory_prints_setup_refusal_without_launching(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        with patch.object(os, "execvpe") as launch:
+            result = self.run_cli("exec", "claude 3", "--version")
+        self.assertEqual(result, (2, "", 'accounts: ~/.claude3 is not set up; /accounts setup "claude 3" first\n'))
+        launch.assert_not_called()
+        self.assertFalse(accounts.account_dir("claude 3").exists())
+
+    def test_exec_named_account_sets_its_config_directory_and_preserves_claude_arguments(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "inherited", "UNCHANGED": "value"}), patch.object(os, "execvpe") as launch:
+            environment = {**os.environ, "CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude 3"))}
+            result = self.run_cli("exec", "claude 3", "--resume", "conversation id", "-p", "a prompt")
+        self.assertEqual(result, (0, "", ""))
+        launch.assert_called_once_with("claude", ["claude", "--resume", "conversation id", "-p", "a prompt"], environment)
+        self.assertIsInstance(accounts.account_directory_readiness("claude 3"), accounts.AccountDirectoryReady)
+
+    def test_exec_uses_one_expected_login_through_resolution_and_readiness(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        note = Path(os.environ["AGENT_NOTES_DIR"]) / "claude 3.md"
+        reads: list[str] = []
+        original_read = Path.read_text
+
+        def change_after_read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            text = original_read(path, encoding=encoding, errors=errors)
+            if path == note:
+                reads.append(text)
+                _ = note.write_text("---\nlogin: next@example.invalid\n---\n")
+            return text
+
+        with patch.object(Path, "read_text", change_after_read), patch.object(os, "execvpe") as launch:
+            result = self.run_cli("exec", "claude 3")
+        self.assertEqual(result, (0, "", ""))
+        self.assertEqual(len(reads), 1)
+        launch.assert_called_once()
+
+    def test_exec_unit_follows_the_role_and_uses_plain_claude_when_unassigned(self) -> None:
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "inherited"}), patch.object(os, "execvpe") as launch:
+            environment = dict(os.environ)
+            del environment["CLAUDE_CONFIG_DIR"]
+            self.assertEqual(self.run_cli("exec", "unit", "--version"), (0, "", ""))
+        launch.assert_called_once_with("claude", ["claude", "--version"], environment)
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "main@example.invalid")
+        self.select_named_unit("claude 3")
+        with patch.object(os, "execvpe") as launch:
+            self.assertEqual(self.run_cli("exec", "unit"), (0, "", ""))
+        launch.assert_called_once_with("claude", ["claude"], {**os.environ, "CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude 3"))})
+
+    def test_exec_named_alias_of_default_login_uses_plain_claude(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.write_note("claude 3", "MAIN@example.invalid")
+        with patch.object(os, "execvpe") as launch:
+            self.assertEqual(self.run_cli("exec", "claude 3"), (0, "", ""))
+        launch.assert_called_once_with("claude", ["claude"], dict(os.environ))
+        self.assertFalse(accounts.account_dir("claude 3").exists())
+
+    def test_exec_discards_an_inherited_oauth_token_for_every_account_selection(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        selections = (
+            ("named account", "claude 3", False, str(accounts.account_dir("claude 3"))),
+            ("default login alias", "claude 2", False, ""),
+            ("named unit role", "unit", True, str(accounts.account_dir("claude 3"))),
+            ("unassigned unit", "unit", False, ""),
+        )
+        for selection, label, named_unit, config_dir in selections:
+            with self.subTest(selection=selection):
+                if named_unit:
+                    self.select_named_unit("claude 3")
+                else:
+                    accounts.accounts_config_file().unlink(missing_ok=True)
+                with (
+                    patch.dict(os.environ, {
+                        "CLAUDE_CODE_OAUTH_TOKEN": "another-account-token",
+                        "CLAUDE_CONFIG_DIR": "inherited",
+                        "UNCHANGED": "value",
+                    }),
+                    patch.object(os, "execvpe") as launch,
+                ):
+                    expected_environment = dict(os.environ)
+                    del expected_environment["CLAUDE_CODE_OAUTH_TOKEN"]
+                    if config_dir:
+                        expected_environment["CLAUDE_CONFIG_DIR"] = config_dir
+                    else:
+                        del expected_environment["CLAUDE_CONFIG_DIR"]
+                    self.assertEqual(self.run_cli("exec", label, "--version"), (0, "", ""))
+                    launch.assert_called_once_with(
+                        "claude", ["claude", "--version"], expected_environment,
+                    )
+                    self.assertEqual(os.environ["CLAUDE_CODE_OAUTH_TOKEN"], "another-account-token")
+
+    def test_exec_allows_a_set_up_logged_out_directory_to_log_in_but_check_refuses_it(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        self.write_identity("claude 3", "unit@example.invalid")
+        config = accounts.account_dir("claude 3") / ".claude.json"
+        for content in ("{}", "missing"):
+            with self.subTest(content=content):
+                if content == "missing":
+                    config.unlink()
+                else:
+                    _ = config.write_text(content)
+                readiness = accounts.account_directory_readiness("claude 3")
+                self.assertIsInstance(readiness, accounts.AccountDirectoryLoggedOut)
+                self.assertIn("not logged in", "\n".join(accounts.check("claude 3")))
+                with patch.object(os, "execvpe") as launch:
+                    self.assertEqual(self.run_cli("exec", "claude 3"), (0, "", ""))
+                launch.assert_called_once_with("claude", ["claude"], {**os.environ, "CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude 3"))})
+
+    def test_exec_allows_login_before_a_new_label_has_a_note(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        _ = (accounts.account_dir("claude 3") / ".claude.json").write_text("{}")
+        (Path(os.environ["AGENT_NOTES_DIR"]) / "claude 3.md").unlink()
+        with patch.object(os, "execvpe") as launch:
+            self.assertEqual(self.run_cli("exec", "claude 3"), (0, "", ""))
+        launch.assert_called_once()
+        self.assertEqual(len(accounts.check("claude 3")), 2)
+
+    def test_exec_refuses_wrong_login_and_status_keeps_the_actual_identity(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "expected@example.invalid")
+        self.write_identity("claude 3", "other@example.invalid")
+        line = "accounts: ~/.claude3 is logged in as other@example.invalid, not claude 3; see Log out and in in ~/.claude/docs/accounts.md"
+        self.assertIsInstance(accounts.account_directory_readiness("claude 3"), accounts.AccountDirectoryWrongLogin)
+        self.assertEqual(accounts.check("claude 3"), [line])
+        with patch.object(os, "execvpe") as launch:
+            self.assertEqual(self.run_cli("exec", "claude 3"), (2, "", line + "\n"))
+        launch.assert_not_called()
+        result = self.run_cli("status")
+        self.assertIn("login: other@example.invalid", result[1])
+        self.assertIn(line, result[1])
+        self.assertEqual(accounts.account_identity(accounts.account_dir("claude 3")), agent_accounts.KnownClaudeAccount("other@example.invalid", "other@example.invalid"))
+
+    def test_exec_refuses_broken_shared_links_even_when_logged_out(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        _ = (accounts.account_dir("claude 3") / ".claude.json").write_text("{}")
+        (self.main_dir / "projects").rmdir()
+        readiness = accounts.account_directory_readiness("claude 3")
+        self.assertIsInstance(readiness, accounts.AccountDirectoryBrokenLinks)
+        with patch.object(os, "execvpe") as launch:
+            result = self.run_cli("exec", "claude 3")
+        self.assertEqual(result, (2, "", f"accounts: {accounts.account_dir('claude 3') / 'projects'} is broken\n"))
+        launch.assert_not_called()
+        self.assertIn("not logged in", "\n".join(readiness.problems))
+
+    def test_removed_optional_shared_source_refuses_check_and_exec(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        source = self.main_dir / "settings.json"
+        _ = source.write_text("{}", encoding="utf-8")
+        self.login_directory("claude 3", "unit@example.invalid")
+        source.unlink()
+        linked = accounts.account_dir("claude 3") / "settings.json"
+        problem = f"accounts: {linked} is broken"
+        self.assertEqual(accounts.check("claude 3"), [problem])
+        self.assertIsInstance(accounts.account_directory_readiness("claude 3"), accounts.AccountDirectoryBrokenLinks)
+        with patch.object(os, "execvpe") as launch:
+            self.assertEqual(self.run_cli("exec", "claude 3"), (2, "", problem + "\n"))
+        launch.assert_not_called()
+        self.assertEqual(accounts.checked_named_accounts(), [])
+
+    def test_exec_refuses_linked_directory_and_identity_files(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        for name in accounts.IDENTITY_ENTRIES:
+            with self.subTest(name=name):
+                path = accounts.account_dir("claude 3") / name
+                original = path.read_bytes() if path.exists() else b""
+                path.unlink(missing_ok=True)
+                path.symlink_to(self.root / "external")
+                with patch.object(os, "execvpe") as launch:
+                    result = self.run_cli("exec", "claude 3")
+                self.assertEqual(result[0], 2)
+                self.assertIn("identity stays in each account dir", result[2])
+                launch.assert_not_called()
+                path.unlink()
+                if original:
+                    _ = path.write_bytes(original)
+        linked = accounts.account_dir("claude 4")
+        linked.symlink_to(accounts.account_dir("claude 3"), target_is_directory=True)
+        with patch.object(os, "execvpe") as launch:
+            result = self.run_cli("exec", "claude 4")
+        self.assertEqual(result[0], 2)
+        self.assertIn("an account dir must be a real directory", result[2])
+        launch.assert_not_called()
+
+    def test_exec_refuses_malformed_existing_identity_instead_of_treating_it_as_logged_out(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        path = accounts.account_dir("claude 3") / ".claude.json"
+        for content in ("not JSON", "[]", '{"oauthAccount": []}', '{"oauthAccount": {"emailAddress": 1}}', '{"oauthAccount": {}}'):
+            with self.subTest(content=content):
+                _ = path.write_text(content)
+                self.assertIsInstance(accounts.account_directory_readiness("claude 3"), accounts.AccountDirectoryUnreadable)
+                with patch.object(os, "execvpe") as launch:
+                    result = self.run_cli("exec", "claude 3")
+                self.assertEqual(result[0], 2)
+                self.assertIn(".claude.json", result[2])
+                self.assertNotIn("not logged in", result[2])
+                launch.assert_not_called()
+
+    def test_exec_refuses_each_unreadable_identity_file(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        original_read = Path.read_text
+        for name in accounts.IDENTITY_ENTRIES:
+            with self.subTest(name=name):
+                blocked = accounts.account_dir("claude 3") / name
+                _ = blocked.touch(exist_ok=True)
+
+                def deny(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                    if path == blocked:
+                        raise PermissionError("fixture read denied")
+                    return original_read(path, encoding=encoding, errors=errors)
+
+                with patch.object(Path, "read_text", deny), patch.object(os, "execvpe") as launch:
+                    readiness = accounts.account_directory_readiness("claude 3")
+                    result = self.run_cli("exec", "claude 3")
+                self.assertIsInstance(readiness, accounts.AccountDirectoryUnreadable)
+                self.assertEqual(result[0], 2)
+                self.assertIn("fixture read denied", result[2])
+                launch.assert_not_called()
+                if name != ".claude.json":
+                    blocked.unlink()
+
+    def test_exec_refuses_missing_or_unreadable_account_notes_for_a_logged_in_directory(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        note = Path(os.environ["AGENT_NOTES_DIR"]) / "claude 3.md"
+        for content in (b"missing", b"body without frontmatter", b"---\nlogin: null\n---\n", b"\xff"):
+            with self.subTest(content=content):
+                if content == b"missing":
+                    note.unlink()
+                else:
+                    _ = note.write_bytes(content)
+                with patch.object(os, "execvpe") as launch:
+                    result = self.run_cli("exec", "claude 3")
+                self.assertEqual(result[0], 2)
+                self.assertIn("claude 3.md", result[2])
+                launch.assert_not_called()
+
+    def test_exec_refuses_an_unreadable_note_even_when_the_directory_is_logged_out(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        _ = (accounts.account_dir("claude 3") / ".claude.json").write_text("{}")
+        _ = (Path(os.environ["AGENT_NOTES_DIR"]) / "claude 3.md").write_text("not frontmatter")
+        with patch.object(os, "execvpe") as launch:
+            result = self.run_cli("exec", "claude 3")
+        self.assertEqual(result[0], 2)
+        self.assertIn("has no readable login", result[2])
+        self.assertNotIn("not logged in", result[2])
+        self.assertEqual(len(accounts.check("claude 3")), 2)
+        launch.assert_not_called()
+
+    def test_status_reports_unreadable_notes_without_erasing_other_account_identities(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        self.login_directory("claude 4", "spare@example.invalid")
+        self.select_named_unit("claude 3")
+        _ = (Path(os.environ["AGENT_NOTES_DIR"]) / "claude 3.md").write_bytes(b"\xff")
+        result = self.run_cli("status")
+        self.assertEqual((result[0], result[2]), (0, ""))
+        self.assertIn("login: unit@example.invalid", result[1])
+        self.assertIn("could not read", result[1])
+        self.assertIn("login: spare@example.invalid", result[1])
+        selection = accounts.claude_account_selection()
+        self.assertEqual([named.identity.label for named in selection.named_accounts], ["claude 4"])
+        self.assertIsInstance(selection.unit_account, agent_accounts.UnreadableClaudeAccount)
+        self.assertTrue(selection.is_default_login("main@example.invalid"))
+
+    def test_exec_reports_an_unavailable_claude_executable_with_exit_two(self) -> None:
+        with patch.object(os, "execvpe", side_effect=FileNotFoundError("fixture executable missing")):
+            result = self.run_cli("exec", "unit")
+        self.assertEqual(result, (2, "", "accounts: could not start claude: fixture executable missing\n"))
+
+    def test_check_wrong_login_or_missing_note_removes_the_named_account_and_unit_role(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        self.select_named_unit("claude 3")
+        self.write_identity("claude 3", "other@example.invalid")
+        for missing_note in (False, True):
+            with self.subTest(missing_note=missing_note):
+                if missing_note:
+                    (Path(os.environ["AGENT_NOTES_DIR"]) / "claude 3.md").unlink()
+                self.assertTrue(accounts.check("claude 3"))
+                self.assertEqual(accounts.checked_named_accounts(), [])
+                selection = accounts.claude_account_selection()
+                self.assertEqual(selection.named_accounts, ())
+                self.assertIsInstance(selection.unit_account, agent_accounts.UnreadableClaudeAccount)
+                self.assertTrue(selection.multiple_accounts)
+
+    def test_check_retains_link_identity_and_note_failures_in_one_readiness_value(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        (accounts.account_dir("claude 3") / "projects").unlink()
+        _ = (accounts.account_dir("claude 3") / ".credentials.json").write_text("invalid JSON")
+        self.write_identity("claude 3", "other@example.invalid")
+        problems = accounts.check("claude 3")
+        self.assertEqual(len(problems), 3)
+        self.assertIn("projects", problems[0])
+        self.assertIn(".credentials.json", problems[1])
+        self.assertIn("logged in as other@example.invalid", problems[2])
+
+    def test_check_missing_note_alone_excludes_an_otherwise_matching_account(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        (Path(os.environ["AGENT_NOTES_DIR"]) / "claude 3.md").unlink()
+        self.assertEqual(accounts.check("claude 3"), [f"accounts: claude 3 has no account note at {Path(os.environ['AGENT_NOTES_DIR']) / 'claude 3.md'}"])
+        self.assertEqual(accounts.claude_account_selection().named_accounts, ())
+        self.assertTrue(accounts.multiple_accounts_configured())
+
+    def test_check_matches_the_requested_note_case_insensitively_even_when_identity_label_differs(self) -> None:
+        self.login_directory("claude 2", "MAIN@example.invalid", default=True)
+        self.login_directory("claude 3", "main@example.invalid")
+        self.assertEqual(accounts.check("claude 3"), [])
+        self.assertEqual(accounts.account_identity(accounts.account_dir("claude 3")), agent_accounts.KnownClaudeAccount("main@example.invalid", "claude 2"))
+
+    def test_swap_refuses_a_wrong_login_target_before_any_role_or_history_write(self) -> None:
+        _ = self.prepare_swap()
+        self.write_identity("claude 1", "other@example.invalid")
+        before = self.role_files()
+        with patch.object(subprocess, "run") as shutdown:
+            result = self.run_cli("swap", "unit", "claude 1")
+        self.assertEqual(result[0], 1)
+        self.assertIn("logged in as other@example.invalid, not claude 1", result[2])
+        self.assertEqual(self.role_files(), before)
+        shutdown.assert_not_called()
+
+    def test_swap_refuses_a_wrong_login_current_unit_before_any_role_or_history_write(self) -> None:
+        _ = self.prepare_swap()
+        self.write_identity("claude 3", "other@example.invalid")
+        before = self.role_files()
+        with patch.object(subprocess, "run") as shutdown:
+            result = self.run_cli("swap", "unit", "claude 1")
+        self.assertEqual(result, (1, "", "accounts: current unit account identity is unreadable\n"))
+        self.assertEqual(self.role_files(), before)
+        shutdown.assert_not_called()
 
     def prepare_swap(self, *, shared_default_login: bool = False) -> accounts.SwapInventory:
         self.login_directory("claude 2", "main@example.invalid", default=True)
@@ -481,24 +846,24 @@ class AccountsTests(unittest.TestCase):
 
     def test_burn_keeps_the_swapped_account_identity_after_logout_or_another_login(self) -> None:
         found = self.prepare_swap()
+        self.login_directory("claude 4", "new@example.invalid")
         notes = Path(os.environ["AGENT_NOTES_DIR"])
-        _ = (notes / "claude 1.md").rename(notes / "claude 4.md")
         _ = (notes / "claude 5.md").write_text("---\nlogin: another@example.invalid\n---\n")
         with patch.object(accounts, "datetime", RoleWriteTime):
-            result, _ = self.swap_cli([found])
+            result, _ = self.swap_cli([found], "claude 4")
         self.assertEqual(result[0], 0, result)
         audit = cast(dict[str, object], json.loads(accounts.roles_history_file().read_text()))
-        self.assertEqual((audit["label"], audit["account_label"]), ("claude 1", "claude 4"))
+        self.assertEqual((audit["label"], audit["account_label"]), ("claude 4", "claude 1"))
         self.write_readings([
-            accounts.QuotaReading(account="claude 4", at=f"2026-10-{day:02d}T00:00:00Z", remaining=left)
+            accounts.QuotaReading(account="claude 1", at=f"2026-10-{day:02d}T00:00:00Z", remaining=left)
             for day, left in ((9, 90.0), (10, 80.0))
         ])
-        config = accounts.account_dir("claude 1") / ".claude.json"
+        config = accounts.account_dir("claude 4") / ".claude.json"
         for content in ({}, {"oauthAccount": {"emailAddress": "another@example.invalid"}}):
             with self.subTest(content=content):
                 _ = config.write_text(json.dumps(content))
                 results = accounts.burn(datetime(2026, 10, 9, tzinfo=timezone.utc), datetime(2026, 10, 10, tzinfo=timezone.utc))
-                self.assertEqual(results, [accounts.AccountRoleBurn("claude 4", ("unit directors",), 10, 1)])
+                self.assertEqual(results, [accounts.AccountRoleBurn("claude 1", ("unit directors",), 10, 1)])
 
     def test_set_role_refuses_unreadable_named_and_default_identities_without_writing(self) -> None:
         for label in ("claude 1", "default"):
@@ -810,6 +1175,55 @@ class AccountsTests(unittest.TestCase):
             },
         )
 
+    def test_setup_creates_missing_required_shared_targets_before_linking(self) -> None:
+        self.write_main_config()
+        for name in accounts.ALWAYS_LINKED:
+            self.assertFalse((self.main_dir / name).exists())
+        self.assertEqual(accounts.setup("claude 3"), [])
+        for name in accounts.ALWAYS_LINKED:
+            target = self.main_dir / name
+            linked = accounts.account_dir("claude 3") / name
+            self.assertTrue(target.is_dir())
+            self.assertTrue(linked.is_symlink())
+            self.assertTrue(linked.is_dir())
+            self.assertEqual(linked.resolve(), target)
+        readiness = accounts.account_directory_readiness("claude 3")
+        self.assertIsInstance(readiness, accounts.AccountDirectoryLoggedOut)
+        self.assertFalse(any("broken" in problem for problem in readiness.problems))
+
+    def test_setup_removes_an_obsolete_expected_shared_link_and_restores_readiness(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        source = self.main_dir / "settings.json"
+        _ = source.write_text("{}", encoding="utf-8")
+        self.login_directory("claude 3", "unit@example.invalid")
+        source.unlink()
+        linked = accounts.account_dir("claude 3") / "settings.json"
+        self.assertTrue(linked.is_symlink())
+        self.assertEqual(accounts.setup("claude 3"), [])
+        self.assertFalse(os.path.lexists(linked))
+        self.assertFalse(source.exists())
+        self.assertEqual(accounts.check("claude 3"), [])
+        self.assertIsInstance(accounts.account_directory_readiness("claude 3"), accounts.AccountDirectoryReady)
+
+    def test_missing_optional_sources_report_wrong_links_and_real_entries_without_removing_them(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        destination = accounts.account_dir("claude 3")
+        outside = self.root / "outside-settings"
+        _ = outside.write_text("outside", encoding="utf-8")
+        linked = destination / "settings.json"
+        linked.symlink_to(outside)
+        local = destination / "CLAUDE.md"
+        _ = local.write_text("private content", encoding="utf-8")
+        self.assertEqual(accounts.check("claude 3"), [
+            f"accounts: {linked} points to {outside}, not {self.main_dir / 'settings.json'}",
+            f"accounts: {local} is a real file; move it aside or merge it into ~/.claude",
+        ])
+        _ = accounts.setup("claude 3")
+        self.assertEqual(os.readlink(linked), str(outside))
+        self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+        self.assertEqual(local.read_text(encoding="utf-8"), "private content")
+
     def test_setup_leaves_correct_link_and_existing_seed_untouched(self) -> None:
         self.write_main_config()
         source = self.main_dir / "settings.json"
@@ -957,8 +1371,10 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(setup_stderr, "")
         self.assertTrue(linked.is_symlink())
         self.assertEqual(os.readlink(linked), str(source))
-        with patch.object(account, "claude_account", return_value=self.logged_in()):
-            self.assertEqual(self.run_cli("check", "claude 2"), (0, "", ""))
+        self.write_note("claude 2", "owner@example.invalid")
+        self.write_identity("claude 2", "owner@example.invalid")
+        problems = accounts.check("claude 2")
+        self.assertIn(f"accounts: {linked} is broken", problems)
 
     def test_invalid_label_is_refused_without_creating_a_directory(self) -> None:
         for command in ("setup", "check"):
@@ -972,9 +1388,9 @@ class AccountsTests(unittest.TestCase):
     def test_check_is_silent_for_a_complete_logged_in_account(self) -> None:
         account_dir = self.home / ".claude2"
         self.correct_links(account_dir)
-
-        with patch.object(account, "claude_account", return_value=self.logged_in()):
-            result, stdout, stderr = self.run_cli("check", "claude 2")
+        self.write_identity("claude 2", "owner@example.invalid")
+        self.write_note("claude 2", "owner@example.invalid")
+        result, stdout, stderr = self.run_cli("check", "claude 2")
 
         self.assertEqual((result, stdout, stderr), (0, "", ""))
 
@@ -990,6 +1406,7 @@ class AccountsTests(unittest.TestCase):
     def test_check_reports_every_link_problem_and_not_logged_in(self) -> None:
         account_dir = self.home / ".claude2"
         self.correct_links(account_dir)
+        self.write_note("claude 2", "owner@example.invalid")
         _ = (account_dir / "settings.json").unlink()
         _ = (account_dir / "CLAUDE.md").unlink()
         _ = (account_dir / "CLAUDE.md").symlink_to(self.root / "wrong")
@@ -1016,6 +1433,7 @@ class AccountsTests(unittest.TestCase):
     def test_check_rejects_a_linked_identity_without_reading_its_login(self) -> None:
         account_dir = self.home / ".claude2"
         self.correct_links(account_dir)
+        self.write_note("claude 2", "owner@example.invalid")
         _ = (account_dir / ".claude.json").symlink_to(self.home / ".claude.json")
 
         with patch.object(account, "claude_account") as login_read:

@@ -329,30 +329,26 @@ class ShutdownLaunchCliTests(unittest.TestCase):
         self.assertEqual(error.count("shutdown state unreadable: "), 1)
 
     def test_launch_blocked_fails_closed_when_account_resolution_crashes(self) -> None:
-        self.write_record(shutdown_record("down"))
-        notes = Path(self.environment["AGENT_NOTES_DIR"])
-        _ = (notes / f"{LABEL}.md").write_bytes(b"\xff")
+        output = io.StringIO()
+        error = io.StringIO()
+        with (
+            patch.object(
+                shutdown,
+                "_selected_account",
+                side_effect=RuntimeError("fixture resolver failed"),
+            ) as resolve,
+            redirect_stdout(output),
+            redirect_stderr(error),
+        ):
+            status = shutdown.main(["launch-blocked", LOGIN])
 
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(Path(__file__).with_name("shutdown.py")),
-                "launch-blocked",
-                LOGIN,
-            ],
-            env=self.environment,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=10,
-        )
-
-        self.assertEqual(result.returncode, 3)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(len(result.stderr.splitlines()), 1)
+        resolve.assert_called_once_with(LOGIN)
+        self.assertEqual(status, 3)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(len(error.getvalue().splitlines()), 1)
         self.assertTrue(
-            result.stderr.startswith("shutdown state unreadable: UnicodeDecodeError: "),
-            result.stderr,
+            error.getvalue().startswith("shutdown state unreadable: RuntimeError: "),
+            error.getvalue(),
         )
 
     def test_restart_permission_matches_record_state_and_progress(self) -> None:

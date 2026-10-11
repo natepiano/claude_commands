@@ -9,6 +9,7 @@ import math
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,7 @@ sys.path.insert(0, str(SCRIPTS / "whoami"))
 
 import account  # noqa: E402
 import agent_accounts  # noqa: E402
+import note_file  # noqa: E402
 
 
 # Shared means Claude Code reads the entry as user content or cross-session
@@ -148,6 +150,102 @@ class NamedAccount:
 AccountSelection = DefaultAccount | NamedAccount
 
 
+@dataclass(frozen=True)
+class AccountDirectoryReady:
+    """A safe directory logged in as the account its note names."""
+
+    login: str
+    problems: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AccountDirectoryLoggedOut:
+    """A safe directory that can start Claude to log in."""
+
+    problems: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AccountDirectoryWrongLogin:
+    """A readable directory logged in as a different account."""
+
+    login: str
+    problems: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AccountDirectoryNotSetUp:
+    """The named directory does not exist yet."""
+
+    problems: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AccountDirectoryBrokenLinks:
+    """Directory or identity isolation, or a shared link, needs repair."""
+
+    problems: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AccountDirectoryUnreadable:
+    """Identity or required account-note data cannot establish readiness."""
+
+    problems: tuple[str, ...]
+
+
+AccountDirectoryReadiness = (
+    AccountDirectoryReady | AccountDirectoryLoggedOut | AccountDirectoryWrongLogin
+    | AccountDirectoryNotSetUp | AccountDirectoryBrokenLinks | AccountDirectoryUnreadable
+)
+
+
+@dataclass(frozen=True)
+class ClaudeDirectoryLogin:
+    """The login read from a directory's valid identity configuration."""
+
+    login: str
+
+
+@dataclass(frozen=True)
+class ClaudeDirectoryLoggedOut:
+    """No login is stored in the missing or valid identity configuration."""
+
+
+@dataclass(frozen=True)
+class UnreadableClaudeDirectoryIdentity:
+    """Existing identity data is inaccessible or malformed."""
+
+    problem: str
+
+
+ClaudeDirectoryIdentity = ClaudeDirectoryLogin | ClaudeDirectoryLoggedOut | UnreadableClaudeDirectoryIdentity
+
+
+@dataclass(frozen=True)
+class ExpectedClaudeLogin:
+    """The login declared by the requested label's note."""
+
+    login: str
+
+
+@dataclass(frozen=True)
+class MissingClaudeAccountNote:
+    """The label has no note yet; a logged-out directory may still log in."""
+
+    problem: str
+
+
+@dataclass(frozen=True)
+class UnreadableClaudeAccountNote:
+    """The existing label note cannot establish its expected login."""
+
+    problem: str
+
+
+ClaudeAccountNote = ExpectedClaudeLogin | MissingClaudeAccountNote | UnreadableClaudeAccountNote
+
+
 class QuotaReading(TypedDict):
     account: str
     at: str
@@ -212,6 +310,7 @@ class CommandLine(argparse.Namespace):
     since: str = ""
     until: str = ""
     dry_run: bool = False
+    claude_args: list[str] = []
 
 
 @dataclass(frozen=True)
@@ -453,7 +552,19 @@ def setup(label: str) -> list[str]:
     source_dir = main_config_dir().absolute()
     for name in SHARED:
         target = source_dir / name
+        if name in ALWAYS_LINKED and not target.exists():
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                problems.append(f"accounts: could not create {target}: {error}")
+                continue
         if name not in ALWAYS_LINKED and not os.path.lexists(target):
+            path = destination / name
+            try:
+                if _is_expected_link(path, target):
+                    path.unlink()
+            except OSError as error:
+                problems.append(f"accounts: could not remove {path}: {error}")
             continue
         try:
             problems.extend(_repair_link(destination / name, target))
@@ -469,9 +580,9 @@ def _link_problems(destination: Path) -> list[str]:
     source_dir = main_config_dir().absolute()
     for name in SHARED:
         target = source_dir / name
-        if name not in ALWAYS_LINKED and not os.path.lexists(target):
-            continue
         path = destination / name
+        if name not in ALWAYS_LINKED and not os.path.lexists(target) and not os.path.lexists(path):
+            continue
         if path.is_symlink():
             if not _is_expected_link(path, target):
                 try:
@@ -481,6 +592,8 @@ def _link_problems(destination: Path) -> list[str]:
                 problems.append(
                     f"accounts: {path} points to {actual}, not {target}"
                 )
+            elif not path.exists():
+                problems.append(f"accounts: {path} is broken")
         elif path.exists():
             problems.append(_real_entry_problem(path))
         else:
@@ -494,22 +607,158 @@ def _login_problem(config_dir: Path) -> list[str]:
     return []
 
 
+def _directory_identity(config_dir: Path) -> ClaudeDirectoryIdentity:
+    path = agent_accounts.claude_config_file(config_dir)
+    try:
+        values = _read_json_object(path)
+    except FileNotFoundError:
+        return ClaudeDirectoryLoggedOut()
+    except (OSError, ValueError, UnicodeError) as error:
+        return UnreadableClaudeDirectoryIdentity(f"accounts: could not read {path}: {error}")
+    oauth = values.get("oauthAccount")
+    if oauth is None:
+        return ClaudeDirectoryLoggedOut()
+    if isinstance(oauth, dict):
+        login = cast(dict[str, object], oauth).get("emailAddress")
+        if isinstance(login, str) and login.strip():
+            return ClaudeDirectoryLogin(login)
+    return UnreadableClaudeDirectoryIdentity(f"accounts: {path} has an invalid oauthAccount identity")
+
+
+def _account_notes_directory() -> Path:
+    return Path(os.environ.get("AGENT_NOTES_DIR", str(accounts_home() / "rust" / "hanadocs" / "agents")))
+
+
+def _account_note(label: str) -> ClaudeAccountNote:
+    path = _account_notes_directory() / f"{label}.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return MissingClaudeAccountNote(f"accounts: {label} has no account note at {path}")
+    except (OSError, UnicodeError) as error:
+        return UnreadableClaudeAccountNote(f"accounts: could not read {path}: {error}")
+    close = text.find("\n---", 3)
+    if text.startswith("---\n") and close != -1:
+        login = note_file.Note(path, "claude", text, 4, close).get("login")
+        if isinstance(login, str) and login.strip() and login not in {"null", "~"}:
+            return ExpectedClaudeLogin(login)
+    return UnreadableClaudeAccountNote(f"accounts: {path} has no readable login in its frontmatter")
+
+
+def _private_identity_problems(destination: Path) -> list[str]:
+    problems: list[str] = []
+    for name in (".credentials.json", "account-label"):
+        path = destination / name
+        if path.is_symlink():
+            continue
+        try:
+            if name == ".credentials.json":
+                _ = _read_json_object(path)
+            else:
+                _ = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, UnicodeError) as error:
+            problems.append(f"accounts: could not read {path}: {error}")
+    return problems
+
+
+def account_directory_readiness(label: str) -> AccountDirectoryReadiness:
+    """Read launch safety and login matching once, retaining every diagnostic."""
+    selected = NamedAccount(label, account_dir(label))
+    return _inspect_account_directory(selected, _account_note(label))
+
+
+def _inspect_account_directory(selected: NamedAccount, expected: ClaudeAccountNote) -> AccountDirectoryReadiness:
+    label = selected.label
+    destination = selected.dir
+    if destination.is_symlink():
+        return AccountDirectoryBrokenLinks((
+            f"accounts: {destination} is a link; an account dir must be a real directory",
+        ))
+    try:
+        metadata = destination.stat()
+        if not stat.S_ISDIR(metadata.st_mode):
+            return AccountDirectoryBrokenLinks((f"accounts: {destination} is not a directory",))
+    except FileNotFoundError:
+        return AccountDirectoryNotSetUp((f"accounts: {destination} is missing",))
+    except OSError as error:
+        return AccountDirectoryUnreadable((f"accounts: could not inspect {destination}: {error}",))
+    identity_problems = _identity_link_problems(destination)
+    links = [*identity_problems, *_link_problems(destination)]
+    private_problems = _private_identity_problems(destination)
+    problems = [*links, *private_problems]
+    # Do not follow an unsafe identity link, even while collecting diagnostics.
+    if (destination / ".claude.json").is_symlink():
+        if not isinstance(expected, ExpectedClaudeLogin):
+            problems.append(expected.problem)
+        return AccountDirectoryBrokenLinks(tuple(problems))
+    identity = _directory_identity(destination)
+    if isinstance(identity, UnreadableClaudeDirectoryIdentity):
+        problems.append(identity.problem)
+    if isinstance(expected, UnreadableClaudeAccountNote):
+        problems.append(expected.problem)
+    if isinstance(identity, ClaudeDirectoryLoggedOut):
+        problems.append(f"accounts: {destination} is not logged in")
+    if isinstance(expected, MissingClaudeAccountNote):
+        problems.append(expected.problem)
+    wrong_login = False
+    if isinstance(identity, ClaudeDirectoryLogin) and isinstance(expected, ExpectedClaudeLogin):
+        wrong_login = identity.login.casefold() != expected.login.casefold()
+        if wrong_login:
+            problems.append(
+                f"accounts: ~/.claude{label.removeprefix('claude ')} is logged in as {identity.login}, not {label}; see Log out and in in ~/.claude/docs/accounts.md"
+            )
+    if links:
+        return AccountDirectoryBrokenLinks(tuple(problems))
+    if (
+        isinstance(identity, UnreadableClaudeDirectoryIdentity)
+        or isinstance(expected, UnreadableClaudeAccountNote)
+        or private_problems
+        or isinstance(identity, ClaudeDirectoryLogin) and isinstance(expected, MissingClaudeAccountNote)
+    ):
+        return AccountDirectoryUnreadable(tuple(problems))
+    if isinstance(identity, ClaudeDirectoryLoggedOut):
+        return AccountDirectoryLoggedOut(tuple(problems))
+    if wrong_login:
+        return AccountDirectoryWrongLogin(identity.login, tuple(problems))
+    return AccountDirectoryReady(identity.login)
+
+
 def check(label: str) -> list[str]:
     """Return every reason a named account is not fit to launch."""
-    destination = account_dir(label)
-    if destination.is_symlink():
-        return [
-            f"accounts: {destination} is a link; an account dir must be a real directory"
-        ]
-    if not destination.exists():
-        return [f"accounts: {destination} is missing"]
-    if not destination.is_dir():
-        return [f"accounts: {destination} is not a directory"]
-    identity_problems = _identity_link_problems(destination)
-    problems = [*identity_problems, *_link_problems(destination)]
-    if not (destination / ".claude.json").is_symlink():
-        problems.extend(_login_problem(destination))
-    return problems
+    return list(account_directory_readiness(label).problems)
+
+
+def exec_account(label: str, arguments: list[str]) -> None:
+    """Replace this process with Claude on the selected, safe directory."""
+    if label == "unit":
+        selected = role_account("unit")
+    else:
+        selected = NamedAccount(label, account_dir(label))
+    environment = dict(os.environ)
+    _ = environment.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    if isinstance(selected, NamedAccount):
+        default = _directory_identity(main_config_dir()) if label != "unit" else ClaudeDirectoryLoggedOut()
+        expected = _account_note(selected.label)
+        default_login = isinstance(default, ClaudeDirectoryLogin) and isinstance(expected, ExpectedClaudeLogin) and expected.login.casefold() == default.login.casefold()
+        if not default_login:
+            readiness = _inspect_account_directory(selected, expected)
+            if isinstance(readiness, AccountDirectoryNotSetUp):
+                raise AccountsError(
+                    f'accounts: ~/.claude{selected.label.removeprefix("claude ")} is not set up; /accounts setup "{selected.label}" first'
+                )
+            if not isinstance(readiness, (AccountDirectoryReady, AccountDirectoryLoggedOut)):
+                raise AccountsError(readiness.problems[0])
+            environment["CLAUDE_CONFIG_DIR"] = str(selected.dir)
+        else:
+            _ = environment.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        _ = environment.pop("CLAUDE_CONFIG_DIR", None)
+    try:
+        os.execvpe("claude", ["claude", *arguments], environment)
+    except OSError as error:
+        raise AccountsError(f"accounts: could not start claude: {error}") from error
 
 
 def _validate_role(role: str) -> None:
@@ -1178,6 +1427,9 @@ def _parser() -> argparse.ArgumentParser:
         command = commands.add_parser(action)
         _ = command.add_argument("label")
     _ = commands.add_parser("status")
+    exec_command = commands.add_parser("exec")
+    _ = exec_command.add_argument("label")
+    _ = exec_command.add_argument("claude_args", nargs=argparse.REMAINDER)
     for action in ("role", "env"):
         command = commands.add_parser(action)
         _ = command.add_argument("role")
@@ -1197,6 +1449,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str]) -> int:
     options = cast(CommandLine, _parser().parse_args(argv))
     try:
+        if options.action == "exec":
+            exec_account(options.label, options.claude_args)
+            return 0
         if options.action == "setup":
             problems = setup(options.label)
             destination = account_dir(options.label)
@@ -1254,7 +1509,7 @@ def main(argv: list[str]) -> int:
         raise AccountsError(f"accounts: unknown action {options.action}")
     except AccountsError as error:
         print(error, file=sys.stderr)
-        return 1
+        return 2 if options.action == "exec" else 1
 
 
 if __name__ == "__main__":

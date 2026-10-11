@@ -30,10 +30,10 @@ class Note:
 
 
 def read_note(path: Path) -> Note | None:
-    """A note with its frontmatter body located, or None if it has none."""
+    """A note with its frontmatter located, or None if unavailable or absent."""
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeError):
         return None
     if not text.startswith("---\n"):
         return None
