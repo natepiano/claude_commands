@@ -256,7 +256,7 @@ After Phase 2 reaches `~/.claude` main, the unit director tells the showrunner t
 **Ruled out:**
 - A separate note for 87df75a9's inspector-first Escape: the command-event note already describes it.
 
-### Phase 8 — natedev and obsidian_knife are logged from their commits  · status: todo
+### Phase 8 — natedev and obsidian_knife are logged from their commits  · status: done
 
 #### Work Order
 
