@@ -1100,8 +1100,20 @@ def _write_unit_role(label: str, identity: agent_accounts.KnownClaudeAccount) ->
 def set_role(role: str, label: str) -> None:
     """Atomically select a readable account and preserve its note identity."""
     _validate_role(role)
-    directory = main_config_dir() if label == "default" else account_dir(label)
-    identity = account_identity(directory)
+    if label == "default":
+        identity = account_identity(main_config_dir())
+    else:
+        directory = account_dir(label)
+        default = account_identity(main_config_dir())
+        if isinstance(default, agent_accounts.KnownClaudeAccount) and label.casefold() == default.label.casefold():
+            raise AccountsError(f"accounts: {label} is the default account; use default")
+        identity = account_identity(directory)
+        if (
+            isinstance(default, agent_accounts.KnownClaudeAccount)
+            and isinstance(identity, agent_accounts.KnownClaudeAccount)
+            and identity.login.casefold() == default.login.casefold()
+        ):
+            raise AccountsError(f"accounts: {label} is the default account; use default")
     if isinstance(identity, agent_accounts.UnreadableClaudeAccount):
         raise AccountsError(f"accounts: account identity for {label} is unreadable")
     _ = _write_unit_role(label, identity)
