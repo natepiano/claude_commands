@@ -259,9 +259,10 @@ The command writes `PROMPT_FILE`,
 retargets `UPDATES` with `NOTIFIER new` without moving its clock, creates
 stall-watch and tmux-names only when absent, and prints `next_due`. Use the
 reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
-When the doc's Updates line reads `on demand`, it makes no `UPDATES` instance
-and removes one left from before, prints `on demand: no scheduled dailies`,
+When the doc's Updates line reads `on demand`, it makes `UPDATES` at the
+default 15 minutes and stops it, prints `on demand: no scheduled dailies`,
 and no scheduled update comes: a dailies runs only when the user asks for one.
+The stopped instance stays, because it is the showrunner's only record.
 
 The prompt:
 
