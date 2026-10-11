@@ -69,10 +69,10 @@ If the directory holds another login, the alias refuses with:
 accounts: ~/.claude3 is logged in as <login>, not claude 3; see Log out and in in ~/.claude/docs/accounts.md
 ```
 
-Start that directory directly, then log out and log in as claude 3:
+Start that directory directly, then log out and log in as claude 3. `env -u` drops an inherited `CLAUDE_CODE_OAUTH_TOKEN`, which would otherwise override the directory's login:
 
 ```sh
-CLAUDE_CONFIG_DIR=~/.claude3 claude
+env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=~/.claude3 claude
 ```
 
 ```text

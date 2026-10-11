@@ -1129,7 +1129,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertEqual(
             stdout,
-            f"CLAUDE_CONFIG_DIR={shlex.quote(str(account_dir))} claude\n/login\n",
+            f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(account_dir))} claude\n/login\n",
         )
         self.assertEqual(account_dir.stat().st_mode & 0o777, 0o700)
         for entry in ("settings.json", "commands", "projects", "sessions"):
@@ -1319,7 +1319,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(
             stdout,
-            f"CLAUDE_CONFIG_DIR={shlex.quote(str(account_dir))} claude\n/login\n",
+            f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(account_dir))} claude\n/login\n",
         )
         self.assertEqual(
             stderr,
