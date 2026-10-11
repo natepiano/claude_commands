@@ -339,7 +339,7 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 **Ruled out:** replaying a director's `--of` address or name unchanged to the other machine (it can mean nothing or a different director there); running the worktree match while tmux answers (it names a director tmux does not show).
 
-### Phase 11 — Claude and Codex sessions know which tool to use · status: todo
+### Phase 11 — Claude and Codex sessions know which tool to use · status: done
 
 #### Work Order
 
