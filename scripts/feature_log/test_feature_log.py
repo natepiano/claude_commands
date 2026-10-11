@@ -15,7 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Literal, NamedTuple, Protocol, TypedDict, cast, final, override
+from typing import Callable, Literal, NamedTuple, Protocol, TypedDict, cast, final, override
 from unittest.mock import patch
 
 import feature_log
@@ -126,7 +126,9 @@ class SupersedeEvent(TypedDict):
     old: list[str]
 
 
-class AmendEvent(TypedDict):
+class LegacyAmendEvent(TypedDict):
+    """An amendment written before provenance snapshots were supported."""
+
     at: str
     verb: Literal["amend"]
     project: str
@@ -135,7 +137,21 @@ class AmendEvent(TypedDict):
     backfill: bool
 
 
-FeatureLogEvent = AddEvent | SupersedeEvent | AmendEvent
+class AmendEvent(TypedDict):
+    at: str
+    verb: Literal["amend"]
+    project: str
+    title: str
+    fields: list[str]
+    backfill: bool
+    old_link: str
+    new_link: str
+    old_completed: str
+    new_completed: str
+    releases_added: list[str]
+
+
+FeatureLogEvent = AddEvent | SupersedeEvent | LegacyAmendEvent | AmendEvent
 
 
 class ProposalArguments(TypedDict):
@@ -882,8 +898,6 @@ class FeatureLogTests(unittest.TestCase):
                 "editing",
                 "--kind",
                 "change",
-                "--completed",
-                "2026-10-09",
                 "--crate",
                 "hana",
                 "--evidence",
@@ -895,7 +909,7 @@ class FeatureLogTests(unittest.TestCase):
         self.assertIn("amended: feature-log/hana/amended result.md", result.stdout)
         amended = path.read_text(encoding="utf-8")
         self.assertIn("area: \"[[editing]]\"\n", amended)
-        self.assertIn("completed_date: \"[[2026-10-09]]\"\n", amended)
+        self.assertIn("completed_date: \"[[2026-10-01]]\"\n", amended)
         self.assertIn("crate:\n  - hana\n", amended)
         self.assertIn("kind: change\n", amended)
         self.assertIn("release: []\n", amended)
@@ -916,8 +930,500 @@ class FeatureLogTests(unittest.TestCase):
             self.fail("amend wrote the wrong event variant")
         self.assertCountEqual(
             event["fields"],
-            ["area", "behavior", "completed_date", "crate", "evidence", "kind", "see", "summary"],
+            ["area", "behavior", "crate", "evidence", "kind", "see", "summary"],
         )
+
+    def test_amend_backfill_corrects_link_and_completed_together(self) -> None:
+        title = "Corrected accepting merge"
+        with patch.object(feature_log, "today", return_value="2026-10-02"):
+            added = self.cli(
+                self.add_arguments(title=title)
+                + ["--backfill", "--completed", "2026-10-01"]
+            )
+        self.assertEqual(added.status, 0, added.stderr)
+        path = self.note("hana", title.lower())
+        original = feature_log.parse_note(path)
+        corrected_link = f"https://github.com/natepiano/hana/commit/{SHA_TWO}"
+
+        result = self.cli(
+            [
+                "amend", "--project", "hana", "--title", title,
+                "--backfill", "--link", corrected_link,
+                "--completed", "2026-09-30",
+            ]
+        )
+
+        self.assertEqual(result.status, 0, result.stderr)
+        self.assertIn(f"amended: feature-log/hana/{title.lower()}.md", result.stdout)
+        self.assertEqual(result.stderr, "")
+        expected = original.copy()
+        expected["link"] = corrected_link
+        expected["completed_date"] = "2026-09-30"
+        expected["date_modified"] = TODAY
+        self.assertEqual(feature_log.parse_note(path), expected)
+        self.assertEqual(list(path.parent.glob("*.md")), [path])
+        events = self.events()
+        self.assertEqual(len(events), 2)
+        event = events[-1]
+        if event["verb"] != "amend":
+            self.fail("provenance correction wrote the wrong event variant")
+        self.assertCountEqual(event["fields"], ["completed_date", "link"])
+        self.assertEqual(
+            {**event, "fields": sorted(event["fields"])},
+            {
+                "at": EVENT_TIME,
+                "verb": "amend",
+                "project": "hana",
+                "title": title.lower(),
+                "fields": ["completed_date", "link"],
+                "backfill": True,
+                "old_link": original["link"],
+                "new_link": corrected_link,
+                "old_completed": "2026-10-01",
+                "new_completed": "2026-09-30",
+                "releases_added": [],
+            },
+        )
+        self.assert_no_temporary_files()
+
+    def test_amend_accepting_provenance_requires_backfill_and_both_fields(self) -> None:
+        self.assertEqual(self.cli(self.add_arguments(title="Paired provenance")).status, 0)
+        prefix = ["amend", "--project", "hana", "--title", "Paired provenance"]
+        link = f"https://github.com/natepiano/hana/commit/{SHA_TWO}"
+        for label, suffix, reason in (
+            ("link alone", ["--backfill", "--link", link], "completed"),
+            ("date alone", ["--backfill", "--completed", "2026-10-01"], "link"),
+            ("live link", ["--link", link], "backfill"),
+            ("live date", ["--completed", "2026-10-01"], "backfill"),
+            (
+                "live pair",
+                ["--link", link, "--completed", "2026-10-01"],
+                "backfill",
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assert_rejected(prefix + suffix, reason)
+
+    def test_amend_backfill_rejects_invalid_link_or_completed_date(self) -> None:
+        self.assertEqual(self.cli(self.add_arguments(title="Validated provenance")).status, 0)
+        prefix = [
+            "amend", "--project", "hana", "--title", "Validated provenance",
+            "--backfill",
+        ]
+        valid_link = f"https://github.com/natepiano/hana/commit/{SHA_TWO}"
+        for link, completed, reason in (
+            ("", "2026-10-01", "link"),
+            ("https://github.com/natepiano/hana/commit/abc", "2026-10-01", "link"),
+            (f"https://github.com/natepiano/nixos/commit/{SHA_TWO}", "2026-10-01", "link"),
+            (valid_link, "2026-02-30", "completed"),
+            (valid_link, "October 1", "completed"),
+        ):
+            with self.subTest(link=link, completed=completed):
+                self.assert_rejected(
+                    prefix + ["--link", link, "--completed", completed], reason
+                )
+
+    def test_amend_duplicate_live_link_needs_separate_result(self) -> None:
+        self.assertEqual(self.cli(self.add_arguments(title="Correction target")).status, 0)
+        self.assertEqual(
+            self.cli(self.add_arguments(title="Other live result", link=SHA_TWO)).status,
+            0,
+        )
+        other_path = self.note("hana", "other live result")
+        other_contents = other_path.read_bytes()
+        shared_link = f"https://github.com/natepiano/hana/commit/{SHA_TWO}"
+        arguments = [
+            "amend", "--project", "hana", "--title", "Correction target",
+            "--backfill", "--link", shared_link, "--completed", "2026-10-01",
+        ]
+        self.assert_rejected(arguments, "other live result")
+
+        result = self.cli(arguments + ["--separate-result"])
+
+        self.assertEqual(result.status, 0, result.stderr)
+        target = feature_log.parse_note(self.note("hana", "correction target"))
+        self.assertEqual(target["link"], shared_link)
+        self.assertEqual(target["completed_date"], "2026-10-01")
+        self.assertEqual(other_path.read_bytes(), other_contents)
+        self.assertEqual(len(list(other_path.parent.glob("*.md"))), 2)
+
+    def test_amend_same_note_link_allows_a_corrected_date(self) -> None:
+        self.assertEqual(self.cli(self.add_arguments(title="Same accepting merge")).status, 0)
+        path = self.note("hana", "same accepting merge")
+        original = feature_log.parse_note(path)
+
+        result = self.cli(
+            [
+                "amend", "--project", "hana", "--title", "Same accepting merge",
+                "--backfill", "--link", original["link"],
+                "--completed", "2026-10-01",
+            ]
+        )
+
+        self.assertEqual(result.status, 0, result.stderr)
+        updated = feature_log.parse_note(path)
+        self.assertEqual(updated["link"], original["link"])
+        self.assertEqual(updated["completed_date"], "2026-10-01")
+
+    def test_amend_link_held_only_by_a_superseded_note_is_allowed(self) -> None:
+        self.assertEqual(self.cli(self.add_arguments(title="Correction target")).status, 0)
+        self.assertEqual(
+            self.cli(self.add_arguments(title="Retired result", link=SHA_TWO)).status,
+            0,
+        )
+        replacement = self.add_arguments(title="Current replacement", link=SHA_THREE)
+        replacement[0] = "supersede"
+        self.assertEqual(self.cli(replacement + ["--old", "Retired result"]).status, 0)
+        old_path = self.note("hana", "retired result")
+        old_contents = old_path.read_bytes()
+        link = f"https://github.com/natepiano/hana/commit/{SHA_TWO}"
+
+        result = self.cli(
+            [
+                "amend", "--project", "hana", "--title", "Correction target",
+                "--backfill", "--link", link, "--completed", "2026-10-01",
+            ]
+        )
+
+        self.assertEqual(result.status, 0, result.stderr)
+        self.assertEqual(
+            feature_log.parse_note(self.note("hana", "correction target"))["link"],
+            link,
+        )
+        self.assertEqual(old_path.read_bytes(), old_contents)
+
+    def test_amend_backfill_adds_exact_releases_and_repeats_unchanged(self) -> None:
+        title = "Historical release membership"
+        with patch.object(feature_log, "today", return_value="2026-10-02"):
+            added = self.cli(
+                self.add_arguments(title=title, crates=("hana_lagrange",))
+                + ["--backfill", "--completed", "2026-10-01",
+                   "--release", "hana_lagrange@1.2.0"]
+            )
+        self.assertEqual(added.status, 0, added.stderr)
+        path = self.note("hana", title.lower())
+        original = feature_log.parse_note(path)
+        arguments = [
+            "amend", "--project", "hana", "--title", title, "--backfill",
+            "--release", "hana_lagrange@2.3.5-alpha.1",
+            "--release", "hana_lagrange@1.2.0",
+            "--release", "hana_lagrange@2.3.4",
+            "--release", "hana_lagrange@2.3.4",
+        ]
+
+        result = self.cli(arguments)
+
+        self.assertEqual(result.status, 0, result.stderr)
+        updated = feature_log.parse_note(path)
+        expected = original.copy()
+        expected["release"] = [
+            "hana_lagrange@1.2.0", "hana_lagrange@2.3.4",
+            "hana_lagrange@2.3.5-alpha.1",
+        ]
+        expected["date_modified"] = TODAY
+        self.assertEqual(updated, expected)
+        self.assertNotIn("Unreleased", path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            self.events()[-1],
+            {
+                "at": EVENT_TIME,
+                "verb": "amend",
+                "project": "hana",
+                "title": title.lower(),
+                "fields": ["release"],
+                "backfill": True,
+                "old_link": original["link"],
+                "new_link": original["link"],
+                "old_completed": "2026-10-01",
+                "new_completed": "2026-10-01",
+                "releases_added": ["hana_lagrange@2.3.4", "hana_lagrange@2.3.5-alpha.1"],
+            },
+        )
+        note_before = path.read_bytes()
+        events_before = (self.state / "events.jsonl").read_bytes()
+
+        repeated = self.cli(arguments)
+
+        self.assertEqual(
+            repeated,
+            CliResult(0, f"unchanged: feature-log/hana/{title.lower()}.md\n", ""),
+        )
+        self.assertEqual(path.read_bytes(), note_before)
+        self.assertEqual((self.state / "events.jsonl").read_bytes(), events_before)
+        self.assert_no_temporary_files()
+
+    def test_amend_historical_releases_require_backfill_and_a_valid_note_crate(self) -> None:
+        self.assertEqual(
+            self.cli(self.add_arguments(title="Validated releases", crates=("hana_lagrange",))).status,
+            0,
+        )
+        prefix = ["amend", "--project", "hana", "--title", "Validated releases"]
+        self.assert_rejected(prefix + ["--release", "hana_lagrange@1.2.3"], "backfill")
+        for release, reason in (
+            ("hana_liminal@1.2.3", "crate"),
+            ("hana_lagrange", "release"),
+            ("hana_lagrange@", "release"),
+            ("hana_lagrange@1.2", "release"),
+            ("hana_lagrange@1.2.3@extra", "release"),
+            ("hana_lagrange@Unreleased", "release"),
+        ):
+            with self.subTest(release=release):
+                self.assert_rejected(prefix + ["--backfill", "--release", release], reason)
+
+    def test_release_prerelease_identifiers_cannot_be_empty_in_any_writer(self) -> None:
+        for verb in ("add", "supersede", "amend"):
+            for number, version in enumerate(("1.2.3-..", "1.2.3-", "1.2.3-a..b")):
+                with self.subTest(verb=verb, version=version):
+                    title = f"Rejected {verb} prerelease {number}"
+                    if verb == "amend":
+                        added = self.cli(
+                            self.add_arguments(title=title, crates=("hana_lagrange",))
+                            + ["--backfill", "--separate-result"]
+                        )
+                        self.assertEqual(added.status, 0, added.stderr)
+                        arguments = ["amend", "--project", "hana", "--title", title]
+                    else:
+                        arguments = self.add_arguments(
+                            title=title, link=SHA_TWO, crates=("hana_lagrange",)
+                        )
+                        arguments[0] = verb
+                        arguments.append("--separate-result")
+                        if verb == "supersede":
+                            old_title = f"Old rejected prerelease {number}"
+                            added = self.cli(
+                                self.add_arguments(title=old_title)
+                                + ["--separate-result"]
+                            )
+                            self.assertEqual(added.status, 0, added.stderr)
+                            arguments.extend(("--old", old_title))
+                    self.assert_rejected(
+                        arguments + ["--backfill", "--release", f"hana_lagrange@{version}"],
+                        "version",
+                    )
+
+    def test_release_prerelease_identifiers_accept_dots_and_hyphens_in_any_writer(self) -> None:
+        for version in ("1.2.3-rc.1", "1.2.3-rc-one.1"):
+            for verb in ("add", "supersede", "amend"):
+                with self.subTest(verb=verb, version=version):
+                    title = f"Accepted {verb} {version}"
+                    if verb == "amend":
+                        added = self.cli(
+                            self.add_arguments(title=title, crates=("hana_lagrange",))
+                            + ["--backfill", "--separate-result"]
+                        )
+                        self.assertEqual(added.status, 0, added.stderr)
+                        arguments = ["amend", "--project", "hana", "--title", title]
+                    else:
+                        arguments = self.add_arguments(
+                            title=title, link=SHA_TWO, crates=("hana_lagrange",)
+                        )
+                        arguments[0] = verb
+                        arguments.append("--separate-result")
+                        if verb == "supersede":
+                            old_title = f"Old accepted {version}"
+                            added = self.cli(
+                                self.add_arguments(title=old_title)
+                                + ["--separate-result"]
+                            )
+                            self.assertEqual(added.status, 0, added.stderr)
+                            arguments.extend(("--old", old_title))
+                    release = f"hana_lagrange@{version}"
+                    result = self.cli(arguments + ["--backfill", "--release", release])
+                    self.assertEqual(result.status, 0, result.stderr)
+                    note = feature_log.parse_note(self.note("hana", feature_log.normalize_title(title)))
+                    self.assertEqual(note["release"], [release])
+
+    def test_amend_correction_retry_preserves_history_after_either_write_fails(self) -> None:
+        append_event = cast(
+            Callable[[feature_log.FeatureLogEvent], None], getattr(feature_log, "_append_event")
+        )
+        write_note = cast(
+            Callable[[Path, feature_log.Note], None], getattr(feature_log, "_write_note")
+        )
+        for writer in ("_append_event", "_write_note"):
+            for written_before_failure in (False, True):
+                with self.subTest(writer=writer, written_before_failure=written_before_failure):
+                    title = f"Retry {writer} {written_before_failure}"
+                    added = self.cli(
+                        self.add_arguments(title=title, crates=("hana_lagrange",))
+                        + ["--backfill", "--completed", "2026-10-01", "--separate-result"]
+                    )
+                    self.assertEqual(added.status, 0, added.stderr)
+                    path = self.note("hana", feature_log.normalize_title(title))
+                    original = feature_log.parse_note(path)
+                    new_link = f"https://github.com/natepiano/hana/commit/{SHA_TWO}"
+                    release = "hana_lagrange@1.2.3"
+                    arguments = [
+                        "amend", "--project", "hana", "--title", title,
+                        "--backfill", "--link", new_link, "--completed", "2026-09-30",
+                        "--release", release, "--separate-result",
+                    ]
+
+                    def interrupted_append(event: feature_log.FeatureLogEvent) -> None:
+                        if written_before_failure:
+                            append_event(event)
+                        raise OSError("interrupted journal append")
+
+                    def interrupted_note(note_path: Path, note: feature_log.Note) -> None:
+                        if written_before_failure:
+                            write_note(note_path, note)
+                        raise OSError("interrupted note write")
+
+                    if writer == "_append_event":
+                        with patch.object(feature_log, writer, side_effect=interrupted_append):
+                            with self.assertRaises(OSError):
+                                _ = self.cli(arguments)
+                    else:
+                        with patch.object(feature_log, writer, side_effect=interrupted_note):
+                            with self.assertRaises(OSError):
+                                _ = self.cli(arguments)
+
+                    retried = self.cli(arguments)
+                    self.assertEqual(retried.status, 0, retried.stderr)
+                    expected = original.copy()
+                    expected["link"] = new_link
+                    expected["completed_date"] = "2026-09-30"
+                    expected["release"] = [release]
+                    self.assertEqual(feature_log.parse_note(path), expected)
+                    events = [
+                        event for event in self.events()
+                        if event["verb"] == "amend" and event["title"] == original["title"]
+                    ]
+                    self.assertEqual(len(events), 1)
+                    self.assertEqual(
+                        events[0],
+                        {
+                            "at": EVENT_TIME, "verb": "amend", "project": "hana",
+                            "title": original["title"],
+                            "fields": ["link", "completed_date", "release"], "backfill": True,
+                            "old_link": original["link"], "new_link": new_link,
+                            "old_completed": "2026-10-01", "new_completed": "2026-09-30",
+                            "releases_added": [release],
+                        },
+                    )
+                    note_bytes = path.read_bytes()
+                    event_bytes = (self.state / "events.jsonl").read_bytes()
+                    repeated = self.cli(arguments)
+                    self.assertEqual(repeated.status, 0, repeated.stderr)
+                    self.assertIn("unchanged:", repeated.stdout)
+                    self.assertEqual(path.read_bytes(), note_bytes)
+                    self.assertEqual((self.state / "events.jsonl").read_bytes(), event_bytes)
+                    self.assert_no_temporary_files()
+
+    def test_amend_release_retry_preserves_additions_after_a_previous_amend(self) -> None:
+        for writer in ("_append_event", "_write_note"):
+            with self.subTest(writer=writer):
+                title = f"Release retry {writer}"
+                added = self.cli(
+                    self.add_arguments(title=title, crates=("hana_lagrange",))
+                    + ["--backfill", "--completed", "2026-10-01", "--separate-result"]
+                )
+                self.assertEqual(added.status, 0, added.stderr)
+                prefix = ["amend", "--project", "hana", "--title", title, "--backfill"]
+                prior = self.cli(prefix + ["--evidence", "A previous review."])
+                self.assertEqual(prior.status, 0, prior.stderr)
+                prior_event = self.events()[-1]
+                release = "hana_lagrange@1.2.3"
+                arguments = prefix + ["--release", release]
+                with patch.object(feature_log, writer, side_effect=OSError("interrupted write")):
+                    with self.assertRaises(OSError):
+                        _ = self.cli(arguments)
+
+                retried = self.cli(arguments)
+                self.assertEqual(retried.status, 0, retried.stderr)
+                path = self.note("hana", feature_log.normalize_title(title))
+                note = feature_log.parse_note(path)
+                self.assertEqual(note["release"], [release])
+                events = [
+                    event for event in self.events()
+                    if event["verb"] == "amend" and event["title"] == note["title"]
+                ]
+                self.assertEqual(len(events), 2)
+                self.assertEqual(events[0], prior_event)
+                event = events[1]
+                if event["verb"] != "amend" or "releases_added" not in event:
+                    self.fail("release correction wrote the wrong event variant")
+                self.assertEqual(event["old_link"], note["link"])
+                self.assertEqual(event["new_link"], note["link"])
+                self.assertEqual(event["old_completed"], "2026-10-01")
+                self.assertEqual(event["new_completed"], "2026-10-01")
+                self.assertEqual(event["releases_added"], [release])
+
+    def test_amend_separate_result_requires_a_link(self) -> None:
+        added = self.cli(self.add_arguments(title="Explicit separate result"))
+        self.assertEqual(added.status, 0, added.stderr)
+        prefix = [
+            "amend", "--project", "hana", "--title", "Explicit separate result",
+            "--separate-result",
+        ]
+        self.assert_rejected(prefix, "--separate-result requires --link")
+        self.assert_rejected(
+            prefix + ["--summary", "A revised summary."],
+            "--separate-result requires --link",
+        )
+        self.assert_rejected(
+            prefix + ["--backfill", "--completed", "2026-10-01"],
+            "--separate-result requires --link",
+        )
+
+    def test_amend_correction_can_be_applied_again_after_it_is_reversed(self) -> None:
+        title = "Repeat a later correction"
+        added = self.cli(
+            self.add_arguments(title=title)
+            + ["--backfill", "--completed", "2026-10-01"]
+        )
+        self.assertEqual(added.status, 0, added.stderr)
+        prefix = ["amend", "--project", "hana", "--title", title, "--backfill"]
+        correction = prefix + ["--link", SHA_TWO, "--completed", "2026-09-30"]
+        reversal = prefix + ["--link", SHA_ONE, "--completed", "2026-10-01"]
+        for arguments in (correction, reversal, correction):
+            result = self.cli(arguments)
+            self.assertEqual(result.status, 0, result.stderr)
+        events = [event for event in self.events() if event["verb"] == "amend"]
+        self.assertEqual(len(events), 3)
+        self.assertEqual(events[0], events[2])
+        self.assertEqual(
+            feature_log.parse_note(self.note("hana", title.lower()))["link"],
+            f"https://github.com/natepiano/hana/commit/{SHA_TWO}",
+        )
+
+    def test_amend_event_records_provenance_and_releases_in_one_correction(self) -> None:
+        title = "Corrected historical result"
+        added = self.cli(
+            self.add_arguments(title=title, crates=("hana_lagrange",))
+            + ["--backfill", "--completed", "2026-10-01"]
+        )
+        self.assertEqual(added.status, 0, added.stderr)
+        new_link = f"https://github.com/natepiano/hana/commit/{SHA_TWO}"
+        result = self.cli(
+            [
+                "amend", "--project", "hana", "--title", title, "--backfill",
+                "--link", new_link, "--completed", "2026-09-30",
+                "--release", "hana_lagrange@1.2.3",
+            ]
+        )
+        self.assertEqual(result.status, 0, result.stderr)
+        event = self.events()[-1]
+        if event["verb"] != "amend":
+            self.fail("historical correction wrote the wrong event variant")
+        self.assertCountEqual(event["fields"], ["completed_date", "link", "release"])
+        self.assertEqual(
+            {**event, "fields": sorted(event["fields"])},
+            {
+                "at": EVENT_TIME,
+                "verb": "amend",
+                "project": "hana",
+                "title": title.lower(),
+                "fields": ["completed_date", "link", "release"],
+                "backfill": True,
+                "old_link": f"https://github.com/natepiano/hana/commit/{SHA_ONE}",
+                "new_link": new_link,
+                "old_completed": "2026-10-01",
+                "new_completed": "2026-09-30",
+                "releases_added": ["hana_lagrange@1.2.3"],
+            },
+        )
+        self.assertEqual(len(self.events()), 2)
 
     def test_amend_rejects_empty_fields_and_immutable_options(self) -> None:
         self.assertEqual(self.cli(self.add_arguments(title="Stable Result")).status, 0)
@@ -928,7 +1434,6 @@ class FeatureLogTests(unittest.TestCase):
             ("empty behavior", ["--behavior", ""], "behavior"),
             ("empty see", ["--see", ""], "see"),
             ("bad crate", ["--crate", "cargo-mend"], "crate"),
-            ("link", ["--link", SHA_TWO], "link"),
             ("state", ["--state", "superseded"], "state"),
             ("replaced by", ["--replaced-by", "other"], "replaced"),
         ):
@@ -1015,9 +1520,12 @@ class FeatureLogTests(unittest.TestCase):
             listed,
             CliResult(
                 0,
-                "2026-10-10 perf newest widget — The newest widget is quick. [hana] (widgets)\n"
-                + "2026-10-09 feature newer panel — The newer panel is visible. [hana] (panels)\n"
-                + "2026-10-01 fix older widget — The older widget works. [hana, hana_catalyst] (widgets)\n",
+                "2026-10-10 perf newest widget — The newest widget is quick. [hana] (widgets) "
+                + f"https://github.com/natepiano/hana/commit/{SHA_THREE}\n"
+                + "2026-10-09 feature newer panel — The newer panel is visible. [hana] (panels) "
+                + f"https://github.com/natepiano/hana/commit/{SHA_TWO}\n"
+                + "2026-10-01 fix older widget — The older widget works. [hana, hana_catalyst] (widgets) "
+                + f"https://github.com/natepiano/hana/commit/{SHA_ONE}\n",
                 "",
             ),
         )
@@ -1261,7 +1769,11 @@ class FeatureLogTests(unittest.TestCase):
             self.fail("amend wrote the wrong event variant")
         self.assertEqual(
             set(amend_event),
-            {"at", "verb", "project", "title", "fields", "backfill"},
+            {
+                "at", "verb", "project", "title", "fields", "backfill",
+                "old_link", "new_link", "old_completed", "new_completed",
+                "releases_added",
+            },
         )
         self.assertEqual(amend_event["fields"], ["summary"])
         self.assertTrue(amend_event["backfill"])
@@ -1706,7 +2218,7 @@ class FeatureLogTests(unittest.TestCase):
             "backfill": False,
             "old": ["old hana result"],
         }
-        hana_amend: AmendEvent = {
+        hana_amend: LegacyAmendEvent = {
             "at": EVENT_TIME,
             "verb": "amend",
             "project": "hana",
