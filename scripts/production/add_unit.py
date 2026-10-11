@@ -520,6 +520,8 @@ def preflight(request: RequestedUnitLaunch) -> ReadyToLaunch:
         raise Refusal("production doc must be inside Showrunner checkout") from error
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     existing = row_is_present(request, lines)
+    if isinstance(request.launch_kind, UnitRestoreLaunch) and isinstance(existing, NoUnitRow):
+        raise Refusal(f"unit {request.unit} has no Units row; a restore never adds one")
     launch = UnitLaunch(
         production=request.production,
         identity=UnitIdentity(request.unit, request.requested_name),

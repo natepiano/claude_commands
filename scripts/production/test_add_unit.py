@@ -513,6 +513,7 @@ class AddUnitTests(unittest.TestCase):
         self.assert_no_launch_change(document, head)
 
     def test_restart_restore_is_allowed_for_its_restarting_unit(self) -> None:
+        self.commit_prepared_row(self.unit_row())
         self.write_shutdown_record(self.shutdown_record("restarting"))
         prior = self.root / "prior-session"
         prior.mkdir()
@@ -572,6 +573,28 @@ class AddUnitTests(unittest.TestCase):
 
         self.assertIn("alpha-unit started", result.stdout)
         self.assertEqual(len(self.recorded_prompts("session-123")), 1)
+
+    def test_restore_without_a_units_row_is_refused_and_adds_nothing(self) -> None:
+        self.write_shutdown_record(self.shutdown_record("restarting"))
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+
+        result = self.cli(
+            "alpha", "--plan", "docs/plans/given.md",
+            "--resume", "session-123", "--cwd", str(prior),
+            "--restart-note", str(note),
+            "--session-name", "recorded-name", "--tmux-session", "recorded-tmux",
+        )
+
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(
+            result.stderr, "add_unit: unit alpha-unit has no Units row; a restore never adds one\n"
+        )
+        self.assert_no_launch_change(document, head)
 
     def test_restart_restore_is_refused_when_record_is_down(self) -> None:
         self.write_shutdown_record(self.shutdown_record("down"))
@@ -1085,6 +1108,7 @@ class AddUnitTests(unittest.TestCase):
         self.assertIn("--resume session-123", self.launch_command())
 
     def test_unit_restore_uses_the_current_unit_account(self) -> None:
+        self.commit_prepared_row(self.unit_row())
         self.env["CLAUDE_CONFIG_DIR"] = str(self.select_unit_account("claude 1"))
         directory = self.prepare_unit_account("claude 3")
         prior = self.root / "prior-session"
@@ -1514,6 +1538,7 @@ class AddUnitTests(unittest.TestCase):
                 self.assertEqual(self.events("systemd-run"), [])
 
     def test_restore_note_recorded_names_and_unique_scope_drive_the_launch(self) -> None:
+        self.commit_prepared_row(self.unit_row())
         prior = self.root / "prior session"
         prior.mkdir()
         note = self.root / "restart note.txt"
@@ -1573,6 +1598,7 @@ class AddUnitTests(unittest.TestCase):
         self.assertGreater(int(epoch), 0)
 
     def test_restore_refuses_launch_when_prompt_cannot_be_recorded(self) -> None:
+        self.commit_prepared_row(self.unit_row())
         prior = self.root / "prior-session"
         prior.mkdir()
         note = self.root / "restart-note.txt"
