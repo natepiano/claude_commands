@@ -897,7 +897,11 @@ This session is on the quota alert list because <StartUpdates/> adds it.
 reaches them only as your relay (<Throughout/>). Run `python3
 ~/.claude/scripts/production/waiting.py quota --production PRODUCTION_DOC
 --state-dir DAILIES_STATE_DIR --notice "<full notice>"`. It relays
-to every unit director and prints one `send <unit>:` receipt each:
+to every unit director and prints one `send <unit>:` receipt each. With more
+than one Claude account in use, a Claude `Quota alert:` names its account and
+roles (`claude 3 (unit directors) at …`). It reaches only the unit directors
+running on that account, prints `skip <unit>: it runs on <other account>` for
+the rest, and reports a unit whose account cannot be read as not told:
 - `Quota alert:` — the command picks the instruction from the notice. A Codex
   notice that says nothing was switched: unit directors keep delegating on Codex,
   whose account may keep working on its credits, and tell you at once if Codex
@@ -908,8 +912,8 @@ to every unit director and prints one `send <unit>:` receipt each:
   item per account, listed first in every Waiting on block with the percent left
   and the reset time, until it is acknowledged or restored.
 - `Quota alert acknowledged:` — drop the held item. Paused work stays paused.
-- `Quota restored:` — tell every unit director delegation on that tool can
-  resume, and drop the held item.
+- `Quota restored:` — tell every unit director that delegation on that tool,
+  or work on that Claude account, can resume, and drop the held item.
 
 What to do about the quota itself is the user's call; relay their decision to
 every unit director.
