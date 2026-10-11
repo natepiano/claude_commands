@@ -96,8 +96,6 @@ KILL_GRACE = 10
 EDIT_TIMEOUT = 30
 USER_ZONE = ZoneInfo("America/Los_Angeles")
 
-Need = Literal["note", "decision", "blocked"]
-
 
 class Episode(TypedDict):
     since: str
@@ -155,11 +153,18 @@ class Job(NamedTuple):
     kind: str
 
 
+class Ask(NamedTuple):
+    """What a direct user message asks: `action`, which the user decides while work goes on or takes before it can."""
+    need: Literal["decision", "blocked"]
+    action: str
+
+
 class UserPush(NamedTuple):
     name: str
     summary: str
     text: str
-    need: Need
+    # None for a note, which asks nothing of the user.
+    ask: Ask | None
 
 
 def load_config() -> Config:
@@ -394,16 +399,14 @@ def user_time(stamp: str | None) -> str:
 def run_out_push(note: AgentNote) -> UserPush:
     """The one direct user message sent when this account's episode opens."""
     name = note.path.stem
+    summary = f"{name} weekly limit"
     first = f"{name} has {percent(note)} of its weekly usage left; it refills {user_time(note.get('resets'))}."
     if note.tool == "codex":
-        text = f"{first} Codex keeps working on its credits. {credit_line(note)}"
-        need: Need = "note"
-    else:
-        count = note.get("limit_reset_count")
-        resets = f" ({count} available)" if count is not None and count != "null" else ""
-        text = f"{first} Log in to another Claude account, or redeem a limit reset{resets}."
-        need = "decision"
-    return UserPush(name, f"{name} weekly limit", text, need)
+        return UserPush(name, summary, f"{first} Codex keeps working on its credits. {credit_line(note)}", None)
+    count = note.get("limit_reset_count")
+    resets = f" ({count} available)" if count is not None and count != "null" else ""
+    return UserPush(name, summary, first,
+                    Ask("decision", f"Log in to another Claude account, or redeem a limit reset{resets}."))
 
 
 def refusal_push(note: AgentNote, switch: Switch | None, failed: str | None, already: bool) -> UserPush:
@@ -417,9 +420,8 @@ def refusal_push(note: AgentNote, switch: Switch | None, failed: str | None, alr
     else:
         outcome = "Nothing was on Codex, so the automatic switch moved nothing"
     name = note.path.stem
-    text = (f"Codex refused work on {name}. {credit_line(note)} {outcome}; add credits or redeem a limit reset "
-            + "to bring Codex back.")
-    return UserPush(name, "Codex refused work", text, "decision")
+    return UserPush(name, "Codex refused work", f"Codex refused work on {name}. {credit_line(note)} {outcome}.",
+                    Ask("decision", f"Add credits to {name} or redeem a limit reset to bring Codex back."))
 
 
 def instruction(tool: str, switch: Switch | None, failed: str | None) -> str:
@@ -495,10 +497,11 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
     return " ".join((done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split())
 
 
-def tell_user(summary: str, text: str, need: Need) -> str | None:
-    """Deliver text directly to the user; None when it arrived, otherwise why not."""
-    command = [sys.executable, str(SEND), "--to", "user", "--from", "quota_alert", "--summary", summary,
-               "--need", need, "--timeout", str(RELAY_TIMEOUT - KILL_GRACE)]
+def tell_user(summary: str, text: str, ask: Ask | None) -> str | None:
+    """Deliver text directly to the user, as a note when `ask` is None; None when it arrived, otherwise why not."""
+    asked = ["--no-action"] if ask is None else ["--need", ask.need, "--action", ask.action]
+    command = [sys.executable, str(SEND), "--to", "user", "--from", "quota_alert", "--summary", summary, *asked,
+               "--timeout", str(RELAY_TIMEOUT - KILL_GRACE)]
     try:
         done = subprocess.run(command, input=text, capture_output=True, text=True, timeout=RELAY_TIMEOUT + 5,
                               check=False)
@@ -574,7 +577,7 @@ def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
             jobs += [Job(name, recipient, text, "restored") for recipient in recipients(config)]
     with ThreadPoolExecutor() as pool:
         relay_future = pool.submit(deliver_and_record, jobs, stamp)
-        push_futures = [pool.submit(tell_user, push.summary, push.text, push.need) for push in pushes]
+        push_futures = [pool.submit(tell_user, push.summary, push.text, push.ask) for push in pushes]
         push_errors = [future.result() for future in push_futures]
         relay_log = relay_future.result()
     if pushes:
@@ -622,7 +625,7 @@ def blocked(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
             if text is not None else [])
     with ThreadPoolExecutor() as pool:
         relay_future = pool.submit(deliver_and_record, jobs, stamp)
-        push_future = pool.submit(tell_user, push.summary, push.text, push.need) if push is not None else None
+        push_future = pool.submit(tell_user, push.summary, push.text, push.ask) if push is not None else None
         error = push_future.result() if push_future is not None else None
         relay_log = relay_future.result()
     if push is not None:
