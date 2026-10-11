@@ -213,7 +213,6 @@ class OffloadCommandTests(unittest.TestCase):
             "probe_timeout_s": "1",
             "unreachable_backoff_s": "300",
             "free_floor_gib": "60",
-            "max_load": "6",
             "mac_budget_gib": "24",
             "mac_budget_gib.hana": "64",
             "linux_only.hana": "",
@@ -224,7 +223,6 @@ class OffloadCommandTests(unittest.TestCase):
             "probe_delay_s": 0.0,
             "probe_lines": [
                 "procs=0",
-                "load=1.25",
                 "power=ac",
                 "free_gib=120",
                 "host=Mac",
@@ -498,25 +496,18 @@ class OffloadCommandTests(unittest.TestCase):
         self.assert_declined(self.command(), "unreachable")
         self.assertEqual(len(self.events_for("ssh")), 1)
 
-    def test_processes_and_load_each_decline_as_mac_busy(self) -> None:
-        for changed_line in ("procs=1", "load=6.01"):
-            with self.subTest(line=changed_line):
-                self.fixture["probe_lines"] = [
-                    changed_line if line.startswith(changed_line.split("=", 1)[0]) else line
-                    for line in [
-                        "procs=0",
-                        "load=1.25",
-                        "power=ac",
-                        "free_gib=120",
-                        "host=Mac",
-                        "rc=0",
-                    ]
-                ]
-                self.sync_fixture()
-                self.assert_declined(self.command(), "mac_busy")
-                self.assertEqual(len(self.events_for("ssh")), 1)
-                self.assertEqual(self.events_for("rsync"), [])
-                self.clear_events()
+    def test_running_build_processes_decline_as_mac_busy(self) -> None:
+        self.fixture["probe_lines"] = [
+            "procs=1",
+            "power=ac",
+            "free_gib=120",
+            "host=Mac",
+            "rc=0",
+        ]
+        self.sync_fixture()
+        self.assert_declined(self.command(), "mac_busy")
+        self.assertEqual(len(self.events_for("ssh")), 1)
+        self.assertEqual(self.events_for("rsync"), [])
 
     def test_battery_and_low_disk_decline_after_probe(self) -> None:
         for original, replacement, reason in (
@@ -528,7 +519,6 @@ class OffloadCommandTests(unittest.TestCase):
                     replacement if line == original else line
                     for line in [
                         "procs=0",
-                        "load=1.25",
                         "power=ac",
                         "free_gib=120",
                         "host=Mac",
@@ -648,12 +638,12 @@ class OffloadCommandTests(unittest.TestCase):
             "cargo",
             "rustc",
             "cargo-nextest",
-            "sysctl -n vm.loadavg",
             "pmset -g batt",
             'df -g "$HOME"',
             "hostname -s",
         ):
             self.assertIn(fragment, probe_script)
+        self.assertNotIn("loadavg", probe_script)
 
         copy = events[1]
         exclude_argument = next(
