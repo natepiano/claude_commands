@@ -300,7 +300,7 @@ After Phase 2 reaches `~/.claude` main, the unit director tells the showrunner t
 **Ruled out:**
 - Storing the rendered changelog section with the reviewed titles and refusing drift before `release` stamps: an amend a minute after stamping drifts the same way, so the check guards no lasting invariant.
 
-### Phase 10 — cargo-liner's and bevy_brp's commits are dispositioned, and both audits finish  · status: todo
+### Phase 10 — cargo-liner's and bevy_brp's commits are dispositioned, and both audits finish  · status: done
 
 #### Work Order
 
