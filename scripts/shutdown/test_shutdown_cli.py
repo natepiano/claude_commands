@@ -384,6 +384,49 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
 
                 self.assertEqual((status, output, error), (1, "", ""))
 
+    def test_a_parked_partial_passes_its_manual_unit_and_holds_new_work(self) -> None:
+        self.write_record(shutdown_record(
+            "restart partial",
+            progress=record.SessionNeedsManualRestart(
+                kind="manual restart", command="claude --resume session-123"
+            ),
+        ))
+        _ = record.park(LOGIN)
+        record.create(shutdown_record(
+            "restarting", requested_at="2026-11-15T17:30:00+00:00", session_id="session-456",
+        ))
+
+        self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (1, "", ""))
+        self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-456"), (1, "", ""))
+        self.assertCountEqual(shutdown.held_session_ids(), ["session-123", "session-456"])
+        (self.state / LOGIN / "record.json").unlink()
+        status, output, error = self.run_cli(LOGIN)
+        self.assertEqual((status, error), (0, ""))
+        self.assertEqual(
+            output,
+            f"{LABEL} is held by a shutdown (restart partial since 2026-10-09 14:49 PDT)\n",
+        )
+        self.assertEqual(shutdown.held_session_ids(), ["session-123"])
+        held = io.StringIO()
+        with redirect_stdout(held):
+            self.assertEqual(shutdown.main(["held-sessions"]), 0)
+        self.assertEqual(held.getvalue(), "session-123\n")
+
+    def test_the_newest_record_holding_a_unit_decides_its_restore(self) -> None:
+        self.write_record(shutdown_record(
+            "restart partial",
+            progress=record.SessionNeedsManualRestart(
+                kind="manual restart", command="claude --resume session-123"
+            ),
+        ))
+        _ = record.park(LOGIN)
+        record.create(shutdown_record("down", requested_at="2026-11-15T17:30:00+00:00"))
+
+        self.assertEqual(
+            self.run_cli(LOGIN, "--restart-of", "session-123"),
+            (0, f"{LABEL} is held by a shutdown (down since 2026-11-15 09:30 PST)\n", ""),
+        )
+
     def test_restart_permission_refuses_entries_the_restart_will_not_launch(self) -> None:
         refused = (
             (

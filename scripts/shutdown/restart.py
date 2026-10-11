@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypedDict, cast
@@ -52,10 +52,15 @@ from record import (  # noqa: E402
     SessionRestartFailed,
     SeatAvailableOnDemand,
     TimerRestore,
+    ShutdownInProgress,
+    account_records,
     archive,
     find_live,
     live_records,
+    park,
+    parked,
     parse_records,
+    unpark,
     update,
 )
 from remote import other_machine, run_remote  # noqa: E402
@@ -73,6 +78,8 @@ WINDOW_DELAY_SECONDS = 1.2
 PACIFIC = ZoneInfo("America/Los_Angeles")
 RESTARTABLE_STATES = frozenset({"down", "stop partial", "restart partial"})
 COMPLETE_PROGRESS = frozenset({"restarted", "seat available on demand"})
+# Worst wins when one machine's `up` attempts several records.
+STATUS_SEVERITY = {"nothing": 0, "done": 1, "partial": 2, "refused": 3}
 
 
 class RestartClaimRejected(Exception):
@@ -463,7 +470,8 @@ def _unit_argv(
         *_add_unit_command(),
         "--production",
         host["doc"],
-        host["unit"].removesuffix("-unit"),
+        # The recorded id, exactly: add_unit strips one "-unit" before adding its own.
+        host["unit"],
         "--plan",
         plan,
         "--resume",
@@ -1221,7 +1229,7 @@ def _print_result(result: MachineRestartResult) -> None:
         print(line)
 
 
-def _up(login: str, dry_run: bool) -> MachineRestartResult:
+def _up_slot(login: str, dry_run: bool) -> MachineRestartResult:
     found = find_live(login)
     machine = settle.local_machine()
     if found["kind"] == "no shutdown":
@@ -1286,7 +1294,13 @@ def _up(login: str, dry_run: bool) -> MachineRestartResult:
                 )
             case RestartClaimed(record=claimed_record):
                 record = claimed_record
+    return _restart_record(login, record, dry_run)
 
+
+def _restart_record(
+    login: str, record: ShutdownRecord, dry_run: bool
+) -> MachineRestartResult:
+    """Resume one claimed slot record, or print a dry run of any record."""
     desktop_state = DesktopLaunchState()
     restarted_at = settle.record_time()
     try:
@@ -1316,8 +1330,68 @@ def _up(login: str, dry_run: bool) -> MachineRestartResult:
         _restore_desktop(desktop_state, dry_run=dry_run)
 
 
+def _free_slot(login: str) -> bool:
+    """Park a slot record left `restart partial`; False while the slot holds any other state."""
+    found = find_live(login)
+    if found["kind"] == "no shutdown":
+        return True
+    if found["record"]["state"] != "restart partial":
+        return False
+    _ = park(login)
+    return True
+
+
+def _combined(results: list[MachineRestartResult]) -> MachineRestartResult:
+    """One machine result for several records: the worst status, every count and session."""
+    worst = max(results, key=lambda result: STATUS_SEVERITY[result.status])
+    return replace(
+        worst,
+        restarted=sum(result.restarted for result in results),
+        seats=sum(result.seats for result in results),
+        manual=sum(result.manual for result in results),
+        failed=sum(result.failed for result in results),
+        failed_sessions=tuple(
+            item for result in results for item in result.failed_sessions
+        ),
+        manual_sessions=tuple(
+            item for result in results for item in result.manual_sessions
+        ),
+        timers_not_started=tuple(
+            item for result in results for item in result.timers_not_started
+        ),
+    )
+
+
+def _up(login: str, dry_run: bool) -> MachineRestartResult:
+    """Resume the slot record, then each parked record once, oldest first."""
+    waiting = parked(login)
+    if not waiting:
+        return _up_slot(login, dry_run)
+    slot = find_live(login)
+    results = [_up_slot(login, dry_run)] if slot["kind"] == "live" else []
+    if dry_run:
+        # A real run frees a restartable slot before any parked record needs it.
+        if slot["kind"] == "no shutdown" or slot["record"]["state"] in RESTARTABLE_STATES:
+            results.extend(
+                _restart_record(login, item, dry_run=True) for item in waiting
+            )
+        return _combined(results)
+    for item in waiting:
+        try:
+            if not _free_slot(login):
+                break
+            unpark(login, item["requested_at"])
+        except (NoLiveRecord, ShutdownInProgress):
+            # Another `up` or `begin` took this record or the slot first.
+            break
+        results.append(_up_slot(login, dry_run=False))
+    if not results:
+        return MachineRestartResult(settle.local_machine(), waiting[0]["label"], "nothing")
+    return _combined(results)
+
+
 def up(login: str, dry_run: bool = False) -> int:
-    """Resume one machine's live record for `login`."""
+    """Resume one machine's records for `login`: the slot record, then each parked one."""
     try:
         return _up(login, dry_run).exit_status
     except (
@@ -1374,15 +1448,24 @@ def _selected_account(requested: AccountNamed | AccountNotNamed) -> Account:
                 return _account_from_records()
 
 
+def _widest_scope(records: list[ShutdownRecord]) -> ShutdownScope:
+    """The scope an alert covers for several records: account-wide when any record is."""
+    scopes = [record["scope"] for record in records]
+    return next(
+        (scope for scope in scopes if scope["kind"] == "all account sessions"),
+        scopes[0],
+    )
+
+
 def _local_restart_scope(
     login: str,
 ) -> RestartScopeKnown | RestartScopeNotFoundLocally:
     try:
-        found = find_live(login)
+        records = account_records(login)
     except (InvalidRecord, OSError, ValueError):
         return RestartScopeNotFoundLocally()
-    if found["kind"] == "live":
-        return RestartScopeKnown(found["record"]["scope"])
+    if records:
+        return RestartScopeKnown(_widest_scope(records))
     return RestartScopeNotFoundLocally()
 
 
@@ -1402,9 +1485,13 @@ def _remote_restart_scope(
             kind="machine not reached", machine=other_machine()
         )
     if remote["kind"] == "records read":
-        for remote_record in remote["records"]:
-            if remote_record["login"].casefold() == login.casefold():
-                return RestartScopeKnown(remote_record["scope"])
+        matching = [
+            remote_record
+            for remote_record in remote["records"]
+            if remote_record["login"].casefold() == login.casefold()
+        ]
+        if matching:
+            return RestartScopeKnown(_widest_scope(matching))
     return RestartScopeUnavailable()
 
 
