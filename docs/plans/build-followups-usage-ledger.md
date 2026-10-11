@@ -84,7 +84,7 @@ Today, each question needs its own scratch script (`seat_usage.py`, `api_cost.py
 
 **Ruled out:** a lens inferred from the seat name (any seat runs any lens); the lens in `mesh_roster.json`.
 
-### Phase 2 — Every other Claude session can record itself · status: todo
+### Phase 2 — Every other Claude session can record itself · status: done
 
 #### Work Order
 
@@ -121,7 +121,7 @@ Today, each question needs its own scratch script (`seat_usage.py`, `api_cost.py
 ### Phase 4 — One store of every model turn · status: todo
 
 - `scripts/usage/collect.py` reads Claude transcripts and Codex rollouts on both machines into `usage.db`, one row per model turn: time, machine, agent id, model, effort, the token classes, and whether it was a compaction or came before the agent's first edit.
-- Each turn is matched to the role in force at its time, through `agents_log.assignments` and `role_at`, keeping their malformed-line diagnostics. Identity comes from the source (family and machine), never the id's form: a Claude worker matches its transcript uuid by a unique 8-hex prefix (an ambiguous prefix stays unresolved); a subagent is scoped to its parent; a historical director comes from the run's `main_agent.session_id` in `progress_history.py` events, never from `cwd` alone. Archived Codex turns with no evidence stay unassigned.
+- Each turn is matched to the role in force at its time, through `agents_log.assignments` and `role_at`, keeping their malformed-line diagnostics. Identity comes from the source (family and machine), never the id's form: a Claude worker matches its transcript uuid by a unique 8-hex prefix (an ambiguous prefix stays unresolved), and `role_at` on the full uuid already merges the lines under the uuid and under its recorded prefix, because the session-start hook writes `interactive` under the full uuid before `agent_bg.sh` writes `worker` under the prefix; a subagent is scoped to its parent; a historical director comes from the run's `main_agent.session_id` in `progress_history.py` events, never from `cwd` alone. Archived Codex turns with no evidence stay unassigned.
 - Attribution is an explicit state per turn: recorded, estimated (from an `approximate` line) or unassigned; a review lens is known, unrecorded or not applicable. Nullable values stay at the storage boundary.
 - Owns the per-turn model and effort parser, a dated weight table per model (raw token classes kept apart from weighting), and the normalized compaction events Phase 5 consumes.
 - Runs incrementally with transactional cursors, handling an incomplete tail; a change to `agents.jsonl` re-attributes the affected turns even when transcripts are unchanged.

@@ -13,11 +13,11 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, TextIO, cast
+from typing import BinaryIO, Literal, cast
 
-Role = Literal["showrunner", "director", "impl", "test", "fix", "review", "worker"]
+Role = Literal["showrunner", "director", "impl", "test", "fix", "review", "worker", "interactive", "subagent"]
 Lens = Literal["adversary", "contract", "craft", "ux"]
-ROLES: tuple[Role, ...] = ("showrunner", "director", "impl", "test", "fix", "review", "worker")
+ROLES: tuple[Role, ...] = ("showrunner", "director", "impl", "test", "fix", "review", "worker", "interactive", "subagent")
 LENSES: tuple[Lens, ...] = ("adversary", "contract", "craft", "ux")
 
 
@@ -61,7 +61,7 @@ def _lens(value: object) -> Lens:
     return value
 
 
-def _write_assignment(output: TextIO, agent_id: str, assignment: Assignment) -> None:
+def _write_assignment(output: BinaryIO, agent_id: str, assignment: Assignment) -> None:
     if not agent_id.strip():
         raise ValueError("agent id must not be empty")
     row: dict[str, object] = {
@@ -73,32 +73,56 @@ def _write_assignment(output: TextIO, agent_id: str, assignment: Assignment) -> 
         row["lens"] = _lens(assignment.lens)
     if assignment.approximate:
         row["approximate"] = True
-    _ = output.write(json.dumps(row, separators=(",", ":")) + "\n")
+    _ = output.write((json.dumps(row, separators=(",", ":")) + "\n").encode("utf-8"))
 
 
-def _terminate_partial_line(output: TextIO) -> None:
+def _terminate_partial_line(output: BinaryIO) -> None:
     size = os.fstat(output.fileno()).st_size
     if size and os.pread(output.fileno(), 1, size - 1) != b"\n":
-        _ = output.write("\n")
+        _ = output.write(b"\n")
 
 
 def append(agent_id: str, role: Role, lens: Lens | None, at: datetime,
            approximate: bool = False) -> None:
     path = state_dir() / "agents.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as output:
+    with path.open("a+b") as output:
         fcntl.flock(output.fileno(), fcntl.LOCK_EX)
         _terminate_partial_line(output)
         _write_assignment(output, agent_id, Assignment(at, role, lens, approximate))
         output.flush()
 
 
-def _read_assignments(lines: Iterable[str], path: Path) -> RoleLog:
+def _names_agent(recorded_id: str, agent_id: str) -> bool:
+    return recorded_id == agent_id or (
+        re.fullmatch(r"[0-9a-fA-F]{8}", recorded_id) is not None
+        and agent_id.startswith(recorded_id)
+    )
+
+
+def register_default(agent_id: str, role: Role, at: datetime) -> bool:
+    """Assign a default role only when no valid row names this agent yet."""
+    path = state_dir() / "agents.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as output:
+        fcntl.flock(output.fileno(), fcntl.LOCK_EX)
+        _ = output.seek(0)
+        log = _read_assignments(output, path)
+        for recorded_id in log.assignments:
+            if _names_agent(recorded_id, agent_id):
+                return False
+        _terminate_partial_line(output)
+        _write_assignment(output, agent_id, Assignment(at, role, None))
+        output.flush()
+    return True
+
+
+def _read_assignments(lines: Iterable[bytes], path: Path) -> RoleLog:
     grouped: dict[str, list[Assignment]] = {}
     problems: list[str] = []
     for number, line in enumerate(lines, 1):
         try:
-            value = cast(object, json.loads(line))
+            value = cast(object, json.loads(line.decode("utf-8")))
             if not isinstance(value, dict):
                 raise ValueError("assignment must be an object")
             row = cast(dict[str, object], value)
@@ -125,7 +149,7 @@ def _read_assignments(lines: Iterable[str], path: Path) -> RoleLog:
 
 def assignments(path: Path) -> RoleLog:
     try:
-        with path.open(encoding="utf-8") as source:
+        with path.open("rb") as source:
             fcntl.flock(source.fileno(), fcntl.LOCK_SH)
             return _read_assignments(source, path)
     except FileNotFoundError:
@@ -133,8 +157,13 @@ def assignments(path: Path) -> RoleLog:
 
 
 def role_at(log: RoleLog, agent_id: str, at: datetime) -> Assignment | Unassigned:
+    """Find the latest assignment across the full id and its worker prefix."""
     moment = _utc(at)
-    for assignment in reversed(log.assignments.get(agent_id, ())):
+    history = list(log.assignments.get(agent_id, ()))
+    prefix = agent_id[:8]
+    if prefix != agent_id and _names_agent(prefix, agent_id):
+        history.extend(log.assignments.get(prefix, ()))
+    for assignment in reversed(sorted(history, key=lambda entry: entry.at)):
         if assignment.at <= moment:
             return assignment
     return Unassigned()
@@ -226,7 +255,7 @@ def backfill(archive: Path, live: Path) -> int:
     path = state_dir() / "agents.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     added = 0
-    with path.open("a+", encoding="utf-8") as output:
+    with path.open("a+b") as output:
         fcntl.flock(output.fileno(), fcntl.LOCK_EX)
         _ = output.seek(0)
         log = _read_assignments(output, path)
@@ -273,6 +302,9 @@ def main(argv: list[str] | None = None) -> int:
     _ = writer.add_argument("--id", required=True)
     _ = writer.add_argument("--role", choices=ROLES, required=True)
     _ = writer.add_argument("--lens", choices=LENSES)
+    registrar = commands.add_parser("register", help="record a default role for an unassigned agent")
+    _ = registrar.add_argument("--id", required=True)
+    _ = registrar.add_argument("--role", choices=ROLES, required=True)
     importer = commands.add_parser("backfill", help="recover surviving run assignments")
     _ = importer.add_argument("--archive", type=Path, default=Path.home() / ".local/state/usage-model/delegate-archive")
     _ = importer.add_argument("--live", type=Path, default=Path("/tmp/claude/delegate"))
@@ -283,6 +315,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if command == "append":
             append(cast(str, args.id), cast(Role, args.role), cast(Lens | None, args.lens), datetime.now(timezone.utc))
+        elif command == "register":
+            _ = register_default(cast(str, args.id), cast(Role, args.role), datetime.now(timezone.utc))
         elif command == "backfill":
             added = backfill(cast(Path, args.archive), cast(Path, args.live))
             print(f"Backfilled {added} assignments.")
