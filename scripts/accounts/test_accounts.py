@@ -1654,6 +1654,20 @@ class AccountsTests(unittest.TestCase):
                     "accounts: showrunner is not a role; only unit is supported\n",
                 )
 
+    def test_set_role_refuses_the_default_note_label_without_writing(self) -> None:
+        """Status names ~/.claude by its note label; set-role points that label at default, not ~/.claude2."""
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        result = self.run_cli("set-role", "unit", "claude 2")
+        self.assertEqual(result, (1, "", "accounts: claude 2 is the default account; use default\n"))
+        self.assertEqual(self.role_files(), {})
+
+    def test_set_role_refuses_a_directory_logged_in_as_the_default_login(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 4", "MAIN@example.invalid")
+        result = self.run_cli("set-role", "unit", "claude 4")
+        self.assertEqual(result, (1, "", "accounts: claude 4 is the default account; use default\n"))
+        self.assertEqual(self.role_files(), {})
+
     def test_set_role_refuses_an_unknown_label_without_writing(self) -> None:
         result, stdout, stderr = self.run_cli("set-role", "unit", "claude2")
 
