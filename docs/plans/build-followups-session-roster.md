@@ -12,7 +12,7 @@ The user, via natedev, 2026-10-10 09:0x PDT: "claude can do a listagents so clau
 
 The user, via natedev, a few minutes later: "it's fine if our skills instruct agents how to do different activities -- what i mean is if a codex needs to list other codex - it can do that itself and if it needs to talk to other claudes, it can use our script / and vice versa, right?"
 
-natedev, 2026-10-10: each kind of agent lists its own kind natively and uses the script for the other kind, and the skills say which to use. Claude keeps ListAgents for Claude sessions. The gap to cover: Codex has no native list it can run from a script across units, so the script lists Codex workers across units for Claude and Codex alike. Boundary: model-study owns `scripts/agents/codex_mesh.py` and the seat launcher (`docs/plans/build-followups-long-lived-seats.md`). Read their records, never edit them, and ask model-study for any field.
+natedev, 2026-10-10: each kind of agent lists its own kind natively and uses the script for the other kind, and the skills say which to use. Claude keeps ListAgents for Claude sessions. The gap to cover: Codex has no native list it can run from a script across units, so the script lists Codex workers across units for Claude and Codex alike. Boundary: model-study owns `scripts/agents/codex_mesh.py` and the seat launcher (`docs/as-built/long-lived-seats.md`). Read their records, never edit them, and ask model-study for any field.
 
 natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's), with the user's words relayed by hana: "Any message in the message infra being sent to a user should go through a message review to make sure that it tells the user the action he needs to take or that there is no action required. Send this to natedev session to address in the messaging infra." Trigger, 09:38 PDT: a widget seat sent an Emergency-priority Pushover, 'widget-enhancements-impl: Mac test paused. The shared Mac gate needs five minutes with no local input and no user Hana process; all other implementation gates have passed.' The user asked how he was supposed to respond; no action was needed. natedev: the gate belongs in the infra, not per sender; every path to the user is `scripts/notify/pushover.py` (called directly, seats included), `send.py --to user` and `commands/alert_user.md`; a message that says neither the action nor that none is needed is refused back to its sender with the reason; Emergency only when the user must act now; `pushover.py` and `alert_user.md` join shutdown-unit's Owns; tests never push.
 
@@ -24,10 +24,10 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
   - Unit directors under a production: the doc's Units table, plus the tmux session marked `SHOWRUNNER_UNIT` / production. `scripts/production/live_units.py` `production_units(doc)` and `unit_lookup.marked_units(slug)` read these. tmux runs only on natedev.
   - Any `/unit:direct` run: `prepare_session.sh` writes `/tmp/claude/delegate/active/<director's Claude session id>`, holding the run's session directory. `end_session.sh` removes it. A marker from a director that died stays behind; 12 markers exist today, some from 2026-10-06.
   - Claude workers: every `agent_bg.sh` launch appends `<session id>\t<name>` to its run's `seats` ledger. `scripts/delegate/remove_seats.py` already decides which runs are live (`live_runs`: a marker whose director is still listed, or a `heartbeat.log` written in the last `LIVE_HEARTBEAT_SECS` = 600).
-- **Codex workers** are threads on one app-server per run. `<session dir>/mesh_roster.json` maps each seat name to `thread_id`, `status` (`starting`, `running`, `done`, `failed`, `waiting_capacity`, `capacity_exhausted`), `turn_id`, `launcher_pid` and `port`. `mesh_server.json` holds the server's `pid` and `port`. `codex_mesh.py list --session-dir` prints one run's roster only. Seat names are `<worktree>-<slot>`, from `scripts/delegate/seat_name.sh`. Running blind reviewers (`codex exec`, launched by `review.sh` through `agent_exec.sh`) have no roster entry, and their command line carries no seat name or session directory, so `broadcast.py` `codex_seats()` does not find them. `review.sh` writes `<session dir>/review_status[_<lens>]` (`reviewing` while it runs) and `review_pid[_<lens>]` (its own pid).
-- **Coming from model-study** (long-lived seats Phase 1, in flight; model-study, 2026-10-10):
+- **Codex workers** are threads on one app-server per run. `<session dir>/mesh_roster.json` maps each seat name to `thread_id`, `status` (`starting`, `running`, `done`, `failed`, `waiting_capacity`, `capacity_exhausted`), `turn_id`, `launcher_pid` and `port`. `mesh_server.json` holds the server's `pid` and `port`. `codex_mesh.py list --session-dir` prints one run's roster only. Seat names are `<worktree>-<slot>`, from `scripts/delegate/seat_name.sh`. Inside a `/unit:direct` run, reviews go to open Codex seats (`review.sh --to <seat>` or `--slot <name>`), which are roster entries. A review outside a run still runs a blind reviewer (`codex exec`, launched by `review.sh` through `agent_exec.sh`); such a reviewer has no roster entry, and their command line carries no seat name or session directory, so `broadcast.py` `codex_seats()` does not find them. `review.sh` writes `<session dir>/review_status[_<lens>]` (`reviewing` while it runs) and `review_pid[_<lens>]` (its own pid).
+- **From model-study** (long-lived seats, shipped; `docs/as-built/long-lived-seats.md`):
   - Each roster entry gets `role` (`impl`, `test`, `fix` or `review`), written on every dispatch.
-  - Long-lived seats Phase 2 adds `lens` (`adversary`, `contract`, `craft`), present only while `role` is `review`.
+  - No launcher writes `lens` into the mesh roster; the lens is recorded in review artifact names and in the progress and findings records.
   - `status: "ended"` is written by `codex_mesh.py end` for one seat and by `stop` for every seat of the run. `done` then means open and idle.
   - `context_tokens` holds the context size at the last turn.
   - A thread that dies without `end` or `stop` keeps its last status, so a pid fallback stays necessary.
@@ -56,26 +56,30 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 - **The message-to-user gate is a required field, not a model's reading** (Phase 2). Every send names its action with `--action` or says `--no-action`, and `pushover.py` refuses one that does neither. A field cannot be skipped by accident, costs no time, and never fails open the way a model call that times out would; tests check it without a network. The sender writes the action because only the sender knows it. One-phase revert to a model review if the user wants judgment on the wording too.
 - **The refusal runs right after Phase 3** (2026-10-10). natedev's generation 206 (`/etc/nixos` 9ef892a) passes `--action` or `--no-action` from `ups.nix` and `disk-floor.nix`, checked against the running system, so the phase that refuses a message with no action stated moved up from last to Phase 4, per its own resequence rule. Packaging only; one-line revert.
 - **Live checks never message a real session.** They use scratch recipients only: a scratch background Claude session, a scratch mesh thread in a scratch session directory, and a scratch daemon thread. All are removed after the check. Listing real sessions is read-only and allowed.
+- **Shutdown tests can never reach the user's phone** (2026-10-10). The user approved a guard after two fixture alerts reached their phone from a test whose fake had gone stale; it runs as Phase 6, right after the process-table move.
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills and scripts. This plan adds the session roster (Phase 1), a gate that makes every message to the user say what the user does (Phase 2), sends to any roster address or name (Phase 3), refuses a message to the user that states no action (Phase 4), moves the process table into its own module (Phase 5), sends to roster groups (Phase 6), covers both machines (Phase 7), and teaches Claude and Codex sessions which tool to use (Phase 8). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-shutdown` on branch `build-followups-shutdown` (unit `shutdown-unit` of production `build-followups`).
+- **Project:** `~/.claude` — Claude Code commands, skills and scripts. This plan adds the session roster (Phase 1), a gate that makes every message to the user say what the user does (Phase 2), sends to any roster address or name (Phase 3), refuses a message to the user that states no action (Phase 4), moves the process table into its own module (Phase 5), makes a shutdown test that reaches a real send fail instead of sending (Phase 6), sends to roster groups (Phase 7), lets the shutdown inventory tests see their sessions again (Phase 8), lists a session with no messaging socket only while its own process runs (Phase 9), covers both machines (Phase 10), and teaches Claude and Codex sessions which tool to use (Phase 11). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-shutdown` on branch `build-followups-shutdown` (unit `shutdown-unit` of production `build-followups`).
 - **Project started:** 2026-10-10T16:30:07.804+00:00
 - **Stack:** Python 3.13 standard library only; bash, zsh; codex-cli 0.162.0 (daemon 0.162.1).
 - **Layout:**
-  - `scripts/message/roster.py` — the roster (new, Phase 1; unique addresses Phase 3; both machines Phase 7)
+  - `scripts/message/roster.py` — the roster (new, Phase 1; unique addresses Phase 3; both machines Phase 10)
+  - `scripts/message/sessions.py` — the Claude session registry readers (Phase 8); a socketless record's process identity (Phase 9)
   - `scripts/message/process_table.py` — the process table the roster, `broadcast.py` and wind-down read (Phase 5)
   - `scripts/message/codex_daemon.py` — reads the shared Codex daemon's live sessions; queues to one (new, Phase 1; queue Phase 3)
   - `scripts/notify/pushover.py`, `scripts/notify/user_action.py` — the message-to-user gate and its action types (Phase 2; refusal Phase 4)
-  - `scripts/message/send.py` — `--action` / `--no-action` for the user (Phase 2); any roster address or name (Phase 3); the other machine (Phase 7)
-  - `scripts/production/broadcast.py` — groups from the roster (Phase 6); both machines (Phase 7)
-  - `commands/message.md`, `commands/announce.md`, `commands/unit/announce.md`, `commands/showrunner/announce.md`, `commands/notify_top_level.md`, `codex/AGENTS-messaging.md`, `scripts/message/install_codex_agents.py` — instructions (Phase 8)
+  - `scripts/message/send.py` — `--action` / `--no-action` for the user (Phase 2); any roster address or name (Phase 3); the other machine (Phase 10)
+  - `scripts/production/broadcast.py` — groups from the roster (Phase 7); both machines (Phase 10)
+  - `scripts/shutdown/test_support.py` — the base every shutdown test derives from; stubs every real send leaf (new, Phase 6)
+  - `commands/message.md`, `commands/announce.md`, `commands/unit/announce.md`, `commands/showrunner/announce.md`, `commands/notify_top_level.md`, `codex/AGENTS-messaging.md`, `scripts/message/install_codex_agents.py` — instructions (Phase 11)
 - **Key files (read, never edited here):** `scripts/agents/codex_mesh.py` (model-study: roster format, `send`), `scripts/delegate/remove_seats.py` (`live_runs`, `LIVE_HEARTBEAT_SECS`, the `seats` ledger), `scripts/delegate/prepare_session.sh` (the run marker), `scripts/production/showrunners.py`, `scripts/production/live_units.py`, `scripts/production/unit_lookup.py`, `scripts/shutdown/remote.py` (`other_machine`).
 - **Test lanes:** `scripts/message/test_*.py`, `scripts/production/test_*.py`, `scripts/notify/test_*.py`, `scripts/shutdown/test_*.py`.
-- **Test:** `python3 -m unittest discover -s scripts/message -p 'test_*.py'`; `python3 -m unittest discover -s scripts/production -p 'test_broadcast.py'`.
-- **Lint:** `basedpyright scripts/message` and `basedpyright scripts/production` report 0 errors, 0 warnings, 0 notes (exit 3 is the missing `.venv` notice and expected); `bash -n` on changed shell scripts.
+- **Test:** `python3 -m unittest discover -s <directory> -p '<pattern>' </dev/null` for each of: `scripts/message` `test_*.py`; `scripts/shutdown` `test_*.py`; `scripts/build_hold` `test_*.py`; `scripts/model_study` `test_rerun.py`; and in `scripts/production` each of `test_broadcast.py`, `test_codex_winddown.py`, `test_tmux_names.py`, `test_unit_status.py`, `test_unit_lookup.py`, `test_adopt.py`, `test_live_units.py`, `test_waiting.py` and `test_stall_watch.py`. Together they are every suite that reads `sessions.py`; some fakes read stdin, hence `</dev/null`. Run each under a scratch `HOME`.
+- **Lint:** `basedpyright scripts/message scripts/shutdown scripts/production` reports 0 errors, 0 warnings, 0 notes (exit 3 is the missing `.venv` notice and expected); `bash -n` on changed shell scripts.
 - **Invariants:**
   - Tests are hermetic. They use temp directories for sessions, the delegate root and the notifier state, fake `tmux`, `ps`, `ssh` and `codex`, and a fake daemon socket. They never reach the real daemon, a real session, `send.py`'s relay, `pushover.py` or the other machine.
+  - From Phase 6, every shutdown `TestCase` derives from `test_support.ShutdownTestCase`, which fails a test that reaches a real send leaf.
   - Everything an agent reads in the roster is plain words. No pids or ports in the text form; the `--json` form carries what a script needs.
   - A source that cannot be read becomes one line on stderr naming it, and the rest of the roster still prints.
 
@@ -109,7 +113,7 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 - A Claude seats-ledger id is `agent_bg.sh`'s background id, a prefix of the `sessionId`.
 - Session records are `~/.claude/sessions/<pid>.json`, indexed once by `(sessionId, pid)`; the newest `updatedAt` wins.
 - Blind reviewers (`codex exec` via `agent_exec.sh`) carry no `--name` or `--session-dir`; only the review status and pid files find them.
-- Codex workers read `role unknown` until their mesh records carry `role` and `lens`.
+- Mesh records carry `role`; a Codex worker with an unrecognized role reads `role unknown`. No launcher writes `lens` into the mesh roster yet.
 - No running registered showrunner is a correct, common state, not a defect.
 
 **Ruled out:** a session's role from its seat-name suffix — roles come from records only.
@@ -142,164 +146,189 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 ### Phase 3 — `send.py` reaches any session the roster lists · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `send.py --to <address or name>` delivers to any roster row that takes messages: a Codex worker by its unique address or its seat name, a user's Codex session by `codex:<thread id>` or exact name, and a Claude session as today. A row that cannot take messages says so and sends nothing. Roster rows name their links as states, not empty strings, and Phase 2's action types close their last two gaps: the refusal check returns a named state, and a `/shutdown` message to a session carries no user action.
-
-**Spec:**
-- **Every roster address is unique on both machines** (`scripts/message/roster.py`):
-  - Claude session: `session:<session id>`; daemon session: `codex:<thread id>` (unchanged).
-  - Codex worker: `seat:<run id>/<seat name>`, where the run id is the name of the run's session directory (a UUID). Two live runs with one seat name now have two addresses.
-  - In memory, `RosterEntry.address: str` becomes `RosterEntry.reach: Messageable | CannotReceiveMessages`: `Messageable(address: str)`, `CannotReceiveMessages(reason: str)`. A blind reviewer is `CannotReceiveMessages("blind reviewer")`. `--json` keeps the `address` key as its serialization (empty for `CannotReceiveMessages`) and adds no key; the text form is unchanged.
-  - **Links are states, not empty strings.** The showrunner link is `UnderShowrunner(production, name, address)` or `NoShowrunner()`; the unit-director link is `UnderDirector(unit, name, address)` or `NoDirector()`; a worker's assignment is `WorkerAssignment(slot_role, session_dir)` or `NotAWorker()` (frozen dataclasses in `roster.py`, replacing the eight flat link fields). `--json` keeps today's flat keys, empty for the no-link states, written only at serialization; the text form is unchanged.
-  - A mesh entry with no `role` reads `no role` (a thread opened without one, such as an ask-a-friend Codex), not `role unknown`.
-- **Resolution in `send.py`**, before its Claude path, by the form of `--to`:
-  1. `user` → the user path (Phase 2). `uds:` and `session:` → the Claude path, unchanged.
-  2. `seat:<run id>/<seat name>` → the roster row with that address; sent through the existing `codex()` path with that row's `session_dir`, so `--codex --session-dir` is no longer needed. Both are still accepted, and they skip the lookup.
-  3. `codex:<thread id>` → `codex_daemon.queue`, no roster read.
-  4. A bare name → the roster rows whose `name` equals it:
-     - one `Messageable` row: sent by its address, as above;
-     - one `CannotReceiveMessages` row: exit 2, `send.py: <name> cannot take messages (<reason>); contact its unit director <director> or wait`, with no delivery attempt;
-     - more than one row: exit 2, `send.py: <name> matches <n> sessions:` followed by each one's address and role, and nothing sent;
-     - none: the Claude path, unchanged.
-- **The roster is read once per send**, and only for forms 2 and 4. Each roster problem prints to stderr as `send.py: roster: <problem>`, and resolution continues on the rows that were read. A roster that cannot be read at all leaves the Claude path as it is today; a `seat:` address then fails with the roster's problem line.
-- **`codex_daemon.queue(thread_id: str, text: str, timeout: float = QUEUE_TIMEOUT_SECONDS) -> Queued | QueueFailed | QueueTimedOut`**, `QUEUE_TIMEOUT_SECONDS = 30`. It runs `codex queue --thread <id> --message <text>` with that timeout. `Queued()` on exit 0; `QueueFailed(reason)` with codex's first stderr line, or `exit <n>`; `QueueTimedOut(seconds)`. `send.py` prints `SENT: queued on Codex session <name or id>` (exit 0) for `Queued`, and `FAILED: <reason>` (exit 3) for the other two; nothing is kept, as for a seat. The module docstring says it reads the shared daemon's live sessions and queues one message to one of them.
-- The docstring and `--help` name the address forms.
-- **Every resolved recipient other than `user` carries `NoUserRecipient`**, so `--action`/`--no-action` stays a usage error for `seat:`, `codex:` and bare-name sends.
-- **`refused_at(action, priority) -> ActionAllowed | ActionRefused`** in `scripts/notify/user_action.py`, `ActionAllowed()` a frozen dataclass replacing `None`; `pushover.py` matches on it.
-- **`/shutdown` session sends take no action.** `scripts/shutdown/settle.py` splits `send_message` into a session send with no action parameter and the user path (`alert_user(..., action: ActionRequired)`); the session callers (`settle.py` near lines 677, 1043, 1337, 1432; `restart.py` near 756) drop their `NoActionRequired()`. Tests prove a session send cannot carry a user action and a user alert cannot omit one; `test_send.py`'s two `settle.send_message` fixtures follow the new session send.
-- **Tests** fake `codex` and `codex_mesh.py` the way `test_send.py` already fakes its subprocesses, and build roster fixtures as `test_roster.py` does. Named cases: two live runs with one seat name, each reached by its `seat:` address, and the bare name ambiguous (exit 2, both addresses listed); a blind reviewer by name exits 2 with no subprocess run; a roster problem line printed while a send to a usable row succeeds; `queue` success, nonzero exit and timeout; `roster.py --json` writes `address` empty for a reviewer; a link-free row serializes today's empty keys; a roleless mesh entry reads `no role`, a `review` entry with and without `lens`; `--action` with a `seat:` address is a usage error.
+- `roster.py` gives every row an address unique on both machines: `session:<id>` (Claude session), `seat:<run id>/<seat name>` (Codex worker; the run id is the run's session directory name), `codex:<thread id>` (daemon session). `RosterEntry.reach: Messageable(address) | CannotReceiveMessages(reason)`: a blind reviewer is `CannotReceiveMessages("blind reviewer")`, and a seat whose mesh status is not `running` / `waiting_capacity` is `CannotReceiveMessages` with a reason naming whether a unit director runs. Links are `ShowrunnerRelationship = RunsProduction | UnderShowrunner | ProductionWithoutRunningShowrunner | NoShowrunner` and `DirectorRelationship = DirectsUnit | UnderDirector | NoDirector`. `RosterEntry.assignment: WorkerAssignment | NotAWorker`. A roleless mesh entry reads `no role`.
+- `--json` flattens these states at one boundary into the old flat keys, empty for no-link states and for `CannotReceiveMessages`; the text form is unchanged.
+- `send.py --to` resolves by form: `user` → user path; `uds:` / `session:` → Claude path; `seat:` → that roster row, sent through `codex()` with the row's `session_dir` (`--codex --session-dir` still works and skips the lookup); `codex:<thread id>` → `codex_daemon.queue`, no roster read; a bare name → roster rows with that `name` (one `Messageable` sends by its address; one `CannotReceiveMessages` exits 2 with the reason and the unit director to contact, or that none runs; several exit 2 listing each address and role; none falls to the Claude path). The roster is read once, only for `seat:` and bare names; each roster problem prints `send.py: roster: <problem>` and resolution continues on the rows read.
+- Every recipient other than `user` carries `NoUserRecipient`, so `--action` / `--no-action` is a usage error for `seat:`, `codex:` and bare-name sends.
+- `codex_daemon.queue(thread_id, text, timeout=QUEUE_TIMEOUT_SECONDS)` (30 s) runs `codex queue --thread <id> --message <text>`; nothing is kept on failure.
+- `settle.send_message` sends to a session with no action parameter and raises `ValueError` for `user`; `settle.alert_user(..., action)` is the only user path. `restart.py` session callers pass no action.
 
 **Files:**
-- `scripts/message/roster.py` — `seat:` addresses, `reach`.
-- `scripts/message/test_roster.py`
-- `scripts/message/send.py`
-- `scripts/message/test_send.py`
-- `scripts/message/codex_daemon.py` — `queue`.
-- `scripts/message/test_codex_daemon.py`
-- `scripts/notify/user_action.py`, `scripts/notify/pushover.py`, `scripts/notify/test_pushover.py` — `ActionAllowed`.
-- `scripts/shutdown/settle.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_stop.py` — session sends without an action.
+- `scripts/message/roster.py` — address forms, `reach`, link states, flat JSON boundary.
+- `scripts/message/send.py` — resolution order, refusals, `codex:` route, key retirement under name and address.
+- `scripts/message/codex_daemon.py` — `queue` to a daemon thread.
+- `scripts/notify/user_action.py`, `scripts/notify/pushover.py` — `ActionAllowed | ActionRefused`; `pushover.py` matches on it.
+- `scripts/shutdown/settle.py`, `scripts/shutdown/restart.py` — session sends without an action; user alerts with one.
+- Tests: `scripts/message/test_roster.py`, `test_send.py`, `test_codex_daemon.py`; `scripts/notify/test_pushover.py`; `scripts/shutdown/test_settle.py`, `test_restart.py`, `test_stop.py`.
 
-**Seats:** `2 writers + 1 tester` — the action cleanup is a file set of its own.
-- `impl` — `roster.py`, `send.py`, `codex_daemon.py`; hub: `roster.py` (the address forms, `reach` and the link states).
-- `test` — `test_roster.py`, `test_send.py` (except the two settle fixtures), `test_codex_daemon.py`, from the Spec alone.
-- `fix2` — `user_action.py`, `pushover.py`, `settle.py`, `restart.py` and `test_pushover.py`, `test_settle.py`, `test_restart.py`, `test_stop.py`, plus `test_send.py`'s two settle fixtures.
+**Binds later work:**
+- Address forms: `session:<id>`, `seat:<run id>/<seat name>`, `codex:<thread id>`, bare names, `uds:`, `user`. `RosterEntry.reach: Messageable(address) | CannotReceiveMessages(reason)`; `ShowrunnerRelationship = RunsProduction | UnderShowrunner | ProductionWithoutRunningShowrunner | NoShowrunner`; `DirectorRelationship = DirectsUnit | UnderDirector | NoDirector`.
+- `--json` keeps flat keys (production, showrunner, showrunner_address, unit, director, director_address, slot_role, session_dir, address). A showrunner's and a unit director's own rows (`RunsProduction` / `DirectsUnit`) carry empty link fields, and a `CannotReceiveMessages` row has an empty `address`: broadcast groups select members by `UnderShowrunner` / `UnderDirector` and skip those rows rather than send to `""`, taking the refusal line from `send.py`.
+- A seat is Messageable only at mesh status `running` / `waiting_capacity`; a seat between turns is resumed only by its unit director. Sends to the other machine route `seat:` and `codex:` through that machine's `codex_mesh` / daemon, and a `seat:` address of a seat between turns keeps `no roster session has address` there too.
+- `send.py` exit codes: 0 sent, 1 queued for a Claude session, 2 usage error / ambiguous name / cannot take messages / no roster session has address / refusal, 3 failed. `codex_daemon.queue` → `Queued | QueueFailed | QueueTimedOut`, printed `SENT:` / `FAILED:`; `FAILED:` has no fallback. The messaging instructions (`commands/message.md`, `codex/AGENTS-messaging.md`) name each exit-2 refusal and its recovery.
+- `user_action.refused_at` → `ActionAllowed | ActionRefused`; `settle.alert_user` always passes `--action` and `settle.send_message` refuses `user`. The refusal of messages with no action stated builds on these.
+
+**Gotchas:** An ephemeral daemon thread refuses `codex queue` (-32600) and cannot be archived; live checks start threads with `ephemeral: false`. `thread/read` does not show a queued message; `thread/turns/list` does once the turn starts. `codex_mesh send` accepts only `running` / `waiting_capacity` seats. A worker under a heartbeat-only run is `NoDirector`, so refusal wording handles a missing unit director.
+
+**Ruled out:** A transport-specific route state in `broadcast.py` (`send.py` already picks the transport); a `cannot take messages` line for a `seat:` address of a seat between turns (such a row has no address).
+
+### Phase 4 — A message with no action stated is refused · status: done
+
+#### As-built
+
+- `pushover.py` refuses `ActionUnstated` (neither `--action` nor `--no-action`) through the same `refuse()` path as its other refusals: nothing sent, exit 2, stderr `pushover: refused before sending: no action stated. <FIX>`, and one log line with outcome `refused before sending: no action stated` and its source.
+- Every refusal comes before the keys file is read, in this order: `ActionRefused` from parsing, `ActionUnstated`, `--action` text over `ACTION_TEXT_MAX`, then `refused_at`. The transition warning and the `sent without an action line` outcome are gone; a send logs `sent` or `sent, receipt <r>`.
+- The module docstring says messages without `--action` or `--no-action` are refused before sending, and that exit 2 means refused before sending, usage, or keys missing.
+
+**Files:**
+- `scripts/notify/pushover.py` — the gate every user message ends in.
+- `scripts/notify/test_pushover.py` — `test_unstated_action_is_refused_before_posting_and_logged`.
+
+**Binds later work:** No message reaches the user without `--action` or `--no-action`. Callers see a refusal as exit 2 and the stderr line naming `FIX`; the recovery is to add the flag and resend, which the messaging instructions give as the meaning of `REFUSED:` (exit 2). No caller of the removed outcome remains: the log holds no `sent without an action line` entry since the phase that added the warning, and natedev's `ups.nix` and `disk-floor.nix` pass the flags.
+
+**Gotchas:** A caller with no keys and no action flag gets the action refusal, not `keys missing`.
+
+### Phase 5 — Process listing gets its own module · status: done
+
+#### As-built
+
+- `scripts/message/process_table.py` (standard library only, imports no other script) holds the process table: `Process(pid, parent, command, arguments)` (`NamedTuple`), `snapshot() -> dict[int, Process]` running `PROCESS_TABLE_PS` (default `ps -eo pid=,ppid=,comm=,args=`), and `is_codex_agent(process: Process) -> bool` (a `codex exec`, or a `codex_mesh.py start` / `follow` turn).
+- `roster.py` and `broadcast.py` read the table from `process_table`. `roster.py` no longer imports `broadcast`; `broadcast.py`'s own `Process`, `processes()`, `is_codex_agent` and `BROADCAST_PS` are gone.
+- `codex_winddown.py` reads the table from `process_table`, and its pid-to-name map and `start()`'s showrunner records from `sessions.live_sessions()` (named records only; `start()` keeps the newest record per name). It still sends through `broadcast.broadcast`, `broadcast.report`, `broadcast.send` and `broadcast.MESSAGE`.
+- A unit's completion projection is `Projection = CompletionExpectedAt(epoch_seconds) | CompletionUnmeasured | ProjectionAnswerOwed` (frozen dataclasses). `read_projections()` decodes the stored JSON (number / `"unmeasured"` / `null`) into them and `_stored_projection()` encodes each back to that shape, so `projections.json` and the count line text are unchanged.
+
+**Files:**
+- `scripts/message/process_table.py` — the one process table every reader shares.
+- `scripts/message/roster.py`, `scripts/production/broadcast.py` — read the table through `process_table`.
+- `scripts/production/codex_winddown.py` — named projection states; session records from `sessions.py`.
+- Tests: `scripts/message/test_process_table.py` (`snapshot`, the `is_codex_agent` cases); `scripts/production/test_codex_winddown.py` (each projection state, a save-and-reload round trip of every state, `start()` reading no `broadcast.live_sessions`); `test_roster.py` patches `process_table`, `test_broadcast.py` sets `PROCESS_TABLE_PS`.
+
+**Binds later work:**
+- `process_table` imports none of `roster`, `broadcast` or `codex_winddown`, so `broadcast.py` can import `roster.py` without a cycle; "`broadcast.py` takes its groups from the roster" relies on this. `broadcast.live_sessions()` has no caller outside `broadcast.py`.
+- Wind-down's `announce()` calls `broadcast.broadcast(sender, {"showrunner": …, "unit director": …})` and `broadcast.report`; a role-key or signature change there carries `codex_winddown.py` and `test_codex_winddown.py`.
+
+**Gotchas:**
+- `PROCESS_TABLE_PS` is read at import, so a test that sets it reloads `process_table` or patches `process_table.PS`.
+- `start()` keeps the first record per name, so it depends on `sessions.live_sessions()` listing the newest record first.
+- Session records are one file per pid (`~/.claude/sessions/<pid>.json`), so a pid-to-name map cannot hold a stale name.
+
+**Ruled out:** a module-wide ban on wind-down calling `broadcast` — it copies the group send into wind-down.
+
+### Phase 6 — A shutdown test that reaches the real sender fails instead of sending · status: done
+
+#### As-built
+
+- `scripts/shutdown/test_support.py` defines `class ShutdownSendLeaf(StrEnum)`, one member per real send leaf in `scripts/shutdown/*.py` (the last call before a process that delivers to a session, the other machine or the user), valued at its dotted name. The recipient each stub names follows the dash:
+  - `DELIVER_MESSAGE = "settle._deliver_message"` — runs `send.py`; `settle.send_message`, `settle.alert_user` and `restart.py`'s note and alert all end here — the `recipient` argument.
+  - `RETIRE_SHUTDOWN_MESSAGES = "settle._retire_shutdown_messages"` — `send.py retire` — `session:<session_id>`.
+  - `RESTART_RETIRE = "restart._retire"` — the same retire through `restart._run` — `session:<session_id>`. A `dry_run=True` call passes through to the real function, which only prints.
+  - `RUN_REMOTE = "remote.run_remote"` — `shutdown.py <args>` over ssh — `<other machine>: shutdown.py <args>`.
+  - `LAUNCH_CONDUCTOR = "settle._launch_conductor"` — a detached `shutdown.py conduct <login>` — `conductor for <login>`.
+  - `RUN_NOTIFIER = "settle.run_notifier"` — the progress notifier's `start` / `stop` — `notifier <instance>`.
+- `class ShutdownTestCase(unittest.TestCase)`: `setUp` patches every binding in `_REAL_LEAF_BINDINGS` with a stub. A reached stub records the hit and raises `AssertionError("shutdown test reached real send leaf <dotted name> for <recipient>; fake the step above it, or allow_leaf(ShutdownSendLeaf.<member>) and fake the subprocess beneath it")`, so no process starts. A cleanup registered in `setUp` fails the test for any recorded hit, so a caller that catches the error (`settle.py`'s `except Exception` around `alert_user` and `stop_work.stop`) still fails it.
+- `allow_leaf(leaf: ShutdownSendLeaf) -> None` restores the real function for the rest of the test; called in a subclass `setUp` after `super().setUp()`, it covers the class. It raises `TypeError` for anything but a `ShutdownSendLeaf`; text becomes a leaf only through `ShutdownSendLeaf("<dotted name>")`, which raises `ValueError` for an unknown name. A test that patches a leaf itself replaces the stub for that patch's span and needs no `allow_leaf`.
+- Every `TestCase` in `scripts/shutdown/test_*.py` derives from `ShutdownTestCase` and calls `super().setUp()` first. `SettleTests` allows `DELIVER_MESSAGE`, `RETIRE_SHUTDOWN_MESSAGES` and `RUN_NOTIFIER` class-wide (its `SHUTDOWN_SEND` and `SHUTDOWN_NOTIFIER` stub scripts); `RemoteTests` allows `RUN_REMOTE` class-wide (a fake `ssh` on `PATH`); single tests in `RestartTests`, `SettleTests` and `ShutdownStatusTests` allow the one leaf they reach over a faked subprocess.
+
+**Files:**
+- `scripts/shutdown/test_support.py` — `ShutdownSendLeaf`, `ShutdownTestCase`, the leaf stubs, `_REAL_LEAF_BINDINGS`, `allow_leaf`.
+- `scripts/shutdown/test_send_guard.py` — each leaf blocked with no `subprocess.run` / `Popen` call, a caught error still failing, `dry_run=True` passing, `allow_leaf` in a test and in `setUp`, a test's own patch, `RUN_REMOTE` restoring all four bindings, an unknown leaf name refused.
+- `scripts/shutdown/test_inventory.py`, `test_record.py`, `test_remote.py`, `test_restart.py`, `test_settle.py`, `test_shutdown_cli.py`, `test_shutdown_status.py`, `test_stop.py` — derive from `ShutdownTestCase`.
+
+**Binds later work:** A new `TestCase` in `scripts/shutdown/` derives from `ShutdownTestCase` and calls `super().setUp()` first.
+
+**Gotchas:**
+- `settle`, `restart` and `shutdown` import `run_remote` by name, so `RUN_REMOTE` stubs and restores four bindings: `remote.run_remote`, `settle.run_remote`, `restart.run_remote`, `shutdown.run_remote`. A new module that imports `run_remote` by name, or a new send leaf, needs an entry in `_REAL_LEAF_BINDINGS` and a stub in `setUp`, or it goes unguarded.
+- `_REAL_LEAF_BINDINGS` holds the real functions captured when `test_support` is imported, so `allow_leaf` restores them even inside a case nested in another guarded case.
+- An uncaught hit is reported twice (the stub's error, then the cleanup's failure); assert the outcome, not a failure count.
+- A proof case defines its `ShutdownTestCase` subclass inside the test method and runs it into a `unittest.TestResult()`; a module-level subclass would be discovered and run on its own. `ShutdownTestCase` has no `test_*` methods, so `discover` importing `test_support.py` adds no tests.
+- `alert_user` returns before sending for a `selected` scope; only an account-wide scope (`record.AllAccountSessions`) reaches `DELIVER_MESSAGE`.
+- `test_shutdown_cli.py`'s child processes (`shutdown.py launch-blocked`, `launch_permission.py exec-new-work`) run outside the guard; neither reaches a leaf.
+- `test_settle.py`'s fake send script reads stdin on every call, `retire` included, so with an open stdin its rollback tests each wait out the 60 s retire timeout.
+
+**Ruled out:** guarding calls that end or start sessions (`stop.py`'s `systemctl` / `launchctl` / `tmux kill-session` / `codex_mesh.py stop` and signals, `restart._add_unit_command`, the launches in `restart._run`) or the read-only `git`, `ps`, `tmux capture-pane` and `github-warm-status` probes — none delivers a message.
+
+### Phase 7 — `broadcast.py` takes its groups from the roster · status: done
+
+#### As-built
+
+- `broadcast.py` selects recipients from `roster.roster()` rows by identity, never by name: a unit's workers carry `UnderDirector(<that director's address>)`, a showrunner's units `UnderShowrunner(<its address>)`; `RunsProduction`, `DirectsUnit`, `ProductionWithoutRunningShowrunner` and `NoDirector` rows join no such group.
+- `BroadcastGroup` (closed, in `broadcast.py`) is not the roster's `Role`, because flags overlap. `broadcast.broadcast(sender, texts: Mapping[BroadcastGroup, str])`; `codex_winddown.announce()` passes `BroadcastGroup` keys. Flags: `--showrunners`; `--units`; `--agents` (every worker and freestanding session, Claude and Codex); `--workers TEXT`, narrowed by a preceding `--of <unit, director name, or session: address>` (unknown: usage error naming the known units; two matching directors: exit 2 listing their addresses); `--top-level TEXT` (Claude sessions neither a unit director under a showrunner nor a worker); `--all`, after which a role flag keeps its own text. A row several flags select gets one delivery, with the last selecting flag's text.
+- Delivery is `send.py --to <address>` from the `Messageable` reach, never `--action`/`--no-action`. A `CannotReceiveMessages` row prints `send.py`'s line (reason, then its unit director or that none runs) and is neither sent nor a failure. A roster problem prints `broadcast: roster: <problem>` and the rest sends. Each selected group with no member besides the sender prints `<group> - none on this machine` before `N sent in S s`.
+- `roster.sender_identity(env) -> SenderIdentity = CodexThread | ClaudeSession | NoSession` (frozen dataclasses). `CODEX_THREAD_ID` wins, since a Codex shell inherits its launching session's `CLAUDE_CODE_SESSION_ID`. `CodexThread` matches a row's `thread`, `ClaudeSession` its `session` (a socketless sender is still left out), `NoSession` nothing. `broadcast.py`, `top_level.py` and the roster's "this session" mark use it.
+- `RosterEntry` gains `thread: CodexThread | NoCodexThread` (from the mesh record or `codex:` address; `--json` `thread`, id or `null`) and `session: ClaudeSession | NoClaudeSession` (newest running session record; no `--json` field). Link addresses, nesting, sort and `--of` use `roster._session_address(entry)` on `session`, so a socketless unit director still owns its workers.
+- A running Claude session whose newest record has no messaging socket is a row with `CannotReceiveMessages("no messaging socket")`: `send.py` refuses it by name (exit 2), `top_level.py` prints `not reachable:`.
+- `sessions.py` adds `running_session(record)` (pid exists), `messaging_socket_exists(record)` and `running_sessions()` (newest first); `live_session`/`live_sessions()` still mean running with a socket.
+- `top_level.py` lists Claude rows that are not unit directors under a showrunner, not workers, not the sender (`NoSession` leaves nobody out), as `<name>\tuds:<socket path>` for `/notify_top_level`'s SendMessage; `build_hold.py record-recipient` gets the row's session id. Same-name sessions are two lines; one conversation in two processes is one line, from the newest record. Roster problems go to stderr as `top_level: roster: <problem>`, exit 0.
+
+**Files:**
+- `scripts/production/broadcast.py` — `BroadcastGroup`, selection and delivery
+- `scripts/message/roster.py` — `SenderIdentity`, `RosterEntry.thread`/`.session`, socketless rows, link addresses
+- `scripts/message/sessions.py` — running and live session readers
+- `scripts/message/top_level.py` — top-level set from the roster
+- `scripts/production/codex_winddown.py` — `announce()` with `BroadcastGroup` keys
+- tests: `scripts/production/test_{broadcast,codex_winddown}.py`, `scripts/message/test_{roster,top_level,sessions}.py`
+
+**Binds later work:**
+- `running_session` checks only the pid, so a stale socketless record with a reused pid reads as running; "a session with no messaging socket is listed only while its own process runs" proves it by `procStart`.
+- Both machines: `--snapshot` carries `session` and `thread`; the remote run is `NoSession`; the empty-group line prints per machine; `send.py`'s director tail on a refusal fits only workers.
+- `docs/as-built/build-memory-admission.md:178` still describes `top_level.py`'s old reader and its usage error.
+
+**Gotchas:**
+- Tests that fake both session readers hide the socket cases; socket fixtures build real session records.
+- `scripts/shutdown/test_inventory.py` fakes `sessions.live_session`, so `live_sessions()` must select through that predicate.
+
+**Ruled out:** name matching for membership or sender exclusion; a `--json` field for `RosterEntry.session`.
+
+### Phase 8 — The shutdown inventory tests see their sessions again · status: done
+
+#### As-built
+
+`sessions._readable_records()` yields every readable registry record. `running_sessions()` keeps those `running_session` accepts and `live_sessions()` those `live_session` accepts, each newest `updatedAt` first. `live_session` is `running_session(record) and messaging_socket_exists(record)`, so the pid check lives in `running_session` alone. Production results are unchanged.
+
+**Files:**
+- `scripts/message/sessions.py` — the session registry readers
+- `scripts/message/test_sessions.py` — regression test that `live_sessions()` selects through a patched `live_session`
+
+**Binds later work:** a change to `running_session` keeps `_readable_records()` and per-predicate selection in both readers.
+
+**Gotchas:** `scripts/shutdown/test_inventory.py` fakes `sessions.live_session` to admit dead-pid fixtures, so `live_sessions()` must call that predicate per record. Suites outside the message package (build_hold, model_study rerun, shutdown) read `live_sessions()`.
+
+**Ruled out:** `live_sessions()` as `running_sessions()` filtered by the socket check (hides the predicate from fakes).
+
+### Phase 9 — A session with no messaging socket is listed only while its own process runs · status: todo
+
+#### Work Order
+
+**Goal:** a leftover Claude session record whose pid now belongs to another process is not a roster row, while a running Claude session with no messaging socket still is.
+
+**Spec:**
+- Phase 7 made a running Claude session with no messaging socket a roster row, `CannotReceiveMessages("no messaging socket")`. `running_session(record)` checks only that the pid exists, so a record left by a session that died without removing it becomes such a row once another process takes its pid. That phantom is reported by `broadcast.py` as a session that was not told, is listed by `top_level.py` as not reachable, and makes a bare name ambiguous in `send.py` (exit 2) when a new session takes the dead one's name.
+- `sessions.py` owns the process-start reader, moved from `scripts/shutdown/inventory.py` `_process_start`: `process_start(pid: int) -> str | None` reads field 22 of `/proc/<pid>/stat` on Linux, and `ps -o lstart= -p <pid>` under `LC_ALL=C` and `TZ=UTC` on macOS, the form Claude Code writes `procStart` in. `inventory.py` uses it in place of its copy, with the same behavior; one copy of the reader remains.
+- `SessionRecord` keeps `procStart`. `running_session(record)`: the pid exists, and either the record's messaging socket exists or its `procStart` equals `process_start(pid)`. A record with no socket and a missing or empty `procStart` is not running. `live_session` stays `running_session(record) and messaging_socket_exists(record)`, so `live_sessions()` and every caller that needs a socket keep today's results.
+- Cost: on Linux one `/proc` read per socketless record; on the Mac one `ps` per socketless record, usually none.
+- Regression tests, each named for the behavior it pins and each failing on the tree before the repair: a socketless record whose pid runs with a different start is in neither `running_sessions()` nor the roster; `top_level.py` lists no such phantom. Also: a socketless record whose start matches is a `CannotReceiveMessages("no messaging socket")` row, and a record with a socket and no `procStart` is still live. The macOS start-format test moves to `test_sessions.py` with the reader if it no longer exercises `inventory.py`.
+
+**Files:**
+- `scripts/message/sessions.py`
+- `scripts/message/test_sessions.py`
+- `scripts/message/test_roster.py` — fixtures for socketless rows carry a matching start.
+- `scripts/message/test_top_level.py` — the same.
+- `scripts/shutdown/inventory.py` — uses `sessions.process_start`.
+- `scripts/shutdown/test_inventory.py` — only to move the macOS start-format test.
+
+**Seats:** `1 writer`.
+- `impl` — every file above; hub: `sessions.py`.
 
 **Constraints from prior phases:**
-- Phase 1's `roster(environment: Mapping[str, str]) -> Roster` (`entries`, `problems`) and `main(argv) -> int`. `RosterEntry` has 15 string fields: `machine`, `kind`, `role`, `name`, `status`, `address`, `cwd`, `production`, `showrunner`, `showrunner_address`, `unit`, `director`, `director_address`, `slot_role`, `session_dir`. `showrunner_address` and `director_address` are `session:<id>` addresses and are what nesting and `--kind` context match on; names are display only.
-- A Codex worker's `address` is its seat name today, and a blind reviewer's is empty; this phase replaces both.
-- `codex_daemon.loaded_sessions(socket_path) -> list[DaemonSession] | DaemonUnreadable` reads under one 5 s deadline for the whole read (`_OperationDeadline`, module clock `_clock = time.monotonic`); `daemon_socket(environment)` gives the socket path. `queue` is a subprocess call and takes its own timeout.
-- Phase 2's `send.py` options carry `action: MessageUserAction = UserAction | NoUserRecipient`: `UserAction` for `--to user`, `NoUserRecipient` for every other recipient; `--action`/`--no-action` without `--to user` is a usage error (`--action and --no-action go with --to user`); `remote()` forwards the action flags only for `user`. `REFUSED:` is exit 2, only when `pushover.py` exits 2 with `refused before sending:` (`user_action.REFUSED_BEFORE_SENDING`) on stderr. The user path is unchanged here.
-- Phase 2's `user_action.refused_at` returns `ActionRefused | None`; `settle.send_message(..., action: UserAction)` requires an action for every recipient, so session callers pass an ignored `NoActionRequired()`.
-- model-study (bbbd791, on the merge branch): mesh entries carry `role` (`impl`, `test`, `fix`, `review`), omitted for roleless threads; `context_tokens`; status `ended` from `codex_mesh.py end`/`stop`. `lens` arrives later. Phase 1 reads `role`, `lens` and `ended` already.
+- Phase 8's readers: one private reader of readable records; `running_sessions()` selects through `running_session` and `live_sessions()` through `live_session`, both newest `updatedAt` first.
+- `scripts/shutdown/test_inventory.py` patches `inventory._process_start`, `sessions.live_session` and `unit_lookup.live_session`; those patches keep working. Every shutdown `TestCase` derives from `test_support.ShutdownTestCase`.
+- Phase 7's socketless row is `CannotReceiveMessages("no messaging socket")`, and `RosterEntry.session` comes from the newest running record.
 
-**Acceptance gate:** the Test and Lint lines green, plus `python3 -m unittest discover -s scripts/notify -p 'test_*.py'`, `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` and basedpyright `scripts/notify scripts/shutdown` 0/0/0. Live, scratch recipients only:
-- a scratch mesh thread in a scratch session directory gets `send.py --to seat:<run id>/<seat name>`, and again by its bare seat name, without `--session-dir`;
-- a scratch daemon thread (started with `thread/start`, `ephemeral: false` — the daemon refuses queued submissions to an ephemeral thread — over the socket, then archived) gets `send.py --to codex:<id>` and shows the queued message in `thread/read` or its queue;
-- an ambiguous name exits 2.
+**Acceptance gate:** the Test and Lint lines green. Live, read only: on natedev `live_sessions()`, `running_sessions()` and `roster.py --json` give the same sessions as on the tree before the phase, so no running session is lost. No Pushover post during the run.
 
-### Phase 4 — A message with no action stated is refused · status: todo
-
-#### Work Order
-
-**Goal:** a message to the user that says neither its action nor that none is needed does not leave: Phase 2's transition warning becomes the refusal.
-
-**Spec:**
-- `pushover.py` refuses `ActionUnstated` like Phase 2's other cases: nothing sent, exit 2, the stderr line `pushover: refused before sending: no action stated. <FIX>`, and log outcome `refused before sending: no action stated`. The warning line and the `sent without an action line` outcome are removed.
-- Before dispatch, the unit director reads the pushover log since the Phase 2 checkpoint for `sent without an action line` entries. Each entry names its source; any source still in that list is updated in this phase when it is in this repo, or named to natedev when it is not.
-
-**Files:**
-- `scripts/notify/pushover.py`
-- `scripts/notify/test_pushover.py`
-
-**Seats:** `1 writer + 1 tester` — nothing splits.
-- `impl` — `pushover.py`.
-- `test` — `test_pushover.py`, from this Spec alone.
-
-**Constraints from prior phases:** Phase 2's `scripts/notify/user_action.py` (`parse_user_action` → `UserAction | ActionUnstated | ActionRefused`, `refused_at`, `first_line`, `FIX`), `pushover.py`'s `--source` and its log entries naming their source, and its refusal line and exit 2. Phase 3's `refused_at` returns `ActionAllowed | ActionRefused`, and `settle.py`'s `alert_user` always passes `--action`. `send.py --to user` and `escalate.py hold` already treat `ActionUnstated` as a usage error, so neither changes here.
-
-**Acceptance gate:** every `sent without an action line` source logged since checkpoint 39f9b69 is either migrated in this repo or confirmed by natedev as passing the flags; `pushover.py`'s docstring names exit 2 as a refusal; `python3 -m unittest discover -s scripts/notify -p 'test_*.py'` green; basedpyright `scripts/notify` 0/0/0; live: `pushover.py "t" "m"` exits 2 and logs the refusal with its source, with nothing sent.
-
-### Phase 5 — Process listing gets its own module · status: todo
-
-#### Work Order
-
-**Goal:** the process table that the roster, `broadcast.py` and Codex wind-down read comes from one module that imports none of them, so `broadcast.py` can read the roster next without an import cycle and wind-down keeps working.
-
-**Spec:**
-- `scripts/message/process_table.py` (new, standard library only) holds what `scripts/production/broadcast.py` defines today, moved without a change in behavior:
-  - `Process(pid, parent, command, arguments)`, a `NamedTuple`;
-  - `snapshot() -> dict[int, Process]` (today's `processes()`), running `ps -eo pid=,ppid=,comm=,args=`, overridable by `PROCESS_TABLE_PS` (replacing `BROADCAST_PS`);
-  - `is_codex_agent(process: Process) -> bool`, unchanged.
-- `roster.py` imports `process_table` and no longer imports `broadcast`.
-- `broadcast.py` imports `Process`, `snapshot` and `is_codex_agent` from `process_table` and deletes its own copies. Its recipient code is otherwise unchanged; the next phase replaces it.
-- `codex_winddown.py` reads the process table through `process_table`, and its pid-to-name map from `sessions.live_sessions()` (`{record["pid"]: record["name"] for record in sessions.live_sessions() if record["name"]}`) in place of `broadcast.live_sessions()`. It still sends through `broadcast.send`.
-- `codex_winddown.py`'s `Projection = float | Literal["unmeasured"] | None` becomes named states: `ProjectedCompletion(fraction)`, `CompletionUnmeasured()`, `ProjectionAnswerOwed()` (frozen dataclasses), converted from JSON in `read_projections()`; `test_codex_winddown.py` covers each.
-- Every test that set `BROADCAST_PS` sets `PROCESS_TABLE_PS`. `is_codex_agent`'s cases move to `scripts/message/test_process_table.py`.
-
-**Files:**
-- `scripts/message/process_table.py` — new.
-- `scripts/message/test_process_table.py` — new.
-- `scripts/message/roster.py`
-- `scripts/message/test_roster.py`
-- `scripts/production/broadcast.py`
-- `scripts/production/test_broadcast.py`
-- `scripts/production/codex_winddown.py`
-- `scripts/production/test_codex_winddown.py`
-
-**Seats:** `1 writer + 1 tester`.
-- `impl` — `process_table.py`, `roster.py`, `broadcast.py`, `codex_winddown.py`; hub: `process_table.py` (the one process table every caller reads).
-- `test` — `test_process_table.py`, `test_roster.py`, `test_broadcast.py`, `test_codex_winddown.py`, from the Spec alone.
-
-**Constraints from prior phases:**
-- `roster.py` reads the process table in `_process_cwds`, `_process_words`, the ancestry walk for blind reviewers and the worker liveness check, all typed on `broadcast.Process`; Phase 3 left these unchanged.
-- `codex_winddown.py` uses `broadcast.live_sessions()`, `broadcast.processes()`, `broadcast.is_codex_agent()`, `broadcast.send` and `broadcast.MESSAGE`; Phase 2 changed only its user message's flags.
-- `sessions.live_sessions() -> list[SessionRecord]` returns every live session, newest record first.
-
-**Acceptance gate:** the Test and Lint lines green, `python3 -m unittest discover -s scripts/production -p 'test_codex_winddown.py'` included. `grep -n "import broadcast" scripts/message/roster.py` prints nothing. Live read-only: `roster.py` lists the same sessions as before the phase.
-
-### Phase 6 — `broadcast.py` takes its groups from the roster · status: todo
-
-#### Work Order
-
-**Goal:** every group send reaches the roster's members of that group, Claude and Codex, and two new groups exist: workers (all, or one unit's) and top level.
-
-**Spec:**
-- `recipients()` reads `roster.roster()` in place of its own session, unit and `codex_seats` code, which is removed, `live_sessions()` included.
-- **Membership comes from identity, never from names.** A unit's workers are the rows whose `director_address` is that unit director's address; a showrunner's units are the rows whose `showrunner_address` is that showrunner's. The sender is left out by identity: the row whose `reach` is `Messageable("session:$CLAUDE_CODE_SESSION_ID")`, and no other row that happens to share its name. Membership matches on Phase 3's link states (`UnderDirector.address`, `UnderShowrunner.address`).
-- Groups:
-  - `--showrunners`: role showrunner.
-  - `--units`: role unit director.
-  - `--agents`: every worker and every freestanding session, Claude and Codex, the user's Codex sessions included.
-  - `--workers TEXT`: every worker. With `--of <unit, unit director name, or session: address>` placed before it, only that unit's workers. An unknown unit is a usage error naming the known ones; a name matching more than one unit director is a usage error listing each one's address.
-  - `--top-level TEXT`: every Claude session that is not a unit director under a showrunner and not a worker, matching `top_level.py`'s set.
-  - `--all`: every role. A role's own flag after `--all` still gives that role its own text.
-  - A row selected by several flags gets one delivery, with the text of the last flag on the command line that selects it.
-- Every recipient is sent through `send.py --to <address>` from its `Messageable` reach, never with `--action` or `--no-action`. `broadcast.py`'s `Recipient` names its route as a state (a Claude session or a Codex worker), replacing the `codex = ""` sentinel. A `CannotReceiveMessages` row (a blind reviewer) is reported `<name>: cannot take messages; contact its unit director <director> or wait`, is not sent, and is not counted as a failure.
-- Each roster problem prints as `broadcast: roster: <problem>`, and the send continues to the rows that were read.
-- The closing line still says who was sent the message, using the new role names.
-- **`top_level.py`** takes its set from `roster.roster()`: Claude rows that are not unit directors under a showrunner, not workers, and not this session by `session:` identity. Its output stays `<name>\tuds:<socket path>`, the socket path read from that session's record through `sessions.py`, because `/notify_top_level` hands it to SendMessage. The `build_hold.py record-recipient --session-id <id> --name <name>` call takes the id from the row's `Messageable("session:<id>")` reach. Two live sessions sharing a name are two lines. A row whose record has no messaging socket prints the `not reachable:` line, as today.
-- **Tests** (`test_broadcast.py`, `test_top_level.py`) fake the roster or build its fixtures. Named cases: two workers sharing a seat name under different directors, each sent once to its own unit by `--of`; `--of` matching two directors is a usage error; a session sharing the sender's name is still sent; a reviewer reported and not counted; a roster problem printed while the rest sends; `top_level.py` two same-name sessions, two lines and two `record-recipient` calls; `--all --top-level --showrunners` sends each row once with the last selecting flag's text.
-
-**Files:**
-- `scripts/production/broadcast.py`
-- `scripts/production/test_broadcast.py`
-- `scripts/message/top_level.py`
-- `scripts/message/test_top_level.py`
-
-**Seats:** `1 writer + 1 tester`.
-- `impl` — `broadcast.py`, `top_level.py`; hub: `broadcast.py` (recipient and group assembly).
-- `test` — `test_broadcast.py`, `test_top_level.py`, from the Spec alone.
-
-**Constraints from prior phases:**
-- Phase 1's `RosterEntry` fields and `roster(environment) -> Roster` (`entries`, `problems`); `showrunner_address` and `director_address` are `session:<id>`.
-- Phase 3's addresses: `session:<id>`, `seat:<run id>/<seat name>`, `codex:<thread id>`, each unique; `RosterEntry.reach: Messageable(address) | CannotReceiveMessages(reason)`; link states `UnderShowrunner | NoShowrunner`, `UnderDirector | NoDirector`, `WorkerAssignment | NotAWorker`; `send.py --to <address>` reaches each, and exits 2 for a `CannotReceiveMessages` name or an ambiguous name. `--action`/`--no-action` on a non-user send is a usage error (Phase 2).
-- Phase 5's `process_table` module: `roster.py` no longer imports `broadcast`, so `broadcast.py` may import `roster`. `codex_winddown.py` still uses `broadcast.send` and `broadcast.MESSAGE`, which stay.
-- `/notify_top_level` reads `top_level.py`'s `uds:` addresses and hands them to SendMessage.
-
-**Acceptance gate:** the Test and Lint lines green, `test_top_level.py` included. A live dry check (`BROADCAST_SEND` pointed at a script that records its arguments) lists the recipients for each flag on natedev, with no message sent, and each flag's list equals the rows `roster.py --json` gives for that group at that moment. A group with no members (no showrunner registered, for one) lists none and says so.
-
-### Phase 7 — Both machines · status: todo
+### Phase 10 — Both machines · status: todo
 
 #### Work Order
 
@@ -310,13 +339,25 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
   - `roster.py` (the command) reads `AllMachines`; `--here` reads `ThisMachine`.
   - `broadcast.py` and `top_level.py` read `ThisMachine`: `broadcast.py` reaches the other machine by running itself there, and `top_level.py` lists this machine only (`/notify_top_level` adds other-machine peers from ListAgents).
   - `send.py` reads `ThisMachine` first and the other machine only when nothing here matches.
-- **`AllMachines`** runs `roster.py --here --json` on `remote.other_machine()` over `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/roster.py" --here --json'`, in parallel with the local read, and merges the entries, this machine first.
-  - ssh failure, a timeout (20 s) or unparseable JSON is one problem line, `<host>: not reached: <why>`, and exit 1.
-  - The other machine's own problems come through, prefixed by its name.
-- **Routing in `send.py`.** Every address form is unique on both machines (Phase 3). This machine first, for every form: a match here is sent here and the other machine is not asked, so a bare name on both machines reaches this machine's session, and `--machine <host>` or the address reaches the other one. An address or a bare name that matches no row here is looked up in the other machine's roster; exactly one `Messageable` row there sends through the existing `--machine <host>` path with its address (action flags forwarded only for `user`); several rows there are Phase 3's ambiguity; a `CannotReceiveMessages` row there gives Phase 3's `cannot take messages` line; an unreachable machine is the `not reached` problem line and the send fails.
-- **`broadcast.py`** runs `broadcast.py --here` on the other machine over ssh with the same flags and texts, and prints its lines under the host's name. The closing line names both machines. `--here` keeps it to this machine and runs no ssh. An unreachable machine is one `NOT sent` line for that machine.
+- **`AllMachines`** runs `roster.py --here --snapshot` on `remote.other_machine()` over `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/roster.py" --here --snapshot'`, in parallel with the local read, and merges the entries, this machine first.
+  - `--snapshot` prints `RosterSnapshot`, a lossless tagged JSON form of `Roster` used only between machines and hidden from `--help`: every reach, relationship, thread and session variant carries its tag and its fields, `CannotReceiveMessages.reason` and `RosterEntry.session` (`ClaudeSession | NoClaudeSession`) included. It is decoded at once into the same variants, so a remote `RosterEntry` equals the one that machine built, and a socketless unit director there keeps its linked workers. `--json` stays the flat public form, unchanged, with no session field.
+  - The remote run has neither `CODEX_THREAD_ID` nor `CLAUDE_CODE_SESSION_ID`, so its sender is `NoSession` and it leaves nobody out: the sender is not on that machine.
+  - ssh failure, a timeout (20 s) or output that does not decode as a snapshot is one problem line, `<host>: not reached: <why>`, and exit 1.
+  - A snapshot that decodes is used whatever the remote exit status: a remote exit 1 with problems still gives its rows, and each of its problems comes through prefixed by the machine's name.
+- **Routing in `send.py`.** The argparse boundary builds `RecipientResolutionScope = LocalOnly | LocalThenPeer | NamedMachine(host)` (frozen dataclasses), replacing `Options.machine: str | None`: `--here` is `LocalOnly`, `--machine HOST` is `NamedMachine(HOST)`, neither is `LocalThenPeer`, and `--here` with `--machine` is a usage error. Every send this machine makes on the other over ssh passes `--here`, so the other machine never asks back. `uds:` is always this machine's socket and never asks the other machine.
+  - `LocalThenPeer`, this machine first for every form: a match here is sent here and the other machine is not asked, so a bare name on both machines reaches this machine's session, and `--machine <host>` or the address reaches the other one. An address that matches no row here, or a bare name that matches no row in a clean local roster (no `Roster.problems`), is looked up in the other machine's roster; exactly one `Messageable` row there sends through `NamedMachine(host)` with its address (action flags forwarded only for `user`); several rows there are Phase 3's ambiguity; a bare name matching only a `CannotReceiveMessages` row there gives Phase 3's `cannot take messages` line with that machine's reason; an unreachable machine is the `not reached` problem line and the send fails.
+  - A bare name with no match here while the local roster has problems is not looked up on the other machine, because absence here is not proven: the problems are printed and the send exits 2 asking for an address or `--machine`.
+  - A `CannotReceiveMessages` row has no address, so a `seat:` address of a seat between turns matches no row on either machine and keeps Phase 3's `no roster session has address` line.
+  - **One refusal text.** `send._cannot_receive_message()` and `broadcast._unreachable()` both append unit-director advice to every refusal today, including a Claude session with no messaging socket, for which no director is expected. One function builds the text for both. Its tail follows the row: a worker under a director gets `contact its unit director <name> or wait`; a worker with `NoDirector` gets no tail, because its reason already says no unit director is running; a Claude session with `no messaging socket` gets `wait for it to open its messaging socket, then read the roster again and send again`. `send.py` refuses with exit 2; `broadcast.py` reports the line and does not fail.
+  - **Recipient selection is named.** `Options.session_dir: str | None` with `codex: bool` becomes, at the argparse boundary, `RecipientSelection = RosterLookup(to) | MeshSeat(session_dir, seat)` (frozen dataclasses) beside `RecipientResolutionScope`; the legacy `--codex --session-dir` flags keep working. A `MeshSeat` names one machine's session directory, so it never asks the other machine: under `LocalOnly` or `LocalThenPeer` it is delivered here, and under `NamedMachine(host)` it is forwarded over ssh with `--here`.
+  - A clean miss on the other machine falls back to Phase 3's local outcome for that form: a `session:` address is kept in the queue here (exit 1), a `codex:` address goes to this machine's daemon, a `seat:` address is `no roster session has address` (exit 2), and a bare name gets Phase 3's no-match result.
+- **`broadcast.py`** runs `broadcast.py --here` on the other machine over ssh with the same groups and texts, and prints its lines under the host's name. The closing line names both machines. `--here` keeps it to this machine and runs no ssh. An unreachable machine is one `NOT sent` line for that machine. When `BROADCAST_SEND` is set here, the ssh command sets it on the other machine to the same path, so a recorder selected here is selected there too; a path missing there fails the send there and delivers nothing.
+  - **One orchestration for both entry points.** `broadcast.broadcast()`, which `codex_winddown.announce()` calls, and the command line run the same local-plus-other-machine path, so wind-down announcements reach both machines; `codex_winddown.py` itself is unchanged.
+  - **`--of` is resolved once across both machines.** `--of session:<id>` or a director's name is matched against both machines' unit directors before anything is delivered: exactly one director gives that director's machine and its resolved identity, and the run on that machine selects by that identity; a name matching directors on both machines is refused before any delivery, listing their addresses; no match is the unknown-unit error. A director's address or name is never replayed unchanged to the other machine, where it can mean nothing or a different director.
+  - **Each delivery stays on the roster row's machine.** Every per-row `send.py` call passes `--here`, so a recipient that leaves between the roster read and its send is a failed delivery here and never a lookup on the other machine.
+  - `<group> - none on this machine` is printed per machine, the other machine's under its host name.
 - The Mac has no tmux: there, unit directors come from the worktree match, and the tmux problem line is left out on a machine with no `tmux` binary.
-- **Tests** fake `ssh`, recording each call. Named cases: a Claude session, a mesh worker and a daemon session each found only on the other machine are sent through `--machine` with their address; one delivery per recipient when both machines answer; a name on both machines is sent here with no ssh call; `--here` on `roster.py`, `broadcast.py` and `send.py` makes no ssh call; `top_level.py` makes no ssh call; an unreachable machine is one problem line and the local rows still print.
+- **Tests** fake `ssh`, recording each call. Named cases: a Claude session, a mesh worker and a daemon session each found only on the other machine are sent through `--machine` with their address; one delivery per recipient when both machines answer; a name on both machines is sent here with no ssh call; `--here` on `roster.py`, `broadcast.py` and `send.py` makes no ssh call; `top_level.py` makes no ssh call; an unreachable machine is one problem line and the local rows still print; a remote snapshot with a problem and exit 1 gives its rows and its prefixed problem; every reach and relationship state round-trips through `--snapshot`, a remote refusal reason included; each `RecipientResolutionScope` case, and `--here` with `--machine` as a usage error; every ssh send carries `--here`; a clean miss on the other machine gives each form's Phase 3 local outcome; a bare name absent from a local roster with problems asks no other machine and delivers to no same-named session there; a `seat:` address of a seat between turns on the other machine says `no roster session has address`; the refusal tail for a worker under a director, a worker with `NoDirector` (no tail) and a Claude session with no messaging socket, through `send.py` (exit 2) and `broadcast.py` (reported, not a failure); `BROADCAST_SEND` reaches the ssh command only when set here. Also: `--of` for a director only on this machine, one only on the other, and two directors sharing a name across the machines (refused before any delivery); `codex_winddown.announce()` reaching both machines for each of its groups through fake ssh; every per-row delivery carries `--here`, and a recipient that disappears after the roster read causes no lookup on the other machine; a socketless unit director with linked workers, `RosterEntry.session` and each thread variant round-trip through `--snapshot`; the remote run leaves nobody out; each machine's `<group> - none on this machine` line under its host; each `RecipientSelection` with each scope.
 
 **Files:**
 - `scripts/message/roster.py`
@@ -325,22 +366,25 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 - `scripts/message/test_send.py`
 - `scripts/production/broadcast.py`
 - `scripts/production/test_broadcast.py`
+- `scripts/production/test_codex_winddown.py` — wind-down announcements reach both machines.
 - `scripts/message/top_level.py` — passes `ThisMachine`.
 - `scripts/message/test_top_level.py`
 
 **Seats:** `1 writer + 1 tester`.
-- `impl` — `roster.py`, `send.py`, `broadcast.py`, `top_level.py`; hub: `roster.py` (`RosterScope` and the aggregate read).
-- `test` — `test_roster.py`, `test_send.py`, `test_broadcast.py`, `test_top_level.py`, from the Spec alone.
+- `impl` — `roster.py`, `send.py`, `broadcast.py`, `top_level.py`; hub: `roster.py` (`RosterScope`, `RosterSnapshot` and the aggregate read).
+- `test` — `test_roster.py`, `test_send.py`, `test_broadcast.py`, `test_codex_winddown.py`, `test_top_level.py`, from the Spec alone.
 
 **Constraints from prior phases:**
 - Phase 3's addresses (`session:<id>`, `seat:<run id>/<seat name>`, `codex:<thread id>`), `RosterEntry.reach`, and `send.py`'s resolution order and exit codes: 0 sent, 1 queued for a Claude session, 2 a usage error, an ambiguous name, a session that cannot take messages, or a refusal, 3 failed.
 - Phase 5's `process_table` module; `roster.py` does not import `broadcast`.
-- Phase 6's groups (`--showrunners`, `--units`, `--agents`, `--workers` with `--of`, `--top-level`, `--all`), membership by `director_address` and `showrunner_address`, the sender left out by `session:` identity, roster problems printed while the rest sends, and `top_level.py`'s `<name>\tuds:<socket path>` lines.
+- Phase 7's groups (`--showrunners`, `--units`, `--agents`, `--workers` with `--of`, `--top-level`, `--all`) as `BroadcastGroup`, membership by `UnderDirector` / `UnderShowrunner` addresses, the sender left out by `SenderIdentity` (`CODEX_THREAD_ID`, else `CLAUDE_CODE_SESSION_ID`), `RosterEntry.thread`, roster problems printed while the rest sends, and `top_level.py`'s `<name>\tuds:<socket path>` lines.
+- Phase 7's `RosterEntry.session: ClaudeSession | NoClaudeSession`, from the newest running record (`sessions.running_sessions()`, newest first); the sender is matched on it, and link addresses (`UnderDirector.address`, the nesting, `--of`) come from it through `roster._session_address(entry)`, so a socketless unit director still owns its workers. A running Claude session with no messaging socket is a row with `CannotReceiveMessages("no messaging socket")`. A selected group with no member besides the sender prints `<group> - none on this machine` before the count. `top_level.py` with no session id leaves nobody out.
+- Phase 9: a socketless record is running only when its `procStart` matches its process, so a phantom never takes part in local-first resolution.
 - `scripts/shutdown/remote.py` `other_machine()` maps `natedev` and `mac` to each other.
 
-**Acceptance gate:** the Test and Lint lines green. Live: `roster.py` on natedev lists the Mac's sessions; `roster.py --here` on the Mac exits 0 or 1 with no ssh. `broadcast.py`'s dry check covers both machines, each recipient once. One scratch background Claude session on the Mac receives `send.py --to <its name>` from natedev and is then removed.
+**Acceptance gate:** the Test and Lint lines green. Live: `roster.py` on natedev lists the Mac's sessions; `roster.py --here` on the Mac exits 0 or 1 with no ssh. `broadcast.py`'s dry check copies a recorder that records its arguments to the same scratch path on both machines and sets `BROADCAST_SEND` to it; both recorders capture their machine's recipients, each recipient once across the two, no message is sent, and the closing line names both machines. One scratch background Claude session on the Mac receives `send.py --to <its name>` from natedev and is then removed.
 
-### Phase 8 — Claude and Codex sessions know which tool to use · status: todo
+### Phase 11 — Claude and Codex sessions know which tool to use · status: todo
 
 #### Work Order
 
@@ -353,12 +397,13 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
   - `send.py --to <address>` for anything the roster lists;
   - `broadcast.py` and its groups for many at once.
 
-  The Sending bullet's `--codex --session-dir` wording becomes "by its `seat:` address or seat name".
-- `commands/announce.md`, `commands/unit/announce.md` and `commands/showrunner/announce.md` say the message reaches both machines and Codex workers. `commands/notify_top_level.md` keeps its steps and its `uds:` wording; Phase 6 kept `top_level.py`'s output.
+  The Sending bullet's `--codex --session-dir` wording becomes "by its `seat:` address or seat name". The section also says what each refusal means and what to do, in the same words as `codex/AGENTS-messaging.md` below.
+- `commands/announce.md` (`--all`: showrunners, unit directors, Codex workers and every other agent), `commands/unit/announce.md` (`--units`: unit directors) and `commands/showrunner/announce.md` (`--showrunners`: showrunners) each say the message reaches both machines; each description names exactly the members its flag selects, so only `commands/announce.md` names Codex workers. `commands/notify_top_level.md` keeps its steps and its `uds:` wording; Phase 7 kept `top_level.py`'s output. Its "Unit directors are left out" becomes: unit directors under a showrunner are left out, since their showrunner passes the message on, and a unit director with no showrunner is included.
 - `codex/AGENTS-messaging.md` (new, in this repo) is the Codex text, short:
   - list every session with `~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py`;
   - message one with `send.py --to <address> --from <your session name>`, a group with `broadcast.py`;
   - message the user with `send.py --to user --summary … --text …` and `--action "<what the user does>"` or `--no-action`; emergency only when the user must act now; `REFUSED:` (exit 2) means fix the action flags as the line says and send again, with no PushNotification fallback; action flags go only with `--to user`;
+  - what each refusal means and what to do: `cannot take messages (<reason>)` (exit 2) — a seat between turns is resumed only by its unit director, so contact that director or wait; `cannot take messages (no messaging socket)` (exit 2) — a Claude session that has not opened its messaging socket yet, so wait, read the roster again and send again; a name matching several sessions (exit 2) lists their addresses, so send again with one of them; `no roster session has address` (exit 2) — the address is stale or its seat is between turns, so read the roster again; `FAILED:` (exit 3) from a Codex queue failure or timeout gets no fallback and is reported;
   - the first-line, context and content-not-approval rules from `/message`;
   - the roster needs network for the other machine and a socket for the daemon, so a sandboxed command that fails is rerun outside the sandbox the way the user's AGENTS.md rules say.
 - `scripts/message/install_codex_agents.py [--machine HOST]` writes that text into `~/.codex/AGENTS.md` between `<!-- claude-messaging: begin -->` and `<!-- claude-messaging: end -->`.
@@ -383,8 +428,8 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 **Constraints from prior phases:**
 - Address forms: `session:<id>` (Claude), `seat:<run id>/<seat name>` (Codex worker), `codex:<thread id>` (the user's Codex sessions), or a bare name; a name matching several rows exits 2 and lists their addresses.
-- `send.py` exit codes: 0 sent, 1 queued for a Claude session, 2 a usage error, an ambiguous name, a session that cannot take messages, or a refusal (`REFUSED:`), 3 failed. `--to user` needs `--action TEXT` or `--no-action`; `--need decision` and `--need blocked` need `--action`.
-- `broadcast.py` groups: `--showrunners`, `--units`, `--agents`, `--workers` (with `--of <unit>` before it), `--top-level`, `--all`; both machines unless `--here`.
+- `send.py` exit codes: 0 sent, 1 queued for a Claude session, 2 a usage error, an ambiguous name, a session that cannot take messages, an address no roster session has, or a refusal (`REFUSED:`), 3 failed. `--here` keeps a send to this machine; `--machine HOST` sends from that machine; neither looks here first, then on the other machine. `--to user` needs `--action TEXT` or `--no-action`; `--need decision` and `--need blocked` need `--action`.
+- `broadcast.py` groups: `--showrunners`, `--units`, `--agents`, `--workers` (with `--of <unit>` before it, resolved once across both machines), `--top-level`, `--all`; both machines unless `--here`. It leaves its sender out by `CODEX_THREAD_ID`, else `CLAUDE_CODE_SESSION_ID`, so a Codex session needs no flag for that.
 - `roster.py` lists both machines unless `--here`; a machine not reached is one stderr line and exit 1; `--json` gives `{"entries": [...], "problems": [...]}`.
 
-**Acceptance gate:** the Test and Lint lines green; `commands/message.md` and `codex/AGENTS-messaging.md` both say what `REFUSED:` means and that it gets no fallback; the block installed on both machines, with the Mac's Rust rules unchanged (`diff` of the text outside the block is empty). Live: a scratch Codex daemon thread on natedev, asked to list every Claude session and its role, runs `roster.py`, and its answer matches `roster.py --json` at that moment, saying so when no showrunner is registered. Then it is archived.
+**Acceptance gate:** the Test and Lint lines green; `commands/message.md` and `codex/AGENTS-messaging.md` both say what `REFUSED:` means and that it gets no fallback, and both name `cannot take messages`, `cannot take messages (no messaging socket)`, the ambiguous-name address list, `no roster session has address`, recovery of a seat between turns through its unit director, and `FAILED:` with no fallback, each with its recovery; each announce command's description names exactly the members its flag selects, and `commands/notify_top_level.md` says which unit directors it leaves out; the block installed on both machines, with the Mac's Rust rules unchanged (`diff` of the text outside the block is empty). Live: a scratch Codex daemon thread on natedev, started with `ephemeral: false` (an ephemeral thread refuses queued messages and cannot be archived), asked to list every Claude session and its role, runs `roster.py`, and its answer matches `roster.py --json` at that moment, saying so when no showrunner is registered. A queued request is checked in `thread/turns/list` once the turn starts, since `thread/read` does not show it. Then it is archived.

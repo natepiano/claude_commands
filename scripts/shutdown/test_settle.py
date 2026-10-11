@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest.mock import ANY, call, patch
 
+from test_support import ShutdownSendLeaf, ShutdownTestCase
 import inventory
 import record
 import restart as restart_work
@@ -223,7 +224,7 @@ def completed_stop_report(current: record.ShutdownRecord) -> stop_work.StopRepor
 
 
 @final
-class SettleTests(unittest.TestCase):
+class SettleTests(ShutdownTestCase):
     root: Path = Path()
     state_root: Path = Path()
     notifier_root: Path = Path()
@@ -237,6 +238,7 @@ class SettleTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.state_root = self.root / "shutdown"
         self.notifier_root = self.root / "notifier"
@@ -329,6 +331,9 @@ print("rc=0")
             self.enterContext(patch.dict(os.environ, environment, clear=True)),
         )
         del environment_context
+        self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
+        self.allow_leaf(ShutdownSendLeaf.RETIRE_SHUTDOWN_MESSAGES)
+        self.allow_leaf(ShutdownSendLeaf.RUN_NOTIFIER)
 
     def write_instance(
         self,
@@ -2197,6 +2202,7 @@ print("rc=0")
     def test_down_refuses_unreachable_or_unavailable_peer_without_changes(
         self,
     ) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RUN_REMOTE)
         local = machine_inventory([])
         for mode, expected in (
             ("unreachable", "Mac is unreachable"),
@@ -2311,6 +2317,7 @@ print("rc=0")
         stop.assert_not_called()
 
     def test_down_succeeds_when_the_started_conductor_already_archived_its_record(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.LAUNCH_CONDUCTOR)
         events: list[str] = []
 
         def complete(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:

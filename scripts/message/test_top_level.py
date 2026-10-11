@@ -1,73 +1,106 @@
 #!/usr/bin/env python3
-"""Tests for one reachable address per live top-level session."""
-
+"""Test roster membership and one socket from the newest record per conversation."""
 from __future__ import annotations
 
 import io
 import json
 import os
-import shutil
+import socket
 import subprocess
+import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Mapping
+from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest import mock
 
+import process_table
+import codex_daemon
+import roster
+import sessions
 import top_level
+
+NO_SHOWRUNNER = roster.NoShowrunner()
+NO_DIRECTOR = roster.NoDirector()
 
 
 class TopLevelTests(unittest.TestCase):
-    folder: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    folder: Path = Path()
+    rows: list[roster.RosterEntry] = []
+    records: list[sessions.SessionRecord] = []
+    problems: list[str] = []
 
     @override
     def setUp(self) -> None:
         self.folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.folder),
+        _ = (self.folder / "ps").write_text("", encoding="utf-8")
+        environment_context = cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            "HOME": str(self.folder), "PATH": os.environ.get("PATH", ""),
             "NOTIFIER_SESSIONS_DIR": str(self.folder),
-            "CLAUDE_CODE_SESSION_ID": "current-id",
+            "CLAUDE_CODE_SESSION_ID": "current-id", "CODEX_THREAD_ID": "",
             "BUILD_HOLD_DIR": str(self.folder / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.folder / "release"),
-        }))
+            "ROSTER_DELEGATE_ROOT": str(self.folder / "delegate"),
+            "ROSTER_CODEX_SOCKET": str(self.folder / "no-daemon.sock"),
+            "PROCESS_TABLE_PS": f"cat {self.folder / 'ps'}",
+        }, clear=True))
+        _ = self.enterContext(environment_context)
+        self.rows, self.records, self.problems = [], [], []
+        _ = self.enterContext(mock.patch.object(roster, "roster", side_effect=self.fixture_roster))
+        _ = self.enterContext(mock.patch.object(sessions, "running_sessions", side_effect=self.fixture_records))
+        _ = self.enterContext(mock.patch.object(sessions, "messaging_socket_exists", side_effect=self.fixture_socket_exists))
+        _ = self.enterContext(mock.patch.object(process_table, "PS", ["cat", str(self.folder / "ps")]))
+
+    def fixture_roster(self, _environment: Mapping[str, str]) -> roster.Roster:
+        return roster.Roster(self.rows, self.problems)
+
+    def fixture_records(self) -> list[sessions.SessionRecord]:
+        return sorted(self.records, key=lambda record: record["updatedAt"], reverse=True)
+
+    def fixture_socket_exists(self, record: sessions.SessionRecord) -> bool:
+        return bool(record["messagingSocketPath"])
 
     def add(
         self, name: str, *, session_id: str = "", file_name: str = "",
-        socket: str | None = "auto", pid: int | None = None,
-        start: str | None = None, tmux: str | None = None, updated: int | None = None,
+        socket: str | None = "auto", pid: int = 12345,
+        tmux: str = "", updated: int = 1,
+        role: str = "freestanding",
+        showrunner: roster.ShowrunnerRelationship = NO_SHOWRUNNER,
+        director: roster.DirectorRelationship = NO_DIRECTOR,
     ) -> str:
-        pid = os.getpid() if pid is None else pid
-        session: dict[str, object] = {
-            "pid": pid,
-            "name": name,
-            "sessionId": session_id or name,
-            "procStart": start if start is not None else top_level.proc_start(pid),
-        }
-        if socket is not None:
-            address = str(self.folder / f"{file_name or name}.sock") if socket == "auto" else socket
-            session["messagingSocketPath"] = address
-        else:
-            address = ""
-        if tmux is not None:
-            session["tmux"] = tmux
-        if updated is not None:
-            session["updatedAt"] = updated
-        _ = (self.folder / f"{file_name or name}.json").write_text(json.dumps(session))
+        session_id = session_id or name
+        address = str(self.folder / f"{file_name or name}.sock") if socket == "auto" else socket or ""
+        self.records.append(sessions.SessionRecord(
+            pid=pid, name=name, sessionId=session_id, messagingSocketPath=address,
+            tmux=tmux, updatedAt=updated, formerNames=[],
+        ))
+        row = roster.RosterEntry(
+            machine="fixture", kind="claude", role=role, name=name, status="working",
+            reach=roster.Messageable(f"session:{session_id}"), cwd="/fixture",
+            showrunner=showrunner, director=director,
+            assignment=roster.WorkerAssignment("test", "/fixture/run") if role == "worker" else roster.NotAWorker(),
+            thread=roster.NoCodexThread(),
+            session=roster.ClaudeSession(session_id),
+        )
+        if not any(existing.reach == row.reach for existing in self.rows):
+            self.rows.append(row)
         return address
 
     def run_main(self, *argv: str, record_exit: int = 0) -> tuple[int, list[str], list[str], list[tuple[str, str]]]:
-        output = io.StringIO()
-        errors = io.StringIO()
+        output, errors = io.StringIO(), io.StringIO()
         recorded: list[tuple[str, str]] = []
 
         def record(command: list[str], **_options: object) -> subprocess.CompletedProcess[bytes]:
-            self.assertIn("record-recipient", command)
+            self.assertEqual(Path(command[1]).name, "build_hold.py")
+            self.assertEqual(command[2], "record-recipient")
             recorded.append((command[command.index("--name") + 1], command[command.index("--session-id") + 1]))
             return subprocess.CompletedProcess(command, record_exit, b"", b"")
 
-        with mock.patch.object(subprocess, "run", side_effect=record), \
-                redirect_stdout(output), redirect_stderr(errors):
+        with (mock.patch.object(subprocess, "run", new=record),
+              redirect_stdout(output), redirect_stderr(errors)):
             result = top_level.main(list(argv))
         return result, output.getvalue().splitlines(), errors.getvalue().splitlines(), recorded
 
@@ -75,16 +108,14 @@ class TopLevelTests(unittest.TestCase):
         first = self.add("shared", session_id="session-a", file_name="first")
         second = self.add("shared", session_id="session-b", file_name="second")
         result, lines, errors, recorded = self.run_main()
-        self.assertEqual(result, 0)
+        self.assertEqual((result, errors), (0, []))
         self.assertEqual(lines, [f"shared\tuds:{first}", f"shared\tuds:{second}"])
-        self.assertEqual(errors, [])
         self.assertEqual(recorded, [("shared", "session-a"), ("shared", "session-b")])
 
     def test_a_conversation_two_processes_hold_is_listed_once_from_its_newest_record(self) -> None:
-        # Seen 2026-10-08: the desktop app still held a conversation a terminal had resumed.
-        _ = self.add("shared", session_id="one-id", file_name="desktop", updated=100)
-        resumed = self.add("shared", session_id="one-id", file_name="terminal", updated=200)
-        _ = self.add("shared", session_id="one-id", file_name="zz-older", updated=150)
+        _ = self.add("shared", session_id="one-id", file_name="desktop", pid=100, updated=100)
+        resumed = self.add("shared", session_id="one-id", file_name="terminal", pid=200, updated=200)
+        _ = self.add("shared", session_id="one-id", file_name="zz-older", pid=300, updated=150)
         result, lines, errors, recorded = self.run_main()
         self.assertEqual((result, errors), (0, []))
         self.assertEqual(lines, [f"shared\tuds:{resumed}"])
@@ -95,9 +126,8 @@ class TopLevelTests(unittest.TestCase):
         second = self.add("shared", session_id="b", file_name="first", socket="/tmp/b.sock")
         first = self.add("shared", session_id="a", file_name="second", socket="/tmp/a.sock")
         result, lines, errors, recorded = self.run_main()
-        self.assertEqual(result, 0)
+        self.assertEqual((result, errors), (0, []))
         self.assertEqual(lines, [f"shared\tuds:{first}", f"shared\tuds:{second}", f"zulu\tuds:{zulu}"])
-        self.assertEqual(errors, [])
         self.assertEqual(set(recorded), {("shared", "a"), ("shared", "b"), ("zulu", "zulu")})
 
     def test_unaddressable_session_is_named_but_not_recorded(self) -> None:
@@ -116,14 +146,13 @@ class TopLevelTests(unittest.TestCase):
     def test_session_types_name_addressability_at_read_boundary(self) -> None:
         address = self.add("reachable", session_id="reachable-id")
         _ = self.add("missing", session_id="missing-id", socket=None)
-        sessions = top_level.forwarded_sessions(self.folder, lambda _target: False)
-        self.assertEqual(len(sessions), 2)
-        reachable = next(session for session in sessions if session.name == "reachable")
-        missing = next(session for session in sessions if session.name == "missing")
+        forwarded = top_level.forwarded_sessions()
+        self.assertEqual(len(forwarded), 2)
+        reachable = next(session for session in forwarded if session.name == "reachable")
+        missing = next(session for session in forwarded if session.name == "missing")
         self.assertIsInstance(reachable, top_level.AddressableSession)
         assert isinstance(reachable, top_level.AddressableSession)
-        self.assertEqual(reachable.session_id, "reachable-id")
-        self.assertEqual(reachable.address, f"uds:{address}")
+        self.assertEqual((reachable.session_id, reachable.address), ("reachable-id", f"uds:{address}"))
         self.assertIsInstance(missing, top_level.UnaddressableSession)
         self.assertEqual(missing.session_id, "missing-id")
 
@@ -131,92 +160,177 @@ class TopLevelTests(unittest.TestCase):
         _ = self.add("shared", session_id="current-id", file_name="current")
         other = self.add("shared", session_id="other-id", file_name="other")
         result, lines, errors, recorded = self.run_main()
-        self.assertEqual(result, 0)
+        self.assertEqual((result, errors), (0, []))
         self.assertEqual(lines, [f"shared\tuds:{other}"])
-        self.assertEqual(errors, [])
         self.assertEqual(recorded, [("shared", "other-id")])
 
-    def test_unset_or_empty_session_id_exits_before_recording(self) -> None:
-        _ = self.add("reachable")
-        for value in (None, ""):
-            with self.subTest(value=value), mock.patch.dict(os.environ):
-                if value is None:
-                    _ = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
-                else:
-                    os.environ["CLAUDE_CODE_SESSION_ID"] = value
-                result, lines, errors, recorded = self.run_main()
-                self.assertEqual(result, 2)
-                self.assertEqual(lines, [])
-                self.assertEqual(errors, [
-                    "top_level: CLAUDE_CODE_SESSION_ID is unset, so this session cannot be left out",
-                ])
-                self.assertEqual(recorded, [])
+    def test_plain_shell_leaves_nobody_out(self) -> None:
+        address = self.add("reachable")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}):
+            result, lines, errors, recorded = self.run_main()
+        self.assertEqual((result, errors), (0, []))
+        self.assertEqual(lines, [f"reachable\tuds:{address}"])
+        self.assertEqual(recorded, [("reachable", "reachable")])
 
-    def test_unit_directors_are_left_out(self) -> None:
-        address = self.add("showrunner")
-        other = self.add("ordinary", tmux="ordinary:@3.%3")
-        _ = self.add("trunk", tmux="unit-trunk:@0.%0")
-        sessions = top_level.forwarded_sessions(
-            self.folder, lambda target: target.rpartition(".")[2] == "%0"
-        )
-        self.assertEqual(
-            [(session.name, session.session_id) for session in sessions],
-            [("ordinary", "ordinary"), ("showrunner", "showrunner")],
-        )
-        self.assertEqual(
-            [session.address for session in sessions if isinstance(session, top_level.AddressableSession)],
-            [f"uds:{other}", f"uds:{address}"],
-        )
-
-    def test_stale_tmux_session_name_uses_live_pane_to_identify_unit(self) -> None:
-        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
-                ["tmux"], 0, f"{top_level.UNIT_MARK}=build-followups\n", "")) as run:
-            self.assertTrue(top_level.is_unit("old-name:@3.%7"))
-        run.assert_called_once_with(
-            ["tmux", "show-environment", "-t", "%7", top_level.UNIT_MARK],
-            capture_output=True,
-            text=True,
-        )
-
-    def test_ended_and_reused_pids_are_left_out(self) -> None:
-        _ = self.add("ended", pid=2**22 + 1, start="1")
-        _ = self.add("reused", start="1")
+    def test_unit_directors_under_showrunners_and_all_workers_are_left_out(self) -> None:
+        address = self.add("showrunner", role="showrunner", showrunner=roster.RunsProduction("production"))
+        other = self.add("ordinary")
+        solo = self.add("solo", role="unit director", director=roster.DirectsUnit("solo"))
+        orphaned = self.add("orphaned unit", role="unit director", director=roster.DirectsUnit("orphan"),
+                            showrunner=roster.ProductionWithoutRunningShowrunner("gone"))
+        _ = self.add("trunk", role="unit director", director=roster.DirectsUnit("trunk"),
+                     showrunner=roster.UnderShowrunner("production", "showrunner", "session:showrunner"))
+        _ = self.add("worker", role="worker", director=roster.UnderDirector("trunk", "trunk", "session:trunk"))
+        _ = self.add("orphan worker", role="worker")
         result, lines, errors, recorded = self.run_main()
-        self.assertEqual(result, 0)
-        self.assertEqual(lines, [])
-        self.assertEqual(errors, [])
-        self.assertEqual(recorded, [])
+        self.assertEqual((result, errors), (0, []))
+        self.assertEqual(set(lines), {f"showrunner\tuds:{address}", f"ordinary\tuds:{other}",
+                                     f"solo\tuds:{solo}", f"orphaned unit\tuds:{orphaned}"})
+        self.assertEqual({session_id for _, session_id in recorded}, {"showrunner", "ordinary", "solo", "orphaned unit"})
+
+    def test_stale_tmux_names_do_not_override_roster_unit_identity(self) -> None:
+        _ = self.add("renamed unit", tmux="old-name:@3.%7", role="unit director",
+                     showrunner=roster.UnderShowrunner("production", "runner", "session:runner"))
+        ordinary = self.add("ordinary", tmux="unit-looking-name:@1.%1")
+        result, lines, errors, recorded = self.run_main()
+        self.assertEqual((result, errors), (0, []))
+        self.assertEqual(lines, [f"ordinary\tuds:{ordinary}"])
+        self.assertEqual(recorded, [("ordinary", "ordinary")])
+
+    def test_records_absent_from_the_live_roster_are_left_out(self) -> None:
+        _ = self.add("ended", pid=2**22 + 1)
+        _ = self.add("reused", pid=12345)
+        self.rows = []
+        result, lines, errors, recorded = self.run_main()
+        self.assertEqual((result, lines, errors, recorded), (0, [], [], []))
 
     def test_failed_recipient_record_returns_one(self) -> None:
         _ = self.add("reachable", session_id="reachable-id")
         result, lines, errors, recorded = self.run_main(record_exit=1)
-        self.assertEqual(result, 1)
-        self.assertEqual(lines, [])
+        self.assertEqual((result, lines), (1, []))
         self.assertEqual(errors, ["could not record recipient reachable [reachable-id]"])
         self.assertEqual(recorded, [("reachable", "reachable-id")])
 
     def test_self_argument_is_no_longer_accepted(self) -> None:
         _ = self.add("reachable")
         result, lines, _errors, recorded = self.run_main("--self", "current")
-        self.assertEqual(result, 2)
-        self.assertEqual(lines, [])
-        self.assertEqual(recorded, [])
+        self.assertEqual((result, lines, recorded), (2, [], []))
+
+    def test_a_name_prefix_cannot_make_a_freestanding_session_a_unit(self) -> None:
+        address = self.add("unit")
+        _ = self.add("unit-trunk", role="unit director",
+                     showrunner=roster.UnderShowrunner("production", "runner", "session:runner"))
+        result, lines, errors, recorded = self.run_main()
+        self.assertEqual((result, errors), (0, []))
+        self.assertEqual(lines, [f"unit\tuds:{address}"])
+        self.assertEqual(recorded, [("unit", "unit")])
+
+    def test_roster_problem_prints_on_stderr_while_readable_rows_still_print(self) -> None:
+        address = self.add("reachable", session_id="reachable-id")
+        self.problems = ["daemon closed mid-call"]
+        result, lines, errors, recorded = self.run_main()
+        self.assertEqual(result, 0)
+        self.assertEqual(lines, [f"reachable\tuds:{address}"])
+        self.assertEqual(errors, ["top_level: roster: daemon closed mid-call"])
+        self.assertEqual(recorded, [("reachable", "reachable-id")])
+
+    def test_codex_and_non_session_addresses_are_not_forwarded_to_sendmessage(self) -> None:
+        _ = self.add("Codex window")
+        self.rows[0] = replace(self.rows[0], kind="codex", reach=roster.Messageable("codex:thread"),
+                               thread=roster.CodexThread("thread"))
+        result, lines, errors, recorded = self.run_main()
+        self.assertEqual((result, lines, errors, recorded), (0, [], [], []))
+
+    def test_codex_identity_does_not_exclude_its_inherited_claude_parent(self) -> None:
+        address = self.add("parent", session_id="current-id")
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "codex-child"}):
+            result, lines, errors, recorded = self.run_main()
+        self.assertEqual((result, errors), (0, []))
+        self.assertEqual(lines, [f"parent\tuds:{address}"])
+        self.assertEqual(recorded, [("parent", "current-id")])
 
 
-    def test_a_gone_session_is_not_taken_for_a_unit_whose_name_it_prefixes(self) -> None:
-        binary = shutil.which("tmux")
-        if binary is None:
-            self.skipTest("tmux is required to check its session matching")
-        server_dir = self.folder / "tmux"
-        server_dir.mkdir()
-        self.enterContext(mock.patch.dict(os.environ, {"TMUX_TMPDIR": str(server_dir)}))
-        _ = os.environ.pop("TMUX", None)
-        self.addCleanup(subprocess.run, [binary, "kill-server"], capture_output=True, check=False)
-        _ = subprocess.run([binary, "-f", "/dev/null", "new-session", "-d", "-s", "unit-trunk", "sleep 60"],
-                           check=True)
-        _ = subprocess.run([binary, "set-environment", "-t", "=unit-trunk", top_level.UNIT_MARK, "1"], check=True)
-        self.assertTrue(top_level.is_unit("stale-name:@0.%0"))
-        self.assertFalse(top_level.is_unit("unit:@1.%1"))
+class TopLevelRunningRecordTests(unittest.TestCase):
+    folder: Path = Path()
+    directory: Path = Path()
+    socket_path: Path = Path()
+    child_pid: int = 0
+
+    @override
+    def setUp(self) -> None:
+        self.folder = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="tl-", dir="/tmp")))
+        self.directory = self.folder / "sessions"
+        self.directory.mkdir()
+        self.socket_path = self.folder / "live.sock"
+        listener = self.enterContext(socket.socket(socket.AF_UNIX))
+        listener.bind(str(self.socket_path))
+        child = self.enterContext(subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ))
+        self.child_pid = child.pid
+        self.addCleanup(child.communicate, timeout=5)
+        environment = cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            "HOME": str(self.folder), "NOTIFIER_SESSIONS_DIR": str(self.directory),
+            "NOTIFIER_STATE_DIR": str(self.folder / "notifier"),
+            "ROSTER_DELEGATE_ROOT": str(self.folder / "delegate"),
+            "ROSTER_CODEX_SOCKET": str(self.folder / "no-daemon.sock"),
+        }, clear=True))
+        _ = self.enterContext(environment)
+        _ = self.enterContext(mock.patch.object(process_table, "snapshot", return_value={}))
+        _ = self.enterContext(mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]))
+
+    def write_record(self, pid: int, *, socket_path: str, updated: int) -> None:
+        record = sessions.SessionRecord(
+            pid=pid, sessionId="shared-id", name="shared", messagingSocketPath=socket_path,
+            updatedAt=updated, tmux="", formerNames=[],
+        )
+        _ = (self.directory / f"{pid}.json").write_text(json.dumps(record), encoding="utf-8")
+
+    def run_main(self) -> tuple[int, str, str, list[list[str]]]:
+        output, errors = io.StringIO(), io.StringIO()
+        recorded: list[list[str]] = []
+
+        def record(command: list[str], **_options: object) -> subprocess.CompletedProcess[bytes]:
+            self.assertEqual(Path(command[1]).name, "build_hold.py")
+            self.assertEqual(command[2], "record-recipient")
+            recorded.append(command)
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        with mock.patch.object(subprocess, "run", new=record), redirect_stdout(output), redirect_stderr(errors):
+            result = top_level.main([])
+        return result, output.getvalue(), errors.getvalue(), recorded
+
+    def test_newest_running_record_without_socket_never_forwards_an_older_socket(self) -> None:
+        self.write_record(os.getpid(), socket_path=str(self.socket_path), updated=10)
+        self.write_record(self.child_pid, socket_path="", updated=20)
+        self.assertEqual(self.run_main(), (
+            0, "", "not reachable: shared [shared-id] has no messaging socket\n", [],
+        ))
+
+    def test_running_session_without_socket_is_reported_and_not_recorded(self) -> None:
+        self.write_record(os.getpid(), socket_path="", updated=10)
+        self.assertEqual(self.run_main(), (
+            0, "", "not reachable: shared [shared-id] has no messaging socket\n", [],
+        ))
+
+    def test_sender_without_socket_is_left_out_by_its_session_identity(self) -> None:
+        self.write_record(os.getpid(), socket_path=str(self.socket_path), updated=10)
+        self.write_record(self.child_pid, socket_path="", updated=20)
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "shared-id"}):
+            found = roster.roster(os.environ)
+            self.assertEqual(len(found.entries), 1)
+            self.assertEqual(found.entries[0].reach, roster.CannotReceiveMessages("no messaging socket"))
+            self.assertTrue(roster.is_sender(found.entries[0], roster.sender_identity(os.environ)))
+            self.assertEqual(self.run_main(), (0, "", "", []))
+
+    def test_newest_running_record_with_missing_socket_path_is_reported(self) -> None:
+        self.write_record(os.getpid(), socket_path=str(self.socket_path), updated=10)
+        self.write_record(self.child_pid, socket_path=str(self.folder / "missing.sock"), updated=20)
+        self.assertEqual(self.run_main(), (
+            0, "", "not reachable: shared [shared-id] has no messaging socket\n", [],
+        ))
+
 
 if __name__ == "__main__":
     _ = unittest.main()

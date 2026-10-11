@@ -151,6 +151,23 @@ class ReportFooterTests(unittest.TestCase):
     def tail(self, result: Run) -> list[str]:
         return after_timeline(self.lines(result))
 
+    def test_counts_print_on_one_line_above_the_chart_in_every_length(self) -> None:
+        counts = [{"label": "nightly queue", "count": 8}, {"label": "proposals", "not_found": True}]
+        for length in ("gantt", "simple", "page", "elaborate"):
+            with self.subTest(length=length):
+                lines = self.lines(render({**report(False), "length": length, "counts": counts}))
+                at = lines.index("counts: nightly queue 8 · proposals not found")
+                self.assertEqual(lines[at + 1 : at + 3], ["", FENCE])
+
+    def test_no_counts_prints_no_counts_line(self) -> None:
+        self.assertFalse([line for line in self.lines(render(report(False))) if line.startswith("counts:")])
+
+    def test_a_count_that_is_not_a_whole_number_is_refused(self) -> None:
+        for count in (-1, 2.5, True, None, "8"):
+            with self.subTest(count=count):
+                self.refused(render({**report(False), "counts": [{"label": "queue", "count": count}]}),
+                             "counts[0].count: a whole number of 0 or more")
+
     def test_hold_line_and_unit_marker(self) -> None:
         lines = self.lines(render(report(True), holders=[holder("2026-10-04T11:15:00-07:00")]))
         self.assertIn("12:40 build hold", next(row for row in timeline(lines) if row.startswith("widget")))

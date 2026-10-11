@@ -417,6 +417,30 @@ notice to the unit director before any merge command runs:
    first `held` or `failed` line stops the run. Send its final `send <unit>:`
    message to the unit director.
 
+<ChangeReviewFeatureLog>
+Run only when the production repository is `~/rust/hana` or
+`~/rust/hana_catalyst`, after `merge_checkpoint.py` accepts the merge.
+
+For each distinct user-visible result:
+
+1. Check the Hana live log for entries it replaces.
+2. Add the next `A<n>` or `C<n>` row under `## To review` in
+   `~/rust/hanadocs/change-review.md`: change, merge date, passing Mac build
+   when available, and a visual or behavioral check.
+3. Run `~/.claude/scripts/lib/py
+   ~/.claude/scripts/feature_log/feature_log.py propose --review <row>` with
+   `--project hana`, every owning crate, kind, title, summary, current behavior,
+   check, merge SHA as `--link`, `--evidence "Showrunner merge <merge-sha>,
+   from checkpoint <checkpoint-sha>."`, `--production <slug>`, every source
+   `--unit`, and one `--old` per replaced live entry. When the merge has
+   several results, pass `--separate-result` for every row.
+
+Several results get several rows. Internal-only work gets none; write
+`feature log: none — <reason>` to the production log. The merge is not complete
+until every row has a valid proposal or that reason is logged. Report no entry
+message.
+</ChangeReviewFeatureLog>
+
 5. **Report where it landed.** Include every `into:` line from the script in
    the user update. Each names the checkout, why it received the merge and
    what gate it unblocks. If the showrunner then merges the merge branch into
@@ -437,6 +461,23 @@ notice to the unit director before any merge command runs:
    `review_regime.py ack` only on the user's own acknowledgment. Pass `--no-ci`
    to `due` when the production rules say CI does not apply.
 </MergeCheckpoint>
+
+---
+
+<CloseChangeReview>
+When the user gives a change-review verdict:
+
+- A verdict beginning `works` or `fine` lands the row with `add --review
+  <row>`, or `supersede --review <row>` when its proposal has `--old`. Propose
+  a missing row first; correct wrong meaning by rerunning `propose` while it is
+  open.
+- Any other verdict runs `drop --review <row> --verdict "<verdict>"`. A fixing
+  merge gets a new row and proposal.
+
+A script failure leaves the row open. After success, move it to `## Reviewed`
+with verdict and date; a landed Change cell may use the printed note link.
+Report no separate feature-log message.
+</CloseChangeReview>
 
 ---
 

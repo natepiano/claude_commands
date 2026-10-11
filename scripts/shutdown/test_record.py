@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
+from test_support import ShutdownTestCase
 import inventory
 import record
 
@@ -87,13 +88,14 @@ def shutdown_record(
 
 
 @final
-class RecordTests(unittest.TestCase):
+class RecordTests(ShutdownTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         environment_context: object = cast(
             object,

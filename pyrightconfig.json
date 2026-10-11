@@ -17,6 +17,12 @@
       ]
     },
     {
+      "root": "scripts/feature_log",
+      "extraPaths": [
+        "scripts/feature_log"
+      ]
+    },
+    {
       "root": "scripts/model_study",
       "extraPaths": [
         "scripts/model_study"

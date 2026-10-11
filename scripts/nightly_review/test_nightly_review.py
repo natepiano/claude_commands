@@ -1,4 +1,4 @@
-"""Launch, quota gate and morning offer of the nightly review."""
+"""Launch and quota gate of the nightly review."""
 
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ from scripts.accounts import accounts
 
 REAL_TMUX = nightly_review.tmux
 NIGHT = date(2026, 9, 29)
-MORNING = datetime(2026, 9, 29, 7, 30)
 
 
 class FakeNote:
@@ -140,12 +139,6 @@ class NightlyReviewTests(unittest.TestCase):
             "entries": [],
             "stop_issues": [],
         }
-
-    def night(self, log: str) -> Path:
-        directory = self.root / NIGHT.isoformat()
-        directory.mkdir()
-        _ = (directory / "launch.log").write_text(log)
-        return directory
 
     def test_launch_starts_both_agents_with_the_prompt_last(self) -> None:
         self.assertEqual(self.launched([]), ["nightly-config: started", "nightly-rust: started"])
@@ -409,47 +402,6 @@ class NightlyReviewTests(unittest.TestCase):
         notes = [FakeNote("claude 1", {"state": "active", "weekly_remaining_usage": "null"}),
                  FakeNote("claude 2", {"state": "active", "weekly_remaining_usage": "2", "resets": past})]
         self.assertEqual(len(self.launched(notes)), 2)
-
-    def test_offer_waits_for_five_and_fires_once(self) -> None:
-        directory = self.night("nightly-config: started\nnightly-rust: started\n")
-        _ = (directory / "config.md").write_text("# proposal\n")
-        self.live = {"nightly-rust"}
-        self.assertIsNone(nightly_review.offer(MORNING.replace(hour=4, minute=59), lambda: "natedev"))
-        context = nightly_review.offer(MORNING, lambda: "natedev")
-        self.assertIsNotNone(context)
-        self.assertIn("config.md is ready", context or "")
-        self.assertIn("rust is still running (tmux session nightly-rust)", context or "")
-        self.assertIn("digest.md is not written yet", context or "")
-        self.assertIsNone(nightly_review.offer(MORNING, lambda: "natedev"))
-
-    def test_offer_is_for_natedev_only(self) -> None:
-        directory = self.night("nightly-config: started\n")
-        self.assertIsNone(nightly_review.offer(MORNING, lambda: "boss of bosses"))
-        self.assertFalse((directory / "offered").exists())
-
-    def test_offer_asks_and_carries_deferred_proposals(self) -> None:
-        _ = self.night("nightly-config: started\n")
-        _ = (self.root / "ledger.md").write_text(
-            "- 2026-09-27 config: Old one — accepted, applied\n- 2026-09-28 rust/hana: Warm runners — deferred\n")
-        context = nightly_review.offer(MORNING, lambda: "natedev") or ""
-        self.assertIn("Deferred earlier: 2026-09-28 rust/hana: Warm runners.", context)
-        self.assertNotIn("Old one", context)
-        self.assertIn("see it and the deferred proposals now or defer it, and on yes present it with /nightly_next", context)
-        self.assertIn("change its ledger line's `— proposed` to `— deferred`", context)
-
-    def test_offer_asks_about_deferred_on_a_skipped_night(self) -> None:
-        _ = self.night("skipped: claude 2 has 4% of its weekly usage left, under the 10% floor\n")
-        _ = (self.root / "ledger.md").write_text("- 2026-09-28 config: Kwin keys — deferred\n")
-        context = nightly_review.offer(MORNING, lambda: "natedev") or ""
-        self.assertIn("Deferred earlier: 2026-09-28 config: Kwin keys.", context)
-        self.assertIn("ask the user once whether they want to see the deferred proposals now or defer", context)
-
-    def test_offer_reports_a_skipped_night(self) -> None:
-        _ = self.night("skipped: claude 2 has 4% of its weekly usage left, under the 10% floor\n")
-        context = nightly_review.offer(MORNING, lambda: "natedev") or ""
-        self.assertIn("skipped: claude 2 has 4%", context)
-        self.assertNotIn("ask the user", context)
-
 
     def test_a_session_the_review_name_prefixes_is_never_taken_for_it(self) -> None:
         binary = shutil.which("tmux")
