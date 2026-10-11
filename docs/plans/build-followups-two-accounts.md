@@ -103,38 +103,39 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 - **Project started:** 2026-10-10T21:07:53.634+00:00
 - **Stack:** Python 3 standard library, checked by basedpyright. zsh launch strings. Claude Code 2.1.296.
 - **Layout:** new `scripts/accounts/` (`accounts.py`, `test_accounts.py`) · `scripts/production/` · `scripts/shutdown/` · `scripts/whoami/` · `scripts/message/` · new `commands/accounts.md` · `settings.json` · `docs/quota_alerts.md` · `docs/as-built/shutdown-and-restart.md`. Outside the repo, live, written only in Phases 6 and 7: `~/.claude1`, `~/.claude2`, `~/.claude3`, and `config/accounts.json` (gitignored like `config/showrunners.json`).
-- **Key files:**
+- **Key files** (as found at planning, cf0e505, cited by name because line numbers move with every merge; each phase's As-built records what it changed):
   - `scripts/whoami/agent_accounts.py`:
-    - `claude_config_dir()` 224: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
-    - `claude_config_file()` 228-236: `~/.claude.json` only for `~/.claude`, else `<dir>/.claude.json`.
-    - `claude_credentials()` 246-254: on darwin it reads the Keychain only without `CLAUDE_CONFIG_DIR`.
-    - `claude_live()` 280-316: `claude auth status`, then `/api/oauth/usage` with the dir's access token.
-    - `claude_on_disk(config_dir)` 318.
-    - `live_reports()` 557.
+    - `claude_config_dir()`: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
+    - `claude_config_file()`: `~/.claude.json` only for `~/.claude`, else `<dir>/.claude.json`.
+    - `claude_credentials()`: on darwin it reads the Keychain only without `CLAUDE_CONFIG_DIR`.
+    - `claude_live()`: `claude auth status`, then `/api/oauth/usage` with the dir's access token.
+    - `claude_on_disk(config_dir)`.
+    - `live_reports()`.
   - `scripts/whoami/account.py`:
-    - `process_config_dir(pid)` 118-159 reads `/proc/<pid>/environ`, or `ps eww` on darwin.
+    - `process_config_dir(pid)` reads `/proc/<pid>/environ`, or `ps eww` on darwin.
     - `account_of(pid)`.
-    - `write_label` writes `<dir>/account-label`; the SessionStart hook at `settings.json` 186 runs it.
-  - `scripts/whoami/agent_notes.py`: `apply` 188-245 marks the env's own account `active` and every other account `inactive`; `update` 255-270. `quota_alert.py` 247-254 and 653 act on `state: active`; `current_session()` reads the registry at 82 and 666. `run_out.py`. `whoami.py`.
+    - `write_label` writes `<dir>/account-label`; a SessionStart hook in `settings.json` runs it.
+  - `scripts/whoami/agent_notes.py`: `apply` marks the env's own account `active` and every other account `inactive`; `update`. In `quota_alert.py`, `low()` and `refresh()` act on `state: active`, and `current_session()` reads the registry through the `SESSIONS` constant. `run_out.py`. `whoami.py`.
   - `scripts/production/add_unit.py`:
-    - `launch_session` 660-693 builds `ENABLE_TOOL_SEARCH=true command claude …; exec zsh` and runs it under `systemd-run --user --scope … tmux new-session … zsh -ic`.
-    - `launch_environment` 696-702 strips every `CLAUDE_*` variable.
-    - The launch check is near 796.
+    - `launch_session` builds `ENABLE_TOOL_SEARCH=true command claude …; exec zsh` and runs it under `systemd-run --user --scope … tmux new-session … zsh -ic`.
+    - `launch_environment` strips every `CLAUDE_*` variable.
+    - The launch check is the `launch_permission.launch_permission(…)` call in `main()`.
     - tmux gives a new session the server's environment, not the client's, so a variable reaches `claude` only inside the command string or through `-e`.
   - `scripts/shutdown/restart.py`:
-    - `_run` 262-273 strips `CLAUDE_*`.
-    - The resume command is built at 355-373.
-    - Units relaunch through `add_unit.py --resume` at 430-455.
+    - `_run` strips `CLAUDE_*`.
+    - `_resume_command` builds the resume command.
+    - Units relaunch through `add_unit.py --resume`; `_unit_argv` builds that command.
     - Each record entry's embedded `session.config_dir` holds the session's dir (absent means `~/.claude`); a non-unit resume keeps it, and a unit relaunches on the current unit role.
-  - `scripts/shutdown/inventory.py`: 1178 lists `~/.claude/sessions`, then filters by `account_of`; 1103 reads `~/.claude/projects` for the last model. `record.py` holds the record types. `shutdown.py` holds the verbs and `conduct`.
-  - `scripts/message/sessions.py` 85-86: `sessions_dir()` is `$NOTIFIER_SESSIONS_DIR` or `~/.claude/sessions`. `send.py` 670-701: the relay is a headless `claude -p` with `CLAUDE_*` stripped, so it runs on `~/.claude`'s account.
-  - `scripts/delegate/remove_seats.py` 98-259 and `scripts/delegate/implement.sh` 316: `claude agents --json` and `claude rm` act on the caller's config dir.
-  - `commands/showrunner/produce.md` 235-237: a manual unit resume runs `claude --resume` from the showrunner's own shell.
+  - `scripts/shutdown/inventory.py`: `inventory()` lists `sessions.live_sessions()` (`~/.claude/sessions`), then keeps the sessions `_configuration_for_session` attributes to the login through `account_of`; `_model()` reads `~/.claude/projects` for the last model. `record.py` holds the record types. `shutdown.py` holds the verbs and `conduct`.
+  - `scripts/message/sessions.py`: `sessions_dir()` is `$NOTIFIER_SESSIONS_DIR` or `~/.claude/sessions`.
+  - `scripts/message/send.py`: `relay()` runs a headless `claude -p` with `CLAUDE_*` stripped, so it runs on `~/.claude`'s account. Where `~/.config/claude/oauth-token.gpg` exists (the Mac; natedev has none), it sets `CLAUDE_CODE_OAUTH_TOKEN` from that file and runs on that token's account.
+  - `scripts/delegate/remove_seats.py` (`list_sessions()` and `main()`) and `scripts/delegate/implement.sh` (`claude_session()` in its inline Python): `claude agents --json` and `claude rm` act on the caller's config dir.
+  - `commands/showrunner/produce.md`, the **Resume.** step of `<LaunchUnits>`: a manual unit resume runs `claude --resume` from the showrunner's own shell.
   - `settings.json`:
-    - 43 allows `Edit(~/.claude/**)`.
-    - 263-265 sandbox `filesystem.allowWrite` lists `~/.claude`.
-    - 243 is the status line, which reads `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/account-label`.
-  - `scripts/nightly_review/nightly_review.py`: the quota gate at 84-97 assumes one active Claude note; the launch is at 109-116.
+    - `permissions.allow` carries `Edit(~/.claude/**)`.
+    - `sandbox.filesystem.allowWrite` lists `~/.claude`.
+    - `statusLine` reads `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/account-label`.
+  - `scripts/nightly_review/nightly_review.py`: the quota gate `quota_permission()` assumes one active Claude note; `start()` launches the review.
   - `docs/as-built/shutdown-and-restart.md`, `docs/quota_alerts.md`: the protocols this plan extends.
 - **Test lanes:** `scripts/accounts/test_accounts.py` (new), `scripts/production/test_add_unit.py`, `scripts/shutdown/test_*.py`, `scripts/whoami/test_*.py`. Tests sit beside the code and import their sibling by bare name.
 - **Build:** none; the code is interpreted.
