@@ -99,6 +99,7 @@
       "extraPaths": [
         "scripts/production",
         "scripts/build_hold",
+        "scripts/delegate",
         "scripts/hooks",
         "scripts/mac_test",
         "scripts/message",
