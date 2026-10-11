@@ -756,6 +756,26 @@ print("rc=0")
             ],
         )
 
+    def test_a_stopped_showrunner_timer_is_recorded_off_and_never_stopped(self) -> None:
+        # A production on demand keeps its showrunner timer stopped, so a restart has nothing to start.
+        stopped = self.write_instance("showrunner-show", "selected", enabled=False)
+        report = machine_inventory(
+            [top_level("selected", "Selected", timers=[stopped.name])]
+        )
+
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            created = settle.begin(LOGIN)
+
+        self.assertTrue((stopped / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertEqual(self.logged_calls(self.notifier_log), [])
+        self.assertEqual(
+            [timer["was_enabled"] for timer in created["entries"][0]["timers"]],
+            [False],
+        )
+
     def test_cancel_keeps_a_released_kept_off_pause_off(self) -> None:
         paused = self.write_instance("delegate-paused", "session", enabled=False)
         pause_path = self.pause_record(
