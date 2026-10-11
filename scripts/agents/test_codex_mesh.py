@@ -37,6 +37,9 @@ from scripts.agents import codex_mesh
 def setUpModule() -> None:
     # No test sees the real Codex sign-in: with none, no server counts as holding an old one.
     home = tempfile.TemporaryDirectory()
+    usage = tempfile.TemporaryDirectory()
+    usage_environment = patch.dict(os.environ, {"USAGE_STATE_DIR": usage.name})
+    _ = usage_environment.start()
     previous = os.environ.get("CODEX_HOME")
     os.environ["CODEX_HOME"] = home.name
 
@@ -45,6 +48,8 @@ def setUpModule() -> None:
             _ = os.environ.pop("CODEX_HOME", None)
         else:
             os.environ["CODEX_HOME"] = previous
+        usage_environment.stop()
+        usage.cleanup()
         home.cleanup()
 
     unittest.addModuleCleanup(restore)
@@ -250,6 +255,9 @@ class MeshCommandTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.patches = contextlib.ExitStack()
+        _ = self.patches.enter_context(patch.dict(os.environ, {
+            "USAGE_STATE_DIR": str(self.session_dir / "usage-state"),
+        }))
         _ = self.patches.enter_context(patch.object(codex_mesh, "QUEUE_GRACE_SECS", 0.0))
         _ = self.patches.enter_context(patch.object(codex_mesh, "_capacity_clock", self.clock, create=True))
         _ = self.patches.enter_context(patch.object(codex_mesh, "_capacity_sleep", self.wait, create=True))
@@ -570,7 +578,7 @@ class MeshCommandTests(unittest.TestCase):
             summary_file=str(self.session_dir / "summary.txt"),
             reply_file="", log_file=str(self.session_dir / "seat.log"),
             model="gpt-test", effort="high", service_tier="", sandbox="danger-full-access",
-            timeout=self.start_args_timeout, resident=False, role="impl",
+            timeout=self.start_args_timeout, resident=False, role="impl", lens=None,
         )
 
     def roster(self) -> dict[str, object]:
@@ -581,6 +589,15 @@ class MeshCommandTests(unittest.TestCase):
     def seat_record(self) -> dict[str, object]:
         return cast("dict[str, object]", self.roster()["seat"])
 
+    def usage_path(self) -> Path:
+        return self.session_dir / "usage-state/agents.jsonl"
+
+    def usage_records(self) -> list[dict[str, object]]:
+        if not self.usage_path().exists():
+            return []
+        return [cast("dict[str, object]", json.loads(line))
+                for line in self.usage_path().read_text(encoding="utf-8").splitlines()]
+
     def methods(self, method: str) -> list[dict[str, object]]:
         return [request for request in self.server.requests if request.get("method") == method]
 
@@ -590,13 +607,14 @@ class MeshCommandTests(unittest.TestCase):
         return result, errors.getvalue()
 
     def run_follow(
-        self, message: str = "Repair the open finding", role: str = "impl"
+        self, message: str = "Repair the open finding", role: str = "impl", lens: str = ""
     ) -> tuple[int, str]:
         message_file = self.session_dir / "follow-up.txt"
         _ = message_file.write_text(message, encoding="utf-8")
         args = self.start_args()
         args.to = "seat"
         args.role = role
+        args.lens = lens or None
         args.message_file = str(message_file)
         with contextlib.redirect_stderr(io.StringIO()) as errors:
             result = codex_mesh.command_follow(args)
@@ -655,6 +673,184 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.seat_record()["role"], "impl")
 
+    def test_start_appends_usage_without_a_lens(self) -> None:
+        code, errors = self.run_start()
+
+        self.assertEqual((code, errors), (0, ""))
+        records = self.usage_records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(set(records[0]), {"id", "role", "at"})
+        self.assertEqual((records[0]["id"], records[0]["role"]), (THREAD_ID, "impl"))
+        self.assertNotIn("lens", self.seat_record())
+
+    def test_start_cli_records_role_and_lens_only_in_the_usage_log(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            code = codex_mesh.main([
+                "start", "--session-dir", str(self.session_dir), "--name", "seat",
+                "--role", "review", "--lens", "contract", "--cwd", str(self.session_dir),
+                "--prompt-file", str(self.session_dir / "prompt.txt"),
+                "--summary-file", str(self.session_dir / "summary.txt"),
+                "--log-file", str(self.session_dir / "seat.log"), "--timeout", "5",
+            ])
+
+        self.assertEqual((code, errors.getvalue()), (0, ""))
+        records = self.usage_records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(set(records[0]), {"id", "role", "lens", "at"})
+        self.assertEqual((records[0]["id"], records[0]["role"], records[0]["lens"]),
+                         (THREAD_ID, "review", "contract"))
+        self.assertEqual(self.seat_record()["role"], "review")
+        self.assertNotIn("lens", self.seat_record())
+
+    def test_follow_records_each_role_and_lens_assignment_on_the_same_thread(self) -> None:
+        self.assertEqual(self.run_start(), (0, ""))
+
+        self.assertEqual(self.run_follow(role="review", lens="adversary"), (0, ""))
+        self.assertEqual(self.run_follow(role="review", lens="adversary"), (0, ""))
+        self.assertEqual(self.run_follow(role="fix"), (0, ""))
+
+        records = self.usage_records()
+        self.assertEqual([(record["id"], record["role"], record.get("lens"))
+                          for record in records], [
+            (THREAD_ID, "impl", None),
+            (THREAD_ID, "review", "adversary"),
+            (THREAD_ID, "review", "adversary"),
+            (THREAD_ID, "fix", None),
+        ])
+        self.assertTrue(all("approximate" not in record for record in records))
+        self.assertEqual(self.seat_record()["role"], "fix")
+        self.assertNotIn("lens", self.seat_record())
+
+    def test_follow_cli_accepts_a_review_lens(self) -> None:
+        self.assertEqual(self.run_start(), (0, ""))
+        message_file = self.session_dir / "follow-up.txt"
+        _ = message_file.write_text("Review the contract", encoding="utf-8")
+
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            code = codex_mesh.main([
+                "follow", "--session-dir", str(self.session_dir), "--to", "seat",
+                "--role", "review", "--lens", "ux", "--message-file", str(message_file),
+                "--summary-file", str(self.session_dir / "summary.txt"),
+                "--log-file", str(self.session_dir / "seat.log"), "--timeout", "5",
+            ])
+
+        self.assertEqual((code, errors.getvalue()), (0, ""))
+        self.assertEqual(len(self.usage_records()), 2)
+        self.assertEqual(self.usage_records()[1]["lens"], "ux")
+        self.assertNotIn("lens", self.seat_record())
+
+    def test_reserved_follow_records_one_assignment_with_its_lens(self) -> None:
+        self.assertEqual(self.run_start(), (0, ""))
+        args = self.start_args()
+        args.to = "seat"
+        args.role = "review"
+        args.lens = "craft"
+        args.claim_pid = os.getpid()
+
+        with contextlib.redirect_stderr(io.StringIO()) as claim_errors:
+            claim_code = codex_mesh.main([
+                "can-follow", "--session-dir", str(self.session_dir), "--to", "seat",
+                "--role", "review", "--lens", "craft", "--claim-pid", str(os.getpid()),
+            ])
+        self.assertEqual((claim_code, claim_errors.getvalue()), (0, ""))
+        self.assertEqual(len(self.usage_records()), 2)
+        self.assertEqual(self.usage_records()[1]["lens"], "craft")
+        self.assertNotIn("lens", self.seat_record())
+        args.message_file = str(self.session_dir / "follow-up.txt")
+        _ = Path(args.message_file).write_text("Review the code", encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            code = codex_mesh.command_follow(args)
+
+        self.assertEqual((code, errors.getvalue()), (0, ""))
+        self.assertEqual(len(self.usage_records()), 2)
+        self.assertNotIn("lens", self.seat_record())
+
+    def test_follow_probe_without_a_claim_does_not_record_an_assignment(self) -> None:
+        self.assertEqual(self.run_start(), (0, ""))
+        args = self.start_args()
+        args.to = "seat"
+        args.role = "review"
+        args.lens = "adversary"
+
+        self.assertEqual(codex_mesh.command_can_follow(args), 0)
+
+        self.assertEqual(len(self.usage_records()), 1)
+        self.assertEqual(self.seat_record()["role"], "impl")
+
+    def test_usage_write_failure_does_not_stop_a_new_thread(self) -> None:
+        self.usage_path().mkdir(parents=True)
+
+        code, errors = self.run_start()
+
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertTrue(errors.startswith("agents_log: "), errors)
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertEqual(len(self.methods("turn/start")), 1)
+
+    def test_start_reports_unexpected_usage_write_failure_and_continues(self) -> None:
+        with patch.object(codex_mesh.agents_log, "append",
+                          side_effect=RuntimeError("usage write failed\ntry later")):
+            code, errors = self.run_start()
+
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(errors, "agents_log: usage write failed try later\n")
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertEqual(len(self.methods("turn/start")), 1)
+
+    def test_usage_write_failure_does_not_stop_a_follow_up(self) -> None:
+        self.assertEqual(self.run_start(), (0, ""))
+        self.usage_path().unlink()
+        self.usage_path().mkdir()
+
+        code, errors = self.run_follow(role="review", lens="adversary")
+
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertTrue(errors.startswith("agents_log: "), errors)
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertEqual(len(self.methods("turn/start")), 2)
+
+    def test_preclaimed_follow_survives_a_deeply_nested_usage_line(self) -> None:
+        self.assertEqual(self.run_start(), (0, ""))
+        args = self.start_args()
+        args.to = "seat"
+        args.role = "review"
+        args.lens = "adversary"
+        args.claim_pid = os.getpid()
+        self.assertEqual(codex_mesh.command_can_follow(args), 0)
+        with self.usage_path().open("a", encoding="utf-8") as ledger:
+            _ = ledger.write("[" * 10_000 + "]" * 10_000 + "\n")
+        args.message_file = str(self.session_dir / "follow-up.txt")
+        _ = Path(args.message_file).write_text("Review the code", encoding="utf-8")
+
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            code = codex_mesh.command_follow(args)
+
+        self.assertEqual(code, 0, errors.getvalue())
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertEqual(len(self.methods("turn/start")), 2)
+
+    def test_preclaimed_follow_reports_unexpected_usage_reader_failure_and_continues(self) -> None:
+        self.assertEqual(self.run_start(), (0, ""))
+        args = self.start_args()
+        args.to = "seat"
+        args.role = "review"
+        args.claim_pid = os.getpid()
+        self.assertEqual(codex_mesh.command_can_follow(args), 0)
+        args.message_file = str(self.session_dir / "follow-up.txt")
+        _ = Path(args.message_file).write_text("Review the code", encoding="utf-8")
+
+        with patch.object(codex_mesh.agents_log, "assignments",
+                          side_effect=RecursionError("ledger is too deeply nested\nread failed")), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            code = codex_mesh.command_follow(args)
+
+        self.assertEqual(code, 0, errors.getvalue())
+        self.assertEqual(errors.getvalue(), "agents_log: ledger is too deeply nested read failed\n")
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertEqual(len(self.methods("turn/start")), 2)
+
     def test_resident_start_without_role_parses_and_omits_role_from_roster(self) -> None:
         args = self.start_args()
         args.role = ""
@@ -662,6 +858,7 @@ class MeshCommandTests(unittest.TestCase):
             code = codex_mesh.command_start(args)
         self.assertEqual((code, errors.getvalue()), (0, ""))
         self.assertNotIn("role", self.seat_record())
+        self.assertEqual(self.usage_records(), [])
 
         parsed: list[argparse.Namespace] = []
 
@@ -930,11 +1127,12 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(codex_mesh.command_can_follow(args), 2)
         self.assertEqual(len(self.methods("turn/start")), 1)
 
-    def test_released_follow_claim_restores_the_prior_role(self) -> None:
+    def test_released_follow_claim_restores_the_prior_role_in_roster_and_usage(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         args = self.start_args()
         args.to = "seat"
         args.role = "review"
+        args.lens = "adversary"
         args.claim_pid = os.getpid()
 
         self.assertEqual(codex_mesh.command_can_follow(args), 0)
@@ -944,6 +1142,8 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(self.seat_record()["status"], "done")
         self.assertEqual(self.seat_record()["role"], "impl")
         self.assertNotIn("previous_role", self.seat_record())
+        self.assertEqual([(record["role"], record.get("lens")) for record in self.usage_records()],
+                         [("impl", None), ("review", "adversary"), ("impl", None)])
 
     def test_released_follow_claim_restores_an_absent_role(self) -> None:
         args = self.start_args()
@@ -961,11 +1161,40 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(self.seat_record()["status"], "done")
         self.assertNotIn("role", self.seat_record())
         self.assertNotIn("previous_role", self.seat_record())
+        self.assertEqual([record["role"] for record in self.usage_records()], ["review"])
+
+    def test_claim_restore_records_prior_role_while_a_peer_turn_remains_running(self) -> None:
+        self.assertEqual(self.run_start(), (0, ""))
+        args = self.start_args()
+        args.to = "seat"
+        args.role = "review"
+        args.lens = "craft"
+        args.claim_pid = os.getpid()
+        self.assertEqual(codex_mesh.command_can_follow(args), 0)
+        self.live_turn = "peer-turn"
+        args.message_file = str(self.session_dir / "follow-up.txt")
+        _ = Path(args.message_file).write_text("Review the code", encoding="utf-8")
+
+        with patch.object(codex_mesh, "_wait_for_claimed_peer", return_value=False), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            code = codex_mesh.command_follow(args)
+
+        self.assertEqual(code, 1, errors.getvalue())
+        self.assertIn("live turn", errors.getvalue())
+        self.assertEqual(self.seat_record()["status"], "running")
+        self.assertEqual(self.seat_record()["turn_id"], "peer-turn")
+        self.assertEqual(self.seat_record()["role"], "impl")
+        self.assertEqual(self.live_turn, "peer-turn")
+        self.assertEqual([(record["role"], record.get("lens")) for record in self.usage_records()],
+                         [("impl", None), ("review", "craft"), ("impl", None)])
+        self.assertEqual(len(self.methods("turn/start")), 1)
 
     def test_live_turn_after_resume_restores_preclaim_roster_when_peer_finishes(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         args = self.start_args()
         args.to = "seat"
+        args.role = "review"
+        args.lens = "ux"
         args.claim_pid = os.getpid()
         self.assertEqual(codex_mesh.command_can_follow(args), 0)
         self.live_turn = "peer-turn"
@@ -979,6 +1208,8 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(code, 1, errors.getvalue())
         self.assertEqual(self.seat_record()["status"], "done")
         self.assertEqual(self.live_turn, "")
+        self.assertEqual([(record["role"], record.get("lens")) for record in self.usage_records()],
+                         [("impl", None), ("review", "ux"), ("impl", None)])
 
     def test_claim_changed_after_dispatch_fails_without_overwriting_peer(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
