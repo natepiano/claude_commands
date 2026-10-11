@@ -1,5 +1,5 @@
 ---
-description: Send every unit director on this machine a message at once. Args - `<message>`.
+description: Send every unit director on both machines a message at once. Args - `<message>`.
 argument-hint: "<message>"
 ---
 
@@ -7,4 +7,4 @@ argument-hint: "<message>"
 
 `python3 ~/.claude/scripts/production/broadcast.py --from <your session name> --units "From the user (via <your session name>, <HH:MM zone>): <message>"`
 
-Each unit director is sent it at the same moment and told that no showrunner or other agent was. `/showrunner:announce` reaches showrunners, `/announce` everyone.
+It reaches every unit director on both machines; each is told that unit directors received it directly. `/showrunner:announce` reaches showrunners, `/announce` everyone.

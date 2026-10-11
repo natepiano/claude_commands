@@ -214,104 +214,111 @@ After Phase 2 reaches `~/.claude` main, the unit director tells the showrunner t
 **Ruled out:**
 - Exempting a date-only correction from the duplicate-link refusal when the note keeps a link another live note shares: such a correction passes `--separate-result` again.
 
-### Phase 6 — cargo-liner's as-built files and changelogs are in the log  · status: todo
+### Phase 6 — cargo-liner's as-built files and changelogs are in the log  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** every record of cargo-liner's structured pool has a disposition, and each surviving result is one live note that is true on `main` today.
-
-**Spec:** Delegation Context → Backfill procedure, for `--project cargo-liner --pool structured`. As-built records first, then the 755 changelog bullets: duplicates across crates and releases combine into one note; tags and landed commits give dates and links; commits are opened only where those records are unclear. A note gets a historical `crate@version` only when one changelog bullet maps to it exactly; never rewrite an old changelog. `cargo-berth-test-support` is excluded. Current surface: each current crate README, CLI help (`cargo mend --help` and the others) from an installed binary only when its version matches the audit ref, otherwise from the crate's argument definitions read at that ref (no build: seats run no raw Cargo), public API, the current Unreleased sections, and user-facing tests.
-
-**Files:**
-- `/home/natepiano/rust/hanadocs/feature-log/cargo-liner/` — notes, through `feature_log.py` only.
-
-**Seats:** `2 writers` — split by crate, by record path.
-- `impl` — claims as `a` (374 records): `--path crates/cargo-mend --path crates/cargo-port`.
-- `test` — opens as impl; claims as `b` (437 records): `--path crates/cargo-berth --path crates/cargo-tile --path crates/cargo-handler --path crates/tui_pane --path docs` (the as-built and phase records), then `--kind tag`.
-
-**Constraints from prior phases:** Phase 1: `feature_log.py` verbs and `--backfill`; published cargo-liner crates are `cargo-mend`, `cargo-port`, `cargo-tile`, `tui_pane`. Phase 3: the frozen cargo-liner ledger. Phase 2: off natedev every `feature_log.py` call forwards to natedev over ssh unless `FEATURE_LOG_VAULT` is set; `amend --evidence` skips evidence already stored, so a repeated amend prints `unchanged`; `amend --backfill` records `backfill: true`. Phase 3 (as built): every ledger is frozen (`collect` now only prints) at hana `ce51498` + hana_catalyst `2408021`, `/etc/nixos` `9d99e9e`, cargo-liner `9301628`, bevy_brp `e65064e`, obsidian_knife `5df4349`, nateroids `c7d6a51`; counts above the proposal are work landed after its 2026-10-10 measurement; `next --path` matches a prefix of the record's source path. Phase 4 (as built): when `git log --first-parent --merges --ancestry-path <commit>..<audit ref>` names no merge (the commit entered the accepted line on a merge's second parent, as in a subtree import or a workspace consolidation), the accepting ref is the earliest commit on the audit ref's first-parent line that descends from the commit, or the commit itself when it is on that line; `feature_log.py` refuses a title over 50 characters, so shorten it and continue; `amend` takes no `--production`/`--unit`. Phase 5 (as built): `amend --backfill` also takes `--link` with `--completed` (a note's accepting ref; a link another live note holds needs `--separate-result`) and `--release crate@version` (exact historical membership; a crate the note lacks, `Unreleased` or a malformed version is refused, and a value already present prints `unchanged`), so a correction never needs a second note; `live` prints each note's link.
-
-**Acceptance gate:** `inventory.py status --project cargo-liner --pool structured` exits 0; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits cargo-liner's live entries against the current surface above and finds no uncovered qualifying behavior in it. The phase report gives the note count and the count per disposition.
-
-### Phase 7 — bevy_brp's structured records and nateroids' as-built files are in the log  · status: todo
-
-#### Work Order
-
-**Goal:** every record of bevy_brp's structured pool and of nateroids' structured pool has a disposition, and each surviving result is one live note that is true on `main` today.
-
-**Spec:** Delegation Context → Backfill procedure, for `--project bevy_brp --pool structured` and `--project nateroids --pool structured`. bevy_brp: as-built files first, then the 205 changelog bullets, combining synchronized-crate duplicates; the 25 tags are release evidence. Current surface: the workspace README, the three published crate READMEs and public APIs, examples, and user-facing tests; test apps excluded. nateroids: the 2 as-built files seed its log; its commits are Phase 8.
+- cargo-liner's frozen structured ledger (as-built files, changelog bullets, tags; `cargo-berth-test-support` excluded) is fully disposed: `inventory.py status --project cargo-liner --pool structured` exits 0 over 811 records — represented 277, combined 458, internal 55, not-current 21, unresolved 0. `feature_log.py check` prints `ok` (415 notes in all projects).
+- Duplicate bullets across crates and releases are one note; a note carries a historical `crate@version` only when exactly one changelog bullet maps to it; no old changelog is rewritten.
+- Live notes are true against cargo-liner's surface at the frozen ref: READMEs, CLI verbs and flags (from argument definitions at that ref when the installed binary's version differs), public API and Unreleased sections. Behavior the changelogs omit has notes from that surface: cargo-berth's checkpoint-and-integrate workflow, `recover --recovered` / `--abandon --why`, `renew`, `integrate --force --why`, cargo-port's focused-pane copying with tui_pane's clipboard registration, and tui_pane's actionable toasts.
+- A commit that entered `main` on a merge's second parent links and dates to its earliest first-parent descendant: 48 cargo-mend notes link cargo-mend's graft commit, and 2026-08-30 work carries 2026-09-03.
 
 **Files:**
-- `/home/natepiano/rust/hanadocs/feature-log/bevy_brp/` — notes, through `feature_log.py` only.
-- `/home/natepiano/rust/hanadocs/feature-log/nateroids/` — notes, through `feature_log.py` only.
+- `/home/natepiano/rust/hanadocs/feature-log/cargo-liner/` — 292 note files, 288 live, written only through `feature_log.py`.
 
-**Seats:** `2 writers` — split by changelog.
-- `impl` — claims as `a`: bevy_brp `--path docs --path mcp/CHANGELOG.md` (as-built records and `mcp` bullets).
-- `test` — opens as impl; claims as `b`: bevy_brp `--path extras/CHANGELOG.md --path mcp_macros/CHANGELOG.md`, then bevy_brp `--kind tag`, then nateroids' structured pool.
+**Gotchas:**
+- `git log -S` on a bullet's current wording finds the last commit that rewrapped or reworded it, not the one that added it; the older wording is searched at that commit's parent. The changelog rewrap `a5f4bf0b` (2026-09-16) is the known case: 48 notes link the pre-rewrap match, and one links the rewrap, which genuinely added that bullet. Seven cargo-port notes link `d9558a79`, a summary rewrite later than the behavior.
+- Changelogs omit CLI verbs and flags and some public API, so coverage needs each crate's argument definitions and public API read beside its changelogs.
+- One `live --grep` refusal ("missing opening frontmatter delimiter") did not reproduce; note temp files (`.<name>.tmp`) are never globbed.
 
-**Constraints from prior phases:** Phase 1: published bevy_brp crates are `bevy_brp_extras`, `bevy_brp_mcp`, `bevy_brp_mcp_macros`. Phase 3: the frozen bevy_brp and nateroids ledgers. Phase 2: off natedev every `feature_log.py` call forwards to natedev over ssh unless `FEATURE_LOG_VAULT` is set; `amend --evidence` skips evidence already stored, so a repeated amend prints `unchanged`; `amend --backfill` records `backfill: true`. Phase 3 (as built): every ledger is frozen (`collect` now only prints) at hana `ce51498` + hana_catalyst `2408021`, `/etc/nixos` `9d99e9e`, cargo-liner `9301628`, bevy_brp `e65064e`, obsidian_knife `5df4349`, nateroids `c7d6a51`; counts above the proposal are work landed after its 2026-10-10 measurement; `next --path` matches a prefix of the record's source path. Phase 4 (as built): when `git log --first-parent --merges --ancestry-path <commit>..<audit ref>` names no merge (the commit entered the accepted line on a merge's second parent, as in a subtree import or a workspace consolidation), the accepting ref is the earliest commit on the audit ref's first-parent line that descends from the commit, or the commit itself when it is on that line; `feature_log.py` refuses a title over 50 characters, so shorten it and continue; `amend` takes no `--production`/`--unit`. Phase 5 (as built): `amend --backfill` also takes `--link` with `--completed` (a note's accepting ref; a link another live note holds needs `--separate-result`) and `--release crate@version` (exact historical membership; a crate the note lacks, `Unreleased` or a malformed version is refused, and a value already present prints `unchanged`), so a correction never needs a second note; `live` prints each note's link.
+### Phase 7 — bevy_brp's structured records and nateroids' as-built files are in the log  · status: done
 
-**Acceptance gate:** `inventory.py status --project bevy_brp --pool structured` and `--project nateroids --pool structured` exit 0; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits bevy_brp's live entries against the current surface above and finds no uncovered qualifying behavior in it. The phase report gives the note count and the count per disposition for each project.
+#### As-built
 
-### Phase 8 — natedev and obsidian_knife are logged from their commits  · status: todo
-
-#### Work Order
-
-**Goal:** every commit, merge and tag in natedev's and obsidian_knife's pools has a disposition, and each project's current surface has one live entry per qualifying behavior.
-
-**Spec:** Delegation Context → Backfill procedure, for `--pool commits` of both. natedev (`crate: []`): `machines/configuration overview.md` in the vault defines the feature boundaries; walk the 976 commit subjects (plus 1 merge and 1 tag) backwards and combine the commits that built one operator-visible result; `--link` is the nixos commit, and `See it` is an operator command or machine state. Current surface: the overview, active `/etc/nixos` modules, installed operator commands, the rebuilt machine state. obsidian_knife: review all 562 subjects, open a diff only for a possible user-visible result, combine repair and follow-up commits into one note. Current surface: the README, example config, CLI behavior, reports, user-facing tests. Both projects' audits finish here.
+- bevy_brp's frozen structured ledger (as-built files, 205 changelog bullets across `extras`, `mcp` and `mcp_macros`, 25 tags) is fully disposed: `inventory.py status --project bevy_brp --pool structured` exits 0 over 234 records — represented 68, combined 78, internal 70, not-current 18, unresolved 0. `feature_log.py check` prints `ok` (490 notes in all projects).
+- A synchronized extras method and its MCP wrapper tool share one note carrying both crates and both exact releases. 24 tags are internal release evidence; v0.18.0 is represented by the repair note "keep real time examples from dividing by zero" (d6ad93da).
+- nateroids' structured pool (2 as-built files) is disposed (`--pool structured` exits 0, represented 2) and seeds 4 notes: "trigger game and camera commands through brp", linking 27f9a238 (2026-03-02, the event layer) and describing the current EscapeEvent form from 87df75a9 (2026-04-19, inspector-first Escape); and three star notes accepted by 23e54104 (stable tiny stars, shared GPU twinkle data, speed change without phase jumps).
+- The tracing note links 470f9d95, the earliest first-parent descendant of its off-line introducing commit c617d8c6; it is the only such link among the 71 bevy_brp notes.
 
 **Files:**
-- `/home/natepiano/rust/hanadocs/feature-log/natedev/` — notes, through `feature_log.py` only.
-- `/home/natepiano/rust/hanadocs/feature-log/obsidian_knife/` — notes, through `feature_log.py` only.
+- `/home/natepiano/rust/hanadocs/feature-log/bevy_brp/` — 71 live notes, written only through `feature_log.py`.
+- `/home/natepiano/rust/hanadocs/feature-log/nateroids/` — 4 notes, written only through `feature_log.py`.
 
-**Seats:** `2 writers` — one project each.
-- `impl` — claims as `a`: natedev.
-- `test` — opens as impl; claims as `b`: obsidian_knife.
+**Binds later work:**
+- nateroids' commit backfill: 87df75a9 combines into "trigger game and camera commands through brp" (link 27f9a238); 23e54104 combines into the three star notes, and its trackpad controls have no note yet. The project gate is `inventory.py status --project nateroids` with no `--pool`, which exits 1 while its 555 commit records are undisposed.
+- bevy_brp's commit backfill: pre-workspace history is accepted by its subtree imports, c0839f61 (`extras/`) and 344e15aa (`mcp/`), both 2025-06-27; the 71 live notes are the combine targets, and `live --project bevy_brp` prints each link; 2,570 commit records remain undisposed.
 
-**Constraints from prior phases:** Phase 1: natedev notes take no `--crate`; obsidian_knife's one crate is `obsidian_knife`, unpublished. Phase 3: the frozen natedev and obsidian_knife ledgers. Phase 2: off natedev every `feature_log.py` call forwards to natedev over ssh unless `FEATURE_LOG_VAULT` is set; `amend --evidence` skips evidence already stored, so a repeated amend prints `unchanged`; `amend --backfill` records `backfill: true`. Phase 3 (as built): every ledger is frozen (`collect` now only prints) at hana `ce51498` + hana_catalyst `2408021`, `/etc/nixos` `9d99e9e`, cargo-liner `9301628`, bevy_brp `e65064e`, obsidian_knife `5df4349`, nateroids `c7d6a51`; counts above the proposal are work landed after its 2026-10-10 measurement; `next --path` matches a prefix of the record's source path. Phase 4 (as built): when `git log --first-parent --merges --ancestry-path <commit>..<audit ref>` names no merge (the commit entered the accepted line on a merge's second parent, as in a subtree import or a workspace consolidation), the accepting ref is the earliest commit on the audit ref's first-parent line that descends from the commit, or the commit itself when it is on that line; `feature_log.py` refuses a title over 50 characters, so shorten it and continue; `amend` takes no `--production`/`--unit`. Phase 5 (as built): `amend --backfill` also takes `--link` with `--completed` (a note's accepting ref; a link another live note holds needs `--separate-result`) and `--release crate@version` (exact historical membership; a crate the note lacks, `Unreleased` or a malformed version is refused, and a value already present prints `unchanged`), so a correction never needs a second note; `live` prints each note's link.
+**Gotchas:**
+- A changelog bullet, commit subject or doc comment can overstate behavior; notes describe the code at the audit ref. extras 0.18.1's bullet and doc comment say type_text types one character per frame, while the queue presses on one frame and releases on the next (one character every two frames).
+- Error-behavior claims hold only for the paths the code marks: a discovery miss and a handler error name their stage; transport and HTTP failures use the generic error.
+- An introducing commit can sit off the audit ref's first-parent line outside any subtree import or consolidation; a link is valid only when `git rev-list --first-parent <audit ref>` contains it.
 
-**Acceptance gate:** `inventory.py status` exits 0 for both projects; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits each project's live entries against its current surface and finds no qualifying behavior without one live entry. The phase report gives the note count, the count per disposition, and the measured review time.
+**Ruled out:**
+- A separate note for 87df75a9's inspector-first Escape: the command-event note already describes it.
 
-### Phase 9 — nateroids' commits and Hana's merges are logged, and both audits finish  · status: todo
+### Phase 8 — natedev and obsidian_knife are logged from their commits  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** every record of nateroids' and hana's commit pools has a disposition, and both projects' current surfaces have one live entry per qualifying behavior, checked in the running apps.
-
-**Spec:** Delegation Context → Backfill procedure, for `--pool commits` of both. nateroids: review the 553 subjects and combine commits by playable result. hana: the 124 `main` merges and 292 `init/catalyst` merges, looking only for results no phase record covered (Phase 4). Current surfaces: hana — as-built docs, player controls, tool definitions, public crate READMEs and APIs, and the running app; nateroids — as-built docs, controls, playable behavior, README, and a play check. Visible behavior that docs, definitions and tests leave unsettled is checked in one batched run of each app, launched with the BRP tools on the unit's port 15798 (production doc 31df9c1) from a detached worktree at the phase's audit ref (Backfill procedure step 3). The two seats share that port: the hana seat runs its app check first, shuts its app down and posts the hand-off on the board before the nateroids seat launches; record review goes on meanwhile.
-
-**Files:**
-- `/home/natepiano/rust/hanadocs/feature-log/hana/` — notes, through `feature_log.py` only.
-- `/home/natepiano/rust/hanadocs/feature-log/nateroids/` — notes, through `feature_log.py` only.
-
-**Seats:** `2 writers` — one project each.
-- `impl` — claims as `a`: hana.
-- `test` — opens as impl; claims as `b`: nateroids.
-
-**Constraints from prior phases:** Phase 4 logged hana's structured pool; Phase 7 seeded nateroids from its as-built files. Phase 3: the frozen ledgers. Phase 3 (as built): every ledger is frozen (`collect` now only prints) at hana `ce51498` + hana_catalyst `2408021`, `/etc/nixos` `9d99e9e`, cargo-liner `9301628`, bevy_brp `e65064e`, obsidian_knife `5df4349`, nateroids `c7d6a51`; counts above the proposal are work landed after its 2026-10-10 measurement; `next --path` matches a prefix of the record's source path. Phase 4 (as built): when `git log --first-parent --merges --ancestry-path <commit>..<audit ref>` names no merge (the commit entered the accepted line on a merge's second parent, as in a subtree import or a workspace consolidation), the accepting ref is the earliest commit on the audit ref's first-parent line that descends from the commit, or the commit itself when it is on that line; `feature_log.py` refuses a title over 50 characters, so shorten it and continue; `amend` takes no `--production`/`--unit`. Phase 5 (as built): `amend --backfill` also takes `--link` with `--completed` (a note's accepting ref; a link another live note holds needs `--separate-result`) and `--release crate@version` (exact historical membership; a crate the note lacks, `Unreleased` or a malformed version is refused, and a value already present prints `unchanged`), so a correction never needs a second note; `live` prints each note's link. A Hana merge already held as a live note's frontmatter `link` (`grep -l '^link: .*<sha>' /home/natepiano/rust/hanadocs/feature-log/hana/*.md`; a sha in Evidence does not count) is a coverage candidate — d2569c62, f9ef2a30 (three notes), 785db466: inspect it for further results before marking it `combined`. Links c7ad7842, 54f2946d and 1bbc6520 are direct first-parent commits, not merges, and need no mark. Merges 34b62541f, eea40e7dc and f8ac6c24d accepted the results of the notes "idle scenes spend work on changed tools", "new tools avoid rebuilding the whole scene" and "frame time shows main and render costs", which Phase 5 relinks to these merges; mark them `combined` into those notes. Five hana notes have no structured record (mesh outlines, monitor-output recovery commands, wheel orbit, fly over scene, step sequencer): the merges that built them mark `combined` into them.
-
-**Acceptance gate:** `inventory.py status` exits 0 for both projects; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits each project's live entries against its current surface, using the running-app check above, and finds no qualifying behavior without one live entry. The phase report gives the note count, the count per disposition, and the measured review time.
-
-### Phase 10 — cargo-liner's and bevy_brp's commits are dispositioned, and both audits finish  · status: todo
-
-#### Work Order
-
-**Goal:** every commit and merge in cargo-liner's and bevy_brp's pools has a disposition, and both projects' current surfaces have one live entry per qualifying behavior.
-
-**Spec:** Delegation Context → Backfill procedure, for `--pool commits` of both. Most commits belong to a result already logged (`combined`) or are internal; inspect a commit only where Phases 6 and 7 left a gap, and mark the rest in bulk with `mark --ids-from`. Current surfaces as in Phases 6 and 7, now complete: every qualifying behavior has one live entry, including behavior the changelogs missed.
+- natedev's frozen commit pool (976 commits, 1 merge, 1 tag, audited at `/etc/nixos` `9d99e9e`, the ledger's frozen ref) is fully disposed: `inventory.py status --project natedev` exits 0 over 978 records — represented 106, combined 182, internal 674, not-current 16, unresolved 0. Its 121 live notes carry `crate: []` and no release; each links a first-parent nixos commit, takes its feature boundary from the vault's `machines/configuration overview.md`, and names an installed operator command or machine state as See it.
+- obsidian_knife's ledger (audited at `5df4349`, its frozen ref) is fully disposed: `inventory.py status --project obsidian_knife` exits 0 over 564 records — represented 27, combined 104, internal 408, not-current 25, unresolved 0. Its 28 live notes carry crate `obsidian_knife` and no release (unpublished); repair and follow-up commits combine into the note they complete.
+- Both projects' audits are finished, and neither has a release value, so no changelog section selects their notes. `feature_log.py check` prints `ok` (639 notes in all projects).
+- A commit with several distinct results has one note per result (`add --backfill --separate-result`): its ledger record is `represented` into one note and each sibling cites the commit in Evidence. nixos 1981b2a, f84bbf2, 504ae96 and 6e6b951 each carry two or three notes.
+- Measured: natedev 22.45 min, obsidian_knife 24.0 min, blind review 21 review-seat minutes, one repair round about 6 min.
 
 **Files:**
-- `/home/natepiano/rust/hanadocs/feature-log/cargo-liner/` — notes, through `feature_log.py` only.
-- `/home/natepiano/rust/hanadocs/feature-log/bevy_brp/` — notes, through `feature_log.py` only.
+- `/home/natepiano/rust/hanadocs/feature-log/natedev/` — 121 live notes, written only through `feature_log.py`.
+- `/home/natepiano/rust/hanadocs/feature-log/obsidian_knife/` — 28 live notes, written only through `feature_log.py`.
 
-**Seats:** `2 writers` — one project each.
-- `impl` — claims as `a`: cargo-liner.
-- `test` — opens as impl; claims as `b`: bevy_brp.
+**Gotchas:**
+- The ledger holds one target per record, so a second result of a commit already marked into another note or `internal` has no record of its own and no status count reports it missing; each commit's diff is read for every result it carries.
+- A note stating specific values links the first-parent commit that reached them: "keep ghostty settings writable after setup" links 7e29ee325 (opacity 0.5, blur 1), and 03a6de0f, which started the feature at other values, is combined into it.
+- A See it command resolves with `command -v`: natedev installs `plasma-review`, not `plasma-diff`.
+- Notes describe the code, and the code differs from the obvious reading: obsidian_knife's phantom-link alias lookup keys on the missing target's name (case-insensitive) and keeps the display label; an image hashing error passes through `.ok()?` in `image_processing.rs` and omits that image instead of stopping analysis.
+- `agent-sessions-snapshot --help` ignores the flag and runs a snapshot, regenerating the vault's generated agent-session pages; a command's source is read before the command runs.
 
-**Constraints from prior phases:** Phase 6 and Phase 7 logged the structured pools of both projects. Phase 3: the frozen ledgers. Phase 3 (as built): every ledger is frozen (`collect` now only prints) at hana `ce51498` + hana_catalyst `2408021`, `/etc/nixos` `9d99e9e`, cargo-liner `9301628`, bevy_brp `e65064e`, obsidian_knife `5df4349`, nateroids `c7d6a51`; counts above the proposal are work landed after its 2026-10-10 measurement; `next --path` matches a prefix of the record's source path. Phase 4 (as built): when `git log --first-parent --merges --ancestry-path <commit>..<audit ref>` names no merge (the commit entered the accepted line on a merge's second parent, as in a subtree import or a workspace consolidation), the accepting ref is the earliest commit on the audit ref's first-parent line that descends from the commit, or the commit itself when it is on that line; `feature_log.py` refuses a title over 50 characters, so shorten it and continue; `amend` takes no `--production`/`--unit`. Phase 5 (as built): `amend --backfill` also takes `--link` with `--completed` (a note's accepting ref; a link another live note holds needs `--separate-result`) and `--release crate@version` (exact historical membership; a crate the note lacks, `Unreleased` or a malformed version is refused, and a value already present prints `unchanged`), so a correction never needs a second note; `live` prints each note's link.
+### Phase 9 — nateroids' commits and Hana's merges are logged, and both audits finish  · status: done
 
-**Acceptance gate:** `inventory.py status` exits 0 for both projects; `feature_log.py check` prints `ok`. The phase's blind review (Backfill procedure step 8) audits each project's live entries against its current surface and finds no qualifying behavior without one live entry. The phase report gives the note count, the count per disposition, the measured review time, and the backfill's total notes across the six projects.
+#### As-built
+
+- hana's frozen merge pool (124 `main` merges and 292 `init/catalyst` merges, audited at hana_catalyst `bcd669367`) is fully disposed: represented 13, combined 273, internal 127, not-current 3. `inventory.py status --project hana` exits 0 over 677 records in both pools — represented 149, combined 376, internal 148, not-current 4, unresolved 0. The merges add 20 notes and the review's coverage repair 9 more, for 152 live hana notes.
+- Picture and control-value delays are separate notes: "delay images through frames and feedback" (render-frame pictures) and "retain control values for graph feedback" (control-clock scalars).
+- nateroids' frozen commit pool (553 commits, 2 merges) is fully disposed: `inventory.py status --project nateroids` exits 0 over both pools; the 555 commit records are represented 37, combined 154, internal 354, not-current 10, unresolved 0. 37 new notes join the 4 from its as-built files, for 41 live notes; 23e54104's trackpad controls are "orbit with forwarded trackpad scroll events".
+- Both audits are finished: a blind review with contract and adversary lenses read every live hana and nateroids note against its project's current surface. `feature_log.py check` prints `ok` (705 notes in all projects).
+
+**Files:**
+- `/home/natepiano/rust/hanadocs/feature-log/hana/` — 152 live notes, written only through `feature_log.py`.
+- `/home/natepiano/rust/hanadocs/feature-log/nateroids/` — 41 live notes, written only through `feature_log.py`.
+
+**Binds later work:** 35 hana notes from Phase 4 still link commits off every first-parent line of hana_catalyst `init/catalyst` (`afd2dde8`, `fb96ceed`, `0fff06f9`, `40e58e32`, `435d78c3`, `b48e6ec6`); "cargo-liner's and bevy_brp's commits are dispositioned, and both audits finish" relinks each to the commit on `git rev-list --first-parent bcd669367` that accepted the implementation commit completing its result.
+
+**Gotchas:**
+- Results that docs and controls never mention sit in public APIs and registries: stock tool catalogs (`stock_tools()`), derive macros, registration functions, picture and value delays. A coverage sweep reads each crate's public API and registries, not only its README and docs.
+- Codex seats have no BRP tools: an app check runs by hand from a detached worktree at the audit ref (`BRP_EXTRAS_PORT=15798 cargo run`, curl JSON-RPC to `http://127.0.0.1:15798`); two seats sharing the port hand it over on the board.
+- A `live` read can fail once with "missing opening frontmatter delimiter" when it catches a note mid-rewrite while Obsidian runs on natedev; `feature_log.py` writes are atomic.
+
+**Ruled out:**
+- Storing the rendered changelog section with the reviewed titles and refusing drift before `release` stamps: an amend a minute after stamping drifts the same way, so the check guards no lasting invariant.
+
+### Phase 10 — cargo-liner's and bevy_brp's commits are dispositioned, and both audits finish  · status: done
+
+#### As-built
+
+- cargo-liner's ledger (audited at `9301628`, its frozen ref) is fully disposed: `inventory.py status --project cargo-liner` exits 0 over 3,043 records — represented 286, combined 1,353, internal 1,362, not-current 42, unresolved 0. It has 298 live notes.
+- bevy_brp's ledger (frozen at `e65064e`, audited at `49089a51`) is fully disposed: `inventory.py status --project bevy_brp` exits 0 over 2,804 records — represented 70, combined 364, internal 2,305, not-current 65, unresolved 0. It has 73 live notes.
+- The 35 hana notes that linked docs checkpoints off hana_catalyst's first-parent line now link the commit on `git rev-list --first-parent bcd669367` that accepted their implementation commit, with that commit's date as `completed_date`; Evidence names both commits. Every one of the 152 live hana notes links that line.
+- Both audits are finished: a blind review with contract and adversary lenses read every live cargo-liner and bevy_brp note against its project's current surface. The backfill is complete: `feature_log.py check` prints `ok` (717 notes in all six projects).
+
+**Files:**
+- `/home/natepiano/rust/hanadocs/feature-log/cargo-liner/` — 298 live notes, written only through `feature_log.py`.
+- `/home/natepiano/rust/hanadocs/feature-log/bevy_brp/` — 73 live notes, written only through `feature_log.py`.
+- `/home/natepiano/rust/hanadocs/feature-log/hana/` — 152 live notes; the 35 relinks written through `feature_log.py amend`.
+
+**Binds later work:** no note carries `@Unreleased` (`--backfill` refuses it), and historical release values are exact versions only (cargo-liner 91, bevy_brp 66). Until live logging writes a crate's entries, "A published crate's changelog section comes from the log" prints only `## [Unreleased]` for it, and `--compare` reports every hand-written Unreleased bullet as a difference.
+
+**Gotchas:**
+- A result built in a commit marked into a broader note or `internal` stays missing until its code is read: 47eaf59f ("perf: off-thread lint history load") also fixed the sync-notification startup race. Each commit's diff is read for results its subject does not name.
+- A docs-move or docs checkpoint commit can hold a note's link; the link is the commit that made the stated behavior true (the exact-file claim note links 268e8792, not docs-move 51042e15).
 
 ### Phase 11 — A published crate's changelog section comes from the log  · status: todo
 
@@ -323,9 +330,9 @@ After Phase 2 reaches `~/.claude` main, the unit director tells the showrunner t
 
 **Spec:** (proposal "Changelog generation")
 
-- `changelog --crate X --version V` (V a version or `Unreleased`): selects every note, live or superseded, whose `crate` holds X and whose `release` holds `X@V`; prints `## [V]`, then one `### <heading>` per non-empty heading in the order Added, Changed, Deprecated, Removed, Fixed, Security (`feature` → Added, `fix` → Fixed, `change` and `perf` → Changed, `deprecation` → Deprecated, `removal` → Removed, `security` → Security), each followed by `- <summary>` lines sorted by summary. An unpublished crate fails with exit 2 and prints nothing.
-- `changelog --crate X --version Unreleased --compare PATH` — compares that output with the `## [Unreleased]` section of the CHANGELOG at PATH (bullet sets per heading); prints `match` (exit 0) or the differences (exit 1). PATH is read on the calling host: where `main` forwards to natedev, it forwards `changelog` without `--compare` and compares the returned section locally. argparse turns the optional `--compare` into `RenderSection` or `CompareSection` at the boundary; the forwarded read returns `ForwardedOutput(text)` or `ForwardFailed(exit, stderr)` through an injectable reader, and a failed read exits 2 with the remote error. `--save FILE` on a `match` writes the selected note titles as `ReviewedReleaseContents`.
-- `release --crate X --version V --contents FILE` — replaces `X@Unreleased` with `X@V` in exactly the notes FILE's `ReviewedReleaseContents` names, including one superseded after the snapshot (it shipped); a note added after the snapshot keeps `X@Unreleased`; `X@Unreleased` is dropped from notes superseded before the snapshot and absent from it (my call: a behavior replaced before a release never shipped, so the generator needs no state filter); appends one `ReleaseEvent` (`at`, `verb: "release"`, `project`, `crate`, `version`, `titles`: the notes it changed), which joins the `FeatureLogEvent` union; a repeat prints `unchanged`. `digest` shows a release event as `= X@V (<n> notes)`.
+- `changelog --crate X --version V` (V a version or `Unreleased`): selects the notes whose `crate` holds X and whose `release` holds `X@V` — for a released version every note, live or superseded (a superseded note shipped in that version); for `Unreleased` only live notes, because superseding keeps a note's `release` values and a result replaced before its release never shipped; prints `## [V]`, then one `### <heading>` per non-empty heading in the order Added, Changed, Deprecated, Removed, Fixed, Security (`feature` → Added, `fix` → Fixed, `change` and `perf` → Changed, `deprecation` → Deprecated, `removal` → Removed, `security` → Security), each followed by `- <summary>` lines sorted by summary. An unpublished crate fails with exit 2 and prints nothing.
+- `changelog --crate X --version Unreleased --compare PATH` — compares that output with the `## [Unreleased]` section of the CHANGELOG at PATH (bullet sets per heading); prints `match` (exit 0) or the differences (exit 1). PATH is read on the calling host: where `main` forwards to natedev, it makes one forwarded read, `changelog --crate X --version V --selection` (internal: prints the rendered section and the selected note titles as JSON), and compares locally. argparse turns the optional `--compare` into `RenderSection` or `CompareSection` at the boundary; the forwarded read returns `ChangelogSelection(section, titles)` or `ForwardFailed(exit, stderr)` through an injectable reader, and a failed read exits 2 with the remote error. `--save FILE` on a `match` writes the selection's titles as `ReviewedReleaseContents` on the calling host; `--save` removes FILE before comparing, so only this comparison's match leaves one, and a file left by an aborted earlier release never makes a crate eligible to stamp.
+- `release --crate X --version V --contents FILE` — FILE is read and validated on the calling host; from another host `main` forwards the validated titles as JSON on stdin, never the path. It replaces `X@Unreleased` with `X@V` in exactly the notes FILE's `ReviewedReleaseContents` names, including one superseded after the snapshot (it shipped); a note added after the snapshot keeps `X@Unreleased`; `X@Unreleased` is dropped from notes superseded before the snapshot and absent from it (my call: a behavior replaced before a release never shipped, so the generator needs no state filter); appends one `ReleaseEvent` (`at`, `verb: "release"`, `project`, `crate`, `version`, `titles`: the notes it changed), which joins the `FeatureLogEvent` union; a repeat prints `unchanged`. `digest` shows a release event as `= X@V (<n> notes)`.
 - `commands/release.md`, in both changelog-finalizing blocks — `<FinalizeOnBase/>` (at 485) and `<FinalizeOnHotfixBranch/>` (at 869), beside the `## [Unreleased]` display: for each published crate being released, run `changelog --compare` and show `match` or the differences to the release owner, who reconciles them with `amend` or in the changelog before finalizing. A crate whose output still differs after reconciliation is reported, not blocked, and gets no saved contents, so it is not stamped (the proposal: connect a crate's release path only after its output matches); a `match` saves `~/.local/state/claude/feature-log/release/<crate>.json` with `--save`.
 - `commands/release.md`, a stamp step inside `<PublishPhases/>` (all three mode sequences reach it), right after each crate's publish succeeds, skipped on a dry run: `release --crate <crate> --version ${VERSION} --contents <saved file>` for a crate with saved contents; a crate without them is not stamped. A later failed publish leaves earlier stamps in place, and a retry's repeat prints `unchanged`.
 
@@ -336,8 +343,8 @@ After Phase 2 reaches `~/.claude` main, the unit director tells the showrunner t
 
 **Seats:** `1 writer + 1 tester` — one script change and one command step; the heading map and selection rules are concrete enough to test first.
 - `impl` — `scripts/feature_log/feature_log.py`, `commands/release.md`.
-- `test` — `scripts/feature_log/test_feature_log.py`: fixture notes covering every kind, a result shared by two crates, a superseded entry with a released version (kept) and one with `@Unreleased` (dropped by `release`), and an unpublished crate (no output); the proposal's cargo-mend 0.23.0 example prints exactly its section; `--compare` matches and differs, and on another host forwards `changelog` without `--compare` and compares locally; `release` and its repeat; a mixed workspace where only matched crates are stamped; a note added after the snapshot stays `@Unreleased`; a note superseded after the snapshot is stamped; a retry after new Unreleased work; a partial publish stamps only the published crates; a failed forwarded read exits 2; `digest` shows the release event.
+- `test` — `scripts/feature_log/test_feature_log.py`: fixture notes covering every kind, a result shared by two crates, a superseded entry with a released version (kept) and one with `@Unreleased` (dropped by `release`), and an unpublished crate (no output); the proposal's cargo-mend 0.23.0 example prints exactly its section; `--compare` matches and differs, and on another host forwards `changelog` without `--compare` and compares locally; `release` and its repeat; a mixed workspace where only matched crates are stamped; a note added after the snapshot stays `@Unreleased`; a note superseded after the snapshot is stamped; a retry after new Unreleased work; a partial publish stamps only the published crates; an earlier `--save` match followed by a differing `--compare --save` leaves no saved file, so nothing is stamped; a failed forwarded read exits 2; for `Unreleased`, a note superseded before the comparison is absent from the section and its saved titles, and `release` drops its `X@Unreleased`; an off-host compare → save → release whose saved file exists only on the calling host's filesystem; `digest` shows the release event.
 
-**Constraints from prior phases:** Phase 1: notes carry `release` values `crate@Unreleased` (derived without `--backfill`) or `crate@version`. Phase 2: `FeatureLogEvent` is a union of per-verb TypedDicts discriminated by `verb`; `digest` reads events by line position and leaves out backfill events; every verb except `project-of` forwards to natedev from another host. Phases 4 and 6–10: backfilled notes carry a historical version only on an exact changelog-bullet match. Phase 5 (as built): `FeatureLogEvent` adds `AmendEvent` (old and new `link` and `completed`, `releases_added`) beside `LegacyAmendEvent`; every writer refuses a version with an empty prerelease identifier.
+**Constraints from prior phases:** Phase 1: notes carry `release` values `crate@Unreleased` (derived without `--backfill`) or `crate@version`. Phase 2: `FeatureLogEvent` is a union of per-verb TypedDicts discriminated by `verb`; `digest` reads events by line position and leaves out backfill events; every verb except `project-of` forwards to natedev from another host. Phases 4 and 6–10: backfilled notes carry a historical version only on an exact changelog-bullet match. Phase 5 (as built): `FeatureLogEvent` adds `AmendEvent` (old and new `link` and `completed`, `releases_added`) beside `LegacyAmendEvent`; every writer refuses a version with an empty prerelease identifier. Phase 10 (as built): the backfill is complete (717 notes across the six projects) and no note carries `@Unreleased`, because `--backfill` refuses it; historical release values are exact versions only (cargo-liner 91, bevy_brp 66). Until live logging writes a crate's entries, `changelog --version Unreleased` prints only `## [Unreleased]` for it and `--compare` reports every hand-written Unreleased bullet as a difference; the live gate's report names those crates as not yet logged, not as mismatches to reconcile.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/feature_log -p 'test_*.py'` green; `basedpyright scripts/feature_log` clean. Live: `changelog --compare` against each published crate's current `CHANGELOG.md`; the phase report names the crates that match and the differences of the rest.

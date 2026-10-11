@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from collections.abc import Callable
+from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
@@ -20,6 +24,11 @@ import note_file
 from agent_notes import local_reset
 from note_file import read_note
 from scripts.accounts import accounts
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
+import send
+# send puts scripts/notify on the path.
+from user_action import ActionRequired, NoActionRequired, UserAction, parse_user_action
 
 Notes = list[quota_alert.AgentNote]
 
@@ -56,6 +65,7 @@ sonnet=low,medium,high
 
 REAL_RECIPIENTS = quota_alert.recipients
 REAL_TELL_USER = quota_alert.tell_user
+REFUSAL_ACTION = "Add credits to codex 1 or redeem a limit reset to bring Codex back."
 
 
 def all_live(names: list[str]) -> list[str]:
@@ -88,7 +98,7 @@ class QuotaAlertTests(unittest.TestCase):
         self.failing: set[str] = set()
         self.sent: list[tuple[str, str]] = []
         self.push_errors: list[str | None] = []
-        self.pushed: list[tuple[str, str, quota_alert.Need]] = []
+        self.pushed: list[tuple[str, str, quota_alert.Ask | None]] = []
 
     @override
     def setUp(self) -> None:
@@ -134,12 +144,40 @@ class QuotaAlertTests(unittest.TestCase):
         self.sent.append((recipient, text))
         return "not reachable" if recipient in self.failing else None
 
-    def tell_user(self, summary: str, text: str, need: quota_alert.Need) -> str | None:
+    def tell_user(self, summary: str, text: str, ask: quota_alert.Ask | None) -> str | None:
         """Record direct delivery so no test can reach send.py's real user channel."""
         self.assertNotIn("/", text)
         self.assertNotIn("@", text)
-        self.pushed.append((summary, text, need))
+        self.pushed.append((summary, text, ask))
         return self.push_errors.pop(0) if self.push_errors else None
+
+    def user_sends(self, deliver: Callable[[], object]) -> dict[str, tuple[str, UserAction]]:
+        """Each user message the real tell_user sends during `deliver`, by title, as send.py's parser takes it.
+
+        subprocess.run is faked, so nothing is sent; a command line send.py refuses fails the test with its reason.
+        """
+        commands: list[list[str]] = []
+
+        def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "SENT: to the user", "")
+
+        with mock.patch.object(quota_alert, "tell_user", REAL_TELL_USER), mock.patch.object(subprocess, "run", run):
+            _ = deliver()
+        sends: dict[str, tuple[str, UserAction]] = {}
+        for command in commands:
+            self.assertEqual(command[:2], [sys.executable, str(quota_alert.SEND)])
+            with redirect_stderr(io.StringIO()) as refusal:
+                try:
+                    options = send.parse(command[2:])
+                except SystemExit:
+                    self.fail(f"send.py refused {command[2:]}: {refusal.getvalue().strip().splitlines()[-1]}")
+            assert options.summary is not None and not isinstance(options.action, send.NoUserRecipient)
+            if isinstance(options.action, ActionRequired):
+                # Placeholder text such as "none" or "n/a" is refused.
+                self.assertEqual(parse_user_action(options.action.text, no_action=False), options.action)
+            sends[options.summary] = (options.need, options.action)
+        return sends
 
     def recipients(self) -> list[str]:
         found = sorted(recipient for recipient, _ in self.sent)
@@ -455,17 +493,31 @@ class QuotaAlertTests(unittest.TestCase):
         _ = quota_alert.alert([note], self.now)
         self.assertEqual(self.pushed, [(
             "claude 2 weekly limit",
-            "claude 2 has 0% of its weekly usage left; it refills Mon 10-12 06:00 PDT. "
-            + "Log in to another Claude account, or redeem a limit reset (3 available).",
-            "decision",
+            "claude 2 has 0% of its weekly usage left; it refills Mon 10-12 06:00 PDT.",
+            quota_alert.Ask("decision", "Log in to another Claude account, or redeem a limit reset (3 available)."),
         )])
 
     def test_codex_push_names_credits_at_note_priority(self) -> None:
         note = self.note("codex 1.md", "active", "0", credit_balance="60498")
         _ = quota_alert.alert([note], self.now)
-        summary, text, need = self.pushed[0]
-        self.assertEqual((summary, need), ("codex 1 weekly limit", "note"))
+        summary, text, ask = self.pushed[0]
+        self.assertEqual((summary, ask), ("codex 1 weekly limit", None))
         self.assertIn("Codex keeps working on its credits. Credits left on codex 1: 60,498.", text)
+
+    def test_every_user_push_states_its_action_as_send_py_requires(self) -> None:
+        claude = self.note("claude 2.md", "active", "0", limit_reset_count="3")
+        codex = self.note("codex 1.md", "active", "0")
+        sends = self.user_sends(lambda: quota_alert.alert([claude, codex], self.now))
+        sends |= self.user_sends(lambda: quota_alert.blocked([codex], self.now))
+        self.assertEqual(sends, {
+            "claude 2 weekly limit": (
+                "decision", ActionRequired("Log in to another Claude account, or redeem a limit reset (3 available).")),
+            "codex 1 weekly limit": ("note", NoActionRequired()),
+            "Codex refused work": ("decision", ActionRequired(REFUSAL_ACTION)),
+        })
+        ask = quota_alert.Ask("blocked", "Redeem a limit reset on claude 2.")
+        self.assertEqual(self.user_sends(lambda: quota_alert.tell_user("title", "text", ask)),
+                         {"title": ("blocked", ActionRequired(ask.action))})
 
     def test_failed_delivery_retries_on_the_same_cadence(self) -> None:
         notes: Notes = [self.note("codex 1.md", "active", "1")]
@@ -686,7 +738,7 @@ class QuotaAlertTests(unittest.TestCase):
                                "quota alert codex 1 -> natedev: sent", "quota alert codex 1 -> boss of bosses: sent"])
         self.assertEqual([recipient for recipient, _ in self.sent], ["natedev", "boss of bosses"])
         self.assertIn("Every function that ran on Codex (delegate, fix) was moved to Claude", self.sent[0][1])
-        self.assertEqual(self.pushed[0][0::2], ("Codex refused work", "decision"))
+        self.assertEqual(self.pushed[0][0::2], ("Codex refused work", quota_alert.Ask("decision", REFUSAL_ACTION)))
         self.assertIn("No credit balance is reported for codex 1.", self.pushed[0][1])
         self.assertIn("The automatic switch moved delegate, fix to Claude", self.pushed[0][1])
         self.sent.clear()
@@ -799,7 +851,7 @@ class QuotaAlertTests(unittest.TestCase):
         log = quota_alert.blocked(notes, self.now)
         self.assertTrue(log[0].startswith("switch to claude for codex 1 failed: ERROR: [delegate.impl] effort 'ultra'"))
         self.assertEqual(log[1], "quota push codex 1 -> user: sent")
-        self.assertEqual(self.pushed[0][0::2], ("Codex refused work", "decision"))
+        self.assertEqual(self.pushed[0][0::2], ("Codex refused work", quota_alert.Ask("decision", REFUSAL_ACTION)))
         self.assertIn("The automatic switch to Claude failed: ERROR: [delegate.impl] effort 'ultra'",
                       self.pushed[0][1])
         second = quota_alert.blocked(notes, self.now)

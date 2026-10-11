@@ -37,8 +37,17 @@ class TopLevelTests(unittest.TestCase):
     def setUp(self) -> None:
         self.folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = (self.folder / "ps").write_text("", encoding="utf-8")
+        binaries = self.folder / "bin"
+        binaries.mkdir()
+        ssh = binaries / "ssh"
+        _ = ssh.write_text(f"#!{sys.executable}\n"
+            + "import os, sys\n"
+            + "with open(os.environ['SSH_RECORD'], 'a') as log: log.write(repr(sys.argv[1:]) + '\\n')\n"
+            + "raise SystemExit(91)\n", encoding="utf-8")
+        ssh.chmod(0o755)
         environment_context = cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
-            "HOME": str(self.folder), "PATH": os.environ.get("PATH", ""),
+            "HOME": str(self.folder), "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
+            "SSH_RECORD": str(self.folder / "ssh.log"),
             "NOTIFIER_SESSIONS_DIR": str(self.folder),
             "CLAUDE_CODE_SESSION_ID": "current-id", "CODEX_THREAD_ID": "",
             "BUILD_HOLD_DIR": str(self.folder / "holders"),
@@ -54,7 +63,8 @@ class TopLevelTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(sessions, "messaging_socket_exists", side_effect=self.fixture_socket_exists))
         _ = self.enterContext(mock.patch.object(process_table, "PS", ["cat", str(self.folder / "ps")]))
 
-    def fixture_roster(self, _environment: Mapping[str, str]) -> roster.Roster:
+    def fixture_roster(self, _environment: Mapping[str, str], scope: roster.RosterScope) -> roster.Roster:
+        self.assertEqual(scope, roster.ThisMachine())
         return roster.Roster(self.rows, self.problems)
 
     def fixture_records(self) -> list[sessions.SessionRecord]:
@@ -103,6 +113,14 @@ class TopLevelTests(unittest.TestCase):
               redirect_stdout(output), redirect_stderr(errors)):
             result = top_level.main(list(argv))
         return result, output.getvalue().splitlines(), errors.getvalue().splitlines(), recorded
+
+    def test_top_level_reads_this_machine_and_makes_no_ssh_call(self) -> None:
+        address = self.add("local", session_id="local-id")
+        result, lines, errors, recorded = self.run_main()
+        self.assertEqual((result, errors), (0, []))
+        self.assertEqual(lines, [f"local\tuds:{address}"])
+        self.assertEqual(recorded, [("local", "local-id")])
+        self.assertFalse((self.folder / "ssh.log").exists())
 
     def test_two_sessions_with_one_name_have_distinct_addresses_and_records(self) -> None:
         first = self.add("shared", session_id="session-a", file_name="first")
@@ -255,12 +273,21 @@ class TopLevelRunningRecordTests(unittest.TestCase):
     directory: Path = Path()
     socket_path: Path = Path()
     child_pid: int = 0
+    process_starts: dict[int, str] = {}
 
     @override
     def setUp(self) -> None:
         self.folder = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="tl-", dir="/tmp")))
         self.directory = self.folder / "sessions"
         self.directory.mkdir()
+        binaries = self.folder / "bin"
+        binaries.mkdir()
+        ssh = binaries / "ssh"
+        _ = ssh.write_text(f"#!{sys.executable}\n"
+            + "import os, sys\n"
+            + "with open(os.environ['SSH_RECORD'], 'a') as log: log.write(repr(sys.argv[1:]) + '\\n')\n"
+            + "raise SystemExit(91)\n", encoding="utf-8")
+        ssh.chmod(0o755)
         self.socket_path = self.folder / "live.sock"
         listener = self.enterContext(socket.socket(socket.AF_UNIX))
         listener.bind(str(self.socket_path))
@@ -269,9 +296,11 @@ class TopLevelRunningRecordTests(unittest.TestCase):
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         ))
         self.child_pid = child.pid
+        self.process_starts = {}
         self.addCleanup(child.communicate, timeout=5)
         environment = cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "HOME": str(self.folder), "NOTIFIER_SESSIONS_DIR": str(self.directory),
+            "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}", "SSH_RECORD": str(self.folder / "ssh.log"),
             "NOTIFIER_STATE_DIR": str(self.folder / "notifier"),
             "ROSTER_DELEGATE_ROOT": str(self.folder / "delegate"),
             "ROSTER_CODEX_SOCKET": str(self.folder / "no-daemon.sock"),
@@ -280,10 +309,13 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(process_table, "snapshot", return_value={}))
         _ = self.enterContext(mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]))
 
-    def write_record(self, pid: int, *, socket_path: str, updated: int) -> None:
+    def write_record(self, pid: int, *, socket_path: str, updated: int, proc_start: str = "") -> None:
+        started = sessions.process_start(pid)
+        assert started is not None
+        self.process_starts[pid] = started
         record = sessions.SessionRecord(
             pid=pid, sessionId="shared-id", name="shared", messagingSocketPath=socket_path,
-            updatedAt=updated, tmux="", formerNames=[],
+            updatedAt=updated, tmux="", formerNames=[], procStart=proc_start or started,
         )
         _ = (self.directory / f"{pid}.json").write_text(json.dumps(record), encoding="utf-8")
 
@@ -291,10 +323,14 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         output, errors = io.StringIO(), io.StringIO()
         recorded: list[list[str]] = []
 
-        def record(command: list[str], **_options: object) -> subprocess.CompletedProcess[bytes]:
+        def record(
+            command: list[str] | tuple[str, ...], **_options: object,
+        ) -> subprocess.CompletedProcess[bytes] | subprocess.CompletedProcess[str]:
+            if command[:3] == ("ps", "-o", "lstart="):
+                return subprocess.CompletedProcess(command, 0, self.process_starts[int(command[-1])] + "\n", "")
             self.assertEqual(Path(command[1]).name, "build_hold.py")
             self.assertEqual(command[2], "record-recipient")
-            recorded.append(command)
+            recorded.append(list(command))
             return subprocess.CompletedProcess(command, 0, b"", b"")
 
         with mock.patch.object(subprocess, "run", new=record), redirect_stdout(output), redirect_stderr(errors):
@@ -308,6 +344,10 @@ class TopLevelRunningRecordTests(unittest.TestCase):
             0, "", "not reachable: shared [shared-id] has no messaging socket\n", [],
         ))
 
+    def test_socketless_record_with_another_process_start_is_not_listed(self) -> None:
+        self.write_record(os.getpid(), socket_path="", updated=10, proc_start="another start")
+        self.assertEqual(self.run_main(), (0, "", "", []))
+
     def test_running_session_without_socket_is_reported_and_not_recorded(self) -> None:
         self.write_record(os.getpid(), socket_path="", updated=10)
         self.assertEqual(self.run_main(), (
@@ -318,7 +358,7 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         self.write_record(os.getpid(), socket_path=str(self.socket_path), updated=10)
         self.write_record(self.child_pid, socket_path="", updated=20)
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "shared-id"}):
-            found = roster.roster(os.environ)
+            found = roster.roster(os.environ, roster.ThisMachine())
             self.assertEqual(len(found.entries), 1)
             self.assertEqual(found.entries[0].reach, roster.CannotReceiveMessages("no messaging socket"))
             self.assertTrue(roster.is_sender(found.entries[0], roster.sender_identity(os.environ)))
