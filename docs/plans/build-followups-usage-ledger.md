@@ -53,9 +53,9 @@ Today, each question needs its own scratch script (`seat_usage.py`, `api_cost.py
 ## Design decisions
 
 - **One SQLite store** at `~/.local/state/usage-model/usage.db` on natedev. The Mac's logs are read over ssh, the way `seat_usage.py` reads them today. SQLite because metrics are queries over joins, and it ships with Python.
-- **The role is recorded when it starts, by the code that assigns it**, not inferred later. An append-only `agents.jsonl` on each machine, with one line per assignment holding only what is lost once a run ends: agent id (Claude session id or Codex thread id), role, lens, and assignment time. Everything else is looked up from the agent id when it is read: the kind (from the id's form), the machine (from the file holding it), the worktree from the transcript's `cwd`, and the unit and production from the production doc's Units table. This follows the user's rule of 2026-10-08, store only what a script cannot look up. A Codex seat that switches from tester to reviewer writes a second line, so each turn is matched to the role in force at its timestamp. The `usage.db` turn rows are measurements and are stored in full.
+- **The role is recorded when it starts, by the code that assigns it**, not inferred later. An append-only `agents.jsonl` on each machine, with one line per assignment holding only what is lost once a run ends: agent id (Claude session id or Codex thread id), role, lens, and assignment time. Everything else is looked up from the agent id when it is read: the kind and the machine (from the source holding it — which family's log, on which machine; never from the id's form), the worktree from the transcript's `cwd`, and the unit and production from the production doc's Units table. This follows the user's rule of 2026-10-08, store only what a script cannot look up. A Codex seat that switches from tester to reviewer writes a second line, so each turn is matched to the role in force at its timestamp. The `usage.db` turn rows are measurements and are stored in full.
 - **Weights are a dated table per model**, not constants. Usage is reported in each model's weighted tokens, and a window that crosses a model change splits there by itself. This replaces `SEAT_MODEL` and the fixed weights in `seat_usage.py` (the pending add-on "weight seat usage by each turn's model" is folded in here).
-- **Accounts come from `scripts/whoami/accounts.py` and its quota readings** once two-accounts' 4a02a1c merges. No second copy is built.
+- **Accounts come from the existing modules**: `scripts/accounts/accounts.py` (accounts and the role-change history), `scripts/whoami/agent_accounts.py`, and the readings that `scripts/whoami/run_out.py` reads. All are already in this checkout. No second copy is built.
 - **The Mac is read over ssh, and ssh's own exit status is always 0 there**, so each remote command prints `rc=$?` and the collector reads that.
 - **No Pushover from the collector.** It fails quietly into its own log; the daily update reports staleness.
 - **Incremental and idempotent.** The collector remembers each log file's size and offset, so a rerun adds only new turns and never doubles one.
@@ -86,52 +86,67 @@ Today, each question needs its own scratch script (`seat_usage.py`, `api_cost.py
 
 ### Phase 2 — Every other Claude session can record itself · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a hook script, tested but not yet registered, that records every Claude session no delegate writer has claimed as `interactive`, and every subagent as `subagent`, exactly once per agent.
-
-**Spec:**
-- `scripts/usage/agents_log.py`:
-  - `Role` gains `interactive` and `subagent`, in the `Literal` alias, the CLI's choices and the reader's validation together.
-  - New `register_default(agent_id: str, role: Role, at: datetime) -> bool`: under the same exclusive `fcntl.flock` that `append` takes, reads the log and appends `{"id", "role", "at"}` only when no line already names this agent. A line names it when its id equals `agent_id`, or when its id is 8 hex characters and a prefix of `agent_id` (an `agent_bg.sh` worker). Returns whether it wrote. The read-check-write is one locked step, so two deliveries at once write one line. A malformed or truncated line is skipped (and does not block the write); the partial-tail rule of `append` applies.
-  - CLI: `register --id <id> --role <role>`; usage errors exit 2, write failures print `agents_log: <reason>` and exit 0, as `append`.
-- New `scripts/hooks/session-start-agents-log.py`: reads the hook payload (JSON) from stdin. When it carries a non-empty `agent_id`, registers that id as `subagent`; otherwise registers `session_id` as `interactive`. Parent session is not stored: a subagent's transcript sits at `<parent transcript stem>/subagents/agent-<agent_id>.jsonl` (`scripts/hooks/context_usage.py` `resolve_transcript`), so the collector derives it. Unparseable input, a missing id or any failure: one stderr line, exit 0, never blocks the session. Imports `agents_log` from `scripts/usage` by path, as `update_registration.py` does. Event-agnostic, so Phase 3 can register it for `SessionStart` and, after a live check, whichever event delivers a subagent's `agent_id`.
-- Ordering is settled by `role_at`, not by the hook: hook first, then a delegate writer, gives `interactive` then the delegate role, and the delegate role governs from its line on; writer first means the hook writes nothing. Resume, compaction, clear and repeated delivery for an id already present write nothing.
-- No `settings.json` change in this phase.
+- `Role` includes `interactive` and `subagent` in the `Literal` alias, the CLI's choices and the reader's validation.
+- `register_default(agent_id: str, role: Role, at: datetime) -> bool` reads the log and appends `{"id", "role", "at"}` in one step under the exclusive `fcntl.flock` that `append` takes, only when no line already names the agent. A line names it when its id equals `agent_id`, or when its id is 8 hex characters and a prefix of `agent_id` (an `agent_bg.sh` worker). It returns whether it wrote; concurrent deliveries write one line.
+- `role_at(log, agent_id, at)` on a full id merges the history under `agent_id[:8]` when that is a recorded 8-hex id, ordered by `at`; a lookup by the prefix itself sees only the prefix's lines. So a worker reads `interactive` until `agent_bg.sh`'s `worker` line, then `worker`.
+- The ledger is read as bytes, and each line is decoded inside its own error handler: an undecodable line is a counted `problems` entry and never blocks a registration.
+- CLI `register --id <id> --role <role>`: usage errors exit 2, write failures print `agents_log: <reason>` and exit 0.
+- `scripts/hooks/session-start-agents-log.py` reads the hook payload from stdin and registers a non-empty `agent_id` as `subagent`, otherwise `session_id` as `interactive`. Any failure prints one `agents_log:` stderr line and exits 0. It is event-agnostic, and imports `agents_log` from `scripts/usage` by path.
 
 **Files:**
-- `scripts/usage/agents_log.py` — two roles; `register_default`; `register` CLI.
-- `scripts/hooks/session-start-agents-log.py` — new: the hook.
-- `scripts/usage/test_agents_log.py` — `register_default` and the new roles.
-- `scripts/usage/test_session_start_hook.py` — new: drives the hook as a subprocess with fixture payloads.
+- `scripts/usage/agents_log.py` — roles, `register_default`, the prefix-merged `role_at`, the byte-wise reader, and the `register` CLI.
+- `scripts/hooks/session-start-agents-log.py` — the hook.
+- `scripts/usage/test_agents_log.py`, `scripts/usage/test_session_start_hook.py` — tests; the hook is driven as a subprocess.
 
-**Seats:** `1 writer + 1 tester`.
-- `impl` — `agents_log.py` and the hook; hub: `scripts/usage/agents_log.py`.
-- `test` — `test_agents_log.py` additions and `test_session_start_hook.py`, from this Spec alone: interactive and subagent payloads each write one line with the right role; hook then writer and writer then hook, read through `role_at`, each give the delegate role after the writer's line; a worker's 8-hex id suppresses the hook's line for the full uuid it prefixes, and an unrelated 8-hex id does not; repeated delivery (startup, resume, compact) writes one line; concurrent `register_default` from several processes writes one line; bad JSON and a missing id exit 0 with a stderr line and write nothing; the new roles are accepted by `append`, `show` and the reader; every test sets `USAGE_STATE_DIR` to a temp dir.
+**Binds later work:** the `role_at` prefix merge does not know the family or whether the prefix is unique, so the turn store validates a unique Claude worker binding before relying on it. A subagent's transcript is `<parent transcript stem>/subagents/agent-<agent_id>.jsonl` (`scripts/hooks/context_usage.py` `resolve_transcript`); the parent is derived from that path, not stored.
 
-**Constraints from prior phases:** `agents.jsonl` lines are `{"id","role","at"}` plus optional `"lens"` and `"approximate": true`; `append` locks the open file and starts a new line after a truncated tail; the reader skips and counts malformed lines and never raises; worker ids are 8-hex prefixes of their transcript uuids (142/142 measured); recording never fails its caller (Phase 1 as built).
+**Gotchas:** hook-first is the normal order for a delegate worker: the hook writes `interactive` under the full uuid before `agent_bg.sh` writes `worker` under the prefix. `register_default` reads the whole log at every session start. The type-check gate covers test files too.
 
-**Acceptance gate:** `python3 -m unittest scripts.usage.test_agents_log scripts.usage.test_session_start_hook scripts.agents.test_codex_mesh scripts.production.test_update_registration` green; basedpyright 0/0/0 on `scripts/usage scripts/hooks/session-start-agents-log.py`; `settings.json` unchanged. Live, with `USAGE_STATE_DIR` at a scratch dir: piping a SessionStart payload for this session's id writes one `interactive` line, a second pipe writes none, and the hook returns in under a second.
+**Ruled out:** an optional parent field on the agent identity; a session and a subagent are distinct identity variants.
 
 ### Phase 3 — Every other Claude session records itself · status: todo
 
-- The `settings.json` change only: register Phase 2's hook for `SessionStart`, and for the event that carries a subagent's `agent_id` once a live check shows which one does. The showrunner's gate refuses settings diffs, and the user approves this one before main, so the other phases keep merging.
-- Done when a new Claude session and a new subagent each appear in `agents.jsonl` within a second of starting.
+#### Work Order
+
+**Goal:** every Claude session and every subagent records its role in `agents.jsonl` as it starts, by registering Phase 2's hook in `settings.json`.
+
+**Spec:**
+- `settings.json`, `hooks.SessionStart`: in the entry with no `matcher` (it fires for startup, resume, clear and compact), append one command hook, written like its neighbours: `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/session-start-agents-log.py"`. Do not touch the `compact` entry or any other hook.
+- `settings.json`, `hooks.SubagentStart`: a new event key holding one entry with no `matcher` and the same command. Live check 2026-10-11 (Claude Code 2.1.296): `SubagentStart` delivers `agent_id` (form `a` + 16 hex, e.g. `a4008deac73c98365`) and `agent_type`; the hook wrote `subagent` at 21:01:02Z and the subagent's first assistant turn came at 21:01:03.685Z. `SessionStart` does not fire for a subagent. `SubagentStop` also carries `agent_id` but fires after the work, so it is not registered.
+- No change to the hook or `agents_log.py`; the edit is JSON only, keys and formatting kept as the file has them (two-space indent).
+- The showrunner's merge check refuses settings diffs: this checkpoint goes to main only after the user approves it in this session.
+
+**Files:**
+- `settings.json` — two hook registrations.
+- `scripts/usage/test_session_start_hook.py` — activation tests.
+
+**Seats:** `1 writer + 1 tester`.
+- `impl` — `settings.json`; hub: `settings.json`.
+- `test` — activation tests in `scripts/usage/test_session_start_hook.py`, from this Spec alone: load the repo's `settings.json`; exactly one `SessionStart` command and exactly one `SubagentStart` command name `scripts/hooks/session-start-agents-log.py`, the first in the matcher-less entry; no other event names it; running each registered command line through `sh -c` with `HOME` set so `$HOME/.claude` resolves to the repo root (a temp dir holding a `.claude` symlink to the repo), `USAGE_STATE_DIR` at a temp dir and a fixture payload on stdin, from an unrelated working directory, writes one `interactive` line for a SessionStart payload and one `subagent` line for a SubagentStart payload; a second delivery writes none.
+
+**Constraints from prior phases:** the hook registers a non-empty `agent_id` as `subagent`, else `session_id` as `interactive`, prints one `agents_log:` stderr line and exits 0 on any failure, and writes nothing for an id already named (exact, or by a recorded 8-hex worker prefix). Hook commands in `settings.json` run through `$HOME/.claude/scripts/lib/py`. Tests never write to the real `~/.local/state/usage-model/`.
+
+**Acceptance gate:** `python3 -m unittest scripts.usage.test_agents_log scripts.usage.test_session_start_hook` green; basedpyright 0/0/0 on `scripts/usage scripts/hooks/session-start-agents-log.py`, test files included; `python3 -m json.tool settings.json` parses; the settings diff holds only the two registrations. Live, after the user approves and the merge reaches `~/.claude`: a new Claude session and a new subagent each appear in `agents.jsonl` within a second of starting, the subagent's line dated before its first turn.
 
 ### Phase 4 — One store of every model turn · status: todo
 
 - `scripts/usage/collect.py` reads Claude transcripts and Codex rollouts on both machines into `usage.db`, one row per model turn: time, machine, agent id, model, effort, the token classes, and whether it was a compaction or came before the agent's first edit.
-- Each turn is matched to the role in force at its time, through `agents_log.assignments` and `role_at`, keeping their malformed-line diagnostics. Identity comes from the source (family and machine), never the id's form: a Claude worker matches its transcript uuid by a unique 8-hex prefix (an ambiguous prefix stays unresolved), and `role_at` on the full uuid already merges the lines under the uuid and under its recorded prefix, because the session-start hook writes `interactive` under the full uuid before `agent_bg.sh` writes `worker` under the prefix; a subagent is scoped to its parent; a historical director comes from the run's `main_agent.session_id` in `progress_history.py` events, never from `cwd` alone. Archived Codex turns with no evidence stay unassigned.
+- Each turn is matched to the role in force at its time, through `agents_log.assignments` and `role_at`, keeping their malformed-line diagnostics. Identity comes from the source (family and machine), never the id's form: a Claude worker matches its transcript uuid by a unique 8-hex prefix (an ambiguous prefix stays unresolved), and `role_at` on the full uuid already merges the lines under the uuid and under its recorded prefix, because the session-start hook writes `interactive` under the full uuid before `agent_bg.sh` writes `worker` under the prefix. `role_at` merges any recorded 8-hex history without knowing family or uniqueness, so the collector calls it on a full uuid only after validating that the prefix binding is a unique Claude worker on that machine; otherwise it looks up the exact id alone. A subagent's turns are read from `<parent transcript stem>/subagents/agent-<agent_id>.jsonl`, looked up under the child's `agent_id`, and stored under an identity scoped by machine, family, parent and child — distinct session and subagent identity variants, never an optional parent field — so parent and child usage stay separate and are each counted once. A historical director comes from the run's `main_agent.session_id` in `progress_history.py` events, never from `cwd` alone. Archived Codex turns with no evidence stay unassigned.
 - Attribution is an explicit state per turn: recorded, estimated (from an `approximate` line) or unassigned; a review lens is known, unrecorded or not applicable. Nullable values stay at the storage boundary.
 - Owns the per-turn model and effort parser, a dated weight table per model (raw token classes kept apart from weighting), and the normalized compaction events Phase 5 consumes.
 - Runs incrementally with transactional cursors, handling an incomplete tail; a change to `agents.jsonl` re-attributes the affected turns even when transcripts are unchanged.
-- Done when a rerun adds nothing; a late assignment corrects an earlier unassigned turn without duplicating it; checked-in Claude and Codex fixtures give their expected raw totals; and mixed-model, changed-effort and weight-date-boundary tests pass (from review 2026-10-11; replaces the `api_cost.py` comparison, which is not in this checkout).
+- Keeps one diagnostic snapshot per `agents.jsonl` source (its `RoleLog.problems` count, malformed and undecodable lines alike), replaced on each run rather than added to, for Phase 6 to show.
+- Done when a rerun adds nothing; a late assignment corrects an earlier unassigned turn without duplicating it; checked-in Claude and Codex fixtures give their expected raw totals; and mixed-model, changed-effort and weight-date-boundary tests pass (from review 2026-10-11; replaces the `api_cost.py` comparison, which is not in this checkout). Attribution fixtures cover a hook-first worker, two uuids sharing an 8-hex prefix (both stay unresolved on the prefix), a cross-family id collision, late prefix evidence correcting unchanged turns, and a parent with a subagent whose usage stays separate. A ledger fixture with malformed bytes keeps its problems count stable across reruns while its valid lines still attribute.
+- **Seats:** `1 writer + 1 tester`. `impl` — `scripts/usage/collect.py`, sole owner of any parser, schema or weight modules it declares; hub: `collect.py`. `test` — new `scripts/usage/test_collect.py` and its fixtures. Gate: `python3 -m unittest scripts.usage.test_collect scripts.usage.test_agents_log`; basedpyright 0/0/0 on `scripts/usage`, test files included.
 
 ### Phase 5 — Outcomes in the same store · status: todo
 
-- Collect checkpoints, phases, findings, review rounds and passes, and account readings, keyed by machine, run, phase and pass instance and source event, with an explicit checkpoint mapping, so usage can be divided by work done. Compactions come from Phase 4's events. Accounts come from `accounts.py` after two-accounts 4a02a1c merges.
+- Collect checkpoints, phases, findings, review rounds and passes, and account readings, keyed by machine, run, phase and pass instance and source event, with an explicit checkpoint mapping, so usage can be divided by work done. Compactions come from Phase 4's events. Accounts come from `scripts/accounts/accounts.py` (accounts and role-change history), `scripts/whoami/agent_accounts.py`, and the readings `scripts/whoami/run_out.py` reads; all exist in this checkout, so nothing gates on another unit. A nullable quota or credit value from those modules becomes a semantic availability state (read, not reported, unreadable) before it enters a usage-owned type.
 - Reruns are idempotent, and a fixture joining several findings or passes to one stretch of work does not multiply its usage.
 - Done when "weighted usage per checkpoint, by role and model, per day" is one query.
+- **Seats:** `1 writer + 1 tester`. `impl` — outcome collection in `scripts/usage/collect.py` (hub). `test` — new `scripts/usage/test_outcomes.py` and its fixtures. Gate: `python3 -m unittest scripts.usage.test_outcomes scripts.usage.test_collect`; basedpyright 0/0/0 on `scripts/usage`, test files included.
 
 ### Phase 6 — Metrics as named queries · status: todo
 
@@ -146,8 +161,10 @@ Today, each question needs its own scratch script (`seat_usage.py`, `api_cost.py
   - account switches;
   - all of them by role × model × unit.
 - `seat_usage.py` becomes a thin view over the store, and its tests keep passing.
-- Every report shows attribution coverage, the estimated-turn share, unassigned usage and unrecorded review lenses, and takes an exact-evidence-only filter.
-- Done when the day 1 long-lived-seats readout is reproduced from a named input fixture to a named expected output under a stated weight version, and a new metric takes one entry.
+- Every report shows attribution coverage, the estimated-turn share, unassigned usage, unrecorded review lenses and each assignment log's skipped-line count (Phase 4's diagnostic snapshot), and takes an exact-evidence-only filter.
+- `interactive` and `subagent` are roles in their own rows; a subagent's usage is counted once, under the subagent, never folded into its parent.
+- Done when the day 1 long-lived-seats readout (2026-10-11, split at the 21:35Z switch to gpt-6.1-sol) is reproduced from the input fixture `scripts/usage/fixtures/day1_seats/` to the expected output `scripts/usage/fixtures/day1_seats/expected.md` under weight version `gpt-6.1-sol@2026-10-10T21:35Z` (1 / 0.05 / 5), and a new metric takes one entry. Report fixtures also pin `interactive` and `subagent` rows, missing assignments, estimated attribution, unrecorded lenses, the skipped-line count and the exact-evidence filter.
+- **Seats:** `1 writer + 1 tester`. `impl` — `scripts/usage/usage_report.py` and `scripts/whoami/seat_usage.py`. `test` — new `scripts/usage/test_usage_report.py`, `scripts/whoami/test_seat_usage.py`, and the report fixtures. Gate: `python3 -m unittest scripts.usage.test_usage_report scripts.whoami.test_seat_usage`; basedpyright 0/0/0 on `scripts/usage scripts/whoami/seat_usage.py`, test files included.
 
 ### Phase 7 — Kept up to date by itself · status: todo
 
@@ -156,3 +173,4 @@ Today, each question needs its own scratch script (`seat_usage.py`, `api_cost.py
 - The daily efficacy update and the showrunner's dailies read from the store, never from raw logs.
 - Each source keeps its own last-success watermark: an unreachable Mac leaves its rows stale and marked so in the daily readout (`seat_usage.py --daily`) and the dailies (`dailies_render.py`), while local sources keep updating; the backlog fills when it is back.
 - Done when every reachable source is never more than an hour behind, with no agent involved, and a simulated Mac outage shows as partial coverage and then recovers.
+- **Seats:** `1 writer + 1 tester`. `impl` — collector freshness and watermarks, both report adapters, and the timer-definition handoff to natedev. `test` — collection-outage tests, `scripts/whoami/test_seat_usage.py`, `scripts/production/test_dailies_render.py`. Gate: `python3 -m unittest scripts.usage.test_collect scripts.whoami.test_seat_usage scripts.production.test_dailies_render`; basedpyright 0/0/0 on every edited Python file, test files included.
