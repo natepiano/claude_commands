@@ -28,6 +28,7 @@ from account import (  # noqa: E402
     named_claude_account,
     own_claude_account,
 )
+import add_unit  # noqa: E402
 import conversation_pause  # noqa: E402
 from inventory import (  # noqa: E402
     PaneNotRecorded,
@@ -425,6 +426,21 @@ def _record_scheduled_restart_prompt(
         raise ScheduledRestartPromptNotRecorded(_error_reason(error)) from error
 
 
+def _units_row_plan(doc: str, unit: str) -> str | None:
+    """The Plan cell add_unit checks a resume against; None when `doc` has no single row for `unit`.
+
+    A run record's plan can differ from it: the plan moves to as-built, or a later run uses another doc.
+    """
+    try:
+        table = add_unit.unit_table(Path(doc).read_text(encoding="utf-8").splitlines())
+    except (OSError, UnicodeError, add_unit.Refusal):
+        return None
+    rows = [row for row in table if add_unit.cell_value(row.get("Unit", "")) == unit]
+    if len(rows) != 1 or "Plan" not in rows[0]:
+        return None
+    return add_unit.cell_value(rows[0]["Plan"])
+
+
 def _unit_argv(
     record: ShutdownRecord,
     entry: ShutdownSessionEntry,
@@ -439,7 +455,7 @@ def _unit_argv(
     if missing_plan:
         plan = "<plan>"
     elif recorded_plan["kind"] == "plan":
-        plan = recorded_plan["path"]
+        plan = _units_row_plan(host["doc"], host["unit"]) or recorded_plan["path"]
     else:
         raise ValueError("unit launch has no run record")
     note_path = _note_path(record, session["session_id"])
