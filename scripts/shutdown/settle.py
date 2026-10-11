@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -32,6 +33,7 @@ from record import (
     NoLiveRecord,
     ShutdownRecord,
     ShutdownScope,
+    ShutdownContinuation,
     ShowrunnerFooter,
     ShutdownInProgress,
     StopIssue,
@@ -39,6 +41,7 @@ from record import (
     TimerRestore,
     archive,
     create,
+    continuation,
     find_live,
     live_records,
     parse_records,
@@ -352,9 +355,10 @@ def alert_user(
     action: ActionRequired,
     *,
     machine: str = "",
+    notify_selected: bool = False,
 ) -> None:
-    """Ask the user to act for an account-wide shutdown."""
-    if scope["kind"] == "selected":
+    """Ask the user to act, keeping routine selected shutdowns quiet."""
+    if scope["kind"] == "selected" and not notify_selected:
         return
     command = [
         *_send_command(),
@@ -468,6 +472,8 @@ def begin(
     login: str,
     requested_by: str | None = None,
     only: Iterable[str] = (),
+    *,
+    then: ShutdownContinuation = "stop",
 ) -> ShutdownRecord:
     """Create one machine's settling record and stop only its recorded timers."""
     scope = _scope(only)
@@ -490,6 +496,8 @@ def begin(
         "entries": [_entry(session) for session in report["sessions"]],
         "stop_issues": [],
     }
+    if then == "restart":
+        record["then"] = then
     create(record)
     try:
         for original in record["entries"]:
@@ -1289,6 +1297,32 @@ def stop_issue_text(issue: StopIssue) -> str:
             return f"{issue['machine']}: stop failed: {issue['reason']}"
 
 
+def shutdown_command(*arguments: str) -> str:
+    """A runnable terminal command with shell-quoted arguments."""
+    return (
+        "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py "
+        + shlex.join(arguments)
+    )
+
+
+def report_restart_skipped(record: ShutdownRecord, reason: str) -> None:
+    """Tell the user how to resume when a peer record prevents automatic restart."""
+    account_label = record["label"]
+    resume_command = shutdown_command("restart", account_label)
+    alert_user(
+        record["scope"],
+        f"{account_label}: automatic restart skipped",
+        "\n".join([
+            reason,
+            f"{account_label} is down; automatic restart could not read the peer record.",
+            resume_command,
+        ]),
+        ActionRequired(f"Run {resume_command}."),
+        machine="natedev" if _machine().casefold() == "mac" else "",
+        notify_selected=True,
+    )
+
+
 def report_stop(
     claimed: ShutdownRecord,
     reports: list[stop_work.StopReport],
@@ -1327,10 +1361,17 @@ def report_stop(
                 for issue in entry["stop_issues"]
             )
     lines.extend(f"  {stop_issue_text(issue)}" for issue in orchestration_issues)
-    lines.append(
-        f"/shutdown restart in any Claude session on {account_label}, or in a terminal "
-        + "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart"
-    )
+    retry_command = shutdown_command("down", account_label, "--restart")
+    restart_after_stop = continuation(claimed) == "restart"
+    if not partial and restart_after_stop:
+        lines.append("The sessions restart automatically: units on the unit account, other sessions on the account they ran on.")
+    else:
+        lines.append(
+            f"/shutdown restart in any Claude session on {account_label}, or in a terminal "
+            + "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart"
+        )
+        if restart_after_stop:
+            lines.append(retry_command)
     text = "\n".join(lines)
     requested_by = claimed["requested_by"]
 
@@ -1352,7 +1393,11 @@ def report_stop(
             claimed["scope"],
             summary,
             text,
-            ActionRequired(f"Run /shutdown restart on {account_label}."),
+            ActionRequired(
+                f"Run {retry_command}."
+                if restart_after_stop
+                else f"Run /shutdown restart on {account_label}."
+            ),
             machine=route,
         )
     except Exception as alert_error:
@@ -1363,10 +1408,52 @@ def report_stop(
     report_to_requester()
 
 
+def retry_stop(login: str) -> None:
+    """Settle the remaining entries of a failed stop, retaining every resume."""
+    def retry(current: ShutdownRecord) -> None:
+        if continuation(current) != "restart":
+            raise ValueError("shutdown was not requested with --restart")
+        if current["state"] == "settling":
+            return
+        if current["state"] not in {"down", "stop partial"}:
+            raise ValueError(f"shutdown is {current['state']}; cannot retry stopping")
+        current["state"] = "settling"
+        current["stop_issues"] = []
+        for entry in current["entries"]:
+            if entry["progress"]["kind"] == "stop failed":
+                entry["progress"] = {"kind": "waiting"}
+                entry["settle_message"] = {"kind": "not sent"}
+            entry["stop_issues"] = [
+                issue for issue in entry["stop_issues"]
+                if issue["kind"] in {
+                    "codex server left running", "unit tmux session left running"
+                }
+            ]
+    _ = update(login, retry)
+
+
 def conduct(login: str, here: bool = False) -> int:
     """Coordinate both machines until every session has reached a safe stop."""
     unreached_since: dict[str, datetime] = {}
     last_alert = datetime.min.replace(tzinfo=timezone.utc)
+    found = find_live(login)
+    if (
+        found["kind"] == "live"
+        and continuation(found["record"]) == "restart"
+        and found["record"]["state"] in {"down", "stop partial"}
+    ):
+        if not here:
+            status, _ = run_remote(["retry-stop", login])
+            if status != 0:
+                retry_issue: MachineStopFailed = {
+                    "kind": "machine stop failed", "at": record_time(),
+                    "machine": other_machine(),
+                    "reason": f"could not retry stopping (rc {status})",
+                }
+                stop_work.close_failed_stop(login, retry_issue)
+                report_stop(found["record"], [], [retry_issue])
+                return 0
+        retry_stop(login)
     while True:
         outcome = conduct_cycle(login, unreached_since, here)
         if outcome["kind"] == "settlement ended":
@@ -1657,6 +1744,10 @@ def _launch_conductor(login: str, label: str, here: bool) -> None:
             *command,
         ]
         conductor = {"kind": "systemd", "unit": service}
+    found = find_live(login)
+    restart_after_stop = (
+        found["kind"] == "live" and continuation(found["record"]) == "restart"
+    )
     result = subprocess.run(launch, check=False, timeout=15)
     if result.returncode != 0:
         raise RuntimeError(f"could not start shutdown conductor {service}")
@@ -1664,10 +1755,18 @@ def _launch_conductor(login: str, label: str, here: bool) -> None:
     def save(current: ShutdownRecord) -> None:
         current["conductor"] = conductor
 
-    _ = update(login, save)
+    try:
+        _ = update(login, save)
+    except NoLiveRecord:
+        # A fast conductor can finish the restart and archive before this save.
+        if not restart_after_stop:
+            raise
 
 
-def down(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
+def down(
+    account: Account, here: bool = False, only: Iterable[str] = (),
+    *, then: ShutdownContinuation = "stop",
+) -> int:
     """Start an account-scoped shutdown after both machines pass preflight."""
     if not _warm():
         print(
@@ -1686,6 +1785,35 @@ def down(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
         return 1
     reports = preflight["reports"]
     local_live = find_live(account.login)
+    retrying = (
+        then == "restart"
+        and local_live["kind"] == "live"
+        and continuation(local_live["record"]) == "restart"
+        and local_live["record"]["state"] in {"down", "stop partial"}
+    )
+    if retrying:
+        if local_live["kind"] != "live":
+            raise NoLiveRecord("no shutdown to retry")
+        if ids and scope != local_live["record"]["scope"]:
+            print("shutdown: retry must keep the original --only scope", file=sys.stderr)
+            return 1
+        if not here:
+            peer = _live_on_other(account.login)
+            if (
+                peer["kind"] != "live"
+                or continuation(peer["record"]) != "restart"
+                or peer["record"]["state"] not in {"down", "stop partial", "settling"}
+                or peer["record"]["scope"] != local_live["record"]["scope"]
+            ):
+                print("shutdown: peer is not ready to retry stopping; nothing was shut down", file=sys.stderr)
+                return 1
+        try:
+            _launch_conductor(account.login, account.label, here)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            print("shutdown: could not start the conductor: nothing was shut down", file=sys.stderr)
+            return 1
+        print(f"shutdown of {account.label} resumed; /shutdown status to watch")
+        return 0
     if local_live["kind"] == "live":
         record = local_live["record"]
         print(f"shutdown: {record['machine']} is already {record['state']}")
@@ -1707,7 +1835,7 @@ def down(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
     print("\n".join(_inventory_text(report) for report in reports))
     requested_by = os.environ.get("CLAUDE_CODE_SESSION_ID")
     try:
-        _ = begin(account.login, requested_by, ids)
+        _ = begin(account.login, requested_by, ids, then=then)
     except ShutdownInProgress as error:
         print(f"shutdown: {error}", file=sys.stderr)
         return 1
@@ -1717,6 +1845,8 @@ def down(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
             arguments.extend(("--requested-by", requested_by))
         if ids:
             arguments.extend(("--only", ",".join(ids)))
+        if then == "restart":
+            arguments.extend(("--then", then))
         status, _ = run_remote(arguments)
         if status != 0:
             _ = _cancel_local(account.login)

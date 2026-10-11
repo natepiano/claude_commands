@@ -231,9 +231,10 @@ When a unit director is blocked on a full context, first capture its pane to
 confirm the block remains and no compaction is running. Type `/compact` into its pane with
 `tmux send-keys -t <pane> -l`, then send `Enter` separately.
 
-**Resume.** To bring back a unit director whose session ended, use
-   `claude --resume <session-id> <flags> --remote-control <session> -n <session>`, which keeps its link and its place in the list.
-   First run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/shutdown/shutdown.py launch-blocked --restart-of <session-id>`. Continue only when it exits 1. On any other exit, do not resume and tell the user its line; exit 0 means the account is held by a shutdown, and `/shutdown restart` brings the unit back.
+**Resume.** To bring back a unit director whose session ended, first run
+   `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py env unit`. If it exits nonzero, do not resume and tell the user its line. Its output (empty for the default account) is `<account>`; put it verbatim before both commands below.
+   Use `<account>claude --resume <session-id> <flags> --remote-control <session> -n <session>`, which keeps its link and its place in the list.
+   First run `<account>$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/shutdown/shutdown.py launch-blocked --restart-of <session-id>`. Continue only when it exits 1. On any other exit, do not resume and tell the user its line; exit 0 means the account is held by a shutdown, and `/shutdown restart` brings the unit back.
    Get `<flags>` first, from `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve production.director || exit 1; [[ "$AGENT_FAMILY" == claude ]] || { echo "unit directors launch only on claude; production.director resolves to $AGENT_FAMILY ($AGENT_MODEL)" >&2; exit 1; }; agents_claude_args'`, which prints `--model <model> [--effort <effort>]`. If it exits nonzero, stop and tell the user its line; never run `claude --resume` without the flags.
 </LaunchUnits>
 
@@ -259,9 +260,10 @@ The command writes `PROMPT_FILE`,
 retargets `UPDATES` with `NOTIFIER new` without moving its clock, creates
 stall-watch and tmux-names only when absent, and prints `next_due`. Use the
 reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
-When the doc's Updates line reads `on demand`, it makes no `UPDATES` instance
-and removes one left from before, prints `on demand: no scheduled dailies`,
+When the doc's Updates line reads `on demand`, it makes `UPDATES` at the
+default 15 minutes and stops it, prints `on demand: no scheduled dailies`,
 and no scheduled update comes: a dailies runs only when the user asks for one.
+The stopped instance stays, because it is the showrunner's only record.
 
 The prompt:
 
@@ -896,7 +898,11 @@ This session is on the quota alert list because <StartUpdates/> adds it.
 reaches them only as your relay (<Throughout/>). Run `python3
 ~/.claude/scripts/production/waiting.py quota --production PRODUCTION_DOC
 --state-dir DAILIES_STATE_DIR --notice "<full notice>"`. It relays
-to every unit director and prints one `send <unit>:` receipt each:
+to every unit director and prints one `send <unit>:` receipt each. With more
+than one Claude account in use, a Claude `Quota alert:` names its account and
+roles (`claude 3 (unit directors) at …`). It reaches only the unit directors
+running on that account, prints `skip <unit>: it runs on <other account>` for
+the rest, and reports a unit whose account cannot be read as not told:
 - `Quota alert:` — the command picks the instruction from the notice. A Codex
   notice that says nothing was switched: unit directors keep delegating on Codex,
   whose account may keep working on its credits, and tell you at once if Codex
@@ -907,8 +913,8 @@ to every unit director and prints one `send <unit>:` receipt each:
   item per account, listed first in every Waiting on block with the percent left
   and the reset time, until it is acknowledged or restored.
 - `Quota alert acknowledged:` — drop the held item. Paused work stays paused.
-- `Quota restored:` — tell every unit director delegation on that tool can
-  resume, and drop the held item.
+- `Quota restored:` — tell every unit director that delegation on that tool,
+  or work on that Claude account, can resume, and drop the held item.
 
 What to do about the quota itself is the user's call; relay their decision to
 every unit director.

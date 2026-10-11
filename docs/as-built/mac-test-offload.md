@@ -27,7 +27,7 @@ A pending or active block is one footer item after the build-hold lines: `Mac bl
 
 - `offload.py run --repo-root DIR --package PKG --call-id ID [--filter-run] [--result FILE] -- <nextest words>` exits 0 when the run passed on the Mac, 75 when the caller must run locally, and the Mac run's own status when tests failed there. `write_result()` writes `mac=`, `reason=`, `seconds=` from one `MacOffloadResult`: `PassedOnMac | FailedOnMac | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun`. Only that file's `mac` word tells a Mac test failure from a killed runner; a missing or contradictory file is no usable result.
 - Declines, each printing `mac_test: staying on natedev (<reason>)`, in order: `off`, `repo`, `linux_only`, `backoff`; the claim (`blocked`, `busy`, `state`); the probe (`unreachable`, which writes the back-off file, `mac_busy`, `battery`, `disk`); `copy`.
-- The probe counts `cargo`, `rustc` and `cargo-nextest` processes, the one-minute load (against `max_load`), power and free GiB (against `free_floor_gib`).
+- The probe counts `cargo`, `rustc` and `cargo-nextest` processes, power and free GiB (against `free_floor_gib`). Load is not checked: apps open on the Mac never keep a test off it (user, 2026-10-11).
 - The copy is `rsync -rlpc --delete --exclude-from` into `~/.local/state/mac-test/mirror/<repo>`, leaving out `/.git`, `/target/` and every ignored path.
 - The run is one ssh call through `lint nextest`, `mac_skip.<repo>` added to the `-E` filter and `LINT_SWEEP_BUDGET_GIB` set from `mac_budget_gib[.<repo>]`. Output streams as it arrives; only an exact `mac_exit=<n>` line is held back as the status. Nextest exit 4 is `NoTestMatchedOnMac`: `mac_test: no test matched on the Mac; running on natedev instead`, exit 75.
 - SIGINT, SIGTERM and SIGHUP stop the ssh child, run `pkill -f <mirror>` on the Mac (10 s limit), release the claim and exit 128 plus the signal. A run whose status line never arrives is `LostMacRun`: it runs the same cleanup, prints `mac_test: the link to the Mac dropped; running on natedev instead`, and exits 75 with the time measured after cleanup.
@@ -56,7 +56,7 @@ It claims the Mac after its reach probe (`mac_test.py claim --pid $$ --what "mac
 
 ## Config — `config/mac_test.conf`
 
-`offload=on`; `host=mac`; `free_floor_gib=100`; `max_load=6`; `mac_budget_gib=24` and `mac_budget_gib.hana=56` (size limits of each mirror's build folder, not memory); `linux_only.hana=hana_video,hana_clerestory`; `mac_skip.hana=test(world_panel_words_match_drawn_pixels)`; `ci_repo=natepiano/hana`, `ci_variable=MACOS_CI`, `ci_workflow=ci.yml`, `ci_job=macOS: Compile and Test`; `gh_timeout_s`, `block_hours`, `block_max_hours`, `block_warn_minutes`. A repository needs a `linux_only.<repo>` key, even empty, before it runs on the Mac. `MAC_TEST_CONFIG` selects another file.
+`offload=on`; `host=mac`; `free_floor_gib=100`; `mac_budget_gib=24` and `mac_budget_gib.hana=56` (size limits of each mirror's build folder, not memory); `linux_only.hana=hana_video,hana_clerestory`; `mac_skip.hana=test(world_panel_words_match_drawn_pixels)`; `ci_repo=natepiano/hana`, `ci_variable=MACOS_CI`, `ci_workflow=ci.yml`, `ci_job=macOS: Compile and Test`; `gh_timeout_s`, `block_hours`, `block_max_hours`, `block_warn_minutes`. A repository needs a `linux_only.<repo>` key, even empty, before it runs on the Mac. `MAC_TEST_CONFIG` selects another file.
 
 ## Invariants
 

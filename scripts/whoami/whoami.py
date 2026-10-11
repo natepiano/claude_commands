@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from datetime import datetime
+from pathlib import Path
 
 from account import label_for
-from agent_accounts import EASTERN, Quota, Report, live_reports
-from agent_notes import AGENTS_DIR, read_note
+from agent_accounts import ClaudeAccountSelection, ClaudeRole, EASTERN, Quota, Report, live_reports
+import note_file
 
 
 def reset_time(value: datetime | None) -> str:
@@ -23,7 +25,7 @@ def quota_line(quota: Quota) -> str:
     return f"  {quota.label}: {remaining}; resets {reset_time(quota.resets_at)}"
 
 
-def render(report: Report) -> list[str]:
+def render(report: Report, selection: ClaudeAccountSelection) -> list[str]:
     lines = [report.tool]
     if report.problem:
         return lines + [f"  {report.problem}"]
@@ -32,7 +34,11 @@ def render(report: Report) -> list[str]:
         lines.append("  Account: email unavailable")
     else:
         label = label_for(report.tool, email)
-        lines.append(f"  Account: {label} — {email}" if label != email else f"  Account: {email}")
+        roles: tuple[ClaudeRole, ...] = ()
+        if report.tool == "Claude" and selection.multiple_accounts:
+            roles = selection.roles_for_login(email)
+        role = f" ({', '.join(roles)})" if roles else ""
+        lines.append(f"  Account: {label}{role} — {email}" if label != email else f"  Account: {email}{role}")
     lines.append(f"  Plan: {report.plan or 'unavailable'}")
     lines += [quota_line(quota) for quota in report.quotas]
     if report.quota_problem:
@@ -45,8 +51,8 @@ def render(report: Report) -> list[str]:
         if count and len(report.limit_reset_expirations) < count:
             lines.append("  Some reset expiration dates are unavailable")
     elif report.tool == "Claude" and report.email:
-        for path in sorted(AGENTS_DIR.glob("claude *.md")):
-            note = read_note(path)
+        for path in sorted(note_file.AGENTS_DIR.glob("claude *.md")):
+            note = note_file.read_note(path)
             if note and (note.get("login") or "").lower() == report.email.lower():
                 expires = note.get("limit_reset")
                 count = note.get("limit_reset_count")
@@ -59,8 +65,16 @@ def render(report: Report) -> list[str]:
 
 
 async def main() -> None:
-    reports = await live_reports()
-    print("\n\n".join("\n".join(render(report)) for report in reports))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.accounts import accounts
+
+    selection = accounts.claude_account_selection()
+    reports = await live_reports(selection)
+    if selection.multiple_accounts:
+        reports = [report for report in reports
+                   if report.tool != "Claude" or report.email is None
+                   or selection.roles_for_login(report.email)]
+    print("\n\n".join("\n".join(render(report, selection)) for report in reports))
 
 
 if __name__ == "__main__":

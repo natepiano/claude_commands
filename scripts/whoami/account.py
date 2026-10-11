@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 from agent_accounts import claude_config_dir, claude_on_disk, codex_email_on_disk, codex_home
-from agent_notes import AGENTS_DIR, read_note
+import note_file
 
 
 @dataclass(frozen=True)
@@ -50,13 +50,13 @@ class CommandLine(argparse.Namespace):
 
 def label_for(tool: str, login: str) -> str:
     """The matching hanadocs note stem, or the login when no note matches."""
-    notes_dir = Path(os.environ.get("AGENT_NOTES_DIR", str(AGENTS_DIR)))
+    notes_dir = Path(os.environ.get("AGENT_NOTES_DIR", str(note_file.AGENTS_DIR)))
     folded_tool = tool.casefold()
     folded_login = login.casefold()
     for path in sorted(notes_dir.glob("*.md")):
         if not path.stem.casefold().startswith(folded_tool):
             continue
-        note = read_note(path)
+        note = note_file.read_note(path)
         if note is not None and (note.get("login") or "").casefold() == folded_login:
             return path.stem
     return login
@@ -80,13 +80,13 @@ def own_claude_account() -> Account:
 
 def named_claude_account(text: str) -> Account:
     """Resolve a Claude note label or accept an explicit login."""
-    notes_dir = Path(os.environ.get("AGENT_NOTES_DIR", str(AGENTS_DIR)))
+    notes_dir = Path(os.environ.get("AGENT_NOTES_DIR", str(note_file.AGENTS_DIR)))
     folded = text.casefold()
     for path in sorted(notes_dir.glob("*.md")):
         stem = path.stem.casefold()
         if not stem.startswith("claude") or stem != folded:
             continue
-        note = read_note(path)
+        note = note_file.read_note(path)
         login = None if note is None else note.get("login")
         if isinstance(login, str) and login:
             return Account("claude", login, path.stem)

@@ -12,14 +12,18 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 from zoneinfo import ZoneInfo
 
 SCRIPTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPTS.parent))
 sys.path.insert(0, str(SCRIPTS / "hooks"))
 sys.path.insert(0, str(SCRIPTS / "shutdown"))
 
 import unit_lookup
+
+if TYPE_CHECKING:
+    from scripts.accounts.accounts import AccountSelection
 
 
 class Production(NamedTuple):
@@ -662,11 +666,14 @@ def launch_session(
     tmux: str,
     director: DirectorAgent,
     prompt: str,
+    selected: AccountSelection,
 ) -> None:
     """Start the unit's session in a tmux session marked as this unit of this production.
 
     The marks are what finds the unit afterwards; its name is only what it is called at launch.
     """
+    from scripts.accounts.accounts import account_prefix
+
     marks = {unit_lookup.PRODUCTION_MARK: request.production.slug, unit_lookup.UNIT_MARK: request.identity.unit}
     argv = ["claude", "--model", director.model]
     if isinstance(director.effort, Effort):
@@ -681,7 +688,7 @@ def launch_session(
                     else request.identity.session)
     argv.extend(["--remote-control", session_name, "-n", session_name,
                  "--settings", '{"disableAgentView": true}', prompt])
-    command = "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
+    command = account_prefix(selected) + "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
     cwd = request.session.cwd if isinstance(request.session, ResumedSession) else request.worktree
     environment = launch_environment()
     scope_name = re.sub(r"[^A-Za-z0-9_.-]", "-", tmux_session)
@@ -773,6 +780,16 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     try:
         request = launch_request(args)
+        # Table readers import this module from copied trees without accounts.
+        from scripts.accounts import accounts
+
+        unit_account = accounts.role_account("unit")
+        if isinstance(unit_account, accounts.NamedAccount):
+            problems = accounts.check(unit_account.label)
+            if problems:
+                raise Refusal(
+                    f"unit account {unit_account.label}: {problems[0]}; /accounts status"
+                )
         # Imported only on the launch path: table readers import add_unit from
         # copied trees that do not include scripts/shutdown.
         import launch_permission
@@ -792,8 +809,11 @@ def main(argv: list[str]) -> int:
                 if isinstance(request.launch_kind, UnitRestoreLaunch)
                 else launch_permission.NewWorkLaunchPurpose()
             )
+            permission_environment = launch_environment()
+            if isinstance(unit_account, accounts.NamedAccount):
+                permission_environment["CLAUDE_CONFIG_DIR"] = str(unit_account.dir)
             permission = launch_permission.launch_permission(
-                launch_environment(), purpose
+                permission_environment, purpose
             )
             if isinstance(permission, launch_permission.BlockedByShutdown):
                 raise Refusal(
@@ -852,7 +872,7 @@ def main(argv: list[str]) -> int:
                     record_scheduled_restore_prompt(
                         request.launch_kind.session_id, prompt
                     )
-                launch_session(request, tmux, ready.director, prompt)
+                launch_session(request, tmux, ready.director, prompt, unit_account)
         finally:
             _ = barrier.__exit__(None, None, None)
         launched = wait_for_remote_control(request, tmux)

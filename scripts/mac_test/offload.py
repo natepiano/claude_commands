@@ -125,7 +125,6 @@ class OffloadConfig:
     probe_timeout_s: float
     unreachable_backoff_s: float
     free_floor_gib: float
-    max_load: float
     default_target_budget_gib: str
     values: dict[str, str]
 
@@ -146,7 +145,6 @@ class ProbeSnapshot:
     """Mac availability values returned by one remote probe."""
 
     processes: int
-    load: float
     power: MacPower
     free_gib: float
     hostname: str
@@ -395,7 +393,6 @@ def read_config() -> OffloadConfig:
             values, "unreachable_backoff_s", 300.0
         ),
         free_floor_gib=positive_number(values, "free_floor_gib", 60.0),
-        max_load=positive_number(values, "max_load", 6.0),
         default_target_budget_gib=values.get("mac_budget_gib", "24"),
         values=values,
     )
@@ -527,12 +524,11 @@ def probe_script(repository: KnownRepository) -> str:
             f'mkdir -p "$HOME"/{mirror} || exit 1',
             "procs=$( (pgrep -x cargo; pgrep -x rustc; "
             + "pgrep -x cargo-nextest) 2>/dev/null | wc -l | tr -d ' ')",
-            "load=$(sysctl -n vm.loadavg | awk '{print $2}')",
             "case \"$(pmset -g batt | head -1)\" in "
             + "*\"AC Power\"*) power=ac ;; *) power=battery ;; esac",
             "free_gib=$(df -g \"$HOME\" | awk 'NR == 2 {print $4}')",
-            "printf 'procs=%s\\nload=%s\\npower=%s\\nfree_gib=%s\\nhost=%s\\nrc=0\\n' "
-            + '"$procs" "$load" "$power" "$free_gib" "$(hostname -s)"',
+            "printf 'procs=%s\\npower=%s\\nfree_gib=%s\\nhost=%s\\nrc=0\\n' "
+            + '"$procs" "$power" "$free_gib" "$(hostname -s)"',
         )
     )
 
@@ -547,7 +543,6 @@ def parse_probe(output: str) -> ProbeResult:
         return UNAVAILABLE_PROBE
     try:
         processes = int(values["procs"])
-        load = float(values["load"])
         free_gib = float(values["free_gib"])
         power = values["power"]
         hostname = values["host"]
@@ -555,13 +550,12 @@ def parse_probe(output: str) -> ProbeResult:
         return UNAVAILABLE_PROBE
     if (
         processes < 0
-        or not math.isfinite(load)
         or not math.isfinite(free_gib)
         or power not in ("ac", "battery")
         or not hostname
     ):
         return UNAVAILABLE_PROBE
-    return ProbeSnapshot(processes, load, power, free_gib, hostname)
+    return ProbeSnapshot(processes, power, free_gib, hostname)
 
 
 def claim_arguments(request: OffloadRequest) -> list[str]:
@@ -743,7 +737,7 @@ def claimed_run(
         if isinstance(probe, UnavailableProbe):
             write_backoff(time.time() + config.unreachable_backoff_s)
             return declined("unreachable", started)
-        if probe.processes > 0 or probe.load > config.max_load:
+        if probe.processes > 0:
             return declined("mac_busy", started)
         if probe.power == "battery":
             return declined("battery", started)
