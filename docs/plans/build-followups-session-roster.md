@@ -315,7 +315,7 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 **Ruled out:** making `procStart` required (it reaches `production/test_codex_winddown.py` to remove a spelling no caller observes).
 
-### Phase 10 — Both machines · status: todo
+### Phase 10 — Both machines · status: done
 
 #### Work Order
 

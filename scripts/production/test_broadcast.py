@@ -4,8 +4,11 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
+import shlex
 import tempfile
 import unittest
+from collections.abc import Mapping
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
@@ -60,14 +63,45 @@ class BroadcastTests(unittest.TestCase):
     rows: list[roster.RosterEntry] = []
     environment: dict[str, str] = {}
     problems: list[str] = []
+    peer_rows: list[roster.RosterEntry] = []
+    peer_problems: list[str] = []
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = (self.root / "send.py").write_text(SEND_STUB, encoding="utf-8")
         _ = (self.root / "ps").write_text("", encoding="utf-8")
+        binaries = self.root / "bin"
+        binaries.mkdir()
+        (self.root / "peer-log").mkdir()
+        peer_driver = binaries / "ssh"
+        _ = peer_driver.write_text(
+            f"#!{sys.executable}\n"
+            + "import json, os, shlex, sys\n"
+            + "from pathlib import Path\n"
+            + "with open(os.environ['SSH_RECORD'], 'a') as log: log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            + "if os.environ.get('SSH_FAIL'): print('ssh: connection refused', file=sys.stderr); raise SystemExit(255)\n"
+            + "if 'roster.py' in sys.argv[-1]: print(os.environ['SSH_SNAPSHOT']); raise SystemExit(0)\n"
+            + "arguments = shlex.split(sys.argv[-1])\n"
+            + "index = next(i for i, item in enumerate(arguments) if item.endswith('/broadcast.py'))\n"
+            + "for item in arguments[:index]:\n"
+            + "    if item.startswith(('BROADCAST_SEND=', 'BROADCAST_CLOSING_MACHINES=')): key, value = item.split('=', 1); os.environ[key] = value\n"
+            + "os.environ.pop('CODEX_THREAD_ID', None); os.environ.pop('CLAUDE_CODE_SESSION_ID', None)\n"
+            + "os.environ['LOG'] = os.environ['PEER_LOG']; os.environ['TOGETHER'] = '1'\n"
+            + f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+            + "import broadcast, roster\n"
+            + "broadcast.SEND = Path(os.environ.get('BROADCAST_SEND') or os.environ['SAFE_PEER_SEND'])\n"
+            + "roster.machine_name = lambda: 'mac'\n"
+            + "roster.roster = lambda environment, scope: roster.RosterSnapshot.decode(os.environ['SSH_SNAPSHOT']).result\n"
+            + "raise SystemExit(broadcast.main(arguments[index + 1:]))\n",
+            encoding="utf-8",
+        )
+        peer_driver.chmod(0o755)
         self.environment = {
-            "HOME": str(self.root), "PATH": os.environ.get("PATH", ""),
+            "HOME": str(self.root), "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
+            "SSH_RECORD": str(self.root / "ssh.jsonl"),
+            "SSH_SNAPSHOT": roster.RosterSnapshot(roster.Roster([], [])).encode(),
+            "PEER_LOG": str(self.root / "peer-log"), "SAFE_PEER_SEND": str(self.root / "send.py"),
             "BROADCAST_SEND": str(self.root / "send.py"), "LOG": str(self.root),
             "TOGETHER": "1", "CLAUDE_CODE_SESSION_ID": "id-natedev",
             "PROCESS_TABLE_PS": f"cat {self.root / 'ps'}",
@@ -92,11 +126,13 @@ class BroadcastTests(unittest.TestCase):
             entry("Codex window", "codex:thread-window", kind="codex",
                   thread=roster.CodexThread("thread-window")),
         ]
-        self.problems = []
+        self.problems, self.peer_problems, self.peer_rows = [], [], []
         _ = self.enterContext(cast(
             AbstractContextManager[object], patch.dict(os.environ, self.environment, clear=True),
         ))
         _ = self.enterContext(patch.object(broadcast, "SEND", self.root / "send.py"))
+        _ = self.enterContext(patch.object(roster, "machine_name", return_value="fixture"))
+        _ = self.enterContext(patch.object(roster.remote, "other_machine", return_value="mac"))
         _ = self.enterContext(patch.object(process_table, "PS", ["cat", str(self.root / "ps")]))
         _ = self.enterContext(patch.object(
             process_table, "snapshot", side_effect=AssertionError("use the fake roster"),
@@ -105,14 +141,22 @@ class BroadcastTests(unittest.TestCase):
             codex_daemon, "loaded_sessions", side_effect=AssertionError("use the fake roster"),
         ))
 
-    def run_main(self, *arguments: str, **environment: str) -> tuple[int, str, str]:
+    def fixture_roster(self, environment: Mapping[str, str], scope: roster.RosterScope) -> roster.Roster:
+        local = roster.Roster(self.rows, self.problems)
+        if isinstance(scope, roster.AllMachines):
+            peer = roster.peer_roster(environment)
+            return roster.Roster([*local.entries, *peer.entries], [*local.problems, *peer.problems])
+        self.assertEqual(scope, roster.ThisMachine())
+        return local
+
+    def run_main(self, *arguments: str, here: bool = True, **environment: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
-        fixture = roster.Roster(self.rows, self.problems)
+        os.environ["SSH_SNAPSHOT"] = roster.RosterSnapshot(roster.Roster(self.peer_rows, self.peer_problems)).encode()
         with (patch.dict(os.environ, environment),
-              patch.object(roster, "roster", return_value=fixture) as read_roster,
+              patch.object(roster, "roster", side_effect=self.fixture_roster) as read_roster,
               patch.object(roster, "sender_identity", wraps=roster.sender_identity) as read_identity,
               redirect_stdout(output), redirect_stderr(errors)):
-            result = broadcast.main(["--from", "natedev", *arguments])
+            result = broadcast.main([*(["--here"] if here else []), "--from", "natedev", *arguments])
         if result != 2:
             read_roster.assert_called_once()
             read_identity.assert_called_once()
@@ -124,15 +168,15 @@ class BroadcastTests(unittest.TestCase):
         for command in commands:
             self.assertEqual(command[:1], ["--to"])
             self.assertEqual(command[2:4], ["--from", "natedev"])
-            self.assertEqual(command[4:5], ["--text"])
-            self.assertEqual(len(command), 6)
+            self.assertEqual(command[4:6], ["--here", "--text"])
+            self.assertEqual(len(command), 7)
         return commands
 
     def sent_texts(self) -> dict[str, str]:
         commands = self.sends()
         addresses = [command[1] for command in commands]
         self.assertEqual(len(addresses), len(set(addresses)), "an address was sent twice")
-        return {command[1]: command[5] for command in commands}
+        return {command[1]: command[6] for command in commands}
 
     def test_all_reaches_every_role_at_once_and_never_the_sender(self) -> None:
         result, output, errors = self.run_main("--all", "From the user: stop builds.", TOGETHER="5")
@@ -141,7 +185,7 @@ class BroadcastTests(unittest.TestCase):
             "session:id-hana", "session:id-trunk", "session:id-ups",
             "seat:run-a/fps-impl", "codex:thread-window",
         })
-        self.assertRegex(output.splitlines()[-1], r"^5 sent in \d+ s$")
+        self.assertRegex(output.splitlines()[-2], r"^5 sent in \d+ s$")
         for text in self.sent_texts().values():
             self.assertTrue(text.startswith("From the user: stop builds.\n\n"))
             self.assertIn("showrunner", text)
@@ -160,8 +204,8 @@ class BroadcastTests(unittest.TestCase):
         result, output, errors = self.run_main("--showrunners", "stop")
         self.assertEqual((result, errors), (0, ""), output)
         self.assertEqual(self.sends(), [])
-        self.assertEqual(output.splitlines()[:-1], ["showrunners - none on this machine"])
-        self.assertRegex(output.splitlines()[-1], r"^0 sent in \d+ s$")
+        self.assertEqual(output.splitlines()[:-2], ["showrunners - none on this machine"])
+        self.assertRegex(output.splitlines()[-2], r"^0 sent in \d+ s$")
 
     def test_empty_showrunners_are_reported_while_unit_directors_are_sent(self) -> None:
         self.rows = [row for row in self.rows if row.role != "showrunner"]
@@ -169,10 +213,10 @@ class BroadcastTests(unittest.TestCase):
         self.assertEqual((result, errors), (0, ""), output)
         self.assertEqual(set(self.sent_texts()), {"session:id-trunk"})
         self.assertTrue(self.sent_texts()["session:id-trunk"].startswith("A\n\n"))
-        self.assertEqual(output.splitlines()[:-1], [
+        self.assertEqual(output.splitlines()[:-2], [
             "trunk - unit director - sent", "showrunners - none on this machine",
         ])
-        self.assertRegex(output.splitlines()[-1], r"^1 sent in \d+ s$")
+        self.assertRegex(output.splitlines()[-2], r"^1 sent in \d+ s$")
 
     def test_a_group_with_only_the_sender_says_none(self) -> None:
         self.rows = [entry("natedev", "session:id-natedev", role="showrunner",
@@ -180,16 +224,16 @@ class BroadcastTests(unittest.TestCase):
         result, output, errors = self.run_main("--showrunners", "stop")
         self.assertEqual((result, errors), (0, ""), output)
         self.assertEqual(self.sends(), [])
-        self.assertEqual(output.splitlines()[:-1], ["showrunners - none on this machine"])
-        self.assertRegex(output.splitlines()[-1], r"^0 sent in \d+ s$")
+        self.assertEqual(output.splitlines()[:-2], ["showrunners - none on this machine"])
+        self.assertRegex(output.splitlines()[-2], r"^0 sent in \d+ s$")
 
     def test_a_unit_with_no_workers_says_none_for_its_scoped_group(self) -> None:
         self.rows = [row for row in self.rows if row.role != "worker"]
         result, output, errors = self.run_main("--of", "trunk-unit", "--workers", "finish")
         self.assertEqual((result, errors), (0, ""), output)
         self.assertEqual(self.sends(), [])
-        self.assertEqual(output.splitlines()[:-1], ["workers of trunk-unit - none on this machine"])
-        self.assertRegex(output.splitlines()[-1], r"^0 sent in \d+ s$")
+        self.assertEqual(output.splitlines()[:-2], ["workers of trunk-unit - none on this machine"])
+        self.assertRegex(output.splitlines()[-2], r"^0 sent in \d+ s$")
 
     def test_empty_groups_are_named_once_in_command_line_order(self) -> None:
         self.rows = []
@@ -199,12 +243,12 @@ class BroadcastTests(unittest.TestCase):
         )
         self.assertEqual((result, errors), (0, ""), output)
         self.assertEqual(self.sends(), [])
-        self.assertEqual(output.splitlines()[:-1], [
+        self.assertEqual(output.splitlines()[:-2], [
             "top level - none on this machine", "agents - none on this machine",
             "all roles - none on this machine", "workers - none on this machine",
             "unit directors - none on this machine", "showrunners - none on this machine",
         ])
-        self.assertRegex(output.splitlines()[-1], r"^0 sent in \d+ s$")
+        self.assertRegex(output.splitlines()[-2], r"^0 sent in \d+ s$")
 
     def test_a_group_overridden_by_a_later_flag_is_still_nonempty(self) -> None:
         self.rows = [entry("hana", "session:id-hana", role="showrunner",
@@ -213,7 +257,7 @@ class BroadcastTests(unittest.TestCase):
         self.assertEqual((result, errors), (0, ""), output)
         self.assertEqual(set(self.sent_texts()), {"session:id-hana"})
         self.assertTrue(self.sent_texts()["session:id-hana"].startswith("runners\n\n"))
-        self.assertEqual(output.splitlines()[:-1], ["hana - showrunner - sent"])
+        self.assertEqual(output.splitlines()[:-2], ["hana - showrunner - sent"])
 
     def test_each_role_gets_its_own_version(self) -> None:
         result, output, errors = self.run_main("--showrunners", "count your agents", "--units", "finish your agents")
@@ -243,7 +287,7 @@ class BroadcastTests(unittest.TestCase):
             with self.subTest(flag=flag):
                 result, output, errors = self.run_main(flag, "merge freeze")
                 self.assertEqual((result, errors), (0, ""), output)
-                latest = next(command[5] for command in self.sends() if command[1] == address)
+                latest = next(command[6] for command in self.sends() if command[1] == address)
                 closing = latest.split("\n\n")[-1]
                 self.assertIn(inside, closing)
                 self.assertNotIn(outside, closing)
@@ -351,7 +395,7 @@ class BroadcastTests(unittest.TestCase):
                 self.assertEqual((result, errors), (0, ""), output)
                 commands = self.sends()
                 self.assertTrue(all(command[1] == "seat:run-a/fps-impl" for command in commands))
-                self.assertEqual(sum(command[5].startswith(target + "\n\n") for command in commands), 1)
+                self.assertEqual(sum(command[6].startswith(target + "\n\n") for command in commands), 1)
         self.assertEqual(len(self.sends()), 2)
 
     def test_socketless_directors_keep_their_session_addresses_in_usage_errors(self) -> None:
@@ -402,8 +446,8 @@ class BroadcastTests(unittest.TestCase):
         self.assertEqual((result, errors), (0, ""), output)
         self.assertEqual(set(self.sent_texts()), {"seat:run-a/fps-impl"})
         self.assertIn("reviewer cannot take messages (blind reviewer); contact its unit director trunk or wait", output)
-        self.assertIn("orphan reviewer cannot take messages (blind reviewer); no unit director is running for it", output)
-        self.assertRegex(output.splitlines()[-1], r"^1 sent in \d+ s$")
+        self.assertIn("orphan reviewer cannot take messages (blind reviewer)", output)
+        self.assertRegex(output.splitlines()[-2], r"^1 sent in \d+ s$")
 
     def test_between_turns_seat_is_reported_without_a_send_or_failure(self) -> None:
         self.rows.append(replace(
@@ -440,6 +484,203 @@ class BroadcastTests(unittest.TestCase):
         self.assertTrue(texts["session:id-ups"].startswith("top\n\n"))
         for address in ("session:id-trunk", "seat:run-a/fps-impl", "codex:thread-window"):
             self.assertTrue(texts[address].startswith("everyone\n\n"))
+
+
+    def ssh_calls(self) -> list[list[str]]:
+        log = self.root / "ssh.jsonl"
+        return [cast(list[str], json.loads(line)) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def peer_sends(self) -> list[list[str]]:
+        return [cast(list[str], json.loads(path.read_text())) for path in (self.root / "peer-log").glob("send-*.json")]
+
+    def peer_worker_groups(self) -> tuple[broadcast.WorkersOfUnit, broadcast.WorkersOfUnit]:
+        self.peer_rows = [
+            replace(entry("director A", "session:director-a", role="unit director",
+                          director=roster.DirectsUnit("unit-a")), machine="mac"),
+            replace(entry("director B", "session:director-b", role="unit director",
+                          director=roster.DirectsUnit("unit-b")), machine="mac"),
+            replace(entry("impl", "seat:run-a/impl", role="worker", kind="codex",
+                          director=roster.UnderDirector("unit-a", "director A", "session:director-a")), machine="mac"),
+            replace(entry("impl", "seat:run-b/impl", role="worker", kind="codex",
+                          director=roster.UnderDirector("unit-b", "director B", "session:director-b")), machine="mac"),
+            replace(entry("orphan", "seat:orphan/impl", role="worker", kind="codex"), machine="mac"),
+        ]
+        return (broadcast.WorkersOfUnit("session:director-a", "unit-a", "mac"),
+                broadcast.WorkersOfUnit("session:director-b", "unit-b", "mac"))
+
+    def assert_peer_worker_texts(
+        self, texts: Mapping[broadcast.BroadcastGroup, str], expected: Mapping[str, str],
+    ) -> None:
+        self.rows = []
+        os.environ["SSH_SNAPSHOT"] = roster.RosterSnapshot(roster.Roster(self.peer_rows, [])).encode()
+        with patch.object(roster, "roster", side_effect=self.fixture_roster):
+            deliveries = broadcast.broadcast("natedev", texts)
+        self.assertTrue(all(delivery.outcome != "NOT sent" for delivery in deliveries), deliveries)
+        self.assertEqual(self.sends(), [])
+        calls = self.ssh_calls()
+        self.assertEqual(len(calls), 1, "the mapping must replay through one fake SSH call")
+        self.assertIn("broadcast.py", calls[0][-1])
+        self.assertIn("--here", shlex.split(calls[0][-1]))
+        commands = self.peer_sends()
+        self.assertCountEqual([command[1] for command in commands], expected)
+        actual: dict[str, str] = {}
+        for command in commands:
+            self.assertIn("--here", command)
+            text = command[command.index("--text") + 1]
+            actual[command[1]] = text.partition("\n\n")[0]
+        self.assertEqual(actual, expected)
+
+    def test_peer_all_workers_after_a_unit_scope_reaches_every_worker_once(self) -> None:
+        unit_a, _unit_b = self.peer_worker_groups()
+        self.assert_peer_worker_texts(
+            {unit_a: "unit text", broadcast.Workers(): "all workers text"},
+            {"seat:run-a/impl": "all workers text", "seat:run-b/impl": "all workers text",
+             "seat:orphan/impl": "all workers text"},
+        )
+
+    def test_peer_unit_scope_after_all_workers_overrides_only_its_own_workers(self) -> None:
+        unit_a, _unit_b = self.peer_worker_groups()
+        self.assert_peer_worker_texts(
+            {broadcast.Workers(): "all workers text", unit_a: "unit text"},
+            {"seat:run-a/impl": "unit text", "seat:run-b/impl": "all workers text",
+             "seat:orphan/impl": "all workers text"},
+        )
+
+    def test_peer_two_unit_scopes_keep_each_units_workers_and_text_separate(self) -> None:
+        unit_a, unit_b = self.peer_worker_groups()
+        self.assert_peer_worker_texts(
+            {unit_a: "A text", unit_b: "B text"},
+            {"seat:run-a/impl": "A text", "seat:run-b/impl": "B text"},
+        )
+
+    def test_here_never_runs_ssh_and_every_recipient_send_stays_here(self) -> None:
+        result, output, errors = self.run_main("--all", "stop")
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertEqual(self.ssh_calls(), [])
+        self.assertTrue(self.sends())
+        self.assertTrue(all("--here" in command for command in self.sends()))
+
+    def test_both_machines_deliver_each_selected_recipient_once_and_name_both_in_the_closing_line(self) -> None:
+        self.peer_rows = [replace(entry("Mac Claude", "session:mac-claude"), machine="mac"),
+                          replace(entry("Mac Codex", "codex:mac-thread", kind="codex"), machine="mac")]
+        result, output, errors = self.run_main("--all", "all", "--agents", "agents", here=False)
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertEqual(len(self.sends()), 5)
+        peer = self.peer_sends()
+        self.assertCountEqual([command[1] for command in peer], ["session:mac-claude", "codex:mac-thread"])
+        self.assertTrue(all("--here" in command for command in peer))
+        self.assertTrue(all(command[command.index("--text") + 1].startswith("agents\n\n") for command in peer))
+        self.assertIn("mac: Mac Claude - freestanding - sent", output)
+        self.assertIn("fixture and mac", output.splitlines()[-1])
+        self.assertEqual(len(self.ssh_calls()), 1)
+
+    def test_remote_run_clears_sender_identities_and_leaves_every_peer_row_in(self) -> None:
+        self.peer_rows = [replace(entry("same id", "session:id-natedev"), machine="mac"),
+                          replace(entry("same thread", "codex:thread-seat", kind="codex",
+                                        thread=roster.CodexThread("thread-seat")), machine="mac")]
+        result, output, errors = self.run_main("--all", "all", here=False,
+                                              CODEX_THREAD_ID="thread-seat", CLAUDE_CODE_SESSION_ID="id-natedev")
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertEqual(len(self.peer_sends()), 2)
+        command = self.ssh_calls()[0][-1]
+        self.assertIn("-u CODEX_THREAD_ID", command)
+        self.assertIn("-u CLAUDE_CODE_SESSION_ID", command)
+
+    def test_unreachable_peer_prints_one_failed_machine_line_while_local_sends_continue(self) -> None:
+        result, output, errors = self.run_main("--all", "all", here=False, SSH_FAIL="1")
+        self.assertEqual(result, 1, errors)
+        self.assertEqual(len(self.sends()), 5)
+        self.assertEqual(len([line for line in output.splitlines() if "mac:" in line and "NOT sent" in line]), 1)
+
+    def test_recording_sender_is_forwarded_only_when_selected_in_the_environment(self) -> None:
+        for selected in (True, False):
+            with self.subTest(selected=selected):
+                if not selected:
+                    _ = os.environ.pop("BROADCAST_SEND")
+                result, output, errors = self.run_main("--all", "all", here=False)
+                self.assertEqual((result, errors), (0, ""), output)
+                command = self.ssh_calls()[-1][-1]
+                self.assertEqual("BROADCAST_SEND=" in command, selected)
+                if selected:
+                    self.assertIn(str(self.root / "send.py"), command)
+        self.assertEqual(len(self.ssh_calls()), 2)
+
+    def test_each_machine_names_its_own_empty_groups(self) -> None:
+        self.rows = []
+        self.peer_rows = []
+        result, output, errors = self.run_main("--showrunners", "all", here=False)
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertEqual([line for line in output.splitlines() if "none on this machine" in line], [
+            "showrunners - none on this machine", "mac: showrunners - none on this machine",
+        ])
+        self.assertEqual(self.sends() + self.peer_sends(), [])
+
+    def test_of_a_local_director_is_resolved_before_delivery_and_never_replayed_on_peer(self) -> None:
+        result, output, errors = self.run_main("--of", "trunk", "--workers", "finish", here=False)
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertEqual(set(self.sent_texts()), {"seat:run-a/fps-impl"})
+        self.assertEqual(self.peer_sends(), [])
+        self.assertTrue(self.ssh_calls())
+        self.assertTrue(all("roster.py" in call[-1] for call in self.ssh_calls()))
+
+    def test_of_a_peer_director_uses_its_resolved_identity_and_only_its_machine(self) -> None:
+        director = replace(entry("peer director", "session:peer-director", role="unit director",
+                                 director=roster.DirectsUnit("peer-unit")), machine="mac",
+                           reach=roster.CannotReceiveMessages("no messaging socket"))
+        worker = replace(entry("impl", "seat:peer/impl", kind="codex", role="worker",
+                               director=roster.UnderDirector("peer-unit", "peer director", "session:peer-director")), machine="mac")
+        self.peer_rows = [director, worker]
+        result, output, errors = self.run_main("--of", "peer director", "--workers", "finish", here=False)
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertEqual(self.sends(), [])
+        self.assertEqual([command[1] for command in self.peer_sends()], ["seat:peer/impl"])
+        forwarded = next(shlex.split(call[-1]) for call in self.ssh_calls() if "broadcast.py" in call[-1])
+        self.assertEqual(forwarded[forwarded.index("--of") + 1], "session:peer-director")
+        self.assertIn("--here", forwarded)
+
+    def test_of_a_name_shared_across_machines_refuses_before_any_delivery(self) -> None:
+        self.peer_rows = [replace(entry("trunk", "session:peer-trunk", role="unit director",
+                                       director=roster.DirectsUnit("peer-unit")), machine="mac")]
+        result, output, errors = self.run_main("--all", "all", "--of", "trunk", "--workers", "finish", here=False)
+        self.assertEqual(result, 2, output + errors)
+        self.assertIn("session:id-trunk", errors)
+        self.assertIn("session:peer-trunk", errors)
+        self.assertEqual(self.sends() + self.peer_sends(), [])
+        self.assertTrue(all("roster.py" in call[-1] for call in self.ssh_calls()))
+
+    def test_of_refuses_before_delivery_when_the_peer_cannot_prove_director_uniqueness(self) -> None:
+        result, output, errors = self.run_main(
+            "--of", "trunk", "--workers", "finish", here=False, SSH_FAIL="1",
+        )
+        self.assertEqual(result, 1, output + errors)
+        self.assertEqual(self.sends() + self.peer_sends(), [])
+        self.assertEqual(len([line for line in output.splitlines() if "NOT sent" in line]), 1)
+        self.assertTrue(all("roster.py" in call[-1] for call in self.ssh_calls()))
+
+    def test_refusal_advice_reports_worker_and_socketless_states_without_failure(self) -> None:
+        self.rows = [
+            replace(entry("owned", "", role="worker", kind="codex",
+                          director=roster.UnderDirector("unit", "director", "session:director")),
+                    reach=roster.CannotReceiveMessages("blind reviewer")),
+            replace(entry("orphan", "", role="worker", kind="codex"),
+                    reach=roster.CannotReceiveMessages("between turns; no unit director is running")),
+            replace(entry("Claude", "session:socketless"), reach=roster.CannotReceiveMessages("no messaging socket")),
+        ]
+        result, output, errors = self.run_main("--all", "all")
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertIn("owned cannot take messages (blind reviewer); contact its unit director director or wait\n", output)
+        self.assertIn("orphan cannot take messages (between turns; no unit director is running)\n", output)
+        self.assertIn("Claude cannot take messages (no messaging socket); wait for it to open its messaging socket, then read the roster again and send again\n", output)
+        self.assertNotIn("NOT sent", output)
+        self.assertEqual(self.sends(), [])
+
+    def test_a_recipient_disappearing_after_roster_read_is_never_looked_up_on_peer(self) -> None:
+        result, output, errors = self.run_main("--units", "finish", REFUSED="session:id-trunk")
+        self.assertEqual(result, 1, errors)
+        self.assertIn("trunk - unit director - NOT sent", output)
+        self.assertEqual(self.ssh_calls(), [])
+        self.assertEqual(len(self.sends()), 1)
+        self.assertIn("--here", self.sends()[0])
 
 
 if __name__ == "__main__":

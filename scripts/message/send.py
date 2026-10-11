@@ -6,7 +6,7 @@ every message follows are /message (~/.claude/commands/message.md).
 
   send.py --to NAME|uds:<path>|session:<id>|seat:<run>/<seat>|codex:<thread>
           [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
-          [--machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
+          [--here | --machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
   send.py --to user --summary TITLE [--need note|decision|blocked]
           (--action TEXT | --no-action) ...                              the user
@@ -26,8 +26,9 @@ SendMessage tool result in the relay's stream, never from what the model says;
 the last stream per recipient stays in STATE/relay/<to>.jsonl.
 `seat:` addresses queue through codex_mesh.py; `codex:` addresses queue through
 the shared Codex daemon. A unique roster name resolves to either. `--codex`
-with `--session-dir` still selects codex_mesh.py directly. `--machine` runs
-this script on HOST over ssh, where ~/.claude is this repo.
+with `--session-dir` still selects codex_mesh.py directly. Names and addresses
+resolve here first, then on the peer. `--here` keeps resolution here; `--machine`
+runs this script on HOST over ssh, where ~/.claude is this repo.
 
 `--to user` reaches the user wherever they are; `--summary` is the title. `--need`
 says what they must do: `note` nothing, `decision` decide while work goes on,
@@ -202,25 +203,66 @@ class UserDelivery:
 @dataclass(frozen=True)
 class RemoteDelivery:
     host: str
+    address: str
 
 
-DeliveryRoute = SessionRecipient | UserDelivery | RemoteDelivery
+@dataclass(frozen=True)
+class RecipientLookupFailed:
+    reason: str
+
+
+DeliveryRoute = SessionRecipient | UserDelivery | RemoteDelivery | RecipientLookupFailed
+
+
+@dataclass(frozen=True)
+class LocalOnly:
+    """Resolve and deliver only here."""
+
+
+@dataclass(frozen=True)
+class LocalThenPeer:
+    """Ask the peer only after proving this machine has no match."""
+
+
+@dataclass(frozen=True)
+class NamedMachine:
+    host: str
+
+
+RecipientResolutionScope = LocalOnly | LocalThenPeer | NamedMachine
+LOCAL_THEN_PEER = LocalThenPeer()
+
+
+@dataclass(frozen=True)
+class RosterLookup:
+    to: str
+
+
+@dataclass(frozen=True)
+class MeshSeat:
+    session_dir: str
+    seat: str
+
+
+RecipientSelection = RosterLookup | MeshSeat
 
 
 class Options(NamedTuple):
-    to: str
+    selection: RecipientSelection
     sender: str | None
     summary: str | None
     key: str | None
     repeat_minutes: float | None
-    machine: str | None
-    codex: bool
-    session_dir: str | None
+    scope: RecipientResolutionScope
     timeout: float
     need: Need
     action: MessageUserAction
     text: str | None
     file: str | None
+
+    @property
+    def to(self) -> str:
+        return self.selection.to if isinstance(self.selection, RosterLookup) else self.selection.seat
 
 
 # ---------------------------------------------------------------------------
@@ -511,14 +553,7 @@ def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
 
 
 def _cannot_receive_message(entry: roster.RosterEntry) -> NoReturn:
-    if not isinstance(entry.reach, roster.CannotReceiveMessages):
-        raise AssertionError("a non-messageable recipient needs a reason")
-    match entry.director:
-        case roster.UnderDirector(name=director):
-            next_step = f"contact its unit director {director} or wait"
-        case _:
-            next_step = "no unit director is running for it"
-    usage_error(f"{entry.name} cannot take messages ({entry.reach.reason}); {next_step}")
+    usage_error(roster.cannot_receive_message_text(entry))
 
 
 def _ambiguous_name(name: str, entries: list[roster.RosterEntry]) -> NoReturn:
@@ -533,37 +568,56 @@ def _ambiguous_name(name: str, entries: list[roster.RosterEntry]) -> NoReturn:
     usage_error("\n".join(lines))
 
 
-def resolve_recipient(to: str) -> SessionRecipient:
-    """Resolve one local non-user target, reading the roster only when needed."""
-    if to.startswith("uds:") or to.startswith("session:"):
-        return ClaudeRecipient(to)
-    if to.startswith("codex:"):
-        thread_id = to.removeprefix("codex:")
-        if not thread_id:
-            usage_error("codex: needs a thread id")
-        return CodexSessionRecipient(to, thread_id, thread_id)
+def _recipient_matches(to: str, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
+    if to.startswith(("session:", "seat:", "codex:")):
+        return [entry for entry in entries
+                if isinstance(entry.reach, roster.Messageable) and entry.reach.address == to]
+    return [entry for entry in entries if entry.name == to]
 
-    result = roster.roster(os.environ)
-    _print_roster_problems(result.problems)
-    if to.startswith("seat:"):
-        matches = [
-            entry
-            for entry in result.entries
-            if isinstance(entry.reach, roster.Messageable) and entry.reach.address == to
-        ]
-        if len(matches) != 1:
-            usage_error(f"no roster session has address {to}")
-        return _messageable_recipient(matches[0])
 
-    matches = [entry for entry in result.entries if entry.name == to]
-    if not matches:
-        return ClaudeRecipient(to)
+def _matched_recipient(to: str, matches: list[roster.RosterEntry]) -> SessionRecipient:
     if len(matches) > 1:
         _ambiguous_name(to, matches)
     entry = matches[0]
     if isinstance(entry.reach, roster.CannotReceiveMessages):
         _cannot_receive_message(entry)
     return _messageable_recipient(entry)
+
+
+def resolve_recipient(
+    to: str, scope: RecipientResolutionScope = LOCAL_THEN_PEER,
+) -> DeliveryRoute:
+    """Resolve locally first; a remote row supplies the address sent to its machine."""
+    if to.startswith("uds:"):
+        return ClaudeRecipient(to)
+    if isinstance(scope, NamedMachine):
+        return RemoteDelivery(scope.host, to)
+    if to.startswith("codex:"):
+        thread_id = to.removeprefix("codex:")
+        if not thread_id:
+            usage_error("codex: needs a thread id")
+    result = roster.roster(os.environ, roster.ThisMachine())
+    _print_roster_problems(result.problems)
+    matches = _recipient_matches(to, result.entries)
+    if matches:
+        return _matched_recipient(to, matches)
+    addressed = to.startswith(("session:", "seat:", "codex:"))
+    if isinstance(scope, LocalThenPeer):
+        if result.problems and not addressed:
+            usage_error(f"absence of {to} here is not proven; use an address or --machine")
+        peer = roster.peer_roster(os.environ)
+        _print_roster_problems(peer.problems)
+        matches = _recipient_matches(to, peer.entries)
+        if matches:
+            recipient = _matched_recipient(to, matches)
+            return RemoteDelivery(roster.remote.other_machine(), recipient.address)
+        if peer.problems:
+            return RecipientLookupFailed("; ".join(peer.problems))
+    if to.startswith("seat:"):
+        usage_error(f"no roster session has address {to}")
+    if to.startswith("codex:"):
+        return CodexSessionRecipient(to, to.removeprefix("codex:"), to.removeprefix("codex:"))
+    return ClaudeRecipient(to)
 
 
 def run(command: list[str], stdin: str, timeout: float, env: dict[str, str] | None = None,
@@ -763,7 +817,7 @@ def user(message: Message, need: Need, action: UserAction, timeout: float) -> Re
 
 def remote(message: Message, host: str, options: Options) -> Result:
     """Run this script on host; its own log and queue record the attempt there."""
-    forwarded = ["--to", message.to, "--from", message.sender, "--summary", message.summary,
+    forwarded = ["--here", "--to", message.to, "--from", message.sender, "--summary", message.summary,
                  "--timeout", f"{options.timeout:g}"]
     if message.key is not None:
         forwarded += ["--key", message.key]
@@ -772,8 +826,10 @@ def remote(message: Message, host: str, options: Options) -> Result:
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
         forwarded += action_arguments(options.action)
-    if options.session_dir is not None:
-        forwarded += ["--codex", "--session-dir", options.session_dir]
+    if isinstance(options.selection, MeshSeat):
+        forwarded += ["--codex", "--session-dir", options.selection.session_dir]
+    if options.repeat_minutes is not None:
+        forwarded += ["--repeat-minutes", f"{options.repeat_minutes:g}"]
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"{REMOTE} {shlex.join(forwarded)}"]
     code, out, err = run(command, message.text, options.timeout + KILL_GRACE + 30)
     line = (out.strip().splitlines() or [""])[-1]
@@ -836,7 +892,9 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--no-action", action="store_true", help="to `user`: nothing is needed")
     _ = parser.add_argument("--key", help="names the message for --repeat-minutes, ack and the queue")
     _ = parser.add_argument("--repeat-minutes", type=float, help="skip a send with --key inside this window")
-    _ = parser.add_argument("--machine", help="deliver from this ssh host instead (mac)")
+    location = parser.add_mutually_exclusive_group()
+    _ = location.add_argument("--machine", help="deliver from this ssh host instead (mac)")
+    _ = location.add_argument("--here", action="store_true", help="resolve and deliver only here")
     _ = parser.add_argument("--codex", action="store_true", help="the recipient is a codex_mesh.py thread")
     _ = parser.add_argument("--session-dir", help="the codex_mesh.py session directory")
     _ = parser.add_argument("--timeout", type=float, default=TIMEOUT, help=f"delivery seconds (default {TIMEOUT})")
@@ -858,21 +916,28 @@ def parse(argv: list[str]) -> Options:
         if isinstance(parsed_action, ActionUnstated):
             parser.error(FIX)
         action = parsed_action
-    get = {name: attr(args, name) for name in Options._fields if name != "action"}
-    options = Options(to=to, sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
+    session_dir = optional_str(attr(args, "session_dir"))
+    is_codex = attr(args, "codex") is True
+    if is_codex != (session_dir is not None):
+        parser.error("--codex and --session-dir go together")
+    selection: RecipientSelection = MeshSeat(session_dir, to) if session_dir is not None else RosterLookup(to)
+    host = optional_str(attr(args, "machine"))
+    scope: RecipientResolutionScope = (
+        NamedMachine(host) if host is not None else
+        LocalOnly() if attr(args, "here") is True else LocalThenPeer()
+    )
+    get = {name: attr(args, name) for name in Options._fields if name not in {"action", "selection", "scope"}}
+    options = Options(selection=selection, sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
-                      machine=optional_str(get["machine"]), codex=get["codex"] is True,
-                      session_dir=optional_str(get["session_dir"]), timeout=optional_float(get["timeout"]) or TIMEOUT,
+                      scope=scope, timeout=optional_float(get["timeout"]) or TIMEOUT,
                       need=cast(Need, get["need"]), action=action, text=optional_str(get["text"]),
                       file=optional_str(get["file"]))
-    if options.to == USER and (options.summary is None or options.codex):
+    if options.to == USER and (options.summary is None or isinstance(options.selection, MeshSeat)):
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
         parser.error("--need goes with --to user")
     if options.to == USER and options.need != "note" and not isinstance(options.action, ActionRequired):
         parser.error(f"--need {options.need} requires --action. {FIX}")
-    if options.codex != (options.session_dir is not None):
-        parser.error("--codex and --session-dir go together")
     if options.repeat_minutes is not None and options.key is None:
         parser.error("--repeat-minutes needs --key")
     return options
@@ -921,21 +986,25 @@ def send(options: Options) -> Result:
         usage_error("the message is empty")
     first = text.strip().splitlines()[0]
     summary = options.summary or (first if len(first) <= 60 else first[:59] + "…")
-    if options.machine is not None:
-        route: DeliveryRoute = RemoteDelivery(options.machine)
+    if isinstance(options.selection, MeshSeat):
+        route: DeliveryRoute = (
+            RemoteDelivery(options.scope.host, options.to) if isinstance(options.scope, NamedMachine)
+            else CodexSeatRecipient(options.to, options.to, options.selection.session_dir)
+        )
     elif options.to == USER:
-        route = UserDelivery()
-    elif options.session_dir is not None:
-        route = CodexSeatRecipient(options.to, options.to, options.session_dir)
+        route = (RemoteDelivery(options.scope.host, USER) if isinstance(options.scope, NamedMachine)
+                 else UserDelivery())
     else:
-        route = resolve_recipient(options.to)
-    destination = route.address if isinstance(route, SessionRecipient) else options.to
+        route = resolve_recipient(options.to, options.scope)
+    destination = route.address if isinstance(route, SessionRecipient | RemoteDelivery) else options.to
     message = Message(destination, options.sender or default_sender(), summary, text, options.key)
     started = now()
     window = None if options.repeat_minutes is None else timedelta(minutes=options.repeat_minutes)
     skip = claim(message, window, started)
     if skip is not None:
         result = Result("skipped", skip)
+    elif isinstance(route, RecipientLookupFailed):
+        result = Result("failed", route.reason)
     elif isinstance(route, RemoteDelivery):
         result = remote(message, route.host, options)
     elif isinstance(route, UserDelivery):

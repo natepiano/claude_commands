@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List every Claude and Codex session of interest on this machine."""
+"""List Claude and Codex sessions on both workstations; --here reads only this one."""
 
 from __future__ import annotations
 
@@ -9,17 +9,19 @@ import io
 import json
 import os
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
 import time
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for _directory in (SCRIPTS / "production", SCRIPTS / "delegate"):
+for _directory in (SCRIPTS / "production", SCRIPTS / "delegate", SCRIPTS / "shutdown"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
@@ -30,12 +32,27 @@ import showrunners  # noqa: E402
 import unit_lookup  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
+import remote as remote  # noqa: E402
 from sessions import SessionRecord, messaging_socket_exists, running_sessions  # noqa: E402
 
 Kind = Literal["claude", "codex"]
 Role = Literal["showrunner", "unit director", "worker", "freestanding"]
 KNOWN_SLOT_ROLES = frozenset(("impl", "test", "fix", "review"))
 MESSAGEABLE_SEAT_STATUSES = frozenset(("running", "waiting_capacity"))
+
+
+@dataclass(frozen=True)
+class ThisMachine:
+    """Read only this workstation's sources."""
+
+
+@dataclass(frozen=True)
+class AllMachines:
+    """Read this workstation and its peer."""
+
+
+RosterScope = ThisMachine | AllMachines
+ALL_MACHINES = AllMachines()
 
 
 @dataclass(frozen=True)
@@ -172,6 +189,137 @@ class RosterEntry:
 class Roster:
     entries: list[RosterEntry]
     problems: list[str]
+
+
+SnapshotState = (MessageReach | ShowrunnerRelationship | DirectorRelationship | Assignment
+                 | CodexThread | NoCodexThread | ClaudeSession | NoClaudeSession)
+_SNAPSHOT_STATES: tuple[type[SnapshotState], ...] = (
+    Messageable, CannotReceiveMessages, UnderShowrunner, RunsProduction,
+    ProductionWithoutRunningShowrunner, NoShowrunner, UnderDirector, DirectsUnit,
+    NoDirector, WorkerAssignment, NotAWorker, CodexThread, NoCodexThread,
+    ClaudeSession, NoClaudeSession,
+)
+
+
+class SnapshotEntry(TypedDict):
+    machine: str
+    kind: str
+    role: str
+    name: str
+    status: str
+    cwd: str
+    reach: dict[str, str]
+    showrunner: dict[str, str]
+    director: dict[str, str]
+    assignment: dict[str, str]
+    thread: dict[str, str]
+    session: dict[str, str]
+
+
+def _tagged_state(state: SnapshotState) -> dict[str, str]:
+    return {"tag": type(state).__name__, **cast(dict[str, str], asdict(state))}
+
+
+def _snapshot_entry(entry: RosterEntry) -> SnapshotEntry:
+    return SnapshotEntry(
+        machine=entry.machine, kind=entry.kind, role=entry.role, name=entry.name,
+        status=entry.status, cwd=entry.cwd, reach=_tagged_state(entry.reach),
+        showrunner=_tagged_state(entry.showrunner), director=_tagged_state(entry.director),
+        assignment=_tagged_state(entry.assignment), thread=_tagged_state(entry.thread),
+        session=_tagged_state(entry.session),
+    )
+
+
+def _snapshot_object(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("snapshot requires an object")
+    result = cast(dict[object, object], value)
+    if not all(isinstance(key, str) for key in result):
+        raise ValueError("snapshot object keys must be strings")
+    return cast(dict[str, object], result)
+
+
+def _snapshot_string(values: Mapping[str, object], key: str) -> str:
+    value = values.get(key)
+    if not isinstance(value, str):
+        raise ValueError(f"snapshot needs string {key}")
+    return value
+
+
+def _decode_state(value: object) -> SnapshotState:
+    values = _snapshot_object(value)
+    tag = _snapshot_string(values, "tag")
+    for state in _SNAPSHOT_STATES:
+        if state.__name__ == tag:
+            names = [field.name for field in fields(state)]
+            if set(values) != {"tag", *names}:
+                raise ValueError(f"invalid fields for snapshot state {tag}")
+            return state(**{name: _snapshot_string(values, name) for name in names})
+    raise ValueError(f"unknown snapshot state {tag}")
+
+
+def _decode_entry(value: object) -> RosterEntry:
+    values = _snapshot_object(value)
+    if set(values) != set(SnapshotEntry.__annotations__):
+        raise ValueError("invalid snapshot entry fields")
+    reach = _decode_state(values.get("reach"))
+    showrunner = _decode_state(values.get("showrunner"))
+    director = _decode_state(values.get("director"))
+    assignment = _decode_state(values.get("assignment"))
+    thread = _decode_state(values.get("thread"))
+    session = _decode_state(values.get("session"))
+    if not (isinstance(reach, Messageable | CannotReceiveMessages)
+            and isinstance(showrunner, ShowrunnerRelationship)
+            and isinstance(director, DirectorRelationship)
+            and isinstance(assignment, Assignment)
+            and isinstance(thread, CodexThread | NoCodexThread)
+            and isinstance(session, ClaudeSession | NoClaudeSession)):
+        raise ValueError("snapshot state is in the wrong field")
+    return RosterEntry(
+        machine=_snapshot_string(values, "machine"), kind=_snapshot_string(values, "kind"),
+        role=_snapshot_string(values, "role"), name=_snapshot_string(values, "name"),
+        status=_snapshot_string(values, "status"), cwd=_snapshot_string(values, "cwd"),
+        reach=reach, showrunner=showrunner, director=director, assignment=assignment,
+        thread=thread, session=session,
+    )
+
+
+@dataclass(frozen=True)
+class RosterSnapshot:
+    """Lossless states exchanged between the two workstations."""
+
+    result: Roster
+
+    def encode(self) -> str:
+        return json.dumps({"tag": "RosterSnapshot", "entries": [
+            _snapshot_entry(entry) for entry in self.result.entries
+        ], "problems": self.result.problems})
+
+    @classmethod
+    def decode(cls, text: str) -> RosterSnapshot:
+        values = _snapshot_object(cast(object, json.loads(text)))
+        entries, problems = values.get("entries"), values.get("problems")
+        if (values.get("tag") != "RosterSnapshot" or not isinstance(entries, list)
+                or not isinstance(problems, list)):
+            raise ValueError("not a roster snapshot")
+        raw_problems = cast(list[object], problems)
+        if not all(isinstance(problem, str) for problem in raw_problems):
+            raise ValueError("snapshot problems must be strings")
+        return cls(Roster([_decode_entry(entry) for entry in cast(list[object], entries)],
+                          cast(list[str], raw_problems)))
+
+
+def cannot_receive_message_text(entry: RosterEntry) -> str:
+    """The same refusal and next step for send and broadcast."""
+    if not isinstance(entry.reach, CannotReceiveMessages):
+        raise ValueError("a refusal needs a CannotReceiveMessages row")
+    text = f"{entry.name} cannot take messages ({entry.reach.reason})"
+    if entry.role == "worker":
+        if isinstance(entry.director, UnderDirector):
+            text += f"; contact its unit director {entry.director.name} or wait"
+    elif entry.kind == "claude" and entry.reach.reason == "no messaging socket":
+        text += "; wait for it to open its messaging socket, then read the roster again and send again"
+    return text
 
 
 def is_sender(entry: RosterEntry, identity: SenderIdentity) -> bool:
@@ -476,43 +624,43 @@ def _production_places(
             if runner["session"] and runner_address
             else ProductionWithoutRunningShowrunner(runner["slug"])
         )
+        has_tmux = shutil.which(os.environ.get("UNIT_LOOKUP_TMUX") or "tmux") is not None
         try:
+            if not has_tmux:
+                raise OSError("no tmux binary")
             units = live_units.production_units(doc)
         except (OSError, ValueError) as error:
-            _problem(problems, f"tmux for {runner['slug']} was not read", error)
-            try:
-                rows = _production_rows(doc, runner["slug"])
-            except (OSError, UnicodeError, ValueError, add_unit.Refusal) as fallback_error:
-                _problem(problems, f"units in {doc}", fallback_error)
-                continue
-            for row in rows:
-                unit = add_unit.cell_value(row.get("Unit", ""))
-                worktree = add_unit.cell_value(row.get("Worktree", ""))
+            if has_tmux:
+                _problem(problems, f"tmux for {runner['slug']} was not read", error)
+        else:
+            for unit in units:
+                marked = unit.session
+                if marked is None:
+                    continue
+                place = _ProductionPlace(showrunner, DirectsUnit(unit.unit))
+                if isinstance(marked.claude, unit_lookup.LiveClaude):
+                    _ = places.setdefault(marked.claude.session_id, place)
+                    continue
+                # A socketless director is still identified by its marked pane.
                 for record in records:
-                    if (
-                        record["sessionId"] not in ledger_workers
-                        and worktree
-                        and details[record["sessionId"]].cwd == worktree
-                    ):
-                        _ = places.setdefault(
-                            record["sessionId"],
-                            _ProductionPlace(
-                                showrunner,
-                                DirectsUnit(unit),
-                            ),
-                        )
+                    if (record["sessionId"] not in ledger_workers and marked.pane
+                            and record["tmux"].rpartition(".")[2] == marked.pane):
+                        _ = places.setdefault(record["sessionId"], place)
+                        break
             continue
-        for unit in units:
-            marked = unit.session
-            claude = marked.claude if marked is not None else None
-            if isinstance(claude, unit_lookup.LiveClaude):
-                _ = places.setdefault(
-                    claude.session_id,
-                    _ProductionPlace(
-                        showrunner,
-                        DirectsUnit(unit.unit),
-                    ),
-                )
+        # Worktree ownership is a fallback only when tmux could not be read.
+        try:
+            rows = _production_rows(doc, runner["slug"])
+        except (OSError, UnicodeError, ValueError, add_unit.Refusal) as fallback_error:
+            _problem(problems, f"units in {doc}", fallback_error)
+            continue
+        for row in rows:
+            unit_name = add_unit.cell_value(row.get("Unit", ""))
+            worktree = add_unit.cell_value(row.get("Worktree", ""))
+            for record in records:
+                if (record["sessionId"] not in ledger_workers and worktree
+                        and details[record["sessionId"]].cwd == worktree):
+                    _ = places.setdefault(record["sessionId"], _ProductionPlace(showrunner, DirectsUnit(unit_name)))
     return places
 
 
@@ -922,9 +1070,13 @@ def _delegate_workers(
     return entries, worker_threads
 
 
-def roster(environment: Mapping[str, str]) -> Roster:
+def machine_name() -> str:
+    return socket.gethostname().split(".", 1)[0]
+
+
+def _local_roster(environment: Mapping[str, str]) -> Roster:
     problems: list[str] = []
-    machine = socket.gethostname().split(".", 1)[0]
+    machine = machine_name()
     records = _newest_sessions()
     details = _raw_session_details(records, problems)
     registered = _registered_showrunners(environment, problems)
@@ -967,6 +1119,39 @@ def roster(environment: Mapping[str, str]) -> Roster:
     return Roster(entries, problems)
 
 
+def peer_roster(environment: Mapping[str, str]) -> Roster:
+    """Read only the peer, decoding states immediately at the ssh boundary."""
+    host = remote.other_machine()
+    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
+               '\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/message/roster.py\" --here --snapshot']
+    try:
+        done = subprocess.run(command, capture_output=True, text=True, timeout=20, check=False,
+                              env={key: value for key, value in environment.items()
+                                   if key not in {"CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"}})
+    except (OSError, subprocess.TimeoutExpired) as error:
+        why = "timed out after 20 s" if isinstance(error, subprocess.TimeoutExpired) else str(error)
+        lines = why.splitlines()
+        return Roster([], [f"{host}: not reached: {lines[0] if lines else type(error).__name__}"])
+    try:
+        result = RosterSnapshot.decode(done.stdout).result
+    except (ValueError, TypeError):
+        detail = (done.stderr or "invalid roster snapshot").strip().splitlines()
+        return Roster([], [f"{host}: not reached: {detail[0] if detail else 'invalid roster snapshot'}"])
+    return Roster(result.entries, [f"{host}: {problem}" for problem in result.problems])
+
+
+def roster(environment: Mapping[str, str], scope: RosterScope) -> Roster:
+    match scope:
+        case ThisMachine():
+            return _local_roster(environment)
+        case AllMachines():
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                peer = pool.submit(peer_roster, environment)
+                local = _local_roster(environment)
+                other = peer.result()
+            return Roster([*local.entries, *other.entries], [*local.problems, *other.problems])
+
+
 def _home_shortened(path: str) -> str:
     if not path:
         return ""
@@ -1005,6 +1190,7 @@ def _chosen_entries(
                 entry
                 for entry in entries
                 if _director_address(worker)
+                and entry.machine == worker.machine
                 and entry.role == "unit director"
                 and _session_address(entry) == _director_address(worker)
             ),
@@ -1017,6 +1203,7 @@ def _chosen_entries(
                 entry
                 for entry in entries
                 if _showrunner_address(worker)
+                and entry.machine == worker.machine
                 and entry.role == "showrunner"
                 and _session_address(entry) == _showrunner_address(worker)
             ),
@@ -1033,7 +1220,7 @@ def _print_text(
     by_machine: dict[str, list[RosterEntry]] = {}
     for entry in entries:
         by_machine.setdefault(entry.machine, []).append(entry)
-    for machine in sorted(by_machine):
+    for machine in by_machine:
         print(machine)
         rows = by_machine[machine]
         printed: set[RosterEntry] = set()
@@ -1041,7 +1228,7 @@ def _print_text(
         def emit(entry: RosterEntry, depth: int) -> None:
             print("  " * depth + _entry_line(
                 entry,
-                you=is_sender(entry, identity),
+                you=machine == machine_name() and is_sender(entry, identity),
                 context=entry in contexts,
             ))
             printed.add(entry)
@@ -1115,8 +1302,13 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--json", action="store_true", dest="as_json")
     _ = parser.add_argument("--kind", choices=("claude", "codex"))
+    _ = parser.add_argument("--here", action="store_true", help="read this machine only")
+    _ = parser.add_argument("--snapshot", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args(argv)
-    result = roster(os.environ)
+    result = roster(os.environ, ThisMachine() if getattr(arguments, "here", False) is True else AllMachines())
+    if getattr(arguments, "snapshot", False) is True:
+        print(RosterSnapshot(result).encode())
+        return 1 if result.problems else 0
     raw_kind = getattr(arguments, "kind", None)
     kind = raw_kind if raw_kind in ("claude", "codex") else None
     entries, contexts = _chosen_entries(result.entries, kind)

@@ -48,6 +48,7 @@ class RosterTests(unittest.TestCase):
     ps_state: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     production_doc: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     director_run: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    ssh_log: Path = Path()
     environment: dict[str, str]  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
@@ -71,6 +72,17 @@ class RosterTests(unittest.TestCase):
             "#!/bin/sh\ncat \"$ROSTER_PS_FIXTURE\"\n", encoding="utf-8",
         )
         fake_ps.chmod(0o755)
+        self.ssh_log = self.root / "ssh.jsonl"
+        fake_ssh = binaries / "ssh"
+        _ = fake_ssh.write_text(
+            f"#!{sys.executable}\n"
+            + "import json, os, sys\n"
+            + "with open(os.environ['SSH_RECORD'], 'a') as log: log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            + "print(os.environ['SSH_SNAPSHOT'])\n"
+            + "raise SystemExit(int(os.environ.get('SSH_STATUS', '0')))\n",
+            encoding="utf-8",
+        )
+        fake_ssh.chmod(0o755)
         fake_codex = binaries / "codex"
         _ = fake_codex.write_text(
             "#!/bin/sh\necho 'test roster unexpectedly ran codex' >&2\nexit 91\n",
@@ -90,6 +102,8 @@ class RosterTests(unittest.TestCase):
             **os.environ,
             "HOME": str(self.home),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
+            "SSH_RECORD": str(self.ssh_log),
+            "SSH_SNAPSHOT": roster.RosterSnapshot(roster.Roster([], [])).encode(),
             "CLAUDE_BIN": str(fake_codex),
             "CLAUDE_CODE_SESSION_ID": "sid-runner",
             "CODEX_THREAD_ID": "",
@@ -326,19 +340,20 @@ class RosterTests(unittest.TestCase):
 
     def _entries(self) -> dict[str, roster.RosterEntry]:
         with mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
-            found = roster.roster(os.environ)
+            found = roster.roster(os.environ, roster.ThisMachine())
         self.assertEqual(found.problems, [])
         return {entry.name: entry for entry in found.entries}
 
     def _run_main(
         self, *arguments: str,
         daemon: list[codex_daemon.DaemonSession] | codex_daemon.DaemonUnreadable | None = None,
+        here: bool = True,
     ) -> tuple[int, list[str], list[str]]:
         output, errors = io.StringIO(), io.StringIO()
         daemon_result = self._daemon_sessions() if daemon is None else daemon
         with mock.patch.object(codex_daemon, "loaded_sessions", return_value=daemon_result), \
                 redirect_stdout(output), redirect_stderr(errors):
-            result = roster.main(list(arguments))
+            result = roster.main([*( ["--here"] if here else []), *arguments])
         return result, output.getvalue().splitlines(), errors.getvalue().splitlines()
 
     def _entry(
@@ -532,7 +547,7 @@ class RosterTests(unittest.TestCase):
                 output, errors = io.StringIO(), io.StringIO()
                 with mock.patch.object(roster, "roster", return_value=fixture), \
                         redirect_stdout(output), redirect_stderr(errors):
-                    result = roster.main(arguments)
+                    result = roster.main(["--here", *arguments])
                 lines = output.getvalue().splitlines()
                 self.assertEqual((result, errors.getvalue()), (0, ""))
                 runners = [line for line in lines if line.lstrip().startswith("showrunner runner")]
@@ -665,7 +680,7 @@ class RosterTests(unittest.TestCase):
         (second_run / "heartbeat.log").touch()
 
         with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
-            found = roster.roster(os.environ)
+            found = roster.roster(os.environ, roster.ThisMachine())
 
         duplicate_seats = [entry for entry in found.entries if entry.name == "alpha-impl"]
         self.assertEqual(len(duplicate_seats), 2)
@@ -746,7 +761,7 @@ class RosterTests(unittest.TestCase):
             self.home / "projects" / "imposter", updated=20,
         )
         with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
-            entries = roster.roster(os.environ).entries
+            entries = roster.roster(os.environ, roster.ThisMachine()).entries
         real = next(
             entry for entry in entries
             if entry.reach == roster.Messageable("session:sid-runner")
@@ -788,7 +803,7 @@ class RosterTests(unittest.TestCase):
         )
         with mock.patch.object(roster, "roster", return_value=fixture), \
                 redirect_stdout(output), redirect_stderr(errors):
-            result = roster.main(["--kind", "codex"])
+            result = roster.main(["--here", "--kind", "codex"])
         lines = output.getvalue().splitlines()
         runner_a_line = next(line for line in lines if "/runner-a" in line)
         runner_b_line = next(line for line in lines if "/runner-b" in line)
@@ -921,6 +936,73 @@ class RosterTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             identity.thread_id = "changed"  # pyright: ignore[reportAttributeAccessIssue]
 
+    def test_marked_unit_without_live_claude_does_not_claim_other_panes_by_worktree(self) -> None:
+        (self.sessions / "director.json").unlink()
+        worktree = self.home / "projects" / "unit-one"
+        for name, pane in (("other-pane", "helper:@2.%2"), ("outside-tmux", "")):
+            self._write_session(name, name, f"sid-{name}", worktree, tmux=pane)
+        entries = self._entries()
+        for name in ("other-pane", "outside-tmux"):
+            with self.subTest(session=name):
+                self.assertEqual(entries[name].role, "freestanding")
+                self.assertEqual(entries[name].director, roster.NoDirector())
+                self.assertTrue(roster.is_top_level(entries[name]))
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_unit_without_marked_session_does_not_claim_a_worktree_session(self) -> None:
+        _ = self.tmux_state.write_text("{}", encoding="utf-8")
+        worktree = self.home / "projects" / "unit-one"
+        worktree.mkdir(parents=True)
+        _ = (worktree / ".git").write_text("gitdir: fixture\n", encoding="utf-8")
+        self._write_session(
+            "helper", "helper", "sid-helper", worktree,
+            tmux="unmarked:@2.%2",
+        )
+        helper = self._entries()["helper"]
+        self.assertEqual(helper.role, "freestanding")
+        self.assertEqual(helper.director, roster.NoDirector())
+        self.assertTrue(roster.is_top_level(helper))
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_socketless_director_in_marked_pane_keeps_unit_without_worktree_match(self) -> None:
+        self._write_session(
+            "director", "director", "sid-director", self.home / "projects" / "elsewhere",
+            tmux="old-label:@1.%1", with_socket=False,
+        )
+        entries = self._entries()
+        director = entries["director"]
+        self.assertEqual(director.reach, roster.CannotReceiveMessages("no messaging socket"))
+        self.assertEqual(director.role, "unit director")
+        self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
+        self.assertEqual(director.showrunner, roster.UnderShowrunner(
+            "alpha", "runner", "session:sid-runner",
+        ))
+        for name in ("claude-worker", "alpha-impl", "adversary reviewer"):
+            with self.subTest(worker=name):
+                self.assertEqual(entries[name].director, roster.UnderDirector(
+                    "unit-one", "director", "session:sid-director",
+                ))
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_unreadable_tmux_keeps_worktree_directors_and_reports_the_problem(self) -> None:
+        broken_tmux = self.root / "bin" / "broken-tmux"
+        _ = broken_tmux.write_text(
+            "#!/bin/sh\necho 'fixture cannot list panes' >&2\nexit 2\n", encoding="utf-8",
+        )
+        broken_tmux.chmod(0o755)
+        with mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(broken_tmux)}), \
+                mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+            found = roster.roster(os.environ, roster.ThisMachine())
+        director = next(entry for entry in found.entries if entry.name == "director")
+        self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
+        self.assertEqual(director.showrunner, roster.UnderShowrunner(
+            "alpha", "runner", "session:sid-runner",
+        ))
+        self.assertEqual(found.problems, [
+            "tmux for alpha was not read: tmux could not list panes: fixture cannot list panes",
+        ])
+        self.assertEqual(self.ssh_calls(), [])
+
     def test_tmux_fallback_places_director_but_never_ledger_worker_by_cwd(self) -> None:
         missing_tmux = self.root / "bin" / "missing-tmux"
         worker_path = self.sessions / "worker.json"
@@ -929,7 +1011,7 @@ class RosterTests(unittest.TestCase):
         _ = worker_path.write_text(json.dumps(worker), encoding="utf-8")
         with mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(missing_tmux)}), \
                 mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
-            found = roster.roster(os.environ)
+            found = roster.roster(os.environ, roster.ThisMachine())
         director = next(entry for entry in found.entries if entry.name == "director")
         worker_entry = next(entry for entry in found.entries if entry.name == "claude-worker")
         self.assertEqual(
@@ -946,7 +1028,7 @@ class RosterTests(unittest.TestCase):
                 roster.UnderDirector("unit-one", "director", "session:sid-director"),
             ),
         )
-        self.assertTrue(any("tmux" in problem.lower() for problem in found.problems))
+        self.assertFalse(any("tmux" in problem.lower() for problem in found.problems))
 
     def test_unreadable_daemon_is_one_problem_and_main_returns_one(self) -> None:
         result, lines, errors = self._run_main(
@@ -962,7 +1044,7 @@ class RosterTests(unittest.TestCase):
         failure = subprocess.CalledProcessError(2, ["ps"])
         with mock.patch.object(process_table, "snapshot", side_effect=failure), \
                 mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
-            found = roster.roster(os.environ)
+            found = roster.roster(os.environ, roster.ThisMachine())
         self.assertTrue(found.entries)
         self.assertEqual(len([problem for problem in found.problems if "process" in problem]), 1)
 
@@ -972,6 +1054,144 @@ class RosterTests(unittest.TestCase):
         os.utime(orphan, (old, old))
         entries = self._entries()
         self.assertNotIn("orphan-impl", entries)
+
+
+    def ssh_calls(self) -> list[list[str]]:
+        if not self.ssh_log.exists():
+            return []
+        return [cast(list[str], json.loads(line)) for line in self.ssh_log.read_text().splitlines()]
+
+    def peer_snapshot(self, result: roster.Roster, *, status: int = 0) -> None:
+        os.environ["SSH_SNAPSHOT"] = roster.RosterSnapshot(result).encode()
+        os.environ["SSH_STATUS"] = str(status)
+
+    def test_here_reads_only_this_machine_without_ssh(self) -> None:
+        result, lines, errors = self._run_main("--json")
+        self.assertEqual((result, errors), (0, []))
+        self.assertTrue(lines)
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_default_scope_merges_peer_rows_after_local_rows_with_one_snapshot_call(self) -> None:
+        peer = replace(self._entry("Mac Claude", "freestanding", "session:mac-id"), machine="mac")
+        self.peer_snapshot(roster.Roster([peer], []))
+        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
+            result = roster.roster(os.environ, roster.AllMachines())
+        self.assertEqual(result.problems, [])
+        self.assertEqual(result.entries[-1], peer)
+        self.assertTrue(all(row.machine != "mac" for row in result.entries[:-1]))
+        commands = self.ssh_calls()
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][:4], ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
+        self.assertIn("--here --snapshot", commands[0][-1])
+        self.assertIn('"$HOME/.claude/scripts/lib/py"', commands[0][-1])
+
+    def test_unreachable_peer_is_one_problem_while_local_rows_still_print(self) -> None:
+        os.environ["SSH_SNAPSHOT"] = "ssh: connection refused"
+        os.environ["SSH_STATUS"] = "255"
+        result, lines, errors = self._run_main(here=False)
+        self.assertEqual(result, 1)
+        self.assertTrue(any("free-claude" in line for line in lines))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("not reached", errors[0])
+        self.assertEqual(len(self.ssh_calls()), 1)
+
+    def test_peer_snapshot_with_problems_and_exit_one_preserves_rows_and_prefixes_problem(self) -> None:
+        peer = replace(self._entry("Mac Claude", "freestanding", "session:mac-id"), machine="mac")
+        self.peer_snapshot(roster.Roster([peer], ["Codex daemon: closed"]), status=1)
+        result, lines, errors = self._run_main("--json", here=False)
+        self.assertEqual(result, 1)
+        document = cast(dict[str, object], json.loads("\n".join(lines)))
+        rows = cast(list[dict[str, object]], document["entries"])
+        self.assertTrue(any(row["name"] == "Mac Claude" for row in rows))
+        self.assertEqual(document["problems"], ["mac: Codex daemon: closed"])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("mac: Codex daemon: closed", errors[0])
+
+    def test_snapshot_round_trips_every_relationship_reach_thread_and_session_state(self) -> None:
+        base = self._entry("base", "freestanding", "session:base")
+        rows = [
+            replace(base, showrunner=roster.RunsProduction("show")),
+            replace(base, showrunner=roster.UnderShowrunner("show", "runner", "session:runner"),
+                    director=roster.DirectsUnit("unit"), reach=roster.CannotReceiveMessages("no messaging socket")),
+            replace(base, kind="codex", role="worker", session=roster.NoClaudeSession(),
+                    thread=roster.CodexThread("seat-thread"), reach=roster.Messageable("seat:run/impl"),
+                    showrunner=roster.ProductionWithoutRunningShowrunner("gone"),
+                    director=roster.UnderDirector("unit", "base", "session:base"),
+                    assignment=roster.WorkerAssignment("impl", "/remote/run")),
+            replace(base, kind="codex", session=roster.NoClaudeSession(), thread=roster.CodexThread("daemon"),
+                    reach=roster.Messageable("codex:daemon")),
+            replace(base, kind="codex", role="worker", session=roster.NoClaudeSession(),
+                    reach=roster.CannotReceiveMessages("between turns; no unit director is running"),
+                    assignment=roster.WorkerAssignment("test", "/remote/no-thread")),
+        ]
+        result = roster.Roster(rows, ["remote source problem"])
+        encoded = roster.RosterSnapshot(result).encode()
+        decoded = roster.RosterSnapshot.decode(encoded)
+        self.assertEqual(decoded.result, result)
+
+    def test_snapshot_command_retains_socketless_director_identity_and_linked_workers(self) -> None:
+        path = self.sessions / "director.json"
+        data = cast(dict[str, object], json.loads(path.read_text()))
+        data["messagingSocketPath"] = ""
+        data["procStart"] = sessions.process_start(os.getpid())
+        _ = path.write_text(json.dumps(data))
+        result, lines, errors = self._run_main("--snapshot")
+        self.assertEqual((result, errors), (0, []))
+        snapshot = roster.RosterSnapshot.decode("\n".join(lines))
+        director = next(row for row in snapshot.result.entries if row.name == "director")
+        worker = next(row for row in snapshot.result.entries if row.name == "alpha-impl")
+        self.assertEqual(director.session, roster.ClaudeSession("sid-director"))
+        self.assertEqual(director.reach, roster.CannotReceiveMessages("no messaging socket"))
+        self.assertEqual(worker.director, roster.UnderDirector("unit-one", "director", "session:sid-director"))
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_snapshot_is_hidden_from_help_and_public_json_has_no_session_field(self) -> None:
+        output = io.StringIO()
+        with self.assertRaises(SystemExit) as raised, redirect_stdout(output):
+            _ = roster.main(["--help"])
+        self.assertEqual(raised.exception.code, 0)
+        self.assertNotIn("--snapshot", output.getvalue())
+        result, lines, errors = self._run_main("--json")
+        self.assertEqual((result, errors), (0, []))
+        document = cast(dict[str, object], json.loads("\n".join(lines)))
+        for row in cast(list[dict[str, object]], document["entries"]):
+            self.assertEqual(set(row), ENTRY_FIELDS)
+            self.assertNotIn("session", row)
+
+    def test_invalid_peer_snapshot_is_one_not_reached_problem(self) -> None:
+        os.environ["SSH_SNAPSHOT"] = '{"entries": [], "problems": []}'
+        result = roster.peer_roster(os.environ)
+        self.assertEqual(result.entries, [])
+        self.assertEqual(len(result.problems), 1)
+        self.assertIn("not reached", result.problems[0])
+        self.assertEqual(len(self.ssh_calls()), 1)
+
+    def test_peer_snapshot_timeout_is_twenty_seconds_and_sender_ids_are_not_forwarded(self) -> None:
+        calls: list[list[str]] = []
+        def timeout(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            calls.append(command)
+            self.assertEqual(command[0], "ssh")
+            self.assertEqual(options["timeout"], 20)
+            environment = cast(dict[str, str], options["env"])
+            self.assertNotIn("CODEX_THREAD_ID", environment)
+            self.assertNotIn("CLAUDE_CODE_SESSION_ID", environment)
+            raise subprocess.TimeoutExpired(command, 20)
+        with mock.patch.object(subprocess, "run", new=timeout):
+            result = roster.peer_roster(os.environ)
+        self.assertEqual(result.entries, [])
+        self.assertEqual(len(result.problems), 1)
+        self.assertIn("not reached: timed out after 20 s", result.problems[0])
+        self.assertEqual(len(calls), 1)
+
+    def test_mac_without_tmux_still_finds_worktree_directors_without_a_tmux_problem(self) -> None:
+        with (mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(self.root / "missing-tmux")}),
+              mock.patch.object(codex_daemon, "loaded_sessions", return_value=[])):
+            result = roster.roster(os.environ, roster.ThisMachine())
+        director = next(row for row in result.entries if row.name == "director")
+        self.assertEqual(director.role, "unit director")
+        self.assertFalse(any("tmux" in problem.lower() for problem in result.problems))
+        self.assertEqual(self.ssh_calls(), [])
 
 
 if __name__ == "__main__":

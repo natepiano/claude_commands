@@ -6,10 +6,11 @@ import io
 import json
 import os
 import socket
+import shlex
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from datetime import timedelta
 from pathlib import Path
 from typing import cast, override
@@ -46,6 +47,11 @@ def answer(body: str, tool_id: str = "t1", error: bool = False) -> dict[str, obj
 OK = '{"success":true,"message":"queued there","msg_id":"m1"}'
 
 
+def local_options(arguments: list[str]) -> send.Options:
+    """Keep pre-peer transport cases on the machine their fixtures describe."""
+    return send.parse([*([] if "--machine" in arguments else ["--here"]), *arguments])
+
+
 class SendTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -62,6 +68,22 @@ class SendTests(unittest.TestCase):
             patcher = mock.patch.object(send, name, value)
             _ = patcher.start()
             self.addCleanup(patcher.stop)
+        binaries = self.root / "bin"
+        binaries.mkdir()
+        fake_ssh = binaries / "ssh"
+        _ = fake_ssh.write_text(
+            f"#!{sys.executable}\n"
+            + "import json, os, sys\n"
+            + "with open(os.environ['SSH_RECORD'], 'a') as log: log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            + "print(os.environ['SSH_SNAPSHOT'])\n",
+            encoding="utf-8",
+        )
+        fake_ssh.chmod(0o755)
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            "HOME": str(self.root), "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
+            "SSH_RECORD": str(self.root / "ssh.jsonl"),
+            "SSH_SNAPSHOT": roster.RosterSnapshot(roster.Roster([], [])).encode(),
+        })))
         # No test reads the machine's own session records, or passes for the session that runs it.
         (self.root / "sessions").mkdir()
         self.enterContext(mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
@@ -87,7 +109,7 @@ class SendTests(unittest.TestCase):
         return self.outcome
 
     def send(self, *args: str) -> send.Result:
-        return send.send(send.parse(["--to", "bogus", "--from", "test", *args]))
+        return send.send(local_options(["--to", "bogus", "--from", "test", *args]))
 
     def log(self) -> list[dict[str, object]]:
         return [send.as_dict(send.loads(line)) for line in (self.root / "log.jsonl").read_text().splitlines()]
@@ -96,7 +118,7 @@ class SendTests(unittest.TestCase):
         self.assertEqual(self.send("--key", "k", "--repeat-minutes", "30", "--text", "one").outcome, "sent")
         skipped = self.send("--key", "k", "--repeat-minutes", "30", "--text", "two")
         self.assertEqual(skipped.outcome, "skipped")
-        self.assertEqual(send.send(send.parse(["--to", "other", "--key", "k", "--repeat-minutes", "30",
+        self.assertEqual(send.send(local_options(["--to", "other", "--key", "k", "--repeat-minutes", "30",
                                                "--text", "three"])).outcome, "sent")
         later = send.now() + timedelta(minutes=31)
         with mock.patch.object(send, "now", return_value=later):
@@ -148,13 +170,13 @@ class SendTests(unittest.TestCase):
     def test_what_did_not_arrive_is_kept_by_session_id_so_a_rename_loses_nothing(self) -> None:
         self.session("id-1", "old")
         self.outcome = send.Result("queued", "relay timed out after 40 s")
-        result = send.send(send.parse(["--to", "old", "--from", "test", "--text", "by name"]))
+        result = send.send(local_options(["--to", "old", "--from", "test", "--text", "by name"]))
         self.assertEqual(result, send.Result("queued", "relay timed out after 40 s"))
-        _ = send.send(send.parse(["--to", f"uds:{self.root / 'id-1.sock'}", "--from", "test", "--text", "by socket"]))
+        _ = send.send(local_options(["--to", f"uds:{self.root / 'id-1.sock'}", "--from", "test", "--text", "by socket"]))
         self.assertEqual([path.name for path in (self.root / "queue").iterdir()], ["session-id-1.jsonl"])
         self.session("id-1", "new", "old")
         # A send to the name the session no longer has is still kept for that session.
-        _ = send.send(send.parse(["--to", "old", "--from", "test", "--text", "by the old name"]))
+        _ = send.send(local_options(["--to", "old", "--from", "test", "--text", "by the old name"]))
         self.assertEqual(send.pending("someone-else"), "")
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
             text = send.pending(None)
@@ -191,7 +213,7 @@ class SendTests(unittest.TestCase):
     def test_live_session_id_relays_to_its_socket_and_logs_the_requested_address(self) -> None:
         self.session("id-1", "recipient")
 
-        result = send.send(send.parse([
+        result = send.send(local_options([
             "--to", "session:id-1", "--from", "test", "--text", "hello by id",
         ]))
 
@@ -202,7 +224,7 @@ class SendTests(unittest.TestCase):
         self.assertEqual(self.log()[0]["to"], "session:id-1")
 
     def test_session_id_without_a_live_session_queues_without_relaying(self) -> None:
-        result = send.send(send.parse([
+        result = send.send(local_options([
             "--to", "session:gone", "--from", "test", "--text", "wait for me",
         ]))
 
@@ -217,14 +239,14 @@ class SendTests(unittest.TestCase):
     def test_a_delivered_keyed_send_retires_its_queued_copy(self) -> None:
         self.session("id-1", "recipient")
         self.outcome = send.Result("queued", "relay unavailable")
-        first = send.send(send.parse([
+        first = send.send(local_options([
             "--to", "session:id-1", "--from", "shutdown", "--key", "shutdown-owner-id-1",
             "--text", "settle first",
         ]))
         self.assertEqual(first.outcome, "queued")
 
         self.outcome = send.Result("sent", "ok")
-        delivered = send.send(send.parse([
+        delivered = send.send(local_options([
             "--to", "session:id-1", "--from", "shutdown", "--key", "shutdown-owner-id-1",
             "--text", "cancel instead",
         ]))
@@ -236,7 +258,7 @@ class SendTests(unittest.TestCase):
         self,
     ) -> None:
         self.outcome = send.Result("queued", "relay unavailable")
-        queued = send.send(send.parse([
+        queued = send.send(local_options([
             "--to", "recipient", "--from", "shutdown", "--key", "shutdown-owner-id-1",
             "--text", "settle first",
         ]))
@@ -252,7 +274,7 @@ class SendTests(unittest.TestCase):
         with mock.patch.object(
             roster, "roster", return_value=roster.Roster([recipient], []),
         ):
-            delivered = send.send(send.parse([
+            delivered = send.send(local_options([
                 "--to", "recipient", "--from", "shutdown", "--key", "shutdown-owner-id-1",
                 "--text", "cancel instead",
             ]))
@@ -272,7 +294,7 @@ class SendTests(unittest.TestCase):
             argv = ["--to", address, "--from", sender, "--text", text]
             if message_key is not None:
                 argv[4:4] = ["--key", message_key]
-            self.assertEqual(send.send(send.parse(argv)).outcome, "queued")
+            self.assertEqual(send.send(local_options(argv)).outcome, "queued")
 
         output = io.StringIO()
         with redirect_stdout(output):
@@ -313,7 +335,7 @@ class SendTests(unittest.TestCase):
             if key is not None:
                 arguments[4:4] = ["--key", key]
             self.assertEqual(
-                send.send(send.parse(arguments)).outcome,
+                send.send(local_options(arguments)).outcome,
                 "queued",
             )
 
@@ -424,7 +446,7 @@ class SendTests(unittest.TestCase):
         with mock.patch.object(
             roster, "roster", return_value=roster.Roster([recipient], []),
         ):
-            result = send.send(send.parse([
+            result = send.send(local_options([
                 "--to", "recipient", "--from", "test", "--text", "hello by name",
             ]))
 
@@ -467,14 +489,14 @@ class SendTests(unittest.TestCase):
             mock.patch.object(send, "codex", side_effect=deliver),
         ):
             for address in (first_address, second_address):
-                result = send.send(send.parse([
+                result = send.send(local_options([
                     "--to", address, "--from", "test", "--text", "hello",
                 ]))
                 self.assertEqual(result.outcome, "sent")
 
             errors = io.StringIO()
             with self.assertRaises(SystemExit) as raised, redirect_stderr(errors):
-                _ = send.main([
+                _ = send.main(["--here",
                     "--to", "shared", "--from", "test", "--text", "hello",
                 ])
 
@@ -506,7 +528,7 @@ class SendTests(unittest.TestCase):
             self.assertRaises(SystemExit) as raised,
             redirect_stderr(errors),
         ):
-            _ = send.main([
+            _ = send.main(["--here",
                 "--to", "blind review", "--from", "test", "--text", "hello",
             ])
 
@@ -525,7 +547,7 @@ class SendTests(unittest.TestCase):
     ) -> None:
         worker = roster.RosterEntry(
             "machine", "codex", "worker", "paused worker", "waiting",
-            roster.CannotReceiveMessages("seat between turns"), "/work",
+            roster.CannotReceiveMessages("seat between turns; no unit director is running"), "/work",
             roster.UnderShowrunner("production", "runner", "session:runner"),
             roster.NoDirector(),
             roster.WorkerAssignment("impl", str(self.root / "run")),
@@ -542,15 +564,14 @@ class SendTests(unittest.TestCase):
             self.assertRaises(SystemExit) as raised,
             redirect_stderr(errors),
         ):
-            _ = send.main([
+            _ = send.main(["--here",
                 "--to", "paused worker", "--from", "test", "--text", "hello",
             ])
 
         self.assertEqual(raised.exception.code, 2)
         self.assertEqual(
             errors.getvalue(),
-            "send.py: paused worker cannot take messages (seat between turns); "
-            + "no unit director is running for it\n",
+            "send.py: paused worker cannot take messages (seat between turns; no unit director is running)\n",
         )
         codex_send.assert_not_called()
         claude_send.assert_not_called()
@@ -580,7 +601,7 @@ class SendTests(unittest.TestCase):
             self.assertRaises(SystemExit) as raised,
             redirect_stderr(errors),
         ):
-            _ = send.main([
+            _ = send.main(["--here",
                 "--to", "duplicate", "--from", "test", "--text", "hello",
             ])
 
@@ -617,7 +638,7 @@ class SendTests(unittest.TestCase):
             mock.patch.object(send, "codex", side_effect=deliver),
             redirect_stderr(errors),
         ):
-            result = send.send(send.parse([
+            result = send.send(local_options([
                 "--to", address, "--from", "test", "--text", "hello",
             ]))
 
@@ -651,7 +672,7 @@ class SendTests(unittest.TestCase):
             ),
             mock.patch.object(send, "codex", side_effect=deliver),
         ):
-            result = send.send(send.parse([
+            result = send.send(local_options([
                 "--to", "only-worker", "--from", "test", "--text", "hello",
             ]))
 
@@ -670,7 +691,7 @@ class SendTests(unittest.TestCase):
             mock.patch.object(roster, "roster", return_value=unavailable),
             redirect_stderr(bare_errors),
         ):
-            bare = send.send(send.parse([
+            bare = send.send(local_options([
                 "--to", "unknown-claude", "--from", "test", "--text", "hello",
             ]))
 
@@ -688,7 +709,7 @@ class SendTests(unittest.TestCase):
             self.assertRaises(SystemExit) as raised,
             redirect_stderr(seat_errors),
         ):
-            _ = send.main([
+            _ = send.main(["--here",
                 "--to", "seat:missing/worker", "--from", "test", "--text", "hello",
             ])
 
@@ -697,23 +718,23 @@ class SendTests(unittest.TestCase):
         self.assertIn("seat:missing/worker", seat_errors.getvalue())
         codex_send.assert_not_called()
 
-    def test_codex_thread_address_queues_without_reading_the_roster(self) -> None:
+    def test_codex_thread_address_queues_after_one_local_roster_read(self) -> None:
         output = io.StringIO()
         with (
-            mock.patch.object(roster, "roster") as read_roster,
+            mock.patch.object(roster, "roster", return_value=roster.Roster([], [])) as read_roster,
             mock.patch.object(
                 codex_daemon, "queue", return_value=codex_daemon.Queued(),
             ) as queue,
             redirect_stdout(output),
         ):
-            code = send.main([
+            code = send.main(["--here",
                 "--to", "codex:thread-one", "--from", "test", "--text", "hello",
             ])
 
         self.assertEqual(code, 0)
         self.assertEqual(output.getvalue(), "SENT: queued on Codex session thread-one\n")
         queue.assert_called_once_with("thread-one", "hello", timeout=send.TIMEOUT)
-        read_roster.assert_not_called()
+        read_roster.assert_called_once()
 
     def test_named_codex_session_uses_its_display_name_in_the_outcome(self) -> None:
         session = roster.RosterEntry(
@@ -729,7 +750,7 @@ class SendTests(unittest.TestCase):
                 codex_daemon, "queue", return_value=codex_daemon.Queued(),
             ) as queue,
         ):
-            result = send.send(send.parse([
+            result = send.send(local_options([
                 "--to", "Codex window", "--from", "test", "--text", "hello",
             ]))
 
@@ -746,14 +767,14 @@ class SendTests(unittest.TestCase):
             with self.subTest(queue_result=queue_result), mock.patch.object(
                 codex_daemon, "queue", return_value=queue_result,
             ), redirect_stdout(output):
-                code = send.main([
+                code = send.main(["--here",
                     "--to", "codex:thread-one", "--from", "test", "--text", "hello",
                 ])
             self.assertEqual(code, 3)
             self.assertEqual(output.getvalue(), f"FAILED: {detail}\n")
         self.assertEqual(send.pending("codex:thread-one"), "")
 
-    def test_roster_is_read_once_only_for_seat_addresses_and_bare_names(self) -> None:
+    def test_local_roster_is_read_once_for_every_roster_address_and_bare_name(self) -> None:
         address = "seat:44444444-4444-4444-4444-444444444444/worker"
         worker = roster.RosterEntry(
             "machine", "codex", "worker", "worker", "running",
@@ -763,8 +784,8 @@ class SendTests(unittest.TestCase):
         for recipient, expected_reads in (
             (address, 1),
             ("worker", 1),
-            ("codex:thread-one", 0),
-            ("session:claude-one", 0),
+            ("codex:thread-one", 1),
+            ("session:claude-one", 1),
             (f"uds:{self.root / 'claude.sock'}", 0),
             ("user", 0),
         ):
@@ -788,13 +809,13 @@ class SendTests(unittest.TestCase):
                         send, "user", return_value=send.Result("sent", "user"),
                     ),
                 ):
-                    _ = send.send(send.parse(options))
+                    _ = send.send(local_options(options))
                 self.assertEqual(read_roster.call_count, expected_reads)
 
     def test_seat_address_with_action_is_a_usage_error(self) -> None:
         errors = io.StringIO()
         with self.assertRaises(SystemExit) as raised, redirect_stderr(errors):
-            _ = send.parse([
+            _ = local_options([
                 "--to", "seat:run/worker", "--action", "reply", "--text", "hello",
             ])
         self.assertEqual(raised.exception.code, 2)
@@ -803,7 +824,7 @@ class SendTests(unittest.TestCase):
     def test_help_description_and_to_option_name_every_recipient_form(self) -> None:
         output = io.StringIO()
         with self.assertRaises(SystemExit) as raised, redirect_stdout(output):
-            _ = send.parse(["--help"])
+            _ = local_options(["--help"])
         self.assertEqual(raised.exception.code, 0)
         help_text = " ".join(output.getvalue().split())
         for recipient_form in (
@@ -831,6 +852,7 @@ class SendTests(unittest.TestCase):
         self.assertEqual(result, send.Result("queued", "on mac: no agent named bogus"))
         self.assertEqual(commands[0][-2], "mac")
         self.assertIn("--key k", commands[0][-1])
+        self.assertIn("--here", commands[0][-1])
         self.assertEqual(send.pending("bogus"), "")
         with mock.patch.object(send, "run", return_value=(255, "", "ssh: connect to host mac: timed out")):
             self.assertEqual(self.send("--machine", "mac", "--text", "hi").outcome, "failed")
@@ -846,8 +868,8 @@ class SendTests(unittest.TestCase):
         told = ["--to", "user", "--from", "test", "--summary", "natedev: disk", "--need", "blocked",
                 "--action", "free disk space", "--text", "full"]
         with mock.patch.object(send, "run", channel):
-            self.assertEqual(send.send(send.parse(told)), send.Result("sent", "to the user"))
-            self.assertEqual(send.send(send.parse(told)).outcome, "failed")
+            self.assertEqual(send.send(local_options(told)), send.Result("sent", "to the user"))
+            self.assertEqual(send.send(local_options(told)).outcome, "failed")
         self.assertEqual(commands[0][2:], ["--priority", "2", "--source", "test", "--action", "free disk space",
                                            "natedev: disk", "full"])
         self.assertEqual(self.relayed, [])
@@ -863,10 +885,11 @@ class SendTests(unittest.TestCase):
             return 0, "SENT: to the user\n", ""
 
         with mock.patch.object(send, "run", remote_run):
-            result = send.send(send.parse(["--to", "user", "--summary", "mac: login", "--need", "decision",
+            result = send.send(local_options(["--to", "user", "--summary", "mac: login", "--need", "decision",
                                            "--action", "log in", "--machine", "natedev", "--text", "hi"]))
         self.assertEqual(result, send.Result("sent", "on natedev: to the user"))
         self.assertIn("--need decision", commands[0][-1])
+        self.assertIn("--here", commands[0][-1])
         self.assertIn("--action 'log in'", commands[0][-1])
 
     def test_pushover_refusal_exits_2_and_keeps_nothing(self) -> None:
@@ -893,20 +916,20 @@ class SendTests(unittest.TestCase):
         self.assertEqual(self.log()[0]["outcome"], "failed")
 
     def test_user_options_hold_one_typed_action(self) -> None:
-        required = send.parse(["--to", "user", "--summary", "choose", "--action", "pick one", "--text", "a or b"])
-        none = send.parse(["--to", "user", "--summary", "news", "--no-action", "--text", "done"])
+        required = local_options(["--to", "user", "--summary", "choose", "--action", "pick one", "--text", "a or b"])
+        none = local_options(["--to", "user", "--summary", "news", "--no-action", "--text", "done"])
         self.assertEqual(required.action, ActionRequired("pick one"))
         self.assertEqual(none.action, NoActionRequired())
 
     def test_non_user_options_have_no_user_recipient_state(self) -> None:
-        options = send.parse(["--to", "natedev", "--text", "hello"])
+        options = local_options(["--to", "natedev", "--text", "hello"])
         self.assertEqual(options.action, send.NoUserRecipient())
 
     def test_action_flags_are_only_for_user_messages(self) -> None:
         for action in (["--no-action"], ["--action", "reply"]):
             errors = io.StringIO()
             with self.assertRaises(SystemExit) as raised, mock.patch("sys.stderr", errors):
-                _ = send.parse(["--to", "natedev", *action, "--text", "hello"])
+                _ = local_options(["--to", "natedev", *action, "--text", "hello"])
             self.assertEqual(raised.exception.code, 2)
             self.assertIn("go with --to user", errors.getvalue())
 
@@ -920,6 +943,267 @@ class SendTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised, mock.patch("sys.stderr"):
                 _ = send.main(argv)
             self.assertEqual(raised.exception.code, 2, argv)
+
+
+class PeerSendTests(unittest.TestCase):
+    root: Path = Path()
+    local: roster.Roster = roster.Roster([], [])
+    ssh_log: Path = Path()
+    relayed: list[send.Message] = []
+    mesh_calls: list[tuple[send.Message, str]] = []
+    daemon_calls: list[str] = []
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        binaries = self.root / "bin"
+        binaries.mkdir()
+        (self.root / "sessions").mkdir()
+        self.ssh_log = self.root / "ssh.jsonl"
+        ssh = binaries / "ssh"
+        _ = ssh.write_text(
+            f"#!{sys.executable}\n"
+            + "import json, os, sys\n"
+            + "with open(os.environ['SSH_RECORD'], 'a') as log: log.write(json.dumps({'args': sys.argv[1:], 'stdin': sys.stdin.read()}) + '\\n')\n"
+            + "if 'roster.py' in sys.argv[-1]:\n"
+            + "    print(os.environ['SSH_SNAPSHOT'])\n"
+            + "    raise SystemExit(int(os.environ.get('SSH_ROSTER_STATUS', '0')))\n"
+            + "print(os.environ.get('SSH_SEND_RESULT', 'SENT: fixture recipient'))\n",
+            encoding="utf-8",
+        )
+        ssh.chmod(0o755)
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            "HOME": str(self.root), "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
+            "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "",
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+            "SSH_RECORD": str(self.ssh_log),
+            "SSH_SNAPSHOT": roster.RosterSnapshot(roster.Roster([], [])).encode(),
+        }, clear=True)))
+        self.local = roster.Roster([], [])
+        self.relayed, self.mesh_calls, self.daemon_calls = [], [], []
+        _ = self.enterContext(mock.patch.object(send, "STATE", self.root / "state"))
+        _ = self.enterContext(mock.patch.object(roster, "roster", side_effect=self.read_local))
+        _ = self.enterContext(mock.patch.object(send, "relay", side_effect=self.relay))
+        _ = self.enterContext(mock.patch.object(send, "codex", side_effect=self.mesh))
+        _ = self.enterContext(mock.patch.object(codex_daemon, "queue", side_effect=self.daemon))
+        _ = self.enterContext(mock.patch.object(send, "user", side_effect=AssertionError("never reach a real user channel")))
+
+    def read_local(self, _environment: object, scope: roster.RosterScope) -> roster.Roster:
+        self.assertEqual(scope, roster.ThisMachine())
+        return self.local
+
+    def relay(self, message: send.Message, _timeout: float) -> send.Result:
+        self.relayed.append(message)
+        return send.Result("sent", "fixture Claude")
+
+    def mesh(self, message: send.Message, directory: str, _timeout: float) -> send.Result:
+        self.mesh_calls.append((message, directory))
+        return send.Result("sent", "fixture mesh")
+
+    def daemon(self, thread: str, _text: str, **_options: object) -> codex_daemon.QueueResult:
+        self.daemon_calls.append(thread)
+        return codex_daemon.Queued()
+
+    def row(self, name: str, address: str, *, machine: str = "mac") -> roster.RosterEntry:
+        kind = "claude" if address.startswith("session:") else "codex"
+        worker = address.startswith("seat:")
+        return roster.RosterEntry(
+            machine, kind, "worker" if worker else "freestanding", name, "working",
+            roster.Messageable(address), "/fixture", roster.NoShowrunner(), roster.NoDirector(),
+            roster.WorkerAssignment("impl", "/fixture/run") if worker else roster.NotAWorker(),
+            roster.CodexThread(address.removeprefix("codex:")) if kind == "codex" else roster.NoCodexThread(),
+            roster.ClaudeSession(address.removeprefix("session:")) if kind == "claude" else roster.NoClaudeSession(),
+        )
+
+    def peer(self, rows: list[roster.RosterEntry], *, problems: tuple[str, ...] = ()) -> None:
+        os.environ["SSH_SNAPSHOT"] = roster.RosterSnapshot(roster.Roster(rows, list(problems))).encode()
+
+    def ssh_calls(self) -> list[dict[str, object]]:
+        if not self.ssh_log.exists():
+            return []
+        return [cast(dict[str, object], json.loads(line)) for line in self.ssh_log.read_text().splitlines()]
+
+    def forwarded(self) -> list[list[str]]:
+        calls = [cast(list[str], call["args"]) for call in self.ssh_calls()]
+        return [shlex.split(call[-1]) for call in calls if "send.py" in call[-1]]
+
+    def run_main(self, to: str, *options: str) -> tuple[int, str, str]:
+        output, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            try:
+                status = send.main(["--to", to, "--from", "fixture sender", *options, "--text", "fixture text"])
+            except SystemExit as error:
+                status = int(cast(int, error.code))
+        return status, output.getvalue(), errors.getvalue()
+
+    def test_remote_only_claude_mesh_and_daemon_recipients_forward_their_addresses(self) -> None:
+        for address in ("session:peer", "seat:peer-run/impl", "codex:peer-thread"):
+            with self.subTest(address=address):
+                self.peer([self.row("peer name", address)])
+                status, output, errors = self.run_main("peer name")
+                self.assertEqual((status, errors), (0, ""), output)
+                forwarded = self.forwarded()[-1]
+                self.assertEqual(forwarded[forwarded.index("--to") + 1], address)
+                self.assertIn("--here", forwarded)
+                self.assertNotIn("--action", forwarded)
+                self.assertNotIn("--no-action", forwarded)
+        self.assertEqual(len(self.forwarded()), 3)
+        self.assertEqual(self.relayed, [])
+        self.assertEqual(self.mesh_calls, [])
+        self.assertEqual(self.daemon_calls, [])
+
+    def test_remote_only_addresses_are_looked_up_before_local_transport_fallback(self) -> None:
+        for address in ("session:peer", "seat:peer-run/impl", "codex:peer-thread"):
+            with self.subTest(address=address):
+                self.peer([self.row("peer", address)])
+                status, output, errors = self.run_main(address)
+                self.assertEqual((status, errors), (0, ""), output)
+                forwarded = self.forwarded()[-1]
+                self.assertEqual(forwarded[forwarded.index("--to") + 1], address)
+                self.assertIn("--here", forwarded)
+        self.assertEqual(len(self.forwarded()), 3)
+        self.assertEqual(self.relayed, [])
+        self.assertEqual(self.mesh_calls, [])
+        self.assertEqual(self.daemon_calls, [])
+
+    def test_a_name_on_both_machines_delivers_here_without_ssh(self) -> None:
+        self.local = roster.Roster([self.row("shared", "codex:local", machine="natedev")], [])
+        self.peer([self.row("shared", "codex:peer")])
+        status, output, errors = self.run_main("shared")
+        self.assertEqual((status, errors), (0, ""), output)
+        self.assertEqual(self.daemon_calls, ["local"])
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_here_and_uds_never_ask_the_other_machine(self) -> None:
+        self.peer([self.row("remote", "codex:peer")])
+        for target, flags in (("remote", ["--here"]), ("uds:/fixture/local.sock", []),
+                              ("uds:/fixture/local.sock", ["--machine", "mac"])):
+            with self.subTest(target=target):
+                status, output, errors = self.run_main(target, *flags)
+                self.assertEqual((status, errors), (0, ""), output)
+        self.assertEqual(self.ssh_calls(), [])
+        self.assertEqual(len(self.relayed), 3)
+
+    def test_parse_names_each_resolution_scope_and_each_recipient_selection(self) -> None:
+        for flags, expected_scope in (([], send.LocalThenPeer()), (["--here"], send.LocalOnly()),
+                                      (["--machine", "mac"], send.NamedMachine("mac"))):
+            for selection_flags, expected_selection in (
+                ([], send.RosterLookup("recipient")),
+                (["--codex", "--session-dir", "/fixture/run"], send.MeshSeat("/fixture/run", "recipient")),
+            ):
+                with self.subTest(scope=expected_scope, selection=expected_selection):
+                    options = send.parse(["--to", "recipient", *flags, *selection_flags, "--text", "hello"])
+                    self.assertEqual(options.scope, expected_scope)
+                    self.assertEqual(options.selection, expected_selection)
+        with self.assertRaises(SystemExit) as raised, redirect_stderr(io.StringIO()):
+            _ = send.parse(["--to", "x", "--here", "--machine", "mac", "--text", "hello"])
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_mesh_selection_stays_here_for_both_local_scopes_and_forwards_only_when_named(self) -> None:
+        for flags in ([], ["--here"], ["--machine", "mac"]):
+            with self.subTest(flags=flags):
+                before = len(self.ssh_calls())
+                status, output, errors = self.run_main("impl", *flags, "--codex", "--session-dir", "/fixture/run")
+                self.assertEqual((status, errors), (0, ""), output)
+                if "--machine" in flags:
+                    self.assertEqual(len(self.ssh_calls()), before + 1)
+                    forwarded = self.forwarded()[-1]
+                    self.assertIn("--here", forwarded)
+                    self.assertEqual(forwarded[forwarded.index("--session-dir") + 1], "/fixture/run")
+                else:
+                    self.assertEqual(len(self.ssh_calls()), before)
+        self.assertEqual(len(self.mesh_calls), 2)
+
+    def test_named_machine_skips_local_and_peer_roster_resolution(self) -> None:
+        self.local = roster.Roster([], ["local source unavailable"])
+        status, output, errors = self.run_main("bare name", "--machine", "mac")
+        self.assertEqual((status, errors), (0, ""), output)
+        self.assertEqual(len(self.ssh_calls()), 1)
+        self.assertEqual(self.forwarded()[0][self.forwarded()[0].index("--to") + 1], "bare name")
+        self.assertIn("--here", self.forwarded()[0])
+
+    def test_clean_peer_misses_keep_each_forms_local_outcome(self) -> None:
+        for target, expected in (("session:gone", 1), ("codex:gone", 0), ("seat:gone/impl", 2), ("bare missing", 0)):
+            with self.subTest(target=target):
+                before = len(self.ssh_calls())
+                status, output, errors = self.run_main(target)
+                self.assertEqual(status, expected, output + errors)
+                self.assertEqual(len(self.ssh_calls()), before + 1)
+                if target.startswith("session:"):
+                    self.assertIn("fixture text", send.queue_path("session-gone").read_text())
+                elif target.startswith("seat:"):
+                    self.assertIn("no roster session has address", errors)
+        self.assertEqual(self.daemon_calls, ["gone"])
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual(self.forwarded(), [])
+
+    def test_local_problems_prevent_unproven_bare_name_fallback_to_the_peer(self) -> None:
+        self.local = roster.Roster([], ["delegate source unreadable"])
+        self.peer([self.row("absent here", "codex:peer")])
+        status, output, errors = self.run_main("absent here")
+        self.assertEqual(status, 2, output + errors)
+        self.assertIn("delegate source unreadable", errors)
+        self.assertIn("--machine", errors)
+        self.assertIn("address", errors)
+        self.assertEqual(self.ssh_calls(), [])
+        self.assertEqual(self.relayed + self.mesh_calls + self.daemon_calls, [])
+
+    def test_an_address_can_resolve_on_peer_even_when_a_local_source_failed(self) -> None:
+        self.local = roster.Roster([], ["delegate source unreadable"])
+        self.peer([self.row("peer", "codex:peer")])
+        status, output, errors = self.run_main("codex:peer")
+        self.assertEqual(status, 0, output + errors)
+        self.assertIn("delegate source unreadable", errors)
+        self.assertEqual(len(self.forwarded()), 1)
+
+    def test_remote_between_turns_seat_address_keeps_no_roster_address_error(self) -> None:
+        row = self.row("impl", "seat:remote/impl")
+        row = roster.RosterEntry(row.machine, row.kind, row.role, row.name, row.status,
+            roster.CannotReceiveMessages("between turns; its unit director resumes it"), row.cwd,
+            row.showrunner, row.director, row.assignment, row.thread, row.session)
+        self.peer([row])
+        status, output, errors = self.run_main("seat:remote/impl")
+        self.assertEqual(status, 2, output + errors)
+        self.assertIn("no roster session has address seat:remote/impl", errors)
+        self.assertEqual(self.forwarded(), [])
+
+    def test_ambiguous_peer_name_lists_every_address_before_sending(self) -> None:
+        self.peer([self.row("shared", "codex:one"), self.row("shared", "seat:run/two")])
+        status, output, errors = self.run_main("shared")
+        self.assertEqual(status, 2, output + errors)
+        self.assertIn("codex:one", errors)
+        self.assertIn("seat:run/two", errors)
+        self.assertEqual(self.forwarded(), [])
+
+    def test_unreachable_peer_reports_one_problem_and_fails_the_send(self) -> None:
+        os.environ["SSH_SNAPSHOT"], os.environ["SSH_ROSTER_STATUS"] = "ssh: connection refused", "255"
+        status, output, errors = self.run_main("only peer")
+        self.assertEqual(status, 3, output + errors)
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertIn("not reached", errors)
+        self.assertIn("FAILED:", output)
+        self.assertEqual(self.forwarded(), [])
+
+    def test_refusal_advice_matches_worker_ownership_and_socketless_claude_state(self) -> None:
+        for role, kind, relationship, reason, expected_tail in (
+            ("worker", "codex", roster.UnderDirector("unit", "director", "session:director"), "blind reviewer",
+             "; contact its unit director director or wait"),
+            ("worker", "codex", roster.NoDirector(), "between turns; no unit director is running", ""),
+            ("freestanding", "claude", roster.NoDirector(), "no messaging socket",
+             "; wait for it to open its messaging socket, then read the roster again and send again"),
+        ):
+            for remote in (False, True):
+                with self.subTest(role=role, remote=remote):
+                    row = roster.RosterEntry("mac" if remote else "natedev", kind, role, "recipient", "waiting",
+                        roster.CannotReceiveMessages(reason), "/fixture", roster.NoShowrunner(), relationship,
+                        roster.WorkerAssignment("review", "/run") if role == "worker" else roster.NotAWorker())
+                    self.local = roster.Roster([] if remote else [row], [])
+                    self.peer([row] if remote else [])
+                    before = len(self.forwarded())
+                    status, output, errors = self.run_main("recipient")
+                    self.assertEqual(status, 2, output + errors)
+                    self.assertIn(f"recipient cannot take messages ({reason}){expected_tail}\n", errors)
+                    self.assertEqual(len(self.forwarded()), before)
 
 
 class ReadRelayTests(unittest.TestCase):
