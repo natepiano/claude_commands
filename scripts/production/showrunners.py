@@ -193,6 +193,19 @@ def registered_showrunners(state_dir: Path | None = None) -> list[Showrunner]:
     return found
 
 
+def production_of(session_id: str, state_dir: Path | None = None) -> Path | None:
+    """The production doc of the showrunner whose update timer is addressed to `session_id`."""
+    for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
+        try:
+            target = _fields(instance / "conf").get("TARGET")
+        except (OSError, UnicodeError):
+            continue
+        doc = checked_doc(instance)
+        if session_id and target == f"session:{session_id}" and isinstance(doc, CheckedDoc):
+            return doc.path
+    return None
+
+
 def production_slug(doc: str) -> str:
     """The slug a production's units are marked with: its doc's name without the suffix."""
     slug = Path(doc).name.removesuffix("-production.md")
