@@ -306,7 +306,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 - `scripts/shutdown/test_shutdown_cli.py` — the fail-closed launch test injects a resolver `RuntimeError`.
 - `docs/accounts.md` — the user's guide; `commands/accounts.md` — dispatch plus a pointer to the guide.
 
-**Binds later work:** a named dir's session starts through `claudeN` / `accounts.py exec 'claude N'`, which drops an inherited OAuth token, refuses a wrong login and passes claude's arguments through. The guide's "Log out and in" is the login procedure: `claudeN`, then `/login` as claude N; a dir on the wrong login starts with `CLAUDE_CONFIG_DIR=~/.claudeN claude`, then `/logout` and `/login`. `setup` may create missing shared targets under `~/.claude`.
+**Binds later work:** a named dir's session starts through `claudeN` / `accounts.py exec 'claude N'`, which drops an inherited OAuth token, refuses a wrong login and passes claude's arguments through. The guide's "Log out and in" is the login procedure: `claudeN`, then `/login` as claude N; a dir on the wrong login starts with `env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=~/.claudeN claude`, then `/logout` and `/login`. `setup` may create missing shared targets under `~/.claude`.
 
 **Gotchas:**
 - A raw `CLAUDE_CONFIG_DIR=~/.claudeN claude` keeps an inherited `CLAUDE_CODE_OAUTH_TOKEN`, which wins over the dir's login; `exec` discards it.
@@ -316,7 +316,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 **Ruled out:** comparing the requested label with `account_identity(...).label` (the dir's login is compared with the note's `login:`); forwarding `account_identity`'s `UnreadableClaudeAccount` into readiness, which joins a logout and a read failure; fixing the non-UTF-8 note crash in `accounts.py` instead of `note_file.read_note`.
 
-### Phase 6 — Live proof on claude 3  · status: todo · gated by G1
+### Phase 6 — Live proof on claude 3  · status: done · gated by G1
 
 #### Work Order
 
@@ -342,6 +342,19 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 4. Exit the probe and delete its scratch transcript dir. Leave `~/.claude3` in place; Phase 7 uses it.
 
 If (b), (c) or (e) fails, stop and bring the failing check to the showrunner with the fix it needs in Phases 1–5. Those three are what the symlink design rests on.
+
+#### Results (2026-10-11, natedev)
+
+- **Setup and login.** The user ran `accounts.py setup "claude 3"` (this session's run of it was refused by Claude Code's auto-mode permission check) and logged in through `claude3`; `accounts.py check "claude 3"` passes. `setup`'s closing hint printed the raw `CLAUDE_CONFIG_DIR=… claude`, which keeps an inherited OAuth token; it and the guide's wrong-login step now print `env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=… claude`. `exec` is not the hint: for a label whose login is `~/.claude`'s, it skips the dir, so `/login` would change `~/.claude`.
+- **Probe.** `acct-probe`, pid 3024638, session `bbbeeb94-1cbc-4f15-a434-51ceefae97fc`, tmux `acct-probe`, cwd `/tmp/claude/acct-probe`. The first start stops on the folder-trust prompt.
+- **(a) Logins — pass.** `claude auth status`: `~/.claude3` is `rubrics.dogwood-1f@icloud.com`, `~/.claude` is `browses31_perks@icloud.com`. `~/.claude/.credentials.json` mtime is 10:08, before the login.
+- **(b) Registry and transcripts — pass.** `~/.claude/sessions/3024638.json` and `~/.claude/projects/-tmp-claude-acct-probe/bbbeeb94-….jsonl`. The status line reads `claude 3 | 5-hour 100% left | weekly 100% left` once the first prompt redraws it; `~/.claude3/account-label` is written by the SessionStart hook 7 s after start.
+- **(c) Messaging — pass.** `ListAgents` lists the probe; SendMessage reaches it and its SendMessage reply returns; `send.py --to acct-probe` delivers and its reply returns; `send.py` from the probe delivers here. That relay runs on `~/.claude`'s account and briefly shows in claude 2's `shutdown.py status` as `unknown account · <relay pid> acct-probe · process start mismatch`. The `notify_when_idle` notice fired for the probe's 17:42 turn; it reached this session at its next turn boundary, not mid-turn.
+- **(d) Shutdown attribution — pass.** `account.py --pid 3024638` names claude 3; `shutdown.py status "claude 3"` lists `acct-probe` and `natepiano-91` (the user's login session); claude 2's status lists neither. Claude Code's auto-mode permission check refused this session's `shutdown.py down` ("Interfere With Workloads"), so the user ran `shutdown.py down 'claude 3' --here --only 'bbbeeb94-…' --restart` at 17:49:38. Its record has scope `selected` with only the probe, one entry (`config_dir` `~/.claude3`), and ended `up` and archived. The probe came back as pid 3277165 via `claude --resume bbbeeb94-… -n acct-probe --remote-control acct-probe --model claude-opus-5-5`, on claude 3, with the same transcript (entries 21:41–21:50Z) and its history. All 27 claude 2 baseline sessions kept running. `natepiano-91` exited outside the shutdown: no record names it, and its transcript last wrote 14 s before the stop was requested.
+- **(e) Resume across accounts — pass.** A print-mode session started on `~/.claude` resumed under `accounts.py exec 'claude 3' --resume <id>` with its history (pid and status line both claude 3), then resumed on `~/.claude` and listed every word from both accounts' turns.
+- **(f) Links survive writes — pass, with a shared-model finding.** After `/model` to Sonnet and back and a prompt, `~/.claude3/settings.json` and `history.jsonl` are still links and the prompt was appended to the shared history. `/model` writes `model` through the link into `~/.claude/settings.json`, so a model choice in any account changes the default for every account, as a plain `~/.claude` session's does. The file was restored byte for byte.
+- **(g) Remote Control.** The phone's app, signed into the main account (claude 2), lists nothing called `acct-probe`. Opening its direct link on the phone, signed into the main account, says "this session is not available". A claude 3 session is neither listed in nor reachable from the main account's Remote Control: the phone reaches units on claude 3 only by signing into claude 3, and showrunners relay as planned.
+- **Cleanup.** The probe exited and its tmux session closed; `~/.claude/projects/-tmp-claude-acct-probe` and `-tmp-claude-acct-resume` and the scratch dirs are deleted. `~/.claude3` stays for Phase 7. No unit role or existing claude 2 session changed.
 
 **Files:**
 

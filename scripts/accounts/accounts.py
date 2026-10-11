@@ -1457,7 +1457,7 @@ def main(argv: list[str]) -> int:
             destination = account_dir(options.label)
             for problem in problems:
                 print(problem, file=sys.stderr)
-            print(f"CLAUDE_CONFIG_DIR={shlex.quote(str(destination))} claude")
+            print(f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(destination))} claude")
             print("/login")
             return 1 if problems else 0
         if options.action == "check":
