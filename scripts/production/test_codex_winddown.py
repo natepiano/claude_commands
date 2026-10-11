@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import json
 import os
+import io
+import shlex
 import socket
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import cast, override
 
@@ -16,6 +19,7 @@ import broadcast
 import codex_winddown
 import fake_showrunner
 import showrunners
+import roster
 from process_table import Process
 from sessions import SessionRecord
 from showrunners import Showrunner
@@ -47,6 +51,50 @@ class CountTests(unittest.TestCase):
             broadcast.UnitDirectors(): "unit from fixture sender",
         })
         report.assert_called_once_with([])
+
+    def test_announcement_reaches_showrunners_and_directors_on_both_machines_through_fake_ssh(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        commands: list[list[str]] = []
+        rows = [roster.RosterEntry(
+            "fixture", "claude", role, name, "working", roster.Messageable(f"session:{name}"),
+            "/fixture", roster.NoShowrunner(), roster.NoDirector(), roster.NotAWorker(),
+            session=roster.ClaudeSession(name),
+        ) for name, role in (("runner", "showrunner"), ("director", "unit director"))]
+
+        def run(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            commands.append(command)
+            if command[0] == "ssh":
+                return subprocess.CompletedProcess(command, 0,
+                    "peer runner - showrunner - sent\npeer director - unit director - sent\n", "")
+            self.assertEqual(Path(command[1]), root / "record-send.py")
+            self.assertIn("--here", command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        output = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"HOME": str(root), "BROADCAST_SEND": str(root / "record-send.py"),
+                                          "CLAUDE_CODE_SESSION_ID": "unrelated", "CODEX_THREAD_ID": "sender"}, clear=True),
+            mock.patch.object(roster, "roster", return_value=roster.Roster(rows, [])) as read,
+            mock.patch.object(roster, "machine_name", return_value="fixture"),
+            mock.patch.object(roster.remote, "other_machine", return_value="mac"),
+            mock.patch.object(broadcast, "SEND", root / "record-send.py"),
+            mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
+            mock.patch.object(codex_winddown, "clock", return_value="fixture time"),
+            mock.patch.object(subprocess, "run", new=run), redirect_stdout(output),
+        ):
+            self.assertTrue(codex_winddown.announce("sender", "runner from {sender}", "unit from {sender}"))
+        read.assert_called_once()
+        self.assertEqual(read.call_args.args[1], roster.ThisMachine())
+        local = [command for command in commands if command[0] != "ssh"]
+        self.assertCountEqual([command[command.index("--to") + 1] for command in local], ["session:runner", "session:director"])
+        ssh = [command for command in commands if command[0] == "ssh"]
+        self.assertEqual(len(ssh), 1)
+        remote_arguments = shlex.split(ssh[0][-1])
+        self.assertIn("--here", remote_arguments)
+        self.assertEqual(remote_arguments[remote_arguments.index("--showrunners") + 1], "runner from sender")
+        self.assertEqual(remote_arguments[remote_arguments.index("--units") + 1], "unit from sender")
+        self.assertIn("mac: peer runner - showrunner - sent", output.getvalue())
+        self.assertIn("mac: peer director - unit director - sent", output.getvalue())
 
     def test_start_counts_the_newest_named_session_without_broadcast_session_lookup(self) -> None:
         state = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -200,8 +248,17 @@ class MessageTests(unittest.TestCase):
             }), encoding="utf-8")
         _ = (self.root / "notifier.sh").write_text(NOTIFIER_STUB, encoding="utf-8")
         _ = (self.root / "send.py").write_text(SEND_STUB, encoding="utf-8")
+        binaries = self.root / "bin"
+        binaries.mkdir()
+        ssh = binaries / "ssh"
+        _ = ssh.write_text(f"#!{sys.executable}\n"
+            + "import json, os, sys\n"
+            + "with open(os.environ['SSH_RECORD'], 'a') as log: log.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+            encoding="utf-8")
+        ssh.chmod(0o755)
         self.environment = {
-            "HOME": str(self.root), "PATH": os.environ.get("PATH", ""),
+            "HOME": str(self.root), "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
+            "SSH_RECORD": str(self.root / "ssh.jsonl"), "BROADCAST_CLOSING_MACHINES": "fixture and mac",
             "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "",
             "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json"),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"), "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
@@ -231,10 +288,10 @@ class MessageTests(unittest.TestCase):
         self.assertCountEqual(lines[:-1], ["hana - showrunner - sent", "trunk - unit director - sent"])
         log = (self.root / "log").read_text(encoding="utf-8")
         for session in ("hana", "trunk"):
-            self.assertIn(f"send --to session:id-{session} --from natedev --text Codex wind-down, from the user", log)
+            self.assertIn(f"send --to session:id-{session} --from natedev --here --text Codex wind-down, from the user", log)
         self.assertEqual(log.count('a "Codex count" message arrives'), 1)
         self.assertEqual(log.count("You are encouraged to continue work on your own"), 1)
-        self.assertEqual(log.count("Sent directly to showrunners and unit directors on this machine; do not pass it on."), 2)
+        self.assertEqual(log.count("Sent directly to showrunners and unit directors on fixture and mac; do not pass it on."), 2)
         self.assertIn("notifier new codex-count-hana --every 2 --to session:id-hana", log)
         prompt = (self.root / "prompts/codex-count-hana.txt").read_text(encoding="utf-8")
         self.assertIn(f"{SCRIPT} count hana`", prompt)
@@ -250,7 +307,7 @@ class MessageTests(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in (self.root / "notifier").iterdir()),
                          ["showrunner-show", "showrunner-zz-gone"])
         log = (self.root / "log").read_text(encoding="utf-8")
-        self.assertIn("send --to session:id-hana --from natedev --text All clear, from the user", log)
+        self.assertIn("send --to session:id-hana --from natedev --here --text All clear, from the user", log)
         self.assertIn("Start using Codex again", log)
 
     def test_triage_needs_a_wind_down_and_carries_the_users_words(self) -> None:
