@@ -27,7 +27,9 @@ changed. User, 2026-10-03.
 
 While `/showrunner:produce` runs scheduled updates through `UPDATES`, a
 dailies the user runs takes the next tick's place. N is the
-production doc's **Updates** interval. Two steps do that:
+production doc's **Updates** interval. When that line reads `on demand`, no
+schedule runs: the builder touches no clock, the report names no next run,
+and step 2 below does nothing. Two steps do that:
 
 1. **Check every unit.** Save the status script's complete output before Gather:
    `zsh ~/.claude/scripts/production/unit_status.sh <scratchpad>/unit_status <ZONE> --production PRODUCTION_DOC > <scratchpad>/unit_status.txt`.
@@ -98,7 +100,7 @@ When the builder prints `<step>: failed — <reason>`, give that exact line to
 the user as the failure message. Correct the named input before reporting.
 When it prints `phase tables: unavailable — <reason>`, continue. Only a unit
 whose records could not be read takes its ETA from the saved status capture
-and needs `started` in its judgment; failed removal of retired notes changes
+and needs `started` in its judgment; a failed archive of retired notes changes
 nothing else.
 
 ```sh
@@ -174,6 +176,7 @@ The builder's output, which the renderer consumes:
 | `length` | `gantt`, `simple`, `page` or `elaborate`, from the argument. |
 | `zone` | `ZONE`, as an IANA name. |
 | `next_run` | The next scheduled run, `HH:MM` in `ZONE`, after any restart. Leave it out when no schedule runs. |
+| `counts` | The builder's, from `~/.claude/config/dailies.conf`: each `label` with its `count`, or `not_found: true` when its file is missing. Leave it to the builder; a production with no lines there has none. |
 | `unit` | The Units table's unit id, never the session's current name. The builder joins on this id. |
 | `name` | The plan the unit runs, when its session name does not say it (a lane that took on another plan): `hana_organon`. Defaults to `unit`. |
 | `label` | The timeline row name, at most 8 characters. Defaults to the unit name without `-unit`. |
@@ -187,7 +190,7 @@ The builder's output, which the renderer consumes:
 | `held_examples` | Optional examples for `held`, written to follow a comma: `such as a main bar clipped in small windows`. In a `simple` report the renderer prints them only the first time that reason appears for the phase; `page` and `elaborate` always print them. |
 | `update` | What the unit is doing now, one line. The length sets how long (below). A unit waiting on another unit says so, with the wait's start and expected clear times from `LOG` (`/showrunner:produce` → Dependencies). |
 | `eta` | The unit's latest phase ETA, in `ZONE`. A matching numbered open phase supplies its absent values from the run record; no `Phase ETA:` line is needed in the status capture, and each judgment value wins. A judgment `time` or `none` decides the ETA entirely. Otherwise the status capture supplies the time. `time` is `HH:MM`, `+1` for tomorrow (`11:21+1`); add `earliest` and `latest` when the unit director gave a range; each is read on the ETA's own day, earliest at or before it and latest at or after. The builder omits both ends of a recorded range when the renderer would place either on the wrong day. With no ETA, `none` in place of `time`, one of: `none measured - requested` (after sending that unit director `/unit:eta` in this turn, the unmeasured-ETA rule in `/showrunner:produce`), `none measured`, `no ETA stated yet`. Never make one up. `percent` is required with `time`: the unit director's phase percent done (the recorder's phase `%`, 0–100), or `null` when it stated none. `detail` is an optional short note on what the time covers (`checks and build included`). It never says where the ETA came from: no `from the recorder`, no `from past runs` (user, 2026-10-02); the renderer refuses a `detail` that starts with `from`. `why` says in a few words why the ETA moved since the last report, from the unit director's own reports (`the four remaining app tests need a new floor anchor`); the renderer prints it after `because` and refuses a move of 15 minutes or more without it (user, 2026-10-01). |
-| `eta.first`, `eta.fixes` | The phase's first stated ETA (`YYYY-MM-DDTHH:MM`), and the fix rounds added since it. `first` seeds the state once; the state then keeps it for the phase. Give `fixes` every report: the repair rounds started after the first ETA. User, 2026-10-03. |
+| `eta.first`, `eta.fixes` | The phase's first stated ETA (`YYYY-MM-DDTHH:MM`), and the fix rounds added since it. `first` seeds the state once; the state then keeps it for the phase. A matching numbered open phase supplies `fixes` from the run record (the repair rounds started after its first stated ETA); otherwise give it every report; a judgment value wins. User, 2026-10-03. |
 | `eta.stated` | Written by the builder with `eta.time`, never by you. A record-backed ETA uses its `stated_at` or projection `as_of` minute in `ZONE`; when that would make a bare clock resolve to the wrong day, it uses the target's own minute. The renderer reads a time that names no day on that date. It is absent without `time`. |
 | `waiting_on_it` | Only for a topic that lands with this unit's phase, and who waits. |
 | `needed` | Only when the subject needs a follow-up nobody has started, from you (the user), the showrunner or another unit director. Say who. |
@@ -223,7 +226,10 @@ unless it names another plan's document. User, 2026-10-02.
 ### What the renderer writes
 
 - **First line:** the length and the time in `ZONE`: `**Dailies (Simple)**, 19:05 PDT`.
-- **`gantt`:** the first line, the chart and the last lines, and above the chart only two things. A subject
+- **Counts:** the production's own counts from `dailies.conf`, on one line just above the chart in every
+  length, `gantt` included: `counts: nightly queue 8 · proposals 3`. A count whose file is missing reads
+  `not found`. None configured, no line. User, 2026-10-10.
+- **`gantt`:** the first line, the counts line, the chart and the last lines, and above the chart only two other things. A subject
   that needs the user keeps its full section. A unit that changed since the last report gets one line for each
   change: `- <unit>: now on <phase>`, `- <unit>: checkpoint not merged, because ...` or `checkpoint no longer
   held`, `- <unit>: eta ...` when the ETA moved 15 minutes or more, and `- <unit>: no longer in the report`.

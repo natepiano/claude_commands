@@ -236,6 +236,21 @@ Problem = NoProblem | ProblemLine
 NO_PROBLEM = NoProblem()
 
 
+class NoExpiredBlockLiftFailure:
+    """No expired block remains in place because its lift failed."""
+
+
+@dataclass(frozen=True)
+class ExpiredBlockLiftFailed:
+    """An expired block remains because its CI switch could not be restored."""
+
+    gh_error_line: str
+
+
+ExpiredBlockLiftFailure = NoExpiredBlockLiftFailure | ExpiredBlockLiftFailed
+NO_EXPIRED_BLOCK_LIFT_FAILURE = NoExpiredBlockLiftFailure()
+
+
 @dataclass(frozen=True)
 class MacTestConfig:
     """Mac block and CI settings."""
@@ -244,7 +259,6 @@ class MacTestConfig:
     ci_variable: str
     ci_workflow: str
     ci_job: str
-    ci_gate_job: str
     gh_timeout_s: float
     block_hours: float
     block_max_hours: float
@@ -257,6 +271,7 @@ class SettleOutcome:
 
     run: RunState
     block: MacBlockState
+    expired_block_lift_failure: ExpiredBlockLiftFailure
     ci_problem: Problem
     waiting_problem: Problem
 
@@ -329,7 +344,6 @@ def read_config() -> MacTestConfig:
         ci_variable=values.get("ci_variable", "MACOS_CI"),
         ci_workflow=values.get("ci_workflow", "ci.yml"),
         ci_job=values.get("ci_job", "macOS: Compile and Test"),
-        ci_gate_job=values.get("ci_gate_job", ""),
         gh_timeout_s=configured_number(values, "gh_timeout_s", 30.0),
         block_hours=configured_number(values, "block_hours", 4.0),
         block_max_hours=configured_number(values, "block_max_hours", 48.0),
@@ -813,19 +827,18 @@ def ci_activity(config: MacTestConfig) -> CiActivity:
         jobs = jobs_for_run(config, database_id)
         if isinstance(jobs, GhFailure):
             return CiUnknown(jobs.line)
+        mac_job_completed = False
         for raw_job in jobs:
             if not isinstance(raw_job, dict):
                 return CiUnknown("gh returned invalid JSON")
             job = cast(dict[str, object], raw_job)
-            name = job.get("name")
-            occupies_mac = name == config.ci_job or (
-                bool(config.ci_gate_job) and name == config.ci_gate_job
-            )
-            if (
-                occupies_mac
-                and job.get("status") != "completed"
-            ):
+            if job.get("name") != config.ci_job:
+                continue
+            if job.get("status") != "completed":
                 return CI_BUSY
+            mac_job_completed = True
+        if not mac_job_completed:
+            return CI_BUSY
     return CI_IDLE
 
 
@@ -1048,7 +1061,11 @@ def expire_block(
                 text,
             )
             return SettleOutcome(
-                run, block, ProblemLine(restored.line), NO_PROBLEM
+                run,
+                block,
+                ExpiredBlockLiftFailed(restored.line),
+                NO_PROBLEM,
+                NO_PROBLEM,
             )
     with locked(paths.lock):
         paths.block.unlink(missing_ok=True)
@@ -1064,7 +1081,13 @@ def expire_block(
         1440,
         expiry_text(block, skipped),
     )
-    return SettleOutcome(run, NO_MAC_BLOCK, NO_PROBLEM, NO_PROBLEM)
+    return SettleOutcome(
+        run,
+        NO_MAC_BLOCK,
+        NO_EXPIRED_BLOCK_LIFT_FAILURE,
+        NO_PROBLEM,
+        NO_PROBLEM,
+    )
 
 
 def warning_text(block: PendingMacBlock | ActiveMacBlock) -> str:
@@ -1145,7 +1168,7 @@ def activate_block(
     ended_work = (
         block.waiting_on.what
         if isinstance(block.waiting_on, WaitingOnLocalRun)
-        else "CI's Mac job"
+        else "CI's hold on the Mac"
     )
     free_message: FreeMessage = (
         FreeMessageOwed(ended_work, now)
@@ -1188,7 +1211,13 @@ def full_settle(
         run = live_run(paths)
         block = read_block(paths.block)
     if isinstance(block, NoMacBlock):
-        return SettleOutcome(run, block, NO_PROBLEM, NO_PROBLEM)
+        return SettleOutcome(
+            run,
+            block,
+            NO_EXPIRED_BLOCK_LIFT_FAILURE,
+            NO_PROBLEM,
+            NO_PROBLEM,
+        )
     now = utc_now()
     if now >= block.expires:
         outcome = expire_block(paths, config, run, block)
@@ -1272,7 +1301,13 @@ def full_settle(
         )
     if not watcher_holds_lock:
         start_watcher(paths)
-    return SettleOutcome(run, block, ci_problem, waiting_problem)
+    return SettleOutcome(
+        run,
+        block,
+        NO_EXPIRED_BLOCK_LIFT_FAILURE,
+        ci_problem,
+        waiting_problem,
+    )
 
 
 def block_duration(raw: str, config: MacTestConfig) -> BlockDuration:
@@ -1380,8 +1415,9 @@ def block_state_line(
         )
     if isinstance(waiting, WaitingOnCiJob):
         return (
-            f"Block pending for {block.holder}: CI's Mac job is running. "
-            + "Nothing new starts there, and you get a message when it ends."
+            f"Block pending for {block.holder}: a CI run may still use the Mac. "
+            + "Nothing new starts there, and you get a message when CI no longer "
+            + "needs the Mac."
         )
     line = (
         waiting_problem.line
@@ -1488,10 +1524,15 @@ def command_block(
             return 0
         print(block_state_line(outcome.block, outcome.waiting_problem))
         if ci_may_still_be_on(outcome.block.ci):
+            lift_failure = outcome.expired_block_lift_failure
             line = (
-                outcome.ci_problem.line
-                if isinstance(outcome.ci_problem, ProblemLine)
-                else "unknown error"
+                lift_failure.gh_error_line
+                if isinstance(lift_failure, ExpiredBlockLiftFailed)
+                else (
+                    outcome.ci_problem.line
+                    if isinstance(outcome.ci_problem, ProblemLine)
+                    else "unknown error"
+                )
             )
             print(
                 f"CI can still use the Mac: {line}. Run github-warmup, then block again."
@@ -1544,7 +1585,7 @@ def pending_wait_text(waiting: WaitingOn) -> str:
     if isinstance(waiting, WaitingOnLocalRun):
         return "a test is running"
     if isinstance(waiting, WaitingOnCiJob):
-        return "CI's Mac job is running"
+        return "a CI run may still use the Mac"
     return "CI could not be checked"
 
 
@@ -1586,6 +1627,12 @@ def print_switch_without_block(config: MacTestConfig) -> None:
 def command_status(paths: StatePaths, config: MacTestConfig) -> int:
     with locked(paths.control_lock):
         outcome = full_settle(paths, config)
+        lift_failure = outcome.expired_block_lift_failure
+        switch_problem = (
+            ProblemLine(lift_failure.gh_error_line)
+            if isinstance(lift_failure, ExpiredBlockLiftFailed)
+            else outcome.ci_problem
+        )
         if isinstance(outcome.run, NoRun):
             print("free")
         else:
@@ -1603,7 +1650,7 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
                 + f"({pending_wait_text(block.waiting_on)}), "
                 + f"lifts {block_time(block.expires)}: {block.reason}"
             )
-            print_switch_with_block(block, outcome.ci_problem)
+            print_switch_with_block(block, switch_problem)
         else:
             print(
                 f"blocked by {block.holder} since {block_time(block.since)}, "
@@ -1613,7 +1660,13 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
                 print(
                     f'The "Mac is free" message has not reached {block.holder} yet.'
                 )
-            print_switch_with_block(block, outcome.ci_problem)
+            print_switch_with_block(block, switch_problem)
+        if isinstance(lift_failure, ExpiredBlockLiftFailed):
+            print(
+                "The block is past its time limit but could not lift: CI's Mac "
+                + "switch could not be turned back on "
+                + f"({lift_failure.gh_error_line}). Run github-warmup, then unblock."
+            )
     return 0
 
 

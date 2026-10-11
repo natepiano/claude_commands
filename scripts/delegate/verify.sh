@@ -100,7 +100,7 @@
 #                                          exact call already passed (or lint
 #                                          failed) on this tree, a flake hunt;
 #                                          the result replaces the record
-#   verify.sh test <package> --local       keep this test run on natedev
+#   verify.sh test <package> --local "<why>"   run on natedev; only for a test that must run on Linux
 #   verify.sh fmt <package>               format only (checkpoint-commit backstop)
 #                                          — gated by config/lint.conf
 #   verify.sh example <package> <name>     clippy one example (only when the
@@ -559,15 +559,35 @@ fi
 # sees them.
 NO_CACHE=0
 LOCAL_ONLY=0
+LOCAL_REASON=""
 ARGS=()
-for arg in "$@"; do
-    case "$arg" in
-        --no-cache) NO_CACHE=1 ;;
-        --local) LOCAL_ONLY=1 ;;
-        *) ARGS+=("$arg") ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --no-cache)
+            NO_CACHE=1
+            shift
+            ;;
+        --local)
+            if [[ $# -lt 2 || "${2:-}" =~ ^[[:space:]]*$ || "${2:-}" == --* ]]; then
+                echo 'verify.sh: --local needs a reason: --local "<why this test must run on Linux>". Leave it off to run on the Mac.' >&2
+                exit 2
+            fi
+            LOCAL_ONLY=1
+            LOCAL_REASON=$2
+            shift 2
+            ;;
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
     esac
 done
 set -- "${ARGS[@]}"
+if [[ "$LOCAL_ONLY" -eq 1 ]]; then
+    export BUILDLOG_LOCAL_REASON="$LOCAL_REASON"
+else
+    unset BUILDLOG_LOCAL_REASON
+fi
 
 # Every step run() runs below carries this call's id, which buildlog joins to
 # the call record note_event writes.

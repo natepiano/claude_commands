@@ -232,6 +232,9 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     name = cast(str, args.name)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name):
         raise Refusal("name must contain only letters, numbers, hyphens, or underscores")
+    # A name given as its unit id would get the suffix twice: feature-log-unit-unit.
+    if name.replace("_", "-").endswith("-unit"):
+        name = name[: -len("-unit")]
     given_plan = cast(str | None, args.plan)
     given_brief = cast(str | None, args.brief)
     standby = cast(bool, args.standby)

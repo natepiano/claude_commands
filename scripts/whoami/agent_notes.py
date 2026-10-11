@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import subprocess
@@ -25,7 +26,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast
+from typing import NotRequired, TypedDict, cast
 
 import codex_pacer
 import five_hour
@@ -36,6 +37,13 @@ from run_out import READINGS_LOG
 AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
 RESET_FORMAT = "%Y-%m-%dT%H:%M:%S"
 FIELD = re.compile(r"^([A-Za-z_][\w-]*):[ \t]*(.*?)[ \t]*$")
+
+
+class StoredReading(TypedDict):
+    account: str
+    at: str
+    remaining: float
+    credits: NotRequired[float]
 
 
 @dataclass
@@ -126,11 +134,11 @@ def still_ahead(value: str | None) -> bool:
         return False
 
 
-def append_readings(readings: list[dict[str, object]], checked_at: datetime) -> None:
+def append_readings(readings: list[StoredReading], checked_at: datetime) -> None:
     """Keep the recent readings and replace the log in one write."""
     READINGS_LOG.parent.mkdir(parents=True, exist_ok=True)
     cutoff = checked_at.astimezone(timezone.utc) - timedelta(days=8)
-    kept: list[dict[str, object]] = []
+    kept: list[StoredReading] = []
     try:
         with READINGS_LOG.open(encoding="utf-8") as existing:
             for line in existing:
@@ -138,12 +146,27 @@ def append_readings(readings: list[dict[str, object]], checked_at: datetime) -> 
                     entry = cast(object, json.loads(line))
                     if not isinstance(entry, dict):
                         continue
-                    record = cast(dict[str, object], entry)
-                    at_text = record.get("at")
-                    if not isinstance(at_text, str):
+                    values = cast(dict[str, object], cast(object, entry))
+                    account = values.get("account")
+                    at_text = values.get("at")
+                    remaining = values.get("remaining")
+                    if (
+                        not isinstance(account, str)
+                        or not isinstance(at_text, str)
+                        or isinstance(remaining, bool)
+                        or not isinstance(remaining, (int, float))
+                    ):
                         continue
                     at = datetime.fromisoformat(at_text)
                     if at.tzinfo is not None and at.astimezone(timezone.utc) >= cutoff:
+                        record: StoredReading = {
+                            "account": account,
+                            "at": at_text,
+                            "remaining": float(remaining),
+                        }
+                        credits = values.get("credits")
+                        if not isinstance(credits, bool) and isinstance(credits, (int, float)):
+                            record["credits"] = float(credits)
                         kept.append(record)
                 except (ValueError, TypeError, KeyError):
                     continue
@@ -170,7 +193,7 @@ def apply(notes: list[Note], account: Report, checked_at: datetime) -> list[str]
     fresh = reset if reset is not None and reset > checked_at else None
     remaining = account.weekly_remaining if fresh is not None else None
     matched = False
-    readings: list[dict[str, object]] = []
+    readings: list[StoredReading] = []
     for note in notes:
         if note.tool != account.tool.lower():
             continue
@@ -199,7 +222,20 @@ def apply(notes: list[Note], account: Report, checked_at: datetime) -> list[str]
         if set_fields(note, updates, stamp):
             messages.append(f"{note.path.name}: " + ", ".join(f"{k}={v}" for k, v in updates.items()))
             if active and remaining is not None:
-                readings.append({"account": note.path.stem, "at": checked_at.astimezone(timezone.utc).isoformat(timespec="seconds"), "remaining": remaining})
+                reading: StoredReading = {
+                    "account": note.path.stem,
+                    "at": checked_at.astimezone(timezone.utc).isoformat(timespec="seconds"),
+                    "remaining": remaining,
+                }
+                if account.tool.lower() == "codex" and (balance := note.get("credit_balance")) is not None:
+                    try:
+                        credits = float(balance)
+                    except ValueError:
+                        pass
+                    else:
+                        if math.isfinite(credits) and credits >= 0:
+                            reading["credits"] = credits
+                readings.append(reading)
     if readings:
         try:
             append_readings(readings, checked_at)

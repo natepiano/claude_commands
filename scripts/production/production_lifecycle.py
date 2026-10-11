@@ -6,6 +6,7 @@ import argparse
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import NamedTuple, cast
 
@@ -16,6 +17,8 @@ from merge_checkpoint import (CodeCheckpoint, MacCheckout, MergeEntry, NoMerge, 
                               PromoteTo, Stop,
                               git, good, merge_branch_history, promote_local_checkout,
                               promotion_from_doc, pull_mac_checkout, report)
+
+PHASE_TABLE = Path(__file__).resolve().parent.parent / "delegate" / "phase_table.py"
 
 
 class PlanLanded(NamedTuple):
@@ -387,6 +390,23 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         # The update timer is the one record of the showrunner, so removing it unregisters it.
         _ = command("notifier", production.checkout, str(notifier), "remove", f"showrunner-{production.slug}")
         report("notifier", "ok", "update timer removed")
+        archived = command(
+            "phase-notes",
+            production.checkout,
+            sys.executable,
+            str(PHASE_TABLE),
+            "archive",
+            "--production-doc",
+            str(production.doc),
+        )
+        count = len(archived.splitlines())
+        report(
+            "phase-notes",
+            "ok",
+            f"archived {count} phase note{'' if count == 1 else 's'}"
+            if count
+            else "no phase notes to archive",
+        )
         updated = [line.replace("**Status: PRODUCTION — running.**", "**Status: PRODUCTION — wrapped.**")
                    for line in lines]
         _ = production.doc.write_text("\n".join(updated) + "\n", encoding="utf-8")

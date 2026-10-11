@@ -50,11 +50,24 @@ def option(name):
 session = pathlib.Path(option('--session-dir'))
 roster_path = session / 'mesh_roster.json'
 roster = json.loads(roster_path.read_text()) if roster_path.exists() else {}
+if verb in ('compact', 'can-follow', 'follow'):
+    with (session / 'mesh_events.txt').open('a') as events:
+        events.write(verb + '\\n')
 if verb == 'start':
     name = option('--name')
     roster[name] = {'thread_id': 'thread-for-' + name, 'turn_id': 'turn-1',
-                    'status': 'done'}
+                    'status': 'done', 'role': option('--role')}
     pathlib.Path(option('--reply-file')).write_text('initial reply\\n')
+elif verb == 'compact':
+    name = option('--to')
+    if os.environ.get('STUB_COMPACT_FAIL') == '1':
+        print('stub compaction failed', file=sys.stderr)
+        sys.exit(1)
+    before = roster[name].get('context_tokens', 0)
+    after = int(os.environ.get('STUB_COMPACT_AFTER', '12000'))
+    roster[name]['context_tokens'] = after
+    roster_path.write_text(json.dumps(roster))
+    print(f'compacted {name}: {before} -> {after} tokens')
 elif verb == 'can-follow':
     name = option('--to')
     entry = roster.get(name, {})
@@ -75,6 +88,7 @@ elif verb == 'can-follow':
         sys.exit(2)
     entry['previous_status'] = status if status in ('done', 'failed') else 'failed'
     entry['status'] = 'starting'
+    entry['role'] = option('--role')
     entry['launcher_pid'] = int(option('--claim-pid'))
     roster_path.write_text(json.dumps(roster))
     sys.exit(0)
@@ -89,6 +103,7 @@ elif verb == 'follow':
         sys.exit(1)
     if os.environ.get('STUB_FOLLOW_HOLD') == 'before':
         time.sleep(60)
+    roster[name]['role'] = option('--role')
     (session / 'follow_message.txt').write_text(pathlib.Path(option('--message-file')).read_text())
     if os.environ.get('STUB_FOLLOW_FAIL') == '1':
         roster[name]['status'] = 'failed'
@@ -240,6 +255,7 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         _ = self.config_file.write_text(
             "\n".join((
                 "PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=180",
+                "PLAN_DELEGATE_COMPACT_ABOVE_TOKENS=100000",
                 "MAX_FIX_ATTEMPTS=3", "MAX_REOPENS=3", "STALLED_ROUNDS=3",
                 "RUNAWAY_ROUNDS=10", "REPAIR_ROUNDS_PER_FINDING=2",
                 "MIN_REPAIR_BUDGET=2", "MAX_CONSECUTIVE_SAME_KIND_PASSES=6",
@@ -366,22 +382,33 @@ class ImplementLauncherSeatTests(unittest.TestCase):
     def mesh_launch(
         self, session_dir: Path, *, to: str = "", slot: str = "impl",
         kind: str = "impl", fail: bool = False, resolves_round: bool = False,
+        compact_fail: bool = False, subtask: str = "",
     ) -> subprocess.CompletedProcess[str]:
         arguments = [
             "bash", str(self.implement_script),
             str(session_dir), str(self.working_dir), str(self.prompt_file),
-            kind, "the retry path", kind, "writing the retry path", "0", slot,
+            subtask or kind, "the retry path", kind, "writing the retry path", "0", slot,
         ]
         if to:
             arguments.insert(2, "--to")
             arguments.insert(3, to)
         environment = self.mesh_environment(fail=fail)
+        if compact_fail:
+            environment["STUB_COMPACT_FAIL"] = "1"
         if resolves_round:
             environment["PLAN_DELEGATE_RESOLVES_ROUND"] = "1"
         return subprocess.run(
             arguments, check=False, capture_output=True, text=True,
             env=environment, timeout=120,
         )
+
+    def set_mesh_context(self, session_dir: Path, name: str, tokens: int) -> None:
+        roster_path = session_dir / "mesh_roster.json"
+        roster = cast("dict[str, dict[str, object]]", json.loads(
+            roster_path.read_text(encoding="utf-8")
+        ))
+        roster[name]["context_tokens"] = tokens
+        _ = roster_path.write_text(json.dumps(roster), encoding="utf-8")
 
     def open_repair_round(self, session_dir: Path) -> None:
         findings = self.root / "scripts" / "delegate" / "findings.py"
@@ -714,6 +741,102 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertIn(f"follow-up to {name}", board)
         self.assertIn("launcher:", board)
         self.assertIn("done:", board)
+
+    def test_follow_up_compacts_above_the_context_threshold_before_claiming(self) -> None:
+        session_dir = self.start_phase("compact-above")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        roster = cast("dict[str, object]", json.loads(
+            (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
+        ))
+        name = next(iter(roster))
+        self.set_mesh_context(session_dir, name, 100001)
+
+        result = self.mesh_launch(session_dir, to=name)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = (session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(events, ["compact", "can-follow", "follow"])
+        board = (session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertIn(
+            f"launcher: compacted {name}: 100001 -> 12000 tokens",
+            board,
+        )
+
+    def test_start_and_follow_write_the_current_kind_as_the_roster_role(self) -> None:
+        session_dir = self.start_phase("roster-role")
+        first = self.mesh_launch(session_dir, kind="impl")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        roster_path = session_dir / "mesh_roster.json"
+        roster = cast("dict[str, dict[str, object]]", json.loads(
+            roster_path.read_text(encoding="utf-8")
+        ))
+        name = next(iter(roster))
+        self.assertEqual(roster[name]["role"], "impl")
+
+        followed = self.mesh_launch(
+            session_dir, to=name, kind="review", subtask="impl"
+        )
+
+        self.assertEqual(followed.returncode, 0, followed.stderr)
+        roster = cast("dict[str, dict[str, object]]", json.loads(
+            roster_path.read_text(encoding="utf-8")
+        ))
+        self.assertEqual(roster[name]["role"], "review")
+
+    def test_compaction_threshold_must_be_configured_as_a_positive_integer(self) -> None:
+        configured = self.config_file.read_text(encoding="utf-8")
+        key = "PLAN_DELEGATE_COMPACT_ABOVE_TOKENS"
+        without_key = "\n".join(
+            line for line in configured.splitlines() if not line.startswith(f"{key}=")
+        ) + "\n"
+        for label, config in (("missing", without_key), ("zero", without_key + f"{key}=0\n")):
+            with self.subTest(value=label):
+                _ = self.config_file.write_text(config, encoding="utf-8")
+                session_dir = self.start_phase(f"threshold-{label}")
+
+                result = self.mesh_launch(session_dir)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(key, result.stderr)
+
+    def test_follow_up_does_not_compact_at_or_below_the_context_threshold(self) -> None:
+        for tokens in (99999, 100000):
+            with self.subTest(tokens=tokens):
+                session_dir = self.start_phase(f"compact-below-{tokens}")
+                first = self.mesh_launch(session_dir)
+                self.assertEqual(first.returncode, 0, first.stderr)
+                roster = cast("dict[str, object]", json.loads(
+                    (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
+                ))
+                name = next(iter(roster))
+                self.set_mesh_context(session_dir, name, tokens)
+
+                result = self.mesh_launch(session_dir, to=name)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                events = (session_dir / "mesh_events.txt").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                self.assertEqual(events, ["can-follow", "follow"])
+
+    def test_failed_compaction_is_reported_and_the_follow_up_still_runs(self) -> None:
+        session_dir = self.start_phase("compact-fails")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        roster = cast("dict[str, object]", json.loads(
+            (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
+        ))
+        name = next(iter(roster))
+        self.set_mesh_context(session_dir, name, 100001)
+
+        result = self.mesh_launch(session_dir, to=name, compact_fail=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((session_dir / "follow_message.txt").exists())
+        board = (session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertIn("compaction failed", board)
+        self.assertIn("continuing follow-up", board)
 
     def test_success_status_follows_pass_and_landed_records(self) -> None:
         session_dir = self.start_phase("status-after-landed")

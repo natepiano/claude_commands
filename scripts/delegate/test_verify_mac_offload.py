@@ -36,6 +36,7 @@ class CallRecord(TypedDict):
     token_wait_s: int
     mac: str
     mac_reason: str
+    local_reason: str
     mac_s: float | None
 
 
@@ -272,6 +273,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
                     "PLAN_DELEGATE_TEAM_ROLE",
                     "BUILDLOG_MAC",
                     "BUILDLOG_MAC_REASON",
+                    "BUILDLOG_LOCAL_REASON",
                     "BUILDLOG_MAC_S",
                 }
             },
@@ -414,9 +416,11 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.assertEqual(len(local), 1)
         runner_arguments = runners[0]["args"]
         self.assertEqual(runner_arguments[0], "run")
+        self.assertEqual(local[0]["args"][2], "--test-threads")
+        self.assertGreater(int(local[0]["args"][3]), 0)
         self.assertEqual(
             runner_arguments[runner_arguments.index("--") + 1 :],
-            local[0]["args"][2:],
+            local[0]["args"][4:],
         )
         self.assertIn("--filter-run", runner_arguments)
         self.assertNotIn("--no-cache", runner_arguments)
@@ -570,11 +574,37 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.assertEqual(record["mac"], "passed_filter")
         self.assertEqual(record["mac_s"], 3.25)
 
-    def test_local_flag_skips_runner_and_shares_recorded_pass_key(self) -> None:
+    def test_local_flag_requires_a_non_option_reason_before_any_work(self) -> None:
+        expected = (
+            'verify.sh: --local needs a reason: --local "<why this test must run on '
+            'Linux>". Leave it off to run on the Mac.\n'
+        )
+        cases = (
+            ("test", "sample", "--local"),
+            ("test", "sample", "--local", ""),
+            ("test", "sample", "--local", " \t "),
+            ("test", "sample", "--local", "--filter", "alpha"),
+        )
+
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                self.clear_observations()
+                call_count = len(self.call_records())
+                result = self.verify(*arguments)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, expected)
+                self.assertEqual(self.cargo_events(), [])
+                self.assertEqual(self.runner_events(), [])
+                self.assertEqual(len(self.call_records()), call_count)
+
+    def test_local_flag_skips_runner_records_reason_and_shares_pass_key(self) -> None:
+        first_reason = 'needs Linux path handling with a "quoted" mount'
         first = self.verify(
             "test",
             "sample",
             "--local",
+            first_reason,
             extra={"TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "42"},
         )
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
@@ -584,6 +614,10 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.assertEqual(first_record["command"], "test sample")
         self.assertEqual(first_record["mac"], "declined")
         self.assertEqual(first_record["mac_reason"], "local_flag")
+        self.assertEqual(first_record["local_reason"], first_reason)
+        self.assertNotIn(first_reason, first_record["command"])
+        saved_results = self.saved_results()
+        self.assertEqual(len(saved_results), 1)
 
         self.clear_observations()
         without_flag = self.verify("test", "sample")
@@ -593,13 +627,41 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.assertIn("PASS (recorded)", without_flag.stdout)
         self.assertEqual(self.runner_events(), [])
         self.assertEqual(self.local_runs(), [])
+        self.assertEqual(self.saved_results(), saved_results)
 
         self.clear_observations()
-        with_flag = self.verify("test", "sample", "--local")
+        second_reason = "requires Linux-only process behavior"
+        with_flag = self.verify("test", "sample", "--local", second_reason)
         self.assertEqual(with_flag.returncode, 0, with_flag.stdout + with_flag.stderr)
         self.assertIn("PASS (recorded)", with_flag.stdout)
         self.assertEqual(self.runner_events(), [])
         self.assertEqual(self.local_runs(), [])
+        self.assertEqual(self.saved_results(), saved_results)
+        second_record = self.last_call()
+        self.assertEqual(second_record["local_reason"], second_reason)
+        self.assertEqual(second_record["command"], "test sample")
+
+    def test_local_flag_parses_before_and_after_filter(self) -> None:
+        reason = "uses Linux filesystem semantics"
+        cases = (
+            ("test", "sample", "--local", reason, "--filter", "alpha"),
+            ("test", "sample", "--filter", "alpha", "--local", reason),
+        )
+
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                self.clear_observations()
+                result = self.verify(*arguments, "--no-cache")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.runner_events(), [])
+                local = self.local_runs()
+                self.assertEqual(len(local), 1)
+                self.assertNotIn("--local", local[0]["args"])
+                self.assertNotIn(reason, local[0]["args"])
+                record = self.last_call()
+                self.assertEqual(record["command"], "test sample --filter alpha")
+                self.assertEqual(record["mac_reason"], "local_flag")
+                self.assertEqual(record["local_reason"], reason)
 
     def test_missing_runner_skips_offload(self) -> None:
         result = self.verify(

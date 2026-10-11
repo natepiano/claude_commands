@@ -16,9 +16,11 @@ from zoneinfo import ZoneInfo
 import unit_lookup
 from add_unit import Refusal, cell_value, live_unit_table, read_production, unit_table
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
+from dailies_counts import CountsFailure, production_counts
 from dailies_render import (InputError, StateRefused, as_list, as_map, check_render_state,
                             local_now, parse_range_end, parse_report, parse_time)
 from merge_checkpoint import NoMerge, git, merge_branch_history
+from update_registration import RegistrationFailure, UpdatesOnDemand, update_schedule
 from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
@@ -144,6 +146,7 @@ class CurrentPhaseEtaUnavailable(NamedTuple):
 
 class FirstStatedEtaTarget(NamedTuple):
     time: datetime
+    repair_rounds: int
 
 
 class EtaNeverStated(NamedTuple):
@@ -472,10 +475,24 @@ def unit_phase_state(value: object, where: str, zone: ZoneInfo) -> UnitPhaseStat
     if not in_plan:
         return NoNumberedOpenPlanPhase(OpenPhaseOutsidePlan())
     first_value = current.get("first_stated_eta_target")
-    first_stated: FirstStatedEtaTarget | EtaNeverStated = (
-        EtaNeverStated() if first_value is None
-        else FirstStatedEtaTarget(record_time(first_value, f"{where}.current.first_stated_eta_target", zone))
-    )
+    first_stated: FirstStatedEtaTarget | EtaNeverStated
+    if first_value is None:
+        first_stated = EtaNeverStated()
+    else:
+        repair_rounds_path = f"{where}.current.repair_rounds_since_first_stated_eta"
+        repair_rounds = current.get("repair_rounds_since_first_stated_eta")
+        if (
+            isinstance(repair_rounds, bool)
+            or not isinstance(repair_rounds, int)
+            or repair_rounds < 0
+        ):
+            raise ValueError(
+                f"{repair_rounds_path}: expected a whole number from 0"
+            )
+        first_stated = FirstStatedEtaTarget(
+            record_time(first_value, f"{where}.current.first_stated_eta_target", zone),
+            repair_rounds,
+        )
     return NumberedOpenPlanPhase(
         int(phase),
         record_time(current.get("started"), f"{where}.current.started", zone),
@@ -651,6 +668,7 @@ def record_eta_value(
     result["percent"] = phase.percent.percent if isinstance(phase.percent, ReportedPhasePercent) else None
     if isinstance(phase.first_stated, FirstStatedEtaTarget):
         result["first"] = record_text(phase.first_stated.time)
+        result["fixes"] = phase.first_stated.repair_rounds
     if isinstance(eta, CurrentStatedPhaseEta):
         result["why"] = " ".join(eta.basis.split())
     else:
@@ -863,6 +881,15 @@ def run(args: argparse.Namespace) -> int:
                            "eta": str(merge.get("eta") or "no ETA stated yet"), "needs_user": bool(merge.get("needs_user", False))})
     report("merge branch", "ok", "pushed" if pushed else "not pushed")
     result: JsonMap = {"length": length, "zone": str(production.zone), "units": units_out, "topics": topics_out}
+    # A bad config line costs only the counts line, never the report.
+    try:
+        counts = production_counts(production.slug)
+    except CountsFailure as failure:
+        report("counts", "unavailable", str(failure))
+    else:
+        if counts:
+            result["counts"] = counts
+            report("counts", "ok", f"{len(counts)} from dailies.conf")
     validate_report(result, holders_path, judgment_path)
     checked = check_render_state(result, render_state, at)
     if isinstance(checked, StateRefused):
@@ -872,16 +899,24 @@ def run(args: argparse.Namespace) -> int:
         production.log.parent.mkdir(parents=True, exist_ok=True)
         with production.log.open("a", encoding="utf-8"):
             pass
-    action = "restart" if user_run else "status"
-    clock = command(notifier, action, instance)
-    if clock.returncode:
-        raise DailiesFailure("clock", clock.stderr.strip() or clock.stdout.strip())
-    result["next_run"] = next_due(clock.stdout, now, production.zone)
-    if user_run:
-        production.log.parent.mkdir(parents=True, exist_ok=True)
-        with production.log.open("a", encoding="utf-8") as log:
-            _ = log.write(next(line for line in clock.stdout.splitlines() if line.startswith("next_due=")) + "\n")
-    report("clock", "ok", str(result["next_run"]))
+    try:
+        on_demand = isinstance(update_schedule(lines), UpdatesOnDemand)
+    except RegistrationFailure as failure:
+        raise DailiesFailure("clock", str(failure)) from failure
+    if on_demand:
+        # No schedule runs, so there is no clock to restart and the report names no next run.
+        report("clock", "ok", "on demand: no scheduled dailies")
+    else:
+        action = "restart" if user_run else "status"
+        clock = command(notifier, action, instance)
+        if clock.returncode:
+            raise DailiesFailure("clock", clock.stderr.strip() or clock.stdout.strip())
+        result["next_run"] = next_due(clock.stdout, now, production.zone)
+        if user_run:
+            production.log.parent.mkdir(parents=True, exist_ok=True)
+            with production.log.open("a", encoding="utf-8") as log:
+                _ = log.write(next(line for line in clock.stdout.splitlines() if line.startswith("next_due=")) + "\n")
+        report("clock", "ok", str(result["next_run"]))
     validate_report(result, holders_path, judgment_path)
     report("judgment", "ok", f"{len(units_out)} units accepted")
     def merge_eta_records(fresh: JsonMap) -> tuple[str, ...]:

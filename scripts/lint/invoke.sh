@@ -300,8 +300,99 @@ require_nextest() {
     fi
 }
 
+# Phase 3 changes this line to the trial verdict. The trial block length must
+# stay in sync with BLOCK_S in scripts/buildlog/width_trial.py.
+LINT_TEST_WIDTH=trial
+
+nextest_physical_cores() {
+    [[ "${LINT_PHYSICAL_CORES+x}" == x ]] && return 0
+    LINT_PHYSICAL_CORES=""
+
+    local sysfs_root="${1:-/sys/devices/system/cpu}"
+    local topology package core pair seen="" count=0 value=""
+    case "$OSTYPE" in
+        linux*)
+            for topology in "$sysfs_root"/cpu[0-9]*/topology; do
+                [[ -r "$topology/physical_package_id" && -r "$topology/core_id" ]] || continue
+                IFS= read -r package < "$topology/physical_package_id" 2>/dev/null || continue
+                IFS= read -r core < "$topology/core_id" 2>/dev/null || continue
+                pair=":$package:$core:"
+                case "$seen" in
+                    *"$pair"*) continue ;;
+                esac
+                seen="$seen$pair"
+                (( count += 1 ))
+            done
+            value="$count"
+            ;;
+        darwin*)
+            value="$(sysctl -n hw.physicalcpu 2>/dev/null)" || value=""
+            ;;
+    esac
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] && LINT_PHYSICAL_CORES="$value"
+    return 0
+}
+
+nextest_logical_cores() {
+    [[ "${LINT_LOGICAL_CORES+x}" == x ]] && return 0
+    LINT_LOGICAL_CORES=""
+
+    local value=""
+    value="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" || value=""
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] && LINT_LOGICAL_CORES="$value"
+    return 0
+}
+
+nextest_width_arm() {
+    local epoch="$1"
+    if (( (epoch / 6000) % 2 == 0 )); then
+        LINT_TEST_WIDTH_ARM=physical
+    else
+        LINT_TEST_WIDTH_ARM=logical
+    fi
+}
+
 run_nextest() {
     require_nextest
+
+    local arg arm="" width=""
+    if [[ "${NEXTEST_TEST_THREADS+x}" != x ]]; then
+        for arg in "$@"; do
+            case "$arg" in
+                --)
+                    break
+                    ;;
+                --test-threads|--test-threads=*|-j|-j*)
+                    run cargo nextest run "$@"
+                    return
+                    ;;
+            esac
+        done
+
+        case "$LINT_TEST_WIDTH" in
+            trial)
+                nextest_width_arm "${EPOCHSECONDS:-$(date +%s)}"
+                arm="$LINT_TEST_WIDTH_ARM"
+                ;;
+            physical|logical)
+                arm="$LINT_TEST_WIDTH"
+                ;;
+        esac
+        case "$arm" in
+            physical)
+                nextest_physical_cores
+                width="${LINT_PHYSICAL_CORES:-}"
+                ;;
+            logical)
+                nextest_logical_cores
+                width="${LINT_LOGICAL_CORES:-}"
+                ;;
+        esac
+        if [[ -n "$width" ]]; then
+            run cargo nextest run --test-threads "$width" "$@"
+            return
+        fi
+    fi
     run cargo nextest run "$@"
 }
 

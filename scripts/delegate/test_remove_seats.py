@@ -192,6 +192,25 @@ class RemoveSeatsTest(unittest.TestCase):
         _ = self.run_dir("ended", ["end1"])
         self.assertEqual(self.remove_seats(), (1, []))
 
+    def test_failed_session_listing_never_runs_the_destructive_server_sweep(self) -> None:
+        own = self.root / "own"
+        arguments = [
+            os.fspath(SCRIPT),
+            "--session-dir",
+            os.fspath(own),
+            "--delegate-root",
+            os.fspath(self.root),
+        ]
+        with patch.object(sys, "argv", arguments), \
+                patch.object(remove_seats, "DEFAULT_ROOT", self.root), \
+                patch.object(remove_seats, "claude_bin", return_value=os.fspath(self.claude)), \
+                patch.object(remove_seats, "list_sessions", return_value=None), \
+                patch.object(remove_seats, "sweep_app_servers") as sweep:
+            result = remove_seats.main()
+
+        self.assertEqual(result, 1)
+        sweep.assert_not_called()
+
     def test_shutdown_query_returns_named_held_sessions(self) -> None:
         completed = subprocess.CompletedProcess[str](
             ["shutdown", "held-sessions"], 0, "first\n\nsecond\n", ""

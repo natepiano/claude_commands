@@ -40,6 +40,7 @@ class CommandFixture(TypedDict):
     run_delay_s: float
     hold_after_first_line: bool
     cleanup_status: int
+    cleanup_delay_s: float
     hold_cleanup: bool
 
 
@@ -93,6 +94,7 @@ if command != "ssh":
 remote = arguments[-1]
 if "pkill -f" in remote:
     (root / "cleanup-called").write_text("called\n", encoding="utf-8")
+    time.sleep(float(fixture["cleanup_delay_s"]))
     if fixture["hold_cleanup"]:
         (root / "cleanup-started").write_text("started\n", encoding="utf-8")
         while not (root / "continue-cleanup").exists():
@@ -173,6 +175,7 @@ class OffloadCommandTests(unittest.TestCase):
             "run_delay_s": 0.0,
             "hold_after_first_line": False,
             "cleanup_status": 0,
+            "cleanup_delay_s": 0.0,
             "hold_cleanup": False,
         }
 
@@ -234,6 +237,7 @@ class OffloadCommandTests(unittest.TestCase):
             "run_delay_s": 0.0,
             "hold_after_first_line": False,
             "cleanup_status": 0,
+            "cleanup_delay_s": 0.0,
             "hold_cleanup": False,
         }
         self.sync_config()
@@ -776,7 +780,11 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(result.returncode, 42, result.stdout)
         self.assertIn("nextest failed\n", result.stdout)
         self.assertIn("this ran on the Mac (macOS)", result.stdout)
-        self.assertIn("rerun with --local", result.stdout)
+        self.assertIn(
+            "only a test that must run on Linux may rerun with --local",
+            result.stdout,
+        )
+        self.assertNotIn("unrelated to your change", result.stdout)
         self.assertNotIn("mac_exit=42", result.stdout)
         self.assert_wire("failed", "")
         self.assertFalse((self.state_directory / "run.json").exists())
@@ -805,21 +813,39 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assert_wire("failed", "")
 
-    def test_missing_run_status_is_lost_and_releases_claim(self) -> None:
+    def test_lost_run_time_includes_remote_cleanup(self) -> None:
         self.fixture["run_lines"] = [
             {"stream": "stdout", "text": "partial output"}
         ]
         self.fixture["run_status_reported"] = False
+        cleanup_seconds = 1.0
+        self.fixture["cleanup_delay_s"] = cleanup_seconds
         self.sync_fixture()
+        command_started = time.monotonic()
         result = self.command()
+        command_seconds = time.monotonic() - command_started
         self.assertEqual(result.returncode, 75, result.stdout)
         self.assertIn("partial output\n", result.stdout)
         self.assertIn(
             "mac_test: the link to the Mac dropped; running on natedev instead\n",
             result.stdout,
         )
-        self.assert_wire("lost", "")
+        wire = self.wire_result()
+        self.assertEqual(wire["mac"], "lost")
+        self.assertEqual(wire["reason"], "")
+        recorded_seconds = float(wire["seconds"])
+        self.assertGreaterEqual(recorded_seconds, cleanup_seconds)
+        self.assertLess(command_seconds - recorded_seconds, cleanup_seconds)
         self.assertFalse((self.state_directory / "run.json").exists())
+        cleanup_events = [
+            event
+            for event in self.events_for("ssh")
+            if "pkill -f" in event["args"][-1]
+        ]
+        self.assertEqual(len(cleanup_events), 1, self.events())
+        cleanup = cleanup_events[0]
+        self.assertTrue(cleanup["claimed"], cleanup)
+        self.assertIn(".local/state/mac-test/mirror/hana", cleanup["args"][-1])
 
     def test_run_signals_request_remote_cleanup_and_release_claim(self) -> None:
         self.fixture["run_delay_s"] = 30.0

@@ -13,31 +13,32 @@ two readings of the same question, which buys one opinion twice. Each takes a
 **lens**, disjoint and named in its prompt; the main review per <DualReview/>
 is the third reader:
 
-| Lens | Reads for | Seat |
-| --- | --- | --- |
-| `adversary` | the failing case — the input that violates a stated invariant, the caller that was not updated, the state the new code cannot reach, the test that passes for the wrong reason | `test` |
-| `contract` | what the Work Order says, including every part no test covers, and anything built that it never asked for; then what the change reaches without naming — callers, consumers, public API, traits, registration, plugin wiring, invariants and transitions | `impl` |
+| Lens | Reads for |
+| --- | --- |
+| `adversary` | the failing case — the input that violates a stated invariant, the caller that was not updated, the state the new code cannot reach, the test that passes for the wrong reason |
+| `contract` | what the Work Order says, including every part no test covers, and anything built that it never asked for; then what the change reaches without naming — callers, consumers, public API, traits, registration, plugin wiring, invariants and transitions |
 
 The `craft` lens is off since 2026-10-04 (user: review trial ended); the run's
 style review still audits style.
 
-No reviewer wrote any of the code — each is a fresh session per
-<ReviewPromptContract/> — so no lens has to be kept away from its own work and
-no assignment turns on who wrote what. **The seat is an address, not a
-judgment**: it names the column the
-reviewer occupies in the progress table and the suffix on its files, and
-`review.sh` derives it from the lens — so the lens is the only thing a call site
-chooses, and the two can never disagree.
+Each lens gets a different open seat. Prefer a seat that did not write the
+files it reviews. When the other seats are busy, a writer may take the
+`adversary` lens on its own work and argue against its choices. Move each seat
+under <RoleReassignment/>; if every open seat is busy, open a role-named review
+seat and keep it for reuse.
+
+The seat is the address and the lens is the judgment. Pass both to `review.sh`;
+artifacts remain keyed by lens even when a different slot takes it.
 
 The adversary's brief is to break the change, not to check it. It reports the
 concrete failing case it built, or reports plainly that it could not build one:
 "no failing case found" from a reader who was trying is evidence, and it is the
 only reading here that produces evidence by finding nothing.
 
-Findings come back as one `review_findings_<pass>_<lens>.txt` per lens. A
-read-only session cannot post to the board, so that file is the whole record —
-<Synthesize/> reads both, tags each finding with the lens that caught it, and
-can tell two independent findings from one finding found twice.
+Findings come back as one `review_findings_<pass>_<lens>.txt` per lens. That
+file is the whole review result: <Synthesize/> reads both, tags each finding
+with the lens that caught it, and can tell two independent findings from one
+finding found twice.
 
 **A repair is not reviewed this way.** <ClosureReview/> is one reader over one
 batch of ids, and splitting a path-limited read two ways buys two passes over
@@ -45,14 +46,28 @@ the same few hunks.
 </TeamReview>
 
 <ReviewPromptContract>
-Every reviewer is a fresh read-only session. It narrates each activity as a
-short output line so the wrapper heartbeat remains live. It does not receive a
-heartbeat path and never receives `${IMPL_SUMMARY}`.
+Every review prompt opens with the selected seat's role switch:
+
+```
+You are slot <slot>, now working as a reviewer. Edit nothing. Read the diff
+cold as if someone else wrote it. If you wrote any of the code, argue against
+your own choices as an adversary would.
+```
+
+In a run, the opening also gives the concrete `board.sh role ... review`
+command for the seat's first tool call. The reviewer narrates each activity as
+a short output line so the wrapper heartbeat remains live. It receives no
+heartbeat path and never receives `${IMPL_SUMMARY}`. `review.sh` verifies that
+the working tree did not change.
 
 Do not repeat the implementer's listed verification or audit style. A reviewer
 may run one specific omitted check only when a plausible regression lies outside
 the listed gate, and must name that command. Broad reviews apply
 <TypeDesignContract/>; closure reviews apply only <ClosureReview/>.
+
+Every review prompt carries the inline Three Gods sentence and the Type Design
+Contract: verbatim for a new seat, or by <WritePromptContract/> item 7's pointer
+for a follow-up.
 
 A broad review's prompt names its lens per <TeamReview/> and asks that lens's
 questions and no others; a closure review names no lens.
@@ -64,8 +79,9 @@ Write one prompt per lens at
 <ReviewPromptContract/> with:
 
 ```
-You are independently reviewing a change you did not write. Read surrounding
-code as needed. Report a numbered list; each item has a title, file:line,
+[the role-switch opening from <ReviewPromptContract/>]
+
+Read surrounding code as needed. Report a numbered list; each item has a title, file:line,
 1-3 sentence explanation, and severity:
 - blocker: wrong behavior, spec violation, or missing required work
 - minor: real edge, error-handling, or quality defect
@@ -87,7 +103,7 @@ count instead.
 [implementer's Work Specification verbatim]
 
 ## Type Design Contract
-[verbatim contract]
+[verbatim contract or the allowed follow-up pointer]
 
 ## Diff
 [complete diff]
@@ -145,13 +161,16 @@ of reviewing the partial diff.
    `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the two
    lenses of <TeamReview/> over <BroadReviewPrompt/>; later passes are one
    reviewer over one repair, per <ClosureReview/>.
-2. Apply <ReviewDiffContract/> and create every prompt the pass needs.
+2. Apply <ReviewDiffContract/>. Choose each lens's open seat under
+   <TeamReview/>, apply <RoleReassignment/> when its role changes, and create
+   the prompt with that slot's role-switch opening.
 3. Launch each reviewer under <DispatchContract/>, pass 1's in one message so
    they run concurrently — `contract` alone when the adversary was armed early,
-   both otherwise:
+   both otherwise. For an open seat:
 
    ```sh
-   bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" \
+   bash ~/.claude/scripts/delegate/review.sh --to "<full-seat-name>" \
+     "${SESSION_DIR}" "${WORKING_DIR}" \
      "${SESSION_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
      "<responsibility>" "<activity>" "${REVIEW_PASS}" <lens>
    ```
@@ -159,10 +178,24 @@ of reviewing the partial diff.
    A closure review passes no lens and keeps the unsuffixed artifacts:
 
    ```sh
-   bash ~/.claude/scripts/delegate/review.sh "${SESSION_DIR}" "${WORKING_DIR}" \
+   bash ~/.claude/scripts/delegate/review.sh --to "<full-seat-name>" \
+     "${SESSION_DIR}" "${WORKING_DIR}" \
      "${SESSION_DIR}/review_prompt_${REVIEW_PASS}.md" review \
      "<responsibility>" "<activity>" "${REVIEW_PASS}"
    ```
+
+   If every open seat is busy, choose an unused role-named slot (`review`, then
+   `review2`) and open and retain it; for example:
+
+   ```sh
+   bash ~/.claude/scripts/delegate/review.sh --slot review \
+     "${SESSION_DIR}" "${WORKING_DIR}" \
+     "${SESSION_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
+     "<responsibility>" "<activity>" "${REVIEW_PASS}" <lens>
+   ```
+
+   Only a review outside a run calls `review.sh` with neither `--to` nor
+   `--slot`.
 
    Keep every blind-review handle; the run's one notifier instance covers the
    whole Claude set, and the Codex poll covers its set.
@@ -180,8 +213,8 @@ of reviewing the partial diff.
    while blind reviewers remain active, read each log once, cancel them all, and
    close each one's own pass with
    `PLAN_DELEGATE_TEAM_ROLE=<seat> … finish-pass --status canceled
-   --orphaned-launcher` per <PassOwnership/>, the seat from <TeamReview/>'s
-   table, then open and gate the finding and apply <FixDispatch/> with useful
+   --orphaned-launcher` per <PassOwnership/>, using each selected review slot,
+   then open and gate the finding and apply <FixDispatch/> with useful
    partial-review evidence. Preempt at most once per phase; never edit while an
    old-diff review remains active. A canceled review supplies no verdict or
    direct-fix agreement.
@@ -198,6 +231,7 @@ of reviewing the partial diff.
 Run `findings.py status` and write a prompt under <ReviewPromptContract/> that
 contains only:
 
+- The role-switch opening from <ReviewPromptContract/>.
 - Each open id, severity, file:line, and title verbatim.
 - Paths named by the fix plus new post-fix paths.
 - Diff limited to those paths, including new files.
@@ -208,11 +242,13 @@ contains only:
   or invariant of its changed symbols.
 - The `## Three Gods` section of <WritePromptContract/>, verbatim; a repair
   hunk that breaks one is a finding of the repair.
+- The `## Type Design Contract` section using <WritePromptContract/> item 7's
+  follow-up pointer.
 
 Forbid whole-phase and already-reviewed design findings, and style or polish
 findings on code the repair did not write. An outside-path problem is valid
 only when a quoted repair hunk causes it. Omit the broad questions and Type
-Design Contract.
+Design questions.
 
 **Early form** (an <EarlyReviewArm/> launch only): the diff section holds the
 partial repair diff at launch, and the prompt opens with the same

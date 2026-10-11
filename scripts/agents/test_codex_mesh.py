@@ -102,6 +102,9 @@ class StubAppServer:
         self.requests: list[dict[str, object]] = []
         self.errors: list[Exception] = []
         self.close_after_turn_start: bool = False
+        self.block_compact_turn_completion: bool = False
+        self.compaction_event_sent: threading.Event = threading.Event()
+        self.release_compact_turn_completion: threading.Event = threading.Event()
         self.listener: socket.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen()
@@ -114,6 +117,7 @@ class StubAppServer:
 
     def close(self) -> None:
         self.stopping.set()
+        self.release_compact_turn_completion.set()
         self.listener.close()
         self.thread.join(timeout=2)
         for conversation in self.conversations:
@@ -159,6 +163,15 @@ class StubAppServer:
             if frames is None:
                 return
             for frame in frames:
+                params = _as_test_dict(frame.get("params"))
+                turn = _as_test_dict(params.get("turn"))
+                if (
+                    self.block_compact_turn_completion
+                    and frame.get("method") == "turn/completed"
+                    and turn.get("id") == "compact-turn"
+                ):
+                    self.compaction_event_sent.set()
+                    _ = self.release_compact_turn_completion.wait(timeout=2)
                 _send_frame(connection, frame)
             if request.get("method") == "turn/start" and self.close_after_turn_start:
                 return
@@ -172,6 +185,10 @@ def _notice(method: str, params: dict[str, object]) -> dict[str, object]:
     return {"jsonrpc": "2.0", "method": method, "params": params}
 
 
+def _as_test_dict(value: object) -> dict[str, object]:
+    return cast("dict[str, object]", value) if isinstance(value, dict) else {}
+
+
 class MeshCommandTests(unittest.TestCase):
     """Exercise the launcher and addressable verbs against a local app-server."""
 
@@ -180,6 +197,10 @@ class MeshCommandTests(unittest.TestCase):
     server: StubAppServer  # pyright: ignore[reportUninitializedInstanceVariable]
     outcomes: list[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     turn_starts: int  # pyright: ignore[reportUninitializedInstanceVariable]
+    turn_inputs: list[str]  # pyright: ignore[reportUninitializedInstanceVariable]
+    context_sizes: list[int]  # pyright: ignore[reportUninitializedInstanceVariable]
+    compact_after_tokens: int  # pyright: ignore[reportUninitializedInstanceVariable]
+    compact_uses_item: bool  # pyright: ignore[reportUninitializedInstanceVariable]
     live_turn: str  # pyright: ignore[reportUninitializedInstanceVariable]
     announce_live_completion: bool  # pyright: ignore[reportUninitializedInstanceVariable]
     queued: list[dict[str, object]]  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -204,6 +225,10 @@ class MeshCommandTests(unittest.TestCase):
         _ = (self.session_dir / "prompt.txt").write_text("Original delegate task", encoding="utf-8")
         self.outcomes = []
         self.turn_starts = 0
+        self.turn_inputs = []
+        self.context_sizes = []
+        self.compact_after_tokens = 20000
+        self.compact_uses_item = False
         self.live_turn = ""
         self.announce_live_completion = False
         self.queued = []
@@ -255,8 +280,23 @@ class MeshCommandTests(unittest.TestCase):
         if method == "turn/start":
             self.error_threads.discard(cast("str", params.get("threadId", THREAD_ID)))
             self.turn_starts += 1
+            inputs = cast("list[dict[str, object]]", params.get("input", []))
+            submitted_text = cast("str", inputs[0].get("text", "")) if inputs else ""
+            self.turn_inputs.append(submitted_text)
             self.queued.clear()
             turn_id = f"turn-{self.turn_starts}"
+            turn_submission_frames = [
+                _reply(request, {"turn": {"id": turn_id}}),
+                _notice("item/completed", {
+                    "threadId": THREAD_ID,
+                    "turnId": turn_id,
+                    "item": {
+                        "id": f"user-message-{self.turn_starts}",
+                        "type": "userMessage",
+                        "content": [{"type": "inputText", "text": submitted_text}],
+                    },
+                }),
+            ]
             outcome = self.outcomes.pop(0) if self.outcomes else "completed"
             if outcome in {
                 "capacity", "capacity_final_queued", "capacity_queued",
@@ -265,10 +305,10 @@ class MeshCommandTests(unittest.TestCase):
             }:
                 self.error_threads.add(THREAD_ID)
             if outcome == "disconnect":
-                return [_reply(request, {"turn": {"id": turn_id}})]
+                return turn_submission_frames
             if outcome == "earlier_completed":
                 return [
-                    _reply(request, {"turn": {"id": turn_id}}),
+                    *turn_submission_frames,
                     _notice("turn/completed", {
                         "threadId": THREAD_ID, "turn": {"id": "earlier-turn"}
                     }),
@@ -278,21 +318,21 @@ class MeshCommandTests(unittest.TestCase):
                 ]
             if outcome == "earlier_only":
                 return [
-                    _reply(request, {"turn": {"id": turn_id}}),
+                    *turn_submission_frames,
                     _notice("turn/completed", {
                         "threadId": THREAD_ID, "turn": {"id": "earlier-turn"}
                     }),
                 ]
             if outcome == "completed_without_id":
                 return [
-                    _reply(request, {"turn": {"id": turn_id}}),
+                    *turn_submission_frames,
                     _notice("turn/completed", {"threadId": THREAD_ID, "turn": {}}),
                 ]
             if outcome == "completed_then_peer":
                 self.live_turn = "peer-turn"
                 self.announce_live_completion = True
                 return [
-                    _reply(request, {"turn": {"id": turn_id}}),
+                    *turn_submission_frames,
                     _notice("turn/completed", {
                         "threadId": THREAD_ID, "turn": {"id": turn_id}
                     }),
@@ -333,6 +373,35 @@ class MeshCommandTests(unittest.TestCase):
                         "id": turn_id, "error": {"message": CAPACITY}
                     }},
                 )
+            elif outcome == "overflow":
+                finished = _notice(
+                    "turn/completed",
+                    {"threadId": THREAD_ID, "turn": {
+                        "id": turn_id,
+                        "error": {
+                            "message": "context window exceeded",
+                            "codexErrorInfo": "contextWindowExceeded",
+                        },
+                    }},
+                )
+            elif outcome == "progress_overflow":
+                frames = turn_submission_frames.copy()
+                frames.append(_notice("item/completed", {
+                    "threadId": THREAD_ID,
+                    "turnId": turn_id,
+                    "item": {"type": "commandExecution", "command": "true"},
+                }))
+                frames.append(_notice(
+                    "turn/completed",
+                    {"threadId": THREAD_ID, "turn": {
+                        "id": turn_id,
+                        "error": {
+                            "message": "context window exceeded",
+                            "codexErrorInfo": "contextWindowExceeded",
+                        },
+                    }},
+                ))
+                return frames
             elif outcome == "failed":
                 finished = _notice(
                     "turn/failed",
@@ -342,7 +411,7 @@ class MeshCommandTests(unittest.TestCase):
                 self.live_turn = "peer-turn"
                 self.announce_live_completion = True
                 return [
-                    _reply(request, {"turn": {"id": turn_id}}),
+                    *turn_submission_frames,
                     _notice("turn/failed", {
                         "threadId": THREAD_ID, "error": {"message": "ordinary failure"}
                     }),
@@ -354,7 +423,7 @@ class MeshCommandTests(unittest.TestCase):
                 self.live_turn = "peer-turn"
                 self.announce_live_completion = True
                 return [
-                    _reply(request, {"turn": {"id": turn_id}}),
+                    *turn_submission_frames,
                     _notice("turn/failed", {
                         "threadId": THREAD_ID, "error": {"message": CAPACITY}
                     }),
@@ -364,7 +433,7 @@ class MeshCommandTests(unittest.TestCase):
                 ]
             elif outcome == "completed_then_capacity":
                 return [
-                    _reply(request, {"turn": {"id": turn_id}}),
+                    *turn_submission_frames,
                     _notice("turn/completed", {
                         "threadId": THREAD_ID, "turn": {"id": turn_id}
                     }),
@@ -379,7 +448,47 @@ class MeshCommandTests(unittest.TestCase):
                 finished = _notice(
                     "turn/completed", {"threadId": THREAD_ID, "turn": {"id": turn_id}}
                 )
-            return [_reply(request, {"turn": {"id": turn_id}}), finished]
+            frames = turn_submission_frames.copy()
+            if self.context_sizes:
+                frames.append(_notice("thread/tokenUsage/updated", {
+                    "threadId": THREAD_ID,
+                    "turnId": turn_id,
+                    "tokenUsage": {
+                        "last": {"inputTokens": self.context_sizes.pop(0)},
+                        "total": {"inputTokens": 0},
+                    },
+                }))
+            frames.append(finished)
+            return frames
+        if method == "thread/compact/start":
+            compact_turn = "compact-turn"
+            completion = _notice(
+                "item/completed",
+                {
+                    "threadId": params["threadId"],
+                    "turnId": compact_turn,
+                    "item": {"id": "compact-item", "type": "contextCompaction"},
+                },
+            ) if self.compact_uses_item else _notice(
+                "thread/compacted",
+                {"threadId": params["threadId"], "turnId": compact_turn},
+            )
+            return [
+                _reply(request, {}),
+                _notice("thread/tokenUsage/updated", {
+                    "threadId": params["threadId"],
+                    "turnId": compact_turn,
+                    "tokenUsage": {
+                        "last": {"inputTokens": self.compact_after_tokens},
+                        "total": {"inputTokens": 0},
+                    },
+                }),
+                completion,
+                _notice("turn/completed", {
+                    "threadId": params["threadId"],
+                    "turn": {"id": compact_turn},
+                }),
+            ]
         if method == "thread/queue/list":
             return [_reply(request, {"data": self.queued.copy(), "nextCursor": None})]
         if method == "thread/queue/add":
@@ -461,7 +570,7 @@ class MeshCommandTests(unittest.TestCase):
             summary_file=str(self.session_dir / "summary.txt"),
             reply_file="", log_file=str(self.session_dir / "seat.log"),
             model="gpt-test", effort="high", service_tier="", sandbox="danger-full-access",
-            timeout=self.start_args_timeout, resident=False,
+            timeout=self.start_args_timeout, resident=False, role="impl",
         )
 
     def roster(self) -> dict[str, object]:
@@ -480,15 +589,35 @@ class MeshCommandTests(unittest.TestCase):
             result = codex_mesh.command_start(self.start_args())
         return result, errors.getvalue()
 
-    def run_follow(self, message: str = "Repair the open finding") -> tuple[int, str]:
+    def run_follow(
+        self, message: str = "Repair the open finding", role: str = "impl"
+    ) -> tuple[int, str]:
         message_file = self.session_dir / "follow-up.txt"
         _ = message_file.write_text(message, encoding="utf-8")
         args = self.start_args()
         args.to = "seat"
+        args.role = role
         args.message_file = str(message_file)
         with contextlib.redirect_stderr(io.StringIO()) as errors:
             result = codex_mesh.command_follow(args)
         return result, errors.getvalue()
+
+    def test_follow_records_its_server_before_it_reopens_the_thread(self) -> None:
+        # A message sent while the follow-up is starting reaches the seat through this port.
+        code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+        ports: list[object] = []
+        respond = self.server.respond
+
+        def watch(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/resume":
+                ports.append(self.seat_record().get("port"))
+            return respond(request)
+
+        self.server.respond = watch
+        code, errors = self.run_follow()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(ports, [self.server.port])
 
     def test_follow_reuses_a_done_thread_and_records_its_new_turn(self) -> None:
         code, errors = self.run_start()
@@ -507,6 +636,192 @@ class MeshCommandTests(unittest.TestCase):
             cast("dict[str, object]", starts[1]["params"])["threadId"], THREAD_ID
         )
         self.assertIn("Repair the open finding", str(starts[1]["params"]))
+        self.assertEqual(self.seat_record()["status"], "done")
+
+    def test_follow_overrides_the_model_for_the_reassigned_role(self) -> None:
+        code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+
+        code, errors = self.run_follow(role="review")
+
+        self.assertEqual((code, errors), (0, ""))
+        starts = self.methods("turn/start")
+        follow_params = cast("dict[str, object]", starts[1]["params"])
+        self.assertEqual(follow_params["model"], "gpt-test")
+
+    def test_start_records_the_assigned_role(self) -> None:
+        code, errors = self.run_start()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["role"], "impl")
+
+    def test_resident_start_without_role_parses_and_omits_role_from_roster(self) -> None:
+        args = self.start_args()
+        args.role = ""
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            code = codex_mesh.command_start(args)
+        self.assertEqual((code, errors.getvalue()), (0, ""))
+        self.assertNotIn("role", self.seat_record())
+
+        parsed: list[argparse.Namespace] = []
+
+        def capture(parsed_args: argparse.Namespace) -> int:
+            parsed.append(parsed_args)
+            return 0
+
+        with patch.object(codex_mesh, "command_start", capture):
+            parsed_code = codex_mesh.main([
+                "start", "--resident",
+                "--session-dir", str(self.session_dir),
+                "--name", "friend",
+                "--cwd", str(self.session_dir),
+                "--prompt-file", str(self.session_dir / "prompt.txt"),
+                "--summary-file", str(self.session_dir / "friend.txt"),
+                "--log-file", str(self.session_dir / "friend.log"),
+            ])
+        self.assertEqual(parsed_code, 0)
+        self.assertEqual(len(parsed), 1)
+        parsed_values = cast("dict[str, object]", cast("object", vars(parsed[0])))
+        self.assertIs(parsed_values.get("resident"), True)
+        self.assertEqual(parsed_values.get("role"), "")
+
+    def test_follow_records_a_reassigned_role_without_losing_context(self) -> None:
+        self.context_sizes = [123456]
+        self.assertEqual(self.run_start()[0], 0)
+
+        code, errors = self.run_follow(role="review")
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["role"], "review")
+        self.assertEqual(self.seat_record()["context_tokens"], 123456)
+
+    def test_turn_final_usage_records_the_context_size_in_the_roster(self) -> None:
+        self.context_sizes = [123456]
+
+        code, errors = self.run_start()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["context_tokens"], 123456)
+
+    def test_compact_refuses_a_running_seat(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        roster = self.roster()
+        seat = cast("dict[str, object]", roster["seat"])
+        seat["status"] = "running"
+        seat["turn_id"] = "live-turn"
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(
+            json.dumps(roster), encoding="utf-8"
+        )
+        args = argparse.Namespace(session_dir=str(self.session_dir), to="seat")
+
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            code = codex_mesh.command_compact(args)
+
+        self.assertEqual(code, 2)
+        self.assertIn("compact requires a finished seat", errors.getvalue())
+        self.assertEqual(self.methods("thread/compact/start"), [])
+
+    def test_compact_waits_for_compaction_and_records_the_smaller_context(self) -> None:
+        self.context_sizes = [150000]
+        self.compact_after_tokens = 18000
+        self.assertEqual(self.run_start()[0], 0)
+        args = argparse.Namespace(session_dir=str(self.session_dir), to="seat")
+
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            code = codex_mesh.command_compact(args)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output.getvalue(), "compacted seat: 150000 -> 18000 tokens\n")
+        self.assertEqual(self.seat_record()["context_tokens"], 18000)
+        self.assertEqual(len(self.methods("thread/compact/start")), 1)
+
+    def test_compact_accepts_the_current_context_compaction_item(self) -> None:
+        self.context_sizes = [150000]
+        self.compact_after_tokens = 17000
+        self.compact_uses_item = True
+        self.assertEqual(self.run_start()[0], 0)
+        args = argparse.Namespace(session_dir=str(self.session_dir), to="seat")
+
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            code = codex_mesh.command_compact(args)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output.getvalue(), "compacted seat: 150000 -> 17000 tokens\n")
+        self.assertEqual(self.seat_record()["context_tokens"], 17000)
+
+    def test_compact_waits_for_turn_completion_after_the_compaction_event(self) -> None:
+        self.context_sizes = [150000]
+        self.compact_uses_item = True
+        self.assertEqual(self.run_start()[0], 0)
+        self.server.block_compact_turn_completion = True
+        args = argparse.Namespace(session_dir=str(self.session_dir), to="seat")
+        codes: list[int] = []
+        failures: list[BaseException] = []
+        output = io.StringIO()
+
+        def compact() -> None:
+            try:
+                with contextlib.redirect_stdout(output):
+                    codes.append(codex_mesh.command_compact(args))
+            except BaseException as exc:
+                failures.append(exc)
+
+        worker = threading.Thread(target=compact)
+        worker.start()
+        self.assertTrue(self.server.compaction_event_sent.wait(timeout=2))
+        self.assertTrue(worker.is_alive(), "compact returned before turn/completed")
+        self.server.release_compact_turn_completion.set()
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(codes, [0])
+        self.assertIn("compacted seat:", output.getvalue())
+
+    def test_context_overflow_starts_one_continue_turn_and_posts_once(self) -> None:
+        self.outcomes = ["overflow", "completed"]
+
+        code, errors = self.run_start()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(
+            self.turn_inputs,
+            ["Original delegate task", "Continue where you stopped."],
+        )
+        board = (self.session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertEqual(board.count("context window filled; sent"), 1)
+
+    def test_continuation_user_message_does_not_clear_overflow_guard(self) -> None:
+        self.outcomes = ["overflow", "overflow"]
+
+        code, errors = self.run_start()
+
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            self.turn_inputs,
+            ["Original delegate task", "Continue where you stopped."],
+        )
+        self.assertIn("context window filled twice in a row without progress", errors)
+        board = (self.session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertEqual(board.count("context window filled; sent"), 1)
+
+    def test_later_overflow_after_progress_gets_one_more_continue_turn(self) -> None:
+        self.outcomes = ["overflow", "progress_overflow", "completed"]
+
+        code, errors = self.run_start()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(
+            self.turn_inputs,
+            [
+                "Original delegate task",
+                "Continue where you stopped.",
+                "Continue where you stopped.",
+            ],
+        )
+        board = (self.session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertEqual(board.count("context window filled; sent"), 2)
+        self.assertEqual(len(self.methods("turn/start")), 3)
         self.assertEqual(self.seat_record()["status"], "done")
 
     def test_follow_refuses_a_running_seat_before_sending(self) -> None:
@@ -614,6 +929,38 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(self.seat_record()["status"], "starting")
         self.assertEqual(codex_mesh.command_can_follow(args), 2)
         self.assertEqual(len(self.methods("turn/start")), 1)
+
+    def test_released_follow_claim_restores_the_prior_role(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        args = self.start_args()
+        args.to = "seat"
+        args.role = "review"
+        args.claim_pid = os.getpid()
+
+        self.assertEqual(codex_mesh.command_can_follow(args), 0)
+        self.assertEqual(self.seat_record()["role"], "review")
+        self.assertEqual(codex_mesh.command_release_follow(args), 0)
+
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertEqual(self.seat_record()["role"], "impl")
+        self.assertNotIn("previous_role", self.seat_record())
+
+    def test_released_follow_claim_restores_an_absent_role(self) -> None:
+        args = self.start_args()
+        args.role = ""
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(codex_mesh.command_start(args), 0)
+        args.to = "seat"
+        args.role = "review"
+        args.claim_pid = os.getpid()
+
+        self.assertEqual(codex_mesh.command_can_follow(args), 0)
+        self.assertEqual(self.seat_record()["role"], "review")
+        self.assertEqual(codex_mesh.command_release_follow(args), 0)
+
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertNotIn("role", self.seat_record())
+        self.assertNotIn("previous_role", self.seat_record())
 
     def test_live_turn_after_resume_restores_preclaim_roster_when_peer_finishes(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
@@ -1158,6 +1505,20 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "")
         self.assertEqual(self.methods("turn/interrupt"), [])
 
+    def test_end_marks_a_finished_seat_ended_and_keeps_its_metadata(self) -> None:
+        self.context_sizes = [123456]
+        self.assertEqual(self.run_start()[0], 0)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = codex_mesh.command_end(argparse.Namespace(
+                session_dir=str(self.session_dir), to="seat"
+            ))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.seat_record()["status"], "ended")
+        self.assertEqual(self.seat_record()["role"], "impl")
+        self.assertEqual(self.seat_record()["context_tokens"], 123456)
+
     def test_capacity_exhaustion_has_a_distinct_run_outcome(self) -> None:
         """Retry exhaustion is control state, not failure text."""
         self.outcomes = ["capacity"] * 20
@@ -1197,7 +1558,10 @@ class MeshCommandTests(unittest.TestCase):
                     self.assertEqual(codex_mesh.command_end(argparse.Namespace(
                         session_dir=str(self.session_dir), to="seat"
                     )), 0)
-            original_wait(seconds)
+                self.waits.append(seconds)
+                self.elapsed += seconds
+            else:
+                original_wait(seconds)
 
         with patch.object(codex_mesh, "_capacity_sleep", end_while_waiting):
             _code, _errors = self.run_start()
@@ -1205,6 +1569,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertTrue(self.methods("thread/queue/list"))
         self.assertTrue((self.session_dir / "seat.end").exists())
         self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.seat_record()["status"], "ended")
         pending = cast("dict[str, object]", json.loads(
             (self.session_dir / "seat.pending.json").read_text(encoding="utf-8") or "{}"
         ))
@@ -1488,8 +1853,17 @@ class SweepTests(unittest.TestCase):
     @staticmethod
     def facts(**changes: object) -> codex_mesh.ServerFacts:
         quiet = codex_mesh.SERVER_IDLE_SECS + 60
-        base = codex_mesh.ServerFacts(pid=10, port=4000, age_secs=quiet, clients=0, session_dir=Path("/run"),
-                                      folder_exists=True, marked_active=False, live_launchers=(), quiet_secs=quiet)
+        base = codex_mesh.ServerFacts(
+            pid=10,
+            port=4000,
+            age_secs=quiet,
+            clients=0,
+            ownership=codex_mesh.CurrentRunServer(Path("/run")),
+            folder_exists=True,
+            run_lifecycle=codex_mesh.UncheckedRunLifecycle(),
+            live_launchers=(),
+            quiet_secs=quiet,
+        )
         return dataclasses.replace(base, **changes)
 
     @staticmethod
@@ -1502,8 +1876,8 @@ class SweepTests(unittest.TestCase):
         deleted = self.verdict(self.facts(folder_exists=False, quiet_secs=None))
         self.assertIsInstance(deleted, codex_mesh.ServerUnused)
         self.assertIn("deleted", deleted.reason)
-        for change in ({"clients": 1}, {"marked_active": True}, {"live_launchers": ("impl",)},
-                       {"age_secs": 60.0}, {"quiet_secs": 60.0}):
+        for change in ({"clients": 1}, {"live_launchers": ("impl",)}, {"age_secs": 60.0},
+                       {"quiet_secs": 60.0}):
             self.assertIsInstance(self.verdict(self.facts(**change)), codex_mesh.ServerInUse, change)
         self.assertIsInstance(self.verdict(self.facts(), ("impl: ThreadLive",)), codex_mesh.ServerInUse)
         self.assertIsInstance(self.verdict(self.facts(folder_exists=False), ("t1: ThreadLive",)),
@@ -1512,22 +1886,57 @@ class SweepTests(unittest.TestCase):
     def test_a_retired_server_is_judged_only_on_its_clients_and_conversations(self) -> None:
         # Its run goes on using a newer server, so the run's marker, launchers and activity say
         # nothing about this one.
-        retired = self.facts(retired=True, marked_active=True, live_launchers=("impl",), age_secs=60.0,
-                             quiet_secs=60.0)
+        retired = self.facts(
+            ownership=codex_mesh.RetiredRunServer(Path("/run")),
+            run_lifecycle=codex_mesh.CheckedRunLifecycle(True, ("impl",)),
+            live_launchers=("impl",),
+            age_secs=60.0,
+            quiet_secs=60.0,
+        )
         unused = self.verdict(retired)
         self.assertIsInstance(unused, codex_mesh.ServerUnused)
         self.assertIn("retired", unused.reason)
         self.assertIsInstance(self.verdict(dataclasses.replace(retired, clients=1)), codex_mesh.ServerInUse)
         self.assertIsInstance(self.verdict(retired, ("impl: ThreadLive",)), codex_mesh.ServerInUse)
 
-    def test_a_server_whose_log_names_no_run_folder_is_never_called_unused(self) -> None:
-        self.assertIsInstance(self.verdict(self.facts(session_dir=None)), codex_mesh.ServerUnknown)
+    def test_an_old_unowned_server_is_unused_only_when_its_conversations_are_idle(self) -> None:
+        unowned = self.facts(ownership=codex_mesh.UnownedServerWithoutLog())
+        self.assertIsInstance(self.verdict(unowned), codex_mesh.ServerUnused)
+        self.assertIsInstance(
+            self.verdict(unowned, ("thread-1: ThreadLive",)), codex_mesh.ServerInUse
+        )
+        self.assertIsInstance(
+            self.verdict(dataclasses.replace(unowned, age_secs=10.0)), codex_mesh.ServerInUse
+        )
+
+    def test_current_server_without_a_marker_must_clear_every_live_and_idle_signal(self) -> None:
+        ended = self.facts(run_lifecycle=codex_mesh.CheckedRunLifecycle(False, ()))
+        self.assertIsInstance(self.verdict(ended), codex_mesh.ServerUnused)
+        for change in (
+            {"clients": 1},
+            {"live_launchers": ("friend",)},
+            {"age_secs": 60.0},
+            {"quiet_secs": 60.0},
+        ):
+            self.assertIsInstance(
+                self.verdict(dataclasses.replace(ended, **change)),
+                codex_mesh.ServerInUse,
+                change,
+            )
+        self.assertIsInstance(
+            self.verdict(ended, ("impl: ThreadLive",)), codex_mesh.ServerInUse
+        )
+        marked = self.facts(run_lifecycle=codex_mesh.CheckedRunLifecycle(True, ()))
+        self.assertIsInstance(self.verdict(marked), codex_mesh.ServerInUse)
+        running = self.facts(run_lifecycle=codex_mesh.CheckedRunLifecycle(False, ("impl",)))
+        self.assertIsInstance(self.verdict(running), codex_mesh.ServerInUse)
 
     def test_servers_and_connections_are_read_from_ps_and_ss(self) -> None:
         ps = ("  111 7200 codex app-server --listen ws://127.0.0.1:47165\n"
-              "  222   30 /nix/store/x/bin/codex app-server --listen ws://127.0.0.1:51009\n"
+              "  222   30 /nix/store/x/bin/codex app-server --listen ws://0.0.0.0:51009\n"
               "  333   99 zsh -c pgrep -af codex app-server --listen ws://127.0.0.1: | head\n"
-              "  444   99 codex app-server --listen stdio://\n")
+              "  444   99 codex app-server --listen unix:///tmp/codex.sock\n"
+              "  555   99 codex app-server daemon --listen ws://127.0.0.1:55555\n")
         ss = "0 0 127.0.0.1:47165 127.0.0.1:60000\n0 0 127.0.0.1:60000 127.0.0.1:47165\n0 0 [::1]:47165 [::1]:60001\n"
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, ps, "")):
             servers = codex_mesh._running_servers()  # pyright: ignore[reportPrivateUsage]
@@ -1535,6 +1944,31 @@ class SweepTests(unittest.TestCase):
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, ss, "")):
             counts = codex_mesh._client_counts()  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(counts, {47165: 2, 60000: 1})
+
+    def test_process_text_that_only_mentions_the_server_command_is_not_a_target(self) -> None:
+        ps = (
+            "  666 99 python3 worker.py codex app-server --listen ws://127.0.0.1:4444\n"
+        )
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, ps, ""),
+        ):
+            servers = codex_mesh._running_servers()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(servers, [])
+
+    def test_unix_daemon_and_app_server_helper_are_never_sweep_targets(self) -> None:
+        ps = (
+            "  444 99 codex app-server --listen unix:///tmp/codex.sock\n"
+            "  555 99 codex app-server daemon --listen ws://127.0.0.1:55555\n"
+        )
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, ps, ""),
+        ):
+            servers = codex_mesh._running_servers()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(servers, [])
 
     def test_the_run_folder_comes_from_the_servers_own_log_handle(self) -> None:
         folder = codex_mesh._server_folder  # pyright: ignore[reportPrivateUsage]
@@ -1546,6 +1980,17 @@ class SweepTests(unittest.TestCase):
             self.assertIsNone(folder(5))
         with patch.object(os, "readlink", side_effect=OSError("no such process")):
             self.assertIsNone(folder(5))
+
+    def test_judgment_preserves_the_explicit_unowned_without_log_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(codex_mesh, "_server_folder", return_value=None), \
+                patch.object(codex_mesh, "_busy_threads", return_value=()):
+            judgment = codex_mesh._judge(  # pyright: ignore[reportPrivateUsage]
+                Path(directory), 5, 4005, codex_mesh.SERVER_IDLE_SECS + 60, 0
+            )
+
+        self.assertIsInstance(judgment.verdict, codex_mesh.ServerUnused)
+        self.assertEqual(judgment.ownership, codex_mesh.UnownedServerWithoutLog())
 
     def test_a_run_folder_reports_its_marker_its_quiet_time_and_its_live_launchers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1619,7 +2064,9 @@ class SweepTests(unittest.TestCase):
         old = codex_mesh.SERVER_IDLE_SECS + 60
         asked: list[int] = []
 
-        def stopper(_root: Path, pid: int, _port: int, _folder: Path) -> bool:
+        def stopper(
+            _root: Path, pid: int, _port: int, _ownership: codex_mesh.ServerOwnership
+        ) -> bool:
             asked.append(pid)
             return stops
 
@@ -1632,27 +2079,96 @@ class SweepTests(unittest.TestCase):
                 patch.object(codex_mesh, "_stop_unused", side_effect=stopper), \
                 contextlib.redirect_stdout(io.StringIO()) as printed:
             self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root=directory, stop=stop)), 0)
-        # Only the server every other check cleared is asked about its conversations.
-        busy.assert_called_once_with(4002, {})
+        # Both recordless servers are old enough to be judged on their conversations.
+        self.assertEqual(
+            [entry.args for entry in busy.call_args_list],
+            [(4002, {}), (4003, {})],
+        )
         return [line.split("\t") for line in printed.getvalue().splitlines()], asked
 
     def test_the_report_lists_each_server_and_stops_nothing(self) -> None:
         rows, asked = self.sweep(stop=False)
-        self.assertEqual([row[2] for row in rows[:3]], ["in use", "unused", "unknown"])
-        self.assertEqual(rows[3], ["3 app-server(s), 1 unused; report only, nothing was stopped"])
+        self.assertEqual([row[2] for row in rows[:3]], ["in use", "unused", "unused"])
+        self.assertEqual(rows[3], ["3 app-server(s), 2 unused; report only, nothing was stopped"])
         self.assertEqual(asked, [])
 
-    def test_stop_reaches_only_the_unused_server(self) -> None:
+    def test_stop_reaches_each_old_unowned_server(self) -> None:
         rows, asked = self.sweep(stop=True)
-        self.assertEqual([row[2] for row in rows[:3]], ["in use", "stopped", "unknown"])
-        self.assertEqual(rows[3], ["3 app-server(s), 1 unused; 1 stopped"])
-        self.assertEqual(asked, [2])
+        self.assertEqual([row[2] for row in rows[:3]], ["in use", "stopped", "stopped"])
+        self.assertEqual(rows[3], ["3 app-server(s), 2 unused; 2 stopped"])
+        self.assertEqual(asked, [2, 3])
         rows, _asked = self.sweep(stop=True, stops=False)
-        self.assertEqual([row[2] for row in rows[:3]], ["in use", "kept", "unknown"])
-        self.assertEqual(rows[3], ["3 app-server(s), 1 unused; 0 stopped"])
+        self.assertEqual([row[2] for row in rows[:3]], ["in use", "kept", "kept"])
+        self.assertEqual(rows[3], ["3 app-server(s), 2 unused; 0 stopped"])
 
-    def second_look(self, folder: Path, running: list[tuple[int, int, float]], clients: dict[int, int],
-                    verdict: codex_mesh.SweepVerdict) -> tuple[bool, list[int]]:
+    def test_unowned_server_is_reaped_only_after_the_second_look(self) -> None:
+        old = codex_mesh.SERVER_IDLE_SECS + 60
+        reaped: list[int] = []
+
+        def reap(pid: int) -> bool:
+            reaped.append(pid)
+            return True
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(codex_mesh, "_running_servers", return_value=[(8, 4008, old)]), \
+                patch.object(codex_mesh, "_client_counts", return_value={}), \
+                patch.object(codex_mesh, "_server_folder", return_value=None), \
+                patch.object(codex_mesh, "_busy_threads", return_value=()), \
+                patch.object(codex_mesh, "_reap", side_effect=reap), \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            code = codex_mesh.command_sweep(argparse.Namespace(root=directory, stop=True))
+        self.assertEqual(code, 0)
+        self.assertEqual(reaped, [8])
+        self.assertIn("8\t4008\tstopped\tno current or retired server record", printed.getvalue())
+
+    def test_recorded_server_stops_when_ended_and_stays_for_each_live_signal(self) -> None:
+        old = codex_mesh.SERVER_IDLE_SECS + 60
+        for marker, running, expected in (
+            (False, False, "stopped"),
+            (True, False, "in use"),
+            (False, True, "in use"),
+        ):
+            with self.subTest(marker=marker, running=running), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                run = root / "run-a"
+                run.mkdir()
+                _ = (run / codex_mesh.SERVER_FILE).write_text(
+                    json.dumps({"pid": 9, "port": 4009}), encoding="utf-8"
+                )
+                _ = (run / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+                    "impl": {"thread_id": "thread-1", "status": "running" if running else "done"}
+                }), encoding="utf-8")
+                stale = time.time() - old
+                for activity in (codex_mesh.SERVER_FILE, codex_mesh.ROSTER_FILE):
+                    os.utime(run / activity, (stale, stale))
+                if marker:
+                    (root / "active").mkdir()
+                    _ = (root / "active" / "session-1").write_text(f"{run}\n", encoding="utf-8")
+                reaped: list[int] = []
+
+                def reap(pid: int) -> bool:
+                    reaped.append(pid)
+                    return True
+
+                with patch.object(codex_mesh, "_running_servers", return_value=[(9, 4009, old)]), \
+                        patch.object(codex_mesh, "_client_counts", return_value={}), \
+                        patch.object(codex_mesh, "_server_folder", return_value=run), \
+                        patch.object(codex_mesh, "_busy_threads", return_value=()), \
+                        patch.object(codex_mesh, "_reap", side_effect=reap), \
+                        contextlib.redirect_stdout(io.StringIO()) as printed:
+                    code = codex_mesh.command_sweep(argparse.Namespace(root=directory, stop=True))
+                self.assertEqual(code, 0)
+                self.assertEqual(printed.getvalue().splitlines()[0].split("\t")[2], expected)
+                self.assertEqual(reaped, [9] if expected == "stopped" else [])
+
+    def second_look(
+        self,
+        folder: Path,
+        running: list[tuple[int, int, float]],
+        clients: dict[int, int],
+        verdict: codex_mesh.SweepVerdict,
+        ownership: codex_mesh.ServerOwnership,
+    ) -> tuple[bool, list[int]]:
         """Whether `_stop_unused` stopped pid 2 on port 4002, and the pids it signalled."""
         reaped: list[int] = []
 
@@ -1662,9 +2178,15 @@ class SweepTests(unittest.TestCase):
 
         with patch.object(codex_mesh, "_running_servers", return_value=running), \
                 patch.object(codex_mesh, "_client_counts", return_value=clients), \
-                patch.object(codex_mesh, "_judge", return_value=(verdict, folder)) as judge, \
+                patch.object(
+                    codex_mesh,
+                    "_judge",
+                    return_value=codex_mesh.SweepJudgment(verdict, ownership),
+                ) as judge, \
                 patch.object(codex_mesh, "_reap", side_effect=reap):
-            stopped = codex_mesh._stop_unused(folder.parent, 2, 4002, folder)  # pyright: ignore[reportPrivateUsage]
+            stopped = codex_mesh._stop_unused(  # pyright: ignore[reportPrivateUsage]
+                folder.parent, 2, 4002, ownership
+            )
         if judge.called:
             self.assertEqual(judge.call_args.args[1:], (2, 4002, 9000.0, clients.get(4002, 0)))
         return stopped, reaped
@@ -1676,25 +2198,41 @@ class SweepTests(unittest.TestCase):
             run.mkdir()
             record = run / codex_mesh.SERVER_FILE
             _ = record.write_text(json.dumps({"pid": 2, "port": 4002}))
+            current = codex_mesh.CurrentRunServer(run)
             # The pid stopped running this server, or now runs it on another port: nothing is signalled.
-            self.assertEqual(self.second_look(run, [], {}, unused), (False, []))
-            self.assertEqual(self.second_look(run, [(2, 4999, 9000.0)], {}, unused), (False, []))
+            self.assertEqual(self.second_look(run, [], {}, unused, current), (False, []))
+            self.assertEqual(self.second_look(run, [(2, 4999, 9000.0)], {}, unused, current), (False, []))
             # A client arrived between the two looks.
-            self.assertEqual(self.second_look(run, [(2, 4002, 9000.0)], {4002: 1}, in_use), (False, []))
+            self.assertEqual(
+                self.second_look(run, [(2, 4002, 9000.0)], {4002: 1}, in_use, current),
+                (False, []),
+            )
             self.assertTrue(record.exists())
-            self.assertEqual(self.second_look(run, [(2, 4002, 9000.0)], {}, unused), (True, [2]))
+            self.assertEqual(
+                self.second_look(run, [(2, 4002, 9000.0)], {}, unused, current),
+                (True, [2]),
+            )
             self.assertFalse(record.exists())
             # A record that names a newer server is left for that server.
             _ = record.write_text(json.dumps({"pid": 7, "port": 4007}))
-            self.assertEqual(self.second_look(run, [(2, 4002, 9000.0)], {}, unused), (True, [2]))
+            self.assertEqual(
+                self.second_look(run, [(2, 4002, 9000.0)], {}, unused, current),
+                (True, [2]),
+            )
             self.assertTrue(record.exists())
             # A deleted run folder is not created again.
             gone = Path(directory) / "gone"
-            self.assertEqual(self.second_look(gone, [(2, 4002, 9000.0)], {}, unused), (True, [2]))
+            gone_owner = codex_mesh.UnownedServerWithLog(gone)
+            self.assertEqual(
+                self.second_look(gone, [(2, 4002, 9000.0)], {}, unused, gone_owner),
+                (True, [2]),
+            )
             self.assertFalse(gone.exists())
         with patch.object(codex_mesh, "_running_servers", side_effect=OSError("no ps")), \
                 patch.object(codex_mesh, "_reap") as reap:
-            self.assertFalse(codex_mesh._stop_unused(gone.parent, 2, 4002, gone))  # pyright: ignore[reportPrivateUsage]
+            self.assertFalse(codex_mesh._stop_unused(  # pyright: ignore[reportPrivateUsage]
+                gone.parent, 2, 4002, gone_owner
+            ))
         reap.assert_not_called()
 
     def idle_stop(self, folder: Path, running: list[tuple[int, int, float]] | OSError,
@@ -1707,7 +2245,13 @@ class SweepTests(unittest.TestCase):
 
         with patch.object(codex_mesh, "_running_servers", side_effect=[running]), \
                 patch.object(codex_mesh, "_client_counts", return_value={}), \
-                patch.object(codex_mesh, "_judge", return_value=(verdict, folder)) as judge, \
+                patch.object(
+                    codex_mesh,
+                    "_judge",
+                    return_value=codex_mesh.SweepJudgment(
+                        verdict, codex_mesh.CurrentRunServer(folder)
+                    ),
+                ) as judge, \
                 patch.object(codex_mesh, "_stop_unused", side_effect=stopper):
             result = codex_mesh.command_idle_stop(argparse.Namespace(session_dir=str(folder), pid=2, port=4002))
         if judge.called:
@@ -1745,31 +2289,100 @@ class SweepTests(unittest.TestCase):
             # The server no longer runs: the watcher is told to leave, and nothing is judged.
             self.assertEqual(self.idle_stop(run, [(2, 4999, 9000.0)], unused), (0, []))
             # Unused at both looks: stopped, with a line in the server's log saying why.
-            self.assertEqual(self.idle_stop(run, [(2, 4002, 9000.0)], unused), (0, [(None, 2, 4002, run)]))
+            self.assertEqual(
+                self.idle_stop(run, [(2, 4002, 9000.0)], unused),
+                (0, [(None, 2, 4002, codex_mesh.CurrentRunServer(run))]),
+            )
             self.assertIn("app-server 2 stopped itself: quiet for 1.0 h",
                           (run / codex_mesh.SERVER_LOG).read_text(encoding="utf-8"))
 
     def test_a_server_judging_itself_ignores_the_run_active_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            run = Path(directory)
+            root = Path(directory)
+            run = root / "run-a"
+            run.mkdir()
+            record = run / codex_mesh.SERVER_FILE
+            _ = record.write_text(json.dumps({"pid": 2, "port": 4002}))
+            old = time.time() - codex_mesh.SERVER_IDLE_SECS - 60
+            os.utime(record, (old, old))
             with patch.object(codex_mesh, "_server_folder", return_value=run), \
                     patch.object(codex_mesh, "_marked_active", return_value=True) as marked, \
                     patch.object(codex_mesh, "_busy_threads", return_value=()):
                 judge = codex_mesh._judge  # pyright: ignore[reportPrivateUsage]
-                self.assertIsInstance(judge(None, 2, 4002, 9000.0, 0)[0], codex_mesh.ServerUnused)
+                self.assertIsInstance(
+                    judge(None, 2, 4002, 9000.0, 0).verdict,
+                    codex_mesh.ServerUnused,
+                )
                 marked.assert_not_called()
-                self.assertIsInstance(judge(run, 2, 4002, 9000.0, 0)[0], codex_mesh.ServerInUse)
+                self.assertIsInstance(
+                    judge(root, 2, 4002, 9000.0, 0).verdict,
+                    codex_mesh.ServerInUse,
+                )
 
     def test_a_server_the_run_retired_is_read_as_retired(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            run = Path(directory)
+            root = Path(directory)
+            run = root / "run-a"
+            run.mkdir()
             _ = (run / codex_mesh.RETIRED_FILE).write_text(json.dumps({"servers": [{"port": 4002, "pid": 2}]}))
             with patch.object(codex_mesh, "_server_folder", return_value=run), \
                     patch.object(codex_mesh, "_marked_active", return_value=True), \
                     patch.object(codex_mesh, "_busy_threads", return_value=()):
                 judge = codex_mesh._judge  # pyright: ignore[reportPrivateUsage]
-                self.assertIsInstance(judge(run, 2, 4002, 60.0, 0)[0], codex_mesh.ServerUnused)
-                self.assertIsInstance(judge(run, 3, 4003, 60.0, 0)[0], codex_mesh.ServerInUse)
+                self.assertIsInstance(
+                    judge(root, 2, 4002, 60.0, 0).verdict,
+                    codex_mesh.ServerUnused,
+                )
+                self.assertIsInstance(
+                    judge(root, 3, 4003, 10.0, 0).verdict,
+                    codex_mesh.ServerInUse,
+                )
+
+    def test_any_live_current_record_protects_a_server_from_stale_duplicate_owners(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ended = root / "a-ended"
+            live = root / "z-live"
+            ended.mkdir()
+            live.mkdir()
+            for run in (ended, live):
+                _ = (run / codex_mesh.SERVER_FILE).write_text(
+                    json.dumps({"pid": 2, "port": 4002}), encoding="utf-8"
+                )
+            old = time.time() - codex_mesh.SERVER_IDLE_SECS - 60
+            os.utime(ended / codex_mesh.SERVER_FILE, (old, old))
+            (root / "active").mkdir()
+            _ = (root / "active" / "session-1").write_text(f"{live}\n", encoding="utf-8")
+            with patch.object(codex_mesh, "_server_folder", return_value=ended), \
+                    patch.object(codex_mesh, "_busy_threads", return_value=()):
+                judgment = codex_mesh._judge(  # pyright: ignore[reportPrivateUsage]
+                    root, 2, 4002, 9000.0, 0
+                )
+        self.assertIsInstance(judgment.verdict, codex_mesh.ServerInUse)
+        self.assertEqual(judgment.ownership, codex_mesh.CurrentRunServer(live))
+
+    def test_a_retired_owner_wins_over_an_ended_stale_current_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stale = root / "a-stale"
+            retired = root / "z-retired"
+            stale.mkdir()
+            retired.mkdir()
+            _ = (stale / codex_mesh.SERVER_FILE).write_text(
+                json.dumps({"pid": 2, "port": 4002}), encoding="utf-8"
+            )
+            _ = (retired / codex_mesh.RETIRED_FILE).write_text(
+                json.dumps({"servers": [{"pid": 2, "port": 4002}]}),
+                encoding="utf-8",
+            )
+            old = time.time() - codex_mesh.SERVER_IDLE_SECS - 60
+            os.utime(stale / codex_mesh.SERVER_FILE, (old, old))
+
+            ownership = codex_mesh._server_ownership(  # pyright: ignore[reportPrivateUsage]
+                root, 2, 4002, stale
+            )
+
+        self.assertEqual(ownership, codex_mesh.RetiredRunServer(retired))
 
     def test_stopping_a_retired_server_drops_it_from_the_retired_list(self) -> None:
         # `stop` signals every pid on that list at the run's end; one already stopped could by then
@@ -1779,7 +2392,13 @@ class SweepTests(unittest.TestCase):
             run.mkdir()
             retired = run / codex_mesh.RETIRED_FILE
             _ = retired.write_text(json.dumps({"servers": [{"port": 4002, "pid": 2}, {"port": 4009, "pid": 9}]}))
-            stopped = self.second_look(run, [(2, 4002, 9000.0)], {}, codex_mesh.ServerUnused("retired"))
+            stopped = self.second_look(
+                run,
+                [(2, 4002, 9000.0)],
+                {},
+                codex_mesh.ServerUnused("retired"),
+                codex_mesh.RetiredRunServer(run),
+            )
             self.assertEqual(stopped, (True, [2]))
             self.assertEqual(json.loads(retired.read_text()), {"servers": [{"port": 4009, "pid": 9}]})
 
@@ -2070,6 +2689,51 @@ class ServerRecordTests(unittest.TestCase):
         _ = codex_mesh.ensure_server(str(self.session_dir))
         self.assertGreater(record.stat().st_mtime, old + 3600)
 
+    def test_replacing_a_server_record_retires_the_old_live_server(self) -> None:
+        old_pid = self.sleeper()
+        self.write_server(4321, old_pid)
+        replacement: codex_mesh.ServerRecord = {"port": 9876, "pid": 99999999}
+
+        codex_mesh._record_started_server(  # pyright: ignore[reportPrivateUsage]
+            str(self.session_dir), replacement
+        )
+
+        current = cast(
+            "dict[str, object]",
+            cast("object", json.loads(
+                (self.session_dir / codex_mesh.SERVER_FILE).read_text(encoding="utf-8")
+            )),
+        )
+        self.assertEqual(current, replacement)
+        self.assertEqual(self.retired_ports(), [4321])
+        self.assertTrue(codex_mesh._pid_alive(old_pid))  # pyright: ignore[reportPrivateUsage]
+
+    def test_a_server_that_never_accepts_is_stopped_before_start_fails(self) -> None:
+        process = subprocess.Popen(["sleep", "30"])
+        self.spawned.append(process)
+        with patch.object(codex_mesh, "SERVER_START_TIMEOUT_SECS", 0), \
+                patch.object(codex_mesh, "_free_port", return_value=4321), \
+                patch.object(subprocess, "Popen", return_value=process):
+            with self.assertRaisesRegex(SystemExit, "did not accept connections"):
+                _ = codex_mesh._start_server(str(self.session_dir))  # pyright: ignore[reportPrivateUsage]
+
+        self.assertIsNotNone(process.poll())
+        self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+
+    def test_a_server_is_stopped_when_recording_its_start_fails(self) -> None:
+        process = subprocess.Popen(["sleep", "30"])
+        self.spawned.append(process)
+        probe = SimpleNamespace(close=lambda: None)
+        with patch.object(codex_mesh, "_free_port", return_value=4321), \
+                patch.object(subprocess, "Popen", return_value=process), \
+                patch.object(codex_mesh, "WebSocket", return_value=probe), \
+                patch.object(codex_mesh, "_record_started_server", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                _ = codex_mesh._start_server(str(self.session_dir))  # pyright: ignore[reportPrivateUsage]
+
+        self.assertIsNotNone(process.poll())
+        self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+
     def watcher(self, pid: int) -> tuple[subprocess.Popen[bytes], Path]:
         """Start the real watcher with a stand-in for the Python that would run `idle-stop`."""
         calls = self.session_dir / "calls"
@@ -2157,6 +2821,37 @@ class ServerRecordTests(unittest.TestCase):
                       json.loads((self.session_dir / codex_mesh.ROSTER_FILE).read_text(encoding="utf-8")))
         self.assertNotIn("port", roster["seat"])
 
+    def attached_seat(self) -> codex_mesh.ThreadRecord:
+        """A running seat whose launcher lives and whose record names no server, as a launcher
+        started before seats recorded one leaves it."""
+        return {"thread_id": "t1", "turn_id": "u1", "status": "running", "launcher_pid": os.getpid()}
+
+    def test_a_seat_with_no_recorded_port_is_reached_on_the_retired_server_holding_it(self) -> None:
+        self.write_server(4321, self.sleeper())
+        _ = codex_mesh._retire_server(str(self.session_dir), 4321)  # pyright: ignore[reportPrivateUsage]
+        self.write_server(9876, self.sleeper())
+
+        def holds(port: int, _thread_id: str) -> bool:
+            return port == 4321
+
+        with patch.object(codex_mesh, "_server_holds", side_effect=holds), \
+                patch.object(codex_mesh, "ensure_server") as ensure:
+            port = codex_mesh._seat_port(str(self.session_dir), self.attached_seat())  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(port, 4321)
+        ensure.assert_not_called()
+
+    def test_a_seat_no_running_server_holds_fails_without_starting_one(self) -> None:
+        # The run's record was retired and its next server not yet started: a new one could not
+        # open a conversation the old one still holds, and would be left running.
+        self.write_server(4321, self.sleeper())
+        _ = codex_mesh._retire_server(str(self.session_dir), 4321)  # pyright: ignore[reportPrivateUsage]
+        with patch.object(codex_mesh, "_server_holds", return_value=False), \
+                patch.object(codex_mesh, "ensure_server") as ensure, \
+                self.assertRaises(SystemExit) as refused:
+            _ = codex_mesh._seat_port(str(self.session_dir), self.attached_seat())  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("nothing was started", str(refused.exception))
+        ensure.assert_not_called()
+
     def test_retiring_drops_the_record_and_keeps_the_pid_for_stop(self) -> None:
         pid = self.sleeper()
         self.write_server(4321, pid)
@@ -2198,6 +2893,16 @@ class ServerRecordTests(unittest.TestCase):
         )
         live_pid = self.sleeper()
         self.write_server(9876, live_pid)
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "project-impl": {
+                "thread_id": "thread-impl", "status": "done", "role": "impl",
+                "context_tokens": 120000,
+            },
+            "project-test": {
+                "thread_id": "thread-test", "status": "running", "role": "test",
+                "turn_id": "turn-test",
+            },
+        }), encoding="utf-8")
 
         code = codex_mesh.command_stop(
             argparse.Namespace(session_dir=str(self.session_dir))
@@ -2213,6 +2918,39 @@ class ServerRecordTests(unittest.TestCase):
             )
         self.assertFalse((self.session_dir / codex_mesh.RETIRED_FILE).exists())
         self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+        roster = cast("dict[str, dict[str, object]]", json.loads(
+            (self.session_dir / codex_mesh.ROSTER_FILE).read_text(encoding="utf-8")
+        ))
+        self.assertEqual(
+            {name: record["status"] for name, record in roster.items()},
+            {"project-impl": "ended", "project-test": "ended"},
+        )
+        self.assertEqual(roster["project-impl"]["context_tokens"], 120000)
+        self.assertEqual(roster["project-test"]["role"], "test")
+
+    def test_stop_without_live_server_still_ends_roster_and_cleans_retired_records(self) -> None:
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "project-impl": {
+                "thread_id": "thread-impl", "status": "done", "role": "impl",
+            },
+        }), encoding="utf-8")
+        _ = (self.session_dir / codex_mesh.RETIRED_FILE).write_text(json.dumps({
+            "servers": [{"port": 4321, "pid": 99999999}],
+        }), encoding="utf-8")
+
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            code = codex_mesh.command_stop(
+                argparse.Namespace(session_dir=str(self.session_dir))
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output.getvalue(), "no app-server running\n")
+        self.assertFalse((self.session_dir / codex_mesh.RETIRED_FILE).exists())
+        roster = cast("dict[str, dict[str, object]]", json.loads(
+            (self.session_dir / codex_mesh.ROSTER_FILE).read_text(encoding="utf-8")
+        ))
+        self.assertEqual(roster["project-impl"]["status"], "ended")
+        self.assertEqual(roster["project-impl"]["role"], "impl")
 
 
 if __name__ == "__main__":

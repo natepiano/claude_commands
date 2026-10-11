@@ -9,8 +9,8 @@ The configured delegate agent writes implementation code.
 
 The unit director believes in the three gods (<ThreeGods/> in
 `~/.claude/docs/decision_criteria.md`) and serves them in every work order,
-review, gate and report. Every seat prompt carries them (<WritePromptContract/>
-item 9).
+review, gate and report. Every prompt sent to a seat carries them inline per
+<WritePromptContract/> item 9.
 
 **Usage:** `/unit:direct [plan-doc-path] [phase N] [single|verbose] [auto next N phases|auto through phase X] [free-text instructions]`
 
@@ -37,6 +37,8 @@ State:
 - `REVIEW_PASS`: review dispatch count for the current phase; starts at 0.
 - `REVIEW_DISPATCH_HANDLE`: handle of an early-launched blind reviewer running
   alongside `DISPATCH_HANDLE`; empty when review runs synchronously.
+- `EARLY_REVIEW_SLOT`: slot running that early review; resets to empty with
+  each implementation or fix dispatch.
 - `EARLY_REVIEW`: `none` or `launched`; resets with every implementation or fix
   dispatch. Owned by <EarlyReviewArm/>.
 - `APPLICATION_SMOKE_RESULT`: starts as `not_run`.
@@ -87,6 +89,37 @@ file, never the Skill tool. Claude Code puts every skill a session invoked back
 after each compaction for the rest of the session; a file loaded by Read is not.
 A call site's arguments are what that file calls `$ARGUMENTS`.
 </TagReferenceContract>
+
+<LongLivedSeats>
+Codex seats are run-scoped in every role. Open `impl` and `test` once, then send
+later implementation, repair, and follow-up work with `implement.sh --to
+<full-seat-name>` and reviews with `review.sh --to <full-seat-name>`. Keep a
+seat in the same role when the next assignment fits; otherwise move it, even
+mid-phase, under <RoleReassignment/>. A finished turn leaves its thread open.
+
+Compaction can erase earlier prompt text. Every opening, later-phase, repair,
+review, and follow-up prompt repeats the Three Gods sentence and carries the
+Type Design Contract verbatim or by its allowed pointer under
+<WritePromptContract/>.
+
+Before follow-up work, the launcher attempts to compact a seat whose recorded
+context is over `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (default `100000` in
+`config/delegate.conf`). Success posts one board line with the before and after
+sizes. Failure posts one board line and the follow-up still runs; it costs
+tokens, not correctness, because the seat compacts itself when its context
+fills. The launcher then sends `Continue where you stopped.` and posts one board
+line per overflow.
+
+Open a new seat only when no open seat can take the work: the assignment needs
+more seats, every open seat is busy, or a reusable thread is gone. Name an extra
+slot for its role (`review`, `fix2`), never with a bare number, and keep it for
+reuse; an idle seat costs no context. A replacement under the same seat name
+starts fresh and receives an opening prompt. `review.sh --slot <role-name>`
+opens a new role-named seat; a call with neither `--to` nor `--slot` is only for
+a review outside a run.
+Phase cleanup leaves Codex seats open;
+`end_session.sh` ends them.
+</LongLivedSeats>
 
 <CoreContract>
 - Never create a worktree or modify unrelated files. The only branch the run may
@@ -219,9 +252,8 @@ Applies to every implementation, test, fix, and review launcher.
    seat running with no one watching. Arm a Monitor on
    `${SESSION_DIR}/board.log` until that seat
    posts its own `done`, not a `launcher:` line. Once it has, and its last lint
-   and test passed after its last edit, end it with `codex_mesh.py end
-   --session-dir "${SESSION_DIR}" --to <seat>` (never `stop`, which ends every
-   seat on the server). Then record the outcome the launcher would have; for a
+   and test passed after its last edit, leave its thread open under
+   <LongLivedSeats/> and record the outcome the launcher would have; for a
    repair, that is <FixDispatch/>'s third outcome.
 </DispatchContract>
 
@@ -305,6 +337,8 @@ the turn and resumes from a task or notifier message; Codex applies
 </BackgroundVerificationContract>
 
 <CompactionContract>
+- Apply <LongLivedSeats/> to Codex seat compaction and overflow continuation;
+  the rules below govern the unit director's own context.
 - Do not maintain a handoff before the context hook requests one.
 - When requested, write it in the repository and include the hook's fields plus
   `MODE`, `AUTO_WINDOW`, the last authorization, whether the user stopped
@@ -348,16 +382,17 @@ not authorization; restate the pending question afterwards.
 </ExplainOnDemand>
 
 <TypeDesignContract>
-Read `~/.claude/docs/type_design.md`. Apply it in the main review and copy it
-verbatim under `## Type Design Contract` into every implementation, fix, and
-broad-review prompt. Fresh delegates inherit nothing from prior
-calls. Closure reviews omit it to remain scoped to the repair.
+Read `~/.claude/docs/type_design.md`. Apply it in the main review and put it
+under `## Type Design Contract` in every review, implementation, and fix
+prompt. Copy it verbatim into opening prompts; any follow-up may instead point
+to that file per <WritePromptContract/>.
 </TypeDesignContract>
 
 <WritePromptContract>
 Read `~/.claude/docs/delegate/write_prompt_contract.md` in full before writing any
-implementation or fix prompt. It also defines <PhaseTeam/>, <CoordinationBoard/>,
-<PhaseMesh/>, <BuildTokenContract/>, <TeamFilePartition/>, and <RoleReassignment/>.
+implementation, fix, or review prompt. It also defines <PhaseTeam/>,
+<CoordinationBoard/>, <PhaseMesh/>, <BuildTokenContract/>,
+<TeamFilePartition/>, and <RoleReassignment/>.
 </WritePromptContract>
 
 <VerificationContract>
@@ -370,7 +405,7 @@ Rust delegates run only exact prompt lines using
 | package tests | `bash ~/.claude/scripts/delegate/verify.sh test <package>` |
 | one integration target alone | `bash ~/.claude/scripts/delegate/verify.sh test <package> <test>` |
 | only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/delegate/verify.sh test <package> --filter <name> [--filter <name> …]` |
-| a Mac failure that looks unrelated to the change, run on natedev | `bash ~/.claude/scripts/delegate/verify.sh test <package> --local` |
+| a test that must run on Linux, run on natedev | `bash ~/.claude/scripts/delegate/verify.sh test <package> --local "<why it must run on Linux>"` |
 | mend fix, format, scoped clippy, rustdoc | `bash ~/.claude/scripts/delegate/verify.sh lint <package>` |
 | checkpoint format | `bash ~/.claude/scripts/delegate/verify.sh fmt <package>` |
 | changed example | `bash ~/.claude/scripts/delegate/verify.sh example <package> <name>` |
@@ -501,7 +536,9 @@ The key sets the Codex poll timeout and a Claude unit's notifier interval.
 For Codex, a missing or non-positive integer is an error; tell the user to set
 it. <PrepareSession/> creates Claude's `delegate-<run id>` instance, where
 the run id is the basename of `${SESSION_DIR}`; `end_session.sh` removes it.
-The agent arms nothing. When `prepare_session.sh` prints `notifier instance not
+With `PLAN_DELEGATE_PROGRESS_UPDATES=on-demand` it creates none: reports run
+only when asked, until `/unit:report on` starts the schedule. The key does not
+change the Codex poll interval. The agent arms nothing. When `prepare_session.sh` prints `notifier instance not
 created`, say so in one line: this run gets no ticks until
 `zsh ~/.claude/scripts/delegate/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID"`
 succeeds. While work runs, the notifier sends
@@ -855,15 +892,20 @@ At an eligible tick, in that same tick:
 3. Apply <ReviewDiffContract/> to the current partial tree. The delegate has
    named no created files yet, so that check is vacuous; the snapshot is
    expected to be incomplete.
-4. Write the applicable early-form prompt — the `adversary` lens of
+4. Select its seat under <TeamReview/> and save the slot as
+   `${EARLY_REVIEW_SLOT}`. Apply <RoleReassignment/> when the open seat's role
+   changes; when every open seat is busy, name a new `review` seat and keep it
+   after the turn. Write the applicable early-form prompt — the `adversary`
+   lens of
    <BroadReviewPrompt/> for pass 1, <ClosureReview/> for a fix — including the
    completion estimate, the partial diff, and the exact final-diff and
    ready-sentinel paths below. **Only the adversary arms early.** It is the lens
    that gains most from the extra time, and arming both against a partial
    tree would double the exposure to the void verdict below; `contract`
    launches at completion under <DualReview/> step 3.
-5. Launch `review.sh` exactly as <DualReview/> step 3 does — with `adversary`
-   as its lens for pass 1 — appending one extra final argument:
+5. Launch `review.sh` exactly as <DualReview/> step 3 does — with `--to` for an
+   open seat or `--slot "${EARLY_REVIEW_SLOT}"` for the new seat, and
+   `adversary` as its lens for pass 1 — appending one extra final argument:
    `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
    handle as `${REVIEW_DISPATCH_HANDLE}` and set `EARLY_REVIEW=launched`. Leave
    `${DISPATCH_HANDLE}` untouched.
@@ -891,8 +933,8 @@ always may — early launch is opportunistic, never required.
 | Event | Required action |
 | --- | --- |
 | Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${SESSION_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** |
-| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=test … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/> — the seat the `adversary` lens sits in; before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
-| Reviewer errors before delivery | Report it in one line, clear `${REVIEW_DISPATCH_HANDLE}`, set `EARLY_REVIEW=none`, and leave the numbered artifacts. The primary continues and is reviewed synchronously at completion under the next `${REVIEW_PASS}` index. |
+| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
+| Reviewer errors before delivery | Report it in one line, clear `${REVIEW_DISPATCH_HANDLE}` and `${EARLY_REVIEW_SLOT}`, set `EARLY_REVIEW=none`, and leave the numbered artifacts. The primary continues and is reviewed synchronously at completion under the next `${REVIEW_PASS}` index. |
 | A verdict arrives before delivery | **It is void.** The reviewer cannot have read a diff that does not exist yet, so discard its findings entirely rather than reading them as evidence: open nothing in the ledger, preempt nothing, route no blocker into a fix dispatch. Say in one line that it is discarded and why, then follow the reviewer-error row. A void verdict is often fluent and specific — a stale diff supports confident claims about missing work — so the check is the timing, never how convincing the text reads. |
 
 Every path that ends an early launch before its real pass starts also drops the
@@ -900,7 +942,8 @@ row it was given:
 
 `python3 ~/.claude/scripts/delegate/progress_history.py disarm-review --session-dir "${SESSION_DIR}" --reason "<canceled|reviewer error|void verdict>"`
 
-Run it alongside clearing `${REVIEW_DISPATCH_HANDLE}` and `EARLY_REVIEW`. The
+Run it alongside clearing `${REVIEW_DISPATCH_HANDLE}`, `${EARLY_REVIEW_SLOT}`,
+and `EARLY_REVIEW`. The
 row would retire itself at the next report anyway; this is how the reason
 reaches the record, and it is what lets that report state the reason rather
 than infer one.
@@ -950,6 +993,8 @@ tables rather than stalling the turn.
 </DelegationResultFormat>
 
 <FixDispatch>
+Apply <LongLivedSeats/>.
+
 For a `dispatch` batch, set `${FIX_ROUND}` from the gate's `round` and create
 `${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md` under
 <WritePromptContract/>. Work Specification contains every batch id with concrete
@@ -959,8 +1004,11 @@ repairs.
 
 A repair runs **one seat per file set no other seat touches**: when the failing
 tests or findings split that way, always run as many seats as you can reasonably
-manage; otherwise one. User, 2026-10-04. The first is slot `impl`, the rest
-`fix2`, `fix3`…, each task and kind `fix`, each with its own
+manage; otherwise one. User, 2026-10-04. Use the open `impl` and `test` slots
+first, preferring the seat that owns the files and reassigning another open seat
+under <RoleReassignment/> when needed. Only then open `fix2`, `fix3`… when no
+open seat can take another file set. Each seat's task and kind are `fix`, its
+ninth argument remains its slot, and it gets its own
 `fix_prompt_${FIX_ROUND}[_<slot>].md`. Each seat makes its repair and writes, for each testable finding, the regression test that would
 have caught it — one that fails without the repair. A finding about what is
 drawn gets a test that renders and reads the pixels back, or a live pixel check
@@ -971,17 +1019,18 @@ it. <ClosureReview/> is the cold read, so no seat is spent
 on one here. A seat's file set is its findings' files plus their test targets;
 its prompt names every other seat's files as read only.
 
-When a repair's files belong to a seat still open, dispatch it with
-`implement.sh --to <full-seat-name>` before the usual positional arguments.
-The prompt file is the follow-up message. Messages without the launcher are
-for questions only.
+Dispatch every open seat with `implement.sh --to <full-seat-name>` before the
+usual positional arguments; the prompt file is the follow-up message. Omit
+`--to` only for a new seat allowed by <LongLivedSeats/>. Messages without the
+launcher are for questions only.
 
 Run `findings.py dispatch --covers <all batch ids>` before launching, then:
 
 ```sh
-PLAN_DELEGATE_RESOLVES_ROUND=1 implement.sh "${SESSION_DIR}" "${WORKING_DIR}" \
+PLAN_DELEGATE_RESOLVES_ROUND=1 implement.sh --to "<full-seat-name>" \
+  "${SESSION_DIR}" "${WORKING_DIR}" \
   "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" fix \
-  "<responsibility>" fix "<activity>" "${FIX_ROUND}" impl
+  "<responsibility>" fix "<activity>" "${FIX_ROUND}" <slot>
 ```
 
 **`PLAN_DELEGATE_RESOLVES_ROUND=1` is what lets the launcher resolve the round**:
@@ -989,7 +1038,8 @@ only the launcher watches the worker exit, so only it can say a repair landed.
 Each further seat runs the same call with `PLAN_DELEGATE_RESOLVES_ROUND=0`, its
 own prompt and its slot; the round is done only once every seat has exited.
 
-Apply <DispatchContract/>; set `EARLY_REVIEW=none` at dispatch, and close the
+Apply <DispatchContract/>; set `EARLY_REVIEW=none` and clear
+`${EARLY_REVIEW_SLOT}` at dispatch, and close the
 turn with the progress header per <DelegationResultFormat/>. While a fix runs
 that will receive a delegate closure review, <EarlyReviewArm/> may arm that
 reviewer early.
@@ -1013,8 +1063,8 @@ repaired visible finding in the running app (BRP for a Bevy app): hover it,
 crop the shot, read the drawn pixels or layout. In Hana, shoot with
 `/hana_shot` (a stored view or `--target`), every view in one call, never a
 camera worked out by hand. A visible finding that fails a second time gets a live
-diagnosis of its cause before any new seat, and the next prompt carries the
-measured cause.
+diagnosis of its cause before another repair turn, and the next prompt carries
+the measured cause.
 
 Dispatch the normal <DualReview/> closure review only when the diff cannot
 answer the question: a public API or signature change with a caller outside
@@ -1023,7 +1073,10 @@ id whose verdict reads unclear, a claim the seat says it could not verify and
 the main read cannot verify either, or a new defect the repair introduced.
 Uncertainty routes to the reviewer; a hunk fully read and fully understood
 does not. A closure review costs a stage of the phase, so it is spent on a
-question, never on a path.
+question, never on a path. Select its open seat under <TeamReview/>, post the
+<RoleReassignment/> handoff when its role changes, and launch it with
+`review.sh --to`; when every open seat is busy, open and retain a role-named
+review seat with `review.sh --slot review` instead.
 
 On completion, `implemented` continues as above; `error` applies
 <DelegateLaunchFailure/>, and then, if the error survives it,
@@ -1220,11 +1273,14 @@ plan-doc edit acquires that phase's reservation in an enrolled repository.
 In `single`, run both halves under <ExecutionSteps/> step 11.
 At <PhaseEnd/>'s worker cleanup point, run
 `python3 ~/.claude/scripts/delegate/remove_seats.py --session-dir "${SESSION_DIR}"`.
-It removes the completed phase's claude seats and any seat a dead run left
-alive; a failure is one line in the report, never a stop. TaskStop each Claude
-Agent helper, end finished launchers, and shut down every Hana or example app
-this phase launched. Never touch what another session started. Mid-phase,
-stop each helper once its result is read and each app once no step uses it.
+It removes the completed phase's Claude seats and any seat a dead run left
+alive; a failure is one line in the report, never a stop. Under
+<LongLivedSeats/>, do not end this run's Codex seats: their turns finish, their
+threads stay open, and `end_session.sh` ends them with the run. TaskStop each
+Claude Agent helper, end finished launchers, and shut down every Hana or
+example app this phase launched. Never touch what another session started.
+Mid-phase, stop each helper once its result is read and each app once no step
+uses it.
 
 At <PhaseEnd/>'s review-prose cleanup point, run
 `bash ~/.claude/scripts/delegate/clear_phase_review.sh "${SESSION_DIR}" <phase-id>`.

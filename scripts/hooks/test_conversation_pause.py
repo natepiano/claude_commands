@@ -298,7 +298,12 @@ print("SENT: delivered")
         instances: tuple[str, ...] = (),
         footers: tuple[str, ...] = (),
         session_id: str = SESSION,
+        scheduled: bool = True,
     ) -> Path:
+        # A paused item is one whose schedule still exists; `scheduled=False` writes a record
+        # naming schedules removed since, as switching a production to on demand does.
+        for name in (*instances, *(f"showrunner-{slug}" for slug in footers)) if scheduled else ():
+            (self.notifier_root / name).mkdir(exist_ok=True)
         self.pause_root.mkdir(parents=True, exist_ok=True)
         path = self.pause_root / f"{session_id}.json"
         _ = path.write_text(json.dumps({
@@ -475,7 +480,6 @@ print("SENT: delivered")
             "/unit:report",
             "/compact",
             "From the user (via the showrunner): go on",
-            '<agent-message from="a1">done</agent-message>',
             '<pasted_content id="1">code</pasted_content> why?',
             "<div> why",
         )
@@ -516,6 +520,7 @@ print("SENT: delivered")
         for prompt in (
             "<task-notification>done</task-notification>",
             "<system-reminder>remember</system-reminder>",
+            '<agent-message from="a1">done</agent-message>',
             "",
         ):
             with self.subTest(prompt=prompt):
@@ -823,6 +828,22 @@ print("SENT: delivered")
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
         self.assertFalse((self.escalate_root / "typed").exists())
 
+    def test_subagent_hand_back_does_not_pause_reports(self) -> None:
+        instance = self.create_instance("showrunner-demo")
+        hand_back = (
+            '<agent-message from="a715bbb613f1bc07c">\n'
+            "[Subagent hand-back] fixed the recorder</agent-message>"
+        )
+        for prompt in (hand_back, f"Another Claude session sent a message:\n{hand_back}"):
+            with self.subTest(prompt=prompt):
+                result = self.run_prompt(prompt)
+                self.assertEqual(
+                    (result.returncode, result.stdout, result.stderr), (0, "", "")
+                )
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
+        self.assertFalse((self.escalate_root / "typed").exists())
+
     def test_recorded_scheduled_prompt_does_not_pause_but_different_prompt_does(self) -> None:
         instance = self.create_instance("delegate-abc")
         recorded = self.run_stop(
@@ -1030,7 +1051,7 @@ print("SENT: delivered")
         record_path = self.write_record(
             {"kind": "replying", "user_wrote_at": 1},
             instances=("showrunner-demo", "delegate-gone"),
-            footers=("demo",),
+            footers=("demo",), scheduled=False,
         )
         result = self.run_cli("resume")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1236,6 +1257,16 @@ print("SENT: delivered")
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
 
+    def test_tick_asks_nothing_when_no_paused_schedule_still_exists(self) -> None:
+        path = self.write_record(
+            {"kind": "quiet", "user_wrote_at": 10, "reply_ended_at": 100},
+            instances=("showrunner-example",), footers=("example",), scheduled=False,
+        )
+        result = self.run_cli("tick", now=1_000)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(path.exists())
+        self.assertEqual(self.calls(self.send_log), [])
+
     def test_tick_waits_for_fifteen_quiet_minutes_and_sends_question_once(self) -> None:
         _ = self.write_record(
             {"kind": "quiet", "user_wrote_at": 10, "reply_ended_at": 100},
@@ -1305,7 +1336,7 @@ print("SENT: delivered")
 
     def test_delivered_question_records_delivery_time(self) -> None:
         _ = self.create_instance("conversation-pause", run="tick")
-        _ = self.write_record({"kind": "question_pending", "due_at": 100})
+        _ = self.write_record({"kind": "question_pending", "due_at": 100}, instances=("delegate-abc",))
         result = self.run_cli("tick", now=170)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.record()["phase"], asked_not_read(170))
@@ -1475,10 +1506,12 @@ print("SENT: delivered")
         send.chmod(0o755)
         _ = self.create_instance("conversation-pause", run="tick")
         _ = self.write_record(
-            {"kind": "question_pending", "due_at": 100}, session_id="a-session"
+            {"kind": "question_pending", "due_at": 100}, session_id="a-session",
+            instances=("delegate-abc",),
         )
         second = self.write_record(
-            {"kind": "question_pending", "due_at": 100}, session_id="b-session"
+            {"kind": "question_pending", "due_at": 100}, session_id="b-session",
+            instances=("delegate-abc",),
         )
         result = self.run_cli(
             "tick",
@@ -2236,7 +2269,7 @@ print("SENT: delivered")
     def test_yes_with_nothing_left_to_turn_on_reads_as_a_full_sentence(self) -> None:
         _ = self.write_record(
             asked_read(100, 1),
-            instances=("delegate-gone",),
+            instances=("delegate-gone",), scheduled=False,
         )
         reply = self.parsed_reply(self.run_prompt("yes", now=200))
         self.assertEqual(reply["systemMessage"], "Automatic updates are back on.")

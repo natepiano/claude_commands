@@ -10,7 +10,7 @@ A phase table shows one unit's current phase with its ETA, and every plan phase 
 
 | File | Role |
 | --- | --- |
-| `scripts/delegate/phase_table.py` | Builds a `PhaseRecord` from run events, renders it as Markdown or JSON, and writes, moves and prunes the notes. It writes no event. |
+| `scripts/delegate/phase_table.py` | Builds a `PhaseRecord` from run events, renders it as Markdown or JSON, and writes, moves and archives the notes. It writes no event. |
 | `scripts/delegate/progress_history.py` | The recorder: the `eta` command, the `eta_stated` event, the note hook, and the public readers the table uses. |
 | `scripts/production/dailies_input.py` | Calls `prune` and `show --production-doc` once per build and fills each unit's start and ETA from its record. |
 | `commands/unit/report.md`, `commands/unit/eta.md`, `commands/unit/eta_breakdown.md` | Where a unit reports progress and records a stated ETA. |
@@ -21,6 +21,7 @@ phase_table.py show    --session-dir <dir> [--zone <IANA>] [--json]
 phase_table.py show    --production-doc <doc> --json
 phase_table.py refresh --session-dir <dir>
 phase_table.py prune   --production-doc <doc>
+phase_table.py archive --production-doc <doc>
 progress_history.py eta --session-dir <dir> --time <YYYY-MM-DDTHH:MM> [--earliest <YYYY-MM-DDTHH:MM> --latest <YYYY-MM-DDTHH:MM>] --basis <text>
 ```
 
@@ -36,6 +37,7 @@ show(session_dir: Path, zone: ZoneInfo, json_output: bool = False) -> str
 show_production(production_doc: Path) -> str
 refresh(session_dir: Path) -> None
 prune(production_doc: Path) -> None
+archive(production_doc: Path) -> list[Path]
 
 PhaseRecord(plan: Path, updated: datetime,
             current: OpenPhase | NoOpenPhase,
@@ -45,6 +47,7 @@ OpenPhase(phase, title, started,
           progress: ReportedPhaseProgress | PhaseProgressNotReported,
           eta: StatedEta | ProjectedEta | EtaUnavailable,
           first_stated: FirstStatedEtaTarget | EtaNeverStated)
+FirstStatedEtaTarget(time, repair_rounds)
 DonePhase(phase, title, times: CompletedPhaseTiming | PhaseTimingNotRecorded)
 TodoPhase(phase, title, times: PredictedPhaseTiming | PhaseTimingNotPredicted)
 StatedEta(time, range: EtaRange | NoEtaRange, stated_at, basis)
@@ -58,7 +61,7 @@ Every state is a named `NamedTuple`. Times are aware `datetime`s, and `None` app
 - **Matching.** A recorded phase instance attaches to a plan row by its recorded title (casefold, backticks removed, whitespace collapsed) when exactly one row has that title, else by phase id, across every run of the plan.
 - **Done row.** Its times come from the title family of its last completed instance, last by write order: the family's earliest start, that instance's finish, and the family's summed `phase_elapsed_seconds`. A todo row never shows recorded times.
 - **Open phase.** The newest instance with a `phase_started` and no `phase_finished` in the plan's newest run, unless that run has a `run_finished` event. A `phase_finished` of any status closes its instance, and an unfinished instance in an older run is not open. The open row's `started` is the earliest start among the open instance and the earlier instances of that plan row with the same recorded title. An open phase that matches no plan row shows in the heading line and marks no row running.
-- **ETA.** The instance's last `eta_stated` while its `eta_at` is later than the current time, even when a progress report came after it. Otherwise the projection from its last `progress_reported` event: the report's time plus `progress_history.eta_band_seconds(phase_percent, elapsed, spread)`, with `as_of` the report's time; none exists at 0% or 100%, or with no elapsed time. Otherwise `EtaUnavailable`. A new phase starts with no stated ETA. `FirstStatedEtaTarget(time)` is the `eta_at` of the instance's first `eta_stated` event: the time first promised, not the moment of the statement. It holds across a restatement and after the ETA passes.
+- **ETA.** The instance's last `eta_stated` while its `eta_at` is later than the current time, even when a progress report came after it. Otherwise the projection from its last `progress_reported` event: the report's time plus `progress_history.eta_band_seconds(phase_percent, elapsed, spread)`, with `as_of` the report's time; none exists at 0% or 100%, or with no elapsed time. Otherwise `EtaUnavailable`. A new phase starts with no stated ETA. `FirstStatedEtaTarget(time, repair_rounds)` holds the `eta_at` of the instance's first valid `eta_stated` event and the count of repair rounds started strictly after that event's `timestamp_epoch`. A repair round is a `fix_pass` of 1 or more on the instance's `pass_started` events, starts at the earliest such event for that number, and counts once across seats; round 0 and rounds that started before the statement do not count. The state holds across a restatement and after the ETA passes.
 - **Predictions.** The typical duration is the median `seconds` of the completed done rows, else the open phase's ETA minus its start. The gap is the median seconds from a `completed` finish to the next `phase_started` in the same run, 0 with no sample. The first todo row starts one gap after the open phase's ETA of either source; with no ETA, one gap after the later of the current time and the open start plus the typical duration; with no open phase, at the current time. Each later row starts one gap after the row before it finishes, and finishes one typical duration later. With no typical duration every todo row is `PhaseTimingNotPredicted`.
 - **Plan finish.** `FinishedAt` the latest recorded finish when every row is done and one has a recorded finish; `PredictedFinish` the latest of the open ETA and the predicted finishes while a row is unfinished; otherwise `UnknownFinish`.
 
@@ -90,10 +93,12 @@ Rows are in descending plan order. Times are `MM-DD HH:MM` in `zone`, the zone a
 
 ```text
 {plan, updated, plan_finish, current, phases}
-current      null, or {phase, of, title, started, percent, eta, first_stated_eta_target}
+current      null, or {phase, of, title, started, percent, eta, first_stated_eta_target, repair_rounds_since_first_stated_eta}
 current.eta  null, or {time, earliest, latest, source: "stated" | "projected", stated_at, basis, as_of}
 phases[]     {phase, title, status: "done" | "running" | "todo", start, finish, seconds}
 ```
+
+`current.repair_rounds_since_first_stated_eta` is the `FirstStatedEtaTarget`'s count when a first stated target exists, else `null`, and is present even when `current.eta` is `null`. The Markdown shows no count.
 
 `show --production-doc` prints one object keyed by unit id, with an entry for every live Units row (`add_unit.live_unit_table`). Each entry is that unit's record or `{"unavailable": "<reason>"}`. `ProductionUnitPlan(unit, plan)` takes the path from the Plan cell (`cell_value(cell).split(" ", 1)[0]`), resolved against the Worktree cell when relative.
 
@@ -105,7 +110,9 @@ phases[]     {phase, title, status: "done" | "running" | "todo", start, finish, 
 - **Name.** `unit_lookup.marked_units(slug)[unit].claude.name` when that is a `LiveClaude` with a name; in every other case the unit id. `/` and NUL become `-`, and leading `.` characters are dropped.
 - **Content.** Frontmatter of exactly three keys in this order (`phase_table: true`, `production: <slug>`, `unit: <unit id>`), then `# <file name>`, then `render(record, zone)`. `NoteOwnership(production, unit)` is those keys; a later refresh recognises this unit's own notes by them.
 - **Publication.** A temp file in the target's directory, mode `0o644`. A target that carries this unit's keys is replaced with `os.replace`. A first write is published with `os.link`, so a file that appears at the target meanwhile is refused with `phase note appeared before publication: <path>`. A target with other keys or none is refused with `phase note target is not owned by <slug>/<unit>: <path>` and left unchanged. Before the write, when the vault root sits inside a Git checkout, `refresh` appends the vault root's path inside that checkout plus `/` (`showrunners/` for the default vault) to the checkout's `info/exclude`, once.
-- **Moves and `prune`.** After the write, every other `*.md` under `<vault root>/*/` with the same ownership is removed, with its folder when that leaves it empty; a renamed unit session or showrunner moves the note by this rule. `prune` removes every owned note under `<vault root>/*/` whose `production` is the doc's slug and whose `unit` is not a live Units row, with each folder it leaves empty.
+- **Archive.** `_archive_note(candidate, vault_root, slug)` moves one owned note to `<vault>/archive/<showrunner folder>/<slug>/<name>.md`, where `<vault>` is the vault root's parent, outside the excluded `showrunners/` folder, so the vault's auto-commit records it. The move is `os.link` then `unlink`. An existing target is never replaced: the next archive uses `<stem>-2.md`, then `<stem>-3.md`, and so on. An `OSError` from the `mkdir`, the link or the unlink is a `Refusal` (`cannot archive phase note <path>: <reason>`), and a failed unlink removes the new link first. A showrunner folder the move leaves empty is removed. Its placement keeps archived notes out of every live-note scan.
+- **`archive`.** Archives every owned note whose `production` is the doc's slug, live or retired unit alike; hand-written notes and other productions' notes stay. It prints one archived path per line and exits 0 also when nothing moved; a vault root whose parent does not exist archives nothing. `production_lifecycle.py wrap` runs it.
+- **Moves and `prune`.** After the write, every other `*.md` under `<vault root>/*/` with the same ownership is removed, with its folder when that leaves it empty; a renamed unit session or showrunner moves the note by this rule. `prune` archives every owned note under `<vault root>/*/` whose `production` is the doc's slug and whose `unit` is not a live Units row, removing each folder it leaves empty.
 
 ### Recorder side
 
@@ -137,9 +144,10 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - **Order.** `run` calls `prune_phase_tables` between `read_production` and `units_from_doc`, its one write before its checks, then `phase_tables` once. Record times are converted to `Production.zone`.
 - **Which units.** A unit is record-backed when its open phase id is all digits, that phase has a `running` row in `phases`, and its number equals the one in the judgment's phase text (`judgment_phase_number`, `^Phase (\d+) of \d+: `). The record fills an absent `started`, and the ETA unless the judgment's `eta` holds `time` or `none`. Every other unit keeps the status-capture path (`eta_state`, `eta_value`).
 - **State.** `record_eta_state` returns `EtaFresh | EtaStale | EtaPassed | EtaNone` in this order: no ETA and no first target is `EtaNone`; no ETA with a first target is `EtaPassed`; held, unchanged and not already requested is `EtaFresh`; a target at or before the build time is `EtaPassed`; a source time (`stated_at` or `as_of`) over one hour old is `EtaStale`; else `EtaFresh`. It keeps the `eta_seen.json` record under `<unit>|<phase text>` with `text` as the target in `YYYY-MM-DDTHH:MM`. A record whose `text` has another form came from a screen capture and is adopted with its `first_seen` and `requested`.
-- **Value.** `record_eta_value` writes `time` as `record_clock` gives it (`HH:MM`, with `+N` when the target falls N days after the build's date), `stated`, the range, `percent` (the reported percent or `null`), `first` when the record holds a first stated target, and `why`: a stated ETA's `basis` with whitespace collapsed, or `it is now projected from <N>% done`. The judgment's own `eta` fields overwrite these, and a stale ETA gets `detail: set HH:MM` when the judgment gave none.
+- **Value.** `record_eta_value` writes `time` as `record_clock` gives it (`HH:MM`, with `+N` when the target falls N days after the build's date), `stated`, the range, `percent` (the reported percent or `null`), `first` and `fixes` when the record holds a first stated target, and `why`: a stated ETA's `basis` with whitespace collapsed, or `it is now projected from <N>% done`. The judgment's own `eta` fields overwrite these, and a stale ETA gets `detail: set HH:MM` when the judgment gave none.
 - **Renderer fit.** `record_eta_stated` returns the anchor the renderer reads a bare clock against: the source minute, or the target's own minute when `parse_time(rendered_time, source)` would land elsewhere. `record_eta_range` writes `earliest` and `latest` only when the renderer's `parse_range_end` reads both back as the record's minutes; else `RecordEtaRangeOmitted` and neither end is written.
-- **Failure.** A failed or unparsable `show`, or a failed `prune`, prints `phase tables: unavailable — <reason>` and the build continues from the status capture.
+- **Repair rounds.** The builder's `FirstStatedEtaTarget(time, repair_rounds)` mirrors the record's. `unit_phase_state` reads `repair_rounds_since_first_stated_eta` only when the first target is not `null`, and requires an `int` (not a `bool`) of 0 or more; anything else raises `ValueError("<where>.current.repair_rounds_since_first_stated_eta: expected a whole number from 0")`. `EtaPassed`, `EtaNone` and an unavailable ETA carry no `fixes`.
+- **Failure.** A failed or unparsable `show`, a record that fails decoding, or a failed `prune` prints `phase tables: unavailable — <reason>` and the build continues from the status capture.
 
 ### Roots and overrides
 
@@ -158,7 +166,7 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - The events are the authority. The session state file supplies the plan path and nothing else; a phase in state with no `phase_started` event does not exist for the table.
 - Open means started and not finished in the events. It is never proof that the unit's session is alive, and each caller decides liveness: the dailies keep `StatusBlock.state` for it.
 - `refresh` never calls the recorder's CLI and never takes its session lock, which the recorder holds for the whole command the hook runs in.
-- A note is replaced or removed only when its frontmatter carries `phase_table: true`, a `production` and a `unit`. A hand-written file is never changed.
+- A note is moved, replaced or removed only when its frontmatter carries `phase_table: true`, a `production` and a `unit`. A hand-written file is never changed.
 - `_json_record` is the only JSON form, and nothing stores it. The first stated target has one place in it: `current.first_stated_eta_target`.
 - A state is a named type, never an optional field or a placeholder `datetime`.
 - Every time in a note and in the production JSON is in the production doc's **User zone**.
@@ -181,9 +189,12 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - `scripts/production/showrunners.py` reads its two directories once, at import. A test that runs `refresh` in a subprocess sets them in the child's environment; a test that calls `phase_table.main()` in process patches the module constants. `scripts/production/fake_showrunner.py` (`write_timer`, `write_session`) supplies the running showrunner a note needs.
 - `add_unit.py` imports its siblings by bare name, so `phase_table.py` puts `scripts/production` on `sys.path` before its `scripts.production` imports. The form type-checks with no ignore and runs from any working directory.
 - A vault on a file system without hard links refuses a note's first write with one line. A showrunner name of `.` or `..`, or one holding `/` or NUL, is refused.
-- Nothing removes the note of a production that has ended. A later unit that takes the same session name in the same folder under another production is refused at every report, because the target belongs to another unit.
+- `production_lifecycle.py wrap` archives every generated note owned by the production before marking its doc wrapped, so another production can reuse the session name and publish a fresh note.
+- The archive sits outside `showrunners/` so that no `vault_root.glob("*/*.md")` scan sees it; widening those globs would pull archived notes back into `refresh`, `prune` and `archive`. The `showrunners/` line in the vault's `info/exclude` is unanchored, so an archive path whose slug or showrunner folder is literally `showrunners` is ignored by Git too.
+- `refresh` deletes, not archives, the older copy of a moved unit's note; the newer note carries the same phases.
+- Repair-round starts go through `_moment` to datetimes, the representation of `stated_at`. A raw float epoch compared against the microsecond-rounded `stated_at` would count an equal-moment round as later.
 - The renderer reads a bare range end on the ETA's own day and moves it at most one day. An end more than a day from its ETA cannot be written, so both ends are left out.
-- `phase tables: unavailable` after a failed prune does not mean the records went unread. A live builder run prunes the real vault unless `PHASE_TABLE_VAULT` points elsewhere.
+- `phase tables: unavailable` after a failed prune does not mean the records went unread. A live builder run archives retired notes in the real vault unless `PHASE_TABLE_VAULT` points elsewhere.
 - The recorder's test suite takes two to four minutes (195 s measured); the table suite about six seconds.
 
 ## Why

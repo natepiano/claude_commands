@@ -125,6 +125,29 @@ class AgentNotesTests(unittest.TestCase):
         _ = apply([note], Report("Codex", email="a@example.com", credit_balance="null"), self.now)
         self.assertEqual(note.get("credit_balance"), "null")
 
+    def test_codex_reading_includes_numeric_credit_balance_from_the_note(self):
+        note = self.note("codex 1.md", "a@example.com", "credit_balance: 60498\n")
+        weekly = Quota("Weekly", 40, self.future)
+        _ = apply([note], Report("Codex", email="a@example.com", quotas=[weekly]), self.now)
+        records = [json.loads(line) for line in (self.root / "readings.jsonl").read_text().splitlines()]
+        self.assertEqual(records, [{
+            "account": "codex 1",
+            "at": self.now.isoformat(timespec="seconds"),
+            "remaining": 60,
+            "credits": 60498.0,
+        }])
+
+    def test_codex_reading_omits_absent_or_non_numeric_credit_balance(self):
+        absent = self.note("codex 1.md", "a@example.com")
+        unlimited = self.note("codex 2.md", "a@example.com", "credit_balance: unlimited\n")
+        weekly = Quota("Weekly", 40, self.future)
+        _ = apply([absent, unlimited], Report("Codex", email="a@example.com", quotas=[weekly]), self.now)
+        records = [json.loads(line) for line in (self.root / "readings.jsonl").read_text().splitlines()]
+        self.assertCountEqual(records, [
+            {"account": "codex 1", "at": self.now.isoformat(timespec="seconds"), "remaining": 60},
+            {"account": "codex 2", "at": self.now.isoformat(timespec="seconds"), "remaining": 60},
+        ])
+
     def test_claude_manual_reset_fields_are_preserved(self):
         note = self.note("claude 1.md", "a@example.com", "limit_reset: 2026-10-22\nlimit_reset_count: 1\n")
         _ = apply([note], Report("Claude", email="a@example.com"), self.now)

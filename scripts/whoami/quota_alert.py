@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Message configured sessions about weekly quota.
+"""Message configured sessions and the user about weekly quota.
 
 The receiver's protocol -- three notices, what each asks -- is ~/.claude/docs/quota_alerts.md.
 
@@ -13,6 +13,12 @@ once its account is known to be back above the threshold -- a used limit reset, 
 new window, another account made active -- and that sends "Quota restored:".
 /quota_refresh (`agent_notes.py refresh`) does the same at once when the user
 reports a reset, and says so even when the timer closed the episode first.
+
+Opening an episode also messages the user directly once. A failed user delivery
+stays due and the two-minute notes timer retries it; acknowledging the session
+alert does not suppress it. Codex refusing work sends a second direct message once
+per episode, retried only by another refusal after a failed delivery. Episodes
+created before direct delivery have no due marker and do not send old news.
 
 Reaching the threshold switches nothing, for either tool: a Codex account whose
 weekly allowance is used up may keep working on its credits, so its alert says to
@@ -33,9 +39,9 @@ except the one they did it in, found from this process's ancestry, so a session
 holding an alert learns it is settled without the user repeating it.
 
 Delivery goes through ~/.claude/scripts/message/send.py as the sender
-`quota_alert`; a recipient it cannot reach has the message queued there, the
-latest per alert. Messages carry note names, never logins: a recipient's inbox
-log can be committed.
+`quota_alert`; it reaches both sessions and the user's configured channel. A
+session it cannot reach has the message queued there, the latest per alert.
+Messages carry note names, never logins: a recipient's inbox log can be committed.
 """
 
 from __future__ import annotations
@@ -43,6 +49,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -51,7 +58,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import NamedTuple, NotRequired, Protocol, TypedDict, cast
+from typing import Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 # Direct script execution and unittest discovery import this as a top-level module.
@@ -86,11 +94,18 @@ KILL_GRACE = 10
 # The whole switch took 2 s of wall time when measured idle and 8 s at load average 87; each entry
 # switched back, 0.4 s idle.
 EDIT_TIMEOUT = 30
+USER_ZONE = ZoneInfo("America/Los_Angeles")
+
+Need = Literal["note", "decision", "blocked"]
 
 
 class Episode(TypedDict):
     since: str
     acknowledged: NotRequired[str]
+    # "due" until the first low-quota user message succeeds, then its UTC ISO time.
+    push: NotRequired[str]
+    # UTC ISO time of the successful Codex-refusal user message.
+    refusal_push: NotRequired[str]
     # Why the editor refused the switch to Claude this Codex episode opened with.
     switch_failed: NotRequired[str]
     # Recipient -> UTC ISO time of the last attempt, delivered or not.
@@ -138,6 +153,13 @@ class Job(NamedTuple):
     recipient: str
     text: str
     kind: str
+
+
+class UserPush(NamedTuple):
+    name: str
+    summary: str
+    text: str
+    need: Need
 
 
 def load_config() -> Config:
@@ -361,6 +383,45 @@ def credit_line(note: AgentNote) -> str:
         return f"No credit balance is reported for {name}."
 
 
+def user_time(stamp: str | None) -> str:
+    """A machine-local note time rendered in the user's zone."""
+    try:
+        return datetime.fromisoformat(stamp or "").astimezone(USER_ZONE).strftime("%a %m-%d %H:%M %Z")
+    except ValueError:
+        return "an unknown time"
+
+
+def run_out_push(note: AgentNote) -> UserPush:
+    """The one direct user message sent when this account's episode opens."""
+    name = note.path.stem
+    first = f"{name} has {percent(note)} of its weekly usage left; it refills {user_time(note.get('resets'))}."
+    if note.tool == "codex":
+        text = f"{first} Codex keeps working on its credits. {credit_line(note)}"
+        need: Need = "note"
+    else:
+        count = note.get("limit_reset_count")
+        resets = f" ({count} available)" if count is not None and count != "null" else ""
+        text = f"{first} Log in to another Claude account, or redeem a limit reset{resets}."
+        need = "decision"
+    return UserPush(name, f"{name} weekly limit", text, need)
+
+
+def refusal_push(note: AgentNote, switch: Switch | None, failed: str | None, already: bool) -> UserPush:
+    """The one direct user message sent when Codex refuses this episode."""
+    if switch is not None:
+        verb = "had already moved" if already else "moved"
+        outcome = f"The automatic switch {verb} {', '.join(switch['moved'])} to Claude"
+    elif failed:
+        reason = re.sub(r"/\S+", "the account registry", failed)
+        outcome = f"The automatic switch to Claude failed: {reason}"
+    else:
+        outcome = "Nothing was on Codex, so the automatic switch moved nothing"
+    name = note.path.stem
+    text = (f"Codex refused work on {name}. {credit_line(note)} {outcome}; add credits or redeem a limit reset "
+            + "to bring Codex back.")
+    return UserPush(name, "Codex refused work", text, "decision")
+
+
 def instruction(tool: str, switch: Switch | None, failed: str | None) -> str:
     """What the alert asks of its recipient, given the switch to Claude made or refused."""
     refused = f"The automatic switch from {tool} to Claude failed: {failed} " if failed else ""
@@ -434,6 +495,20 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
     return " ".join((done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split())
 
 
+def tell_user(summary: str, text: str, need: Need) -> str | None:
+    """Deliver text directly to the user; None when it arrived, otherwise why not."""
+    command = [sys.executable, str(SEND), "--to", "user", "--from", "quota_alert", "--summary", summary,
+               "--need", need, "--timeout", str(RELAY_TIMEOUT - KILL_GRACE)]
+    try:
+        done = subprocess.run(command, input=text, capture_output=True, text=True, timeout=RELAY_TIMEOUT + 5,
+                              check=False)
+    except (subprocess.TimeoutExpired, OSError) as error:
+        return str(error)
+    if done.returncode == 0:
+        return None
+    return " ".join((done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split())
+
+
 def deliver(jobs: list[Job]) -> list[str | None]:
     """Relay every job in parallel; one error or None per job, in order.
 
@@ -467,6 +542,7 @@ def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
     threshold = config["threshold_percent"]
     repeat = timedelta(minutes=config["repeat_minutes"])
     jobs: list[Job] = []
+    pushes: list[UserPush] = []
     log: list[str] = []
     with state_file() as state:
         episodes = state["episodes"]
@@ -474,8 +550,10 @@ def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
         for note in low(notes, threshold):
             name = note.path.stem
             if name not in episodes:
-                episodes[name] = {"since": stamp, "last": {}}
+                episodes[name] = {"since": stamp, "push": "due", "last": {}}
             episode = episodes[name]
+            if episode.get("push") == "due":
+                pushes.append(run_out_push(note))
             if "acknowledged" in episode:
                 continue
             switch = state.get("switch") if note.tool == "codex" else None
@@ -494,7 +572,20 @@ def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
             text = restored_message(accounts, f"the {name} alert is closed", threshold,
                                     back if tool == "codex" else None)
             jobs += [Job(name, recipient, text, "restored") for recipient in recipients(config)]
-    return log + deliver_and_record(jobs, stamp)
+    with ThreadPoolExecutor() as pool:
+        relay_future = pool.submit(deliver_and_record, jobs, stamp)
+        push_futures = [pool.submit(tell_user, push.summary, push.text, push.need) for push in pushes]
+        push_errors = [future.result() for future in push_futures]
+        relay_log = relay_future.result()
+    if pushes:
+        with state_file() as state:
+            for push, error in zip(pushes, push_errors):
+                episode = state["episodes"].get(push.name)
+                if error is None and episode is not None and episode.get("push") == "due":
+                    episode["push"] = stamp
+                outcome = "sent" if error is None else f"not delivered: {error}"
+                log.append(f"quota push {push.name} -> user: {outcome}")
+    return log + relay_log
 
 
 def blocked(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
@@ -506,22 +597,43 @@ def blocked(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
     """
     stamp = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
     config = load_config()
+    text: str | None = None
     with state_file() as state:
         out = [note for note in low(notes, config["threshold_percent"]) if note.tool == "codex"]
         if not out:
             return ["codex refused work for quota, but no active codex account is at or under the threshold; "
                     + "nothing switched"]
-        if switch := state.get("switch"):
-            return [f"codex refused work for quota; its functions were already moved to claude at {switch['at']}"]
         note = out[0]
         name = note.path.stem
         episode = state["episodes"].setdefault(name, {"since": stamp, "last": {}})
-        _ = episode.pop("switch_failed", None)
-        log = [switch_to_claude(state, note, stamp)]
-        if "switch" not in state and "switch_failed" not in episode:
-            return log
-        text = message(note, notes, config, state.get("switch"), episode.get("switch_failed"))
-    return log + deliver_and_record([Job(name, recipient, text, "alert") for recipient in recipients(config)], stamp)
+        switch = state.get("switch")
+        already = switch is not None
+        if switch is not None:
+            log = [f"codex refused work for quota; its functions were already moved to claude at {switch['at']}"]
+        else:
+            _ = episode.pop("switch_failed", None)
+            log = [switch_to_claude(state, note, stamp)]
+            switch = state.get("switch")
+            if switch is not None or "switch_failed" in episode:
+                text = message(note, notes, config, switch, episode.get("switch_failed"))
+        push = (None if "refusal_push" in episode
+                else refusal_push(note, switch, episode.get("switch_failed"), already))
+    jobs = ([Job(name, recipient, text, "alert") for recipient in recipients(config)]
+            if text is not None else [])
+    with ThreadPoolExecutor() as pool:
+        relay_future = pool.submit(deliver_and_record, jobs, stamp)
+        push_future = pool.submit(tell_user, push.summary, push.text, push.need) if push is not None else None
+        error = push_future.result() if push_future is not None else None
+        relay_log = relay_future.result()
+    if push is not None:
+        if error is None:
+            with state_file() as state:
+                episode = state["episodes"].get(name)
+                if episode is not None and "refusal_push" not in episode:
+                    episode["refusal_push"] = stamp
+        outcome = "sent" if error is None else f"not delivered: {error}"
+        log.append(f"quota push {name} -> user: {outcome}")
+    return log + relay_log
 
 
 def refresh(notes: list[AgentNote], here: str | None, now: datetime | None = None) -> list[str]:

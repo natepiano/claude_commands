@@ -153,12 +153,16 @@ class MulAddHookTests(unittest.TestCase):
                 "    let _ = a * 0.5 + c;\n" * lines +
                 "}\n"
             )
-            started = time.perf_counter()
-            _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
-            timings.append(time.perf_counter() - started)
-            self.assertEqual(len(findings), lines)
-            self.assertEqual(findings[-1].line, lines + 1)
-        self.assertLess(timings[1], timings[0] * 7)
+            samples: list[float] = []
+            for _ in range(5):
+                started = time.perf_counter()
+                _, findings = mul_add_lib.float_mul_add_findings(self.rs_file)
+                samples.append(time.perf_counter() - started)
+                self.assertEqual(len(findings), lines)
+                self.assertEqual(findings[-1].line, lines + 1)
+            timings.append(min(samples))
+        # A linear scan is about 4× here, while a quadratic scan is about 16×.
+        self.assertLess(timings[1], timings[0] * 10)
 
     def test_source_without_product_skips_detector_import(self) -> None:
         _ = self.rs_file.write_text("fn sample() {\n" + "    let _ = 1.0;\n" * 248 + "}\n")
