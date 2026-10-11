@@ -257,7 +257,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 **Ruled out:** consolidating the readings path's three homes, since it reaches `seat_usage.py`, outside the accounts scripts.
 
-### Phase 4 — One-command swap of the unit account  · status: todo
+### Phase 4 — One-command swap of the unit account  · status: done
 
 #### Work Order
 

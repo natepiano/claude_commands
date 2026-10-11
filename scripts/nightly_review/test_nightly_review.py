@@ -230,7 +230,7 @@ class NightlyReviewTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_nightly_gate_uses_the_supplied_default_identity_for_the_whole_launch(self) -> None:
-        """F002: nightly does not independently resolve the default login after the snapshot."""
+        """Nightly does not independently resolve the default login after the snapshot."""
         (Path.home() / ".claude3").mkdir()
         selection = accounts.claude_account_selection()
         _ = (Path.home() / ".claude.json").write_text(json.dumps({
@@ -248,7 +248,7 @@ class NightlyReviewTests(unittest.TestCase):
         resolve.assert_called_once_with()
 
     def test_named_caller_and_tmux_server_cannot_select_the_nightly_account(self) -> None:
-        """F004: the guard and launched Claude both use the default account."""
+        """The guard and launched Claude both use the default account."""
         named = Path.home() / ".claude3"
         named.mkdir()
         binary = self.root / "bin"
@@ -306,7 +306,7 @@ class NightlyReviewTests(unittest.TestCase):
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", launched_environment)
 
     def test_unconfigured_nightly_launch_keeps_its_command_and_environment(self) -> None:
-        """F004: legacy launches retain the previous argv and inherited environment."""
+        """Legacy launches retain the previous argv and inherited environment."""
         inherited = {**os.environ, "CLAUDE_TEST_MARKER": "fixture"}
         with (
             mock.patch.dict(os.environ, inherited),

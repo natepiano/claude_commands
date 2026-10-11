@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import inventory
 import record
+import restart as restart_work
 import remote as remote_transport
 import settle
 import shutdown
@@ -325,6 +326,7 @@ class StopTests(unittest.TestCase):
                     os.environ,
                     {
                         **os.environ,
+                        "HOME": str(self.root),
                         "SHUTDOWN_STATE_DIR": str(self.state_root),
                         "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
                         "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
@@ -1168,6 +1170,152 @@ class StopTests(unittest.TestCase):
             ],
         )
 
+    def test_restart_retry_finishes_leftover_cleanup_before_automatic_resume(self) -> None:
+        for owner_present in (True, False):
+            with self.subTest(owner_present=owner_present), patch.dict(
+                os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / str(owner_present))}
+            ):
+                run_dir = str(self.root / "unit-run")
+                stored = unit("unit", 101, tmux_session="unit-exact", run_dirs=[run_dir])
+                owned_seat = seat("seat", 102, owner="unit")
+                current = shutdown_record([entry(stored), entry(owned_seat, "passive seat ready")])
+                current["then"] = "restart"
+                record.create(current)
+                inventories = FreshInventorySequence([
+                    machine_inventory([stored, owned_seat] if owner_present else []),
+                    machine_inventory([]),
+                ])
+                first = stop.stop(
+                    LOGIN,
+                    kill=lambda _pid, _signal: None,
+                    is_alive=lambda _pid: False,
+                    session_record_exists=lambda _pid: False,
+                    fresh_inventory=inventories,
+                    clock=lambda: NOW_UTC,
+                    codex_mesh=lambda _arguments: 1,
+                    tmux=lambda _arguments: 0,
+                    sleep=lambda _seconds: None,
+                )
+                self.assertEqual(first["record"]["state"], "stop partial")
+                self.assertEqual(len(first["record"]["entries"][0]["stop_issues"]), 2)
+                settle.retry_stop(LOGIN)
+                codex_calls: list[list[str]] = []
+                tmux_calls: list[list[str]] = []
+
+                def codex(arguments: list[str]) -> int:
+                    codex_calls.append(arguments)
+                    return 0
+
+                def tmux(arguments: list[str]) -> int:
+                    tmux_calls.append(arguments)
+                    return 1 if arguments[0] == "has-session" else 0
+
+                def finish(login: str, _reports: list[settle.RefreshReport]) -> tuple[list[stop.StopReport], list[record.OrchestrationStopIssue]]:
+                    stopped = stop.stop(
+                        login,
+                        kill=lambda _pid, _signal: self.fail("a stopped owner was signalled"),
+                        is_alive=lambda _pid: False,
+                        session_record_exists=lambda _pid: False,
+                        fresh_inventory=lambda _login, _scope: machine_inventory([]),
+                        clock=lambda: NOW_UTC,
+                        codex_mesh=codex,
+                        tmux=tmux,
+                        sleep=lambda _seconds: None,
+                    )
+                    return [stopped], []
+
+                def resume(login: str) -> int:
+                    self.assertEqual(login, LOGIN)
+                    completed = self.stored_record()
+                    self.assertEqual(completed["state"], "down")
+                    self.assertTrue(all(not item["stop_issues"] for item in completed["entries"]))
+                    return 0
+
+                with (
+                    patch.object(settle, "conduct_cycle", return_value=settle.ReadyToStop(kind="ready to stop", reports=[refresh_report(self.stored_record())])),
+                    patch.object(settle, "_stop_machines", side_effect=finish),
+                    patch.object(settle, "report_stop"),
+                    patch.object(restart_work, "up", side_effect=resume) as up,
+                ):
+                    self.assertEqual(shutdown.main(["conduct", LOGIN, "--here"]), 0)
+                up.assert_called_once_with(LOGIN)
+                self.assertEqual(codex_calls, [["stop", "--session-dir", run_dir]])
+                self.assertEqual(tmux_calls, [
+                    ["kill-session", "-t", "=unit-exact"],
+                    ["has-session", "-t", "=unit-exact"],
+                ])
+
+    def test_restart_retry_cleans_only_resources_still_unconfirmed(self) -> None:
+        run_dir = str(self.root / "leftover-run")
+        stored = unit("unit", 101, run_dirs=[str(self.root / "clean-run"), run_dir])
+        stopped = entry(stored)
+        stopped["progress"] = record.SessionStopped(kind="stopped", at=NOW)
+        stopped["stop_issues"] = [
+            record.CodexServerLeftRunning(kind="codex server left running", at=NOW, run_dir=run_dir, cause="stop not confirmed"),
+            record.UnitTmuxLeftRunning(kind="unit tmux session left running", at=NOW, tmux_session="tmux-unit", cause="stop not confirmed"),
+        ]
+        current = shutdown_record([stopped], state="stop partial")
+        current["then"] = "restart"
+        record.create(current)
+        codex_calls: list[list[str]] = []
+
+        def codex(arguments: list[str]) -> int:
+            codex_calls.append(arguments)
+            return 0
+
+        settle.retry_stop(LOGIN)
+        first = stop.stop(
+            LOGIN,
+            kill=lambda _pid, _signal: self.fail("a stopped owner was signalled"),
+            is_alive=lambda _pid: False,
+            session_record_exists=lambda _pid: False,
+            fresh_inventory=lambda _login, _scope: machine_inventory([]),
+            clock=lambda: NOW_UTC,
+            codex_mesh=codex,
+            tmux=lambda _arguments: 0,
+            sleep=lambda _seconds: None,
+        )
+        self.assertEqual(first["record"]["state"], "stop partial")
+        self.assertEqual([issue["kind"] for issue in first["record"]["entries"][0]["stop_issues"]], ["unit tmux session left running"])
+        self.assertEqual(codex_calls, [["stop", "--session-dir", run_dir]])
+        settle.retry_stop(LOGIN)
+        second = stop.stop(
+            LOGIN,
+            kill=lambda _pid, _signal: self.fail("a stopped owner was signalled"),
+            is_alive=lambda _pid: False,
+            session_record_exists=lambda _pid: False,
+            fresh_inventory=lambda _login, _scope: machine_inventory([]),
+            clock=lambda: NOW_UTC,
+            codex_mesh=lambda _arguments: self.fail("confirmed cleanup was repeated"),
+            tmux=lambda arguments: 1 if arguments[0] == "has-session" else 0,
+            sleep=lambda _seconds: None,
+        )
+        self.assertEqual(second["record"]["state"], "down")
+        self.assertEqual(second["record"]["entries"][0]["stop_issues"], [])
+
+    def test_stop_without_restart_does_not_retry_stopped_owner_cleanup(self) -> None:
+        stopped = entry(unit("unit", 101))
+        stopped["progress"] = record.SessionStopped(kind="stopped", at=NOW)
+        stopped["stop_issues"] = [record.UnitTmuxLeftRunning(
+            kind="unit tmux session left running", at=NOW,
+            tmux_session="tmux-unit", cause="stop not confirmed",
+        )]
+        current = shutdown_record([stopped])
+        record.create(current)
+        completed = stop.stop(
+            LOGIN,
+            kill=lambda _pid, _signal: self.fail("a stopped owner was signalled"),
+            is_alive=lambda _pid: False,
+            session_record_exists=lambda _pid: False,
+            fresh_inventory=lambda _login, _scope: machine_inventory([]),
+            clock=lambda: NOW_UTC,
+            codex_mesh=lambda _arguments: self.fail("legacy cleanup was repeated"),
+            tmux=lambda _arguments: self.fail("legacy cleanup was repeated"),
+            sleep=lambda _seconds: None,
+        )
+        self.assertEqual(completed["record"]["state"], "stop partial")
+        self.assertEqual(completed["record"]["entries"], current["entries"])
+
     def test_retry_repeats_cleanup_when_first_cleanup_dies_before_completion(
         self,
     ) -> None:
@@ -1520,6 +1668,120 @@ class StopTests(unittest.TestCase):
         )
 
         self.assertEqual(report["record"]["state"], "down")
+
+    def test_conduct_restarts_only_after_persisting_a_completed_stop(self) -> None:
+        current = shutdown_record([], state="settling")
+        current["then"] = "restart"
+        record.create(current)
+        events: list[str] = []
+
+        def finish(_login: str, _reports: list[settle.RefreshReport]) -> tuple[list[stop.StopReport], list[record.OrchestrationStopIssue]]:
+            def down(changing: ShutdownRecord) -> None:
+                changing["state"] = "down"
+            stopped = record.update(LOGIN, down)
+            events.append("down")
+            return [stop_report(stopped)], []
+
+        def resume(login: str) -> int:
+            self.assertEqual(login, LOGIN)
+            self.assertEqual(self.stored_record()["state"], "down")
+            events.append("restart")
+            return 0
+
+        with (
+            patch.object(settle, "conduct_cycle", return_value=settle.ReadyToStop(kind="ready to stop", reports=[refresh_report(current)])),
+            patch.object(settle, "_stop_machines", side_effect=finish),
+            patch.object(settle, "report_stop"),
+            patch.object(restart_work, "up", side_effect=resume) as up,
+        ):
+            self.assertEqual(shutdown.main(["conduct", LOGIN, "--here"]), 0)
+        up.assert_called_once_with(LOGIN)
+        self.assertEqual(events, ["down", "restart"])
+
+    def test_conduct_does_not_restart_cancelled_partial_or_unfinished_records(self) -> None:
+        for state in ("cancelled", "stop partial", "settling", "stopping"):
+            with self.subTest(state=state), patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / state)}):
+                current = shutdown_record([], state=cast(ShutdownState, state))
+                current["then"] = "restart"
+                record.create(current)
+                with patch.object(settle, "conduct", return_value=0), patch.object(restart_work, "up") as up, patch.object(restart_work, "restart") as restart:
+                    self.assertEqual(shutdown.main(["conduct", LOGIN, "--here"]), 0)
+                up.assert_not_called()
+                restart.assert_not_called()
+
+    def test_conduct_keeps_legacy_and_explicit_stop_records_down(self) -> None:
+        for explicit in (False, True):
+            with self.subTest(explicit=explicit), patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / str(explicit))}):
+                current = shutdown_record([], state="down")
+                if explicit:
+                    current["then"] = "stop"
+                record.create(current)
+                with patch.object(settle, "conduct", return_value=0), patch.object(restart_work, "up") as up:
+                    self.assertEqual(shutdown.main(["conduct", LOGIN, "--here"]), 0)
+                up.assert_not_called()
+
+    def test_conduct_requires_the_peer_to_be_down_before_restarting(self) -> None:
+        current = shutdown_record([], state="down")
+        current["then"] = "restart"
+        record.create(current)
+        peer = shutdown_record([], machine="Mac", state="stop partial")
+        peer["then"] = "restart"
+        with (
+            patch.object(settle, "conduct", return_value=0),
+            patch.object(shutdown, "run_remote", return_value=(0, json.dumps([peer]))) as remote,
+            patch.object(restart_work, "restart") as restart,
+        ):
+            self.assertEqual(shutdown.main(["conduct", LOGIN]), 0)
+        remote.assert_called_once_with(["records", "--json", "--here"])
+        restart.assert_not_called()
+
+    def test_conduct_restarts_both_completed_machine_records_by_login(self) -> None:
+        current = shutdown_record([], state="down")
+        current["then"] = "restart"
+        record.create(current)
+        peer = shutdown_record([], machine="Mac", state="down")
+        peer["then"] = "restart"
+        with (
+            patch.object(settle, "conduct", return_value=0),
+            patch.object(shutdown, "run_remote", return_value=(0, json.dumps([peer]))),
+            patch.object(restart_work, "restart", return_value=0) as restart,
+        ):
+            self.assertEqual(shutdown.main(["conduct", LOGIN]), 0)
+        restart.assert_called_once_with(
+            restart_work.AccountNamed(LOGIN), dry_run=False,
+            alerts=restart_work.AlertWhenNotBack(),
+        )
+
+    def test_conduct_alerts_when_peer_record_cannot_authorize_automatic_restart(self) -> None:
+        for code, output, reason in ((255, "", "unreachable"), (7, "refused", "unavailable"), (0, "invalid JSON", "unreadable")):
+            with self.subTest(reason=reason), patch.dict(
+                os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / reason)}
+            ):
+                current = shutdown_record([], state="down")
+                current["then"] = "restart"
+                record.create(current)
+                with (
+                    patch.object(settle, "conduct", return_value=0),
+                    patch.object(shutdown, "run_remote", return_value=(code, output)),
+                    patch.object(shutdown, "other_machine", return_value="Mac"),
+                    patch.object(settle, "_machine", return_value="natedev"),
+                    patch.object(settle, "alert_user") as alert,
+                    patch.object(restart_work, "restart") as restart,
+                    patch.object(restart_work, "up") as up,
+                ):
+                    self.assertEqual(shutdown.main(["conduct", LOGIN]), 0)
+                restart.assert_not_called()
+                up.assert_not_called()
+                alert.assert_called_once()
+                self.assertEqual(alert.call_args.args[0], current["scope"])
+                self.assertEqual(alert.call_args.args[1], f"{LABEL}: automatic restart skipped")
+                text = cast(str, cast(object, alert.call_args.args[2]))
+                resume = "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart 'claude 2'"
+                self.assertIn(reason, text)
+                self.assertIn(f"{LABEL} is down", text)
+                self.assertIn(resume, text.splitlines())
+                self.assertEqual(alert.call_args.args[3], ActionRequired(f"Run {resume}."))
+                self.assertEqual(self.stored_record(), current)
 
     def test_conduct_stops_other_machine_then_reports_to_requesting_session(
         self,

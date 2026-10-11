@@ -150,7 +150,7 @@ class AgentNotesTests(unittest.TestCase):
         self.assertEqual(len((self.root / "readings.jsonl").read_text().splitlines()), 2)
 
     def test_role_swap_during_update_keeps_one_unit_login_active(self) -> None:
-        """F002: every note uses the same role selection for the entire update."""
+        """Every note uses the same role selection for the entire update."""
         _ = self.account_dir("default", "main@example.com", "main-token")
         _ = self.account_dir("claude 1", "old-unit@example.com", "old-token")
         _ = self.account_dir("claude 3", "new-unit@example.com", "new-token")
@@ -180,7 +180,7 @@ class AgentNotesTests(unittest.TestCase):
         })
 
     def test_five_hour_watch_uses_the_default_directory_independent_of_report_order(self) -> None:
-        """F005: order, shared logins and missing emails cannot select the named reading."""
+        """Order, shared logins and missing emails cannot select the named reading."""
         default = self.account_dir("default", "shared@example.com", "main-token")
         named = self.account_dir("claude 3", "shared@example.com", "named-token")
         self.select_unit("claude 3")
@@ -200,7 +200,7 @@ class AgentNotesTests(unittest.TestCase):
             self.assertEqual(watched, [codex, main])
 
     def test_updater_and_alert_share_the_same_role_snapshot(self) -> None:
-        """F002: the timer entry point resolves roles once for writes and notices."""
+        """The timer entry point resolves roles once for writes and notices."""
         _ = self.account_dir("default", "main@example.com", "main-token")
         _ = self.account_dir("claude 3", "unit@example.com", "unit-token")
         self.select_unit("claude 3")
@@ -291,7 +291,7 @@ class AgentNotesTests(unittest.TestCase):
         self.assertNotIn("spare@example.com", output.getvalue())
 
     def test_whoami_filter_and_labels_share_one_role_selection_during_a_swap(self) -> None:
-        """F002: one display cannot switch unit accounts between filtering and rendering."""
+        """One display cannot switch unit accounts between filtering and rendering."""
         _ = self.account_dir("default", "main@example.com", "main-token")
         _ = self.account_dir("claude 1", "old-unit@example.com", "old-token")
         _ = self.account_dir("claude 3", "new-unit@example.com", "new-token")

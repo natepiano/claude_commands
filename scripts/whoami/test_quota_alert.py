@@ -233,7 +233,7 @@ class QuotaAlertTests(unittest.TestCase):
             self.assertNotIn("acknowledged", state["episodes"]["claude 2"])
 
     def test_acknowledgement_survives_spare_and_unit_role_changes_until_quota_recovers(self) -> None:
-        """F001: a role change does not close or rearm the same account's episode."""
+        """A role change does not close or rearm the same account's episode."""
         self.configure_claude_roles()
         unit = self.note("claude 3.md", "active", "0", login="unit@example.invalid")
         spare = self.note("claude 1.md", "inactive", "90", login="spare@example.invalid")
@@ -273,7 +273,7 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertEqual((len(self.sent), len(self.pushed)), (2, 1))
 
     def test_a_weekly_reset_closes_the_spare_accounts_acknowledged_episode(self) -> None:
-        """F001: an account's own reset ends its episode even while it is spare."""
+        """An account's own reset ends its episode even while it is spare."""
         self.configure_claude_roles()
         unit = self.note("claude 3.md", "active", "0", login="unit@example.invalid")
         _ = quota_alert.alert([unit], self.now)
@@ -289,7 +289,7 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertTrue(all(text.startswith("Quota restored: work on claude 3 can resume;") for _, text in self.sent))
 
     def test_one_alert_run_keeps_its_roles_when_a_swap_happens_during_rendering(self) -> None:
-        """F002: every message and spare comparison uses one role value."""
+        """Every message and spare comparison uses one role value."""
         self.configure_claude_roles()
         notes: Notes = [
             self.note("claude 2.md", "active", "0", login="showrunner@example.invalid"),
@@ -314,7 +314,7 @@ class QuotaAlertTests(unittest.TestCase):
             self.assertEqual(set(state["episodes"]), {"claude 2", "claude 3"})
 
     def test_alert_uses_the_updaters_role_value_without_resolving_again(self) -> None:
-        """F002: update and alert can share the same run's role value."""
+        """Update and alert can share the same run's role value."""
         self.configure_claude_roles()
         unit = self.note("claude 3.md", "active", "0", login="unit@example.invalid")
         roles = accounts.claude_account_selection()
@@ -324,7 +324,7 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertTrue(self.sent[0][1].startswith("Quota alert: claude 3 (unit directors)"))
 
     def test_refusal_uses_supplied_selection_without_resolving_again(self) -> None:
-        """F002: refusal notices accept the same run's frozen role value."""
+        """Refusal notices accept the same run's frozen role value."""
         self.configure_claude_roles()
         note = self.note("codex 1.md", "active", "0")
         roles = accounts.claude_account_selection()

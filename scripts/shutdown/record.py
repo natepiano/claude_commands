@@ -12,7 +12,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 from inventory import Session, parse_session
 from launch_permission import launch_barrier, shutdown_state_root
@@ -276,6 +276,9 @@ ShutdownState = Literal[
 ]
 
 
+ShutdownContinuation = Literal["stop", "restart"]
+
+
 class ShutdownRecord(TypedDict):
     login: str
     label: str
@@ -286,8 +289,14 @@ class ShutdownRecord(TypedDict):
     scope: ShutdownScope
     conductor: Conductor
     force: StopTiming
+    then: NotRequired[ShutdownContinuation]
     entries: list[ShutdownSessionEntry]
     stop_issues: list[OrchestrationStopIssue]
+
+
+def continuation(record: ShutdownRecord) -> ShutdownContinuation:
+    """Legacy records stop; an explicit restart survives conductor launches."""
+    return record.get("then", "stop")
 
 
 class LiveShutdownRecord(TypedDict):
@@ -663,6 +672,10 @@ def _record(value: object, place: str) -> ShutdownRecord:
     force = _string(_required(values, "force", place), f"{place}.force")
     if force not in {"wait for ready", "now"}:
         raise InvalidRecord(f"{place}.force is invalid")
+    if "then" in values:
+        next_action = _string(values["then"], f"{place}.then")
+        if next_action not in {"stop", "restart"}:
+            raise InvalidRecord(f"{place}.then is invalid")
     entry_values = _items(_required(values, "entries", place), f"{place}.entries")
     values["entries"] = [
         _entry(entry, f"{place}.entries[{index}]")

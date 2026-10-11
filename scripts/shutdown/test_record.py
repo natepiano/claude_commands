@@ -379,6 +379,35 @@ class RecordTests(unittest.TestCase):
                 self.assertNotIn("config_dir", restored)
                 self.assertEqual(restored["session"].get("config_dir"), config_dir)
 
+    def test_restart_continuation_round_trips_in_the_record(self) -> None:
+        for action in ("stop", "restart"):
+            with self.subTest(action=action):
+                live = shutdown_record()
+                live["then"] = action
+                record.create(live)
+                found = record.find_live(live["login"])
+                if found["kind"] != "live":
+                    self.fail("expected a live shutdown record")
+                self.assertEqual(record.continuation(found["record"]), action)
+                self.assertEqual(record.parse_records(json.dumps([live])), [live])
+                (self.root / "shutdown" / live["login"] / "record.json").unlink()
+
+    def test_legacy_record_stops_without_changing_its_wire_shape(self) -> None:
+        live = shutdown_record()
+        restored = record.parse_records(json.dumps([live]))[0]
+        self.assertEqual(record.continuation(restored), "stop")
+        self.assertEqual(restored, live)
+        self.assertNotIn("then", restored)
+
+    def test_record_rejects_unknown_or_non_string_continuations(self) -> None:
+        for action in ("launch", "", 1, None, {"kind": "restart"}):
+            with self.subTest(action=action):
+                live = shutdown_record()
+                values = cast(dict[str, object], cast(object, live))
+                values["then"] = action
+                with self.assertRaisesRegex(record.InvalidRecord, r"records\[0\]\.then"):
+                    _ = record.parse_records(json.dumps([live]))
+
     def test_every_record_variant_round_trips(self) -> None:
         progresses: list[record.SessionProgress] = [
             record.SessionWaiting(kind="waiting"),
