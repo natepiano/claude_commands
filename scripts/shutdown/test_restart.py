@@ -146,6 +146,7 @@ def unit(
     plan: inventory.UnitPlan | None = None,
     tmux_session: str | None = None,
     run_dirs: list[str] | None = None,
+    doc: str = "/tmp/demo production.md",
 ) -> inventory.UnitSession:
     return inventory.UnitSession(
         **common_session(session_id, run_dirs=run_dirs),
@@ -154,7 +155,7 @@ def unit(
             kind="unit",
             production="demo",
             unit=f"{session_id}-unit",
-            doc="/tmp/demo production.md",
+            doc=doc,
             tmux_session=tmux_session or f"tmux-{session_id}",
             plan=plan or inventory.PlanFromRunRecord(kind="plan", path=f"/tmp/{session_id} plan.md"),
         ),
@@ -610,6 +611,41 @@ class RestartTests(ShutdownTestCase):
         self.assertTrue(any(line.startswith("manual restart unknown:") for line in lines))
         self.assertEqual(self.stored_record(), original)
         self.assertEqual(list(self.state_root.rglob("restart-note-*.txt")), [])
+
+    def test_unit_resumes_with_its_units_row_plan_when_its_run_record_names_another(self) -> None:
+        doc = self.root / "production.md"
+        _ = doc.write_text(
+            "\n".join([
+                "# Demo",
+                "",
+                "## Units",
+                "",
+                "| Unit | Plan | Worktree | Branch | Port | Owns |",
+                "| --- | --- | --- | --- | --- | --- |",
+                "| tables-unit | docs/as-built/tables.md | /w/tables | demo-tables | — | `x/` |",
+                "",
+            ]),
+            encoding="utf-8",
+        )
+        moved = entry(unit(
+            "tables",
+            doc=str(doc),
+            plan=inventory.PlanFromRunRecord(kind="plan", path="docs/plans/demo-tables-followups.md"),
+        ))
+        record.create(shutdown_record([moved]))
+
+        output = io.StringIO()
+        with (
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
+
+        argv = next(
+            shlex.split(line) for line in output.getvalue().splitlines() if "add_unit.py" in line
+        )
+        self.assertEqual(argv[argv.index("--plan") + 1], "docs/as-built/tables.md")
 
     def test_window_dry_run_reads_and_restores_the_starting_desktop(self) -> None:
         restored = entry(top_level(
