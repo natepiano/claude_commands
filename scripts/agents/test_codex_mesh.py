@@ -32,14 +32,28 @@ from typing import Callable, cast, final, override
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh
+from scripts.usage import agents_log
+
+
+def set_environment(name: str, value: str) -> Callable[[], None]:
+    """Set one environment variable and return the call that puts it back."""
+    previous = os.environ.get(name)
+    os.environ[name] = value
+
+    def restore() -> None:
+        if previous is None:
+            _ = os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+
+    return restore
 
 
 def setUpModule() -> None:
     # No test sees the real Codex sign-in: with none, no server counts as holding an old one.
     home = tempfile.TemporaryDirectory()
     usage = tempfile.TemporaryDirectory()
-    usage_environment = patch.dict(os.environ, {"USAGE_STATE_DIR": usage.name})
-    _ = usage_environment.start()
+    restore_usage = set_environment("USAGE_STATE_DIR", usage.name)
     previous = os.environ.get("CODEX_HOME")
     os.environ["CODEX_HOME"] = home.name
 
@@ -48,7 +62,7 @@ def setUpModule() -> None:
             _ = os.environ.pop("CODEX_HOME", None)
         else:
             os.environ["CODEX_HOME"] = previous
-        usage_environment.stop()
+        restore_usage()
         usage.cleanup()
         home.cleanup()
 
@@ -255,9 +269,7 @@ class MeshCommandTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.patches = contextlib.ExitStack()
-        _ = self.patches.enter_context(patch.dict(os.environ, {
-            "USAGE_STATE_DIR": str(self.session_dir / "usage-state"),
-        }))
+        _ = self.patches.callback(set_environment("USAGE_STATE_DIR", str(self.session_dir / "usage-state")))
         _ = self.patches.enter_context(patch.object(codex_mesh, "QUEUE_GRACE_SECS", 0.0))
         _ = self.patches.enter_context(patch.object(codex_mesh, "_capacity_clock", self.clock, create=True))
         _ = self.patches.enter_context(patch.object(codex_mesh, "_capacity_sleep", self.wait, create=True))
@@ -789,7 +801,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(len(self.methods("turn/start")), 1)
 
     def test_start_reports_unexpected_usage_write_failure_and_continues(self) -> None:
-        with patch.object(codex_mesh.agents_log, "append",
+        with patch.object(agents_log, "append",
                           side_effect=RuntimeError("usage write failed\ntry later")):
             code, errors = self.run_start()
 
@@ -841,7 +853,7 @@ class MeshCommandTests(unittest.TestCase):
         args.message_file = str(self.session_dir / "follow-up.txt")
         _ = Path(args.message_file).write_text("Review the code", encoding="utf-8")
 
-        with patch.object(codex_mesh.agents_log, "assignments",
+        with patch.object(agents_log, "assignments",
                           side_effect=RecursionError("ledger is too deeply nested\nread failed")), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
             code = codex_mesh.command_follow(args)
