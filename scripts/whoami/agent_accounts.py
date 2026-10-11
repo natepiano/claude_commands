@@ -38,6 +38,7 @@ from typing import TypedDict, cast
 from zoneinfo import ZoneInfo
 
 WEEK_MINUTES = 7 * 24 * 60
+FIVE_HOUR_MINUTES = 5 * 60
 EASTERN = ZoneInfo("America/New_York")
 
 
@@ -66,6 +67,11 @@ class Report:
     quota_problem: str | None = None
     limit_reset_count: int | None = None
     limit_reset_expirations: list[datetime] = field(default_factory=list)
+    # The 5-hour window, kept out of `quotas`, which hold the weekly ones.
+    five_hour: Quota | None = None
+    # Codex credits that carry work past the weekly allowance: whole credits, "unlimited", or "null"
+    # when the rate limits were read and report none. None means they were not read.
+    credit_balance: str | None = None
 
     @property
     def weekly_reset(self) -> datetime | None:
@@ -151,14 +157,22 @@ class CodexWindow(TypedDict, total=False):
     resetsAt: int | None
 
 
+class CodexCredits(TypedDict, total=False):
+    hasCredits: bool
+    unlimited: bool
+    balance: str | None
+
+
 class CodexBucket(TypedDict, total=False):
     primary: CodexWindow | None
     secondary: CodexWindow | None
+    credits: CodexCredits | None
 
 
 class CodexRateLimits(TypedDict, total=False):
     rateLimits: CodexBucket
     rateLimitsByLimitId: dict[str, CodexBucket] | None
+    rateLimitResetCredits: object
 
 
 class RpcError(TypedDict, total=False):
@@ -211,8 +225,12 @@ def claude_config_dir() -> Path:
     return Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
 
 
-def claude_config_file() -> Path:
+def claude_config_file(config_dir: Path | None = None) -> Path:
     """Claude Code's `.claude.json`: inside CLAUDE_CONFIG_DIR when set, else in home."""
+    if config_dir is not None:
+        return (Path.home() / ".claude.json"
+                if config_dir == Path.home() / ".claude"
+                else config_dir / ".claude.json")
     if "CLAUDE_CONFIG_DIR" in os.environ:
         return claude_config_dir() / ".claude.json"
     return Path.home() / ".claude.json"
@@ -251,6 +269,14 @@ def claude_usage_quotas(usage: dict[str, object]) -> list[Quota]:
     return quotas
 
 
+def claude_five_hour(usage: dict[str, object]) -> Quota | None:
+    held = usage.get("five_hour")
+    if not isinstance(held, dict):
+        return None
+    window = cast(UsageWindow, cast(object, held))
+    return Quota("5-hour", window.get("utilization"), parse_reset(window.get("resets_at")))
+
+
 def claude_live() -> Report:
     report = Report("Claude")
     try:
@@ -279,6 +305,7 @@ def claude_live() -> Report:
         with opened as response:
             usage = cast(dict[str, object], json.loads(response.read()))
         report.quotas = claude_usage_quotas(usage)
+        report.five_hour = claude_five_hour(usage)
         if not any(quota.label == "Weekly" for quota in report.quotas):
             report.quota_problem = "Weekly quota: unavailable"
     except urllib.error.HTTPError as error:
@@ -288,7 +315,7 @@ def claude_live() -> Report:
     return report
 
 
-def claude_on_disk() -> Report:
+def claude_on_disk(config_dir: Path | None = None) -> Report:
     """The logged-in Claude account and the usage Claude Code last cached for it.
 
     The cache is trusted only when its accountUuid is the logged-in account's, so
@@ -297,18 +324,44 @@ def claude_on_disk() -> Report:
     """
     report = Report("Claude")
     try:
-        config = cast(ClaudeConfig, json.loads(claude_config_file().read_text()))
+        decoded = cast(object, json.loads(claude_config_file(config_dir).read_text()))
     except (OSError, ValueError):
         report.problem = "Account unavailable (could not read Claude config)"
         return report
-    account = config.get("oauthAccount")
-    if not account or not account.get("emailAddress"):
+    if not isinstance(decoded, dict):
+        report.problem = "Account unavailable (could not read Claude config)"
+        return report
+    config = cast(dict[str, object], cast(object, decoded))
+    decoded_account = config.get("oauthAccount")
+    if decoded_account is not None and not isinstance(decoded_account, dict):
+        report.problem = "Account unavailable (could not read Claude config)"
+        return report
+    if decoded_account is None:
         report.problem = "Not logged in"
         return report
-    report.email = account.get("emailAddress")
-    cached = config.get("cachedUsageUtilization")
-    if cached and cached.get("accountUuid") == account.get("accountUuid"):
-        report.quotas = claude_usage_quotas(cached.get("utilization", {}))
+    account = cast(dict[str, object], cast(object, decoded_account))
+    email = account.get("emailAddress")
+    if not isinstance(email, str) or not email:
+        report.problem = "Not logged in"
+        return report
+    report.email = email
+    decoded_cached = config.get("cachedUsageUtilization")
+    if decoded_cached is not None and not isinstance(decoded_cached, dict):
+        report.quota_problem = "Weekly quota: cached usage unreadable"
+        return report
+    cached = (
+        cast(dict[str, object], cast(object, decoded_cached))
+        if decoded_cached
+        else None
+    )
+    utilization = cached.get("utilization") if cached is not None else None
+    if utilization is not None and not isinstance(utilization, dict):
+        report.quota_problem = "Weekly quota: cached usage unreadable"
+        return report
+    if cached is not None and cached.get("accountUuid") == account.get("accountUuid"):
+        report.quotas = claude_usage_quotas(
+            cast(dict[str, object], cast(object, utilization or {}))
+        )
     else:
         report.quota_problem = "Weekly quota: no cached usage for this account"
     return report
@@ -317,22 +370,41 @@ def claude_on_disk() -> Report:
 # --- Codex -------------------------------------------------------------------
 
 
-def codex_email_on_disk() -> str | None:
+def codex_email_on_disk(home: Path | None = None) -> str | None:
     """The email claim of the id_token in Codex's auth.json, if logged in with ChatGPT."""
     try:
-        auth = cast(CodexAuth, json.loads((codex_home() / "auth.json").read_text()))
+        decoded = cast(
+            object,
+            json.loads(((home or codex_home()) / "auth.json").read_text()),
+        )
     except (OSError, ValueError):
         return None
-    token = auth.get("tokens", {}).get("id_token", "")
+    if not isinstance(decoded, dict):
+        return None
+    auth = cast(dict[str, object], cast(object, decoded))
+    decoded_tokens = auth.get("tokens")
+    if not isinstance(decoded_tokens, dict):
+        return None
+    tokens = cast(dict[str, object], cast(object, decoded_tokens))
+    token = tokens.get("id_token", "")
+    if not isinstance(token, str):
+        return None
     parts = token.split(".")
     if len(parts) != 3:
         return None
     payload = parts[1] + "=" * (-len(parts[1]) % 4)
     try:
-        claims = cast(IdTokenClaims, json.loads(base64.urlsafe_b64decode(payload)))
+        decoded_claims = cast(
+            object,
+            json.loads(base64.urlsafe_b64decode(payload)),
+        )
     except (binascii.Error, ValueError):
         return None
-    return claims.get("email") or None
+    if not isinstance(decoded_claims, dict):
+        return None
+    claims = cast(dict[str, object], cast(object, decoded_claims))
+    email = claims.get("email")
+    return email if isinstance(email, str) and email else None
 
 
 class CodexServer:
@@ -392,6 +464,29 @@ def codex_weekly_quotas(usage: CodexRateLimits) -> list[Quota]:
     return quotas
 
 
+def codex_credits(usage: CodexRateLimits) -> str:
+    """The main Codex bucket's credit balance as Report.credit_balance holds it."""
+    bucket = (usage.get("rateLimitsByLimitId") or {}).get("codex") or usage.get("rateLimits", {})
+    credits = bucket.get("credits")
+    if not credits:
+        return "null"
+    if credits.get("unlimited"):
+        return "unlimited"
+    try:
+        return f"{float(credits.get('balance') or ''):.0f}"
+    except ValueError:
+        return "null" if credits.get("hasCredits") else "0"
+
+
+def codex_five_hour(usage: CodexRateLimits) -> Quota | None:
+    """The main Codex bucket's 5-hour window."""
+    bucket = (usage.get("rateLimitsByLimitId") or {}).get("codex") or usage.get("rateLimits", {})
+    for window in (bucket.get("primary"), bucket.get("secondary")):
+        if window and window.get("windowDurationMins") == FIVE_HOUR_MINUTES:
+            return Quota("5-hour", window.get("usedPercent"), parse_reset(window.get("resetsAt")))
+    return None
+
+
 async def codex_live() -> Report:
     report = Report("Codex")
     server: CodexServer | None = None
@@ -416,7 +511,9 @@ async def codex_live() -> Report:
         try:
             usage = cast(CodexRateLimits, await server.request(3, "account/rateLimits/read", {}))
             report.quotas = codex_weekly_quotas(usage)
-            reset_credits(report, cast(dict[str, object], usage).get("rateLimitResetCredits"))
+            report.five_hour = codex_five_hour(usage)
+            report.credit_balance = codex_credits(usage)
+            reset_credits(report, usage.get("rateLimitResetCredits"))
             if not report.quotas:
                 report.quota_problem = "Weekly quota: unavailable (no weekly window returned)"
         except (OSError, ValueError, KeyError, RuntimeError, asyncio.TimeoutError):
@@ -436,15 +533,21 @@ def reset_credits(report: Report, summary: object) -> None:
     """Count comes from the summary; detail rows can be absent or capped."""
     if not isinstance(summary, dict):
         return
-    count = summary.get("availableCount")
+    fields = cast(dict[str, object], summary)
+    count = fields.get("availableCount")
     if type(count) is not int or count < 0:
         return
     report.limit_reset_count = count
     report.limit_reset_expirations = []
     if count == 0:
         return
-    for credit in summary.get("credits") or []:
-        if isinstance(credit, dict) and credit.get("status") == "available":
+    credits = cast(list[object], fields.get("credits") or [])
+    for item in credits:
+        if isinstance(item, dict):
+            credit = cast(dict[str, object], item)
+        else:
+            continue
+        if credit.get("status") == "available":
             expires = parse_reset(credit.get("expiresAt"))
             if expires is not None:
                 report.limit_reset_expirations.append(expires)

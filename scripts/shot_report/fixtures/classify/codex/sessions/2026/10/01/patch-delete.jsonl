@@ -1,0 +1,7 @@
+{"timestamp":"2026-10-01T00:00:00.000Z","type":"session_meta","payload":{"id":"patch-delete","cwd":"/fictional/studio"}}
+{"timestamp":"2026-10-01T00:00:00.000Z","type":"response_item","payload":{"type":"function_call","name":"functions.apply_patch","call_id":"delete-0","arguments":"{\"input\":\"*** Begin Patch\\n*** Add File: /fictional/studio/remove.py\\n+rpc('brp_extras/screenshot', {})\\n*** End Patch\"}"}}
+{"timestamp":"2026-10-01T00:00:05.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"delete-0","output":"Success"}}
+{"timestamp":"2026-10-01T00:00:30.000Z","type":"response_item","payload":{"type":"function_call","name":"functions.apply_patch","call_id":"delete-1","arguments":"{\"input\":\"*** Begin Patch\\n*** Delete File: /fictional/studio/remove.py\\n*** End Patch\"}"}}
+{"timestamp":"2026-10-01T00:00:35.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"delete-1","output":"Success"}}
+{"timestamp":"2026-10-01T00:01:00.000Z","type":"response_item","payload":{"type":"function_call","name":"functions.exec_command","call_id":"delete-2","arguments":"{\"cmd\":\"python3 /fictional/studio/remove.py\"}"}}
+{"timestamp":"2026-10-01T00:01:05.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"delete-2","output":"not found"}}

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Stop hook: keep a /unit:delegate run going across auto-compaction.
+"""Stop hook: keep a /unit:direct run going across auto-compaction.
 
 Auto-compaction fires on the *next request*, never mid-turn. So an agent that
 ends its turn near the limit is doing the one thing that guarantees compaction
-never runs -- the run just sits there waiting for the user. `delegate.md` tells
+never runs -- the run just sits there waiting for the user. `direct.md` tells
 the agent not to do this, but prose loses at 85% context.
 
 This hook fires right before the response concludes and returns
@@ -12,7 +12,7 @@ continuation is itself a new request, which is what actually lets compaction
 happen.
 
 It stays out of the way unless all of these hold:
-  * a /unit:delegate run is active in this session (marker file)
+  * a /unit:direct run is active in this session (marker file)
   * context is at or past the same handoff threshold the PostToolUse hook uses
   * this turn is not already the product of a block (`stop_hook_active`)
   * the agent is the main thread, not a subagent
@@ -50,10 +50,10 @@ from context_usage import (
 from delegate_run import active_run, delegate_working
 
 REASON = """\
-Delegate run active, {tokens:,} / {trigger:,} tokens ({percent}%). Do not end the \
+/unit:direct run active, {tokens:,} / {trigger:,} tokens ({percent}%). Do not end the \
 turn — compaction fires on the next request, never mid-turn, so stopping here is \
 what prevents it. Take the next workflow action and let it fire underneath you; \
-re-read ~/.claude/commands/unit/delegate.md afterwards.
+re-read ~/.claude/commands/unit/direct.md afterwards.
 
 Waiting on a user decision instead? State it in one line and end the turn — this \
 will not block twice."""
@@ -70,7 +70,7 @@ def main() -> None:
     # Already continuing because of a previous block -- let this one through.
     if payload.get("stop_hook_active"):
         return
-    # Subagents do not orchestrate delegate runs; their stop is a real result.
+    # Subagents do not orchestrate /unit:direct runs; their stop is a real result.
     if payload.get("agent_id"):
         return
 

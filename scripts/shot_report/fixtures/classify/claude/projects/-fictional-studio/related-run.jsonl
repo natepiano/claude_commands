@@ -1,0 +1,4 @@
+{"type":"assistant","timestamp":"2026-10-01T00:00:00.000Z","cwd":"/fictional/studio","sessionId":"related-run","message":{"role":"assistant","content":[{"type":"tool_use","id":"related-run-0","name":"Write","input":{"file_path":"/fictional/studio/query.py","content":"rpc('world.query', {})\n"}}]}}
+{"type":"user","timestamp":"2026-10-01T00:00:05.000Z","cwd":"/fictional/studio","sessionId":"related-run","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"related-run-0","content":"done"}]}}
+{"type":"assistant","timestamp":"2026-10-01T00:00:30.000Z","cwd":"/fictional/studio","sessionId":"related-run","message":{"role":"assistant","content":[{"type":"tool_use","id":"related-run-1","name":"Bash","input":{"command":"python3 query.py"}}]}}
+{"type":"user","timestamp":"2026-10-01T00:00:35.000Z","cwd":"/fictional/studio","sessionId":"related-run","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"related-run-1","content":"done"}]}}

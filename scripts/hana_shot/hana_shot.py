@@ -7,8 +7,9 @@ import argparse
 from collections.abc import Callable, Generator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing, contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from enum import StrEnum
 import http.client
 import json
 import math
@@ -24,7 +25,8 @@ import sys
 import tempfile
 import time
 import tomllib
-from typing import IO, NamedTuple, NotRequired, TypedDict, cast
+from types import FrameType
+from typing import IO, Literal, NamedTuple, NotRequired, TypedDict, cast
 
 
 REFUSED_PORT = 15702
@@ -98,6 +100,75 @@ class Failure(Exception):
 
 class CaptureTimeout(Exception):
     """A screenshot that never answered; exit 3, and never resend it."""
+
+
+class ExitSignal(BaseException):
+    """A catchable process signal that should unwind the active shot."""
+
+    def __init__(self, number: int) -> None:
+        super().__init__(number)
+        self.number: int = number
+
+
+@dataclass(frozen=True)
+class ExitSignalsEnabled:
+    """The first exit signal may unwind the active operation."""
+
+
+@dataclass(frozen=True)
+class ExitSignalsDeferred:
+    """Cleanup must finish before an exit signal unwinds the operation."""
+
+
+@dataclass(frozen=True)
+class DeferredExitSignal:
+    """The first exit signal received while cleanup was protected."""
+
+    number: int
+
+
+@dataclass(frozen=True)
+class ExitSignalsLatched:
+    """An unwind or final cleanup has begun; later exit signals do nothing."""
+
+
+class ExitSignalLatch:
+    """Make the first exit signal unwind once, after any cleanup in progress."""
+
+    def __init__(self) -> None:
+        self.state: ExitSignalsEnabled | ExitSignalsDeferred | DeferredExitSignal | ExitSignalsLatched
+        self.state = ExitSignalsEnabled()
+
+    def reset(self) -> None:
+        self.state = ExitSignalsEnabled()
+
+    def latch(self) -> None:
+        self.state = ExitSignalsLatched()
+
+    def interrupt(self, number: int) -> None:
+        if isinstance(self.state, ExitSignalsEnabled):
+            self.state = ExitSignalsLatched()
+            raise ExitSignal(number)
+        if isinstance(self.state, ExitSignalsDeferred):
+            self.state = DeferredExitSignal(number)
+
+    @contextmanager
+    def defer_during_cleanup(self) -> Generator[None, None, None]:
+        deferring = isinstance(self.state, ExitSignalsEnabled)
+        if deferring:
+            self.state = ExitSignalsDeferred()
+        try:
+            yield
+        finally:
+            if deferring and isinstance(self.state, ExitSignalsDeferred):
+                self.state = ExitSignalsEnabled()
+            elif deferring and isinstance(self.state, DeferredExitSignal):
+                deferred = self.state
+                self.state = ExitSignalsLatched()
+                raise ExitSignal(deferred.number)
+
+
+EXIT_SIGNAL_LATCH = ExitSignalLatch()
 
 
 class BrpCallError(Failure):
@@ -206,12 +277,31 @@ class ToolValue(TypedDict):
 class WindowResolutionValue(TypedDict):
     physical_width: int
     physical_height: int
+    scale_factor_override: float | None
     scale_factor: float
 
 
 class WindowValue(TypedDict):
     resolution: WindowResolutionValue
     window_level: str
+
+
+@dataclass(frozen=True)
+class WindowLevelPending:
+    """The session has not yet prepared the macOS window for capture."""
+
+
+@dataclass(frozen=True)
+class WindowLeftAlone:
+    """The session found no unique primary window to raise."""
+
+
+@dataclass(frozen=True)
+class WindowRaised:
+    """A window this session must restore when it closes."""
+
+    entity: int
+    restore_level: str
 
 
 class RectValue(TypedDict):
@@ -273,6 +363,74 @@ class TimingRecord(TypedDict):
     width: int
     height: int
     bytes: int
+
+
+class LegacySuccess(TimingRecord):
+    """A successful shot line written before invocation records existed."""
+
+
+class FailureReason(StrEnum):
+    TIMEOUT = "timeout"
+    ALREADY_IN_PROGRESS = "already_in_progress"
+    BLACK_CAPTURE = "black_capture"
+    EMPTY_CROP = "empty_crop"
+    NO_APP = "no_app"
+    INVALID_REQUEST = "invalid_request"
+    NO_TARGET = "no_target"
+    INVALID_PNG = "invalid_png"
+    COPY_FAILED = "copy_failed"
+    BRP_ERROR = "brp_error"
+    SHOT_FAILED = "shot_failed"
+
+
+class PresentSession(TypedDict):
+    state: Literal["present"]
+    value: str
+
+
+class AbsentSession(TypedDict):
+    state: Literal["absent"]
+
+
+class SuccessfulAttempt(TimingRecord):
+    status: Literal["success"]
+    image_paths: list[str]
+
+
+class FailedAttempt(TypedDict):
+    status: Literal["failure"]
+    label: str
+    view: str | None
+    image_paths: list[str]
+    failure_reason: FailureReason
+
+
+class SuccessfulInvocation(TimingRecord):
+    status: Literal["success"]
+    invocation_kind: Literal["shot", "views_check"]
+    exit_code: Literal[0]
+    session: PresentSession | AbsentSession
+    attempts: list[SuccessfulAttempt | FailedAttempt]
+
+
+class FailedInvocation(TypedDict):
+    time: str
+    host: str
+    port: int
+    status: Literal["failure"]
+    invocation_kind: Literal["shot", "views_check"]
+    exit_code: int
+    failure_reason: FailureReason
+    session: PresentSession | AbsentSession
+    attempts: list[SuccessfulAttempt | FailedAttempt]
+
+
+@dataclass
+class InProgressCaptureInvocation:
+    kind: Literal["shot", "views_check"] = "shot"
+    attempts: list[SuccessfulAttempt | FailedAttempt] = field(default_factory=list)
+    successful_timings: list[TimingRecord] = field(default_factory=list)
+    failures: list[FailureReason] = field(default_factory=list)
 
 
 class LaunchState(TypedDict):
@@ -506,7 +664,7 @@ class Session:
         self.rect_support: bool | None = None
         self.last_move: tuple[object, ...] | None = None
         self.last_state: CameraState | None = None
-        self.window_level_set: bool = False
+        self.window_level: WindowLevelPending | WindowLeftAlone | WindowRaised = WindowLevelPending()
 
     def start(self) -> CameraState:
         system = None if self.remote is None else POOL.submit(remote_system, self.remote)
@@ -525,14 +683,32 @@ class Session:
         return camera_state(rows[0]["components"])
 
     def close(self) -> None:
-        """End the remote keep-awake: with its stdin closed, the remote shell kills caffeinate."""
+        """Latch exit signals, restore the window, then end the keep-awake."""
+        EXIT_SIGNAL_LATCH.latch()
+        self.restore_window_and_end_keep_awake()
+
+    def restore_window_and_end_keep_awake(self) -> None:
+        """Undo window preparation without changing the active outcome."""
+        window_level = self.window_level
+        if isinstance(window_level, WindowRaised):
+            try:
+                self.brp.mutate(window_level.entity, WINDOW, ".window_level", window_level.restore_level)
+            except Failure as exc:
+                print(
+                    f"hana_shot: could not put the window level back to {window_level.restore_level}: {exc}",
+                    file=sys.stderr,
+                )
+        self.window_level = WindowLevelPending()
         if self.keep_awake is None:
             return
+        keep_awake_process = self.keep_awake
         try:
-            _ = self.keep_awake.communicate(timeout=CALL_TIMEOUT)
+            if self.remote is None:
+                keep_awake_process.terminate()
+            _ = keep_awake_process.communicate(timeout=CALL_TIMEOUT)
         except subprocess.TimeoutExpired:
-            self.keep_awake.kill()
-            _ = self.keep_awake.wait()
+            keep_awake_process.kill()
+            _ = keep_awake_process.wait()
         self.keep_awake = None
 
     def read_camera(self) -> CameraState:
@@ -1139,7 +1315,10 @@ def ensure_window(session: Session, size: str) -> None:
     if len(rows) != 1:
         raise Failure(f"expected one primary window, found {len(rows)}")
     window = cast(WindowValue, rows[0].get("components", {})[WINDOW])
-    scale = window["resolution"]["scale_factor"]
+    resolution = window["resolution"]
+    scale = resolution["scale_factor_override"]
+    if scale is None:
+        scale = resolution["scale_factor"]
     width = round(int(match.group(1)) * scale)
     height = round(int(match.group(2)) * scale)
     if session.read_camera().size == (width, height):
@@ -1157,19 +1336,35 @@ def ensure_window(session: Session, size: str) -> None:
 
 def keep_visible(session: Session) -> None:
     """macOS draws nothing for a hidden window: raise it above others and wake the display."""
-    if session.window_level_set:
+    if not isinstance(session.window_level, WindowLevelPending):
         return
-    rows = session.brp.query({"data": {}, "filter": {"with": [PRIMARY_WINDOW]}})
+    rows = session.brp.query({"data": {"components": [WINDOW]}, "filter": {"with": [PRIMARY_WINDOW]}})
+    prepared_window: WindowLeftAlone | WindowRaised = WindowLeftAlone()
     if len(rows) == 1:
-        session.brp.mutate(rows[0]["entity"], WINDOW, ".window_level", "AlwaysOnTop")
-    if session.remote is not None:
-        session.keep_awake = keep_awake(session.remote)
-    else:
-        caffeinate = shutil.which("caffeinate")
-        if caffeinate is not None:
-            _ = subprocess.Popen([caffeinate, "-u", "-t", "30"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    session.window_level_set = True
-    session.wait_frames(2)
+        raw_window = rows[0].get("components", {}).get(WINDOW)
+        window = cast(WindowValue, cast(object, raw_window)) if isinstance(raw_window, dict) else None
+        level = window.get("window_level") if window is not None else None
+        restore_level = level if isinstance(level, str) and level != "AlwaysOnTop" else "Normal"
+        entity = rows[0]["entity"]
+        prepared_window = WindowRaised(entity, restore_level)
+        session.window_level = prepared_window
+    try:
+        if isinstance(prepared_window, WindowRaised):
+            session.brp.mutate(prepared_window.entity, WINDOW, ".window_level", "AlwaysOnTop")
+        if session.remote is not None:
+            session.keep_awake = keep_awake(session.remote)
+        else:
+            caffeinate = shutil.which("caffeinate")
+            if caffeinate is not None:
+                session.keep_awake = subprocess.Popen(
+                    [caffeinate, "-u", "-t", "30"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+        session.wait_frames(2)
+        session.window_level = prepared_window
+    except BaseException:
+        with EXIT_SIGNAL_LATCH.defer_during_cleanup():
+            session.restore_window_and_end_keep_awake()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1253,9 +1448,9 @@ def git_toplevel() -> Path | None:
     return Path(result.stdout.strip()) if result.returncode == 0 else None
 
 
-def log_timing(
+def timing_record(
     result: Result, port: int, sha: str, frame_ms: float | None, window: tuple[int, int], remote: str | None,
-) -> None:
+) -> TimingRecord:
     phases = result.phases
     record: TimingRecord = {
         "time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
@@ -1281,10 +1476,83 @@ def log_timing(
         "height": result.height,
         "bytes": result.size_bytes,
     }
+    return record
+
+
+def append_timing(record: SuccessfulInvocation | FailedInvocation) -> None:
     path = cache_directory() / "timings.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as handle:
         _ = handle.write(json.dumps(record) + "\n")
+
+
+def session_evidence() -> PresentSession | AbsentSession:
+    for name in ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"):
+        value = os.environ.get(name)
+        if value:
+            return {"state": "present", "value": value}
+    return {"state": "absent"}
+
+
+def failure_reason(exc: Refused | Failure | CaptureTimeout) -> FailureReason:
+    if isinstance(exc, CaptureTimeout) or "gave no answer" in str(exc):
+        return FailureReason.TIMEOUT
+    if isinstance(exc, Refused):
+        return FailureReason.INVALID_REQUEST
+    if isinstance(exc, BrpCallError):
+        if "already in progress" in exc.message.lower():
+            return FailureReason.ALREADY_IN_PROGRESS
+        return FailureReason.BRP_ERROR
+    message = str(exc)
+    if "no Hana answers" in message or "Hana exited" in message:
+        return FailureReason.NO_APP
+    if "must name exactly one entity" in message:
+        return FailureReason.NO_TARGET
+    if "not a PNG" in message:
+        return FailureReason.INVALID_PNG
+    if "could not copy" in message or "no PNG came back" in message:
+        return FailureReason.COPY_FAILED
+    if "crop is empty" in message:
+        return FailureReason.EMPTY_CROP
+    return FailureReason.SHOT_FAILED
+
+
+def failed_attempt(shot: Shot, path: Path, reason: FailureReason, started_ns: int) -> FailedAttempt:
+    try:
+        image_paths = [str(path)] if path.is_file() and path.stat().st_mtime_ns >= started_ns else []
+    except OSError:
+        image_paths = []
+    return {
+        "status": "failure", "label": shot.label, "view": shot.view,
+        "image_paths": image_paths, "failure_reason": reason,
+    }
+
+
+def append_invocation(invocation: InProgressCaptureInvocation, port: int, remote: str | None, exit_code: int) -> None:
+    if exit_code == 0 and invocation.successful_timings:
+        success: SuccessfulInvocation = {
+            **invocation.successful_timings[-1], "status": "success", "exit_code": 0,
+            "invocation_kind": invocation.kind,
+            "session": session_evidence(), "attempts": invocation.attempts,
+        }
+        append_timing(success)
+        return
+    failure: FailedInvocation = {
+        "time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "host": socket.gethostname() if remote is None else remote.rsplit("@", 1)[-1],
+        "port": port, "status": "failure", "exit_code": exit_code,
+        "invocation_kind": invocation.kind,
+        "failure_reason": invocation.failures[0] if invocation.failures else FailureReason.SHOT_FAILED,
+        "session": session_evidence(), "attempts": invocation.attempts,
+    }
+    append_timing(failure)
+
+
+def write_invocation(invocation: InProgressCaptureInvocation, port: int, remote: str | None, exit_code: int) -> None:
+    try:
+        append_invocation(invocation, port, remote, exit_code)
+    except OSError as exc:
+        print(f"hana_shot: could not write timing record: {exc}", file=sys.stderr)
 
 
 def report(result: Result) -> None:
@@ -1705,21 +1973,33 @@ def with_overrides(shot: Shot, args: Arguments) -> Shot:
 
 def run_shots(
     brp: Brp, shots: list[Shot], out: str | None, remote: str | None, on_result: Callable[[Result], None],
+    invocation: InProgressCaptureInvocation,
 ) -> list[Result]:
     with closing(Session(brp, remote)) as session:
         _ = session.start()
         sha = git_sha(Path.cwd())
         results: list[Result] = []
         for shot, path in zip(shots, output_paths(out, [shot.label for shot in shots]), strict=True):
-            result = take(session, shot, path)
+            started_ns = time.time_ns()
+            try:
+                result = take(session, shot, path)
+            except (Refused, Failure, CaptureTimeout) as exc:
+                reason = failure_reason(exc)
+                invocation.attempts.append(failed_attempt(shot, path, reason, started_ns))
+                invocation.failures.append(reason)
+                raise
             window = session.last_state.size if session.last_state else (0, 0)
-            log_timing(result, brp.port, sha, session.frame_ms, window, remote)
+            timing = timing_record(result, brp.port, sha, session.frame_ms, window, remote)
+            invocation.successful_timings.append(timing)
+            invocation.attempts.append({
+                **timing, "status": "success", "image_paths": [str(result.path)],
+            })
             on_result(result)
             results.append(result)
         return results
 
 
-def command_shot(args: Arguments) -> int:
+def command_shot(args: Arguments, invocation: InProgressCaptureInvocation) -> int:
     if args.view and args.target:
         raise Refused("give --view or --target, not both")
     if args.view:
@@ -1730,10 +2010,12 @@ def command_shot(args: Arguments) -> int:
         if missing:
             raise Refused(f"no view named {', '.join(missing)} in {path}; known: {', '.join(views)}")
         shots = [with_overrides(shot_from_view(name, views[name]), args) for name in names]
+        if not shots:
+            raise Refused(f"no views to shoot in {path}")
     else:
         shots = [shot_from_arguments(args)]
     with instance(args.port, args.launch, args.shutdown, args.worktree, args.binary) as brp:
-        _ = run_shots(brp, shots, args.out, args.remote, report)
+        _ = run_shots(brp, shots, args.out, args.remote, report, invocation)
     return 0
 
 
@@ -1785,38 +2067,73 @@ def command_targets(args: Arguments) -> int:
     return 0
 
 
+def usable_stats_shot(item: dict[str, object], since: str | None, phases: tuple[str, ...]) -> bool:
+    stamp = item.get("time")
+    return (
+        isinstance(stamp, str)
+        and (since is None or stamp >= since)
+        and isinstance(item.get("mode"), str)
+        and isinstance(item.get("crop"), str)
+        and all(isinstance(item.get(key), (int, float)) for key in phases)
+    )
+
+
 def command_stats(args: Arguments) -> int:
     path = cache_directory() / "timings.jsonl"
     if not path.exists():
         print(f"no timings yet at {path}")
         return 0
-    records: list[TimingRecord] = []
+    records: list[LegacySuccess | SuccessfulAttempt] = []
+    failures: dict[str, int] = {}
+    phases = ("resolve_ms", "move_ms", "settle_ms", "capture_ms", "crop_ms", "total_ms")
     for line in path.read_text().splitlines():
         if not line.strip():
             continue
-        record = cast(TimingRecord, json.loads(line))
-        if args.since and record["time"] < args.since:
+        try:
+            raw = cast(object, json.loads(line))
+        except json.JSONDecodeError:
             continue
-        records.append(record)
+        if not isinstance(raw, dict):
+            continue
+        item = cast(dict[str, object], raw)
+        if item.get("status") == "failure":
+            cause = item.get("failure_reason")
+            stamp = item.get("time")
+            if isinstance(cause, str) and isinstance(stamp, str) and (not args.since or stamp >= args.since):
+                failures[cause] = failures.get(cause, 0) + 1
+        if "status" not in item:
+            if usable_stats_shot(item, args.since, phases):
+                records.append(cast(LegacySuccess, cast(object, item)))
+        else:
+            attempts = item.get("attempts")
+            if not isinstance(attempts, list):
+                continue
+            for raw_attempt in cast(list[object], attempts):
+                if not isinstance(raw_attempt, dict):
+                    continue
+                attempt = cast(dict[str, object], raw_attempt)
+                if attempt.get("status") == "success" and usable_stats_shot(attempt, args.since, phases):
+                    records.append(cast(SuccessfulAttempt, cast(object, attempt)))
     if not records:
         print("no shots in that span")
-        return 0
-    print(f"{len(records)} shots since {records[0]['time'][:10]} ({path})")
-    groups: dict[str, list[TimingRecord]] = {"all": records}
-    for record in records:
-        groups.setdefault(f"{record['mode']}/{record['crop']}", []).append(record)
-    phases = ("resolve_ms", "move_ms", "settle_ms", "capture_ms", "crop_ms", "total_ms")
-    print(f"{'group':<18}{'shots':>6}" + "".join(f"{phase[:-3]:>10}" for phase in phases) + "   (median ms)")
-    for group, items in groups.items():
-        medians = "".join(
-            f"{statistics.median(item[phase] for item in items):>10.1f}"
-            for phase in phases
-        )
-        print(f"{group:<18}{len(items):>6}{medians}")
+    else:
+        print(f"{len(records)} shots since {records[0]['time'][:10]} ({path})")
+        groups: dict[str, list[LegacySuccess | SuccessfulAttempt]] = {"all": records}
+        for record in records:
+            groups.setdefault(f"{record['mode']}/{record['crop']}", []).append(record)
+        print(f"{'group':<18}{'shots':>6}" + "".join(f"{phase[:-3]:>10}" for phase in phases) + "   (median ms)")
+        for group, items in groups.items():
+            medians = "".join(
+                f"{statistics.median(item[phase] for item in items):>10.1f}"
+                for phase in phases
+            )
+            print(f"{group:<18}{len(items):>6}{medians}")
+    for cause, count in sorted(failures.items()):
+        print(f"failure {cause}: {count}")
     return 0
 
 
-def command_views(args: Arguments) -> int:
+def command_views(args: Arguments, invocation: InProgressCaptureInvocation | None = None) -> int:
     path = views_path(args.views_file)
     if args.action == "list":
         for name, view in load_views(path).items():
@@ -1832,7 +2149,9 @@ def command_views(args: Arguments) -> int:
         return 0
     if args.action == "add":
         return views_add(args, path)
-    return views_check(args, path)
+    if invocation is None:
+        raise RuntimeError("views check needs an invocation")
+    return views_check(args, path, invocation)
 
 
 def views_add(args: Arguments, path: Path) -> int:
@@ -1923,10 +2242,12 @@ def from_current(session: Session, args: Arguments, mode: str) -> ViewValue:
     return view
 
 
-def views_check(args: Arguments, path: Path) -> int:
+def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvocation) -> int:
     """Shoot every view and fail any that resolves wrong, is rejected, is black, or crops empty."""
     views = load_views(path)
     names = args.view if args.view and args.view != ["all"] else list(views)
+    if not names:
+        raise Refused(f"no views to check in {path}")
     missing = [name for name in names if name not in views]
     if missing:
         raise Refused(f"no view named {', '.join(missing)} in {path}")
@@ -1942,23 +2263,43 @@ def views_check(args: Arguments, path: Path) -> int:
         today = datetime.now().strftime("%Y-%m-%d")
         for name, final in zip(names, output_paths(out, names), strict=True):
             shot = with_overrides(shot_from_view(name, views[name]), args)
+            started_ns = time.time_ns()
             try:
                 result = take(session, shot, final)
-            except Failure as exc:
+            except (Failure, CaptureTimeout) as exc:
+                reason = failure_reason(exc)
+                invocation.attempts.append(failed_attempt(shot, final, reason, started_ns))
+                invocation.failures.append(reason)
                 failures.append(f"FAIL {name}: {exc}")
                 print(failures[-1], file=sys.stderr)
                 continue
             window = session.last_state.size if session.last_state else (0, 0)
-            log_timing(result, brp.port, sha, session.frame_ms, window, args.remote)
-            peak = brightest(result.path)
+            try:
+                peak = brightest(result.path)
+            except Failure as exc:
+                reason = failure_reason(exc)
+                invocation.attempts.append(failed_attempt(shot, result.path, reason, started_ns))
+                invocation.failures.append(reason)
+                failures.append(f"FAIL {name}: {exc}")
+                print(failures[-1], file=sys.stderr)
+                continue
             if peak < BLACK_MAXIMUM:
+                invocation.attempts.append(failed_attempt(shot, result.path, FailureReason.BLACK_CAPTURE, started_ns))
+                invocation.failures.append(FailureReason.BLACK_CAPTURE)
                 failures.append(f"FAIL {name}: the shot is black (brightest {peak:.3f}) at {result.path}")
                 print(failures[-1], file=sys.stderr)
                 continue
             if result.width < 2 or result.height < 2:
+                invocation.attempts.append(failed_attempt(shot, result.path, FailureReason.EMPTY_CROP, started_ns))
+                invocation.failures.append(FailureReason.EMPTY_CROP)
                 failures.append(f"FAIL {name}: the crop is empty ({result.width}x{result.height})")
                 print(failures[-1], file=sys.stderr)
                 continue
+            timing = timing_record(result, brp.port, sha, session.frame_ms, window, args.remote)
+            invocation.successful_timings.append(timing)
+            invocation.attempts.append({
+                **timing, "status": "success", "image_paths": [str(result.path)],
+            })
             views[name]["verified"] = {"sha": sha, "date": today}
             passed.append(name)
             print(f"PASS {name} {result.width}x{result.height} {result.phases['total_ms']:.0f} ms {result.path}")
@@ -1997,7 +2338,10 @@ def add_shot_flags(parser: argparse.ArgumentParser) -> None:
 
 def add_run_flags(parser: argparse.ArgumentParser, port_required: bool = True) -> None:
     _ = parser.add_argument("--port", type=int, required=port_required, default=0)
-    _ = parser.add_argument("--window", help="logical window size, such as 1440x900")
+    _ = parser.add_argument(
+        "--window",
+        help="logical window size, such as 1280x720 (the PNG is 2560x1440 at Hana's 2x scale)",
+    )
     _ = parser.add_argument("--settle", type=int, help="extra frames to wait after the camera stops")
     _ = parser.add_argument("--out", help="directory, or one .png path")
     _ = parser.add_argument("--views-file")
@@ -2051,17 +2395,41 @@ def arguments(argv: list[str]) -> Arguments:
     return parser.parse_args(argv, namespace=Arguments())
 
 
+def exit_for_signal(number: int, _frame: FrameType | None) -> None:
+    EXIT_SIGNAL_LATCH.interrupt(number)
+
+
 def main(argv: list[str]) -> int:
-    args = arguments(argv)
+    try:
+        args = arguments(argv)
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 2
+        if code != 0 and (argv[:1] == ["shot"] or argv[:2] == ["views", "check"]):
+            port = 0
+            if "--port" in argv:
+                index = argv.index("--port") + 1
+                if index < len(argv):
+                    try:
+                        port = int(argv[index])
+                    except ValueError:
+                        pass
+            kind: Literal["shot", "views_check"] = "shot" if argv[:1] == ["shot"] else "views_check"
+            write_invocation(InProgressCaptureInvocation(kind=kind, failures=[FailureReason.INVALID_REQUEST]), port, None, code)
+        return code
     handlers: dict[str, Callable[[Arguments], int]] = {
-        "shot": command_shot,
         "pose": command_pose,
         "targets": command_targets,
-        "views": command_views,
         "stats": command_stats,
         "launch": command_launch,
         "shutdown": command_shutdown,
     }
+    invocation = (InProgressCaptureInvocation(kind="shot" if args.command == "shot" else "views_check")
+                  if args.command == "shot" or args.command == "views" and args.action == "check" else None)
+    EXIT_SIGNAL_LATCH.reset()
+    _ = signal.signal(signal.SIGINT, exit_for_signal)
+    _ = signal.signal(signal.SIGTERM, exit_for_signal)
+    _ = signal.signal(signal.SIGHUP, exit_for_signal)
+    exit_code = 1
     try:
         if args.command == "views" and args.action in ("check", "add") and args.from_current or (
             args.command == "views" and args.action == "check"
@@ -2069,16 +2437,33 @@ def main(argv: list[str]) -> int:
             check_port(args.port)
         if args.remote is not None and (args.launch or args.shutdown):
             raise Refused(f"--launch and --shutdown run a Hana on this machine only; start and stop the one on {args.remote} there")
-        return handlers[args.command](args)
+        if args.command == "shot" and invocation is not None:
+            exit_code = command_shot(args, invocation)
+        elif args.command == "views":
+            exit_code = command_views(args, invocation)
+        else:
+            exit_code = handlers[args.command](args)
     except Refused as exc:
         print(f"hana_shot: refused: {exc}", file=sys.stderr)
-        return 2
+        exit_code = 2
+        if invocation is not None and not invocation.failures:
+            invocation.failures.append(failure_reason(exc))
     except CaptureTimeout as exc:
         print(f"hana_shot: {exc}", file=sys.stderr)
-        return 3
+        exit_code = 3
+        if invocation is not None and not invocation.failures:
+            invocation.failures.append(failure_reason(exc))
     except Failure as exc:
         print(f"hana_shot: {exc}", file=sys.stderr)
-        return 1
+        exit_code = 1
+        if invocation is not None and not invocation.failures:
+            invocation.failures.append(failure_reason(exc))
+    except ExitSignal as exc:
+        exit_code = 128 + exc.number
+    finally:
+        if invocation is not None:
+            write_invocation(invocation, args.port, args.remote, exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 ---
-description: Run a production as its showrunner — launch each unit director (a /unit:delegate session), merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA on a schedule.
+description: Run a production as its showrunner — launch each unit director (a /unit:direct session), merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA on a schedule.
 ---
 
 # Produce
@@ -25,12 +25,22 @@ State:
   doc.
 - `CHECKOUT` — this session's checkout, which must be on `MERGE_BRANCH`.
 - `SCRATCH` — this session's scratchpad directory.
+- `DAILIES_STATE_DIR` — `<SCRATCH>/dailies_input_state`, the dailies builder's
+  `--state-dir` (`commands/showrunner/dailies.md` passes this path) and the
+  `--state-dir` for every `ci_points.py` and stateful `waiting.py` call.
 - `LAST_MERGED[unit]` — the unit's last merged checkpoint. Read it from the
   merge commit subjects on `MERGE_BRANCH`, never from memory.
 - `NOTIFIER` — `zsh ~/.claude/scripts/message/notifier.sh`.
 - `UPDATES` — `showrunner-<slug>`, where `<slug>` is the production doc's file
   name less `-production.md`.
 - `PROMPT_FILE` — `~/.local/state/showrunner/<slug>/prompt.txt`.
+- `SHOWRUNNER_STATE` — `<SCRATCH>/showrunner_state.json`, one JSON object with
+  optional `units` rows (`{"unit": "<unit session name>", "phase": "<text>",
+  "wait": "<text>"}`), `merges_held` (a list of text), and `open_for_user`
+  (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`).
+- `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<slug>.json`, written
+  by `update_registration.py footer --state` when `SHOWRUNNER_STATE` includes
+  `open_for_user`. Omitting that key leaves the durable list unchanged.
 
 `<DecisionEconomy/>` is defined by this import:
 
@@ -40,20 +50,26 @@ State:
 
 <Throughout>
 - **Time.** Before writing any time, run
-  `TZ=<ZONE> date '+%H:%M %Z'`. Give every time in `ZONE` only, never UTC (user,
-  2026-10-02). Unit directors state times in `ZONE` (user, 2026-10-04); convert any that arrive in another zone.
-- **Log.** Write one line per event in `LOG`: `- HH:MM <zone>: <event>`. Every
-  ten events, and before a compaction, add a `### STATE <time>` block. It gives:
-  - each unit's phase, last merged checkpoint and what it waits on;
-  - merges accepted but held;
-  - items open for the user.
-
+  `python3 ~/.claude/scripts/production/update_registration.py time <ISO or HH:MM>
+  --production PRODUCTION_DOC`. For the current time, pass `"$(date -Iseconds)"`.
+  Use its `HH:MM <zone>` output. Give every time in `ZONE` only, never UTC
+  (user, 2026-10-02).
+- **Log.** Run `python3 ~/.claude/scripts/production/update_registration.py
+  log "<event>" --production PRODUCTION_DOC` for each event. Add
+  `--state SHOWRUNNER_STATE` once that file exists, and `--before-compaction`
+  before a compaction. The command writes
+  the event line and each tenth `### STATE` block, including unit phase, last
+  merged checkpoint, waits, accepted but held merges and items open for the user.
   After a compaction, the production doc plus `LOG` is the whole state.
 - **Unit worktrees.** Never `cd` into one; use `git -C`. Never commit, reset or
   edit files there.
+- **A unit's pane** is looked up each time it is needed, never remembered:
+  `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
+  prints it (`<unit>` is the Units row's Unit value). No tool finds a pane by a
+  session name; the user may rename a session at any time.
 - **The user's words for a unit director** go into its terminal. Send
-  `tmux send-keys -t <session> -l "From the user (via the showrunner): <words>"`,
-  then `tmux send-keys -t <session> Enter` as a separate call:
+  `tmux send-keys -t <pane> -l "From the user (via the showrunner): <words>"`,
+  then `tmux send-keys -t <pane> Enter` as a separate call:
   - Relay only words the user gave.
   - Never send C-c or Escape; typing replaces a prompt suggestion.
   - Text after a unit director's `❯` in a pane capture may be a prompt
@@ -88,47 +104,61 @@ State:
 - **Helpers.** Stop each named helper agent once its report is read.
 - **An auto-mode denial** is never retried or worked around. Tell the user what
   was denied and let them add a permission rule.
-- **Unmeasured ETAs.** Whenever a unit's phase ETA reads "none measured" or its
-  unit director has stated none — in an update tick, a dailies report or its
-  own message — send the unit director `From the showrunner: run /unit:eta (or read ~/.claude/commands/unit/eta.md if it is not in your skill list)` by SendMessage, in that same
-  turn. Ask once per phase; ask again only if it answered without a time. Until
-  it answers, report that ETA as `none measured - requested`.
-- **Waiting on block.** After the footer, leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. The user's items come first. Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. User, 2026-10-06.
-- **Footer.** Paste the output of
-  `python3 ~/.claude/scripts/production/dailies_render.py --footer --zone <ZONE>`,
-  word for word before the Waiting on block. It starts with a blank line and `---`, then
-  `HH:MM <zone> update:` and a blank line. Its `* ` bullets list each build
-  hold, each agent in the dailies report's words, then
-  `next dailies: HH:MM <zone>` or `no dailies scheduled`. A later day's
-  schedule includes its weekday. The last bullet ends ` - nothing needed`
-  when it applies. Put outstanding items in the Waiting on block, user's
-  first. Pass:
-  - `--next-run <HH:MM[+N]>`: `next_due` from `NOTIFIER status UPDATES` in
-    `ZONE`, with `+N` when it falls N days later, never from memory (user,
-    2026-10-02); leave it out when no schedule runs.
-  - Build holds come from the holder files in `~/.local/state/build-hold/`:
-    one line per active holder, including after a partial release. In a dailies
-    input, mark `units[i].build_hold: true` when you told that unit director to
-    stop builds. The renderer refuses a marker with no holder file, or active
-    holder files with no marked unit.
-  - `--nothing-needed`: when no subject needs a follow-up nobody has started.
-  - `--outstanding <OUTSTANDING>`, always, on the footer and on every dailies
-    render. `OUTSTANDING` is `~/.local/state/showrunner/outstanding/<slug>.json`:
-    `[{"since": "YYYY-MM-DDTHH:MM", "text": "..."}]`, one entry per thing the
-    user must do or decide, each with enough context to recall it without my
-    memory (what, where, why). Add an entry the moment it arises; remove it only
-    when the user addresses it and tells you. An entry the user defers gets
-    `"after": "YYYY-MM-DDTHH:MM"` (local) and stays hidden until then. User, 2026-10-05.
+- **Unmeasured ETAs.** When a unit has no measured phase ETA, run `python3
+  ~/.claude/scripts/production/waiting.py eta-request <unit> --phase <phase>
+  --production PRODUCTION_DOC --state-dir DAILIES_STATE_DIR` in that turn.
+  Send its `request /unit:eta:` line to the unit director with `From the
+  showrunner: run /unit:eta (or read ~/.claude/commands/unit/eta.md if it is
+  not in your skill list)`. The shared record asks once per phase; if the
+  director answered without a time, message it yourself, because
+  the command will not repeat the request. Report `none measured - requested`
+  until it answers.
+- **Waiting on block.** When footers are on, after the footer leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. The user's items come first. Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. The footer hook checks the shape and item order. User, 2026-10-06.
+- **Footer.** Run `python3 ~/.claude/scripts/production/update_registration.py
+  footer --production PRODUCTION_DOC` for the footer, adding
+  `--state SHOWRUNNER_STATE` once that file exists. Paste the rendered footer
+  word for word before the Waiting on block.
+  Pass `--nothing-needed` when no subject needs a follow-up nobody has started.
+  When the user-facing open list changes, set `open_for_user` in
+  `SHOWRUNNER_STATE` to the complete new list, starting from `OUTSTANDING`'s
+  current items; `[]` clears it.
+  When the footer switch is off, the command says `footers off`; omit both the
+  footer and the Waiting on block. The command reads the switch, the notifier's
+  next due time, and open-for-the-user items from `OUTSTANDING`. Keep each
+  item specific enough to recall what, where and why without memory. Remove
+  an item only when the user addresses it and tells you; defer an item with
+  `after` when the user asks. Build holds come from holder files in
+  `~/.local/state/build-hold/`, and a dailies input marks each held unit. A
+  pending or active Mac block comes from `~/.local/state/mac-test/`.
 
   `scripts/hooks/stop-showrunner-footer.py` checks each reply in the session
-  targeted by `UPDATES` (<StartUpdates/> step 3). It uses the production doc's
-  running status and `ZONE`, notifier `next_due`, and `OUTSTANDING`. When the
-  footer's last bullet ends ` - nothing needed`, it passes `--nothing-needed`.
-  When the footer's update minute is at most five minutes old, it renders
-  with `--at` for that minute and its zone occurrence. A missing or outdated
-  footer or Waiting on block blocks the reply with the exact footer lines and
-  Waiting on shape. End the reply with those lines and the Waiting on block.
-  The hook passes a reply after any Stop-hook block and passes on errors.
+  targeted by `UPDATES`. When footers are on, a missing or outdated footer or
+  Waiting on block blocks the reply with the exact footer lines and Waiting on
+  shape. End the reply with those lines and the Waiting on block. The hook
+  passes a reply after any Stop-hook block and passes on errors.
+
+  `/showrunner:footer off` and `/showrunner:footer on` pause and resume the
+  footer for this showrunner. Run them when the user says "footers off" or
+  "footers on" as well as when they type the command. While `/showrunner:footer`
+  reports off, omit both the footer and the Waiting on block. Run
+  `/showrunner:footer` after every compaction and session resume: its switch
+  survives both. An `/adhoc_review` in this session pauses current dailies and
+  footers, then asks whether to turn back on what it paused at the end
+  (`commands/adhoc_review.md` Steps 2 and 5). The dailies keep their own switch.
+
+  When the user types a message here, the dailies and footer pause on their own.
+  Later, a `conversation-pause:` message asks you to put this question to the
+  user word for word: `Return to automatic updates? (yes / no) They return on
+  their own in 5 minutes.` Never answer it for them. Their typed yes or no is
+  handled without you while the reply that put the question is your latest.
+  Once you have replied again, a bare yes or no reaches you as the answer to
+  whatever you asked last, and the pause's question stays open until it times
+  out. The question comes fifteen minutes after your reply ends, or thirty
+  minutes after their message when the reply was interrupted. Unanswered for
+  five minutes, the updates return on their own. While an `/adhoc_review` is
+  open here, the question waits for the review to end.
+  `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/conversation_pause.py" status`
+  says what is paused.
 
   Example with a hold and an active agent (user, 2026-10-04):
 
@@ -138,6 +168,7 @@ State:
   11:37 PDT update:
 
   * build hold: <holder> since 11:34 PDT, for the frame-time lane's breakdown of what each added tool costs - release eta: 11:40 PDT (3 minutes)
+  * Mac block: <holder> since 11:35 PDT, for the Mac-only test run - lifts Wed 12:35 PDT
   * claude 1: …
   * next dailies: 11:53 PDT - nothing needed
 
@@ -166,72 +197,44 @@ State:
 ---
 
 <LoadProduction>
-Read the production doc. `CHECKOUT` must be on `MERGE_BRANCH`, or, when that
-branch does not exist yet, clean on the commit it will start from. Otherwise
-stop with `Run /showrunner:produce in a checkout on <merge branch>.`
+Run `python3 ~/.claude/scripts/production/production_lifecycle.py load
+--production PRODUCTION_DOC`, adding `--resume` on resume. The command checks
+the checkout, reads the last `### STATE` block of `LOG`, rebuilds each unit's
+last code checkpoint from first-parent merge history, and checks its tmux
+session. Use its lines to restore state. <StartUpdates/> registers this session
+again and retargets the instance. A reboot needs nothing.
 
-On `resume`, or when the doc's status is `running`:
-1. Read `LOG` from its last `### STATE` block.
-2. Rebuild `LAST_MERGED` from
-   `git -C CHECKOUT log --first-parent --format='%H %s' MERGE_BRANCH`,
-   using the `Merge <unit> phase <N> (<hash>)` subjects.
-3. Check each unit director's session with `tmux has-session`.
-4. <StartUpdates/> registers this session in the doc again and runs step 3 to
-   retarget the instance. A reboot needs nothing.
+When the production doc's **Production rules** say CI does not apply, pass
+`--no-ci` to this and every lifecycle subcommand.
 </LoadProduction>
 
 ---
 
 <OpenMergeBranch>
-Only when the doc's status is `planned`:
-
-1. If `MERGE_BRANCH` does not exist, create it in `CHECKOUT` from its current
-   commit: `git -C CHECKOUT switch -c <merge branch>`. The production doc
-   authorizes this one branch.
-2. Set the doc's status to `running`, and its `**Showrunner session:**` line
-   to this session's name, from the first line of ListAgents.
-3. Commit the production doc and every unit plan as
-   `production(<name>): plans for <n> units`, and push `MERGE_BRANCH` with its
-   upstream set.
-4. Add `LOG` to `$(git -C CHECKOUT rev-parse --git-common-dir)/info/exclude`,
-   then create it with a `# Production log — <name>` heading.
+For a planned production, run
+`python3 ~/.claude/scripts/production/production_lifecycle.py open
+--production PRODUCTION_DOC`. The command creates and pushes the merge
+branch, records the running doc and plans, and initializes `LOG`. Rerun it
+after a failed step; it resumes at the first unfinished step.
 </OpenMergeBranch>
 
 ---
 
 <LaunchUnits>
-For each unit without a live unit director:
+For each unit without a live unit director, run
+`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>`.
+`<name>` is the Units row's Unit value without `-unit`; the existing row is adopted.
+Use `--standby` for a unit waiting for an assignment. Tell the user one line
+per unit director: its session name and `tmux attach -t <session>`.
 
-1. **Worktree.** If it is absent, run
-   `git -C CHECKOUT worktree add <worktree> -b <branch> <merge branch>`, then
-   `git -C CHECKOUT push -u origin <branch>`. When the
-   repository has `.claude/config/berth.toml`, also set
-   `git -C CHECKOUT config branch.<branch>.cargoBerthTarget <merge branch>`, so
-   cargo-berth measures the unit against the merge branch.
-2. **Session.** Always use detached tmux. The unit director then outlives this
-   session, runs while the screen is locked, and the showrunner can type into
-   it. When a unit director is blocked on a full context, type `/compact` into it with
-   `send-keys -l`, then `Enter`. First capture the pane to check the block is
-   still showing and no compaction is already running, since the user may have
-   typed it already.
-   - tmux is `command -v tmux`, or else
-     `$(nix build --no-link --print-out-paths 'nixpkgs#tmux^out')/bin/tmux`.
-   - Start it through `systemd-run --user --scope --unit=<session>`, so it lives
-     outside this session's scope.
-   - Remove every `CLAUDE_*` variable from its environment. An inherited
-     `CLAUDE_CODE_CHILD_SESSION` turns off transcript saving.
-   - `SHOWRUNNER_UNIT` marks it as yours: `/notify_top_level` messages reach
-     you, not it. Pass on what applies to it.
-   - Launch:
-     `tmux new-session -d -s <session> -c <worktree> -e SHOWRUNNER_UNIT=<slug> zsh -ic "ENABLE_TOOL_SEARCH=true command claude --remote-control <session> -n <session> --settings '{\"disableAgentView\": true}' '/unit:delegate <unit plan>'; exec zsh"`
-3. **Check.** Log the launch only after the pane shows `/remote-control is
-   active`. The mobile session list lags by minutes; trust the pane.
-   Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py add <this session's name> --zone <zone> --unit <session>`.
-4. **Resume.** To bring back a unit director whose session ended, use
-   `claude --resume <session-id> --remote-control <session> -n <session>`, which
-   keeps its link and its place in the list.
+When a unit director is blocked on a full context, first capture its pane to
+confirm the block remains and no compaction is running. Type `/compact` into its pane with
+`tmux send-keys -t <pane> -l`, then send `Enter` separately.
 
-Tell the user one line per unit director: its session name, and `tmux attach -t <session>`.
+**Resume.** To bring back a unit director whose session ended, use
+   `claude --resume <session-id> <flags> --remote-control <session> -n <session>`, which keeps its link and its place in the list.
+   First run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/shutdown/shutdown.py launch-blocked --restart-of <session-id>`. Continue only when it exits 1. On any other exit, do not resume and tell the user its line; exit 0 means the account is held by a shutdown, and `/shutdown restart` brings the unit back.
+   Get `<flags>` first, from `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve production.director || exit 1; [[ "$AGENT_FAMILY" == claude ]] || { echo "unit directors launch only on claude; production.director resolves to $AGENT_FAMILY ($AGENT_MODEL)" >&2; exit 1; }; agents_claude_args'`, which prints `--model <model> [--effort <effort>]`. If it exits nonzero, stop and tell the user its line; never run `claude --resume` without the flags.
 </LaunchUnits>
 
 ---
@@ -245,34 +248,33 @@ The instance belongs to the production and keeps running when this session
 exits. On resume, retarget it. Remove it at <Wrap/>; its check removes it after
 the doc says `wrapped`. Each production has its own instance and log.
 
-Run these steps at the start and on every resume:
+At the start and on every resume, run:
 
-1. **Register.** Set the doc's `**Showrunner session:**` line to this session's
-   name, from the first line of ListAgents. If the line changed, commit the doc
-   as `production(<name>): showrunner session <session name>`.
-2. **Prompt.** Fill the prompt below from the production doc and write it to
-   `PROMPT_FILE`.
-3. **Register instance.** Run `NOTIFIER new UPDATES --to
-   session:$CLAUDE_CODE_SESSION_ID --every <N from the doc's **Updates:** line>
-   --prompt-file PROMPT_FILE --from showrunner-timer-<slug> --check "zsh
-   $HOME/.claude/scripts/production/production_check.sh <absolute doc path>"`,
-   plus `--aligned` when that line says on the hour. A repeated `new` retargets
-   without moving the clock.
-   Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py add <this session's name> --zone <zone> --unit <each unit's tmux session>`, using the name from ListAgents.
-4. **Stall watch.** If `NOTIFIER status stall-watch` reports no instance, run
-   `NOTIFIER new stall-watch --every 1 --run "$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/stall_watch.py"`.
-5. **Status.** Run `NOTIFIER status UPDATES` for the next tick and fire log.
-   The declared job runs the ticks.
+`python3 ~/.claude/scripts/production/update_registration.py register
+--production PRODUCTION_DOC`
+
+This session's name is written nowhere: the update timer is addressed to its
+Claude session id, and every tool looks the name up from that when it needs it.
+The command writes `PROMPT_FILE`,
+retargets `UPDATES` with `NOTIFIER new` without moving its clock, creates
+stall-watch and tmux-names only when absent, and prints `next_due`. Use the
+reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
+When the doc's Updates line reads `on demand`, it makes no `UPDATES` instance
+and removes one left from before, prints `on demand: no scheduled dailies`,
+and no scheduled update comes: a dailies runs only when the user asks for one.
 
 The prompt:
 
-> Scheduled update (every <N> minutes, every unit in full; the user is in
-> <zone>). Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> <sessions…> | cut -c1-400`.
+> Scheduled update (every <N> minutes, every unit checked; the user is in
+> <zone>). `<SCRATCH>` below stands for your own scratchpad directory: put its
+> path in place of it before you run a command. Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> --production <production doc> > <SCRATCH>/unit_status.txt`.
 > It checks every unit director: its session and Claude are running, anything waiting
-> on the user, and its latest step and ETA. Then give the user
-> `/showrunner:dailies simple` for every unit and open topic. If the script
-> shows SESSION GONE, CLAUDE NOT RUNNING, FORM WAITING, a usage limit, or a
-> DECISION for the user, that subject goes first, with `needed:` saying what
+> on the user, and its latest step and ETA. Run `/showrunner:dailies gantt`
+> for every unit and open topic; its input builder reads the saved status file.
+> Pass `--render-state <SCRATCH>/dailies_state.json` to the builder; the renderer
+> uses that same file as `--state`.
+> Follow each `flags first:` line: a SESSION GONE, CLAUDE NOT RUNNING, FORM
+> WAITING, usage-limit or DECISION subject goes first, with `needed:` saying what
 > the user must do. Do no other work in this turn, except `/unit:eta` requests,
 > merging a unit's checkpoint on a fresh design-check pass, acting on a BLOCK
 > past its limit (`/showrunner:produce` → Dependencies, rule 4), and compacting
@@ -286,7 +288,7 @@ is the update tick, not a peer's message. Do not reply to it.
 **Compact after a checkpoint.** At most once per phase: on the first tick or
 dailies after a unit director checkpoints a phase, read its context size from its pane
 footer (`<session> | 157,352 | <model>`). When it is at 150,000 tokens or more
-and idle, type `/compact` into it: `tmux send-keys -t <session> -l
+and idle, type `/compact` into it: `tmux send-keys -t <pane> -l
 "/compact"`, then `Enter` as a separate call. Idle means no spinner line
 (`✶ Doing… (12s …)`), nothing after `❯` except a ghost suggestion (dim:
 `tmux capture-pane -e` shows `\e[2m` before it), and no form, permission
@@ -299,8 +301,11 @@ compacting on every tick doubled the compaction rate and saved no tokens,
 because a unit director re-reads its files at
 once and passes 150K again within 12-20 minutes.)
 
-**Every scheduled update is a `/showrunner:dailies simple` report**, never a
-one-unit note: the user sees every unit on every tick, each checked in full.
+**Every scheduled update is a `/showrunner:dailies gantt` report** (none come
+when the Updates line reads `on demand`), never a
+one-unit note: every unit is checked on every tick and has its row in the chart.
+Above the chart a `gantt` dailies prints only what needs the user and one line for
+each thing that changed; the user asks for `simple` to see every unit's section.
 
 A `/showrunner:dailies` the user runs takes the next tick's slot: it runs the
 script, and then runs `NOTIFIER restart UPDATES` so the next tick comes N minutes after
@@ -333,45 +338,28 @@ whatever arrived:
 | a unit blocked on the showrunner | <ClearGate/>, <LandingCall/>, or answer it |
 | a unit director's decision for the user | show it to the user; relay the answer |
 | a quota alert | <QuotaAlert/> |
-| the user asks for a status | `/showrunner:dailies`, `simple` unless they name a length |
+| the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
 
 A unit repairing failing tests that split by file runs parallel repair seats
-(`/unit:delegate` → <FixDispatch/>); one that runs a lone seat on them gets
+(`/unit:direct` → <FixDispatch/>); one that runs a lone seat on them gets
 told to split. User, 2026-10-04.
 
 Merge one checkpoint at a time. A notice that arrives while a merge is testing
 waits its turn. When every unit's final checkpoints are merged, go to <Wrap/>.
+Routing arrivals and ordering that queue are the showrunner's calls.
 </Direct>
 
 ---
 
 <MergeCheckpoint>
-Input: the unit, phase, hash and shots from its notice.
+Input: the unit, phase, hash, shots, and `review trial:` line from its notice.
+Take the phase start time from the unit's previous merge time in `LOG`, or
+from its launch line in `LOG` for the first phase.
 
-1. **Ancestry.** `git -C CHECKOUT cat-file -e <hash>^{commit}` must succeed.
-   `git -C CHECKOUT merge-base --is-ancestor <LAST_MERGED[unit]> <hash>` must
-   succeed, so nothing merged before is dropped. A unit's first merge has no
-   `LAST_MERGED` and skips this check.
+The showrunner first judges the following points. A held judgment returns the
+notice to the unit director before any merge command runs:
 
-   The hash must also be on origin: after `git -C CHECKOUT fetch origin
-   <branch>`, `git -C CHECKOUT merge-base --is-ancestor <hash> origin/<branch>`
-   succeeds. If it fails, tell the unit director to push its branch. The merge
-   does not wait.
-2. **Scope.** `git -C CHECKOUT diff --name-only <merge branch>...<hash>` lists
-   the unit's changes. Every path must be:
-   - in the unit's **Owns**;
-   - one of its hub files;
-   - or named in the notice as `also touches`.
-
-   For anything else, ask the unit director why, and hold the merge until it
-   answers.
-3. **Conflicts.**
-   `git -C CHECKOUT merge-tree --write-tree --name-only <merge branch> <hash>`
-   exits 1 on a conflict. On a conflict:
-   - the unit director merges the merge branch, resolves the conflict on its
-     side, and sends a new hash;
-   - do not merge the old one.
-4. **Other units.** For each other unit, compare this change's paths with:
+1. **Other units.** For each other unit, compare this change's paths with:
    - its branch, `git -C CHECKOUT diff --name-only <merge branch>...<its branch>`;
    - its uncommitted edits, `git -C <its worktree> status --short`.
 
@@ -384,10 +372,10 @@ Input: the unit, phase, hash and shots from its notice.
    line lacks `tested against <owner tip>` or a fix owner the owner agreed to
    goes back (`production_format.md` → <ProductionUnit/> item 9). User,
    2026-10-06.
-5. **New public items.** Each new `pub` item in the diff needs a user in
+2. **New public items.** Each new `pub` item in the diff needs a user in
    production code. One with no consumer goes back to the unit director as a
    finding.
-6. **Design check.** A change users can see, in the app or in any example,
+3. **Design check.** A change users can see, in the app or in any example,
    needs shots and the unit's own verdict on them: the notice's `design check:`
    line (`production_format.md` → <ProductionUnit/> item 3). The unit runs the
    check before sending; you do not repeat it.
@@ -405,86 +393,90 @@ Input: the unit, phase, hash and shots from its notice.
    rule and the fix, and do not merge. Never ask the user whether a visible
    defect matters. User rule 2026-10-01 (nightly review): the unit judges its
    own shots before it moves on, so holds are not found after it has.
-7. **Merge.** Write the message to `<SCRATCH>/merge_<short hash>.msg`:
+4. **Run the checkpoint.** In the background, run
+   `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/merge_checkpoint.py --production
+   <PRODUCTION_DOC> <unit> <phase> <hash> --started <ISO>
+   --review-trial "<the complete review trial: line>"
+   --delivers "<one line of what the phase delivers>"`.
+   Add one `--also <path>` per approved outside path, one `--trailer <line>`
+   per attribution line this session requires, `--regime trial` if the broad
+   review used the craft lens, `--holds <K>` (this phase's held checkpoints)
+   and `--merge-defects <D>` (the defect rows its merge design checks found in
+   its own work, moved ones included and rows the check calls older left out),
+   both counted from `LOG`, and `--excluded "no merge design check"` for a
+   phase no merge design check judged (`report` and `watch` leave it out). The
+   default regime is `after`; both counts default to zero. Give `--scratch
+   <SCRATCH>` to keep its merge message and test log there. For a phase shrink
+   notice, add `--shrink`; omit `--review-trial` and `--delivers`. Add
+   `--cancel-prior` only with `Push: validate_and_push` when this push supersedes
+   an older queued or running CI run on the merge branch and no CI point is
+   watching its result or diagnosing a red run. The script checks ancestry,
+   origin, scope and conflicts, reports overlaps with other units, merges,
+   tests, reruns red packages, pushes, promotes, and records the result. Its
+   first `held` or `failed` line stops the run. Send its final `send <unit>:`
+   message to the unit director.
 
-   ```
-   Merge <unit> phase <N> (<short hash>) into <merge branch>
+<ChangeReviewFeatureLog>
+Run only when the production repository is `~/rust/hana` or
+`~/rust/hana_catalyst`, after `merge_checkpoint.py` accepts the merge.
 
-   <one line: what the phase delivers>
+For each distinct user-visible result:
 
-   <the attribution lines this session's commits require>
-   ```
+1. Check the Hana live log for entries it replaces.
+2. Add the next `A<n>` or `C<n>` row under `## To review` in
+   `~/rust/hanadocs/change-review.md`: change, merge date, passing Mac build
+   when available, and a visual or behavioral check.
+3. Run `~/.claude/scripts/lib/py
+   ~/.claude/scripts/feature_log/feature_log.py propose --review <row>` with
+   `--project hana`, every owning crate, kind, title, summary, current behavior,
+   check, merge SHA as `--link`, `--evidence "Showrunner merge <merge-sha>,
+   from checkpoint <checkpoint-sha>."`, `--production <slug>`, every source
+   `--unit`, and one `--old` per replaced live entry. When the merge has
+   several results, pass `--separate-result` for every row.
 
-   Then run `git -C CHECKOUT merge --no-ff -q -F <msg file> <hash>`.
-8. **Test.** In the background, test each package that owns a changed file (its
-   nearest `Cargo.toml`), plus the doc's **Merge tests**, one after another:
+Several results get several rows. Internal-only work gets none; write
+`feature log: none — <reason>` to the production log. The merge is not complete
+until every row has a valid proposal or that reason is logged. Report no entry
+message.
+</ChangeReviewFeatureLog>
 
-   ```sh
-   log=<SCRATCH>/merge_<short hash>_test.log; : > $log
-   for p in <packages>; do
-     bash ~/.claude/scripts/delegate/verify.sh test $p >> $log 2>&1
-     print -r -- "${p}_EXIT=$?" >> $log
-   done
-   ```
+5. **Report where it landed.** Include every `into:` line from the script in
+   the user update. Each names the checkout, why it received the merge and
+   what gate it unblocks. If the showrunner then merges the merge branch into
+   a unit worktree, add an `into:` line for that worktree with the same why
+   and unblocks fields. A failed promote still reports each place already
+   reached. A rerun of the same hash resumes promotion.
 
-   Then add a step for each changed example (`crates/<pkg>/examples/<name>.rs`
-   or `crates/<pkg>/examples/<name>/`): `verify.sh example <pkg> <name>`, with
-   its own `_EXIT` line. Tests and the quick push never run clippy on an example,
-   and CI's Clippy job does (`--all-targets`). On 2026-10-03, examples' Phase 1
-   turned the merge branch red this way.
-
-   When the notification arrives, read the `_EXIT` lines once.
-9. **Red.** Rerun each red package once, alone.
-   - Green alone, and memory names it as a known load-sensitive flake: log it
-     and continue.
-   - Otherwise, confirm that `HEAD` is this unpushed merge and undo it with
-     `git -C CHECKOUT reset --keep HEAD~1`. Send the unit director the failing
-     tests and the log path.
-10. **Green.** Push through CI's mend, rustfmt and taplo checks, which the tests
-    above do not cover. Before this push, check for an older queued or running
-    CI run on the merge branch. Add `--cancel-prior` when this push supersedes
-    it and no CI point is watching its result or diagnosing a red run. With
-    `dangerouslyDisableSandbox: true`, run in the background:
-
-    ```sh
-    bash ~/.claude/scripts/validate_and_push/validate_and_push.sh --quick \
-      --to "<merge branch>" \
-      --fix-commit "ci(<name>): format fixes after <unit> phase <N>"
-    ```
-
-    It commits what those tools fix as that one commit, fails on a mend warning
-    they cannot fix, and pushes. Never force-push. Leave the CI run it reports
-    to <CIPoint/>. On a failure nothing was pushed: undo the merge and any fix
-    commit with `git -C CHECKOUT reset --keep origin/<merge branch>` (if the
-    failed step's own edits block it, `git -C CHECKOUT restore .` first), and
-    send the unit director the failing step and the log. Log a push:
-    `- HH:MM <zone>: <unit> phase <N> (<hash>) merged as <merge hash>; <packages> green; pushed`.
-11. **After the push:**
-    - run <ClearGate/> for any gate this checkpoint clears;
-    - run <CrossUnitChange/> when the change renamed or removed public items,
-      or restructured files;
-    - after every fifth merge since the last CI point, run <CIPoint/>.
-    - record the phase in the review ledger:
-      `python3 ~/.claude/scripts/production/review_regime.py add --unit <unit> --phase <N> --regime after --started <ISO> --merged <ISO> --holds <K> --merge-defects <D> --ux-findings <N> --code-findings <N> --review-minutes <M> --ux-check-minutes <U> --ux-repair-minutes <R>`.
-      `holds` counts this phase's held checkpoints and `merge-defects` the
-      defect rows its merge design checks found in its own work, moved ones
-      included and rows the check calls older left out, both from `LOG`. A
-      phase no merge design check judged adds `--excluded "no merge design
-      check"`, and `report` and `watch` leave it out. The last three come
-      from the unit's `review trial:` checkpoint line. A phase whose broad
-      review ran the `craft` lens is `--regime trial`. The 12-phase report
-      says whether the screenshot check's minutes (check plus its repairs) buy
-      fewer holds and merge defects (user, 2026-10-04).
-    - then run `review_regime.py watch` (user decision 2026-10-04: watch 12
-      phases without the code reviewer; since 2026-10-05 only phases with no
-      `excluded` reason count). The first time it exits 3, run
-      `report --since 2026-09-28`, push at once
-      (`~/.claude/scripts/notify/pushover.py --priority 1 "Hana: review watch" "<one line; the table is in this session>"`),
-      log it, and give the user the table. While it exits 3, the dailies
-      `Review watch` topic needs the user, and every build report (`/builds`,
-      every 4 hours) carries it and pushes again. Run `review_regime.py ack`
-      only on the user's own acknowledgment.
+6. **After the push.** Run <ClearGate/> for a code checkpoint's first merge;
+   run <CrossUnitChange/> when public items were renamed or removed or files
+   restructured. Run `python3 ~/.claude/scripts/production/ci_points.py due
+   --production PRODUCTION_DOC --state-dir DAILIES_STATE_DIR` after each code
+   merge; when it says due, run <CIPoint/>. Run `python3
+   ~/.claude/scripts/production/ci_points.py watch --production PRODUCTION_DOC
+   --state-dir DAILIES_STATE_DIR` after each code checkpoint. Give the user its
+   table on the first alert. A shrink adds no review-ledger row or CI count. While the
+   watch exits 3, the dailies `Review watch` topic needs the user, and every
+   build report (`/builds`, every 4 hours) carries it and pushes again. Run
+   `review_regime.py ack` only on the user's own acknowledgment. Pass `--no-ci`
+   to `due` when the production rules say CI does not apply.
 </MergeCheckpoint>
+
+---
+
+<CloseChangeReview>
+When the user gives a change-review verdict:
+
+- A verdict beginning `works` or `fine` lands the row with `add --review
+  <row>`, or `supersede --review <row>` when its proposal has `--old`. Propose
+  a missing row first; correct wrong meaning by rerunning `propose` while it is
+  open.
+- Any other verdict runs `drop --review <row> --verdict "<verdict>"`. A fixing
+  merge gets a new row and proposal.
+
+A script failure leaves the row open. After success, move it to `## Reviewed`
+with verdict and date; a landed Change cell may use the printed note link.
+Report no separate feature-log message.
+</CloseChangeReview>
 
 ---
 
@@ -520,7 +512,7 @@ Screenshots and the guide never load into the showrunner's own context: never
 Read a shot, not even to look before a merge or before the user sees it. The
 2026-10-01 nightly review counted 116 shots (227k tokens) loaded there in 2.6
 days. Units run this check themselves before each checkpoint notice
-(<MergeCheckpoint/> step 6). Run it here only when a notice's verdict is
+(<MergeCheckpoint/> step 3). Run it here only when a notice's verdict is
 missing or stale: spawn a fresh helper agent with this prompt:
 
 > Read `~/.claude/commands/ux_eval.md` and follow it for these shots:
@@ -558,45 +550,43 @@ or helper working a camera out by hand gets pointed at it.
 ---
 
 <CIPoint>
-Validation needs a clean tree, so merge nothing while it runs. Before this
-push, check for an older queued or running CI run on the merge branch. Add
-`--cancel-prior` when this push supersedes it and no CI point is watching its
-result or diagnosing a red run. With `dangerouslyDisableSandbox: true`, run in
-the background:
-
-```sh
-bash ~/.claude/scripts/validate_and_push/validate_and_push.sh \
-  --to "<merge branch>" \
-  --fix-commit "ci(<name>): validation fixes after <unit> phase <N>"
-```
-
-Then watch its run with
-`gh run watch <run-id> --repo <repo> --exit-status`, also in the background.
-Red CI goes to the unit director whose unit owns the failing files. It fixes the failure as
-its next checkpoint, and you merge that as usual. Log each point and its
-result.
-
-When validation passes, start <PromoteMain/>'s smoke launch before the next
-merge. When the watch reports green, finish <PromoteMain/>.
+Merge nothing during validation. Before the push, check for an older queued or
+running CI run on `MERGE_BRANCH`; add `--cancel-prior` when this push supersedes
+it and no CI point is watching its result or diagnosing a red run. With
+`dangerouslyDisableSandbox: true`, run
+`python3 ~/.claude/scripts/production/ci_points.py ci start --production
+PRODUCTION_DOC --state-dir DAILIES_STATE_DIR [--cancel-prior]` in the background.
+It validates, pushes, and records the CI run. When validation passes, start
+<PromoteMain/>'s smoke launch before the next merge. Then run `python3
+~/.claude/scripts/production/ci_points.py ci collect --production
+PRODUCTION_DOC --state-dir DAILIES_STATE_DIR` in the background. Its last line is
+`--ci-green <tip>` only after the current tip's required jobs pass. When its
+last line is `--ci-green <tip>`, finish <PromoteMain/> with it. Give a failed
+collect line to the dailies judgment file as a topic with
+`needs_user: true`; send red CI to the unit director that owns the failing
+files for a small fix checkpoint. Log each point and its result. Pass
+`--no-ci` to both calls when the production rules say CI does not apply.
 
 **Mac run.** After every green CI on the merge branch, run its sha on the Mac
 in the background: `zsh ~/.claude/scripts/production/mac_run.sh <CHECKOUT> <sha> 60`.
 It builds, checks hana stays up 60 s, and stops it, then builds and runs each
 demo example (list in the script) for 20 s with the command you would type, so
 each starts at once from the clone `~/rust/hana_catalyst_mac`. Exit 3 means the
-Mac is unreachable: skip it. It never gates a merge; a failure (7 hana, 8 an
-example) goes to the unit whose merge it was. User, 2026-10-04 and 2026-10-05.
+Mac is unreachable: skip it. Exit 9 means the Mac is blocked, busy with a test,
+or its coordination state cannot be read: skip the run; it is not an outage.
+It never gates a merge; a failure (7 hana, 8 an example) goes to the unit whose
+merge it was. Never skip it: the user demos
+from that clone. User, 2026-10-04, 2026-10-05 and 2026-10-06.
 </CIPoint>
 
 ---
 
 <PromoteMain>
-Moves `main` to the sha a <CIPoint/> pushed, when that sha builds and runs.
-Every check is on that exact sha.
+Promote the exact sha pushed by <CIPoint/> after these checks:
 
-1. **Validation.** The CIPoint's local validation passed.
-2. **Smoke launch.** Right after validation, with `CHECKOUT` still at the sha,
-   run in the background with `dangerouslyDisableSandbox: true`:
+1. The CIPoint's local validation passed.
+2. Right after validation, with `CHECKOUT` still at that sha, run in the
+   background with `dangerouslyDisableSandbox: true`:
 
    ```sh
    bash ~/.claude/scripts/production/smoke_launch.sh CHECKOUT <sha> <SCRATCH>/smoke_<short sha>.log
@@ -605,26 +595,30 @@ Every check is on that exact sha.
    It builds `hana`, starts it on port 15790 with an empty config directory,
    waits until BRP answers, and shuts it down. Merge nothing while it runs.
    Exit 0 is a pass.
-3. **GitHub CI.** The run concluded `success`. In
+3. The GitHub CI run concluded `success`. In
    `gh run view <run-id> --json jobs`, every job concluded `success` or
    `skipped`, and `Test Suite` (Linux) concluded `success`.
-   `macOS: Compile and Test` skipped because its runner is offline passes; the
-   log line then adds `macOS skipped (runner offline)`. A macOS job that ran
-   and failed blocks. User rule 2026-10-02.
-4. **Not dirty.** After `git -C CHECKOUT fetch origin main`,
-   `git -C CHECKOUT merge-base --is-ancestor origin/main <sha>` succeeds. If
-   main has commits the merge branch lacks, leave main alone and make it a
-   topic in the next dailies.
-5. **Push.** `git -C CHECKOUT push origin <sha>:refs/heads/main`, never with
-   force. It starts one more CI run on the same sha. This plain push leaves
-   the public bevy_hana mirror alone: the mirror updates only when main lands
-   through validate_and_push, whose post-push hook publishes it (user,
-   2026-10-03).
-6. **Local main.** Find the worktree on `main` with
-   `git -C CHECKOUT worktree list`. Fast-forward it with
+   `macOS: Compile and Test` skipped because its runner is offline or the Mac
+   is blocked passes. Add `macOS skipped (runner offline)` or `macOS skipped
+   (Mac blocked)` to the log line. A macOS job that ran and failed blocks. User
+   rule 2026-10-02.
+4. Run `python3 ~/.claude/scripts/production/production_lifecycle.py
+   promote-main --production PRODUCTION_DOC --ci-green <sha>
+   --smoke-passed <sha>`. The command checks that main is not dirty, pushes
+   and promotes the doc's **Promote:** destinations. A held main is a topic in
+   the next dailies. The push is never forced. It starts one more CI run on
+   the same sha and leaves the public bevy_hana mirror alone: the mirror
+   updates only when main lands through validate_and_push, whose post-push
+   hook publishes it (user, 2026-10-03).
+5. Only when the doc declares no **Promote:** destination, find the worktree
+   on `main` with `git -C CHECKOUT worktree list`. Fast-forward it with
    `git -C <it> merge --ff-only <sha>` only when its tree is clean and
-   `git -C <it> rev-list --count <sha>..main` is 0. Otherwise leave it and say
-   why in the log line.
+   `git -C <it> rev-list --count <sha>..main` is 0. Otherwise leave it and
+   say why in the log line.
+
+When CI does not apply, run the command with `--no-ci` in place of both
+verdict flags. It reports the skipped CI, smoke-launch and Mac-run steps and
+still promotes the declared destinations, including the Mac pull.
 
 Log `- HH:MM <zone>: main promoted to <short sha> (<n> commits)`, or
 `- HH:MM <zone>: main not promoted at <short sha>: <reason>`.
@@ -633,17 +627,15 @@ Log `- HH:MM <zone>: main promoted to <short sha> (<n> commits)`, or
 ---
 
 <ClearGate>
-When a merged checkpoint is what a gate waits on, SendMessage the waiting unit
-director:
+When a merged checkpoint clears a gate, run `python3
+~/.claude/scripts/production/ci_points.py notice clear G<k> --production
+PRODUCTION_DOC` and SendMessage its `send <unit>:` line. The unit director
+checks the merge in git before continuing.
 
-`From the showrunner: G<k> clear — <unit> phase <M> is on <merge branch> as <merge hash>. Merge <merge branch> and continue.`
-
-The unit director checks this in git itself before it continues.
-
-When a gate's test under <Dependencies/> rule 1 passes without the gating
-checkpoint, lift the gate instead:
-
-`From the showrunner: G<k> lifted — your tests pass without <unit> phase <M> (<log path>). Continue.`
+When a gate's test under <Dependencies/> rule 1 passes without that checkpoint,
+run `python3 ~/.claude/scripts/production/ci_points.py notice lift G<k>
+--production PRODUCTION_DOC --log <test log path>` and SendMessage its
+`send <unit>:` line.
 </ClearGate>
 
 ---
@@ -662,10 +654,13 @@ it needs. Every other wait is yours to clear, and fast.
    - **Preference:** "to avoid conflicts", "to build on their version". Never a
      block; tell the unit director to continue.
 
-   Before accepting a code block, have the waiting unit director test it: in a scratch
-   worktree, merge `MERGE_BRANCH` without the other unit's work and run its
-   tests. Green means it is not blocked: tell it to continue, or lift the gate
-   (<ClearGate/>).
+   Before accepting a code block, run `python3 ~/.claude/scripts/production/waiting.py scratch-test
+   <waiting unit> --tests "<command>" --production PRODUCTION_DOC
+   --state-dir DAILIES_STATE_DIR`. It tests a detached scratch checkout with
+   `MERGE_BRANCH`, without the other unit's unmerged work. Green means it is
+   not blocked: tell it to continue, or lift the gate (<ClearGate/>) using the
+   printed log path. A red test needs your classification; a merge conflict
+   is not a red test.
 2. **The unit waited on lands what is needed now.** Send its unit director:
 
    `From the showrunner: <waiting unit> waits on your <what>. Checkpoint at your next green point; if only part is needed, checkpoint that part first.`
@@ -728,14 +723,16 @@ it needs. Every other wait is yours to clear, and fast.
    - `- HH:MM <zone>: block: <waiting unit> on <unit> (<code | files>: <what>), clears ~HH:MM`
    - `- HH:MM <zone>: block cleared: <waiting unit> on <unit>`
 
-   At 30 minutes past its clear time, or one hour open without movement, act
+   At each tick, run `python3 ~/.claude/scripts/production/waiting.py waits
+   --production PRODUCTION_DOC` for berth overlaps, open waits and their ages.
+   At 30 minutes past a wait's clear time, or one hour open without movement, act
    under rules 2 and 3 in that turn, an update tick included, and log the call.
    A longer wait needs a logged reason. In the dailies, the waiting unit's
    `update` names the wait with its start and clear times.
 
-   While it waits, give the waiting unit other work inside its current phase:
-   its fix built in a scratch copy, tests, docs or research. Never its next
-   phase (Rules: one phase at a time).
+   While it waits, start the waiting unit's next phase that does not need the
+   wait (Rules: parallel by default); else work inside its current phase: its
+   fix built in a scratch copy, tests, docs or research.
 5. **Two things still go to the user:** a wait that clears only by changing what
    ships, and approvals that belong in a unit director's own session.
 6. **A block on the user is still yours** (user, 2026-10-03, after trunk sat
@@ -762,7 +759,7 @@ it needs. Every other wait is yours to clear, and fast.
    3. **Otherwise, tell the user exactly what to do,** in one line they can act on from
       a phone: the session, the exact words to type or the exact allow rule
       to add, and why the check refused it, in a few words. Put it in
-      `needed:` and send it as a <Notify/> priority 2 alert.
+      `needed:` and send it as a <Notify/> `blocked` alert.
    4. **Rule 4's limit holds.** Read the pane again each hour, and repeat 1–3.
       A `needed:` line never repeats unchanged from tick to tick.
    5. **Prevent the next one.** When a routine action for the unit is refused
@@ -774,17 +771,21 @@ it needs. Every other wait is yours to clear, and fast.
 </Dependencies>
 
 <Notify>
-Phone alerts go through Pushover (user's pick, 2026-10-03), because the user
-often ignores ordinary push notifications:
+Phone alerts use the one message path, which reaches the phone through
+Pushover (user's pick, 2026-10-03), because the user often ignores ordinary
+push notifications:
 
-`~/.claude/scripts/notify/pushover.py [--priority 0|1|2] "Hana: <unit or topic>" "<message>"`
+`python3 ~/.claude/scripts/message/send.py --to user --need note|decision|blocked (--action "<what the user does>" | --no-action) --summary "Hana: <unit or topic>" --text "<message>"`
 
-The message is the one action or fact, under 200 characters. Exit 0 means
-sent. On 1 (refused or unreachable) or 2 (bad usage or missing keys), fall back
-to PushNotification and say so in the log. Never read or print
-`~/.config/pushover/env`. Every send is logged in
-`~/.local/state/notify/pushover.jsonl`, one JSON line holding the time,
-priority, title, full message and outcome.
+On the Mac, add `--machine natedev`; the keys exist only on natedev. The
+message is the one action or fact, under 200 characters. Every message says
+what the user does with `--action`, or says nothing is needed with
+`--no-action`. Emergency (`--need blocked`) is only for an action the user must
+take now. Exit 0 means sent. On `FAILED` (exit 3), fall back to PushNotification
+with the same `Action: <what the user does>` or `No action needed.` first line,
+and say so in the log. Never
+read or print `~/.config/pushover/env`. Every attempt is logged in
+`~/.local/state/message/log.jsonl`.
 
 **Push whenever work waits on the user.** When the production or any unit is
 blocked on something only the user can do (a rebuild, `github-warmup`, an
@@ -793,14 +794,14 @@ blocked, the exact action, and on which machine. One push per new block.
 Units tell you, and you push; the machine-config session (natedev, macbook)
 pushes for blocks it owns. Each block has one owner. User, 2026-10-04, after a
 rebuild waited 1.5 h with no push. A rebuild is pushed even when nothing waits
-on it, at priority 1: the user wants a text for every rebuild needed (user,
+on it, with `--need decision`: the user wants a text for every rebuild needed (user,
 2026-10-04).
 
-| Priority | When |
+| Need | When |
 | --- | --- |
-| 2: emergency, repeats every 5 min until the user taps Acknowledge | Work has stopped, and only the user can restart it: a block under <Dependencies/> rule 6, after steps 1–2, carrying the exact action; a cold gpg-agent stopping every push (the user runs `github-warmup`). Send once per block. |
-| 1: high | The user is needed, but nothing has stopped: a product decision only they can make while units have other work; main's CI red after <PromoteMain/>; a block still open an hour after they acknowledged it. That last one says what changed, never the same text again. |
-| 0: normal | A unit's whole plan finished and merged; before/after shots ready for the user's review. |
+| `blocked` (priority 2; repeats every 5 min until the user taps Acknowledge) | Work has stopped, and only the user can restart it: a block under <Dependencies/> rule 6, after steps 1–2, carrying the exact action; a cold gpg-agent stopping every push (the user runs `github-warmup`). Send once per block. |
+| `decision` (priority 1) | The user is needed, but nothing has stopped: a product decision only they can make while units have other work; main's CI red after <PromoteMain/>; a block still open an hour after they acknowledged it. That last one says what changed, never the same text again. |
+| `note` (priority 0) | A unit's whole plan finished and merged; before/after shots ready for the user's review. |
 
 Never sent: dailies, ETAs, routine merges, green CI, flakes rerun, and hardware
 checks that wait on the user's travel.
@@ -811,6 +812,10 @@ checks that wait on the user's travel.
 <Agenda>
 A phase that runs past 8 hours is talked over with the user (user,
 2026-10-04). It never blocks the unit.
+
+At each tick, run `python3 ~/.claude/scripts/production/waiting.py agenda
+--production PRODUCTION_DOC --state-dir DAILIES_STATE_DIR`. Its new items are
+deduplicated per unit and phase; supply the cause, options and your pick.
 
 - **When.** In the tick or turn that first sees a phase 8 hours past its
   start, or an ETA more than 8 hours after its start, add it.
@@ -854,9 +859,9 @@ land a phase sooner. Each design check covers every view of the change at once
 
 <CrossUnitChange>
 1. **Renamed or removed public items.** Search every other unit for uses of
-   the old name:
-   - its branch, with `git -C CHECKOUT grep -n <old> <branch>`;
-   - its worktree, with grep under the source directories.
+   the old name with `python3 ~/.claude/scripts/production/waiting.py search
+   <old name> <new name> --production PRODUCTION_DOC`. It lists branch and
+   worktree sites with paths and lines.
 
    Message the unit director of each unit that has uses. Give the exact sites
    and the replacement, and ask it to merge the merge branch and fix them before
@@ -888,9 +893,17 @@ section adds only what the showrunner role needs.
 This session is on the quota alert list because <StartUpdates/> adds it.
 
 **Unit directors act through you.** They are not on the list, so each notice
-reaches them only as your relay (<Throughout/>):
-- `Quota alert:` — tell every unit director to start no new delegate work on
-  that tool; running seats finish and the unit director does the rest itself. Hold the alert as one
+reaches them only as your relay (<Throughout/>). Run `python3
+~/.claude/scripts/production/waiting.py quota --production PRODUCTION_DOC
+--state-dir DAILIES_STATE_DIR --notice "<full notice>"`. It relays
+to every unit director and prints one `send <unit>:` receipt each:
+- `Quota alert:` — the command picks the instruction from the notice. A Codex
+  notice that says nothing was switched: unit directors keep delegating on Codex,
+  whose account may keep working on its credits, and tell you at once if Codex
+  refuses work for quota; bring a refusal to the user. A notice that says every
+  function moved: delegation continues on Claude. A Claude notice, or a Codex one
+  whose switch failed: start no new delegate work on that tool; running seats
+  finish and the unit director does the rest itself. Hold the alert as one
   item per account, listed first in every Waiting on block with the percent left
   and the reset time, until it is acknowledged or restored.
 - `Quota alert acknowledged:` — drop the held item. Paused work stays paused.
@@ -906,37 +919,24 @@ every unit director.
 <Wrap>
 When every unit's final-gate and as-built checkpoints are merged:
 
-1. Run a final <CIPoint/>, then <PromoteMain/> on its sha.
+1. Run a final <CIPoint/> and all <PromoteMain/> checks on its exact sha:
+   local validation, smoke launch and GitHub CI verdict, then the promotion
+   call. Pass `ci collect`'s `--ci-green <sha>` and the smoke launch's
+   `--smoke-passed <sha>` when CI applies, or
+   `--no-ci` under the production's no-CI rule.
 2. Work through the production doc's **Close-out** items in order:
    - an item the **Production rules** pre-approve runs as written;
    - any other item that cannot be undone gets the user's OK first;
    - back up user data before migrating it.
-3. For each unit, check that its worktree is clean
-   (`git -C <worktree> status --short` is empty) and that its branch is merged
-   (`git -C CHECKOUT branch --merged <merge branch>` lists it). Then:
-   - retire any cargo-berth reservation the worktree still holds;
-   - `git -C CHECKOUT worktree remove <worktree>`;
-   - `git -C CHECKOUT branch -d <branch>`;
-   - `git -C CHECKOUT push origin --delete <branch>`, when
-     `git -C CHECKOUT ls-remote --exit-code --heads origin <branch>` finds it.
-
-   Leave the tmux sessions; the user closes them.
-4. Remove the update instance with `NOTIFIER remove UPDATES`, then run
-   `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py remove <this session's name>`.
-5. Set the doc's status to `wrapped`, commit it as
-   `production(<name>): wrapped`, and push.
-6. Report:
-
-   ```markdown
-   | Area | Result |
-   | --- | --- |
-   | Units | <unit>: <n> phases merged, last <hash>; one row per unit |
-   | Merge branch | `<branch>` at <hash>, pushed |
-   | CI | <last point: green / red → repaired in <hash>> |
-   | Close-out | <each item: done / waiting on you> |
-   | Main | promoted to <hash> (<n> commits), or why not |
-   | Next | <what is left for the user, e.g. close-out items waiting on them> |
-   ```
+   Finish each item before passing its exact text as `--close-out-done "<item>"`.
+3. Run `python3 ~/.claude/scripts/production/production_lifecycle.py wrap
+   --production PRODUCTION_DOC --ci-green <sha> --smoke-passed <sha>
+   --close-out-done "<item>"` (repeat the last flag for every item), or pass
+   `--no-ci` when CI does not apply. The command holds on an unfinished close-out item,
+   a dirty worktree, or an unmerged branch. It promotes main, retires the unit
+   worktrees and branches, removes the update instance, archives the production's
+   phase notes in the vault, wraps and pushes the doc, and prints the final report.
+   Leave tmux sessions for the user to close.
 </Wrap>
 
 ---
@@ -948,17 +948,33 @@ When every unit's final-gate and as-built checkpoints are merged:
 - Only the showrunner pushes the merge branch and main, never with force.
   Units push only their own branch.
 - Merge only from a checkpoint notice. Never merge a visible change before a
-  fresh design-check pass on its shots (<MergeCheckpoint/> step 6).
+  fresh design-check pass on its shots (<MergeCheckpoint/> step 3).
+- **An out-of-date as-built doc may always be corrected.** You and every unit
+  may correct an as-built doc under `docs/as-built/` that contradicts the
+  code, in any unit's doc, without asking the user or the owner. Never hold a
+  merge because a unit corrected another unit's as-built doc. User,
+  2026-10-07.
 - **Check intent before ruling.** Before ruling that a design-check finding
   must change something deliberate-looking, read the repository's
   `docs/design-decisions.md`, the plan and the as-built docs; if intent stays
   unclear, keep it. When the user overrules a ruling or settles intent, add the
   entry there. User, 2026-10-04, after two such rulings were reversed.
-- **One phase at a time.** A unit starts phase N+1 only after phase N is merged
-  into the merge branch. A held checkpoint is fixed inside phase N; the unit
-  never builds the next phase on top of it. User rule 2026-10-01: widget ran
-  Phases 29 and 30 at once, and the dailies could not say which phase it was in.
-- **Disk.** Units keep saved run output under a few GB (`/unit:delegate` →
+- **Parallel by default.** Plan for parallelism; the user never has to find it.
+  Every phase that can run safely runs now. At each ETA, notice or new item, ask
+  which waiting work could start, and start it unasked:
+  - A unit's later phase runs beside its current one, with its own seats, berth
+    reservation and checkpoint. A checkpoint commits only its own phase's paths.
+    Where files overlap, it claims after the earlier phase and builds on its tree.
+  - Gates run side by side: review, live check, shots and design check run
+    alongside the final lint and tests, with one repair round for all findings.
+    A code change reruns lint and test before the checkpoint.
+  - New work goes to whichever unit can start it soonest, not to the owner's
+    queue, when its files can be fenced through berth.
+  - A held checkpoint is fixed inside its own phase. Dailies name the oldest
+    unmerged phase, with the others in `update`. If builds queue on the shared
+    lock, run fewer at once, never none. User, 2026-10-06, replacing the
+    2026-10-01 one-phase rule.
+- **Disk.** Units keep saved run output under a few GB (`/unit:direct` →
   <ToolingContract/>). When builds turn cold for no reason, run `df -h /` and
   find the large output before anything else. User, 2026-10-04.
 - Never ask the user to review until <DesignCheck/> passed on the shots.

@@ -1,6 +1,6 @@
 # Production format
 
-The shared contract for a **production**: several `/unit:delegate` runs building
+The shared contract for a **production**: several `/unit:direct` runs building
 one deliverable in parallel, coordinated by one session. The commands sit in one
 folder per role under `~/.claude/commands/`. These read or write this format and
 must not drift from it:
@@ -12,7 +12,7 @@ must not drift from it:
 - `/showrunner:produce` — runs the production from the showrunner session.
 - `/showrunner:dailies` — reports the production to the executive producer.
 - `/showrunner:interval` — changes how often the scheduled updates come.
-- `/unit:delegate` — a unit's run; it applies <ProductionUnit/> below.
+- `/unit:direct` — a unit's run; it applies <ProductionUnit/> below.
 
 ---
 
@@ -27,15 +27,19 @@ must not drift from it:
 - **Showrunner** — the session running `/showrunner:produce`. It merges, tests, pushes,
   makes the visual choices, clears waits between units, relays the user's words
   and reports on a schedule. It writes no implementation code.
-- **Unit** — one `/unit:delegate` run on one unit plan, in its own worktree and
+- **Unit** — one `/unit:direct` run on one unit plan, in its own worktree and
   branch. A unit is named `<area>-unit`, e.g. `widget-unit`. Its plan, worktree,
   branch, phases, checkpoints and ETA are the unit's.
-- **Unit director** — the Claude session that runs a unit: the `/unit:delegate`
+- **Unit director** — the Claude session that runs a unit: the `/unit:direct`
   session the showrunner launches in tmux. It receives messages, decides, writes
   Work Orders, dispatches seats, runs gates, checkpoints and reports. It writes
   no implementation code.
-- **Seat** — a codex worker the unit director dispatches, as implementer or
-  reviewer.
+- **Seat** — a Codex worker thread the unit director dispatches. Implementation
+  seats open once per run, continue across phases and repairs in whatever role
+  is needed, attempt compaction above `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` but
+  continue after a failed attempt, press on after context overflow with
+  `Continue where you stopped.`, open anew only when no open seat can take the
+  work, and end at `end_session.sh`. Reviews still open their own threads.
 - **Merge branch** — the branch every unit's checkpoints merge into. cargo-berth
   calls it the trunk. In prose, call it by its branch name, because a unit may be
   named `trunk-unit`.
@@ -64,24 +68,39 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Repository:** <main checkout path>
 - **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
 - **Showrunner checkout:** <path, on the merge branch>
-- **Showrunner session:** <the showrunner's SendMessage name, as ListAgents prints it> —
-  `/showrunner:produce` writes it at start and on every resume; the update timer
-  sends each tick to it
 - **Log:** <repo-relative path> — git-excluded; one line per event
 - **User zone:** <IANA zone> — every time the showrunner reports is in this zone plus UTC
-- **Updates:** every <N> minutes (default 15); each update reports every unit in full;
-  the update timer reads N from this line, and `/showrunner:interval` changes it
+- **Updates:** every <N> minutes (default 15), or `on demand`; each update reports every
+  unit in full; the update timer reads N from this line, `on demand` runs no timer and a
+  dailies runs only when the user asks, and `/showrunner:interval` changes it
 - **Merge tests:** <packages tested on every merge besides the changed ones, e.g. the
   app crate>; omit if none
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
 - **UX guide:** <path to the project's UX rules, e.g. `~/rust/hanadocs/ux`>; omit when
   nothing users see changes
 
+The showrunner's session name is not in the doc: a name can change, so it is
+looked up when needed. `~/.claude/scripts/lib/py
+~/.claude/scripts/production/showrunners.py name <slug>` prints it as it is now.
+
 ## Units
 
-| Unit | Plan | Worktree | Branch | Session | Port | Owns |
-| --- | --- | --- | --- | --- | --- | --- |
-| <name>-unit | <plan path> | <path> | <branch> | <tmux and remote-control name> | <app port or —> | <dirs/files> |
+| Unit | Plan | Worktree | Branch | Port | Owns |
+| --- | --- | --- | --- | --- | --- |
+| <name>-unit | <plan path> | <path> | <branch> | <app port or —> | <dirs/files> |
+
+The Unit value names the unit everywhere: in the log, the dailies, the waits and every
+tool's arguments. A unit's session name is written nowhere, because the user may rename
+a session at any time. The unit's tmux session carries the production's slug and the
+unit's id as marks, set at launch. To reach a unit, look it up at that moment:
+`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
+prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and its
+session name now. `<slug>` is this doc's file name without `-production.md`.
+
+A retired unit keeps its row. Its Plan cell begins with `retired`, alone or inside
+an opening parenthesis, as in `(retired by the user 2026-10-07, worktree removed)`.
+The status script, the dailies, the waits and the stall watch then skip it. The word
+anywhere else in the cell changes nothing.
 
 ## Hub files
 
@@ -121,10 +140,13 @@ Each gated phase carries its gate directly under the phase heading:
 ---
 
 <ProductionUnit>
-Applies to a `/unit:delegate` run whose plan header carries a
+Applies to a `/unit:direct` run whose plan header carries a
 `> **Production:**` line. Read the production doc it names at the start of the
 run and after every compaction. Your row in its **Units** table gives your name,
 branch, port and the files you own.
+
+A unit's run state is written down nowhere and the unit sets nothing. Each reader takes it, when it needs it, from the records `/unit:direct` keeps of the runs in the unit's worktree: no run yet is standing by, a newest run with no finish is running, a newest run that finished is run-finished. A session stays live after its run ends, and its next run reads as running from that run's first record.
+A run that stopped, failed, or waits on a decision has no finish in its record, so it does not read as finished, and nothing asks for `run done` text in the Plan cell.
 
 1. **Your port.** Every app launch for smoke tests and shots uses your port,
    never the user's default port or another unit's.
@@ -136,8 +158,9 @@ branch, port and the files you own.
    outside your **Owns**, another unit's crate included (user, 2026-10-04). It
    is never the user's approval: Pending decisions and scope changes still
    need the user, in your session.
-3. **Checkpoint notice.** After <RecordPhaseCompletion/>, and after the
-   final-gate and as-built commits, send the showrunner one message:
+3. **Commit notices.** The checkpoint hash is mergeable at once. Also send a
+   notice after each final-gate and as-built commit. Timing:
+   `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 
    ```
    From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
@@ -147,7 +170,20 @@ branch, port and the files you own.
 
    A phase checkpoint's notice carries the second line:
    `progress_history.py review-trial`'s output, verbatim
-   (`/unit:checkpoint` step 9).
+   (`/unit:checkpoint` step 9). `Phase <next> ETA` counts from the code
+   checkpoint commit.
+
+   The shrink notice has this form:
+
+   ```
+   From <unit>: phase <N> shrink <hash> — plan doc only.
+   ```
+
+   When the commit also carries the approved next-items file, the notice ends
+   `— plan doc and <next-items path>.` instead. The showrunner merges it like
+   any checkpoint whose only paths are the unit's own plan files, with no
+   review-ledger row and no CI count. The shrink notice carries no `review trial` or `design check`
+   line.
 
    The as-built notice's title names what moved: each doc created, amended,
    moved or deleted, and each link repointed, this doc's **Units** row
@@ -161,7 +197,7 @@ branch, port and the files you own.
    round.
 
    Such a notice carries the third line: the verdict of the design check
-   (`/unit:delegate` → <UXReview/>) that a fresh helper gave on exactly the
+   (`/unit:direct` → <UXReview/>) that a fresh helper gave on exactly the
    shots this notice sends, taken from a build of `<hash>`. A verdict on other
    shots, or on a build from before a later change to what users see, is
    stale: re-shoot and re-judge before sending. Send the notice on a `pass`,
@@ -170,8 +206,8 @@ branch, port and the files you own.
    a fresh verdict, and 3 holds were caught after the unit had moved on, 187
    minutes in 2.6 days; with a fresh pass the merge followed in 1–2 minutes.
 
-   Start the next phase only after the showrunner merges this one
-   (`/showrunner:produce` → Rules, one phase at a time).
+   Under <PhaseEnd/> step 6, start each next phase that can run under berth,
+   with its own checkpoint (`/showrunner:produce` → Rules, parallel by default).
 4. **The merge branch is the showrunner's.** Never merge into it or push it.
    Push only your own branch; <PushCheckpoint/> does it at each checkpoint.
    <PeriodicCI/> and <CICleanup/> do not run in a unit; the showrunner runs CI
@@ -238,7 +274,7 @@ branch, port and the files you own.
 9. **Files you do not own.** Edit another unit's files or hub files only through
    cargo-berth's normal flow. An incursion resolves itself. The showrunner picks
    each overlap answer, and no berth decision waits on the user
-   (`/unit:delegate` <BerthDecisions/>). Name each such file in your checkpoint
+   (`/unit:direct` <BerthDecisions/>). Name each such file in your checkpoint
    notice as `also touches <path> (owner <unit>), tested against <owner tip>`.
    Before the notice, on a clean tree, trial-merge the owner's current tip in
    your own worktree (`git merge --no-commit --no-ff <owner tip>`), run the
@@ -247,6 +283,10 @@ branch, port and the files you own.
    work can fix goes to the owner before the notice: what breaks and who fixes
    it, named on the line. The owner never absorbs your break in a repair
    round. User, 2026-10-06.
+   Correcting an as-built doc under `docs/as-built/` that contradicts the
+   code is always allowed, in any unit's doc, without asking the user, the
+   showrunner or the owner; the checkpoint notice still names the file as
+   `also touches`. User, 2026-10-07.
 10. **Turn-end lines.** A wait the showrunner can clear names it:
     `— blocked: waiting on the showrunner: <what>`. A wait on another unit is
     one of these: `— blocked: waiting on the showrunner: <unit> <what>`. A wait
@@ -275,7 +315,7 @@ branch, port and the files you own.
     the error it names, wherever it is in the workspace, then lint once.
     Never re-run lint on a tree that has not changed. A Work Order runs lint
     once after the seat's edits, never once per crate; per crate is right
-    only for test (`/unit:delegate`). Fix a file you do not
+    only for test (`/unit:direct`). Fix a file you do not
     own through item 9, and name it in your checkpoint notice. Tell your seats
     this in every Work Order that runs lint.
 14. **When others wait on you** (user, 2026-09-29). When your checkpoint turns

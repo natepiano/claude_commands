@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
 # Authorize Claude Code file-writing tools against cargo-berth's exact-file check.
 # Bash writes are deliberately outside this hook and are observed after the fact.
 #

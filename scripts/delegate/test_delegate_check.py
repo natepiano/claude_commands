@@ -16,6 +16,7 @@ REPO = Path(__file__).resolve().parents[2]
 PY = REPO / "scripts" / "lib" / "py"
 CHECK = REPO / "scripts" / "hooks" / "delegate_run.py"
 UNIT_NOTIFIER = REPO / "scripts" / "delegate" / "unit_notifier.sh"
+NOTIFIER = REPO / "scripts" / "message" / "notifier.sh"
 
 
 class DelegateCheckTests(unittest.TestCase):
@@ -64,9 +65,9 @@ class DelegateCheckTests(unittest.TestCase):
             env=self.environment(),
         )
 
-    def run_unit_notifier(self) -> subprocess.CompletedProcess[str]:
+    def run_unit_notifier(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["zsh", str(UNIT_NOTIFIER), self.session_id],
+            ["zsh", str(UNIT_NOTIFIER), self.session_id, *arguments],
             check=False,
             capture_output=True,
             text=True,
@@ -127,6 +128,160 @@ class DelegateCheckTests(unittest.TestCase):
         result = self.run_unit_notifier()
         self.assertEqual(result.returncode, 1)
         self.assertFalse((self.state_dir / f"delegate-{self.session_dir.name}").exists())
+
+    def test_unit_notifier_off_then_on_changes_instance_state(self) -> None:
+        self.write_marker()
+        created = self.run_unit_notifier()
+        self.assertEqual(created.returncode, 0, created.stderr)
+        state_path = self.state_dir / f"delegate-{self.session_dir.name}" / "state"
+
+        stopped = self.run_unit_notifier("off")
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertEqual(stopped.stdout.splitlines(), [
+            f"progress updates off: delegate-{self.session_dir.name}"
+        ])
+        self.assertIn("ENABLED=0", state_path.read_text(encoding="utf-8").splitlines())
+
+        started = self.run_unit_notifier("on")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertEqual(len(started.stdout.splitlines()), 1)
+        self.assertTrue(started.stdout.startswith(
+            f"progress updates on: delegate-{self.session_dir.name} next_due="
+        ), started.stdout)
+        self.assertIn("ENABLED=1", state_path.read_text(encoding="utf-8").splitlines())
+
+    def test_unit_notifier_off_without_marker_leaves_state_untouched(self) -> None:
+        result = self.run_unit_notifier("off")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no active unit run marker:", result.stderr)
+        self.assertFalse(self.state_dir.exists())
+
+    def test_unit_notifier_on_with_empty_marker_leaves_state_untouched(self) -> None:
+        _ = (self.active_dir / self.session_id).write_text("", encoding="utf-8")
+        result = self.run_unit_notifier("on")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("empty unit run marker:", result.stderr)
+        self.assertFalse(self.state_dir.exists())
+
+    def test_unit_notifier_rejects_bad_mode_and_extra_arguments(self) -> None:
+        self.write_marker()
+        for arguments in (("pause",), ("on", "extra")):
+            with self.subTest(arguments=arguments):
+                result = self.run_unit_notifier(*arguments)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("usage: unit_notifier.sh", result.stderr)
+        self.assertFalse(self.state_dir.exists())
+
+    def test_unit_notifier_on_makes_the_instance_a_run_never_had(self) -> None:
+        self.write_marker()
+        result = self.run_unit_notifier("on")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.startswith(
+            f"progress updates on: delegate-{self.session_dir.name} next_due="
+        ), result.stdout)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        conf = (self.state_dir / f"delegate-{self.session_dir.name}" / "conf").read_text(encoding="utf-8")
+        self.assertIn("COMMAND=/unit:report", conf.splitlines())
+
+    def on_demand(self) -> None:
+        _ = self.config_file.write_text(
+            "PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=900\nPLAN_DELEGATE_PROGRESS_UPDATES=on-demand # asked for\n",
+            encoding="utf-8",
+        )
+
+    def test_unit_notifier_on_demand_makes_no_schedule(self) -> None:
+        self.write_marker()
+        self.on_demand()
+        result = self.run_unit_notifier()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            f"progress updates on demand: delegate-{self.session_dir.name} has no schedule; "
+            + "/unit:report on starts one"
+        ])
+        self.assertFalse((self.state_dir / f"delegate-{self.session_dir.name}").exists())
+
+    def test_unit_notifier_on_demand_stops_the_schedule_a_resumed_run_holds(self) -> None:
+        self.write_marker()
+        created = self.run_unit_notifier()
+        self.assertEqual(created.returncode, 0, created.stderr)
+        self.on_demand()
+        resumed = self.run_unit_notifier()
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        state = self.state_dir / f"delegate-{self.session_dir.name}" / "state"
+        self.assertIn("ENABLED=0", state.read_text(encoding="utf-8").splitlines())
+        started = self.run_unit_notifier("on")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertIn("ENABLED=1", state.read_text(encoding="utf-8").splitlines())
+
+    def run_unit_notifier_as(self, session_id: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["zsh", str(UNIT_NOTIFIER), session_id, *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=self.environment(),
+        )
+
+    def start_run(self, session_id: str) -> str:
+        session_dir = self.root / f"run-{session_id}"
+        session_dir.mkdir()
+        _ = (self.active_dir / session_id).write_text(f"{session_dir}\n", encoding="utf-8")
+        created = self.run_unit_notifier_as(session_id)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        return f"delegate-{session_dir.name}"
+
+    def instance_files(self, instance: str) -> tuple[list[str], list[str]]:
+        directory = self.state_dir / instance
+        return (
+            (directory / "conf").read_text(encoding="utf-8").splitlines(),
+            (directory / "state").read_text(encoding="utf-8").splitlines(),
+        )
+
+    def test_unit_notifier_all_retimes_every_run_and_keeps_a_stopped_one_stopped(self) -> None:
+        _ = self.config_file.write_text("PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=900\n", encoding="utf-8")
+        running = self.start_run("running")
+        stopped = self.start_run("stopped")
+        self.assertEqual(self.run_unit_notifier_as("stopped", "off").returncode, 0)
+        other = subprocess.run(
+            ["zsh", str(NOTIFIER), "new", "showrunner-film", "--to", "session:film",
+             "--every", "15", "--command", "/showrunner:dailies"],
+            check=False, capture_output=True, text=True, env=self.environment(),
+        )
+        self.assertEqual(other.returncode, 0, other.stderr)
+        _ = self.config_file.write_text("PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=3600\n", encoding="utf-8")
+
+        result = self.run_unit_notifier_as("--all")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 2, result.stdout)
+        self.assertTrue(lines[0].startswith(f"{running} every 60 min, on, next_due="), lines[0])
+        self.assertEqual(lines[1], f"{stopped} every 60 min, off")
+        for instance, enabled in ((running, "ENABLED=1"), (stopped, "ENABLED=0")):
+            conf, state = self.instance_files(instance)
+            self.assertIn("EVERY=60", conf)
+            self.assertIn(enabled, state)
+        conf, _ = self.instance_files("showrunner-film")
+        self.assertIn("EVERY=15", conf)
+
+    def test_unit_notifier_all_takes_minutes_over_the_configured_interval(self) -> None:
+        running = self.start_run("running")
+        result = self.run_unit_notifier_as("--all", "30")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        conf, _ = self.instance_files(running)
+        self.assertIn("EVERY=30", conf)
+
+    def test_unit_notifier_all_says_so_when_no_run_has_a_schedule(self) -> None:
+        result = self.run_unit_notifier_as("--all")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["no unit run has a report schedule"])
+
+    def test_unit_notifier_all_rejects_a_bad_interval(self) -> None:
+        for arguments in (("0",), ("hourly",), ("60", "extra")):
+            with self.subTest(arguments=arguments):
+                result = self.run_unit_notifier_as("--all", *arguments)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("usage: unit_notifier.sh", result.stderr)
 
 
 if __name__ == "__main__":

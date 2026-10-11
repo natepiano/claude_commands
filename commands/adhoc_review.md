@@ -30,6 +30,8 @@ count into Step 2 without listing the items.
 
 ## Step 2: Set up where decisions get recorded
 
+Before the first item, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/review_pause.py" pause` and show each line it prints. In a showrunner session this pauses current dailies and footers and records only what it changed. The record outlives compaction and session resume; a repeated `pause` keeps it. In a session no production targets, the command prints nothing and the review continues normally.
+
 By default the review gets a transient doc: a new file at the working repo's root, excluded from git with `bash ~/.claude/scripts/exclude/exclude.sh <path>` (the scratchpad does not survive compaction), headed with today's date and where the items came from. It holds each decision and any action the decision leaves pending, and is deleted in Step 5. Create it without asking, and open the first item with one line: `N items; decisions in <path>, deleted when the review ends.` An item may also be acted on as soon as it is decided; the doc then records that it was done.
 
 Ask first only when an obvious doc is in scope that the user did not name, a file they have been editing or named this session that the decisions belong in:
@@ -149,6 +151,8 @@ This is a scaffold, not a demand for headings when a very small item reads more 
 ## Step 5: Wrap up
 
 When every item is done:
+
+Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/review_pause.py" status`. Across its records, ask one line naming only settings the review paused: `Turn dailies and footers back on? (yes / dailies only / footers only / leave off)`, `Turn footers back on? (yes / leave off)`, or `Turn dailies back on? (yes / leave off)`. Wait for the answer. Then run the same script with `resume both`, `resume dailies`, `resume footers`, or `resume none` respectively; `yes` selects everything the review paused, and `leave off` selects `none`. If the records say nothing was paused, run `resume none` without asking. The records outlive compaction and session resume, so Step 5 applies after a resumed review too. When `status` prints nothing, continue without a question.
 
 - Transient doc: summarize inline, one line per item — `1. <label> → <decision>` — then every action still pending (or `none pending`), then delete the doc.
 - A doc the user chose: one-line summary — `Wrote decisions for N completed items to <path>`. It stays.

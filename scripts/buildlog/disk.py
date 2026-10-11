@@ -125,7 +125,7 @@ def outside_directory_bytes(folders: list[tuple[str, str]]) -> tuple[dict[str, i
         frontier: list[tuple[str, int, tuple[str, ...]]] = [(os.path.expanduser(root), 0, ())]
         while frontier:
             directory, depth, parents = frontier.pop()
-            if os.path.isfile(os.path.join(directory, sweep.RUSTC_INFO)):
+            if sweep.is_cargo_target(directory):
                 continue
             counted = (*parents, directory) if depth in (0, 1, 2, 3) else parents
             if depth in (0, 1, 2, 3):

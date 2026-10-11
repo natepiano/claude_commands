@@ -10,9 +10,23 @@
   ],
   "executionEnvironments": [
     {
+      "root": "scripts/feature_log",
+      "extraPaths": [
+        "scripts/feature_log"
+      ]
+    },
+    {
+      "root": "scripts/model_study",
+      "extraPaths": [
+        "scripts/model_study"
+      ]
+    },
+    {
       "root": "scripts/hooks",
       "extraPaths": [
-        "scripts/hooks"
+        "scripts/hooks",
+        "scripts/message",
+        "scripts/notify"
       ]
     },
     {
@@ -24,20 +38,27 @@
     {
       "root": "scripts/whoami",
       "extraPaths": [
-        "scripts/whoami"
+        "scripts/whoami",
+        "scripts/message",
+        "scripts/notify"
       ]
     },
     {
       "root": "scripts/nightly_review",
       "extraPaths": [
         "scripts/nightly_review",
+        "scripts/shutdown",
         "scripts/whoami"
       ]
     },
     {
       "root": "scripts/message",
       "extraPaths": [
-        "scripts/message"
+        "scripts/message",
+        "scripts/production",
+        "scripts/delegate",
+        "scripts/notify",
+        "scripts/shutdown"
       ]
     },
     {
@@ -51,6 +72,13 @@
       "root": "scripts/buildlog",
       "extraPaths": [
         "scripts/buildlog",
+        "scripts/lint"
+      ]
+    },
+    {
+      "root": "scripts/mac_test",
+      "extraPaths": [
+        "scripts/mac_test",
         "scripts/lint"
       ]
     },
@@ -71,13 +99,31 @@
       "extraPaths": [
         "scripts/production",
         "scripts/build_hold",
+        "scripts/hooks",
+        "scripts/mac_test",
+        "scripts/message",
+        "scripts/notify",
+        "scripts/shutdown",
         "scripts/whoami"
       ]
     },
     {
       "root": "scripts/build_hold",
       "extraPaths": [
-        "scripts/build_hold"
+        "scripts/build_hold",
+        "scripts/message",
+        "scripts/notify"
+      ]
+    },
+    {
+      "root": "scripts/shutdown",
+      "extraPaths": [
+        "scripts/shutdown",
+        "scripts/whoami",
+        "scripts/message",
+        "scripts/notify",
+        "scripts/production",
+        "scripts/hooks"
       ]
     },
     {

@@ -13,7 +13,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
-from typing import override
+from typing import cast, override
 
 
 BOARD = Path(__file__).with_name("board.sh")
@@ -65,8 +65,7 @@ class BoardReclaimTests(unittest.TestCase):
             self.fail("guard helper has no stdout")
         ready, _, _ = select.select([helper.stdout], [], [], 5)
         self.assertTrue(ready, "guard helper did not start")
-        self.assertEqual(os.read(helper.stdout.fileno(), 64).decode().strip(), "locked")
-        helper.stdout.close()
+        self.assertEqual(cast(str, helper.stdout.readline()).strip(), "locked")
         return helper
 
     @staticmethod
@@ -80,6 +79,8 @@ class BoardReclaimTests(unittest.TestCase):
         if helper.poll() is None:
             helper.kill()
         _ = helper.wait(timeout=5)
+        if helper.stdout is not None:
+            helper.stdout.close()
 
     def assert_guard_file(self) -> None:
         self.assertFalse((self.root / "locks" / "cargo.reclaim").exists())
@@ -247,6 +248,25 @@ class BoardReclaimTests(unittest.TestCase):
         self.assertEqual(stdout.strip(), "released cargo")
         self.assertFalse(self.lock.exists())
         self.assert_guard_file()
+
+    def test_reclaimed_same_slot_release_keeps_new_holder_lock(self) -> None:
+        first = self.holder_process()
+        second = self.holder_process()
+        self.assert_acquired(self.board("acquire", "holder", "cargo", "--pid", str(first.pid),
+                                        "--hold", "10"), "acquired cargo")
+        self.assert_acquired(self.board("acquire", "holder", "cargo", "--pid", str(second.pid),
+                                        "--wait", "0", epoch=1011),
+                             "acquired cargo (reclaimed from holder)")
+
+        old_release = self.board("release", "holder", "cargo", "--pid", str(first.pid))
+        self.assertEqual(old_release.returncode, 3, old_release.stdout + old_release.stderr)
+        self.assertEqual((self.lock / "holder_pid").read_text(), str(second.pid))
+        self.assertTrue(self.lock.exists())
+
+        unrelated_release = self.board("release", "holder", "cargo", "--pid", "1")
+        self.assertEqual(unrelated_release.returncode, 1,
+                         unrelated_release.stdout + unrelated_release.stderr)
+        self.assertEqual((self.lock / "holder_pid").read_text(), str(second.pid))
 
 
 if __name__ == "__main__":

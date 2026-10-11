@@ -1,0 +1,9 @@
+{
+  "piped_hana": "python3 /tools/hana_shot.py shot --view main | tail -5",
+  "piped_curl": "curl -s -X POST localhost:15702 -d '{\"method\":\"brp_extras/screenshot\"}' | head -c 200",
+  "search_hana": "rg -n 'hana_shot.py shot' scripts",
+  "search_brp": "rg -n 'brp_extras_screenshot' scripts",
+  "heredoc": "cat <<EOF\n{\"method\":\"brp_extras/screenshot\"}\nEOF",
+  "move": "curl -s -X POST localhost:15702 -d '{\"method\":\"world.query\"}'",
+  "skip": "curl -s -X POST localhost:15702 -d '{\"method\":\"brp_extras/status\"}'"
+}

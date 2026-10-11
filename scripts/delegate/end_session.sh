@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# end_session.sh — Mark this Claude session's delegate run finished.
+# end_session.sh — Mark this Claude session's unit run finished.
 #
 # Usage: end_session.sh
 #
@@ -25,6 +25,8 @@ set -euo pipefail
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.10.
 PY="${HOME}/.claude/scripts/lib/py"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MESH="${SCRIPT_DIR}/../agents/codex_mesh.py"
 
 if [[ -z "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
   echo "No CLAUDE_CODE_SESSION_ID in the environment — nothing to clear."
@@ -37,23 +39,25 @@ if [[ -f "${MARKER}" ]]; then
   # The marker holds the session directory, which is where the mesh files live.
   SESSION_DIR="$(head -n 1 "${MARKER}")"
   if [[ -n "${SESSION_DIR}" ]]; then
-    "$PY" "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/remove_seats.py" \
+    "$PY" "${SCRIPT_DIR}/remove_seats.py" \
       --session-dir "${SESSION_DIR}" || true
   fi
-  if [[ -n "${SESSION_DIR}" && -f "${SESSION_DIR}/mesh_server.json" ]]; then
-    "$PY" "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agents/codex_mesh.py" \
+  if [[ -n "${SESSION_DIR}" && ( -f "${SESSION_DIR}/mesh_roster.json" || -f "${SESSION_DIR}/mesh_server.json" || -f "${SESSION_DIR}/mesh_retired.json" ) ]]; then
+    "$PY" "${MESH}" \
       stop --session-dir "${SESSION_DIR}" || true
+  fi
+  if [[ -n "${SESSION_DIR}" ]]; then
+    "$PY" "${MESH}" sweep --root "$(dirname "${SESSION_DIR}")" --stop || true
   fi
   if [[ -n "${SESSION_DIR}" && -d "${SESSION_DIR}/verify_cache" ]]; then
     rm -rf -- "${SESSION_DIR}/verify_cache"
   fi
   if [[ -n "${SESSION_DIR}" ]]; then
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     zsh "${SCRIPT_DIR}/../message/notifier.sh" remove "delegate-$(basename "${SESSION_DIR}")" \
       >/dev/null 2>&1 || true
   fi
   rm -f "${MARKER}"
-  echo "Delegate run ended; marker cleared."
+  echo "Unit run ended; marker cleared."
 else
-  echo "No active delegate run marker for this session."
+  echo "No active unit run marker for this session."
 fi

@@ -21,6 +21,9 @@ phase; `report` compares the phases before, under and after the trial:
 - better: fewer holds at merge and fewer defects found by the merge design check;
 - cost: longer phases (start to merge) and more review-seat minutes.
 
+From 2026-10-07, the code number is every code finding the phase's review
+raised; before that it was the code-quality reviewer's alone.
+
 `holds` counts the checkpoints of the phase the showrunner held; `merge-defects`
 counts the defect rows its merge design checks found in the phase's own work,
 moved ones included and rows the check calls older than the phase left out.
@@ -185,7 +188,7 @@ def report(since: str | None) -> None:
         lambda group: mean_of([row.ux_repair_minutes for row in group if row.ux_repair_minutes is not None]),
     )
     line("UX reviewer findings per phase (mean)", lambda group: mean_of([float(row.ux_findings) for row in group if row.ux_findings is not None]))
-    line("code reviewer findings per phase (mean)", lambda group: mean_of([float(row.code_findings) for row in group if row.code_findings is not None]))
+    line("code findings per phase (mean)", lambda group: mean_of([float(row.code_findings) for row in group if row.code_findings is not None]))
     print("\n".join(lines))
 
 

@@ -24,7 +24,7 @@ list_skills() {
 usage() {
     local fn="${1:-}" switched="${2:-}"
     local ex_fn="delegate" ex_other="claude" ex_row="delegate.review"
-    local ex_pair="gpt-5.6-sol:max" family row_line
+    local ex_pair="gpt-6.1-sol:max" family row_line
     if [[ -n "$switched" ]]; then
         [[ "$switched" == "codex" ]] && ex_other="claude" || ex_other="codex"
     fi
@@ -200,6 +200,9 @@ elif [[ "$#" -eq 1 ]]; then
     if _agents_config_has_section "$1.agents"; then
         agents_set_all_assignments "$1"
         echo "# switched every function to $1"
+        for fn in $AGENT_KEPT_FUNCTIONS; do
+            echo "# kept $fn on $(_agents_pinned_family "$fn"): its only set"
+        done
         agents_list_assignments
         echo ""
         usage "" "$1"
@@ -209,6 +212,9 @@ elif [[ "$#" -eq 1 ]]; then
     if [[ -n "$(_agents_agent_families_inline "$1")" ]]; then
         agents_set_model "$1"
         echo "# switched every function to $1 ($AGENT_SWEEP_FAMILY), efforts kept"
+        for fn in $AGENT_KEPT_FUNCTIONS; do
+            echo "# kept $fn on $(_agents_pinned_family "$fn"): its only set"
+        done
         agents_list_assignments
         echo ""
         usage "" "$AGENT_SWEEP_FAMILY"

@@ -1,6 +1,6 @@
 # User-facing explanation
 
-Shared by `/adhoc_review` and `/unit:delegate`. Both reference this file rather
+Shared by `/adhoc_review` and `/unit:direct`. Both reference this file rather
 than carrying their own copy, so the method cannot drift between them. Applies
 to any turn that presents a finding, a briefing, or a decision to the user.
 

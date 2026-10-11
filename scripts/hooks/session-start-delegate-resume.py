@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""SessionStart(compact) hook: re-seat a /unit:delegate run after compaction.
+"""SessionStart(compact) hook: re-seat a /unit:direct run after compaction.
 
-`delegate.md` already says to re-read the command file after compaction and
+`direct.md` already says to re-read the command file after compaction and
 resume the same control flow. The problem is where that instruction lives: in
 the conversation being summarized. Summarization drops the rules that were not
 firing at the moment it ran, which is exactly the set that matters on the far
@@ -11,7 +11,7 @@ A SessionStart hook with `source == "compact"` runs after the summary is built
 and its `additionalContext` is injected into the fresh context. So this text
 cannot be summarized away -- it is the first thing the resumed agent reads.
 
-Silent unless a delegate run is actually active in this session; an ordinary
+Silent unless a /unit:direct run is actually active in this session; an ordinary
 compaction gets nothing.
 """
 
@@ -36,13 +36,13 @@ class SessionStartInput(TypedDict, total=False):
 
 
 CONTEXT = """\
-A /unit:delegate run is active in this session and was just compacted. The \
+A /unit:direct run is active in this session and was just compacted. The \
 summary above is not the whole picture -- compaction is a normal, expected event \
 in a long run, and the run continues.
 
 Before any further workflow action:
 
-1. Re-read ~/.claude/commands/unit/delegate.md in full. Do not reconstruct the \
+1. Re-read ~/.claude/commands/unit/direct.md in full. Do not reconstruct the \
 workflow from the summary; a summarized workflow silently drops rules, and the \
 ones it drops are the ones that were not firing when compaction hit.
 2. Read back the handoff doc named in the summary and resume the control flow it \

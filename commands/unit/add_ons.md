@@ -1,20 +1,21 @@
 ---
-description: Review the add-ons a delegate run has collected for later.
+description: Review the add-ons a /unit:direct run has collected for later.
 ---
 
-# Delegate — next items
+# Direct — next items
 
 **Usage:** `/unit:add_ons`
 
-Type this to review the add-ons a delegate run has accumulated: it walks
+Type this to review the add-ons a `/unit:direct` run has accumulated: it walks
 `${NEXT_ITEMS_PENDING}` through <ReviewPendingAddOns/> now. It runs inside the
-current session and already knows the plan and its phases. If no delegate run is
+current session and already knows the plan and its phases. If no `/unit:direct` run is
 active, say so in one line and stop.
 
-`/unit:delegate` reads this file at each phase boundary and at every interactive
+`/unit:direct` reads this file at each phase boundary and at every interactive
 point. It defines <ConsiderNextItems/> and <ReviewPendingAddOns/> in full. Never
 work from memory of an earlier read: silence in automatic mode and the
 one-line reporting rule are the parts that drift.
+Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 
 Everything below is the contract.
 
@@ -22,7 +23,9 @@ Everything below is the contract.
 
 <ConsiderNextItems>
 Phased plans only. The unit director performs this assessment; do not launch another
-agent. After shrink, read the current `As-built` block, phase diff,
+agent. In loop/verbose, read the current Work Order; in `single`, read the
+current `As-built` block. In all modes, read the phase diff,
+`${SESSION_DIR}/phase_review_retrospective_<phase>.md`,
 `${SESSION_DIR}/phase_review_outcomes_<phase>.md`, remaining `todo` Work Orders,
 `${SESSION_DIR}/next_item_amendments_<phase>.md` when present, and
 `${NEXT_ITEMS_PATH}` when it exists. Inspect targeted in-scope consumer or crate
@@ -32,7 +35,8 @@ A candidate must be needed for the plan's broader outcome and target an
 in-scope consumer named by Delegation Context, the crate's API/implementation,
 or a crate example. Exclude a current-phase defect, work already owned by a
 remaining Work Order, and optional polish or an idea that is not required.
-Current-phase defects return to <Synthesize/>.
+Handle current-phase defects under <PhaseEnd/> step 3; in `single`, return them
+to <Synthesize/>.
 
 Each new candidate is an `add` proposal with title, target, need, completion
 condition, source phase, and `Class: gate`. Import each architect proposal with

@@ -299,11 +299,12 @@ stderr_out="$(agents_set_row editable.work nosuch:high 2>&1 >/dev/null || true)"
 [[ "$stderr_out" == *"[codex.agents]"* && "$stderr_out" == *"[claude.agents]"* ]] \
     || fail "unknown agent error did not list both catalogs"
 
-# A claude agent for a function that has no claude set names the real problem.
-assert_fails "inferred family has no set" agents_set_row bare.work opus:high
-cmp "$before" "$AGENTS_CONFIG_FILE" || fail "missing inferred-family set changed the registry"
+# A Claude agent cannot move a function that has only a Codex set.
+assert_fails "switching a Codex-only row to Claude" agents_set_row bare.work opus:high
+cmp "$before" "$AGENTS_CONFIG_FILE" || fail "rejected Codex-only row edit changed the registry"
 stderr_out="$(agents_set_row bare.work opus:high 2>&1 >/dev/null || true)"
-[[ "$stderr_out" == *"no [bare.claude]"* ]] || fail "missing inferred-family set did not name the section"
+[[ "$stderr_out" == *"'bare' runs only on codex: [bare.codex] is its only set."* ]] \
+    || fail "one-family row refusal did not name its only set"
 
 function_list="$(agents_list_function editable)"
 printf '%s\n' "$function_list" | grep -q '^task=editable.work family=codex agent=gpt-test effort=high active=yes tier=inherit$' \
@@ -343,12 +344,16 @@ cmp "$before" "$AGENTS_CONFIG_FILE" || fail "unknown family changed the registry
 stderr_out="$(agents_set_all_assignments nosuch 2>&1 >/dev/null || true)"
 [[ "$stderr_out" == *"Configured families"* ]] || fail "unknown family error did not list the families"
 
-# One missing set or invalid row anywhere rejects the whole switch.
+# A function with no set in either family still rejects a whole switch;
+# codex-only functions in this fixture are pinned and do not cause it.
 write_fixture "$TEST_DIR/base.conf"
 before="$TEST_DIR/switchall-base.conf"
 cp "$AGENTS_CONFIG_FILE" "$before"
 assert_fails "switch-all with a missing set" agents_set_all_assignments claude
 cmp "$before" "$AGENTS_CONFIG_FILE" || fail "rejected switch-all changed the registry"
+stderr_out="$(agents_set_all_assignments claude 2>&1 >/dev/null || true)"
+[[ "$stderr_out" == *"missing [missing_set.claude]"* ]] \
+    || fail "switch-all refusal was not caused by the function with no set"
 
 # A bare agent puts every function on it: fixed assignments switch to the
 # agent's family, every row of that family takes the agent with its effort
@@ -742,5 +747,94 @@ agents_resolve paced.work
 agents_set_service_tier default paced
 agents_set_service_tier pace paced
 [[ "$(_agents_registry_get paced.options codex_service_tier)" == "pace" ]] || fail "pace could not be set"
+
+# Production has only a Claude set. Every-function switches keep it, while a
+# direct switch of production must refuse before changing a byte.
+cat > "$TEST_DIR/production.conf" <<'EOF'
+[assignments]
+ordinary=claude
+production=claude
+codex_only=codex
+
+[ordinary.codex]
+work=gpt-old:high
+
+[ordinary.claude]
+work=opus:high
+
+[production.claude]
+director=opus:xhigh
+
+[codex_only.codex]
+work=gpt-old:high
+
+[codex.agents]
+gpt-old=low,medium,high
+gpt-test=low,medium,high
+
+[claude.agents]
+opus=low,medium,high,xhigh
+sonnet=low,medium,high,xhigh
+EOF
+
+admin() {
+    AGENTS_CONFIG_FILE="$AGENTS_CONFIG_FILE" CODEX_CONFIG_FILE="$CODEX_CONFIG_FILE" \
+        CODEX_MODELS_CACHE_FILE="$CODEX_MODELS_CACHE_FILE" \
+        CODEX_CATALOG_SYNC_STATE_FILE="$CODEX_CATALOG_SYNC_STATE_FILE" \
+        bash "$SCRIPT_DIR/agent_admin.sh" "$@"
+}
+
+assert_production_refusal() {
+    local output
+    cp "$AGENTS_CONFIG_FILE" "$TEST_DIR/production-before.conf"
+    if output="$(admin "$@" 2>&1)"; then
+        fail "production switch unexpectedly succeeded: $*"
+    fi
+    [[ "${output%%$'\n'*}" == "ERROR: 'production' runs only on claude: [production.claude] is its only set." ]] \
+        || fail "production switch gave the wrong error: $output"
+    cmp "$TEST_DIR/production-before.conf" "$AGENTS_CONFIG_FILE" \
+        || fail "rejected production switch changed the registry: $*"
+}
+
+write_fixture "$TEST_DIR/production.conf"
+admin_output="$(admin codex)"
+[[ "$admin_output" == *$'# switched every function to codex\n# kept production on claude: its only set'* ]] \
+    || fail "family switch did not report kept production after switched line"
+[[ "$admin_output" == *"# kept codex_only on codex: its only set"* ]] \
+    || fail "family switch did not report kept Codex-only function"
+[[ "$(_agents_registry_get assignments ordinary)" == "codex" ]] || fail "family switch missed ordinary"
+[[ "$(_agents_registry_get assignments production)" == "claude" ]] || fail "family switch moved production"
+[[ "$(_agents_registry_get assignments codex_only)" == "codex" ]] || fail "family switch moved Codex-only function"
+agents_resolve production.director
+[[ "$AGENT_FAMILY" == "claude" && "$AGENT_MODEL" == "opus" && "$AGENT_EFFORT" == "xhigh" ]] \
+    || fail "family switch changed production director"
+
+write_fixture "$TEST_DIR/production.conf"
+admin_output="$(admin gpt-test)"
+[[ "$admin_output" == *$'# switched every function to gpt-test (codex), efforts kept\n# kept production on claude: its only set'* ]] \
+    || fail "agent sweep did not report kept production after switched line"
+[[ "$admin_output" == *"# kept codex_only on codex: its only set"* ]] \
+    || fail "agent sweep did not report kept Codex-only function"
+agents_resolve ordinary.work
+[[ "$AGENT_FAMILY" == "codex" && "$AGENT_MODEL" == "gpt-test" && "$AGENT_EFFORT" == "high" ]] \
+    || fail "agent sweep did not switch ordinary"
+agents_resolve production.director
+[[ "$AGENT_FAMILY" == "claude" && "$AGENT_MODEL" == "opus" && "$AGENT_EFFORT" == "xhigh" ]] \
+    || fail "agent sweep changed production director"
+agents_resolve codex_only.work
+[[ "$AGENT_FAMILY" == "codex" && "$AGENT_MODEL" == "gpt-old" && "$AGENT_EFFORT" == "high" ]] \
+    || fail "agent sweep changed Codex-only row"
+
+write_fixture "$TEST_DIR/production.conf"
+assert_production_refusal production codex
+assert_production_refusal production gpt-test
+assert_production_refusal production.director gpt-test:xhigh
+
+admin_output="$(admin production.director sonnet:xhigh)"
+[[ "$admin_output" == *"# updated [production.claude] production.director — live"* ]] \
+    || fail "director row edit did not report a live Claude row"
+agents_resolve production.director
+[[ "$AGENT_FAMILY" == "claude" && "$AGENT_MODEL" == "sonnet" && "$AGENT_EFFORT" == "xhigh" ]] \
+    || fail "director row edit did not resolve sonnet:xhigh"
 
 echo "agents_config tests passed"

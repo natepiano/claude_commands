@@ -1,6 +1,6 @@
 # Compose the work order
 
-Read at the point of use from `/unit:delegate`. Defines `<ComposeWorkOrder/>` in
+Read at the point of use from `/unit:direct`. Defines `<ComposeWorkOrder/>` in
 full.
 
 **Read when:** starting a phase, before any prompt is written. Read it every

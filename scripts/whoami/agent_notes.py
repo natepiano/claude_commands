@@ -6,33 +6,44 @@ that quota window expires; unknown or expired usage is YAML null. Never infer
 100% remaining from a reset. weekly_usage_checked_at records the observation in
 UTC so a saved reading is distinguishable from live usage. No credentials are
 saved. Other frontmatter and note bodies are preserved. Run as a script, it then
-records each run-out the readings show (run_out.py), then hands the notes to
-quota_alert.py, which messages sessions when an account runs low, and to
-codex_pacer.py, which decides the `pace` tier from them; `refresh`
-(/quota_refresh) is the run after the user reports a usage reset.
+hands the notes to quota_alert.py, which messages sessions when an account runs
+low, and to codex_pacer.py, which decides the `pace` tier from them; `refresh`
+(/quota_refresh) is the run after the user reports a usage reset. `blocked` is
+codex_mesh.py reporting that Codex refused a launch for quota: it reads the notes
+as the timer left them and hands them to quota_alert.blocked().
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast
+from typing import NotRequired, TypedDict, cast
 
 import codex_pacer
+import five_hour
 from agent_accounts import EASTERN, Report, live_reports
-from quota_alert import AgentNote, alert, current_session, refresh
-from run_out import READINGS_LOG, RUN_OUTS_LOG, record_run_outs
+from quota_alert import AgentNote, alert, blocked, current_session, refresh
+from run_out import READINGS_LOG
 
 AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
 RESET_FORMAT = "%Y-%m-%dT%H:%M:%S"
 FIELD = re.compile(r"^([A-Za-z_][\w-]*):[ \t]*(.*?)[ \t]*$")
+
+
+class StoredReading(TypedDict):
+    account: str
+    at: str
+    remaining: float
+    credits: NotRequired[float]
 
 
 @dataclass
@@ -123,11 +134,11 @@ def still_ahead(value: str | None) -> bool:
         return False
 
 
-def append_readings(readings: list[dict[str, object]], checked_at: datetime) -> None:
+def append_readings(readings: list[StoredReading], checked_at: datetime) -> None:
     """Keep the recent readings and replace the log in one write."""
     READINGS_LOG.parent.mkdir(parents=True, exist_ok=True)
     cutoff = checked_at.astimezone(timezone.utc) - timedelta(days=8)
-    kept: list[dict[str, object]] = []
+    kept: list[StoredReading] = []
     try:
         with READINGS_LOG.open(encoding="utf-8") as existing:
             for line in existing:
@@ -135,12 +146,27 @@ def append_readings(readings: list[dict[str, object]], checked_at: datetime) -> 
                     entry = cast(object, json.loads(line))
                     if not isinstance(entry, dict):
                         continue
-                    record = cast(dict[str, object], entry)
-                    at_text = record.get("at")
-                    if not isinstance(at_text, str):
+                    values = cast(dict[str, object], cast(object, entry))
+                    account = values.get("account")
+                    at_text = values.get("at")
+                    remaining = values.get("remaining")
+                    if (
+                        not isinstance(account, str)
+                        or not isinstance(at_text, str)
+                        or isinstance(remaining, bool)
+                        or not isinstance(remaining, (int, float))
+                    ):
                         continue
                     at = datetime.fromisoformat(at_text)
                     if at.tzinfo is not None and at.astimezone(timezone.utc) >= cutoff:
+                        record: StoredReading = {
+                            "account": account,
+                            "at": at_text,
+                            "remaining": float(remaining),
+                        }
+                        credits = values.get("credits")
+                        if not isinstance(credits, bool) and isinstance(credits, (int, float)):
+                            record["credits"] = float(credits)
                         kept.append(record)
                 except (ValueError, TypeError, KeyError):
                     continue
@@ -167,7 +193,7 @@ def apply(notes: list[Note], account: Report, checked_at: datetime) -> list[str]
     fresh = reset if reset is not None and reset > checked_at else None
     remaining = account.weekly_remaining if fresh is not None else None
     matched = False
-    readings: list[dict[str, object]] = []
+    readings: list[StoredReading] = []
     for note in notes:
         if note.tool != account.tool.lower():
             continue
@@ -182,6 +208,8 @@ def apply(notes: list[Note], account: Report, checked_at: datetime) -> list[str]
                 # Preserve the earliest known expiration, including its Eastern offset.
                 expirations = account.limit_reset_expirations
                 updates["limit_reset"] = expirations[0].astimezone(EASTERN).isoformat(timespec="seconds") if expirations else "null"
+            if account.credit_balance is not None:
+                updates["credit_balance"] = account.credit_balance
             updates["weekly_remaining_usage"] = "null" if remaining is None else f"{remaining:g}"
             if fresh is not None:
                 updates["resets"] = local_reset(fresh)
@@ -194,7 +222,20 @@ def apply(notes: list[Note], account: Report, checked_at: datetime) -> list[str]
         if set_fields(note, updates, stamp):
             messages.append(f"{note.path.name}: " + ", ".join(f"{k}={v}" for k, v in updates.items()))
             if active and remaining is not None:
-                readings.append({"account": note.path.stem, "at": checked_at.astimezone(timezone.utc).isoformat(timespec="seconds"), "remaining": remaining})
+                reading: StoredReading = {
+                    "account": note.path.stem,
+                    "at": checked_at.astimezone(timezone.utc).isoformat(timespec="seconds"),
+                    "remaining": remaining,
+                }
+                if account.tool.lower() == "codex" and (balance := note.get("credit_balance")) is not None:
+                    try:
+                        credits = float(balance)
+                    except ValueError:
+                        pass
+                    else:
+                        if math.isfinite(credits) and credits >= 0:
+                            reading["credits"] = credits
+                readings.append(reading)
     if readings:
         try:
             append_readings(readings, checked_at)
@@ -220,6 +261,11 @@ def update() -> list[str]:
     messages: list[str] = []
     for account in reports:
         messages += apply(notes, account, checked_at)
+    try:
+        messages += five_hour.watch(reports)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        # The 5-hour watch must never cost the notes or the weekly alerts.
+        messages.append(f"5-hour watch did not run: {error!r}")
     return messages
 
 
@@ -234,16 +280,14 @@ def mark_tier(plan: codex_pacer.Plan) -> None:
 
 
 def main() -> None:
+    if sys.argv[1:] == ["blocked"]:
+        for line in blocked(list(read_notes())):
+            print(line)
+        return
     if sys.argv[1:] not in ([], ["refresh"]):
-        sys.exit("usage: agent_notes.py [refresh]")
+        sys.exit("usage: agent_notes.py [refresh|blocked]")
     for line in update():
         print(line)
-    try:
-        for line in record_run_outs(READINGS_LOG, RUN_OUTS_LOG):
-            print(line)
-    except (OSError, ValueError) as error:
-        # A failed record only leaves the footer's lean where it was.
-        print(f"run-outs not recorded: {error!r}")
     notes: list[AgentNote] = list(read_notes())
     for line in refresh(notes, current_session()) if sys.argv[1:] else alert(notes):
         print(line)

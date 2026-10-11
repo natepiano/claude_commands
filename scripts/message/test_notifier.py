@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -29,6 +31,7 @@ class NotifierTests(unittest.TestCase):
         self.sessions_dir: Path = Path()
         self.send_args: Path = Path()
         self.fake_send: Path = Path()
+        self.launcher_dir: Path = Path()
         self.socket_path: Path = Path()
         self.live_socket: socket.socket = socket.socket(socket.AF_UNIX)
 
@@ -42,6 +45,21 @@ class NotifierTests(unittest.TestCase):
         self.fake_send = self.root / "fake-send"
         _ = self.fake_send.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$FAKE_SEND_ARGS"\nprintf "fake send result\\n"\nexit "$FAKE_SEND_RC"\n')
         self.fake_send.chmod(0o755)
+        launcher_dir = self.root / "launcher-bin"
+        launcher_dir.mkdir()
+        launcher = launcher_dir / "systemd-run"
+        _ = launcher.write_text(
+            "\n".join((
+                "#!/usr/bin/env python3",
+                "import subprocess",
+                "import sys",
+                "subprocess.Popen(sys.argv[sys.argv.index('--') + 1:], "
+                + "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+                + "stderr=subprocess.DEVNULL, start_new_session=True)",
+            )) + "\n"
+        )
+        launcher.chmod(0o755)
+        self.launcher_dir = launcher_dir
         self.addCleanup(self.live_socket.close)
         self.socket_path = self.root / "live.sock"
         self.live_socket.bind(str(self.socket_path))
@@ -66,6 +84,7 @@ class NotifierTests(unittest.TestCase):
                 "NOTIFIER_NOW_EPOCH": str(now),
                 "FAKE_SEND_ARGS": str(self.send_args),
                 "FAKE_SEND_RC": str(send_rc),
+                "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
             },
             capture_output=True, text=True, check=False,
         )
@@ -101,6 +120,23 @@ class NotifierTests(unittest.TestCase):
             time.sleep(0.02)
         self.fail(f"{path} did not contain {expected!r} before the deadline")
 
+    def fail_mv_to(self, filename: str) -> Path:
+        real_mv = shutil.which("mv")
+        self.assertIsNotNone(real_mv)
+        assert real_mv is not None
+        stub = self.launcher_dir / "mv"
+        _ = stub.write_text(
+            "\n".join((
+                "#!/bin/sh",
+                "destination=",
+                'for argument in "$@"; do destination=$argument; done',
+                f'case "$destination" in */{filename}) exit 23 ;; esac',
+                f'exec "{real_mv}" "$@"',
+            )) + "\n"
+        )
+        stub.chmod(0o755)
+        return stub
+
     def test_minute_rule_new_preserves_existing_state_and_retargets(self) -> None:
         self.assertTrue(self.new().startswith(f"next_due={MINUTE + 120} ("))
         self.assertEqual(self.state()["ENABLED"], "1")
@@ -112,6 +148,32 @@ class NotifierTests(unittest.TestCase):
         )
         self.assertEqual(self.state(), before)
         self.assertEqual((self.conf()["TARGET"], self.conf()["EVERY"]), ("other", "5"))
+
+    def test_new_state_write_failure_leaves_no_conf(self) -> None:
+        _ = self.fail_mv_to("state")
+        result = self.run_cli(
+            "new", "example", "--to", "session:sid-1", "--every", "2",
+            "--command", "the scheduled prompt",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.state_dir / "example" / "conf").exists())
+
+    def test_new_conf_write_failure_is_completed_by_next_new(self) -> None:
+        stub = self.fail_mv_to("conf")
+        result = self.run_cli(
+            "new", "example", "--to", "session:sid-1", "--every", "2",
+            "--command", "the scheduled prompt",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.state_dir / "example" / "state").exists())
+        self.assertFalse((self.state_dir / "example" / "conf").exists())
+        self.assertNotIn("example", self.successful("status"))
+
+        stub.unlink()
+        _ = self.new()
+        self.assertTrue((self.state_dir / "example" / "conf").exists())
+        _ = self.successful("tick", now=MINUTE + 120)
+        self.assertEqual(len(self.lines()), 1)
 
     def test_start_stop_restart_and_interval_schedules(self) -> None:
         _ = self.new()
@@ -126,6 +188,35 @@ class NotifierTests(unittest.TestCase):
         self.assertTrue(self.successful("interval", "example", "3", now=NOW + 190).startswith(f"next_due={MINUTE + 360} ("))
         self.assertEqual(self.conf()["EVERY"], "3")
         self.assertEqual(self.run_cli("interval", "example", "0").returncode, 2)
+
+    def test_resume_keeps_an_upcoming_due_time_and_enabled_state(self) -> None:
+        _ = self.new()
+        due = self.state()["NEXT_DUE"]
+        _ = self.successful("stop", "example")
+        output = self.successful("resume", "example", now=MINUTE + 60)
+        self.assertTrue(output.startswith(f"next_due={due} ("), output)
+        self.assertEqual(self.state()["ENABLED"], "1")
+        self.assertEqual(self.state()["NEXT_DUE"], due)
+
+        before = self.state()
+        output = self.successful("resume", "example", now=MINUTE + 90)
+        self.assertTrue(output.startswith(f"next_due={due} ("), output)
+        self.assertEqual(self.state(), before)
+
+    def test_resume_keeps_a_past_due_time_then_tick_sends_once(self) -> None:
+        _ = self.new()
+        due = self.state()["NEXT_DUE"]
+        _ = self.successful("stop", "example")
+        output = self.successful("resume", "example", now=MINUTE + 180)
+        self.assertTrue(output.startswith(f"next_due={due} ("), output)
+        self.assertEqual(self.state()["ENABLED"], "1")
+        self.assertEqual(self.state()["NEXT_DUE"], due)
+
+        _ = self.successful("tick", now=MINUTE + 180)
+        self.assertEqual(len(self.lines()), 1)
+        self.assertEqual(self.state()["LAST_SENT"], str(MINUTE + 180))
+        _ = self.successful("tick", now=MINUTE + 180)
+        self.assertEqual(len(self.lines()), 1)
 
     def test_aligned_schedule_lands_on_the_clock(self) -> None:
         def at(zone: str, hour: int, minute: int) -> int:
@@ -230,6 +321,15 @@ class NotifierTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(mkdir_marker.exists())
 
+    def test_unreadable_session_records_are_logged_as_a_failed_lookup(self) -> None:
+        _ = self.new()
+        self.live_socket.close()
+        self.socket_path.unlink()
+        _ = (self.sessions_dir / "broken.json").write_text("{ not json")
+        _ = self.successful("fire", "example")
+        self.assertIn(" | skip session lookup exit 3", self.lines()[-1])
+        self.assertFalse(self.send_args.exists())
+
     def test_check_zero_and_missing_session(self) -> None:
         _ = self.new("--check", "/bin/sh -c 'exit 0'")
         _ = self.successful("fire", "example")
@@ -320,6 +420,107 @@ class NotifierTests(unittest.TestCase):
         _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run timeout")
         self.assertTrue(any("timeout" in line for line in self.lines()))
         self.assertFalse(self.send_args.exists())
+
+    def test_run_only_job_survives_tick_process_group_exit_and_logs_failure(self) -> None:
+        started = self.root / "started"
+        finished = self.root / "finished"
+        job = self.root / "job"
+        _ = job.write_text(
+            f"#!/bin/sh\nprintf started > {started}\nsleep 0.5\n"
+            + f"printf finished > {finished}\nexit 7\n"
+        )
+        job.chmod(0o755)
+        _ = self.successful("new", "example", "--every", "1", "--run", str(job))
+        tick = subprocess.Popen(
+            ["zsh", str(SCRIPT), "tick"],
+            env={
+                **os.environ,
+                "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
+                "NOTIFIER_STATE_DIR": str(self.state_dir),
+                "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
+                "NOTIFIER_NOW_EPOCH": str(MINUTE + 60),
+            },
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+        )
+        try:
+            _, stderr = tick.communicate(timeout=3)
+            self.assertEqual(tick.returncode, 0, stderr)
+            _ = self.wait_for_text(started, "started")
+            self.assertFalse(finished.exists())
+        finally:
+            try:
+                os.killpg(tick.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self.assertEqual(self.wait_for_text(finished, "finished"), "finished")
+        _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run exit 7")
+
+    def test_mac_run_only_job_removes_label_after_fire_log_and_runs_once(self) -> None:
+        launcher = self.launcher_dir / "launchctl"
+        _ = launcher.write_text(
+            """#!/usr/bin/env python3
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+state = Path(os.environ["FAKE_LAUNCHCTL_STATE"])
+action = sys.argv[1]
+if action == "submit":
+    label = sys.argv[sys.argv.index("-l") + 1]
+    (state / "submitted").write_text(label)
+    command = sys.argv[sys.argv.index("--") + 1:]
+    job = subprocess.Popen(
+        [sys.executable, __file__, "loop", label, *command],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    (state / "pid").write_text(str(job.pid))
+elif action == "loop":
+    label = sys.argv[2]
+    removed = state / f"{label}.removed"
+    while not removed.exists():
+        subprocess.run(sys.argv[3:], check=False)
+        time.sleep(0.05)
+elif action == "remove":
+    label = sys.argv[2]
+    fire_log = Path(os.environ["FAKE_LAUNCHCTL_FIRE"])
+    result = "after-fire" if fire_log.exists() and "run exit 7" in fire_log.read_text() else "before-fire"
+    (state / f"{label}.removed").write_text(result)
+"""
+        )
+        launcher.chmod(0o755)
+        launch_state = self.root / "launchctl-state"
+        launch_state.mkdir()
+
+        def stop_fake_job() -> None:
+            pid_file = launch_state / "pid"
+            if pid_file.exists():
+                try:
+                    os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+        self.addCleanup(stop_fake_job)
+        runs = self.root / "mac-runs"
+        fire_log = self.state_dir / "example" / "fire.log"
+        with mock.patch.dict(os.environ, {
+            "NOTIFIER_PLATFORM": "darwin",
+            "FAKE_LAUNCHCTL_STATE": str(launch_state),
+            "FAKE_LAUNCHCTL_FIRE": str(fire_log),
+        }):
+            _ = self.successful(
+                "new", "example", "--every", "1", "--run",
+                f"/bin/sh -c 'printf run >> {runs}; exit 7'",
+            )
+            _ = self.successful("tick", now=MINUTE + 60)
+        self.assertEqual(self.wait_for_text(fire_log, "run exit 7").count("run exit 7"), 1)
+        self.assertEqual(self.wait_for_text(runs, "run"), "run")
+        label = (launch_state / "submitted").read_text()
+        removed = launch_state / f"{label}.removed"
+        self.assertEqual(self.wait_for_text(removed, "after-fire"), "after-fire")
+        self.assertEqual(runs.read_text(), "run")
 
     def test_run_only_long_run_does_not_hold_tick_or_other_due_instance(self) -> None:
         started_file = self.root / "started"

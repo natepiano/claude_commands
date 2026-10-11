@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration tests for review.sh's pass recording around the ready sentinel."""
+"""Integration tests for review.sh's fresh and long-lived reviewer paths."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import TypedDict, cast, override
@@ -23,6 +24,106 @@ STUB_AGENT_EXEC = """#!/usr/bin/env bash
 set -euo pipefail
 printf 'No findings.\\n' > "$5"
 printf 'stub agent log\\n' > "$6"
+"""
+
+STUB_MESH = """#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+verb = sys.argv[1]
+
+def option(name):
+    return sys.argv[sys.argv.index(name) + 1]
+
+session = pathlib.Path(option('--session-dir'))
+roster_path = session / 'mesh_roster.json'
+roster = json.loads(roster_path.read_text()) if roster_path.exists() else {}
+if verb in ('start', 'compact', 'can-follow', 'follow'):
+    with (session / 'mesh_events.txt').open('a') as events:
+        events.write(verb + '\\n')
+
+name = option('--name') if verb == 'start' else option('--to')
+entry = roster.get(name, {})
+if verb == 'start':
+    entry = {
+        'thread_id': 'thread-' + name,
+        'turn_id': 'turn-1',
+        'status': 'running',
+        'role': option('--role'),
+        'context_tokens': 12000,
+    }
+    (session / 'follow_message.txt').write_text(
+        pathlib.Path(option('--prompt-file')).read_text()
+    )
+    pathlib.Path(option('--summary-file')).write_text('No findings.\\n')
+    pathlib.Path(option('--log-file')).write_text('stub mesh log\\n')
+    entry['status'] = 'done'
+elif verb == 'compact':
+    before = entry.get('context_tokens', 0)
+    entry['context_tokens'] = 12000
+    roster_path.write_text(json.dumps(roster))
+    print(f'compacted {name}: {before} -> 12000 tokens')
+elif verb == 'can-follow':
+    if entry.get('status') not in ('done', 'failed'):
+        print(f'codex_mesh: {name}: seat is busy or not followable; follow refused',
+              file=sys.stderr)
+        sys.exit(2)
+    entry['previous_status'] = entry['status']
+    if 'role' in entry:
+        entry['previous_role'] = entry['role']
+    entry['status'] = 'starting'
+    entry['role'] = option('--role')
+    entry['launcher_pid'] = int(option('--claim-pid'))
+elif verb == 'release-follow':
+    if (entry.get('status') == 'starting'
+            and entry.get('launcher_pid') == int(option('--claim-pid'))):
+        entry['status'] = entry.get('previous_status', 'failed')
+        if 'previous_role' in entry:
+            entry['role'] = entry['previous_role']
+        else:
+            entry.pop('role', None)
+        entry.pop('launcher_pid', None)
+        entry.pop('previous_status', None)
+        entry.pop('previous_role', None)
+elif verb == 'follow':
+    if (entry.get('status') != 'starting'
+            or entry.get('launcher_pid') != int(option('--claim-pid'))):
+        print(f'codex_mesh: {name}: follow claim changed after dispatch', file=sys.stderr)
+        sys.exit(1)
+    entry['status'] = 'running'
+    entry['role'] = option('--role')
+    pathlib.Path(session / 'follow_message.txt').write_text(
+        pathlib.Path(option('--message-file')).read_text()
+    )
+    finish_file = os.environ.get('STUB_REVIEW_FINISH_FILE', '')
+    while finish_file and not pathlib.Path(finish_file).exists():
+        time.sleep(0.02)
+    edit_path = os.environ.get('STUB_REVIEW_EDIT', '')
+    if edit_path:
+        pathlib.Path(edit_path).write_text('changed by reviewer\\n')
+    if os.environ.get('STUB_REVIEW_COMMIT', ''):
+        working_dir = os.environ['STUB_REVIEW_WORKING_DIR']
+        subprocess.run(
+            ['git', '-c', 'user.name=Review Test', '-c',
+             'user.email=review@example.com', 'add', '.'],
+            cwd=working_dir, check=True,
+        )
+        subprocess.run(
+            ['git', '-c', 'user.name=Review Test', '-c',
+             'user.email=review@example.com', 'commit', '-m', 'reviewer edit'],
+            cwd=working_dir, check=True,
+        )
+    pathlib.Path(option('--summary-file')).write_text('No findings.\\n')
+    pathlib.Path(option('--log-file')).write_text('stub mesh log\\n')
+    entry['status'] = 'done'
+else:
+    sys.exit(2)
+roster[name] = entry
+roster_path.write_text(json.dumps(roster))
 """
 
 class OpenPass(TypedDict):
@@ -46,6 +147,9 @@ review=gpt-blind:max
 [codex.agents]
 gpt-called=low,medium,high,xhigh,max
 gpt-blind=low,medium,high,xhigh,max
+
+[delegate.options]
+codex_mesh=1
 """
 
 
@@ -83,13 +187,36 @@ class ReviewLauncherPassTests(unittest.TestCase):
         )
         self.config_file = self.root / "delegate.conf"
         _ = self.config_file.write_text(
-            "PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=180\n", encoding="utf-8"
+            "\n".join([
+                "PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=180",
+                "PLAN_DELEGATE_COMPACT_ABOVE_TOKENS=100000",
+                "",
+            ]),
+            encoding="utf-8",
         )
         registry = self.root / ".claude" / "config" / "agents.conf"
         registry.parent.mkdir(parents=True)
         _ = registry.write_text(AGENTS_REGISTRY, encoding="utf-8")
         self.prompt_file = self.root / "review_prompt.md"
         _ = self.prompt_file.write_text("Review the diff.\n", encoding="utf-8")
+        reviewed = self.working_dir / "reviewed.txt"
+        _ = reviewed.write_text("original\n", encoding="utf-8")
+        _ = subprocess.run(
+            ["git", "-c", "user.name=Review Test", "-c",
+             "user.email=review@example.com", "add", "reviewed.txt"],
+            cwd=self.working_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        _ = subprocess.run(
+            ["git", "-c", "user.name=Review Test", "-c",
+             "user.email=review@example.com", "commit", "-m", "baseline"],
+            cwd=self.working_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         self.review_script = self.build_script_tree()
 
     @override
@@ -112,13 +239,19 @@ class ReviewLauncherPassTests(unittest.TestCase):
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # directory.
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", lib / "py")
-        for name in ("review.sh", "progress_history.py", "board.sh"):
+        for name in (
+            "review.sh", "implement.sh", "progress_history.py", "findings.py",
+            "board.sh", "seat_name.sh",
+        ):
             _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
         for name in ("agents_config.sh", "heartbeat.sh", "heartbeat_watch.sh"):
             _ = shutil.copy2(AGENTS_DIR / name, agents / name)
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
         stub.chmod(0o755)
+        mesh = agents / "codex_mesh.py"
+        _ = mesh.write_text(STUB_MESH, encoding="utf-8")
+        mesh.chmod(0o755)
         return delegate / "review.sh"
 
     def environment(self) -> dict[str, str]:
@@ -167,12 +300,20 @@ class ReviewLauncherPassTests(unittest.TestCase):
         )
         return session_dir
 
-    def review_command(self, session_dir: Path, lens: str, ready_file: str) -> list[str]:
-        return [
+    def review_command(
+        self, session_dir: Path, lens: str, ready_file: str, to: str = "",
+        new_slot: str = "",
+    ) -> list[str]:
+        command = [
             "bash", str(self.review_script), str(session_dir), str(self.working_dir),
             str(self.prompt_file), "review", "blind review", "reviewing the diff",
             "1", lens, ready_file,
         ]
+        if to:
+            command[2:2] = ["--to", to]
+        elif new_slot:
+            command[2:2] = ["--slot", new_slot]
+        return command
 
     def run_review(self, session_dir: Path, ready_file: Path) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -183,6 +324,52 @@ class ReviewLauncherPassTests(unittest.TestCase):
             env=self.environment(),
             timeout=120,
         )
+
+    def run_seated_review(
+        self,
+        session_dir: Path,
+        seat: str,
+        *,
+        edit_path: str = "",
+        commit_change: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = self.environment()
+        environment["STUB_REVIEW_WORKING_DIR"] = str(self.working_dir)
+        if edit_path:
+            environment["STUB_REVIEW_EDIT"] = edit_path
+        if commit_change:
+            environment["STUB_REVIEW_COMMIT"] = "1"
+        return subprocess.run(
+            self.review_command(session_dir, "", "", seat),
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=120,
+        )
+
+    def finish_implementation(self, session_dir: Path) -> None:
+        self.recorder(
+            "finish-pass", "--session-dir", str(session_dir), "--status", "completed"
+        )
+
+    def open_seat(
+        self, session_dir: Path, *, status: str = "done", context_tokens: int = 0
+    ) -> str:
+        name = "fixture-impl"
+        _ = (session_dir / "mesh_roster.json").write_text(
+            json.dumps({
+                name: {
+                    "thread_id": "thread-fixture",
+                    "turn_id": "turn-1",
+                    "status": status,
+                    "role": "impl",
+                    "context_tokens": context_tokens,
+                }
+            }),
+            encoding="utf-8",
+        )
+        return name
 
     def events(self, name: str) -> list[dict[str, object]]:
         path = self.history_dir / "runs" / f"{name}.jsonl"
@@ -248,6 +435,304 @@ class ReviewLauncherPassTests(unittest.TestCase):
             ],
         )
 
+    def test_a_named_open_seat_receives_the_review_and_writes_findings(self) -> None:
+        session_dir = self.start_implementation("seated")
+        self.finish_implementation(session_dir)
+        seat = self.open_seat(session_dir)
+
+        result = self.run_seated_review(session_dir, seat)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (session_dir / "follow_message.txt").read_text(encoding="utf-8"),
+            "Review the diff.\n",
+        )
+        self.assertEqual(
+            (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
+            "No findings.\n",
+        )
+        self.assertEqual(
+            (session_dir / "review_status").read_text(encoding="utf-8"),
+            "reviewed\n",
+        )
+        roster = cast(
+            "dict[str, dict[str, object]]",
+            json.loads((session_dir / "mesh_roster.json").read_text(encoding="utf-8")),
+        )
+        self.assertEqual(roster[seat]["role"], "review")
+        reviews = [
+            event for event in self.pass_events("seated")
+            if event.get("pass_kind") == "review"
+        ]
+        self.assertEqual(
+            [(event["event_type"], event.get("team_slot")) for event in reviews],
+            [("pass_started", "impl"), ("pass_finished", "impl")],
+        )
+
+    def test_a_review_opened_seat_has_durable_identity_for_an_implementation_claim(self) -> None:
+        session_dir = self.start_implementation("new-seat")
+        self.finish_implementation(session_dir)
+
+        result = subprocess.run(
+            self.review_command(session_dir, "", "", new_slot="review2"),
+            check=False,
+            capture_output=True,
+            text=True,
+            env=self.environment(),
+            timeout=120,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
+            ["start"],
+        )
+        roster = cast(
+            "dict[str, dict[str, object]]",
+            json.loads((session_dir / "mesh_roster.json").read_text(encoding="utf-8")),
+        )
+        seat = "project-review2"
+        self.assertEqual(roster[seat]["status"], "done")
+        self.assertEqual(roster[seat]["role"], "review")
+        self.assertEqual(
+            (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
+            "No findings.\n",
+        )
+        reviews = [
+            event for event in self.pass_events("new-seat")
+            if event.get("pass_kind") == "review"
+        ]
+        self.assertEqual(
+            [(event["event_type"], event.get("team_slot")) for event in reviews],
+            [("pass_started", "review2"), ("pass_finished", "review2")],
+        )
+        identity = cast(
+            "dict[str, object]",
+            json.loads((session_dir / "impl_seat_review2.json").read_text()),
+        )
+        self.assertEqual(identity, {
+            "name": seat,
+            "slot": "review2",
+            "family": "codex",
+            "model": "gpt-called",
+            "seat_id": f"thread-{seat}",
+        })
+
+        implementation = subprocess.run(
+            [
+                "bash", str(self.review_script.with_name("implement.sh")),
+                "--to", seat, str(session_dir), str(self.working_dir),
+                str(self.prompt_file), "implementation", "write the repair",
+                "impl", "writing the repair", "0", "review2",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=self.environment(),
+            timeout=120,
+        )
+        self.assertEqual(implementation.returncode, 0, implementation.stderr)
+        self.assertEqual(
+            (session_dir / "impl_status_review2").read_text(encoding="utf-8"),
+            "implemented\n",
+        )
+
+    def test_hyphenated_new_slot_is_refused_to_keep_followup_identity_stable(self) -> None:
+        session_dir = self.start_implementation("hyphenated-slot")
+        self.finish_implementation(session_dir)
+
+        result = subprocess.run(
+            self.review_command(session_dir, "", "", new_slot="review-extra"),
+            check=False,
+            capture_output=True,
+            text=True,
+            env=self.environment(),
+            timeout=120,
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("alphanumeric/_ characters", result.stderr)
+        self.assertFalse((session_dir / "mesh_roster.json").exists())
+
+    def test_an_early_seated_review_baselines_after_the_writers_final_edit(self) -> None:
+        session_dir = self.start_implementation("early-writer-edit")
+        seat = self.open_seat(session_dir)
+        ready = session_dir / "final_diff_1.ready"
+        finish_review = session_dir / "finish_review"
+        environment = self.environment()
+        environment["STUB_REVIEW_FINISH_FILE"] = str(finish_review)
+        process = subprocess.Popen(
+            self.review_command(session_dir, "adversary", str(ready), seat),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+
+        _ = (self.working_dir / "reviewed.txt").write_text(
+            "writer final edit\n", encoding="utf-8"
+        )
+        self.finish_implementation(session_dir)
+        ready.touch()
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if any(
+                event.get("event_type") == "pass_started"
+                and event.get("pass_kind") == "review"
+                for event in self.pass_events("early-writer-edit")
+            ):
+                break
+            time.sleep(0.05)
+        else:
+            process.kill()
+            self.fail("the early review never started its delivered pass")
+        finish_review.touch()
+        _stdout, errors = process.communicate(timeout=120)
+
+        self.assertEqual(process.returncode, 0, errors)
+        self.assertEqual(
+            (session_dir / "review_status_adversary").read_text(encoding="utf-8"),
+            "reviewed\n",
+        )
+
+    def test_a_seated_early_review_before_delivery_records_no_pass(self) -> None:
+        session_dir = self.start_implementation("seated-early")
+        seat = self.open_seat(session_dir)
+        ready = session_dir / "final_diff_1.ready"
+
+        result = subprocess.run(
+            self.review_command(session_dir, "adversary", str(ready), seat),
+            check=False,
+            capture_output=True,
+            text=True,
+            env=self.environment(),
+            timeout=120,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (session_dir / "review_status_adversary").read_text(encoding="utf-8"),
+            "reviewed\n",
+        )
+        recorded = self.pass_events("seated-early")
+        self.assertEqual(
+            [(event["event_type"], event.get("pass_kind")) for event in recorded],
+            [("pass_started", "impl")],
+        )
+        heartbeat = (session_dir / "heartbeat.log").read_text(encoding="utf-8")
+        self.assertIn("finished before delivery", heartbeat)
+
+    def test_a_seated_reviewer_that_edits_fails_and_names_the_seat_and_path(self) -> None:
+        session_dir = self.start_implementation("edited")
+        self.finish_implementation(session_dir)
+        seat = self.open_seat(session_dir)
+        edited = self.working_dir / "reviewed.txt"
+
+        result = self.run_seated_review(session_dir, seat, edit_path=str(edited))
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(seat, result.stderr)
+        self.assertIn("reviewed.txt", result.stderr)
+        self.assertEqual(
+            (session_dir / "review_status").read_text(encoding="utf-8"), "error\n"
+        )
+        self.assertEqual(
+            (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
+            "No findings.\n",
+        )
+        reviews = [
+            event for event in self.pass_events("edited")
+            if event.get("pass_kind") == "review"
+        ]
+        self.assertEqual(reviews[-1].get("status"), "error")
+
+    def test_a_reviewer_commit_is_detected_and_names_its_changed_path(self) -> None:
+        session_dir = self.start_implementation("committed-edit")
+        self.finish_implementation(session_dir)
+        seat = self.open_seat(session_dir)
+
+        result = self.run_seated_review(
+            session_dir,
+            seat,
+            edit_path=str(self.working_dir / "reviewed.txt"),
+            commit_change=True,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(seat, result.stderr)
+        self.assertIn("reviewed.txt", result.stderr)
+        self.assertEqual(
+            (session_dir / "review_status").read_text(encoding="utf-8"), "error\n"
+        )
+
+    def test_a_change_to_an_existing_untracked_file_is_detected(self) -> None:
+        session_dir = self.start_implementation("untracked-edit")
+        self.finish_implementation(session_dir)
+        seat = self.open_seat(session_dir)
+        untracked = self.working_dir / "notes.txt"
+        _ = untracked.write_text("before review\n", encoding="utf-8")
+
+        result = self.run_seated_review(
+            session_dir, seat, edit_path=str(untracked)
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(seat, result.stderr)
+        self.assertIn("notes.txt", result.stderr)
+        self.assertEqual(
+            (session_dir / "review_status").read_text(encoding="utf-8"), "error\n"
+        )
+
+    def test_without_a_named_seat_the_fresh_read_only_path_is_unchanged(self) -> None:
+        session_dir = self.start_implementation("fresh")
+        self.finish_implementation(session_dir)
+
+        result = subprocess.run(
+            self.review_command(session_dir, "", ""),
+            check=False,
+            capture_output=True,
+            text=True,
+            env=self.environment(),
+            timeout=120,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((session_dir / "mesh_events.txt").exists())
+        self.assertEqual(
+            (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
+            "No findings.\n",
+        )
+        self.assertEqual(
+            (session_dir / "review_status").read_text(encoding="utf-8"), "reviewed\n"
+        )
+
+    def test_a_busy_named_seat_is_refused_before_review_artifacts_change(self) -> None:
+        session_dir = self.start_implementation("busy")
+        self.finish_implementation(session_dir)
+        seat = self.open_seat(session_dir, status="running")
+
+        result = self.run_seated_review(session_dir, seat)
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(f"codex_mesh: {seat}: seat is busy or not followable", result.stderr)
+        self.assertFalse((session_dir / "review_status").exists())
+        self.assertFalse((session_dir / "review_findings_1.txt").exists())
+
+    def test_a_large_named_seat_is_compacted_before_the_review_claim(self) -> None:
+        session_dir = self.start_implementation("compact")
+        self.finish_implementation(session_dir)
+        seat = self.open_seat(session_dir, context_tokens=100001)
+
+        result = self.run_seated_review(session_dir, seat)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
+            ["compact", "can-follow", "follow"],
+        )
+        board = (session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertIn(f"compacted {seat}: 100001 -> 12000 tokens", board)
+
     def test_both_lenses_run_at_once_without_overwriting_each_other(self) -> None:
         """The whole reason the lens exists: two reviewers, one session dir.
 
@@ -300,7 +785,7 @@ class ReviewLauncherPassTests(unittest.TestCase):
         )
         self.assertNotIn(
             "interrupted",
-            [str(event.get("pass_status")) for event in self.pass_events("lenses")],
+            [str(event.get("status")) for event in self.pass_events("lenses")],
         )
 
         board = (session_dir / "board.log").read_text(encoding="utf-8")

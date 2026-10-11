@@ -2,7 +2,7 @@
 
 How to decide what reaches the user when coding and reviewing code. This file is
 the single source for that guidance: imported by `~/.claude/CLAUDE.md` for every
-session, and by `/unit:delegate` and `/team_review`, where it also defines the
+session, and by `/unit:direct` and `/team_review`, where it also defines the
 `<DecisionEconomy/>` contract. Related memories hold only provenance and point here.
 
 <ThreeGods>

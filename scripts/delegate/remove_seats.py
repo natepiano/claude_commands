@@ -29,6 +29,10 @@ covers a run with no marker, which prepare_session.sh skips outside a Claude
 session: a seat still working beats every minute.
 
 Only background sessions are ever removed, and never the session running this.
+After a successful Claude session listing, phase cleanup also asks codex_mesh to
+sweep unused app-servers under the real delegate root. That destructive sweep is
+best-effort and never runs when the listing failed and cleanup cannot account for
+its other effects.
 """
 
 from __future__ import annotations
@@ -42,13 +46,17 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Literal, TypedDict, cast
 
 DEFAULT_ROOT = Path("/tmp/claude/delegate")
 LEDGER = "seats"
 HEARTBEAT = "heartbeat.log"
 LIVE_HEARTBEAT_SECS = 600
 CLAUDE_TIMEOUT_SECS = 30
+SHUTDOWN_TIMEOUT_SECS = 30
+SHUTDOWN = Path(__file__).resolve().parents[1] / "shutdown" / "shutdown.py"
+CODEX_MESH = Path(__file__).resolve().parents[1] / "agents" / "codex_mesh.py"
+SWEEP_TIMEOUT_SECS = 120
 
 # Seats launched before the ledger were named `<session dir basename>-<slot>`,
 # and the basename was a uuid, so the name alone says which run owns them.
@@ -63,6 +71,16 @@ class AgentRow(TypedDict, total=False):
     sessionId: str
     kind: str
     name: str
+
+
+class HeldSessions(TypedDict):
+    kind: Literal["held sessions"]
+    session_ids: set[str]
+
+
+class ShutdownStateUnreadable(TypedDict):
+    kind: Literal["shutdown state unreadable"]
+    reason: str
 
 
 def claude_bin() -> str:
@@ -100,12 +118,72 @@ def list_sessions(claude: str) -> list[AgentRow] | None:
     return [cast("AgentRow", cast("object", row)) for row in rows if isinstance(row, dict)]
 
 
+def shutdown_held_sessions() -> HeldSessions | ShutdownStateUnreadable:
+    """Read validated shutdown holds; failure means callers must retain everything."""
+    try:
+        result = subprocess.run(
+            [*shutdown_command(), "held-sessions"],
+            capture_output=True,
+            text=True,
+            timeout=SHUTDOWN_TIMEOUT_SECS,
+            check=False,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        reason = str(error) or type(error).__name__
+        return {"kind": "shutdown state unreadable", "reason": reason}
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        reason = f"held-sessions exited {result.returncode}"
+        if detail:
+            reason = f"{reason}: {detail}"
+        return {"kind": "shutdown state unreadable", "reason": reason}
+    return {
+        "kind": "held sessions",
+        "session_ids": {
+            line.strip() for line in result.stdout.splitlines() if line.strip()
+        },
+    }
+
+
+def shutdown_command() -> list[str]:
+    """Return the command prefix used to query shutdown-held sessions."""
+    return [sys.executable, str(SHUTDOWN)]
+
+
+def sweep_app_servers(root: Path) -> None:
+    """Best-effort orphan cleanup after a phase releases its Claude seats."""
+    try:
+        result = subprocess.run(
+            [sys.executable, str(CODEX_MESH), "sweep", "--root", str(root), "--stop"],
+            timeout=SWEEP_TIMEOUT_SECS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"remove_seats: app-server sweep could not run: {error}", file=sys.stderr)
+        return
+    if result.returncode:
+        print(
+            f"remove_seats: app-server sweep exited {result.returncode}; seat cleanup continues.",
+            file=sys.stderr,
+        )
+
+
 def live_runs(root: Path, listed_sessions: set[str]) -> set[Path]:
     live: set[Path] = set()
+    shutdown_state = shutdown_held_sessions()
+    if shutdown_state["kind"] == "shutdown state unreadable":
+        print(
+            "remove_seats: shutdown state could not be read; keeping every active run.",
+            file=sys.stderr,
+        )
     active = root / "active"
     if active.is_dir():
         for marker in active.iterdir():
-            if marker.name not in listed_sessions:
+            if (
+                shutdown_state["kind"] == "held sessions"
+                and marker.name not in listed_sessions
+                and marker.name not in shutdown_state["session_ids"]
+            ):
                 continue
             lines = marker.read_text(encoding="utf-8").splitlines()
             if lines and lines[0].strip():
@@ -169,6 +247,13 @@ def main() -> int:
     if rows is None:
         print("remove_seats: could not list sessions with `claude agents --json`; nothing removed.", file=sys.stderr)
         return 1
+
+    # --session-dir identifies phase cleanup. Restrict the automatic destructive
+    # sweep to the real delegate root; tests and callers inspecting another root
+    # must invoke codex_mesh.py themselves. List Claude sessions first so an
+    # early failure can truthfully promise that cleanup changed nothing.
+    if own_run is not None and root.resolve() == DEFAULT_ROOT.resolve():
+        sweep_app_servers(root)
 
     listed_sessions = {row.get("sessionId", "") for row in rows}
     targets = removal_targets(root, own_run, rows, live_runs(root, listed_sessions))

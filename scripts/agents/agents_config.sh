@@ -134,6 +134,22 @@ _agents_function_families_inline() {
     done
 }
 
+# Print the sole family of a function with exactly one configured set.
+_agents_pinned_family() {
+    local function="$1" family found=""
+    for family in codex claude; do
+        _agents_config_has_section "$function.$family" || continue
+        [[ -n "$found" ]] && return 0
+        found="$family"
+    done
+    [[ -z "$found" ]] || printf '%s' "$found"
+}
+
+_agents_pinned_error() {
+    local function="$1" family="$2"
+    echo "ERROR: '$function' runs only on $family: [$function.$family] is its only set." >&2
+}
+
 # Every family whose catalog lists <agent>, inline for error text. Agent names
 # are disjoint across families, so exactly one match names a row's family and
 # two means the catalogs collided and the caller must refuse rather than pick.
@@ -532,7 +548,7 @@ agents_list_function() {
 }
 
 agents_set_assignment() {
-    local function="$1" family="$2" section line subtask pair tmp_file allowed_families current
+    local function="$1" family="$2" section line subtask pair tmp_file allowed_families current pinned
 
     if [[ -z "$function" || "$function" == *.* ]]; then
         echo "ERROR: assignment function must be one segment; got '$function'." >&2
@@ -546,6 +562,11 @@ agents_set_assignment() {
     fi
     if [[ "$family" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
         echo "ERROR: '$AGENTS_CALLER_ASSIGNMENT' is not a switch target; it is written by hand in $AGENTS_CONFIG_FILE [assignments]." >&2
+        return 1
+    fi
+    pinned="$(_agents_pinned_family "$function")"
+    if [[ -n "$pinned" && "$family" != "$pinned" ]]; then
+        _agents_pinned_error "$function" "$pinned"
         return 1
     fi
     section="$function.$family"
@@ -587,7 +608,8 @@ agents_set_assignment() {
 # to one family. Validated wholesale first, so a switch that would leave any
 # task unresolvable is rejected before a single line is written.
 agents_set_all_assignments() {
-    local family="$1" line key fn subtask section row seen="" tmp_file
+    local family="$1" line key fn subtask section row pinned seen="" tmp_file
+    AGENT_KEPT_FUNCTIONS=""
 
     if [[ -z "$family" ]] || ! _agents_config_has_section "$family.agents"; then
         echo "ERROR: unknown family '$family'." >&2
@@ -600,6 +622,14 @@ agents_set_all_assignments() {
         # target either; it already resolves through whichever family asks.
         [[ "$(agents_config_trim "${line#*=}")" == "$AGENTS_CALLER_ASSIGNMENT" ]] && continue
         fn="${key%%.*}"
+        pinned="$(_agents_pinned_family "$fn")"
+        if [[ -n "$pinned" ]]; then
+            case " $AGENT_KEPT_FUNCTIONS " in
+                *" $fn "*) ;;
+                *) AGENT_KEPT_FUNCTIONS="${AGENT_KEPT_FUNCTIONS:+$AGENT_KEPT_FUNCTIONS }$fn" ;;
+            esac
+            continue
+        fi
         section="$fn.$family"
         if ! _agents_config_has_section "$section"; then
             echo "ERROR: cannot assign '$fn' to '$family': missing [$section]." >&2
@@ -627,7 +657,8 @@ agents_set_all_assignments() {
     done < <(_agents_config_section_values assignments)
 
     tmp_file="$(mktemp "${AGENTS_CONFIG_FILE}.XXXXXX")"
-    if ! awk -v fam="$family" -v caller="$AGENTS_CALLER_ASSIGNMENT" '
+    if ! awk -v fam="$family" -v caller="$AGENTS_CALLER_ASSIGNMENT" \
+        -v kept=" $AGENT_KEPT_FUNCTIONS " '
         /^\[/ {
             in_section = ($0 == "[assignments]")
             print
@@ -643,6 +674,10 @@ agents_set_all_assignments() {
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
                 found = 1
                 if (value == caller) { print; next }
+                key = substr(before_comment, 1, equals - 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+                sub(/\..*/, "", key)
+                if (index(kept, " " key " ") > 0) { print; next }
                 match(before_comment, /[[:space:]]*$/)
                 spacing = substr(before_comment, RSTART)
                 comment = hash ? substr(content, hash) : ""
@@ -670,8 +705,9 @@ agents_set_all_assignments() {
 # the agent's catalog lacks rejects the change with the file untouched -- then
 # one awk pass writes it. Sets AGENT_SWEEP_FAMILY.
 agents_set_model() {
-    local agent="$1" only="${2:-}" family line key value fn section row pair
+    local agent="$1" only="${2:-}" family line key value fn section row pair pinned
     local sections="" matched=0 tmp_file
+    AGENT_KEPT_FUNCTIONS=""
 
     if [[ -z "$agent" || "$agent" == *:* ]]; then
         echo "ERROR: name the agent alone; each row keeps its own effort. Got '$agent'." >&2
@@ -696,6 +732,20 @@ agents_set_model() {
         fn="${key%%.*}"
         [[ -n "$only" && "$fn" != "$only" ]] && continue
         matched=1
+        pinned="$(_agents_pinned_family "$fn")"
+        if [[ -n "$pinned" ]]; then
+            if [[ -z "$only" ]]; then
+                case " $AGENT_KEPT_FUNCTIONS " in
+                    *" $fn "*) ;;
+                    *) AGENT_KEPT_FUNCTIONS="${AGENT_KEPT_FUNCTIONS:+$AGENT_KEPT_FUNCTIONS }$fn" ;;
+                esac
+                continue
+            fi
+            if [[ "$family" != "$pinned" ]]; then
+                _agents_pinned_error "$fn" "$pinned"
+                return 1
+            fi
+        fi
         section="$fn.$family"
         if ! _agents_config_has_section "$section"; then
             # A caller function with no set for this family has nothing to write.
@@ -729,7 +779,8 @@ agents_set_model() {
 
     tmp_file="$(mktemp "${AGENTS_CONFIG_FILE}.XXXXXX")"
     if ! NEW_AGENT="$agent" awk -v fam="$family" -v only="$only" \
-        -v caller="$AGENTS_CALLER_ASSIGNMENT" -v secs="$sections " '
+        -v caller="$AGENTS_CALLER_ASSIGNMENT" -v secs="$sections " \
+        -v kept=" $AGENT_KEPT_FUNCTIONS " '
         /^\[/ {
             name = substr($0, 2, length($0) - 2)
             in_assign = ($0 == "[assignments]")
@@ -756,6 +807,7 @@ agents_set_model() {
                 }
                 fn = substr(before_comment, 1, equals - 1)
                 sub(/\..*/, "", fn)
+                if (index(kept, " " fn " ") > 0) { print; next }
                 if ((only == "" || fn == only) && value != caller) {
                     print substr(before_comment, 1, equals) fam spacing comment
                     next
@@ -780,7 +832,7 @@ agents_set_model() {
 # row's family is the one resolving today).
 agents_set_row() {
     local task="$1" pair="$2" function subtask family families active
-    local section tmp_file configured
+    local section tmp_file configured pinned
 
     function="${task%%.*}"
     subtask="${task#*.}"
@@ -810,6 +862,11 @@ agents_set_row() {
         return 1
     fi
     family="$families"
+    pinned="$(_agents_pinned_family "$function")"
+    if [[ -n "$pinned" && "$family" != "$pinned" ]]; then
+        _agents_pinned_error "$function" "$pinned"
+        return 1
+    fi
 
     section="$function.$family"
     if ! _agents_config_has_section "$section"; then

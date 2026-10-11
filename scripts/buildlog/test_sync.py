@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -182,14 +184,47 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(cli.main(["sync", "pause", "Mac hold"]), 0)
         with (
             mock.patch.object(ci, "ci", return_value=0) as poll,
+            mock.patch.object(cli, "screenshot_hourly", return_value=0) as screenshots,
             mock.patch.object(rust_release, "check_release", return_value=0) as release,
             mock.patch.object(index, "update", return_value=0),
         ):
             self.assertEqual(cli.hourly(), 0)
 
         poll.assert_called_once_with()
+        screenshots.assert_called_once_with()
         release.assert_called_once_with()
         self.assertEqual(self.commands, [])
+
+    def test_screenshot_hourly_invokes_report_hourly_once(self) -> None:
+        commands: list[tuple[list[str], bool, int]] = []
+
+        def fake_run(args: list[str], *, check: bool, timeout: int) -> subprocess.CompletedProcess[str]:
+            commands.append((args, check, timeout))
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            self.assertEqual(cli.screenshot_hourly(), 0)
+        self.assertEqual(len(commands), 1)
+        command, check, timeout = commands[0]
+        self.assertEqual(command[-1], "hourly")
+        self.assertTrue(command[-2].endswith("scripts/shot_report/shot_report.py"))
+        self.assertFalse(check)
+        self.assertEqual(timeout, cli.SCREENSHOT_HOURLY_TIMEOUT_SECONDS)
+
+    def test_screenshot_hourly_timeout_leaves_five_minutes_after_mac_read(self) -> None:
+        module_path = Path(cli.__file__).resolve().parents[1] / "shot_report" / "shot_report.py"
+        spec = importlib.util.spec_from_file_location("shot_report_timeout_contract", module_path)
+        if spec is None or spec.loader is None:
+            self.fail(f"could not load {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        with (
+            mock.patch.object(sys, "path", [str(module_path.parent), *sys.path]),
+            mock.patch.dict(sys.modules, {spec.name: module}),
+        ):
+            spec.loader.exec_module(module)
+
+        mac_timeout = cast(int, getattr(module, "MAC_SSH_TIMEOUT_SECONDS"))
+        self.assertGreaterEqual(cli.SCREENSHOT_HOURLY_TIMEOUT_SECONDS - mac_timeout, 300)
 
     def test_resume_removes_pause_and_next_sync_contacts_peer(self) -> None:
         self.assertEqual(cli.main(["sync", "pause", "Mac hold"]), 0)

@@ -72,10 +72,11 @@ timeout --kill-after=5 <seconds + 15> \
   ffmpeg -hide_banner -loglevel error -nostdin -y \
     -f x11grab -framerate 60 -window_id <decimal id> -i $DISPLAY \
     -t <seconds> -fs 500000000 \
-    -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p <path>
+    -vf crop=trunc(iw/2)*2:trunc(ih/2)*2 \
+    -c:v libx264 -preset veryfast -tune zerolatency -crf 18 -pix_fmt yuv420p <path>
 ```
 
-`-y` overwrites the reserved empty file. Outcomes:
+`-y` overwrites the reserved empty file. The crop trims an odd width or height to even, which libx264's yuv420p requires; a 401×301 window records as 400×300. `-tune zerolatency` keeps x264 from queueing frames, so ffmpeg exits soon after `-t` (see Calibration). Outcomes:
 
 | Exit | Cause | Clip | Stderr |
 | --- | --- | --- | --- |
@@ -98,7 +99,7 @@ Every failure deletes only the path this run reserved.
 
 ### Disk: the prune and the disk-floor job
 
-The clip directory is on `/`, the same filesystem the disk-floor job (`/etc/nixos/modules/linux/disk-floor.nix`) holds at 500 GiB free. That job runs `scripts/lint/sweep.py --floor-only` every 2 minutes and frees only cargo target directories, then sends a phone alert when `/` is under 300 GiB. It never touches `~/.cache/screen-record/`. The prune is that directory's only bound: under 2 GiB when a run starts, plus the one clip that run writes, at most a little over 500 MB. Clips can therefore take at most about 2.5 GB of the room the floor protects, and when `/` drops under the floor the sweep deletes build caches, never clips.
+The clip directory is on `/`, the same filesystem the disk-floor job (`/etc/nixos/modules/linux/disk-floor.nix`) holds at 300 GiB free. That job runs `scripts/lint/sweep.py --floor-only` every 2 minutes and frees only cargo target directories, then sends a phone alert when `/` is under 150 GiB. It never touches `~/.cache/screen-record/`. The prune is that directory's only bound: under 2 GiB when a run starts, plus the one clip that run writes, at most a little over 500 MB. Clips can therefore take at most about 2.5 GB of the room the floor protects, and when `/` drops under the floor the sweep deletes build caches, never clips.
 
 ## Invariants
 
@@ -119,6 +120,8 @@ The clip directory is on `/`, the same filesystem the disk-floor job (`/etc/nixo
 - **Clip size.** 7 s of a 1280×720 window at 60 fps came to 330 KB, recorded at real speed. A busy window costs far more, but a 60 s clip rarely reaches the 500 MB cap.
 - **The file cap.** ffmpeg exits 0 when `-fs` stops it, and the file ends slightly over the cap. The script tells a capped clip from a full one by its size alone (`>= MAX_BYTES`).
 - **The outer timeout's kill path.** `timeout` returns 124 when ffmpeg stops on the TERM. If ffmpeg ignores the TERM for 5 s, `--kill-after` sends SIGKILL to `timeout`'s whole process group, `timeout` itself included, so Python reads a return code of −9, not 137. `screen_record.py` treats −9 like 124 and 137: exit 3, clip deleted. A test drives the real `timeout` against a stub ffmpeg that ignores TERM and checks the run matches the 137 case.
+- **Odd window sizes.** libx264 refuses yuv420p at an odd width or height (`width not divisible by 2 (401x301)`, ffmpeg exit 187). The crop trims one column or row: 401×301 records as 400×300.
+- **Overrun after `-t`.** `-t` ends the capture on time, but x264's default lookahead and frame threads hold dozens of frames, and ffmpeg encodes all of them before it exits. On a 3840×2012 window at load average 196, default veryfast had written 0 of 53 frames at the `-t` cutoff and exited 1.56 s later; with `-tune zerolatency` it had written 103 of 112 and exited 0.26 s later. Starved to half a core (`systemd-run --user --scope -p CPUQuota=50%`), the old command hit the outer timeout on a 10 s clip (exit 3 at 31 s); with zerolatency it finished in 12.9 s. FFmpeg 8.1's default fps mode adds no duplicate frames here (`dup=0`), so `-fps_mode` changes nothing.
 - **Prune timing.** The prune runs only when a recording run gets past its refusals and its tool and `DISPLAY` checks. Nothing expires clips between runs, so the 7-day limit takes effect at the next run, and the caller's `rm` is what keeps the directory empty.
 - **Lookup time.** A failed lookup takes the full 10 s; the no-match test waits it by design. A substring that matches more than one title fails at once; pass a longer one.
 - **Window id.** `xprop` reports hex ids; ffmpeg gets the decimal form.

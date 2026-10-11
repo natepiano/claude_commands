@@ -9,7 +9,7 @@ settled design through a decision-by-decision conversation with the user. The
 deliverable is one design doc in the owning repository.
 
 This command does not implement. It creates no worktree, no branch, and no code;
-it runs no delegate; it commits nothing; it never edits the issue.
+it runs no `/unit:direct`; it commits nothing; it never edits the issue.
 
 **Usage:**
 
@@ -215,9 +215,9 @@ Report the issue, its rank, the repository, and the design doc path. Then
 recommend exactly one next command, but do not invoke it:
 
 - **Design settled, needs phases** — `/plan:to_phased_plan` to compile the doc,
-  then `/make_a_worktree`, then `/unit:delegate`.
+  then `/make_a_worktree`, then `/unit:direct`.
 - **Design settled, small and coherent** — `/make_a_worktree`, then
-  `/unit:delegate single` with the design doc as context.
+  `/unit:direct single` with the design doc as context.
 - **Decomposed into several issues** — `/issue` for each; its survey rates them
   and the background watcher ranks them automatically.
 - **Already implemented or obsolete** — `/close_issue` with the supported
@@ -225,7 +225,7 @@ recommend exactly one next command, but do not invoke it:
 
 State that nothing was implemented, no worktree or branch was created, the issue
 was not edited, and nothing was committed. On either delegation path, add that
-`/unit:delegate` finishes by running `/plan:to_as_built` itself, which will act
+`/unit:direct` finishes by running `/plan:to_as_built` itself, which will act
 on the `As-built disposition:` line this design doc carries.
 
 ## Invariants

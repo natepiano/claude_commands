@@ -9,7 +9,7 @@ from typing import override
 from unittest.mock import patch
 
 import agent_notes
-from agent_accounts import Quota, Report, reset_credits
+from agent_accounts import CodexRateLimits, Quota, Report, codex_credits, reset_credits
 from agent_notes import Note, apply, local_reset, read_note
 
 
@@ -102,6 +102,51 @@ class AgentNotesTests(unittest.TestCase):
         _ = apply([note], report, self.now)
         self.assertEqual(note.get("limit_reset_count"), "0")
         self.assertEqual(note.get("limit_reset"), "null")
+
+    def test_credit_balance_is_read_from_the_main_bucket(self):
+        def usage(credits: object) -> CodexRateLimits:
+            return {"rateLimits": {"credits": credits}}  # pyright: ignore[reportReturnType]
+
+        self.assertEqual(codex_credits(usage({"hasCredits": True, "unlimited": False,
+                                              "balance": "60498.0534770000"})), "60498")
+        self.assertEqual(codex_credits(usage({"hasCredits": False, "unlimited": False, "balance": None})), "0")
+        self.assertEqual(codex_credits(usage({"hasCredits": True, "unlimited": True, "balance": None})), "unlimited")
+        self.assertEqual(codex_credits(usage({"hasCredits": True, "unlimited": False, "balance": None})), "null")
+        self.assertEqual(codex_credits(usage(None)), "null")
+        self.assertEqual(codex_credits({}), "null")
+
+    def test_credit_balance_is_written_and_an_unread_one_is_kept(self):
+        note = self.note("codex 1.md", "a@example.com")
+        _ = apply([note], Report("Codex", email="a@example.com", credit_balance="60498"), self.now)
+        self.assertEqual(note.get("credit_balance"), "60498")
+        # A failed read must not erase the last balance seen.
+        _ = apply([note], Report("Codex", email="a@example.com"), self.now)
+        self.assertEqual(note.get("credit_balance"), "60498")
+        _ = apply([note], Report("Codex", email="a@example.com", credit_balance="null"), self.now)
+        self.assertEqual(note.get("credit_balance"), "null")
+
+    def test_codex_reading_includes_numeric_credit_balance_from_the_note(self):
+        note = self.note("codex 1.md", "a@example.com", "credit_balance: 60498\n")
+        weekly = Quota("Weekly", 40, self.future)
+        _ = apply([note], Report("Codex", email="a@example.com", quotas=[weekly]), self.now)
+        records = [json.loads(line) for line in (self.root / "readings.jsonl").read_text().splitlines()]
+        self.assertEqual(records, [{
+            "account": "codex 1",
+            "at": self.now.isoformat(timespec="seconds"),
+            "remaining": 60,
+            "credits": 60498.0,
+        }])
+
+    def test_codex_reading_omits_absent_or_non_numeric_credit_balance(self):
+        absent = self.note("codex 1.md", "a@example.com")
+        unlimited = self.note("codex 2.md", "a@example.com", "credit_balance: unlimited\n")
+        weekly = Quota("Weekly", 40, self.future)
+        _ = apply([absent, unlimited], Report("Codex", email="a@example.com", quotas=[weekly]), self.now)
+        records = [json.loads(line) for line in (self.root / "readings.jsonl").read_text().splitlines()]
+        self.assertCountEqual(records, [
+            {"account": "codex 1", "at": self.now.isoformat(timespec="seconds"), "remaining": 60},
+            {"account": "codex 2", "at": self.now.isoformat(timespec="seconds"), "remaining": 60},
+        ])
 
     def test_claude_manual_reset_fields_are_preserved(self):
         note = self.note("claude 1.md", "a@example.com", "limit_reset: 2026-10-22\nlimit_reset_count: 1\n")

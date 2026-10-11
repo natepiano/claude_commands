@@ -55,6 +55,7 @@
       "Bash(bash ~/.claude/scripts/delegate/verify.sh *)",
       "Bash(bash ~/.claude/scripts/delegate/progress_timer.sh *)",
       "Bash(zsh ~/.claude/scripts/message/notifier.sh *)",
+      "Bash(\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/conversation_pause.py\" *)",
       "Bash(cat *)",
       "Bash(head *)",
       "Bash(tail *)",
@@ -182,6 +183,10 @@
           },
           {
             "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/whoami/account.py\" --write-label >/dev/null 2>&1 || true"
+          },
+          {
+            "type": "command",
             "command": "\"$HOME/.claude/scripts/settings/ensure_git_filters.sh\""
           },
           {
@@ -209,6 +214,10 @@
           },
           {
             "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-conversation-pause.py\""
+          },
+          {
+            "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-assistant-prose-banned-words.py\""
           },
           {
@@ -217,11 +226,21 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/user-prompt-submit-conversation-pause.py\""
+          }
+        ]
+      }
     ]
   },
   "statusLine": {
     "type": "command",
-    "command": "exec jq -r --arg pwd \"$PWD\" -f \"$HOME/.claude/scripts/statusline/statusline.jq\""
+    "command": "read -r account 2>/dev/null < \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/account-label\"; exec jq -r --arg pwd \"$PWD\" --arg account \"$account\" -f \"$HOME/.claude/scripts/statusline/statusline.jq\""
   },
   "enabledPlugins": {
     "rust-analyzer-lsp@claude-plugins-official": false

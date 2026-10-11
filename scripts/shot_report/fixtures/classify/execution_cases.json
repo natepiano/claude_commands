@@ -1,0 +1,71 @@
+{
+  "positional": [
+    "bash brp.sh brp_extras/screenshot '{\"path\":\"/tmp/a.png\"}'",
+    "python3 $P/brp.py brp_extras/screenshot '{\"path\":\"/tmp/a.png\"}'",
+    "shot(){ bash $B 15722 brp_extras/screenshot '{\"path\":\"/tmp/a.png\"}'; }; shot a"
+  ],
+  "python_call": [
+    "python3 -c \"import brp; brp.call('brp_extras/screenshot', {'path': '/tmp/a.png'})\"",
+    "./py.sh -c \"from brp import rpc; rpc('brp_extras/screenshot', {'path': '/tmp/a.png'})\""
+  ],
+  "heredoc": [
+    "python3 - <<'PY'\nfrom brp import rpc\nrpc('brp_extras/screenshot', {'path': '/tmp/a.png'})\nPY",
+    "bash <<EOF\ncurl -d '{\"method\":\"brp_extras/screenshot\"}' localhost\nEOF",
+    "cat > /tmp/x.py <<'EOF'\nrpc('brp_extras/screenshot', {'path': '/tmp/a.png'})\nEOF\npython3 /tmp/x.py"
+  ],
+  "compound": [
+    "for i in 1 2; do bash brp.sh brp_extras/screenshot '{}'; done",
+    "if true; then curl -d '{\"method\":\"brp_extras/screenshot\"}' localhost; fi",
+    "while true; do (bash brp.sh brp_extras/screenshot '{}'); done",
+    "{ bash brp.sh \\\nbrp_extras/screenshot '{}'; }"
+  ],
+  "wrapped": [
+    "time python3 /tools/hana_shot.py shot --port 15714",
+    "timeout 30 nice env MODE=x command bash brp.sh brp_extras/screenshot '{}'",
+    "echo $(curl -d '{\"method\":\"brp_extras/screenshot\"}' localhost)",
+    "echo `curl -d '{\"method\":\"brp_extras/screenshot\"}' localhost`",
+    "bash -c 'bash brp.sh brp_extras/screenshot {}'",
+    "ssh host 'curl -d \"{\\\"method\\\":\\\"brp_extras/screenshot\\\"}\" localhost'",
+    "ssh host <<EOF\ncurl -d '{\"method\":\"brp_extras/screenshot\"}' localhost\nEOF",
+    "nice -n 5 python3 /tools/hana_shot.py shot --port 15714"
+  ],
+  "text_only": [
+    "cat >> HANDOFF.md <<'EOF'\n`brp_extras/screenshot` will not sample\nEOF",
+    "python3 - <<'PY'\np='HANDOFF'; print('`brp_extras/screenshot` cannot sample')\nPY",
+    "echo '- use python3 /tools/hana_shot.py shot --port 15714' >> handoff.md",
+    "printf -- 'hana_shot.py shot'",
+    "rg -n 'brp_extras/screenshot' .",
+    "python3 findings.py verdict --evidence '180 Bash brp_extras/screenshot commands'",
+    "cat > /tmp/x.py <<'EOF'\nrpc('brp_extras/screenshot', {})\nEOF"
+  ],
+  "other": [
+    "bash brp.sh world.get_components '{}'",
+    "python3 -c \"brp.call('world.query', {})\"",
+    "python3 - <<'PY'\nrpc('bevy/get', {})\nPY"
+  ],
+  "later_shot": [
+    "bash brp.sh world.query '{}' ; bash brp.sh brp_extras/screenshot '{}'",
+    "python3 - <<'PY'\nrpc('world.query', {})\nrpc('brp_extras/screenshot', {})\nPY",
+    "bash brp.sh world.query '{}' ; python3 /tools/hana_shot.py shot --view home"
+  ],
+  "variable_runner": [
+    "$B brp_extras/screenshot '{\"path\":\"/tmp/a.png\"}'",
+    "$S/brp_p3.sh brp_extras/screenshot '{\"path\":\"/tmp/a.png\"}'"
+  ],
+  "compound_heredoc": [
+    "cd /tmp && python3 - <<'PY'\nrpc('brp_extras/screenshot', {})\nPY",
+    "cd /tmp; cat > shot.py <<'EOF'\nrpc('brp_extras/screenshot', {})\nEOF\npython3 shot.py",
+    "cat > /tmp/cam.sh <<'EOF'\nrpc brp_extras/screenshot '{}'\nEOF\nbash /tmp/cam.sh"
+  ],
+  "assigned_request": [
+    "B='{\"method\":\"brp_extras/screenshot\"}'; curl -d \"$B\" localhost"
+  ],
+  "script_execution": [
+    "$PY - <<'PY'\nrpc('brp_extras/screenshot', {})\nPY",
+    "cat > /tmp/shoot.py <<'EOF'\nrpc('brp_extras/screenshot', {})\nEOF\npython3 -u /tmp/shoot.py",
+    "cat > /tmp/shoot.py <<'EOF'\nrpc('brp_extras/screenshot', {})\nEOF\nuv run --with pillow python /tmp/shoot.py",
+    "cat > /tmp/shot_helper.py <<'EOF'\ndef shoot(): rpc('brp_extras/screenshot', {})\nEOF\npython3 -c 'from shot_helper import shoot; shoot()'",
+    "for kv in '.zoom.current:0.7'; do val=${kv#*:}; $S/brp.sh world.query '{}'; done; $S/brp.sh brp_extras/screenshot '{}'",
+    "bash /tmp/do.sh 'rpc brp_extras/screenshot {\"path\":\"/tmp/a.png\"}'"
+  ]
+}

@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 import time
@@ -17,7 +16,9 @@ from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
 
+import add_unit
 import showrunners
+import unit_lookup
 
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
@@ -26,7 +27,9 @@ SESSIONS = Path(os.environ.get("STALL_WATCH_SESSIONS") or Path(__file__).resolve
 SEND = Path(os.environ.get("STALL_WATCH_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
 TMUX = os.environ.get("STALL_WATCH_TMUX") or "tmux"
 PS = os.environ.get("STALL_WATCH_PS") or "ps"
-TURN_END = re.compile(r"^\s*(?:— )?(?:holding|gate|decision|blocked|done):.*$", re.MULTILINE)
+WAITING_KINDS = ("done", "blocked", "gate", "decision")
+HOLDING_KIND = "holding"
+TURN_END = re.compile(rf"^\s*(?:— )?(?P<kind>{'|'.join((*WAITING_KINDS, HOLDING_KIND))}):.*$", re.MULTILINE)
 WORK = {"zsh", "bash", "sh", "implement.sh", "review.sh", "verify.sh"}
 
 
@@ -48,6 +51,9 @@ class Delivery(NamedTuple):
     state_path: Path
     kind: str
     command: list[str]
+
+
+
 
 
 def command_output(command: list[str]) -> str:
@@ -79,11 +85,6 @@ def descendants(root: int, rows: list[Process]) -> list[Process]:
     return found
 
 
-def claude_pid(pane_pid: int, rows: list[Process]) -> int | None:
-    return next((row.pid for row in descendants(pane_pid, rows)
-                 if row.command == "claude" or row.command.startswith("claude ")), None)
-
-
 def work_running(pid: int, rows: list[Process]) -> bool:
     for row in descendants(pid, rows):
         if row.command.endswith(" <defunct>"):
@@ -103,18 +104,6 @@ def latest_transcript_activity(session_id: str) -> float:
             if path.is_file():
                 latest = max(latest, path.stat().st_mtime)
     return latest
-
-
-def unit_socket(pid: int) -> tuple[str, str] | None:
-    try:
-        session_id = command_output([sys.executable, str(SESSIONS), "id", str(pid)])
-        record = cast(dict[str, object], json.loads((SESSIONS_DIR / f"{pid}.json").read_text(encoding="utf-8")))
-        socket = record.get("messagingSocketPath")
-        if session_id and isinstance(socket, str) and socket:
-            return session_id, socket
-    except (OSError, ValueError, TypeError):
-        pass
-    return None
 
 
 def stretch_path(slug: str, unit: str) -> Path:
@@ -139,13 +128,6 @@ def save_stretch(path: Path, stretch: Stretch) -> None:
     temporary = path.with_suffix(f".{os.getpid()}.tmp")
     _ = temporary.write_text(json.dumps(stretch) + "\n", encoding="utf-8")
     os.replace(temporary, path)
-
-
-def socket_for_target(target: str) -> str | None:
-    try:
-        return command_output([sys.executable, str(SESSIONS), "socket", target]) or None
-    except OSError:
-        return None
 
 
 def delivery(path: Path, kind: str, socket: str, key: str, text: str) -> Delivery:
@@ -186,60 +168,52 @@ def tick(now: float) -> None:
     settings = showrunners.load_settings()
     rows = processes()
     pending: list[Delivery] = []
-    missing = showrunners.missing_showrunners(settings)
-    missing_slugs = {runner.slug for runner in missing}
-    for path in STATE_DIR.glob("missing-*.json"):
-        if path.stem.removeprefix("missing-") not in missing_slugs:
-            path.unlink()
-    faults_socket = socket_for_target(settings["faults_to"])
-    for runner in missing:
-        path = STATE_DIR / f"missing-{runner.slug}.json"
-        stretch = read_stretch(path, runner.socket, now)
-        save_stretch(path, stretch)
-        if not stretch["tell_sent"] and faults_socket:
-            if isinstance(runner.prompt, showrunners.PromptUnits):
-                args = shlex.join(["add", runner.session, "--zone", runner.prompt.zone,
-                                   *(arg for unit in runner.prompt.unit_sessions for arg in ("--unit", unit))])
-                prompt_note = ""
-            else:
-                args = f"add {shlex.quote(runner.session)} --zone <zone> --unit <tmux session>"
-                prompt_note = f" The prompt gave no zone or units because {runner.prompt.reason}."
-            add = "$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py " + args
-            message = (f"stall-watch: showrunner {runner.slug} (session {runner.session}) is running but "
-                       "missing from config/showrunners.json, so its units are not watched. "
-                       f"It should run: {add}.{prompt_note}")
-            pending.append(delivery(path, "missing", faults_socket,
-                                    f"stall-watch:missing:{runner.slug}:{int(stretch['since'])}", message))
-    for configured in settings["showrunners"]:
-        showrunner_socket = socket_for_target(configured["session"])
-        if showrunner_socket is None:
+    for configured in showrunners.registered_showrunners():
+        # A showrunner that is not running has no one to tell: its units are not watched.
+        showrunner_socket = configured["socket"]
+        if not showrunner_socket:
             continue
         try:
             zone = ZoneInfo(configured["zone"])
         except (KeyError, ValueError):
-            print(f"stall-watch: invalid zone for {configured['session']}: {configured['zone']}", file=sys.stderr)
+            print(f"stall-watch: invalid zone for {configured['slug']}: {configured['zone']}", file=sys.stderr)
             continue
-        for unit in configured["units"]:
-            if subprocess.run([TMUX, "has-session", "-t", f"={unit}"], capture_output=True, check=False).returncode != 0:
+        # The units are the doc's live rows; each is found by the mark on its tmux session.
+        try:
+            slug = showrunners.production_slug(configured["doc"])
+            lines = Path(configured["doc"]).read_text(encoding="utf-8").splitlines()
+            live = {add_unit.cell_value(cells.get("Unit", "")): add_unit.cell_value(cells.get("Worktree", ""))
+                    for cells in add_unit.live_unit_table(lines, slug)}
+            marked = unit_lookup.marked_units(slug)
+        except (OSError, UnicodeError, ValueError, add_unit.Refusal) as error:
+            print(f"stall-watch: {configured['slug']}: its units are not watched: {error}", file=sys.stderr)
+            continue
+        for name, unit in marked.items():
+            # A unit is watched while the newest /unit:direct run in its worktree is unfinished.
+            try:
+                running = name in live and unit_lookup.run_state(Path(live[name])) is unit_lookup.UnitState.RUNNING
+            except (OSError, UnicodeError) as error:
+                print(f"stall-watch: {name}: its run state is unknown: {error}", file=sys.stderr)
+                continue
+            if not running:
+                stretch_path(slug, name).unlink(missing_ok=True)
+                continue
+            claude = unit.claude
+            if not isinstance(claude, unit_lookup.LiveClaude):
+                if isinstance(claude, unit_lookup.ClaudeUnknown):
+                    print(f"stall-watch: {name}: {claude.reason}", file=sys.stderr)
                 continue
             try:
-                pane_pid = int(command_output([TMUX, "display-message", "-p", "-t", f"={unit}:", "#{pane_pid}"]))
-                pane = command_output([TMUX, "capture-pane", "-p", "-J", "-S", "-400", "-t", f"={unit}:"])
-            except (OSError, ValueError) as error:
-                print(f"stall-watch: {unit}: {error}", file=sys.stderr)
+                pane = command_output([TMUX, "capture-pane", "-p", "-J", "-S", "-400", "-t", unit.pane])
+            except OSError as error:
+                print(f"stall-watch: {name}: {error}", file=sys.stderr)
                 continue
-            pid = claude_pid(pane_pid, rows)
-            if pid is None:
-                continue
-            identity = unit_socket(pid)
-            if identity is None:
-                continue
-            session_id, socket = identity
-            path = stretch_path(configured["session"], unit)
+            pid, session_id, socket = claude.pid, claude.session_id, claude.socket
+            path = stretch_path(slug, name)
             stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
-            turns = TURN_END.findall(pane)
-            last = cast(str, turns[-1]).strip() if turns else "none on screen"
-            if last.lstrip("— ").startswith("done:"):
+            turns = list(TURN_END.finditer(pane))
+            last = turns[-1].group(0).strip() if turns else "none on screen"
+            if turns and turns[-1].group("kind") in WAITING_KINDS:
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)
@@ -255,7 +229,7 @@ def tick(now: float) -> None:
             if now - since < settings["stall_minutes"] * 60 or running_work:
                 continue
             since_text = datetime.fromtimestamp(since, zone).strftime("%H:%M %Z")
-            key = f"stall-watch:{unit}:{int(since)}"
+            key = f"stall-watch:{name}:{int(since)}"
             if not stretch["reported_status"]:
                 stretch["reported_status"] = last
                 save_stretch(path, stretch)
@@ -264,7 +238,7 @@ def tick(now: float) -> None:
                         "Continue your run; if you are waiting on someone, say on whom in one line.")
                 pending.append(delivery(path, "bump", socket, f"{key}:bump", text))
             if not stretch["tell_sent"] and showrunner_socket:
-                text = f"{unit} idle since {since_text}, nothing running; bumped. Last status: {last}"
+                text = f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}"
                 pending.append(delivery(path, "tell", showrunner_socket, f"{key}:tell", text))
     send_all(pending)
 

@@ -1,16 +1,16 @@
 ---
-description: Run a delegate run's periodic CI point now, or one the run skipped.
+description: Run a /unit:direct run's periodic CI point now, or one the run skipped.
 ---
 
-# Delegate — periodic CI
+# Direct — periodic CI
 
 **Usage:** `/unit:ci`
 
 Type this when a run skipped a CI point, or to run one now. It runs inside the
 current session and already knows the plan doc, the plan slug, and the mode. If
-no delegate run is active, say so in one line and stop.
+no `/unit:direct` run is active, say so in one line and stop.
 
-`/unit:delegate` reads this file after every checkpoint and once at the end of
+`/unit:direct` reads this file after every checkpoint and once at the end of
 the run. It defines `<PeriodicCI/>` and `<CICleanup/>` in full. Never work from
 memory of an earlier read.
 

@@ -53,15 +53,28 @@ variants. The 24 GiB default covers the other projects' whole targets
 
 The disk floor. Each budget fits the disk; together they do not (hana 96 GiB
 in each of 9 worktrees, 24 in 7 other repos, CI 160 x 2), and natedev's disk
-filled on 2026-10-03. So when lint.conf sets sweep_free_floor_gib.<host>, or
-sweep_free_floor_gib, and the disk holding the home has less free than that,
-every sweep also removes the least recently used build output across every
-cargo target directory (one holding .rustc_info.json) under FLOOR_ROOTS that
-no build holds, until the floor is free again: an idle worktree's output goes
-before a busy one's. One sweep holds the floor at a time, and it keeps every
-idle target's cargo locks while it scans, so a build starting there waits. --floor-only skips the working
-directory's own sweep, as disk-floor.nix's 2-minute timer runs it. CI's
-targets are not under FLOOR_ROOTS, and its accounts cannot read lint.conf.
+filled on 2026-10-03. When lint.conf sets sweep_free_floor_gib.<host> or
+sweep_free_floor_gib, the shortfall below that free-space floor sets how much
+build output goes. A target is a directory under FLOOR_ROOTS holding
+.rustc_info.json, or cargo's CACHEDIR.TAG beside a build tree: a folder cargo
+creates carries the tag from its first moment, and .rustc_info.json may come
+only when the first build ends, or never. Cargo's registry carries the same
+tag with no build tree. A folder made before a build with
+CARGO_CACHE_RUSTC_INFO=0 has neither and stays unseen. Orphaned files go first
+from every idle target. Then idle targets under SCRATCH_ROOTS lose
+output, then the least recently used target, then by build-unit use within
+each target. On 2026-10-08 the tag rule found 76 targets where
+.rustc_info.json alone found 41: 31 finished scratch targets carried only the
+tag, and one in its first build had reached 22 GiB unseen. A target's last use
+is the newer of its .lint-sweep-used stamp and its units' last uses. A target
+whose cargo locks a build holds is never touched. One sweep holds the floor at
+a time and keeps every idle target's cargo locks while scanning and removing,
+so a build starting there waits.
+--floor-only skips the workspace sweep for disk-floor.nix's 2-minute timer.
+CI's targets are outside FLOOR_ROOTS, and its accounts cannot read lint.conf.
+By 15:23 PDT on 2026-10-06 that timer had taken 801 GiB, from units last
+used a median 3.0 h earlier. In a 60 GiB shortfall simulation, target-first order spared the
+active hana targets that the prior global unit order reached.
 
 The doc index. rustdoc rewrites doc/search.index, doc/trait.impl and
 doc/type.impl when a crate finishes, and its peak memory tracks what those
@@ -94,8 +107,10 @@ Last use. cargo reads a unit's fingerprint JSON whenever the unit is in a
 build graph, so the newest atime of the files in .fingerprint/<unit>/ is its
 last use. relatime refreshes an atime at most once a day, so eviction orders
 by whole days since last use, then by compile time (newest mtime) inside a
-day. An incremental dir's mtime moves on every compile of its crate. Anything
-that reads every fingerprint JSON resets every atime and erases that order;
+day. A no-op build writes nothing under target/, so only the target's use
+stamp records that step reliably. An incremental dir's mtime moves on every
+compile of its crate. Anything that reads every fingerprint JSON resets every
+atime and erases that order;
 cargo-sweep --installed does exactly that, and running it before --time kept
 this sweep's predecessor from removing anything at all. Listing a directory
 refreshes the directory's own atime the same way, so this scan, or a du,
@@ -121,7 +136,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -161,8 +176,11 @@ DEP_INFO_HEAD = 4096
 MAX_TREE_DEPTH = 3
 FLOOR_KEY = "sweep_free_floor_gib"
 FLOOR_ONLY_FLAG = "--floor-only"
+USE_STAMP = ".lint-sweep-used"
 # Every cargo target directory on natedev was under one of these (2026-10-03).
 FLOOR_ROOTS = ("~/rust", "~/.local/state", "/tmp")
+# Targets under these roots are scratch builds: below the floor they lose output before any other target.
+SCRATCH_ROOTS = ("/tmp",)
 FLOOR_LOCK = os.path.join("~", ".local", "state", "lint-sweep", "floor.lock")
 FLOOR_STATE_ENV = "LINT_SWEEP_STATE_DIR"
 BUILDLOG_DIR_ENV = "BUILDLOG_DIR"
@@ -179,10 +197,14 @@ PACIFIC = ZoneInfo("America/Los_Angeles")
 # /tmp/claude-<uid>/<project>/<session>/scratchpad/ up to 7.
 FLOOR_SEARCH_DEPTH = 8
 FLOOR_SKIP = frozenset({".git", "node_modules"})
-# cargo writes this at a target directory's root on every build. Not
-# CACHEDIR.TAG: cargo writes that only when it creates the directory itself,
-# and mend's wrapper creates hana worktrees' first.
+# cargo writes this at a target directory's root: early in a build into a
+# folder that already exists; into a folder it creates, when the first build
+# ends or never (31 finished scratch targets had none on 2026-10-08). It
+# writes CACHEDIR.TAG at once, but only into a folder it creates (mend's
+# wrapper makes hana worktrees' first), so each marker covers the other's gap.
 RUSTC_INFO = ".rustc_info.json"
+CACHE_TAG = "CACHEDIR.TAG"
+CARGO_TAG_LINE = "# This file is a cache directory tag created by cargo."
 HASH_LENGTH = 16
 HEX_DIGITS = frozenset("0123456789abcdef")
 
@@ -200,10 +222,15 @@ class Group:
     """One removable piece of build output and the inode links it holds."""
 
     kind: GroupKind
+    build_tree: str
     entries: list[str] = field(default_factory=list)
     inodes: list[InodeKey] = field(default_factory=list)
     last_used: float = 0.0
     compiled: float = 0.0
+
+
+# Sort key for build units; the unit with the smallest key is removed first.
+RemovalOrder = Callable[[Group], tuple[float, ...]]
 
 
 @dataclass
@@ -211,7 +238,7 @@ class Scan:
     blocks: dict[InodeKey, int] = field(default_factory=dict)
     links: dict[InodeKey, int] = field(default_factory=dict)
     groups: list[Group] = field(default_factory=list)
-    orphans: Group = field(default_factory=lambda: Group(kind="orphan"))
+    orphans: list[Group] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -351,6 +378,23 @@ def build_trees(root: str) -> list[str]:
                 continue
         frontier = next_frontier
     return trees
+
+
+def is_cargo_target(directory: str) -> bool:
+    """Whether cargo built into directory."""
+    if os.path.isfile(os.path.join(directory, RUSTC_INFO)):
+        return True
+    # Cost: one more stat per directory without rustc info; reads and tree
+    # searches happen only where that stat finds a tag.
+    tag = os.path.join(directory, CACHE_TAG)
+    if not os.path.isfile(tag):
+        return False
+    try:
+        with open(tag, "rb") as handle:
+            lines = handle.read(512).decode("utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return CARGO_TAG_LINE in lines and bool(build_trees(directory))
 
 
 def lock_trees(trees: list[str]) -> tuple[list[int], str | None]:
@@ -519,7 +563,7 @@ def group_roots(trees: list[str], scan: Scan) -> dict[str, Group]:
                     continue
                 group = units.get(digest)
                 if group is None:
-                    group = Group(kind="unit")
+                    group = Group(kind="unit", build_tree=tree)
                     units[digest] = group
                     scan.groups.append(group)
                 attach(entry.path, group, roots)
@@ -537,11 +581,15 @@ def group_roots(trees: list[str], scan: Scan) -> dict[str, Group]:
                 # these entries any more; their own mtimes are all there is.
                 mtimes = [os.lstat(path).st_mtime for path in group.entries]
                 group.last_used = group.compiled = max(mtimes)
+        orphans = Group(kind="orphan", build_tree=tree)
         for source, directory in directories.items():
-            claim_copies(directory, copies[source], candidates[source], roots, scan.orphans)
+            claim_copies(directory, copies[source], candidates[source], roots, orphans)
+        if orphans.entries:
+            scan.orphans.append(orphans)
         for entry in listing(os.path.join(tree, INCREMENTAL_DIR)):
             _, modified = newest_times(entry.path)
-            group = Group(kind="incremental", entries=[entry.path], last_used=modified, compiled=modified)
+            group = Group(kind="incremental", entries=[entry.path], last_used=modified,
+                          compiled=modified, build_tree=tree)
             scan.groups.append(group)
             roots[entry.path] = group
     return roots
@@ -583,19 +631,22 @@ def freed_by(group: Group, scan: Scan, remaining: dict[InodeKey, int]) -> int:
     return freed
 
 
-def choose(scan: Scan, total: int, budget: int, remaining: dict[InodeKey, int]) -> tuple[list[Group], int]:
-    """Least recently used groups to remove, and the size left once they go."""
-    now = time.time()
-    order = sorted(
-        scan.groups,
-        key=lambda group: (-int((now - group.last_used) // DAY_SECONDS), group.compiled),
-    )
-    chosen: list[Group] = []
-    for group in order:
+def unit_age(group: Group, now: float) -> tuple[float, float]:
+    """Sorts the build unit unused for the most whole days first, then the oldest compile."""
+    return (-int((now - group.last_used) // DAY_SECONDS), group.compiled)
+
+
+def choose(
+    scan: Scan, total: int, budget: int, remaining: dict[InodeKey, int], removal_order: RemovalOrder
+) -> tuple[list[tuple[Group, int]], int]:
+    """Groups to remove, first in removal_order first, and the size left once they go."""
+    chosen: list[tuple[Group, int]] = []
+    for group in sorted(scan.groups, key=removal_order):
         if total <= budget:
             break
-        chosen.append(group)
-        total -= freed_by(group, scan, remaining)
+        freed = freed_by(group, scan, remaining)
+        chosen.append((group, freed))
+        total -= freed
     return chosen, total
 
 
@@ -721,7 +772,8 @@ def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run:
     label = ", ".join(roots)
     state = "within" if total <= budget else "over"
     print(f"lint sweep: {label} is {gib(total)}, {state} the {gib(budget)} budget ({source})")
-    left, failures = shrink(scan, total, budget, dry_run)
+    now = time.time()
+    left, failures, _ = shrink(scan, total, budget, dry_run, lambda group: unit_age(group, now))
     if left > budget:
         print(
             f"lint sweep: {gib(left)} remains over budget in output this sweep never removes"
@@ -730,33 +782,52 @@ def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run:
     return 1 if failures else 0
 
 
-def shrink(scan: Scan, total: int, budget: int, dry_run: bool) -> tuple[int, int]:
-    """Remove the orphans, then the least recently used groups until total fits
-    budget, and say what went; returns the size left and the failed removals."""
+def shrink(
+    scan: Scan, total: int, budget: int, dry_run: bool, removal_order: RemovalOrder
+) -> tuple[int, int, list[tuple[Group, int]]]:
+    """Remove the orphans, then groups in removal_order until total fits budget,
+    and say what went; return the size left, failures, and groups taken."""
     verb, result = ("would remove", "would leave") if dry_run else ("removed", "left")
     remaining = dict(scan.links)
     failures = 0
-    orphans = scan.orphans
-    if orphans.entries:
-        freed = freed_by(orphans, scan, remaining)
-        total -= freed
-        failures += 0 if dry_run else remove([orphans])
+    taken: list[tuple[Group, int]] = []
+    if scan.orphans:
+        orphaned = 0
+        for group in scan.orphans:
+            freed = freed_by(group, scan, remaining)
+            orphaned += freed
+            if dry_run:
+                taken.append((group, freed))
+            else:
+                failed = remove([group])
+                failures += failed
+                if not failed:
+                    taken.append((group, freed))
+        total -= orphaned
         print(
-            f"lint sweep: {verb} {len(orphans.entries)} orphaned files ({gib(freed)}),"
+            f"lint sweep: {verb} {sum(len(group.entries) for group in scan.orphans)} orphaned files ({gib(orphaned)}),"
             + f" copied-up output whose build unit is gone; {result} {gib(total)}"
         )
     if total <= budget:
-        return total, failures
-    chosen, left = choose(scan, total, budget, remaining)
-    failures += 0 if dry_run else remove(chosen)
+        return total, failures, taken
+    chosen, left = choose(scan, total, budget, remaining, removal_order)
+    for group, freed in chosen:
+        if dry_run:
+            taken.append((group, freed))
+        else:
+            failed = remove([group])
+            failures += failed
+            if not failed:
+                taken.append((group, freed))
     if chosen:
-        units = sum(1 for group in chosen if group.kind == "unit")
+        units = sum(1 for group, _ in chosen if group.kind == "unit")
+        uses = [group.last_used for group, _ in chosen]
         print(
             f"lint sweep: {verb} {units} build units and {len(chosen) - units} incremental dirs"
-            + f" ({gib(total - left)}), last used {when(chosen[0].last_used)}"
-            + f" to {when(chosen[-1].last_used)}; {result} {gib(left)}"
+            + f" ({gib(total - left)}), last used {when(min(uses))}"
+            + f" to {when(max(uses))}; {result} {gib(left)}"
         )
-    return left, failures
+    return left, failures, taken
 
 
 def target_dirs(roots: Sequence[str]) -> list[str]:
@@ -766,7 +837,7 @@ def target_dirs(roots: Sequence[str]) -> list[str]:
         frontier = [(os.path.expanduser(root), 0)]
         while frontier:
             directory, depth = frontier.pop()
-            if os.path.isfile(os.path.join(directory, RUSTC_INFO)):
+            if is_cargo_target(directory):
                 found.add(os.path.realpath(directory))
                 continue
             if depth < FLOOR_SEARCH_DEPTH:
@@ -776,6 +847,28 @@ def target_dirs(roots: Sequence[str]) -> list[str]:
                     if entry.name not in FLOOR_SKIP and entry.is_dir(follow_symlinks=False)
                 )
     return sorted(found)
+
+
+def is_scratch_target(root: str, scratch_roots: Sequence[str]) -> bool:
+    """Whether the target directory root lies under one of scratch_roots."""
+    target = os.path.realpath(root)
+    for scratch_root in scratch_roots:
+        scratch = os.path.realpath(os.path.expanduser(scratch_root))
+        try:
+            if os.path.commonpath((target, scratch)) == scratch:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def target_last_use(root: str, groups: list[Group]) -> float:
+    """Newest workspace step or build-unit use in a target."""
+    try:
+        stamp_used = os.stat(os.path.join(root, USE_STAMP)).st_mtime
+    except OSError:
+        stamp_used = 0.0
+    return max(stamp_used, max((group.last_used for group in groups), default=0.0))
 
 
 def free_bytes(path: str) -> int:
@@ -1009,7 +1102,12 @@ def send_floor_alert(message: str, channels: FloorAlertChannels) -> bool:
         ("message", [sys.executable, str(scripts / "message/send.py"), "--to", "natedev", "--from", "disk_floor", "--timeout", "30"]),
     ]
     if channels is FloorAlertChannels.NATEDEV_AND_PHONE:
-        commands.append(("phone", [sys.executable, str(scripts / "notify/pushover.py"), "--priority", "0", "natedev: disk under its floor", message]))
+        commands.append(("phone", [
+            sys.executable, str(scripts / "message/send.py"),
+            "--to", "user", "--need", "note",
+            "--action", "Free disk space outside build caches on natedev.",
+            "--summary", "natedev: disk under its floor", "--text", message,
+        ]))
     delivered = False
     for channel, command in commands:
         try:
@@ -1019,15 +1117,20 @@ def send_floor_alert(message: str, channels: FloorAlertChannels) -> bool:
                 state = "queued" if result.returncode == 1 else "delivered"
                 print(f"lint sweep: {channel} alert {state}")
             else:
-                print(f"lint sweep: {channel} alert failed ({result.returncode}): {result.stderr.strip()}", file=sys.stderr)
+                print(f"lint sweep: {channel} alert failed ({result.returncode}): {result.stderr.strip() or result.stdout.strip()}", file=sys.stderr)
         except (OSError, subprocess.TimeoutExpired) as error:
             print(f"lint sweep: {channel} alert failed: {error}", file=sys.stderr)
     return delivered
 
 
-def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = FLOOR_ROOTS, lock: str = FLOOR_LOCK) -> int:
-    """Below floor bytes free, remove the least recently used build output across
-    every target directory no build holds until floor is free again."""
+def hold_floor(
+    floor: int,
+    dry_run: bool,
+    roots: Sequence[str] = FLOOR_ROOTS,
+    lock: str = FLOOR_LOCK,
+    scratch_roots: Sequence[str] = SCRATCH_ROOTS,
+) -> int:
+    """Below the floor, take the shortfall from the least used idle targets."""
     home = os.path.expanduser("~")
     free = free_bytes(home)
     if free >= floor:
@@ -1044,6 +1147,7 @@ def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = FLOOR_ROOTS, lo
         previous = read_floor_record(record_path)
         idle: list[str] = []
         trees: list[str] = []
+        tree_targets: dict[str, str] = {}
         busy: list[str] = []
         for root in target_dirs(roots):
             root_trees = build_trees(root)
@@ -1054,7 +1158,13 @@ def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = FLOOR_ROOTS, lo
             held.extend(root_held)
             idle.append(root)
             trees.extend(root_trees)
+            tree_targets.update({tree: root for tree in root_trees})
         scan = scan_roots(idle, trees)
+        target_groups: dict[str, list[Group]] = {root: [] for root in idle}
+        for group in scan.groups:
+            target_groups[tree_targets[group.build_tree]].append(group)
+        target_uses = {root: target_last_use(root, groups) for root, groups in target_groups.items()}
+        scratch_targets = {root: is_scratch_target(root, scratch_roots) for root in idle}
         total = sum(scan.blocks.values())
         held_bytes = sum(directory_blocks(path) for path in busy)
         ci_bytes = sum(directory_blocks(path) for path in CI_TARGETS)
@@ -1065,7 +1175,27 @@ def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = FLOOR_ROOTS, lo
             + f" target dirs ({gib(total)}), {len(busy)} left alone while a build holds them"
         )
         budget = total - (floor - free)
-        left, failures = shrink(scan, total, budget, dry_run)
+        ordered_at = time.time()
+        left, failures, chosen = shrink(
+            scan,
+            total,
+            budget,
+            dry_run,
+            lambda group: (
+                0.0 if scratch_targets[tree_targets[group.build_tree]] else 1.0,
+                target_uses[tree_targets[group.build_tree]],
+                *unit_age(group, ordered_at),
+            ),
+        )
+        taken: dict[str, int] = {}
+        for group, freed in chosen:
+            root = tree_targets[group.build_tree]
+            taken[root] = taken.get(root, 0) + freed
+        for root, size in sorted(taken.items(), key=lambda item: (-item[1], item[0])):
+            if size:
+                verb = "would take" if dry_run else "took"
+                print(f"lint sweep: the floor {verb} {gib(size)} from {root},"
+                      + f" last used {when(target_uses[root])}")
         after_free = free_bytes(home)
         print(f"lint sweep: {gib(after_free)} free")
         if not dry_run:
@@ -1225,6 +1355,12 @@ def sweep_workspace(target_dir: str | None, config: str, dry_run: bool) -> int:
         return 2
     if target_dir is None:
         roots = cargo_roots()
+        if not dry_run:
+            for root in roots:
+                try:
+                    Path(root, USE_STAMP).touch()
+                except OSError:
+                    pass
     else:
         roots = [os.path.realpath(target_dir)] if os.path.isdir(target_dir) else []
     if not roots:

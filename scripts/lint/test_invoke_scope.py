@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from typing import cast
 
 
 INVOKE = Path(__file__).with_name("invoke.sh")
@@ -68,6 +71,27 @@ class BuildScopeTests(unittest.TestCase):
         result = self.run_scope(["sh", "-c", "exit 7"])
         self.assertEqual(result.returncode, 7)
 
+    def test_scope_writes_cgroup_sidecar_before_step(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scope = root / "fake-cgroup"
+            scope.mkdir()
+            _ = (scope / "memory.peak").write_text("123\n")
+            _ = (scope / "memory.pressure").write_text("some avg10=0 total=0\n")
+            marker = root / "peak"
+            command = scope_command().replace(
+                '"/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"', f'"{scope}"'
+            )
+            result = subprocess.run(
+                ["/bin/sh", "-c", 'exec 3>&2; exec /bin/sh -c "$@"',
+                 "scope-test", command, str(marker), "sh", "-c",
+                 'test -f "$1.cgroup" && cat "$1.cgroup"', "step", str(marker)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.strip(), str(scope))
+            self.assertEqual((root / "peak.cgroup").read_text().strip(), str(scope))
+
     def test_failed_score_write_is_silent_and_step_runs_under_exported_errexit(self) -> None:
         readonly_score = Path("/proc/self/status")
         if not readonly_score.exists():
@@ -82,6 +106,76 @@ class BuildScopeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "ran\n")
         self.assertEqual(result.stderr, "")
+
+    def test_sampler_exits_when_its_parent_shell_dies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shell: subprocess.Popen[str] = subprocess.Popen(
+                ["bash", "-c", 'source "$1"; parent=$BASHPID; buildlog_sample_anon "$2" "$3" "$parent" & printf "%s\\n" "$!"; wait',
+                 "sampler-test", str(INVOKE), str(root / "scope.cgroup"), str(root / "maximum")],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                env={**os.environ, "HOME": directory, "LINT_CONFIG_READER": str(root / "missing-config")},
+            )
+            sampler_pid = 0
+            try:
+                assert shell.stdout is not None
+                sampler_pid = int(cast(str, shell.stdout.readline()).strip())
+                os.kill(shell.pid, signal.SIGKILL)
+                _ = shell.wait(timeout=3)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline and self.process_running(sampler_pid):
+                    time.sleep(0.05)
+                self.assertFalse(self.process_running(sampler_pid), "sampler survived its parent shell")
+            finally:
+                if shell.poll() is None:
+                    shell.kill()
+                    _ = shell.wait(timeout=3)
+                if sampler_pid and self.process_running(sampler_pid):
+                    os.kill(sampler_pid, signal.SIGKILL)
+                if shell.stdout is not None:
+                    shell.stdout.close()
+
+    @staticmethod
+    def process_running(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        stat = Path(f"/proc/{pid}/stat")
+        if stat.exists():
+            try:
+                return stat.read_text().rsplit(") ", 1)[1][0] != "Z"
+            except FileNotFoundError:
+                return False
+        return True
+
+    def test_unreserved_scoped_step_removes_cgroup_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scope = root / "fake-cgroup"
+            scope.mkdir()
+            _ = (scope / "memory.peak").write_text("123\n")
+            _ = (scope / "memory.pressure").write_text("some avg10=0 total=0\n")
+            command = scope_command().replace(
+                '"/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"', f'"{scope}"'
+            )
+            shell = (
+                'source "$1"; BUILDLOG_SCOPE_SH=$2; '
+                'buildlog_begin() { BUILDLOG_PEAK="$TMPDIR/buildlog.test.peak"; BUILDLOG_START=""; }; '
+                'sweep_after_step() { :; }; '
+                'systemd-run() { while [[ "$1" != -- ]]; do shift; done; shift; "$@"; }; '
+                'run_once sh -c \'test -f "$1.cgroup"\' step "$TMPDIR/buildlog.test.peak" "$TMPDIR/sweep.py"'
+            )
+            result = subprocess.run(
+                ["bash", "-c", shell, "sidecar-test", str(INVOKE), command],
+                capture_output=True, text=True, check=False,
+                env={**os.environ, "HOME": directory, "TMPDIR": directory,
+                     "LINT_CONFIG_READER": str(root / "missing-config")},
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(list(root.glob("*.peak.cgroup")), [])
 
 
 if __name__ == "__main__":

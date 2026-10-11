@@ -13,7 +13,7 @@ After a direct push, `validate_and_push.sh --cancel-prior` cancels the branch's 
 | `scripts/validate_and_push/validate_and_push.sh` | The `--cancel-prior` flag and `cancel_prior_runs`. |
 | `scripts/validate_and_push/push_direct.sh` | Pushes, runs the post-push hook, waits for the sha's run, prints the CI handoff. Unchanged by this feature. |
 | `scripts/validate_and_push/test_cancel_prior.sh` | Test with stubbed `git` and `gh`. |
-| `commands/showrunner/produce.md` | The cancel-prior rule at <MergeCheckpoint/> step 10 and <CIPoint/>. |
+| `commands/showrunner/produce.md` | The cancel-prior rule at <MergeCheckpoint/> (the `merge_checkpoint.py` call) and <CIPoint/> (`ci_points.py ci start`). |
 
 ### Data flow
 
@@ -55,7 +55,7 @@ Output lines:
 
 ### The showrunner rule
 
-The rule appears in `produce.md` at <MergeCheckpoint/> step 10 (the `--quick` push of a green merge) and at <CIPoint/>. Before the push, check for an older CI run on the merge branch that is still queued or running. Add `--cancel-prior` when this push replaces that run and no CI point is watching its result or diagnosing a red run. The command blocks in those sections leave the flag out; the showrunner adds it push by push.
+The rule appears in `produce.md` at <MergeCheckpoint/> (`merge_checkpoint.py --cancel-prior` passes the flag to the `--quick` push of a green merge, and is refused with `Push: git`) and at <CIPoint/> (`ci_points.py ci start --cancel-prior`). Before the push, check for an older CI run on the merge branch that is still queued or running. Add `--cancel-prior` when this push replaces that run and no CI point is watching its result or diagnosing a red run. The command blocks in those sections leave the flag out; the showrunner adds it push by push.
 
 ### The test
 

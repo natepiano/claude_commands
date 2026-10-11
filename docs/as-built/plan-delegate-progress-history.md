@@ -1,7 +1,7 @@
 # Plan-delegate progress history
 
 `scripts/delegate/progress_history.py` is the shared progress recorder for
-Claude and Codex implementations of `/unit:delegate`. It writes append-only
+Claude and Codex implementations of `/unit:direct`. It writes append-only
 per-run JSONL files under:
 
 ```text
@@ -21,6 +21,7 @@ Schema version 1 records these event types:
 - `pass_started` / `pass_finished`
 - `activity_started` / `activity_finished`
 - `progress_reported`
+- `eta_stated`
 - `finding_opened` / `finding_batch_dispatched` / `finding_verdict` /
   `finding_gate`, appended by `scripts/delegate/findings.py` to the same stream
 
@@ -37,6 +38,11 @@ percentages, decision source, override reason, each elapsed clock, and the
 calibration evidence used for that report. The phase decision also repeats the
 historical bias, suggested adjustment, and chosen adjustment so downstream
 analysis does not need to unpack the calibration snapshot.
+
+`eta_stated` records the active phase's promised arrival as epoch `eta_at` and
+its `basis`. A ranged statement also carries epoch `eta_earliest_at` and
+`eta_latest_at`; an exact statement carries neither range key. The event is the
+only recorder copy of a stated ETA. The live state does not duplicate it.
 
 ## Project clock
 
@@ -146,7 +152,7 @@ whether the calibration helped and continue tuning that original estimate.
 
 ## Findings ledger
 
-`scripts/delegate/findings.py` bounds `/unit:delegate`'s fix loop. It replaced a
+`scripts/delegate/findings.py` bounds `/unit:direct`'s fix loop. It replaced a
 `FIX_PASS < 10` counter, which could not converge: the re-review after each fix
 was a fresh blind review of a now-larger diff, with no memory of what had already
 been accepted, so it always returned something.
@@ -182,7 +188,7 @@ verdict: a finding reopened `MAX_REOPENS` times after being accepted; a finding
 that failed to close after `MAX_FIX_ATTEMPTS` repair attempts; `STALLED_ROUNDS`
 consecutive rounds with no decrease in the gating-open count;
 `MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind in a row; more than
-`MAX_REVIEW_CANCELLATIONS` blind-review cancellations; a spent repair budget; the
+`MAX_REVIEW_CANCELLATIONS` review cancellations; a spent repair budget; the
 `RUNAWAY_ROUNDS` backstop.
 
 Each of these used to stop the phase and hand it to the user. They stopped too
@@ -221,12 +227,27 @@ progress_history.py start-activity --session-dir <dir> --label <label> --activit
 progress_history.py finish-activity --session-dir <dir> [--status completed|error|canceled|interrupted] [--result <outcome>]
 progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
 progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>]
+progress_history.py eta --session-dir <dir> --time <YYYY-MM-DDTHH:MM> [--earliest <YYYY-MM-DDTHH:MM> --latest <YYYY-MM-DDTHH:MM>] --basis <text>
 progress_history.py finish-phase ...
 progress_history.py finish-run ...
 progress_history.py timeline --session-dir <dir> [--phase <id>]
 progress_history.py phase-count --plan-doc <path> [--phase-percent <N>]
 progress_history.py aggregate [--percent <N>]
 ```
+
+For production plans, `start-phase`, every `progress` report, `finish-phase`,
+and `finish-run` end by asking `phase_table.py refresh` to rewrite the unit's
+phase note from the event stream; `eta` asks for it after its append and before
+its `ETA recorded:` line. A refresh failure adds one stderr line and changes
+neither the command's output nor its exit status. Plans without a
+`> **Production:` line skip the subprocess. [Phase tables](phase-tables.md)
+covers the note, the table built from these events and the hook's limits.
+
+`eta` reads its times in the process `TZ`, requires an active phase, appends
+one `eta_stated` event, and prints `ETA recorded: <HH:MM zone>`. It exits 2 on
+a malformed or past time, a time the local clock skips, a range that does not
+enclose the target, one range end alone, a blank basis, or no active phase.
+`/unit:eta` and `/unit:eta_breakdown` run it under `TZ=<User zone>`.
 
 `implement.sh` and `review.sh` own pass lifecycle: they set
 `PLAN_DELEGATE_PASS_OWNER=launcher` on their own `start-pass` / `finish-pass`
@@ -238,20 +259,22 @@ open: `finish-pass --status canceled --orphaned-launcher` closes it, and only
 that status, and only while a pass is open.
 
 `progress` writes the event and prints two tables under a line naming the
-worktree, the branch, and — when the plan's headings can be counted — the
-position of the phase in flight, `phase N of M`. That position is the finished
-count plus one, off the same headings the project percentage derives from, so
-the line and the table can never disagree; a plan that cannot be counted keeps
-the short worktree-and-branch form. The first table holds the clocks: a project
+worktree, and the branch when it differs. The line carries no position: how
+far through the plan the run is belongs to the first table's Phases column,
+and a plan with deferred earlier phases or retired ids puts the active phase
+at an ordinal that matches neither number. The first table holds the clocks: a project
 row and a phase row carrying the reported percentage, elapsed, ETA, unchanged,
 — when the plan's headings can be counted — how many phases are done, and last
 the best and worst arrival the percentage still allows.
 
 The second is the round table, under the phase heading: one row per round,
-oldest first, led by `Stage`, `Start` and `Elapsed`, then a column for each of
-the two slots — `Agent 1` and `Agent 2`, the `impl` and `test` slots in that
-order, numbered so the header carries no role word the cell
-beneath could contradict — and closed by the finding result. The first column is
+oldest first, led by `Stage`, `Start` and `Elapsed`, then a column for each
+seat — `Agent 1` and `Agent 2`, the `impl` and `test` slots in that order, then
+one `Agent N` per extra seat (`review`, `review2`, `fix2`, …) in the order seats
+first appear, numbered so the header carries no role word the cell beneath
+could contradict — and closed by the finding result. An extra seat appears when
+it records a pass or receives a board `handoff`; the original `review` seat
+shows only while a displayed stage seats it. The first column is
 `Stage` rather than `Round` because a row is not always a round: a verification,
 a smoke run, or a lone reviewer each own one. A round is nonetheless the unit
 that advances: it is dispatched, it lands, and the ledger stamps its number
@@ -346,11 +369,11 @@ carries both identities per pass for anyone reconstructing a run after the fact.
 
 Windows that sit in no round keep a row apiece, named as they always were: a
 unit-director activity, which holds no seat, and every pass that records none — a
-solo run's, and the closure reviewer `review.sh` launches between rounds. A
-broad review's two lens reviewers do record seats and join the round they
-read, one row below the writers. Such a seatless pass is drawn in the seat its
+solo run's, and a lens-less review `review.sh` runs with neither `--to` nor
+`--slot`. A review on an open seat records under that seat, and a broad
+review's lens reviewers join the round they read, one row below the writers. Such a seatless pass is drawn in the seat its
 kind names — `review 9m` under
-Agent 2, `impl 3m` under Agent 1 — so a reader finds the closure review in a
+Agent 2, `impl 3m` under Agent 1 — so a reader finds a seatless review in a
 seat's column rather than a row of dashes; an activity
 names no seat and keeps them. These rows keep the per-window finding attribution — the interval
 running to whatever opened next — which is wrong for concurrent seats and
@@ -358,9 +381,10 @@ exactly right for the sequential windows that still reach it. An early-armed rev
 one, and otherwise keeps its own row beside the writer.
 
 A round splits into a further row wherever a seat is occupied a second time,
-because that is a move no `handoff` marks: the writers' sessions have
-exited and the reviewers that take their chairs are fresh read-only ones that
-post no movement. The whole wave takes one boundary rather than one per launch,
+as when a writer's open seat takes a review after its writing pass closes: a
+new pass is a move whether or not the seat posted a `handoff` for it. An extra
+seat outside `impl` and `test` opens such a row when its first occupancy
+begins, so it does not appear to have worked from the writers' start. The whole wave takes one boundary rather than one per launch,
 and each cell reports the occupancy that stretch falls in — so a phase reads
 `impl / test / impl` on one row and `review / review / review` on the next,
 with the round's result on the row that closes it. A later occupancy reports the
@@ -409,6 +433,11 @@ capped number the row displays, it never contradicts the percentage beside it,
 and it inherits that number's accuracy: derived phase counts for the project,
 the reporter's estimate for the phase.
 
+`eta_band_seconds` names both outcomes. `EtaBand` carries the projected
+`remaining`, `earliest`, and `latest` seconds in that order;
+`EtaProjectionUnavailable` says the displayed percentage and elapsed time do
+not support a projection.
+
 `ETA low` and `ETA high` close the row with the two arrivals that same
 percentage still allows, each followed by its own distance from the ETA as
 `(-HH:MM)` and `(+HH:MM)` so the swing reads without subtracting clock times by
@@ -424,6 +453,28 @@ rate whatever the measured error says — a spread wider than the percentage
 itself would otherwise push the pessimistic end to 1% and quote an arrival
 ninety-nine times the elapsed clock. Both cells are blank wherever the ETA is.
 
+An active phase with no pass or activity open — reviews closed, repair writers
+not started — still gets every section. `progress` reads the phase's last
+`progress_reported` event and prints the clocks table from it: that call's
+percentages, unchanged clocks, and calibration spread, with elapsed and ETA
+measured at the event's timestamp and each arrival's day named from now. The
+`Phases` cell counts the plan as it stands. A `*Percentages and clocks as of <time>,
+the last progress report.*` line above the table names that moment, dated only
+when it falls on another day. A phase never reported reads as of its start: 0
+for the phase, and the project at the plan's phase count held below 100, or the
+last reported project percent when the plan cannot be counted. The round table
+is the phase's windows as they stand, and a phase with none yet draws one
+`no stage yet` row. In place of the activity sentence goes `No pass or activity
+is open.` and the warning that the records say nothing about whether a worker
+is still running. The percent options are neither required nor checked. The
+call appends no event and opens no window; like every `progress` call it
+restarts the notifier clock, and it writes state only to resolve a missing
+project clock.
+A missing phase, or a closed phase with no open activity, is refused with
+`No active phase to report`. When the last phase is closed and an activity is
+still open, `progress` prints both tables from that phase's last recorded values
+and shows the activity as the running row.
+
 `timeline` renders the stage table alone, for one phase or for every phase of
 the run, and needs no open window. It answers the questions asked after the
 fact — how many fix passes a phase took, how long each review ran — without
@@ -438,7 +489,7 @@ front of them is current and how long until the next one. The next tick comes
 from the Claude unit's `delegate-<run id>` notifier instance: every `progress`
 call runs `notifier.sh restart` on it as its first act, before it reads state,
 and a rendered report names the `next_due` that restart prints. A refused call
-(no open window, a failed percent check, a missing override reason or
+(no active phase, a failed percent check, a missing override reason or
 `--cap-stage`) keeps its message and exit status but still restarts the clock,
 so the next tick lands one interval after the call. With no instance, or a
 restart that fails, the recorder falls

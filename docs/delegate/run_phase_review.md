@@ -1,15 +1,18 @@
 # Run phase review
 
-Read at the point of use from `/unit:delegate`. Defines `<RunPhaseReview/>` and
+Read at the point of use from `/unit:direct`. Defines `<RunPhaseReview/>` and
 `<RunPhaseShrink/>` in full.
+Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 
-**Read when:** after smoke and `<UXReview/>`, once per phase, before the checkpoint.
+**Read when:** at the phase review or shrink step; in `single`, after smoke and
+`<UXReview/>`.
 
 <RunPhaseReview>
 For phased plans, read `~/.claude/commands/plan/phase_review.md` in full and
 apply it with this run's `SESSION_DIR` and `WORKING_DIR`; its arguments are `auto`
 in loop/verbose, plus `skip-architect` as below. Make `${NEXT_ITEMS_PATH}`
-available.
+available. Run the retrospective, state audit, architect review when triggered,
+and forward edits.
 Its retrospective, review outcomes, and proposed next-item amendments are
 temporary session files, never plan sections. It may edit only remaining `todo`
 Work Orders; earlier `done` phases remain byte-identical. Later user choices
@@ -43,20 +46,26 @@ often. Name the trigger that fired in the one-line report, so a run that
 dispatches it every phase is visible as the drift it represents.
 
 Otherwise pass `skip-architect`. When dispatched, focus real-code checking on
-affected phases and next items, then give the rest a consistency pass. It uses
-`review.sh`, this session, and the next review index. Ad hoc work skips this
-section.
+affected phases and next items, then give the rest a consistency pass. Choose
+an open seat that did not write the affected files when one exists; otherwise
+have their writer read them cold and argue against its choices. Post the
+<RoleReassignment/> handoff when its role changes, open the prompt under
+<ReviewPromptContract/>, and use `review.sh --to <full-seat-name>`, this
+session, and the next review index.
+If every open seat is busy, open and retain a role-named seat with `review.sh
+--slot review`. Only a phase review outside a delegate run omits both `--to`
+and `--slot`. The prompt keeps the inline Three Gods sentence and Type Design
+Contract or its follow-up pointer. Ad hoc work skips this section.
 </RunPhaseReview>
 
 <RunPhaseShrink>
 For a phased plan, read `~/.claude/commands/plan/shrink.md` in full and apply it
 with arguments `"${PLAN_DOC}" --phases <current-id> --closeout "${SESSION_DIR}"`
-after phase review and before checkpoint. This is
-the final plan mutation for the phase. It replaces only the current phase's
-`Work Order` with `As-built`; prior `done` phases must remain byte-identical and
-remaining `todo` phases must retain the forward edits from phase review.
+at the shrink step. Shrink replaces only the completed phase's `Work Order`
+with `As-built`; prior `done` phases must remain byte-identical. Remaining
+`todo` phases must retain the forward edits from phase review and
+<ConsiderNextItems/>.
 
 Require a successful structural check and a current phase containing no Work
-Order, Retrospective, or Phase Review heading. Failure blocks checkpoint. Ad hoc
-work skips this section.
+Order, Retrospective, or Phase Review heading. Ad hoc work skips this section.
 </RunPhaseShrink>

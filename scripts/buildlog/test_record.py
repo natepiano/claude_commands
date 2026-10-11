@@ -34,6 +34,7 @@ NEXTEST = ["cargo", "nextest", "run", "--workspace", "--retries", "2"]
 AMBIENT = (
     "BUILDLOG_CALLER",
     "BUILDLOG_CALL_ID",
+    "BUILDLOG_LOCAL_REASON",
     "LINT_OUTPUT_DIR",
     "VALIDATE_TARGET_DIR",
     "CLAUDECODE",
@@ -597,6 +598,50 @@ class RecordTests(unittest.TestCase):
                 records = self.records()
                 self.assertEqual(len(records), before + 1)
                 self.assertEqual(records[-1]["token_wait_s"], 0)
+
+    def test_call_records_mac_result_and_local_reason(self) -> None:
+        local_reason = 'needs Linux path handling with a "quoted" mount'
+        result = self.record(
+            "call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana",
+            extra={
+                "BUILDLOG_MAC": "passed",
+                "BUILDLOG_MAC_REASON": "",
+                "BUILDLOG_MAC_S": "12.5",
+                "BUILDLOG_LOCAL_REASON": local_reason,
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        call_record = self.records()[-1]
+        self.assertEqual(call_record["mac"], "passed")
+        self.assertEqual(call_record["mac_reason"], "")
+        self.assertEqual(call_record["mac_s"], 12.5)
+        self.assertEqual(call_record["local_reason"], local_reason)
+
+    def test_call_local_reason_defaults_to_empty(self) -> None:
+        result = self.record(
+            "call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records()[-1]["local_reason"], "")
+
+    def test_call_records_null_mac_seconds_when_value_is_unusable(self) -> None:
+        for value in ("", "abc", "-1"):
+            with self.subTest(value=value):
+                before = len(self.records())
+                result = self.record(
+                    "call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana",
+                    extra={
+                        "BUILDLOG_MAC": "declined",
+                        "BUILDLOG_MAC_REASON": "runner",
+                        "BUILDLOG_MAC_S": value,
+                    },
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                records = self.records()
+                self.assertEqual(len(records), before + 1)
+                self.assertEqual(records[-1]["mac"], "declined")
+                self.assertEqual(records[-1]["mac_reason"], "runner")
+                self.assertIsNone(records[-1]["mac_s"])
 
     def test_backfill_is_idempotent(self) -> None:
         same = ledger_line()

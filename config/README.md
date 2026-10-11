@@ -31,13 +31,13 @@ Which lint checks run, everywhere they run: `cache`, `mend`, `style_review`,
 `clippy`, `doc`, `fmt`, under an `[operations]` section. Values are `on` or
 `off`; a missing key or missing file means `on`. One key per check with no
 per-consumer override — `clippy=off` means cargo clippy does not run in the
-`/clippy` skill *or* in a delegate phase.
+`/clippy` skill *or* in a `/unit:direct` phase.
 
 Use `/lint_config` to view or change them. The two consumers read it on their
 next run, so a change is immediate:
 
 - the `/clippy` skill, at the start of every run — including runs started by
-  `/commit_prep` or a `/unit:delegate` work order
+  `/commit_prep` or a `/unit:direct` work order
 - `scripts/delegate/verify.sh` — the `lint`, `fmt`, and `final` arms
 
 Deliberately not gated: `verify.sh check`/`test`/`example`, the workspace check
@@ -50,6 +50,19 @@ config decides whether a check runs, never with what flags.
 `scripts/lint/lint_config.sh` is both the reader and the editor: source it and
 call `lint_config_enabled <op>` (plus `lint_config_skip_notice <op> <what>` for
 the SKIPPED line), or run it as the `/lint_config` CLI.
+
+## mac_test.conf
+
+Controls Mac test offload and the `/mac_test` block command. It names the CI
+repository, workflow, job and repository variable; bounds each `gh` call;
+sets the default and maximum block lifetime; and sets the expiry-warning
+window. Offload settings name the SSH host and connection and probe time
+limits, the unreachable retry delay, the free-space and load limits, default
+and repository size limits for each Mac mirror's build folder,
+Linux-only packages, and Mac nextest exclusions. A repository needs a
+`linux_only.<repo>` key, even when its value is empty, before tests can run on
+the Mac. An empty `ci_repo` disables CI calls. `MAC_TEST_CONFIG` selects a
+different file for isolated runs.
 
 ## clippy.conf
 
@@ -79,7 +92,7 @@ always, since a codex sub-session has no agent tool to launch anything with.
 
 ## delegate.conf
 
-The `/unit:delegate` tuning file: the convergence limits — how many automatic
+The `/unit:direct` tuning file: the convergence limits — how many automatic
 fix rounds one phase runs before the gate remarks on how it is going — plus
 the progress-report interval. `MIN_REPAIR_BUDGET` is the floor every phase gets
 regardless of finding count (3);
@@ -98,9 +111,17 @@ made from what gets reported.
 `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` sets the Codex poll timeout and the
 default interval of a Claude unit's notifier instance. It is read by
 `scripts/delegate/unit_notifier.sh` and by the main agent per
-`<ProgressContract/>` in `commands/unit/delegate.md`, not by `findings.py`.
+`<ProgressContract/>` in `commands/unit/direct.md`, not by `findings.py`.
 Claude units do not launch `progress_timer.sh`. A missing or non-numeric value
-makes the notifier use 900 seconds; Codex requires a positive integer.
+makes the notifier use 900 seconds; Codex requires a positive integer. It is
+3600, one hour (user, 2026-10-10). After changing it,
+`unit_notifier.sh --all` retimes every unit run's instance to the new value,
+or to `--all <minutes>`, and leaves each one on or off.
+
+`PLAN_DELEGATE_PROGRESS_UPDATES=on-demand` gives a new Claude unit run no
+notifier instance, so `/unit:report` runs only when someone asks for it;
+`/unit:report on` makes the instance then. `scheduled`, or no line, makes it
+at every run's start. It is `scheduled` (user, 2026-10-10).
 
 `scripts/delegate/findings.py` reads the file at startup, so an edit applies to
 the next `findings.py gate` with nothing to restart. The file is authoritative:
@@ -109,6 +130,21 @@ value below its minimum makes `findings.py` list every problem it found and
 exit 2 before running the command. `PLAN_DELEGATE_CONFIG` overrides the path,
 which is how `test_findings.py` supplies its own limits rather than this
 machine's.
+
+## dailies.conf
+
+The counts each production's dailies show on one line above the chart, in
+every length: `counts: nightly queue 8 · proposals 3`. A line is
+`<production slug>.<label>=lines <file> <regex>`, which counts the file's lines
+matching the regex, or `<production slug>.<label>=files <glob>`, which counts
+the matching files. The slug is the production doc's file name less
+`-production.md`. `~` expands, and a hyphen in the label reads as a space.
+`scripts/production/dailies_counts.py` reads it each time the dailies input is
+built, so an edit applies to the next dailies. A missing file shows as `not
+found`. A bad line leaves out the counts line, and the builder prints
+`counts: unavailable — dailies.conf line <n>: …`. `DAILIES_COUNTS_CONFIG`
+overrides the path. Today it holds build-followups' nightly review queue and
+plan backlog, and tool-based-ui's hanadocs proposals (user, 2026-10-10).
 
 ## cargo-fmt-exclusions.json
 

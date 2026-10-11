@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import signal
 import struct
 import subprocess
 import sys
@@ -71,6 +72,10 @@ class Call(TypedDict):
 
 
 class TimingLine(TypedDict):
+    status: str
+    exit_code: int
+    session: dict[str, str]
+    attempts: list[dict[str, object]]
     port: int
     mode: str
     crop: str
@@ -83,16 +88,17 @@ class TimingLine(TypedDict):
     total_ms: float
 
 
-def png(width: int, height: int) -> bytes:
+def png(width: int, height: int, brightness: int = 128) -> bytes:
     def chunk(kind: bytes, data: bytes) -> bytes:
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
 
-    rows = b"".join(b"\x00" + b"\x80\x80\x80" * width for _ in range(height))
+    pixel = bytes([brightness]) * 3
+    rows = b"".join(b"\x00" + pixel * width for _ in range(height))
     header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
 
 
-def camera_components() -> dict[str, object]:
+def camera_components(physical_size: tuple[int, int] = (1280, 720), scale_factor: float = 1.0) -> dict[str, object]:
     angles = {"yaw": 0.0, "pitch": 0.3}
     return {
         "hana_lagrange::orbit_cam::OrbitCam": {
@@ -106,7 +112,7 @@ def camera_components() -> dict[str, object]:
             "viewport": None,
             "computed": {
                 "clip_from_view": [1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 0, -1.0, 0, 0, 0.1, 0],
-                "target_info": {"physical_size": [1280, 720], "scale_factor": 1.0},
+                "target_info": {"physical_size": list(physical_size), "scale_factor": scale_factor},
             },
         },
     }
@@ -120,6 +126,13 @@ class Fake:
         self.frame: int = 0
         self.screenshot: str = "ok"
         self.remote: Path | None = None
+        self.window_physical_size: tuple[int, int] = (1280, 720)
+        self.window_scale_factor: float = 1.0
+        self.window_scale_factor_override: float | None = None
+        self.window_level: str = "Normal"
+        self.refuse_window_level_raise_once: bool = False
+        self.refuse_window_level_restore: bool = False
+        self.screenshot_started: threading.Event = threading.Event()
         self.release: threading.Event = threading.Event()
         self.lock: threading.Lock = threading.Lock()
 
@@ -131,15 +144,32 @@ class Fake:
         with self.lock:
             self.calls.append({"method": method, "params": params})
             screenshots = sum(1 for call in self.calls if call["method"] == "brp_extras/screenshot")
+            if method == "world.mutate_components" and params.get("component") == WINDOW:
+                width, height = self.window_physical_size
+                if params.get("path") == ".resolution.physical_width":
+                    self.window_physical_size = (cast(int, params["value"]), height)
+                elif params.get("path") == ".resolution.physical_height":
+                    self.window_physical_size = (width, cast(int, params["value"]))
+                elif params.get("path") == ".window_level":
+                    level = cast(str, params["value"])
+                    if self.refuse_window_level_raise_once and level == "AlwaysOnTop":
+                        self.refuse_window_level_raise_once = False
+                        return {"error": {"code": -32603, "message": "raise refused once"}}
+                    if self.refuse_window_level_restore and level != "AlwaysOnTop":
+                        return {"error": {"code": -32603, "message": "restore refused"}}
+                    self.window_level = level
             if method == "brp_extras/get_diagnostics":
                 self.frame += 1
                 return {"result": {"frame_time_ms": {"current": 8.0}, "frame_count": float(self.frame)}}
         if method == "world.query":
-            return {"result": query(params)}
+            return {"result": query(self, params)}
         if method == "world.get_resources":
             return {"result": {"value": {"home": {"animation_duration_milliseconds": 2000}}}}
         if method == "world.get_components":
-            return {"result": {"components": camera_components(), "errors": {}}}
+            return {"result": {"components": camera_components(
+                self.window_physical_size,
+                self.window_scale_factor_override or self.window_scale_factor,
+            ), "errors": {}}}
         if method == "world.list_components":
             entity = params.get("entity")
             if entity is None:
@@ -148,26 +178,45 @@ class Fake:
                 return {"result": [NAME]}
             return {"error": {"code": -23402, "message": f"entity {entity} not found"}}
         if method == "brp_extras/screenshot":
-            if self.screenshot == "hang":
+            self.screenshot_started.set()
+            if self.screenshot in ("hang", "hold"):
                 _ = self.release.wait(15)
                 return {"result": None}
             if self.screenshot == "busy-always" or (self.screenshot == "busy-once" and screenshots == 1):
                 return {"error": {"code": -32603, "message": "Screenshot already in progress"}}
+            if self.screenshot == "error":
+                return {"error": {"code": -32603, "message": "camera rejected capture"}}
             path = Path(cast(str, params["path"]))
             if self.remote is not None:
                 path = self.remote / path.name
-            _ = path.write_bytes(png(*SHOT_SIZE))
+            if self.screenshot == "invalid":
+                _ = path.write_bytes(b"not png")
+            elif self.screenshot == "black":
+                _ = path.write_bytes(png(*SHOT_SIZE, brightness=0))
+            elif self.screenshot == "tiny":
+                _ = path.write_bytes(png(1, 1))
+            else:
+                _ = path.write_bytes(png(*SHOT_SIZE))
             return {"result": {"path": params["path"], "status": "ok"}}
         return {"result": None}
 
 
-def query(params: dict[str, object]) -> list[dict[str, object]]:
+def query(fake: Fake, params: dict[str, object]) -> list[dict[str, object]]:
     with_types = cast(dict[str, list[str]], params.get("filter") or {}).get("with", [])
     data = cast(dict[str, list[str]], params.get("data") or {})
     if EDITOR_CAMERA in with_types:
-        return [{"entity": CAMERA_ENTITY, "components": camera_components()}]
+        return [{"entity": CAMERA_ENTITY, "components": camera_components(
+            fake.window_physical_size,
+            fake.window_scale_factor_override or fake.window_scale_factor,
+        )}]
     if PRIMARY_WINDOW in with_types:
-        return [{"entity": WINDOW_ENTITY, "components": {}}]
+        width, height = fake.window_physical_size
+        return [{"entity": WINDOW_ENTITY, "components": {WINDOW: {"resolution": {
+            "physical_width": width,
+            "physical_height": height,
+            "scale_factor_override": fake.window_scale_factor_override,
+            "scale_factor": fake.window_scale_factor,
+        }, "window_level": fake.window_level}}}]
     if SWITCH_SLIDER in with_types:
         return [
             {"entity": entity, "components": {path: {"id": tool_id, "definition": definition}}, "has": {AABB: False}}
@@ -221,7 +270,10 @@ class HanaShotTest(unittest.TestCase):
     def timings(self) -> Path:
         return self.scratch / "cache" / "hana-shot" / "timings.jsonl"
 
-    def run_script(self, *args: str) -> subprocess.CompletedProcess[str]:
+    def timing_lines(self) -> list[dict[str, object]]:
+        return [cast(dict[str, object], json.loads(line)) for line in self.timings.read_text().splitlines()]
+
+    def script_environment(self, session_variables: dict[str, str] | None = None) -> dict[str, str]:
         environment = {
             **os.environ,
             "XDG_CACHE_HOME": str(self.scratch / "cache"),
@@ -229,10 +281,37 @@ class HanaShotTest(unittest.TestCase):
             # RemoteTests puts its fake scp and ssh here.
             "PATH": f"{self.scratch / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
         }
+        for name in ("CLAUDE_SESSION_ID", "CODEX_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+            _ = environment.pop(name, None)
+        if session_variables is not None:
+            environment.update(session_variables)
+        return environment
+
+    def run_python(
+        self, program: Path, *args: str, session_variables: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(SCRIPT), *args],
-            cwd=self.scratch, env=environment, capture_output=True, text=True, timeout=60, check=False,
+            [sys.executable, str(program), *args],
+            cwd=self.scratch, env=self.script_environment(session_variables), capture_output=True, text=True,
+            timeout=60, check=False,
         )
+
+    def run_script(self, *args: str, session_variables: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        return self.run_python(SCRIPT, *args, session_variables=session_variables)
+
+    def start_python(self, program: Path, *args: str) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            [sys.executable, str(program), *args],
+            cwd=self.scratch, env=self.script_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+    def start_script(self, *args: str) -> subprocess.Popen[str]:
+        return self.start_python(SCRIPT, *args)
+
+    def stop_script(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is None:
+            process.kill()
+        _ = process.communicate()
 
     def shot(self, *args: str) -> subprocess.CompletedProcess[str]:
         return self.run_script("shot", "--port", str(self.port), "--out", str(self.scratch / "shot.png"), *args)
@@ -300,6 +379,39 @@ class SelectorTests(HanaShotTest):
 
 
 class ViewsTests(HanaShotTest):
+    def test_empty_registry_records_a_refused_invocation(self) -> None:
+        _ = (self.scratch / "views.toml").write_text("")
+        shot = self.run_script(
+            "shot", "--port", str(self.port), "--view", "all", "--views-file", str(self.scratch / "views.toml"),
+        )
+        check = self.views("check", "--port", str(self.port))
+        self.assertEqual((shot.returncode, check.returncode), (2, 2))
+        self.assertEqual([line["failure_reason"] for line in self.timing_lines()], ["invalid_request"] * 2)
+        self.assertEqual([line["invocation_kind"] for line in self.timing_lines()], ["shot", "views_check"])
+
+    def test_check_records_black_and_empty_crops_after_validation(self) -> None:
+        _ = (self.scratch / "views.toml").write_text('[views.front]\nmode = "home"\n')
+        fake_magick = self.scratch / "bin" / "magick"
+        fake_magick.parent.mkdir()
+        _ = fake_magick.write_text("#!/bin/sh\necho 0\n")
+        fake_magick.chmod(0o755)
+        self.fake.screenshot = "black"
+        black = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"))
+        self.assertEqual(black.returncode, 1, black.stderr)
+        self.assertEqual(self.timing_lines()[0]["failure_reason"], "black_capture")
+
+        _ = fake_magick.write_text("#!/bin/sh\necho 0.5\n")
+        self.fake.screenshot = "tiny"
+        empty = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"))
+        self.assertEqual(empty.returncode, 1, empty.stderr)
+        self.assertEqual(self.timing_lines()[1]["failure_reason"], "empty_crop")
+
+        self.fake.screenshot = "ok"
+        passed = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"))
+        self.assertEqual(passed.returncode, 0, passed.stderr)
+        self.assertEqual(self.timing_lines()[2]["status"], "success")
+        self.assertEqual([line["invocation_kind"] for line in self.timing_lines()], ["views_check"] * 3)
+
     def test_add_list_show_and_replace(self) -> None:
         added = self.views(
             "add", "log-back", "--target", "name:Log", "--yaw", "3.14159", "--margin", "0.2",
@@ -360,7 +472,66 @@ class ShotTests(HanaShotTest):
             (self.port, "home", "none", "1280x720", *SHOT_SIZE),
         )
         self.assertGreaterEqual(line["total_ms"], line["capture_ms"])
+        self.assertEqual((line["status"], line["exit_code"]), ("success", 0))
+        self.assertEqual(line["session"], {"state": "absent"})
+        [attempt] = line["attempts"]
+        self.assertEqual((attempt["status"], attempt["label"], attempt["view"]), ("success", "home", None))
+        self.assertEqual(attempt["image_paths"], [str(self.scratch / "shot.png")])
         self.assertEqual([path.name for path in self.scratch.glob(".shot-*")], [])
+
+    def test_window_uses_override_scale_when_it_is_higher_than_base_scale(self) -> None:
+        self.fake.window_scale_factor = 1.0
+        self.fake.window_scale_factor_override = 2.0
+
+        result = self.shot("--mode", "home", "--window", "1280x720")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertCountEqual(self.fake.methods("world.mutate_components"), [
+            {"entity": WINDOW_ENTITY, "component": WINDOW,
+             "path": ".resolution.physical_width", "value": 2560},
+            {"entity": WINDOW_ENTITY, "component": WINDOW,
+             "path": ".resolution.physical_height", "value": 1440},
+        ])
+
+    def test_window_uses_override_scale_when_it_is_lower_than_base_scale(self) -> None:
+        self.fake.window_scale_factor = 2.0
+        self.fake.window_scale_factor_override = 1.0
+
+        result = self.shot("--mode", "home", "--window", "1280x720")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fake.methods("world.mutate_components"), [])
+
+    def test_window_uses_base_scale_when_override_is_absent(self) -> None:
+        self.fake.window_scale_factor = 2.0
+
+        result = self.shot("--mode", "home", "--window", "1280x720")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertCountEqual(self.fake.methods("world.mutate_components"), [
+            {"entity": WINDOW_ENTITY, "component": WINDOW,
+             "path": ".resolution.physical_width", "value": 2560},
+            {"entity": WINDOW_ENTITY, "component": WINDOW,
+             "path": ".resolution.physical_height", "value": 1440},
+        ])
+
+    def test_session_evidence_uses_codex_thread_before_claude_code_session(self) -> None:
+        cases: tuple[tuple[dict[str, str], dict[str, str]], ...] = (
+            ({"CLAUDE_CODE_SESSION_ID": "claude"}, {"state": "present", "value": "claude"}),
+            ({"CODEX_THREAD_ID": "codex"}, {"state": "present", "value": "codex"}),
+            ({"CLAUDE_CODE_SESSION_ID": "claude", "CODEX_THREAD_ID": "codex"},
+             {"state": "present", "value": "codex"}),
+            ({}, {"state": "absent"}),
+            ({"CLAUDE_SESSION_ID": "old-claude", "CODEX_SESSION_ID": "old-codex"}, {"state": "absent"}),
+        )
+        for variables, expected in cases:
+            with self.subTest(variables=variables):
+                result = self.run_script(
+                    "shot", "--port", str(self.port), "--out", str(self.scratch / "shot.png"),
+                    "--mode", "home", session_variables=variables,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.timing_lines()[-1]["session"], expected)
 
     def test_timed_out_screenshot_is_never_resent(self) -> None:
         self.fake.screenshot = "hang"
@@ -369,7 +540,9 @@ class ShotTests(HanaShotTest):
         self.assertIn("without resending", result.stderr)
         self.assertEqual(len(self.fake.methods("brp_extras/screenshot")), 1)
         self.assertFalse((self.scratch / "shot.png").exists())
-        self.assertFalse(self.timings.exists())
+        [line] = self.timing_lines()
+        self.assertEqual((line["exit_code"], line["failure_reason"]), (3, "timeout"))
+        self.assertEqual(cast(list[dict[str, object]], line["attempts"])[0]["image_paths"], [])
 
     def test_busy_screenshot_is_resent_once(self) -> None:
         self.fake.screenshot = "busy-once"
@@ -384,6 +557,108 @@ class ShotTests(HanaShotTest):
         result = self.shot("--mode", "home")
         self.assertEqual(result.returncode, 1)
         self.assertIn("already in progress", result.stderr)
+        self.assertEqual(self.timing_lines()[0]["failure_reason"], "already_in_progress")
+
+    def test_failed_capture_causes_have_one_record_each(self) -> None:
+        for mode, reason in (("error", "brp_error"), ("invalid", "invalid_png")):
+            with self.subTest(mode=mode):
+                self.fake.screenshot = mode
+                result = self.shot("--mode", "home")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                line = self.timing_lines()[-1]
+                self.assertEqual((line["status"], line["failure_reason"]), ("failure", reason))
+
+    def test_missing_target_and_invalid_request_are_recorded(self) -> None:
+        missing = self.shot("--target", "name:Absent")
+        refused = self.shot("--mode", "pose")
+        self.assertEqual((missing.returncode, refused.returncode), (1, 2))
+        self.assertEqual([line["failure_reason"] for line in self.timing_lines()], ["no_target", "invalid_request"])
+
+    def test_parser_error_is_recorded(self) -> None:
+        result = self.run_script("shot", "--port", str(self.port), "--mode")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        [line] = self.timing_lines()
+        self.assertEqual((line["port"], line["failure_reason"], line["exit_code"]),
+                         (self.port, "invalid_request", 2))
+
+    def test_multi_view_failure_keeps_earlier_attempt(self) -> None:
+        views = self.scratch / "views.toml"
+        _ = views.write_text('[views.first]\nmode = "home"\n[views.second]\ntarget = "name:Absent"\n')
+        result = self.run_script("shot", "--port", str(self.port), "--view", "all", "--views-file", str(views))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        [line] = self.timing_lines()
+        self.assertEqual(line["failure_reason"], "no_target")
+        attempts = cast(list[dict[str, object]], line["attempts"])
+        self.assertEqual([attempt["status"] for attempt in attempts], ["success", "failure"])
+        self.assertEqual(len(cast(list[str], attempts[0]["image_paths"])), 1)
+        self.assertEqual(attempts[0]["mode"], "home")
+        stats = self.run_script("stats")
+        self.assertIn("1 shots since", stats.stdout)
+        self.assertIn("failure no_target: 1", stats.stdout)
+
+    def test_stats_counts_each_view_and_legacy_shot_once(self) -> None:
+        views = self.scratch / "views.toml"
+        _ = views.write_text('[views.first]\nmode = "home"\n[views.second]\ntarget = "name:Log"\nmode = "hana-frame"\n')
+        shot = self.run_script("shot", "--port", str(self.port), "--view", "all", "--views-file", str(views))
+        self.assertEqual(shot.returncode, 0, shot.stderr)
+        [line] = self.timing_lines()
+        attempts = cast(list[dict[str, object]], line["attempts"])
+        self.assertEqual([attempt["mode"] for attempt in attempts], ["home", "hana-frame"])
+        self.assertTrue(all("total_ms" in attempt for attempt in attempts))
+        legacy = {key: value for key, value in line.items() if key not in ("status", "exit_code", "session", "attempts")}
+        with self.timings.open("a") as handle:
+            _ = handle.write(json.dumps(legacy) + "\n")
+        stats = self.run_script("stats")
+        self.assertEqual(stats.returncode, 0, stats.stderr)
+        rows = {row.split()[0]: row.split() for row in stats.stdout.splitlines()[2:]}
+        self.assertEqual(rows["all"][1], "3")
+        self.assertEqual(rows["home/none"][1], "1")
+        self.assertEqual(rows["hana-frame/none"][1], "2")
+
+    def test_failed_attempt_paths_require_a_new_file(self) -> None:
+        output = self.scratch / "shot.png"
+        _ = output.write_bytes(png(*SHOT_SIZE))
+        old = 1_600_000_000_000_000_000
+        os.utime(output, ns=(old, old))
+        self.fake.screenshot = "error"
+        failed = self.shot("--mode", "home")
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        first_attempts = cast(list[dict[str, object]], self.timing_lines()[0]["attempts"])
+        self.assertEqual(first_attempts[0]["image_paths"], [])
+
+        _ = (self.scratch / "views.toml").write_text('[views.front]\nmode = "home"\n')
+        fake_magick = self.scratch / "bin" / "magick"
+        fake_magick.parent.mkdir()
+        _ = fake_magick.write_text("#!/bin/sh\necho 0\n")
+        fake_magick.chmod(0o755)
+        self.fake.screenshot = "black"
+        black = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"))
+        self.assertEqual(black.returncode, 1, black.stderr)
+        second_attempts = cast(list[dict[str, object]], self.timing_lines()[1]["attempts"])
+        self.assertEqual(second_attempts[0]["image_paths"], [str(self.scratch / "check" / "front.png")])
+
+    def test_timing_write_failure_keeps_call_outcome(self) -> None:
+        _ = (self.scratch / "cache").write_text("occupied")
+        success = self.shot("--mode", "home")
+        self.assertEqual(success.returncode, 0, success.stderr)
+        self.assertEqual(success.stdout.strip(), str(self.scratch / "shot.png"))
+        self.assertEqual(sum("could not write timing record" in line for line in success.stderr.splitlines()), 1)
+        self.assertIn("Not a directory", success.stderr)
+        self.assertNotIn("Traceback", success.stderr)
+
+        self.fake.screenshot = "error"
+        failure = self.shot("--mode", "home")
+        self.assertEqual(failure.returncode, 1, failure.stderr)
+        self.assertEqual(failure.stdout, "")
+        self.assertIn("camera rejected capture", failure.stderr)
+        self.assertEqual(sum("could not write timing record" in line for line in failure.stderr.splitlines()), 1)
+        self.assertIn("Not a directory", failure.stderr)
+        self.assertNotIn("Traceback", failure.stderr)
+
+    def test_no_app_is_recorded(self) -> None:
+        result = self.run_script("shot", "--port", "65001", "--mode", "home")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.timing_lines()[0]["failure_reason"], "no_app")
 
 
 class RemoteTests(HanaShotTest):
@@ -411,6 +686,37 @@ class RemoteTests(HanaShotTest):
         if not self.ssh_log.exists():
             return []
         return [cast(list[str], json.loads(line)) for line in self.ssh_log.read_text().splitlines()]
+
+    def hana_shot_driver(self, name: str, setup: str) -> Path:
+        driver = self.scratch / name
+        _ = driver.write_text("\n".join([
+            "import os",
+            "import signal",
+            "import sys",
+            f"sys.path.insert(0, {str(SCRIPT.parent.resolve())!r})",
+            "import hana_shot",
+            "",
+            setup,
+            "",
+            "raise SystemExit(hana_shot.main(sys.argv[1:]))",
+            "",
+        ]))
+        return driver
+
+    def interrupt_held_remote_mac_shot(self, signal_number: int, program: Path = SCRIPT) -> tuple[int, str]:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        self.fake.window_level = "AlwaysOnBottom"
+        self.fake.screenshot = "hold"
+        process = self.start_python(
+            program,
+            "shot", "--port", str(self.port), "--out", str(self.scratch / "shot.png"),
+            "--mode", "home", "--remote", REMOTE_HOST,
+        )
+        self.addCleanup(self.stop_script, process)
+        self.assertTrue(self.fake.screenshot_started.wait(10), "the screenshot call never reached the fake")
+        process.send_signal(signal_number)
+        _, stderr = process.communicate(timeout=60)
+        return cast(int, process.returncode), stderr
 
     def test_remote_shot_copies_the_png_back_and_removes_it_there(self) -> None:
         remote = self.fake_remote(copies=True)
@@ -444,7 +750,7 @@ class RemoteTests(HanaShotTest):
         )
         self.assertEqual(len(list(remote.iterdir())), 1)
         self.assertFalse((self.scratch / "shot.png").exists())
-        self.assertFalse(self.timings.exists())
+        self.assertEqual(self.timing_lines()[0]["failure_reason"], "copy_failed")
 
     def test_remote_mac_shot_raises_the_window_and_holds_the_display_awake_for_the_run(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
@@ -452,7 +758,9 @@ class RemoteTests(HanaShotTest):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.fake.methods("world.mutate_components"), [
             {"entity": WINDOW_ENTITY, "component": WINDOW, "path": ".window_level", "value": "AlwaysOnTop"},
+            {"entity": WINDOW_ENTITY, "component": WINDOW, "path": ".window_level", "value": "Normal"},
         ])
+        self.assertEqual(self.fake.window_level, "Normal")
         calls = self.ssh_calls()
         uname, awake, copy = calls[:3]
         self.assertEqual(uname, ["ssh", REMOTE_HOST, "uname", "-s"])
@@ -460,6 +768,170 @@ class RemoteTests(HanaShotTest):
         self.assertTrue(awake[2].startswith("caffeinate -u "), awake)
         self.assertEqual(copy[0], "scp", "the display is awake before the shot")
         self.assertIn(["ended"], calls, "the keep-awake ends before the run exits")
+
+    def test_remote_mac_shot_restores_an_always_on_bottom_window(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        self.fake.window_level = "AlwaysOnBottom"
+
+        result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
+            "AlwaysOnTop", "AlwaysOnBottom",
+        ])
+        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
+        self.assertIn(["ended"], self.ssh_calls())
+
+    def test_remote_mac_shot_repairs_an_already_always_on_top_window_to_normal(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        self.fake.window_level = "AlwaysOnTop"
+
+        result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
+            "AlwaysOnTop", "Normal",
+        ])
+        self.assertEqual(self.fake.window_level, "Normal")
+        self.assertIn(["ended"], self.ssh_calls())
+
+    def test_failed_remote_mac_shot_restores_the_window_and_ends_keep_awake(self) -> None:
+        _ = self.fake_remote(copies=False, system="Darwin")
+        self.fake.window_level = "AlwaysOnBottom"
+
+        result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
+            "AlwaysOnTop", "AlwaysOnBottom",
+        ])
+        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
+        self.assertIn(["ended"], self.ssh_calls())
+
+    def test_signal_during_close_does_not_interrupt_window_restore(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        self.fake.window_level = "AlwaysOnBottom"
+        driver = self.hana_shot_driver("signal_during_restore.py", """\
+real_mutate = hana_shot.Brp.mutate
+def signal_during_restore(brp, entity, component, path, value, *args, **kwargs):
+    if path == ".window_level" and value != "AlwaysOnTop":
+        os.kill(os.getpid(), signal.SIGTERM)
+    return real_mutate(brp, entity, component, path, value, *args, **kwargs)
+hana_shot.Brp.mutate = signal_during_restore
+""")
+
+        result = self.run_python(
+            driver,
+            "shot", "--port", str(self.port), "--out", str(self.scratch / "shot.png"),
+            "--mode", "home", "--remote", REMOTE_HOST,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
+            "AlwaysOnTop", "AlwaysOnBottom",
+        ])
+        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
+        self.assertIn(["ended"], self.ssh_calls())
+        [line] = self.timing_lines()
+        self.assertEqual(line["exit_code"], 0)
+
+    def test_second_signal_during_unwinding_keeps_the_first_exit_and_closes_the_session(self) -> None:
+        driver = self.hana_shot_driver("second_signal_during_close.py", """\
+real_close = hana_shot.Session.close
+def signal_before_close(session):
+    os.kill(os.getpid(), signal.SIGHUP)
+    return real_close(session)
+hana_shot.Session.close = signal_before_close
+""")
+
+        return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGTERM, driver)
+
+        self.assertEqual(return_code, 128 + signal.SIGTERM, stderr)
+        self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
+            "AlwaysOnTop", "AlwaysOnBottom",
+        ])
+        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
+        self.assertIn(["ended"], self.ssh_calls())
+        [line] = self.timing_lines()
+        self.assertEqual(line["exit_code"], 128 + signal.SIGTERM)
+
+    def test_sigint_restores_the_remote_mac_window_and_records_the_signal_exit(self) -> None:
+        return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGINT)
+
+        self.assertEqual(return_code, 128 + signal.SIGINT, stderr)
+        self.assertNotIn("KeyboardInterrupt", stderr)
+        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
+        self.assertIn(["ended"], self.ssh_calls())
+        [line] = self.timing_lines()
+        self.assertEqual((line["invocation_kind"], line["exit_code"]), ("shot", 128 + signal.SIGINT))
+
+    def test_sigterm_restores_the_remote_mac_window_and_records_the_signal_exit(self) -> None:
+        return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGTERM)
+
+        self.assertEqual(return_code, 128 + signal.SIGTERM, stderr)
+        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
+        self.assertIn(["ended"], self.ssh_calls())
+        [line] = self.timing_lines()
+        self.assertEqual((line["invocation_kind"], line["exit_code"]), ("shot", 128 + signal.SIGTERM))
+
+    def test_sighup_restores_the_remote_mac_window_and_records_the_signal_exit(self) -> None:
+        return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGHUP)
+
+        self.assertEqual(return_code, 128 + signal.SIGHUP, stderr)
+        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
+        self.assertIn(["ended"], self.ssh_calls())
+        [line] = self.timing_lines()
+        self.assertEqual((line["invocation_kind"], line["exit_code"]), ("shot", 128 + signal.SIGHUP))
+
+    def test_views_check_retries_window_preparation_after_a_refused_raise(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        self.fake.window_level = "AlwaysOnBottom"
+        self.fake.refuse_window_level_raise_once = True
+        _ = (self.scratch / "views.toml").write_text(
+            '[views.first]\nmode = "home"\n[views.second]\nmode = "home"\n',
+        )
+        fake_magick = self.scratch / "bin" / "magick"
+        _ = fake_magick.write_text("#!/bin/sh\necho 0.5\n")
+        fake_magick.chmod(0o755)
+
+        result = self.views(
+            "check", "--port", str(self.port), "--out", str(self.scratch / "check"),
+            "--remote", REMOTE_HOST,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("FAIL first:", result.stderr)
+        self.assertIn("raise refused once", result.stderr)
+        self.assertIn("PASS second", result.stdout)
+        self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
+            "AlwaysOnTop", "AlwaysOnBottom", "AlwaysOnTop", "AlwaysOnBottom",
+        ])
+        self.assertEqual(len(self.fake.methods("brp_extras/screenshot")), 1)
+        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
+        calls = self.ssh_calls()
+        awake = next(index for index, call in enumerate(calls) if call[:2] == ["ssh", REMOTE_HOST]
+                     and len(call) > 2 and call[2].startswith("caffeinate -u "))
+        copy = next(index for index, call in enumerate(calls) if call[:1] == ["scp"])
+        self.assertLess(awake, copy, "the second shot starts only after keep-awake is running")
+        self.assertIn(["ended"], calls)
+
+    def test_refused_window_restore_reports_once_without_changing_a_success_exit(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        self.fake.refuse_window_level_restore = True
+
+        result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+
+        self.assertEqual(result.returncode, 0)
+        restore_errors = [
+            line for line in result.stderr.splitlines()
+            if line.startswith("hana_shot: could not put the window level back")
+        ]
+        self.assertEqual(restore_errors, [
+            "hana_shot: could not put the window level back to Normal: "
+            + "world.mutate_components failed (-32603): restore refused",
+        ])
+        self.assertEqual(self.fake.window_level, "AlwaysOnTop")
+        self.assertIn(["ended"], self.ssh_calls())
 
     def test_remote_host_that_gives_no_system_fails_before_any_shot(self) -> None:
         _ = self.fake_remote(copies=True, system="")
@@ -489,6 +961,21 @@ class PoseTests(HanaShotTest):
 
 
 class StatsTests(HanaShotTest):
+    def test_failures_by_reason_and_bad_lines_are_skipped(self) -> None:
+        self.timings.parent.mkdir(parents=True)
+        _ = self.timings.write_text(
+            '\n'.join([
+                '{"time":"2026-10-03T10:00:00+00:00","status":"failure","exit_code":3,"failure_reason":"timeout"}',
+                '{"time":"2026-10-03T11:00:00+00:00","status":"failure","exit_code":1,"failure_reason":"no_app"}',
+                '{"time":"2026-10-03T12:00:00+00:00","status":"failure","exit_code":3,"failure_reason":"timeout"}',
+                '{bad}',
+            ]) + '\n'
+        )
+        result = self.run_script("stats")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("failure no_app: 1", result.stdout)
+        self.assertIn("failure timeout: 2", result.stdout)
+
     def write_timings(self, *rows: tuple[str, str, str, float]) -> None:
         self.timings.parent.mkdir(parents=True)
         records = [

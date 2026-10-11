@@ -1,0 +1,2 @@
+{"type":"assistant","timestamp":"2026-10-01T00:00:00.000Z","cwd":"/fictional/studio","sessionId":"loop-three","message":{"role":"assistant","content":[{"type":"tool_use","id":"loop-three-0","name":"Bash","input":{"command":"for i in 1 2 3; do curl -d '{\"method\":\"brp_extras/screenshot\"}' localhost; done"}}]}}
+{"type":"user","timestamp":"2026-10-01T00:00:05.000Z","cwd":"/fictional/studio","sessionId":"loop-three","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"loop-three-0","content":"done"}]}}
