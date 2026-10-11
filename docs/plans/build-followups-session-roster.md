@@ -299,34 +299,21 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 ### Phase 9 — A session with no messaging socket is listed only while its own process runs · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a leftover Claude session record whose pid now belongs to another process is not a roster row, while a running Claude session with no messaging socket still is.
-
-**Spec:**
-- Phase 7 made a running Claude session with no messaging socket a roster row, `CannotReceiveMessages("no messaging socket")`. `running_session(record)` checks only that the pid exists, so a record left by a session that died without removing it becomes such a row once another process takes its pid. That phantom is reported by `broadcast.py` as a session that was not told, is listed by `top_level.py` as not reachable, and makes a bare name ambiguous in `send.py` (exit 2) when a new session takes the dead one's name.
-- `sessions.py` owns the process-start reader, moved from `scripts/shutdown/inventory.py` `_process_start`: `process_start(pid: int) -> str | None` reads field 22 of `/proc/<pid>/stat` on Linux, and `ps -o lstart= -p <pid>` under `LC_ALL=C` and `TZ=UTC` on macOS, the form Claude Code writes `procStart` in. `inventory.py` uses it in place of its copy, with the same behavior; one copy of the reader remains.
-- `SessionRecord` keeps `procStart`. `running_session(record)`: the pid exists, and either the record's messaging socket exists or its `procStart` equals `process_start(pid)`. A record with no socket and a missing or empty `procStart` is not running. `live_session` stays `running_session(record) and messaging_socket_exists(record)`, so `live_sessions()` and every caller that needs a socket keep today's results.
-- Cost: on Linux one `/proc` read per socketless record; on the Mac one `ps` per socketless record, usually none.
-- Regression tests, each named for the behavior it pins and each failing on the tree before the repair: a socketless record whose pid runs with a different start is in neither `running_sessions()` nor the roster; `top_level.py` lists no such phantom. Also: a socketless record whose start matches is a `CannotReceiveMessages("no messaging socket")` row, and a record with a socket and no `procStart` is still live. The macOS start-format test moves to `test_sessions.py` with the reader if it no longer exercises `inventory.py`.
+`sessions.process_start(pid: int) -> str | None` is the one process-start reader: on Linux it reads `/proc/<pid>/stat` as bytes, splits after the last `)` and returns field 22 when it is all digits; on macOS it runs `ps -o lstart= -p <pid>` under `LC_ALL=C` and `TZ=UTC` with a 5 s timeout. `SessionRecord.procStart` is `NotRequired[str]`, and `read_session` fills it (empty when the record has none). `running_session(record)` holds when the pid exists and either the messaging socket exists or a nonempty `procStart` equals `process_start(pid)`; `live_session` is unchanged. A socketless record whose pid now runs another process, or that has no start, is not a roster row, a `broadcast.py` "not told" line, a `top_level.py` unreachable line or a cause of name ambiguity in `send.py`. `scripts/shutdown/inventory.py` imports the reader as `_process_start`, so its patch point stays.
 
 **Files:**
-- `scripts/message/sessions.py`
-- `scripts/message/test_sessions.py`
-- `scripts/message/test_roster.py` — fixtures for socketless rows carry a matching start.
-- `scripts/message/test_top_level.py` — the same.
-- `scripts/shutdown/inventory.py` — uses `sessions.process_start`.
-- `scripts/shutdown/test_inventory.py` — only to move the macOS start-format test.
+- `scripts/message/sessions.py` — session registry readers and the process-start reader
+- `scripts/message/test_sessions.py` — start mismatch, missing and empty start, socket record with no start, Linux field-22 and macOS formats, truncated UTF-8 names, malformed stat
+- `scripts/message/test_roster.py`, `scripts/message/test_top_level.py` — phantom exclusion; socketless fixtures carry a real start
+- `scripts/shutdown/inventory.py`, `scripts/shutdown/test_inventory.py` — use `sessions.process_start`; the macOS format test lives in `test_sessions.py`
 
-**Seats:** `1 writer`.
-- `impl` — every file above; hub: `sessions.py`.
+**Binds later work:** a socketless record is running only while its `procStart` matches its process, so a phantom never takes part in local-first resolution; `sessions.process_start` is the one reader. The macOS `ps -o lstart=` path is covered only with a faked `ps`, so the both-machines roster's Mac live check is its first native run.
 
-**Constraints from prior phases:**
-- Phase 8's readers: one private reader of readable records; `running_sessions()` selects through `running_session` and `live_sessions()` through `live_session`, both newest `updatedAt` first.
-- `scripts/shutdown/test_inventory.py` patches `inventory._process_start`, `sessions.live_session` and `unit_lookup.live_session`; those patches keep working. Every shutdown `TestCase` derives from `test_support.ShutdownTestCase`.
-- Phase 7's socketless row is `CannotReceiveMessages("no messaging socket")`, and `RosterEntry.session` comes from the newest running record.
+**Gotchas:** read `/proc/<pid>/stat` as bytes: the kernel's 15-byte `comm` limit can cut a process name inside a UTF-8 character. `procStart` is `NotRequired` because `production/test_codex_winddown.py` builds records without it; callers read `record.get("procStart", "")`. When `process_start` returns `None` (malformed stat, `ps` failure), a socketless record is not running until its start reads again.
 
-**Acceptance gate:** the Test and Lint lines green. Live, read only: on natedev `live_sessions()`, `running_sessions()` and `roster.py --json` give the same sessions as on the tree before the phase, so no running session is lost. No Pushover post during the run.
+**Ruled out:** making `procStart` required (it reaches `production/test_codex_winddown.py` to remove a spelling no caller observes).
 
 ### Phase 10 — Both machines · status: todo
 
@@ -382,7 +369,7 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 - Phase 9: a socketless record is running only when its `procStart` matches its process, so a phantom never takes part in local-first resolution.
 - `scripts/shutdown/remote.py` `other_machine()` maps `natedev` and `mac` to each other.
 
-**Acceptance gate:** the Test and Lint lines green. Live: `roster.py` on natedev lists the Mac's sessions; `roster.py --here` on the Mac exits 0 or 1 with no ssh. `broadcast.py`'s dry check copies a recorder that records its arguments to the same scratch path on both machines and sets `BROADCAST_SEND` to it; both recorders capture their machine's recipients, each recipient once across the two, no message is sent, and the closing line names both machines. One scratch background Claude session on the Mac receives `send.py --to <its name>` from natedev and is then removed.
+**Acceptance gate:** the Test and Lint lines green. Live: `roster.py` on natedev lists the Mac's sessions; `roster.py --here` on the Mac exits 0 or 1 with no ssh, and lists every Claude session running there, the first native run of Phase 9's macOS process-start reader. `broadcast.py`'s dry check copies a recorder that records its arguments to the same scratch path on both machines and sets `BROADCAST_SEND` to it; both recorders capture their machine's recipients, each recipient once across the two, no message is sent, and the closing line names both machines. One scratch background Claude session on the Mac receives `send.py --to <its name>` from natedev and is then removed.
 
 ### Phase 11 — Claude and Codex sessions know which tool to use · status: todo
 
