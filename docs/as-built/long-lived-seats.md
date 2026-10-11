@@ -33,7 +33,7 @@ Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Eac
 - `context_tokens`: `tokenUsage.last.inputTokens` from the turn's latest `thread/tokenUsage/updated`.
 - During a claim only: `previous_role` and `previous_status`.
 
-The read-only roster reader `scripts/message/roster.py` uses `role`, `context_tokens` and `ended`. When a `lens` field is present it shows the seat as `review (<lens>)`, but no launcher currently writes `lens` into the mesh roster. The lens is recorded in artifact names and in the progress and findings records.
+The read-only roster reader `scripts/message/roster.py` (`docs/as-built/session-roster.md`) reads `thread_id`, `status`, `role`, `lens`, `launcher_pid` and `cwd`, and leaves `ended` seats out. A `review` seat with a `lens` field shows as `review (<lens>)`, but no launcher writes `lens` into the mesh roster. The lens is recorded in artifact names and in the progress and findings records.
 
 **Overflow press-on.** When a turn ends with `codexErrorInfo: contextWindowExceeded`, `start` or `follow` does three things in the same call:
 
