@@ -19,7 +19,7 @@ Two additions to the build log. The first is a "Tests per edit" section in the d
 
 **Source.** `calls` rows with `tool = 'verify.sh'`, plus `steps.tree_key` joined through `steps.call_id`. `calls` has no tree key of its own.
 
-**Seats.** A seat is `coalesce(nullif(delegate_session,''), nullif(session,''))`. Several delegate seats can share one session, so the delegate session wins. A call with neither is skipped.
+**Seats.** A seat is `coalesce(nullif(delegate_session,''), nullif(session,''))`. Several delegate seats can share one session, so the delegate session wins. A call with neither is skipped. `record.py` sets `session` from `CODEX_THREAD_ID` before `CLAUDE_CODE_SESSION_ID`, so a Codex seat keeps its own identity even when it inherits its director's Claude id; existing rows retain their recorded identities.
 
 **Trees per call.** `call_trees(connection, end_day) -> dict[str, KnownCallTrees]` gives each verify call the first and last known `tree_key` among its steps, in step order. A call with no keyed step is absent from the map.
 
@@ -73,7 +73,7 @@ Otherwise `waiting_reason()` returns the first failing reason (`build hold activ
 | `toolchain` | `rustup toolchain install <ver> --profile minimal --component clippy --component rustc-dev` | 1800 s |
 | `clone` | `git clone --local --no-checkout ~/rust/hana <clone>` | 600 s |
 | `revision` | `git -C ~/rust/hana rev-parse origin/init/catalyst`, then `git -C <clone> checkout --detach <sha>` | 30 s, 600 s |
-| `clippy` | in the clone: `nix develop .#ci -c cargo +<ver> clippy --workspace --all-targets --all-features --message-format=json`, with `CARGO_INCREMENTAL=0` and `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold -C target-cpu=x86-64-v3"`, byte-identical to hana CI's (`docs/plans/build-followups-mul-add.md` Phase 2) | 7200 s |
+| `clippy` | in the clone: `nix develop .#ci -c cargo +<ver> clippy --workspace --all-targets --all-features --message-format=json`, with `CARGO_INCREMENTAL=0` and `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold -C target-cpu=x86-64-v3"`, enabling FMA; hana's `origin/main` CI still has mold-only flags (see [fused multiply-add](build-followups-mul-add.md)) | 7200 s |
 | `cargo-mend` | in the clone: `cargo +<ver> install --path ~/rust/cargo-liner/crates/cargo-mend --root <clone>/mend-root`, with `RUSTC_BOOTSTRAP=1` and `CARGO_TARGET_DIR=<clone>/mend-target` | 3600 s |
 
 - `run_process()` starts each step in its own session (`start_new_session=True`). On timeout it sends `SIGKILL` to the whole process group, then raises `TimeoutExpired`.
@@ -146,7 +146,7 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 - **Edits come from tree keys at call boundaries.** A seat's edits are what changed between its calls. Comparing one call's last tree with the next call's first tree leaves out a lint call's own rewrite. `steps` already carries `tree_key`, so no schema change was needed in `index.py` or `record.py`.
 - **Failures sit beside the ratio.** A ratio alone could look fine while failures went unseen for many edits. The bins show what each gap length costs in time to green, and they are the data the target was set from. 0.5 is where recovery time stays low, not a ceiling, so `above` is not a fault.
 - **Interrupted runs are neither green nor failure.** They say nothing about the code.
-- **The trial mirrors CI's Linux clippy without `-D warnings`.** CI already holds hana at zero warnings under the pin, so every warning under the new release is new, and dropping `-D warnings` lets the build count all of them. CI's windows-gnu clippy is left out of the trial; the Linux run shows the cost.
+- **The trial uses CI's Linux clippy targets without `-D warnings`, with FMA enabled.** CI already holds hana at zero warnings under the pin, so every warning under the new release is new, and dropping `-D warnings` lets the build count all of them. The trial adds `-C target-cpu=x86-64-v3` alongside mold; `origin/main` CI still lacks that flag. CI's windows-gnu clippy is left out of the trial; the Linux run shows the cost.
 - **cargo-mend is trialed too.** It is built on `rustc_private`, so a new rustc can break it. The `rustc-dev` component and `RUSTC_BOOTSTRAP=1` let a stable toolchain build it.
 - **Only the latest stable is trialed.** A release a newer stable has superseded is never the bump target.
 - **Night, no hold, no cargo, enough disk.** The trial is a full workspace build. It must not compete with agents' builds or a held test, and must not take the disk below the floor the sweep defends (natedev's disk filled on 2026-10-03).
