@@ -539,6 +539,40 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(len(self.events("systemd-run")), 1)
         self.assertEqual(len(self.recorded_prompts("session-123")), 1)
 
+    def test_restart_restore_adopts_a_row_added_from_a_brief_whose_plan_is_now_its_as_built(self) -> None:
+        checkout = self.doc.parents[2]
+        (checkout / "docs/as-built").mkdir(parents=True, exist_ok=True)
+        _ = (checkout / "docs/as-built/alpha.md").write_text("# Alpha\n", encoding="utf-8")
+        row = self.unit_row(plan="docs/as-built/alpha.md")
+        _ = self.doc.write_text(self.production_doc().replace("## Gates", row + "\n\n## Gates"), encoding="utf-8")
+        _ = self.git("add", "docs/plans/build-followups-production.md", "docs/as-built/alpha.md")
+        _ = self.git("commit", "-m", "production(build-followups): add unit alpha-unit (brief)")
+        _ = self.git("push", "origin", "build-followups")
+        self.write_shutdown_record(self.shutdown_record("restarting"))
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+
+        result = self.successful(
+            "alpha",
+            "--plan",
+            "docs/as-built/alpha.md",
+            "--resume",
+            "session-123",
+            "--cwd",
+            str(prior),
+            "--restart-note",
+            str(note),
+            "--session-name",
+            "recorded-name",
+            "--tmux-session",
+            "recorded-tmux",
+        )
+
+        self.assertIn("alpha-unit started", result.stdout)
+        self.assertEqual(len(self.recorded_prompts("session-123")), 1)
+
     def test_restart_restore_is_refused_when_record_is_down(self) -> None:
         self.write_shutdown_record(self.shutdown_record("down"))
         prior = self.root / "prior-session"

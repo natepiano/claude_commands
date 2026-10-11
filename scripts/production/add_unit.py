@@ -532,7 +532,10 @@ def preflight(request: RequestedUnitLaunch) -> ReadyToLaunch:
         launch_kind=request.launch_kind,
         timeout=request.timeout,
     )
-    if isinstance(existing, ExistingUnitRow) and recorded_mode(launch, existing) != launch.mode_name:
+    # A restore adopts the row it matched: how the unit was first added, and whether its Plan cell
+    # still names a live plan rather than its as-built, describe new work, not the session it resumes.
+    restoring = isinstance(launch.launch_kind, UnitRestoreLaunch) and isinstance(existing, ExistingUnitRow)
+    if isinstance(existing, ExistingUnitRow) and not restoring and recorded_mode(launch, existing) != launch.mode_name:
         raise Refusal(f"unit name {launch.identity.unit} is already taken in Units table")
     has_worktree = worktree_on_branch(launch)
     if has_worktree and isinstance(existing, NoUnitRow):
@@ -542,7 +545,7 @@ def preflight(request: RequestedUnitLaunch) -> ReadyToLaunch:
     if (local_branch or remote_head(production, request.branch)) and not (
             isinstance(existing, ExistingUnitRow) and has_worktree):
         raise Refusal(f"branch {request.branch} already exists")
-    if isinstance(launch.plan, PlanGiven):
+    if isinstance(launch.plan, PlanGiven) and not restoring:
         result = git(production, "show", f"{production.merge_branch}:{launch.plan.path.as_posix()}", check=False)
         if result.returncode != 0 or not any(line.startswith("> **Production:") for line in result.stdout.splitlines()):
             raise Refusal(f"plan {launch.plan.path} is missing on {production.merge_branch} or lacks the Production header")
