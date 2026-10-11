@@ -214,7 +214,7 @@ After Phase 2 reaches `~/.claude` main, the unit director tells the showrunner t
 **Ruled out:**
 - Exempting a date-only correction from the duplicate-link refusal when the note keeps a link another live note shares: such a correction passes `--separate-result` again.
 
-### Phase 6 — cargo-liner's as-built files and changelogs are in the log  · status: todo
+### Phase 6 — cargo-liner's as-built files and changelogs are in the log  · status: done
 
 #### Work Order
 
