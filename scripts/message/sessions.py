@@ -6,11 +6,12 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import sys
 from collections.abc import Iterator
 from enum import Enum
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 
 class SessionRecord(TypedDict):
@@ -19,6 +20,8 @@ class SessionRecord(TypedDict):
     name: str
     messagingSocketPath: str
     updatedAt: int
+    # Older records and callers may omit it; read_session normalizes absence to empty.
+    procStart: NotRequired[str]
     # "<tmux session name at start>:@<window>.%<pane>"; empty outside tmux. Only the pane id stays true.
     tmux: str
     # Every name the session had before the one it has now.
@@ -43,6 +46,7 @@ def read_session(path: Path) -> RegistryEntry:
         name = data.get("name")
         socket_path = data.get("messagingSocketPath")
         updated_at = data.get("updatedAt")
+        proc_start = data.get("procStart")
         tmux = data.get("tmux")
         former = data.get("formerNames")
         if (
@@ -62,6 +66,7 @@ def read_session(path: Path) -> RegistryEntry:
             name=name,
             messagingSocketPath=socket_path,
             updatedAt=updated_at,
+            procStart=proc_start if isinstance(proc_start, str) else "",
             tmux=tmux if isinstance(tmux, str) else "",
             formerNames=[name for name in cast(list[object], former) if isinstance(name, str)]
             if isinstance(former, list) else [],
@@ -70,15 +75,46 @@ def read_session(path: Path) -> RegistryEntry:
         return UnreadableSessionRecord.FOUND
 
 
+def process_start(pid: int) -> str | None:
+    """The process identity stored in session records, in this platform's native units."""
+    if sys.platform == "darwin":
+        # Claude writes procStart under this locale and zone; other text never matches.
+        try:
+            result = subprocess.run(
+                ("ps", "-o", "lstart=", "-p", str(pid)),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        started = result.stdout.strip()
+        return started if result.returncode == 0 and started else None
+    try:
+        # The kernel can truncate the process name inside a UTF-8 character.
+        _, separator, fields = Path(f"/proc/{pid}/stat").read_bytes().rpartition(b")")
+        if not separator:
+            return None
+        started = fields.split()[19].decode("ascii")
+        return started if started.isdigit() else None
+    except (OSError, IndexError, UnicodeDecodeError):
+        return None
+
+
 def running_session(record: SessionRecord) -> bool:
-    """The record's process still runs, whether or not it has a socket."""
+    """The pid runs and a socket or matching start identifies it as this session."""
     try:
         os.kill(record["pid"], 0)
     except PermissionError:
         pass
     except (ProcessLookupError, OverflowError):
         return False
-    return True
+    if messaging_socket_exists(record):
+        return True
+    recorded_start = record.get("procStart", "")
+    return bool(recorded_start) and recorded_start == process_start(record["pid"])
 
 
 def messaging_socket_exists(record: SessionRecord) -> bool:

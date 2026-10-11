@@ -297,7 +297,7 @@ natedev, 2026-10-10 09:5x PDT, inserting Phase 2 (urgent; packaging is natedev's
 
 **Ruled out:** `live_sessions()` as `running_sessions()` filtered by the socket check (hides the predicate from fakes).
 
-### Phase 9 — A session with no messaging socket is listed only while its own process runs · status: todo
+### Phase 9 — A session with no messaging socket is listed only while its own process runs · status: done
 
 #### Work Order
 

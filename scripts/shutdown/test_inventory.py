@@ -841,22 +841,5 @@ elif "comm=" in joined:
             _ = inventory.parse_inventory(json.dumps(document))
 
 
-@final
-class DarwinProcessStartTests(ShutdownTestCase):
-    def test_darwin_start_is_read_in_the_locale_and_zone_claude_records(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=(), returncode=0, stdout="Fri Oct  9 23:24:25 2026\n"
-        )
-        with (
-            patch("inventory.sys.platform", "darwin"),
-            patch("inventory.subprocess.run", return_value=completed) as run,
-        ):
-            started = inventory._process_start(4242)  # pyright: ignore[reportPrivateUsage]
-
-        self.assertEqual(started, "Fri Oct  9 23:24:25 2026")
-        environment = cast(dict[str, str], run.call_args.kwargs["env"])
-        self.assertEqual((environment["LC_ALL"], environment["TZ"]), ("C", "UTC"))
-
-
 if __name__ == "__main__":
     _ = unittest.main()

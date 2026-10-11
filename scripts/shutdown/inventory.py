@@ -19,6 +19,7 @@ for dependency in ("whoami", "message", "production"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import sessions
+from sessions import process_start as _process_start
 import showrunners
 import unit_lookup
 from account import Account, account_of, label_for
@@ -683,35 +684,6 @@ def _configuration_for_session(pid: int) -> Account | None:
     try:
         return account_of(pid)
     except (OSError, UnicodeError, ValueError, TypeError):
-        return None
-
-
-def _process_start(pid: int) -> str | None:
-    """The process identity stored in session records, in this platform's native units."""
-    if sys.platform == "darwin":
-        # Claude writes `procStart` from `ps` under this locale and zone; any other text never matches.
-        try:
-            result = subprocess.run(
-                ("ps", "-o", "lstart=", "-p", str(pid)),
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        started = result.stdout.strip()
-        return started if result.returncode == 0 and started else None
-    try:
-        fields = (
-            Path(f"/proc/{pid}/stat")
-            .read_text(encoding="utf-8")
-            .rpartition(")")[2]
-            .split()
-        )
-        return fields[19]
-    except (OSError, IndexError):
         return None
 
 

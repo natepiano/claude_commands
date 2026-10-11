@@ -26,6 +26,7 @@ import codex_daemon
 import process_table
 import remove_seats
 import roster
+import sessions
 import showrunners
 
 
@@ -136,18 +137,25 @@ class RosterTests(unittest.TestCase):
         updated: int = 1,
         pid: int | None = None,
         with_socket: bool = True,
+        proc_start: str = "",
     ) -> None:
         socket_path = self.sessions / f"{file_name}.sock"
         if with_socket:
             listener = socket.socket(socket.AF_UNIX)
             listener.bind(str(socket_path))
             self.addCleanup(listener.close)
+        record_pid = os.getpid() if pid is None else pid
+        if not with_socket and not proc_start:
+            started = sessions.process_start(record_pid)
+            assert started is not None
+            proc_start = started
         _ = (self.sessions / f"{file_name}.json").write_text(json.dumps({
-            "pid": os.getpid() if pid is None else pid,
+            "pid": record_pid,
             "sessionId": session_id,
             "name": name,
             "messagingSocketPath": str(socket_path) if with_socket else "",
             "updatedAt": updated,
+            "procStart": proc_start,
             "tmux": tmux,
             "cwd": str(cwd),
             "status": status,
@@ -687,6 +695,15 @@ class RosterTests(unittest.TestCase):
         self.assertEqual((entry.cwd, entry.status), (
             str(self.home / "projects" / "free"), "ready",
         ))
+
+    def test_socketless_record_with_another_process_start_is_absent_from_the_roster(self) -> None:
+        self._write_session(
+            "reused", "phantom", "sid-phantom", self.home / "projects" / "ended",
+            with_socket=False, proc_start="another start",
+        )
+        entries = self._entries()
+        self.assertNotIn("phantom", list(entries))
+        self.assertFalse(any(entry.session == roster.ClaudeSession("sid-phantom") for entry in entries.values()))
 
     def test_running_session_without_socket_retains_identity_and_has_no_address(self) -> None:
         self._write_session(
