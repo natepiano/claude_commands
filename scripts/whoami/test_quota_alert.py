@@ -14,11 +14,17 @@ from collections.abc import Callable
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 import quota_alert
-from agent_notes import local_reset, read_note
+from agent_accounts import ClaudeAccountSelection
+import agent_notes
+import note_file
+from agent_notes import local_reset
+from note_file import read_note
+from scripts.accounts import accounts
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 import send
@@ -100,6 +106,12 @@ class QuotaAlertTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        environment_context = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
+        })))
+        del environment_context
+        _ = self.enterContext(mock.patch.object(note_file, "AGENTS_DIR", self.root))
+        _ = self.enterContext(mock.patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl"))
         config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({"threshold_percent": 1, "repeat_minutes": 30,
                                           "stall_minutes": 5, "faults_to": "natedev", "always": ["natedev"]}))
@@ -174,15 +186,227 @@ class QuotaAlertTests(unittest.TestCase):
         return found
 
     def note(self, name: str, state: str, left: str, resets: str | None = None, *,
-             credit_balance: str | None = None, limit_reset_count: str | None = None) -> quota_alert.AgentNote:
+             credit_balance: str | None = None, limit_reset_count: str | None = None,
+             login: str = "someone@example.com") -> quota_alert.AgentNote:
         path = self.root / name
         extras = "".join(f"{key}: {value}\n" for key, value in (
             ("credit_balance", credit_balance), ("limit_reset_count", limit_reset_count)) if value is not None)
-        _ = path.write_text(f"---\nlogin: someone@example.com\nresets: {resets or self.resets}\n"
+        _ = path.write_text(f"---\nlogin: {login}\nresets: {resets or self.resets}\n"
                             + f"state: {state}\nweekly_remaining_usage: {left}\n{extras}---\n")
         note = read_note(path)
         assert note is not None
         return note
+
+    def configure_claude_roles(self) -> None:
+        _ = (self.root / ".claude").mkdir()
+        _ = (self.root / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "showrunner@example.invalid"}}), encoding="utf-8",
+        )
+        for label, login in (("claude 1", "spare@example.invalid"), ("claude 3", "unit@example.invalid")):
+            self.assertEqual(accounts.setup(label), [])
+            _ = (accounts.account_dir(label) / ".claude.json").write_text(
+                json.dumps({"oauthAccount": {"emailAddress": login}}), encoding="utf-8",
+            )
+        accounts.set_role("unit", "claude 3")
+
+    def test_unit_alert_names_role_and_suggests_the_fit_spare_with_most_remaining(self) -> None:
+        self.configure_claude_roles()
+        # A second spare tests selection by quota rather than account number.
+        self.assertEqual(accounts.setup("claude 4"), [])
+        _ = (accounts.account_dir("claude 4") / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "other-spare@example.invalid"}}), encoding="utf-8",
+        )
+        notes: Notes = [
+            self.note("claude 3.md", "active", "1", login="unit@example.invalid"),
+            self.note("claude 2.md", "active", "99", login="showrunner@example.invalid"),
+            self.note("claude 1.md", "inactive", "40", login="spare@example.invalid"),
+            self.note("claude 4.md", "inactive", "70", login="other-spare@example.invalid"),
+        ]
+        config = quota_alert.load_config()
+        config["threshold_percent"] = 4
+        text = quota_alert.message(notes[0], notes, config)
+        self.assertTrue(text.startswith("Quota alert: claude 3 (unit directors) at 1%"))
+        self.assertIn('swap: /showrunner:accounts swap unit "claude 4"', text)
+        self.assertIn("Sessions on claude 3 start no new Claude work", text)
+        self.assertIn("Showrunners relay this notice to their units on that account.", text)
+        self.assertNotIn("@", text)
+
+    def test_unit_alert_rejects_expired_unknown_lower_and_unfit_spares(self) -> None:
+        self.configure_claude_roles()
+        unit = self.note("claude 3.md", "active", "1", login="unit@example.invalid")
+        for left, resets in (("null", self.resets), ("nan", self.resets),
+                             ("inf", self.resets), ("101", self.resets), ("1", self.resets),
+                             ("0", self.resets), ("90", local_reset(self.now - timedelta(hours=1)))):
+            with self.subTest(left=left, resets=resets):
+                spare = self.note("claude 1.md", "inactive", left, resets, login="spare@example.invalid")
+                text = quota_alert.message(unit, [unit, spare], quota_alert.load_config())
+                self.assertIn("no spare account has more left", text)
+        spare = self.note("claude 1.md", "inactive", "90", login="spare@example.invalid")
+        (accounts.account_dir("claude 1") / "projects").unlink()
+        self.assertIn("no spare account has more left", quota_alert.message(
+            unit, [unit, spare], quota_alert.load_config(),
+        ))
+
+    def test_showrunner_alert_names_its_role_without_suggesting_a_unit_swap(self) -> None:
+        self.configure_claude_roles()
+        note = self.note("claude 2.md", "active", "0", login="showrunner@example.invalid")
+        _ = quota_alert.alert([note], self.now)
+        self.assertTrue(self.sent[0][1].startswith("Quota alert: claude 2 (showrunners) at 0%"))
+        self.assertNotIn("swap:", self.sent[0][1])
+        self.assertIn("claude 2 (showrunners)", self.pushed[0][1])
+
+    def test_acknowledging_one_claude_account_keeps_the_other_account_alerting(self) -> None:
+        self.configure_claude_roles()
+        notes: Notes = [
+            self.note("claude 2.md", "active", "0", login="showrunner@example.invalid"),
+            self.note("claude 3.md", "active", "0", login="unit@example.invalid"),
+        ]
+        _ = quota_alert.alert(notes, self.now)
+        _ = quota_alert.acknowledge("claude 3", now=self.now)
+        self.sent.clear()
+        _ = quota_alert.alert(notes, self.now + timedelta(minutes=30))
+        self.assertEqual(len(self.sent), 2)
+        self.assertTrue(all(text.startswith("Quota alert: claude 2 (showrunners)") for _, text in self.sent))
+        with quota_alert.state_file() as state:
+            self.assertIn("acknowledged", state["episodes"]["claude 3"])
+            self.assertNotIn("acknowledged", state["episodes"]["claude 2"])
+
+    def test_acknowledgement_survives_spare_and_unit_role_changes_until_quota_recovers(self) -> None:
+        """A role change does not close or rearm the same account's episode."""
+        self.configure_claude_roles()
+        unit = self.note("claude 3.md", "active", "0", login="unit@example.invalid")
+        spare = self.note("claude 1.md", "inactive", "90", login="spare@example.invalid")
+        main = self.note("claude 2.md", "active", "80", login="showrunner@example.invalid")
+        _ = quota_alert.alert([unit, spare, main], self.now)
+        _ = quota_alert.acknowledge("claude 3", now=self.now)
+        self.sent.clear()
+        self.pushed.clear()
+
+        accounts.set_role("unit", "claude 1")
+        spare = self.note("claude 1.md", "active", "90", login="spare@example.invalid")
+        for left in ("0", "null"):
+            unit = self.note("claude 3.md", "inactive", left, login="unit@example.invalid")
+            _ = quota_alert.alert([unit, spare, main], self.now + timedelta(minutes=2))
+            with quota_alert.state_file() as state:
+                self.assertEqual(state["episodes"]["claude 3"].get("acknowledged"), self.now.isoformat(timespec="seconds"))
+        _ = quota_alert.alert([spare, main], self.now + timedelta(minutes=3))
+        accounts.set_role("unit", "claude 3")
+        unit = self.note("claude 3.md", "active", "0", login="unit@example.invalid")
+        spare = self.note("claude 1.md", "inactive", "90", login="spare@example.invalid")
+        _ = quota_alert.alert([unit, spare, main], self.now + timedelta(hours=1))
+        self.assertEqual((self.sent, self.pushed), ([], []))
+        with quota_alert.state_file() as state:
+            self.assertIn("acknowledged", state["episodes"]["claude 3"])
+
+        accounts.set_role("unit", "claude 1")
+        unit = self.note("claude 3.md", "inactive", "80", login="unit@example.invalid")
+        _ = quota_alert.alert([unit, spare, main], self.now + timedelta(hours=2))
+        self.assertTrue(all(text.startswith("Quota restored: work on claude 3 can resume;") for _, text in self.sent))
+        self.assertEqual(len(self.sent), 2)
+        with quota_alert.state_file() as state:
+            self.assertNotIn("claude 3", state["episodes"])
+        self.sent.clear()
+        accounts.set_role("unit", "claude 3")
+        unit = self.note("claude 3.md", "active", "0", login="unit@example.invalid")
+        _ = quota_alert.alert([unit, spare, main], self.now + timedelta(hours=3))
+        self.assertEqual((len(self.sent), len(self.pushed)), (2, 1))
+
+    def test_a_weekly_reset_closes_the_spare_accounts_acknowledged_episode(self) -> None:
+        """An account's own reset ends its episode even while it is spare."""
+        self.configure_claude_roles()
+        unit = self.note("claude 3.md", "active", "0", login="unit@example.invalid")
+        _ = quota_alert.alert([unit], self.now)
+        _ = quota_alert.acknowledge("claude 3", now=self.now)
+        accounts.set_role("unit", "claude 1")
+        unit = self.note("claude 3.md", "inactive", "null",
+                         local_reset(self.now - timedelta(minutes=1)), login="unit@example.invalid")
+        self.sent.clear()
+        _ = quota_alert.alert([unit], self.now + timedelta(minutes=2))
+        with quota_alert.state_file() as state:
+            self.assertNotIn("claude 3", state["episodes"])
+        self.assertEqual(len(self.sent), 2)
+        self.assertTrue(all(text.startswith("Quota restored: work on claude 3 can resume;") for _, text in self.sent))
+
+    def test_one_alert_run_keeps_its_roles_when_a_swap_happens_during_rendering(self) -> None:
+        """Every message and spare comparison uses one role value."""
+        self.configure_claude_roles()
+        notes: Notes = [
+            self.note("claude 2.md", "active", "0", login="showrunner@example.invalid"),
+            self.note("claude 3.md", "active", "0", login="unit@example.invalid"),
+            self.note("claude 1.md", "active", "0", login="spare@example.invalid"),
+        ]
+        resolve_roles = accounts.claude_account_selection
+
+        def swap_after_resolving() -> ClaudeAccountSelection:
+            roles = resolve_roles()
+            accounts.set_role("unit", "claude 1")
+            return roles
+
+        with mock.patch.object(accounts, "claude_account_selection", side_effect=swap_after_resolving) as resolve:
+            _ = quota_alert.alert(notes, self.now)
+        resolve.assert_called_once_with()
+        first_lines = [text.splitlines()[0] for _, text in self.sent]
+        self.assertEqual(len(first_lines), 4)
+        self.assertEqual(sum(line.startswith("Quota alert: claude 2 (showrunners)") for line in first_lines), 2)
+        self.assertEqual(sum(line.startswith("Quota alert: claude 3 (unit directors)") for line in first_lines), 2)
+        with quota_alert.state_file() as state:
+            self.assertEqual(set(state["episodes"]), {"claude 2", "claude 3"})
+
+    def test_alert_uses_the_updaters_role_value_without_resolving_again(self) -> None:
+        """Update and alert can share the same run's role value."""
+        self.configure_claude_roles()
+        unit = self.note("claude 3.md", "active", "0", login="unit@example.invalid")
+        roles = accounts.claude_account_selection()
+        accounts.set_role("unit", "claude 1")
+        with mock.patch.object(accounts, "claude_account_selection", side_effect=AssertionError("roles resolved twice")):
+            _ = quota_alert.alert([unit], self.now, selection=roles)
+        self.assertTrue(self.sent[0][1].startswith("Quota alert: claude 3 (unit directors)"))
+
+    def test_refusal_uses_supplied_selection_without_resolving_again(self) -> None:
+        """Refusal notices accept the same run's frozen role value."""
+        self.configure_claude_roles()
+        note = self.note("codex 1.md", "active", "0")
+        roles = accounts.claude_account_selection()
+        with mock.patch.object(accounts, "claude_account_selection", side_effect=AssertionError("roles resolved twice")):
+            lines = quota_alert.blocked([note], self.now, selection=roles)
+        self.assertEqual(lines[0], "switched to claude for codex 1: delegate, fix")
+        self.assertEqual((len(self.sent), len(self.pushed)), (2, 1))
+
+    def test_claude_recovery_names_only_the_recovered_account(self) -> None:
+        self.configure_claude_roles()
+        notes: Notes = [
+            self.note("claude 2.md", "active", "0", login="showrunner@example.invalid"),
+            self.note("claude 3.md", "active", "0", login="unit@example.invalid"),
+        ]
+        _ = quota_alert.alert(notes, self.now)
+        self.sent.clear()
+        notes[1] = self.note("claude 3.md", "active", "80", login="unit@example.invalid")
+        _ = quota_alert.alert(notes, self.now + timedelta(minutes=2))
+        self.assertEqual(len(self.sent), 2)
+        for _, text in self.sent:
+            self.assertTrue(text.startswith("Quota restored: work on claude 3 can resume;"))
+            self.assertNotIn("claude 2", text)
+        with quota_alert.state_file() as state:
+            self.assertEqual(set(state["episodes"]), {"claude 2"})
+
+    def test_recovery_does_not_announce_a_different_healthy_claude_account(self) -> None:
+        self.configure_claude_roles()
+        unit = self.note("claude 3.md", "active", "0", login="unit@example.invalid")
+        main = self.note("claude 2.md", "active", "80", login="showrunner@example.invalid")
+        _ = quota_alert.alert([unit, main], self.now)
+        self.sent.clear()
+        unit = self.note("claude 3.md", "inactive", "0", login="unit@example.invalid")
+        _ = quota_alert.alert([unit, main], self.now + timedelta(minutes=2))
+        self.assertEqual(self.sent, [])
+
+    def test_unconfigured_claude_alert_retains_the_original_message(self) -> None:
+        note = self.note("claude 2.md", "active", "0")
+        text = quota_alert.message(note, [note], quota_alert.load_config())
+        self.assertEqual(text.splitlines()[0],
+                         f"Quota alert: claude 2, the active Claude account, has 0% of its weekly "
+                         + f"usage left (threshold 1%); it resets {self.resets}.")
+        self.assertNotIn("swap:", text)
+        self.assertIn("if you delegate Claude work, start no new Claude work", text)
 
     def test_quota_config_uses_shared_showrunner_settings(self) -> None:
         self.assertEqual(quota_alert.Config.__module__, "scripts.production.showrunners")
@@ -265,12 +489,15 @@ class QuotaAlertTests(unittest.TestCase):
             self.assertNotIn("push", state["episodes"]["claude 2"])
 
     def test_claude_push_names_refill_and_reset_count_at_decision_priority(self) -> None:
-        resets = "2026-10-12 09:00"
+        # Ahead of the real clock, which decides whether a reset is still to come.
+        refill = (datetime.now().astimezone() + timedelta(days=2)).replace(second=0, microsecond=0)
+        resets = refill.strftime("%Y-%m-%d %H:%M")
         note = self.note("claude 2.md", "active", "0", resets, limit_reset_count="3")
         _ = quota_alert.alert([note], self.now)
         self.assertEqual(self.pushed, [(
             "claude 2 weekly limit",
-            "claude 2 has 0% of its weekly usage left; it refills Mon 10-12 06:00 PDT.",
+            "claude 2 has 0% of its weekly usage left; it refills "
+            + f"{refill.astimezone(ZoneInfo('America/Los_Angeles')):%a %m-%d %H:%M %Z}.",
             quota_alert.Ask("decision", "Log in to another Claude account, or redeem a limit reset (3 available)."),
         )])
 

@@ -482,7 +482,10 @@ git commit -m "docs: update compatibility tables for v${VERSION}"
 
 **This is an agent judgment step.** For each discovered changelog file:
 
-1. Display the content under `## [Unreleased]` to the user
+1. Display the content under `## [Unreleased]` to the user. If this crate is being released, read `{crate_name}` from `{crate_dir}/Cargo.toml` `[package].name` and compare its log section beside it:
+   `~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py changelog --crate {crate_name} --version Unreleased --compare {crate_dir}/CHANGELOG.md --save ~/.local/state/claude/feature-log/release/{crate_name}.json`
+   On exit 2 with `crate {crate_name} is not published` on stderr, report once, discard any saved contents for that crate, and continue without stamping it.
+   Show `match` or the differences. The release owner reconciles with `amend` or changelog edits; an existing entry becomes pending with `amend --backfill --release {crate_name}@Unreleased` (add `--summary` if the wording differs). Rerun before finalizing. `not compared:` lists hand-written headings outside the six change headings and never prevents a `match`. Report remaining differences and continue without stamping that crate; only a match leaves saved contents.
 2. Review the entries and verify:
    - Entries exist (not empty)
    - Entries accurately reflect the actual code changes since the last release
@@ -588,6 +591,8 @@ This produces a clean commit label visible in GitHub's file list for both CHANGE
 
 <PublishPhases>
 ## STEP 6: Publish to crates.io
+
+Never stamp on a dry run. After each crate's publish succeeds, if `~/.local/state/claude/feature-log/release/${PACKAGE_NAME}.json` exists, run `~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py release --crate ${PACKAGE_NAME} --version ${VERSION} --contents ~/.local/state/claude/feature-log/release/${PACKAGE_NAME}.json`. Report its output. For `cargo publish --workspace`, stamp each confirmed successful upload, including those before a later failure. Keep earlier stamps; a retry prints `unchanged`. Crates without saved contents are not stamped.
 
 **IMPORTANT**: When `[[publish_phases]]` config exists, dry-runs and publishing happen **per-phase**, not all-upfront. This is critical for workspace dependency chains where later phases depend on earlier phases being published first (e.g., Phase 2 crates may depend on Phase 1 crates via workspace dependencies that get updated between phases).
 
@@ -866,7 +871,10 @@ git push origin ${BASE_BRANCH}
 
 **This is an agent judgment step.** For each discovered changelog file:
 
-1. Display the content under `## [Unreleased]` to the user
+1. Display the content under `## [Unreleased]` to the user. If this crate is being released, read `{crate_name}` from `{crate_dir}/Cargo.toml` `[package].name` and compare its log section beside it:
+   `~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py changelog --crate {crate_name} --version Unreleased --compare {crate_dir}/CHANGELOG.md --save ~/.local/state/claude/feature-log/release/{crate_name}.json`
+   On exit 2 with `crate {crate_name} is not published` on stderr, report once, discard any saved contents for that crate, and continue without stamping it.
+   Show `match` or the differences. The release owner reconciles with `amend` or changelog edits; an existing entry becomes pending with `amend --backfill --release {crate_name}@Unreleased` (add `--summary` if the wording differs). Rerun before finalizing. `not compared:` lists hand-written headings outside the six change headings and never prevents a `match`. Report remaining differences and continue without stamping that crate; only a match leaves saved contents.
 2. Review the entries and verify:
    - Entries exist (not empty)
    - Entries accurately reflect the actual code changes in the hotfix

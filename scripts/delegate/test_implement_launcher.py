@@ -63,6 +63,9 @@ elif verb == 'compact':
     if os.environ.get('STUB_COMPACT_FAIL') == '1':
         print('stub compaction failed', file=sys.stderr)
         sys.exit(1)
+    if os.environ.get('STUB_COMPACT_FAIL') == '3':
+        print('stub turn still live', file=sys.stderr)
+        sys.exit(3)
     before = roster[name].get('context_tokens', 0)
     after = int(os.environ.get('STUB_COMPACT_AFTER', '12000'))
     roster[name]['context_tokens'] = after
@@ -382,7 +385,7 @@ class ImplementLauncherSeatTests(unittest.TestCase):
     def mesh_launch(
         self, session_dir: Path, *, to: str = "", slot: str = "impl",
         kind: str = "impl", fail: bool = False, resolves_round: bool = False,
-        compact_fail: bool = False, subtask: str = "",
+        compact_fail: bool = False, subtask: str = "", compact_still_live: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         arguments = [
             "bash", str(self.implement_script),
@@ -395,6 +398,8 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         environment = self.mesh_environment(fail=fail)
         if compact_fail:
             environment["STUB_COMPACT_FAIL"] = "1"
+        if compact_still_live:
+            environment["STUB_COMPACT_FAIL"] = "3"
         if resolves_round:
             environment["PLAN_DELEGATE_RESOLVES_ROUND"] = "1"
         return subprocess.run(
@@ -837,6 +842,25 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn("compaction failed", board)
         self.assertIn("continuing follow-up", board)
+
+    def test_a_seat_left_with_a_live_turn_by_compaction_gets_no_follow_up(self) -> None:
+        session_dir = self.start_phase("compact-still-live")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        roster = cast("dict[str, object]", json.loads(
+            (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
+        ))
+        name = next(iter(roster))
+        self.set_mesh_context(session_dir, name, 100001)
+
+        result = self.mesh_launch(session_dir, to=name, compact_still_live=True)
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("still has a live turn after compaction; end the seat", result.stderr)
+        self.assertFalse((session_dir / "follow_message.txt").exists())
+        board = (session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertIn("follow-up not sent", board)
+        self.assertNotIn("continuing follow-up", board)
 
     def test_success_status_follows_pass_and_landed_records(self) -> None:
         session_dir = self.start_phase("status-after-landed")

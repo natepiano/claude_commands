@@ -38,6 +38,8 @@ elif args[0] == "new":
     print("next_due=1791334500 (2026-10-06 17:55 PDT)")
 elif args[0] == "remove":
     instance.unlink(missing_ok=True)
+elif args[0] == "stop":
+    _ = instance.write_text("stopped", encoding="utf-8")
 else:
     raise SystemExit(2)
 '''
@@ -208,7 +210,7 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual((records[0]["id"], records[0]["role"]), ("current-session-id", "showrunner"))
         self.assertNotIn("lens", records[0])
 
-    def test_on_demand_registers_no_dailies_schedule_and_removes_an_old_one(self) -> None:
+    def test_on_demand_keeps_a_stopped_timer_as_the_showrunners_record(self) -> None:
         first = self.run_command("register")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         doc = self.doc.read_text(encoding="utf-8")
@@ -220,13 +222,16 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
         self.assertIn("register: ok — showrunner-example on demand: no scheduled dailies", resumed.stdout)
         calls = self.notifier_calls()[before:]
-        self.assertNotIn(["new", "showrunner-example"], [call[:2] for call in calls])
-        self.assertIn(["remove", "showrunner-example"], calls)
-        self.assertFalse((self.state / "instance-showrunner-example").exists())
+        self.assertIn(["new", "showrunner-example"], [call[:2] for call in calls])
+        self.assertIn(["stop", "showrunner-example"], calls)
+        self.assertNotIn(["remove", "showrunner-example"], calls)
+        self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
         again = self.run_command("register")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        # A re-register retargets the timer and stops it again, so it stays stopped.
         self.assertEqual([call[0] for call in self.notifier_calls()[before + len(calls):]],
-                         ["status", "status", "status"])
+                         ["new", "stop", "status", "status"])
+        self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
 
     def test_register_requires_the_environment_session_id(self) -> None:
         without_id = {key: value for key, value in self.env.items() if key != "CLAUDE_CODE_SESSION_ID"}
@@ -388,6 +393,32 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         enabled = self.run_command("footer")
         self.assertEqual(enabled.returncode, 0, enabled.stdout + enabled.stderr)
         self.assertIn("next dailies:", enabled.stdout)
+
+    def test_footer_switch_off_still_stores_what_waits_on_the_user(self) -> None:
+        switch = self.state / "showrunner/footers-off/example"
+        switch.parent.mkdir(parents=True)
+        switch.touch()
+        outstanding = self.outstanding()
+        state = self.root / "judgment.json"
+        _ = state.write_text(json.dumps({"open_for_user": [
+            "review colors", {"text": "choose layout", "after": "2099-01-01T08:00"}]}), encoding="utf-8")
+        stored = self.run_command("footer", "--state", str(state))
+        self.assertEqual(stored.returncode, 0, stored.stdout + stored.stderr)
+        self.assertEqual(stored.stdout.strip(), "footer: ok — footers off")
+        entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
+        self.assertEqual([entry["text"] for entry in entries], ["review colors", "choose layout"])
+        self.assertEqual(entries[1]["after"], "2099-01-01T08:00")
+        before = outstanding.read_bytes()
+        _ = state.write_text(json.dumps({"units": []}), encoding="utf-8")
+        kept = self.run_command("footer", "--state", str(state))
+        self.assertEqual(kept.stdout.strip(), "footer: ok — footers off")
+        self.assertEqual(outstanding.read_bytes(), before)
+        _ = state.write_text(json.dumps({"open_for_user": [{"text": "choose layout", "after": "tomorrow"}]}),
+                             encoding="utf-8")
+        bad = self.run_command("footer", "--state", str(state))
+        self.assertEqual(bad.returncode, 2, bad.stdout + bad.stderr)
+        self.assertIn("footer: failed", bad.stdout)
+        self.assertEqual(outstanding.read_bytes(), before)
 
     def test_footer_switch_off_drops_all_output_and_on_renders_footer(self) -> None:
         switch = self.state / "showrunner/footers-off/example"

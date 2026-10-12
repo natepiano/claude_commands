@@ -301,6 +301,12 @@ with lock_file.open("a+") as lock:
                 else:
                     detail = (compact.stderr.strip() or compact.stdout.strip()
                               or f"exit {compact.returncode}").splitlines()[-1]
+                    # Exit 3: a turn is still live on the seat's thread, so a follow-up would be refused.
+                    if compact.returncode == 3:
+                        post(f"launcher: {name} still has a live turn after compaction: {detail}; "
+                             "follow-up not sent")
+                        fail(f"{name} still has a live turn after compaction; end the seat "
+                             f"(codex_mesh.py end --to {name}) and start a fresh one")
                     post(f"launcher: compaction failed for {name}: {detail}; continuing follow-up")
             check = subprocess.run(
                 [sys.executable, mesh_script, "can-follow", "--session-dir", root_text,

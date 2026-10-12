@@ -2,7 +2,7 @@
 
 ## What it is
 
-The 4-hourly build report (`/builds` with no argument) runs in the build-report session, not in natedev's `/watcher` session. A notifier instance, `report-builds`, sends the report prompt to the build-report session every 240 minutes, and that session shows the `/builds` output unchanged. The user asked for this on 2026-10-06 and wanted that session on Sonnet 5.5 at xhigh effort; the session's model is set on the session itself, and no command selects it.
+The 4-hourly build report (`/build:report` with no argument) runs in the build-report session, not in natedev's `/watcher` session. A notifier instance, `report-builds`, sends the report prompt to the build-report session every 240 minutes, and that session shows the `/build:report` output unchanged. The user asked for this on 2026-10-06 and wanted that session on Sonnet 5.5 at xhigh effort; the session's model is set on the session itself, and no command selects it.
 
 ## How it works
 
@@ -13,20 +13,20 @@ The 4-hourly build report (`/builds` with no argument) runs in the build-report 
 | `TARGET` | `session:<id>`, the build-report session's `$CLAUDE_CODE_SESSION_ID` |
 | `EVERY` | `240` |
 | `FROM` | `report-builds` |
-| `COMMAND` | `Scheduled report (builds, every 4 hours): run /builds with no argument and show its output unchanged. Do nothing else for this message.` |
+| `COMMAND` | `Scheduled report (builds, every 4 hours): run /build:report with no argument and show its output unchanged. Do nothing else for this message.` |
 
 There is no `CHECK`, no hold and no alignment, so the clock is the notifier's default: the next whole minute, 240 minutes out.
 
 The conversation pause treats `report-builds` like any other automatic update aimed at the session. When the user writes to the build-report session, it records and stops the enabled instance; a yes or the answer timeout runs `notifier.sh resume report-builds`, which keeps `NEXT_DUE` unchanged. See `docs/as-built/conversation-pause.md`.
 
-The build-report session owns the retarget. The "Owner session" section, last in `commands/builds.md`, holds the one command that points the schedule at the running session (`notifier.sh new report-builds --to "session:$CLAUDE_CODE_SESSION_ID" --every 240 --from report-builds --command '<the text above>'`), then `notifier.sh status report-builds`.
+The build-report session owns the retarget. The "Owner session" section, last in `commands/build/report.md`, holds the one command that points the schedule at the running session (`notifier.sh new report-builds --to "session:$CLAUDE_CODE_SESSION_ID" --every 240 --from report-builds --command '<the text above>'`), then `notifier.sh status report-builds`.
 
-`/watcher` STEP 5 (natedev only) runs `notifier.sh status report-builds` and nothing else. STEP 6 reports the next send from that status. The Standing reports rule in `commands/watcher.md` tells a watcher to run what a `report-<name>` message asks, show its output unchanged, and do nothing else, and points to `commands/builds.md` for `report-builds`.
+`/watcher` STEP 5 (natedev only) runs `notifier.sh status report-builds` and nothing else. STEP 6 reports the next send from that status. The Standing reports rule in `commands/watcher.md` tells a watcher to run what a `report-<name>` message asks, show its output unchanged, and do nothing else, and points to `commands/build/report.md` for `report-builds`.
 
 ## Invariants
 
-- The watcher never retargets `report-builds`. The retarget command lives once, in `commands/builds.md`.
-- The report text stays exactly `Scheduled report (builds, every 4 hours): run /builds with no argument and show its output unchanged. Do nothing else for this message.`
+- The watcher never retargets `report-builds`. The retarget command lives once, in `commands/build/report.md`.
+- The report text stays exactly `Scheduled report (builds, every 4 hours): run /build:report with no argument and show its output unchanged. Do nothing else for this message.`
 - A repeated `new` on an existing instance keeps the clock: it rewrites `conf` and leaves `state` (`NEXT_DUE`, `ENABLED`) alone, and prints nothing.
 
 ## Calibration and gotchas

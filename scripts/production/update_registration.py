@@ -101,6 +101,9 @@ class ScheduledUpdates(NamedTuple):
     aligned: bool
 
 
+DEFAULT_MINUTES = 15
+
+
 class UpdatesOnDemand(NamedTuple):
     """The doc's Updates line reads `on demand`: a dailies runs only when the user asks for one."""
 
@@ -110,7 +113,7 @@ def update_schedule(lines: list[str]) -> ScheduledUpdates | UpdatesOnDemand:
     if re.search(r"\bon demand\b", line):
         return UpdatesOnDemand()
     match = re.search(r"every (\d+) minutes", line)
-    minutes = int(match.group(1)) if match else 15
+    minutes = int(match.group(1)) if match else DEFAULT_MINUTES
     if minutes <= 0:
         raise RegistrationFailure("prompt", "Updates interval must be positive")
     return ScheduledUpdates(minutes, "on the hour" in line)
@@ -141,8 +144,10 @@ def register(production: Production) -> None:
         print("agents_log: " + " ".join(str(exc).splitlines()), file=sys.stderr)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     schedule = update_schedule(lines)
-    prompt = (scheduled_prompt(schedule.minutes, str(production.zone), production.doc)
-              if isinstance(schedule, ScheduledUpdates) else "")
+    # An on-demand timer is made at the default interval and stopped, so it stays the showrunner's record.
+    minutes, aligned = ((schedule.minutes, schedule.aligned) if isinstance(schedule, ScheduledUpdates)
+                        else (DEFAULT_MINUTES, False))
+    prompt = scheduled_prompt(minutes, str(production.zone), production.doc)
     relative = production.doc.relative_to(production.checkout)
     dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
     if dirty:
@@ -151,17 +156,15 @@ def register(production: Production) -> None:
     state_root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
     prompt_file = state_root / production.slug / "prompt.txt"
     updates = f"showrunner-{production.slug}"
-    if isinstance(schedule, ScheduledUpdates):
-        prompt_file.parent.mkdir(parents=True, exist_ok=True)
-        if not prompt_file.exists() or prompt_file.read_text(encoding="utf-8") != prompt:
-            _ = prompt_file.write_text(prompt, encoding="utf-8")
-        check = f"zsh {Path.home()}/.claude/scripts/production/production_check.sh {production.doc}"
-        _ = notifier(["new", updates, "--to", f"session:{session_id}", "--every", str(schedule.minutes),
-                  "--prompt-file", str(prompt_file), "--from", f"showrunner-timer-{production.slug}",
-                  "--check", check, *(["--aligned"] if schedule.aligned else [])])
-    elif isinstance(instance(updates), InstancePresent):
-        # A schedule from before the doc said on demand would keep sending the prompt.
-        _ = notifier(["remove", updates])
+    prompt_file.parent.mkdir(parents=True, exist_ok=True)
+    if not prompt_file.exists() or prompt_file.read_text(encoding="utf-8") != prompt:
+        _ = prompt_file.write_text(prompt, encoding="utf-8")
+    check = f"zsh {Path.home()}/.claude/scripts/production/production_check.sh {production.doc}"
+    _ = notifier(["new", updates, "--to", f"session:{session_id}", "--every", str(minutes),
+              "--prompt-file", str(prompt_file), "--from", f"showrunner-timer-{production.slug}",
+              "--check", check, *(["--aligned"] if aligned else [])])
+    if isinstance(schedule, UpdatesOnDemand):
+        _ = notifier(["stop", updates])
     for name, script in (("stall-watch", "stall_watch.py"), ("tmux-names", "tmux_names.py")):
         if isinstance(instance(name), InstanceAbsent):
             run = f"{Path.home()}/.claude/scripts/lib/py {Path.home()}/.claude/scripts/production/{script}"
@@ -298,9 +301,6 @@ def append_log(production: Production, event: str, path: Path | None, before_com
 
 
 def footer(production: Production, path: Path | None, nothing_needed: bool) -> None:
-    if footer_state(production.slug) is FooterState.OFF:
-        report("footer", "ok", "footers off")
-        return
     state = judgment_state(path, "footer")
     outstanding = outstanding_path(production)
     if isinstance(state.outstanding, ReplaceOutstanding):
@@ -326,6 +326,11 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
             entries.append(entry)
         outstanding.parent.mkdir(parents=True, exist_ok=True)
         _ = outstanding.write_text(json.dumps(entries) + "\n", encoding="utf-8")
+    # The switch hides the printed footer only. What waits on the user is stored above either way,
+    # so the dailies and the open-questions count still see it.
+    if footer_state(production.slug) is FooterState.OFF:
+        report("footer", "ok", "footers off")
+        return
     schedule = instance(f"showrunner-{production.slug}")
     next_run: str | None = None
     if isinstance(schedule, InstancePresent) and not schedule.output.splitlines()[0].endswith(", stopped"):

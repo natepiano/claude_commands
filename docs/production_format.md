@@ -11,7 +11,9 @@ must not drift from it:
   production doc.
 - `/showrunner:produce` — runs the production from the showrunner session.
 - `/showrunner:dailies` — reports the production to the executive producer.
-- `/showrunner:interval` — changes how often the scheduled updates come.
+- `/showrunner:report_interval` — changes how often the scheduled updates come.
+- `/showrunner:accounts` — shows every Claude and Codex account in one table; sets up a
+  Claude folder or swaps the unit account.
 - `/unit:direct` — a unit's run; it applies <ProductionUnit/> below.
 
 ---
@@ -45,6 +47,14 @@ must not drift from it:
   named `trunk-unit`.
 - **Gate** — a unit phase that cannot start until another unit's checkpoint is on
   the merge branch.
+- **Parent, child and root showrunner** — a production's showrunner may report
+  to another production's (`/showrunner:attach`). The one at the top of a tree is
+  the root, and only the root talks with the user. A child showrunner is never a
+  unit: it keeps its own production doc, merge branch and units, and has no row
+  in its parent's Units table. Which production reports to which is state on the
+  machine, `~/.local/state/showrunner/<child slug>/parent`, and no line in either
+  production doc, so either side attaches without a commit in the other's
+  checkout. Look it up with `showrunners.py parent|children|root <slug>`.
 
 User, 2026-09-28: production, showrunner and unit were chosen because Hana is a
 DCC app and the film words are short.
@@ -72,16 +82,23 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **User zone:** <IANA zone> — every time the showrunner reports is in this zone plus UTC
 - **Updates:** every <N> minutes (default 15), or `on demand`; each update reports every
   unit in full; the update timer reads N from this line, `on demand` runs no timer and a
-  dailies runs only when the user asks, and `/showrunner:interval` changes it
+  dailies runs only when the user asks, and `/showrunner:report_interval` changes it
 - **Merge tests:** <packages tested on every merge besides the changed ones, e.g. the
   app crate>; omit if none
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
 - **UX guide:** <path to the project's UX rules, e.g. `~/rust/hanadocs/ux`>; omit when
   nothing users see changes
+- **Proposals:** <folder for finished proposals, e.g. `~/rust/hanadocs/proposals`>; its
+  `index.md` holds one row for each, `| Date | Proposal | Unit | Summary | Status |`,
+  added by the showrunner, and `/showrunner:proposals` shows every row whose Status is
+  not closed; omit when the production keeps no such folder
 
 The showrunner's session name is not in the doc: a name can change, so it is
 looked up when needed. `~/.claude/scripts/lib/py
 ~/.claude/scripts/production/showrunners.py name <slug>` prints it as it is now.
+A unit sends to the address `showrunners.py address <slug>` prints, not to the
+name: the address is the showrunner's session on this machine, and `SendMessage`
+refuses a name that another session of the same account also has.
 
 ## Units
 

@@ -55,7 +55,7 @@ state = Path(os.environ["STUB_STATE"])
 (state / "launch-blocked-ran").write_text(" ".join(sys.argv[1:]))
 status = int(os.environ["STUB_STATUS"])
 if status == 0:
-    print("claude 2 is held by a shutdown (down since 2026-10-09 14:49 PDT)")
+    print("claude 2 is held by a shutdown (since 2026-10-09 14:49 PDT)")
 elif status == 3:
     print("shutdown state unreadable: malformed record", file=sys.stderr)
 raise SystemExit(status)
@@ -141,7 +141,7 @@ raise SystemExit(0 if os.environ.get("PGRP_MATCH") == "1" else 1)
         self.assertEqual(
             result.stdout,
             "fix-trigger: skipped: claude 2 is held by a shutdown"
-            + " (down since 2026-10-09 14:49 PDT)\n",
+            + " (since 2026-10-09 14:49 PDT)\n",
         )
         self.assertEqual(result.stderr, "")
         self.assertFalse((self.state / "fix-ran").exists())

@@ -8,8 +8,8 @@
 #
 # Called as:  jq -r --arg pwd "$PWD" --arg account "$account" -f statusline.jq
 # Input:      the status line JSON on stdin.
-# Output:     Line 1: "<dirname> | <tokens with thousands separators> | <model [effort]>"
-#             Line 2, when present: "<account> | 5-hour <N>% left | weekly <M>% left"
+# Output:     Line 1: "<machine> | <account> | <dirname> | <tokens with thousands separators> | <model [effort]>"
+#             Line 2, when present: "5-hour <N>% left | weekly <M>% left"
 
 # Thousands separators, matching `printf "%'d"` under en_US: walk the digits
 # from the right and insert a comma (codepoint 44) before every third one. The
@@ -18,6 +18,11 @@
 def commas: tostring | explode | reverse | to_entries
   | map(if .key > 0 and .key % 3 == 0 then [44, .value] else [.value] end)
   | flatten | reverse | implode;
+
+# The machine's ssh name, told apart by platform as the shell prompt does
+# (modules/common/shell.nix in the nixos repo). macOS keeps homes under /Users;
+# reading $ENV costs no process.
+def machine: if ($ENV.HOME // "" | startswith("/Users/")) then "mac" else "natedev" end;
 
 def remaining($window):
   ($window.used_percentage? // null) as $used
@@ -36,9 +41,14 @@ def remaining($window):
 | ((.model.display_name // "")
    + (if (.effort.level // "") == "" then "" else " " + .effort.level end)) as $m
 | ([
+     machine,
      (if $account == "" then empty else $account end),
+     $base,
+     ((.context_window.total_input_tokens // 0) | commas),
+     $m
+   ] | join(" | ")) as $first_line
+| ([
      (remaining(.rate_limits.five_hour?) | "5-hour \(.)% left"),
      (remaining(.rate_limits.seven_day?) | "weekly \(.)% left")
    ] | join(" | ")) as $second_line
-| "\($base) | \((.context_window.total_input_tokens // 0) | commas) | \($m)"
-  + (if $second_line == "" then "" else "\n" + $second_line end)
+| $first_line + (if $second_line == "" then "" else "\n" + $second_line end)

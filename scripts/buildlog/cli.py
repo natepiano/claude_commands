@@ -4,6 +4,7 @@
   buildlog query [--json] "<SQL>"   bring the index up to date, run SQL read-only
   buildlog schema                   tables, columns, views and example queries
   buildlog report [YYYY-MM-DD]      one day (default today) as markdown: each kind by caller, then a summary
+  buildlog mac-report [--hours N]    Mac test outcomes over the last N hours and three local days
   buildlog reindex                  rebuild the index from the JSON lines
   buildlog tree-key [DIR]           the tree key of DIR's worktree (default the current folder; treekey.py)
   buildlog sync                     exchange records with the Mac (natedev's hourly job)
@@ -37,6 +38,7 @@ import ci
 import disk
 import index
 import launches
+import mac_report
 import memory
 import record
 import report
@@ -228,6 +230,8 @@ def main(argv: list[str]) -> int:
         return schema()
     if command == "report":
         return day_report(rest)
+    if command == "mac-report":
+        return mac_report.main(rest)
     if command == "launches":
         if rest:
             print("usage: buildlog launches", file=sys.stderr)

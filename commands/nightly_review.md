@@ -1,9 +1,9 @@
 ---
-description: Nightly read-only review ending in one improvement proposal with a measured baseline. `config` covers machine configuration; `rust` covers ~/rust code, style and the development process. The nightly-review timer launches both on natedev at 01:00.
-argument-hint: config | rust
+description: Nightly read-only review ending in one improvement proposal per mode, each with a measured baseline. `config` covers machine configuration; `rust` covers ~/rust code, style and the development process. The nightly-review timer launches one session on natedev at 01:00 that does both, `config` first.
+argument-hint: config | rust | config rust
 ---
 
-Mode: `$ARGUMENTS`. NIGHT is today's local date, DIR is `~/.local/state/nightly-review/NIGHT`, LEDGER is `~/.local/state/nightly-review/ledger.md`.
+Modes: `$ARGUMENTS`, done one at a time in the order given. Finish a mode, its report written and its message sent, before starting the next; a mode that cannot finish says why in its report, and the next still runs. NIGHT is the local date when the session started, DIR is `~/.local/state/nightly-review/NIGHT`, LEDGER is `~/.local/state/nightly-review/ledger.md`.
 
 <Rules>
 - Read-only: write nothing outside DIR. No edits, commits, pushes, rebuilds or installs. A worktree only when a measurement needs a build that must not touch a working copy; remove it after.
@@ -17,23 +17,26 @@ Every memory (`~/.claude/projects/*/memory/`; the Mac's over `ssh mac` if it ans
 </Scope>
 
 <Scope mode="rust">
-One target a night, by weight: hana 12, cargo-liner 3, bevy_brp 2, showrunner 1, obsidian_knife 1, nateroids 1 (of 20). Over LEDGER's last 20 `rust/` entries (N of them), take the target with the largest `weight × N / 20 − its count`; ties go to the heavier weight, then this order.
+One target a night, by weight: hana 12, cargo-liner 3, bevy_brp 2, showrunner 1, obsidian_knife 1, nateroids 1 (of 20). Over LEDGER's last 20 `rust/` proposals (N of them; a line marked `, also found` or `, noted` is no proposal), take the target with the largest `weight × N / 20 − its count`; ties go to the heavier weight, then this order.
 - A project: its code against its conventions and `~/rust/nate_style`, and style rules that cost more than they catch.
 - `showrunner`: the showrunner, producer and unit commands under `~/.claude/commands/` with their docs and scripts, against run history (`/history`) and delegate progress logs: steps that repeat work, stall, or wait on the user without need.
 </Scope>
 
 <Proposal>
-Pick the single change with the largest measurable gain for its cost, and measure its baseline tonight. Write `DIR/<mode>.md`:
+For each mode, pick the single change with the largest measurable gain for its cost, and measure its baseline tonight. Write `DIR/<mode>.md`:
 
 ```
 # <title>
 **Target:** config | rust/<target>
 **Innovation:** <the change, one or two sentences>
 **Measurable improvement:** <metric>: <baseline tonight> → <target>, measured by <command or method>
+**Gain per week:** <`N min` or `N h` of user-visible time (waiting, red CI, failed runs) and what it is, else `N% of tokens`, from tonight's numbers; `unmeasured` when neither can be measured>
 **Evidence:** <files and lines, measurements>
 **Cost:** <what implementing takes and risks>
-**Also found:** <up to three one-line runners-up>
+**Also found:** <up to three one-line runners-up, each `- **<title>.** <one line> [gain/week: 12 min red CI]` or `[gain/week: 0.4% of tokens]`; leave the tag off an unmeasured one>
 ```
 
-Then `SendMessage` natedev, first line `Nightly proposal ready: DIR/<mode>.md`, second line the title; if natedev is not listed, skip it; `/nightly_next` reads every night's reports. Stay open: the user may attach to ask about it.
+LEDGER gets one line for the proposal and one for each Also found item, with these gains, and `/nightly_next` and `/showrunner:nightly` rank by them. Write each gain as a week's worth in the form shown, so a script can read it. Anything that is no candidate (what was denied tonight, a note on the target choice) goes below the items under a plain line of its own, which closes the list.
+
+Then `SendMessage` to the address `python3 ~/.claude/scripts/message/sessions.py address natedev` prints, which is natedev's session on this machine: first line `Nightly proposal ready: DIR/<mode>.md`, second line the title. If it prints nothing, natedev is not running: skip the message; `/nightly_next` reads every night's reports. After the last mode, stay open: the user may attach to ask about it.
 </Proposal>

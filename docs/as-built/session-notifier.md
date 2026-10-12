@@ -24,8 +24,8 @@ The session notifier sends a message to a live Claude session on a schedule: the
 | `scripts/production/dailies_input.py` | `--user-run` restarts the showrunner instance for a dailies the user runs. |
 | `scripts/production/production_lifecycle.py` | `wrap` removes the showrunner instance. |
 | `scripts/shutdown/settle.py`, `scripts/shutdown/restart.py` | `/shutdown` runs `stop` on each enabled instance targeting a session it stops; `/shutdown cancel` and `/shutdown restart` run `start` on those. Never `remove`. |
-| `commands/showrunner/{produce,dailies,interval}.md` | Call those commands; `/showrunner:interval` retimes the showrunner instance. |
-| `commands/unit/direct.md` `<ProgressContract>`, `commands/unit/report.md`, `commands/unit/interval.md` | How a unit treats its ticks, and `/unit:interval`. |
+| `commands/showrunner/{produce,dailies,interval}.md` | Call those commands; `/showrunner:report_interval` retimes the showrunner instance. |
+| `commands/unit/direct.md` `<ProgressContract>`, `commands/unit/report.md`, `commands/unit/report_interval.md` | How a unit treats its ticks, and `/unit:report_interval`. |
 | `config/delegate.conf` | `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS`, the unit interval; `PLAN_DELEGATE_PROGRESS_UPDATES`, `scheduled` or `on-demand`. |
 | `/etc/nixos/modules/common/session-notifier.nix` | The 15 s job. |
 | `scripts/message/test_notifier.py`, `test_sessions.py`, `scripts/delegate/test_delegate_check.py` | CLI tests, run through the `NOTIFIER_*` variables. |
@@ -73,7 +73,7 @@ The slot is claimed before the check runs, so a concurrent tick or `fire` cannot
 
 ### Delivery
 
-`sessions.py socket` reads every `*.json` record in the sessions directory, matches `session:<id>` against `sessionId` or a bare name against `name`, keeps records whose pid is alive (`PermissionError` counts as alive) and whose `messagingSocketPath` is a socket, and prints the socket with the newest `updatedAt`. No match exits 1; a usage error exits 2; a registry that cannot be listed, or an unreadable entry with no live match, exits 3. The socket is resolved on every send, so a restarted process is found at its new socket. `send.py` then relays through a headless `claude -p` (sonnet) that makes one `SendMessage` call to that socket. A `COMMAND` is sent as text; a `PROMPT_FILE` is read at send time, so editing the file changes the next tick's text. The key `notifier-<instance>` means a tick that could not be delivered (`QUEUED`, exit 1) replaces the previous queued one, so each instance has at most one tick in `send.py`'s queue.
+`sessions.py socket` reads every `*.json` record in the sessions directory, matches `session:<id>` against `sessionId` or a bare name against `name`, keeps records whose pid is alive (`PermissionError` counts as alive) and whose `messagingSocketPath` is a socket, and prints the socket with the newest `updatedAt`. `sessions.py address` takes the same targets and prints that socket as `uds:<socket>`, the `to` that `SendMessage` accepts for a session on this machine. No match exits 1; a usage error exits 2; a registry that cannot be listed, or an unreadable entry with no live match, exits 3. The socket is resolved on every send, so a restarted process is found at its new socket. `send.py` then relays through a headless `claude -p` (sonnet) that makes one `SendMessage` call to that socket. A `COMMAND` is sent as text; a `PROMPT_FILE` is read at send time, so editing the file changes the next tick's text. The key `notifier-<instance>` means a tick that could not be delivered (`QUEUED`, exit 1) replaces the previous queued one, so each instance has at most one tick in `send.py`'s queue.
 
 ### CLI
 
@@ -105,7 +105,7 @@ The slot is claimed before the check runs, so a concurrent tick or `fire` cannot
 - **any other nonzero**: skip, logged as `skip check exit <rc>`.
 - Not finished within `TIMEOUT`: killed, logged as `skip check timeout`.
 
-`production_check.sh <doc>` reads the doc's `Status: PRODUCTION — <word>` line: `running` 0, `wrapped` 2, anything else (or no such line, or no file) 1.
+`production_check.sh <doc>` reads the doc's `Status: PRODUCTION — <word>` line: `running` 0, `wrapped` 2, anything else (or no such line, or no file) 1. For a running production it first runs `log_backup.py <doc>`, which keeps dated copies of the production's LOG (LOG backups in `docs/as-built/showrunner-automation.md`). A failed copy prints to stderr and does not change the exit code.
 
 `delegate_run.py check <claude_session_id> <session_dir>` exits 2 when the marker `/tmp/claude/delegate/active/<id>` is missing or names another directory (the run ended, or a new run in the same session replaced it); 0 when `running_work()` finds work in flight; 1 when the unit is idle; 3 on a usage error. Work in flight is an `impl_status` or `impl_status_*` file reading `implementing`, a `review_status*` file reading `reviewing`, or a `progress_history_state.json` activity with status `active`. That last one covers `verify.sh final` and UX review, which open activities.
 
@@ -149,8 +149,8 @@ A Codex unit has no `CLAUDE_CODE_SESSION_ID`, so it gets no marker and no instan
 
 ### Changing the interval
 
-- `/unit:interval [minutes]` finds `delegate-<run id>` from `/tmp/claude/delegate/active/$CLAUDE_CODE_SESSION_ID`. No argument runs `notifier.sh status`; a positive integer runs `notifier.sh interval` (exit 2 means refused) and reports the next tick from `next_due` in local time. It changes this run only and is unavailable on a Codex unit.
-- `/showrunner:interval [minutes]` edits the doc's `**Updates:**` line and the `every N minutes` text in `PROMPT_FILE`, runs `notifier.sh interval UPDATES <minutes>`, commits the doc, logs the old and new interval, and tells the user the next tick in `ZONE` and UTC. No argument reports status only.
+- `/unit:report_interval [minutes]` finds `delegate-<run id>` from `/tmp/claude/delegate/active/$CLAUDE_CODE_SESSION_ID`. No argument runs `notifier.sh status`; a positive integer runs `notifier.sh interval` (exit 2 means refused) and reports the next tick from `next_due` in local time. It changes this run only and is unavailable on a Codex unit.
+- `/showrunner:report_interval [minutes]` edits the doc's `**Updates:**` line and the `every N minutes` text in `PROMPT_FILE`, runs `notifier.sh interval UPDATES <minutes>`, commits the doc, logs the old and new interval, and tells the user the next tick in `ZONE` and UTC. No argument reports status only.
 
 ### TICKS FAILING
 
@@ -183,7 +183,7 @@ For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <
 - **Unit interval.** `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=3600` gives one hour (user, 2026-10-10). `unit_notifier.sh` reads the leading digits, so a trailing `# comment` keeps the value. A missing key, unreadable file or non-numeric value gives 900 s. Minutes round up with a floor of 1, so `0` means 1 minute. Codex requires a positive integer. `progress_history.py` reads the key on its own and drops the next-report clause on a bad value; that only shows when there is no instance.
 - **Interval cost.** Each report costs the unit director about 40 s of generation. Keep the interval at or above the median review, about 5 minutes.
 - **Showrunner interval.** 15 minutes when the doc has no `**Updates:**` line.
-- **On demand (user, 2026-10-10).** A doc whose `**Updates:**` line reads `on demand` gets no `showrunner-<slug>` instance: `register` (`update_schedule` → `UpdatesOnDemand`) removes one left from before and prints `on demand: no scheduled dailies`, and `dailies_input.py` runs no `status` or `restart` and leaves `next_run` out, so the footer reads `no dailies scheduled`. `PLAN_DELEGATE_PROGRESS_UPDATES=on-demand` in `delegate.conf` does the same for units: `unit_notifier.sh` with no mode makes no `delegate-<run id>`, stops one a resumed run still holds, and prints `progress updates on demand: …`, which `prepare_session.sh` passes on; `on` makes the instance when there is none. The repo's `delegate.conf` went back to `scheduled` the same day, hourly.
+- **On demand (user, 2026-10-10).** A doc whose `**Updates:**` line reads `on demand` gets a stopped `showrunner-<slug>` instance: `register` (`update_schedule` → `UpdatesOnDemand`) runs `new` at the default 15 minutes, then `stop`, and prints `on demand: no scheduled dailies`. The instance is kept because it is the showrunner's only record (`showrunners.py` and shutdown's inventory find showrunners through it; until 2026-10-11 `register` removed it, and every unit of an on-demand production was classed top-level). A stopped instance never fires, a conversation pause records only enabled instances, and `/shutdown` restarts only the instances it stopped itself. `new` keeps an existing instance's state, so `/showrunner:report_interval` turning an on-demand doc back to `every N minutes` runs `register` and then `start`. `dailies_input.py` runs no `status` or `restart` and leaves `next_run` out, so the footer reads `no dailies scheduled`. `PLAN_DELEGATE_PROGRESS_UPDATES=on-demand` in `delegate.conf` puts units on demand: `unit_notifier.sh` with no mode makes no `delegate-<run id>`, stops one a resumed run still holds, and prints `progress updates on demand: …`, which `prepare_session.sh` passes on; `on` makes the instance when there is none. The repo's `delegate.conf` went back to `scheduled` the same day, hourly.
 - **Retiming every unit run.** `unit_notifier.sh --all [minutes]` needs no marker. It runs `notifier.sh interval <instance> <minutes>` on each `delegate-*` directory under `NOTIFIER_STATE_DIR` that holds a `conf` and `state`, with minutes from the config unless given. `interval` never changes `ENABLED`, so a stopped instance stays stopped. It prints `<instance> every <N> min, on, <next_due line>` or `<instance> every <N> min, off`, or `no unit run has a report schedule`, and exits 1 when any `interval` failed. Other instances, `showrunner-*` included, are untouched.
 - **Timing.** `next_due` is a whole minute; the tick that sends it lands within about 15 s after. On natedev a slow tick pushes the next one back (the interval counts from the end of the run); on the Mac an overlapping tick finds `.tick.lock` held and exits at once.
 - **A skip uses its slot.** An idle unit, a missing session or a hold skips the whole interval, not 15 s.
@@ -193,7 +193,7 @@ For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <
 - **`PLAN_DELEGATE_ACTIVE_DIR`** is a test-only variable honoured only by `delegate_run.py`, `unit_notifier.sh` and `unit_status.sh`. `prepare_session.sh` and `end_session.sh` use the fixed `/tmp/claude/delegate/active`, so a live caller leaves it unset or pointed where the marker is.
 - **`CHECK` quoting.** `unit_notifier.sh` `(q)`-quotes each word of the check, so a repo path with spaces survives the `(Q)(z)` split.
 - **`progress` cost.** Every `progress` call, refused ones included, spawns one zsh for the restart, even for a run with no instance. Because the restart comes before any refusal, a call that exits with `No active phase to report` or a missing cap stage still moves the next tick one interval out.
-- **`/unit:interval` lasts for the run.** Rerunning `unit_notifier.sh` resets `EVERY` to the config value.
+- **`/unit:report_interval` lasts for the run.** Rerunning `unit_notifier.sh` resets `EVERY` to the config value.
 - **`fire`** moves the clock and skips the hold, but a failing check or a missing session still skips it.
 
 ## Why
