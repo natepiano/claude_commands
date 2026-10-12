@@ -156,7 +156,7 @@ Measured with `python3 ~/.local/state/mul-add-hook/reach-2026-10-12/gate.py scri
 
 **Ruled out:** narrowing `VECTOR` for `.min(`, `.max(`, `.left` and `.size()` now (the gates pass; the re-measure decides whether it is needed); importing the measured prototype (the rule is built on the shared scanner).
 
-### Phase 3 — Live check  · status: todo
+### Phase 3 — Live check  · status: done
 
 **Blocked by:** G1 — Phase 2's checkpoint is in `~/.claude` on natedev.
 
