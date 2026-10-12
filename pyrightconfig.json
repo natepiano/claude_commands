@@ -148,6 +148,13 @@
       ]
     },
     {
+      "root": "scripts/bevy_upgrade",
+      "extraPaths": [
+        "scripts/bevy_upgrade",
+        "scripts/production"
+      ]
+    },
+    {
       "root": "."
     }
   ]
