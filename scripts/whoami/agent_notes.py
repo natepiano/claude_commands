@@ -32,8 +32,8 @@ import five_hour
 import note_file
 from note_file import FIELD, Note
 from agent_accounts import (ClaudeAccountSelection, ClaudeDirectorySource, CodexHomeSource, EASTERN, Report,
-                            codex_email_on_disk, codex_home, codex_home_display, codex_homes,
-                            codex_report_in_use, live_reports)
+                            codex_email_on_disk, codex_home_display, codex_homes,
+                            codex_report_in_use, live_reports, seats_home as resolve_seats_home)
 from quota_alert import AgentNote, alert, blocked, current_session, refresh
 from run_out import READINGS_LOG
 import usage_store
@@ -178,6 +178,7 @@ def append_readings(readings: list[StoredReading], checked_at: datetime) -> None
 def apply(
     notes: list[Note], account: Report, checked_at: datetime,
     activity: AccountActivity = OBSERVED_ACCOUNT_ACTIVITY,
+    *, multiple_codex_homes: bool = False,
 ) -> list[str]:
     """Write the matching login's quota independently of its launch-role activity."""
     messages: list[str] = []
@@ -241,7 +242,7 @@ def apply(
         messages.append(f"{account.tool}: no note has login {account.email}")
     if account.problem or account.quota_problem:
         tool = account.tool
-        if (tool.lower() == "codex" and len(codex_homes()) > 1
+        if (tool.lower() == "codex" and multiple_codex_homes
                 and (account.problem or account.email is None)
                 and isinstance(account.source, CodexHomeSource)):
             tool += f" ({codex_home_display(account.source.home)})"
@@ -253,15 +254,17 @@ def update() -> list[str]:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.accounts import accounts
 
-    return update_for_selection(accounts.claude_account_selection())
+    seats_home = resolve_seats_home()
+    return update_for_selection(accounts.claude_account_selection(), seats_home)
 
 
-def update_for_selection(selection: ClaudeAccountSelection) -> list[str]:
+def update_for_selection(selection: ClaudeAccountSelection, seats_home: Path) -> list[str]:
     """Use one run's role identities for every note and live report."""
     notes = note_file.read_notes()
     if not notes:
         return [f"no agent notes in {note_file.AGENTS_DIR}"]
-    reports = asyncio.run(live_reports(selection))
+    multiple_codex_homes = len(codex_homes(seats_home)) > 1
+    reports = asyncio.run(live_reports(selection, seats_home))
     checked_at = datetime.now(timezone.utc)
     messages: list[str] = []
     try:
@@ -276,21 +279,20 @@ def update_for_selection(selection: ClaudeAccountSelection) -> list[str]:
             if note.tool == "claude" and (login := note.get("login"))
             and selection.roles_for_login(login)
         ))
-    codex_activity: AccountActivity = ObservedAccountActivity()
-    if len(codex_homes()) > 1:
-        in_use_login = codex_email_on_disk(codex_home())
-        codex_activity = (RoleAccountActivity(frozenset({in_use_login.casefold()}))
-                          if in_use_login else UnknownAccountActivity())
+    in_use_login = codex_email_on_disk(seats_home)
+    codex_activity: AccountActivity = (RoleAccountActivity(frozenset({in_use_login.casefold()}))
+                                      if in_use_login else UnknownAccountActivity())
     for account in reports:
         messages += apply(
             notes, account, checked_at,
             activity if account.tool.lower() == "claude" else codex_activity,
+            multiple_codex_homes=multiple_codex_homes,
         )
     try:
         # The existing 5-hour watcher has one episode per tool. Keep its default
         # Claude input and the Codex home in use; weekly episodes belong to quota_alert.
         watch_reports = [report for report in reports
-                         if (report.tool.lower() != "codex" or codex_report_in_use(report))
+                         if (report.tool.lower() != "codex" or codex_report_in_use(report, seats_home))
                          and (report.tool.lower() != "claude" or not selection.multiple_accounts
                               or (report.source.directory == Path.home() / ".claude"
                                   if isinstance(report.source, ClaudeDirectorySource)
@@ -323,7 +325,8 @@ def main() -> None:
     from scripts.accounts import accounts
 
     selection = accounts.claude_account_selection()
-    for line in update_for_selection(selection):
+    seats_home = resolve_seats_home()
+    for line in update_for_selection(selection, seats_home):
         print(line)
     notes: list[AgentNote] = list(note_file.read_notes())
     for line in (refresh(notes, current_session(), selection=selection) if sys.argv[1:]
