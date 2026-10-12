@@ -4,14 +4,17 @@
 Usage: proposals_table.py [--production <production doc>]
 
 Without `--production`, the doc is the one held by the update timer of the calling session
-(`CLAUDE_CODE_SESSION_ID`). Three sources, in this order:
+(`CLAUDE_CODE_SESSION_ID`). Four sources, in this order:
 
-  1. the plan backlog: ledger lines ending `proposed` or `deferred`;
-  2. proposal docs: `docs/plans/proposal-*.md` in the trunk and unit worktrees, while the doc's
+  1. the production's proposals index: `index.md` in the folder its doc's `Proposals` line
+     names, every row whose Status is not closed;
+  2. the plan backlog: ledger lines ending `proposed` or `deferred`;
+  3. proposal docs: `docs/plans/proposal-*.md` in the trunk and unit worktrees, while the doc's
      status line still says PROPOSAL;
-  3. add-ons: the entries each unit's runs hold for the user's `next` or `drop`.
+  4. add-ons: the entries each unit's runs hold for the user to build, save for later or drop.
 
-It reads only, and writes nothing.
+Each row says what the change is and what the user can do about it. It reads only, and writes
+nothing.
 """
 from __future__ import annotations
 
@@ -24,7 +27,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 import showrunners
-from add_unit import Refusal
+from add_unit import Refusal, production_field
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
 import phase_table
@@ -34,22 +37,42 @@ BACKLOG_DIR = Path(os.environ.get("PLAN_BACKLOG_DIR") or Path.home() / ".local/s
 # A run keeps its pending add-ons here, in a directory named by its run id.
 SESSION_ROOT = Path("/tmp/claude/delegate")
 PENDING_NAME = "next_items_pending.md"
-ADD_ON_STATE = "add-on: next or drop"
+INDEX_NAME = "index.md"
+# The Production Context line that names the folder a production keeps its proposals in.
+PROPOSALS_FIELD = "Proposals"
+# A state says what the user can do, in their terms.
+REVIEW_STATE = "waiting for your review"
+ADD_ON_STATE = "your call: build, save for later, or drop"
+BACKLOG_STATES = {"proposed": REVIEW_STATE, "deferred": "deferred until you ask for it"}
+# An index row whose Status begins with one of these words is closed, and is not shown.
+CLOSED_WORDS = frozenset({
+    "done", "built", "shipped", "merged", "declined", "dropped", "rejected", "superseded", "withdrawn", "closed",
+})
+UNTITLED_ADD_ON = "an add-on with no description"
 NONE = "—"
-# A title longer than this is cut, so one long sentence cannot widen the whole table.
-TITLE_WIDTH = 90
+# A cell longer than its width is cut, so one long sentence cannot widen the whole table.
+TITLE_WIDTH = 110
+STATE_WIDTH = 140
 
 BACKLOG_LINE = re.compile(r"^- (?P<date>\d{4}-\d{2}-\d{2}) (?P<title>.+) — (?P<state>proposed|deferred)\s*$")
 # The file a backlog line names, as `(file.md)` or `([[file]])`, closes its title.
 BACKLOG_FILE = re.compile(r"\s*\((?:\[\[(?P<link>[^\]]+)\]\]|(?P<file>[^()]+\.md))\)$")
 BY_LINE = re.compile(r"(?:Proposed|Written) (?P<date>\d{4}-\d{2}-\d{2}) by (?P<who>[^.,(]+)")
 STATUS_LINE = re.compile(r"^>\s*\*\*Status:(?P<status>[^*]*)")
-# A pending add-on is one top-level list item. Units write its title in three ways: on a
-# `Title:` line under `- Action: add`, as the item's bold lead, or after the action word.
+# A pending add-on is one top-level list item with its fields on the lines below it. Units
+# write its title in three ways: on a `Title:` line, as the item's bold lead, or after the
+# action word. The action word alone is never a title.
 ADD_ON_ENTRY = re.compile(r"^- (?P<text>.+)$")
-ADD_ON_TITLE = re.compile(r"^\s+(?:- )?Title:\s*(?P<title>.+)$")
-ADD_ON_BOLD = re.compile(r"^\*\*(?P<title>.+?)\*\*")
+ADD_ON_FIELD = re.compile(r"^\s+(?:- )?(?P<name>[A-Z][A-Za-z ]*):\s*(?P<value>.+)$")
+ADD_ON_BOLD = re.compile(r"^\*\*(?P<lead>.+?)\*\*(?P<rest>.*)$")
 ADD_ON_ACTION = re.compile(r"^(?:add|change|remove)\s*[·:]\s*", re.IGNORECASE)
+ACTION_WORDS = frozenset({"add", "change", "remove"})
+# Where an entry with no title finds its words, in this order.
+DESCRIBING_FIELDS = ("proposed", "need", "why needed", "why")
+SENTENCE_END = re.compile(r"(?<=[.!?])\s")
+# A Markdown link, which an index writes its proposal's title as.
+LINK = re.compile(r"\[(?P<text>[^\]]+)\]\([^)]*\)")
+CELL_EDGE = re.compile(r"(?<!\\)\|")
 
 
 class Row(NamedTuple):
@@ -91,8 +114,56 @@ def backlog_rows(backlog: Path) -> list[Row]:
             title = title[: named.start()]
             file_name = named["file"] or f"{named['link']}.md"
             proposer, _ = by_line(read_lines(backlog / file_name)[:12])
-        rows.append(Row(proposer or "plan backlog", title, found["date"], found["state"]))
+        rows.append(Row(proposer or "plan backlog", title, found["date"], BACKLOG_STATES[found["state"]]))
     return rows
+
+
+def table_cells(line: str) -> list[str]:
+    return [cell.strip() for cell in CELL_EDGE.split(line.strip().removeprefix("|").removesuffix("|"))]
+
+
+def closed(status: str) -> bool:
+    word = re.match(r"[A-Za-z]+", status)
+    return word is not None and word[0].lower() in CLOSED_WORDS
+
+
+def index_row(cells: dict[str, str]) -> Row | None:
+    """The row of one index line, or None once its Status is closed."""
+    status = cells.get("status", "")
+    if closed(status):
+        return None
+    title = LINK.sub(lambda found: found["text"], cells.get("proposal", ""))
+    summary = cells.get("summary", "").split(";")[0].strip()
+    state = REVIEW_STATE if status in ("", "waiting for review") else status
+    return Row(cells.get("unit") or NONE, f"{title} — {summary}" if summary else title, cells.get("date") or NONE, state)
+
+
+def index_rows(index: Path) -> list[Row]:
+    """The open rows of a production's proposals index: a table read by its column names."""
+    rows: list[Row] = []
+    columns: list[str] = []
+    for line in read_lines(index):
+        if not line.lstrip().startswith("|"):
+            columns = []
+            continue
+        cells = table_cells(line)
+        if not columns:
+            names = [cell.lower() for cell in cells]
+            columns = names if {"proposal", "status"} <= set(names) else []
+        elif any(cell.strip("-: ") for cell in cells):
+            row = index_row(dict(zip(columns, cells)))
+            if row is not None:
+                rows.append(row)
+    return rows
+
+
+def proposals_index(doc: Path) -> Path | None:
+    """`index.md` in the folder the production doc's Proposals line names, or None when it names none."""
+    try:
+        folder = Path(production_field(read_lines(doc), PROPOSALS_FIELD)).expanduser()
+    except Refusal:
+        return None
+    return (folder if folder.is_absolute() else worktree_of(doc) / folder) / INDEX_NAME
 
 
 def doc_row(path: Path, owner: str) -> Row | None:
@@ -105,7 +176,7 @@ def doc_row(path: Path, owner: str) -> Row | None:
     proposer, date = by_line(lines[:12])
     if not date:
         date = file_date(path)
-    return Row(proposer or owner, heading.removeprefix("Proposal:").strip(), date, "proposed")
+    return Row(proposer or owner, heading.removeprefix("Proposal:").strip(), date, REVIEW_STATE)
 
 
 def doc_rows(worktrees: list[Worktree]) -> list[Row]:
@@ -128,21 +199,29 @@ def file_date(path: Path) -> str:
         return NONE
 
 
+def head_title(text: str) -> str:
+    """The title an entry's first line holds, or nothing when that line is only its action."""
+    bold = ADD_ON_BOLD.match(text)
+    if bold is not None:
+        lead = bold["lead"].strip()
+        text = bold["rest"].lstrip(" —–-:·") if lead.lower() in ACTION_WORDS else lead
+    if text.startswith("Action:"):
+        return ""
+    title = ADD_ON_ACTION.sub("", text.strip()).split(" · ")[0].strip()
+    return "" if title.lower() in ACTION_WORDS else title
+
+
 def add_on_titles(lines: list[str]) -> list[str]:
-    """The title of each entry of a pending add-on list, in the list's order."""
+    """What each entry of a pending add-on list is, in the list's order: its title, else the
+    first sentence of the field that describes it."""
     starts = [index for index, line in enumerate(lines) if ADD_ON_ENTRY.match(line)]
     titles: list[str] = []
     for start, end in zip(starts, [*starts[1:], len(lines)]):
-        text = lines[start][2:].strip()
-        bold = ADD_ON_BOLD.match(text)
-        if text.startswith("Action:"):
-            title = next((found["title"] for line in lines[start + 1:end] if (found := ADD_ON_TITLE.match(line))), "")
-        elif bold is not None:
-            title = bold["title"]
-        else:
-            title = text
-        title = ADD_ON_ACTION.sub("", title.strip()).split(" · ")[0]
-        titles.append(title.strip() or text)
+        fields = {found["name"].strip().lower(): found["value"].strip()
+                  for line in lines[start + 1:end] if (found := ADD_ON_FIELD.match(line))}
+        described = next((SENTENCE_END.split(fields[name], maxsplit=1)[0].rstrip(".")
+                          for name in DESCRIBING_FIELDS if name in fields), "")
+        titles.append(fields.get("title") or head_title(lines[start][2:].strip()) or described or UNTITLED_ADD_ON)
     return titles
 
 
@@ -182,14 +261,17 @@ def worktree_of(plan: Path) -> Path:
     return plan.parent.parent.parent
 
 
-def escaped(cell: str) -> str:
+def escaped(cell: str, width: int) -> str:
     text = " ".join(cell.split()).replace("|", "\\|")
-    return text if len(text) <= TITLE_WIDTH else text[: TITLE_WIDTH - 1].rstrip() + "…"
+    return text if len(text) <= width else text[: width - 1].rstrip() + "…"
 
 
 def table(rows: list[Row]) -> str:
     lines = ["| Proposed by | Proposal | Date | State |", "| --- | --- | --- | --- |"]
-    lines.extend("| " + " | ".join(escaped(cell) for cell in row) + " |" for row in rows)
+    for row in rows:
+        cells = (escaped(row.proposer, TITLE_WIDTH), escaped(row.proposal, TITLE_WIDTH), row.date,
+                 escaped(row.state, STATE_WIDTH))
+        lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 
@@ -197,7 +279,9 @@ def open_rows(doc: Path, records: dict[str, object]) -> list[Row]:
     plans = unit_plan_paths(records)
     worktrees = [Worktree("trunk", worktree_of(doc))]
     worktrees.extend(Worktree(unit, worktree_of(plan)) for unit, plan in plans.items())
-    rows = backlog_rows(BACKLOG_DIR) + doc_rows(worktrees)
+    index = proposals_index(doc)
+    rows = index_rows(index) if index is not None else []
+    rows += backlog_rows(BACKLOG_DIR) + doc_rows(worktrees)
     for unit, plan in plans.items():
         rows.extend(unit_add_on_rows(unit, plan))
     return rows

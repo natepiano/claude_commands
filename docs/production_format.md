@@ -80,6 +80,10 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
 - **UX guide:** <path to the project's UX rules, e.g. `~/rust/hanadocs/ux`>; omit when
   nothing users see changes
+- **Proposals:** <folder for finished proposals, e.g. `~/rust/hanadocs/proposals`>; its
+  `index.md` holds one row for each, `| Date | Proposal | Unit | Summary | Status |`,
+  added by the showrunner, and `/showrunner:proposals` shows every row whose Status is
+  not closed; omit when the production keeps no such folder
 
 The showrunner's session name is not in the doc: a name can change, so it is
 looked up when needed. `~/.claude/scripts/lib/py
