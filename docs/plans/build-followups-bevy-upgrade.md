@@ -142,7 +142,7 @@ okay - we should have some kind of note for tracking the upgrade so your report 
 
 **Ruled out:** a pause between crates.io requests — not needed at this volume.
 
-### Phase 3 — For a dependency with no release on the target, `check` records its GitHub branch and port pull requests  · status: todo
+### Phase 3 — For a dependency with no release on the target, `check` records its GitHub branch and port pull requests  · status: done
 
 #### Work Order
 
@@ -175,7 +175,7 @@ def pull_state(fetch: Fetch, repository: str, number: int) -> tuple[Literal["ope
 
 - `http_fetch` raises `NotFound` for HTTP 404, with the text it has today (`<host>: HTTP 404`), and `FetchFailure` for every other fault. `fixture_fetch` raises `NotFound` for a URL whose fixture value is JSON `null`. `github_repository` is today's private `_repository` parse for a string, made public; `crate_info` uses it.
 - `default_branch` reads `https://api.github.com/repos/<repository>` (`default_branch`). `branch_head` reads `https://api.github.com/repos/<repository>/commits/<branch>` (`sha`, `commit.committer.date`).
-- `manifest_requirement` reads `https://raw.githubusercontent.com/<repository>/<rev>/Cargo.toml` and parses it with `tomllib`. It looks at `[dependencies]` and `[workspace.dependencies]` keys that are `bevy` or in `bevy_names` (the rule of `release_requirement`: `bevy` is read whether or not the lockfile names it). A string value is the requirement; a table gives its `version`; a table with `workspace = true` takes the requirement from `[workspace.dependencies]`; a table with only `path` or `git` is skipped. It returns the requirement of `bevy` when found, else the first by sorted key, else `""`.
+- `manifest_requirement` reads `https://raw.githubusercontent.com/<repository>/<rev>/Cargo.toml` and parses it with `tomllib`. It looks at `[dependencies]` and `[workspace.dependencies]` keys that are `bevy` or in `bevy_names` (the rule of `release_requirement`: `bevy` is read whether or not the lockfile names it). A string value is the requirement; a table gives its `version`; a table with `workspace = true` takes the requirement from `[workspace.dependencies]`; a table with only `path` or `git` is skipped. It returns the requirement of `bevy` when found, else the first by sorted key, else `""`. A manifest URL that answers not found gives `""` too: a repository with no root manifest names no requirement.
 - `port_items` reads `https://api.github.com/repos/<repository>/issues?state=all&since=<since>T00:00:00Z&sort=updated&direction=desc&per_page=100` and keeps the items whose title contains `<target>` as a substring and whose `created_at` date is not before `since`. An item with a `pull_request` key is a `pr`. The filter runs here and not in GitHub's search, because the search does not match `0.20` inside `v0.20.0` (checked 2026-10-12 against Multirious/bevy_tween pull request 97, "Migrate to Bevy v0.20.0").
 - `pull_state` reads `https://api.github.com/repos/<repository>/pulls/<number>` and returns the state (`merged` when `merged` is true) and the head as `<head.ref> @ <first 7 of head.sha>`.
 
@@ -194,22 +194,23 @@ class BranchRead(TypedDict):
     rev: str                     # its head commit
     committed: str               # YYYY-MM-DD of that commit
     requirement: str             # the Bevy requirement in that commit's manifest; "" when it names none
+    repository: str              # the owner/name this branch and the entry's items were read from
 class Entry(TypedDict):          # added and widened fields
     crates_io: CratesIoUnread | CratesIoRead | CratesIoUnlisted
     branch: BranchUnread | BranchRead
     items: list[Item]
 ```
 
-`load` and `apply_pins` give a missing `branch` `{"status": "unread"}` and missing `items` `[]`; a field that is present is validated, the `unlisted` form of `crates_io` included.
+`load` gives a missing `branch` `{"status": "unread"}` and missing `items` `[]`, and `apply_pins` gives a new entry the same; a field that is present is validated, the `unlisted` form of `crates_io` included.
 
 `upgrade_check.py`: after the crates.io step, an entry reads GitHub when its `crates_io` is read with `ready` `""`, or is unlisted, and its `repository` is not `""`.
 
-- A crate crates.io does not list: when `crate_info` raises `NotFound`, the entry's `crates_io` becomes `unlisted` with this pass's `checked` and, as `repository`, `github_repository(<pin url>)` for a git pin and `""` for any other pin. Its `error` is cleared and it does not count as failed. `NotFound` from any other request is a failure like every `FetchFailure`. An unlisted entry asks crates.io once on every check, since the crate may be published later.
+- A crate crates.io does not list: when `crate_info` raises `NotFound`, the entry's `crates_io` becomes `unlisted` with this pass's `checked` and, as `repository`, `github_repository(<pin url>)` for a git pin and `""` for any other pin. Its `error` is cleared and it does not count as failed. `NotFound` from any other request is a failure like every `FetchFailure`, except a missing manifest and a stored branch name that is gone, both below. An unlisted entry asks crates.io once on every check, since the crate may be published later.
 
 - The crates.io phase's skip rule comes first and covers GitHub too: an entry that is `done`, a patched Bevy crate or path-pinned makes no request of any kind, whatever an earlier check stored for it. An entry with `ready`, or with no `repository`, makes no GitHub request. In each case its `branch` and `items` are left as they are.
-- `default_branch` once: skipped when `branch` is read, whose `name` is kept.
+- `default_branch` once per repository: skipped when `branch` is read and its `repository` is this check's, whose `name` is kept. Stored `branch` and `items` read from another repository are not reused: the entry reads GitHub as if `branch` were unread and no item were stored. When `branch_head` answers not found for a stored name, `default_branch` is read again and `branch_head` asked once more with that name; a stored `rev` equal to the new head still keeps its `requirement`.
 - `branch_head` every check. `manifest_requirement` only when the head's `rev` differs from the stored `rev`.
-- `port_items` every check, with the target's `since` when `target_bevy` is `pre-release` or `released`, else the record's `started` date. `pull_state` only for a `pr` whose `updated` differs from the stored item's, or that is new; an unchanged `pr` keeps its stored `state` and `head`.
+- `port_items` every check, with the target's `since` when `target_bevy` is `pre-release` or `released`, else the record's `started` date. `pull_state` only for a `pr` whose `updated` differs from the stored item's, or that is new; an unchanged `pr` keeps its stored `state` and `head`. A stored item whose number the answer lacks is kept as stored, because the answer is one page of 100.
 - A git pin's own requirement needs no request: `Entry.bevy` already comes from the lockfile.
 - The failure rule and the budget of the crates.io step cover these requests too: one `FetchFailure` leaves the whole entry as it was, this pass's crates.io facts included, and sets `error`.
 
@@ -230,11 +231,12 @@ The command file gains: when a row reads `ask the user: git pin?`, ask the user 
 - `scripts/bevy_upgrade/test_upgrade_check.py` — the GitHub step's requests and failures.
 - `scripts/bevy_upgrade/test_upgrade_record.py` — the branch and item fields' starting values and validation.
 - `scripts/bevy_upgrade/test_upgrade_report.py` — the new states and cells.
+- `scripts/bevy_upgrade/test_cli.py` — GitHub answers in the CLI fixtures, and one check that prints the Git cell.
 - `commands/showrunner/bevy_upgrade.md` — the rule for asking the user once.
 
 **Seats:** 1 writer + 1 tester — the same four modules as the crates.io phase, each extended.
 - `impl` — `upstream.py`, `upgrade_check.py`, `upgrade_record.py`, `upgrade_report.py`, `commands/showrunner/bevy_upgrade.md`.
-- `test` — the additions to `test_upstream.py`, `test_upgrade_check.py`, `test_upgrade_record.py` and `test_upgrade_report.py`, from the Spec, with the recording fetcher and the fake clock the crates.io phase's tests use.
+- `test` — the additions to `test_upstream.py`, `test_upgrade_check.py`, `test_upgrade_record.py`, `test_upgrade_report.py` and `test_cli.py`, from the Spec, with the recording fetcher and the fake clock the crates.io phase's tests use.
 
 **Constraints from prior phases:** the crates.io phase built `Fetch`, `FetchFailure`, `http_fetch` and `fixture_fetch`; `crate_info`, whose `repository` is `owner/name` or `""`; `run_check(record, pins, fetch, clock) -> CheckPass` with its per-entry failure rule, its 180 s budget read before every request, and its entry order; `target_fit(requirement, target) -> TargetFit` (`on target`, `off target`, `unreadable`); `Entry.crates_io` (`CratesIoUnread | CratesIoRead`, the latter holding `checked`, `releases`, `newest`, `ready`, `repository`) and `Entry.error`; and `Record.target_bevy`, tagged by `status`, with `since` on `pre-release` and `released`.
 - `upgrade_report.state` returns `re-vendor` for a path pin and `no port yet` for a read entry with no `ready`; this phase refines the second.

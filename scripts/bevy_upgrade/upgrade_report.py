@@ -6,7 +6,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 from pins import Pin
-from upgrade_record import Entry, Record, on_target
+from upgrade_record import Entry, Record, on_target, target_fit
 
 State = Literal["git ready", "release ready", "re-vendor", "port in PR", "no port yet", "not checked", "done"]
 STATE_ORDER: tuple[State, ...] = (
@@ -20,9 +20,16 @@ def state(entry: Entry, target: str) -> State:
     if entry["patched_bevy"] or entry["pin"]["source"] == "path":
         return "re-vendor"
     facts = entry["crates_io"]
+    if facts["status"] == "read" and facts["ready"]:
+        return "release ready"
+    branch = entry["branch"]
+    if branch["status"] == "read" and target_fit(branch["requirement"], target) == "on target":
+        return "git ready"
+    if any(item["kind"] == "pr" and item["state"] == "open" for item in entry["items"]):
+        return "port in PR"
     if facts["status"] == "unread":
         return "not checked"
-    return "release ready" if facts["ready"] else "no port yet"
+    return "no port yet"
 
 
 def _pin(pin: Pin) -> str:
@@ -48,12 +55,31 @@ def _crates_io(entry: Entry, target: str) -> str:
         cell = "—"
     elif facts["status"] == "unread":
         cell = "—" if on_target(entry["bevy"], target) else "not checked"
+    elif facts["status"] == "unlisted":
+        cell = "not on crates.io"
     else:
         cell = _release(facts["newest"], facts["releases"].get(facts["newest"], ""))
         if facts["ready"] and facts["ready"] != facts["newest"]:
             cell += f" → {_release(facts['ready'], facts['releases'].get(facts['ready'], ''))}"
     if entry["error"]:
         cell += f"; last check failed: {entry['error']}"
+    return cell
+
+
+def _git(entry: Entry) -> str:
+    branch = entry["branch"]
+    facts = entry["crates_io"]
+    if branch["status"] == "read":
+        cell = _release(f"{branch['name']} @ {branch['rev'][:7]}", branch["requirement"])
+    elif facts["status"] != "unread" and not facts["repository"]:
+        cell = "not on GitHub"
+    else:
+        cell = "—"
+    for item in sorted(entry["items"], key=lambda item: item["number"], reverse=True):
+        if item["kind"] == "pr":
+            cell += f"; PR #{item['number']} {item['state']} ({item['head']})"
+        else:
+            cell += f"; issue #{item['number']} {item['state']}"
     return cell
 
 
@@ -70,6 +96,19 @@ def _next(entry: Entry, target: str, current: State) -> str:
         facts = entry["crates_io"]
         if facts["status"] == "read":
             return f"bump to {facts['ready']}"
+    if current == "git ready":
+        branch = entry["branch"]
+        answer = entry["answer"]
+        if answer is None:
+            return "ask the user: git pin?"
+        if answer["answer"] == "declined":
+            return f"wait for a release (declined {answer['at']})"
+        if branch["status"] == "read":
+            return f"pin git rev {branch['rev'][:7]} (approved {answer['at']})"
+    if current == "port in PR":
+        number = max(item["number"] for item in entry["items"]
+                     if item["kind"] == "pr" and item["state"] == "open")
+        return f"wait for PR #{number}"
     return "wait" if current == "no port yet" else "run check"
 
 
@@ -104,7 +143,7 @@ def _row(name: str, entry: Entry, target: str) -> str:
         pin += f" on Bevy {entry['bevy']}"
     current = state(entry, target)
     next_step = _next(entry, target, current)
-    return f"| {_cell(dependency)} | {_cell(pin)} | {_cell(_crates_io(entry, target))} | — | {current} | {_cell(next_step)} |"
+    return f"| {_cell(dependency)} | {_cell(pin)} | {_cell(_crates_io(entry, target))} | {_cell(_git(entry))} | {current} | {_cell(next_step)} |"
 
 
 def table(record: Record, zone: ZoneInfo, now: datetime) -> str:

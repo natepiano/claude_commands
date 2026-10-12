@@ -35,7 +35,12 @@ class CannedFetch:
         self.urls.append(url)
         if url not in self.bodies:
             raise upstream.FetchFailure(f"{urlsplit(url).hostname}: no fixture")
-        return json.dumps(self.bodies[url]).encode()
+        body = self.bodies[url]
+        if isinstance(body, upstream.FetchFailure):
+            raise body
+        if body is None:
+            raise upstream.NotFound(f"{urlsplit(url).hostname}: HTTP 404")
+        return body.encode() if isinstance(body, str) else json.dumps(body).encode()
 
 
 @final
@@ -195,6 +200,140 @@ class UpstreamTests(unittest.TestCase):
                 self.assertTrue(str(caught.exception).startswith("crates.io: "))
                 if isinstance(error, HTTPError):
                     self.assertEqual(str(caught.exception), "crates.io: HTTP 503")
+
+    def test_http_not_found_is_distinct_from_other_http_failures(self) -> None:
+        url = f"{API}/missing"
+        for code in (404, 500):
+            with self.subTest(code=code), mock.patch("urllib.request.urlopen",
+                    side_effect=HTTPError(url, code, "failure", Message(), None)):
+                with self.assertRaises(upstream.FetchFailure) as caught:
+                    _ = upstream.http_fetch(url)
+                self.assertEqual(str(caught.exception), f"crates.io: HTTP {code}")
+                self.assertEqual(isinstance(caught.exception, upstream.NotFound), code == 404)
+
+    def test_null_fixture_means_not_found_and_missing_fixture_is_failure(self) -> None:
+        url = f"{API}/missing"
+        path = self.root / "fixtures.json"
+        _ = path.write_text(json.dumps({url: None}), encoding="utf-8")
+        fetch = upstream.fixture_fetch(path)
+        with self.assertRaises(upstream.NotFound) as caught:
+            _ = fetch(url)
+        self.assertEqual(str(caught.exception), "crates.io: HTTP 404")
+        with self.assertRaises(upstream.FetchFailure) as missing:
+            _ = fetch(f"{API}/unknown")
+        self.assertNotIsInstance(missing.exception, upstream.NotFound)
+
+    def test_public_repository_parser_removes_suffix_and_trailing_path(self) -> None:
+        for url, expected in (
+            ("https://github.com/owner/project.git/tree/main", "owner/project"),
+            ("https://github.com/owner/project/", "owner/project"),
+            ("https://gitlab.com/owner/project", ""), ("https://github.com/owner", ""), ("", ""),
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(upstream.github_repository(url), expected)
+
+    def test_default_branch_and_commit_head_use_repository_urls(self) -> None:
+        base = "https://api.github.com/repos/owner/project"
+        fetch = CannedFetch({base: {"default_branch": "main"},
+                            f"{base}/commits/main": {"sha": "abcdef0123456789",
+                                "commit": {"committer": {"date": "2026-10-11T12:34:56Z"}}}})
+        self.assertEqual(upstream.default_branch(fetch, "owner/project"), "main")
+        self.assertEqual(upstream.branch_head(fetch, "owner/project", "main"),
+                         upstream.BranchHead("abcdef0123456789", "2026-10-11"))
+        self.assertEqual(fetch.urls, [base, f"{base}/commits/main"])
+
+    def test_manifest_requirement_prefers_bevy_and_resolves_workspace_inheritance(self) -> None:
+        url = "https://raw.githubusercontent.com/owner/project/abcdef/Cargo.toml"
+        manifests = (
+            ('[dependencies]\nbevy = "^0.20"\nbevy_ecs = "^0.19"\n', "^0.20"),
+            ('[dependencies]\nbevy = { workspace = true }\n'
+             + '[workspace.dependencies]\nbevy = { version = "~0.20.1" }\n', "~0.20.1"),
+            ('[workspace.dependencies]\nbevy = "=0.20.0"\n', "=0.20.0"),
+            ('[dependencies]\nbevy_ecs = { version = "^0.19" }\nbevy_app = "^0.20"\n', "^0.20"),
+            ('[dependencies]\nbevy = { path = "../bevy" }\n'
+             + 'bevy_ecs = { git = "https://example.invalid/bevy" }\nbevy_egui = "^0.20"\n', ""),
+        )
+        for manifest, expected in manifests:
+            with self.subTest(manifest=manifest):
+                fetch = CannedFetch({url: manifest})
+                self.assertEqual(upstream.manifest_requirement(fetch, "owner/project", "abcdef",
+                                 frozenset({"bevy_ecs", "bevy_app"})), expected)
+                self.assertEqual(fetch.urls, [url])
+
+    def test_invalid_manifest_is_a_host_qualified_fetch_failure(self) -> None:
+        url = "https://raw.githubusercontent.com/owner/project/abcdef/Cargo.toml"
+        fetch = CannedFetch({url: "[broken"})
+        with self.assertRaises(upstream.FetchFailure) as caught:
+            _ = upstream.manifest_requirement(fetch, "owner/project", "abcdef", frozenset({"bevy_ecs"}))
+        self.assertTrue(str(caught.exception).startswith("raw.githubusercontent.com: "))
+
+    def test_missing_manifest_names_no_requirement_but_server_failure_is_preserved(self) -> None:
+        url = "https://raw.githubusercontent.com/owner/project/abcdef/Cargo.toml"
+        fetch = CannedFetch({url: None})
+        self.assertEqual(upstream.manifest_requirement(fetch, "owner/project", "abcdef",
+                         frozenset({"bevy_ecs"})), "")
+        self.assertEqual(fetch.urls, [url])
+        fetch = CannedFetch({url: upstream.FetchFailure("raw.githubusercontent.com: HTTP 500")})
+        with self.assertRaises(upstream.FetchFailure) as caught:
+            _ = upstream.manifest_requirement(fetch, "owner/project", "abcdef", frozenset({"bevy_ecs"}))
+        self.assertNotIsInstance(caught.exception, upstream.NotFound)
+        self.assertEqual(str(caught.exception), "raw.githubusercontent.com: HTTP 500")
+        self.assertEqual(fetch.urls, [url])
+
+    def test_port_items_filter_title_substrings_and_creation_date(self) -> None:
+        url = ("https://api.github.com/repos/owner/project/issues?state=all&since=2026-10-01T00:00:00Z"
+               "&sort=updated&direction=desc&per_page=100")
+        def item(number: int, title: str, created: str, pr: bool = False) -> dict[str, object]:
+            result: dict[str, object] = {"number": number, "title": title, "state": "open",
+                "created_at": created, "updated_at": "2026-10-12T00:00:00Z"}
+            if pr:
+                result["pull_request"] = {"url": "unused"}
+            return result
+        fetch = CannedFetch({url: [
+            item(7, "Migrate to Bevy v0.20.0", "2026-10-01T00:00:00Z", True),
+            item(6, "Port to 0.20", "2026-09-30T23:59:59Z"),
+            item(5, "Unrelated work", "2026-10-12T00:00:00Z"),
+            item(4, "Track 0.20 upgrade", "2026-10-02T00:00:00Z"),
+        ]})
+        self.assertEqual(upstream.port_items(fetch, "owner/project", "0.20", "2026-10-01"), [
+            {"number": 7, "kind": "pr", "state": "open", "title": "Migrate to Bevy v0.20.0",
+             "updated": "2026-10-12T00:00:00Z", "head": ""},
+            {"number": 4, "kind": "issue", "state": "open", "title": "Track 0.20 upgrade",
+             "updated": "2026-10-12T00:00:00Z", "head": ""},
+        ])
+        self.assertEqual(fetch.urls, [url])
+
+    def test_pull_state_reports_merged_closed_and_open_with_short_head(self) -> None:
+        url = "https://api.github.com/repos/owner/project/pulls/7"
+        for state, merged, expected in (("closed", True, "merged"), ("closed", False, "closed"),
+                                         ("open", False, "open")):
+            with self.subTest(state=state, merged=merged):
+                fetch = CannedFetch({url: {"state": state, "merged": merged,
+                                          "head": {"ref": "port", "sha": "abcdef0123456789"}}})
+                self.assertEqual(upstream.pull_state(fetch, "owner/project", 7), (expected, "port @ abcdef0"))
+                self.assertEqual(fetch.urls, [url])
+
+    def test_github_missing_or_malformed_bodies_use_fetch_failure_boundary(self) -> None:
+        base = "https://api.github.com/repos/owner/project"
+        cases = (
+            (base, "branch"), (f"{base}/commits/main", "head"),
+            (f"{base}/pulls/7", "pull"),
+            (f"{base}/issues?state=all&since=2026-10-01T00:00:00Z&sort=updated&direction=desc&per_page=100", "items"),
+        )
+        bodies: tuple[object, ...] = ({}, "invalid JSON", None)
+        for url, lookup in cases:
+            for body in bodies:
+                with self.subTest(lookup=lookup, body=body):
+                    fetch = CannedFetch({url: body})
+                    with self.assertRaises(upstream.FetchFailure):
+                        if lookup == "branch":
+                            _ = upstream.default_branch(fetch, "owner/project")
+                        elif lookup == "head":
+                            _ = upstream.branch_head(fetch, "owner/project", "main")
+                        elif lookup == "pull":
+                            _ = upstream.pull_state(fetch, "owner/project", 7)
+                        else:
+                            _ = upstream.port_items(fetch, "owner/project", "0.20", "2026-10-01")
 
 
 if __name__ == "__main__":
