@@ -262,7 +262,7 @@ class FollowableRecord(TypedDict):
     thread_id: str
     status: Literal["done", "failed"]
     role: NotRequired[SeatRole]
-    context_tokens: NotRequired[int]
+    context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
 
 
@@ -275,7 +275,7 @@ class ActiveRecord(TypedDict):
     launcher_pid: NotRequired[int]
     port: NotRequired[int]
     role: NotRequired[SeatRole]
-    context_tokens: NotRequired[int]
+    context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
 
 
@@ -285,7 +285,7 @@ class StartingRecord(TypedDict):
     launcher_pid: NotRequired[int]
     port: NotRequired[int]
     role: NotRequired[SeatRole]
-    context_tokens: NotRequired[int]
+    context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
 
 
@@ -295,7 +295,7 @@ class WaitingCapacityRecord(TypedDict):
     launcher_pid: int
     port: NotRequired[int]
     role: NotRequired[SeatRole]
-    context_tokens: NotRequired[int]
+    context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
 
 
@@ -303,7 +303,7 @@ class ExhaustedRecord(TypedDict):
     thread_id: str
     status: Literal["capacity_exhausted"]
     role: NotRequired[SeatRole]
-    context_tokens: NotRequired[int]
+    context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
 
 
@@ -311,7 +311,7 @@ class EndedRecord(TypedDict):
     thread_id: str
     status: Literal["ended"]
     role: NotRequired[SeatRole]
-    context_tokens: NotRequired[int]
+    context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
 
 
@@ -379,6 +379,14 @@ class ContextSizeUnavailable:
 
 
 ContextSize = KnownContextSize | ContextSizeUnavailable
+
+
+@dataclass(frozen=True)
+class NotMeasuredSinceCompaction:
+    """Compaction finished, but the next turn has not measured the seat's size."""
+
+
+RecordedContextSize = KnownContextSize | NotMeasuredSinceCompaction | ContextSizeUnavailable
 
 
 def _roster_thread(value: object) -> RosterThread:
@@ -492,8 +500,10 @@ def _as_float(value: object, fallback: float) -> float:
     return float(value) if isinstance(value, (int, float)) else fallback
 
 
-def _context_size_from_record(value: object) -> ContextSize:
+def _context_size_from_record(value: object) -> RecordedContextSize:
     tokens = _as_dict(value).get("context_tokens")
+    if tokens == "not_measured_since_compaction":
+        return NotMeasuredSinceCompaction()
     if isinstance(tokens, int) and tokens >= 0:
         return KnownContextSize(tokens)
     return ContextSizeUnavailable()
@@ -738,9 +748,7 @@ def _write_roster_record(handle: TextIO, roster: dict[str, object], name: str,
                         record: ThreadRecord) -> None:
     previous = _as_dict(roster.get(name))
     stored = dict(record)
-    context_tokens = record.get("context_tokens", previous.get("context_tokens"))
-    if isinstance(context_tokens, int) and context_tokens >= 0:
-        stored["context_tokens"] = context_tokens
+    size = _context_size_from_record(record if "context_tokens" in record else previous)
     role = record.get("role", previous.get("role"))
     if isinstance(role, str) and role in SEAT_ROLES:
         stored["role"] = role
@@ -762,8 +770,10 @@ def _write_roster_record(handle: TextIO, roster: dict[str, object], name: str,
         and record["status"] != "ended"
     ):
         stored = dict(previous)
-        if isinstance(context_tokens, int) and context_tokens >= 0:
-            stored["context_tokens"] = context_tokens
+    if isinstance(size, KnownContextSize):
+        stored["context_tokens"] = size.tokens
+    elif isinstance(size, NotMeasuredSinceCompaction):
+        stored["context_tokens"] = "not_measured_since_compaction"
     roster[name] = stored
     _ = handle.seek(0)
     _ = handle.truncate()
@@ -2077,7 +2087,7 @@ def command_compact(args: argparse.Namespace) -> int:
         )
         return 2
     before = _context_size_from_record(record)
-    if isinstance(before, ContextSizeUnavailable):
+    if not isinstance(before, KnownContextSize):
         print(
             f"codex_mesh: {name}: no recorded context size; compact refused",
             file=sys.stderr,
@@ -2110,17 +2120,22 @@ def command_compact(args: argparse.Namespace) -> int:
             after = _compact_thread(client, state.thread_id)
         except CompactionTimedOut as timeout:
             return _abandon_compaction(client, name, state.thread_id, timeout)
+        size: RecordedContextSize = after if after.tokens > 0 else NotMeasuredSinceCompaction()
+        compacted_record: FollowableRecord = {"thread_id": state.thread_id, "status": state.status}
+        if isinstance(size, KnownContextSize):
+            compacted_record["context_tokens"] = size.tokens
+        else:
+            compacted_record["context_tokens"] = "not_measured_since_compaction"
         _ = _update_roster_if_expected(
             session_dir,
             name,
-            {
-                "thread_id": state.thread_id,
-                "status": state.status,
-                "context_tokens": after.tokens,
-            },
+            compacted_record,
             RosterOnThread(state.thread_id),
         )
-        print(f"compacted {name}: {before.tokens} -> {after.tokens} tokens")
+        if isinstance(size, KnownContextSize):
+            print(f"compacted {name}: {before.tokens} -> {size.tokens} tokens")
+        else:
+            print(f"compacted {name}: {before.tokens} tokens, size not measured until its next turn")
         return 0
     except (ConnectionError, OSError, SystemExit) as exc:
         print(f"codex_mesh: {name}: {exc}", file=sys.stderr)
