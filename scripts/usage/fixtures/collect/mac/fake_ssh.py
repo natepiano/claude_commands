@@ -38,6 +38,12 @@ class StreamReport(TypedDict):
     options: list[str]
     turn_records: int
     compaction_records: int
+    opening_records: int
+    edit_records: int
+    outcome_records: int
+    history_cursor_records: int
+    altered_outcome_records: int
+    altered_lifecycle_records: int
     role_snapshots: list[CommittedRoleSnapshot]
     director_records: int
     history_file_records: int
@@ -46,7 +52,7 @@ class StreamReport(TypedDict):
     altered_evidence_records: int
 
 
-StreamKind = Literal["turn", "compaction", "cursor", "other"]
+StreamKind = Literal["turn", "compaction", "opening", "edit", "cursor", "other"]
 
 
 def stream_kind(value: object) -> StreamKind:
@@ -55,7 +61,7 @@ def stream_kind(value: object) -> StreamKind:
     fields = cast(dict[str, object], value)
     for name in ("kind", "type"):
         tag = fields.get(name)
-        if tag in ("turn", "compaction", "cursor"):
+        if tag in ("turn", "compaction", "opening", "edit", "cursor"):
             return cast(StreamKind, tag)
     for child in fields.values():
         kind = stream_kind(child)
@@ -92,6 +98,8 @@ def main() -> int:
         "measurement_records": 0, "cursor_records": 0, "forwarded_bytes": 0,
         "stdin_bytes": len(stdin), "options": sys.argv[1:-1],
         "turn_records": 0, "compaction_records": 0,
+        "opening_records": 0, "edit_records": 0, "outcome_records": 0, "history_cursor_records": 0,
+        "altered_outcome_records": 0, "altered_lifecycle_records": 0,
         "role_snapshots": [],
         "director_records": 0, "history_file_records": 0, "history_chunks": 0,
         "metadata_chunks": 0, "altered_evidence_records": 0,
@@ -124,6 +132,7 @@ def main() -> int:
                 changed_record = False
                 attribution_ready = False
                 history_file = False
+                transcript_file = False
                 for line in cast(Iterable[bytes], process.stdout):
                     if behavior == "cut_before_status" and line.startswith(b"rc="):
                         report["role_snapshots"].append(observe_role_snapshot(configuration))
@@ -140,6 +149,7 @@ def main() -> int:
                     record_type = fields.get("type")
                     if record_type == "file":
                         history_file = fields.get("kind") == "history"
+                        transcript_file = fields.get("kind") in ("claude", "codex")
                         if history_file:
                             report["history_file_records"] += 1
                     elif record_type == "chunk":
@@ -162,9 +172,25 @@ def main() -> int:
                             line = json.dumps(fields).encode("utf-8") + b"\n"
                             report["altered_evidence_records"] += 1
                     cut_record = False
+                    outcome_record = bool(fields) and history_file and record_type not in ("file", "cursor", "problem")
+                    if outcome_record and behavior == "missing_outcome_field" and not changed_record:
+                        changed_record = True
+                        payload_field = next(name for name in fields if name not in ("type", "kind", "family", "path"))
+                        del fields[payload_field]
+                        line = json.dumps(fields).encode("utf-8") + b"\n"
+                        report["altered_outcome_records"] += 1
+                    if not changed_record and ((behavior == "missing_opening_time" and kind == "opening")
+                                               or (behavior == "invalid_edit_time" and kind == "edit")):
+                        changed_record = True
+                        if behavior == "missing_opening_time":
+                            del fields["at"]
+                        else:
+                            fields["at"] = "invalid-time"
+                        line = json.dumps(fields).encode("utf-8") + b"\n"
+                        report["altered_lifecycle_records"] += 1
                     if behavior in ("malformed_record", "unknown_measurement", "missing_output",
                                     "oversized_output", "cut_inside_record") and (
-                            report["cursor_records"] == 1 and kind == "turn" and not changed_record):
+                            transcript_file and report["cursor_records"] == 1 and kind == "turn" and not changed_record):
                         changed_record = True
                         if behavior == "malformed_record":
                             line = b"not JSON\n"
@@ -183,7 +209,7 @@ def main() -> int:
                                     tokens["output"] = 2**63
                             line = json.dumps(record).encode("utf-8") + b"\n"
                     report["forwarded_bytes"] += len(line)
-                    if kind in ("turn", "compaction"):
+                    if kind in ("turn", "compaction", "opening", "edit"):
                         report["measurement_records"] += 1
                     if kind == "turn":
                         report["turn_records"] += 1
@@ -191,8 +217,17 @@ def main() -> int:
                             second_file_turns += 1
                     elif kind == "compaction":
                         report["compaction_records"] += 1
+                    elif kind == "opening":
+                        report["opening_records"] += 1
+                    elif kind == "edit":
+                        report["edit_records"] += 1
                     elif kind == "cursor":
-                        report["cursor_records"] += 1
+                        if history_file:
+                            report["history_cursor_records"] += 1
+                        else:
+                            report["cursor_records"] += 1
+                    elif outcome_record:
+                        report["outcome_records"] += 1
                     save_stream_report(Path(configuration["report"]), report)
                     try:
                         _ = output.write(line)
@@ -204,7 +239,11 @@ def main() -> int:
                         break
                     if cut_record:
                         break
-                    if behavior == "cut_after_first_cursor" and report["cursor_records"] == 1:
+                    if behavior == "cut_inside_history" and outcome_record:
+                        break
+                    if behavior == "cut_after_history_cursor" and kind == "cursor" and history_file:
+                        break
+                    if behavior == "cut_after_first_cursor" and kind == "cursor" and transcript_file and report["cursor_records"] == 1:
                         break
                     if behavior == "cut_inside_second_file" and second_file_turns == 2:
                         break

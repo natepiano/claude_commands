@@ -57,3 +57,19 @@ def weighted(turn_row: Mapping[str, object] | sqlite3.Row, at: datetime | str) -
             raise ValueError(f"invalid token count for {column}")
         total += count * coefficient
     return total
+
+
+def register(db: sqlite3.Connection) -> None:
+    def weighted_tokens(model: object, at: object, input: object, cache_write_5m: object,
+                        cache_write_1h: object, cache_read: object, output: object) -> float | None:
+        # SQLite's NULL is returned only at this SQL boundary.
+        if not isinstance(at, str):
+            raise ValueError("invalid turn time")
+        row = {"model": model, "input": input, "cache_write_5m": cache_write_5m,
+               "cache_write_1h": cache_write_1h, "cache_read": cache_read, "output": output}
+        try:
+            return weighted(row, at)
+        except UnweightedModel:
+            return None
+
+    db.create_function("weighted_tokens", 7, weighted_tokens, deterministic=True)

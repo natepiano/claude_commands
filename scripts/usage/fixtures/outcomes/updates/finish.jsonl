@@ -1,0 +1,4 @@
+{"event_id":"unfinished-pass-close","event_type":"pass_finished","timestamp":"2026-10-10T22:00:00Z","pass_instance_id":"unfinished-pass","status":"cancelled"}
+{"event_id":"finding-three-close","event_type":"finding_verdict","timestamp":"2026-10-10T22:01:00Z","phase_instance_id":"fixture-phase","finding_id":"three","resulting_state":"closed"}
+{"event_id":"phase-finish","event_type":"phase_finished","timestamp":"2026-10-10T22:02:00Z","phase_instance_id":"fixture-phase","status":"complete"}
+{"event_id":"run-finish","event_type":"run_finished","timestamp":"2026-10-10T22:03:00Z","status":"complete"}

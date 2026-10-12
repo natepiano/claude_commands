@@ -189,7 +189,7 @@ Today, each question needs its own scratch script (`seat_usage.py`, `api_cost.py
 
 **Ruled out:** copying the Mac's raw logs to natedev (holds transcripts twice; whole files in one transaction hit a 720 s limit twice and kept nothing); sending run-history files as bytes (59 files, 49.6 MB on the wire, 117 s on every pass, 2026-10-12).
 
-### Phase 6 — Outcomes in the same store · status: todo
+### Phase 6 — Outcomes in the same store · status: done
 
 #### Work Order
 
