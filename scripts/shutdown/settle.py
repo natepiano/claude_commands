@@ -26,7 +26,7 @@ from account import Account
 import conversation_pause
 from inventory import Inventory, Session, inventory
 import record as store
-from record import SessionShutdown, SessionStopIssue, TimerRestore, ShowrunnerFooter, NoFooter, ShutdownContinuation, ReadinessCheck
+from record import NoRemoteControl, SessionShutdown, SessionStopIssue, TimerRestore, ShowrunnerFooter, NoFooter, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
 import showrunner_footer
 import stop as stop_work
@@ -37,6 +37,8 @@ NOTIFIER = SCRIPTS / "message" / "notifier.sh"
 SEND = SCRIPTS / "message" / "send.py"
 SETTLE_INTERVAL_SECONDS = 15
 SETTLE_RETRY_SECONDS = 300
+NOT_ANSWERING_AFTER = timedelta(minutes=5)
+REPEAT_HOLDOUT_ALERT = timedelta(minutes=60)
 
 class MessageSent(TypedDict):
     kind: Literal["sent"]
@@ -600,12 +602,16 @@ def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
 
 def _send_settle_message(saved: SessionShutdown) -> None:
     session = saved["session"]
+    found = store.lookup_session(saved["login"], session["session_id"])
+    if (not isinstance(found, store.ShutdownFound) or found.record["request_id"] != saved["request_id"]
+        or found.record["progress"]["kind"] != "waiting"):
+        return
     delivery = send_message(f"session:{session['session_id']}",
         f"Shutdown of {saved['label']}: reach a safe stop", _settle_text(saved, session),
         key=f"shutdown-{saved['login']}-{session['session_id']}")
     at = record_time()
     def save(current: SessionShutdown) -> None:
-        if current["progress"]["kind"] != "waiting":
+        if current["request_id"] != saved["request_id"] or current["progress"]["kind"] != "waiting":
             return
         current["settle_message"] = ({"kind": "sent", "at": at} if delivery["kind"] == "sent"
                                     else {"kind": "queued", "at": at, "reason": delivery["reason"]})
@@ -671,7 +677,7 @@ def _restore_record(saved: SessionShutdown) -> None:
             key=f"shutdown-{saved['login']}-{saved['session']['session_id']}")
 
 
-def _unrecorded_local_sessions(login: str, ids: tuple[str, ...], records: list[SessionShutdown]) -> dict[str, str]:
+def unrecorded_local_sessions(login: str, ids: tuple[str, ...], records: list[SessionShutdown]) -> dict[str, str]:
     missing = frozenset(ids) - {saved["session"]["session_id"] for saved in records}
     if not missing:
         return {}
@@ -687,7 +693,7 @@ def cancel(account: Account, here: bool = False, only: Iterable[str] = ()) -> in
     retained = False
     ids = tuple(only)
     records = store.session_records(account.login)
-    missing = _unrecorded_local_sessions(account.login, ids, records)
+    missing = unrecorded_local_sessions(account.login, ids, records)
     local_ids = {saved["session"]["session_id"] for saved in records} | missing.keys()
     for name in missing.values():
         print(f"{name}: no shutdown in progress")
@@ -747,7 +753,7 @@ def now(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
     refused = False
     ids = tuple(only)
     records = store.session_records(account.login)
-    missing = _unrecorded_local_sessions(account.login, ids, records)
+    missing = unrecorded_local_sessions(account.login, ids, records)
     local_ids = {saved["session"]["session_id"] for saved in records} | missing.keys()
     for name in missing.values():
         print(f"{name}: no shutdown in progress")
@@ -919,9 +925,91 @@ class PendingSessionAction:
 
 
 @dataclass(frozen=True)
+class ConfirmedRelaunchPass:
+    records: list[SessionShutdown]
+    no_remote_control: tuple[NoRemoteControl, ...]
+
+
+@dataclass(frozen=True)
 class PendingRegistryConfirmation:
     records: list[SessionShutdown]
-    future: Future[frozenset[str]]
+    future: Future[ConfirmedRelaunchPass]
+
+
+def _confirm_relaunch_pass(records: list[SessionShutdown]) -> ConfirmedRelaunchPass:
+    import restart as restart_work
+    confirmation = restart_work.wait_for_confirmation(
+        frozenset(saved["session"]["session_id"] for saved in records), restart_work.SESSION_WAIT_SECONDS)
+    confirmed: list[SessionShutdown] = []
+    for saved in records:
+        claim = saved["progress"]
+        if claim["kind"] == "restarting":
+            try:
+                restart_work.confirm_entry(saved, claim["at"], saved["session"]["session_id"] in confirmation.live_ids)
+            except store.NoLiveRecord:
+                continue
+            except Exception as error:
+                _action_failed(saved, error, stopping=False)
+                continue
+            confirmed.append(saved)
+    confirmed_ids = {saved["session"]["session_id"] for saved in confirmed}
+    control_records = restart_work.RegistryConfirmation(tuple(
+        item for item in confirmation.records if item["sessionId"] in confirmed_ids))
+    missing = restart_work.remote_control_missing(confirmed, control_records)
+    return ConfirmedRelaunchPass(records, missing)
+
+
+def _remote_control_alert(records: list[SessionShutdown], missing: tuple[NoRemoteControl, ...]) -> None:
+    due = [item for item in missing if item["alerts"] == "user"]
+    if not due:
+        return
+    instruction = "Turn on Remote Control in each named session at its terminal: /remote-control"
+    text = "\n".join([*(f"{item['name']}: running, no Remote Control" for item in due), instruction])
+    alert_user(f"{records[0]['label']} is not fully back", text, ActionRequired(instruction),
+        machine="natedev" if local_machine().casefold() == "mac" else "")
+
+
+def _holdout_due(saved: SessionShutdown, at: datetime) -> bool:
+    message = saved["settle_message"]
+    since = message["at"] if message["kind"] == "sent" else saved["requested_at"]
+    return (saved["alerts"] == "user" and at - datetime.fromisoformat(since) >= NOT_ANSWERING_AFTER
+        and ("alerted_at" not in saved or at - datetime.fromisoformat(saved["alerted_at"]) >= REPEAT_HOLDOUT_ALERT))
+
+
+def _reserve_holdout_alert(saved: SessionShutdown, at: datetime) -> bool:
+    accepted = False
+    def mark(current: SessionShutdown) -> None:
+        nonlocal accepted
+        if (current["request_id"] == saved["request_id"] and current["progress"]["kind"] in {"waiting", "ready"}
+            and _holdout_due(current, at)):
+            current["alerted_at"] = record_time()
+            accepted = True
+    try:
+        _ = store.update_session(saved["login"], saved["session"]["session_id"], mark)
+    except store.NoLiveRecord:
+        pass
+    return accepted
+
+
+def _send_holdout_alert(due: list[tuple[SessionShutdown, str]]) -> None:
+    first = due[0][0]
+    summaries = [f"{saved['session']['name']} is not answering the shutdown of {saved['label']}" for saved, _ in due]
+    lines: list[str] = []
+    actions: list[str] = []
+    for saved, reason in due:
+        name = saved["session"]["name"]
+        action = f"/shutdown cancel --only {name} (take it out; it carries on), /shutdown now --only {name} (stop it anyway)"
+        actions.append(action)
+        lines.append(f"{saved['machine']} {name}: {reason}; {action}")
+    text = "\n".join(lines)
+    summary = "; ".join(summaries)
+    try:
+        alert_user(summary, text, ActionRequired("; ".join(actions)),
+            machine="natedev" if local_machine().casefold() == "mac" else "")
+    finally:
+        origins = {saved["requested_by"]["session_id"] for saved, _ in due if saved["requested_by"]["kind"] == "session"}
+        for origin in sorted(origins):
+            _ = send_message(f"session:{origin}", summary, text, key=f"shutdown-holdout-{first['login']}")
 
 
 def _archive_finished(saved: SessionShutdown) -> bool:
@@ -988,7 +1076,9 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                          "sessions": [], "unattributed": []}
     next_inventory_at = time.monotonic()
     try:
-        with ThreadPoolExecutor(max_workers=restart_work.RESTART_LAUNCH_WORKERS) as executor, ThreadPoolExecutor(max_workers=restart_work.RESTART_LAUNCH_WORKERS) as registry:
+        with ThreadPoolExecutor(max_workers=restart_work.RESTART_LAUNCH_WORKERS) as executor, ThreadPoolExecutor(max_workers=restart_work.RESTART_LAUNCH_WORKERS) as registry, ThreadPoolExecutor(max_workers=restart_work.RESTART_LAUNCH_WORKERS) as notifications:
+            sends: list[Future[None]] = []
+            messages: dict[str, Future[None]] = {}
             def accept_launch(original: SessionShutdown, result: SessionShutdown) -> None:
                 if restart_work.owns_relaunch_claim(original, result):
                     launched.append(result)
@@ -1031,24 +1121,26 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                     confirmations.remove(batch)
                     changed = True
                     try:
-                        live = batch.future.result()
+                        completed = batch.future.result()
                     except Exception as error:
                         for saved in batch.records:
                             _action_failed(saved, error, stopping=False)
                         continue
-                    for saved in batch.records:
-                        claim = saved["progress"]
-                        if claim["kind"] != "restarting":
-                            continue
-                        try:
-                            restart_work.confirm_entry(saved, claim["at"], saved["session"]["session_id"] in live)
-                        except store.NoLiveRecord:
-                            continue
-                        except Exception as error:
-                            _action_failed(saved, error, stopping=False)
+                    if completed.no_remote_control:
+                        sends.append(notifications.submit(_remote_control_alert, completed.records, completed.no_remote_control))
+                    for saved in completed.records:
                         found = store.lookup_session(login, saved["session"]["session_id"])
                         if isinstance(found, store.ShutdownFound) and found.record["progress"]["kind"] == "restarted":
                             archive(found.record)
+
+                for identity, future in list(messages.items()):
+                    if future.done():
+                        del messages[identity]
+                        try:
+                            future.result()
+                        except store.NoLiveRecord:
+                            pass
+                sends = [future for future in sends if not future.done()]
 
                 records = store.session_records(login)
                 _clear_finished_hold(login, archived)
@@ -1065,6 +1157,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                     attempted.clear()
                     next_inventory_at = current + SETTLE_INTERVAL_SECONDS
                 if due or changed:
+                    holdouts: list[tuple[SessionShutdown, str]] = []
                     confirming_ids = {saved["session"]["session_id"] for batch in confirmations for saved in batch.records}
                     confirming_ids.update(saved["session"]["session_id"] for saved in launched)
                     for saved in records:
@@ -1073,14 +1166,16 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                             continue
                         owner = stop_work.fresh_session(saved["session"], report)
                         step = next_step(saved, owner, records, now_utc())
+                        if (due and saved["progress"]["kind"] in {"waiting", "ready"}
+                            and (saved["progress"]["kind"] == "waiting" or isinstance(step, Hold))
+                            and _holdout_due(saved, now_utc()) and _reserve_holdout_alert(saved, now_utc())):
+                            holdouts.append((saved, hold_reason(saved, owner)))
                         if (session_id, type(step)) in attempted:
                             continue
                         if isinstance(step, SendSettleMessage):
                             attempted.add((session_id, type(step)))
-                            try:
-                                _send_settle_message(saved)
-                            except store.NoLiveRecord:
-                                pass
+                            if session_id not in messages:
+                                messages[session_id] = notifications.submit(_send_settle_message, saved)
                         elif isinstance(step, StopSession):
                             attempted.add((session_id, type(step)))
                             future = executor.submit(stop_work.stop_session, saved)
@@ -1090,10 +1185,11 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                             start_launch(saved)
                         elif isinstance(step, Finished) and saved["progress"]["kind"] == "restarted":
                             archive(saved)
+                    if holdouts:
+                        sends.append(notifications.submit(_send_holdout_alert, holdouts))
                 if launched and (due or not any(isinstance(action.step, RelaunchSession) for action in pending.values())):
                     batch_records, launched = launched, []
-                    future = registry.submit(restart_work.wait_for_sessions,
-                        frozenset(saved["session"]["session_id"] for saved in batch_records), restart_work.SESSION_WAIT_SECONDS)
+                    future = registry.submit(_confirm_relaunch_pass, batch_records)
                     confirmations.append(PendingRegistryConfirmation(batch_records, future))
                 # wait observes completion without setting either result type.
                 futures = [cast(Future[object], cast(object, action.future)) for action in pending.values()]

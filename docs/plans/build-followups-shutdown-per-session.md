@@ -181,7 +181,7 @@ The showrunner's account of that morning, 2026-10-12 (claude 3, 20 sessions, `do
 
 **Ruled out:** per-session action and no-conductor lines in `status` (one line per action per machine, naming its sessions, instead).
 
-### Phase 5 — The not-answering alert, the live check, the skill text and the as-built  · status: todo
+### Phase 5 — The not-answering alert, the live check, the skill text and the as-built  · status: done
 
 #### Work Order
 

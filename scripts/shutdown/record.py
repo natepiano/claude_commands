@@ -25,6 +25,12 @@ CLAIM_STALE_SECONDS = 120
 CONDUCTOR_LOCK_RETRY_DELAYS = (0.05,) * 5
 
 
+class NoRemoteControl(TypedDict):
+    session_id: str
+    name: str
+    alerts: Literal["user", "none"]
+
+
 class ReadinessClear(TypedDict):
     kind: Literal["clear"]
 

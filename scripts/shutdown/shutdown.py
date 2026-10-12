@@ -561,6 +561,8 @@ def main(arguments: list[str] | None = None) -> int:
     _ = up.add_argument("account")
     _ = up.add_argument("--dry-run", action="store_true")
     _ = up.add_argument("--only")
+    _ = up.add_argument("--here", action="store_true")
+    _ = up.add_argument("--json", action="store_true", dest="as_json")
     ownership = commands.add_parser("conductor-status")
     _ = ownership.add_argument("account")
     _ = ownership.add_argument("--json", action="store_true", dest="as_json")
@@ -605,6 +607,10 @@ def main(arguments: list[str] | None = None) -> int:
         return 0
 
     if options.command == "up":
+        if options.as_json:
+            result = restart_work.up_result(options.account or "", options.dry_run, _only_ids(options.only))
+            print(json.dumps(result, sort_keys=True))
+            return 1 if result["outcome"] == "partial" or result["refused"] else 0
         return restart_work.up(options.account or "", options.dry_run, _only_ids(options.only))
 
     if options.command == "restart":
