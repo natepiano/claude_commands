@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable
+import io
+import json
+from contextlib import redirect_stdout
+from collections.abc import Iterable, Sequence
 import os
 import re
 import shlex
@@ -14,8 +17,9 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo
@@ -40,13 +44,13 @@ from inventory import (  # noqa: E402
     TmuxHost,
     TmuxPane,
     WindowHost,
-    inventory,
 )
 from record import (  # noqa: E402
     CLAIM_STALE_SECONDS,
     AccountHold,
     InvalidRecord,
     NoLiveRecord,
+    NoRemoteControl,
     PendingTimer,
     SessionShutdown,
     SessionRestoredTimersPending,
@@ -99,6 +103,9 @@ class ShutdownServices(Protocol):
         self, recipient: str, summary: str, text: str, *,
         machine: str = "", key: str = "",
     ) -> RestartMessageDelivery: ...
+    def unrecorded_local_sessions(
+        self, login: str, ids: tuple[str, ...], records: list[SessionShutdown],
+    ) -> dict[str, str]: ...
     def alert_user(
         self, summary: str, text: str, action: ActionRequired, *, machine: str = "",
     ) -> None: ...
@@ -112,13 +119,13 @@ SEND = SCRIPTS / "message" / "send.py"
 SESSION_WAIT_SECONDS = 90.0
 SESSION_POLL_SECONDS = 0.5
 RESTART_LAUNCH_WORKERS = 6
-REFUSED_ONLY_EXIT = 4
+REMOTE_CONTROL_WAIT_SECONDS = 10.0
 WINDOW_DELAY_SECONDS = 1.2
 PACIFIC = ZoneInfo("America/Los_Angeles")
 RESTARTABLE_PROGRESS = frozenset({"stopped", "already gone", "process identity lost", "manual restart", "restart failed", "timers pending"})
 COMPLETE_PROGRESS = frozenset({"restarted"})
 # Worst wins when one machine's `up` attempts several records.
-STATUS_SEVERITY = {"nothing": 0, "done": 1, "partial": 2, "refused": 3}
+STATUS_SEVERITY = {"nothing": 0, "done": 1, "partial": 2}
 
 
 class RestartAccountNotDetermined(Exception):
@@ -211,11 +218,46 @@ class TimerNotStarted:
     reason: str
 
 
+class RestartNotStopped(TypedDict):
+    kind: Literal["not stopped"]
+    session_id: str
+    name: str
+    progress: Literal["waiting", "ready", "stopping"]
+
+
+class RestartNoShutdown(TypedDict):
+    kind: Literal["no shutdown"]
+    session_id: str
+    name: str
+
+
+RestartRefusal = RestartNotStopped | RestartNoShutdown
+
+
+class PeerRestartResult(TypedDict):
+    machine: str
+    label: str
+    outcome: Literal["done", "partial", "nothing"]
+    lines: list[str]
+    no_remote_control: list[NoRemoteControl]
+    refused: list[RestartRefusal]
+
+
+@dataclass(frozen=True)
+class RegistryConfirmation:
+    """Live registry records retained from the final confirmation poll."""
+    records: tuple[sessions.SessionRecord, ...] = ()
+
+    @property
+    def live_ids(self) -> frozenset[str]:
+        return frozenset(record["sessionId"] for record in self.records)
+
+
 @dataclass(frozen=True)
 class MachineRestartResult:
     machine: str
     label: str
-    status: Literal["done", "partial", "nothing", "refused"]
+    status: Literal["done", "partial", "nothing"]
     restarted: int = 0
     seats: int = 0
     manual: int = 0
@@ -223,9 +265,9 @@ class MachineRestartResult:
     failed_sessions: tuple[FailedSessionRestart, ...] = ()
     manual_sessions: tuple[ManualSessionRestart, ...] = ()
     timers_not_started: tuple[TimerNotStarted, ...] = ()
-    refusal_line: str = ""
     elapsed_seconds: float = 0.0
-    refused: bool = False
+    refused: list[RestartRefusal] = field(default_factory=list)
+    no_remote_control: list[NoRemoteControl] = field(default_factory=list)
     local_session_ids: frozenset[str] = frozenset()
 
     @property
@@ -344,19 +386,49 @@ def _session_liveness(
     return SessionNotLive()
 
 
-def wait_for_sessions(session_ids: frozenset[str], timeout: float) -> frozenset[str]:
-    """Wait once for all launched sessions and return those live at the last poll."""
+def wait_for_confirmation(session_ids: frozenset[str], timeout: float) -> RegistryConfirmation:
+    """Keep the final liveness poll's records for the subsequent field check."""
     if not session_ids:
-        return frozenset()
+        return RegistryConfirmation()
     deadline = time.monotonic() + timeout
-    while True:
-        live = session_ids & _live_session_ids()
-        if live == session_ids:
-            return live
+    confirmed = RegistryConfirmation()
+    while time.monotonic() < deadline:
+        live = sessions.live_sessions()
+        confirmed = RegistryConfirmation(tuple(item for item in live if item["sessionId"] in session_ids))
+        if confirmed.live_ids == session_ids:
+            return confirmed
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return live
+            break
         time.sleep(min(SESSION_POLL_SECONDS, remaining))
+    return confirmed
+
+
+def wait_for_remote_control(records: Sequence[sessions.SessionRecord], timeout: float) -> frozenset[str]:
+    """Poll small registry files, starting no poll after the deadline."""
+    ids = frozenset(item["sessionId"] for item in records)
+    active: frozenset[str] = frozenset()
+    deadline = time.monotonic() + timeout
+    while ids and time.monotonic() < deadline:
+        active = frozenset(item["sessionId"] for item in records if sessions.remote_control(item) == "active")
+        if active == ids:
+            return active
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(SESSION_POLL_SECONDS, remaining))
+    return active
+
+
+def remote_control_missing(records: list[SessionShutdown], confirmation: RegistryConfirmation) -> tuple[NoRemoteControl, ...]:
+    """Print the diagnostic while retaining each archived session's alert policy."""
+    active = wait_for_remote_control(confirmation.records, REMOTE_CONTROL_WAIT_SECONDS)
+    missing = tuple(NoRemoteControl(session_id=saved["session"]["session_id"],
+        name=saved["session"]["name"], alerts=saved["alerts"]) for saved in records
+        if saved["session"]["session_id"] in confirmation.live_ids - active)
+    for item in missing:
+        print(f"{item['name']}: running, no Remote Control")
+    return missing
 
 
 def _pacific(value: str) -> str:
@@ -1159,8 +1231,6 @@ def _timing_line(result: MachineRestartResult) -> str:
 def _result_lines(result: MachineRestartResult) -> list[str]:
     if result.status == "nothing":
         return []
-    if result.status == "refused":
-        return [result.refusal_line] if result.refusal_line else []
     lines = [
         "{}: {} restarted, {} seats available on demand".format(
             result.machine, result.restarted, result.seats
@@ -1304,19 +1374,21 @@ def owns_relaunch_claim(original: SessionShutdown, result: SessionShutdown) -> b
     )
 
 
-def _confirm_entries(records: list[SessionShutdown]) -> None:
+def _confirm_entries(records: list[SessionShutdown]) -> tuple[NoRemoteControl, ...]:
     launched = [record for record in records if record["progress"]["kind"] == "restarting"]
-    live: frozenset[str] = wait_for_sessions(
+    confirmation = wait_for_confirmation(
         frozenset(record["session"]["session_id"] for record in launched),
         SESSION_WAIT_SECONDS,
-    ) if launched else frozenset()
+    ) if launched else RegistryConfirmation()
     for record in launched:
         progress = record["progress"]
         if progress["kind"] == "restarting":
-            confirm_entry(record, progress["at"], record["session"]["session_id"] in live)
+            confirm_entry(record, progress["at"], record["session"]["session_id"] in confirmation.live_ids)
     for record in records:
         if record["progress"]["kind"] == "restarted":
             archive_session(record["login"], record["session"]["session_id"])
+
+    return remote_control_missing(launched, confirmation)
 
 
 def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartResult:
@@ -1327,21 +1399,20 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
     all_records = session_records(login)
     hold_outcome = lookup_account_hold(login)
     records = [saved for saved in all_records if not ids or saved["session"]["session_id"] in ids]
-    refused = False
+    refused: list[RestartRefusal] = []
     local_ids = {saved["session"]["session_id"] for saved in all_records}
-    missing = frozenset(ids) - local_ids
-    if missing:
-        report = inventory(login, missing)
-        for owner in report["sessions"]:
-            if owner["session_id"] in missing and owner["kind"] != "seat":
-                local_ids.add(owner["session_id"])
-                print(f"{owner['name']}: no shutdown in progress")
-                refused = True
+    for identity, name in settle.unrecorded_local_sessions(login, ids, all_records).items():
+        local_ids.add(identity)
+        refusal = RestartNoShutdown(kind="no shutdown", session_id=identity, name=name)
+        refused.append(refusal)
+        print(refusal_line(refusal))
     at = datetime.fromisoformat(settle.record_time())
     for saved in records:
         if ids and saved["progress"]["kind"] in {"waiting", "ready", "stopping"}:
-            print(f"{saved['session']['name']} is {saved['progress']['kind']}, not stopped; nothing to restart")
-            refused = True
+            refusal = RestartNotStopped(kind="not stopped", session_id=saved["session"]["session_id"],
+                name=saved["session"]["name"], progress=cast(Literal["waiting", "ready", "stopping"], saved["progress"]["kind"]))
+            refused.append(refusal)
+            print(refusal_line(refusal))
         elif ids and saved["progress"]["kind"] == "restarting" and (
             at - datetime.fromisoformat(saved["progress"]["at"])
         ).total_seconds() < CLAIM_STALE_SECONDS:
@@ -1388,7 +1459,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
                 if current["progress"]["kind"] == "restarting" and not owns_relaunch_claim(original, current):
                     continue
                 attempted.append(current)
-        _confirm_entries(attempted)
+        missing_control = list(_confirm_entries(attempted))
         for record in requesters:
             other_unfinished = [
                 item for item in session_records(login)
@@ -1401,7 +1472,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
             current = relaunch_session(record, dry_run=False, desktop_state=state)
             if current["progress"]["kind"] == "restarting" and not owns_relaunch_claim(record, current):
                 continue
-            _confirm_entries([current])
+            missing_control.extend(_confirm_entries([current]))
             attempted.append(current)
         remaining = session_records(login)
         if isinstance(hold_outcome, AccountHeld) and not any(item["request_id"] == hold_outcome.hold["request_id"] for item in remaining):
@@ -1411,19 +1482,79 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
             elif finished_requests:
                 clear_finished_account_hold(login, request_ids=finished_requests)
         result = replace(_machine_result(attempted, machine, label), elapsed_seconds=time.monotonic() - started_at)
-        result = replace(result, refused=refused, local_session_ids=frozenset(local_ids))
+        result = replace(result, refused=refused, no_remote_control=missing_control, local_session_ids=frozenset(local_ids))
         _print_result(result)
         return result
     finally:
         state.restore(dry_run=dry_run)
 
 
+def refusal_line(refusal: RestartRefusal) -> str:
+    if refusal["kind"] == "no shutdown":
+        return f"{refusal['name']}: no shutdown in progress"
+    return f"{refusal['name']} is {refusal['progress']}, not stopped; nothing to restart"
+
+
+def up_result(login: str, dry_run: bool = False, only: Iterable[str] = ()) -> PeerRestartResult:
+    """Run the local verb and retain its printed lines in a validated peer object."""
+    output = io.StringIO()
+    with redirect_stdout(output):
+        try:
+            result = _up(login, dry_run, only)
+        except (InvalidRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            print(f"{settle.local_machine()}: restart failed: {error}")
+            result = MachineRestartResult(settle.local_machine(), login, "partial", failed=1)
+    return PeerRestartResult(machine=result.machine, label=result.label, outcome=result.status,
+        lines=output.getvalue().splitlines(), no_remote_control=list(result.no_remote_control), refused=list(result.refused))
+
+
+def parse_peer_result(text: str) -> PeerRestartResult:
+    """Refuse older or malformed peer replies at the transport boundary."""
+    value = cast(object, json.loads(text))
+    if not isinstance(value, dict):
+        raise ValueError("invalid peer restart result")
+    fields = cast(dict[str, object], value)
+    for key in ("machine", "label"):
+        if not isinstance(fields.get(key), str) or not fields[key]:
+            raise ValueError(f"invalid peer restart {key}")
+    if fields.get("outcome") not in ("done", "partial", "nothing"):
+        raise ValueError("invalid peer restart outcome")
+    raw_lines = fields.get("lines")
+    if not isinstance(raw_lines, list) or any(not isinstance(line, str) for line in cast(list[object], raw_lines)):
+        raise ValueError("invalid peer restart lines")
+    missing: list[NoRemoteControl] = []
+    refusals: list[RestartRefusal] = []
+    for key in ("no_remote_control", "refused"):
+        raw = fields.get(key)
+        if not isinstance(raw, list):
+            raise ValueError(f"invalid peer restart {key}")
+        for entry in cast(list[object], raw):
+            if not isinstance(entry, dict):
+                raise ValueError(f"invalid peer restart {key} entry")
+            item = cast(dict[str, object], entry)
+            if any(not isinstance(item.get(field), str) or not item[field] for field in ("session_id", "name")):
+                raise ValueError(f"invalid peer restart {key} identity")
+            identity, name = cast(str, item["session_id"]), cast(str, item["name"])
+            if key == "no_remote_control":
+                if item.get("alerts") not in ("user", "none"):
+                    raise ValueError("invalid peer alert policy")
+                missing.append(NoRemoteControl(session_id=identity, name=name, alerts=cast(Literal["user", "none"], item["alerts"])))
+            elif item.get("kind") == "no shutdown":
+                refusals.append(RestartNoShutdown(kind="no shutdown", session_id=identity, name=name))
+            elif item.get("kind") == "not stopped" and item.get("progress") in ("waiting", "ready", "stopping"):
+                refusals.append(RestartNotStopped(kind="not stopped", session_id=identity, name=name,
+                    progress=cast(Literal["waiting", "ready", "stopping"], item["progress"])))
+            else:
+                raise ValueError("invalid peer restart refusal")
+    return PeerRestartResult(machine=cast(str, fields["machine"]), label=cast(str, fields["label"]),
+        outcome=cast(Literal["done", "partial", "nothing"], fields["outcome"]), lines=cast(list[str], raw_lines),
+        no_remote_control=missing, refused=refusals)
+
+
 def up(login: str, dry_run: bool = False, only: Iterable[str] = ()) -> int:
     """Resume each eligible local session without waiting on another machine."""
     try:
         result = _up(login, dry_run, only)
-        if result.refused and result.status in {"done", "nothing"}:
-            return REFUSED_ONLY_EXIT
         return result.exit_status
     except (InvalidRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         print(f"{settle.local_machine()}: restart failed: {error}")
@@ -1510,23 +1641,31 @@ def select_account(requested: AccountNamed | AccountNotNamed) -> Account:
                 return _account_from_records()
 
 
-def _restart_alerts_enabled(login: str, only: Iterable[str] = (), *, here: bool = False) -> bool:
+class PeerRestartAvailability(Enum):
+    NOT_ASKED = "not asked"
+    NOT_REACHED = "not reached"
+    REACHED_TO_BE_READ = "reached and to be read"
+
+
+def _restart_alerts_enabled(login: str, only: Iterable[str] = (), *, peer: PeerRestartAvailability) -> bool:
     ids = tuple(only)
     try:
         records = [saved for saved in session_records(login)
                    if not ids or saved["session"]["session_id"] in ids]
     except (InvalidRecord, OSError, ValueError):
         return True
-    if here:
+    if peer is PeerRestartAvailability.NOT_ASKED:
         return (not records and not ids) or any(saved["alerts"] == "user" for saved in _eligible_records(records))
+    if peer is PeerRestartAvailability.NOT_REACHED:
+        return (not records and not ids) or any(saved["alerts"] == "user" for saved in records)
     try:
-        peer = _remote_records()
+        peer_records = _remote_records()
     except (InvalidRecord, OSError, ValueError):
         return (not records and not ids) or any(saved["alerts"] == "user" for saved in records)
-    if peer["kind"] == "machine not reached":
+    if peer_records["kind"] == "machine not reached":
         return (not records and not ids) or any(saved["alerts"] == "user" for saved in records)
     records.extend(
-        saved for saved in peer["records"]
+        saved for saved in peer_records["records"]
         if saved["login"].casefold() == login.casefold()
         and (not ids or saved["session"]["session_id"] in ids)
     )
@@ -1577,59 +1716,55 @@ def restart(
                 FailedSessionRestart(selected.label, _error_reason(error)),
             ),
         )
-    remote_args = ["up", selected.login]
+    remote_args = ["up", selected.login, "--here", "--json"]
     if dry_run:
         remote_args.append("--dry-run")
     peer_ids = [identity for identity in ids if identity not in local_ids]
     if ids:
         remote_args.extend(("--only", ",".join(peer_ids)))
-    status, output = ((0, "") if here or (ids and not peer_ids) else run_remote(
-        remote_args, limit={"kind": "while link alive"}
-    ))
-    if output:
-        print(output)
-    remote_failure = ""
-    if status not in {0, 255, REFUSED_ONLY_EXIT} and not output.strip():
-        remote_failure = (
-            f"{other_machine()}: restart failed (exit {status})"
-        )
-        print(remote_failure)
+    peer = PeerRestartResult(machine=other_machine(), label=selected.label, outcome="nothing",
+        lines=[], no_remote_control=[], refused=[])
+    peer_availability = PeerRestartAvailability.NOT_ASKED
+    if not here and (not ids or peer_ids):
+        status, output = run_remote(remote_args, limit={"kind": "while link alive"})
+        try:
+            if status not in {0, 1}:
+                raise ValueError("peer not reached")
+            peer = parse_peer_result(output)
+            peer_availability = PeerRestartAvailability.REACHED_TO_BE_READ
+        except (ValueError, TypeError):
+            peer_availability = PeerRestartAvailability.NOT_REACHED
+    not_reached = peer_availability is PeerRestartAvailability.NOT_REACHED
+    for line in peer["lines"]:
+        print(line)
     incomplete = ""
-    if status == 255:
-        incomplete = (
-            f"restart incomplete: {other_machine()} not reached — run /shutdown "
-            "restart again when it is back"
-        )
+    if not_reached:
+        incomplete = (f"restart incomplete: {other_machine()} not reached — run /shutdown "
+            "restart again when it is back")
         print(incomplete)
-
-    if not dry_run:
-        lines = _result_lines(local)
-        if output:
-            lines.extend(output.splitlines())
-        if remote_failure:
-            lines.append(remote_failure)
-        if incomplete:
-            lines.append(incomplete)
-        fully_back = (
-            local.status in {"done", "nothing"}
-            and status == 0
-            and not remote_failure
-            and not incomplete
-        )
-        needs_alert = (local.status == "partial" or status not in {0, REFUSED_ONLY_EXIT}) if ids else not fully_back
-        if notify and not fully_back and needs_alert and _restart_alerts_enabled(selected.login, ids, here=here):
-            lines.append(
-                "Fix what is named above, then run /shutdown restart again; "
-                + "it brings back only what is left."
-            )
+    missing = [item for item in (*local.no_remote_control, *peer["no_remote_control"]) if item["alerts"] == "user"]
+    bring_back = local.status == "partial" or peer["outcome"] == "partial" or not_reached
+    if notify:
+        failure_alert = bring_back and _restart_alerts_enabled(selected.login, ids, peer=peer_availability)
+        if failure_alert or missing:
+            lines = _result_lines(local) if failure_alert else []
+            if failure_alert:
+                excluded = {refusal_line(item) for item in peer["refused"]}
+                excluded.update(f"{item['name']}: running, no Remote Control" for item in peer["no_remote_control"])
+                lines.extend(line for line in peer["lines"] if line not in excluded)
+                if incomplete:
+                    lines.append(incomplete)
+            lines.extend(f"{item['name']}: running, no Remote Control" for item in missing)
+            actions: list[str] = []
+            if failure_alert:
+                lines.append("Fix what is named above, then run /shutdown restart again; it brings back only what is left.")
+                actions.append("Fix what is named, then run /shutdown restart again.")
+            if missing:
+                instruction = "Turn on Remote Control in each named session at its terminal: /remote-control"
+                lines.append(instruction)
+                actions.append(instruction)
             try:
-                settle.alert_user(
-                    f"{selected.label} is not fully back",
-                    "\n".join(lines),
-                    ActionRequired(
-                        "Fix what is named, then run /shutdown restart again."
-                    ),
-                )
+                settle.alert_user(f"{selected.label} is not fully back", "\n".join(lines), ActionRequired(" ".join(actions)))
             except (OSError, RuntimeError, ValueError):
                 pass
-    return 0 if local.exit_status == 0 and status in {0, 255} else 1
+    return 0 if local.exit_status == 0 and peer["outcome"] != "partial" and not peer["refused"] else 1

@@ -16,11 +16,12 @@ from pathlib import Path
 from typing import Literal, cast, final, override
 from unittest.mock import patch
 
-from test_support import ShutdownTestCase
+from test_support import registry_confirmation, ShutdownTestCase
 import inventory
 from test_record import LegacyRecordFixture, LegacyEntryFixture, write_old
 import launch_permission
 import record
+import sessions
 import shutdown
 import settle
 import restart as restart_work
@@ -694,6 +695,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.root / "state")})))
+        _ = self.enterContext(patch.object(sessions, "remote_control", return_value="active"))
         self.owners = []
         for identity, name in (("alpha-id", "Alpha"), ("beta-id", "Beta"), ("gamma-id", "Gamma")):
             owner = unit_session(identity)
@@ -710,7 +712,7 @@ class OnlySessionCliTests(ShutdownTestCase):
             return {**report, "sessions": [owner for owner in self.owners if not ids or owner["session_id"] in ids]}
         _ = self.enterContext(patch.object(settle, "run_inventory", side_effect=observed))
         _ = self.enterContext(patch.object(settle, "inventory", side_effect=observed))
-        _ = self.enterContext(patch.object(restart_work, "inventory", side_effect=observed))
+        _ = self.enterContext(patch.object(settle, "inventory", side_effect=observed))
         _ = self.enterContext(patch.object(settle, "_warm", return_value=True))
         _ = self.enterContext(patch.object(settle, "_launch_conductor"))
         _ = self.enterContext(patch.object(settle, "_retire_shutdown_messages"))
@@ -718,9 +720,9 @@ class OnlySessionCliTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(restart_work, "_retire"))
         _ = self.enterContext(patch.object(restart_work, "_send_restart_note", return_value=settle.MessageSent(kind="sent")))
         _ = self.enterContext(patch.object(restart_work, "_live_session_ids", return_value=frozenset()))
-        def confirmed(ids: frozenset[str], _timeout: float) -> frozenset[str]:
-            return ids
-        _ = self.enterContext(patch.object(restart_work, "wait_for_sessions", side_effect=confirmed))
+        def confirmed(ids: frozenset[str], _timeout: float) -> restart_work.RegistryConfirmation:
+            return registry_confirmation(ids)
+        _ = self.enterContext(patch.object(restart_work, "wait_for_confirmation", side_effect=confirmed))
         _ = self.enterContext(patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched()))
 
     def save_three(self, progress: record.SessionProgress) -> list[record.SessionShutdown]:
@@ -899,7 +901,7 @@ class OnlySessionCliTests(ShutdownTestCase):
 
     def test_selected_live_local_session_without_record_answers_without_peer(self) -> None:
         for verb in ("cancel", "now", "restart"):
-            with self.subTest(verb=verb), patch.object(shutdown, "run_remote") as selection_peer, patch.object(settle, "run_remote") as action_peer, patch.object(restart_work, "run_remote") as restart_peer, patch.object(restart_work, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[self.owners[1]], unattributed=[])) as observed, patch.object(settle, "_launch_conductor") as conductor:
+            with self.subTest(verb=verb), patch.object(shutdown, "run_remote") as selection_peer, patch.object(settle, "run_remote") as action_peer, patch.object(restart_work, "run_remote") as restart_peer, patch.object(settle, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[self.owners[1]], unattributed=[])) as observed, patch.object(settle, "_launch_conductor") as conductor:
                 output, error = io.StringIO(), io.StringIO()
                 with redirect_stdout(output), redirect_stderr(error):
                     status = shutdown.main([verb, LOGIN, "--only", "beta-id"])
@@ -958,7 +960,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertEqual((status, error), (1, ""))
         self.assertIn("Alpha is waiting, not stopped; nothing to restart\n", output)
         alert.assert_called_once()
-        body = cast(str, alert.call_args.args[1])
+        body = cast(str, cast(object, alert.call_args.args[1]))
         self.assertIn("Beta", body)
         self.assertIn("window launch failed", body)
         self.assertNotIn("2 not back", body)
@@ -1016,6 +1018,29 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertEqual(changed["force"], "now")
         self.assertEqual(record.find_session(LOGIN, "beta-id"), refused)
         self.assertEqual(record.find_session(LOGIN, "gamma-id"), before[2])
+
+    def test_up_json_returns_one_object_with_structured_refusals(self) -> None:
+        _ = self.save_three({"kind": "waiting"})
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(shutdown.main(["up", LOGIN, "--here", "--json", "--only", "beta-id"]), 1)
+        result = restart_work.parse_peer_result(output.getvalue())
+        self.assertEqual(result["outcome"], "nothing")
+        self.assertEqual(result["lines"], ["Beta is waiting, not stopped; nothing to restart"])
+        self.assertEqual(result["no_remote_control"], [])
+        self.assertEqual(result["refused"], [{"kind": "not stopped", "session_id": "beta-id", "name": "Beta", "progress": "waiting"}])
+
+    def test_up_json_keeps_remote_control_diagnostic_and_archived_alert_policy(self) -> None:
+        _ = self.save_three({"kind": "stopped", "at": OCTOBER})
+        def quiet(current: record.SessionShutdown) -> None:
+            current["alerts"] = "none"
+        _ = record.update_session(LOGIN, "beta-id", quiet)
+        with patch.object(restart_work, "wait_for_remote_control", return_value=frozenset()), redirect_stdout(output := io.StringIO()):
+            self.assertEqual(shutdown.main(["up", LOGIN, "--here", "--json", "--only", "beta-id"]), 0)
+        result = restart_work.parse_peer_result(output.getvalue())
+        self.assertIn("Beta: running, no Remote Control", result["lines"])
+        self.assertEqual(result["no_remote_control"], [{"session_id": "beta-id", "name": "Beta", "alerts": "none"}])
+        self.assertIsNone(record.find_session(LOGIN, "beta-id"))
 
 
 
