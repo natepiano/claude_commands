@@ -51,7 +51,38 @@ class UsageStoreTests(unittest.TestCase):
             {"left": 100.0, "resets": "", "at": "2026-10-12T14:30:00+00:00"},
         )
 
-    def test_a_refused_read_and_other_tools_change_nothing(self) -> None:
+    def test_a_codex_login_keeps_its_credits_apart_from_a_claude_login_at_the_same_address(self) -> None:
+        usage_store.save([
+            Report("Claude", email="Main@Example.invalid", quotas=[Quota("Weekly", 10.0, RESETS)]),
+            Report("Codex", email="Main@Example.invalid", quotas=[Quota("Weekly", 100.0, RESETS)],
+                   five_hour=Quota("5-hour", 25.0, READ + timedelta(hours=1)), credit_balance="13446"),
+        ], READ)
+
+        stored = usage_store.load()
+
+        self.assertEqual(sorted(stored), ["codex:main@example.invalid", "main@example.invalid"])
+        self.assertNotIn("credits", stored["main@example.invalid"])
+        self.assertEqual(stored["codex:main@example.invalid"], {
+            "five_hour": {"left": 75.0, "resets": "2026-10-12T15:30:00+00:00", "at": "2026-10-12T14:30:00+00:00"},
+            "weekly": {"left": 0.0, "resets": "2026-10-15T16:00:00+00:00", "at": "2026-10-12T14:30:00+00:00"},
+            "credits": {"balance": "13446", "at": "2026-10-12T14:30:00+00:00"},
+        })
+
+    def test_a_codex_account_with_no_five_hour_window_stores_none(self) -> None:
+        with_window = Report("Codex", email="main@example.invalid", quotas=[Quota("Weekly", 100.0, RESETS)],
+                             five_hour=Quota("5-hour", 25.0, READ + timedelta(hours=1)), credit_balance="unlimited")
+        without = Report("Codex", email="main@example.invalid", quotas=[Quota("Weekly", 81.0, RESETS)],
+                         credit_balance="unlimited")
+        usage_store.save([with_window], READ)
+
+        usage_store.save([without], READ + timedelta(minutes=2))
+
+        self.assertEqual(usage_store.load()["codex:main@example.invalid"], {
+            "weekly": {"left": 19.0, "resets": "2026-10-15T16:00:00+00:00", "at": "2026-10-12T14:32:00+00:00"},
+            "credits": {"balance": "unlimited", "at": "2026-10-12T14:32:00+00:00"},
+        })
+
+    def test_a_refused_read_changes_nothing(self) -> None:
         usage_store.save([Report("Claude", email="main@example.invalid", quotas=[Quota("Weekly", 10.0, RESETS)])], READ)
         before = usage_store.store_file().read_text(encoding="utf-8")
 
@@ -59,7 +90,8 @@ class UsageStoreTests(unittest.TestCase):
             Report("Claude", email="main@example.invalid",
                    quota_problem="Weekly quota: unavailable (HTTP 429; try Claude /usage)"),
             Report("Claude", problem="Not logged in"),
-            Report("Codex", email="codex@example.invalid", quotas=[Quota("Weekly", 50.0, RESETS)]),
+            Report("Codex", email="codex@example.invalid",
+                   quota_problem="Weekly quota: unavailable (Codex usage API failed)"),
         ], READ + timedelta(minutes=2))
 
         self.assertEqual(usage_store.store_file().read_text(encoding="utf-8"), before)
@@ -72,7 +104,8 @@ class UsageStoreTests(unittest.TestCase):
             _ = path.write_text(contents, encoding="utf-8")
             self.assertEqual(usage_store.load(), {})
         _ = path.write_text(json.dumps({
-            "a@example.invalid": {"weekly": {"left": True, "resets": "", "at": ""}, "five_hour": "junk"},
+            "a@example.invalid": {"weekly": {"left": True, "resets": "", "at": ""}, "five_hour": "junk",
+                                  "credits": {"balance": 5, "at": ""}},
             "b@example.invalid": "junk",
         }), encoding="utf-8")
         self.assertEqual(usage_store.load(), {"a@example.invalid": {}})

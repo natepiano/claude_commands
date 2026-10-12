@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import base64
 import json
 import os
 import shlex
@@ -14,7 +15,7 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from collections.abc import Callable
 from typing import Self, cast, final, override
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import accounts
@@ -73,6 +74,10 @@ class RoleWriteTime(datetime):
         return cls(2026, 10, 8, tzinfo=timezone.utc).astimezone(tz)
 
 
+# The Codex home's row when nothing is signed in to it.
+CODEX_HOME_ROW = ("~/.codex", "—", "not logged in", "seats", *("—",) * 7)
+
+
 @final
 class AccountsTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
@@ -83,6 +88,7 @@ class AccountsTests(unittest.TestCase):
         # The live reading the status table gets for a folder; a folder without one cannot be read.
         self.live: dict[Path, agent_accounts.Report] = {}
         self.live_reads = MagicMock()
+        self.codex_reads = AsyncMock()
 
     @override
     def setUp(self) -> None:
@@ -105,6 +111,9 @@ class AccountsTests(unittest.TestCase):
         del environment_context
         self.live = {}
         self.live_reads = self.enterContext(patch.object(agent_accounts, "claude_live", side_effect=self.live_report))
+        self.codex_reads = cast(AsyncMock, self.enterContext(patch.object(
+            agent_accounts, "codex_live", return_value=agent_accounts.Report("Codex", problem="Not logged in"),
+        )))
         _ = self.enterContext(patch.object(showrunners, "registered_showrunners", return_value=[
             showrunners.Showrunner(session="fixture", socket="", slug="fixture", zone="America/Los_Angeles", doc=""),
         ]))
@@ -175,6 +184,15 @@ class AccountsTests(unittest.TestCase):
     def write_note(self, label: str, login: str) -> None:
         path = Path(os.environ["AGENT_NOTES_DIR"]) / f"{label}.md"
         _ = path.write_text(f"---\nlogin: {login}\n---\n", encoding="utf-8")
+
+    def codex_login(self, login: str) -> None:
+        """Sign the Codex home in the way Codex stores it: the login is a claim of its id token."""
+        claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
+        codex_home = self.home / ".codex"
+        codex_home.mkdir(exist_ok=True)
+        _ = (codex_home / "auth.json").write_text(
+            json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}), encoding="utf-8",
+        )
 
     def write_identity(self, label: str, login: str) -> None:
         _ = (accounts.account_dir(label) / ".claude.json").write_text(
@@ -1605,14 +1623,16 @@ class AccountsTests(unittest.TestCase):
 
         self.assertEqual(self.status_rows(), [
             ("~/.claude", "claude 2", "main@example.invalid", "showrunners",
-             "64%", soon.astimezone(zone).strftime("%H:%M %Z"), "71%", weekly_cell, read_cell),
-            ("~/.claude1", "claude 1", "not set up", "—", "—", "—", "—", "—", "—"),
+             "64%", soon.astimezone(zone).strftime("%H:%M %Z"), "71%", weekly_cell, "—", "—", read_cell),
+            ("~/.claude1", "claude 1", "not set up", "—", *("—",) * 7),
             ("~/.claude3", "claude 3", "unit@example.invalid", "unit directors",
-             "100%", "—", "12%", weekly_cell, read_cell),
-            ("~/.claude4", "claude 4", "not logged in", "spare", "—", "—", "—", "—", "—"),
+             "100%", "—", "12%", weekly_cell, "—", "—", read_cell),
+            ("~/.claude4", "claude 4", "not logged in", "spare", *("—",) * 7),
+            CODEX_HOME_ROW,
         ])
         self.assertIn("PDT", read_cell + weekly_cell)
         self.live_reads.assert_not_called()
+        self.codex_reads.assert_not_awaited()
         self.assertFalse(accounts.account_dir("claude 1").exists())
         self.assertFalse(accounts.account_dir("claude 2").exists())
 
@@ -1634,8 +1654,8 @@ class AccountsTests(unittest.TestCase):
 
         self.assertEqual((result, stderr), (0, ""))
         lines = stdout.splitlines()
-        # The heading, the rule, and the default folder.
-        self.assertEqual(len(lines), 3)
+        # The heading, the rule, the default folder, and the Codex home.
+        self.assertEqual(len(lines), 4)
         self.assertEqual(len({len(line) for line in lines}), 1)
         self.assertEqual(set(lines[1]), {"|", " ", "-"})
         self.assertTrue(lines[2].startswith("| ~/.claude | claude 2 | main@example.invalid | showrunners, unit directors | "))
@@ -1652,9 +1672,67 @@ class AccountsTests(unittest.TestCase):
         second = self.status_rows()[0]
 
         self.assertEqual((first[4], first[6]), ("90%", "60%"))
-        self.assertNotEqual(first[8], "—")
+        self.assertNotEqual(first[10], "—")
         self.assertEqual(second, first)
         self.live_reads.assert_called_once_with(self.main_dir)
+
+    def test_status_table_shows_each_codex_account_and_whether_it_is_on_credits(self) -> None:
+        self.write_main_config()
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.codex_login("Seats@example.invalid")
+        self.write_note("codex 1", "other@example.invalid")
+        self.write_note("codex 2", "seats@example.invalid")
+        now = datetime.now(timezone.utc)
+        read = now - timedelta(minutes=1)
+        later = now + timedelta(days=3)
+        zone = ZoneInfo("America/Los_Angeles")
+        used_up = agent_accounts.Quota("5-hour", 100.0, now + timedelta(hours=1))
+        # Weekly percent used, the 5-hour window if the account has one, and the balance as Codex reports it.
+        cases: list[tuple[float, agent_accounts.Quota | None, str, tuple[str, str]]] = [
+            (100.0, None, "13446", ("yes", "13,446")),
+            (81.0, None, "13446", ("no", "13,446")),
+            (100.0, None, "0", ("no", "0")),
+            (81.0, used_up, "unlimited", ("yes", "unlimited")),
+            (100.0, None, "null", ("unavailable", "unavailable")),
+        ]
+        for weekly_used, five_hour, balance, credit_cells in cases:
+            with self.subTest(weekly_used=weekly_used, balance=balance):
+                usage_store.save([agent_accounts.Report(
+                    "Codex", email="seats@example.invalid", quotas=[agent_accounts.Quota("Weekly", weekly_used, later)],
+                    five_hour=five_hour, credit_balance=balance,
+                )], read)
+
+                rows = self.status_rows()
+
+                self.assertEqual(rows[-2][:4], ("~/.codex", "codex 2", "Seats@example.invalid", "seats"))
+                # An account with no 5-hour window shows none.
+                self.assertEqual(rows[-2][4:6], ("—", "—") if five_hour is None else ("0%", rows[-2][5]))
+                self.assertEqual(rows[-2][6:], (
+                    f"{100 - weekly_used:.0f}%", later.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
+                    *credit_cells, read.astimezone(zone).strftime("%H:%M %Z"),
+                ))
+                self.assertEqual(rows[-1], ("—", "codex 1", "not logged in", "—", *("—",) * 7))
+        self.codex_reads.assert_not_awaited()
+
+    def test_status_reads_codex_live_only_when_no_reading_is_recent_and_keeps_what_it_read(self) -> None:
+        self.write_main_config()
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.codex_login("seats@example.invalid")
+        later = datetime.now(timezone.utc) + timedelta(days=3)
+        self.codex_reads.return_value = agent_accounts.Report(
+            "Codex", email="seats@example.invalid", quotas=[agent_accounts.Quota("Weekly", 30.0, later)],
+            credit_balance="5",
+        )
+
+        first = self.status_rows()[-1]
+        second = self.status_rows()[-1]
+
+        # A login with no account note has no label.
+        self.assertEqual(first[:4], ("~/.codex", "—", "seats@example.invalid", "seats"))
+        self.assertEqual((first[6], first[8], first[9]), ("70%", "no", "5"))
+        self.assertNotEqual(first[10], "—")
+        self.assertEqual(second, first)
+        self.codex_reads.assert_awaited_once_with()
 
     def test_status_keeps_the_last_good_reading_when_the_service_refuses_a_read(self) -> None:
         self.write_main_config()
@@ -1676,9 +1754,9 @@ class AccountsTests(unittest.TestCase):
         rows = self.status_rows()
 
         self.assertEqual(rows[0][4:7], ("unavailable", "unavailable", "75%"))
-        self.assertEqual(rows[0][8], read.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z"))
+        self.assertEqual(rows[0][10], read.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z"))
         # claude 3 is logged in and has never been read.
-        self.assertEqual(rows[1][2:], ("unit@example.invalid", "spare", "unavailable", "unavailable", "unavailable", "unavailable", "—"))
+        self.assertEqual(rows[1][2:], ("unit@example.invalid", "spare", *("unavailable",) * 4, "—", "—", "—"))
         self.assertEqual(self.live_reads.call_count, 2)
 
     def test_status_times_use_this_machines_zone_when_no_production_runs_or_none_can_be_read(self) -> None:

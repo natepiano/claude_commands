@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import math
 import os
@@ -95,10 +96,14 @@ KNOWN_PRIVATE_NAMES = frozenset(
 IDENTITY_ENTRIES = (".credentials.json", ".claude.json", "account-label")
 IDENTITY_ENTRIES_NOT_SEEDED = (".credentials.json", "account-label")
 LABEL_PATTERN = re.compile(r"claude ([1-9][0-9]*)")
+CODEX_LABEL_PATTERN = re.compile(r"codex ([1-9][0-9]*)")
+# What the Codex account does in a production.
+CODEX_ROLE = "seats"
 # A table cell with nothing to show: the folder has no login, or is not set up.
 NO_VALUE = "—"
 TABLE_HEADINGS = (
-    "Folder", "Label", "Login", "Role", "5-hour left", "5-hour resets", "Weekly left", "Weekly resets", "Read",
+    "Folder", "Label", "Login", "Role", "5-hour left", "5-hour resets", "Weekly left", "Weekly resets",
+    "On credits", "Credits left", "Read",
 )
 # A stored reading older than this is read again before the table shows it.
 STALE_AFTER = timedelta(minutes=10)
@@ -317,6 +322,17 @@ class AccountStatus:
     unclassified: tuple[str, ...]
     missing_mcp_servers: tuple[str, ...]
     extra_mcp_servers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CodexStatus:
+    """One Codex row: the Codex home, or an account with a note that the home does not hold."""
+
+    folder: str
+    label: str
+    # The login the home is signed in with. Empty when it has none, and for an account no home holds.
+    login: str
+    role: str
 
 
 class CommandLine(argparse.Namespace):
@@ -1447,6 +1463,26 @@ def account_statuses() -> list[AccountStatus]:
     return statuses
 
 
+def codex_statuses() -> list[CodexStatus]:
+    """The Codex home, then every Codex account that has a note and that the home does not hold."""
+    home = agent_accounts.codex_home()
+    folder = f"~/{home.relative_to(Path.home())}" if home.is_relative_to(Path.home()) else str(home)
+    login = agent_accounts.codex_email_on_disk(home) or ""
+    label = account.label_for("Codex", login) if login else NO_VALUE
+    noted = sorted(
+        (path.stem for path in _account_notes_directory().glob("codex *.md") if CODEX_LABEL_PATTERN.fullmatch(path.stem)),
+        key=lambda stem: int(stem.removeprefix("codex ")),
+    )
+    return [
+        CodexStatus(folder, NO_VALUE if label == login else label, login, CODEX_ROLE),
+        *(CodexStatus(NO_VALUE, other, "", NO_VALUE) for other in noted if other != label),
+    ]
+
+
+def _codex_live() -> agent_accounts.Report:
+    return asyncio.run(agent_accounts.codex_live())
+
+
 def _stored_time(text: str) -> datetime | None:
     try:
         value = datetime.fromisoformat(text)
@@ -1456,23 +1492,38 @@ def _stored_time(text: str) -> datetime | None:
 
 
 def _read_at(usage: usage_store.StoredUsage | None) -> datetime | None:
-    """When the older of a login's two stored windows was read. None when either is missing."""
-    if usage is None or "five_hour" not in usage or "weekly" not in usage:
+    """When the oldest of a login's stored windows was read. None when it has no weekly window."""
+    if usage is None or "weekly" not in usage:
         return None
-    times = [_stored_time(usage["five_hour"]["at"]), _stored_time(usage["weekly"]["at"])]
+    windows = [usage["weekly"], *([usage["five_hour"]] if "five_hour" in usage else [])]
+    times = [_stored_time(window["at"]) for window in windows]
     return None if None in times else min(time for time in times if time is not None)
 
 
-def _usage_by_login(statuses: list[AccountStatus], now: datetime) -> dict[str, usage_store.StoredUsage]:
-    """Each login's stored windows. A logged-in folder with none read lately is read live first, all at once."""
+def _is_stale(usage: usage_store.StoredUsage | None, now: datetime) -> bool:
+    read = _read_at(usage)
+    return read is None or now - read > STALE_AFTER
+
+
+def _stored_usage(
+    statuses: list[AccountStatus], codex: list[CodexStatus], now: datetime,
+) -> dict[str, usage_store.StoredUsage]:
+    """Each login's stored readings. A login with none read lately is read live first, all at once."""
     stored = usage_store.load()
     stale = [
         status.config_dir for status in statuses
-        if status.login and ((read := _read_at(stored.get(status.login.casefold()))) is None or now - read > STALE_AFTER)
+        if status.login and _is_stale(stored.get(usage_store.key("Claude", status.login)), now)
     ]
-    if stale:
+    # One Codex home, so one live read covers the one login it holds.
+    codex_is_stale = any(
+        status.login and _is_stale(stored.get(usage_store.key("Codex", status.login)), now) for status in codex
+    )
+    if stale or codex_is_stale:
         with ThreadPoolExecutor() as pool:
-            reports = list(pool.map(agent_accounts.claude_live, stale))
+            reads = [pool.submit(agent_accounts.claude_live, config_dir) for config_dir in stale]
+            if codex_is_stale:
+                reads.append(pool.submit(_codex_live))
+            reports = [read.result() for read in reads]
         if usage_store.merge(stored, reports, now):
             try:
                 usage_store.write(stored)
@@ -1493,38 +1544,89 @@ def _user_zone() -> tzinfo | None:
     return ZoneInfo(zone) if zone else None
 
 
+def _is_current(window: usage_store.StoredWindow, now: datetime) -> bool:
+    """Whether a stored window still describes now. One that has ended says nothing about the one after it."""
+    if not window["resets"]:
+        return True
+    resets = _stored_time(window["resets"])
+    return resets is not None and resets > now
+
+
 def _window_cells(
     window: usage_store.StoredWindow | None, now: datetime, zone: tzinfo | None, pattern: str,
 ) -> tuple[str, str]:
     """What is left of one window and when it resets."""
-    if window is None:
+    if window is None or not _is_current(window, now):
         return ("unavailable", "unavailable")
-    if not window["resets"]:
-        return (f"{window['left']:.0f}%", NO_VALUE)
     resets = _stored_time(window["resets"])
-    # A window that has ended says nothing about the one after it.
-    if resets is None or resets <= now:
+    return (f"{window['left']:.0f}%", NO_VALUE if resets is None else resets.astimezone(zone).strftime(pattern))
+
+
+def _credit_cells(usage: usage_store.StoredUsage, now: datetime) -> tuple[str, str]:
+    """Whether Codex work now draws on the account's credits, and the credits left.
+
+    Codex spends credits once an allowance window is used up.
+    """
+    credits = usage.get("credits")
+    if credits is None:
         return ("unavailable", "unavailable")
-    return (f"{window['left']:.0f}%", resets.astimezone(zone).strftime(pattern))
+    balance = credits["balance"]
+    try:
+        amount = math.inf if balance == "unlimited" else float(balance)
+    except ValueError:
+        # Codex reported no balance.
+        return ("unavailable", "unavailable")
+    left = "unlimited" if math.isinf(amount) else f"{amount:,.0f}"
+    windows = [window for window in (usage.get("five_hour"), usage.get("weekly")) if window is not None]
+    current = [window for window in windows if _is_current(window, now)]
+    if any(window["left"] <= 0 for window in current):
+        return ("yes" if amount > 0 else "no", left)
+    return ("no" if "weekly" in usage and len(current) == len(windows) else "unavailable", left)
+
+
+def _reading_cells(
+    usage: usage_store.StoredUsage | None, now: datetime, zone: tzinfo | None, *, has_credits: bool,
+) -> tuple[str, ...]:
+    """The cells after the role: both windows, the credits, and when they were read."""
+    held = usage or usage_store.StoredUsage()
+    read = _read_at(usage)
+    has_no_five_hour_window = "weekly" in held and "five_hour" not in held
+    return (
+        *((NO_VALUE, NO_VALUE) if has_no_five_hour_window else _window_cells(held.get("five_hour"), now, zone, "%H:%M %Z")),
+        *_window_cells(held.get("weekly"), now, zone, "%a %m-%d %H:%M %Z"),
+        *(_credit_cells(held, now) if has_credits else (NO_VALUE, NO_VALUE)),
+        NO_VALUE if read is None else read.astimezone(zone).strftime("%H:%M %Z"),
+    )
+
+
+NO_READING = (NO_VALUE,) * 7
 
 
 def _table_row(
     status: AccountStatus, usage: usage_store.StoredUsage | None, now: datetime, zone: tzinfo | None,
 ) -> tuple[str, ...]:
-    """One folder's row. `usage` is its login's stored reading, if it has one."""
+    """One Claude folder's row. `usage` is its login's stored reading, if it has one."""
     if not status.is_set_up:
-        return (status.folder, status.label, "not set up", status.role, *(NO_VALUE,) * 5)
+        return (status.folder, status.label, "not set up", status.role, *NO_READING)
     if not status.account_is_safe_to_inspect:
-        return (status.folder, status.label, "unavailable", status.role, *(NO_VALUE,) * 5)
+        return (status.folder, status.label, "unavailable", status.role, *NO_READING)
     if not status.login:
-        return (status.folder, status.label, "not logged in", status.role, *(NO_VALUE,) * 5)
-    held = usage or usage_store.StoredUsage()
-    read = _read_at(usage)
+        return (status.folder, status.label, "not logged in", status.role, *NO_READING)
     return (
         status.folder, status.label, status.login, status.role,
-        *_window_cells(held.get("five_hour"), now, zone, "%H:%M %Z"),
-        *_window_cells(held.get("weekly"), now, zone, "%a %m-%d %H:%M %Z"),
-        NO_VALUE if read is None else read.astimezone(zone).strftime("%H:%M %Z"),
+        *_reading_cells(usage, now, zone, has_credits=False),
+    )
+
+
+def _codex_row(
+    status: CodexStatus, usage: usage_store.StoredUsage | None, now: datetime, zone: tzinfo | None,
+) -> tuple[str, ...]:
+    """One Codex row. `usage` is its login's stored reading, if it has one."""
+    if not status.login:
+        return (status.folder, status.label, "not logged in", status.role, *NO_READING)
+    return (
+        status.folder, status.label, status.login, status.role,
+        *_reading_cells(usage, now, zone, has_credits=True),
     )
 
 
@@ -1557,13 +1659,15 @@ def _status_notes(status: AccountStatus) -> list[str]:
 
 
 def status_report() -> str:
-    """One table row per account folder, then one line for each thing wrong or unusual in a folder."""
+    """One table row per Claude folder and Codex account, then one line for each thing wrong in a folder."""
     statuses = account_statuses()
+    codex = codex_statuses()
     now = datetime.now(timezone.utc)
-    usage = _usage_by_login(statuses, now)
+    usage = _stored_usage(statuses, codex, now)
     zone = _user_zone()
     table = _render_table([
-        _table_row(status, usage.get(status.login.casefold()), now, zone) for status in statuses
+        *(_table_row(status, usage.get(usage_store.key("Claude", status.login)), now, zone) for status in statuses),
+        *(_codex_row(status, usage.get(usage_store.key("Codex", status.login)), now, zone) for status in codex),
     ])
     notes = [note for status in statuses for note in _status_notes(status)]
     return "\n".join([table, *([""] if notes else []), *notes])
