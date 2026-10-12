@@ -1,6 +1,6 @@
 # Nested showrunners: a showrunner runs other showrunners, to any depth
 
-> **Status: IMPLEMENTATION PLAN — nothing built; six phases, all todo.**
+> **Status: IMPLEMENTATION PLAN — Phase 1 (the tree) is built, its live attach of tool-based-ui under build-followups waiting on the showrunner's go; Phases 2–6 are todo.**
 
 > **As-built disposition: amend** — `docs/as-built/showrunner-automation.md`
 
@@ -80,7 +80,19 @@ On the showrunner's go, the phases run in order in this worktree. Each ends with
 
 ## Phases
 
-### Phase 1 — The tree: attach, detach, and who reports to whom  · status: todo
+### Phase 1 — The tree: attach, detach, and who reports to whom  · status: done · live attach waits on the showrunner's go
+
+#### As-built
+
+- `scripts/production/showrunners.py`: `SHOWRUNNER_STATE_DIR` (env of that name, else `~/.local/state/showrunner`), `PARENT_FILE`. `Timer` and `_timer(instance)` hold what makes a timer a complete showrunner's, with no process started; `_registered` builds on it. `timer_slugs()`, `edges(slugs=None) -> dict[child, parent]`, `parent_of`, `children_of`, `root_of`, `highest_running(runners)`, `tree_lines(runners)`, `own_slug()`, `attach(child, parent)`, `detach(child) -> parent`, `tell(slug, key, text)`, `tell_others(texts, key)`. CLI verbs `parent|children|root <slug>`, `tree`, `attach <child> [<parent>]`, `detach <child>`.
+- The lookups are named `parent_of`, `children_of` and `root_of`, not the `parent`, `children` and `root` this Work Order wrote, so a caller's own `parent` variable does not hide the function.
+- A cycle written by hand counts for none of its members. That is stronger than the Work Order's "stops at a slug it has already seen": `root_of` needs no guard, and each member is a root in every reader.
+- `tmux_names.fault` tells `showrunners.highest_running(...)`, not strictly roots: below a root that is down, the nearest running showrunner hears, so a fault is not lost while a root is stopped.
+- `commands/showrunner/attach.md`; `produce.md` → Throughout → Nested showrunners, and three rows in the Direct table; `docs/production_format.md` → Words → Parent, child and root showrunner; `docs/as-built/showrunner-automation.md` → Nested showrunners, which each later phase extends.
+
+**Binds later work:** `edges()` is the one reader of the tree; Phases 2 and 3 walk it for descendants. `attach(child, parent)` raises `ValueError` with the refusal, which Phase 4 calls after its launch. `own_slug()` is how a script learns which production its session runs. Tests point the tree at a temp dir with `SHOWRUNNER_STATE_DIR` and catch messages with `SHOWRUNNERS_SEND`.
+
+**Gotchas:** `registered_showrunners()` starts one process per showrunner to find its socket; `timer_slugs()` and `edges()` start none, so call those where only the tree is needed. `detach` removes a parent file even when its edge no longer counts.
 
 #### Work Order
 
