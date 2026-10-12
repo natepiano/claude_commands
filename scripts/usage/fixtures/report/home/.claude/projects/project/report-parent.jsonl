@@ -1,0 +1,5 @@
+{"type":"user","timestamp":"2026-10-10T21:30:00Z","cwd":"/invented/build"}
+{"type":"assistant","timestamp":"2026-10-10T21:34:50Z","effort":"high","requestId":"parent-before","message":{"id":"parent-before","model":"claude-opus-4-6","usage":{"input_tokens":100,"cache_creation_input_tokens":30,"cache_creation":{"ephemeral_5m_input_tokens":20,"ephemeral_1h_input_tokens":10},"cache_read_input_tokens":100,"output_tokens":20}}}
+{"type":"assistant","timestamp":"2026-10-10T21:34:51Z","cwd":"/invented/ignored","requestId":"parent-edit","message":{"id":"parent-edit","content":[{"type":"tool_use","name":"Edit"}]}}
+{"type":"system","subtype":"compact_boundary","timestamp":"2026-10-10T21:34:55Z"}
+{"type":"assistant","timestamp":"2026-10-10T21:35:10Z","effort":"high","requestId":"parent-after","message":{"id":"parent-after","model":"claude-opus-4-6","usage":{"input_tokens":200,"output_tokens":20}}}

@@ -224,7 +224,7 @@ The store is at `PRAGMA user_version` 6 (`STORE_VERSION`) and holds what the wor
 
 **Ruled out:** importing `scripts/whoami/agent_accounts.py` (it reports the live state the readings file already records over time); storing weights; storing a finding's title, file or detail (`source_event` finds them in the history file).
 
-### Phase 7 — Metrics as named queries · status: todo
+### Phase 7 — Metrics as named queries · status: done
 
 #### Work Order
 
