@@ -143,7 +143,7 @@
 
 **Ruled out:** the pool launcher closing its own pass on a signal — the unit director's cancel call then fails on a closed pass, and the two arms differ; a pool prompt that points at `config/review_pool/code.md` — a leased reviewer holds the earlier pinned text; the record's status derived from the exit code.
 
-### Phase 4 — The trial report  · status: todo
+### Phase 4 — The trial report  · status: done
 
 #### Work Order
 
