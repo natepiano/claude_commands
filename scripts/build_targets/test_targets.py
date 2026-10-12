@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 import unittest
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, is_dataclass
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +16,7 @@ from unittest import mock
 
 import targets
 import mac_test
+import offload
 
 
 SHIPPED_CONFIG = Path(__file__).resolve().parents[2] / "config" / "build_targets.conf"
@@ -79,6 +80,9 @@ class IsolatedTargetTest(unittest.TestCase):
             "MAC_TEST_STATE_DIR": str(self.mac_state),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "",
+            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         })))
         _ = os.environ.pop("BUILD_TARGETS_CONFIG", None)
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
@@ -196,6 +200,59 @@ class ConfigurationTests(IsolatedTargetTest):
             + "platform.natedev = linux\n"
         )
         self.assertEqual(targets.read_targets(config), (targets.LocalTarget("natedev", "linux"),))
+
+
+class EligibilityTests(IsolatedTargetTest):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        config = self.write_config(
+            "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            + "kind.natedev=local\nplatform.natedev=linux\n"
+        )
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)})))
+        _ = self.enterContext(mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")))
+
+    def test_eligibility_table_keeps_linux_and_excludes_each_mac_constraint(self) -> None:
+        mac = targets.SshTarget("mac", "macos", self.settings)
+        local = targets.LocalTarget("natedev", "linux")
+        for settings, routing, expected in (
+            ("linux_only.hana=\n", targets.AnyEligibleTarget(), targets.EligibleTarget(mac)),
+            ("linux_only.other=\n", targets.AnyEligibleTarget(), targets.ExcludedTarget(mac, "repo")),
+            ("linux_only.hana=other,hana\n", targets.AnyEligibleTarget(), targets.ExcludedTarget(mac, "linux_only")),
+            ("linux_only.hana=other\n", targets.AnyEligibleTarget(), targets.EligibleTarget(mac)),
+            ("", targets.LocalRequired("Linux sockets required"), targets.ExcludedTarget(mac, "Linux sockets required")),
+        ):
+            with self.subTest(settings=settings, routing=routing):
+                _ = self.settings.write_text(settings)
+                self.assertEqual(targets.target_eligibility(self.root, "hana", routing),
+                                 (expected, targets.EligibleTarget(local)))
+
+    def test_unknown_repository_excludes_mac_without_excluding_linux(self) -> None:
+        with mock.patch.object(offload, "repository_identity", return_value=offload.UNKNOWN_REPOSITORY):
+            results = targets.target_eligibility(self.root, "hana", targets.AnyEligibleTarget())
+        self.assertEqual(results[0], targets.ExcludedTarget(targets.SshTarget("mac", "macos", self.settings), "repo"))
+        self.assertEqual(results[1], targets.EligibleTarget(targets.LocalTarget("natedev", "linux")))
+
+    def test_reversed_order_and_alternate_settings_decide_eligibility(self) -> None:
+        alternate = self.root / "alternate.conf"
+        _ = alternate.write_text("linux_only.hana=hana\n")
+        config = self.write_config(
+            "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=alternate.conf\n"
+        )
+        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}):
+            results = targets.target_eligibility(self.root, "hana", targets.AnyEligibleTarget())
+        self.assertEqual(results, (targets.EligibleTarget(targets.LocalTarget("natedev", "linux")),
+                                  targets.ExcludedTarget(targets.SshTarget("mac", "macos", alternate), "linux_only")))
+
+    def test_routing_results_are_frozen_domain_values(self) -> None:
+        for value in (targets.AnyEligibleTarget(), targets.LocalRequired("reason"),
+                      targets.EligibleTarget(targets.LocalTarget("natedev", "linux")),
+                      targets.ExcludedTarget(targets.SshTarget("mac", "macos", self.settings), "repo")):
+            self.assertTrue(is_dataclass(value))
+            with self.assertRaises(FrozenInstanceError):
+                setattr(value, "reason", "changed")
 
 
 class TargetStateTests(IsolatedTargetTest):
