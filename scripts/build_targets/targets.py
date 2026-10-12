@@ -16,6 +16,7 @@ for directory in ("build_hold", "mac_test", "lint"):
     sys.path.insert(0, str(SCRIPTS / directory))
 import build_hold
 import mac_test
+import offload
 import sweep
 
 
@@ -36,6 +37,31 @@ class SshTarget:
 
 
 Target = LocalTarget | SshTarget
+
+
+@dataclass(frozen=True)
+class AnyEligibleTarget:
+    """The test may run on any target that supports its repository and package."""
+
+
+@dataclass(frozen=True)
+class LocalRequired:
+    reason: str
+
+
+Routing = AnyEligibleTarget | LocalRequired
+ANY_ELIGIBLE_TARGET = AnyEligibleTarget()
+
+
+@dataclass(frozen=True)
+class EligibleTarget:
+    target: Target
+
+
+@dataclass(frozen=True)
+class ExcludedTarget:
+    target: Target
+    reason: str
 
 
 class ConfigError(ValueError):
@@ -124,6 +150,31 @@ def read_targets(path: Path | None = None) -> tuple[Target, ...]:
             raise ConfigError(f"{key}: settings file does not exist: {settings}")
         targets.append(SshTarget(name, platform, settings))
     return tuple(targets)
+
+
+def target_eligibility(
+    repo_root: Path, package: str, routing: Routing
+) -> tuple[EligibleTarget | ExcludedTarget, ...]:
+    """Keep configured order while excluding Mac targets the test cannot use."""
+    results: list[EligibleTarget | ExcludedTarget] = []
+    repository = offload.repository_identity(repo_root)
+    for target in read_targets():
+        if target.platform == "linux":
+            results.append(EligibleTarget(target))
+        elif isinstance(routing, LocalRequired):
+            results.append(ExcludedTarget(target, routing.reason))
+        elif isinstance(repository, offload.UnknownRepository):
+            results.append(ExcludedTarget(target, "repo"))
+        else:
+            config = offload.read_config(target.settings) if isinstance(target, SshTarget) else offload.read_config()
+            key = f"linux_only.{repository.name}"
+            if key not in config.values:
+                results.append(ExcludedTarget(target, "repo"))
+            elif package in offload.comma_values(config.values[key]):
+                results.append(ExcludedTarget(target, "linux_only"))
+            else:
+                results.append(EligibleTarget(target))
+    return tuple(results)
 
 
 def utc_now() -> datetime:

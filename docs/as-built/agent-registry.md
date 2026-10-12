@@ -178,7 +178,23 @@ would strand the message and kill the delegate mid-reply. At each turn boundary
 `start` checks `thread/queue/list` and the thread's state, then watches
 `QUEUE_GRACE_SECS` (3 s) for a queued turn already in flight, and keeps
 streaming while work remains. The summary is the last turn's answer, so a peer's
-follow-up is reflected in what the unit director reads. With `--resident`
+follow-up is reflected in what the unit director reads.
+
+A `follow` launcher accepts a completion only for the turn it follows, so that
+the end of an earlier turn cannot finish it. Once that turn has ended it follows
+no turn until the next `turn/started` names one. It does not take the next id
+from `thread/read`: when a peer's turn opens the instant the followed one ends,
+the thread reads `active` while its turn list still shows the old turn in
+progress. Before 2026-10-12 the launcher kept that old id, ignored the peer
+turn's start and end, and waited to its deadline; a tester seat showed
+`running` for 48 minutes that way.
+
+A launcher that gets no notice for `UNSEEN_END_CHECK_SECS` (60 s) checks with
+`_ended_unseen` that its turn has not ended without one: an empty queue and a
+thread that reads `idle` (read without turns, so it stays small) finish the run,
+and the seat's log says `thread is idle and no completion notice arrived`. The
+run is `done` when an answer was seen and failed when none was. A launcher
+waiting out a capacity retry skips the check. With `--resident`
 (ask_a_friend's friend) `start` stays attached across turns instead: each
 finished turn's reply is printed and delivered as it lands, the thread keeps
 accepting `send`, and only `end` releases the block.
