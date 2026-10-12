@@ -116,6 +116,14 @@ NO_RESULT_FILE = NoResultFile()
 
 
 @dataclass(frozen=True)
+class DefaultMacSettings:
+    """Select settings through MAC_TEST_CONFIG or its existing default."""
+
+
+DEFAULT_MAC_SETTINGS = DefaultMacSettings()
+
+
+@dataclass(frozen=True)
 class OffloadConfig:
     """Settings that govern one Mac offload decision."""
 
@@ -231,6 +239,21 @@ class UnavailableProbe:
 
 ProbeResult = ProbeSnapshot | UnavailableProbe
 UNAVAILABLE_PROBE = UnavailableProbe()
+
+
+@dataclass(frozen=True)
+class ReachableHost:
+    """The host completed a command over SSH."""
+
+
+@dataclass(frozen=True)
+class UnreachableHost:
+    """The host could not complete the reachability probe."""
+
+    reason: str
+
+
+HostReachability = ReachableHost | UnreachableHost
 
 
 class NoBackoff:
@@ -382,8 +405,9 @@ def positive_number(values: dict[str, str], key: str, default: float) -> float:
     return value if math.isfinite(value) and value > 0 else default
 
 
-def read_config() -> OffloadConfig:
-    values = sweep.config_values(str(config_path()))
+def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> OffloadConfig:
+    settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
+    values = sweep.config_values(str(settings))
     return OffloadConfig(
         enabled=values.get("offload") == "on",
         host=values.get("host", "mac"),
@@ -582,6 +606,20 @@ def release_claim(controller: ProcessController) -> None:
             str(os.getpid()),
         ]
     )
+
+
+def probe_reachability(
+    controller: ProcessController,
+    config: OffloadConfig,
+) -> HostReachability:
+    """Check SSH reachability without creating or inspecting a repository."""
+    result = controller.capture(
+        [*ssh_prefix(config), "true"],
+        CommandTimeLimit(config.probe_timeout_s),
+    )
+    if isinstance(result, CommandOutput) and result.status == 0:
+        return ReachableHost()
+    return UnreachableHost(f"SSH probe failed for {config.host}")
 
 
 def probe_mac(
