@@ -62,7 +62,8 @@ and repository size limits for each Mac mirror's build folder,
 Linux-only packages, and Mac nextest exclusions. A repository needs a
 `linux_only.<repo>` key, even when its value is empty, before tests can run on
 the Mac. An empty `ci_repo` disables CI calls. `MAC_TEST_CONFIG` selects a
-different file for isolated runs.
+different file for a checkout's scripts in tests. Installed scripts refuse to
+run with `MAC_TEST_CONFIG` set.
 
 ## clippy.conf
 

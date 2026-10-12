@@ -662,6 +662,7 @@ class OffloadCommandTests(unittest.TestCase):
         (scripts_directory / "lint").symlink_to(
             SCRIPT.parent.parent / "lint", target_is_directory=True
         )
+        (scripts_directory / "build_hold").symlink_to(SCRIPT.parent.parent / "build_hold", target_is_directory=True)
         return runner
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
