@@ -35,7 +35,7 @@
 | delegate-rename-unit | docs/as-built/agent-registry.md and docs/as-built/session-notifier.md (runs done 2026-10-08) | /home/natepiano/worktrees/claude-build-followups-delegate-rename | build-followups-delegate-rename | — | commands/unit/direct.md, the stub commands/unit/delegate.md, and the lines that name the command in commands/, skills/, docs/, scripts/ and config/ (README.md, delegate.conf, lint.conf, clippy.conf); not CLAUDE.md, not settings.json |
 | shutdown-unit | `docs/as-built/session-roster.md` (earlier run: `docs/as-built/shutdown-and-restart.md`) | /home/natepiano/worktrees/claude-build-followups-shutdown | build-followups-shutdown | — | `docs/as-built/session-roster.md`; `scripts/message/`; `scripts/production/broadcast.py`; `commands/message.md`; the announce commands; `commands/notify_top_level.md`; `codex/AGENTS-messaging.md`; `scripts/notify/pushover.py`; `commands/alert_user.md` |
 | test-threads-unit-unit | docs/plans/build-followups-test-threads-unit.md | /home/natepiano/worktrees/claude-build-followups-test-threads-unit | build-followups-test-threads-unit | — | scripts/delegate/verify.sh, scripts/delegate/invoke.sh, the memory gate (memory_admit.py, anon_peaks.jsonl) |
-| feature-log-unit-unit | docs/plans/build-followups-feature-log-unit.md | /home/natepiano/worktrees/claude-build-followups-feature-log-unit | build-followups-feature-log-unit | 15798 (Phase 8 app checks only) | scripts/feature_log/; commands/validate_and_push.md (<FeatureLogCloseOut/> only); commands/showrunner/produce.md (<ChangeReviewFeatureLog/> and <CloseChangeReview/> only); docs/plans/build-followups-feature-log.md |
+| feature-log-unit-unit | `docs/as-built/feature-log.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-feature-log-unit | build-followups-feature-log-unit | 15798 (Phase 8 app checks only) | scripts/feature_log/; commands/validate_and_push.md (<FeatureLogCloseOut/> only); commands/showrunner/produce.md (<ChangeReviewFeatureLog/> and <CloseChangeReview/> only); commands/feature_log.md; commands/release.md (the changelog compare and release stamp steps only); pyrightconfig.json (its feature_log entry only); `docs/as-built/feature-log.md` |
 | two-accounts-unit | docs/plans/build-followups-two-accounts.md | /home/natepiano/worktrees/claude-build-followups-two-accounts | build-followups-two-accounts | — | docs/plans/build-followups-two-accounts.md |
 
 ## Hub files
@@ -45,7 +45,7 @@
 | `settings.json` | stalls-unit | mul_add-unit (mul_add PostToolUse handler after fn-length) |
 | `scripts/hooks/codex_hooks.py` | mul_add-unit (both fn-length and mul_add Codex handlers) | — |
 | `scripts/hooks/fn_length_lib.py` | stalls-unit | mul_add-unit (shared scanner, edit parser, lint reader and multiply-add target-root helper) |
-| `commands/showrunner/produce.md` | stalls-unit | enh-showrunner-unit (after stalls-unit Phase 6 merges) |
+| `commands/showrunner/produce.md` | stalls-unit | enh-showrunner-unit (after stalls-unit Phase 6 merges); feature-log-unit-unit (<ChangeReviewFeatureLog/> and <CloseChangeReview/>) |
 | `commands/showrunner/promote_unit.md` | stalls-unit | enh-showrunner-unit (after stalls-unit Phase 6 merges) |
 | `scripts/production/showrunners.py` | stalls-unit | enh-showrunner-unit (after stalls-unit Phase 6 merges) |
 | `scripts/production/stall_watch.py` | stalls-unit | enh-showrunner-unit (after stalls-unit Phase 6 merges) |

@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest.mock import patch
@@ -25,6 +25,7 @@ import launch_permission
 import unit_lookup
 from add_unit import cell_value, live_unit_table, plan_cell_is_retired, retired_units
 from scripts.accounts import accounts
+from test_support import ShutdownTestCase
 
 
 SCRIPT = Path(__file__).with_name("add_unit.py")
@@ -81,7 +82,7 @@ elif name == "nix":
 
 
 @final
-class AddUnitTests(unittest.TestCase):
+class AddUnitTests(ShutdownTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -100,6 +101,7 @@ class AddUnitTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         # Rows read in this process name worktrees that exist nowhere: answer for them here, so no
         # test asks the real disk, and a row with a worktree never asks tmux. RetiredRowTests covers the rule.
         _ = self.enterContext(patch.object(add_unit, "worktree_is_linked", return_value=True))
@@ -421,6 +423,8 @@ class AddUnitTests(unittest.TestCase):
         self,
         launch_kind: add_unit.NewWorkLaunch | add_unit.UnitRestoreLaunch,
         claude: unit_lookup.Claude,
+        *,
+        already_marked: bool = True,
     ) -> tuple[int, str, list[list[str]], int, int]:
         request = add_unit.UnitLaunch(
             production=add_unit.read_production(self.doc),
@@ -493,7 +497,7 @@ class AddUnitTests(unittest.TestCase):
             patch.object(
                 add_unit,
                 "launched_unit",
-                return_value=add_unit.MarkedUnitFound(marked),
+                return_value=(add_unit.MarkedUnitFound(marked) if already_marked else add_unit.NoMarkedUnit()),
             ),
             patch.object(add_unit, "tmux_live", return_value=False),
             patch.object(add_unit, "write_stub") as write_stub,
@@ -501,14 +505,58 @@ class AddUnitTests(unittest.TestCase):
             patch.object(add_unit, "commit_unit"),
             patch.object(add_unit, "ensure_worktree"),
             patch.object(add_unit, "launch_session", side_effect=launch),
-            patch.object(add_unit, "wait_for_remote_control", return_value=marked),
+            patch.object(add_unit, "wait_for_remote_control", return_value=marked) as wait,
             patch.object(add_unit, "record"),
             patch.object(subprocess, "run", side_effect=run),
             patch.dict(os.environ, self.env),
             redirect_stderr(error),
         ):
             result = add_unit.main(["--production", "unused", "alpha", "--plan", "unused"])
+        if result == 0:
+            if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
+                wait.assert_not_called()
+            else:
+                wait.assert_called_once_with(request, "tmux")
         return result, error.getvalue(), commands, len(launches), write_stub.call_count
+
+    def test_restore_returns_zero_without_waiting_for_remote_control(self) -> None:
+        launch_kind = add_unit.UnitRestoreLaunch(
+            "session-123", self.root / "restart-note", "recorded-name", "recorded-tmux"
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result, error, commands, launches, _writes = self.run_with_marked_unit(
+                launch_kind, unit_lookup.ClaudeNotRunning(), already_marked=False
+            )
+        self.assertEqual(result, 0, error)
+        self.assertEqual(commands, [])
+        self.assertEqual(launches, 1)
+        self.assertEqual(output.getvalue(), "alpha-unit restore launched: tmux attach -t recorded-tmux\n")
+
+    def test_restore_already_running_returns_zero_without_waiting_for_remote_control(self) -> None:
+        launch_kind = add_unit.UnitRestoreLaunch(
+            "session-123", self.root / "restart-note", "recorded-name", "recorded-tmux"
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result, error, commands, launches, _writes = self.run_with_marked_unit(
+                launch_kind, unit_lookup.LiveClaude("recorded-name", "session-123", "/socket", 123)
+            )
+        self.assertEqual(result, 0, error)
+        self.assertEqual(commands, [])
+        self.assertEqual(launches, 0)
+        self.assertEqual(output.getvalue(), "alpha-unit restore launched: tmux attach -t marked-tmux\n")
+
+    def test_new_work_launch_still_waits_for_remote_control(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result, error, commands, launches, _writes = self.run_with_marked_unit(
+                add_unit.NewWorkLaunch(), unit_lookup.ClaudeNotRunning(), already_marked=False
+            )
+        self.assertEqual(result, 0, error)
+        self.assertEqual(commands, [])
+        self.assertEqual(launches, 1)
+        self.assertEqual(output.getvalue(), "alpha-unit started: tmux attach -t marked-tmux\n")
 
     def test_restore_replaces_marked_tmux_without_running_claude(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
@@ -563,7 +611,7 @@ class AddUnitTests(unittest.TestCase):
             "recorded-tmux",
         )
 
-        self.assertIn("alpha-unit started", result.stdout)
+        self.assertIn("alpha-unit restore launched", result.stdout)
         self.assertEqual(len(self.events("systemd-run")), 1)
         self.assertEqual(len(self.recorded_prompts("session-123")), 1)
 
@@ -598,7 +646,7 @@ class AddUnitTests(unittest.TestCase):
             "recorded-tmux",
         )
 
-        self.assertIn("alpha-unit started", result.stdout)
+        self.assertIn("alpha-unit restore launched", result.stdout)
         self.assertEqual(len(self.recorded_prompts("session-123")), 1)
 
     def test_restore_without_a_units_row_is_refused_and_adds_nothing(self) -> None:
@@ -814,14 +862,6 @@ class AddUnitTests(unittest.TestCase):
             add_unit.NoUnitRow(),
             add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
         )
-        marked = unit_lookup.MarkedUnit(
-            "alpha-unit",
-            "%7",
-            "recorded-tmux",
-            unit_lookup.LiveClaude(
-                "recorded-name", "session-123", "/socket", 123
-            ),
-        )
         creator: subprocess.Popen[str] | None = None
 
         def start_shutdown(_request: add_unit.UnitLaunch) -> None:
@@ -860,15 +900,12 @@ class AddUnitTests(unittest.TestCase):
                         contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
                     )
 
-        def wait(
-            _request: add_unit.UnitLaunch, _tmux: str
-        ) -> unit_lookup.MarkedUnit:
+        def finish_shutdown() -> None:
             self.assertIsNotNone(creator)
             if creator is None:
                 self.fail("shutdown creator did not start")
-            stdout, stderr = creator.communicate(timeout=5)
+            stdout, stderr = creator.communicate(timeout=1)
             self.assertEqual(creator.returncode, 0, (stdout, stderr))
-            return marked
 
         error = io.StringIO()
         with (
@@ -887,7 +924,7 @@ class AddUnitTests(unittest.TestCase):
             patch.object(add_unit, "ensure_worktree"),
             patch.object(add_unit, "record_scheduled_restore_prompt"),
             patch.object(add_unit, "launch_session", side_effect=launch),
-            patch.object(add_unit, "wait_for_remote_control", side_effect=wait),
+            patch.object(add_unit, "wait_for_remote_control") as wait,
             patch.object(add_unit, "record"),
             patch.dict(os.environ, self.env),
             redirect_stderr(error),
@@ -895,8 +932,10 @@ class AddUnitTests(unittest.TestCase):
             result = add_unit.main(
                 ["--production", "unused", "alpha", "--plan", "unused"]
             )
+            finish_shutdown()
 
         self.assertEqual(result, 0, error.getvalue())
+        wait.assert_not_called()
         account = Path(self.env["SHUTDOWN_STATE_DIR"]) / "owner@example.com"
         self.assertTrue((account / "record.json").is_file())
 
@@ -1812,9 +1851,10 @@ class PythonImportConfiguration(TypedDict):
 
 
 @final
-class UnitLaunchProtocolTests(unittest.TestCase):
+class UnitLaunchProtocolTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
+        super().setUp()
         home = self.enterContext(tempfile.TemporaryDirectory())
         home_context = cast(object, self.enterContext(
             patch.dict(os.environ, {"HOME": home})
@@ -1876,7 +1916,7 @@ class UnitLaunchProtocolTests(unittest.TestCase):
         ))
 
 
-class RetiredRowTests(unittest.TestCase):
+class RetiredRowTests(ShutdownTestCase):
     """A unit is retired by its Plan cell, or when its worktree and its tmux session are both gone."""
 
     root: Path = Path()
@@ -1886,6 +1926,7 @@ class RetiredRowTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root)
         home_context = cast(object, self.enterContext(
