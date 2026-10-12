@@ -30,7 +30,10 @@ Run these steps in order for each completed loop or verbose phase:
 5. **Worker cleanup and completion.** Run the worker half of <PhaseCleanup/>:
    `remove_seats.py`, helpers, launchers, and apps. Run it before the next
    launch. Per <LongLivedSeats/>, Codex turns finish but their threads remain
-   open until `end_session.sh`; Claude seats keep their existing cleanup. Then
+   open until `end_session.sh`; Claude seats keep their existing cleanup.
+   When the production doc names a review pool, run
+   `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py end-lease --production <slug> --unit <unit> --phase <phase>`
+   in this worker cleanup. Then
    run <RecordPhaseCompletion/>, including `finish-phase` and deletion of the
    inactive reservation state file before the next phase writes its own.
 6. **Next launch.** In loop mode or an active auto window with a next phase,

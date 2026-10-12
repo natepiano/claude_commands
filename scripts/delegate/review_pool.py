@@ -117,6 +117,7 @@ class PoolArguments(argparse.Namespace):
     type: ReviewerType = "code"
     instructions_file: str = ""
     reviewer: str = ""
+    thread_id: str = ""
     unit: str = ""
     phase: str = ""
     pass_number: str = ""
@@ -475,6 +476,8 @@ def command_release(args: PoolArguments) -> int:
     with _production(str(args.production)).locked() as pool:
         reviewer = pool.reviewers.get(str(args.reviewer))
         if reviewer is not None and isinstance(reviewer.ownership, ClaimedReviewer) and reviewer.ownership.pid == int(args.pid):
+            if args.thread_id and args.thread_id != reviewer.thread_id:
+                reviewer.thread_id = args.thread_id
             reviewer.ownership = IdleReviewer()
             reviewer.reviews += 1
     return 0
@@ -605,6 +608,7 @@ def main() -> int:
             _ = command.add_argument("--pid", type=int, required=True)
         if verb == "release":
             _ = command.add_argument("--reviewer", required=True)
+            _ = command.add_argument("--thread-id", default="")
         if verb == "split":
             _ = command.add_argument("--set", choices=("hash", "all", "off"), required=True)
         if verb == "health":
