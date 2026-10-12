@@ -17,19 +17,24 @@ from typing import TypedDict, cast
 
 
 from targets import (
+    ANY_ELIGIBLE_TARGET,
     ConfigError,
+    EligibleTarget,
     ExpiresAt,
     Free,
     Held,
     LocalTarget,
+    LocalRequired,
     ReleaseEstimated,
     Running,
+    Routing,
     SshTarget,
     StateUnreadable,
     TargetState,
     Unreachable,
     read_targets,
     target_state,
+    target_eligibility,
 )
 import offload
 import build_hold
@@ -57,6 +62,9 @@ class CliArguments(argparse.Namespace):
         self.call_id: str = ""
         self.pid: int = 0
         self.signal_name: str = "TERM"
+        self.repo_root: str = ""
+        self.package: str = ""
+        self.local_reason: str = ""
 
 
 def local_time(instant: datetime) -> str:
@@ -110,6 +118,23 @@ def command_status(probe: bool = False) -> int:
     return 0
 
 
+def command_eligible(
+    repo_root: Path, package: str, routing: Routing = ANY_ELIGIBLE_TARGET
+) -> int:
+    try:
+        eligibility = target_eligibility(repo_root, package, routing)
+    except (ConfigError, OSError, UnicodeError) as error:
+        print(f"build targets: {error}", file=sys.stderr)
+        return 2
+    for result in eligibility:
+        target = result.target
+        disposition = "eligible" if isinstance(result, EligibleTarget) else "excluded"
+        reason = "-" if isinstance(result, EligibleTarget) else display_field(result.reason)
+        settings = str(target.settings) if isinstance(target, SshTarget) else "-"
+        print(f"{target.name}\t{disposition}\t{reason}\t{settings}")
+    return 0
+
+
 
 def wait_clock() -> datetime:
     supplied = os.environ.get("BUILD_TARGETS_NOW", "")
@@ -135,6 +160,51 @@ def record_admission(admission: build_hold.AdmittedTurn) -> None:
     destination = os.environ.get("BUILDLOG_HOLD_ADMISSION_FILE", "")
     if destination:
         _ = Path(destination).write_text(f"{admission.cycle_id} {admission.generation}\n")
+
+
+def register_local_call(key: str, call_id: str, pid: int) -> build_hold.Admission:
+    """Register the waiting verify process and remember its actual cycle."""
+    progress = os.environ.get("BUILDLOG_HOLD_STARTED_FILE", "")
+    _ = build_hold.register_wait(key, call_id=call_id, pid=pid,
+                                 started=bool(progress and Path(progress).exists()))
+    admission = build_hold.read_admission(key, call_id)
+    if isinstance(admission, (build_hold.AwaitingTurn, build_hold.AdmittedTurn)):
+        destination = os.environ.get("BUILDLOG_HOLD_REGISTRATION_FILE", "")
+        if destination:
+            registration: CallRegistration = {"key": key, "cycle_id": admission.cycle_id}
+            _ = Path(destination).write_text(json.dumps(registration))
+    return admission
+
+
+def command_register_local(call_id: str, *, pid: int) -> int:
+    try:
+        state = target_state(local_target())
+        if isinstance(state, StateUnreadable):
+            print(wait_diagnostic(state.reason), file=sys.stderr, flush=True)
+            return 12
+        if not isinstance(state, Held):
+            return 0
+        key = build_hold.waiter_key(call_id)
+        admission = build_hold.read_admission(key, call_id)
+        if isinstance(admission, build_hold.AwaitingTurn):
+            admission = register_local_call(key, call_id, pid)
+        if isinstance(admission, build_hold.AdmissionReadError):
+            print(wait_diagnostic(admission.reason), file=sys.stderr, flush=True)
+            return 12
+        if isinstance(admission, build_hold.AdmittedTurn):
+            record_admission(admission)
+            return 0
+        print(f"verify.sh: natedev is held by {display_field(state.holder)} for "
+              + f"{display_field(state.reason)}.",
+              file=sys.stderr, flush=True)
+        escalation = float(os.environ.get("BUILD_TARGETS_ESCALATE_S", "7200"))
+        if (wait_clock() - state.since).total_seconds() >= escalation:
+            print(f"verify.sh: natedev has been held for 2 h by {display_field(state.holder)}; ask them.",
+                  file=sys.stderr, flush=True)
+        return 10
+    except (ConfigError, OSError, build_hold.ReleaseRecordReadError) as error:
+        print(wait_diagnostic(str(error)), file=sys.stderr, flush=True)
+        return 12
 
 
 def command_wait_local(call_id: str, *, pid: int = 0) -> int:
@@ -184,14 +254,11 @@ def command_wait_local(call_id: str, *, pid: int = 0) -> int:
             if isinstance(admission, build_hold.AwaitingTurn):
                 identity = (admission.cycle_id, admission.generation)
                 if identity != registered:
-                    progress = os.environ.get("BUILDLOG_HOLD_STARTED_FILE", "")
-                    _ = build_hold.register_wait(key, call_id=call_id, pid=process,
-                                                 started=bool(progress and Path(progress).exists()))
-                    registered = identity
-                    destination = os.environ.get("BUILDLOG_HOLD_REGISTRATION_FILE", "")
-                    if destination:
-                        registration: CallRegistration = {"key": key, "cycle_id": identity[0]}
-                        _ = Path(destination).write_text(json.dumps(registration))
+                    updated = register_local_call(key, call_id, process)
+                    if isinstance(updated, (build_hold.AwaitingTurn, build_hold.AdmittedTurn)):
+                        registered = (updated.cycle_id, updated.generation)
+                    else:
+                        registered = identity
                     continue
             if not announced:
                 print(f"verify.sh: natedev is held by {display_field(state.holder)} for "
@@ -317,14 +384,28 @@ def command_finish_local(call_id: str) -> int:
     return 0
 
 
+def positive_pid(value: str) -> int:
+    pid = int(value)
+    if pid <= 0:
+        raise argparse.ArgumentTypeError("must be a positive PID")
+    return pid
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
     status = commands.add_parser("status")
     _ = status.add_argument("--probe", action="store_true")
+    eligible = commands.add_parser("eligible")
+    _ = eligible.add_argument("--repo-root", required=True)
+    _ = eligible.add_argument("--package", required=True)
+    _ = eligible.add_argument("--local", dest="local_reason", default="")
+    register = commands.add_parser("register-local")
+    _ = register.add_argument("--call-id", required=True)
+    _ = register.add_argument("--pid", type=positive_pid, required=True)
     waiter = commands.add_parser("wait-local")
     _ = waiter.add_argument("--call-id", required=True)
-    _ = waiter.add_argument("--pid", type=int, default=0)
+    _ = waiter.add_argument("--pid", type=positive_pid, default=0)
     _ = commands.add_parser("check-local")
     admission = commands.add_parser("check-admission")
     _ = admission.add_argument("--call-id", required=True)
@@ -338,6 +419,11 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args(namespace=CliArguments())
+    if args.command == "eligible":
+        routing = LocalRequired(args.local_reason) if args.local_reason else ANY_ELIGIBLE_TARGET
+        return command_eligible(Path(args.repo_root).resolve(), args.package, routing)
+    if args.command == "register-local":
+        return command_register_local(args.call_id, pid=args.pid)
     if args.command == "wait-local":
         return command_wait_local(args.call_id, pid=args.pid)
     if args.command == "check-local":

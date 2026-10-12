@@ -15,6 +15,9 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import fields
+import io
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast, final, override
 from unittest import mock
@@ -34,9 +37,11 @@ class RemoteLine(TypedDict):
 
 class CommandFixture(TypedDict):
     probe_status: int
+    probe_error: str
     probe_delay_s: float
     probe_lines: list[str]
     rsync_status: int
+    hold_copy: bool
     run_lines: list[RemoteLine]
     run_status_reported: bool
     run_status_line: str
@@ -89,6 +94,10 @@ with (root / "events.jsonl").open("a", encoding="utf-8") as output:
     output.write(json.dumps(event) + "\n")
 
 if command == "rsync":
+    (root / "copy-started").write_text("started\n")
+    if fixture["hold_copy"]:
+        while not (root / "continue-copy").exists():
+            time.sleep(0.01)
     raise SystemExit(int(fixture["rsync_status"]))
 if command != "ssh":
     (root / (command + "-called")).write_text("called\n", encoding="utf-8")
@@ -120,6 +129,8 @@ if "lint nextest" in remote:
 
 (root / "probe-started").write_text("started\n", encoding="utf-8")
 time.sleep(float(fixture["probe_delay_s"]))
+if fixture["probe_error"]:
+    print(fixture["probe_error"], file=sys.stderr, flush=True)
 for line in fixture["probe_lines"]:
     print(line, flush=True)
 raise SystemExit(int(fixture["probe_status"]))
@@ -256,6 +267,34 @@ class OffloadSettingsTests(unittest.TestCase):
                 if isinstance(result, offload.UnreachableHost):
                     self.assertTrue(result.reason)
 
+    def test_resource_probe_needs_no_process_count_and_ignores_legacy_counts(self) -> None:
+        wire = "power=ac\nfree_gib=120\nhost=Mac\nrc=0\n"
+        expected = offload.ProbeSnapshot("ac", 120.0, "Mac")
+        self.assertEqual(offload.parse_probe(wire), expected)
+        self.assertEqual(offload.parse_probe("procs=12\n" + wire), expected)
+        self.assertEqual(offload.parse_probe("procs=unreadable\n" + wire), expected)
+        self.assertNotIn("processes", {field.name for field in fields(expected)})
+        script = offload.probe_script(offload.KnownRepository("hana"))
+        self.assertNotIn("pgrep", script)
+        self.assertNotIn("procs", script)
+
+    def test_probe_that_cannot_start_reports_its_limit_through_run(self) -> None:
+        _ = self.settings.write_text("offload=on\nlinux_only.hana=\nprobe_timeout_s=2.5\n")
+        destination = self.root / "result"
+        responses = [offload.CommandOutput(0, "", ""), offload.COMMAND_COULD_NOT_START,
+                     offload.CommandOutput(0, "", "")]
+        with mock.patch.object(sys, "argv", ["offload.py", "run", "--repo-root", str(self.root),
+                                             "--package", "hana", "--call-id", "probe-start", "--result", str(destination)]), \
+             mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")), \
+             mock.patch.object(offload.ProcessController, "capture", side_effect=responses) as capture, \
+             redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(offload.main(), 75)
+        self.assertEqual(output.getvalue(), "mac_test: not running on the Mac (unreachable)\n")
+        self.assertRegex(errors.getvalue(), r"^mac_test: could not reach the Mac: .*could not start.*2\.5.*\n$")
+        self.assertEqual(capture.call_count, 3)
+        self.assertEqual(destination.read_text().splitlines()[:2], ["mac=declined", "reason=unreachable"])
+        self.assertTrue((self.root / "state" / "unreachable_until").exists())
+
 
 @final
 class OffloadCommandTests(unittest.TestCase):
@@ -273,9 +312,11 @@ class OffloadCommandTests(unittest.TestCase):
         self.config: dict[str, str] = {}
         self.fixture: CommandFixture = {
             "probe_status": 0,
+            "probe_error": "",
             "probe_delay_s": 0.0,
             "probe_lines": [],
             "rsync_status": 0,
+            "hold_copy": False,
             "run_lines": [],
             "run_status_reported": True,
             "run_status_line": "mac_exit=0",
@@ -327,15 +368,16 @@ class OffloadCommandTests(unittest.TestCase):
         }
         self.fixture = {
             "probe_status": 0,
+            "probe_error": "",
             "probe_delay_s": 0.0,
             "probe_lines": [
-                "procs=0",
                 "power=ac",
                 "free_gib=120",
                 "host=Mac",
                 "rc=0",
             ],
             "rsync_status": 0,
+            "hold_copy": False,
             "run_lines": [],
             "run_status_reported": True,
             "run_status_line": "mac_exit=0",
@@ -354,6 +396,10 @@ class OffloadCommandTests(unittest.TestCase):
             "MAC_TEST_STATE_DIR": str(self.state_directory),
             "MAC_TEST_CONFIG": str(self.config_path),
             "MAC_TEST_STUB_DIR": str(self.stub_directory),
+            "BUILD_HOLD_DIR": str(self.root / "holders"),
+            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         }
 
     def write_executable(self, path: Path, source: str) -> None:
@@ -379,6 +425,9 @@ class OffloadCommandTests(unittest.TestCase):
         repository: Path | None = None,
         filter_run: bool = False,
         timeout: float = 10,
+        settings: Path | offload.DefaultMacSettings = offload.DEFAULT_MAC_SETTINGS,
+        last_decline: str = "",
+        separate_stderr: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
@@ -394,6 +443,10 @@ class OffloadCommandTests(unittest.TestCase):
         ]
         if filter_run:
             arguments.append("--filter-run")
+        if isinstance(settings, Path):
+            arguments.extend(["--settings", str(settings)])
+        if last_decline:
+            arguments.extend(["--last-decline", last_decline])
         arguments.extend(["--result", str(self.result_path), "--"])
         arguments.extend(nextest_arguments)
         return subprocess.run(
@@ -401,7 +454,7 @@ class OffloadCommandTests(unittest.TestCase):
             cwd=self.root,
             env=self.environment,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
             text=True,
             check=False,
             timeout=timeout,
@@ -507,7 +560,8 @@ class OffloadCommandTests(unittest.TestCase):
         self, result: subprocess.CompletedProcess[str], reason: str
     ) -> None:
         self.assertEqual(result.returncode, 75, result.stdout)
-        self.assertEqual(result.stdout, f"mac_test: staying on natedev ({reason})\n")
+        self.assertTrue(result.stdout.endswith(f"mac_test: not running on the Mac ({reason})\n"), result.stdout)
+        self.assertNotIn("mac_test: running on the Mac", result.stdout)
         self.assert_wire("declined", reason)
         self.assertFalse((self.state_directory / "run.json").exists())
 
@@ -593,17 +647,32 @@ class OffloadCommandTests(unittest.TestCase):
         self.fixture["probe_delay_s"] = 3.0
         self.sync_config()
         self.sync_fixture()
-        self.assert_declined(self.command(timeout=5), "unreachable")
+        result = self.command(timeout=5, separate_stderr=True)
+        self.assert_declined(result, "unreachable")
+        self.assertRegex(result.stderr, r"^mac_test: could not reach the Mac: .*0\.1.*\n$")
+        self.assertRegex(result.stderr, r"(?i)tim(?:e|ed).*out|limit|finish")
         self.assertTrue((self.stub_directory / "probe-started").exists())
         self.assertEqual(len(self.events_for("ssh")), 1)
 
     def test_probe_without_final_status_declines_as_unreachable(self) -> None:
         self.fixture["probe_lines"] = self.fixture["probe_lines"][:-1]
         self.sync_fixture()
-        self.assert_declined(self.command(), "unreachable")
+        result = self.command(separate_stderr=True)
+        self.assert_declined(result, "unreachable")
+        self.assertEqual(result.stderr, "mac_test: could not reach the Mac: the probe answer could not be read\n")
         self.assertEqual(len(self.events_for("ssh")), 1)
 
-    def test_running_build_processes_decline_as_mac_busy(self) -> None:
+    def test_failed_probe_prints_collapsed_ssh_error_before_unreachable_decline(self) -> None:
+        self.fixture["probe_status"] = 255
+        self.fixture["probe_error"] = "ssh:\tconnection refused\n  host mac is unavailable  "
+        self.sync_fixture()
+        result = self.command(separate_stderr=True)
+        self.assert_declined(result, "unreachable")
+        self.assertEqual(result.stderr, "mac_test: could not reach the Mac: ssh: connection refused host mac is unavailable\n")
+        self.assertEqual(self.events_for("rsync"), [])
+        self.assertTrue((self.state_directory / "unreachable_until").exists())
+
+    def test_other_build_processes_do_not_decline_mac_tests(self) -> None:
         self.fixture["probe_lines"] = [
             "procs=1",
             "power=ac",
@@ -612,9 +681,26 @@ class OffloadCommandTests(unittest.TestCase):
             "rc=0",
         ]
         self.sync_fixture()
-        self.assert_declined(self.command(), "mac_busy")
-        self.assertEqual(len(self.events_for("ssh")), 1)
-        self.assertEqual(self.events_for("rsync"), [])
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assert_wire("passed", "")
+        self.assertEqual(len(self.events_for("ssh")), 2)
+        self.assertEqual(len(self.events_for("rsync")), 1)
+
+    def test_run_settings_selects_alternate_host_and_budget_over_environment_default(self) -> None:
+        alternate = self.root / "alternate settings.conf"
+        values = {**self.config, "host": "alternate-mac", "mac_budget_gib.hana": "8"}
+        _ = alternate.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+        self.config["offload"] = "off"
+        self.sync_config()
+        result = self.command(settings=alternate)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assert_wire("passed", "")
+        ssh = self.events_for("ssh")
+        self.assertEqual(ssh[0]["args"][-2], "alternate-mac")
+        self.assertEqual(ssh[1]["args"][-2], "alternate-mac")
+        self.assertIn("LINT_SWEEP_BUDGET_GIB=8", ssh[1]["args"][-1])
+        self.assertIn("alternate-mac:.local/state/mac-test/mirror/hana/", self.events_for("rsync")[0]["args"])
 
     def test_battery_and_low_disk_decline_after_probe(self) -> None:
         for original, replacement, reason in (
@@ -625,7 +711,6 @@ class OffloadCommandTests(unittest.TestCase):
                 self.fixture["probe_lines"] = [
                     replacement if line == original else line
                     for line in [
-                        "procs=0",
                         "power=ac",
                         "free_gib=120",
                         "host=Mac",
@@ -671,7 +756,8 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(claimed.returncode, 0, claimed.stdout + claimed.stderr)
         busy = self.command()
         self.assertEqual(busy.returncode, 75, busy.stdout)
-        self.assertEqual(busy.stdout, "mac_test: staying on natedev (busy)\n")
+        self.assertTrue(busy.stdout.endswith("mac_test: not running on the Mac (busy)\n"), busy.stdout)
+        self.assertIn("busy", busy.stdout)
         self.assert_wire("declined", "busy")
         self.assertTrue((self.state_directory / "run.json").exists())
         self.assertEqual(self.events(), [])
@@ -681,8 +767,89 @@ class OffloadCommandTests(unittest.TestCase):
         _ = (self.state_directory / "block.json").write_text(
             "damaged\n", encoding="utf-8"
         )
-        self.assert_declined(self.command(), "state")
+        unreadable = self.command()
+        self.assert_declined(unreadable, "state")
+        self.assertIn("state unreadable", unreadable.stdout)
+        self.assertIn("block.json", unreadable.stdout)
         self.assertEqual(self.events(), [])
+
+    def test_retained_expired_block_still_declines_and_prints_holder_diagnostic(self) -> None:
+        self.state_directory.mkdir()
+        now = datetime.now(timezone.utc)
+        block = {"version": 2, "holder": "alice", "for": "restore CI first",
+                 "since": (now - timedelta(hours=2)).isoformat(),
+                 "expires": (now - timedelta(seconds=1)).isoformat(),
+                 "session": None, "showrunner": None, "state": "active",
+                 "ci": "off_by_this_block", "free_message": {"kind": "not_needed"}}
+        path = self.state_directory / "block.json"
+        _ = path.write_text(json.dumps(block))
+        before = path.read_bytes()
+        result = self.command()
+        self.assert_declined(result, "blocked")
+        self.assertIn("blocked by alice: restore CI first", result.stdout)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.events(), [])
+
+    def test_repeated_busy_decline_is_silent_and_preserves_wire_result(self) -> None:
+        claimed = self.state_command("claim", "--pid", str(os.getpid()), "--what", "other tests",
+                                     "--worktree", str(self.repository))
+        self.assertEqual(claimed.returncode, 0, claimed.stdout + claimed.stderr)
+        first = self.command(separate_stderr=True)
+        first_wire = self.wire_result()
+        self.assertEqual(first.stdout, "mac_test: not running on the Mac (busy)\n")
+        self.assertTrue(first.stderr)
+        repeated = self.command(last_decline="busy", separate_stderr=True)
+        self.assertEqual((repeated.returncode, repeated.stdout, repeated.stderr), (75, "", ""))
+        self.assertEqual(repeated.returncode, first.returncode)
+        self.assertEqual(self.wire_result()["mac"], first_wire["mac"])
+        self.assertEqual(self.wire_result()["reason"], first_wire["reason"])
+        self.assertEqual(self.events(), [])
+        self.assertTrue((self.state_directory / "run.json").exists())
+
+    def test_changed_decline_prints_normally_and_repeated_blocked_decline_is_silent(self) -> None:
+        self.state_directory.mkdir()
+        now = datetime.now(timezone.utc)
+        block = {"version": 2, "holder": "alice", "for": "restore CI first",
+                 "since": now.isoformat(), "expires": (now + timedelta(hours=1)).isoformat(),
+                 "session": None, "showrunner": None, "state": "active",
+                 "ci": "not_configured", "free_message": {"kind": "not_needed"}}
+        _ = (self.state_directory / "block.json").write_text(json.dumps(block))
+        first = self.command(separate_stderr=True)
+        changed = self.command(last_decline="busy", separate_stderr=True)
+        self.assertEqual((changed.returncode, changed.stdout, changed.stderr),
+                         (first.returncode, first.stdout, first.stderr))
+        self.assertEqual(changed.stdout, "mac_test: not running on the Mac (blocked)\n")
+        self.assertIn("blocked by alice: restore CI first", changed.stderr)
+        self.assert_wire("declined", "blocked")
+        repeated = self.command(last_decline="blocked", separate_stderr=True)
+        self.assertEqual((repeated.returncode, repeated.stdout, repeated.stderr), (75, "", ""))
+        self.assert_wire("declined", "blocked")
+        self.assertEqual(self.events(), [])
+
+    def test_mac_run_line_waits_for_claim_and_tree_copy(self) -> None:
+        self.fixture["hold_copy"] = True
+        self.sync_fixture()
+        process = self.start_command(script=self.claim_stub_runner())
+        try:
+            self.wait_for_path(self.stub_directory / "claim-started")
+            output = process.stdout
+            assert output is not None
+            self.assertEqual(select.select([output], [], [], 0)[0], [])
+            self.assertEqual(self.events(), [])
+            _ = (self.stub_directory / "finish-claim").write_text("continue\n")
+            self.wait_for_path(self.stub_directory / "copy-started")
+            self.assertEqual(select.select([output], [], [], 0)[0], [])
+            self.assertEqual([event["command"] for event in self.events()], ["ssh", "rsync"])
+            self.assert_claimed_commands()
+            _ = (self.stub_directory / "continue-copy").write_text("continue\n")
+            text, _ = process.communicate(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                _ = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, text)
+        self.assertEqual(text.count("mac_test: running on the Mac (macOS, host Mac); tree copied in "), 1)
+        self.assert_wire("passed", "")
 
     def test_signal_during_claim_releases_a_possible_claim(self) -> None:
         process = self.start_command(script=self.claim_stub_runner())
@@ -741,16 +908,14 @@ class OffloadCommandTests(unittest.TestCase):
         probe_script = probe[len(ssh_arguments)]
         for fragment in (
             ".local/state/mac-test/mirror/hana",
-            "pgrep -x",
-            "cargo",
-            "rustc",
-            "cargo-nextest",
             "pmset -g batt",
             'df -g "$HOME"',
             "hostname -s",
         ):
             self.assertIn(fragment, probe_script)
         self.assertNotIn("loadavg", probe_script)
+        self.assertNotIn("pgrep", probe_script)
+        self.assertNotIn("procs", probe_script)
 
         copy = events[1]
         exclude_argument = next(
@@ -1068,7 +1233,7 @@ class OffloadCommandTests(unittest.TestCase):
         self.result_path = self.root / "missing" / "result"
         result = self.command()
         self.assertEqual(result.returncode, 75, result.stdout)
-        self.assertIn("mac_test: staying on natedev (off)\n", result.stdout)
+        self.assertIn("mac_test: not running on the Mac (off)\n", result.stdout)
         self.assertIn("FileNotFoundError", result.stdout)
         self.assertFalse(self.result_path.exists())
 

@@ -614,8 +614,20 @@ export BUILDLOG_HOLD_WAIT_S=0
 HOLD_WAIT_DIR=""
 HOLD_WAITER_PID=""
 RUN_STEP_PID=""
+ROUTING_WAIT_STARTED=""
+
+collect_routing_wait() {
+    if [[ -n "$ROUTING_WAIT_STARTED" ]]; then
+        "$PY" -c 'import sys, time
+with open(sys.argv[2], "a") as output:
+    output.write("%.6f\n" % max(0, time.monotonic() - float(sys.argv[1])))' \
+            "$ROUTING_WAIT_STARTED" "$BUILDLOG_HOLD_WAIT_FILE"
+        ROUTING_WAIT_STARTED=""
+    fi
+}
 
 collect_hold_wait() {
+    collect_routing_wait
     if [[ -n "${BUILDLOG_HOLD_WAIT_FILE:-}" && -f "$BUILDLOG_HOLD_WAIT_FILE" ]]; then
         BUILDLOG_HOLD_WAIT_S="$(awk '{ total += $1 } END { printf "%.6f", total }' "$BUILDLOG_HOLD_WAIT_FILE")"
         export BUILDLOG_HOLD_WAIT_S
@@ -659,6 +671,7 @@ FILTER_RUN=0
 BUILDLOG_MAC=""
 BUILDLOG_MAC_REASON=""
 BUILDLOG_MAC_S=""
+export BUILDLOG_TARGET=""
 if [[ "$CMD" == test && " ${ARGS[*]} " == *" --filter "* ]]; then
     FILTER_RUN=1
 fi
@@ -738,6 +751,7 @@ forward_mac_runner_signal() {
             rm -f "$MAC_RESULT_FILE"
         fi
     fi
+    note_event interrupted "$SECONDS" 0 "" 0 "$exit_status"
     exit "$exit_status"
 }
 
@@ -748,7 +762,10 @@ try_mac_test() {
     local runner_status result_text="" result_word="" result_reason=""
     local result_seconds="" mac_words=0 line
     local runner_args=(run --repo-root "$(git rev-parse --show-toplevel)"
-        --package "$PKG" --call-id "$BUILDLOG_CALL_ID")
+        --package "$PKG" --call-id "$BUILDLOG_CALL_ID" --settings "$1")
+    if [[ $# -gt 1 ]]; then
+        runner_args+=(--last-decline "$2")
+    fi
     MAC_RESULT_FILE="$(mktemp)"
     runner_args+=(--result "$MAC_RESULT_FILE")
     if [[ "$FILTER_RUN" -eq 1 ]]; then
@@ -756,6 +773,7 @@ try_mac_test() {
     fi
     runner_args+=(-- "${NEXTEST_ARGS[@]}")
 
+    export BUILDLOG_TARGET=mac
     "$PY" "$MAC_RUNNER" "${runner_args[@]}" &
     MAC_RUNNER_PID=$!
     if wait "$MAC_RUNNER_PID"; then
@@ -763,7 +781,9 @@ try_mac_test() {
     else
         runner_status=$?
     fi
-    trap - INT TERM HUP
+    trap 'hold_interrupted INT 130' INT
+    trap 'hold_interrupted TERM 143' TERM
+    trap 'hold_interrupted HUP 129' HUP
     MAC_RUNNER_PID=""
 
     if [[ -f "$MAC_RESULT_FILE" && -r "$MAC_RESULT_FILE" \
@@ -794,6 +814,7 @@ try_mac_test() {
         BUILDLOG_MAC=declined
         BUILDLOG_MAC_REASON=runner
         BUILDLOG_MAC_S=""
+        export BUILDLOG_TARGET=""
         return
     fi
 
@@ -802,6 +823,7 @@ try_mac_test() {
     BUILDLOG_MAC_S="$result_seconds"
     case "$result_word" in
         declined|lost)
+            export BUILDLOG_TARGET=""
             return
             ;;
         failed)
@@ -818,6 +840,121 @@ try_mac_test() {
             echo "verify.sh: passed on the Mac (macOS); now confirming on natedev, which is the gate."
             ;;
     esac
+}
+
+# Registration is local demand, not a reservation to retain while another
+# target runs. A successful withdrawal also discards the old admission stamp.
+withdraw_local_demand() {
+    if [[ -f "$BUILDLOG_HOLD_REGISTRATION_FILE" ]]; then
+        local status=0
+        python3 "$BUILD_TARGETS_SCRIPT" finish-local --call-id "$BUILDLOG_CALL_ID" || status=$?
+        if [[ "$status" != 0 ]]; then exit "$status"; fi
+        rm -f "$BUILDLOG_HOLD_REGISTRATION_FILE" "$BUILDLOG_HOLD_ADMISSION_FILE"
+    fi
+}
+
+# The helper still diagnoses every registration. Show its stderr again only
+# when the holder, reason or escalation message changes during this wait.
+register_routing_demand() {
+    local admission=0
+    python3 "$BUILD_TARGETS_SCRIPT" register-local --call-id "$BUILDLOG_CALL_ID" --pid $$ \
+        2>"$HOLD_WAIT_DIR/routing-diagnostic" || admission=$?
+    if ! cmp -s "$HOLD_WAIT_DIR/routing-diagnostic" "$HOLD_WAIT_DIR/last-routing-diagnostic"; then
+        cat "$HOLD_WAIT_DIR/routing-diagnostic" >&2
+        cp "$HOLD_WAIT_DIR/routing-diagnostic" "$HOLD_WAIT_DIR/last-routing-diagnostic"
+    fi
+    return "$admission"
+}
+
+route_test() {
+    local table name eligibility reason settings admission=0 announced_reason="" retry_index
+    local retry_settings=() retry_reasons=()
+    local eligible_args=(eligible --repo-root "$(git rev-parse --show-toplevel)" --package "$PKG")
+    if [[ "$LOCAL_ONLY" -eq 1 ]]; then
+        eligible_args+=(--local "$LOCAL_REASON")
+    fi
+    table="$(python3 "$BUILD_TARGETS_SCRIPT" "${eligible_args[@]}")"
+
+    # Read exclusions before selecting a target so local-first routing also
+    # records why a Mac cannot run this package.
+    while IFS=$'\t' read -r name eligibility reason settings; do
+        if [[ "$eligibility" == excluded && "$settings" != - ]]; then
+            BUILDLOG_MAC=declined
+            if [[ "$LOCAL_ONLY" -eq 0 ]]; then
+                BUILDLOG_MAC_REASON="$reason"
+                export BUILDLOG_LOCAL_REASON="$reason"
+            fi
+        fi
+    done <<< "$table"
+
+    while IFS=$'\t' read -r name eligibility reason settings; do
+        [[ "$eligibility" == eligible ]] || continue
+        if [[ "$settings" == - ]]; then
+            admission=0
+            python3 "$BUILD_TARGETS_SCRIPT" check-admission --call-id "$BUILDLOG_CALL_ID" || admission=$?
+            case "$admission" in
+                0) return 0 ;;
+                10|12) continue ;;
+                *) exit "$admission" ;;
+            esac
+        fi
+        [[ -f "$MAC_RUNNER" ]] || continue
+        try_mac_test "$settings"
+        if [[ "$BUILDLOG_MAC" == declined && ( "$BUILDLOG_MAC_REASON" == busy || "$BUILDLOG_MAC_REASON" == blocked ) ]]; then
+            retry_settings+=("$settings")
+            retry_reasons+=("$BUILDLOG_MAC_REASON")
+        else
+            # A full Mac pass needs the local gate; a lost attempt or another
+            # decline needs the existing local wait, without more Mac tries.
+            return 0
+        fi
+    done <<< "$table"
+
+    [[ ${#retry_settings[@]} -gt 0 ]] || return 0
+    while true; do
+        admission=0
+        register_routing_demand || admission=$?
+        case "$admission" in
+            0) collect_routing_wait; return 0 ;;
+            10) ;;
+            *) exit "$admission" ;;
+        esac
+        if [[ "$announced_reason" != "$BUILDLOG_MAC_REASON" ]]; then
+            echo "verify.sh: waiting for the Mac ($BUILDLOG_MAC_REASON) or natedev's release." >&2
+            announced_reason="$BUILDLOG_MAC_REASON"
+        fi
+        ROUTING_WAIT_STARTED="$("$PY" -c 'import time; print(time.monotonic())')"
+        sleep "${BUILD_TARGETS_POLL_S:-15}" &
+        HOLD_WAITER_PID=$!
+        wait "$HOLD_WAITER_PID"
+        HOLD_WAITER_PID=""
+
+        # A release can admit this call while the holder file remains. Renew
+        # demand each pass and use the admission decision before another try.
+        admission=0
+        register_routing_demand || admission=$?
+        case "$admission" in
+            0) collect_routing_wait; return 0 ;;
+            10) ;;
+            *) exit "$admission" ;;
+        esac
+        collect_routing_wait
+        withdraw_local_demand
+        for ((retry_index=0; retry_index<${#retry_settings[@]}; retry_index++)); do
+            try_mac_test "${retry_settings[$retry_index]}" "${retry_reasons[$retry_index]}"
+            if [[ "$BUILDLOG_MAC" != declined || ( "$BUILDLOG_MAC_REASON" != busy && "$BUILDLOG_MAC_REASON" != blocked ) ]]; then
+                return 0
+            fi
+            # A declined claim is more hold wait; a runner that executes tests
+            # returns or exits above, so its runtime is never added here.
+            printf '%s\n' "${BUILDLOG_MAC_S:-0}" >> "$BUILDLOG_HOLD_WAIT_FILE"
+            retry_reasons[$retry_index]="$BUILDLOG_MAC_REASON"
+            if [[ "$announced_reason" != "$BUILDLOG_MAC_REASON" ]]; then
+                echo "verify.sh: waiting for the Mac ($BUILDLOG_MAC_REASON) or natedev's release." >&2
+                announced_reason="$BUILDLOG_MAC_REASON"
+            fi
+        done
+    done
 }
 
 # Succeeds, after printing the record, when this call already passed on this
@@ -942,13 +1079,6 @@ if cache_lookup; then
     exit "${LOOKUP_STATUS}"
 fi
 
-if [[ "$CMD" == test ]]; then
-    compose_nextest_args
-    if [[ "$LOCAL_ONLY" -eq 0 && -f "$MAC_RUNNER" ]]; then
-        try_mac_test
-    fi
-fi
-
 HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.XXXXXX")"
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_ADMISSION_FILE="$HOLD_WAIT_DIR/admission"
@@ -970,6 +1100,10 @@ hold_interrupted() {
 trap 'hold_interrupted INT 130' INT
 trap 'hold_interrupted TERM 143' TERM
 trap 'hold_interrupted HUP 129' HUP
+if [[ "$CMD" == test ]]; then
+    compose_nextest_args
+    route_test
+fi
 python3 "$BUILD_TARGETS_SCRIPT" wait-local --call-id "$BUILDLOG_CALL_ID" --pid $$ &
 HOLD_WAITER_PID=$!
 HOLD_WAIT_STATUS=0
@@ -1188,6 +1322,8 @@ case "$CMD" in
         run cargo check --workspace --lib --bins "${FEATURE_FLAGS[@]}"
         ;;
     test)
+        export BUILDLOG_TARGET=natedev
+        echo "verify.sh: running on natedev"
         run_nextest "${NEXTEST_ARGS[@]}"
         ;;
     lint)

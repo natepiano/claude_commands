@@ -219,7 +219,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 **Ruled out:**
 - Strict queue order for a resumed call (it holds its run's cargo token and must not wait behind entries that have not started).
 
-### Phase 5 — A test goes to the first free target it may use, and waits instead of falling back  · status: todo
+### Phase 5 — A test goes to the first free target it may use, and waits instead of falling back  · status: done
 
 #### Work Order
 

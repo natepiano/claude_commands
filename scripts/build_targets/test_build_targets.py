@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import sys
+import subprocess
 import time
 from collections.abc import Generator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -19,6 +21,11 @@ import build_hold
 import offload
 import targets
 from test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
+
+REAL_SUBPROCESS_RUN = subprocess.run
+REAL_SUBPROCESS_POPEN = subprocess.Popen
+REAL_PROCESS_START_TIME = build_hold.process_start_time
+REAL_CALL_IS_LIVE = build_hold.call_is_live
 
 
 @contextmanager
@@ -262,6 +269,28 @@ class StatusTests(IsolatedTargetTest):
         self.assertEqual(block.read_bytes(), before)
 
 
+class EligibleCommandTests(IsolatedTargetTest):
+    def test_cli_prints_every_target_in_config_order_with_resolved_settings(self) -> None:
+        config = self.write_config(
+            "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+        )
+        for settings, local, reason in (("linux_only.hana=\n", [], "-"),
+                                        ("", [], "repo"),
+                                        ("linux_only.hana=hana\n", [], "linux_only"),
+                                        ("", ["--local", "Linux filesystem required"], "Linux filesystem required")):
+            with self.subTest(reason=reason):
+                _ = self.settings.write_text(settings)
+                output = io.StringIO()
+                with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+                     mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")), \
+                     mock.patch.object(sys, "argv", ["build_targets.py", "eligible", "--repo-root", str(self.root),
+                                                    "--package", "hana", *local]), redirect_stdout(output):
+                    self.assertEqual(build_targets.main(), 0)
+                disposition = "eligible" if reason == "-" else "excluded"
+                self.assertEqual(output.getvalue(), f"natedev\teligible\t-\t-\nmac\t{disposition}\t{reason}\t{self.settings}\n")
+
+
 class WaitLocalTests(IsolatedTargetTest):
     sleeps: int = 0
 
@@ -432,6 +461,106 @@ class WaitLocalTests(IsolatedTargetTest):
         cycle = build_hold.read_cycle()
         assert cycle is not None
         self.assertFalse(any(entry["state"] == "MemoryGateReturned" for entry in cycle["entries"]))
+
+    def test_register_local_is_nonblocking_repeatable_and_uses_given_pid(self) -> None:
+        self.begin_hold()
+        with mock.patch.object(build_targets, "wait_sleep", side_effect=AssertionError("Registration must return")):
+            for _ in range(2):
+                self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 10)
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        self.assertEqual(len(cycle["entries"]), 1)
+        calls = cycle["entries"][0]["calls"]
+        self.assertEqual([(call["call_id"], call["pid"]) for call in calls], [("call-a", 12345)])
+        self.assertEqual(json.loads((self.root / "registration").read_text()),
+                         {"key": "verify:call-a", "cycle_id": cycle["id"]})
+
+    def test_register_local_renews_after_cycle_and_generation_change(self) -> None:
+        self.begin_hold()
+        self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 10)
+        first = build_hold.read_cycle()
+        assert first is not None
+        _ = build_hold.open_cycle(NOW + timedelta(seconds=1))
+        self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 10)
+        second = build_hold.read_cycle()
+        assert second is not None
+        self.assertNotEqual(second["id"], first["id"])
+        self.assertEqual(second["entries"][0]["calls"][0]["call_id"], "call-a")
+        self.release_turn(0)
+        self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 0)
+        _ = build_hold.start_hold(self.holders, "another", "new hold", build_hold.NoReleaseEta(), NOW + timedelta(seconds=2))
+        self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 10)
+        renewed = build_hold.read_cycle()
+        assert renewed is not None
+        self.assertGreater(renewed.get("holder_generation", 1), second.get("holder_generation", 1))
+        self.assertEqual(len(renewed["entries"][0]["calls"]), 1)
+
+    def test_register_local_free_and_unreadable_states_do_not_create_registration(self) -> None:
+        self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 0)
+        self.assertFalse((self.root / "registration").exists())
+        with mock.patch.object(build_targets, "target_state", return_value=targets.StateUnreadable("permission denied")), \
+             redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 12)
+        self.assertIn("permission denied", errors.getvalue())
+        self.assertFalse((self.root / "registration").exists())
+
+    def test_nonblocking_registration_keeps_holder_and_two_hour_diagnostic(self) -> None:
+        self.begin_hold()
+        with mock.patch.object(build_targets, "wait_clock", return_value=NOW + timedelta(hours=2)), \
+             redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 10)
+        self.assertEqual(errors.getvalue(), "verify.sh: natedev is held by hana for render checks.\n"
+                         + "verify.sh: natedev has been held for 2 h by hana; ask them.\n")
+
+    def test_register_local_rejects_nonpositive_pid_before_reading_state(self) -> None:
+        for pid in ("0", "-1"):
+            with self.subTest(pid=pid), \
+                 mock.patch.object(sys, "argv", ["build_targets.py", "register-local", "--call-id", "call-a", "--pid", pid]), \
+                 mock.patch.object(build_targets, "target_state", side_effect=AssertionError("Invalid arguments must not read state")), \
+                 redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit) as refused:
+                _ = build_targets.main()
+            self.assertEqual(refused.exception.code, 2)
+            self.assertIn("argument --pid:", errors.getvalue())
+            self.assertIn("positive", errors.getvalue())
+        self.assertFalse((self.root / "registration").exists())
+
+    def test_registration_outlives_helper_and_is_owned_by_waiting_process(self) -> None:
+        self.begin_hold()
+        environment = dict(os.environ)
+        environment.update({"CLAUDE_CODE_SESSION_ID": "", "PLAN_DELEGATE_BOARD_DIR": "",
+                            "PLAN_DELEGATE_SESSION_DIR": ""})
+        # Restore only this subprocess boundary: the CLI must leave its parent's live PID in the record.
+        with mock.patch.object(subprocess, "run", wraps=REAL_SUBPROCESS_RUN), \
+             mock.patch.object(subprocess, "Popen", wraps=REAL_SUBPROCESS_POPEN):
+            result = subprocess.run([sys.executable, build_targets.__file__, "register-local", "--call-id", "call-a",
+                                     "--pid", str(os.getpid())], env=environment, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 10, result.stdout + result.stderr)
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        call = cycle["entries"][0]["calls"][0]
+        self.assertEqual(call["pid"], os.getpid())
+        with mock.patch.object(build_hold, "process_start_time", wraps=REAL_PROCESS_START_TIME), \
+             mock.patch.object(build_hold, "call_is_live", wraps=REAL_CALL_IS_LIVE):
+            self.assertTrue(build_hold.call_is_live(call))
+
+    def test_finish_local_on_admitted_unmarked_call_releases_next_entry(self) -> None:
+        self.begin_hold()
+        build_hold.record_recipients([("owner", "owner"), ("peer", "peer")])
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        cycle["release_started_at"] = NOW.isoformat()
+        build_hold.save_cycle(cycle)
+        _ = build_hold.advance_release(cycle, NOW, clock=lambda: NOW)
+        with mock.patch.object(build_hold, "waiter_key", return_value="owner"):
+            self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 0)
+        self.assertIsInstance(build_hold.read_admission("owner", "call-a"), build_hold.AdmittedTurn)
+        self.assertEqual(build_targets.command_finish_local("call-a"), 0)
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        with mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as sent:
+            _ = build_hold.advance_release(cycle, NOW, clock=lambda: NOW)
+        self.assertEqual(sent.call_count, 1)
+        self.assertEqual(sent.call_args.args[0]["session_id"], "peer")
 
 
 if __name__ == "__main__":
