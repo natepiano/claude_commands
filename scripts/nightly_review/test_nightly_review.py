@@ -165,6 +165,14 @@ class NightlyReviewTests(unittest.TestCase):
             "stop_issues": [],
         }
 
+    def test_review_settings_deny_edits_under_the_main_folder_and_every_account_folder(self) -> None:
+        settings = cast(dict[str, dict[str, list[str]]], json.loads(nightly_review.SETTINGS.read_text(encoding="utf-8")))
+        denied = settings["permissions"]["deny"]
+
+        self.assertIn("Edit(~/.claude/**)", denied)
+        for label in ("claude 1", "claude 2", "claude 3"):
+            self.assertIn(f"Edit(~/{accounts.account_dir(label).name}/**)", denied)
+
     def review_command(self) -> str:
         """The Claude command line every launch ends with."""
         return shlex.join([

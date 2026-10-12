@@ -3,6 +3,9 @@
   "permissions": {
     "deny": [
       "Edit(~/.claude/**)",
+      "Edit(~/.claude1/**)",
+      "Edit(~/.claude2/**)",
+      "Edit(~/.claude3/**)",
       "Edit(~/rust/**)",
       "Edit(//etc/nixos/**)",
       "Bash(git checkout *)",
