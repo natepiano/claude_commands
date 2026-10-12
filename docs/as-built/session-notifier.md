@@ -105,7 +105,7 @@ The slot is claimed before the check runs, so a concurrent tick or `fire` cannot
 - **any other nonzero**: skip, logged as `skip check exit <rc>`.
 - Not finished within `TIMEOUT`: killed, logged as `skip check timeout`.
 
-`production_check.sh <doc>` reads the doc's `Status: PRODUCTION — <word>` line: `running` 0, `wrapped` 2, anything else (or no such line, or no file) 1.
+`production_check.sh <doc>` reads the doc's `Status: PRODUCTION — <word>` line: `running` 0, `wrapped` 2, anything else (or no such line, or no file) 1. For a running production it first runs `log_backup.py <doc>`, which keeps dated copies of the production's LOG (LOG backups in `docs/as-built/showrunner-automation.md`). A failed copy prints to stderr and does not change the exit code.
 
 `delegate_run.py check <claude_session_id> <session_dir>` exits 2 when the marker `/tmp/claude/delegate/active/<id>` is missing or names another directory (the run ended, or a new run in the same session replaced it); 0 when `running_work()` finds work in flight; 1 when the unit is idle; 3 on a usage error. Work in flight is an `impl_status` or `impl_status_*` file reading `implementing`, a `review_status*` file reading `reviewing`, or a `progress_history_state.json` activity with status `active`. That last one covers `verify.sh final` and UX review, which open activities.
 
@@ -190,7 +190,7 @@ For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <
 - **Timeouts.** `TIMEOUT` (120 s default) bounds both the check and the relay. One relay takes about 9 s. `tick` waits for every instance's subshell before it releases `.tick.lock`, so a check must stay fast.
 - **Health window.** `.last_tick` older than 120 s means the job is not running; `health` reports it even for a stopped instance.
 - **Seats inherit `CLAUDE_CODE_SESSION_ID`.** A seat can inherit the unit director's id, so `prepare_session.sh` or `end_session.sh` run from a seat or a test acts on the unit director's marker and instance. Tests run them only with a fresh id and a temp `NOTIFIER_STATE_DIR`; `end_session.sh`'s `remove` inherits that variable.
-- **`PLAN_DELEGATE_ACTIVE_DIR`** is a test-only variable honoured only by `delegate_run.py`, `unit_notifier.sh` and `unit_status.sh`. `prepare_session.sh` and `end_session.sh` use the fixed `/tmp/claude/delegate/active`, so a live caller leaves it unset or pointed where the marker is.
+- **`PLAN_DELEGATE_ACTIVE_DIR`** is set by tests for a checkout's scripts; installed build scripts refuse to run with it set. `delegate_run.py`, `unit_notifier.sh` and `unit_status.sh` read it. `prepare_session.sh` and `end_session.sh` use the fixed `/tmp/claude/delegate/active`, so a live build caller leaves it unset.
 - **`CHECK` quoting.** `unit_notifier.sh` `(q)`-quotes each word of the check, so a repo path with spaces survives the `(Q)(z)` split.
 - **`progress` cost.** Every `progress` call, refused ones included, spawns one zsh for the restart, even for a run with no instance. Because the restart comes before any refusal, a call that exits with `No active phase to report` or a missing cap stage still moves the next tick one interval out.
 - **`/unit:report_interval` lasts for the run.** Rerunning `unit_notifier.sh` resets `EVERY` to the config value.

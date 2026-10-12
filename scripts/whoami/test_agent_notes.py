@@ -82,6 +82,9 @@ class AgentNotesTests(unittest.TestCase):
         config.parent.mkdir(parents=True, exist_ok=True)
         _ = config.write_text(json.dumps(accounts.AccountsConfiguration(unit=label)))
 
+    def select_seats(self, label: str) -> None:
+        self.assertEqual(accounts.main(["set-role", "seats", label]), 0)
+
     def codex_login(self, home: Path, login: str) -> None:
         home.mkdir(exist_ok=True)
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
@@ -145,6 +148,7 @@ class AgentNotesTests(unittest.TestCase):
         _ = self.note("codex 2.md", "selected@example.com")
         default_report = Report("Codex", email="default@example.com", source=CodexHomeSource(default),
             quotas=[Quota("Weekly", 10, self.future)])
+        self.select_seats("codex 2")
         selected_report = Report("Codex", email="selected@example.com", source=CodexHomeSource(selected),
             quotas=[Quota("Weekly", 30, self.future)])
         with (
@@ -180,13 +184,14 @@ class AgentNotesTests(unittest.TestCase):
 
     def test_failed_selected_codex_read_preserves_activity_and_alert_acknowledgement(self) -> None:
         default = self.root / ".codex"
-        selected = self.root / ".codex2"
+        selected = self.root / ".codex1"
         self.codex_login(default, "spare@example.com")
         self.codex_login(selected, "SEATS@example.com")
         seats = self.note("codex 1.md", "seats@example.com")
         _ = self.note("codex 2.md", "spare@example.com")
         _ = apply([seats], Report("Codex", email="seats@example.com",
             quotas=[Quota("Weekly", 100, self.future)]), self.now)
+        self.select_seats("codex 1")
         before = seats.path.read_text()
         stamp = self.now.isoformat(timespec="seconds")
         episode: quota_alert.Episode = {"since": stamp, "acknowledged": stamp, "last": {}}
@@ -203,7 +208,7 @@ class AgentNotesTests(unittest.TestCase):
             patch.object(agent_notes, "live_reports", return_value=[spare_report, seats_report]),
             patch.object(five_hour, "watch", return_value=[]) as watch,
         ):
-            _ = agent_notes.update_for_selection(selection)
+            _ = agent_notes.update_for_selection(selection, agent_accounts.seats_home())
 
         notes = {note.path.stem: note for note in note_file.read_notes()}
         self.assertEqual(notes["codex 1"].get("state"), "active")
@@ -218,10 +223,9 @@ class AgentNotesTests(unittest.TestCase):
 
     def test_unreadable_selected_codex_login_preserves_every_note_state(self) -> None:
         default = self.root / ".codex"
-        selected = self.root / ".codex2"
+        selected = self.root / ".codex1"
         self.codex_login(default, "spare@example.com")
-        selected.mkdir()
-        _ = (selected / "auth.json").write_text("not json")
+        self.codex_login(selected, "seats@example.com")
         seats = self.note("codex 1.md", "seats@example.com")
         spare = self.note("codex 2.md", "spare@example.com")
         _ = self.note("codex 3.md", "absent@example.com")
@@ -229,6 +233,8 @@ class AgentNotesTests(unittest.TestCase):
             quotas=[Quota("Weekly", 100, self.future)]), self.now)
         _ = apply([spare], Report("Codex", email="spare@example.com",
             quotas=[Quota("Weekly", 90, self.future)]), self.now)
+        self.select_seats("codex 1")
+        _ = (selected / "auth.json").write_text("not json")
         before = {note.path.stem: note.get("state") for note in note_file.read_notes()}
         seats_report = Report("Codex", problem="Account unavailable", source=CodexHomeSource(selected))
         spare_report = Report("Codex", email="spare@example.com", source=CodexHomeSource(default),
@@ -308,6 +314,31 @@ class AgentNotesTests(unittest.TestCase):
         self.assertEqual(updated[current.path.stem].get("weekly_remaining_usage"), "80")
         self.assertTrue(all(note.path.read_text().endswith("---\nBody stays.\n") for note in (current, spare)))
         watch.assert_called_once_with([report])
+
+    def test_notes_and_watch_keep_one_seats_role_through_a_role_change_during_read(self) -> None:
+        default = self.root / ".codex"
+        selected = self.root / ".codex1"
+        next_home = self.root / ".codex3"
+        for home, login, label in ((default, "default@example.com", "codex 2"),
+            (selected, "selected@example.com", "codex 1"), (next_home, "next@example.com", "codex 3")):
+            self.codex_login(home, login)
+            _ = self.note(f"{label}.md", login)
+        self.select_seats("codex 1")
+        reports = [Report("Codex", email="selected@example.com", source=CodexHomeSource(selected),
+            quotas=[Quota("Weekly", 100, self.future)]),
+            Report("Codex", email="next@example.com", source=CodexHomeSource(next_home),
+                quotas=[Quota("Weekly", 10, self.future)])]
+        async def read(_selection: agent_accounts.ClaudeAccountSelection, seats_home: Path) -> list[Report]:
+            self.assertEqual(seats_home, selected)
+            self.select_seats("codex 3")
+            return reports
+        with patch.dict(os.environ, {"CODEX_HOME": str(default)}), patch.object(agent_notes, "live_reports", side_effect=read), patch.object(five_hour, "watch", return_value=[]) as watch:
+            _ = agent_notes.update()
+        notes = {note.path.stem: note for note in note_file.read_notes()}
+        self.assertEqual(notes["codex 1"].get("state"), "active")
+        self.assertEqual(notes["codex 3"].get("state"), "inactive")
+        self.assertEqual(notes["codex 3"].get("weekly_remaining_usage"), "90")
+        watch.assert_called_once_with([reports[0]])
 
     def test_update_reads_two_active_accounts_and_an_inactive_spare(self) -> None:
         default = self.account_dir("default", "main@example.com", "main-fixture-token")
@@ -456,7 +487,7 @@ class AgentNotesTests(unittest.TestCase):
         ):
             agent_notes.main()
         resolve.assert_called_once_with()
-        collect.assert_called_once_with(selection)
+        collect.assert_called_once_with(selection, agent_accounts.seats_home())
         notice_roles = cast(object, alert.call_args.kwargs["selection"])
         self.assertIs(notice_roles, selection)
 
@@ -561,7 +592,7 @@ class AgentNotesTests(unittest.TestCase):
     def test_legacy_whoami_account_line_is_unchanged(self) -> None:
         _ = self.note("claude 2.md", "main@example.com")
         self.assertEqual(whoami.render(Report("Claude", email="main@example.com"),
-                                      accounts.claude_account_selection()), [
+                                      accounts.claude_account_selection(), agent_accounts.seats_home()), [
             "Claude", "  Account: claude 2 — main@example.com", "  Plan: unavailable",
         ])
 

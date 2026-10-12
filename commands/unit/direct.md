@@ -151,12 +151,16 @@ Phase cleanup leaves Codex seats open;
 When the plan header carries a `> **Production:**` line, this run is a unit of
 that production. Read `~/.claude/docs/production_format.md` → <ProductionUnit/>
 in full at <PrepareSession/> and after every compaction, and apply it
-throughout. It changes four things in this command:
+throughout. It changes five things in this command:
 - it adds one commit kind to <CoreContract/>: merging the production's merge
   branch into this branch;
 - it replaces <PeriodicCI/> and <CICleanup/>, because the showrunner runs CI;
 - it sends checkpoint and shrink notices at <PhaseEnd/>'s points;
-- it adds a landing rule to the repair rounds in <FixDispatch/>.
+- it adds a landing rule to the repair rounds in <FixDispatch/>;
+- it sends design choices, Pending decisions about how something is built and
+  add-ons to the showrunner, whose answer settles them (item 2). Only an
+  action that cannot be undone, or a choice only the user knows the answer
+  to, still reaches the user.
 </ProductionUnit>
 
 <TurnEndGate>

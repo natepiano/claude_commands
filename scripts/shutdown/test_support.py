@@ -13,7 +13,7 @@ import remote
 import restart
 import settle
 import shutdown
-from record import ShutdownRecord, ShutdownSessionEntry
+from record import SessionShutdown
 
 
 class ShutdownSendLeaf(StrEnum):
@@ -104,14 +104,14 @@ class ShutdownTestCase(unittest.TestCase):
         )
 
     def _block_restart_retire(
-        self, record: ShutdownRecord, entry: ShutdownSessionEntry, *, dry_run: bool
+        self, record: SessionShutdown, *, dry_run: bool
     ) -> None:
         if dry_run:
-            _REAL_RESTART_RETIRE(record, entry, dry_run=True)
+            _REAL_RESTART_RETIRE(record, dry_run=True)
             return
         self._reached_send_leaf(
             ShutdownSendLeaf.RESTART_RETIRE,
-            f"session:{entry['session']['session_id']}",
+            f"session:{record['session']['session_id']}",
         )
 
     def _block_run_remote(
@@ -126,7 +126,7 @@ class ShutdownTestCase(unittest.TestCase):
             f"{remote.other_machine()}: shutdown.py {shlex.join(args)}",
         )
 
-    def _block_launch_conductor(self, login: str, label: str, here: bool) -> Never:
+    def _block_launch_conductor(self, login: str, label: str, here: bool = True) -> Never:
         del label, here
         self._reached_send_leaf(
             ShutdownSendLeaf.LAUNCH_CONDUCTOR, f"conductor for {login}"

@@ -10,7 +10,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Literal, cast, final, override
@@ -18,9 +17,9 @@ from unittest.mock import patch
 
 from test_support import ShutdownTestCase
 import inventory
+from test_record import LegacyRecordFixture, LegacyEntryFixture, write_old
 import launch_permission
 import record
-import restart as restart_work
 import shutdown
 import settle
 from account import Account
@@ -59,24 +58,24 @@ def unit_session(session_id: str) -> inventory.UnitSession:
 
 
 def shutdown_record(
-    state: record.ShutdownState,
+    state: str,
     *,
     requested_at: str = OCTOBER,
     progress: record.SessionProgress | None = None,
     session_id: str = "session-123",
-) -> record.ShutdownRecord:
-    return record.ShutdownRecord(
+) -> LegacyRecordFixture:
+    return LegacyRecordFixture(
         login=LOGIN,
         label=LABEL,
         machine="natedev",
         state=state,
         requested_at=requested_at,
         requested_by=record.FromTerminal(kind="terminal"),
-        scope=record.AllAccountSessions(kind="all account sessions"),
-        conductor=record.ConductorNotStarted(kind="not started"),
+        scope={"kind": "all account sessions"},
+        conductor={"kind": "not started"},
         force="wait for ready",
         entries=[
-            record.ShutdownSessionEntry(
+            LegacyEntryFixture(
                 session=unit_session(session_id),
                 timers=[],
                 settle_message=record.SettleMessageNotSent(kind="not sent"),
@@ -99,7 +98,7 @@ def session_shutdown(
     item = old["entries"][0]
     return record.SessionShutdown(
         login=LOGIN, label=LABEL, machine="natedev", requested_at=OCTOBER,
-        requested_by=old["requested_by"], hold=hold,
+        requested_by=old["requested_by"], hold=hold, request_id="request-one",
         then="restart", force="wait for ready", alerts="user",
         session=item["session"], seats=[], timers=[],
         settle_message=item["settle_message"], where=item["where"],
@@ -110,7 +109,7 @@ def session_shutdown(
 def account_hold() -> record.AccountHold:
     return record.AccountHold(
         login=LOGIN, label=LABEL, machine="natedev", requested_at=OCTOBER,
-        requested_by=record.FromTerminal(kind="terminal"), then="restart",
+        requested_by=record.FromTerminal(kind="terminal"), then="restart", request_id="request-one",
     )
 
 
@@ -175,9 +174,9 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             status = shutdown.main(["launch-blocked", *arguments])
         return status, output.getvalue(), error.getvalue()
 
-    def write_record(self, live: record.ShutdownRecord) -> None:
+    def write_record(self, live: LegacyRecordFixture) -> None:
         self.clear_state()
-        record.create(live)
+        write_old(live)
 
     def run_exec(self, command: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -207,21 +206,9 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 "down", LABEL, "--restart", "--only", "unit-a,unit-b,unit-a", "--here",
             ]), 0)
         down.assert_called_once_with(
-            selected, True, ("unit-a", "unit-b"), then="restart"
+            selected, True, ("unit-a", "unit-b"), then="restart", alerts="user", requested_by=None, request_id=""
         )
 
-    def test_internal_slot_records_preserves_empty_old_writer_records(self) -> None:
-        saved = shutdown_record("down")
-        saved["entries"] = []
-        self.write_record(saved)
-        output = io.StringIO()
-        with redirect_stdout(output):
-            self.assertEqual(shutdown.main(["slot-records", "--json", "--here"]), 0)
-        self.assertEqual(json.loads(output.getvalue()), [saved])
-        output = io.StringIO()
-        with redirect_stdout(output):
-            self.assertEqual(shutdown.main(["records", "--json", "--here"]), 0)
-        self.assertEqual(json.loads(output.getvalue()), [])
 
     def test_internal_holds_preserves_empty_old_account_shutdowns(self) -> None:
         saved = shutdown_record("down")
@@ -231,6 +218,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         with redirect_stdout(output):
             self.assertEqual(shutdown.main(["holds", "--json", "--here"]), 0)
         expected = account_hold()
+        expected["request_id"] = f"legacy-natedev-{OCTOBER}"
         expected["then"] = "stop"
         self.assertEqual(output.getvalue(), json.dumps([expected], sort_keys=True) + "\n")
         self.assertEqual(record.session_records(LOGIN), [])
@@ -247,39 +235,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertTrue(error.getvalue().startswith("shutdown: "))
         self.assertIn(str(broken), error.getvalue())
 
-    def test_settle_old_writer_reads_the_internal_slot_transport(self) -> None:
-        saved = shutdown_record("stop partial")
-        saved["machine"] = "Mac"
-        with (
-            patch.object(settle, "run_remote", return_value=(0, json.dumps([saved]))) as remote,
-        ):
-            read_peer = cast(Callable[[str], settle.RemoteRecordOutcome], getattr(settle, "_live_on_other"))
-            lookup = read_peer(LOGIN)
-        self.assertEqual(lookup, settle.RemoteRecordFound(kind="live", record=saved))
-        remote.assert_called_once_with(["slot-records", "--json", "--here"])
 
-    def test_conduct_keeps_the_old_peer_state_check(self) -> None:
-        for peer_state in ("down", "stop partial"):
-            with self.subTest(peer_state=peer_state):
-                local = shutdown_record("down")
-                local["then"] = "restart"
-                self.write_record(local)
-                peer = shutdown_record(cast(record.ShutdownState, peer_state))
-                peer["then"] = "restart"
-                with (
-                    patch.object(settle, "conduct", return_value=0),
-                    patch.object(shutdown, "run_remote", return_value=(0, json.dumps([peer]))) as remote,
-                    patch.object(restart_work, "restart", return_value=0) as restart,
-                ):
-                    self.assertEqual(shutdown.main(["conduct", LOGIN]), 0)
-                remote.assert_called_once_with(["slot-records", "--json", "--here"])
-                if peer_state == "down":
-                    restart.assert_called_once_with(
-                        restart_work.AccountNamed(LOGIN), dry_run=False,
-                        alerts=restart_work.AlertWhenNotBack(),
-                    )
-                else:
-                    restart.assert_not_called()
 
     def test_down_without_restart_keeps_the_existing_dispatch(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
@@ -288,61 +244,9 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             patch.object(settle, "down", return_value=0) as down,
         ):
             self.assertEqual(shutdown.main(["down", LABEL]), 0)
-        down.assert_called_once_with(selected, False, ())
+        down.assert_called_once_with(selected, False, (), then="stop", alerts="user", requested_by=None, request_id="")
 
-    def test_begin_accepts_the_remote_restart_intent(self) -> None:
-        with patch.object(settle, "begin") as begin:
-            self.assertEqual(shutdown.main([
-                "begin", LOGIN, "--requested-by", "outside", "--only", "unit-a",
-                "--then", "restart",
-            ]), 0)
-        begin.assert_called_once_with(LOGIN, "outside", ("unit-a",), then="restart")
 
-    def test_selected_restart_record_never_includes_unselected_sessions(self) -> None:
-        selected = unit_session("unit-a")
-        unselected = unit_session("unit-b")
-        sessions = [selected, unselected]
-        seen_scopes: list[record.ShutdownScope] = []
-
-        def scoped_inventory(login: str, scope: record.ShutdownScope) -> inventory.Inventory:
-            self.assertEqual(login, LOGIN)
-            seen_scopes.append(scope)
-            wanted = scope["session_ids"] if scope["kind"] == "selected" else []
-            return inventory.Inventory(
-                machine="natedev", login=LOGIN, label=LABEL,
-                sessions=[item for item in sessions if not wanted or item["session_id"] in wanted],
-                unattributed=[],
-            )
-
-        def finish(login: str, here: bool) -> int:
-            self.assertEqual((login, here), (LOGIN, True))
-            def stopped(current: record.ShutdownRecord) -> None:
-                current["state"] = "down"
-            _ = record.update(login, stopped)
-            return 0
-
-        def resume(login: str) -> int:
-            found = record.find_live(login)
-            if found["kind"] != "live":
-                self.fail("expected the selected shutdown record")
-            self.assertEqual([item["session"]["session_id"] for item in found["record"]["entries"]], ["unit-a"])
-            self.assertEqual(found["record"]["scope"], record.SelectedSessions(kind="selected", session_ids=["unit-a"]))
-            return 0
-
-        with (
-            patch.object(shutdown, "named_claude_account", return_value=Account("claude", LOGIN, LABEL)),
-            patch.object(settle, "_warm", return_value=True),
-            patch.object(settle, "run_inventory", side_effect=scoped_inventory),
-            patch.object(settle, "_session_timer_snapshot", return_value=[]),
-            patch.object(settle, "_launch_conductor"),
-            patch.object(settle, "conduct", side_effect=finish),
-            patch.object(restart_work, "up", side_effect=resume) as up,
-            redirect_stdout(io.StringIO()),
-        ):
-            self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "unit-a", "--restart"]), 0)
-            self.assertEqual(shutdown.main(["conduct", LOGIN, "--here"]), 0)
-        up.assert_called_once_with(LOGIN)
-        self.assertTrue(all(scope == record.SelectedSessions(kind="selected", session_ids=["unit-a"]) for scope in seen_scopes))
 
     def test_launch_blocked_holds_all_six_shutdown_states(self) -> None:
         for state in (
@@ -354,7 +258,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             "restart partial",
         ):
             with self.subTest(state=state):
-                self.write_record(shutdown_record(cast(record.ShutdownState, state)))
+                self.write_record(shutdown_record(cast(str, state)))
                 status, output, error = self.run_cli(LOGIN)
                 self.assertEqual(status, 0)
                 self.assertEqual(
@@ -408,7 +312,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
     def test_terminal_old_record_no_longer_holds_the_account(self) -> None:
         for state in ("cancelled", "up"):
             with self.subTest(state=state):
-                self.write_record(shutdown_record(cast(record.ShutdownState, state)))
+                self.write_record(shutdown_record(cast(str, state)))
                 self.assertEqual(self.run_cli(LOGIN), (1, "", ""))
 
     def test_account_hold_blocks_even_without_a_session(self) -> None:
@@ -423,8 +327,8 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 self.clear_state()
                 if old_format:
                     saved = shutdown_record("settling")
-                    saved["scope"] = record.SelectedSessions(kind="selected", session_ids=["session-123"])
-                    record.create(saved)
+                    saved["scope"] = {"kind": "selected", "session_ids": ["session-123"]}
+                    write_old(saved)
                 else:
                     self.assertTrue(record.create_session(session_shutdown(record.SessionWaiting(kind="waiting"))))
                 self.assertEqual(self.run_cli(LOGIN), (1, "", ""))
@@ -477,7 +381,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             record.SessionStopped(kind="stopped", at=OCTOBER),
             record.SessionAlreadyGone(kind="already gone", at=OCTOBER),
             record.ProcessIdentityLost(kind="process identity lost", at=OCTOBER),
-            record.SessionRestarting(kind="restarting", at=OCTOBER),
+            record.SessionRestarting(kind="restarting", at=OCTOBER, prior=record.SessionStopped(kind="stopped", at=OCTOBER)),
             record.SessionRestartFailed(kind="restart failed", at=OCTOBER, reason="window did not open"),
             record.SessionNeedsManualRestart(kind="manual restart", command="claude --resume session-123"),
         )
@@ -508,48 +412,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             0, f"{LABEL} is held by a shutdown (since 2026-10-09 14:49 PDT)\n", "",
         ))
 
-    def test_a_parked_partial_passes_its_manual_unit_and_holds_new_work(self) -> None:
-        self.write_record(shutdown_record(
-            "restart partial",
-            progress=record.SessionNeedsManualRestart(
-                kind="manual restart", command="claude --resume session-123"
-            ),
-        ))
-        _ = record.park(LOGIN)
-        record.create(shutdown_record(
-            "restarting", requested_at="2026-11-15T17:30:00+00:00", session_id="session-456",
-        ))
 
-        self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (1, "", ""))
-        self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-456"), (1, "", ""))
-        self.assertCountEqual(shutdown.held_session_ids(), ["session-123", "session-456"])
-        (self.state / LOGIN / "record.json").unlink()
-        status, output, error = self.run_cli(LOGIN)
-        self.assertEqual((status, error), (0, ""))
-        self.assertEqual(
-            output,
-            f"{LABEL} is held by a shutdown (since 2026-10-09 14:49 PDT)\n",
-        )
-        self.assertEqual(shutdown.held_session_ids(), ["session-123"])
-        held = io.StringIO()
-        with redirect_stdout(held):
-            self.assertEqual(shutdown.main(["held-sessions"]), 0)
-        self.assertEqual(held.getvalue(), "session-123\n")
-
-    def test_the_newest_old_request_for_a_session_decides_its_restore(self) -> None:
-        self.write_record(shutdown_record(
-            "restart partial",
-            progress=record.SessionNeedsManualRestart(
-                kind="manual restart", command="claude --resume session-123"
-            ),
-        ))
-        _ = record.park(LOGIN)
-        record.create(shutdown_record("settling", requested_at="2026-11-15T17:30:00+00:00"))
-
-        self.assertEqual(
-            self.run_cli(LOGIN, "--restart-of", "session-123"),
-            (0, "alpha is held by a shutdown (since 2026-11-15 09:30 PST)\n", ""),
-        )
 
     def test_selected_waiting_session_restore_is_held_without_an_account_hold(self) -> None:
         saved = session_shutdown(record.SessionWaiting(kind="waiting"))
@@ -793,6 +656,29 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         )
         self.assertEqual(result.stdout.count("shutdown state unreadable: "), 1)
         self.assertEqual(result.stderr, "")
+
+
+    def test_conduct_dispatches_only_the_local_conductor(self) -> None:
+        with patch.object(settle, "conduct", return_value=0) as conduct:
+            self.assertEqual(shutdown.main(["conduct", LOGIN]), 0)
+        conduct.assert_called_once_with(LOGIN)
+
+    def test_peer_down_receives_request_identity_origin_and_alert_policy(self) -> None:
+        selected = Account("claude", LOGIN, LABEL)
+        with patch.object(shutdown, "named_claude_account", return_value=selected), patch.object(settle, "down", return_value=0) as down:
+            self.assertEqual(shutdown.main(["down", LOGIN, "--here", "--restart", "--no-alert", "--requested-by", "requester", "--request-id", "same-request"]), 0)
+        down.assert_called_once_with(selected, True, (), then="restart", alerts="none", requested_by="requester", request_id="same-request")
+
+    def test_stopping_session_restore_is_held_by_name(self) -> None:
+        self.assertTrue(record.create_session(session_shutdown(record.SessionStopping(kind="stopping", at=OCTOBER))))
+        self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (0, "alpha is held by a shutdown (since 2026-10-09 14:49 PDT)\n", ""))
+
+    def test_removed_writer_verbs_are_rejected(self) -> None:
+        removed = ("begin", "refresh", "retry-stop", "stop", "claim-stop", "close-failed-stop")
+        for verb in removed:
+            with self.subTest(verb=verb), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                _ = shutdown.main([verb, LOGIN])
+            self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

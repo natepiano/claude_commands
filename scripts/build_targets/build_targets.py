@@ -38,6 +38,7 @@ from targets import (
 )
 import offload
 import build_hold
+import override_guard
 
 
 
@@ -418,6 +419,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    override_guard.refuse_overrides(Path(__file__), "build_targets/build_targets.py")
     args = parser().parse_args(namespace=CliArguments())
     if args.command == "eligible":
         routing = LocalRequired(args.local_reason) if args.local_reason else ANY_ELIGIBLE_TARGET

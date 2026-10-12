@@ -69,13 +69,15 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Literal, NotRequired, TextIO, TypedDict, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.usage import agents_log
+from scripts.whoami.agent_accounts import seats_home, codex_home, codex_home_display, user_zone
 
 SERVER_FILE = "mesh_server.json"
 SERVER_LOG = "mesh_server.log"
@@ -89,6 +91,7 @@ RETIRED_FILE = "mesh_retired.json"
 LOCK_FILE = "mesh_server.lock"
 CONNECT_TIMEOUT_SECS = 20
 CALL_TIMEOUT_SECS = 300
+THREAD_RELEASE_TIMEOUT_SECS = 20.0
 # How long `compact` waits for a thread to read idle: after it interrupts a compaction turn that
 # did not finish, and before it refuses a finished seat that still has a live turn.
 COMPACT_IDLE_WAIT_SECS = 60
@@ -142,6 +145,7 @@ class RpcMessage(TypedDict, total=False):
 class ServerRecord(TypedDict):
     port: int
     pid: int
+    codex_home: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -528,6 +532,7 @@ class Client:
     """A JSON-RPC conversation with the app-server over one websocket."""
 
     def __init__(self, port: int, name: str) -> None:
+        self.port: int = port
         self._ws: WebSocket = WebSocket(port)
         self._name: str = name
         self._counter: int = 0
@@ -924,17 +929,47 @@ def _seat_port(session_dir: str, record: ThreadRecord) -> int:
                      + "of this run holds it; nothing was started and the message was not delivered")
 
 
-def _run_servers(session_dir: str) -> list[int]:
-    """Ports of the run's servers still running: those it retired, oldest first, then its current one."""
+def _recorded_run_servers(session_dir: str) -> list[dict[str, object]]:
+    """Retired process records followed by the run's current process record."""
     stored = _read_json_object(_session_path(session_dir, RETIRED_FILE)).get("servers")
     records = [_as_dict(record) for record in (cast("list[object]", stored) if isinstance(stored, list) else [])]
     records.append(_read_json_object(_session_path(session_dir, SERVER_FILE)))
+    return records
+
+
+def _run_servers(session_dir: str) -> list[int]:
+    """Ports of the run's servers still running: those it retired, oldest first, then its current one."""
     ports: list[int] = []
-    for record in records:
+    for record in _recorded_run_servers(session_dir):
         port, pid = record.get("port"), record.get("pid")
         if isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid) and port not in ports:
             ports.append(port)
     return ports
+
+
+def _loaded_thread_ids(client: Client, deadline: float) -> set[str]:
+    threads: set[str] = set()
+    cursor = ""
+    seen: set[str] = set()
+    while time.monotonic() < deadline:
+        params: dict[str, object] = {"cursor": cursor} if cursor else {}
+        listed = _require(client.call("thread/loaded/list", params,
+                                      timeout=max(0.01, deadline - time.monotonic())), "thread/loaded/list")
+        data = listed.get("data")
+        if not isinstance(data, list):
+            raise SystemExit("server returned no loaded-thread list")
+        for item in cast(list[object], data):
+            if not isinstance(item, str) or not item:
+                raise SystemExit("server returned an invalid loaded-thread id")
+            threads.add(item)
+        next_cursor = listed.get("nextCursor")
+        if next_cursor is None or next_cursor == "":
+            return threads
+        if not isinstance(next_cursor, str) or next_cursor in seen:
+            raise SystemExit("server returned an invalid loaded-thread cursor")
+        cursor = next_cursor
+        seen.add(cursor)
+    raise SystemExit("loaded-thread list timed out")
 
 
 def _server_holds(port: int, thread_id: str) -> bool:
@@ -943,8 +978,7 @@ def _server_holds(port: int, thread_id: str) -> bool:
     except (ConnectionError, OSError, SystemExit):
         return False
     try:
-        loaded = _as_dict(client.call("thread/loaded/list", {}).get("result")).get("data")
-        return isinstance(loaded, list) and thread_id in cast("list[object]", loaded)
+        return thread_id in _loaded_thread_ids(client, time.monotonic() + THREAD_RELEASE_TIMEOUT_SECS)
     except (ConnectionError, OSError, SystemExit):
         return False
     finally:
@@ -998,11 +1032,35 @@ def _pending_for_thread(handle: TextIO, thread_id: str) -> list[str]:
     return [item for item in cast("list[object]", messages) if isinstance(item, str)] if isinstance(messages, list) else []
 
 
-def _write_pending(handle: TextIO, thread_id: str, messages: list[str]) -> None:
+class SeatPendingMessages(TypedDict):
+    thread_id: str
+    messages: list[str]
+    accepting_messages: bool
+
+
+def _messages_closed(handle: TextIO, thread_id: str) -> bool:
+    _ = handle.seek(0)
+    stored = _as_dict(_loads(handle.read()))
+    return stored.get("thread_id") == thread_id and stored.get("accepting_messages") is False
+
+
+def _write_pending(handle: TextIO, thread_id: str, messages: list[str], *, accepting_messages: bool = True) -> None:
+    stored: SeatPendingMessages = {
+        "thread_id": thread_id, "messages": messages, "accepting_messages": accepting_messages,
+    }
     _ = handle.seek(0)
     _ = handle.truncate()
-    _ = handle.write(json.dumps({"thread_id": thread_id, "messages": messages}))
+    _ = handle.write(json.dumps(stored))
     handle.flush()
+
+
+def _close_messages_if_empty(session_dir: str, name: str, thread_id: str) -> bool:
+    """Exclude senders while claiming an empty inbox and closing its launcher."""
+    with _pending_file(session_dir, name) as handle:
+        if _pending_for_thread(handle, thread_id):
+            return False
+        _write_pending(handle, thread_id, [], accepting_messages=False)
+        return True
 
 
 def _add_pending(session_dir: str, name: str, thread_id: str, message: str) -> None:
@@ -1181,11 +1239,10 @@ def _log_server(session_dir: str, line: str) -> None:
         _ = log.write(f"[{_now_stamp()}] mesh: {line}\n")
 
 
-def _sign_in_changed_at() -> float | None:
+def _sign_in_changed_at(home: Path) -> float | None:
     """When Codex's sign-in file last changed. Only its change time is read, never its contents."""
-    home = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
     try:
-        return (Path(home) / "auth.json").stat().st_mtime
+        return (home / "auth.json").stat().st_mtime
     except OSError:
         return None
 
@@ -1212,10 +1269,10 @@ def _server_started_at(pid: int) -> float | None:
     return None if elapsed is None else time.time() - elapsed
 
 
-def _holds_old_sign_in(pid: int) -> bool:
+def _holds_old_sign_in(pid: int, home: Path) -> bool:
     """Whether the server started before Codex's sign-in last changed. It read the sign-in once, at
     start, and cannot refresh a token the change revoked."""
-    changed = _sign_in_changed_at()
+    changed = _sign_in_changed_at(home)
     if changed is None:
         return False
     started = _server_started_at(pid)
@@ -1248,7 +1305,13 @@ def _start_watcher(session_dir: str, pid: int, port: int) -> subprocess.Popen[by
     )
 
 
-def ensure_server(session_dir: str) -> tuple[int, bool]:
+def server_record_home(record: dict[str, object]) -> Path:
+    """A recorded home, or the default used by launchers before homes were recorded."""
+    recorded = _as_str(record.get("codex_home"))
+    return Path(recorded) if recorded else Path.home() / ".codex"
+
+
+def ensure_server(session_dir: str, home: Path | None = None) -> tuple[int, bool]:
     """This session's app-server port, and whether this call is what started it.
 
     A caller that started the server just proved the provider was reachable
@@ -1256,37 +1319,44 @@ def ensure_server(session_dir: str) -> tuple[int, bool]:
     provider's answer. A caller that attached to one already running has proved
     nothing of the kind -- see _retry_warranted.
     """
+    selected_home = seats_home() if home is None else home
     with _server_lock(session_dir):
         path = _session_path(session_dir, SERVER_FILE)
         record = _read_json_object(path)
         port = record.get("port")
         pid = record.get("pid")
         if isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid):
-            if not _holds_old_sign_in(pid):
+            recorded_home = server_record_home(record)
+            matching_home = recorded_home == selected_home
+            old_sign_in = matching_home and _holds_old_sign_in(pid, recorded_home)
+            if matching_home and not old_sign_in:
                 # The record's change time is when the server was last used; its watcher reads it.
                 os.utime(path)
                 return port, False
             # A sign-in change `signin-changed` did not catch. The seats still on this server keep
             # it until they let go; its watcher then stops it.
             _retire_record(session_dir, record)
-            _log_server(session_dir, f"app-server {pid} holds a Codex sign-in that has since changed; "
-                        + "retired, starting a new one")
-            _ = _start_watcher(session_dir, pid, port)
-        return _start_server(session_dir), True
+            cause = (f"holds the old sign-in at {codex_home_display(selected_home)}" if old_sign_in
+                     else f"no longer serves the seats home {codex_home_display(selected_home)}")
+            _log_server(session_dir, f"app-server {pid} {cause}; retired, starting a new one")
+            if not _stop_unused_with_lock_held(None, pid, port):
+                _ = _start_watcher(session_dir, pid, port)
+        return _start_server(session_dir, selected_home), True
 
 
-def _start_server(session_dir: str) -> int:
+def _start_server(session_dir: str, seats_home: Path) -> int:
     """Start this session's app-server and record it. The caller holds the server lock."""
     chosen = _free_port()
     log_path = _session_path(session_dir, SERVER_LOG)
     with log_path.open("ab") as log_handle:
         process = subprocess.Popen(
-            ["codex", "app-server", "--listen", f"ws://127.0.0.1:{chosen}"],
+            ["codex", "-c", "thread_unload_delay_secs=0", "app-server", "--listen", f"ws://127.0.0.1:{chosen}"],
             stdout=subprocess.DEVNULL,
             stderr=log_handle,
             start_new_session=True,
+            env={**os.environ, "CODEX_HOME": str(seats_home)},
         )
-    served: ServerRecord = {"port": chosen, "pid": process.pid}
+    served: ServerRecord = {"port": chosen, "pid": process.pid, "codex_home": str(seats_home)}
     try:
         deadline = time.time() + SERVER_START_TIMEOUT_SECS
         while time.time() < deadline:
@@ -1374,10 +1444,9 @@ def _ended_unseen(client: Client, thread_id: str) -> bool:
 def _more_work_coming(client: Client, thread_id: str, deadline: float) -> bool:
     """True when a turn that just ended is not the delegate's last.
 
-    A peer's `send` lands in the thread queue and the server starts a turn for it
-    on its own. Two ways that shows up at this moment: the message is still
-    queued, or it has already been dequeued and its `turn/started` is in flight.
-    The queue read catches the first; a short grace window catches the second.
+    Peer sends land in the seat's locked pending file, checked by the caller
+    before it closes the launcher. This check covers older server-queued work:
+    a message still queued, or a dequeued turn whose start notice is in flight.
     """
     listed = client.call("thread/queue/list", {"threadId": thread_id})
     items = _as_dict(listed.get("result")).get("data")
@@ -1704,10 +1773,22 @@ def command_follow(args: argparse.Namespace) -> int:
     client: Client | None = None
     live_turn = ""
     try:
-        port, _fresh = ensure_server(session_dir)
+        home = seats_home()
+        port, _fresh = ensure_server(session_dir, home)
         _note_seat_port(session_dir, name, owner_pid, port)
+        released = _release_other_seat_writers(session_dir, name, thread_id, port)
+        if isinstance(released, SeatThreadStateUnknown):
+            raise SystemExit(f"thread {thread_id}: {released.reason}; follow-up did not start")
+        if isinstance(released, SeatWaitingOnLiveTurn):
+            raise SystemExit(released.reason)
         client = Client(port, name)
-        _ = _require(client.call("thread/resume", _resume_params(session_dir, name, thread_id)), "thread/resume")
+        resumed = _resume_seat_thread(args, session_dir, name, thread_id, client, home)
+        if resumed.thread_replaced:
+            thread_id = resumed.thread_id
+            _update_roster(session_dir, name, {
+                "thread_id": thread_id, "status": "starting", "launcher_pid": owner_pid, "port": port,
+            })
+            _record_assignment(thread_id, role, _dispatch_lens(args))
         live = _read_live_turn(client, thread_id)
         if not isinstance(live, ThreadIdle):
             if isinstance(live, ThreadLive):
@@ -1866,7 +1947,14 @@ def command_compact(args: argparse.Namespace) -> int:
         return 2
     client: Client | None = None
     try:
-        port, _fresh = ensure_server(session_dir)
+        home = seats_home()
+        port, _fresh = ensure_server(session_dir, home)
+        released = _release_other_seat_writers(session_dir, name, state.thread_id, port)
+        if not isinstance(released, _ReleasedSeatThread):
+            line = f"{name}: {released.reason}; compact refused; follow-up checks release again"
+            _post_board_status(session_dir, name, line)
+            print(f"codex_mesh: {line}", file=sys.stderr)
+            return COMPACT_TURN_STILL_LIVE if isinstance(released, SeatWaitingOnLiveTurn) else 2
         client = Client(port, f"compact-{name}")
         _ = _require(
             client.call("thread/resume", _resume_params(session_dir, name, state.thread_id)),
@@ -2030,6 +2118,7 @@ def _attach_and_run(
             "thread_id": thread_id,
             "status": "starting",
             "port": port,
+            "launcher_pid": os.getpid(),
         }
         role = _roster_role(_attr(args, "role"))
         if isinstance(role, AssignedDelegateRole):
@@ -2044,10 +2133,10 @@ def _attach_and_run(
 def _stream_turn(
     args: argparse.Namespace,
     client: Client,
-    port: int,
+    initial_port: int,
     session_dir: str,
     name: str,
-    thread_id: str,
+    initial_thread_id: str,
     prompt: str,
     timeout: float,
     opened: float,
@@ -2055,6 +2144,8 @@ def _stream_turn(
     follow: bool = False,
 ) -> RunOutcome:
     """Stream a new or resumed thread's turn through the same lifecycle."""
+    port: int = initial_port
+    thread_id: str = initial_thread_id
     log_path = Path(_as_str(_attr(args, "log_file")))
     summary_path = Path(_as_str(_attr(args, "summary_file")))
     reply_file = _as_str(_attr(args, "reply_file"))
@@ -2074,13 +2165,19 @@ def _stream_turn(
     retry_waited = False
     waiting_for_progress_after_overflow = False
     run_outcome: RunOutcome = RunCompleted()
+    changed: bool
+    moved: SeatMoveResult
+    started: MovedSeat
     deadline = time.time() + timeout
+    with _pending_file(session_dir, name) as handle:
+        _write_pending(handle, thread_id, _pending_for_thread(handle, thread_id))
     try:
         # The roster is written before this call: a disconnect after thread
         # creation must still leave its id reachable.
         if not follow:
             _ = client.call("thread/name/set", {"threadId": thread_id, "name": name})
-        turn_id = _start_turn(client, args, thread_id, prompt)
+        started = _start_seats_turn(args, session_dir, name, thread_id, client, prompt)
+        client, port, thread_id, turn_id = started.client, started.port, started.thread_id, started.turn_id
         if not turn_id:
             raise SystemExit("codex_mesh: turn/start returned no turn id")
         followed_turn = turn_id if follow else ""
@@ -2098,6 +2195,18 @@ def _stream_turn(
                 if frame is None:
                     if not resident and time.time() < deadline:
                         if not resume_owed and _ended_unseen(client, thread_id):
+                            moved = _move_resident(args, session_dir, name, thread_id, client)
+                            if isinstance(moved, SeatThreadStateUnknown):
+                                raise SeatMoveUncertain(thread_id, moved)
+                            if isinstance(moved, MovedSeat):
+                                client, port, thread_id = moved.client, moved.port, moved.thread_id
+                                if moved.turn_id:
+                                    turn_id = moved.turn_id
+                                    if follow:
+                                        followed_turn = turn_id
+                                    continue
+                            if not _close_messages_if_empty(session_dir, name, thread_id):
+                                continue
                             _ = log.write(f"[{_now_stamp()}] mesh: {name} thread is idle and no "
                                           + "completion notice arrived; finishing\n")
                             log.flush()
@@ -2108,14 +2217,27 @@ def _stream_turn(
                         continue
                     if end_marker.exists():
                         break
-                    if resident and _record_port(session_dir) != port:
+                    if resident:
+                        selected_home = seats_home()
+                        record = _read_json_object(_session_path(session_dir, SERVER_FILE))
+                        with _pending_file(session_dir, name) as handle:
+                            held_messages = bool(_pending_for_thread(handle, thread_id))
+                        if (server_record_home(record) == selected_home
+                                and record.get("port") == port and not held_messages):
+                            continue
                         moved = _move_resident(args, session_dir, name, thread_id, client)
-                        if moved is not None:
-                            client, port = moved.client, moved.port
-                            turn_id = moved.turn_id or turn_id
-                            _ = log.write(f"[{_now_stamp()}] mesh: {name} moved to the run's app-server on "
-                                          + f"port {port}; the run retired the one it was on\n")
+                        if isinstance(moved, SeatThreadStateUnknown):
+                            if isinstance(moved.cleanup, SeatTurnCleanup):
+                                raise SeatMoveUncertain(thread_id, moved)
+                            _ = log.write(f"[{_now_stamp()}] mesh: {name} cannot move: {moved.reason}; waiting\n")
                             log.flush()
+                        elif isinstance(moved, MovedSeat):
+                            changed = bool(moved.port != port or moved.thread_id != thread_id)
+                            client, port, thread_id = moved.client, moved.port, moved.thread_id
+                            turn_id = moved.turn_id or turn_id
+                            if changed:
+                                _ = log.write(f"[{_now_stamp()}] mesh: {name} moved to the seats app-server on port {port}\n")
+                                log.flush()
                     continue
                 method = frame.get("method")
                 params = _as_dict(frame.get("params"))
@@ -2179,7 +2301,8 @@ def _stream_turn(
                             f"[{_now_stamp()}] context window filled; starting one continuation turn\n"
                         )
                         log.flush()
-                        turn_id = _start_turn(client, args, thread_id, continuation)
+                        started = _start_seats_turn(args, session_dir, name, thread_id, client, continuation)
+                        client, port, thread_id, turn_id = started.client, started.port, started.thread_id, started.turn_id
                         if follow:
                             followed_turn = turn_id
                         _update_roster(
@@ -2269,38 +2392,61 @@ def _stream_turn(
                                         "launcher_pid": os.getpid(),
                                     })
                             continue
-                        with _pending_file(session_dir, name) as pending_file:
+                        with _pending_file(session_dir, name):
                             if end_marker.exists() or not _roster_still_on_thread(session_dir, name, thread_id):
                                 reason = "ended" if end_marker.exists() else "replaced"
                                 _ = log.write(f"[{_now_stamp()}] capacity launcher {reason}; no resume turn started\n")
                                 log.flush()
                                 return FailedWithThread(thread_id, f"capacity launcher {reason}", time.time() - opened)
-                            messages = _pending_for_thread(pending_file, thread_id)
-                            turn_id = _start_turn(
-                                client, args, thread_id,
-                                "Your last turn stopped because the model was at capacity. Continue from where you stopped; your edits are already in the tree.",
-                                tuple(messages),
-                            )
-                            if follow:
-                                followed_turn = turn_id
-                            _write_pending(pending_file, thread_id, [])
-                            _update_roster(session_dir, name, {
-                                "thread_id": thread_id, "turn_id": turn_id, "status": "running"
-                            })
+                        started = _start_seats_turn(
+                            args, session_dir, name, thread_id, client,
+                            "Your last turn stopped because the model was at capacity. Continue from where you stopped; your edits are already in the tree.",
+                        )
+                        client, port, thread_id, turn_id = started.client, started.port, started.thread_id, started.turn_id
+                        if follow:
+                            followed_turn = turn_id
                         resume_owed = False
                         continue
-                    # A finished turn may have a peer turn opening behind it.
-                    if follow and isinstance(turn_outcome, TurnFailed) and not followed_failure:
+                    if follow and not resident and isinstance(turn_outcome, TurnFailed) and not followed_failure:
                         followed_failure = turn_outcome.detail
+                    failure = followed_failure or (turn_outcome.detail if isinstance(turn_outcome, TurnFailed) else "")
+                    if resident:
+                        replies += 1
+                        _deliver_reply(name, replies, final_answer, failure, summary_path, reply_path, log)
+                        final_answer = ""
+                        failure = ""
+                        if end_marker.exists():
+                            break
+                    with _pending_file(session_dir, name) as handle:
+                        held_messages = bool(_pending_for_thread(handle, thread_id))
+                    if resident or held_messages:
+                        thread_id = _as_str(cast(object, thread_id))
+                        moved = _move_resident(args, session_dir, name, thread_id, client)
+                        if isinstance(moved, SeatThreadStateUnknown):
+                            raise SeatMoveUncertain(thread_id, moved)
+                        if isinstance(moved, MovedSeat):
+                            client, port, thread_id = moved.client, moved.port, moved.thread_id
+                            if moved.turn_id:
+                                turn_id = moved.turn_id
+                                if follow:
+                                    followed_turn = turn_id
+                                continue
+                    # A finished turn may have a peer turn opening behind it.
                     if not resident and _more_work_coming(client, thread_id, deadline):
                         continue
-                    failure = followed_failure or (turn_outcome.detail if isinstance(turn_outcome, TurnFailed) else "")
                     if not resident:
-                        break
-                    replies += 1
-                    _deliver_reply(name, replies, final_answer, failure, summary_path, reply_path, log)
-                    final_answer = ""
-                    failure = ""
+                        if _close_messages_if_empty(session_dir, name, thread_id):
+                            break
+                        moved = _move_resident(args, session_dir, name, thread_id, client)
+                        if isinstance(moved, SeatThreadStateUnknown):
+                            raise SeatMoveUncertain(thread_id, moved)
+                        if isinstance(moved, MovedSeat):
+                            client, port, thread_id = moved.client, moved.port, moved.thread_id
+                            if moved.turn_id:
+                                turn_id = moved.turn_id
+                                if follow:
+                                    followed_turn = turn_id
+                        continue
                     _update_roster(session_dir, name, {"thread_id": thread_id, "turn_id": turn_id, "status": "running"})
                     if end_marker.exists():
                         break
@@ -2320,12 +2466,18 @@ def _stream_turn(
     except (ConnectionError, OSError, SystemExit) as exc:
         # Once thread/start returned, even a disconnected turn/start may have
         # begun work. Keep its id and never resubmit the original prompt.
+        if isinstance(exc, SeatMoveUncertain) and isinstance(exc.cleanup, SeatTurnCleanup):
+            port = exc.cleanup.port
+            thread_id = exc.cleanup.thread_id
         _ = _end_unwatched_turn(port, thread_id, log_path)
         failure = str(exc) or exc.__class__.__name__
         if _roster_still_on_thread(session_dir, name, thread_id):
             _update_roster(session_dir, name, {"thread_id": thread_id, "status": "failed"})
         return FailedWithThread(thread_id, failure, time.time() - opened)
     finally:
+        if not end_marker.exists():
+            with _pending_file(session_dir, name) as handle:
+                _write_pending(handle, thread_id, _pending_for_thread(handle, thread_id), accepting_messages=False)
         client.close()
 
 
@@ -2333,50 +2485,285 @@ def _stream_turn(
 class MovedSeat:
     client: Client
     port: int
-    # The turn opened for messages that were waiting; empty when none were.
+    # Empty when the move has no messages to start.
     turn_id: str
+    thread_id: str
+    thread_replaced: bool
+
+
+@dataclass(frozen=True)
+class SeatWaitingOnLiveTurn:
+    """The outgoing thread is still working and keeps its server."""
+
+    reason: str = "the outgoing thread still has a live turn"
+
+
+@dataclass(frozen=True)
+class SeatTurnCleanup:
+    """A turn may have started here even though its reply was lost."""
+
+    port: int
+    thread_id: str
+
+
+@dataclass(frozen=True)
+class NoSeatTurnToCleanUp:
+    """No new turn was submitted during this failed move."""
+
+
+@dataclass(frozen=True)
+class SeatThreadStateUnknown:
+    """The outgoing thread cannot be proved idle; no new turn may start."""
+
+    reason: str
+    cleanup: SeatTurnCleanup | NoSeatTurnToCleanUp = field(default_factory=NoSeatTurnToCleanUp)
+
+
+SeatMoveResult = MovedSeat | SeatWaitingOnLiveTurn | SeatThreadStateUnknown
+
+
+class SeatMoveUncertain(SystemExit):
+    def __init__(self, thread_id: str, result: SeatThreadStateUnknown) -> None:
+        super().__init__(f"thread {thread_id}: state unknown ({result.reason}); no turn resubmitted")
+        self.cleanup: SeatTurnCleanup | NoSeatTurnToCleanUp = result.cleanup
+
+
+@dataclass(frozen=True)
+class _ReleasedSeatThread:
+    """The old server no longer holds the thread's writer."""
+
+
+def _recorded_server_gone(session_dir: str, port: int) -> bool:
+    pids = [pid for record in _recorded_run_servers(session_dir)
+            if record.get("port") == port and isinstance(pid := record.get("pid"), int)]
+    return bool(pids) and not any(_pid_alive(pid) for pid in pids)
+
+
+def _release_blocker_reason(client: Client, session_dir: str, thread_id: str) -> str:
+    seats = _roster_threads(Path(session_dir))
+    busy: list[str] = []
+    for identity, name in seats.items():
+        try:
+            reply = client.call("thread/read", {"threadId": identity, "includeTurns": False}, timeout=1.0)
+        except (ConnectionError, OSError, SystemExit):
+            continue
+        thread = _as_dict(_as_dict(reply.get("result")).get("thread"))
+        if _as_str(_as_dict(thread.get("status")).get("type")) in ("active", "running"):
+            busy.append(name)
+    held_by = ", ".join(busy) or seats.get(thread_id, thread_id)
+    return (f"run {Path(session_dir).name}, seat {held_by}: old server has not released the thread; "
+            + "follow-up goes through once that turn ends")
+
+
+def _release_seat_thread(client: Client, thread_id: str, session_dir: str) -> _ReleasedSeatThread | SeatThreadStateUnknown:
+    deadline = time.monotonic() + THREAD_RELEASE_TIMEOUT_SECS
+    try:
+        unsubscribed = _require(client.call("thread/unsubscribe", {"threadId": thread_id},
+                                           timeout=THREAD_RELEASE_TIMEOUT_SECS), "thread/unsubscribe")
+        if unsubscribed.get("status") == "notLoaded":
+            return _ReleasedSeatThread()
+        while time.monotonic() < deadline:
+            if thread_id not in _loaded_thread_ids(client, deadline):
+                return _ReleasedSeatThread()
+            frame = client.next_frame(time.time() + min(0.1, max(0.0, deadline - time.monotonic())))
+            if frame and frame.get("method") == "thread/closed" and _as_str(_as_dict(frame.get("params")).get("threadId")) == thread_id:
+                return _ReleasedSeatThread()
+        if _recorded_server_gone(session_dir, client.port):
+            return _ReleasedSeatThread()
+        return SeatThreadStateUnknown(_release_blocker_reason(client, session_dir, thread_id))
+    except (ConnectionError, OSError, SystemExit) as error:
+        if _recorded_server_gone(session_dir, client.port):
+            return _ReleasedSeatThread()
+        return SeatThreadStateUnknown(f"old thread release could not be confirmed: {error}")
+
+
+@dataclass(frozen=True)
+class _SeatThreadForHome:
+    thread_id: str
+    thread_replaced: bool
+
+
+def _resume_seat_thread(
+    args: argparse.Namespace, session_dir: str, name: str, thread_id: str, client: Client,
+    seats_home: Path,
+) -> _SeatThreadForHome:
+    params = _resume_params(session_dir, name, thread_id)
+    instructions_file = _as_str(_lookup(session_dir, name).get("instructions_file"))
+    resumed = client.call("thread/resume", params)
+    if not resumed.get("error"):
+        _ = _require(resumed, "thread/resume")
+        return _SeatThreadForHome(thread_id, False)
+    start_params = _thread_start_params(args)
+    if "developerInstructions" in params:
+        start_params.update({
+            "developerInstructions": params["developerInstructions"],
+            "sandbox": "read-only", "approvalPolicy": "never",
+        })
+    started = _require(client.call("thread/start", start_params), "thread/start")
+    replacement = _as_str(_as_dict(started.get("thread")).get("id"))
+    if not replacement:
+        raise SystemExit("thread/start returned no replacement thread id")
+    record: StartingRecord = {"thread_id": replacement, "status": "starting", "port": client.port}
+    if instructions_file:
+        record["instructions_file"] = instructions_file
+    _update_roster(session_dir, name, record)
+    _ = client.call("thread/name/set", {"threadId": replacement, "name": name})
+    _post_board_status(
+        session_dir, name,
+        f"{codex_home_display(seats_home)} refused to resume {thread_id}; seat continues as new thread {replacement}",
+    )
+    return _SeatThreadForHome(replacement, True)
+
+
+def _release_other_seat_writers(
+    session_dir: str, name: str, thread_id: str, target_port: int,
+) -> _ReleasedSeatThread | SeatWaitingOnLiveTurn | SeatThreadStateUnknown:
+    for port in _run_servers(session_dir):
+        if port == target_port:
+            continue
+        records = _recorded_run_servers(session_dir)
+        pids = {pid for record in records
+                if record.get("port") == port and isinstance(pid := record.get("pid"), int)}
+        live_pids = {pid for pid in pids if _pid_alive(pid)}
+        current_pid = records[-1].get("pid") if records[-1].get("port") == port else None
+        stopped_pids = {pid for pid in live_pids if pid != current_pid
+                        and _stop_unused(None, pid, port, RetiredRunServer(Path(session_dir)))}
+        if pids and live_pids <= stopped_pids:
+            continue
+        client: Client | None = None
+        try:
+            client = Client(port, f"release-{name}")
+            if thread_id not in _loaded_thread_ids(client, time.monotonic() + THREAD_RELEASE_TIMEOUT_SECS):
+                continue
+            state = _read_live_turn(client, thread_id)
+            if isinstance(state, ThreadStateUnknown):
+                return SeatThreadStateUnknown(state.reason)
+            if not isinstance(state, ThreadIdle):
+                return SeatWaitingOnLiveTurn(
+                    f"run {Path(session_dir).name}, seat {name}: old server still has a live turn; "
+                    + "follow-up goes through once that turn ends")
+            with _pending_file(session_dir, name) as handle:
+                messages = _pending_for_thread(handle, thread_id)
+                def park(message: str) -> None:
+                    messages.append(message)
+                    _write_pending(handle, thread_id, messages)
+                _move_queue_to_pending(client, thread_id, park)
+                state = _read_live_turn(client, thread_id)
+                if not isinstance(state, ThreadIdle):
+                    return SeatThreadStateUnknown("old thread is no longer idle")
+                released = _release_seat_thread(client, thread_id, session_dir)
+                if isinstance(released, SeatThreadStateUnknown):
+                    return released
+        except (ConnectionError, OSError, SystemExit) as error:
+            if _recorded_server_gone(session_dir, port):
+                continue
+            return SeatThreadStateUnknown(f"old writer could not be checked: {error}")
+        finally:
+            if client is not None:
+                client.close()
+    return _ReleasedSeatThread()
 
 
 def _move_resident(
-    args: argparse.Namespace, session_dir: str, name: str, thread_id: str, client: Client
-) -> MovedSeat | None:
-    """Move a resident seat between turns onto the run's current app-server; None while a turn runs.
+    args: argparse.Namespace, session_dir: str, name: str, thread_id: str, client: Client,
+    *, message: str = "",
+) -> SeatMoveResult:
+    try:
+        return _move_idle_seat(args, session_dir, name, thread_id, client, message=message)
+    except (ConnectionError, OSError, SystemExit) as error:
+        return SeatThreadStateUnknown(str(error) or type(error).__name__)
 
-    The run retired the server this seat is attached to, most often because Codex was signed in
-    again after it started. The move holds the seat's pending lock, which `send` also takes, so no
-    message lands between the two servers: what was queued on the old one opens the first turn on
-    the new one.
-    """
-    if not isinstance(_read_live_turn(client, thread_id), ThreadIdle):
-        return None
+
+def _move_idle_seat(
+    args: argparse.Namespace, session_dir: str, name: str, thread_id: str, client: Client,
+    *, message: str = "",
+) -> SeatMoveResult:
+    """Check one new-turn boundary and move an idle thread onto the seats home."""
+    state = _read_live_turn(client, thread_id)
+    if isinstance(state, ThreadStateUnknown):
+        return SeatThreadStateUnknown(state.reason)
+    if not isinstance(state, ThreadIdle):
+        return SeatWaitingOnLiveTurn()
+    seats_home_for_turn = seats_home()
     with _pending_file(session_dir, name) as handle:
-        if not isinstance(_read_live_turn(client, thread_id), ThreadIdle):
-            return None
+        if _end_marker_path(session_dir, name).exists() or not _roster_still_on_thread(session_dir, name, thread_id):
+            return SeatThreadStateUnknown("seat ended or was replaced before the new turn")
+        state = _read_live_turn(client, thread_id)
+        if isinstance(state, ThreadStateUnknown):
+            return SeatThreadStateUnknown(state.reason)
+        if not isinstance(state, ThreadIdle):
+            return SeatWaitingOnLiveTurn()
         messages = _pending_for_thread(handle, thread_id)
 
-        def park(message: str) -> None:
-            messages.append(message)
+        def park(text: str) -> None:
+            messages.append(text)
             _write_pending(handle, thread_id, messages)
 
         _move_queue_to_pending(client, thread_id, park)
-        params = _resume_params(session_dir, name, thread_id)
-        client.close()
-        port, _fresh = ensure_server(session_dir)
-        moved = Client(port, name)
-        try:
-            _ = _require(moved.call("thread/resume", params), "thread/resume")
-        except (ConnectionError, OSError, SystemExit):
-            moved.close()
-            raise
+        state = _read_live_turn(client, thread_id)
+        if isinstance(state, ThreadStateUnknown):
+            return SeatThreadStateUnknown(state.reason)
+        if not isinstance(state, ThreadIdle):
+            return SeatWaitingOnLiveTurn()
+        port, _fresh = ensure_server(session_dir, seats_home_for_turn)
+        previous = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+        old_port = client.port
+        moved = client
+        replaced = False
+        if port != old_port:
+            released = _release_seat_thread(client, thread_id, session_dir)
+            if isinstance(released, SeatThreadStateUnknown):
+                return released
+            moved = Client(port, name)
+            try:
+                resumed = _resume_seat_thread(args, session_dir, name, thread_id, moved, seats_home_for_turn)
+                thread_id, replaced = resumed.thread_id, resumed.thread_replaced
+                if replaced:
+                    _write_pending(handle, thread_id, messages)
+                    role = _roster_role(previous.get("role"))
+                    if isinstance(role, AssignedDelegateRole):
+                        _record_assignment(thread_id, role.role, _dispatch_lens(args))
+            except (ConnectionError, OSError, SystemExit) as error:
+                moved.close()
+                current = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+                current_thread = _as_str(current.get("thread_id")) or thread_id
+                cleanup = (SeatTurnCleanup(port, current_thread)
+                           if replaced or current_thread != thread_id else NoSeatTurnToCleanUp())
+                return SeatThreadStateUnknown(str(error) or type(error).__name__, cleanup)
+            client.close()
         turn_id = ""
-        if messages:
-            turn_id = _start_turn(moved, args, thread_id, messages[0], tuple(messages[1:]))
+        if message or messages:
+            _update_roster(session_dir, name, {"thread_id": thread_id, "status": "starting", "port": port})
+            inputs = [message, *messages] if message else messages
+            try:
+                turn_id = _start_turn(moved, args, thread_id, inputs[0], tuple(inputs[1:]))
+            except (ConnectionError, OSError, SystemExit) as error:
+                if moved is not client:
+                    moved.close()
+                return SeatThreadStateUnknown(str(error) or type(error).__name__, SeatTurnCleanup(port, thread_id))
             _write_pending(handle, thread_id, [])
-        previous = _as_str(_as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)).get("turn_id"))
+        prior_turn = _as_str(previous.get("turn_id")) if not replaced else ""
         _update_roster(session_dir, name, {
-            "thread_id": thread_id, "turn_id": turn_id or previous, "status": "running", "port": port
+            "thread_id": thread_id, "turn_id": turn_id or prior_turn, "status": "running", "port": port
         })
-    return MovedSeat(moved, port, turn_id)
+    return MovedSeat(moved, port, turn_id, thread_id, replaced)
+
+
+def _start_seats_turn(
+    args: argparse.Namespace, session_dir: str, name: str, thread_id: str,
+    client: Client, message: str,
+) -> MovedSeat:
+    deadline = time.monotonic() + _as_float(_attr(args, "timeout"), 86400.0)
+    while time.monotonic() < deadline:
+        result = _move_resident(args, session_dir, name, thread_id, client, message=message)
+        if isinstance(result, SeatThreadStateUnknown):
+            raise SeatMoveUncertain(thread_id, result)
+        if isinstance(result, MovedSeat):
+            return result
+        if _end_marker_path(session_dir, name).exists():
+            raise SystemExit(f"thread {thread_id}: ended while waiting; no turn started")
+        time.sleep(RESIDENT_POLL_SECS)
+    raise SystemExit(f"thread {thread_id}: still live at the timeout; no new turn started")
 
 
 def _start_turn(
@@ -2448,18 +2835,6 @@ def _end_unwatched_turn(
     return RelaunchAllowed()
 
 
-def _load_thread(client: Client, session_dir: str, name: str, thread_id: str) -> None:
-    """Reopen a conversation this server has not loaded.
-
-    A server started after the last one stopped accepts a queued message for a thread it has not
-    loaded and never runs it. The first page of the list is enough: reopening a loaded thread is
-    what every `follow` does.
-    """
-    loaded = _as_dict(client.call("thread/loaded/list", {}).get("result")).get("data")
-    if not isinstance(loaded, list) or thread_id not in cast("list[object]", loaded):
-        _ = _require(client.call("thread/resume", _resume_params(session_dir, name, thread_id)), "thread/resume")
-
-
 def command_send(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     target = _as_str(_attr(args, "to"))
@@ -2475,36 +2850,28 @@ def command_send(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+        if _messages_closed(pending_file, record["thread_id"]):
+            print(f"codex_mesh: {target}'s launcher is closing; message not delivered; relaunch the seat", file=sys.stderr)
+            return 2
         if status not in LAUNCHER_ATTACHED_STATUSES:
             raise SystemExit(
                 f"codex_mesh: {target} is {status}, not running; read its summary file"
             )
-        if status == WAITING_CAPACITY:
-            messages = _pending_for_thread(pending_file, record["thread_id"])
-            messages.append(_message_text(args))
-            _write_pending(pending_file, record["thread_id"], messages)
-            print(f"message for {target} will be delivered when the seat resumes")
-            return 0
-        client = Client(_seat_port(session_dir, record), f"send-{os.getpid()}")
-        try:
-            try:
-                _load_thread(client, session_dir, target, record["thread_id"])
-            except OSError as exc:
-                print(f"codex_mesh: {target}: {exc}", file=sys.stderr)
-                return 1
-            _ = _require(
-                client.call(
-                    "thread/queue/add",
-                    {
-                        "threadId": record["thread_id"],
-                        "clientUserMessageId": f"mesh-{secrets.token_hex(6)}",
-                        "input": [{"type": "text", "text": _message_text(args)}],
-                    },
-                ),
-                "thread/queue/add",
-            )
-        finally:
-            client.close()
+        launcher_pid = record.get("launcher_pid")
+        if not isinstance(launcher_pid, int) or launcher_pid <= 0 or not _pid_alive(launcher_pid):
+            print(f"codex_mesh: {target} has no live launcher to read a message; end the seat and relaunch it", file=sys.stderr)
+            return 2
+        home = seats_home()
+        # Retiring is enough here. A live launcher keeps its outgoing connection
+        # and claims this held message at its next checked turn boundary.
+        with _server_lock(session_dir):
+            current = _read_json_object(_session_path(session_dir, SERVER_FILE))
+            if current and server_record_home(current) != home:
+                _retire_record(session_dir, current)
+        messages = _pending_for_thread(pending_file, record["thread_id"])
+        messages.append(_message_text(args))
+        _write_pending(pending_file, record["thread_id"], messages)
+
     print(f"queued for {target}")
     return 0
 
@@ -2908,13 +3275,13 @@ def _running_servers() -> list[tuple[int, int, float]]:
             command = shlex.split(fields[2])
         except ValueError:
             continue
-        if (
-            len(command) < 4
-            or Path(command[0]).name != "codex"
-            or tuple(command[1:3]) != SERVER_ARGUMENTS
-        ):
+        if not command or Path(command[0]).name != "codex":
             continue
-        address = command[3]
+        server_index = next((index for index in range(1, len(command) - 2)
+                             if tuple(command[index:index + 2]) == SERVER_ARGUMENTS), -1)
+        if server_index < 0:
+            continue
+        address = command[server_index + 2]
         if not address.startswith("ws://"):
             continue
         port = address.rpartition(":")[2]
@@ -3232,11 +3599,17 @@ def _marker_sessions(root: Path, folder: Path) -> list[str]:
     return holders
 
 
-def _notify_holder(session_id: str, line: str) -> None:
+class CodexNoticeKind(Enum):
+    SEATS_CHANGED = "seats_changed"
+    SIGN_IN_CHANGED = "sign_in_changed"
+
+
+def _notify_holder(session_id: str, line: str, kind: CodexNoticeKind) -> None:
+    seats_changed = kind is CodexNoticeKind.SEATS_CHANGED
     try:
         sent = subprocess.run(
-            [sys.executable, str(SEND_SCRIPT), "--to", f"session:{session_id}", "--from", "codex-sign-in",
-             "--summary", "Codex sign-in changed", "--text", line],
+            [sys.executable, str(SEND_SCRIPT), "--to", f"session:{session_id}", "--from", "codex-seats" if seats_changed else "codex-sign-in",
+             "--summary", "Codex seats account changed" if seats_changed else "Codex sign-in changed", "--text", line],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=NOTICE_TIMEOUT_SECS, check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -3257,18 +3630,22 @@ def command_signin_changed(args: argparse.Namespace) -> int:
     second run finds nothing older and moves nothing.
     """
     root = Path(_as_str(_attr(args, "root")) or SWEEP_ROOT)
-    changed = _sign_in_changed_at()
+    home = codex_home()
+    changed = _sign_in_changed_at(home)
     if changed is None:
         print("codex_mesh: no Codex sign-in file; nothing moved")
         return 0
-    at = datetime.fromtimestamp(changed).astimezone().strftime("%H:%M %Z")
+    at = datetime.fromtimestamp(changed).astimezone(user_zone()).strftime("%H:%M %Z")
     moved = 0
     for record_path in sorted(root.glob(f"*/{SERVER_FILE}")):
         folder = record_path.parent
         with _server_lock(str(folder)):
             record = _read_json_object(record_path)
             port, pid = record.get("port"), record.get("pid")
-            if not (isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid) and _holds_old_sign_in(pid)):
+            recorded_home = server_record_home(record)
+            if not (recorded_home == home
+                    and isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid)
+                    and _holds_old_sign_in(pid, recorded_home)):
                 continue
             _retire_record(str(folder), record)
         stopped = _stop_unused(None, pid, port, RetiredRunServer(folder))
@@ -3280,11 +3657,49 @@ def command_signin_changed(args: argparse.Namespace) -> int:
                 + f"that turn ends; the old server {old}.")
         _log_server(str(folder), line)
         for session_id in _marker_sessions(root, folder):
-            _notify_holder(session_id, line)
+            _notify_holder(session_id, line, CodexNoticeKind.SIGN_IN_CHANGED)
         print(line)
         moved += 1
     print(f"{moved} run(s) moved off the old sign-in")
     return 0
+
+
+def retire_seats_servers(seats_home: Path, label: str, *, dry_run: bool = False) -> list[str]:
+    """Retire current run servers and notify each affected holder once."""
+    notices: dict[str, list[str]] = {}
+    lines: list[str] = []
+    at = datetime.now().astimezone(user_zone()).strftime("%H:%M %Z")
+    for record_path in sorted(SWEEP_ROOT.glob(f"*/{SERVER_FILE}")):
+        folder = record_path.parent
+        with _server_lock(str(folder)):
+            record = _read_json_object(record_path)
+            pid, port = record.get("pid"), record.get("port")
+            if not isinstance(pid, int) or not isinstance(port, int) or not _pid_alive(pid):
+                continue
+            previous_home = server_record_home(record)
+            line = (
+                f"Seats account {'would move' if dry_run else 'changed'} at {at} to {label} "
+                + f"({codex_home_display(seats_home)}): run {folder.name}'s seats move from "
+                + f"{codex_home_display(previous_home)} at their next turn; "
+                + "a working seat finishes first. Continue dispatching as usual."
+            )
+            if not dry_run:
+                _retire_record(str(folder), record)
+                _log_server(str(folder), line)
+        if not dry_run and not _stop_unused(None, pid, port, RetiredRunServer(folder)):
+            _ = _start_watcher(str(folder), pid, port)
+        lines.append(line)
+        for session_id in _marker_sessions(SWEEP_ROOT, folder):
+            notices.setdefault(session_id, []).append(folder.name)
+    if not dry_run:
+        for session_id, runs in notices.items():
+            _notify_holder(
+                session_id,
+                f"Seats account changed at {at} to {label} ({codex_home_display(seats_home)}): "
+                + f"runs {', '.join(runs)} move at their next turn; working seats finish first. Continue dispatching as usual.",
+                CodexNoticeKind.SEATS_CHANGED,
+            )
+    return lines
 
 
 def command_serve(args: argparse.Namespace) -> int:
@@ -3350,6 +3765,10 @@ def command_fork(args: argparse.Namespace) -> int:
         if isinstance(source, InvalidThread):
             raise SystemExit(source.reason)
         port, _fresh = ensure_server(session_dir)
+        released = _release_other_seat_writers(session_dir, source_name, source.thread_id, port)
+        if not isinstance(released, _ReleasedSeatThread):
+            print(f"codex_mesh: {name}: {released.reason}; fork refused", file=sys.stderr)
+            return 2
         client = Client(port, name)
         params = _resume_params(session_dir, source_name, source.thread_id)
         _ = _require(client.call("thread/resume", params), "thread/resume")
@@ -3419,6 +3838,10 @@ def command_reset(args: argparse.Namespace) -> int:
         claimed = True
         claimed_thread_id = state.thread_id
         port, _fresh = ensure_server(session_dir)
+        released = _release_other_seat_writers(session_dir, name, state.thread_id, port)
+        if not isinstance(released, _ReleasedSeatThread):
+            print(f"codex_mesh: {name}: {released.reason}; reset refused", file=sys.stderr)
+            return 2
         client = Client(port, name)
         _ = _require(client.call("thread/resume", _resume_params(session_dir, name, state.thread_id)), "thread/resume")
         read = _require(client.call("thread/read", {

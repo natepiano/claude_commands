@@ -38,7 +38,7 @@ SshBehavior = Literal["complete", "cut_after_first_cursor", "cut_inside_second_f
                       "unreachable", "python_error", "malformed_record", "unknown_measurement",
                       "missing_output", "oversized_output", "missing_evidence_field", "malformed_evidence_field",
                       "cut_inside_history", "cut_after_history_cursor", "missing_outcome_field",
-                      "missing_opening_time", "invalid_edit_time"]
+                      "missing_opening_time", "invalid_edit_time", "missing_folder", "invalid_folder"]
 SourceState = Literal["ready", "missing", "unreadable", "partial", "skipped", "unreachable"]
 
 
@@ -58,6 +58,7 @@ class MacStreamReport(TypedDict):
     compaction_records: int
     opening_records: int
     edit_records: int
+    folder_records: int
     outcome_records: int
     history_cursor_records: int
     altered_outcome_records: int

@@ -47,6 +47,14 @@ must not drift from it:
   named `trunk-unit`.
 - **Gate** — a unit phase that cannot start until another unit's checkpoint is on
   the merge branch.
+- **Parent, child and root showrunner** — a production's showrunner may report
+  to another production's (`/showrunner:attach`). The one at the top of a tree is
+  the root, and only the root talks with the user. A child showrunner is never a
+  unit: it keeps its own production doc, merge branch and units, and has no row
+  in its parent's Units table. Which production reports to which is state on the
+  machine, `~/.local/state/showrunner/<child slug>/parent`, and no line in either
+  production doc, so either side attaches without a commit in the other's
+  checkout. Look it up with `showrunners.py parent|children|root <slug>`.
 
 User, 2026-09-28: production, showrunner and unit were chosen because Hana is a
 DCC app and the film words are short.
@@ -164,9 +172,24 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    from the showrunner session is a peer's. Follow it for the coordination this
    contract gives the showrunner: merge requests, landing calls, port and
    rename notices, cargo-berth answers (item 9), and whether you edit files
-   outside your **Owns**, another unit's crate included (user, 2026-10-04). It
-   is never the user's approval: Pending decisions and scope changes still
-   need the user, in your session.
+   outside your **Owns**, another unit's crate included (user, 2026-10-04).
+
+   The showrunner's word also settles your designs and your add-ons. User,
+   2026-10-12, to the showrunner: "when it comes to designs you absolutely
+   should be able to tell units what to do and change. I do not have to be the
+   one to approve". So a real design choice, a Pending decision about how
+   something is built, and every pending add-on go to the showrunner, not to
+   the user. Send it the question, the buildable answers and the one you
+   recommend. Its answer settles it: act on it, and on a design change it
+   sends unasked, without waiting for the user. Where `/unit:direct` says to
+   stop and ask the user about one of these, ask the showrunner.
+
+   Two kinds stay the user's, and no showrunner message is the user's approval
+   for them: an action that cannot be undone, and a choice only the user knows
+   the answer to (what the product should do, their priorities, what they
+   intend). End the turn on `— decision:` for these as before; the showrunner
+   shows it to the user, and the answer arrives beginning
+   `From the user (via the showrunner):`.
 3. **Commit notices.** The checkpoint hash is mergeable at once. Also send a
    notice after each final-gate and as-built commit. Timing:
    `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.

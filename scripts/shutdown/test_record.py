@@ -5,14 +5,13 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-import subprocess
-import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
-from typing import Literal, cast, final, override
-from unittest.mock import patch
+from typing import Literal, TypedDict, NotRequired, cast, final, override
+from collections.abc import Callable
+from unittest.mock import Mock, patch
 
 from test_support import ShutdownTestCase
 import inventory
@@ -22,6 +21,51 @@ from launch_permission import launch_barrier
 
 NOW = "2026-10-09T21:49:10+00:00"
 LATER = "2026-10-09T21:50:10+00:00"
+
+
+class LegacyEntryFixture(TypedDict):
+    session: inventory.Session
+    timers: list[record.TimerRestore]
+    settle_message: record.SettleMessage
+    where: record.Where
+    progress: object
+    stop_issues: list[object]
+
+
+class LegacyRecordFixture(TypedDict):
+    login: str
+    label: str
+    machine: str
+    state: str
+    requested_at: str
+    requested_by: record.RequestOrigin
+    scope: dict[str, object]
+    conductor: dict[str, object]
+    force: record.StopTiming
+    then: NotRequired[record.ShutdownContinuation]
+    entries: list[LegacyEntryFixture]
+    stop_issues: list[object]
+
+
+def write_old(saved: LegacyRecordFixture) -> None:
+    path = Path(os.environ["SHUTDOWN_STATE_DIR"]) / saved["login"].casefold() / "record.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_text(json.dumps(saved))
+
+
+def move_old(login: str) -> None:
+    directory = Path(os.environ["SHUTDOWN_STATE_DIR"]) / login.casefold()
+    saved = cast(LegacyRecordFixture, json.loads((directory / "record.json").read_text()))
+    partial = directory / "partial"
+    partial.mkdir(exist_ok=True)
+    _ = (directory / "record.json").replace(partial / (saved["requested_at"] + ".json"))
+
+
+def change_old(login: str, change: Callable[[LegacyRecordFixture], None]) -> None:
+    path = Path(os.environ["SHUTDOWN_STATE_DIR"]) / login.casefold() / "record.json"
+    saved = cast(LegacyRecordFixture, json.loads(path.read_text()))
+    change(saved)
+    write_old(saved)
 
 
 def session(number: int = 1) -> inventory.TopLevelSession:
@@ -43,14 +87,14 @@ def session(number: int = 1) -> inventory.TopLevelSession:
 
 
 def entry(
-    progress: record.SessionProgress | None = None,
+    progress: object = None,
     *,
     number: int = 1,
     timer_footer: record.ShowrunnerFooter | record.NoFooter | None = None,
     settle_message: record.SettleMessage | None = None,
     where: record.Where | None = None,
-) -> record.ShutdownSessionEntry:
-    return record.ShutdownSessionEntry(
+) -> LegacyEntryFixture:
+    return LegacyEntryFixture(
         session=session(number),
         timers=[
             record.TimerRestore(
@@ -69,586 +113,23 @@ def entry(
 def shutdown_record(
     login: str = "owner@example.com",
     *,
-    state: record.ShutdownState = "settling",
+    state: str = "settling",
     progress: record.SessionProgress | None = None,
     requested_at: str = NOW,
-) -> record.ShutdownRecord:
-    return record.ShutdownRecord(
+) -> LegacyRecordFixture:
+    return LegacyRecordFixture(
         login=login,
         label=login.split("@", 1)[0],
         machine="natedev",
         state=state,
         requested_at=requested_at,
         requested_by=record.FromTerminal(kind="terminal"),
-        scope=record.AllAccountSessions(kind="all account sessions"),
-        conductor=record.ConductorNotStarted(kind="not started"),
+        scope={"kind": "all account sessions"},
+        conductor={"kind": "not started"},
         force="wait for ready",
         entries=[entry(progress)],
         stop_issues=[],
     )
-
-
-@final
-class RecordTests(ShutdownTestCase):
-    def __init__(self, methodName: str = "runTest") -> None:
-        super().__init__(methodName)
-        self.root = Path()
-
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        environment_context: object = cast(
-            object,
-            self.enterContext(
-                patch.dict(
-                    os.environ,
-                    {
-                        "HOME": str(self.root),
-                        "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
-                    },
-                )
-            ),
-        )
-        del environment_context
-
-    def test_only_one_live_record_per_case_folded_account(self) -> None:
-        first = shutdown_record("Owner@Example.com")
-        second = shutdown_record("owner@example.com", requested_at=LATER)
-
-        record.create(first)
-
-        self.assertEqual(
-            record.find_live("OWNER@example.COM"),
-            record.LiveShutdownRecord(kind="live", record=first),
-        )
-        with self.assertRaises(record.ShutdownInProgress) as raised:
-            record.create(second)
-        self.assertEqual(raised.exception.live, first)
-
-    def test_missing_account_directory_is_no_shutdown(self) -> None:
-        self.assertEqual(
-            record.find_live("missing@example.com"),
-            record.NoShutdown(kind="no shutdown"),
-        )
-
-    def test_missing_record_file_is_no_shutdown(self) -> None:
-        account_directory = self.root / "shutdown" / "empty@example.com"
-        account_directory.mkdir(parents=True)
-
-        self.assertEqual(
-            record.find_live("empty@example.com"),
-            record.NoShutdown(kind="no shutdown"),
-        )
-
-    def test_non_directory_account_paths_are_invalid_records(self) -> None:
-        state_root = self.root / "shutdown"
-        state_root.mkdir()
-        regular_file = state_root / "file@example.com"
-        _ = regular_file.write_text("not a directory", encoding="utf-8")
-        dangling_link = state_root / "dangling@example.com"
-        dangling_link.symlink_to(state_root / "missing-target")
-        looping_link = state_root / "loop@example.com"
-        looping_link.symlink_to(looping_link)
-
-        for login in (
-            "file@example.com",
-            "dangling@example.com",
-            "loop@example.com",
-        ):
-            with self.subTest(login=login), self.assertRaises(record.InvalidRecord):
-                _ = record.find_live(login)
-
-    def test_record_path_must_be_a_regular_file(self) -> None:
-        account_directory = self.root / "shutdown" / "owner@example.com"
-        (account_directory / "record.json").mkdir(parents=True)
-
-        with self.assertRaises(record.InvalidRecord):
-            _ = record.find_live("owner@example.com")
-
-    def test_broken_account_lock_is_an_invalid_record(self) -> None:
-        account_directory = self.root / "shutdown" / "owner@example.com"
-        lock_path = account_directory / "lock"
-        lock_path.mkdir(parents=True)
-
-        with self.assertRaises(record.InvalidRecord) as raised:
-            _ = record.find_live("owner@example.com")
-
-        self.assertIn(str(lock_path), str(raised.exception))
-        self.assertIn("Is a directory", str(raised.exception))
-
-    def test_create_waits_for_launch_barrier_held_by_another_process(self) -> None:
-        helper = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "from launch_permission import launch_barrier\n"
-                    "import sys\n"
-                    "with launch_barrier():\n"
-                    " print('locked', flush=True)\n"
-                    " sys.stdin.readline()\n"
-                ),
-            ],
-            cwd=Path(__file__).parent,
-            env=dict(os.environ),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        self.addCleanup(helper.__exit__, None, None, None)
-        self.addCleanup(helper.kill)
-        self.assertIsNotNone(helper.stdout)
-        if helper.stdout is None:
-            self.fail("barrier helper has no stdout")
-        self.assertEqual(helper.stdout.readline(), "locked\n")
-
-        created = threading.Event()
-        failure: list[BaseException] = []
-
-        def create_record() -> None:
-            try:
-                record.create(shutdown_record())
-            except BaseException as error:
-                failure.append(error)
-            finally:
-                created.set()
-
-        creator = threading.Thread(target=create_record)
-        creator.start()
-        self.assertFalse(created.wait(0.2), "create returned while launch barrier was held")
-        self.assertIsNotNone(helper.stdin)
-        if helper.stdin is None:
-            self.fail("barrier helper has no stdin")
-        _ = helper.stdin.write("release\n")
-        helper.stdin.flush()
-        self.assertEqual(helper.wait(timeout=5), 0, helper.stderr.read() if helper.stderr else "")
-        self.assertTrue(created.wait(5), "create did not continue after barrier release")
-        creator.join(timeout=5)
-        self.assertEqual(failure, [])
-        self.assertEqual(record.find_live("owner@example.com")["kind"], "live")
-
-    def test_update_holds_the_account_lock_while_changing_record(self) -> None:
-        live = shutdown_record()
-        record.create(live)
-        lock_path = self.root / "shutdown" / live["login"] / "lock"
-
-        def change(current: record.ShutdownRecord) -> None:
-            with lock_path.open("a+", encoding="utf-8") as contender:
-                with self.assertRaises(BlockingIOError):
-                    fcntl.flock(
-                        contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
-                    )
-            current["state"] = "stopping"
-
-        changed = record.update(live["login"], change)
-
-        self.assertEqual(changed["state"], "stopping")
-        found = record.find_live(live["login"])
-        self.assertEqual(found["kind"], "live")
-        if found["kind"] == "live":
-            self.assertEqual(found["record"]["state"], "stopping")
-
-    def test_unsafe_login_is_refused_before_any_record_path_is_created(self) -> None:
-        outside_directory = self.root / "outside@example.com"
-        unsafe_logins = [
-            str(outside_directory),
-            "nested/owner@example.com",
-            "",
-            "nul\0owner@example.com",
-            ".hidden@example.com",
-        ]
-
-        def leave_unchanged(current: record.ShutdownRecord) -> None:
-            del current
-
-        for login in unsafe_logins:
-            with self.subTest(login=login):
-                live = shutdown_record(login)
-                with self.assertRaises(record.InvalidRecord):
-                    record.create(live)
-                with self.assertRaises(ValueError):
-                    _ = record.find_live(login)
-                with self.assertRaises(ValueError):
-                    _ = record.update(login, leave_unchanged)
-                with self.assertRaises(ValueError):
-                    record.archive(login)
-                with self.assertRaises(record.InvalidRecord):
-                    _ = record.parse_records(json.dumps([live]))
-
-        self.assertFalse(outside_directory.exists())
-        self.assertFalse((self.root / "shutdown" / "nested").exists())
-
-    def test_update_refuses_identity_changes_without_modifying_stored_record(
-        self,
-    ) -> None:
-        original = shutdown_record("alpha@example.com")
-        record.create(original)
-
-        def change_login(current: record.ShutdownRecord) -> None:
-            current["login"] = "beta@example.com"
-
-        with self.assertRaises(ValueError):
-            _ = record.update(original["login"], change_login)
-        self.assertEqual(
-            record.find_live(original["login"]),
-            record.LiveShutdownRecord(kind="live", record=original),
-        )
-        self.assertEqual(
-            record.find_live("beta@example.com"),
-            record.NoShutdown(kind="no shutdown"),
-        )
-
-        def change_machine(current: record.ShutdownRecord) -> None:
-            current["machine"] = "Mac"
-
-        with self.assertRaises(ValueError):
-            _ = record.update(original["login"], change_machine)
-        self.assertEqual(
-            record.find_live(original["login"]),
-            record.LiveShutdownRecord(kind="live", record=original),
-        )
-
-    def test_archive_requires_terminal_state_and_moves_the_record(self) -> None:
-        live = shutdown_record()
-        record.create(live)
-
-        with self.assertRaises(ValueError):
-            record.archive(live["login"])
-        self.assertEqual(record.find_live(live["login"])["kind"], "live")
-
-        def cancel(current: record.ShutdownRecord) -> None:
-            current["state"] = "cancelled"
-
-        _ = record.update(live["login"], cancel)
-        record.archive(live["login"])
-
-        self.assertEqual(
-            record.find_live(live["login"]), record.NoShutdown(kind="no shutdown")
-        )
-        history = self.root / "shutdown" / live["login"] / "history" / f"{NOW}.json"
-        archived = cast(object, json.loads(history.read_text()))
-        self.assertIsInstance(archived, dict)
-        self.assertEqual(cast(dict[str, object], archived)["state"], "cancelled")
-
-    def test_archive_also_accepts_up(self) -> None:
-        live = shutdown_record(state="up")
-        record.create(live)
-
-        record.archive(live["login"])
-
-        self.assertEqual(record.find_live(live["login"])["kind"], "no shutdown")
-
-    def test_live_records_reads_two_accounts_in_login_order(self) -> None:
-        second = shutdown_record("zeta@example.com")
-        first = shutdown_record("alpha@example.com", requested_at=LATER)
-        record.create(second)
-        record.create(first)
-
-        self.assertEqual(record.live_records(), [first, second])
-
-    def test_a_parked_restart_partial_frees_the_slot_and_stays_held(self) -> None:
-        unfinished = shutdown_record(state="restart partial")
-        record.create(unfinished)
-
-        self.assertEqual(record.park(unfinished["login"]), unfinished)
-
-        self.assertEqual(record.find_live(unfinished["login"])["kind"], "no shutdown")
-        self.assertEqual(record.parked(unfinished["login"]), [unfinished])
-        newer = shutdown_record(requested_at=LATER)
-        record.create(newer)
-        self.assertEqual(record.live_records(), [newer, unfinished])
-        self.assertEqual(record.account_records(newer["login"]), [newer, unfinished])
-
-    def test_park_and_unpark_refuse_without_moving_a_record(self) -> None:
-        for state in ("settling", "stopping", "down", "stop partial", "restarting"):
-            with self.subTest(state=state):
-                live = shutdown_record(state=cast(record.ShutdownState, state))
-                record.create(live)
-                with self.assertRaises(ValueError):
-                    _ = record.park(live["login"])
-                self.assertEqual(record.account_records(live["login"]), [live])
-                (self.root / "shutdown" / live["login"] / "record.json").unlink()
-        unfinished = shutdown_record(state="restart partial")
-        with self.assertRaises(record.NoLiveRecord):
-            _ = record.park(unfinished["login"])
-        with self.assertRaises(record.NoLiveRecord):
-            record.unpark(unfinished["login"], unfinished["requested_at"])
-        record.create(unfinished)
-        _ = record.park(unfinished["login"])
-        newer = shutdown_record(requested_at=LATER)
-        record.create(newer)
-
-        with self.assertRaises(record.ShutdownInProgress):
-            record.unpark(unfinished["login"], unfinished["requested_at"])
-
-        self.assertEqual(record.account_records(newer["login"]), [newer, unfinished])
-        (self.root / "shutdown" / newer["login"] / "record.json").unlink()
-        record.unpark(unfinished["login"], unfinished["requested_at"])
-        self.assertEqual(record.account_records(unfinished["login"]), [unfinished])
-        self.assertEqual(record.parked(unfinished["login"]), [])
-
-    def test_config_dir_is_saved_only_on_the_session_and_round_trips(self) -> None:
-        """F004: persistence keeps one authoritative directory on the session."""
-        live = shutdown_record()
-        config_dir = str(self.root / "account with spaces")
-        live["entries"][0]["session"]["config_dir"] = config_dir
-
-        record.create(live)
-
-        found = record.find_live(live["login"])
-        if found["kind"] != "live":
-            self.fail("expected a live shutdown record")
-        restored = found["record"]["entries"][0]
-        self.assertEqual(restored["session"].get("config_dir"), config_dir)
-        self.assertNotIn("config_dir", restored)
-        self.assertEqual(
-            record.parse_records(json.dumps([found["record"]])),
-            [found["record"]],
-        )
-
-    def test_obsolete_entry_config_dir_is_ignored_when_reading_records(self) -> None:
-        """F004: old entry-level directories never override the session snapshot."""
-        for obsolete_dir in (str(self.root / "old account"), 123):
-            with self.subTest(obsolete_dir=obsolete_dir):
-                live = shutdown_record()
-                config_dir = str(self.root / "current account")
-                live["entries"][0]["session"]["config_dir"] = config_dir
-                entry_values = cast(dict[str, object], cast(object, live["entries"][0]))
-                entry_values["config_dir"] = obsolete_dir
-
-                restored = record.parse_records(json.dumps([live]))[0]["entries"][0]
-
-                self.assertNotIn("config_dir", restored)
-                self.assertEqual(restored["session"].get("config_dir"), config_dir)
-
-    def test_restart_continuation_round_trips_in_the_record(self) -> None:
-        for action in ("stop", "restart"):
-            with self.subTest(action=action):
-                live = shutdown_record()
-                live["then"] = action
-                record.create(live)
-                found = record.find_live(live["login"])
-                if found["kind"] != "live":
-                    self.fail("expected a live shutdown record")
-                self.assertEqual(record.continuation(found["record"]), action)
-                self.assertEqual(record.parse_records(json.dumps([live])), [live])
-                (self.root / "shutdown" / live["login"] / "record.json").unlink()
-
-    def test_legacy_record_stops_without_changing_its_wire_shape(self) -> None:
-        live = shutdown_record()
-        restored = record.parse_records(json.dumps([live]))[0]
-        self.assertEqual(record.continuation(restored), "stop")
-        self.assertEqual(restored, live)
-        self.assertNotIn("then", restored)
-
-    def test_record_rejects_unknown_or_non_string_continuations(self) -> None:
-        for action in ("launch", "", 1, None, {"kind": "restart"}):
-            with self.subTest(action=action):
-                live = shutdown_record()
-                values = cast(dict[str, object], cast(object, live))
-                values["then"] = action
-                with self.assertRaisesRegex(record.InvalidRecord, r"records\[0\]\.then"):
-                    _ = record.parse_records(json.dumps([live]))
-
-    def test_every_record_variant_round_trips(self) -> None:
-        progresses: list[record.SessionProgress] = [
-            record.SessionWaiting(kind="waiting"),
-            record.SessionReadyToStop(kind="ready", at=NOW),
-            record.PassiveSeatReadyToStop(kind="passive seat ready", at=NOW),
-            record.SessionStopped(kind="stopped", at=NOW),
-            record.SessionAlreadyGone(kind="already gone", at=NOW),
-            record.ProcessIdentityLost(kind="process identity lost", at=NOW),
-            record.SessionStopFailed(kind="stop failed", at=NOW, reason="permission denied"),
-            record.SessionRestarted(kind="restarted", at=NOW),
-            record.SessionRestoredTimersPending(
-                kind="timers pending",
-                at=NOW,
-                timers=[
-                    record.PendingTimer(
-                        instance="showrunner-demo", reason="notifier unavailable"
-                    )
-                ],
-            ),
-            record.SessionRestartFailed(
-                kind="restart failed", at=NOW, reason="window did not open"
-            ),
-            record.SessionNeedsManualRestart(kind="manual restart", command="claude --resume id"),
-        ]
-        states: list[record.ShutdownState] = [
-            "settling",
-            "stopping",
-            "down",
-            "stop partial",
-            "restarting",
-            "restart partial",
-            "cancelled",
-            "up",
-        ]
-        records = [
-            shutdown_record(
-                f"account-{index}@example.com",
-                state=states[index % len(states)],
-                progress=progress,
-            )
-            for index, progress in enumerate(progresses)
-        ]
-        records[0]["requested_by"] = record.FromSession(
-            kind="session", session_id="requester"
-        )
-        records[0]["scope"] = record.SelectedSessions(
-            kind="selected", session_ids=["session-1"]
-        )
-        records[0]["conductor"] = record.SystemdConductor(
-            kind="systemd", unit="shutdown-owner"
-        )
-        records[0]["force"] = "now"
-        records[0]["entries"][0] = entry(
-            progresses[0],
-            timer_footer=record.ShowrunnerFooter(kind="footer", slug="production"),
-            settle_message=record.SettleMessageSent(kind="sent", at=NOW),
-            where=record.WhereSaid(kind="said", text="ready here", at=NOW),
-        )
-        records[1]["conductor"] = record.LaunchdConductor(
-            kind="launchd", label="shutdown-owner"
-        )
-
-        encoded = json.dumps(records)
-
-        self.assertEqual(record.parse_records(encoded), records)
-
-    def test_every_stop_issue_variant_round_trips(self) -> None:
-        live = shutdown_record()
-        session_issues: list[record.SessionStopIssue] = [
-            record.NotReadyToStop(
-                kind="not ready to stop",
-                at=NOW,
-                status="busy",
-                progress="waiting",
-            ),
-            record.StillRunningAfterStop(
-                kind="still running",
-                at=NOW,
-                reason="alive after two SIGTERMs",
-            ),
-            record.AccountUnreadableAtStop(kind="account unreadable", at=NOW),
-            record.SeatStillLive(kind="seat still live", at=NOW),
-            record.CodexServerLeftRunning(
-                kind="codex server left running",
-                at=NOW,
-                run_dir="/tmp/run",
-                cause="stop not confirmed",
-            ),
-            record.UnitTmuxLeftRunning(
-                kind="unit tmux session left running",
-                at=NOW,
-                tmux_session="demo-unit",
-                cause="owner identity lost",
-            ),
-        ]
-        orchestration_issues: list[record.OrchestrationStopIssue] = [
-            record.StopClaimFailed(
-                kind="stop claim failed",
-                at=NOW,
-                machine="Mac",
-                reason="claim-stop failed (rc 3)",
-            ),
-            record.MachineStopFailed(
-                kind="machine stop failed",
-                at=NOW,
-                machine="natedev",
-                reason="inventory failed",
-            ),
-        ]
-        live["entries"][0]["stop_issues"] = session_issues
-        live["stop_issues"] = orchestration_issues
-
-        self.assertEqual(record.parse_records(json.dumps([live])), [live])
-
-    def test_stop_issue_parser_refuses_unknown_tags_and_noncanonical_time(
-        self,
-    ) -> None:
-        malformed_issues: list[dict[str, object]] = [
-            {"kind": "not a stop issue", "at": NOW},
-            {
-                "kind": "codex server left running",
-                "at": NOW,
-                "run_dir": "/tmp/run",
-                "cause": "maybe stopped",
-            },
-            {
-                "kind": "not ready to stop",
-                "at": NOW,
-                "status": "busy",
-                "progress": "refused",
-            },
-            {
-                "kind": "still running",
-                "at": "2026-10-09T21:49:10Z",
-                "reason": "alive after two SIGTERMs",
-            },
-        ]
-
-        for issue in malformed_issues:
-            with self.subTest(issue=issue):
-                live = shutdown_record()
-                entry_values = cast(
-                    dict[str, object], cast(object, live["entries"][0])
-                )
-                entry_values["stop_issues"] = [issue]
-                with self.assertRaises(record.InvalidRecord):
-                    _ = record.parse_records(json.dumps([live]))
-
-    def test_missing_stop_issue_fields_read_as_empty_lists(self) -> None:
-        live = shutdown_record()
-        entry_values = cast(
-            dict[str, object], cast(object, live["entries"][0])
-        )
-        record_values = cast(dict[str, object], cast(object, live))
-        del entry_values["stop_issues"]
-        del record_values["stop_issues"]
-
-        parsed = record.parse_records(json.dumps([live]))[0]
-
-        self.assertEqual(parsed["entries"][0]["stop_issues"], [])
-        self.assertEqual(parsed["stop_issues"], [])
-
-    def test_queued_settle_message_round_trips(self) -> None:
-        live = shutdown_record()
-        live["entries"][0]["settle_message"] = record.SettleMessageQueued(
-            kind="queued", at=NOW, reason="no live session"
-        )
-
-        self.assertEqual(record.parse_records(json.dumps([live])), [live])
-
-    def test_queued_settle_message_requires_a_reason(self) -> None:
-        live = shutdown_record()
-        malformed = cast(
-            dict[str, object], cast(object, live["entries"][0])
-        )
-        malformed["settle_message"] = {"kind": "queued", "at": NOW}
-
-        with self.assertRaisesRegex(
-            record.InvalidRecord,
-            r"records\[0\]\.entries\[0\]\.settle_message\.reason is missing",
-        ):
-            _ = record.parse_records(json.dumps([live]))
-
-    def test_malformed_tag_names_its_field_path(self) -> None:
-        malformed = cast(dict[str, object], cast(object, shutdown_record()))
-        malformed["scope"] = {"kind": "some sessions"}
-
-        with self.assertRaisesRegex(
-            record.InvalidRecord, r"records\[0\]\.scope\.kind is invalid"
-        ):
-            _ = record.parse_records(json.dumps([malformed]))
-
-    def test_parse_records_refuses_noncanonical_utc_timestamp(self) -> None:
-        malformed = shutdown_record(requested_at="2026-10-09/21:49:10+00:00")
-
-        with self.assertRaises(record.InvalidRecord):
-            _ = record.parse_records(json.dumps([malformed]))
 
 
 def session_shutdown(
@@ -663,10 +144,11 @@ def session_shutdown(
     return record.SessionShutdown(
         login=login, label=login.split("@", 1)[0], machine="natedev",
         requested_at=requested_at, requested_by=record.FromTerminal(kind="terminal"),
+        request_id=f"legacy-natedev-{NOW}",
         hold=hold, then="stop", force="wait for ready", alerts="user",
         session=saved_entry["session"], seats=[], timers=saved_entry["timers"],
         settle_message=saved_entry["settle_message"], where=saved_entry["where"],
-        progress=saved_entry["progress"], stop_issues=[],
+        progress=cast(record.SessionProgress, saved_entry["progress"]), stop_issues=[],
     )
 
 
@@ -674,6 +156,7 @@ def account_hold(login: str = "owner@example.com") -> record.AccountHold:
     return record.AccountHold(
         login=login, label=login.split("@", 1)[0], machine="natedev",
         requested_at=NOW, requested_by=record.FromTerminal(kind="terminal"), then="stop",
+        request_id=f"legacy-natedev-{NOW}",
     )
 
 
@@ -744,10 +227,10 @@ class SessionRecordTests(ShutdownTestCase):
             with (self.directory / "lock").open("a+") as contender:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            current["progress"] = record.SessionRestarting(kind="restarting", at=LATER)
+            current["progress"] = record.SessionRestarting(kind="restarting", at=LATER, prior=record.SessionStopped(kind="stopped", at=NOW))
 
         changed = record.update_session(first["login"], "session-1", change)
-        self.assertEqual(changed["progress"], {"kind": "restarting", "at": LATER})
+        self.assertEqual(changed["progress"], {"kind": "restarting", "at": LATER, "prior": {"kind": "stopped", "at": NOW}})
         self.assertEqual(record.find_session(first["login"], "session-1"), changed)
         self.assertEqual(record.find_session(first["login"], "session-2"), second)
 
@@ -812,7 +295,7 @@ class SessionRecordTests(ShutdownTestCase):
         old = shutdown_record("legacy@example.com", state="down")
         old["label"] = "Zulu"
         old["entries"] = []
-        record.create(old)
+        write_old(old)
         legacy = account_hold(old["login"])
         legacy["label"] = old["label"]
         self.assertTrue(record.create_session(session_shutdown(login="selected@example.com")))
@@ -1005,7 +488,7 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
         self.assertEqual([path.name for path in (self.directory / "sessions").iterdir()], ["session-1.json"])
 
-    def test_session_records_unreadable_parked_directory_refuses_reads(self) -> None:
+    def test_session_records_unreadable_partial_directory_refuses_reads(self) -> None:
         self.directory.mkdir(parents=True)
         (self.directory / "partial").mkdir()
         with patch.object(Path, "iterdir", side_effect=PermissionError("partial unavailable")):
@@ -1024,7 +507,7 @@ class SessionRecordTests(ShutdownTestCase):
                 self.assertEqual(path.read_text(), text)
 
     def test_session_records_validate_seats_and_claim_timestamps(self) -> None:
-        saved = session_shutdown(progress=record.SessionRestarting(kind="restarting", at=LATER))
+        saved = session_shutdown(progress=record.SessionRestarting(kind="restarting", at=LATER, prior=record.SessionStopped(kind="stopped", at=NOW)))
         saved["seats"] = [owned_seat()]
         saved["alerted_at"] = NOW
         self.assertEqual(record.parse_session_records(json.dumps([saved])), [saved])
@@ -1043,14 +526,14 @@ class SessionRecordTests(ShutdownTestCase):
         for state in ("settling", "down", "restarting"):
             with self.subTest(state=state):
                 login = f"{state}@example.com"
-                old = shutdown_record(login, state=cast(record.ShutdownState, state))
+                old = shutdown_record(login, state=state)
                 old["then"] = "restart"
                 old["force"] = "now"
                 old["entries"][0]["progress"] = record.SessionStopped(kind="stopped", at=LATER) if state == "down" else record.SessionWaiting(kind="waiting")
-                worker = entry(record.PassiveSeatReadyToStop(kind="passive seat ready", at=NOW), number=9)
+                worker = entry({"kind": "passive seat ready", "at": NOW}, number=9)
                 worker["session"] = owned_seat()
                 old["entries"].append(worker)
-                record.create(old)
+                write_old(old)
                 directory = self.directory.parent / login
                 before = (directory / "record.json").read_bytes()
                 converted = record.session_records(login)
@@ -1073,42 +556,42 @@ class SessionRecordTests(ShutdownTestCase):
             entry(record.SessionRestarted(kind="restarted", at=LATER)),
             entry(record.SessionNeedsManualRestart(kind="manual restart", command="resume"), number=2),
         ]
-        record.create(old)
+        write_old(old)
         converted = record.session_records(old["login"])
         self.assertEqual(converted[0]["progress"], old["entries"][0]["progress"])
         self.assertEqual(converted[1]["progress"], {"kind": "stopped", "at": NOW})
 
-    def test_session_records_read_parked_and_selected_slot_records_together(self) -> None:
+    def test_session_records_read_partial_and_selected_legacy_requests_together(self) -> None:
         old = shutdown_record(state="restart partial", progress=record.SessionRestartFailed(kind="restart failed", at=NOW, reason="not live"))
-        record.create(old)
-        _ = record.park(old["login"])
+        write_old(old)
+        _ = move_old(old["login"])
         selected = shutdown_record(requested_at=LATER)
-        selected["scope"] = record.SelectedSessions(kind="selected", session_ids=["session-2"])
+        selected["scope"] = {"kind": "selected", "session_ids": ["session-2"]}
         selected["entries"] = [entry(number=2)]
-        record.create(selected)
+        write_old(selected)
         records = record.session_records(old["login"])
         self.assertEqual([item["session"]["session_id"] for item in records], ["session-1", "session-2"])
         self.assertEqual([item["hold"] for item in records], ["account", "session"])
         self.assertEqual(record.all_session_records(), records)
         self.assertEqual(record.account_hold(old["login"]), account_hold())
 
-    def test_session_records_slot_wins_over_parked_entry_with_the_same_request_time(self) -> None:
-        parked = shutdown_record(
+    def test_session_records_slot_wins_over_partial_entry_with_the_same_request_time(self) -> None:
+        partial = shutdown_record(
             state="restart partial",
             progress=record.SessionNeedsManualRestart(kind="manual restart", command="resume old"),
         )
-        parked_worker = entry(number=8)
-        parked_worker["session"] = owned_seat()
-        parked["entries"].append(parked_worker)
-        record.create(parked)
-        _ = record.park(parked["login"])
+        partial_worker = entry(number=8)
+        partial_worker["session"] = owned_seat()
+        partial["entries"].append(partial_worker)
+        write_old(partial)
+        _ = move_old(partial["login"])
         slot = shutdown_record(progress=record.SessionWaiting(kind="waiting"))
         slot_worker = entry(number=9)
         seat = owned_seat()
         seat["session_id"] = "slot-seat"
         slot_worker["session"] = seat
         slot["entries"].append(slot_worker)
-        record.create(slot)
+        write_old(slot)
 
         found = record.find_session(slot["login"], "session-1")
         self.assertIsNotNone(found)
@@ -1119,13 +602,13 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertEqual(record.session_records(slot["login"]), [found])
         self.assertEqual(record.all_session_records(), [found])
 
-    def test_session_records_newest_parked_entry_wins_for_one_session(self) -> None:
+    def test_session_records_newest_partial_entry_wins_for_one_session(self) -> None:
         older = shutdown_record(
             state="restart partial",
             progress=record.SessionNeedsManualRestart(kind="manual restart", command="resume old"),
         )
-        record.create(older)
-        _ = record.park(older["login"])
+        write_old(older)
+        _ = move_old(older["login"])
         newer = shutdown_record(
             state="restart partial", requested_at=LATER,
             progress=record.SessionRestartFailed(kind="restart failed", at=LATER, reason="new failure"),
@@ -1133,13 +616,13 @@ class SessionRecordTests(ShutdownTestCase):
         worker = entry(number=9)
         worker["session"] = owned_seat()
         newer["entries"].append(worker)
-        record.create(newer)
-        _ = record.park(newer["login"])
+        write_old(newer)
+        _ = move_old(newer["login"])
 
         found = record.find_session(newer["login"], "session-1")
         self.assertIsNotNone(found)
         if found is None:
-            self.fail("expected the newest parked session record")
+            self.fail("expected the newest partial session record")
         self.assertEqual(found["requested_at"], LATER)
         self.assertEqual(found["progress"], newer["entries"][0]["progress"])
         self.assertEqual(found["seats"], [worker["session"]])
@@ -1149,7 +632,7 @@ class SessionRecordTests(ShutdownTestCase):
     def test_session_records_new_files_suppress_matching_old_entries_only(self) -> None:
         old = shutdown_record()
         old["entries"].append(entry(number=2))
-        record.create(old)
+        write_old(old)
         saved = session_shutdown(requested_at=LATER, progress=record.SessionStopped(kind="stopped", at=LATER))
         sessions = self.directory / "sessions"
         sessions.mkdir()
@@ -1160,7 +643,7 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertFalse(record.create_session(session_shutdown(2)))
         self.assertFalse((sessions / "session-2.json").exists())
 
-    def test_session_records_invalid_old_slot_and_parked_records_name_the_file(self) -> None:
+    def test_session_records_invalid_old_slot_and_partial_records_name_the_file(self) -> None:
         self.directory.mkdir(parents=True)
         partial = self.directory / "partial"
         partial.mkdir()
@@ -1175,7 +658,7 @@ class SessionRecordTests(ShutdownTestCase):
 
     def test_finished_old_cancelled_record_has_no_session_records_or_hold(self) -> None:
         saved = shutdown_record(state="cancelled")
-        record.create(saved)
+        write_old(saved)
         path = self.directory / "record.json"
         before = path.read_bytes()
 
@@ -1187,7 +670,7 @@ class SessionRecordTests(ShutdownTestCase):
 
     def test_finished_old_up_record_has_no_session_records_or_hold(self) -> None:
         saved = shutdown_record(state="up")
-        record.create(saved)
+        write_old(saved)
         path = self.directory / "record.json"
         before = path.read_bytes()
 
@@ -1203,7 +686,7 @@ class SessionRecordTests(ShutdownTestCase):
         for state in ("cancelled", "up"):
             with self.subTest(state=state):
                 saved = cast(dict[str, object], cast(object, shutdown_record(
-                    state=cast(record.ShutdownState, state),
+                    state=state,
                 )))
                 saved["entries"] = "invalid entries"
                 _ = path.write_text(json.dumps(saved))
@@ -1215,19 +698,138 @@ class SessionRecordTests(ShutdownTestCase):
     def test_session_records_legacy_account_hold_excludes_selected_and_finished_records(self) -> None:
         old = shutdown_record()
         old["entries"] = []
-        record.create(old)
+        write_old(old)
         self.assertEqual(record.account_hold(old["login"]), account_hold())
         self.assertEqual(record.session_records(old["login"]), [])
         for state in ("cancelled", "up"):
-            def change(current: record.ShutdownRecord) -> None:
-                current["state"] = cast(record.ShutdownState, state)
-            _ = record.update(old["login"], change)
+            def change(current: LegacyRecordFixture) -> None:
+                current["state"] = state
+            _ = change_old(old["login"], change)
             self.assertIsNone(record.account_hold(old["login"]))
-        def select(current: record.ShutdownRecord) -> None:
+        def select(current: LegacyRecordFixture) -> None:
             current["state"] = "settling"
-            current["scope"] = record.SelectedSessions(kind="selected", session_ids=[])
-        _ = record.update(old["login"], select)
+            current["scope"] = {"kind": "selected", "session_ids": []}
+        _ = change_old(old["login"], select)
         self.assertIsNone(record.account_hold(old["login"]))
+
+
+    def test_migrate_each_legacy_state_and_keep_its_inferred_hold(self) -> None:
+        for state in ("settling", "stopping", "down", "stop partial", "restarting", "restart partial", "cancelled", "up"):
+            with self.subTest(state=state):
+                saved = shutdown_record(f"{state}@example.com", state=state)
+                saved["conductor"] = {"kind": "systemd", "unit": "old-service"}
+                saved["stop_issues"] = [{"kind": "machine stop failed", "at": NOW, "machine": "Mac", "reason": "not reached"}]
+                worker = entry({"kind": "passive seat ready", "at": NOW}, number=9)
+                worker["session"] = owned_seat()
+                saved["entries"].append(worker)
+                write_old(saved)
+                before = record.session_records(saved["login"])
+                hold = record.account_hold(saved["login"])
+                lines = record.migrate(saved["login"])
+                self.assertEqual(len(lines), 1)
+                self.assertIn(f"converted the {state} record", lines[0])
+                self.assertEqual(record.session_records(saved["login"]), before)
+                self.assertEqual(record.account_hold(saved["login"]), hold)
+                directory = self.directory.parent / saved["login"]
+                self.assertFalse((directory / "record.json").exists())
+                self.assertTrue((directory / "history" / f"{NOW}-record.json").is_file())
+                self.assertEqual(record.migrate(saved["login"]), [])
+
+    def test_session_reads_without_existing_lock_do_not_change_the_files(self) -> None:
+        write_old(shutdown_record(state="down"))
+        before = {path.relative_to(self.directory): path.read_bytes() for path in self.directory.rglob("*") if path.is_file()}
+        self.assertEqual(len(record.session_records("owner@example.com")), 1)
+        self.assertIsNotNone(record.find_session("owner@example.com", "session-1"))
+        self.assertIsNotNone(record.account_hold("owner@example.com"))
+        after = {path.relative_to(self.directory): path.read_bytes() for path in self.directory.rglob("*") if path.is_file()}
+        self.assertEqual(after, before)
+
+    def test_migrate_invalid_finished_file_moves_and_writes_nothing(self) -> None:
+        write_old(shutdown_record())
+        partial = self.directory / "partial"
+        partial.mkdir()
+        broken = partial / "finished.json"
+        _ = broken.write_text(json.dumps({"state": "up"}))
+        before = {path.relative_to(self.directory): path.read_bytes() for path in self.directory.rglob("*.json")}
+        with self.assertRaises(record.InvalidRecord) as raised:
+            _ = record.migrate("owner@example.com")
+        self.assertIn(str(broken), str(raised.exception))
+        after = {path.relative_to(self.directory): path.read_bytes() for path in self.directory.rglob("*.json")}
+        self.assertEqual(after, before)
+
+    def test_migrate_preserves_explicit_hold_and_new_session_precedence(self) -> None:
+        explicit = account_hold()
+        explicit["request_id"] = "current-hold"
+        record.set_account_hold(explicit)
+        fresh = session_shutdown()
+        self.assertTrue(record.create_session(fresh))
+        write_old(shutdown_record(progress=record.SessionNeedsManualRestart(kind="manual restart", command="old")))
+        _ = record.migrate(fresh["login"])
+        self.assertEqual(record.find_session(fresh["login"], "session-1"), fresh)
+        self.assertEqual(record.account_hold(fresh["login"]), explicit)
+
+    def test_migrate_refuses_a_legacy_id_that_collides_with_a_current_filename(self) -> None:
+        current = session_shutdown()
+        current["session"]["session_id"] = "id-one"
+        self.assertTrue(record.create_session(current))
+        old = shutdown_record()
+        old["entries"][0]["session"]["session_id"] = "id/one"
+        write_old(old)
+        before = {path.relative_to(self.directory): path.read_bytes()
+                  for path in self.directory.rglob("*") if path.is_file()}
+        with self.assertRaises(record.InvalidRecord) as raised:
+            _ = record.migrate(current["login"])
+        self.assertIn("id-one", str(raised.exception))
+        self.assertIn("id/one", str(raised.exception))
+        after = {path.relative_to(self.directory): path.read_bytes()
+                 for path in self.directory.rglob("*") if path.is_file()}
+        self.assertEqual(after, before)
+
+    def test_stop_incomplete_includes_failed_stops_and_terminal_resource_issues(self) -> None:
+        for kind in ("stopped", "already gone", "process identity lost", "stop failed", "waiting", "restarted"):
+            for issues in (False, True):
+                with self.subTest(kind=kind, issues=issues):
+                    saved = session_shutdown()
+                    progress: dict[str, object] = {"kind": kind, "at": NOW}
+                    if kind == "stop failed":
+                        progress["reason"] = "still running"
+                    saved["progress"] = cast(record.SessionProgress, cast(object, progress))
+                    if issues:
+                        saved["stop_issues"] = [record.UnitTmuxLeftRunning(
+                            kind="unit tmux session left running", at=NOW,
+                            tmux_session="unit", cause="stop not confirmed")]
+                    self.assertEqual(record.stop_incomplete(saved), kind == "stop failed" or (
+                        issues and kind in {"stopped", "already gone", "process identity lost"}))
+
+    def test_withdraw_session_keeps_a_stop_claim_and_does_not_restore_timers(self) -> None:
+        saved = session_shutdown(progress=record.SessionStopping(kind="stopping", at=NOW))
+        self.assertTrue(record.create_session(saved))
+        with patch.object(record, "archive_session") as archive:
+            restore = Mock()
+            result = record.withdraw_session(saved["login"], "session-1", restore)
+        self.assertIsInstance(result, record.SessionRetained)
+        restore.assert_not_called()
+        archive.assert_not_called()
+        self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+
+    def test_withdraw_session_restores_and_archives_under_the_account_lock(self) -> None:
+        saved = session_shutdown()
+        self.assertTrue(record.create_session(saved))
+        def restore(_saved: record.SessionShutdown) -> None:
+            with (self.directory / "lock").open("a+") as contender:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = record.withdraw_session(saved["login"], "session-1", restore)
+        self.assertIsInstance(result, record.SessionWithdrawn)
+        self.assertIsNone(record.find_session(saved["login"], "session-1"))
+
+    def test_conductor_lock_allows_only_one_local_loop(self) -> None:
+        with record.conductor_lock("owner@example.com") as first:
+            self.assertIsInstance(first, record.ConductorAcquired)
+            with record.conductor_lock("owner@example.com") as second:
+                self.assertIsInstance(second, record.ConductorAlreadyRunning)
+        with record.conductor_lock("owner@example.com") as third:
+            self.assertIsInstance(third, record.ConductorAcquired)
 
 
 if __name__ == "__main__":

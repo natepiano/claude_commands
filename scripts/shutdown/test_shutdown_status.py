@@ -15,10 +15,13 @@ from unittest.mock import patch
 
 from test_support import ShutdownSendLeaf, ShutdownTestCase
 import shutdown
+import settle
+import inventory
 import record as record_store
 from account import UnreadableAccount
 from inventory import Inventory
-from record import SessionShutdown, ShutdownRecord
+from record import SessionShutdown
+from test_record import LegacyRecordFixture, write_old, move_old
 
 
 LOGIN = "owner@example.com"
@@ -58,9 +61,9 @@ def complete_session(*, host: object) -> dict[str, object]:
     }
 
 
-def complete_record(machine: str = "natedev") -> ShutdownRecord:
+def complete_record(machine: str = "natedev") -> LegacyRecordFixture:
     return cast(
-        ShutdownRecord,
+        LegacyRecordFixture,
         cast(
             object,
             {
@@ -96,11 +99,11 @@ def session_shutdown(machine: str = "natedev", name: str = "shutdown") -> Sessio
     item["session"]["session_id"] = name + "-id"
     return SessionShutdown(
         login=LOGIN, label="claude 2", machine=machine,
-        requested_at=old["requested_at"], requested_by=old["requested_by"],
+        requested_at=old["requested_at"], requested_by=old["requested_by"], request_id="request-one",
         hold="account", then="stop", force=old["force"], alerts="user",
         session=item["session"], seats=[], timers=item["timers"],
         settle_message=item["settle_message"], where=item["where"],
-        progress=item["progress"], stop_issues=item["stop_issues"],
+        progress=cast(record_store.SessionProgress, item["progress"]), stop_issues=[],
     )
 
 
@@ -436,7 +439,7 @@ else:
             record_store.NotReadyToStop(kind="not ready to stop", at=at, status="busy", progress="ready"),
             record_store.StillRunningAfterStop(kind="still running", at=at, reason="alive after two SIGTERMs"),
             record_store.AccountUnreadableAtStop(kind="account unreadable", at=at),
-            record_store.SeatStillLive(kind="seat still live", at=at),
+            {"kind": "seat still live", "at": at},
         ]
         remote_record = session_shutdown(machine="Mac", name="remote")
         remote_record["stop_issues"] = [
@@ -447,7 +450,7 @@ else:
                 kind="unit tmux session left running", at=at, tmux_session="demo-unit", cause="owner identity lost",
             ),
         ]
-        record_store.create(local)
+        write_old(local)
         os.environ["SHUTDOWN_STATUS_RECORD_OUTPUT"] = json.dumps([remote_record])
         result, output, error = self.run_plain_status_with_ssh()
         self.assertEqual((result, error), (0, ""))
@@ -456,7 +459,6 @@ else:
             "    not stopped: busy, ready",
             "    still running: alive after two SIGTERMs",
             "    not stopped: account unreadable",
-            "    not stopped: owner or seat still live",
             "  remote: waiting",
             "    Codex server /tmp/run left running: stop not confirmed",
             "    tmux session demo-unit left running: owner identity lost",
@@ -499,19 +501,76 @@ else:
         ])
         self.assertNotIn("shutdown restart partial", output.getvalue())
 
-    def test_status_and_records_read_old_parked_and_slot_sessions_oldest_first(self) -> None:
+    def test_status_prints_observed_readiness_causes_for_waiting_and_ready_sessions(self) -> None:
+        for kind in ("waiting", "ready"):
+            with self.subTest(kind=kind):
+                saved = session_shutdown(name=kind)
+                if kind == "ready":
+                    saved["progress"] = {"kind": "ready", "at": saved["requested_at"]}
+                self.assertTrue(record_store.create_session(saved))
+                observed = inventory.parse_session({**saved["session"], "status": "busy",
+                    "checkout": {"kind": "git", "path": "/tmp/checkout", "head": {"kind": "branch", "name": "work"},
+                                 "upstream": {"kind": "tracking", "ahead": 2}, "dirty": []},
+                    "codex_servers": [{"run_dir": "/tmp/run", "pid": 5000, "busy_seats": ["worker"]}]}, "observed")
+                report = empty_inventory()
+                report["sessions"] = [observed]
+                output = io.StringIO()
+                with patch.object(shutdown, "inventory", return_value=report), patch.object(settle, "_showing_form", return_value=True), patch.object(settle, "merge_in_progress", return_value=True), redirect_stdout(output):
+                    self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+                self.assertIn(f"  {kind}: {kind} — busy, showing a form, ahead 2 on work, merge in progress, Codex seat worker is still running", output.getvalue())
+                record_store.archive_session(LOGIN, saved["session"]["session_id"])
+
+    def test_status_keeps_unobserved_sessions_without_a_readiness_detail(self) -> None:
+        saved = session_shutdown(name="missing")
+        self.assertTrue(record_store.create_session(saved))
+        output = io.StringIO()
+        with patch.object(shutdown, "inventory", return_value=empty_inventory()), patch.object(settle, "_showing_form", side_effect=RuntimeError("cannot observe")), redirect_stdout(output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        self.assertEqual(output.getvalue().splitlines()[-1], "  missing: waiting")
+
+    def test_status_reports_owned_busy_seats_and_a_queued_message_once(self) -> None:
+        saved = session_shutdown(name="owner")
+        saved["settle_message"] = {"kind": "queued", "at": saved["requested_at"], "reason": "delivery pending"}
+        self.assertTrue(record_store.create_session(saved))
+        worker = inventory.parse_session({**saved["session"], "kind": "seat", "session_id": "worker",
+            "name": "worker", "status": "busy", "host": {"kind": "unknown"},
+            "owner": {"kind": "director", "session_id": saved["session"]["session_id"]}}, "worker")
+        report = empty_inventory()
+        report["sessions"] = [saved["session"], worker]
+        output = io.StringIO()
+        with patch.object(shutdown, "inventory", return_value=report), patch.object(settle, "_showing_form", return_value=False), patch.object(settle, "merge_in_progress", return_value=False), redirect_stdout(output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        line = output.getvalue().splitlines()[-1]
+        self.assertIn("Codex seat worker is still running", line)
+        self.assertEqual(line.count("message queued: delivery pending"), 1)
+
+    def test_status_uses_reported_peer_activity_without_local_process_probes(self) -> None:
+        saved = session_shutdown(machine="Mac", name="peer")
+        observed = inventory.parse_session({**saved["session"], "status": "busy"}, "peer")
+        peer = empty_inventory("Mac")
+        peer["sessions"] = [observed]
+        def remote(arguments: list[str]) -> tuple[int, str]:
+            return 0, json.dumps(peer if arguments[0] == "status" else [saved])
+        output = io.StringIO()
+        with patch.object(shutdown, "inventory", return_value=empty_inventory()), patch.object(shutdown, "run_remote", side_effect=remote), patch.object(settle, "_showing_form", return_value=False) as form, patch.object(settle, "merge_in_progress", return_value=False) as merge, redirect_stdout(output):
+            self.assertEqual(shutdown.main(["status", LOGIN]), 0)
+        self.assertIn("  peer: waiting — busy", output.getvalue())
+        form.assert_not_called()
+        merge.assert_not_called()
+
+    def test_status_and_records_read_old_partial_and_slot_sessions_oldest_first(self) -> None:
         unfinished = complete_record()
         unfinished["state"] = "restart partial"
         unfinished["entries"][0]["session"]["name"] = "failed launch"
         unfinished["entries"][0]["progress"] = record_store.SessionRestartFailed(
             kind="restart failed", at=unfinished["requested_at"], reason="window did not open",
         )
-        record_store.create(unfinished)
-        _ = record_store.park(LOGIN)
+        write_old(unfinished)
+        _ = move_old(LOGIN)
         newer = complete_record()
         newer["entries"][0]["session"]["session_id"] = "another-session"
         newer["requested_at"] = "2026-10-10T01:02:03+00:00"
-        record_store.create(newer)
+        write_old(newer)
         status_output = io.StringIO()
         records_output = io.StringIO()
         with patch.object(shutdown, "inventory", return_value=empty_inventory()):
@@ -544,7 +603,7 @@ else:
         second["session"]["session_id"] = "second-session"
         second["session"]["name"] = "second"
         old["entries"].append(second)
-        record_store.create(old)
+        write_old(old)
         path = self.state / LOGIN / "record.json"
         before = path.read_bytes()
         output = io.StringIO()

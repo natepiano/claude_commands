@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Never, Protocol, cast, final, override
 from unittest.mock import patch
 
-import inventory
 import record
 import remote
 import restart
@@ -32,57 +31,16 @@ NOW = "2026-10-10T21:00:00+00:00"
 class RetireShutdownSession(Protocol):
     def __call__(
         self,
-        current: record.ShutdownRecord,
-        entry: record.ShutdownSessionEntry,
+        current: record.SessionShutdown,
         *,
         dry_run: bool,
     ) -> None: ...
 
 
-def restart_fixture() -> tuple[record.ShutdownRecord, record.ShutdownSessionEntry]:
-    session = inventory.TopLevelSession(
-        session_id="x",
-        pid=12345,
-        proc_start="fixture-start",
-        name="fixture session",
-        cwd="/tmp/fixture-checkout",
-        status="idle",
-        model=inventory.NoReplyYet(kind="no reply yet"),
-        checkout=inventory.GitCheckout(
-            kind="git",
-            path="/tmp/fixture-checkout",
-            head=inventory.OnBranch(kind="branch", name="fixture"),
-            upstream=inventory.Tracking(kind="tracking", ahead=0),
-            dirty=[],
-        ),
-        run_dirs=[],
-        codex_servers=[],
-        timers=[],
-        kind="top-level",
-        host=inventory.UnknownHost(kind="unknown"),
-    )
-    entry = record.ShutdownSessionEntry(
-        session=session,
-        timers=[],
-        settle_message=record.SettleMessageNotSent(kind="not sent"),
-        where=record.WhereNotSaid(kind="not said"),
-        progress=record.SessionStopped(kind="stopped", at=NOW),
-        stop_issues=[],
-    )
-    current = record.ShutdownRecord(
-        login=LOGIN,
-        label=LABEL,
-        machine="natedev",
-        state="down",
-        requested_at=NOW,
-        requested_by=record.FromTerminal(kind="terminal"),
-        scope=record.AllAccountSessions(kind="all account sessions"),
-        conductor=record.ConductorNotStarted(kind="not started"),
-        force="wait for ready",
-        entries=[entry],
-        stop_issues=[],
-    )
-    return current, entry
+def restart_fixture() -> record.SessionShutdown:
+    from test_restart import entry, top_level
+
+    return entry(top_level("x", name="fixture session"))
 
 
 @final
@@ -148,7 +106,6 @@ class SendGuardTests(ShutdownTestCase):
         class UnfakedAlert(ShutdownTestCase):
             def test_alert(self) -> None:
                 settle.alert_user(
-                    record.AllAccountSessions(kind="all account sessions"),
                     "summary", "text", ActionRequired("act"),
                 )
 
@@ -161,8 +118,7 @@ class SendGuardTests(ShutdownTestCase):
             def test_alert(self) -> None:
                 try:
                     settle.alert_user(
-                        record.AllAccountSessions(kind="all account sessions"),
-                        "summary", "text", ActionRequired("act"),
+                            "summary", "text", ActionRequired("act"),
                     )
                 except Exception:
                     pass
@@ -210,12 +166,12 @@ class SendGuardTests(ShutdownTestCase):
                             Callable[[list[str]], tuple[int, str]],
                             getattr(module, "run_remote"),
                         )
-                        _ = run_remote(["stop", LOGIN])
+                        _ = run_remote(["status", LOGIN])
 
                 self.assert_blocked(
                     UnfakedRemote("test_remote"),
                     ShutdownSendLeaf.RUN_REMOTE,
-                    f"{remote.other_machine()}: shutdown.py stop {LOGIN}",
+                    f"{remote.other_machine()}: shutdown.py status {LOGIN}",
                 )
 
     def test_launching_a_conductor_fails(self) -> None:
@@ -247,12 +203,12 @@ class SendGuardTests(ShutdownTestCase):
                 )
 
     def test_restart_retirement_fails_when_it_would_send(self) -> None:
-        current, entry = restart_fixture()
+        current = restart_fixture()
 
         class UnfakedRestartRetirement(ShutdownTestCase):
             def test_retire(self) -> None:
                 retire = cast(RetireShutdownSession, getattr(restart, "_retire"))
-                retire(current, entry, dry_run=False)
+                retire(current, dry_run=False)
 
         self.assert_blocked(
             UnfakedRestartRetirement("test_retire"),
@@ -261,12 +217,12 @@ class SendGuardTests(ShutdownTestCase):
         )
 
     def test_restart_retirement_dry_run_prints_without_sending(self) -> None:
-        current, entry = restart_fixture()
+        current = restart_fixture()
 
         class DryRunRestartRetirement(ShutdownTestCase):
             def test_retire(self) -> None:
                 retire = cast(RetireShutdownSession, getattr(restart, "_retire"))
-                retire(current, entry, dry_run=True)
+                retire(current, dry_run=True)
 
         output = io.StringIO()
         with redirect_stdout(output):
@@ -283,7 +239,6 @@ class SendGuardTests(ShutdownTestCase):
             def test_alert(self) -> None:
                 self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
                 settle.alert_user(
-                    record.AllAccountSessions(kind="all account sessions"),
                     "summary", "text", ActionRequired("act"),
                 )
 
@@ -304,7 +259,6 @@ class SendGuardTests(ShutdownTestCase):
 
             def test_alert(self) -> None:
                 settle.alert_user(
-                    record.AllAccountSessions(kind="all account sessions"),
                     "summary", "text", ActionRequired("act"),
                 )
 
@@ -327,8 +281,7 @@ class SendGuardTests(ShutdownTestCase):
             def test_alert(self) -> None:
                 with patch.object(settle, "_deliver_message", new=fake_delivery):
                     settle.alert_user(
-                        record.AllAccountSessions(kind="all account sessions"),
-                        "summary", "text", ActionRequired("act"),
+                            "summary", "text", ActionRequired("act"),
                     )
 
         result = self.run_without_subprocesses(PatchedDelivery("test_alert"))

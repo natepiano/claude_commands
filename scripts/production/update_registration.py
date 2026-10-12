@@ -301,9 +301,6 @@ def append_log(production: Production, event: str, path: Path | None, before_com
 
 
 def footer(production: Production, path: Path | None, nothing_needed: bool) -> None:
-    if footer_state(production.slug) is FooterState.OFF:
-        report("footer", "ok", "footers off")
-        return
     state = judgment_state(path, "footer")
     outstanding = outstanding_path(production)
     if isinstance(state.outstanding, ReplaceOutstanding):
@@ -329,6 +326,11 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
             entries.append(entry)
         outstanding.parent.mkdir(parents=True, exist_ok=True)
         _ = outstanding.write_text(json.dumps(entries) + "\n", encoding="utf-8")
+    # The switch hides the printed footer only. What waits on the user is stored above either way,
+    # so the dailies and the open-questions count still see it.
+    if footer_state(production.slug) is FooterState.OFF:
+        report("footer", "ok", "footers off")
+        return
     schedule = instance(f"showrunner-{production.slug}")
     next_run: str | None = None
     if isinstance(schedule, InstancePresent) and not schedule.output.splitlines()[0].endswith(", stopped"):

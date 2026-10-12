@@ -1,0 +1,2 @@
+{"type":"assistant","timestamp":"2026-10-10T21:35:01Z","requestId":"large-one","message":{"id":"large-one","model":"claude-opus-4-6","usage":{"input_tokens":4611686018427387904,"cache_read_input_tokens":1,"output_tokens":1}}}
+{"type":"assistant","timestamp":"2026-10-10T21:35:02Z","requestId":"large-two","message":{"id":"large-two","model":"claude-opus-4-6","usage":{"input_tokens":4611686018427387904,"cache_read_input_tokens":1,"output_tokens":1}}}

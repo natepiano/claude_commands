@@ -23,6 +23,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 from sessions import addressed, live_sessions  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import override_guard
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
@@ -1390,6 +1392,7 @@ def wait_for_quiet(
 
 
 def main(arguments: list[str]) -> int:
+    override_guard.refuse_overrides(Path(__file__), "build_hold/build_hold.py")
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     hold = commands.add_parser("hold")

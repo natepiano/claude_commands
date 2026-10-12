@@ -25,6 +25,7 @@ from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_stat
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 from build_hold import ActiveHolders, read_holders
+import override_guard
 
 JsonMap = dict[str, object]
 
@@ -944,6 +945,7 @@ def run(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    override_guard.refuse_overrides(Path(__file__), "production/dailies_input.py")
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("production", "status", "judgment", "state-dir", "out"):
         _ = parser.add_argument(f"--{name}", required=True, type=Path)

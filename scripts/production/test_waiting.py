@@ -1055,6 +1055,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         open_topics = dailies.split("5. **Open topics.**", 1)[1].split("6. **Review watch.**", 1)[0]
 
         self.assertIn("listed first in every Waiting on block", " ".join(quota.split()))
+        self.assertIn("led by `quota: `", " ".join(quota.split()))
         self.assertIn("held quota alerts", open_topics)
         self.assertIn("`- HH:MM <zone>: agenda: <item>`", agenda_words)
         self.assertEqual(agenda_words.count("`For discussion with you`"), 1)

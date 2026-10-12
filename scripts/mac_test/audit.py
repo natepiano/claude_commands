@@ -16,6 +16,8 @@ from typing import Literal, cast
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
+import override_guard
 import sweep
 
 import offload
@@ -475,6 +477,7 @@ def run(repo_dir: str, check: bool) -> int:
 
 
 def main() -> int:
+    override_guard.refuse_overrides(Path(__file__), "mac_test/audit.py")
     arguments = parser().parse_args(namespace=AuditArguments())
     return run(arguments.repo_dir, arguments.check)
 
