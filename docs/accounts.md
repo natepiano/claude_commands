@@ -28,7 +28,7 @@ The status line's second row shows this session's account label. To print it:
 | Credits left | Codex only: the credit balance, or `unlimited`. |
 | Read | When those numbers were read. |
 
-Each Codex account can stay signed in in its own home. Seats continue on `~/.codex` today. The table's `seats` role follows `CODEX_HOME`, or `~/.codex` when it is unset. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts.
+Each Codex account can stay signed in in its own home. The table's `seats` role follows `seats` in `~/.claude/config/accounts.json`, defaulting to `~/.codex`. A caller's `CODEX_HOME` does not change the seats role. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts. Freestanding Codex sessions keep their own process home.
 
 Times are in the running production's User zone, or this machine's zone when no production runs. The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Lines under the table name anything wrong or unusual in a folder: a failed check, unclassified entries, MCP servers that differ from `~/.claude`.
 
@@ -194,15 +194,35 @@ Setup creates `~/.codex1` with mode 0700 and links existing shared entries to `~
 
 Setup refuses without changing files or printing a sign-in command when another home already holds the account's login, because two homes on one login break token refresh.
 
+Before printing the command, setup waits for Codex to finish indexing the shared sessions and answer its startup request. An interrupted first start can block later starts for 15 minutes, followed by the remaining index work; setup retries servers that exit unanswered and waits up to 20 minutes. If the limit is reached, rerun setup. A table row saying Codex did not start names the same repair command.
+
 Run the printed command in a terminal and sign in as codex 1:
 
 ```sh
 CODEX_HOME=~/.codex1 codex login
 ```
 
-Then run `/showrunner:accounts`. The new home's row shows `spare` and its own numbers; `~/.codex` continues to show `seats`. To check the home directly, use `/showrunner:accounts check "codex 1"`. Problems under the table name missing, broken or replaced shared links, unclassified entries, the wrong login, or a login held by another home. Keep each login in one home: two homes on one login break token refresh.
+Keep `CODEX_HOME` on that command. Without it, `codex login` signs `~/.codex` out and in, leaving its seats unable to work until login finishes; seats use that default home unless their role names another.
+
+Then run `/showrunner:accounts`. The new home's row shows `spare` and its own numbers until selected for seats. To check the home directly, use `/showrunner:accounts check "codex 1"`. Problems under the table name missing, broken or replaced shared links, unclassified entries, the wrong login, or a login held by another home. Keep each login in one home: two homes on one login break token refresh.
 
 The repository's hook installer keeps a linked `hooks.json` and adds missing hooks to its target, so numbered homes continue to share the default home's hooks.
+
+## Swapping the Codex seats account
+
+One account serves every unit's Codex seats, including the `codex exec` fallback. The updater, 5-hour watcher, `/whoami` and account table follow that role. Read it with `/showrunner:accounts role seats`.
+
+```text
+/showrunner:accounts swap seats "codex 1" --dry-run
+/showrunner:accounts swap seats "codex 1"
+/showrunner:accounts swap seats default
+```
+
+A swap checks the target home, its sign-in, both usage windows and its credits before changing the role. It retires each run's current server and tells each affected unit director once. A working seat finishes its turn on the outgoing home; its next turn runs under the new one. Held messages move with it. The move confirms that the old server released the thread before the new server resumes it. If Codex refuses that resume, the seat starts a new thread and its board line names the replacement. An unreadable thread state or unconfirmed release starts no replacement turn.
+
+`--dry-run` prints the target account, its home and the runs that would move, with no role or history write. `set-role seats "codex N"` (or `default`) selects future turns directly, without the swap's usage check or notices. Each role write keeps the other role; `unit` and `seats` history share `~/.local/state/accounts/roles.jsonl`.
+
+Refusals leave both the role and history unchanged. A home-check failure names the file, link, login or duplicate sign-in to fix; rerun setup or correct that home's sign-in. An already-selected account needs no swap. An account used up with no credits needs a different target, credits or its reset. Unknown or expired usage needs a fresh reading before trying again. Selecting `default` requires a real, signed-in `~/.codex` whose login no other home holds; its shared entries remain real files and directories.
 
 ## Low-quota alerts
 
