@@ -390,6 +390,25 @@ class AddUnitTests(unittest.TestCase):
         return [cast(list[str], record["args"]) for record in self.events("tmux")
                 if cast(list[str], record["args"])[:1] == ["new-session"]]
 
+    def restore(self, name: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+        return self.cli(name, "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(cwd),
+                        "--restart-note", str(note), "--session-name", "recorded-name",
+                        "--tmux-session", "recorded-tmux")
+
+    def repository_state(self) -> tuple[str, str, str]:
+        """The production doc, every branch with its commit, and every worktree with its branch."""
+        return (self.doc.read_text(), self.git("for-each-ref", "refs/heads"),
+                self.git("worktree", "list", "--porcelain"))
+
+    def commit_row_off_the_naming_pattern(self) -> Path:
+        """Unit `trunk` as seen live: neither its worktree nor its branch is what the naming pattern gives."""
+        worktree = self.root / "tool-based-ui-trunk"
+        _ = self.git("worktree", "add", str(worktree), "-b", "init/catalyst-trunk")
+        self.commit_prepared_row(self.unit_row("trunk", branch="init/catalyst-trunk", worktree=worktree))
+        return worktree
+
     def run_with_marked_unit(
         self,
         launch_kind: add_unit.NewWorkLaunch | add_unit.UnitRestoreLaunch,
@@ -595,6 +614,69 @@ class AddUnitTests(unittest.TestCase):
             result.stderr, "add_unit: unit alpha-unit has no Units row; a restore never adds one\n"
         )
         self.assert_no_launch_change(document, head)
+
+    def test_restore_adopts_a_row_whose_worktree_and_branch_are_off_the_naming_pattern(self) -> None:
+        recorded = self.commit_row_off_the_naming_pattern()
+        before = self.repository_state()
+
+        result = self.restore("trunk", recorded)
+
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(result.stderr, "")
+        tmux = self.new_sessions()[0]
+        self.assertEqual(tmux[tmux.index("-c") + 1], str(recorded))
+        self.assertEqual(self.repository_state(), before)
+
+    def test_new_work_and_a_promote_still_refuse_a_row_off_the_naming_pattern(self) -> None:
+        recorded = self.commit_row_off_the_naming_pattern()
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        promote = ("--resume", "session-123", "--cwd", str(recorded))
+        for launch, flags in (("new work", ()), ("promote", promote)):
+            with self.subTest(launch=launch):
+                result = self.cli("trunk", "--plan", "docs/plans/given.md", *flags)
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertEqual(
+                    result.stderr,
+                    f"add_unit: unit trunk-unit Worktree is {str(recorded)!r}; expected {str(self.checkout)!r}\n",
+                )
+                self.assert_no_launch_change(document, head)
+
+    def test_restore_in_a_cwd_other_than_the_row_worktree_launches_there_with_one_warning(self) -> None:
+        self.commit_prepared_row(self.unit_row())
+        worktree = self.root / "project-alpha"
+        recorded = self.root / "prior-session"
+        _ = self.git("worktree", "add", str(recorded), "-b", "build-followups-alpha")
+        before = self.repository_state()
+
+        result = self.restore("alpha", recorded)
+
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(
+            result.stderr,
+            f"add_unit: warning: unit alpha-unit Worktree is {str(worktree)!r}; "
+            + f"restoring in the recorded {str(recorded)!r}\n",
+        )
+        tmux = self.new_sessions()[0]
+        self.assertEqual(tmux[tmux.index("-c") + 1], str(recorded))
+        self.assertEqual(self.repository_state(), before)
+        self.assertFalse(worktree.exists())
+
+    def test_restore_in_the_row_worktree_on_another_branch_launches_with_one_warning(self) -> None:
+        self.commit_prepared_row(self.unit_row())
+        worktree = self.root / "project-alpha"
+        _ = self.git("worktree", "add", str(worktree), "-b", "other-branch")
+        before = self.repository_state()
+
+        result = self.restore("alpha", worktree)
+
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(
+            result.stderr,
+            "add_unit: warning: unit alpha-unit Branch is 'build-followups-alpha'; "
+            + f"the recorded {str(worktree)!r} is on 'other-branch'\n",
+        )
+        self.assertEqual(self.repository_state(), before)
 
     def test_restart_restore_is_refused_when_record_is_down(self) -> None:
         self.write_shutdown_record(self.shutdown_record("down"))

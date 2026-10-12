@@ -943,6 +943,29 @@ def _mark_restart_failed(
     )
 
 
+def _launch_failure_left_session_live(
+    record: ShutdownRecord,
+    entry: ShutdownSessionEntry,
+    error: BaseException,
+) -> bool:
+    """Settle a failed launch command by the session registry; True when its session is live.
+
+    A launcher can fail after it started the session, as add_unit does when remote control never
+    reports active. That session is launched: recording it failed invites a second process on it.
+    """
+    name = entry["session"]["name"]
+    reason = _error_reason(error)
+    match _session_liveness(entry["session"]["session_id"]):
+        case SessionLive():
+            print(f"{record['machine']}: {name} is live; its launch reported: {reason}")
+            return True
+        case SessionNotLive():
+            _mark_restart_failed(record, entry, reason)
+        case SessionLivenessUnknown(reason=unknown):
+            print(f"{record['machine']}: {name} restart unfinished: {reason}; {unknown}")
+    return False
+
+
 def _restart_note_delivered(
     record: ShutdownRecord,
     entry: ShutdownSessionEntry,
@@ -1039,9 +1062,9 @@ def _process_session_entry(
             )
         return
     except (OSError, subprocess.CalledProcessError, subprocess.SubprocessError) as error:
-        if not dry_run:
-            _mark_restart_failed(record, entry, _error_reason(error))
-        return
+        if dry_run or not _launch_failure_left_session_live(record, entry, error):
+            return
+        launch = SessionLaunched()
     if isinstance(launch, ManualRestartRequired):
         if dry_run:
             print(f"manual restart {session['name']}: {launch.command}")
