@@ -101,6 +101,8 @@ FMA improves runtime by eliminating the fallback calls and allowing vectorizatio
 
 ## Measured outcome
 
+**Detector reach, live check.** The wider detector, which reports every likely multiply-add on an edited line with a conditional message, reached the live natedev hooks at **T_reach = 2026-10-12 11:13:42 PDT (America/Los_Angeles, UTC-07:00)**, the committer time of merge `b22c1218`. In separate scratch crates outside every repository, Codex `apply_patch` and Claude `Edit` each received one block when adding `let centre_row = top + metrics.button.height * 0.5;`. Both blocks read, with the scratch path normalized: `<file>:3: if top + metrics.button.height * 0.5 is f32 or f64 arithmetic, write metrics.button.height.mul_add(0.5, top) (clippy::suboptimal_flops). Leave integer and vector arithmetic as it is. The edit was applied.` A second `apply_patch` changed only `let top` and received no block; Claude's second `Edit` did the same and received no block. The live `blocks.jsonl` contains one matching record per block, tagged `codex` and `claude`. `python3 scripts/hooks/codex_hooks.py check` exited 0 and reported both handlers trusted.
+
 `cost.py`, `loop.py`, `clippy_fail_lints.py` and `tml_lengths.py` cover the same 96-hour window, **2026-10-06 22:44:05 to 2026-10-10 22:44:05 PDT**, containing **763 hana clippy steps, 250 failed**.
 
 | Measure | `suboptimal_flops` baseline | Current | `too_many_lines` baseline | Current |
