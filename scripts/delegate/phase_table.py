@@ -920,16 +920,18 @@ def _row_clocks(
     return "—", "—"
 
 
-def render(record: PhaseRecord, zone: ZoneInfo) -> str:
-    """Render a phase record as the compact Markdown report."""
+def _heading_text(record: PhaseRecord) -> str:
     current = record.current
     if isinstance(current, NoOpenPhase):
         done = sum(isinstance(row, DonePhase) for row in record.phases)
-        heading = f"**No phase running — {done} of {len(record.phases)} done**"
-    else:
-        heading = (
-            f"**Phase {current.phase} of {len(record.phases)} — {current.title}**"
-        )
+        return f"No phase running — {done} of {len(record.phases)} done"
+    return f"Phase {current.phase} of {len(record.phases)} — {current.title}"
+
+
+def render(record: PhaseRecord, zone: ZoneInfo) -> str:
+    """Render a phase record as the compact Markdown report."""
+    current = record.current
+    heading = f"**{_heading_text(record)}**"
 
     started = "—"
     percent = "—"
@@ -1250,6 +1252,7 @@ def _note_text(
             "phase_table: true",
             f"production: {production}",
             f"unit: {unit}",
+            f"now: {json.dumps(_heading_text(record), ensure_ascii=False)}",
             "---",
             "",
             f"# {name}",
