@@ -16,6 +16,7 @@ import argparse
 import base64
 import contextlib
 import dataclasses
+import fcntl
 import io
 import json
 import os
@@ -774,6 +775,204 @@ class MeshCommandTests(unittest.TestCase):
         self.assertIn("scripted request failure", errors)
         self.assertTrue(opened, "the failed request must use a client")
         self.assertCountEqual(opened, closed)
+
+    def replacement_record(self) -> dict[str, object]:
+        return {"thread_id": "replacement-thread", "status": "running", "turn_id": "replacement-turn",
+                "context_tokens": 777, "role": "test", "launcher_pid": os.getpid(),
+                "port": self.server.port, "instructions_file": "replacement-instructions.txt"}
+
+    def replace_seat(self, name: str = "seat") -> dict[str, object]:
+        entries = self.roster()
+        previous = _as_test_dict(entries.get(name))
+        entries[name] = {**previous, "status": "ended"}
+        self.write_pool_roster(entries)
+        replacement = self.replacement_record()
+        entries[name] = replacement
+        self.write_pool_roster(entries)
+        return replacement
+
+    def test_old_launcher_normal_end_preserves_the_replacement_roster(self) -> None:
+        replacement = self.replacement_record()
+        def replace_at_end(_port: int, _thread_id: str, _log_path: Path) -> codex_mesh.RelaunchAllowed:
+            self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
+            self.assertEqual(self.replace_seat(), replacement)
+            return codex_mesh.RelaunchAllowed()
+        with patch.object(codex_mesh, "_end_unwatched_turn", side_effect=replace_at_end):
+            code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record(), replacement)
+
+    def test_old_launcher_exception_preserves_the_replacement_roster(self) -> None:
+        original = codex_mesh.Client.next_frame
+        replacement = self.replacement_record()
+        failed = [False]
+        def fail_after_replacement(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            if not failed[0]:
+                failed[0] = True
+                self.assertEqual(self.replace_seat(), replacement)
+                raise ConnectionError("invented stream failure")
+            return original(client, deadline)
+        with patch.object(codex_mesh.Client, "next_frame", fail_after_replacement):
+            code, errors = self.run_start()
+        self.assertEqual(code, 1)
+        self.assertIn("invented stream failure", errors)
+        self.assertEqual(self.seat_record(), replacement)
+
+    def test_old_thread_start_and_token_notices_preserve_every_replacement_field(self) -> None:
+        original = codex_mesh.Client.next_frame
+        replacement = self.replacement_record()
+        notices = [
+            codex_mesh.RpcMessage(method="turn/started", params={"threadId": THREAD_ID, "turn": {"id": "turn-1"}}),
+            codex_mesh.RpcMessage(method="thread/tokenUsage/updated", params={"threadId": THREAD_ID, "turnId": "turn-1",
+                                 "tokenUsage": {"last": {"inputTokens": 99999}, "total": {"inputTokens": 0}}}),
+        ]
+        observed: list[dict[str, object]] = []
+        def next_frame(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            if len(notices) == 2:
+                self.assertEqual(self.replace_seat(), replacement)
+            else:
+                observed.append(self.seat_record())
+            if notices:
+                return notices.pop(0)
+            return original(client, deadline)
+        with patch.object(codex_mesh.Client, "next_frame", next_frame):
+            code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertGreaterEqual(len(observed), 2)
+        for entry in observed:
+            self.assertEqual(entry, replacement)
+        self.assertEqual(self.seat_record(), replacement)
+
+    def test_compaction_reply_after_replacement_preserves_its_context_and_identity(self) -> None:
+        self.context_sizes = [150000]
+        self.assertEqual(self.run_start()[0], 0)
+        replacement = self.replacement_record()
+        respond = self.respond
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            frames = respond(request)
+            if request.get("method") == "thread/compact/start":
+                self.assertEqual(self.replace_seat(), replacement)
+            return frames
+        self.server.respond = reply
+        code, output, errors = self.run_mesh(["compact", "--to", "seat"])
+        self.assertEqual((code, output, errors), (0, "compacted seat: 150000 -> 20000 tokens\n", ""))
+        self.assertEqual(self.seat_record(), replacement)
+
+    def test_compaction_checks_ownership_after_acquiring_the_roster_lock(self) -> None:
+        self.context_sizes = [150000]
+        self.assertEqual(self.run_start()[0], 0)
+        replacement = self.replacement_record()
+        armed = [False]
+        writes = [0]
+        flock = fcntl.flock
+        respond = self.respond
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            frames = respond(request)
+            if request.get("method") == "thread/compact/start":
+                armed[0] = True
+            return frames
+        def acquire(descriptor: int, operation: int) -> None:
+            path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+            if armed[0] and operation == fcntl.LOCK_EX and path.name == codex_mesh.ROSTER_FILE:
+                armed[0] = False
+                with path.open("r+") as other:
+                    flock(other.fileno(), fcntl.LOCK_EX)
+                    entries = cast(dict[str, object], json.loads(other.read()))
+                    entries["seat"] = replacement
+                    _ = other.seek(0)
+                    _ = other.truncate()
+                    _ = other.write(json.dumps(entries))
+                    other.flush()
+                    flock(other.fileno(), fcntl.LOCK_UN)
+                writes[0] += 1
+            flock(descriptor, operation)
+        self.server.respond = reply
+        with patch.object(fcntl, "flock", acquire):
+            code, output, errors = self.run_mesh(["compact", "--to", "seat"])
+        self.assertEqual((code, output, errors), (0, "compacted seat: 150000 -> 20000 tokens\n", ""))
+        self.assertEqual(writes[0], 1)
+        self.assertEqual(self.seat_record(), replacement)
+
+    def test_steer_on_the_same_thread_keeps_fields_and_records_the_live_turn(self) -> None:
+        original = {**self.replacement_record(), "thread_id": THREAD_ID, "turn_id": "stale-turn"}
+        self.write_pool_roster({"seat": original})
+        calls = [0]
+        respond = self.respond
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/steer":
+                calls[0] += 1
+                if calls[0] == 1:
+                    return [{"id": request["id"], "error": {"message": "expected turn, but found `live-turn`"}}]
+                return [_reply(request, {})]
+            return respond(request)
+        self.server.respond = reply
+        code, output, errors = self.run_mesh(["steer", "--to", "seat", "--message", "invented correction"])
+        self.assertEqual((code, output, errors), (0, "steered seat\n", ""))
+        self.assertEqual(self.seat_record(), {**original, "turn_id": "live-turn"})
+
+    def test_steer_reply_after_replacement_preserves_its_context_and_identity(self) -> None:
+        self.write_pool_roster({"seat": {"thread_id": THREAD_ID, "status": "running",
+                                      "turn_id": "stale-turn", "context_tokens": 150000,
+                                      "port": self.server.port}})
+        replacement = self.replacement_record()
+        calls = [0]
+        respond = self.respond
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/steer":
+                calls[0] += 1
+                if calls[0] == 1:
+                    return [{"id": request["id"], "error": {"message": "expected turn, but found `live-turn`"}}]
+                self.assertEqual(self.replace_seat(), replacement)
+                return [_reply(request, {})]
+            return respond(request)
+        self.server.respond = reply
+        code, output, errors = self.run_mesh(["steer", "--to", "seat", "--message", "invented correction"])
+        self.assertEqual((code, output, errors), (0, "steered seat\n", ""))
+        self.assertEqual(calls[0], 2)
+        self.assertEqual(self.seat_record(), replacement)
+
+    def taken_fork(self, *, release_unknown: bool, initially_absent: bool = False) -> tuple[int, str, str]:
+        entries: dict[str, object] = {"template": {"thread_id": THREAD_ID, "status": "done"}}
+        if not initially_absent:
+            entries["reviewer"] = {"thread_id": "ended-thread", "status": "ended"}
+        self.write_pool_roster(entries)
+        self.server.requests.clear()
+        marker = self.session_dir / "reviewer.end"
+        pending = self.session_dir / "reviewer.pending.json"
+        _ = marker.write_text("replacement marker\n", encoding="utf-8")
+        _ = pending.write_text('{"messages": ["replacement message"]}\n', encoding="utf-8")
+        respond = self.respond
+        replacement = self.replacement_record()
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            frames = respond(request)
+            if request.get("method") == "thread/name/set":
+                self.assertEqual(self.replace_seat("reviewer"), replacement)
+            if request.get("method") == "thread/unsubscribe" and release_unknown:
+                return [{"id": request["id"], "error": {"message": "invented release refusal"}}]
+            return frames
+        self.server.respond = reply
+        result = self.run_mesh(["fork", "--from", "template", "--name", "reviewer"])
+        self.assertEqual(self.roster()["reviewer"], replacement)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "replacement marker\n")
+        self.assertEqual(pending.read_text(encoding="utf-8"), '{"messages": ["replacement message"]}\n')
+        self.assertEqual([_as_test_dict(request["params"]).get("threadId")
+                          for request in self.methods("thread/unsubscribe")], [self.fork_thread_id])
+        return result
+
+    def test_fork_taken_during_request_releases_only_its_new_thread_and_refuses(self) -> None:
+        for initially_absent in (False, True):
+            with self.subTest(initially_absent=initially_absent):
+                code, output, errors = self.taken_fork(release_unknown=False, initially_absent=initially_absent)
+                self.assertEqual((code, output, errors), (2, "",
+                                 "codex_mesh: reviewer: name was taken while the fork ran; fork refused\n"))
+
+    def test_fork_taken_during_request_reports_unconfirmed_release_without_touching_replacement(self) -> None:
+        code, output, errors = self.taken_fork(release_unknown=True)
+        self.assertEqual((code, output), (1, ""))
+        self.assertEqual(errors, f"codex_mesh: reviewer: name was taken while the fork ran; "
+                         + f"fork thread {self.fork_thread_id} not released: "
+                         + 'old thread release could not be confirmed: codex_mesh: thread/unsubscribe failed: '
+                         + '{"message": "invented release refusal"}\n')
 
     def test_prime_creates_and_names_a_read_only_review_template_without_a_turn(self) -> None:
         arguments = self.prime_cli("--model", "gpt-test", "--service-tier", "fast")
@@ -1567,6 +1766,87 @@ class MeshCommandTests(unittest.TestCase):
         starts = self.methods("turn/start")
         follow_params = cast("dict[str, object]", starts[1]["params"])
         self.assertEqual(follow_params["model"], "gpt-test")
+
+    def follow_with_name_taken(self, take_at: str, *, release_unknown: bool = False) -> tuple[int, str]:
+        self.write_pool_roster({"seat": {"thread_id": "old-follow-thread", "status": "done",
+                                       "role": "impl", "context_tokens": 123, "port": self.server.port}})
+        replacement = self.replacement_record()
+        marker = self.session_dir / "seat.end"
+        pending = self.session_dir / "seat.pending.json"
+        marker_text = "new owner's end marker\n"
+        pending_text = json.dumps({"thread_id": replacement["thread_id"], "messages": ["new owner's message"]})
+        respond = self.respond
+        taken = [False]
+
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            method = request.get("method")
+            if method == take_at:
+                taken[0] = True
+                self.assertEqual(self.replace_seat(), replacement)
+                _ = marker.write_text(marker_text, encoding="utf-8")
+                _ = pending.write_text(pending_text, encoding="utf-8")
+            if method == "thread/resume":
+                return [{"id": request["id"], "error": {"message": "invented resume refusal"}}]
+            if method == "thread/unsubscribe" and release_unknown:
+                return [{"id": request["id"], "error": {"message": "invented release refusal"}}]
+            return respond(request)
+
+        self.server.respond = reply
+        result = self.run_follow()
+        self.assertTrue(taken[0])
+        self.assertEqual(self.seat_record(), replacement)
+        self.assertEqual(marker.read_text(encoding="utf-8"), marker_text)
+        self.assertEqual(pending.read_text(encoding="utf-8"), pending_text)
+        self.assertEqual([_as_test_dict(request["params"]).get("threadId")
+                          for request in self.methods("thread/unsubscribe")], [THREAD_ID])
+        self.assertEqual(self.methods("turn/start"), [])
+        self.assertNotIn(THREAD_ID, [record["id"] for record in self.usage_records()])
+        if take_at == "thread/resume":
+            self.assertEqual(self.methods("thread/name/set"), [])
+            board = self.session_dir / "board.log"
+            self.assertNotIn("seat continues as new thread", board.read_text() if board.exists() else "")
+        return result
+
+    def test_follow_name_taken_during_resume_releases_fallback_without_touching_new_owner(self) -> None:
+        code, errors = self.follow_with_name_taken("thread/resume")
+        self.assertEqual((code, errors), (1, "codex_mesh: seat: name was taken while the follow-up ran; "
+                                         + "follow-up did not start\n"))
+
+    def test_follow_name_taken_after_fallback_is_named_releases_it_without_starting_a_turn(self) -> None:
+        code, errors = self.follow_with_name_taken("thread/name/set")
+        self.assertEqual((code, errors), (1, "codex_mesh: seat: name was taken while the follow-up ran; "
+                                         + "follow-up did not start\n"))
+
+    def test_follow_name_taken_reports_unconfirmed_fallback_release_and_keeps_new_owner(self) -> None:
+        code, errors = self.follow_with_name_taken("thread/resume", release_unknown=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(errors, "codex_mesh: seat: name was taken while the follow-up ran; "
+                         + f"replacement thread {THREAD_ID} not released: "
+                         + "old thread release could not be confirmed: codex_mesh: thread/unsubscribe failed: "
+                         + '{"message": "invented release refusal"}\n')
+
+    def test_follow_refused_resume_without_replacement_owner_runs_on_the_fallback_thread(self) -> None:
+        self.write_pool_roster({"seat": {"thread_id": "old-follow-thread", "status": "done",
+                                       "role": "impl", "context_tokens": 123, "port": self.server.port}})
+        respond = self.respond
+
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/resume":
+                return [{"id": request["id"], "error": {"message": "invented resume refusal"}}]
+            return respond(request)
+
+        self.server.respond = reply
+        self.assertEqual(self.run_follow(), (0, ""))
+        self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertEqual(self.seat_record()["context_tokens"], 123)
+        self.assertEqual([_as_test_dict(request["params"]).get("threadId")
+                          for request in self.methods("thread/name/set")], [THREAD_ID])
+        self.assertEqual([_as_test_dict(request["params"]).get("threadId")
+                          for request in self.methods("turn/start")], [THREAD_ID])
+        self.assertEqual([record["id"] for record in self.usage_records()], ["old-follow-thread", THREAD_ID])
+        self.assertIn(f"seat continues as new thread {THREAD_ID}",
+                      (self.session_dir / "board.log").read_text(encoding="utf-8"))
 
     def test_start_records_the_assigned_role(self) -> None:
         code, errors = self.run_start()

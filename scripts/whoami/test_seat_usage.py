@@ -393,5 +393,123 @@ with patch.object(sqlite3, 'connect', counting_connect), \\
             self.assertLessEqual(expanded_calls["calls"][name], count, name)
 
 
+class StoredSwitchTests(OutcomeFixture):
+    def stored_row(self, readings: tuple[tuple[str, str, float], ...],
+                   roles: tuple[tuple[str, str, str], ...], *,
+                   start: str = "2026-10-04", end: str = "2026-10-07") -> list[str]:
+        for name in ("baseline-readings", "readings", "account-roles"):
+            _ = (self.root / f"{name}.jsonl").write_text("", encoding="utf-8")
+        _ = (self.root / "readings.jsonl").write_text("".join(
+            json.dumps({"at": at, "account": account, "credits": credits}) + "\n"
+            for at, account, credits in readings), encoding="utf-8")
+        _ = (self.root / "account-roles.jsonl").write_text("".join(
+            json.dumps({"at": at, "role": role, "label": label}) + "\n"
+            for at, role, label in roles), encoding="utf-8")
+        _ = self.collect()
+        self.assertEqual(len(self.rows("SELECT * FROM account_readings")), len(readings))
+        self.assertEqual(len(self.rows("SELECT * FROM account_role_changes")), len(roles))
+        environment = os.environ.copy()
+        _ = environment.pop("PYTHONPATH", None)
+        environment.update(HOME=str(self.root), USAGE_STATE_DIR=str(self.state), PYTHONDONTWRITEBYTECODE="1")
+        result = subprocess.run([sys.executable, str(READOUT), "--db", str(self.db_path),
+                                 "--before", start, end, "--after", start, end],
+                                env=environment, cwd=self.root, capture_output=True, text=True,
+                                check=False, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        rows = [line for line in result.stdout.splitlines() if line.startswith("| Before |")]
+        self.assertEqual(len(rows), 1, result.stdout)
+        return [cell.strip() for cell in rows[0].split("|")]
+
+    def dual_readings(self) -> tuple[tuple[str, str, float], ...]:
+        return tuple((f"2026-10-{day:02d}T00:00:00Z", account, balance)
+                     for day, balances in ((4, (100.0, 200.0)), (5, (90.0, 170.0)), (6, (80.0, 140.0)))
+                     for account, balance in zip(("codex 1", "CODEX 2"), balances))
+
+    def test_readings_without_role_history_keep_the_legacy_label_switches(self) -> None:
+        row = self.stored_row((("2026-10-04T00:00:00Z", "codex 1", 100),
+                               ("2026-10-05T00:00:00Z", "codex 2", 90),
+                               ("2026-10-06T00:00:00Z", "codex 1", 80)), ())
+        self.assertEqual(row[7], "7.0")
+
+    def test_piece_wholly_before_role_history_keeps_the_legacy_label_switches(self) -> None:
+        row = self.stored_row((("2026-10-04T00:00:00Z", "codex 1", 100),
+                               ("2026-10-05T00:00:00Z", "codex 2", 90),
+                               ("2026-10-06T00:00:00Z", "codex 1", 80)),
+                              (("2026-10-08T00:00:00Z", "unit", "claude 1"),))
+        self.assertEqual(row[7], "7.0")
+
+    def test_simultaneous_accounts_after_history_without_seats_changes_have_zero_switches(self) -> None:
+        row = self.stored_row(self.dual_readings(), (("2026-10-03T00:00:00Z", "unit", "claude 1"),))
+        self.assertEqual(row[7], "0.0")
+
+    def test_seats_changes_use_the_prior_piece_and_ignore_first_repeated_and_unit_labels(self) -> None:
+        row = self.stored_row(self.dual_readings(), (
+            ("2026-10-01T00:00:00Z", "unit", "claude 1"),
+            ("2026-10-02T00:00:00Z", "seats", "codex 1"),
+            ("2026-10-04T00:00:00Z", "seats", "codex 2"),
+            ("2026-10-05T00:00:00Z", "seats", "codex 2"),
+            ("2026-10-05T12:00:00Z", "unit", "claude 2"),
+            ("2026-10-06T00:00:00Z", "seats", "codex 1")))
+        self.assertEqual(row[7], "7.0")
+
+    def test_simultaneous_role_changes_are_ordered_by_timestamp_then_label(self) -> None:
+        row = self.stored_row(self.dual_readings(), (
+            ("2026-10-01T00:00:00Z", "unit", "claude 1"),
+            ("2026-10-02T00:00:00Z", "seats", "codex 1"),
+            ("2026-10-05T00:00:00Z", "seats", "codex 2"),
+            ("2026-10-05T00:00:00Z", "seats", "codex 1")))
+        self.assertEqual(row[7], "3.5")
+
+    def test_first_seats_observation_counts_no_switch_and_never_compares_a_reading_label(self) -> None:
+        row = self.stored_row(self.dual_readings(), (("2026-10-03T00:00:00Z", "unit", "claude 1"),
+                                                   ("2026-10-05T00:00:00Z", "seats", "codex other")))
+        self.assertEqual(row[7], "0.0")
+
+    def test_piece_across_history_counts_legacy_and_role_changes_without_crossing_the_boundary(self) -> None:
+        row = self.stored_row((("2026-10-03T00:00:00Z", "codex 1", 100),
+                               ("2026-10-04T00:00:00Z", "codex 2", 90),
+                               ("2026-10-05T00:00:00Z", "codex 1", 80),
+                               ("2026-10-05T12:00:00Z", "codex 2", 75),
+                               ("2026-10-06T00:00:00Z", "codex 2", 70)),
+                              (("2026-10-05T00:00:00Z", "unit", "claude 1"),
+                               ("2026-10-05T00:00:00Z", "seats", "codex 2"),
+                               ("2026-10-06T00:00:00Z", "seats", "codex 1")), start="2026-10-03")
+        self.assertEqual(row[7], "4.7")
+
+    def test_role_changes_at_both_coverage_endpoints_count_and_outside_changes_do_not(self) -> None:
+        row = self.stored_row((("2026-10-04T06:00:00Z", "codex 1", 100),
+                               ("2026-10-06T06:00:00Z", "codex 1", 80)), (
+            ("2026-10-01T00:00:00Z", "seats", "codex 1"),
+            ("2026-10-04T05:00:00Z", "seats", "codex 2"),
+            ("2026-10-04T06:00:00Z", "seats", "codex 1"),
+            ("2026-10-06T06:00:00Z", "seats", "codex 2"),
+            ("2026-10-06T07:00:00Z", "seats", "codex 1")))
+        self.assertEqual(row[7], "7.0")
+
+    def test_reading_before_the_piece_extends_coverage_to_its_start_for_a_role_switch(self) -> None:
+        row = self.stored_row((("2026-10-03T00:00:00Z", "codex 1", 100),
+                               ("2026-10-06T00:00:00Z", "codex 1", 80)), (
+            ("2026-10-02T00:00:00Z", "seats", "codex 1"),
+            ("2026-10-04T00:00:00Z", "seats", "codex 2")))
+        self.assertEqual(row[7], "3.5")
+
+    def test_role_changes_without_positive_reading_coverage_still_have_an_unavailable_rate(self) -> None:
+        row = self.stored_row((("2026-10-05T00:00:00Z", "codex 1", 100),),
+                              (("2026-10-03T00:00:00Z", "seats", "codex 1"),
+                               ("2026-10-05T00:00:00Z", "seats", "codex 2")))
+        self.assertEqual(row[7], "—")
+
+    def test_role_changes_without_any_reading_in_the_piece_have_an_unavailable_rate(self) -> None:
+        row = self.stored_row((("2026-10-03T00:00:00Z", "codex 1", 100),),
+                              (("2026-10-03T00:00:00Z", "seats", "codex 1"),
+                               ("2026-10-05T00:00:00Z", "seats", "codex 2")))
+        self.assertEqual(row[7], "—")
+
+    def test_simultaneous_account_credits_sum_each_accounts_own_decrease(self) -> None:
+        row = self.stored_row(self.dual_readings(), (("2026-10-03T00:00:00Z", "unit", "claude 1"),))
+        self.assertEqual(row[8], "40.0")
+
+
 if __name__ == "__main__":
     _ = unittest.main()
