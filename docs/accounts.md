@@ -12,7 +12,7 @@ The status line's second row shows this session's account label. To print it:
 
 ## Every account in one table
 
-`/showrunner:accounts` prints one table with a row for `~/.claude` and each `~/.claudeN`, logged in or not. In a terminal:
+`/showrunner:accounts` prints one table: a row for `~/.claude` and each `~/.claudeN`, logged in or not, then a row for each Codex account. In a terminal:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py status
@@ -22,11 +22,15 @@ The status line's second row shows this session's account label. To print it:
 | --- | --- |
 | Label | The account's label. A named folder keeps its own label whatever login it holds. |
 | Login | The login, `not logged in`, or `not set up` for an account that has a note and is in no folder. |
-| Role | `showrunners`, `unit directors`, or `spare`. |
-| 5-hour left, Weekly left | Percent of each window left, each with its reset time. |
+| Role | `showrunners`, `unit directors`, or `spare`; `seats` for the Codex account. |
+| 5-hour left, Weekly left | Percent of each window left, each with its reset time. A dash when the account has no such window. |
+| On credits | Codex only: `yes` when a window is used up and the account's credits now pay for the work. |
+| Credits left | Codex only: the credit balance, or `unlimited`. |
 | Read | When those numbers were read. |
 
-Times are in the running production's User zone, or this machine's zone when no production runs. The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and a folder with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Lines under the table name anything wrong or unusual in a folder: a failed check, unclassified entries, MCP servers that differ from `~/.claude`.
+Codex has one home, `~/.codex`, so one Codex account is signed in at a time. Each other Codex account that has a note gets a `not logged in` row with no numbers.
+
+Times are in the running production's User zone, or this machine's zone when no production runs. The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Lines under the table name anything wrong or unusual in a folder: a failed check, unclassified entries, MCP servers that differ from `~/.claude`.
 
 ## Starting a session
 
