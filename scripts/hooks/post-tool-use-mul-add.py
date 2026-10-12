@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tell an editing agent when Rust contains a provable float multiply-add."""
+"""Tell an editing agent when Rust contains a likely multiply-add."""
 
 from __future__ import annotations
 
@@ -64,9 +64,9 @@ def main() -> None:
             written = written_lines(source, replacements)
             if not written:
                 continue
-            from mul_add_lib import float_mul_add_findings
+            from mul_add_lib import mul_add_findings
 
-            _, findings = float_mul_add_findings(file, written)
+            _, findings = mul_add_findings(file, written)
             if not findings:
                 continue
             try:
@@ -74,7 +74,7 @@ def main() -> None:
             except ValueError:
                 shown = file
             descriptions.extend(
-                f"{shown}:{finding.line}: write {finding.rewrite} for {finding.expr} "
+                f"{shown}:{finding.line}: if {finding.expr} is f32 or f64 arithmetic, write {finding.rewrite} "
                 + "(clippy::suboptimal_flops)"
                 for finding in findings
             )
@@ -87,15 +87,15 @@ def main() -> None:
             return
         total = len(descriptions)
         if len(affected) == 1:
-            summary = f"{os.path.basename(affected[0][0])} has {total} float multiply-add expression(s)"
+            summary = f"{os.path.basename(affected[0][0])} has {total} possible multiply-add expression(s)"
         else:
             files = ", ".join(file for file, _ in affected)
-            summary = f"{total} float multiply-add expression(s) in {files}"
+            summary = f"{total} possible multiply-add expression(s) in {files}"
         for file, findings in records:
             _log_block(edit, file, findings)
         print(json.dumps({
             "decision": "block",
-            "reason": "; ".join(descriptions) + " The edit was applied.",
+            "reason": "; ".join(descriptions) + ". Leave integer and vector arithmetic as it is. The edit was applied.",
             "continue": True,
             "systemMessage": f"mul_add: {summary}",
             "hookSpecificOutput": {

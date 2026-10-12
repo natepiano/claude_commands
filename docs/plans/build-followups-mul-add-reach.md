@@ -109,7 +109,7 @@ def float_mul_add_findings(rs_file, written: frozenset[int] | None = None)  # No
 
 **Ruled out:** comparing `old` and `new` by characters (an added line shares its indentation with its neighbour, which then counts as written); a per-character newline index of the whole file (43 ms on a large file before the cheap text check).
 
-### Phase 2 — Report every likely multiply-add  · status: todo
+### Phase 2 — Report every likely multiply-add  · status: done
 
 #### Work Order
 
@@ -121,22 +121,22 @@ Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`,
 
 The detector changes from "report what is proved float" to "report what looks like a multiply-add unless something disproves it". `~/.local/state/mul-add-hook/reach-2026-10-12/proto.py` is the measured prototype of items 1 and 2; read it, then build the rule into `scripts/hooks/mul_add_lib.py` on the shared scanner. Do not import the prototype.
 
-1. **Shape.** Scan each function body `_functions` returns, with comments and strings blanked. A candidate is a product chain that is a direct operand of binary `+` or `-`, or the whole right side of `+=` or `-=`. In a run of `*`, `/`, `%` at one nesting depth the last operator must be `*`. An operand may be a literal, a name, a path (`a::B`), a field chain, a call, a method chain, an index, a cast (`index as f32`), a `?`, a parenthesized group, or any of these under unary `-`, `&` or `*`. Expressions inside macro invocation arguments (`assert!(…)`, `debug_assert!(…)`, `vec![…]`) are candidates; `macro_rules!` definitions are not. One finding per sum: when both sides of one `+` or `-` are products, the left product is the receiver side, as clippy chooses.
+1. **Shape.** Scan each function body `_functions` returns, with comments and strings blanked. A candidate is a product chain that is a direct operand of binary `+` or `-`, or the whole right side of `+=` or `-=`. In a run of `*`, `/`, `%` at one nesting depth the last operator must be `*`. An operand may be a literal, a name, a path (`a::B`), a field chain, a call (generic arguments included, `load::<f32>()`), a method chain, an index, a cast (`index as f32`), a `?`, a parenthesized group, or any of these under unary `-`, `&` or `*`. Expressions inside macro invocation arguments (`assert!(…)`, `debug_assert!(…)`, `vec![…]`) are candidates; `macro_rules!` definitions are not. One finding per sum: when both sides of one `+` or `-` are products, the left product is the receiver side, as clippy chooses. A product chain wrapped in its own parentheses is the same candidate: `(a * b) + c`, `c + (a * b)` and `c += (a * b)` are reported as their unwrapped forms are, with the rewrite built from the inner factors.
 
 2. **Disproved, so skipped.** Evidence is read from the text of the whole sum.
    - Float evidence: a float literal token, or a match of
      `\bas\s+f(?:32|64)\b|\bf(?:32|64)::|\.to_f(?:32|64)\s*\(|\.(?:sin|cos|tan|sqrt|powi|powf|to_radians|to_degrees|sin_cos|atan2|exp|ln|hypot|recip|fract|signum|lerp)\s*\(|\b(?:PI|TAU|FRAC_PI_\d|EPSILON)\b`.
-   - Integer evidence: an integer literal that is a factor of the product or a term of the sum (not inside `[...]` or call arguments, and not a tuple field such as `.0`), or a match of `\bas\s+(?:usize|isize|[iu](?:8|16|32|64|128))\b|\.(?:len|count)\s*\(\s*\)`. A sum with integer evidence and no float evidence is skipped.
-   - Vector evidence, which skips the sum whatever else it holds: a match of the `VECTOR` pattern in `measure2.py` (copy it verbatim); or a factor or term that is a bare name whose annotation in the function (a parameter or `let name: T`) is a type other than `f32` or `f64`; or a bare name bound by `let` from a vector constructor (today's `_VECTOR_BINDING` with `_VECTOR_VALUE`); or a bare name that is a file `const` or `static` typed other than `f32` or `f64` (today's `_FILE_VALUE`). A name with no annotation disproves nothing.
+   - Integer evidence: an integer literal that is a factor of the product or a term of the sum (not inside `[...]` or call arguments, and not a tuple field such as `.0`), or a match of `\bas\s+(?:usize|isize|[iu](?:8|16|32|64|128))\b|\.(?:len|count)\s*\(\s*\)`, or the sum being the whole content of an index (`grid[r * w + c]`; an array literal such as `[a * b + c, d]` is not one). A sum with integer evidence and no float evidence is skipped.
+   - Vector evidence, which skips the sum whatever else it holds: a match of the `VECTOR` pattern in `measure2.py` (copy it verbatim); or a factor or term that is a bare name whose annotation in the function (a parameter or `let name: T`) is a type other than `f32` or `f64`; or a bare name bound by `let` from a vector constructor (today's `_VECTOR_BINDING` with `_VECTOR_VALUE`); or a bare name that is a file `const` or `static` typed other than `f32` or `f64` (today's `_FILE_VALUE`). A name with no annotation disproves nothing. A name's evidence is its last annotation or binding before the sum, the parameter when there is none; a `let` inside a nested function never counts for its parent.
    - The `VECTOR` pattern is a starting rule. Narrow it to the end of an operand, or widen it, when the gates below hold or improve; name each change in the report.
 
-3. **Kept exemptions**, as today: lint scope and the no_std root check, `allow`/`expect` attributes, const items, `const fn`, const blocks, static initializers, a sum that is a `.sqrt()` receiver, and today's rule for an unsuffixed literal receiver.
+3. **Kept exemptions**, as today: lint scope and the no_std root check, `allow`/`expect` attributes, const items, `const fn`, const blocks, static initializers (`static mut` too), a sum that is a `.sqrt()` receiver, and today's rule for an unsuffixed literal receiver.
 
 4. **Removed:** the same-file field proof (`_NAMED_FIELDS`, `_SCALAR_TYPE`, the `scalar_fields` and `nonfloat_fields` sets), `_float_atom`, `_literal_compatible`, and the pattern-binding, destructuring and let-else exclusions (`_PATTERN_BINDING`, `_DESTRUCTURED_PATTERN`, `_LET_ELSE`, `_COMPOUND_PATTERN`, `_has_let_else`), with every test that pins them. A name of unknown type no longer silences a report.
 
 5. **Names.** The result no longer claims float: `FloatMulAddFinding` becomes `MulAddFinding` and `float_mul_add_findings` becomes `mul_add_findings`, with the same parameters and fields. Their only callers are the hook entry and the tests.
 
-6. **Rewrite text**, clippy's form: `a.mul_add(b, c)`; `c - a * b` gives `a.mul_add(-b, c)`; `a * b - c` gives `a.mul_add(b, -c)`; `x += a * b` gives `x = a.mul_add(b, x)`. The receiver is the product's left side: a chain `a * b * c + d` gives `(a * b).mul_add(c, d)`. Parenthesize a receiver that is a cast, a unary or a binary expression, and a negated operand that is not a single name, literal, call or field chain. `expr` and `rewrite` are source text with each run of whitespace collapsed to one space.
+6. **Rewrite text**, clippy's form: `a.mul_add(b, c)`; `c - a * b` gives `a.mul_add(-b, c)`; `a * b - c` gives `a.mul_add(b, -c)`; `x += a * b` gives `x = a.mul_add(b, x)`. The receiver is the product's left side: a chain `a * b * c + d` gives `(a * b).mul_add(c, d)`. Parenthesize a receiver that is a cast, a unary or a binary expression, and a negated operand that is not a single name, literal, call or field chain. `expr` and `rewrite` are source text with each run of whitespace outside string and char literals collapsed to one space, and comments left out. A float literal with a signed exponent (`1e-3`) is one operand.
 
 7. **Message** (`scripts/hooks/post-tool-use-mul-add.py`). One description per finding:
 
@@ -154,7 +154,8 @@ The detector changes from "report what is proved float" to "report what looks li
    - every kept exemption still passes;
    - the exact `reason`, `additionalContext` and `systemMessage` for one finding and for two files;
    - the Phase 1 written-line cases still pass with the new shapes;
-   - a sum that spans two lines is reported when the edit wrote only its second line, and passes when the edit wrote neither.
+   - a sum that spans two lines is reported when the edit wrote only its second line, and passes when the edit wrote neither;
+   - the review's cases: a product in its own parentheses is reported on either side of the sum and as the right side of `+=`; a grouped chain receiver keeps its grouping (`((a + b) * (c + d)).mul_add(e, f)`); a call with generic arguments keeps its callee; a string literal operand keeps its inner spaces and a comment inside a sum is left out; `dt * 1e-3 + t` is reported with `1e-3` whole; a whole-index sum passes; a later `let v: f32` does not change an earlier sum over a `Vec2` parameter `v`, and a nested function's `let` does not silence its parent; a block-valued `static mut` initializer passes.
 
    Each test is named for the behavior it pins.
 
