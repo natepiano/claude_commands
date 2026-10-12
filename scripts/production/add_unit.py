@@ -897,6 +897,17 @@ def main(argv: list[str]) -> int:
                 launch_session(request, tmux, ready.director, prompt, unit_account)
         finally:
             _ = barrier.__exit__(None, None, None)
+        if isinstance(request.launch_kind, UnitRestoreLaunch):
+            record(request)
+            restored_tmux_session = (
+                marked_unit.unit.label
+                if isinstance(marked_unit, MarkedUnitFound)
+                else request.launch_kind.tmux_session
+            )
+            print(
+                f"{request.identity.unit} restore launched: tmux attach -t {restored_tmux_session}"
+            )
+            return 0
         launched = wait_for_remote_control(request, tmux)
         record(request)
         print(f"{request.identity.unit} started: tmux attach -t {launched.label}")

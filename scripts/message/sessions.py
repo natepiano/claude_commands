@@ -104,17 +104,17 @@ def process_start(pid: int) -> str | None:
 
 
 def running_session(record: SessionRecord) -> bool:
-    """The pid runs and a socket or matching start identifies it as this session."""
+    """The pid runs with its recorded start, or an older record has its socket."""
     try:
         os.kill(record["pid"], 0)
     except PermissionError:
         pass
     except (ProcessLookupError, OverflowError):
         return False
-    if messaging_socket_exists(record):
-        return True
     recorded_start = record.get("procStart", "")
-    return bool(recorded_start) and recorded_start == process_start(record["pid"])
+    if recorded_start:
+        return recorded_start == process_start(record["pid"])
+    return messaging_socket_exists(record)
 
 
 def messaging_socket_exists(record: SessionRecord) -> bool:
