@@ -181,6 +181,7 @@ class FollowableRecord(TypedDict):
     status: Literal["done", "failed"]
     role: NotRequired[SeatRole]
     context_tokens: NotRequired[int]
+    instructions_file: NotRequired[str]
 
 
 # `port` is the app-server the seat's launcher is attached to. It stays the seat's way in while
@@ -193,6 +194,7 @@ class ActiveRecord(TypedDict):
     port: NotRequired[int]
     role: NotRequired[SeatRole]
     context_tokens: NotRequired[int]
+    instructions_file: NotRequired[str]
 
 
 class StartingRecord(TypedDict):
@@ -202,6 +204,7 @@ class StartingRecord(TypedDict):
     port: NotRequired[int]
     role: NotRequired[SeatRole]
     context_tokens: NotRequired[int]
+    instructions_file: NotRequired[str]
 
 
 class WaitingCapacityRecord(TypedDict):
@@ -211,6 +214,7 @@ class WaitingCapacityRecord(TypedDict):
     port: NotRequired[int]
     role: NotRequired[SeatRole]
     context_tokens: NotRequired[int]
+    instructions_file: NotRequired[str]
 
 
 class ExhaustedRecord(TypedDict):
@@ -218,6 +222,7 @@ class ExhaustedRecord(TypedDict):
     status: Literal["capacity_exhausted"]
     role: NotRequired[SeatRole]
     context_tokens: NotRequired[int]
+    instructions_file: NotRequired[str]
 
 
 class EndedRecord(TypedDict):
@@ -225,6 +230,7 @@ class EndedRecord(TypedDict):
     status: Literal["ended"]
     role: NotRequired[SeatRole]
     context_tokens: NotRequired[int]
+    instructions_file: NotRequired[str]
 
 
 ThreadRecord = (FollowableRecord | ActiveRecord | StartingRecord |
@@ -640,6 +646,11 @@ def _update_roster(session_dir: str, name: str, record: ThreadRecord) -> None:
         role = record.get("role", previous.get("role"))
         if isinstance(role, str) and role in SEAT_ROLES:
             stored["role"] = role
+        instructions_file = record.get("instructions_file")
+        if instructions_file is None and previous.get("thread_id") == record["thread_id"]:
+            instructions_file = previous.get("instructions_file")
+        if isinstance(instructions_file, str) and instructions_file:
+            stored["instructions_file"] = instructions_file
         if record["status"] in ("starting", "running", WAITING_CAPACITY):
             pid = record.get("launcher_pid", previous.get("launcher_pid"))
             if isinstance(pid, int) and pid > 0:
@@ -728,6 +739,19 @@ def _lookup_state(session_dir: str, name: str) -> RosterThread:
     return _roster_thread(_lookup(session_dir, name))
 
 
+def _resume_params(session_dir: str, name: str, thread_id: str) -> dict[str, object]:
+    """Restore a roster thread's standing instructions whenever it is reopened."""
+    params: dict[str, object] = {"threadId": thread_id}
+    record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+    instructions_file = _as_str(record.get("instructions_file"))
+    if instructions_file:
+        try:
+            params["developerInstructions"] = Path(instructions_file).read_text(encoding="utf-8")
+        except UnicodeError as exc:
+            raise OSError(f"cannot read instructions file {instructions_file}: {exc}") from exc
+    return params
+
+
 def _roster_still_on_thread(session_dir: str, name: str, thread_id: str) -> bool:
     entry = _read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)
     state = _roster_thread(entry)
@@ -777,7 +801,8 @@ def _claim_follow(
 
 
 def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
-                          live_turn: str = "", *, finished: bool = False) -> None:
+                          live_turn: str = "", *, finished: bool = False,
+                          expected_thread_id: str = "") -> None:
     """Release only this launcher's unstarted claim; retain a peer's live turn."""
     path = _session_path(session_dir, ROSTER_FILE)
     with path.open("a+", encoding="utf-8") as handle:
@@ -786,6 +811,8 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
         roster = _as_dict(_loads(handle.read()))
         entry = _as_dict(roster.get(name))
         status = entry.get("status")
+        if expected_thread_id and entry.get("thread_id") != expected_thread_id:
+            return
         if entry.get("launcher_pid") != launcher_pid or not (
             status == "starting" or (finished and status == "running")
         ):
@@ -1680,7 +1707,7 @@ def command_follow(args: argparse.Namespace) -> int:
         port, _fresh = ensure_server(session_dir)
         _note_seat_port(session_dir, name, owner_pid, port)
         client = Client(port, name)
-        _ = _require(client.call("thread/resume", {"threadId": thread_id}), "thread/resume")
+        _ = _require(client.call("thread/resume", _resume_params(session_dir, name, thread_id)), "thread/resume")
         live = _read_live_turn(client, thread_id)
         if not isinstance(live, ThreadIdle):
             if isinstance(live, ThreadLive):
@@ -1842,7 +1869,7 @@ def command_compact(args: argparse.Namespace) -> int:
         port, _fresh = ensure_server(session_dir)
         client = Client(port, f"compact-{name}")
         _ = _require(
-            client.call("thread/resume", {"threadId": state.thread_id}),
+            client.call("thread/resume", _resume_params(session_dir, name, state.thread_id)),
             "thread/resume",
         )
         # A finished seat with a live turn is finishing one nobody waits on; give it time to end.
@@ -2332,10 +2359,15 @@ def _move_resident(
             _write_pending(handle, thread_id, messages)
 
         _move_queue_to_pending(client, thread_id, park)
+        params = _resume_params(session_dir, name, thread_id)
         client.close()
         port, _fresh = ensure_server(session_dir)
         moved = Client(port, name)
-        _ = _require(moved.call("thread/resume", {"threadId": thread_id}), "thread/resume")
+        try:
+            _ = _require(moved.call("thread/resume", params), "thread/resume")
+        except (ConnectionError, OSError, SystemExit):
+            moved.close()
+            raise
         turn_id = ""
         if messages:
             turn_id = _start_turn(moved, args, thread_id, messages[0], tuple(messages[1:]))
@@ -2353,7 +2385,18 @@ def _start_turn(
 ) -> str:
     inputs: list[dict[str, str]] = [{"type": "text", "text": message}]
     inputs.extend({"type": "text", "text": item} for item in pending)
+    images = _attr(args, "image")
+    if isinstance(images, list):
+        inputs.extend(
+            {"type": "localImage", "path": path}
+            for path in cast("list[object]", images) if isinstance(path, str)
+        )
     params: dict[str, object] = {"threadId": thread_id, "input": inputs}
+    cwd = _as_str(_attr(args, "turn_cwd"))
+    if cwd:
+        params["cwd"] = cwd
+    if _attr(args, "read_only") is True:
+        params["sandboxPolicy"] = {"type": "readOnly", "networkAccess": False}
     model = _as_str(_attr(args, "model"))
     if model:
         params["model"] = model
@@ -2405,7 +2448,7 @@ def _end_unwatched_turn(
     return RelaunchAllowed()
 
 
-def _load_thread(client: Client, thread_id: str) -> None:
+def _load_thread(client: Client, session_dir: str, name: str, thread_id: str) -> None:
     """Reopen a conversation this server has not loaded.
 
     A server started after the last one stopped accepts a queued message for a thread it has not
@@ -2414,7 +2457,7 @@ def _load_thread(client: Client, thread_id: str) -> None:
     """
     loaded = _as_dict(client.call("thread/loaded/list", {}).get("result")).get("data")
     if not isinstance(loaded, list) or thread_id not in cast("list[object]", loaded):
-        _ = _require(client.call("thread/resume", {"threadId": thread_id}), "thread/resume")
+        _ = _require(client.call("thread/resume", _resume_params(session_dir, name, thread_id)), "thread/resume")
 
 
 def command_send(args: argparse.Namespace) -> int:
@@ -2444,7 +2487,11 @@ def command_send(args: argparse.Namespace) -> int:
             return 0
         client = Client(_seat_port(session_dir, record), f"send-{os.getpid()}")
         try:
-            _load_thread(client, record["thread_id"])
+            try:
+                _load_thread(client, session_dir, target, record["thread_id"])
+            except OSError as exc:
+                print(f"codex_mesh: {target}: {exc}", file=sys.stderr)
+                return 1
             _ = _require(
                 client.call(
                     "thread/queue/add",
@@ -3246,6 +3293,171 @@ def command_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_prime(args: argparse.Namespace) -> int:
+    """Create a read-only reviewer template without starting a turn."""
+    session_dir = _as_str(_attr(args, "session_dir"))
+    name = _as_str(_attr(args, "name"))
+    client: Client | None = None
+    try:
+        instructions_path = Path(_as_str(_attr(args, "instructions_file"))).resolve()
+        instructions = instructions_path.read_text(encoding="utf-8")
+        params: dict[str, object] = {
+            "developerInstructions": instructions,
+            "cwd": _as_str(_attr(args, "cwd")),
+            "sandbox": "read-only",
+            "approvalPolicy": "never",
+        }
+        model = _as_str(_attr(args, "model"))
+        if model:
+            params["model"] = model
+        service_tier = _as_str(_attr(args, "service_tier"))
+        if service_tier:
+            params["serviceTier"] = service_tier
+        port, _fresh = ensure_server(session_dir)
+        client = Client(port, name)
+        result = _require(client.call("thread/start", params), "thread/start")
+        thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
+        if not thread_id:
+            raise SystemExit("thread/start returned no thread id")
+        _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": name}), "thread/name/set")
+        _update_roster(session_dir, name, {
+            "thread_id": thread_id, "status": "done", "role": "review",
+            "context_tokens": 0, "instructions_file": str(instructions_path),
+        })
+        print(thread_id)
+        return 0
+    except (ConnectionError, OSError, UnicodeError, SystemExit) as exc:
+        print(f"codex_mesh: {name}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if client is not None:
+            client.close()
+
+
+def command_fork(args: argparse.Namespace) -> int:
+    """Load a template and create a named read-only reviewer from it."""
+    session_dir = _as_str(_attr(args, "session_dir"))
+    name = _as_str(_attr(args, "name"))
+    client: Client | None = None
+    try:
+        existing = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+        if _as_str(existing.get("thread_id")) and existing.get("status") != "ended":
+            print(f"codex_mesh: {name}: name already belongs to a thread; fork refused", file=sys.stderr)
+            return 2
+        source_name = _as_str(_attr(args, "from_name"))
+        source_record = _lookup(session_dir, source_name)
+        source = _roster_thread(source_record)
+        if isinstance(source, InvalidThread):
+            raise SystemExit(source.reason)
+        port, _fresh = ensure_server(session_dir)
+        client = Client(port, name)
+        params = _resume_params(session_dir, source_name, source.thread_id)
+        _ = _require(client.call("thread/resume", params), "thread/resume")
+        fork_params = dict(params)
+        fork_params.update({"sandbox": "read-only", "approvalPolicy": "never"})
+        result = _require(client.call("thread/fork", fork_params), "thread/fork")
+        thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
+        if not thread_id:
+            raise SystemExit("thread/fork returned no thread id")
+        _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": name}), "thread/name/set")
+        record: FollowableRecord = {
+            "thread_id": thread_id, "status": "done", "role": "review", "context_tokens": 0,
+        }
+        instructions_file = _as_str(source_record.get("instructions_file"))
+        if instructions_file:
+            record["instructions_file"] = instructions_file
+        _update_roster(session_dir, name, record)
+        print(thread_id)
+        return 0
+    except (ConnectionError, OSError, SystemExit) as exc:
+        print(f"codex_mesh: {name}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _clear_reset_context(session_dir: str, name: str, thread_id: str, launcher_pid: int) -> bool:
+    """Clear context only while reset still owns this thread's seat claim."""
+    path = _session_path(session_dir, ROSTER_FILE)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _ = handle.seek(0)
+        roster = _as_dict(_loads(handle.read()))
+        entry = _as_dict(roster.get(name))
+        if (entry.get("thread_id") != thread_id or entry.get("status") != "starting"
+                or entry.get("launcher_pid") != launcher_pid):
+            return False
+        entry["context_tokens"] = 0
+        roster[name] = entry
+        _ = handle.seek(0)
+        _ = handle.truncate()
+        _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
+        handle.flush()
+        return True
+
+
+def command_reset(args: argparse.Namespace) -> int:
+    """Remove all review turns from an idle, followable thread."""
+    session_dir = _as_str(_attr(args, "session_dir"))
+    name = _as_str(_attr(args, "to"))
+    client: Client | None = None
+    claimed = False
+    claimed_thread_id = ""
+    owner_pid = os.getpid()
+    try:
+        state = _lookup_state(session_dir, name)
+        if not isinstance(state, FollowableThread):
+            reason = state.reason if isinstance(state, InvalidThread) else "seat is busy or not followable"
+            print(f"codex_mesh: {name}: {reason}; reset refused", file=sys.stderr)
+            return 2
+        role = _roster_role(_lookup(session_dir, name).get("role"))
+        reset_role = role.role if isinstance(role, AssignedDelegateRole) else "review"
+        if not _claim_follow(session_dir, name, state.thread_id, owner_pid, reset_role):
+            print(f"codex_mesh: {name}: seat was already claimed; reset refused", file=sys.stderr)
+            return 2
+        claimed = True
+        claimed_thread_id = state.thread_id
+        port, _fresh = ensure_server(session_dir)
+        client = Client(port, name)
+        _ = _require(client.call("thread/resume", _resume_params(session_dir, name, state.thread_id)), "thread/resume")
+        read = _require(client.call("thread/read", {
+            "threadId": state.thread_id, "includeTurns": False,
+        }), "thread/read")
+        thread = _as_dict(read.get("thread"))
+        status = _as_str(_as_dict(thread.get("status")).get("type"))
+        if status != "idle":
+            print(f"codex_mesh: {name}: thread state is {status or 'unknown'}; reset refused", file=sys.stderr)
+            return 2
+        result = _require(client.call("thread/turns/list", {
+            "threadId": state.thread_id, "sortDirection": "asc", "limit": 1,
+        }), "thread/turns/list")
+        turns = result.get("data")
+        if not isinstance(turns, list):
+            raise SystemExit("thread/turns/list returned no turn list")
+        if turns:
+            first_turn_id = _as_str(_as_dict(cast("list[object]", turns)[0]).get("id"))
+            if not first_turn_id:
+                raise SystemExit("thread/turns/list returned no first turn id")
+            _ = _require(client.call("thread/revert", {
+                "threadId": state.thread_id, "beforeTurnId": first_turn_id,
+            }), "thread/revert")
+        if not _clear_reset_context(session_dir, name, state.thread_id, owner_pid):
+            print(f"codex_mesh: {name}: seat claim changed; reset refused", file=sys.stderr)
+            return 2
+        return 0
+    except (ConnectionError, OSError, SystemExit) as exc:
+        print(f"codex_mesh: {name}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        try:
+            if client is not None:
+                client.close()
+        finally:
+            if claimed:
+                _restore_follow_claim(session_dir, name, owner_pid, expected_thread_id=claimed_thread_id)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="verb", required=True)
@@ -3293,8 +3505,31 @@ def main(argv: list[str] | None = None) -> int:
     _ = follow.add_argument("--model", default="")
     _ = follow.add_argument("--effort", default="")
     _ = follow.add_argument("--service-tier", default="")
+    _ = follow.add_argument("--cwd", dest="turn_cwd", default="")
+    _ = follow.add_argument("--read-only", action="store_true")
+    _ = follow.add_argument("--image", action="append", default=[])
     _ = follow.add_argument("--timeout", type=float, default=86400.0)
     follow.set_defaults(handler=command_follow)
+
+    prime = subparsers.add_parser("prime", help="create a read-only reviewer template without a turn")
+    _ = prime.add_argument("--session-dir", required=True)
+    _ = prime.add_argument("--name", required=True)
+    _ = prime.add_argument("--instructions-file", required=True)
+    _ = prime.add_argument("--cwd", required=True)
+    _ = prime.add_argument("--model", default="")
+    _ = prime.add_argument("--service-tier", default="")
+    prime.set_defaults(handler=command_prime)
+
+    fork = subparsers.add_parser("fork", help="create a named read-only fork of a template")
+    _ = fork.add_argument("--session-dir", required=True)
+    _ = fork.add_argument("--from", dest="from_name", required=True)
+    _ = fork.add_argument("--name", required=True)
+    fork.set_defaults(handler=command_fork)
+
+    reset = subparsers.add_parser("reset", help="remove all turns from an idle reviewer")
+    _ = reset.add_argument("--session-dir", required=True)
+    _ = reset.add_argument("--to", required=True)
+    reset.set_defaults(handler=command_reset)
 
     compact = subparsers.add_parser("compact", help="compact a finished delegate")
     _ = compact.add_argument("--session-dir", required=True)

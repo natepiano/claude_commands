@@ -234,6 +234,9 @@ class MeshCommandTests(unittest.TestCase):
     stale_read_turn: str  # pyright: ignore[reportUninitializedInstanceVariable]
     stale_reads: int  # pyright: ignore[reportUninitializedInstanceVariable]
     next_thread_id: str  # pyright: ignore[reportUninitializedInstanceVariable]
+    fork_thread_id: str  # pyright: ignore[reportUninitializedInstanceVariable]
+    history_turns: list[dict[str, object]]  # pyright: ignore[reportUninitializedInstanceVariable]
+    failing_method: str  # pyright: ignore[reportUninitializedInstanceVariable]
     auto_turn_starts: int  # pyright: ignore[reportUninitializedInstanceVariable]
     waits: list[float]  # pyright: ignore[reportUninitializedInstanceVariable]
     elapsed: float  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -265,6 +268,9 @@ class MeshCommandTests(unittest.TestCase):
         self.stale_read_turn = ""
         self.stale_reads = 0
         self.next_thread_id = THREAD_ID
+        self.fork_thread_id = "thread-review-fork"
+        self.history_turns = []
+        self.failing_method = ""
         self.auto_turn_starts = 0
         self.waits = []
         self.elapsed = 0.0
@@ -299,10 +305,22 @@ class MeshCommandTests(unittest.TestCase):
     def respond(self, request: dict[str, object]) -> list[dict[str, object]] | None:
         method = request.get("method")
         params = cast("dict[str, object]", request.get("params", {}))
+        if method == self.failing_method:
+            return [{"id": request["id"], "error": {"message": "scripted request failure"}}]
         if method == "thread/start":
             return [_reply(request, {"thread": {"id": self.next_thread_id}})]
         if method == "thread/resume":
             return [_reply(request, {"thread": {"id": params["threadId"]}})]
+        if method == "thread/fork":
+            return [_reply(request, {"thread": {"id": self.fork_thread_id}})]
+        if method == "thread/turns/list":
+            turns = self.history_turns.copy()
+            if params.get("sortDirection") != "asc":
+                turns.reverse()
+            limit = params.get("limit")
+            if isinstance(limit, int):
+                turns = turns[:limit]
+            return [_reply(request, {"data": turns, "nextCursor": None})]
         if method == "turn/start":
             self.error_threads.discard(cast("str", params.get("threadId", THREAD_ID)))
             self.turn_starts += 1
@@ -677,6 +695,621 @@ class MeshCommandTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()) as errors:
             result = codex_mesh.command_follow(args)
         return result, errors.getvalue()
+
+    def run_mesh(self, arguments: list[str]) -> tuple[int, str, str]:
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            contextlib.redirect_stderr(io.StringIO()) as errors,
+        ):
+            code = codex_mesh.main([
+                arguments[0], "--session-dir", str(self.session_dir), *arguments[1:]
+            ])
+        return code, output.getvalue(), errors.getvalue()
+
+    def write_pool_roster(self, entries: dict[str, object]) -> None:
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(
+            json.dumps(entries), encoding="utf-8"
+        )
+
+    def prime_cli(self, *options: str) -> list[str]:
+        instructions_file = self.session_dir / "review-instructions.txt"
+        _ = instructions_file.write_text("Review only.\nKeep café text intact.\n", encoding="utf-8")
+        return [
+            "prime", "--name", "template", "--instructions-file", str(instructions_file),
+            "--cwd", str(self.session_dir), *options,
+        ]
+
+    def follow_cli(self, *options: str) -> list[str]:
+        message_file = self.session_dir / "review-request.txt"
+        _ = message_file.write_text("Review the second worktree", encoding="utf-8")
+        return [
+            "follow", "--to", "seat", "--role", "review", "--message-file", str(message_file),
+            "--summary-file", str(self.session_dir / "summary.txt"),
+            "--log-file", str(self.session_dir / "seat.log"), "--timeout", "5", *options,
+        ]
+
+    def assert_review_record(self, name: str, thread_id: str) -> None:
+        record = _as_test_dict(self.roster().get(name))
+        self.assertEqual(
+            {key: record.get(key) for key in ("thread_id", "status", "role")},
+            {"thread_id": thread_id, "status": "done", "role": "review"},
+        )
+
+    def assert_request_failure_closes_clients(self, arguments: list[str], name: str) -> None:
+        client_type = codex_mesh.Client
+        original_close = client_type.close
+        opened: list[codex_mesh.Client] = []
+        closed: list[codex_mesh.Client] = []
+
+        def open_client(port: int, client_name: str) -> codex_mesh.Client:
+            client = client_type(port, client_name)
+            opened.append(client)
+            return client
+
+        def close_client(client: codex_mesh.Client) -> None:
+            closed.append(client)
+            original_close(client)
+
+        with (
+            patch.object(codex_mesh, "Client", open_client),
+            patch.object(client_type, "close", close_client),
+        ):
+            code, output, errors = self.run_mesh(arguments)
+
+        self.assertEqual(code, 1, errors)
+        self.assertEqual(output, "")
+        self.assertEqual(len(errors.splitlines()), 1, errors)
+        self.assertTrue(errors.startswith(f"codex_mesh: {name}: "), errors)
+        self.assertIn("scripted request failure", errors)
+        self.assertTrue(opened, "the failed request must use a client")
+        self.assertCountEqual(opened, closed)
+
+    def test_prime_creates_and_names_a_read_only_review_template_without_a_turn(self) -> None:
+        arguments = self.prime_cli("--model", "gpt-test", "--service-tier", "fast")
+        instructions = (self.session_dir / "review-instructions.txt").read_text(encoding="utf-8")
+        self.write_pool_roster({"other": {"thread_id": "other-thread", "status": "done"}})
+
+        code, output, errors = self.run_mesh(arguments)
+
+        self.assertEqual((code, output, errors), (0, f"{THREAD_ID}\n", ""))
+        requests = [request for request in self.server.requests if request.get("method") != "initialize"]
+        self.assertEqual([request["method"] for request in requests], ["thread/start", "thread/name/set"])
+        params = _as_test_dict(requests[0].get("params"))
+        self.assertEqual(params.get("developerInstructions"), instructions)
+        self.assertEqual(params.get("sandbox"), "read-only")
+        self.assertEqual(params.get("approvalPolicy"), "never")
+        self.assertEqual(params.get("cwd"), str(self.session_dir))
+        self.assertEqual(params.get("model"), "gpt-test")
+        self.assertEqual(params.get("serviceTier"), "fast")
+        self.assertEqual(requests[1]["params"], {"threadId": THREAD_ID, "name": "template"})
+        self.assert_review_record("template", THREAD_ID)
+        self.assertEqual(self.roster()["other"], {"thread_id": "other-thread", "status": "done"})
+        self.assertEqual(self.methods("turn/start"), [])
+
+    def test_prime_accepts_omitted_model_and_service_tier(self) -> None:
+        code, output, errors = self.run_mesh(self.prime_cli())
+
+        self.assertEqual((code, output, errors), (0, f"{THREAD_ID}\n", ""))
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assert_review_record("template", THREAD_ID)
+
+    def test_prime_reports_request_failures_and_closes_every_client(self) -> None:
+        for method in ("thread/start", "thread/name/set"):
+            with self.subTest(method=method):
+                self.write_pool_roster({})
+                self.failing_method = method
+                self.assert_request_failure_closes_clients(self.prime_cli(), "template")
+                self.assertNotIn("template", self.roster())
+
+    def test_prime_reports_an_unreadable_instructions_file_as_a_named_failure(self) -> None:
+        code, output, errors = self.run_mesh([
+            "prime", "--name", "template", "--cwd", str(self.session_dir),
+            "--instructions-file", str(self.session_dir / "missing-instructions.txt"),
+        ])
+
+        self.assertEqual(code, 1, errors)
+        self.assertEqual(output, "")
+        self.assertTrue(errors.startswith("codex_mesh: template: "), errors)
+        self.assertIn("missing-instructions.txt", errors)
+        self.assertEqual(self.methods("thread/start"), [])
+
+    def test_fork_resumes_the_source_before_creating_and_naming_a_read_only_review_thread(self) -> None:
+        source = {"thread_id": THREAD_ID, "status": "done", "role": "review"}
+        self.write_pool_roster({"template": source})
+
+        code, output, errors = self.run_mesh(["fork", "--from", "template", "--name", "reviewer"])
+
+        self.assertEqual((code, output, errors), (0, f"{self.fork_thread_id}\n", ""))
+        requests = [request for request in self.server.requests if request.get("method") != "initialize"]
+        self.assertEqual([request["method"] for request in requests],
+                         ["thread/resume", "thread/fork", "thread/name/set"])
+        self.assertEqual(_as_test_dict(requests[0]["params"]).get("threadId"), THREAD_ID)
+        self.assertEqual(requests[1]["params"], {
+            "threadId": THREAD_ID, "sandbox": "read-only", "approvalPolicy": "never",
+        })
+        self.assertEqual(requests[2]["params"], {"threadId": self.fork_thread_id, "name": "reviewer"})
+        self.assert_review_record("reviewer", self.fork_thread_id)
+        self.assertEqual(self.roster()["template"], source)
+        self.assertEqual(self.methods("turn/start"), [])
+
+    def test_fork_refuses_a_destination_with_any_nonended_thread(self) -> None:
+        for status in ("done", "failed", "running", "starting", "waiting_capacity", "exhausted", "unknown", ""):
+            with self.subTest(status=status):
+                entries: dict[str, object] = {
+                    "template": {"thread_id": THREAD_ID, "status": "done"},
+                    "reviewer": {"thread_id": "occupied-thread", "status": status},
+                }
+                self.write_pool_roster(entries)
+                self.server.requests.clear()
+
+                code, output, errors = self.run_mesh(["fork", "--from", "template", "--name", "reviewer"])
+
+                self.assertEqual(code, 2, errors)
+                self.assertEqual(output, "")
+                self.assertTrue(errors.startswith("codex_mesh: reviewer: "), errors)
+                self.assertEqual(self.roster(), entries)
+                self.assertEqual(self.methods("thread/fork"), [])
+                self.assertEqual(self.methods("thread/name/set"), [])
+
+    def test_fork_replaces_an_ended_destination_thread(self) -> None:
+        self.write_pool_roster({
+            "template": {"thread_id": THREAD_ID, "status": "done"},
+            "reviewer": {"thread_id": "ended-thread", "status": "ended", "context_tokens": 150000},
+        })
+
+        code, output, errors = self.run_mesh(["fork", "--from", "template", "--name", "reviewer"])
+
+        self.assertEqual((code, output, errors), (0, f"{self.fork_thread_id}\n", ""))
+        self.assertEqual(len(self.methods("thread/fork")), 1)
+        self.assert_review_record("reviewer", self.fork_thread_id)
+        self.assertEqual(_as_test_dict(self.roster()["reviewer"]).get("context_tokens"), 0)
+
+    def standing_instructions(self) -> Path:
+        path = self.session_dir / "standing-instructions.txt"
+        _ = path.write_text("Review only.\nEnd with café.\n", encoding="utf-8")
+        return path
+
+    def seed_instruction_thread(self, path: Path) -> None:
+        self.write_pool_roster({"seat": {
+            "thread_id": THREAD_ID, "status": "done", "role": "review",
+            "context_tokens": 150000, "instructions_file": str(path),
+        }})
+
+    def assert_instruction_resume(self, path: Path) -> None:
+        resumes = self.methods("thread/resume")
+        self.assertTrue(resumes, "the verb must resume the roster thread")
+        for request in resumes:
+            self.assertEqual(request["params"], {
+                "threadId": THREAD_ID,
+                "developerInstructions": path.read_text(encoding="utf-8"),
+            })
+
+    def test_prime_records_the_absolute_instructions_path(self) -> None:
+        path = self.standing_instructions()
+
+        code, _output, errors = self.run_mesh([
+            "prime", "--name", "template", "--cwd", str(self.session_dir),
+            "--instructions-file", os.path.relpath(path),
+        ])
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(_as_test_dict(self.roster()["template"]).get("instructions_file"), str(path))
+
+    def test_fork_supplies_and_copies_the_source_standing_instructions(self) -> None:
+        path = self.standing_instructions()
+        self.seed_instruction_thread(path)
+
+        code, _output, errors = self.run_mesh(["fork", "--from", "seat", "--name", "reviewer"])
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.methods("thread/fork")[0]["params"], {
+            "threadId": THREAD_ID, "sandbox": "read-only", "approvalPolicy": "never",
+            "developerInstructions": path.read_text(encoding="utf-8"),
+        })
+        self.assertEqual(_as_test_dict(self.roster()["reviewer"]).get("instructions_file"), str(path))
+
+    def test_fork_source_resume_supplies_standing_instructions(self) -> None:
+        path = self.standing_instructions()
+        self.seed_instruction_thread(path)
+
+        code, _output, errors = self.run_mesh(["fork", "--from", "seat", "--name", "reviewer"])
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assert_instruction_resume(path)
+
+    def test_follow_resume_supplies_standing_instructions(self) -> None:
+        path = self.standing_instructions()
+        self.seed_instruction_thread(path)
+
+        code, _output, errors = self.run_mesh(self.follow_cli())
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assert_instruction_resume(path)
+
+    def test_compact_resume_supplies_standing_instructions(self) -> None:
+        path = self.standing_instructions()
+        self.seed_instruction_thread(path)
+
+        code, _output, errors = self.run_mesh(["compact", "--to", "seat"])
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assert_instruction_resume(path)
+
+    def test_reset_resume_supplies_standing_instructions(self) -> None:
+        path = self.standing_instructions()
+        self.seed_instruction_thread(path)
+
+        code, _output, errors = self.run_mesh(["reset", "--to", "seat"])
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assert_instruction_resume(path)
+
+    def test_follow_completion_keeps_the_standing_instructions_path(self) -> None:
+        path = self.standing_instructions()
+        self.seed_instruction_thread(path)
+
+        code, _output, errors = self.run_mesh(self.follow_cli())
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertEqual(self.seat_record().get("instructions_file"), str(path))
+
+    def test_resume_without_standing_instructions_keeps_the_original_request(self) -> None:
+        cases = [self.follow_cli(), ["compact", "--to", "seat"],
+                 ["reset", "--to", "seat"], ["fork", "--from", "seat", "--name", "reviewer"]]
+        for arguments in cases:
+            with self.subTest(verb=arguments[0]):
+                self.write_pool_roster({"seat": {
+                    "thread_id": THREAD_ID, "status": "done", "role": "review", "context_tokens": 150000,
+                }})
+                self.server.requests.clear()
+
+                code, _output, errors = self.run_mesh(arguments)
+
+                self.assertEqual((code, errors), (0, ""))
+                resumes = self.methods("thread/resume")
+                self.assertTrue(resumes)
+                for request in resumes:
+                    self.assertEqual(request["params"], {"threadId": THREAD_ID})
+
+    def test_unreadable_standing_instructions_fail_before_any_turn(self) -> None:
+        path = self.session_dir / "missing-standing-instructions.txt"
+        cases = [(self.follow_cli(), "seat"), (["compact", "--to", "seat"], "seat"),
+                 (["reset", "--to", "seat"], "seat"),
+                 (["fork", "--from", "seat", "--name", "reviewer"], "reviewer")]
+        for arguments, name in cases:
+            with self.subTest(verb=arguments[0]):
+                self.seed_instruction_thread(path)
+                self.server.requests.clear()
+
+                code, output, errors = self.run_mesh(arguments)
+
+                self.assertEqual(code, 1, errors)
+                self.assertEqual(output, "")
+                self.assertTrue(errors.startswith(f"codex_mesh: {name}: "), errors)
+                self.assertIn(path.name, errors)
+                self.assertEqual(self.methods("turn/start"), [])
+                self.assertEqual(self.methods("thread/compact/start"), [])
+                self.assertEqual(self.methods("thread/revert"), [])
+                self.assertEqual(self.methods("thread/fork"), [])
+
+    def claim_review_follow(self) -> bool:
+        return codex_mesh._claim_follow(  # pyright: ignore[reportPrivateUsage]
+            str(self.session_dir), "seat", THREAD_ID, os.getpid(), "review"
+        )
+
+    def test_reset_and_a_follow_claim_between_idle_read_and_revert_have_one_winner(self) -> None:
+        self.write_pool_roster({"seat": {
+            "thread_id": THREAD_ID, "status": "done", "role": "review", "context_tokens": 9876,
+        }})
+        self.history_turns = [{"id": "first-turn", "status": "completed", "items": []}]
+        claims: list[bool] = []
+        claimed_records: list[dict[str, object]] = []
+        respond = self.server.respond
+
+        def claim_during_list(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/turns/list":
+                claims.append(self.claim_review_follow())
+                claimed_records.append(self.seat_record())
+            return respond(request)
+
+        self.server.respond = claim_during_list
+
+        code, _output, errors = self.run_mesh(["reset", "--to", "seat"])
+
+        self.assertEqual(len(claims), 1, "the claim must race after idle read, before revert")
+        if claims[0]:
+            self.assertEqual(code, 2, errors)
+            self.assertEqual(self.methods("thread/revert"), [])
+            self.assertEqual(self.seat_record(), claimed_records[0])
+            self.assertEqual(self.seat_record()["status"], "starting")
+            self.assertEqual(self.seat_record()["launcher_pid"], os.getpid())
+        else:
+            self.assertEqual((code, errors), (0, ""))
+            self.assertEqual(len(self.methods("thread/revert")), 1)
+            self.assertEqual(self.seat_record()["context_tokens"], 0)
+            self.assertTrue(self.claim_review_follow(), "reset must release its winning claim")
+
+    def test_reset_refuses_a_seat_with_a_follow_claim_and_preserves_the_launcher(self) -> None:
+        self.write_pool_roster({"seat": {"thread_id": THREAD_ID, "status": "done", "role": "review"}})
+        self.assertTrue(self.claim_review_follow())
+        claimed = self.seat_record()
+
+        code, _output, errors = self.run_mesh(["reset", "--to", "seat"])
+
+        self.assertEqual(code, 2, errors)
+        self.assertEqual(self.methods("thread/revert"), [])
+        self.assertEqual(self.seat_record(), claimed)
+
+    def test_reset_releases_its_claim_after_success_with_or_without_history(self) -> None:
+        histories: list[list[dict[str, object]]] = [
+            [], [{"id": "first-turn", "status": "completed", "items": []}],
+        ]
+        for history in histories:
+            with self.subTest(history=history):
+                self.write_pool_roster({"seat": {
+                    "thread_id": THREAD_ID, "status": "done", "role": "review", "context_tokens": 9876,
+                }})
+                self.history_turns = history
+
+                code, _output, errors = self.run_mesh(["reset", "--to", "seat"])
+
+                self.assertEqual((code, errors), (0, ""))
+                self.assertNotIn("launcher_pid", self.seat_record())
+                self.assertTrue(self.claim_review_follow(), "follow must be claimable immediately")
+
+    def test_reset_releases_its_claim_after_each_failed_request(self) -> None:
+        self.history_turns = [{"id": "first-turn", "status": "completed", "items": []}]
+        for method in ("thread/resume", "thread/read", "thread/turns/list", "thread/revert"):
+            with self.subTest(method=method):
+                self.write_pool_roster({"seat": {
+                    "thread_id": THREAD_ID, "status": "done", "role": "review", "context_tokens": 9876,
+                }})
+                self.failing_method = method
+
+                code, _output, errors = self.run_mesh(["reset", "--to", "seat"])
+
+                self.assertEqual(code, 1, errors)
+                self.assertEqual(self.seat_record()["context_tokens"], 9876)
+                self.assertNotIn("launcher_pid", self.seat_record())
+                self.assertTrue(self.claim_review_follow(), "failure must release reset ownership")
+
+    def test_start_namespace_keeps_cwd_on_thread_start_and_out_of_turn_start(self) -> None:
+        code, errors = self.run_start()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.methods("thread/start")[0]["params"], {
+            "cwd": str(self.session_dir), "approvalPolicy": "never",
+            "sandbox": "danger-full-access", "model": "gpt-test",
+        })
+        self.assertEqual(self.methods("turn/start")[0]["params"], {
+            "threadId": THREAD_ID,
+            "input": [{"type": "text", "text": "Original delegate task"}],
+            "model": "gpt-test", "effort": "high",
+        })
+
+    def test_follow_cwd_is_parsed_into_the_turn_cwd_destination(self) -> None:
+        parsed: list[argparse.Namespace] = []
+
+        def capture(args: argparse.Namespace) -> int:
+            parsed.append(args)
+            return 0
+
+        with patch.object(codex_mesh, "command_follow", capture):
+            code, _output, errors = self.run_mesh(self.follow_cli("--cwd", str(self.session_dir)))
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(getattr(parsed[0], "turn_cwd", ""), str(self.session_dir))
+        self.assertFalse(hasattr(parsed[0], "cwd"))
+
+    def test_fork_reports_request_failures_and_closes_every_client(self) -> None:
+        for method in ("thread/resume", "thread/fork", "thread/name/set"):
+            with self.subTest(method=method):
+                self.write_pool_roster({"template": {"thread_id": THREAD_ID, "status": "done"}})
+                self.failing_method = method
+                self.assert_request_failure_closes_clients(
+                    ["fork", "--from", "template", "--name", "reviewer"], "reviewer"
+                )
+                self.assertNotIn("reviewer", self.roster())
+
+    def test_reset_reverts_before_the_earliest_turn_and_clears_context_for_followable_states(self) -> None:
+        self.history_turns = [
+            {"id": "first-turn", "status": "completed", "items": []},
+            {"id": "later-turn", "status": "completed", "items": []},
+        ]
+        for status in ("done", "failed"):
+            with self.subTest(status=status):
+                original = {"thread_id": THREAD_ID, "status": status, "role": "review", "context_tokens": 9876}
+                self.write_pool_roster({"seat": original})
+                self.server.requests.clear()
+
+                code, _output, errors = self.run_mesh(["reset", "--to", "seat"])
+
+                self.assertEqual((code, errors), (0, ""))
+                requests = [request for request in self.server.requests if request.get("method") != "initialize"]
+                methods = [request["method"] for request in requests]
+                self.assertIn("thread/read", methods)
+                self.assertLess(methods.index("thread/read"), methods.index("thread/turns/list"))
+                self.assertEqual([method for method in methods if method != "thread/read"],
+                                 ["thread/resume", "thread/turns/list", "thread/revert"])
+                self.assertEqual(_as_test_dict(self.methods("thread/resume")[0]["params"]).get("threadId"), THREAD_ID)
+                self.assertEqual(_as_test_dict(self.methods("thread/turns/list")[0]["params"]).get("threadId"), THREAD_ID)
+                self.assertEqual(self.methods("thread/revert")[0]["params"], {
+                    "threadId": THREAD_ID, "beforeTurnId": "first-turn",
+                })
+                self.assertEqual(self.seat_record(), {**original, "context_tokens": 0})
+                self.assertEqual(self.methods("turn/start"), [])
+
+    def test_reset_of_a_thread_without_turns_clears_context_without_reverting(self) -> None:
+        self.write_pool_roster({"seat": {
+            "thread_id": THREAD_ID, "status": "done", "role": "review", "context_tokens": 9876,
+        }})
+
+        code, _output, errors = self.run_mesh(["reset", "--to", "seat"])
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(len(self.methods("thread/resume")), 1)
+        self.assertEqual(len(self.methods("thread/turns/list")), 1)
+        self.assertEqual(self.methods("thread/revert"), [])
+        self.assertEqual(self.seat_record()["context_tokens"], 0)
+
+    def test_reset_refuses_nonfollowable_roster_states_without_reverting(self) -> None:
+        for status in ("running", "starting", "waiting_capacity", "exhausted", "ended", "unknown", ""):
+            with self.subTest(status=status):
+                entries: dict[str, object] = {"seat": {
+                    "thread_id": THREAD_ID, "status": status, "context_tokens": 9876,
+                }}
+                self.write_pool_roster(entries)
+                self.server.requests.clear()
+
+                code, output, errors = self.run_mesh(["reset", "--to", "seat"])
+
+                self.assertEqual(code, 2, errors)
+                self.assertEqual(output, "")
+                self.assertTrue(errors.startswith("codex_mesh: seat: "), errors)
+                self.assertEqual(self.roster(), entries)
+                self.assertEqual(self.methods("thread/revert"), [])
+                self.assertEqual(self.methods("thread/turns/list"), [])
+
+    def test_reset_refuses_threads_that_do_not_read_idle(self) -> None:
+        for status in ("active", "systemError", "notLoaded"):
+            with self.subTest(status=status):
+                entries: dict[str, object] = {"seat": {
+                    "thread_id": THREAD_ID, "status": "done", "context_tokens": 9876,
+                }}
+                self.write_pool_roster(entries)
+                self.thread_statuses[THREAD_ID] = status
+                self.server.requests.clear()
+
+                code, output, errors = self.run_mesh(["reset", "--to", "seat"])
+
+                self.assertEqual(code, 2, errors)
+                self.assertEqual(output, "")
+                self.assertTrue(errors.startswith("codex_mesh: seat: "), errors)
+                self.assertTrue(self.methods("thread/read"))
+                self.assertEqual(self.methods("thread/turns/list"), [])
+                self.assertEqual(self.methods("thread/revert"), [])
+                self.assertEqual(self.roster(), entries)
+
+    def test_reset_refuses_a_live_turn_without_erasing_its_context(self) -> None:
+        self.live_turn = "live-review-turn"
+        entries: dict[str, object] = {"seat": {
+            "thread_id": THREAD_ID, "status": "done", "context_tokens": 9876,
+        }}
+        self.write_pool_roster(entries)
+
+        code, output, errors = self.run_mesh(["reset", "--to", "seat"])
+
+        self.assertEqual(code, 2, errors)
+        self.assertEqual(output, "")
+        self.assertTrue(errors.startswith("codex_mesh: seat: "), errors)
+        self.assertEqual(self.methods("thread/revert"), [])
+        self.assertEqual(self.roster(), entries)
+
+    def test_reset_reports_request_failures_without_clearing_context_and_closes_clients(self) -> None:
+        self.history_turns = [{"id": "first-turn", "status": "completed", "items": []}]
+        for method in ("thread/resume", "thread/read", "thread/turns/list", "thread/revert"):
+            with self.subTest(method=method):
+                entries: dict[str, object] = {"seat": {
+                    "thread_id": THREAD_ID, "status": "done", "context_tokens": 9876,
+                }}
+                self.write_pool_roster(entries)
+                self.failing_method = method
+                self.assert_request_failure_closes_clients(["reset", "--to", "seat"], "seat")
+                self.assertEqual(self.roster(), entries)
+
+    def test_follow_cli_sends_worktree_read_only_policy_and_images_after_text_in_order(self) -> None:
+        self.write_pool_roster({"seat": {"thread_id": THREAD_ID, "status": "done", "role": "review"}})
+        worktree = self.session_dir / "second-worktree"
+        worktree.mkdir()
+        images = [self.session_dir / "first.png", self.session_dir / "second.png"]
+        for path in images:
+            _ = path.write_bytes(b"image fixture")
+
+        code, _output, errors = self.run_mesh(self.follow_cli(
+            "--cwd", str(worktree), "--read-only", "--image", str(images[0]), "--image", str(images[1]),
+            "--model", "gpt-test", "--effort", "high",
+        ))
+
+        self.assertEqual((code, errors), (0, ""))
+        starts = self.methods("turn/start")
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0]["params"], {
+            "threadId": THREAD_ID,
+            "input": [
+                {"type": "text", "text": "Review the second worktree"},
+                {"type": "localImage", "path": str(images[0])},
+                {"type": "localImage", "path": str(images[1])},
+            ],
+            "model": "gpt-test", "effort": "high", "cwd": str(worktree),
+            "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+        })
+
+    def test_follow_cli_without_new_flags_keeps_the_original_turn_request(self) -> None:
+        cases: list[tuple[list[str], dict[str, object]]] = [
+            ([], {}),
+            (["--model", "gpt-test", "--effort", "high"], {"model": "gpt-test", "effort": "high"}),
+        ]
+        for options, overrides in cases:
+            with self.subTest(options=options):
+                self.write_pool_roster({"seat": {"thread_id": THREAD_ID, "status": "done", "role": "review"}})
+                self.server.requests.clear()
+
+                code, _output, errors = self.run_mesh(self.follow_cli(*options))
+
+                self.assertEqual((code, errors), (0, ""))
+                starts = self.methods("turn/start")
+                self.assertEqual(len(starts), 1)
+                self.assertEqual(starts[0]["params"], {
+                    "threadId": THREAD_ID,
+                    "input": [{"type": "text", "text": "Review the second worktree"}],
+                    **overrides,
+                })
+
+    def test_follow_cli_accepts_each_new_flag_independently(self) -> None:
+        image = self.session_dir / "review.png"
+        _ = image.write_bytes(b"image fixture")
+        cases: list[tuple[list[str], dict[str, object]]] = [
+            (["--cwd", str(self.session_dir)], {"cwd": str(self.session_dir)}),
+            (["--read-only"], {"sandboxPolicy": {"type": "readOnly", "networkAccess": False}}),
+            (["--image", str(image)], {"input": [
+                {"type": "text", "text": "Review the second worktree"},
+                {"type": "localImage", "path": str(image)},
+            ]}),
+        ]
+        for options, overrides in cases:
+            with self.subTest(options=options):
+                self.write_pool_roster({"seat": {"thread_id": THREAD_ID, "status": "done", "role": "review"}})
+                self.server.requests.clear()
+
+                code, _output, errors = self.run_mesh(self.follow_cli(*options))
+
+                self.assertEqual((code, errors), (0, ""))
+                starts = self.methods("turn/start")
+                self.assertEqual(len(starts), 1)
+                self.assertEqual(starts[0]["params"], {
+                    "threadId": THREAD_ID,
+                    "input": [{"type": "text", "text": "Review the second worktree"}],
+                    **overrides,
+                })
+
+    def test_pool_verbs_report_server_failures_with_the_destination_name(self) -> None:
+        cases = [
+            (self.prime_cli(), "template"),
+            (["fork", "--from", "template", "--name", "reviewer"], "reviewer"),
+            (["reset", "--to", "seat"], "seat"),
+        ]
+        for arguments, name in cases:
+            with self.subTest(verb=arguments[0]):
+                self.write_pool_roster({
+                    "template": {"thread_id": THREAD_ID, "status": "done"},
+                    "seat": {"thread_id": THREAD_ID, "status": "done"},
+                })
+                with patch.object(codex_mesh, "ensure_server", side_effect=OSError("server unavailable")):
+                    code, output, errors = self.run_mesh(arguments)
+
+                self.assertEqual((code, output, errors), (1, "", f"codex_mesh: {name}: server unavailable\n"))
 
     def test_follow_records_its_server_before_it_reopens_the_thread(self) -> None:
         # A message sent while the follow-up is starting reaches the seat through this port.
