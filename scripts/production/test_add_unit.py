@@ -398,6 +398,25 @@ class AddUnitTests(unittest.TestCase):
         return [cast(list[str], record["args"]) for record in self.events("tmux")
                 if cast(list[str], record["args"])[:1] == ["new-session"]]
 
+    def restore(self, name: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+        return self.cli(name, "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(cwd),
+                        "--restart-note", str(note), "--session-name", "recorded-name",
+                        "--tmux-session", "recorded-tmux")
+
+    def repository_state(self) -> tuple[str, str, str]:
+        """The production doc, every branch with its commit, and every worktree with its branch."""
+        return (self.doc.read_text(), self.git("for-each-ref", "refs/heads"),
+                self.git("worktree", "list", "--porcelain"))
+
+    def commit_row_off_the_naming_pattern(self) -> Path:
+        """Unit `trunk` as seen live: neither its worktree nor its branch is what the naming pattern gives."""
+        worktree = self.root / "tool-based-ui-trunk"
+        _ = self.git("worktree", "add", str(worktree), "-b", "init/catalyst-trunk")
+        self.commit_prepared_row(self.unit_row("trunk", branch="init/catalyst-trunk", worktree=worktree))
+        return worktree
+
     def run_with_marked_unit(
         self,
         launch_kind: add_unit.NewWorkLaunch | add_unit.UnitRestoreLaunch,
@@ -521,6 +540,7 @@ class AddUnitTests(unittest.TestCase):
         self.assert_no_launch_change(document, head)
 
     def test_restart_restore_is_allowed_for_its_restarting_unit(self) -> None:
+        self.commit_prepared_row(self.unit_row())
         self.write_shutdown_record(self.shutdown_record("restarting"))
         prior = self.root / "prior-session"
         prior.mkdir()
@@ -546,6 +566,117 @@ class AddUnitTests(unittest.TestCase):
         self.assertIn("alpha-unit started", result.stdout)
         self.assertEqual(len(self.events("systemd-run")), 1)
         self.assertEqual(len(self.recorded_prompts("session-123")), 1)
+
+    def test_restart_restore_adopts_a_row_added_from_a_brief_whose_plan_is_now_its_as_built(self) -> None:
+        checkout = self.doc.parents[2]
+        (checkout / "docs/as-built").mkdir(parents=True, exist_ok=True)
+        _ = (checkout / "docs/as-built/alpha.md").write_text("# Alpha\n", encoding="utf-8")
+        row = self.unit_row(plan="docs/as-built/alpha.md")
+        _ = self.doc.write_text(self.production_doc().replace("## Gates", row + "\n\n## Gates"), encoding="utf-8")
+        _ = self.git("add", "docs/plans/build-followups-production.md", "docs/as-built/alpha.md")
+        _ = self.git("commit", "-m", "production(build-followups): add unit alpha-unit (brief)")
+        _ = self.git("push", "origin", "build-followups")
+        self.write_shutdown_record(self.shutdown_record("restarting"))
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+
+        result = self.successful(
+            "alpha",
+            "--plan",
+            "docs/as-built/alpha.md",
+            "--resume",
+            "session-123",
+            "--cwd",
+            str(prior),
+            "--restart-note",
+            str(note),
+            "--session-name",
+            "recorded-name",
+            "--tmux-session",
+            "recorded-tmux",
+        )
+
+        self.assertIn("alpha-unit started", result.stdout)
+        self.assertEqual(len(self.recorded_prompts("session-123")), 1)
+
+    def test_restore_without_a_units_row_is_refused_and_adds_nothing(self) -> None:
+        self.write_shutdown_record(self.shutdown_record("restarting"))
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+
+        result = self.cli(
+            "alpha", "--plan", "docs/plans/given.md",
+            "--resume", "session-123", "--cwd", str(prior),
+            "--restart-note", str(note),
+            "--session-name", "recorded-name", "--tmux-session", "recorded-tmux",
+        )
+
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(
+            result.stderr, "add_unit: unit alpha-unit has no Units row; a restore never adds one\n"
+        )
+        self.assert_no_launch_change(document, head)
+
+    def test_restore_adopts_a_row_whose_worktree_and_branch_are_off_the_naming_pattern(self) -> None:
+        recorded = self.commit_row_off_the_naming_pattern()
+        before = self.repository_state()
+
+        result = self.restore("trunk", recorded)
+
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(result.stderr, "")
+        tmux = self.new_sessions()[0]
+        self.assertEqual(tmux[tmux.index("-c") + 1], str(recorded))
+        self.assertEqual(self.repository_state(), before)
+
+    def test_new_work_and_a_promote_still_refuse_a_row_off_the_naming_pattern(self) -> None:
+        recorded = self.commit_row_off_the_naming_pattern()
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        promote = ("--resume", "session-123", "--cwd", str(recorded))
+        for launch, flags in (("new work", ()), ("promote", promote)):
+            with self.subTest(launch=launch):
+                result = self.cli("trunk", "--plan", "docs/plans/given.md", *flags)
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertEqual(
+                    result.stderr,
+                    f"add_unit: unit trunk-unit Worktree is {str(recorded)!r}; expected {str(self.checkout)!r}\n",
+                )
+                self.assert_no_launch_change(document, head)
+
+    def test_restore_in_a_cwd_other_than_the_row_worktree_launches_there(self) -> None:
+        self.commit_prepared_row(self.unit_row())
+        worktree = self.root / "project-alpha"
+        recorded = self.root / "prior-session"
+        _ = self.git("worktree", "add", str(recorded), "-b", "build-followups-alpha")
+        before = self.repository_state()
+
+        result = self.restore("alpha", recorded)
+
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(result.stderr, "")
+        tmux = self.new_sessions()[0]
+        self.assertEqual(tmux[tmux.index("-c") + 1], str(recorded))
+        self.assertEqual(self.repository_state(), before)
+        self.assertFalse(worktree.exists())
+
+    def test_restore_in_the_row_worktree_on_another_branch_launches(self) -> None:
+        self.commit_prepared_row(self.unit_row())
+        worktree = self.root / "project-alpha"
+        _ = self.git("worktree", "add", str(worktree), "-b", "other-branch")
+        before = self.repository_state()
+
+        result = self.restore("alpha", worktree)
+
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(self.repository_state(), before)
 
     def test_restart_restore_is_refused_when_record_is_down(self) -> None:
         self.write_shutdown_record(self.shutdown_record("down"))
@@ -1059,6 +1190,7 @@ class AddUnitTests(unittest.TestCase):
         self.assertIn("--resume session-123", self.launch_command())
 
     def test_unit_restore_uses_the_current_unit_account(self) -> None:
+        self.commit_prepared_row(self.unit_row())
         self.env["CLAUDE_CONFIG_DIR"] = str(self.select_unit_account("claude 1"))
         directory = self.prepare_unit_account("claude 3")
         prior = self.root / "prior-session"
@@ -1488,6 +1620,7 @@ class AddUnitTests(unittest.TestCase):
                 self.assertEqual(self.events("systemd-run"), [])
 
     def test_restore_note_recorded_names_and_unique_scope_drive_the_launch(self) -> None:
+        self.commit_prepared_row(self.unit_row())
         prior = self.root / "prior session"
         prior.mkdir()
         note = self.root / "restart note.txt"
@@ -1547,6 +1680,7 @@ class AddUnitTests(unittest.TestCase):
         self.assertGreater(int(epoch), 0)
 
     def test_restore_refuses_launch_when_prompt_cannot_be_recorded(self) -> None:
+        self.commit_prepared_row(self.unit_row())
         prior = self.root / "prior-session"
         prior.mkdir()
         note = self.root / "restart-note.txt"

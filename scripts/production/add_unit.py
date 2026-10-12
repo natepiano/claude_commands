@@ -9,7 +9,7 @@ import shlex
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
@@ -136,6 +136,11 @@ class UnitLaunchConfiguration:
         if isinstance(self.plan, PlanGiven):
             return "plan"
         return "brief" if isinstance(self.plan, BriefGiven) else "standby"
+
+    @property
+    def session_cwd(self) -> Path:
+        """Where the session runs: a resumed one where its transcript lives, a new one in the worktree."""
+        return self.session.cwd if isinstance(self.session, ResumedSession) else self.worktree
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -418,6 +423,9 @@ def desired_row(request: UnitLaunch, headings: list[str]) -> str:
 
 
 def row_is_present(request: RequestedUnitLaunch, lines: list[str]) -> NoUnitRow | ExistingUnitRow:
+    # A restore creates no worktree or branch, so the naming pattern behind `request.worktree` and
+    # `request.branch` neither reserves them against other rows nor has to match the unit's own row.
+    restoring = isinstance(request.launch_kind, UnitRestoreLaunch)
     matching: list[ExistingUnitRow] = []
     for cells in unit_table(lines):
         fields = {heading: cell_value(cell) for heading, cell in cells.items()}
@@ -427,16 +435,17 @@ def row_is_present(request: RequestedUnitLaunch, lines: list[str]) -> NoUnitRow 
                                                 fields["Port"], fields["Owns"]))
             except KeyError as error:
                 raise Refusal(f"unit {request.unit} has an invalid Units row") from error
-        elif fields.get("Worktree") == str(request.worktree) or fields.get("Branch") == request.branch:
+        elif not restoring and (fields.get("Worktree") == str(request.worktree)
+                                or fields.get("Branch") == request.branch):
             raise Refusal(f"branch or worktree for {request.unit} is already used in Units table")
     if len(matching) > 1:
         raise Refusal(f"unit name {request.unit} is already taken in Units table")
     if not matching:
         return NoUnitRow()
     existing = matching[0]
-    for cell, actual, expected in (("Plan", existing.plan, request.plan_cell),
-                                   ("Worktree", existing.worktree, str(request.worktree)),
-                                   ("Branch", existing.branch, request.branch)):
+    pattern_cells = () if restoring else (("Worktree", existing.worktree, str(request.worktree)),
+                                          ("Branch", existing.branch, request.branch))
+    for cell, actual, expected in (("Plan", existing.plan, request.plan_cell), *pattern_cells):
         if actual != expected:
             raise Refusal(f"unit {request.unit} {cell} is {actual!r}; expected {expected!r}")
     for cell, actual, supplied in (("Port", existing.port, request.port),
@@ -520,6 +529,12 @@ def preflight(request: RequestedUnitLaunch) -> ReadyToLaunch:
         raise Refusal("production doc must be inside Showrunner checkout") from error
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     existing = row_is_present(request, lines)
+    restoring = isinstance(request.launch_kind, UnitRestoreLaunch)
+    if restoring:
+        if isinstance(existing, NoUnitRow):
+            raise Refusal(f"unit {request.unit} has no Units row; a restore never adds one")
+        # Its row, not the naming pattern, names a restored unit's worktree and branch.
+        request = replace(request, worktree=Path(existing.worktree), branch=existing.branch)
     launch = UnitLaunch(
         production=request.production,
         identity=UnitIdentity(request.unit, request.requested_name),
@@ -532,6 +547,11 @@ def preflight(request: RequestedUnitLaunch) -> ReadyToLaunch:
         launch_kind=request.launch_kind,
         timeout=request.timeout,
     )
+    if restoring:
+        # A restore adopts the row it matched and creates nothing: how the unit was first added, whether
+        # its Plan cell still names a live plan rather than its as-built, and whether its worktree and
+        # branch are free all describe new work, not the session it resumes.
+        return ReadyToLaunch(launch, existing, director_agent(launch))
     if isinstance(existing, ExistingUnitRow) and recorded_mode(launch, existing) != launch.mode_name:
         raise Refusal(f"unit name {launch.identity.unit} is already taken in Units table")
     has_worktree = worktree_on_branch(launch)
@@ -689,12 +709,11 @@ def launch_session(
     argv.extend(["--remote-control", session_name, "-n", session_name,
                  "--settings", '{"disableAgentView": true}', prompt])
     command = account_prefix(selected) + "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
-    cwd = request.session.cwd if isinstance(request.session, ResumedSession) else request.worktree
     environment = launch_environment()
     scope_name = re.sub(r"[^A-Za-z0-9_.-]", "-", tmux_session)
     scope = f"--unit={scope_name}-{int(time.time())}"
     _ = subprocess.run(["systemd-run", "--user", "--scope", scope, tmux,
-                        "new-session", "-d", "-s", tmux_session, "-c", str(cwd),
+                        "new-session", "-d", "-s", tmux_session, "-c", str(request.session_cwd),
                         *(argument for name, value in marks.items() for argument in ("-e", f"{name}={value}")),
                         "zsh", "-ic", command],
                        env=environment, text=True, capture_output=True, check=True)
@@ -865,7 +884,9 @@ def main(argv: list[str]) -> int:
             write_stub(request)
             append_row(request, ready.row)
             commit_unit(request)
-            ensure_worktree(request)
+            # A restore resumes in the recorded cwd and creates no worktree or branch.
+            if not isinstance(request.launch_kind, UnitRestoreLaunch):
+                ensure_worktree(request)
             if isinstance(marked_unit, NoMarkedUnit):
                 prompt = prompt_for(request)
                 if isinstance(request.launch_kind, UnitRestoreLaunch):

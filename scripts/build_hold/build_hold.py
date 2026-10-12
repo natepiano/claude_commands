@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, time as ClockTime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, Required, TypedDict, cast
+from typing import Literal, NotRequired, Required, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
@@ -40,6 +40,24 @@ LOOKUP_RETRY_S = 1.0
 GateOutcome = Literal["Granted", "TimedOut", "MeminfoUnavailable"]
 
 
+@dataclass(frozen=True)
+class OwningSession:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class NoOwningSession:
+    pass
+
+
+class PendingCall(TypedDict):
+    call_id: str
+    pid: int
+    proc_start: str
+    started: bool
+    admitted_generation: int
+
+
 class ReleaseEntry(TypedDict, total=False):
     session_id: Required[str]
     name: Required[str]
@@ -50,6 +68,11 @@ class ReleaseEntry(TypedDict, total=False):
     wait_ended_at: str
     outcome: str
     answered_at: str
+    calls: Required[list[PendingCall]]
+    active_call_id: Required[str]
+    active_released_at: Required[str]
+    session_pending: Required[bool]
+    session_admitted_generation: Required[int]
 
 
 class HoldCycle(TypedDict):
@@ -59,6 +82,8 @@ class HoldCycle(TypedDict):
     recipients: dict[str, str]
     entries: list[ReleaseEntry]
     release_started_at: str
+    holder_generation: NotRequired[int]
+    holder_signature: NotRequired[str]
 
 
 class ReleaseRecordReadError(ValueError):
@@ -68,6 +93,26 @@ class ReleaseRecordReadError(ValueError):
 @dataclass(frozen=True)
 class NoCycle:
     pass
+
+
+@dataclass(frozen=True)
+class AwaitingTurn:
+    cycle_id: str
+    generation: int
+
+
+@dataclass(frozen=True)
+class AdmittedTurn:
+    cycle_id: str
+    generation: int
+
+
+@dataclass(frozen=True)
+class AdmissionReadError:
+    reason: str
+
+
+Admission = NoCycle | AwaitingTurn | AdmittedTurn | AdmissionReadError
 
 
 @dataclass(frozen=True)
@@ -141,7 +186,7 @@ def read_release_state(entry: Mapping[str, object]) -> ReleaseState:
     session_id = entry.get("session_id")
     if not isinstance(state, str) or not isinstance(session_id, str) or not isinstance(entry.get("name"), str):
         raise ValueError("invalid release entry identity or state")
-    fields = set(entry) - {"session_id", "name", "state"}
+    fields = set(entry) - {"session_id", "name", "state", "calls", "active_call_id", "active_released_at", "session_pending", "session_admitted_generation"}
     expected: dict[str, set[str]] = {
         "AwaitingRelease": set(),
         "RecipientGone": set(),
@@ -198,6 +243,8 @@ def store_release_state(entry: ReleaseEntry, state: ReleaseState) -> None:
     for field in ("attempted_at", "released_at", "wait_started_at", "wait_ended_at", "outcome", "answered_at"):
         _ = entry.pop(field, None)
     entry["state"] = type(state).__name__
+    if isinstance(state, (MemoryGateReturned, NothingToBuild)) and not entry.get("active_call_id", ""):
+        entry["session_pending"] = False
     if isinstance(state, (DeliveryFailed, DeliveryQueued)):
         entry["attempted_at"] = state.attempted_at.isoformat()
     elif isinstance(state, (ReleasedAwaitingAdmission, NoAdmissionAck)):
@@ -298,6 +345,143 @@ class Quiet:
 @dataclass(frozen=True)
 class Busy:
     reasons: tuple[str, ...]
+
+
+def owning_session() -> OwningSession | NoOwningSession:
+    """Find the session that owns this run before using the shell's session id."""
+    run = os.environ.get("PLAN_DELEGATE_BOARD_DIR", "") or os.environ.get("PLAN_DELEGATE_SESSION_DIR", "")
+    if run:
+        active = Path(os.environ.get("PLAN_DELEGATE_ACTIVE_DIR", "/tmp/claude/delegate/active"))
+        try:
+            markers = tuple(active.iterdir())
+        except OSError:
+            markers = ()
+        matches: list[tuple[int, str]] = []
+        for marker in markers:
+            try:
+                if marker.is_file() and marker.read_text().strip() == run:
+                    matches.append((marker.stat().st_mtime_ns, marker.name))
+            except (OSError, UnicodeError):
+                continue
+        if matches:
+            return OwningSession(max(matches)[1])
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    return OwningSession(session_id) if session_id else NoOwningSession()
+
+
+def waiter_key(call_id: str) -> str:
+    owner = owning_session()
+    return owner.session_id if isinstance(owner, OwningSession) else f"verify:{call_id}"
+
+
+def process_start_time(pid: int) -> str:
+    if pid <= 0:
+        return ""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace").rsplit(")", 1)[1].split()
+        return fields[19] if fields[0] != "Z" else ""
+    except (OSError, IndexError):
+        return ""
+
+
+def call_is_live(call: PendingCall) -> bool:
+    return bool(call["proc_start"]) and process_start_time(call["pid"]) == call["proc_start"]
+
+
+def group_defaults(entry: ReleaseEntry) -> None:
+    _ = entry.setdefault("calls", [])
+    _ = entry.setdefault("active_call_id", "")
+    _ = entry.setdefault("active_released_at", "")
+    _ = entry.setdefault("session_pending", entry["state"] in {"AwaitingRelease", "DeliveryQueued", "ReleasedAwaitingAdmission", "WaitingForMemory"})
+    _ = entry.setdefault("session_admitted_generation", 0)
+
+
+def holders_signature() -> str:
+    holders = read_holders(holder_directory())
+    return "" if isinstance(holders, NoHolders) else json.dumps(sorted(
+        (holder.key, holder.since.isoformat()) for holder in holders.holders
+    ))
+
+
+
+def _decode_holder_signature(signature: str) -> tuple[tuple[str, str], ...]:
+    if not signature:
+        return ()
+    value = cast(object, json.loads(signature))
+    if not isinstance(value, list):
+        raise ValueError("invalid holder signature")
+    pairs: list[tuple[str, str]] = []
+    for item in cast(list[object], value):
+        if not isinstance(item, list):
+            raise ValueError("invalid holder signature")
+        pair = cast(list[object], item)
+        if len(pair) != 2 or not isinstance(pair[0], str) or not isinstance(pair[1], str):
+            raise ValueError("invalid holder signature")
+        pairs.append((pair[0], pair[1]))
+    return tuple(pairs)
+
+def update_holder_generation(cycle: HoldCycle) -> None:
+    signature = holders_signature()
+    previous = cycle.get("holder_signature", "")
+    _ = cycle.setdefault("holder_generation", 1)
+    cycle["holder_signature"] = signature
+    if not previous or previous == signature:
+        return
+    cycle["holder_generation"] = cycle.get("holder_generation", 1) + 1
+    before = set(_decode_holder_signature(previous))
+    after = set(_decode_holder_signature(signature))
+    if after - before:
+        cycle["release_started_at"] = ""
+    for entry in cycle["entries"]:
+        group_defaults(entry)
+        entry["active_call_id"] = ""
+        if entry["calls"] or entry["session_pending"]:
+            store_release_state(entry, AwaitingRelease())
+
+
+def prune_calls(entry: ReleaseEntry) -> None:
+    group_defaults(entry)
+    entry["calls"] = [call for call in entry["calls"] if call_is_live(call)]
+    if entry["active_call_id"] and not any(call["call_id"] == entry["active_call_id"] for call in entry["calls"]):
+        entry["active_call_id"] = ""
+        store_release_state(entry, AwaitingRelease() if entry["calls"] or entry["session_pending"] else RecipientGone())
+
+
+def read_admission(key: str, call_id: str = "") -> Admission:
+    try:
+        cycle = read_cycle()
+        if cycle is None:
+            return NoCycle()
+        generation = cycle.get("holder_generation", 1)
+        signature = cycle.get("holder_signature", "")
+        if signature and signature != holders_signature():
+            return AwaitingTurn(cycle["id"], generation + 1)
+        waiting = AwaitingTurn(cycle["id"], generation)
+        for entry in cycle["entries"]:
+            if entry["session_id"] != key:
+                continue
+            state = read_release_state(entry)
+            if call_id:
+                call = next((call for call in entry["calls"] if call["call_id"] == call_id), None)
+                if call is None or not call_is_live(call):
+                    return waiting
+                if call["admitted_generation"] == generation:
+                    return AdmittedTurn(cycle["id"], generation)
+                if entry["active_call_id"] != call_id:
+                    return waiting
+                allowed = (DeliveryQueued, ReleasedAwaitingAdmission, WaitingForMemory, RecipientGone, DeliveryFailed)
+            else:
+                if entry["session_admitted_generation"] == generation:
+                    return AdmittedTurn(cycle["id"], generation)
+                if entry["active_call_id"]:
+                    return waiting
+                allowed = (DeliveryQueued, ReleasedAwaitingAdmission, WaitingForMemory)
+            return AdmittedTurn(cycle["id"], generation) if isinstance(state, allowed) else waiting
+        return waiting
+    except ReleaseRecordReadError as error:
+        return AdmissionReadError(f"release record could not be read: {error}")
+    except (OSError, UnicodeError) as error:
+        return AdmissionReadError(str(error))
 
 
 def holder_directory() -> Path:
@@ -522,6 +706,47 @@ def read_cycle() -> HoldCycle | None:
             if not isinstance(entry, dict):
                 raise ValueError(f"invalid entry {index}: expected object")
             _ = read_release_state(cast(dict[str, object], entry))
+            fields = cast(dict[str, object], entry)
+            calls = fields.get("calls", [])
+            if not isinstance(calls, list):
+                raise ValueError(f"invalid calls for entry {index}")
+            identifiers: set[str] = set()
+            for pending in cast(list[object], calls):
+                if not isinstance(pending, dict):
+                    raise ValueError("invalid pending call")
+                call = cast(dict[str, object], pending)
+                if (not isinstance(call.get("call_id"), str) or not call["call_id"]
+                    or not isinstance(call.get("pid"), int) or cast(int, call["pid"]) <= 0
+                    or not isinstance(call.get("proc_start"), str) or not call["proc_start"]
+                    or not isinstance(call.get("started"), bool)
+                    or not isinstance(call.get("admitted_generation"), int)):
+                    raise ValueError("invalid pending call identity or admission")
+                identifier = cast(str, call["call_id"])
+                if identifier in identifiers:
+                    raise ValueError("duplicate pending call")
+                identifiers.add(identifier)
+            if (not isinstance(fields.get("active_call_id", ""), str)
+                or not isinstance(fields.get("session_pending", True), bool)
+                or not isinstance(fields.get("session_admitted_generation", 0), int)):
+                raise ValueError("invalid grouped entry turn")
+            turn_time = fields.get("active_released_at", "")
+            if not isinstance(turn_time, str):
+                raise ValueError("invalid active turn timestamp")
+            if turn_time:
+                _ = aware_instant(turn_time)
+            if fields.get("active_call_id", "") and fields["active_call_id"] not in identifiers:
+                raise ValueError("active call is not listed")
+            if "session_admitted_generation" not in fields and "calls" not in fields and fields.get("state") == "MemoryGateReturned":
+                fields["session_admitted_generation"] = cycle.get("holder_generation", 1)
+            group_defaults(cast(ReleaseEntry, cast(object, fields)))
+        if not isinstance(cycle.get("holder_generation", 1), int) or cast(int, cycle.get("holder_generation", 1)) < 1:
+            raise ValueError("invalid holder generation")
+        signature = cycle.get("holder_signature", "")
+        if not isinstance(signature, str):
+            raise ValueError("invalid holder signature")
+        _ = _decode_holder_signature(signature)
+        _ = cycle.setdefault("holder_generation", 1)
+        _ = cycle.setdefault("holder_signature", "")
         return cast(HoldCycle, cast(object, cycle))
     except (OSError, ValueError, TypeError, KeyError) as error:
         raise ReleaseRecordReadError(str(error)) from error
@@ -560,7 +785,7 @@ def save_cycle(cycle: HoldCycle) -> None:
 
 
 def open_cycle(now: datetime) -> HoldCycle:
-    cycle: HoldCycle = {"id": uuid.uuid4().hex, "opened_at": now.isoformat(), "holders": {}, "recipients": {}, "entries": [], "release_started_at": ""}
+    cycle: HoldCycle = {"id": uuid.uuid4().hex, "opened_at": now.isoformat(), "holders": {}, "recipients": {}, "entries": [], "release_started_at": "", "holder_generation": 1, "holder_signature": ""}
     save_cycle(cycle)
     _ = (release_directory() / "current").write_text(cycle["id"] + "\n")
     return cycle
@@ -573,9 +798,12 @@ def start_hold(directory: Path, name: str, purpose: str, request: ReleaseRequest
             cycle = open_cycle(now)
         else:
             cycle = read_cycle_for_change()
+        if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)) and not cycle.get("holder_signature", ""):
+            cycle["holder_signature"] = holders_signature()
         notice = write_hold(directory, name, purpose, request, now, label)
         if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
             cycle["holders"][name] = {"since": now.isoformat(), "released_at": ""}
+            update_holder_generation(cycle)
             save_cycle(cycle)
         return notice + " Run python3 ~/.claude/scripts/build_hold/build_hold.py wait now in this session."
 
@@ -598,7 +826,8 @@ def record_recipients(recipients: Sequence[tuple[str, str]]) -> None:
         save_cycle(cycle)
 
 
-def register_wait(session_id: str, name: str = "") -> str:
+def register_wait(session_id: str, name: str = "", *, call_id: str = "", pid: int = 0,
+                  proc_start: str = "", started: bool = False) -> str:
     if not session_id:
         return "NoSessionId: hold remains active; this session cannot register"
     if not has_holder_file(holder_directory()):
@@ -606,26 +835,70 @@ def register_wait(session_id: str, name: str = "") -> str:
     with release_lock():
         if isinstance(read_holders(holder_directory()), NoHolders):
             return "no build hold"
-        cycle = read_cycle_for_change()
-        if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
+        cycle = read_cycle() if call_id else read_cycle_for_change()
+        if cycle is None or isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
             return "no hold cycle: wait for the release broadcast"
+        update_holder_generation(cycle)
         existing = next((entry for entry in cycle["entries"] if entry["session_id"] == session_id), None)
         if existing is None:
-            cycle["entries"].append(new_entry(session_id, name or cycle["recipients"].get(session_id, session_id)))
-            save_cycle(cycle)
-        elif isinstance(read_release_state(existing), NoRegistration):
+            existing = new_entry(session_id, name or cycle["recipients"].get(session_id, session_id))
+            existing["session_pending"] = not bool(call_id)
+            cycle["entries"].append(existing)
+        group_defaults(existing)
+        prune_calls(existing)
+        if call_id:
+            if not any(call["call_id"] == call_id for call in existing["calls"]):
+                process = pid or os.getpid()
+                identity = proc_start or process_start_time(process)
+                if not identity:
+                    raise ReleaseRecordReadError("waiting call process cannot be identified")
+                existing["calls"].append({"call_id": call_id, "pid": process, "proc_start": identity,
+                                          "started": started, "admitted_generation": 0})
+        elif existing["session_admitted_generation"] != cycle.get("holder_generation", 1):
+            existing["session_pending"] = True
+        state = read_release_state(existing)
+        terminal = (NothingToBuild, MemoryGateReturned, NoAdmissionAck, NoRegistration, RecipientGone, DeliveryFailed)
+        pending = any(call["admitted_generation"] != cycle.get("holder_generation", 1) for call in existing["calls"])
+        if isinstance(state, terminal) and not existing["active_call_id"] and (pending or existing["session_pending"]):
             cycle["entries"].remove(existing)
+            existing["active_call_id"] = ""
             store_release_state(existing, AwaitingRelease())
             cycle["entries"].append(existing)
-            save_cycle(cycle)
+        save_cycle(cycle)
         return f"registered {session_id}; wait for direct release before building"
 
 
 def new_entry(session_id: str, name: str) -> ReleaseEntry:
-    return {"session_id": session_id, "name": name, "state": "AwaitingRelease"}
+    entry: ReleaseEntry = {"session_id": session_id, "name": name, "state": "AwaitingRelease",
+                           "calls": [], "active_call_id": "", "active_released_at": "", "session_pending": True,
+                           "session_admitted_generation": 0}
+    group_defaults(entry)
+    return entry
 
 
-def mark_gate(session_id: str, state: str, outcome: str = "") -> str:
+def remove_call(key: str, call_id: str, *, cycle_id: str = "") -> None:
+    if not (release_directory() / "current").exists():
+        return
+    with release_lock():
+        cycle = read_cycle()
+        if cycle is None or (cycle_id and cycle["id"] != cycle_id):
+            return
+        changed = False
+        for entry in cycle["entries"]:
+            if entry["session_id"] != key:
+                continue
+            count = len(entry["calls"])
+            entry["calls"] = [call for call in entry["calls"] if call["call_id"] != call_id]
+            changed = changed or len(entry["calls"]) != count
+            if entry["active_call_id"] == call_id:
+                changed = True
+                entry["active_call_id"] = ""
+                store_release_state(entry, AwaitingRelease() if entry["calls"] or entry["session_pending"] else RecipientGone())
+        if changed:
+            save_cycle(cycle)
+
+
+def mark_gate(session_id: str, state: str, outcome: str = "", *, call_id: str = "", cycle_id: str = "", generation: int = 0) -> str:
     if not session_id:
         return "NoSessionId"
     if not has_holder_file(holder_directory()):
@@ -636,18 +909,34 @@ def mark_gate(session_id: str, state: str, outcome: str = "") -> str:
         cycle = read_cycle_for_change()
         if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
             return "no hold cycle"
+        if cycle_id and cycle["id"] != cycle_id:
+            return "mark ignored"
+        if generation and generation != cycle.get("holder_generation", 1):
+            return "mark ignored"
+        if cycle.get("holder_signature", "") and cycle.get("holder_signature", "") != holders_signature():
+            return "mark ignored"
         for entry in cycle["entries"]:
-            if entry["session_id"] != session_id:
+            if entry["session_id"] != session_id or entry["active_call_id"] != call_id:
                 continue
             previous = read_release_state(entry)
-            if not isinstance(previous, (ReleasedAwaitingAdmission, DeliveryQueued, WaitingForMemory)):
+            if not isinstance(previous, (ReleasedAwaitingAdmission, DeliveryQueued, WaitingForMemory, RecipientGone, DeliveryFailed)):
                 continue
-            instant = datetime.now().astimezone()
+            instant = release_clock()
+            if call_id:
+                call = next((call for call in entry["calls"] if call["call_id"] == call_id), None)
+                if call is None or not call_is_live(call):
+                    return "mark ignored"
+                call["started"] = True
+                call["admitted_generation"] = cycle.get("holder_generation", 1)
             if state == "WaitingForMemory" and not isinstance(previous, WaitingForMemory):
-                released_at = previous.released_at if isinstance(previous, ReleasedAwaitingAdmission) else previous.attempted_at
+                released_at = previous.released_at if isinstance(previous, ReleasedAwaitingAdmission) else previous.attempted_at if isinstance(previous, (DeliveryQueued, DeliveryFailed)) else instant
                 store_release_state(entry, WaitingForMemory(released_at, instant))
             elif state == "MemoryGateReturned" and outcome in {"Granted", "TimedOut", "MeminfoUnavailable"}:
                 store_release_state(entry, MemoryGateReturned(instant, cast(GateOutcome, outcome)))
+                entry["active_call_id"] = ""
+                if not call_id:
+                    entry["session_pending"] = False
+                    entry["session_admitted_generation"] = cycle.get("holder_generation", 1)
             else:
                 return "mark ignored"
             save_cycle(cycle)
@@ -670,8 +959,9 @@ def answer_nothing_to_build(session_id: str) -> str:
         entry = next((entry for entry in cycle["entries"] if entry["session_id"] == session_id), None)
         if entry is None:
             return "nothing-to-build ignored: this session is not registered"
-        if not isinstance(read_release_state(entry), (ReleasedAwaitingAdmission, DeliveryQueued)):
+        if entry["active_call_id"] or not isinstance(read_release_state(entry), (ReleasedAwaitingAdmission, DeliveryQueued)):
             return f"nothing-to-build ignored: {entry_text(entry)}"
+        entry["session_pending"] = False
         store_release_state(entry, NothingToBuild(datetime.now().astimezone()))
         save_cycle(cycle)
         return f"{entry_text(entry)}; the release moves on to the next session"
@@ -736,6 +1026,21 @@ def release_clock() -> datetime:
 
 def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], datetime] = release_clock) -> tuple[bool, str]:
     entries = cycle["entries"]
+    for entry in entries:
+        prune_calls(entry)
+    generation = cycle.get("holder_generation", 1)
+    for entry in tuple(entries):
+        state = read_release_state(entry)
+        pending = any(call["admitted_generation"] != generation for call in entry["calls"])
+        if isinstance(state, MemoryGateReturned) and now >= state.wait_ended_at + timedelta(seconds=RELEASE_SETTLE_S) and pending:
+            entries.remove(entry)
+            store_release_state(entry, AwaitingRelease())
+            entries.append(entry)
+    resumed = [entry for entry in entries if isinstance(read_release_state(entry), AwaitingRelease)
+               and any(call["started"] and call["admitted_generation"] != generation for call in entry["calls"])]
+    if resumed:
+        entries[:] = resumed + [entry for entry in entries if entry not in resumed]
+    save_cycle(cycle)
     release_start = aware_instant(cycle["release_started_at"])
     registered = {entry["session_id"] for entry in entries}
     missing = [(session_id, name) for session_id, name in cycle["recipients"].items() if session_id not in registered]
@@ -749,15 +1054,27 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
     active = (AwaitingRelease, DeliveryQueued, ReleasedAwaitingAdmission, WaitingForMemory)
     for index, entry in enumerate(entries):
         state = read_release_state(entry)
+        if isinstance(state, (RecipientGone, DeliveryFailed)) and entry["active_call_id"]:
+            started_at = aware_instant(entry["active_released_at"]) if entry["active_released_at"] else state.attempted_at if isinstance(state, DeliveryFailed) else release_start
+            if (now - started_at).total_seconds() < NO_ADMISSION_ACK_S:
+                return False, entry_text(entry)
+            entry["active_call_id"] = ""
+            store_release_state(entry, NoAdmissionAck(started_at))
+            save_cycle(cycle)
+            continue
         if isinstance(state, WaitingForMemory):
             if (now - state.wait_started_at).total_seconds() < int(os.environ.get("BUILDLOG_MEM_WAIT_LIMIT_S", "900")) + RELEASE_SETTLE_S:
                 return False, entry_text(entry)
+            entry["active_call_id"] = ""
+            entry["session_pending"] = False
             store_release_state(entry, NoAdmissionAck(state.released_at))
             save_cycle(cycle)
         elif isinstance(state, (ReleasedAwaitingAdmission, DeliveryQueued)):
             started_at = state.released_at if isinstance(state, ReleasedAwaitingAdmission) else state.attempted_at
             if (now - started_at).total_seconds() < NO_ADMISSION_ACK_S:
                 return False, entry_text(entry)
+            entry["active_call_id"] = ""
+            entry["session_pending"] = False
             store_release_state(entry, NoAdmissionAck(started_at))
             save_cycle(cycle)
         elif isinstance(state, MemoryGateReturned):
@@ -766,7 +1083,32 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
                 next_entry = next((following for following in entries[index + 1:] if isinstance(read_release_state(following), AwaitingRelease)), None)
                 target = entry_text(next_entry) if next_entry is not None else "final check"
                 return False, f"{entry_text(entry)}; next {target} at {ready.astimezone():%H:%M:%S %Z}"
+            pending = any(call["admitted_generation"] != generation for call in entry["calls"])
+            if pending or entry["session_pending"]:
+                entries.remove(entry)
+                store_release_state(entry, AwaitingRelease())
+                entries.append(entry)
+                save_cycle(cycle)
+                return False, entry_text(entry)
         elif isinstance(state, AwaitingRelease):
+            pending_calls = [call for call in entry["calls"] if call["admitted_generation"] != generation]
+            pending_calls.sort(key=lambda call: not call["started"])
+            if pending_calls:
+                entry["active_call_id"] = pending_calls[0]["call_id"]
+                entry["session_admitted_generation"] = generation
+                entry["session_pending"] = False
+            elif not entry["session_pending"]:
+                store_release_state(entry, RecipientGone())
+                save_cycle(cycle)
+                continue
+            entry["active_released_at"] = clock().isoformat()
+            if entry["session_id"].startswith("verify:"):
+                store_release_state(entry, ReleasedAwaitingAdmission(clock()))
+                for call in pending_calls:
+                    if call["call_id"] == entry["active_call_id"]:
+                        call["admitted_generation"] = generation
+                save_cycle(cycle)
+                return False, entry_text(entry)
             try:
                 socket = socket_for(entry["session_id"])
             except SessionLookupUnavailable as error:
@@ -785,9 +1127,26 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
                         store_release_state(entry, DeliveryQueued(attempted_at))
                     else:
                         store_release_state(entry, DeliveryFailed(attempted_at))
+            delivered_state = read_release_state(entry)
+            if pending_calls and not entry["active_call_id"] and isinstance(delivered_state, (RecipientGone, DeliveryFailed)):
+                entry["active_call_id"] = pending_calls[0]["call_id"]
+                if isinstance(delivered_state, RecipientGone):
+                    entry["session_pending"] = False
+            if entry["active_call_id"]:
+                for call in pending_calls:
+                    if call["call_id"] == entry["active_call_id"]:
+                        call["admitted_generation"] = generation
             save_cycle(cycle)
-            if isinstance(read_release_state(entry), active):
+            if entry["active_call_id"] or isinstance(read_release_state(entry), active):
                 return False, entry_text(entry)
+    for entry in entries:
+        state = read_release_state(entry)
+        pending = any(call["admitted_generation"] != generation for call in entry["calls"])
+        if pending and not isinstance(state, active):
+            store_release_state(entry, AwaitingRelease())
+            entry["active_call_id"] = ""
+            save_cycle(cycle)
+            return False, entry_text(entry)
     if missing or (not cycle["recipients"] and (now - release_start).total_seconds() < NO_REGISTRATION_S):
         return False, "waiting for registrations" + (": " + ", ".join(name for _, name in missing) if missing else "")
     if any(isinstance(read_release_state(entry), active) for entry in entries):
@@ -808,6 +1167,7 @@ def release_cycle(directory: Path, name: str) -> str:
             if not path.is_file():
                 raise ValueError(f"{name} held nothing")
             now = datetime.now().astimezone()
+            update_holder_generation(cycle)
             holders = read_holders(directory)
             if cycle["holders"].get(name, {}).get("released_at", "") == "":
                 cycle["holders"].setdefault(name, {"since": now.isoformat(), "released_at": ""})["released_at"] = now.isoformat()
@@ -898,7 +1258,10 @@ def main(arguments: list[str]) -> int:
     mark = commands.add_parser("mark")
     _ = mark.add_argument("--state", required=True, choices=["WaitingForMemory", "MemoryGateReturned"])
     _ = mark.add_argument("--outcome", choices=["Granted", "TimedOut", "MeminfoUnavailable"], default="")
-    _ = mark.add_argument("--session-id", default="")
+    _ = mark.add_argument("--session-id", default=argparse.SUPPRESS)
+    _ = mark.add_argument("--call-id", default="")
+    _ = mark.add_argument("--cycle-id", default="")
+    _ = mark.add_argument("--generation", type=int, default=0)
     recipient = commands.add_parser("record-recipient")
     _ = recipient.add_argument("--session-id", required=True)
     _ = recipient.add_argument("--name", required=True)
@@ -939,7 +1302,11 @@ def main(arguments: list[str]) -> int:
         elif action == "nothing-to-build":
             print(answer_nothing_to_build(os.environ.get("CLAUDE_CODE_SESSION_ID", "")))
         elif action == "mark":
-            print(mark_gate(cast(str, options.session_id) or os.environ.get("CLAUDE_CODE_SESSION_ID", ""), cast(str, options.state), cast(str, options.outcome)))
+            call_id = cast(str, options.call_id)
+            owner = OwningSession(cast(str, options.session_id)) if hasattr(options, "session_id") else owning_session()
+            session_id = waiter_key(call_id) if call_id and not hasattr(options, "session_id") else owner.session_id if isinstance(owner, OwningSession) else ""
+            print(mark_gate(session_id, cast(str, options.state), cast(str, options.outcome),
+                            call_id=call_id, cycle_id=cast(str, options.cycle_id), generation=cast(int, options.generation)))
         elif action == "record-recipient":
             record_recipients([(cast(str, options.name), cast(str, options.session_id))])
         else:

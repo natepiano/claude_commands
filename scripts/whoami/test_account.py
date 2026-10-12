@@ -20,7 +20,8 @@ import account
 
 
 STATUS_LINE = Path(__file__).parents[1] / "statusline" / "statusline.jq"
-EXAMPLE_FIRST_LINE = "claude_commands | 182,340 | Opus 5.5 high"
+EXAMPLE_FIRST_LINE = "natedev | claude_commands | 182,340 | Opus 5.5 high"
+ACCOUNT_FIRST_LINE = "natedev | claude 2 | claude_commands | 182,340 | Opus 5.5 high"
 
 
 class AccountTests(unittest.TestCase):
@@ -441,6 +442,7 @@ class AccountTests(unittest.TestCase):
         self,
         document: object,
         label: str | None = None,
+        home: str = "/home/someone",
     ) -> str:
         arguments = [
             "jq",
@@ -456,12 +458,13 @@ class AccountTests(unittest.TestCase):
             arguments,
             capture_output=True,
             check=True,
+            env=dict(os.environ) | {"HOME": home},
             input=json.dumps(document),
             text=True,
         )
         return result.stdout
 
-    def test_status_line_prints_account_and_both_remaining_windows(self) -> None:
+    def test_status_line_prints_account_first_and_both_remaining_windows_second(self) -> None:
         document = self.status_line_input() | {
             "rate_limits": {
                 "five_hour": {"used_percentage": 26.4, "resets_at": 1_800_000_000},
@@ -471,8 +474,7 @@ class AccountTests(unittest.TestCase):
 
         self.assertEqual(
             self.render_status_line(document, "claude 2"),
-            EXAMPLE_FIRST_LINE
-            + "\nclaude 2 | 5-hour 73% left | weekly 41% left\n",
+            ACCOUNT_FIRST_LINE + "\n5-hour 73% left | weekly 41% left\n",
         )
 
     def test_status_line_floors_and_clamps_remaining_percentage(self) -> None:
@@ -494,14 +496,23 @@ class AccountTests(unittest.TestCase):
                     + f"\n5-hour {remaining_percentage}% left\n",
                 )
 
-    def test_status_line_prints_only_the_account_when_limits_are_absent(self) -> None:
-        output = self.render_status_line(self.status_line_input(), "claude 2")
-
+    def test_status_line_is_one_line_with_the_account_when_limits_are_absent(self) -> None:
         self.assertEqual(
-            output,
-            EXAMPLE_FIRST_LINE + "\nclaude 2\n",
+            self.render_status_line(self.status_line_input(), "claude 2"),
+            ACCOUNT_FIRST_LINE + "\n",
         )
-        self.assertNotIn("claude 2", output.splitlines()[0])
+
+    def test_status_line_names_the_machine_by_home_directory(self) -> None:
+        cases = (
+            ("/home/someone", "natedev"),
+            ("/Users/someone", "mac"),
+        )
+        for home, machine in cases:
+            with self.subTest(home=home):
+                self.assertEqual(
+                    self.render_status_line(self.status_line_input(), home=home),
+                    f"{machine} | claude_commands | 182,340 | Opus 5.5 high\n",
+                )
 
     def test_status_line_prints_windows_without_an_account_argument(self) -> None:
         document = self.status_line_input() | {

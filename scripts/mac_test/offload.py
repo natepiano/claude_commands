@@ -116,6 +116,14 @@ NO_RESULT_FILE = NoResultFile()
 
 
 @dataclass(frozen=True)
+class DefaultMacSettings:
+    """Select settings through MAC_TEST_CONFIG or its existing default."""
+
+
+DEFAULT_MAC_SETTINGS = DefaultMacSettings()
+
+
+@dataclass(frozen=True)
 class OffloadConfig:
     """Settings that govern one Mac offload decision."""
 
@@ -125,7 +133,6 @@ class OffloadConfig:
     probe_timeout_s: float
     unreachable_backoff_s: float
     free_floor_gib: float
-    max_load: float
     default_target_budget_gib: str
     values: dict[str, str]
 
@@ -146,7 +153,6 @@ class ProbeSnapshot:
     """Mac availability values returned by one remote probe."""
 
     processes: int
-    load: float
     power: MacPower
     free_gib: float
     hostname: str
@@ -233,6 +239,21 @@ class UnavailableProbe:
 
 ProbeResult = ProbeSnapshot | UnavailableProbe
 UNAVAILABLE_PROBE = UnavailableProbe()
+
+
+@dataclass(frozen=True)
+class ReachableHost:
+    """The host completed a command over SSH."""
+
+
+@dataclass(frozen=True)
+class UnreachableHost:
+    """The host could not complete the reachability probe."""
+
+    reason: str
+
+
+HostReachability = ReachableHost | UnreachableHost
 
 
 class NoBackoff:
@@ -384,8 +405,9 @@ def positive_number(values: dict[str, str], key: str, default: float) -> float:
     return value if math.isfinite(value) and value > 0 else default
 
 
-def read_config() -> OffloadConfig:
-    values = sweep.config_values(str(config_path()))
+def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> OffloadConfig:
+    settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
+    values = sweep.config_values(str(settings))
     return OffloadConfig(
         enabled=values.get("offload") == "on",
         host=values.get("host", "mac"),
@@ -395,7 +417,6 @@ def read_config() -> OffloadConfig:
             values, "unreachable_backoff_s", 300.0
         ),
         free_floor_gib=positive_number(values, "free_floor_gib", 60.0),
-        max_load=positive_number(values, "max_load", 6.0),
         default_target_budget_gib=values.get("mac_budget_gib", "24"),
         values=values,
     )
@@ -527,12 +548,11 @@ def probe_script(repository: KnownRepository) -> str:
             f'mkdir -p "$HOME"/{mirror} || exit 1',
             "procs=$( (pgrep -x cargo; pgrep -x rustc; "
             + "pgrep -x cargo-nextest) 2>/dev/null | wc -l | tr -d ' ')",
-            "load=$(sysctl -n vm.loadavg | awk '{print $2}')",
             "case \"$(pmset -g batt | head -1)\" in "
             + "*\"AC Power\"*) power=ac ;; *) power=battery ;; esac",
             "free_gib=$(df -g \"$HOME\" | awk 'NR == 2 {print $4}')",
-            "printf 'procs=%s\\nload=%s\\npower=%s\\nfree_gib=%s\\nhost=%s\\nrc=0\\n' "
-            + '"$procs" "$load" "$power" "$free_gib" "$(hostname -s)"',
+            "printf 'procs=%s\\npower=%s\\nfree_gib=%s\\nhost=%s\\nrc=0\\n' "
+            + '"$procs" "$power" "$free_gib" "$(hostname -s)"',
         )
     )
 
@@ -547,7 +567,6 @@ def parse_probe(output: str) -> ProbeResult:
         return UNAVAILABLE_PROBE
     try:
         processes = int(values["procs"])
-        load = float(values["load"])
         free_gib = float(values["free_gib"])
         power = values["power"]
         hostname = values["host"]
@@ -555,13 +574,12 @@ def parse_probe(output: str) -> ProbeResult:
         return UNAVAILABLE_PROBE
     if (
         processes < 0
-        or not math.isfinite(load)
         or not math.isfinite(free_gib)
         or power not in ("ac", "battery")
         or not hostname
     ):
         return UNAVAILABLE_PROBE
-    return ProbeSnapshot(processes, load, power, free_gib, hostname)
+    return ProbeSnapshot(processes, power, free_gib, hostname)
 
 
 def claim_arguments(request: OffloadRequest) -> list[str]:
@@ -588,6 +606,20 @@ def release_claim(controller: ProcessController) -> None:
             str(os.getpid()),
         ]
     )
+
+
+def probe_reachability(
+    controller: ProcessController,
+    config: OffloadConfig,
+) -> HostReachability:
+    """Check SSH reachability without creating or inspecting a repository."""
+    result = controller.capture(
+        [*ssh_prefix(config), "true"],
+        CommandTimeLimit(config.probe_timeout_s),
+    )
+    if isinstance(result, CommandOutput) and result.status == 0:
+        return ReachableHost()
+    return UnreachableHost(f"SSH probe failed for {config.host}")
 
 
 def probe_mac(
@@ -743,7 +775,7 @@ def claimed_run(
         if isinstance(probe, UnavailableProbe):
             write_backoff(time.time() + config.unreachable_backoff_s)
             return declined("unreachable", started)
-        if probe.processes > 0 or probe.load > config.max_load:
+        if probe.processes > 0:
             return declined("mac_busy", started)
         if probe.power == "battery":
             return declined("battery", started)

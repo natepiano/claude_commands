@@ -159,6 +159,15 @@ raise SystemExit(1)
         self.assertEqual(self.successful("name", "show"), "renamed\n")
         self.assertFalse(self.config.exists())
 
+    def test_a_stopped_timer_still_names_its_showrunner(self) -> None:
+        # A production on demand keeps its timer stopped, and the timer is still the showrunner's record.
+        self.instance("showrunner-show", doc=self.doc)
+        _ = (self.notifier / "showrunner-show" / "state").write_text(
+            "ENABLED=0\nNEXT_DUE=0\nLAST_SENT=0\nLAST_RESTART=0\nLAST_TARGET=\n", encoding="utf-8")
+        _ = self.record("on-demand", "live-id")
+        self.assertEqual(self.successful("name", "show"), "on-demand\n")
+        self.assertIn("show\ton-demand\t", self.successful("list"))
+
     def test_name_refuses_a_showrunner_that_is_not_running_or_has_no_timer(self) -> None:
         self.instance("showrunner-show", doc=self.doc)
         for slug in ("show", "absent"):

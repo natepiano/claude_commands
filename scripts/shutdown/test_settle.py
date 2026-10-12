@@ -756,6 +756,26 @@ print("rc=0")
             ],
         )
 
+    def test_a_stopped_showrunner_timer_is_recorded_off_and_never_stopped(self) -> None:
+        # A production on demand keeps its showrunner timer stopped, so a restart has nothing to start.
+        stopped = self.write_instance("showrunner-show", "selected", enabled=False)
+        report = machine_inventory(
+            [top_level("selected", "Selected", timers=[stopped.name])]
+        )
+
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "now_utc", return_value=NOW_UTC),
+        ):
+            created = settle.begin(LOGIN)
+
+        self.assertTrue((stopped / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertEqual(self.logged_calls(self.notifier_log), [])
+        self.assertEqual(
+            [timer["was_enabled"] for timer in created["entries"][0]["timers"]],
+            [False],
+        )
+
     def test_cancel_keeps_a_released_kept_off_pause_off(self) -> None:
         paused = self.write_instance("delegate-paused", "session", enabled=False)
         pause_path = self.pause_record(
@@ -2528,6 +2548,93 @@ print("rc=0")
             self.assertEqual(settle.down(self.account, then="restart"), 1)
         self.assertEqual(self.found_record(), current)
         launch.assert_not_called()
+
+    def test_down_parks_an_unfinished_restart_and_starts_the_next_shutdown(self) -> None:
+        unfinished = empty_shutdown_record("natedev", record.SelectedSessions(kind="selected", session_ids=["unit-a"]))
+        unfinished["state"] = "restart partial"
+        record.create(unfinished)
+        peer = unfinished.copy()
+        peer["machine"] = "Mac"
+        output = io.StringIO()
+        with (
+            patch.object(settle, "_warm", return_value=True),
+            patch.object(settle, "_preflight_inventories", return_value=settle.PreflightReady(kind="ready", reports=[machine_inventory([])])),
+            patch.object(settle, "_live_on_other", return_value=settle.RemoteRecordFound(kind="live", record=peer)),
+            patch.object(settle, "run_inventory", return_value=machine_inventory([unit("unit-b", "Beta")])),
+            patch.object(settle, "_session_timer_snapshot", return_value=[]),
+            patch.object(settle, "run_remote", return_value=(0, "")),
+            patch.object(settle, "_launch_conductor") as launch,
+            redirect_stdout(output),
+        ):
+            self.assertEqual(settle.down(self.account, only=("unit-b",), then="restart"), 0)
+        launch.assert_called_once_with(LOGIN, LABEL, False)
+        self.assertEqual(record.parked(LOGIN), [unfinished])
+        self.assertEqual(self.found_record()["state"], "settling")
+        self.assertEqual([entry["session"]["session_id"] for entry in self.found_record()["entries"]], ["unit-b"])
+        self.assertIn(
+            f"shutdown: parked the unfinished restart of {LABEL} from 2026-10-09 14:49 PDT; /shutdown restart finishes it",
+            output.getvalue(),
+        )
+
+    def test_down_still_refuses_every_other_held_state_here_or_on_the_peer(self) -> None:
+        for state in ("settling", "stopping", "down", "stop partial", "restarting"):
+            held = empty_shutdown_record("natedev", record.AllAccountSessions(kind="all account sessions"))
+            held["state"] = cast(record.ShutdownState, state)
+            peer = held.copy()
+            peer["machine"] = "Mac"
+            for where in ("here", "peer"):
+                with self.subTest(state=state, where=where):
+                    if where == "here":
+                        record.create(held)
+                    output = io.StringIO()
+                    with (
+                        patch.object(settle, "_warm", return_value=True),
+                        patch.object(settle, "_preflight_inventories", return_value=settle.PreflightReady(kind="ready", reports=[machine_inventory([])])),
+                        patch.object(settle, "_live_on_other", return_value=settle.RemoteRecordFound(kind="live", record=peer)),
+                        patch.object(settle, "_launch_conductor") as launch,
+                        redirect_stdout(output), redirect_stderr(io.StringIO()),
+                    ):
+                        self.assertEqual(settle.down(self.account), 1)
+                    machine = "natedev" if where == "here" else "Mac"
+                    self.assertIn(f"shutdown: {machine} is already {state}", output.getvalue())
+                    launch.assert_not_called()
+                    self.assertEqual(record.parked(LOGIN), [])
+                    if where == "here":
+                        self.assertEqual(self.found_record(), held)
+                        (self.state_root / LOGIN / "record.json").unlink()
+
+    def test_begin_parks_only_an_unfinished_restart(self) -> None:
+        """The peer runs `begin` alone, so it parks and refuses without `down`'s checks."""
+        report = machine_inventory([unit("unit-b", "Beta")])
+        for state in ("settling", "stopping", "down", "stop partial", "restarting"):
+            with self.subTest(state=state):
+                held = empty_shutdown_record("natedev", record.AllAccountSessions(kind="all account sessions"))
+                held["state"] = cast(record.ShutdownState, state)
+                record.create(held)
+                with (
+                    patch.object(settle, "run_inventory", return_value=report),
+                    self.assertRaises(record.ShutdownInProgress),
+                ):
+                    _ = settle.begin(LOGIN)
+                self.assertEqual(record.account_records(LOGIN), [held])
+                (self.state_root / LOGIN / "record.json").unlink()
+        unfinished = empty_shutdown_record("natedev", record.AllAccountSessions(kind="all account sessions"))
+        unfinished["state"] = "restart partial"
+        record.create(unfinished)
+        output = io.StringIO()
+        with (
+            patch.object(settle, "run_inventory", return_value=report),
+            patch.object(settle, "_session_timer_snapshot", return_value=[]),
+            patch.object(settle, "record_time", return_value="2026-10-10T01:02:03+00:00"),
+            redirect_stdout(output),
+        ):
+            created = settle.begin(LOGIN, then="restart")
+        self.assertEqual(record.account_records(LOGIN), [created, unfinished])
+        self.assertEqual((created["state"], created["requested_at"]), ("settling", "2026-10-10T01:02:03+00:00"))
+        self.assertEqual(
+            output.getvalue(),
+            f"shutdown: parked the unfinished restart of {LABEL} from 2026-10-09 14:49 PDT; /shutdown restart finishes it\n",
+        )
 
     def test_down_names_the_account_on_its_first_output_line(self) -> None:
         output = io.StringIO()

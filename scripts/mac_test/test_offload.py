@@ -17,6 +17,9 @@ import time
 import unittest
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast, final, override
+from unittest import mock
+
+import offload
 
 
 SCRIPT = Path(__file__).with_name("offload.py")
@@ -150,6 +153,110 @@ raise SystemExit(12)
 '''
 
 
+class OffloadSettingsTests(unittest.TestCase):
+    root: Path = Path()
+    settings: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.settings = self.root / "mac_test.conf"
+        _ = self.settings.write_text("", encoding="utf-8")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "MAC_TEST_CONFIG": str(self.settings),
+            "MAC_TEST_STATE_DIR": str(self.root / "state"),
+        })))
+        _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
+        _ = self.enterContext(mock.patch("subprocess.run", side_effect=AssertionError("No external command expected")))
+        _ = self.enterContext(mock.patch("subprocess.Popen", side_effect=AssertionError("No external command expected")))
+
+    def test_explicit_settings_path_controls_every_offload_field(self) -> None:
+        settings = self.root / "other-mac.conf"
+        _ = settings.write_text(
+            "offload=on\nhost=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n"
+            + "unreachable_backoff_s=4\nfree_floor_gib=5\nmac_budget_gib=6\n"
+            + "mac_budget_gib.hana=7\nlinux_only.hana=local-package\n",
+            encoding="utf-8",
+        )
+        config = offload.read_config(settings)
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.host, "other-mac")
+        self.assertEqual(config.connect_timeout_s, 2.0)
+        self.assertEqual(config.probe_timeout_s, 3.0)
+        self.assertEqual(config.unreachable_backoff_s, 4.0)
+        self.assertEqual(config.free_floor_gib, 5.0)
+        self.assertEqual(config.default_target_budget_gib, "6")
+        self.assertEqual(config.values["mac_budget_gib.hana"], "7")
+        self.assertEqual(config.values["linux_only.hana"], "local-package")
+
+    def test_no_argument_config_reader_keeps_existing_defaults(self) -> None:
+        expected = offload.OffloadConfig(False, "mac", 6.0, 15.0, 300.0, 60.0, "24", {})
+        self.assertEqual(offload.read_config(), expected)
+        self.assertEqual(offload.read_config(self.settings), expected)
+
+    def test_no_argument_config_reader_still_uses_environment_path(self) -> None:
+        _ = self.settings.write_text("offload=on\nhost=environment-mac\nprobe_timeout_s=7\n", encoding="utf-8")
+        expected = offload.OffloadConfig(
+            True, "environment-mac", 6.0, 7.0, 300.0, 60.0, "24",
+            {"offload": "on", "host": "environment-mac", "probe_timeout_s": "7"},
+        )
+        self.assertEqual(offload.read_config(), expected)
+
+    def test_path_reader_keeps_invalid_numeric_defaults(self) -> None:
+        _ = self.settings.write_text(
+            "connect_timeout_s=bad\nprobe_timeout_s=0\nunreachable_backoff_s=-1\nfree_floor_gib=nan\n",
+            encoding="utf-8",
+        )
+        config = offload.read_config(self.settings)
+        self.assertEqual(
+            (config.connect_timeout_s, config.probe_timeout_s, config.unreachable_backoff_s, config.free_floor_gib),
+            (6.0, 15.0, 300.0, 60.0),
+        )
+
+    def test_reachability_probe_runs_only_a_read_only_remote_command(self) -> None:
+        _ = self.settings.write_text("host=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n", encoding="utf-8")
+        config = offload.read_config(self.settings)
+        controller = offload.ProcessController()
+        calls: list[tuple[list[str], offload.CommandDeadline]] = []
+
+        def capture(
+            arguments: list[str],
+            deadline: offload.CommandDeadline = offload.NO_COMMAND_TIME_LIMIT,
+        ) -> offload.CapturedCommandResult:
+            calls.append((arguments, deadline))
+            return offload.CommandOutput(0, "", "")
+
+        with mock.patch.object(controller, "capture", side_effect=capture):
+            self.assertEqual(offload.probe_reachability(controller, config), offload.ReachableHost())
+        self.assertEqual(len(calls), 1)
+        arguments, deadline = calls[0]
+        self.assertEqual(arguments[:-1], [
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "other-mac",
+        ])
+        self.assertEqual(arguments[-1], "true")
+        self.assertNotRegex(arguments[-1], r"\b(?:mkdir|touch|tee|rm|mv|cp)\b|[>]")
+        self.assertEqual(deadline, offload.CommandTimeLimit(3.0))
+        self.assertFalse((self.root / "state").exists())
+
+    def test_failed_reachability_command_reports_unreachable(self) -> None:
+        config = offload.read_config(self.settings)
+        failures: tuple[offload.CapturedCommandResult, ...] = (
+            offload.CommandOutput(255, "", "connection refused"),
+            offload.CommandOutput(1, "", "remote command failed"),
+            offload.COMMAND_TIMED_OUT,
+            offload.COMMAND_COULD_NOT_START,
+        )
+        for failure in failures:
+            with self.subTest(result=type(failure).__name__):
+                controller = offload.ProcessController()
+                with mock.patch.object(controller, "capture", return_value=failure):
+                    result = offload.probe_reachability(controller, config)
+                self.assertIsInstance(result, offload.UnreachableHost)
+                if isinstance(result, offload.UnreachableHost):
+                    self.assertTrue(result.reason)
+
+
 @final
 class OffloadCommandTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
@@ -213,7 +320,6 @@ class OffloadCommandTests(unittest.TestCase):
             "probe_timeout_s": "1",
             "unreachable_backoff_s": "300",
             "free_floor_gib": "60",
-            "max_load": "6",
             "mac_budget_gib": "24",
             "mac_budget_gib.hana": "64",
             "linux_only.hana": "",
@@ -224,7 +330,6 @@ class OffloadCommandTests(unittest.TestCase):
             "probe_delay_s": 0.0,
             "probe_lines": [
                 "procs=0",
-                "load=1.25",
                 "power=ac",
                 "free_gib=120",
                 "host=Mac",
@@ -498,25 +603,18 @@ class OffloadCommandTests(unittest.TestCase):
         self.assert_declined(self.command(), "unreachable")
         self.assertEqual(len(self.events_for("ssh")), 1)
 
-    def test_processes_and_load_each_decline_as_mac_busy(self) -> None:
-        for changed_line in ("procs=1", "load=6.01"):
-            with self.subTest(line=changed_line):
-                self.fixture["probe_lines"] = [
-                    changed_line if line.startswith(changed_line.split("=", 1)[0]) else line
-                    for line in [
-                        "procs=0",
-                        "load=1.25",
-                        "power=ac",
-                        "free_gib=120",
-                        "host=Mac",
-                        "rc=0",
-                    ]
-                ]
-                self.sync_fixture()
-                self.assert_declined(self.command(), "mac_busy")
-                self.assertEqual(len(self.events_for("ssh")), 1)
-                self.assertEqual(self.events_for("rsync"), [])
-                self.clear_events()
+    def test_running_build_processes_decline_as_mac_busy(self) -> None:
+        self.fixture["probe_lines"] = [
+            "procs=1",
+            "power=ac",
+            "free_gib=120",
+            "host=Mac",
+            "rc=0",
+        ]
+        self.sync_fixture()
+        self.assert_declined(self.command(), "mac_busy")
+        self.assertEqual(len(self.events_for("ssh")), 1)
+        self.assertEqual(self.events_for("rsync"), [])
 
     def test_battery_and_low_disk_decline_after_probe(self) -> None:
         for original, replacement, reason in (
@@ -528,7 +626,6 @@ class OffloadCommandTests(unittest.TestCase):
                     replacement if line == original else line
                     for line in [
                         "procs=0",
-                        "load=1.25",
                         "power=ac",
                         "free_gib=120",
                         "host=Mac",
@@ -648,12 +745,12 @@ class OffloadCommandTests(unittest.TestCase):
             "cargo",
             "rustc",
             "cargo-nextest",
-            "sysctl -n vm.loadavg",
             "pmset -g batt",
             'df -g "$HOME"',
             "hostname -s",
         ):
             self.assertIn(fragment, probe_script)
+        self.assertNotIn("loadavg", probe_script)
 
         copy = events[1]
         exclude_argument = next(

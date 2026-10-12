@@ -130,7 +130,8 @@ class AgentsLogTests(unittest.TestCase):
         ))
 
     def test_cli_append_accepts_every_role_and_lens(self) -> None:
-        for role in ("showrunner", "director", "impl", "test", "fix", "review", "worker"):
+        for role in ("showrunner", "director", "impl", "test", "fix", "review", "worker",
+                     "interactive", "subagent"):
             with self.subTest(role=role):
                 result = self.cli("append", "--id", role, "--role", role)
                 self.assertEqual((result.returncode, result.stderr), (0, ""))
@@ -139,16 +140,203 @@ class AgentsLogTests(unittest.TestCase):
                 result = self.cli("append", "--id", lens, "--role", "review", "--lens", lens)
                 self.assertEqual((result.returncode, result.stderr), (0, ""))
         records = self.records()
-        self.assertEqual(len(records), 11)
-        self.assertEqual({record["role"] for record in records[:7]},
-                         {"showrunner", "director", "impl", "test", "fix", "review", "worker"})
-        self.assertEqual({record["lens"] for record in records[7:]},
+        self.assertEqual(len(records), 13)
+        self.assertEqual({record["role"] for record in records[:9]},
+                         {"showrunner", "director", "impl", "test", "fix", "review", "worker",
+                          "interactive", "subagent"})
+        self.assertEqual({record["lens"] for record in records[9:]},
                          {"adversary", "contract", "craft", "ux"})
         for record in records:
             recorded_at = datetime.fromisoformat(cast("str", record["at"]))
             self.assertEqual(recorded_at.microsecond, 0)
             self.assertEqual(recorded_at.utcoffset(), timedelta(0))
             self.assertNotIn("approximate", record)
+
+    def test_interactive_and_subagent_roles_survive_append_reader_and_show(self) -> None:
+        roles: tuple[agents_log.Role, ...] = ("interactive", "subagent")
+        for role in roles:
+            agents_log.append(f"{role}-id", role, None, AT)
+
+        log = agents_log.assignments(self.log_path)
+        self.assertEqual(log.problems, ())
+        for role in roles:
+            self.assertEqual(log.assignments[f"{role}-id"], (
+                agents_log.Assignment(AT, role, None, False),
+            ))
+        shown = self.cli("show")
+        self.assertEqual((shown.returncode, shown.stderr), (0, ""))
+        for role in roles:
+            self.assertIn(f"| {role}-id | {role} |", shown.stdout)
+
+    def test_register_default_returns_whether_it_wrote_and_keeps_the_original_assignment(self) -> None:
+        self.assertIs(agents_log.register_default("session-one", "interactive", AT), True)
+        before = self.log_path.read_bytes()
+
+        self.assertIs(agents_log.register_default("session-one", "subagent", AT + timedelta(hours=1)), False)
+
+        self.assertEqual(self.log_path.read_bytes(), before)
+        record = self.records()[0]
+        self.assertEqual(set(record), {"id", "role", "at"})
+        self.assertEqual((record["id"], record["role"]), ("session-one", "interactive"))
+        self.assertEqual(datetime.fromisoformat(cast(str, record["at"])), AT)
+
+    def test_register_default_preserves_an_existing_assignment_in_every_role(self) -> None:
+        roles: tuple[agents_log.Role, ...] = (
+            "showrunner", "director", "impl", "test", "fix", "review", "worker",
+            "interactive", "subagent",
+        )
+        for role in roles:
+            agents_log.append(f"already-{role}", role, None, AT)
+        before = self.log_path.read_bytes()
+
+        for role in roles:
+            with self.subTest(role=role):
+                self.assertIs(agents_log.register_default(f"already-{role}", "interactive", AT), False)
+
+        self.assertEqual(self.log_path.read_bytes(), before)
+
+    def test_register_default_recognizes_eight_hex_character_worker_prefixes(self) -> None:
+        for prefix in ("a1b2c3d4", "A1B2C3D4"):
+            with self.subTest(prefix=prefix):
+                agents_log.append(prefix, "worker", None, AT)
+                before = self.log_path.read_bytes()
+
+                wrote = agents_log.register_default(prefix + "-1234-4567-89ab-123456789abc", "interactive", AT)
+
+                self.assertIs(wrote, False)
+                self.assertEqual(self.log_path.read_bytes(), before)
+
+    def test_register_default_preserves_future_and_approximate_assignments(self) -> None:
+        agents_log.append("future-agent", "director", None, AT + timedelta(days=1))
+        agents_log.append("backfilled-agent", "worker", None, AT - timedelta(days=1), approximate=True)
+        before = self.log_path.read_bytes()
+
+        for agent_id in ("future-agent", "backfilled-agent"):
+            with self.subTest(agent_id=agent_id):
+                self.assertIs(agents_log.register_default(agent_id, "interactive", AT), False)
+
+        self.assertEqual(self.log_path.read_bytes(), before)
+
+    def test_register_default_rejects_unrelated_nonhex_and_wrong_length_prefix_matches(self) -> None:
+        for recorded_id, full_id in (
+            ("deadbeef", "a1b2c3d4-1234-4567-89ab-123456789abc"),
+            ("1122334", "11223344-1234-4567-89ab-123456789abc"),
+            ("556677889", "556677889-1234-4567-89ab-123456789abc"),
+            ("zzzzzzzz", "zzzzzzzz-1234-4567-89ab-123456789abc"),
+        ):
+            with self.subTest(recorded_id=recorded_id):
+                agents_log.append(recorded_id, "worker", None, AT)
+
+                self.assertIs(agents_log.register_default(full_id, "interactive", AT), True)
+
+                self.assertEqual(agents_log.assignments(self.log_path).assignments[full_id], (
+                    agents_log.Assignment(AT, "interactive", None, False),
+                ))
+
+    def test_register_default_skips_malformed_matches_and_separates_a_truncated_tail(self) -> None:
+        self.state.mkdir()
+        malformed = [
+            "not JSON",
+            json.dumps({"id": "session-one", "role": "interactive", "at": "invalid"}),
+            json.dumps({"id": "session-one", "role": "unknown", "at": AT.isoformat()}),
+        ]
+        _ = self.log_path.write_text("\n".join(malformed) + '\n{"id":"session-one"', encoding="utf-8")
+
+        self.assertIs(agents_log.register_default("session-one", "interactive", AT), True)
+
+        log = agents_log.assignments(self.log_path)
+        self.assertEqual(len(log.problems), 4)
+        self.assertEqual(log.assignments, {"session-one": (
+            agents_log.Assignment(AT, "interactive", None, False),
+        )})
+        before = self.log_path.read_bytes()
+        self.assertIs(agents_log.register_default("session-one", "interactive", AT), False)
+        self.assertEqual(self.log_path.read_bytes(), before)
+
+    def test_register_cli_accepts_new_roles_and_does_not_reassign_existing_ids(self) -> None:
+        for role in ("interactive", "subagent"):
+            with self.subTest(role=role):
+                result = self.cli("register", "--id", role + "-id", "--role", role)
+                self.assertEqual((result.returncode, result.stderr), (0, ""))
+        before = self.log_path.read_bytes()
+
+        repeated = self.cli("register", "--id", "interactive-id", "--role", "subagent")
+
+        self.assertEqual((repeated.returncode, repeated.stderr), (0, ""))
+        self.assertEqual(self.log_path.read_bytes(), before)
+        records = self.records()
+        self.assertEqual([(row["id"], row["role"]) for row in records],
+                         [("interactive-id", "interactive"), ("subagent-id", "subagent")])
+        for row in records:
+            self.assertEqual(set(row), {"id", "role", "at"})
+            at = datetime.fromisoformat(cast(str, row["at"]))
+            self.assertEqual(at.microsecond, 0)
+            self.assertEqual(at.utcoffset(), timedelta(0))
+
+    def test_register_cli_rejects_unknown_roles_and_missing_arguments_without_writing(self) -> None:
+        for arguments in (("--id", "session-one", "--role", "unknown"),
+                          ("--role", "interactive"), ("--id", "session-one")):
+            with self.subTest(arguments=arguments):
+                result = self.cli("register", *arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("usage:", result.stderr)
+                self.assertFalse(self.log_path.exists())
+
+    def test_register_cli_write_failure_reports_one_line_and_keeps_exit_zero(self) -> None:
+        self.log_path.mkdir(parents=True)
+
+        result = self.cli("register", "--id", "session-one", "--role", "interactive")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertTrue(result.stderr.startswith("agents_log: "), result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_concurrent_default_registration_writes_one_assignment_and_returns_one_true(self) -> None:
+        script = """
+import json
+import sys
+from datetime import datetime, timezone
+from scripts.usage.agents_log import register_default
+print('ready', flush=True)
+sys.stdin.readline()
+print(json.dumps(register_default('shared-session', 'interactive', datetime.now(timezone.utc))))
+"""
+        processes: list[subprocess.Popen[str]] = []
+        outcomes: list[bool] = []
+        try:
+            for _worker in range(6):
+                processes.append(subprocess.Popen(
+                    [sys.executable, "-c", script],
+                    cwd=REPOSITORY, env=os.environ.copy(),
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                ))
+            for process in processes:
+                assert process.stdout is not None
+                self.assertEqual(process.stdout.readline(), "ready\n")
+            for process in processes:
+                assert process.stdin is not None
+                _ = process.stdin.write("go\n")
+                process.stdin.flush()
+            for process in processes:
+                output, errors = process.communicate(timeout=20)
+                self.assertEqual((process.returncode, errors), (0, ""))
+                wrote = cast(object, json.loads(output))
+                self.assertIsInstance(wrote, bool)
+                assert isinstance(wrote, bool)
+                outcomes.append(wrote)
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                _ = process.communicate()
+
+        self.assertEqual(outcomes.count(True), 1)
+        self.assertEqual(outcomes.count(False), 5)
+        records = self.records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual((records[0]["id"], records[0]["role"]), ("shared-session", "interactive"))
+        self.assertEqual(agents_log.assignments(self.log_path).problems, ())
 
     def test_cli_rejects_an_unknown_role_or_lens_without_writing(self) -> None:
         for arguments in (("--role", "unknown"),
@@ -205,6 +393,20 @@ class AgentsLogTests(unittest.TestCase):
         self.assertEqual([assignment.role for assignment in log.assignments["thread-1"]],
                          ["impl", "review"])
 
+    def test_invalid_utf8_lines_are_counted_and_surrounding_assignments_load(self) -> None:
+        agents_log.append("earlier-thread", "impl", None, AT)
+        with self.log_path.open("ab") as handle:
+            _ = handle.write(b'\xff\n{"id":"bad-\xff","role":"worker","at":"2026-10-11T17:30:00+00:00"}\n')
+        agents_log.append("later-thread", "review", "contract", AT + timedelta(seconds=1))
+
+        log = agents_log.assignments(self.log_path)
+
+        self.assertEqual(set(log.assignments), {"earlier-thread", "later-thread"})
+        self.assertEqual(len(log.problems), 2)
+        for number, problem in enumerate(log.problems, 2):
+            self.assertIn(f"{self.log_path}:{number}:", problem)
+            self.assertIn("utf-8", problem)
+
     def test_append_separates_a_truncated_tail_from_new_assignments(self) -> None:
         agents_log.append("earlier-thread", "impl", None, AT)
         with self.log_path.open("a", encoding="utf-8") as handle:
@@ -235,6 +437,41 @@ class AgentsLogTests(unittest.TestCase):
             with self.subTest(query=query):
                 self.assertEqual(agents_log.role_at(log, "thread-1", query),
                                  agents_log.Assignment(AT + timedelta(hours=1), "review", "adversary", True))
+
+    def test_role_at_merges_full_and_prefix_histories_by_time_and_keeps_prefix_lookup(self) -> None:
+        prefix = "a1b2c3d4"
+        session_id = prefix + "-1234-4567-89ab-123456789abc"
+        initial = agents_log.Assignment(AT, "interactive", None)
+        worker = agents_log.Assignment(AT + timedelta(seconds=1), "worker", None)
+        director = agents_log.Assignment(AT + timedelta(seconds=2), "director", None)
+        agents_log.append(session_id, director.role, director.lens, director.at)
+        agents_log.append(prefix, worker.role, worker.lens, worker.at)
+        agents_log.append(session_id, initial.role, initial.lens, initial.at)
+
+        log = agents_log.assignments(self.log_path)
+
+        self.assertEqual(agents_log.role_at(log, session_id, AT - timedelta(seconds=1)),
+                         agents_log.Unassigned())
+        for expected in (initial, worker, director):
+            with self.subTest(role=expected.role):
+                self.assertEqual(agents_log.role_at(log, session_id, expected.at), expected)
+        self.assertEqual(agents_log.role_at(log, prefix, AT), agents_log.Unassigned())
+        self.assertEqual(agents_log.role_at(log, prefix, director.at), worker)
+
+    def test_role_at_ignores_unrelated_nonhex_and_wrong_length_prefixes(self) -> None:
+        for recorded_id, session_id in (
+            ("deadbeef", "a1b2c3d4-1234-4567-89ab-123456789abc"),
+            ("1122334", "11223344-1234-4567-89ab-123456789abc"),
+            ("556677889", "556677889-1234-4567-89ab-123456789abc"),
+            ("zzzzzzzz", "zzzzzzzz-1234-4567-89ab-123456789abc"),
+        ):
+            with self.subTest(recorded_id=recorded_id):
+                agents_log.append(session_id, "interactive", None, AT)
+                agents_log.append(recorded_id, "worker", None, AT + timedelta(seconds=1))
+                log = agents_log.assignments(self.log_path)
+
+                self.assertEqual(agents_log.role_at(log, session_id, AT + timedelta(seconds=2)),
+                                 agents_log.Assignment(AT, "interactive", None))
 
     def test_assignment_and_unassigned_are_frozen(self) -> None:
         assignment = agents_log.Assignment(AT, "impl", None, False)
