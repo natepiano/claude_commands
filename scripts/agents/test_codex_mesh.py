@@ -994,6 +994,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(requests[1]["params"], {"threadId": THREAD_ID, "name": "template"})
         self.assert_review_record("template", THREAD_ID)
         self.assertEqual(self.roster()["other"], {"thread_id": "other-thread", "status": "done"})
+        self.assertEqual(_as_test_dict(self.roster()["template"]).get("context_tokens"), 0)
         self.assertEqual(self.methods("turn/start"), [])
 
     def test_prime_accepts_omitted_model_and_service_tier(self) -> None:
@@ -2098,6 +2099,83 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("compact requires a finished seat", errors.getvalue())
         self.assertEqual(self.methods("thread/compact/start"), [])
+
+    def compact_with_zero_usage(self) -> dict[str, object]:
+        self.context_sizes = [150000]
+        self.compact_after_tokens = 0
+        self.assertEqual(self.run_start()[0], 0)
+        code, output, errors = self.run_mesh(["compact", "--to", "seat"])
+        self.assertEqual((code, output, errors), (
+            0, "compacted seat: 150000 tokens, size not measured until its next turn\n", "",
+        ))
+        record = self.seat_record()
+        self.assertEqual(record.get("context_tokens"), "not_measured_since_compaction")
+        return record
+
+    def test_zero_compaction_reports_an_unmeasured_size_and_list_keeps_three_fields(self) -> None:
+        _ = self.compact_with_zero_usage()
+        code, output, errors = self.run_mesh(["list"])
+        self.assertEqual((code, output, errors), (0, f"seat\tdone\t{THREAD_ID}\n", ""))
+
+    def test_next_turn_usage_replaces_the_unmeasured_compaction_size(self) -> None:
+        _ = self.compact_with_zero_usage()
+        self.context_sizes = [23456]
+        self.assertEqual(self.run_follow(), (0, ""))
+        self.assertEqual(self.seat_record()["context_tokens"], 23456)
+
+    def test_follow_up_without_usage_keeps_the_unmeasured_compaction_size(self) -> None:
+        original = self.compact_with_zero_usage()
+        self.assertEqual(self.run_follow(), (0, ""))
+        self.assertEqual(self.seat_record().get("context_tokens"), original.get("context_tokens"))
+
+    def test_roster_writes_without_size_preserve_the_unmeasured_compaction_state(self) -> None:
+        original = self.compact_with_zero_usage()
+        codex_mesh._update_roster(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "failed",
+        })
+        self.assertEqual(self.seat_record(), {**original, "status": "failed"})
+        self.assertTrue(codex_mesh._update_roster_if_expected(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "done",
+        }, codex_mesh.RosterOnThread(THREAD_ID)))
+        self.assertEqual(self.seat_record(), original)
+        codex_mesh._update_roster(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "ended",
+        })
+        ended = self.seat_record()
+        self.assertTrue(codex_mesh._update_roster_if_expected(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "done",
+        }, codex_mesh.RosterOnThread(THREAD_ID)))
+        self.assertEqual(self.seat_record(), ended)
+        self.assertEqual(ended.get("context_tokens"), original.get("context_tokens"))
+
+    def test_reset_replaces_unmeasured_compaction_state_with_measured_zero(self) -> None:
+        _ = self.compact_with_zero_usage()
+        code, _output, errors = self.run_mesh(["reset", "--to", "seat"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["context_tokens"], 0)
+
+    def test_failed_compaction_keeps_the_complete_recorded_size(self) -> None:
+        self.context_sizes = [150000]
+        self.assertEqual(self.run_start()[0], 0)
+        original = self.seat_record()
+        self.failing_method = "thread/compact/start"
+        code, output, errors = self.run_mesh(["compact", "--to", "seat"])
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("scripted request failure", errors)
+        self.assertEqual(self.seat_record(), original)
+
+    def test_roster_writes_without_size_keep_a_measured_size(self) -> None:
+        self.context_sizes = [150000]
+        self.assertEqual(self.run_start()[0], 0)
+        original = self.seat_record()
+        codex_mesh._update_roster(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "failed",
+        })
+        self.assertEqual(self.seat_record(), {**original, "status": "failed"})
+        self.assertTrue(codex_mesh._update_roster_if_expected(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "done",
+        }, codex_mesh.RosterOnThread(THREAD_ID)))
+        self.assertEqual(self.seat_record(), original)
 
     def test_compact_waits_for_compaction_and_records_the_smaller_context(self) -> None:
         self.context_sizes = [150000]
