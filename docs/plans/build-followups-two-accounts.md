@@ -526,7 +526,16 @@ User, 2026-10-12, through the showrunner: "make the codex account half of this w
 5. `agent_notes.apply`: a Codex note is `active` when any home holds its login. Quota alerts, the 5-hour hold and the pacer keep reading only the account the seats run on, until Phase 12.
 6. The table: one row per Codex home, then a `not set up` row for each noted account in no home. Role `seats` on the home in use, `spare` on the others. Check problems print under the table.
 
-**Files:** `scripts/accounts/accounts.py`, `scripts/whoami/agent_accounts.py`, `scripts/whoami/agent_notes.py`, `scripts/whoami/whoami.py`, the tests beside each, `docs/accounts.md`, `commands/showrunner/accounts.md`.
+**Files:**
+
+- `scripts/accounts/accounts.py` — `setup` and `check` for a Codex home; a table row per home.
+- `scripts/accounts/test_accounts.py`
+- `scripts/whoami/agent_accounts.py` — `codex_live(home)`; one Codex report per home.
+- `scripts/whoami/agent_notes.py` — a Codex note is active when any home holds its login.
+- `scripts/whoami/test_agent_notes.py`
+- `scripts/whoami/whoami.py` — each Codex report under its account.
+- `docs/accounts.md`
+- `commands/showrunner/accounts.md`
 
 **Acceptance gate:** suites and lint pass. Live: `~/.codex1` is set up, the user signs codex 1 in there, and the table shows both Codex accounts with numbers read in the last 10 minutes while seats keep running on `~/.codex`.
 
@@ -549,7 +558,18 @@ User, 2026-10-12, through the showrunner: "make the codex account half of this w
 
 One Codex account serves all seats at a time, as one Claude account serves all unit directors. A single unit on its own Codex account belongs with Phase 8.
 
-**Files:** `scripts/accounts/accounts.py`, `scripts/agents/codex_mesh.py`, `scripts/agents/agent_exec.sh`, `scripts/message/codex_daemon.py`, the tests beside each, `docs/accounts.md`, `commands/showrunner/accounts.md`.
+**Files:**
+
+- `scripts/accounts/accounts.py` — the `seats` role and `swap seats`.
+- `scripts/accounts/test_accounts.py`
+- `scripts/agents/codex_mesh.py` — the server starts under the role's home and records it.
+- `scripts/agents/test_codex_mesh.py`
+- `scripts/agents/agent_exec.sh`
+- `scripts/agents/test_agent_exec.sh`
+- `scripts/message/codex_daemon.py`
+- `scripts/message/test_codex_daemon.py`
+- `docs/accounts.md`
+- `commands/showrunner/accounts.md`
 
 **Acceptance gate:** suites and lint pass. Live: one swap to codex 1 and back while a seat works, the seat continues, `mesh_server.json` names the home, and the table shows the role moved.
 
@@ -568,7 +588,17 @@ One Codex account serves all seats at a time, as one Claude account serves all u
 3. The 5-hour hold and its relay are keyed by account, so a swap carries no hold across.
 4. `codex_mesh` gives `blocked` the account that refused, and the alert names it. The Codex-to-Claude `switch` opens for the account in the role and closes when a swap moves the seats to an account with allowance.
 
-**Files:** `scripts/whoami/quota_alert.py`, `scripts/whoami/five_hour.py`, `scripts/whoami/agent_notes.py`, `scripts/agents/codex_mesh.py`, the tests beside each, `docs/quota_alerts.md`.
+**Files:**
+
+- `scripts/whoami/quota_alert.py`
+- `scripts/whoami/test_quota_alert.py`
+- `scripts/whoami/five_hour.py`
+- `scripts/whoami/test_five_hour.py`
+- `scripts/whoami/agent_notes.py`
+- `scripts/whoami/test_agent_notes.py`
+- `scripts/agents/codex_mesh.py` — gives `blocked` the account that refused.
+- `scripts/agents/test_codex_mesh.py`
+- `docs/quota_alerts.md`
 
 **Acceptance gate:** suites and lint pass, with fixtures of two signed-in Codex accounts: one in the role and low, one spare.
 
