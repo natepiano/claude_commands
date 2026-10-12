@@ -14,9 +14,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict, cast, final, override
 
-from . import seat_usage
-from ..usage.test_outcomes import OutcomeFixture
-from ..usage.test_collect import FIXTURES as COLLECT_FIXTURES, SNAPSHOT_COMMIT_SCRIPT, SshBehavior
+from scripts.whoami import seat_usage
+from scripts.usage.test_outcomes import OutcomeFixture
+from scripts.usage.test_collect import FIXTURES as COLLECT_FIXTURES, SNAPSHOT_COMMIT_SCRIPT, SshBehavior
 
 
 def record(record_type: str, at: str, payload: dict[str, object]) -> str:
