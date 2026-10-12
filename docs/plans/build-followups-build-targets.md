@@ -151,7 +151,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **Ruled out:** changing the release's 15 min admission limit (crediting the owner removes the cause of the wait).
 
-### Phase 3 — verify.sh and app launches wait out a natedev hold by themselves  · status: todo
+### Phase 3 — verify.sh and app launches wait out a natedev hold by themselves  · status: done
 
 #### Work Order
 
@@ -202,6 +202,9 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 - `wait-local` on `StateUnreadable`: print `verify.sh: natedev's hold state cannot be read (<reason>); not starting.` and exit 12, the code `mac_test.py claim` uses for unreadable state. A build never starts on a hold state nobody can read.
 - `HoldEnd = ExpiresAt | ReleaseEstimated | UntilReleased | AwaitingBlockRemoval`; a natedev hold carries `ReleaseEstimated` or `UntilReleased`.
 - `build_targets.display_field` collapses whitespace in one displayed field (`format_state` renders a whole status line with it); use `display_field(state.holder)` and `display_field(state.reason)` in the waiting line and the deny reason.
+- From the showrunner, 2026-10-11, required while another unit's test-width trial runs: make no edit to `scripts/lint/memory_admit.py` or `scripts/buildlog/width_trial.py`.
+- In `scripts/lint/invoke.sh` the hold wait ends before the step's start clock (`BUILDLOG_START`) is taken for the record, is never added to `BUILDLOG_MEM_WAIT_S`, and is recorded only in `BUILDLOG_HOLD_WAIT_S`.
+- For the nextest step the hold wait happens before `run_nextest` picks its width: the wait sits at the top of `run_nextest`, after `require_nextest` and before the width choice. Change nothing on the `LINT_TEST_WIDTH` line, in `require_nextest` or in `nextest_physical_cores`.
 
 **Acceptance gate:** the unittest discover lines for `scripts/build_targets`, `scripts/build_hold`, `scripts/delegate` and `scripts/hooks` green; basedpyright clean; `bash -n` on the four shell files.
 
