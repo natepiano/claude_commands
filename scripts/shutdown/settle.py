@@ -16,10 +16,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 from uuid import uuid4
-from zoneinfo import ZoneInfo
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "notify", "production", "hooks"):
+for dependency in ("whoami", "message", "notify", "production", "hooks", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 from account import Account
@@ -31,6 +30,7 @@ from remote import other_machine, run_remote
 import showrunner_footer
 import stop as stop_work
 from user_action import ActionRequired
+from user_zone import user_zone
 
 SHUTDOWN = Path(__file__).resolve().parent / "shutdown.py"
 NOTIFIER = SCRIPTS / "message" / "notifier.sh"
@@ -87,9 +87,9 @@ def record_time() -> str:
     """Return a canonical timestamp for a shutdown record field."""
     return now_utc().isoformat(timespec="seconds")
 
-def _pacific(value: str) -> str:
+def _user_time(value: str) -> str:
     return datetime.fromisoformat(value).astimezone(
-        ZoneInfo("America/Los_Angeles")
+        user_zone()
     ).strftime("%Y-%m-%d %H:%M %Z")
 
 def _machine() -> str:
@@ -373,7 +373,7 @@ def _warm() -> bool:
 def _settle_text(record: SessionShutdown, session: Session) -> str:
     opening = (
         f"Shutdown of account {record['label']} requested by the user with /shutdown "
-        f"({_pacific(record['requested_at'])}). "
+        f"({_user_time(record['requested_at'])}). "
     )
     command = (
         "`~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py "
