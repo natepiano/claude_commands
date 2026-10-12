@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 from pins import Pin, Pins
+from upstream import TargetPrerelease, TargetReleased, TargetUnpublished
 
 if TYPE_CHECKING:
     from add_unit import Production
@@ -24,6 +25,27 @@ class Answer(TypedDict):
     words: str
 
 
+class CratesIoUnread(TypedDict):
+    status: Literal["unread"]
+
+
+class CratesIoRead(TypedDict):
+    status: Literal["read"]
+    checked: str
+    releases: dict[str, str]
+    newest: str
+    ready: str  # Empty when no walked release is on the target.
+    repository: str  # Empty when the crate names no GitHub repository.
+
+
+class TargetUnread(TypedDict):
+    status: Literal["unread"]
+
+
+TargetBevy = TargetUnread | TargetUnpublished | TargetPrerelease | TargetReleased
+TargetFit = Literal["on target", "off target", "unreadable"]
+
+
 class Entry(TypedDict):
     pin: Pin
     bevy: str
@@ -31,6 +53,8 @@ class Entry(TypedDict):
     patched_bevy: bool
     answer: Answer | None  # None means the user has given no current answer for this crate.
     note: str
+    crates_io: CratesIoUnread | CratesIoRead
+    error: str
 
 
 class Record(TypedDict):
@@ -43,6 +67,9 @@ class Record(TypedDict):
     bevy: list[str]
     pins_read: str
     dependencies: dict[str, Entry]
+    target_bevy: TargetBevy
+    target_error: str
+    checked: str | None  # None means no check has reached every entry yet.
 
 
 class RecordFailure(Exception):
@@ -92,6 +119,44 @@ def _string_list(value: object, label: str) -> None:
         raise ValueError(f"{label} must be an array of strings")
 
 
+def _timestamp(value: object, label: str) -> None:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a timestamp")
+    _ = datetime.fromisoformat(value)
+
+
+def _upstream_fields(data: dict[str, object]) -> None:
+    _ = data.setdefault("target_bevy", {"status": "unread"})
+    _ = data.setdefault("target_error", "")
+    _ = data.setdefault("checked", None)
+    _strings(data, "target_error")
+    if data["checked"] is not None:
+        _timestamp(data["checked"], "checked")
+    target = _object(data["target_bevy"], "target_bevy")
+    status = target.get("status")
+    if status == "released":
+        _strings(target, "version", "date", "since")
+    elif status == "pre-release":
+        _strings(target, "since")
+    elif status not in ("unread", "unpublished"):
+        raise ValueError("target_bevy status must be unread, unpublished, pre-release or released")
+
+
+def _crates_io_fields(entry: dict[str, object]) -> None:
+    _ = entry.setdefault("crates_io", {"status": "unread"})
+    _ = entry.setdefault("error", "")
+    _strings(entry, "error")
+    facts = _object(entry["crates_io"], "crates_io")
+    if facts.get("status") == "read":
+        _strings(facts, "checked", "newest", "ready", "repository")
+        _timestamp(facts["checked"], "crates_io checked")
+        for requirement in _object(facts.get("releases"), "releases").values():
+            if not isinstance(requirement, str):
+                raise ValueError("release requirements must be strings")
+    elif facts.get("status") != "unread":
+        raise ValueError("crates_io status must be unread or read")
+
+
 def _validate(value: object) -> Record:
     data = _object(value, "record")
     _strings(data, "slug", "production", "checkout", "target", "started", "pins_read")
@@ -100,9 +165,11 @@ def _validate(value: object) -> Record:
     for key in ("started", "pins_read", "closed"):
         if data[key] is not None:
             _ = datetime.fromisoformat(cast(str, data[key]))
+    _upstream_fields(data)
     _string_list(data.get("bevy"), "bevy")
     for name, raw in _object(data.get("dependencies"), "dependencies").items():
         entry = _object(raw, name)
+        _crates_io_fields(entry)
         _strings(entry, "bevy", "note")
         _string_list(entry.get("via"), "via")
         if not isinstance(entry.get("patched_bevy"), bool):
@@ -178,7 +245,8 @@ def start(production: Production, target: str, pins: Pins, now: datetime) -> Rec
             raise RecordFailure(f"{path}: {error}") from error
     return apply_pins(Record(slug=production.slug, production=str(production.doc),
                              checkout=str(production.checkout), target=target, started=_utc(now),
-                             closed=None, bevy=[], pins_read=_utc(now), dependencies={}), pins, now)
+                             closed=None, bevy=[], pins_read=_utc(now), dependencies={},
+                             target_bevy=TargetUnread(status="unread"), target_error="", checked=None), pins, now)
 
 
 def apply_pins(record: Record, pins: Pins, now: datetime) -> Record:
@@ -187,7 +255,8 @@ def apply_pins(record: Record, pins: Pins, now: datetime) -> Record:
         entry = record["dependencies"].get(dependent.name)
         if entry is None:
             entry = Entry(pin=dependent.pin, bevy=dependent.bevy, via=list(dependent.via),
-                          patched_bevy=dependent.patched_bevy, answer=None, note="")
+                          patched_bevy=dependent.patched_bevy, answer=None, note="",
+                          crates_io=CratesIoUnread(status="unread"), error="")
         else:
             entry["pin"] = dependent.pin
             entry["bevy"] = dependent.bevy
@@ -230,3 +299,10 @@ def set_note(record: Record, crate: str, text: str) -> Record:
 def on_target(version: str, target: str) -> bool:
     parts = version.split(".", 2)
     return len(parts) >= 2 and ".".join(parts[:2]) == target
+
+
+def target_fit(requirement: str, target: str) -> TargetFit:
+    remainder = requirement[1:] if requirement.startswith(("^", "~", "=")) else requirement
+    if re.fullmatch(r"\d+\.\d+(\.\d+)?(-[\w.]+)?", remainder) is None:
+        return "unreadable"
+    return "on target" if on_target(remainder.split("-", 1)[0], target) else "off target"

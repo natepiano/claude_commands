@@ -96,7 +96,7 @@ okay - we should have some kind of note for tracking the upgrade so your report 
 
 **Ruled out:** an opaque per-crate digest for change detection — the change lines need the previous state word.
 
-### Phase 2 — `check` records each dependency's crates.io releases and which one is on the target  · status: todo
+### Phase 2 — `check` records each dependency's crates.io releases and which one is on the target  · status: done
 
 #### Work Order
 
@@ -110,7 +110,7 @@ Types follow the user's Type Design Contract. A value that can be missing in two
 `scripts/bevy_upgrade/upstream.py` holds every lookup and the types they return. Each lookup takes the fetcher as its first argument.
 
 ```python
-Fetch = Callable[[str], bytes]                # GET one URL; raises FetchFailure on any failure
+Fetch = Callable[[str], bytes]                # GET one URL; raises FetchFailure on any failure, a truncated or malformed response (`http.client.HTTPException`) included
 class FetchFailure(Exception): ...            # str() is "<host>: <reason>", e.g. "crates.io: HTTP 503"
 def http_fetch(url: str) -> bytes: ...        # urllib, User-Agent "bevy-upgrade (natepiano)", timeout 30 s
 def fixture_fetch(path: Path) -> Fetch: ...   # serves each URL from a JSON file of URL to body
@@ -135,7 +135,7 @@ def target_release(fetch: Fetch, target: str) -> TargetUnpublished | TargetPrere
 ```
 
 - `crate_info` reads `https://crates.io/api/v1/crates/<crate>`: `versions[].num` and `.yanked`, and `crate.repository`. A repository URL on github.com gives `owner/name` with any `.git` suffix and trailing path removed; any other URL, or none, gives `""`.
-- `release_requirement` reads `https://crates.io/api/v1/crates/<crate>/<version>/dependencies` and returns the `req` of the dependency named `bevy` when one of kind other than `dev` exists, else the `req` of the first such dependency, by sorted name, whose `crate_id` is in `bevy_names`, else `""`. A name outside `bevy_names` is never read as Bevy: `bevy_egui` is a third-party crate.
+- `release_requirement` reads `https://crates.io/api/v1/crates/<crate>/<version>/dependencies` and returns the `req` of the dependency named `bevy` when one of kind other than `dev` exists (whether or not `bevy` is in `bevy_names`: a lockfile with only Bevy sub-crates has no `bevy` package), else the `req` of the first such dependency, by sorted name, whose `crate_id` is in `bevy_names`, else `""`. A name outside `bevy_names` is never read as Bevy: `bevy_egui` is a third-party crate.
 - `target_release` reads `https://crates.io/api/v1/crates/bevy/versions` and looks at each `num` that starts with `<target>.`, with its `created_at`. No such version gives `TargetUnpublished`; only pre-releases give `TargetPrerelease`; otherwise `TargetReleased`.
 - `fixture_fetch` returns a fetcher over the file at `path`; a URL the file lacks raises `FetchFailure("<host>: no fixture")`.
 
@@ -192,7 +192,7 @@ def run_check(record: Record, pins: Pins, fetch: Fetch, clock: Clock) -> CheckPa
 `upgrade_report.py`:
 
 - `state` is now, in order: `done`; `re-vendor` when `patched_bevy` or the pin is a path pin; `release ready` when `crates_io` is read and `ready` is not `""`; `not checked` when `crates_io` is `unread`; else `no port yet`.
-- The crates.io cell reads `<newest> on Bevy <requirement>`, with ` → <ready> on Bevy <its requirement>` appended when `ready` is set and differs from `newest`. A requirement of `""` prints as `requirement unknown` in place of `on Bevy <requirement>`. The cell is `—` for a patched Bevy crate or a path pin, and `not checked` while `crates_io` is `unread`. An entry with `error` appends `; last check failed: <error>` to that cell.
+- The crates.io cell reads `<newest> on Bevy <requirement>`, with ` → <ready> on Bevy <its requirement>` appended when `ready` is set and differs from `newest`. A requirement of `""` prints as `requirement unknown` in place of `on Bevy <requirement>`. The cell is `—` for a patched Bevy crate, a path pin, or a `done` entry whose `crates_io` is `unread` (no check ever reads a done entry, so `not checked` would never change), and `not checked` for any other entry while `crates_io` is `unread`. A `done` entry that was read before it reached the target keeps its release text. An entry with `error` appends `; last check failed: <error>` to that cell.
 - Next: `bump to <ready>` for `release ready`; `wait` for `no port yet`; `run check` for `not checked`. For `re-vendor` it stays `re-vendor from Bevy <target>` for a patched Bevy crate and reads `port the copy at <path> to Bevy <target>` for a path-pinned dependent, which no check can move.
 - The second line of `table` has three parts. The target: `Bevy <target>: released as <version> on <date>.` for `released`, `Bevy <target>: not released yet.` for `pre-release` and `unpublished`, `Bevy <target>: release not looked up yet.` for `unread`. Then ` Release lookup failed: <target_error>.` when `target_error` is not `""`. Then the check: ` Upstream: no complete check yet.` while `checked` is `None`; else ` Upstream checked <HH:MM zone>.`; or ` Upstream last checked <YYYY-MM-DD HH:MM zone> (stale).` when `checked` is older than eight hours, any entry has `error`, or `target_error` is not `""`.
 

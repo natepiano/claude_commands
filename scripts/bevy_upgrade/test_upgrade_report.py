@@ -1,9 +1,9 @@
-"""Derive phase 1 states and print pins and user answers in a stable table."""
+"""Test the derived states and the table of pins and user answers."""
 from __future__ import annotations
 
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, final
 from zoneinfo import ZoneInfo
@@ -27,7 +27,7 @@ REVISION = "1234567890abcdef1234567890abcdef12345678"
 def entry(pin: pins.Pin, bevy: str = "0.19.1", patched: bool = False,
           via: tuple[str, ...] = ()) -> upgrade_record.Entry:
     return {"pin": pin, "bevy": bevy, "via": list(via), "patched_bevy": patched,
-            "answer": None, "note": ""}
+            "answer": None, "note": "", "crates_io": {"status": "unread"}, "error": ""}
 
 
 @final
@@ -39,6 +39,7 @@ class ReportTests(unittest.TestCase):
             "slug": "demo", "production": "", "checkout": "", "target": "0.20",
             "started": NOW.isoformat(), "closed": None, "bevy": [],
             "pins_read": NOW.isoformat(), "dependencies": {},
+            "target_bevy": {"status": "unread"}, "target_error": "", "checked": None,
         }
 
     @override
@@ -62,6 +63,7 @@ class ReportTests(unittest.TestCase):
             "slug": "demo", "production": str(doc), "checkout": str(checkout),
             "target": "0.20", "started": NOW.isoformat(), "closed": None,
             "bevy": ["0.19.1", "0.20.0"], "pins_read": NOW.isoformat(), "dependencies": {},
+            "target_bevy": {"status": "unread"}, "target_error": "", "checked": None,
         }
 
     def render(self) -> str:
@@ -93,13 +95,13 @@ class ReportTests(unittest.TestCase):
         lines = self.render().splitlines()
         self.assertEqual(lines[:4], [
             f"Bevy 0.20 upgrade for demo: {self.current['checkout']}, on Bevy 0.19.1 and 0.20.0.",
-            "Upstream: not checked yet.", "",
+            "Bevy 0.20: release not looked up yet. Upstream: no complete check yet.", "",
             "| Dependency | Our pin | crates.io | Git | State | Next |",
         ])
         self.assertNotIn("Answers on git pins:", lines)
         self.assertNotIn("Notes:", lines)
 
-    def test_rows_sort_by_state_then_name_with_exact_phase_one_cells(self) -> None:
+    def test_rows_sort_by_state_then_name_with_exact_cells(self) -> None:
         self.current["dependencies"] = {
             "a-done": entry({"source": "registry", "version": "5.0.0"}, "0.20.0"),
             "z-unchecked": entry({"source": "registry", "version": "2.0.0"}),
@@ -112,8 +114,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(rows, [
             "| a-patched (patched Bevy crate) | path ../vendor/a, 0.19.1 | — | — | re-vendor | re-vendor from Bevy 0.20 |",
             "| z-patched (patched Bevy crate) | path vendor/z, 0.19.1 | — | — | re-vendor | re-vendor from Bevy 0.20 |",
-            "| a-unchecked (via a-parent, z-parent) | 3.0.0 on Bevy 0.19.1 | — | — | not checked | run check |",
-            "| z-unchecked | 2.0.0 on Bevy 0.19.1 | — | — | not checked | run check |",
+            "| a-unchecked (via a-parent, z-parent) | 3.0.0 on Bevy 0.19.1 | not checked | — | not checked | run check |",
+            "| z-unchecked | 2.0.0 on Bevy 0.19.1 | not checked | — | not checked | run check |",
             "| a-done | 5.0.0 on Bevy 0.20.0 | — | — | done | — |",
         ])
 
@@ -125,14 +127,14 @@ class ReportTests(unittest.TestCase):
                     "source": "git", "version": "1.0.0", "url": "https://github.com/example/adapter",
                     "ref": ref, "rev": REVISION,
                 })}
-                self.assertIn(f"| adapter | git {label} @ {REVISION[:7]} on Bevy 0.19.1 | — | — | not checked | run check |",
+                self.assertIn(f"| adapter | git {label} @ {REVISION[:7]} on Bevy 0.19.1 | not checked | — | not checked | run check |",
                               self.render().splitlines())
 
     def test_a_path_dependent_prints_its_bevy_version(self) -> None:
         self.current["dependencies"] = {
             "adapter": entry({"source": "path", "version": "2.0.0", "path": "vendor/adapter"}),
         }
-        self.assertIn("| adapter | path vendor/adapter, 2.0.0 on Bevy 0.19.1 | — | — | not checked | run check |",
+        self.assertIn("| adapter | path vendor/adapter, 2.0.0 on Bevy 0.19.1 | — | — | re-vendor | port the copy at vendor/adapter to Bevy 0.20 |",
                       self.render().splitlines())
 
     def test_patched_bevy_label_and_pin_omit_via_and_bevy_suffix(self) -> None:
@@ -167,6 +169,95 @@ class ReportTests(unittest.TestCase):
         output = self.render()
         self.assertNotIn("Answers on git pins:", output)
         self.assertNotIn("Notes:", output)
+
+    def checked_entry(self, newest: str = "2.0.0", ready: str = "") -> upgrade_record.Entry:
+        current = entry({"source": "registry", "version": "1.0.0"})
+        current["crates_io"] = {"status": "read", "checked": NOW.isoformat(), "newest": newest,
+                                "ready": ready, "repository": "owner/adapter",
+                                "releases": {"3.0.0": "", "2.0.0": "^0.19", "1.0.0": "^0.20"}}
+        return current
+
+    def test_done_unread_cell_is_empty_while_read_facts_remain_visible(self) -> None:
+        unread = entry({"source": "registry", "version": "5.0.0"}, "0.20.0")
+        read = self.checked_entry()
+        read["bevy"] = "0.20.0"
+        self.current["dependencies"] = {"done-unread": unread, "done-read": read,
+                                        "waiting": entry({"source": "registry", "version": "1.0.0"})}
+        lines = self.render().splitlines()
+        self.assertIn("| done-unread | 5.0.0 on Bevy 0.20.0 | — | — | done | — |", lines)
+        self.assertIn("| done-read | 1.0.0 on Bevy 0.20.0 | 2.0.0 on Bevy ^0.19 | — | done | — |", lines)
+        self.assertIn("| waiting | 1.0.0 on Bevy 0.19.1 | not checked | — | not checked | run check |", lines)
+
+    def test_ready_and_no_port_states_and_next_steps(self) -> None:
+        self.current["dependencies"] = {"ready": self.checked_entry(ready="1.0.0"), "waiting": self.checked_entry()}
+        lines = self.render().splitlines()
+        self.assertIn("| ready | 1.0.0 on Bevy 0.19.1 | 2.0.0 on Bevy ^0.19 → 1.0.0 on Bevy ^0.20 | — | release ready | bump to 1.0.0 |", lines)
+        self.assertIn("| waiting | 1.0.0 on Bevy 0.19.1 | 2.0.0 on Bevy ^0.19 | — | no port yet | wait |", lines)
+        self.assertLess(lines.index(next(line for line in lines if line.startswith("| ready |"))),
+                        lines.index(next(line for line in lines if line.startswith("| waiting |"))))
+
+    def test_ready_equal_to_newest_does_not_repeat_it_and_unknown_requirement_is_explicit(self) -> None:
+        current = self.checked_entry("1.0.0", "1.0.0")
+        self.current["dependencies"] = {"adapter": current}
+        text = self.render()
+        self.assertIn("| 1.0.0 on Bevy ^0.20 |", text)
+        self.assertNotIn(" → ", text)
+        current["crates_io"] = {"status": "read", "checked": NOW.isoformat(), "newest": "3.0.0", "ready": "1.0.0",
+                                "repository": "", "releases": {"3.0.0": "", "1.0.0": "^0.20"}}
+        self.assertIn("3.0.0 requirement unknown → 1.0.0 on Bevy ^0.20", self.render())
+
+    def test_pin_and_done_states_take_precedence_over_cached_ready(self) -> None:
+        current = self.checked_entry(ready="1.0.0")
+        current["pin"] = {"source": "path", "version": "1.0.0", "path": "vendor/adapter"}
+        self.assertEqual(upgrade_report.state(current, "0.20"), "re-vendor")
+        current["bevy"] = "0.20.1"
+        self.assertEqual(upgrade_report.state(current, "0.20"), "done")
+
+    def test_entry_error_appends_to_unread_read_and_path_cells(self) -> None:
+        self.current["dependencies"] = {"unread": entry({"source": "registry", "version": "1.0.0"}),
+                                        "read": self.checked_entry(),
+                                        "path": entry({"source": "path", "version": "1.0.0", "path": "vendor/adapter"})}
+        for value in self.current["dependencies"].values():
+            value["error"] = "crates.io: HTTP 503"
+        text = self.render()
+        for cell in ("not checked", "2.0.0 on Bevy ^0.19", "—"):
+            self.assertIn(f"| {cell}; last check failed: crates.io: HTTP 503 |", text)
+
+    def test_second_line_for_each_target_status(self) -> None:
+        cases: tuple[tuple[upgrade_record.TargetBevy, str], ...] = (
+            ({"status": "unread"}, "release not looked up yet"),
+            ({"status": "unpublished"}, "not released yet"),
+            ({"status": "pre-release", "since": "2026-10-01"}, "not released yet"),
+            ({"status": "released", "version": "0.20.2", "date": "2026-10-12", "since": "2026-10-01"},
+             "released as 0.20.2 on 2026-10-12"),
+        )
+        for target, words in cases:
+            with self.subTest(target=target):
+                self.current["target_bevy"] = target
+                self.assertEqual(self.render().splitlines()[1], f"Bevy 0.20: {words}. Upstream: no complete check yet.")
+
+    def test_second_line_fresh_and_stale_checks_use_production_zone(self) -> None:
+        self.current["checked"] = NOW.isoformat()
+        self.assertEqual(self.render().splitlines()[1],
+                         "Bevy 0.20: release not looked up yet. Upstream checked 15:08 EDT.")
+        self.current["checked"] = (NOW - timedelta(hours=8)).isoformat()
+        self.assertNotIn("stale", self.render().splitlines()[1])
+        self.current["checked"] = (NOW - timedelta(hours=8, seconds=1)).isoformat()
+        self.assertEqual(self.render().splitlines()[1],
+                         "Bevy 0.20: release not looked up yet. Upstream last checked 2026-10-12 07:08 EDT (stale).")
+        self.current["checked"] = NOW.isoformat()
+        self.current["dependencies"] = {"adapter": self.checked_entry()}
+        self.current["dependencies"]["adapter"]["error"] = "crates.io: offline"
+        self.assertIn("Upstream last checked 2026-10-12 15:08 EDT (stale).", self.render().splitlines()[1])
+
+    def test_failed_target_lookup_is_printed_and_marks_checked_data_stale(self) -> None:
+        self.current["target_bevy"] = {"status": "pre-release", "since": "2026-10-01"}
+        self.current["target_error"] = "crates.io: HTTP 503"
+        self.assertEqual(self.render().splitlines()[1],
+                         "Bevy 0.20: not released yet. Release lookup failed: crates.io: HTTP 503. Upstream: no complete check yet.")
+        self.current["checked"] = NOW.isoformat()
+        self.assertEqual(self.render().splitlines()[1],
+                         "Bevy 0.20: not released yet. Release lookup failed: crates.io: HTTP 503. Upstream last checked 2026-10-12 15:08 EDT (stale).")
 
 
 if __name__ == "__main__":
