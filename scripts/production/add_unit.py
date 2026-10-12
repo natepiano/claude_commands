@@ -808,7 +808,7 @@ def main(argv: list[str]) -> int:
             problems = accounts.check(unit_account.label)
             if problems:
                 raise Refusal(
-                    f"unit account {unit_account.label}: {problems[0]}; /accounts status"
+                    f"unit account {unit_account.label}: {problems[0]}; /showrunner:accounts"
                 )
         # Imported only on the launch path: table readers import add_unit from
         # copied trees that do not include scripts/shutdown.
