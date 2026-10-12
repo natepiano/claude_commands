@@ -1,4 +1,4 @@
-"""Find provable scalar float multiply-add expressions in Rust edits."""
+"""Find likely multiply-add expressions in Rust edits."""
 
 from __future__ import annotations
 
@@ -43,7 +43,11 @@ class SuboptimalFlopsLintScope:
         return self.state is ScopeState.ENABLED
 
 
-class FloatMulAddFinding:
+class SourceLineSelection(Enum):
+    ALL = "all source lines"
+
+
+class MulAddFinding:
     __slots__: tuple[str, ...] = ("_line", "_a", "_b", "_c", "_expr", "_rewrite")
     _line: int
     _a: str
@@ -83,39 +87,32 @@ class FloatMulAddFinding:
 
 _EXEMPT = re.compile(r"clippy::(?:suboptimal_flops|nursery)\b")
 _STRING = re.compile(r'"(?:\\.|[^"\\])*"')
-_LITERALS = re.compile(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])' ''', re.VERBOSE)
-_FLOAT = re.compile(r"(?:\d+\.\d*(?:[eE][+-]?\d+)?|\d+(?:[eE][+-]?\d+|f(?:32|64)))(?:_?f(?:32|64))?\Z")
-_LEX = re.compile(r"\d+(?:\.\d*)?(?:[eE][+-]?\d+)?(?:_?f(?:32|64))?|[A-Za-z_]\w*|\+=|-=|=>|&&|\|\||\.\.|::|[^\s]")
-_ANNOTATION = re.compile(r"\b([A-Za-z_]\w*)\s*:\s*(&?\s*(?:mut\s+)?(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)")
-_SCALAR_TYPE = re.compile(r"\b([A-Za-z_]\w*)\s*:\s*f(?:32|64)\b")
-_NAMED_FIELDS = re.compile(r"\b(?:struct|enum)\s+[A-Za-z_]\w*[^;{]*\{([^}]*)\}")
+_LITERALS = re.compile(
+    r'(?:br|cr|r)(?P<hashes>\#*)"[\s\S]*?"(?P=hashes)|'
+    + r'(?:b|c)?"(?:\\[\s\S]|[^"\\])*"|(?:b)?\'(?:\\(?:u\{[0-9a-fA-F_]+\}|.)|[^\'\\])\''
+)
+_FLOAT = re.compile(r"\d[\d_]*\.\d[\d_]*(?:[eE][+-]?\d+)?(?:_?f(?:32|64))?\Z|\d[\d_]*[eE][+-]?\d+(?:_?f(?:32|64))?\Z|\d[\d_]*_?f(?:32|64)\Z|\d[\d_]*\.\Z")
+_INTEGER = re.compile(r"(?:0[xbo][\da-fA-F_]+|\d[\d_]*)(?:_?[iu](?:8|16|32|64|128|size))?\Z")
+_LEX = re.compile(
+    r"\d[\d_]*\.\d[\d_]*(?:[eE][+-]?\d+)?(?:_?f(?:32|64))?|"
+    + r"\d[\d_]*[eE][+-]?\d+(?:_?f(?:32|64))?|\d[\d_]*_?f(?:32|64)|\d[\d_]*\.(?![.\w])|"
+    + r"0[xbo][\da-fA-F_]+\w*|\d[\d_]*\w*|[A-Za-z_]\w*|"
+    + r"\.\.=|\.\.|<<=|>>=|\+=|-=|\*=|/=|%=|==|!=|<=|>=|&&|\|\||->|=>|::|[^\s]"
+)
+_FLOAT_EVIDENCE = re.compile(r"\bas\s+f(?:32|64)\b|\bf(?:32|64)::|\.to_f(?:32|64)\s*\(|\.(?:sin|cos|tan|sqrt|powi|powf|to_radians|to_degrees|sin_cos|atan2|exp|ln|hypot|recip|fract|signum|lerp)\s*\(|\b(?:PI|TAU|FRAC_PI_\d|EPSILON)\b")
+_INTEGER_EVIDENCE = re.compile(r"\bas\s+(?:usize|isize|[iu](?:8|16|32|64|128))\b|\.(?:len|count)\s*\(\s*\)")
+VECTOR = re.compile(r"\b(?:D?Vec[234]A?|Quat|Mat[234]|Dir[23]|Affine[23]|Isometry[23]d?|Transform|GlobalTransform|LinearRgba|Srgba|Color)\b|\.(?:normalize(?:_or_zero|_or)?|translation|rotation|truncate|extend|xy|xz|yz|xyz|as_vec[234]|as_dvec[234]|cross|perp|forward|right|up|back|left|down|local_[xyz]|half_size|half_extents|center|centre|size|extents|position|origin|direction|normal|tangent|min|max|offset|scale)\b(?!\s*[.(]\s*[xyzw\d]\b)(?!\.(?:x|y|z|w|width|height|depth|length|0|1)\b)")
+_PARAMETER = re.compile(r"(?:^|[,(])\s*(?:mut\s+)?([A-Za-z_]\w*)\s*:\s*([^,)=]+)")
+_LET_BINDING = re.compile(r"\blet\s+(?:mut\s+)?([A-Za-z_]\w*)\b")
+_ANNOTATION = re.compile(r"\blet\s+(?:mut\s+)?([A-Za-z_]\w*)\s*:\s*([^=;]+)")
 _VECTOR_BINDING = re.compile(r"\blet\s+(?:mut\s+)?([A-Za-z_]\w*)\s*=\s*([^;]+);")
 _VECTOR_VALUE = re.compile(r"\b(?:D?Vec[234]::(?:new|splat|from|ZERO|ONE|X|Y|Z)|\.as_[diu]?vec[234]\s*\(|\.transform_(?:point|vector)\s*\()")
-_REFERENCE_VALUE = re.compile(r"^\s*&|\.(?:iter|get|first|last)\s*\(")
-_PATTERN_BINDING = re.compile(r"\b(?:for|if\s+let|while\s+let)\s+(?:mut\s+)?([A-Za-z_]\w*)\s+(?:in|=)|\|([^|]+)\||\b([A-Za-z_]\w*)\s*=>")
-_DESTRUCTURED_PATTERN = re.compile(r"\b(?:if\s+let|while\s+let)\s+\w+\s*\(\s*([A-Za-z_]\w*)\s*\)\s*=|\b\w+\s*\(\s*([A-Za-z_]\w*)\s*\)\s*=>")
-_LET_ELSE = re.compile(r"\blet\s+(?:\w+\s*\(\s*)?([A-Za-z_]\w*)\s*\)?\s*=\s*[^;]+?\belse\s*\{")
-_COMPOUND_PATTERN = re.compile(r"\bfor\s+(.+?)\s+in\b|\b(?:if|while)\s+let\s+(.+?)\s*=|\blet\s+(.+?)\s*=\s*[^;]+?\belse\s*\{")
-_FILE_VALUE = re.compile(r"\b(?:const|static)\s+([A-Za-z_]\w*)\s*:\s*([^=;]+)=")
-_BOUNDARY = frozenset(("(", "[", "{", ",", ";", "=", "+=", "-=", "=>", "<", ">", "&&", "||", "..", "return", "let"))
-
-
-def _has_let_else(source: str, start: int) -> bool:
-    """Find an else on this let statement, after an initializer not ending in }."""
-    brackets: list[str] = []
-    previous = ""
-    for match in _LEX.finditer(source, start):
-        token = match.group()
-        if not brackets and token == ";":
-            return False
-        if not brackets and token == "else" and previous != "}":
-            return True
-        if token in {"(", "[", "{"}:
-            brackets.append(token)
-        elif token in {")", "]", "}"} and brackets:
-            _ = brackets.pop()
-        previous = token
-    return False
+_FILE_VALUE = re.compile(r"\b(?:const|static(?:\s+mut)?)\s+([A-Za-z_]\w*)\s*:\s*([^=;]+)=")
+_KEY_BOUND = frozenset(("return", "let", "if", "else", "match", "while", "in", "for", "loop", "break", "mut", "move", "where", "fn", "const", "static"))
+_OP_BOUND = frozenset((",", ";", "=", "+=", "-=", "*=", "/=", "%=", "==", "!=", "<", ">", "<=", ">=", "&&", "||", "=>", "->", "..", "..=", "|", ":", "#", "!"))
+_OPEN = {"(": ")", "[": "]", "{": "}"}
+_CLOSE = frozenset(_OPEN.values())
+_SCALAR_RESULT = re.compile(r"^\s*\(\s*\)\s*\.\s*(?:x|y|z|w|width|height|depth|length|0|1)\b")
 
 
 def _attribute_exempts(attribute: str) -> bool:
@@ -141,7 +138,7 @@ def _visible(source: str, comments: dict[int, int], tokens: list[RustToken], pai
     spans = [(start, end) for end, start in comments.items()]
     spans.extend((match.start(), match.end()) for match in _LITERALS.finditer(source))
     for index, token in enumerate(tokens):
-        if token.text != "!" or not macro_before(source, token.start, comments):
+        if token.text != "!" or macro_before(source, token.start, comments) != "macro_rules":
             continue
         opener = index + 1
         while opener < len(tokens) and tokens[opener].text not in {"{", "(", "["}:
@@ -223,119 +220,239 @@ def _functions(
     return bodies
 
 
-def _atom(lexemes: list[RustToken], index: int, direction: int) -> tuple[int, int]:
-    if not 0 <= index < len(lexemes):
-        return -1, -1
-    token = lexemes[index].text
-    if direction < 0 and token == ")":
-        depth = 1
-        for cursor in range(index - 1, -1, -1):
-            depth += (lexemes[cursor].text == ")") - (lexemes[cursor].text == "(")
-            if depth == 0:
-                return cursor, index + 1
-    if direction > 0 and token == "(":
-        depth = 1
-        for cursor in range(index + 1, len(lexemes)):
-            depth += (lexemes[cursor].text == "(") - (lexemes[cursor].text == ")")
-            if depth == 0:
-                return index, cursor + 1
-    if re.fullmatch(r"[A-Za-z_]\w*|\d[\w.]*", token) or _FLOAT.fullmatch(token):
-        start, end = index, index + 1
-        if direction < 0:
-            while start >= 2 and lexemes[start - 1].text == "." and re.fullmatch(r"[A-Za-z_]\w*", lexemes[start - 2].text):
-                start -= 2
+class ArithmeticTokens:
+    """Operands and matched groups in one visible function body."""
+
+    __slots__: tuple[str, ...] = ("lexemes", "pairs")
+    lexemes: list[RustToken]
+    pairs: dict[int, int]
+
+    def __init__(self, visible: str, start: int, end: int) -> None:
+        self.lexemes = [RustToken(match.group(), start + match.start(), start + match.end())
+                        for match in _LEX.finditer(visible[start:end])]
+        self.pairs = {}
+        stack: list[int] = []
+        for index, token in enumerate(self.lexemes):
+            generic = token.text == "<" and (
+                index > 0 and self.lexemes[index - 1].text == "::"
+                or bool(stack) and self.lexemes[stack[-1]].text == "<"
+            )
+            if token.text in _OPEN or generic:
+                stack.append(index)
+            elif stack and _OPEN.get(self.lexemes[stack[-1]].text, ">") == token.text:
+                opening = stack.pop()
+                self.pairs[index] = opening
+                self.pairs[opening] = index
+
+    def binary(self, index: int) -> bool:
+        if index <= 0:
+            return False
+        previous = self.lexemes[index - 1].text
+        return (bool(re.fullmatch(r"[A-Za-z_]\w*", previous) or _FLOAT.fullmatch(previous)
+                     or _INTEGER.fullmatch(previous))
+                and previous not in _KEY_BOUND and previous != "as") or previous in {")", "]", "?"} or (
+                    previous == ">" and index - 1 in self.pairs
+                )
+
+    def boundary(self, index: int, direction: int, *, additive: bool = False) -> int:
+        while 0 <= index < len(self.lexemes):
+            text = self.lexemes[index].text
+            if direction < 0 and (text in _CLOSE or text == ">") and index in self.pairs:
+                index = self.pairs[index] - 1
+                continue
+            if direction > 0 and (text in _OPEN or text == "<") and index in self.pairs:
+                index = self.pairs[index] + 1
+                continue
+            if text in _OPEN or text in _CLOSE or text in _OP_BOUND or text in _KEY_BOUND:
+                return index
+            if text == "&" and self.binary(index):
+                return index
+            if text in {"+", "-"} and self.binary(index) and not additive:
+                return index
+            index += direction
+        return index
+
+    def product_root(self, start: int, end: int) -> int:
+        root = -1
+        index = start
+        while index < end:
+            text = self.lexemes[index].text
+            if (text in _OPEN or text == "<") and index in self.pairs:
+                index = self.pairs[index] + 1
+                continue
+            if text in {"*", "/", "%"} and self.binary(index):
+                root = index
+            index += 1
+        return root
+
+    def disproving_terms(
+        self, start: int, end: int, names: BareNameEvidence, at: int,
+    ) -> tuple[bool, bool]:
+        """Integer literals and excluded bare names outside calls and indices."""
+        integer = vector = False
+        index = start
+        while index < end:
+            text = self.lexemes[index].text
+            previous = self.lexemes[index - 1].text if index > start else ""
+            following = self.lexemes[index + 1].text if index + 1 < end else ""
+            if text == "[" or text == "<" and index in self.pairs or (
+                text == "(" and index > start and self.binary(index)
+            ):
+                index = self.pairs.get(index, index) + 1
+                continue
+            continuation = previous in {".", "::", "as"} or following in {".", "::", "(", "[", "?"}
+            unary = previous in {"-", "&", "*"} and not self.binary(index - 1)
+            if not continuation:
+                integer |= bool(_INTEGER.fullmatch(text))
+                vector |= not unary and names.disproves(text, at)
+            index += 1
+        return integer, vector
+
+
+class NameArithmeticEvidence(Enum):
+    UNKNOWN = "unannotated binding"
+    FLOAT = "f32 or f64 annotation"
+    NONFLOAT = "another annotated type"
+    VECTOR = "vector constructor binding"
+
+
+class BareNameEvidence:
+    """The latest binding before a sum, within its own function."""
+
+    __slots__: tuple[str, ...] = ("fallback", "bindings")
+    fallback: dict[str, NameArithmeticEvidence]
+    bindings: dict[str, list[tuple[int, NameArithmeticEvidence]]]
+
+    def __init__(
+        self, visible: str, fn_start: int, start: int, end: int,
+        file_nonfloats: set[str], nested: list[tuple[int, int]],
+    ) -> None:
+        self.fallback = dict.fromkeys(file_nonfloats, NameArithmeticEvidence.NONFLOAT)
+        for match in _PARAMETER.finditer(visible[fn_start:start]):
+            self.fallback[match.group(1)] = (
+                NameArithmeticEvidence.FLOAT if match.group(2).strip() in {"f32", "f64"}
+                else NameArithmeticEvidence.NONFLOAT
+            )
+        self.bindings = {}
+        body = visible[start:end]
+        nested_starts = [left for left, _ in nested]
+        for match in _LET_BINDING.finditer(body):
+            position = start + match.start()
+            enclosing = bisect_right(nested_starts, position) - 1
+            if enclosing >= 0 and position < nested[enclosing][1]:
+                continue
+            state = NameArithmeticEvidence.UNKNOWN
+            if annotation := _ANNOTATION.match(body, match.start()):
+                state = (NameArithmeticEvidence.FLOAT
+                         if annotation.group(2).strip() in {"f32", "f64"}
+                         else NameArithmeticEvidence.NONFLOAT)
+            elif binding := _VECTOR_BINDING.match(body, match.start()):
+                if _VECTOR_VALUE.search(binding.group(2)):
+                    state = NameArithmeticEvidence.VECTOR
+            self.bindings.setdefault(match.group(1), []).append((position, state))
+
+    def disproves(self, name: str, at: int) -> bool:
+        bindings = self.bindings.get(name, [])
+        index = bisect_right(bindings, at, key=lambda binding: binding[0]) - 1
+        state = (bindings[index][1] if index >= 0
+                 else self.fallback.get(name, NameArithmeticEvidence.UNKNOWN))
+        return state in {NameArithmeticEvidence.NONFLOAT, NameArithmeticEvidence.VECTOR}
+
+
+def _compact(text: str) -> str:
+    if not any(marker in text for marker in ('"', "'", "//", "/*")):
+        return re.sub(r"\s+", " ", text).strip()
+    _, comments = tokenize_rust(text)
+    spans = [(start, end, False) for end, start in comments.items()]
+    spans.extend((match.start(), match.end(), True) for match in _LITERALS.finditer(text))
+    pieces: list[str] = []
+    outside: list[str] = []
+    cursor = 0
+    for start, end, literal in sorted(spans):
+        if start < cursor:
+            continue
+        outside.append(text[cursor:start])
+        if literal:
+            pieces.append(re.sub(r"\s+", " ", "".join(outside)))
+            pieces.append(text[start:end])
+            outside.clear()
         else:
-            while end + 1 < len(lexemes) and lexemes[end].text == "." and re.fullmatch(r"[A-Za-z_]\w*", lexemes[end + 1].text):
-                end += 2
-        return start, end
-    return -1, -1
+            outside.append(" ")
+        cursor = end
+    outside.append(text[cursor:])
+    pieces.append(re.sub(r"\s+", " ", "".join(outside)))
+    return "".join(pieces).strip()
 
 
-def _float_atom(text: str, scalars: set[str], excluded: set[str]) -> bool:
-    stripped = text.strip()
-    if stripped.startswith("(") and stripped.endswith(")"):
-        stripped = stripped[1:-1].strip()
-    if match := re.fullmatch(r"([A-Za-z_]\w*)\s*([+-])\s*([A-Za-z_]\w*)", stripped):
-        return match.group(1) in scalars and match.group(3) in scalars
-    if stripped in excluded:
-        return False
-    return bool(_FLOAT.fullmatch(stripped) or stripped in scalars or re.search(r"\bas\s+f(?:32|64)\b\s*$", stripped))
+def _vector_evidence(text: str) -> bool:
+    return any(not (match.group().startswith(".") and _SCALAR_RESULT.match(text[match.end():]))
+               for match in VECTOR.finditer(text))
 
 
-def _literal_compatible(text: str, excluded: set[str]) -> bool:
-    if _FLOAT.fullmatch(text):
-        return True
-    if re.fullmatch(r"[A-Za-z_]\w*", text):
-        return text not in excluded
-    if text.startswith("(") and text.endswith(")"):
-        return not any(match.group() in excluded for match in re.finditer(r"[A-Za-z_]\w*", text))
-    return False
+def _receiver(text: str) -> str:
+    text = _compact(text)
+    tokens = ArithmeticTokens(text, 0, len(text))
+    if tokens.lexemes and tokens.lexemes[0].text == "(" and tokens.pairs.get(0) == len(tokens.lexemes) - 1:
+        return text
+    if text.startswith(("-", "&", "*")):
+        return f"({text})"
+    cursor = 0
+    while cursor < len(tokens.lexemes):
+        word = tokens.lexemes[cursor].text
+        if (word in _OPEN or word == "<") and cursor in tokens.pairs:
+            cursor = tokens.pairs[cursor] + 1
+            continue
+        if word == "as" or word in {"+", "-", "*", "/", "%", "&"} and tokens.binary(cursor):
+            return f"({text})"
+        cursor += 1
+    return text
 
 
-def _sqrt_receiver(lexemes: list[RustToken], expr_start: int, expr_end: int) -> bool:
-    cursor = expr_end
-    while cursor < len(lexemes) and lexemes[cursor].text == ")":
-        opening, _ = _atom(lexemes, cursor, -1)
-        if opening < 0 or opening >= expr_start:
+def _negated(text: str) -> str:
+    text = _compact(text)
+    tokens = ArithmeticTokens(text, 0, len(text))
+    cursor = 0
+    while cursor < len(tokens.lexemes):
+        word = tokens.lexemes[cursor].text
+        if word in {"[", "?"}:
+            return f"-({text})"
+        if (word in _OPEN or word == "<") and cursor in tokens.pairs:
+            cursor = tokens.pairs[cursor] + 1
+            continue
+        if word == "as" or word in {"+", "-", "*", "/", "%", "&", "[", "?"}:
+            return f"-({text})"
+        cursor += 1
+    return f"-{text}"
+
+
+def _sqrt_receiver(tokens: ArithmeticTokens, start: int, end: int) -> bool:
+    cursor = end
+    while cursor < len(tokens.lexemes) and tokens.lexemes[cursor].text == ")":
+        if tokens.pairs.get(cursor, start) >= start:
             return False
         cursor += 1
-    return (
-        cursor > expr_end
-        and cursor + 1 < len(lexemes)
-        and lexemes[cursor].text == "."
-        and lexemes[cursor + 1].text == "sqrt"
-    )
+    return (cursor > end and cursor + 1 < len(tokens.lexemes)
+            and tokens.lexemes[cursor].text == "." and tokens.lexemes[cursor + 1].text == "sqrt")
 
 
 def _find_in_body(
     source: str, visible: str, fn_start: int, start: int, end: int,
-    scalar_fields: set[str], nonfloat_fields: set[str], file_floats: set[str], file_nonfloats: set[str],
-    nested: list[tuple[int, int]],
-    const_ranges: list[tuple[int, int]],
-) -> list[FloatMulAddFinding]:
+    file_nonfloats: set[str], nested: list[tuple[int, int]], const_ranges: list[tuple[int, int]],
+    newlines: list[int], selected: frozenset[int] | SourceLineSelection,
+) -> list[MulAddFinding]:
     body = visible[start:end]
     if "*" not in body or "+" not in body and "-" not in body:
         return []
-    typed_source = visible[fn_start:end]
-    annotations = {match.group(1): match.group(2).strip() for match in _ANNOTATION.finditer(typed_source)}
-    scalars = {name for name, annotation in annotations.items() if annotation in {"f32", "f64"}}
-    local_bindings = {match.group(1) for match in _VECTOR_BINDING.finditer(typed_source)}
-    scalars |= file_floats - annotations.keys() - local_bindings
-    excluded = (file_nonfloats - annotations.keys()) | {
-        name for name, annotation in annotations.items() if annotation not in {"f32", "f64"}
-    }
-    for match in _PATTERN_BINDING.finditer(typed_source):
-        names = ([match.group(1), match.group(3)] if match.group(2) is None
-                 else [name.group() for name in re.finditer(r"[A-Za-z_]\w*", match.group(2))])
-        excluded.update(name for name in names if name and name not in annotations)
-    excluded.update(name for match in _DESTRUCTURED_PATTERN.finditer(typed_source)
-                    if (name := match.group(1) or match.group(2)) not in annotations)
-    excluded.update(match.group(1) for match in _LET_ELSE.finditer(typed_source)
-                    if match.group(1) not in annotations and _has_let_else(typed_source, match.start()))
-    for match in _COMPOUND_PATTERN.finditer(typed_source):
-        pattern = match.group(1) or match.group(2) or match.group(3)
-        if match.group(3) and not _has_let_else(typed_source, match.start()):
-            continue
-        excluded.update(name.group() for name in re.finditer(r"[A-Za-z_]\w*", pattern)
-                        if name.group() not in annotations)
-    excluded.update(
-        match.group(1) for match in _VECTOR_BINDING.finditer(typed_source)
-        if _VECTOR_VALUE.search(match.group(2)) or _REFERENCE_VALUE.search(match.group(2))
-    )
-    def field_is_scalar(expression: str) -> bool:
-        if "." not in expression:
-            return True
-        fields = re.findall(r"(?<!\d)\.([A-Za-z_]\w*|\d+)\b", expression)
-        return not fields or fields[-1] in scalar_fields
-
-    lexemes = [RustToken(match.group(), start + match.start(), start + match.end()) for match in _LEX.finditer(body)]
-    statement_boundaries = [index for index, lexeme in enumerate(lexemes) if lexeme.text in {";", "{", "}"}]
-    nested_starts = [range_start for range_start, _ in nested]
-    const_starts = [range_start for range_start, _ in const_ranges]
-    findings: list[FloatMulAddFinding] = []
-    newlines: list[int] | None = None
+    names = BareNameEvidence(visible, fn_start, start, end, file_nonfloats, nested)
+    tokens = ArithmeticTokens(visible, start, end)
+    lexemes = tokens.lexemes
+    nested_starts = [left for left, _ in nested]
+    const_starts = [left for left, _ in const_ranges]
+    seen_roots: set[int] = set()
+    seen_sums: set[int] = set()
+    findings: list[MulAddFinding] = []
     for index, token in enumerate(lexemes):
-        if token.text != "*":
+        if token.text != "*" or not tokens.binary(index):
             continue
         nested_index = bisect_right(nested_starts, token.start) - 1
         if nested_index >= 0 and token.start < nested[nested_index][1]:
@@ -343,120 +460,91 @@ def _find_in_body(
         const_index = bisect_right(const_starts, token.start) - 1
         if const_index >= 0 and token.start < const_ranges[const_index][1]:
             continue
-        a_start, a_end = _atom(lexemes, index - 1, -1)
-        b_start, b_end = _atom(lexemes, index + 1, 1)
-        if a_start < 0 or b_start < 0:
+        left = tokens.boundary(index - 1, -1)
+        right = tokens.boundary(index + 1, 1)
+        root = tokens.product_root(left + 1, right)
+        if root < 0 or lexemes[root].text != "*" or root in seen_roots:
             continue
-        if (a_start > 0 and lexemes[a_start - 1].text in {".", "::"}) or (
-            b_end < len(lexemes) and lexemes[b_end].text in {".", "::", "(", "["}
+        seen_roots.add(root)
+        factor_start, factor_end = left + 1, right
+        while (left >= 0 and right < len(lexemes) and lexemes[left].text == "("
+               and tokens.pairs.get(left) == right and not tokens.binary(left)):
+            left -= 1
+            right += 1
+        before = lexemes[left].text if left >= 0 else ""
+        after = lexemes[right].text if right < len(lexemes) else ""
+        if factor_start != left + 1 and (
+            before in {"*", "/", "%", "&"}
+            or before == "-" and not tokens.binary(left)
+            or after in {"*", "/", "%"}
         ):
             continue
-        a = source[lexemes[a_start].start:lexemes[a_end - 1].end]
-        b = source[lexemes[b_start].start:lexemes[b_end - 1].end]
-        if a in excluded or b in excluded:
+        product_last = (before in {"+=", "-="} and after not in {"+", "-"}
+                        or before in {"+", "-"} and tokens.binary(left))
+        if product_last:
+            operator = left
+            term_end = left
+            term_start = (tokens.boundary(left - 1, -1, additive=before in {"+", "-"}) + 1)
+            expr_start, expr_end = term_start, right
+        elif after in {"+", "-"} and tokens.binary(right):
+            operator = right
+            term_start = right + 1
+            term_end = tokens.boundary(right + 1, 1)
+            expr_start, expr_end = left + 1, term_end
+        else:
             continue
-        if not field_is_scalar(a) or not field_is_scalar(b):
+        if operator in seen_sums or term_start >= term_end or root <= factor_start or root + 1 >= factor_end:
             continue
-        literal_proof = bool(_FLOAT.fullmatch(a) or _FLOAT.fullmatch(b))
-        if literal_proof:
-            if not ((_literal_compatible(a, excluded) or "." in a and field_is_scalar(a))
-                    and (_literal_compatible(b, excluded) or "." in b and field_is_scalar(b))):
-                continue
-        elif not ((_float_atom(a, scalars, excluded) or "." in a and "(" not in a and field_is_scalar(a)
-                   and a.rsplit(".", 1)[-1] not in nonfloat_fields)
-                  and (_float_atom(b, scalars, excluded) or "." in b and "(" not in b and field_is_scalar(b)
-                       and b.rsplit(".", 1)[-1] not in nonfloat_fields)):
+        seen_sums.add(operator)
+        evidence_start = tokens.boundary(left - 1, -1, additive=True) + 1 if before in {"+", "-"} else left + 1
+        evidence_end = tokens.boundary(right + 1, 1, additive=True) if after in {"+", "-"} else right
+        if product_last:
+            evidence_start = term_start
+        evidence = visible[lexemes[evidence_start].start:lexemes[evidence_end - 1].end]
+        float_evidence = bool(_FLOAT_EVIDENCE.search(evidence)) or any(
+            _FLOAT.fullmatch(lexeme.text) for lexeme in lexemes[evidence_start:evidence_end]
+        )
+        integer, vector_name = tokens.disproving_terms(
+            evidence_start, evidence_end, names, lexemes[expr_start].start,
+        )
+        index_open = evidence_start - 1
+        integer |= (index_open >= 0 and lexemes[index_open].text == "["
+                    and tokens.pairs.get(index_open) == evidence_end and tokens.binary(index_open))
+        if _vector_evidence(evidence) or vector_name or not float_evidence and (integer or _INTEGER_EVIDENCE.search(evidence)):
             continue
-        if a_start > 0 and lexemes[a_start - 1].text in {"*", "/", "%", "as"}:
+        if _sqrt_receiver(tokens, expr_start, expr_end):
             continue
-        if b_end < len(lexemes) and lexemes[b_end].text in {"*", "/", "%", "as"}:
-            continue
-        form = ""
-        c_start = c_end = expr_start = expr_end = -1
-        previous = lexemes[a_start - 1].text if a_start else "="
-        unary_minus = (previous == "-" and
-                       (a_start == 1 or a_start >= 2 and lexemes[a_start - 2].text in _BOUNDARY))
-        if previous in {"+", "-", "+=", "-="} and a_start >= 2 and not unary_minus:
-            c_start, c_end = _atom(lexemes, a_start - 2, -1)
-            if c_start >= 0:
-                while c_start >= 2 and lexemes[c_start - 1].text in {"+", "-"}:
-                    earlier, _ = _atom(lexemes, c_start - 2, -1)
-                    if earlier < 0:
-                        break
-                    c_start = earlier
-                expr_start, expr_end = c_start, b_end
-                form = "product_last_" + previous
-        elif b_end < len(lexemes) and lexemes[b_end].text in {"+", "-"}:
-            c_start, c_end = _atom(lexemes, b_end + 1, 1)
-            expr_start, expr_end = a_start - int(unary_minus), c_end
-            form = "product_first_" + lexemes[b_end].text
-        if c_start < 0 or c_end < 0 or expr_start < 0:
-            continue
-        if c_start > 0 and lexemes[c_start - 1].text in {".", "::"}:
-            continue
-        if c_end < len(lexemes) and lexemes[c_end].text in {".", "::", "(", "["}:
-            continue
-        if form.startswith("product_first") and c_end < len(lexemes) and lexemes[c_end].text in {"+", "-"}:
-            continue
-        c = source[lexemes[c_start].start:lexemes[c_end - 1].end]
-        if "." not in c and any(name.group() in excluded for name in re.finditer(r"[A-Za-z_]\w*", c)):
-            continue
-        if not field_is_scalar(c):
-            continue
-        if c == "()":
-            continue
-        if form.startswith("product_last") and c_start > 0 and lexemes[c_start - 1].text in {"*", "/", "%"}:
-            continue
-        if form.startswith("product_first") and c_end < len(lexemes) and lexemes[c_end].text in {"*", "/", "%"}:
-            continue
-        boundary = bisect_right(statement_boundaries, expr_start - 1) - 1
-        statement_start = statement_boundaries[boundary] if boundary >= 0 else -1
-        if any(lexeme.text in {"const", "static"} for lexeme in lexemes[statement_start + 1:expr_start]):
-            continue
-        if form.startswith("product_first") and a_start > 0 and previous not in _BOUNDARY and not unary_minus:
-            continue
-        if form.startswith("product_last") and c_start > 0 and lexemes[c_start - 1].text not in _BOUNDARY:
-            continue
-        if form.startswith("product_last") and any(lexeme.text in {"*", "/", "%"} for lexeme in lexemes[c_start:c_end]):
-            continue
+        a = source[lexemes[factor_start].start:lexemes[root - 1].end]
+        b = source[lexemes[root + 1].start:lexemes[factor_end - 1].end]
+        c = source[lexemes[term_start].start:lexemes[term_end - 1].end]
         if _FLOAT.fullmatch(a) and not re.search(r"_?f(?:32|64)$", a):
             if _FLOAT.fullmatch(b) and not re.search(r"_?f(?:32|64)$", b):
                 continue
             a, b = b, a
-        if unary_minus:
-            a = f"-{a}"
-        if _sqrt_receiver(lexemes, expr_start, expr_end):
-            continue
-        if form in {"product_last_-", "product_last_-="}:
-            receiver, addend = f"(-{a})", c
-        elif form == "product_first_-":
-            receiver, addend = a, f"-{c}"
-        else:
-            receiver, addend = a, c
-        if not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*|\d[\w.]*", receiver):
-            receiver = f"({receiver})" if not receiver.startswith("(") else receiver
-        call = f"{receiver}.mul_add({b}, {addend})"
-        if form == "product_last_-=":
-            call = f"{c} = {call}"
-        elif form == "product_last_+=":
-            call = f"{c} = {call}"
-        expr = source[lexemes[expr_start].start:lexemes[expr_end - 1].end]
-        if newlines is None:
-            newlines = [position for position, char in enumerate(source) if char == "\n"]
+        word = lexemes[operator].text
+        addend = _negated(c) if not product_last and word == "-" else c
+        factor = _negated(b) if product_last and word in {"-", "-="} else b
+        rewrite = f"{_receiver(a)}.mul_add({_compact(factor)}, {_compact(addend)})"
+        if word in {"+=", "-="}:
+            rewrite = f"{_compact(c)} = {rewrite}"
+        raw_expr = source[lexemes[expr_start].start:lexemes[expr_end - 1].end]
         line = bisect_right(newlines, lexemes[expr_start].start) + 1
-        findings.append(FloatMulAddFinding(line, a, b, c, expr, call))
+        last_line = bisect_right(newlines, lexemes[expr_end - 1].end - 1) + 1
+        if isinstance(selected, frozenset) and not any(number in selected for number in range(line, last_line + 1)):
+            continue
+        findings.append(MulAddFinding(line, a, b, c, _compact(raw_expr), _compact(rewrite)))
     return findings
 
 
-def float_mul_add_findings(
+def mul_add_findings(
     rs_file: os.PathLike[str] | str, written: frozenset[int] | None = None,
-) -> tuple[SuboptimalFlopsLintScope, list[FloatMulAddFinding]]:
-    """Return only expressions whose scalar float types can be proved locally."""
+) -> tuple[SuboptimalFlopsLintScope, list[MulAddFinding]]:
+    """Return likely multiply-adds; written=None includes every source line."""
     scope = suboptimal_flops_scope(rs_file)
     if not scope.enabled:
         return scope, []
     source = read_text(os.fspath(rs_file))
-    if not re.search(r"\*[^;{}]*[+-]|[+-][^;{}]*\*", source):
+    if "*" not in source or "+" not in source and "-" not in source:
         return scope, []
     tokens, comments = tokenize_rust(source)
     pairs = pair_delimiters(tokens)
@@ -466,37 +554,47 @@ def float_mul_add_findings(
     const_ranges = sorted((match.start(), tokens[pairs[opening_at[match.end() - 1]]].end)
                           for match in re.finditer(r"\bconst\s*\{", visible)
                           if match.end() - 1 in opening_at and opening_at[match.end() - 1] in pairs)
-    scalar_fields = {field.group(1) for declaration in _NAMED_FIELDS.finditer(visible)
-                     for field in _SCALAR_TYPE.finditer(declaration.group(1))}
-    nonfloat_fields = {field.group(1) for declaration in _NAMED_FIELDS.finditer(visible)
-                       for field in _ANNOTATION.finditer(declaration.group(1))
-                       if field.group(2).strip() not in {"f32", "f64"}}
     declarations = [(match.start(), match.group(1), match.group(2).strip())
                     for match in _FILE_VALUE.finditer(visible)]
-    file_values: dict[str, str] = {}
-    for position, name, annotation in declarations:
-        if not any(start <= position < end for _, start, end in bodies):
-            if name not in file_values or annotation not in {"f32", "f64"}:
-                file_values[name] = annotation
-    results: list[FloatMulAddFinding] = []
-    for body_index, (fn_start, start, end) in enumerate(bodies):
-        visible_values = file_values.copy()
-        visible_values.update((name, annotation) for position, name, annotation in declarations
-                              if start <= position < end)
-        file_floats = {name for name, annotation in visible_values.items() if annotation in {"f32", "f64"}}
-        file_nonfloats = visible_values.keys() - file_floats
+    token_starts = [token.start for token in tokens]
+    for match in _FILE_VALUE.finditer(visible):
+        index = bisect_right(token_starts, match.end() - 1)
+        while index < len(tokens):
+            if tokens[index].text == ";":
+                const_ranges.append((match.start(), tokens[index].end))
+                break
+            index = pairs[index] + 1 if index in pairs else index + 1
+    merged_ranges: list[tuple[int, int]] = []
+    for left, right in sorted(const_ranges):
+        if merged_ranges and left <= merged_ranges[-1][1]:
+            merged_ranges[-1] = (merged_ranges[-1][0], max(right, merged_ranges[-1][1]))
+        else:
+            merged_ranges.append((left, right))
+    function_ranges: list[tuple[int, int]] = []
+    for index, token in enumerate(tokens):
+        if token.text == "fn":
+            opener = body_opener(tokens, pairs, index + 1)
+            if opener in pairs:
+                function_ranges.append((tokens[opener].end, tokens[pairs[opener]].start))
+    file_nonfloats = {name for position, name, annotation in declarations
+                     if annotation not in {"f32", "f64"}
+                     and not any(start <= position < end for start, end in function_ranges)}
+    newlines = [match.start() for match in re.finditer("\n", source)]
+    function_starts = [start for start, _ in function_ranges]
+    selected = SourceLineSelection.ALL if written is None else written
+    results: list[MulAddFinding] = []
+    for fn_start, start, end in bodies:
         nested: list[tuple[int, int]] = []
-        for _, nested_start, nested_end in bodies[body_index + 1:]:
+        for nested_start, nested_end in function_ranges[bisect_right(function_starts, start):]:
             if nested_start >= end:
                 break
-            if nested_end < end:
-                nested.append((nested_start, nested_end))
+            if start < nested_start and nested_end < end:
+                if not nested or nested_start >= nested[-1][1]:
+                    nested.append((nested_start, nested_end))
+        excluded = file_nonfloats | {name for position, name, annotation in declarations
+                                    if start <= position < end and annotation not in {"f32", "f64"}
+                                    and not any(left <= position < right for left, right in nested)}
         results.extend(_find_in_body(source, visible, fn_start, start, end,
-                                     scalar_fields, nonfloat_fields, file_floats, file_nonfloats,
-                                     nested, const_ranges))
-    if written is not None:
-        results = [finding for finding in results
-                   if any(line in written for line in range(
-                       finding.line, finding.line + finding.expr.count("\n") + 1,
-                   ))]
+                                     excluded, nested, merged_ranges, newlines, selected))
+    results.sort(key=lambda finding: finding.line)
     return scope, results
