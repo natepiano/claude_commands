@@ -44,6 +44,7 @@ from record import (
     continuation,
     find_live,
     live_records,
+    park,
     parse_records,
     update,
 )
@@ -468,6 +469,11 @@ def _entry(session: Session) -> ShutdownSessionEntry:
     }
 
 
+def _parkable(record: ShutdownRecord) -> bool:
+    """An unfinished restart is no obstacle to a shutdown: `begin` parks it."""
+    return record["state"] == "restart partial"
+
+
 def begin(
     login: str,
     requested_by: str | None = None,
@@ -475,9 +481,20 @@ def begin(
     *,
     then: ShutdownContinuation = "stop",
 ) -> ShutdownRecord:
-    """Create one machine's settling record and stop only its recorded timers."""
+    """Create one machine's settling record and stop only its recorded timers.
+
+    An unfinished restart in the slot is parked first, so one failed restart
+    never blocks the account's next shutdown.
+    """
     scope = _scope(only)
     report = run_inventory(login, scope)
+    current = find_live(login)
+    if current["kind"] == "live" and _parkable(current["record"]):
+        unfinished = park(login)
+        print(
+            f"shutdown: parked the unfinished restart of {unfinished['label']} "
+            + f"from {_pacific(unfinished['requested_at'])}; /shutdown restart finishes it"
+        )
     requested_at = record_time()
     record: ShutdownRecord = {
         "login": login,
@@ -1693,6 +1710,11 @@ def _preflight_inventories(
 
 
 def _live_on_other(login: str) -> RemoteRecordOutcome:
+    """The peer's first record for `login`: its slot record when it has one.
+
+    `records` lists each account's slot record before its parked ones, and a
+    parked record is always `restart partial`.
+    """
     status, output = run_remote(["records", "--json", "--here"])
     machine = other_machine()
     if status == 255:
@@ -1814,7 +1836,7 @@ def down(
             return 1
         print(f"shutdown of {account.label} resumed; /shutdown status to watch")
         return 0
-    if local_live["kind"] == "live":
+    if local_live["kind"] == "live" and not _parkable(local_live["record"]):
         record = local_live["record"]
         print(f"shutdown: {record['machine']} is already {record['state']}")
         return 1
@@ -1826,7 +1848,7 @@ def down(
         if remote["kind"] == "unreachable":
             print(_failure_text(remote), file=sys.stderr)
             return 1
-        if remote["kind"] == "live":
+        if remote["kind"] == "live" and not _parkable(remote["record"]):
             print(
                 f"shutdown: {remote['record']['machine']} is already {remote['record']['state']}"
             )

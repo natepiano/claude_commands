@@ -1,9 +1,9 @@
 ---
-description: Nightly read-only review ending in one improvement proposal with a measured baseline. `config` covers machine configuration; `rust` covers ~/rust code, style and the development process. The nightly-review timer launches both on natedev at 01:00.
-argument-hint: config | rust
+description: Nightly read-only review ending in one improvement proposal per mode, each with a measured baseline. `config` covers machine configuration; `rust` covers ~/rust code, style and the development process. The nightly-review timer launches one session on natedev at 01:00 that does both, `config` first.
+argument-hint: config | rust | config rust
 ---
 
-Mode: `$ARGUMENTS`. NIGHT is today's local date, DIR is `~/.local/state/nightly-review/NIGHT`, LEDGER is `~/.local/state/nightly-review/ledger.md`.
+Modes: `$ARGUMENTS`, done one at a time in the order given. Finish a mode, its report written and its message sent, before starting the next; a mode that cannot finish says why in its report, and the next still runs. NIGHT is the local date when the session started, DIR is `~/.local/state/nightly-review/NIGHT`, LEDGER is `~/.local/state/nightly-review/ledger.md`.
 
 <Rules>
 - Read-only: write nothing outside DIR. No edits, commits, pushes, rebuilds or installs. A worktree only when a measurement needs a build that must not touch a working copy; remove it after.
@@ -23,7 +23,7 @@ One target a night, by weight: hana 12, cargo-liner 3, bevy_brp 2, showrunner 1,
 </Scope>
 
 <Proposal>
-Pick the single change with the largest measurable gain for its cost, and measure its baseline tonight. Write `DIR/<mode>.md`:
+For each mode, pick the single change with the largest measurable gain for its cost, and measure its baseline tonight. Write `DIR/<mode>.md`:
 
 ```
 # <title>
@@ -35,5 +35,5 @@ Pick the single change with the largest measurable gain for its cost, and measur
 **Also found:** <up to three one-line runners-up>
 ```
 
-Then `SendMessage` natedev, first line `Nightly proposal ready: DIR/<mode>.md`, second line the title; if natedev is not listed, skip it; `/nightly_next` reads every night's reports. Stay open: the user may attach to ask about it.
+Then `SendMessage` to the address `python3 ~/.claude/scripts/message/sessions.py address natedev` prints, which is natedev's session on this machine: first line `Nightly proposal ready: DIR/<mode>.md`, second line the title. If it prints nothing, natedev is not running: skip the message; `/nightly_next` reads every night's reports. After the last mode, stay open: the user may attach to ask about it.
 </Proposal>

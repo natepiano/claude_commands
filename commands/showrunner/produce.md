@@ -167,7 +167,7 @@ State:
   ---
   11:37 PDT update:
 
-  * build hold: <holder> since 11:34 PDT, for the frame-time lane's breakdown of what each added tool costs - release eta: 11:40 PDT (3 minutes)
+  * build hold: <holder> holds builds since 11:34 PDT for the frame-time lane's breakdown of what each added tool costs; expected to release 11:40 PDT (in 3 minutes)
   * Mac block: <holder> since 11:35 PDT, for the Mac-only test run - lifts Wed 12:35 PDT
   * claude 1: …
   * next dailies: 11:53 PDT - nothing needed
@@ -260,9 +260,10 @@ The command writes `PROMPT_FILE`,
 retargets `UPDATES` with `NOTIFIER new` without moving its clock, creates
 stall-watch and tmux-names only when absent, and prints `next_due`. Use the
 reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
-When the doc's Updates line reads `on demand`, it makes no `UPDATES` instance
-and removes one left from before, prints `on demand: no scheduled dailies`,
+When the doc's Updates line reads `on demand`, it makes `UPDATES` at the
+default 15 minutes and stops it, prints `on demand: no scheduled dailies`,
 and no scheduled update comes: a dailies runs only when the user asks for one.
+The stopped instance stays, because it is the showrunner's only record.
 
 The prompt:
 
@@ -340,6 +341,7 @@ whatever arrived:
 | a unit director's decision for the user | show it to the user; relay the answer |
 | a quota alert | <QuotaAlert/> |
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
+| the user asks which phase or task each unit is on | `/showrunner:units` |
 
 A unit repairing failing tests that split by file runs parallel repair seats
 (`/unit:direct` → <FixDispatch/>); one that runs a lone seat on them gets
@@ -897,7 +899,11 @@ This session is on the quota alert list because <StartUpdates/> adds it.
 reaches them only as your relay (<Throughout/>). Run `python3
 ~/.claude/scripts/production/waiting.py quota --production PRODUCTION_DOC
 --state-dir DAILIES_STATE_DIR --notice "<full notice>"`. It relays
-to every unit director and prints one `send <unit>:` receipt each:
+to every unit director and prints one `send <unit>:` receipt each. With more
+than one Claude account in use, a Claude `Quota alert:` names its account and
+roles (`claude 3 (unit directors) at …`). It reaches only the unit directors
+running on that account, prints `skip <unit>: it runs on <other account>` for
+the rest, and reports a unit whose account cannot be read as not told:
 - `Quota alert:` — the command picks the instruction from the notice. A Codex
   notice that says nothing was switched: unit directors keep delegating on Codex,
   whose account may keep working on its credits, and tell you at once if Codex
@@ -908,8 +914,8 @@ to every unit director and prints one `send <unit>:` receipt each:
   item per account, listed first in every Waiting on block with the percent left
   and the reset time, until it is acknowledged or restored.
 - `Quota alert acknowledged:` — drop the held item. Paused work stays paused.
-- `Quota restored:` — tell every unit director delegation on that tool can
-  resume, and drop the held item.
+- `Quota restored:` — tell every unit director that delegation on that tool,
+  or work on that Claude account, can resume, and drop the held item.
 
 What to do about the quota itself is the user's call; relay their decision to
 every unit director.

@@ -20,6 +20,7 @@ import note_file
 import agent_accounts
 import codex_pacer
 import five_hour
+import usage_store
 import whoami
 from agent_accounts import (ClaudeDirectorySource, CodexRateLimits, Quota, Report,
                             codex_credits, reset_credits)
@@ -148,6 +149,10 @@ class AgentNotesTests(unittest.TestCase):
             _ = agent_notes.update()
         self.assertEqual([note.get("state") for note in note_file.read_notes()], ["active", "active"])
         self.assertEqual(len((self.root / "readings.jsonl").read_text().splitlines()), 2)
+        self.assertEqual(
+            {login: usage.get("weekly", {}).get("left") for login, usage in usage_store.load().items()},
+            {"main@example.com": 80.0, "unit@example.com": 4.0},
+        )
 
     def test_role_swap_during_update_keeps_one_unit_login_active(self) -> None:
         """Every note uses the same role selection for the entire update."""

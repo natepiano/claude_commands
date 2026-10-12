@@ -38,6 +38,8 @@ elif args[0] == "new":
     print("next_due=1791334500 (2026-10-06 17:55 PDT)")
 elif args[0] == "remove":
     instance.unlink(missing_ok=True)
+elif args[0] == "stop":
+    _ = instance.write_text("stopped", encoding="utf-8")
 else:
     raise SystemExit(2)
 '''
@@ -208,7 +210,7 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual((records[0]["id"], records[0]["role"]), ("current-session-id", "showrunner"))
         self.assertNotIn("lens", records[0])
 
-    def test_on_demand_registers_no_dailies_schedule_and_removes_an_old_one(self) -> None:
+    def test_on_demand_keeps_a_stopped_timer_as_the_showrunners_record(self) -> None:
         first = self.run_command("register")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         doc = self.doc.read_text(encoding="utf-8")
@@ -220,13 +222,16 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
         self.assertIn("register: ok — showrunner-example on demand: no scheduled dailies", resumed.stdout)
         calls = self.notifier_calls()[before:]
-        self.assertNotIn(["new", "showrunner-example"], [call[:2] for call in calls])
-        self.assertIn(["remove", "showrunner-example"], calls)
-        self.assertFalse((self.state / "instance-showrunner-example").exists())
+        self.assertIn(["new", "showrunner-example"], [call[:2] for call in calls])
+        self.assertIn(["stop", "showrunner-example"], calls)
+        self.assertNotIn(["remove", "showrunner-example"], calls)
+        self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
         again = self.run_command("register")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        # A re-register retargets the timer and stops it again, so it stays stopped.
         self.assertEqual([call[0] for call in self.notifier_calls()[before + len(calls):]],
-                         ["status", "status", "status"])
+                         ["new", "stop", "status", "status"])
+        self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
 
     def test_register_requires_the_environment_session_id(self) -> None:
         without_id = {key: value for key, value in self.env.items() if key != "CLAUDE_CODE_SESSION_ID"}

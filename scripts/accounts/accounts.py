@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import math
 import os
@@ -13,10 +14,12 @@ import stat
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
+from zoneinfo import ZoneInfo
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +30,7 @@ sys.path.insert(0, str(SCRIPTS / "whoami"))
 import account  # noqa: E402
 import agent_accounts  # noqa: E402
 import note_file  # noqa: E402
+import usage_store  # noqa: E402
 
 
 # Shared means Claude Code reads the entry as user content or cross-session
@@ -85,11 +89,24 @@ KNOWN_PRIVATE_NAMES = frozenset(
         "daemon",
         "jobs",
         "backups",
+        "cache",
+        ".last-cleanup",
     }
 )
 IDENTITY_ENTRIES = (".credentials.json", ".claude.json", "account-label")
 IDENTITY_ENTRIES_NOT_SEEDED = (".credentials.json", "account-label")
 LABEL_PATTERN = re.compile(r"claude ([1-9][0-9]*)")
+CODEX_LABEL_PATTERN = re.compile(r"codex ([1-9][0-9]*)")
+# What the Codex account does in a production.
+CODEX_ROLE = "seats"
+# A table cell with nothing to show: the folder has no login, or is not set up.
+NO_VALUE = "—"
+TABLE_HEADINGS = (
+    "Folder", "Label", "Login", "Role", "5-hour left", "5-hour resets", "Weekly left", "Weekly resets",
+    "On credits", "Credits left", "Read",
+)
+# A stored reading older than this is read again before the table shows it.
+STALE_AFTER = timedelta(minutes=10)
 
 
 class ProjectSeed(TypedDict, total=False):
@@ -291,16 +308,31 @@ class AccountsError(ValueError):
 class AccountStatus:
     """The user-visible state of one default or named account directory."""
 
-    display_path: str
+    folder: str
+    config_dir: Path
     is_named_account: bool
+    # False for a label that has an account note and no folder yet.
+    is_set_up: bool
     account_is_safe_to_inspect: bool
     label: str
+    # The login stored in the folder. Empty when none is stored or it cannot be read.
     login: str
-    roles: tuple[str, ...]
+    role: str
     problems: tuple[str, ...]
     unclassified: tuple[str, ...]
     missing_mcp_servers: tuple[str, ...]
     extra_mcp_servers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CodexStatus:
+    """One Codex row: the Codex home, or an account with a note that the home does not hold."""
+
+    folder: str
+    label: str
+    # The login the home is signed in with. Empty when it has none, and for an account no home holds.
+    login: str
+    role: str
 
 
 class CommandLine(argparse.Namespace):
@@ -730,6 +762,11 @@ def check(label: str) -> list[str]:
     return list(account_directory_readiness(label).problems)
 
 
+def _drop_named_account(environment: dict[str, str]) -> None:
+    for name in account.NAMED_ACCOUNT_VARIABLES:
+        _ = environment.pop(name, None)
+
+
 def exec_account(label: str, arguments: list[str]) -> None:
     """Replace this process with Claude on the selected, safe directory."""
     if label == "unit":
@@ -746,15 +783,15 @@ def exec_account(label: str, arguments: list[str]) -> None:
             readiness = _inspect_account_directory(selected, expected)
             if isinstance(readiness, AccountDirectoryNotSetUp):
                 raise AccountsError(
-                    f'accounts: ~/.claude{selected.label.removeprefix("claude ")} is not set up; /accounts setup "{selected.label}" first'
+                    f'accounts: ~/.claude{selected.label.removeprefix("claude ")} is not set up; /showrunner:accounts setup "{selected.label}" first'
                 )
             if not isinstance(readiness, (AccountDirectoryReady, AccountDirectoryLoggedOut)):
                 raise AccountsError(readiness.problems[0])
-            environment["CLAUDE_CONFIG_DIR"] = str(selected.dir)
+            environment.update(account.named_account_environment(selected.dir))
         else:
-            _ = environment.pop("CLAUDE_CONFIG_DIR", None)
+            _drop_named_account(environment)
     else:
-        _ = environment.pop("CLAUDE_CONFIG_DIR", None)
+        _drop_named_account(environment)
     try:
         os.execvpe("claude", ["claude", *arguments], environment)
     except OSError as error:
@@ -796,7 +833,7 @@ def account_prefix(selected: AccountSelection) -> str:
     """Return the shell assignment for an already selected account."""
     if isinstance(selected, DefaultAccount):
         return ""
-    return f"CLAUDE_CONFIG_DIR={shlex.quote(str(selected.dir))} "
+    return account.named_account_prefix(selected.dir)
 
 
 def launch_prefix(role: str) -> str:
@@ -1100,8 +1137,20 @@ def _write_unit_role(label: str, identity: agent_accounts.KnownClaudeAccount) ->
 def set_role(role: str, label: str) -> None:
     """Atomically select a readable account and preserve its note identity."""
     _validate_role(role)
-    directory = main_config_dir() if label == "default" else account_dir(label)
-    identity = account_identity(directory)
+    if label == "default":
+        identity = account_identity(main_config_dir())
+    else:
+        directory = account_dir(label)
+        default = account_identity(main_config_dir())
+        if isinstance(default, agent_accounts.KnownClaudeAccount) and label.casefold() == default.label.casefold():
+            raise AccountsError(f"accounts: {label} is the default account; use default")
+        identity = account_identity(directory)
+        if (
+            isinstance(default, agent_accounts.KnownClaudeAccount)
+            and isinstance(identity, agent_accounts.KnownClaudeAccount)
+            and identity.login.casefold() == default.login.casefold()
+        ):
+            raise AccountsError(f"accounts: {label} is the default account; use default")
     if isinstance(identity, agent_accounts.UnreadableClaudeAccount):
         raise AccountsError(f"accounts: account identity for {label} is unreadable")
     _ = _write_unit_role(label, identity)
@@ -1312,46 +1361,51 @@ def _existing_named_accounts() -> list[NamedAccount]:
     return sorted(accounts, key=lambda account: int(account.label.removeprefix("claude ")))
 
 
-def _roles_by_directory() -> dict[Path, tuple[str, ...]]:
+def _folder_role(config_dir: Path) -> str:
+    """The sessions a folder's account runs now; `spare` when no role uses it."""
     selected = role_account("unit")
-    directory = main_config_dir() if isinstance(selected, DefaultAccount) else selected.dir
-    return {directory: ("unit",)}
+    unit_dir = main_config_dir() if isinstance(selected, DefaultAccount) else selected.dir
+    roles: list[agent_accounts.ClaudeRole] = []
+    if config_dir == main_config_dir():
+        roles.append("showrunners")
+    if config_dir == unit_dir:
+        roles.append("unit directors")
+    return ", ".join(roles) or "spare"
 
 
-def _status_for(
-    config_dir: Path,
-    display_path: str,
-    is_named_account: bool,
-    roles: tuple[str, ...],
-    problems: list[str],
-) -> AccountStatus:
+def _status_for(config_dir: Path, folder: str, named: NamedAccount | None, problems: list[str]) -> AccountStatus:
     baseline = _mcp_server_names(accounts_home() / ".claude.json")
     account_is_safe_to_inspect = not config_dir.is_symlink() and not (
-        is_named_account and (config_dir / ".claude.json").is_symlink()
+        named is not None and (config_dir / ".claude.json").is_symlink()
     )
+    # A named folder keeps its own label whatever login it holds; `problems` names a mismatch.
+    label = named.label if named is not None else NO_VALUE
+    login = ""
     if account_is_safe_to_inspect:
         identity = account_identity(config_dir)
-        login = identity.login if isinstance(identity, agent_accounts.KnownClaudeAccount) else "unavailable"
-        account_label = identity.label if isinstance(identity, agent_accounts.KnownClaudeAccount) else "unavailable"
+        if isinstance(identity, agent_accounts.KnownClaudeAccount):
+            login = identity.login
+            if named is None:
+                label = identity.label
         config_file = (
             accounts_home() / ".claude.json"
             if config_dir == main_config_dir()
             else config_dir / ".claude.json"
         )
         current = _mcp_server_names(config_file)
-        unclassified = _unclassified(config_dir) if is_named_account else ()
+        unclassified = _unclassified(config_dir) if named is not None else ()
     else:
-        login = "unavailable"
-        account_label = "unavailable"
         current = baseline
         unclassified = ()
     return AccountStatus(
-        display_path=display_path,
-        is_named_account=is_named_account,
+        folder=folder,
+        config_dir=config_dir,
+        is_named_account=named is not None,
+        is_set_up=True,
         account_is_safe_to_inspect=account_is_safe_to_inspect,
-        label=account_label,
+        label=label,
         login=login,
-        roles=roles,
+        role=_folder_role(config_dir),
         problems=tuple(problems),
         unclassified=unclassified,
         missing_mcp_servers=tuple(sorted(baseline - current)),
@@ -1359,9 +1413,20 @@ def _status_for(
     )
 
 
+def _label_number(label: str) -> int:
+    return int(label.removeprefix("claude "))
+
+
+def _noted_labels() -> set[str]:
+    """Every `claude N` label that has an account note, with or without a folder."""
+    return {
+        path.stem for path in _account_notes_directory().glob("claude *.md")
+        if LABEL_PATTERN.fullmatch(path.stem)
+    }
+
+
 def account_statuses() -> list[AccountStatus]:
-    """Inspect the default account and every named account already on disk."""
-    roles = _roles_by_directory()
+    """Inspect the default account, every named account on disk, and every noted account that no folder holds."""
     default_dir = main_config_dir()
     default_problems: list[str] = []
     if not default_dir.exists():
@@ -1370,59 +1435,248 @@ def account_statuses() -> list[AccountStatus]:
         default_problems.append(f"accounts: {default_dir} is not a directory")
     else:
         default_problems.extend(_login_problem(default_dir))
-    statuses = [
-        _status_for(
-            default_dir,
-            f"~/.claude ({default_dir})",
-            False,
-            roles.get(default_dir, ()),
-            default_problems,
-        )
-    ]
-    for named in _existing_named_accounts():
-        statuses.append(
-            _status_for(
-                named.dir,
-                f"~/.claude{named.label.removeprefix('claude ')}",
-                True,
-                roles.get(named.dir, ()),
-                check(named.label),
-            )
-        )
+    statuses = [_status_for(default_dir, "~/.claude", None, default_problems)]
+    on_disk = {named.label: named for named in _existing_named_accounts()}
+    for label in sorted({*on_disk, *_noted_labels()}, key=_label_number):
+        folder = f"~/.claude{_label_number(label)}"
+        named = on_disk.get(label)
+        if named is not None:
+            statuses.append(_status_for(named.dir, folder, named, check(label)))
+            continue
+        if label == statuses[0].label:
+            # The default folder holds this account; a second row would repeat its label.
+            continue
+        statuses.append(AccountStatus(
+            folder=folder,
+            config_dir=account_dir(label),
+            is_named_account=True,
+            is_set_up=False,
+            account_is_safe_to_inspect=True,
+            label=label,
+            login="",
+            role=NO_VALUE,
+            problems=(),
+            unclassified=(),
+            missing_mcp_servers=(),
+            extra_mcp_servers=(),
+        ))
     return statuses
 
 
-def _render_status(status: AccountStatus) -> str:
-    roles = ", ".join(status.roles) if status.roles else "none"
-    problems = "ok" if not status.problems else "\n".join(
-        f"    {problem}" for problem in status.problems
+def codex_statuses() -> list[CodexStatus]:
+    """The Codex home, then every Codex account that has a note and that the home does not hold."""
+    home = agent_accounts.codex_home()
+    folder = f"~/{home.relative_to(Path.home())}" if home.is_relative_to(Path.home()) else str(home)
+    login = agent_accounts.codex_email_on_disk(home) or ""
+    label = account.label_for("Codex", login) if login else NO_VALUE
+    noted = sorted(
+        (path.stem for path in _account_notes_directory().glob("codex *.md") if CODEX_LABEL_PATTERN.fullmatch(path.stem)),
+        key=lambda stem: int(stem.removeprefix("codex ")),
     )
+    return [
+        CodexStatus(folder, NO_VALUE if label == login else label, login, CODEX_ROLE),
+        *(CodexStatus(NO_VALUE, other, "", NO_VALUE) for other in noted if other != label),
+    ]
+
+
+def _codex_live() -> agent_accounts.Report:
+    return asyncio.run(agent_accounts.codex_live())
+
+
+def _stored_time(text: str) -> datetime | None:
+    try:
+        value = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return value if value.tzinfo is not None else None
+
+
+def _read_at(usage: usage_store.StoredUsage | None) -> datetime | None:
+    """When the oldest of a login's stored windows was read. None when it has no weekly window."""
+    if usage is None or "weekly" not in usage:
+        return None
+    windows = [usage["weekly"], *([usage["five_hour"]] if "five_hour" in usage else [])]
+    times = [_stored_time(window["at"]) for window in windows]
+    return None if None in times else min(time for time in times if time is not None)
+
+
+def _is_stale(usage: usage_store.StoredUsage | None, now: datetime) -> bool:
+    read = _read_at(usage)
+    return read is None or now - read > STALE_AFTER
+
+
+def _stored_usage(
+    statuses: list[AccountStatus], codex: list[CodexStatus], now: datetime,
+) -> dict[str, usage_store.StoredUsage]:
+    """Each login's stored readings. A login with none read lately is read live first, all at once."""
+    stored = usage_store.load()
+    stale = [
+        status.config_dir for status in statuses
+        if status.login and _is_stale(stored.get(usage_store.key("Claude", status.login)), now)
+    ]
+    # One Codex home, so one live read covers the one login it holds.
+    codex_is_stale = any(
+        status.login and _is_stale(stored.get(usage_store.key("Codex", status.login)), now) for status in codex
+    )
+    if stale or codex_is_stale:
+        with ThreadPoolExecutor() as pool:
+            reads = [pool.submit(agent_accounts.claude_live, config_dir) for config_dir in stale]
+            if codex_is_stale:
+                reads.append(pool.submit(_codex_live))
+            reports = [read.result() for read in reads]
+        if usage_store.merge(stored, reports, now):
+            try:
+                usage_store.write(stored)
+            except OSError:
+                # The table still shows what was read; only the next run reads it again.
+                pass
+    return stored
+
+
+def _user_zone() -> tzinfo | None:
+    """The zone the user reads times in: a running production's, else this machine's (None)."""
+    from scripts.production import showrunners
+
+    try:
+        zone = next((runner["zone"] for runner in showrunners.registered_showrunners()), "")
+    except OSError:
+        zone = ""
+    return ZoneInfo(zone) if zone else None
+
+
+def _is_current(window: usage_store.StoredWindow, now: datetime) -> bool:
+    """Whether a stored window still describes now. One that has ended says nothing about the one after it."""
+    if not window["resets"]:
+        return True
+    resets = _stored_time(window["resets"])
+    return resets is not None and resets > now
+
+
+def _window_cells(
+    window: usage_store.StoredWindow | None, now: datetime, zone: tzinfo | None, pattern: str,
+) -> tuple[str, str]:
+    """What is left of one window and when it resets."""
+    if window is None or not _is_current(window, now):
+        return ("unavailable", "unavailable")
+    resets = _stored_time(window["resets"])
+    return (f"{window['left']:.0f}%", NO_VALUE if resets is None else resets.astimezone(zone).strftime(pattern))
+
+
+def _credit_cells(usage: usage_store.StoredUsage, now: datetime) -> tuple[str, str]:
+    """Whether Codex work now draws on the account's credits, and the credits left.
+
+    Codex spends credits once an allowance window is used up.
+    """
+    credits = usage.get("credits")
+    if credits is None:
+        return ("unavailable", "unavailable")
+    balance = credits["balance"]
+    try:
+        amount = math.inf if balance == "unlimited" else float(balance)
+    except ValueError:
+        # Codex reported no balance.
+        return ("unavailable", "unavailable")
+    left = "unlimited" if math.isinf(amount) else f"{amount:,.0f}"
+    windows = [window for window in (usage.get("five_hour"), usage.get("weekly")) if window is not None]
+    current = [window for window in windows if _is_current(window, now)]
+    if any(window["left"] <= 0 for window in current):
+        return ("yes" if amount > 0 else "no", left)
+    return ("no" if "weekly" in usage and len(current) == len(windows) else "unavailable", left)
+
+
+def _reading_cells(
+    usage: usage_store.StoredUsage | None, now: datetime, zone: tzinfo | None, *, has_credits: bool,
+) -> tuple[str, ...]:
+    """The cells after the role: both windows, the credits, and when they were read."""
+    held = usage or usage_store.StoredUsage()
+    read = _read_at(usage)
+    has_no_five_hour_window = "weekly" in held and "five_hour" not in held
+    return (
+        *((NO_VALUE, NO_VALUE) if has_no_five_hour_window else _window_cells(held.get("five_hour"), now, zone, "%H:%M %Z")),
+        *_window_cells(held.get("weekly"), now, zone, "%a %m-%d %H:%M %Z"),
+        *(_credit_cells(held, now) if has_credits else (NO_VALUE, NO_VALUE)),
+        NO_VALUE if read is None else read.astimezone(zone).strftime("%H:%M %Z"),
+    )
+
+
+NO_READING = (NO_VALUE,) * 7
+
+
+def _table_row(
+    status: AccountStatus, usage: usage_store.StoredUsage | None, now: datetime, zone: tzinfo | None,
+) -> tuple[str, ...]:
+    """One Claude folder's row. `usage` is its login's stored reading, if it has one."""
+    if not status.is_set_up:
+        return (status.folder, status.label, "not set up", status.role, *NO_READING)
+    if not status.account_is_safe_to_inspect:
+        return (status.folder, status.label, "unavailable", status.role, *NO_READING)
+    if not status.login:
+        return (status.folder, status.label, "not logged in", status.role, *NO_READING)
+    return (
+        status.folder, status.label, status.login, status.role,
+        *_reading_cells(usage, now, zone, has_credits=False),
+    )
+
+
+def _codex_row(
+    status: CodexStatus, usage: usage_store.StoredUsage | None, now: datetime, zone: tzinfo | None,
+) -> tuple[str, ...]:
+    """One Codex row. `usage` is its login's stored reading, if it has one."""
+    if not status.login:
+        return (status.folder, status.label, "not logged in", status.role, *NO_READING)
+    return (
+        status.folder, status.label, status.login, status.role,
+        *_reading_cells(usage, now, zone, has_credits=True),
+    )
+
+
+def _render_table(rows: list[tuple[str, ...]]) -> str:
+    """A Markdown table, padded so it also reads as plain text."""
+    widths = [max(len(line[column]) for line in (TABLE_HEADINGS, *rows)) for column in range(len(TABLE_HEADINGS))]
+
+    def rendered(cells: tuple[str, ...]) -> str:
+        return "| " + " | ".join(cell.ljust(width) for cell, width in zip(cells, widths)) + " |"
+
+    return "\n".join([
+        rendered(TABLE_HEADINGS),
+        rendered(tuple("-" * width for width in widths)),
+        *(rendered(row) for row in rows),
+    ])
+
+
+def _status_notes(status: AccountStatus) -> list[str]:
+    """What is wrong or unusual in one folder. Nothing for a folder in order."""
+    notes = list(status.problems)
+    if status.unclassified:
+        notes.append(f"{status.folder}: unclassified: {', '.join(status.unclassified)}")
     mcp_differences = [
         *(f"- {name}" for name in status.missing_mcp_servers),
         *(f"+ {name}" for name in status.extra_mcp_servers),
     ]
-    mcp_servers = (
-        "unavailable"
-        if not status.account_is_safe_to_inspect
-        else ", ".join(mcp_differences) if mcp_differences else "same"
-    )
-    lines = [
-        status.display_path,
-        f"  label: {status.label}",
-        f"  login: {status.login}",
-        f"  role: {roles}",
-        f"  check: {problems}",
-    ]
-    if status.is_named_account:
-        unclassified = ", ".join(status.unclassified) if status.unclassified else "none"
-        lines.append(f"  unclassified: {unclassified}")
-    lines.append(f"  mcpServers: {mcp_servers}")
-    return "\n".join(lines)
+    if mcp_differences:
+        notes.append(f"{status.folder}: mcpServers: {', '.join(mcp_differences)}")
+    return notes
+
+
+def status_report() -> str:
+    """One table row per Claude folder and Codex account, then one line for each thing wrong in a folder."""
+    statuses = account_statuses()
+    codex = codex_statuses()
+    now = datetime.now(timezone.utc)
+    usage = _stored_usage(statuses, codex, now)
+    zone = _user_zone()
+    table = _render_table([
+        *(_table_row(status, usage.get(usage_store.key("Claude", status.login)), now, zone) for status in statuses),
+        *(_codex_row(status, usage.get(usage_store.key("Codex", status.login)), now, zone) for status in codex),
+    ])
+    notes = [note for status in statuses for note in _status_notes(status)]
+    return "\n".join([table, *([""] if notes else []), *notes])
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest="action", required=True)
+    commands = parser.add_subparsers(dest="action")
+    parser.set_defaults(action="status")
     for action in ("setup", "check"):
         command = commands.add_parser(action)
         _ = command.add_argument("label")
@@ -1457,7 +1711,7 @@ def main(argv: list[str]) -> int:
             destination = account_dir(options.label)
             for problem in problems:
                 print(problem, file=sys.stderr)
-            print(f"CLAUDE_CONFIG_DIR={shlex.quote(str(destination))} claude")
+            print(f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(destination))} claude")
             print("/login")
             return 1 if problems else 0
         if options.action == "check":
@@ -1466,7 +1720,7 @@ def main(argv: list[str]) -> int:
                 print(problem)
             return 1 if problems else 0
         if options.action == "status":
-            print("\n\n".join(_render_status(status) for status in account_statuses()))
+            print(status_report())
             return 0
         if options.action == "role":
             selected = role_account(options.role)

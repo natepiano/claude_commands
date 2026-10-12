@@ -347,6 +347,47 @@ class RecordTests(ShutdownTestCase):
 
         self.assertEqual(record.live_records(), [first, second])
 
+    def test_a_parked_restart_partial_frees_the_slot_and_stays_held(self) -> None:
+        unfinished = shutdown_record(state="restart partial")
+        record.create(unfinished)
+
+        self.assertEqual(record.park(unfinished["login"]), unfinished)
+
+        self.assertEqual(record.find_live(unfinished["login"])["kind"], "no shutdown")
+        self.assertEqual(record.parked(unfinished["login"]), [unfinished])
+        newer = shutdown_record(requested_at=LATER)
+        record.create(newer)
+        self.assertEqual(record.live_records(), [newer, unfinished])
+        self.assertEqual(record.account_records(newer["login"]), [newer, unfinished])
+
+    def test_park_and_unpark_refuse_without_moving_a_record(self) -> None:
+        for state in ("settling", "stopping", "down", "stop partial", "restarting"):
+            with self.subTest(state=state):
+                live = shutdown_record(state=cast(record.ShutdownState, state))
+                record.create(live)
+                with self.assertRaises(ValueError):
+                    _ = record.park(live["login"])
+                self.assertEqual(record.account_records(live["login"]), [live])
+                (self.root / "shutdown" / live["login"] / "record.json").unlink()
+        unfinished = shutdown_record(state="restart partial")
+        with self.assertRaises(record.NoLiveRecord):
+            _ = record.park(unfinished["login"])
+        with self.assertRaises(record.NoLiveRecord):
+            record.unpark(unfinished["login"], unfinished["requested_at"])
+        record.create(unfinished)
+        _ = record.park(unfinished["login"])
+        newer = shutdown_record(requested_at=LATER)
+        record.create(newer)
+
+        with self.assertRaises(record.ShutdownInProgress):
+            record.unpark(unfinished["login"], unfinished["requested_at"])
+
+        self.assertEqual(record.account_records(newer["login"]), [newer, unfinished])
+        (self.root / "shutdown" / newer["login"] / "record.json").unlink()
+        record.unpark(unfinished["login"], unfinished["requested_at"])
+        self.assertEqual(record.account_records(unfinished["login"]), [unfinished])
+        self.assertEqual(record.parked(unfinished["login"]), [])
+
     def test_config_dir_is_saved_only_on_the_session_and_round_trips(self) -> None:
         """F004: persistence keeps one authoritative directory on the session."""
         live = shutdown_record()

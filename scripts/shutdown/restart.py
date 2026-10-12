@@ -11,7 +11,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypedDict, cast
@@ -25,9 +26,11 @@ from account import (  # noqa: E402
     Account,
     UnknownAccountName,
     UnreadableAccount,
+    named_account_prefix,
     named_claude_account,
     own_claude_account,
 )
+import add_unit  # noqa: E402
 import conversation_pause  # noqa: E402
 from inventory import (  # noqa: E402
     PaneNotRecorded,
@@ -51,10 +54,15 @@ from record import (  # noqa: E402
     SessionRestartFailed,
     SeatAvailableOnDemand,
     TimerRestore,
+    ShutdownInProgress,
+    account_records,
     archive,
     find_live,
     live_records,
+    park,
+    parked,
     parse_records,
+    unpark,
     update,
 )
 from remote import other_machine, run_remote  # noqa: E402
@@ -68,10 +76,13 @@ ADD_UNIT = SCRIPTS / "production" / "add_unit.py"
 SEND = SCRIPTS / "message" / "send.py"
 SESSION_WAIT_SECONDS = 90.0
 SESSION_POLL_SECONDS = 0.5
+RESTART_LAUNCH_WORKERS = 6
 WINDOW_DELAY_SECONDS = 1.2
 PACIFIC = ZoneInfo("America/Los_Angeles")
 RESTARTABLE_STATES = frozenset({"down", "stop partial", "restart partial"})
 COMPLETE_PROGRESS = frozenset({"restarted", "seat available on demand"})
+# Worst wins when one machine's `up` attempts several records.
+STATUS_SEVERITY = {"nothing": 0, "done": 1, "partial": 2, "refused": 3}
 
 
 class RestartClaimRejected(Exception):
@@ -166,6 +177,18 @@ class SessionLaunched:
 
 
 @dataclass(frozen=True)
+class EntryLaunched:
+    """A launched entry needs confirmation from the session registry."""
+
+    relaunching_pending_timers: bool
+
+
+@dataclass(frozen=True)
+class EntrySettled:
+    """The entry needs no launch confirmation in this attempt."""
+
+
+@dataclass(frozen=True)
 class ManualRestartRequired:
     """The recorded session needs a person to run its resume command."""
 
@@ -204,6 +227,7 @@ class MachineRestartResult:
     manual_sessions: tuple[ManualSessionRestart, ...] = ()
     timers_not_started: tuple[TimerNotStarted, ...] = ()
     refusal_line: str = ""
+    elapsed_seconds: float = 0.0
 
     @property
     def exit_status(self) -> int:
@@ -309,15 +333,18 @@ def _session_liveness(
     return SessionNotLive()
 
 
-def wait_for_session(session_id: str, timeout: float) -> bool:
-    """Wait until the resumed session has a live registry record."""
+def wait_for_sessions(session_ids: frozenset[str], timeout: float) -> frozenset[str]:
+    """Wait once for all launched sessions and return those live at the last poll."""
+    if not session_ids:
+        return frozenset()
     deadline = time.monotonic() + timeout
     while True:
-        if session_id in _live_session_ids():
-            return True
+        live = session_ids & _live_session_ids()
+        if live == session_ids:
+            return live
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return False
+            return live
         time.sleep(min(SESSION_POLL_SECONDS, remaining))
 
 
@@ -357,7 +384,7 @@ def _resume_command(session: Session, prompt: str) -> str:
     default_dir = str(Path.home() / ".claude")
     config_dir = session.get("config_dir", default_dir)
     prefix = (
-        f"CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} "
+        named_account_prefix(Path(config_dir))
         if config_dir != default_dir
         else ""
     )
@@ -425,6 +452,21 @@ def _record_scheduled_restart_prompt(
         raise ScheduledRestartPromptNotRecorded(_error_reason(error)) from error
 
 
+def _units_row_plan(doc: str, unit: str) -> str | None:
+    """The Plan cell add_unit checks a resume against; None when `doc` has no single row for `unit`.
+
+    A run record's plan can differ from it: the plan moves to as-built, or a later run uses another doc.
+    """
+    try:
+        table = add_unit.unit_table(Path(doc).read_text(encoding="utf-8").splitlines())
+    except (OSError, UnicodeError, add_unit.Refusal):
+        return None
+    rows = [row for row in table if add_unit.cell_value(row.get("Unit", "")) == unit]
+    if len(rows) != 1 or "Plan" not in rows[0]:
+        return None
+    return add_unit.cell_value(rows[0]["Plan"])
+
+
 def _unit_argv(
     record: ShutdownRecord,
     entry: ShutdownSessionEntry,
@@ -439,7 +481,7 @@ def _unit_argv(
     if missing_plan:
         plan = "<plan>"
     elif recorded_plan["kind"] == "plan":
-        plan = recorded_plan["path"]
+        plan = _units_row_plan(host["doc"], host["unit"]) or recorded_plan["path"]
     else:
         raise ValueError("unit launch has no run record")
     note_path = _note_path(record, session["session_id"])
@@ -447,7 +489,8 @@ def _unit_argv(
         *_add_unit_command(),
         "--production",
         host["doc"],
-        host["unit"].removesuffix("-unit"),
+        # The recorded id, exactly: add_unit strips one "-unit" before adding its own.
+        host["unit"],
         "--plan",
         plan,
         "--resume",
@@ -614,6 +657,20 @@ def _respawn_pane_argv(
     ]
 
 
+def _new_window_argv(tmux: str, tmux_session: str, cwd: str, command: str) -> list[str]:
+    return [
+        tmux,
+        "new-window",
+        "-t",
+        f"={tmux_session}:",
+        "-c",
+        cwd,
+        "zsh",
+        "-ic",
+        command,
+    ]
+
+
 def _tmux_launch(command: str, session: Session, *, dry_run: bool) -> None:
     host = session["host"]
     if host["kind"] != "tmux":
@@ -633,33 +690,37 @@ def _tmux_launch(command: str, session: Session, *, dry_run: bool) -> None:
     probe_argv = [tmux, "has-session", "-t", f"={host['tmux_session']}"]
     probe = _probe(probe_argv, dry_run=dry_run)
     if pane["kind"] == "pane" and reusable_pane:
-        argv = _respawn_pane_argv(tmux, pane, session, command)
-    elif probe.returncode == 0:
-        argv = [
-            tmux,
-            "new-window",
-            "-t",
-            f"={host['tmux_session']}:",
-            "-c",
-            session["cwd"],
-            "zsh",
-            "-ic",
-            command,
-        ]
-    else:
-        argv = [
-            tmux,
-            "new-session",
-            "-d",
-            "-s",
-            host["tmux_session"],
-            "-c",
-            session["cwd"],
-            "zsh",
-            "-ic",
-            command,
-        ]
-    _ = _run(argv, dry_run=dry_run)
+        _ = _run(_respawn_pane_argv(tmux, pane, session, command), dry_run=dry_run)
+        return
+    if probe.returncode == 0:
+        _ = _run(
+            _new_window_argv(tmux, host["tmux_session"], session["cwd"], command),
+            dry_run=dry_run,
+        )
+        return
+    try:
+        _ = _run(
+            [
+                tmux,
+                "new-session",
+                "-d",
+                "-s",
+                host["tmux_session"],
+                "-c",
+                session["cwd"],
+                "zsh",
+                "-ic",
+                command,
+            ],
+            dry_run=dry_run,
+        )
+    except subprocess.CalledProcessError:
+        if dry_run or _probe(probe_argv, dry_run=False).returncode != 0:
+            raise
+        _ = _run(
+            _new_window_argv(tmux, host["tmux_session"], session["cwd"], command),
+            dry_run=False,
+        )
 
 
 def _launch_session(
@@ -873,11 +934,17 @@ def _entry_order(record: ShutdownRecord, entry: ShutdownSessionEntry) -> tuple[i
         requester["kind"] == "session"
         and requester["session_id"] == session["session_id"]
     ):
-        return 3, session["name"]
-    return (
-        {"unit": 0, "showrunner": 1, "top-level": 2, "seat": 4}[session["kind"]],
-        session["name"],
-    )
+        return 1, session["name"]
+    return 0, session["name"]
+
+
+def _dry_run_entry_order(record: ShutdownRecord, entry: ShutdownSessionEntry) -> tuple[int, str]:
+    """Keep the dry run's printed order."""
+    session = entry["session"]
+    rank = 3 if _entry_order(record, entry)[0] else {
+        "unit": 0, "showrunner": 1, "top-level": 2,
+    }[session["kind"]]
+    return rank, session["name"]
 
 
 def _claim(login: str) -> RestartClaimed | NothingToRestart:
@@ -919,6 +986,29 @@ def _mark_restart_failed(
     )
 
 
+def _launch_failure_left_session_live(
+    record: ShutdownRecord,
+    entry: ShutdownSessionEntry,
+    error: BaseException,
+) -> bool:
+    """Settle a failed launch command by the session registry; True when its session is live.
+
+    A launcher can fail after it started the session, as add_unit does when remote control never
+    reports active. That session is launched: recording it failed invites a second process on it.
+    """
+    name = entry["session"]["name"]
+    reason = _error_reason(error)
+    match _session_liveness(entry["session"]["session_id"]):
+        case SessionLive():
+            print(f"{record['machine']}: {name} is live; its launch reported: {reason}")
+            return True
+        case SessionNotLive():
+            _mark_restart_failed(record, entry, reason)
+        case SessionLivenessUnknown(reason=unknown):
+            print(f"{record['machine']}: {name} restart unfinished: {reason}; {unknown}")
+    return False
+
+
 def _restart_note_delivered(
     record: ShutdownRecord,
     entry: ShutdownSessionEntry,
@@ -948,17 +1038,17 @@ def _restart_note_delivered(
     return False
 
 
-def _process_session_entry(
+def launch_entry(
     record: ShutdownRecord,
     entry: ShutdownSessionEntry,
     restarted_at: str,
     desktop_state: DesktopLaunchState,
     *,
     dry_run: bool,
-) -> None:
+) -> EntryLaunched | EntrySettled:
     progress = entry["progress"]
     if progress["kind"] in COMPLETE_PROGRESS:
-        return
+        return EntrySettled()
     session = entry["session"]
     session_id = session["session_id"]
     relaunching_pending_timers = False
@@ -970,9 +1060,9 @@ def _process_session_entry(
                 failures = _restore_timers(timers, dry_run=dry_run)
                 if not dry_run:
                     _record_timer_restore_progress(record, entry, failures)
-                return
+                return EntrySettled()
             case SessionLivenessUnknown():
-                return
+                return EntrySettled()
             case SessionNotLive():
                 pass
     try:
@@ -984,23 +1074,23 @@ def _process_session_entry(
                 entry,
                 f"queued shutdown messages not retired: {_error_reason(error)}",
             )
-        return
+        return EntrySettled()
     was_live = session_id in _live_session_ids()
     note = restart_note(record, entry, restarted_at)
     if was_live:
         if progress["kind"] != "manual restart" and not _restart_note_delivered(
             record, entry, note, dry_run=dry_run
         ):
-            return
+            return EntrySettled()
         timer_failures = _restore_timers(entry["timers"], dry_run=dry_run)
         if not dry_run:
             _record_timer_restore_progress(record, entry, timer_failures)
-        return
+        return EntrySettled()
 
     if progress["kind"] == "manual restart":
         if dry_run:
             print(f"manual restart {session['name']}: {progress['command']}")
-        return
+        return EntrySettled()
 
     try:
         launch = _launch_session(
@@ -1013,11 +1103,11 @@ def _process_session_entry(
                 entry,
                 f"restart prompt not recorded: {_error_reason(error)}",
             )
-        return
+        return EntrySettled()
     except (OSError, subprocess.CalledProcessError, subprocess.SubprocessError) as error:
-        if not dry_run:
-            _mark_restart_failed(record, entry, _error_reason(error))
-        return
+        if dry_run or not _launch_failure_left_session_live(record, entry, error):
+            return EntrySettled()
+        launch = SessionLaunched()
     if isinstance(launch, ManualRestartRequired):
         if dry_run:
             print(f"manual restart {session['name']}: {launch.command}")
@@ -1026,20 +1116,28 @@ def _process_session_entry(
                 kind="manual restart", command=launch.command
             )
             _ = _set_entry_progress(record["login"], session_id, entry["progress"])
-        return
+        return EntrySettled()
     if dry_run:
-        return
-    if relaunching_pending_timers:
-        _record_relaunched_timers_pending(record, entry)
-    if not wait_for_session(session_id, SESSION_WAIT_SECONDS):
-        entry["progress"] = SessionRestartFailed(
-            kind="restart failed",
-            at=settle.record_time(),
-            reason=f"session not live after {SESSION_WAIT_SECONDS:g} seconds",
+        return EntrySettled()
+    return EntryLaunched(relaunching_pending_timers)
+
+
+def confirm_entry(
+    record: ShutdownRecord,
+    entry: ShutdownSessionEntry,
+    restarted_at: str,
+    live: bool,
+) -> None:
+    """Finish an entry after its shared registry wait."""
+    if not live:
+        _mark_restart_failed(
+            record,
+            entry,
+            f"session not live after {SESSION_WAIT_SECONDS:g} seconds",
         )
-        _ = _set_entry_progress(record["login"], session_id, entry["progress"])
         return
-    if session["kind"] == "showrunner":
+    if entry["session"]["kind"] == "showrunner":
+        note = restart_note(record, entry, restarted_at)
         if not _restart_note_delivered(record, entry, note, dry_run=False):
             return
     timer_failures = _restore_timers(entry["timers"], dry_run=False)
@@ -1175,6 +1273,10 @@ def _finish_record(record: ShutdownRecord) -> MachineRestartResult:
     )
 
 
+def _timing_line(result: MachineRestartResult) -> str:
+    return f"{result.machine}: restarted {result.restarted} in {result.elapsed_seconds:.1f} s"
+
+
 def _result_lines(result: MachineRestartResult) -> list[str]:
     if result.status == "nothing":
         return []
@@ -1197,6 +1299,7 @@ def _result_lines(result: MachineRestartResult) -> list[str]:
         f"{result.machine}: timer {item.instance} of {item.session_name} not started: {item.reason}"
         for item in result.timers_not_started
     )
+    lines.append(_timing_line(result))
     return lines
 
 
@@ -1205,7 +1308,7 @@ def _print_result(result: MachineRestartResult) -> None:
         print(line)
 
 
-def _up(login: str, dry_run: bool) -> MachineRestartResult:
+def _up_slot(login: str, dry_run: bool) -> MachineRestartResult:
     found = find_live(login)
     machine = settle.local_machine()
     if found["kind"] == "no shutdown":
@@ -1270,26 +1373,65 @@ def _up(login: str, dry_run: bool) -> MachineRestartResult:
                 )
             case RestartClaimed(record=claimed_record):
                 record = claimed_record
+    return _restart_record(login, record, dry_run)
 
+
+def _restart_record(
+    login: str, record: ShutdownRecord, dry_run: bool
+) -> MachineRestartResult:
+    """Resume one claimed slot record, or print a dry run of any record."""
     desktop_state = DesktopLaunchState()
     restarted_at = settle.record_time()
+    started_at = time.monotonic()
     try:
-        entries = sorted(record["entries"], key=lambda entry: _entry_order(record, entry))
-        for entry in entries:
-            if entry["session"]["kind"] != "seat":
-                _process_session_entry(
+        entries = sorted(
+            (entry for entry in record["entries"] if entry["session"]["kind"] != "seat"),
+            key=lambda entry: _entry_order(record, entry),
+        )
+        if dry_run:
+            entries.sort(key=lambda entry: _dry_run_entry_order(record, entry))
+            for entry in entries:
+                _ = launch_entry(
                     record,
                     entry,
                     restarted_at,
                     desktop_state,
-                    dry_run=dry_run,
+                    dry_run=True,
                 )
+        else:
+            requester = [entry for entry in entries if _entry_order(record, entry)[0]]
+            others = [entry for entry in entries if not _entry_order(record, entry)[0]]
+            launched: list[ShutdownSessionEntry] = []
+            with ThreadPoolExecutor(max_workers=RESTART_LAUNCH_WORKERS) as executor:
+                workers = [
+                    (
+                        entry,
+                        executor.submit(
+                            _launch_entry_safely, record, entry, restarted_at, desktop_state
+                        ),
+                    )
+                    for entry in others
+                    if entry["session"]["host"]["kind"] not in {"ghostty", "zed", "terminal"}
+                ]
+                for entry in others:
+                    if entry["session"]["host"]["kind"] in {"ghostty", "zed", "terminal"}:
+                        outcome = _launch_entry_safely(record, entry, restarted_at, desktop_state)
+                        if isinstance(outcome, EntryLaunched):
+                            launched.append(entry)
+                for entry, future in workers:
+                    if isinstance(future.result(), EntryLaunched):
+                        launched.append(entry)
+            _confirm_entries(record, launched, restarted_at)
+            for entry in requester:
+                outcome = _launch_entry_safely(record, entry, restarted_at, desktop_state)
+                if isinstance(outcome, EntryLaunched):
+                    _confirm_entries(record, [entry], restarted_at)
         _process_seats(record, dry_run=dry_run)
         if dry_run:
-            return MachineRestartResult(
-                record["machine"], record["label"], "done"
-            )
-        result = _finish_record(record)
+            return MachineRestartResult(record["machine"], record["label"], "done")
+        result = replace(
+            _finish_record(record), elapsed_seconds=time.monotonic() - started_at
+        )
         _print_result(result)
         return result
     except BaseException:
@@ -1300,8 +1442,100 @@ def _up(login: str, dry_run: bool) -> MachineRestartResult:
         _restore_desktop(desktop_state, dry_run=dry_run)
 
 
+def _launch_entry_safely(
+    record: ShutdownRecord,
+    entry: ShutdownSessionEntry,
+    restarted_at: str,
+    desktop_state: DesktopLaunchState,
+) -> EntryLaunched | EntrySettled:
+    try:
+        outcome = launch_entry(record, entry, restarted_at, desktop_state, dry_run=False)
+        if isinstance(outcome, EntryLaunched) and outcome.relaunching_pending_timers:
+            _record_relaunched_timers_pending(record, entry)
+        return outcome
+    except Exception as error:
+        _mark_restart_failed(record, entry, _error_reason(error))
+        return EntrySettled()
+
+
+def _confirm_entries(
+    record: ShutdownRecord,
+    entries: list[ShutdownSessionEntry],
+    restarted_at: str,
+) -> None:
+    if not entries:
+        return
+    live = wait_for_sessions(
+        frozenset(entry["session"]["session_id"] for entry in entries),
+        SESSION_WAIT_SECONDS,
+    )
+    for entry in entries:
+        confirm_entry(record, entry, restarted_at, entry["session"]["session_id"] in live)
+
+
+def _free_slot(login: str) -> bool:
+    """Park a slot record left `restart partial`; False while the slot holds any other state."""
+    found = find_live(login)
+    if found["kind"] == "no shutdown":
+        return True
+    if found["record"]["state"] != "restart partial":
+        return False
+    _ = park(login)
+    return True
+
+
+def _combined(results: list[MachineRestartResult]) -> MachineRestartResult:
+    """One machine result for several records: the worst status, every count and session."""
+    worst = max(results, key=lambda result: STATUS_SEVERITY[result.status])
+    return replace(
+        worst,
+        restarted=sum(result.restarted for result in results),
+        seats=sum(result.seats for result in results),
+        manual=sum(result.manual for result in results),
+        failed=sum(result.failed for result in results),
+        elapsed_seconds=sum(result.elapsed_seconds for result in results),
+        failed_sessions=tuple(
+            item for result in results for item in result.failed_sessions
+        ),
+        manual_sessions=tuple(
+            item for result in results for item in result.manual_sessions
+        ),
+        timers_not_started=tuple(
+            item for result in results for item in result.timers_not_started
+        ),
+    )
+
+
+def _up(login: str, dry_run: bool) -> MachineRestartResult:
+    """Resume the slot record, then each parked record once, oldest first."""
+    waiting = parked(login)
+    if not waiting:
+        return _up_slot(login, dry_run)
+    slot = find_live(login)
+    results = [_up_slot(login, dry_run)] if slot["kind"] == "live" else []
+    if dry_run:
+        # A real run frees a restartable slot before any parked record needs it.
+        if slot["kind"] == "no shutdown" or slot["record"]["state"] in RESTARTABLE_STATES:
+            results.extend(
+                _restart_record(login, item, dry_run=True) for item in waiting
+            )
+        return _combined(results)
+    for item in waiting:
+        try:
+            if not _free_slot(login):
+                break
+            unpark(login, item["requested_at"])
+        except (NoLiveRecord, ShutdownInProgress):
+            # Another `up` or `begin` took this record or the slot first.
+            break
+        results.append(_up_slot(login, dry_run=False))
+    if not results:
+        return MachineRestartResult(settle.local_machine(), waiting[0]["label"], "nothing")
+    return _combined(results)
+
+
 def up(login: str, dry_run: bool = False) -> int:
-    """Resume one machine's live record for `login`."""
+    """Resume one machine's records for `login`: the slot record, then each parked one."""
     try:
         return _up(login, dry_run).exit_status
     except (
@@ -1358,15 +1592,24 @@ def _selected_account(requested: AccountNamed | AccountNotNamed) -> Account:
                 return _account_from_records()
 
 
+def _widest_scope(records: list[ShutdownRecord]) -> ShutdownScope:
+    """The scope an alert covers for several records: account-wide when any record is."""
+    scopes = [record["scope"] for record in records]
+    return next(
+        (scope for scope in scopes if scope["kind"] == "all account sessions"),
+        scopes[0],
+    )
+
+
 def _local_restart_scope(
     login: str,
 ) -> RestartScopeKnown | RestartScopeNotFoundLocally:
     try:
-        found = find_live(login)
+        records = account_records(login)
     except (InvalidRecord, OSError, ValueError):
         return RestartScopeNotFoundLocally()
-    if found["kind"] == "live":
-        return RestartScopeKnown(found["record"]["scope"])
+    if records:
+        return RestartScopeKnown(_widest_scope(records))
     return RestartScopeNotFoundLocally()
 
 
@@ -1386,9 +1629,13 @@ def _remote_restart_scope(
             kind="machine not reached", machine=other_machine()
         )
     if remote["kind"] == "records read":
-        for remote_record in remote["records"]:
-            if remote_record["login"].casefold() == login.casefold():
-                return RestartScopeKnown(remote_record["scope"])
+        matching = [
+            remote_record
+            for remote_record in remote["records"]
+            if remote_record["login"].casefold() == login.casefold()
+        ]
+        if matching:
+            return RestartScopeKnown(_widest_scope(matching))
     return RestartScopeUnavailable()
 
 

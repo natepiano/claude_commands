@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -113,6 +114,29 @@ def codex_account(home: Path) -> Account | None:
 
 def _default_claude_config_dir() -> Path:
     return Path.home() / ".claude"
+
+
+# Claude Code saves a memory file without asking only when no link sits in the
+# file's path. A named account's `projects` is a link into the default
+# directory, so its sessions are pointed at the memory under that directory.
+MEMORY_BASE_VARIABLE = "CLAUDE_CODE_REMOTE_MEMORY_DIR"
+NAMED_ACCOUNT_VARIABLES = ("CLAUDE_CONFIG_DIR", MEMORY_BASE_VARIABLE)
+
+
+def named_account_environment(config_dir: Path) -> dict[str, str]:
+    """The variables that start Claude Code on a named account's directory."""
+    return {
+        "CLAUDE_CONFIG_DIR": str(config_dir),
+        MEMORY_BASE_VARIABLE: str(_default_claude_config_dir()),
+    }
+
+
+def named_account_prefix(config_dir: Path) -> str:
+    """The same variables as shell assignments placed before a command."""
+    return "".join(
+        f"{name}={shlex.quote(value)} "
+        for name, value in named_account_environment(config_dir).items()
+    )
 
 
 def parse_darwin_config_dir(output: str, expected_uid: int) -> Path | None:

@@ -1,6 +1,6 @@
 # Two accounts: showrunners on one Claude account, unit directors on another
 
-> **Status: IMPLEMENTATION PLAN — the code phases (1–5) are approved; nothing starts until the user says go (G1).** Phases 1–5 build everything and initiate nothing: no account dir, no login, no role. Phase 6 onward waits on the user. The design: each account the user has gets its own config dir, `~/.claude1`, `~/.claude2` and `~/.claude3`. Each holds only that account's login, and everything else is a symlink into `~/.claude`. Unit directors launch with `CLAUDE_CONFIG_DIR` set to the unit account's dir. Showrunners and every other session stay on `~/.claude`'s own login, as today. When the unit account runs low, one command swaps every unit onto a spare account through `/shutdown`'s safe stop and resume. Phased, delegate-ready once approved.
+> **Status: IMPLEMENTATION PLAN — phases 1–6 are done; the cutover (Phase 7) moved all ten build-followups unit directors to claude 3 on 2026-10-11, with the spare dir and the cross-machine message check still open; Phase 8 (move any one session) waits on the user's go.** Phases 1–5 built everything and initiated nothing: no account dir, no login, no role. Phase 6 proved `~/.claude3` live. The design: each account the user has gets its own config dir, `~/.claude1`, `~/.claude2` and `~/.claude3`. Each holds only that account's login, and everything else is a symlink into `~/.claude`. Unit directors launch with `CLAUDE_CONFIG_DIR` set to the unit account's dir. Showrunners and every other session stay on `~/.claude`'s own login, as today. When the unit account runs low, one command swaps every unit onto a spare account through `/shutdown`'s safe stop and resume. Any one session, a showrunner included, moves to any account the same way with `/showrunner:accounts move` (Phase 8). Phased, delegate-ready once approved.
 
 > **As-built disposition: create**
 
@@ -48,17 +48,17 @@ Everything else is a symlink into `~/.claude`: `settings.json`, `CLAUDE.md`, `co
   - The unit account spends about 25–35 a day and **lasts 3–4 days**: units swap once mid-week onto the third account, and those two together just about cover the week.
   - Two accounts stay active at all times, as the user wants. The split does not add capacity; it decides which sessions stop when an account runs out. Showrunners never do, and only units move.
 
-**What changes for the user:** nothing when starting sessions by hand. `~/.claude`'s login is the showrunner account, and `/login` there switches it as today. Units launch on the unit account by themselves. When the unit account runs low, the quota alert names the spare account with the most left and the one command, `/accounts swap unit "claude N"`. Each account is logged in once in its own dir, by the user, at setup.
+**What changes for the user:** nothing when starting sessions by hand. `~/.claude`'s login is the showrunner account, and `/login` there switches it as today. Units launch on the unit account by themselves. When the unit account runs low, the quota alert names the spare account with the most left and the one command, `/showrunner:accounts swap unit "claude N"`. Each account is logged in once in its own dir, by the user, at setup.
 
 **Costs:**
 
 - **Remote Control is per account.** A unit director on account N shows in account N's claude.ai session list, not the one the phone is signed into. Showrunners stay visible on the main account and relay as today. Phase 2 checks this live.
-- **`.claude.json` is per dir.** A new dir is seeded with project trust, onboarding flags and the user-scope MCP servers (today `brp`), so launches never stop at a dialog. An MCP server added later to one dir does not reach the others; `/accounts status` reports the difference.
+- **`.claude.json` is per dir.** A new dir is seeded with project trust, onboarding flags and the user-scope MCP servers (today `brp`), so launches never stop at a dialog. An MCP server added later to one dir does not reach the others; `/showrunner:accounts` reports the difference.
 - **Claude Code may replace a symlinked file when it writes it,** for example `settings.json` after `/model`. Phase 2 tests this; the launch check catches a replaced link either way.
 
 **Calls I made (each a one-line revert):**
 
-- Showrunners, top-level sessions, the nightly review, the fix pipeline and the `send.py` relay stay on `~/.claude`'s login. Only units get a role account, because they spend about 70% and they are the sessions that can be stopped safely and resumed.
+- Showrunners, top-level sessions, the fix pipeline and the `send.py` relay stay on `~/.claude`'s login. The nightly review ran there too until 2026-10-11, when it moved to the unit role's account (Phase 7). Only units get a role account, because they spend about 70% and they are the sessions that can be stopped safely and resumed.
 - A swap reuses `/shutdown`'s safe stop and resume instead of moving each unit at its next checkpoint.
 - The Mac is out of scope: units launch only on natedev (`add_unit.py` uses `systemd-run` and tmux). Mac sessions stay on `~/.claude`.
 - A long-lived `CLAUDE_CODE_OAUTH_TOKEN` per launch is ruled out: such a token "can't establish Remote Control sessions", and every unit runs with `--remote-control`.
@@ -79,7 +79,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
    - Phase 1: the account tool, `accounts.py`, which creates, checks and reports account dirs.
    - Phase 2: unit launch and restart learn the unit account.
    - Phase 3: the quota notes and alerts handle two accounts in use at once.
-   - Phase 4: `/accounts swap`.
+   - Phase 4: `/showrunner:accounts swap`.
 
    Phase 2 also edits `settings.json`: allow rules and sandbox write entries for `~/.claude1`–`~/.claude3`. That edit reaches main only with the user's go.
 2. **Shell commands and the guide (Phase 5). Nothing live changes.**
@@ -89,13 +89,16 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
    - The unit creates `~/.claude3`. The user runs `claude3` and logs in as claude 3 (`rubrics.dogwood-1f@icloud.com`).
    - The unit runs one throwaway session on claude 3 and checks its login, messaging both ways, `/shutdown`, resuming across accounts, and that the links survive `/model`. The user checks Remote Control on the phone.
    - The probe stops. Every existing session stays on claude 2. Undo: `rm -rf ~/.claude3`.
-4. **Cutover (Phase 7), at a time the user picks.**
+4. **Cutover (Phase 7), one unit at a time on the user's word.**
    - The user logs in `~/.claude1` with `claude1` (the spare).
-   - Unit directors stop safely, as `/shutdown` does it, and resume on claude 3 with their conversations intact. New units start on claude 3.
+   - New units start on claude 3. Each unit director the user names stops safely, as `/shutdown` does it, and resumes on claude 3 with its conversation intact.
    - Showrunners and the user's own sessions stay on claude 2.
-   - Undo: `/accounts swap unit default`.
-5. **During the week.** When claude 3 runs low, the alert names `/accounts swap unit "claude 1"`. Nothing switches by itself.
-6. **Day 7 (Phase 8).** A readout gives points per account per day, the times of any swaps, and whether the showrunner account lasted the week.
+   - Undo: `/showrunner:accounts swap unit default`.
+5. **Move any one session (Phase 8), when the user says go.**
+   - `/showrunner:accounts move <session> "claude N"` moves one showrunner, unit director or top-level session to any account. It stops safely, as `/shutdown` does it, and resumes the same conversation on the target in its own tmux pane or window.
+   - Undo: move it back.
+6. **During the week.** When claude 3 runs low, the alert names `/showrunner:accounts swap unit "claude 1"`. Nothing switches by itself.
+7. **Day 7 (Phase 9).** A readout gives points per account per day, the times of any swaps, and whether the showrunner account lasted the week.
 
 ## Delegation Context
 
@@ -176,7 +179,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 | G0 | Phase 1 | the user | cleared 2026-10-10 for the code phases 1–5: "prepare everything but don't initiate" |
 | G1 | Phase 6 | the user | the user explicitly authorizes the first live proof. Phase 6 then creates `~/.claude3`, and the user completes its login (step 2) before any probe starts |
 | G2 | Phase 7 | the user | the user authorizes cutover at a chosen time and confirms the unit account. Phase 7 then sets up and logs in the remaining dirs, and every check passes before step 4 writes the role |
-| G3 | Phase 8 | the clock | 7 days after cutover |
+| G3 | Phase 9 | the clock | 7 days after cutover |
 
 ## Phases
 
@@ -206,7 +209,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 #### As-built
 
-- `scripts/production/add_unit.py` resolves `accounts.role_account("unit")` once per launch and passes the selection to `launch_session`. A named account must pass `accounts.check(label)`, else exit 2: `add_unit: unit account <label>: <first problem>; /accounts status`. The launch guard (`launch_permission`) runs with `CLAUDE_CONFIG_DIR` set to that account's dir; `launch_environment` strips `CLAUDE_*`. The tmux command string is `accounts.account_prefix(selected) + "ENABLE_TOOL_SEARCH=true command claude …"`, so tmux passes the prefix whatever its server's environment. With no `config/accounts.json` the prefix is empty and the guard env is unchanged.
+- `scripts/production/add_unit.py` resolves `accounts.role_account("unit")` once per launch and passes the selection to `launch_session`. A named account must pass `accounts.check(label)`, else exit 2: `add_unit: unit account <label>: <first problem>; /showrunner:accounts`. The launch guard (`launch_permission`) runs with `CLAUDE_CONFIG_DIR` set to that account's dir; `launch_environment` strips `CLAUDE_*`. The tmux command string is `accounts.account_prefix(selected) + "ENABLE_TOOL_SEARCH=true command claude …"`, so tmux passes the prefix whatever its server's environment. With no `config/accounts.json` the prefix is empty and the guard env is unchanged.
 - `accounts.account_prefix(selected: AccountSelection) -> str` renders the env prefix for a selection (empty for the default account); `launch_prefix(role)` is `account_prefix(role_account(role))`.
 - The manual unit resume in `commands/showrunner/produce.md` runs `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py env unit` first, stops on a nonzero exit, and puts its output verbatim before both `shutdown.py launch-blocked --restart-of <id>` and `claude --resume <id> …`; no `eval`.
 - Shutdown inventory reads each session's account and config dir together at one boundary (`AttributedSessionConfiguration`) and stores the dir as `config_dir` on the session snapshot, absent meaning `~/.claude`; an unreadable environment leaves the session unattributed. `ShutdownSessionEntry` has no `config_dir`, and an entry-level key from an older record is ignored on read. `restart.py` puts `CLAUDE_CONFIG_DIR=<quoted dir> ` before `ENABLE_TOOL_SEARCH=true` for a non-unit resume whose dir is not `~/.claude`; units relaunch through `add_unit.py` on the current role.
@@ -227,7 +230,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 - `pyrightconfig.json` — the scripts/production environment adds `"."` so `scripts.accounts` resolves.
 - `docs/as-built/shutdown-and-restart.md` — config dir on the snapshot and the restart rule.
 
-**Binds later work:** add_unit resolves the unit role once per launch, refuses a named account failing `accounts.check` with exit 2 `add_unit: unit account <label>: <first problem>; /accounts status`, and asks the launch guard on that account's dir, so after a role change a unit relaunched through add_unit lands on and is judged against the new account (the swap of the unit account relies on this). A rule added to `accounts.check` reaches the unit launch with no change to add_unit. `account_prefix(selected)` and the `accounts.py env <role>` verb render the account prefix for any launch, including an `exec` verb. Restart restores a non-unit session on its recorded `config_dir`. `shutdown.py launch-blocked` with no account argument judges the default account (`CLAUDE_*` stripped), so a swap-time shutdown check passes the target dir. The add_unit refusal is user-actionable; the user's guide covers it under "When a unit will not start".
+**Binds later work:** add_unit resolves the unit role once per launch, refuses a named account failing `accounts.check` with exit 2 `add_unit: unit account <label>: <first problem>; /showrunner:accounts`, and asks the launch guard on that account's dir, so after a role change a unit relaunched through add_unit lands on and is judged against the new account (the swap of the unit account relies on this). A rule added to `accounts.check` reaches the unit launch with no change to add_unit. `account_prefix(selected)` and the `accounts.py env <role>` verb render the account prefix for any launch, including an `exec` verb. Restart restores a non-unit session on its recorded `config_dir`. `shutdown.py launch-blocked` with no account argument judges the default account (`CLAUDE_*` stripped), so a swap-time shutdown check passes the target dir. The add_unit refusal is user-actionable; the user's guide covers it under "When a unit will not start".
 
 **Gotchas:** a check about a named account through `shutdown.py launch-blocked` must name the account or set its dir, or it judges the default one; a held named unit account refuses with `…; /shutdown restart first`. Code that imports `scripts.accounts` from `scripts/production` needs the repo root on `sys.path`.
 
@@ -239,8 +242,8 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 - With accounts configured, `~/.claude`'s login (showrunner) and the unit account are both `state: active`; spares are `inactive`, yet each fresh reading still reaches its note and `readings.jsonl`. `claude_live` and `claude_credentials` take an optional `config_dir`; `None` keeps the single-dir behavior. With no `config/accounts.json` and no named dir, output and launches are unchanged.
 - One frozen `ClaudeAccountSelection` (`default_account`, `unit_account`, `multiple_accounts`, `named_accounts`) per operation, built by `accounts.claude_account_selection()` from `checked_named_accounts()` and `account_identity(dir)`; consumers take it as a value and never re-resolve roles.
-- Alerts name label and role (`Quota alert: claude 3 (unit directors) at 4%`); a unit-account alert adds `swap: /accounts swap unit "<label>"` for the fit spare with the most remaining, or `no spare account has more left`. In multi-account mode an episode closes only on that account's recovery or reset, never on a role change; a low spare opens no episode.
-- `whoami.py` prints each active Claude account with its role. `run_out.py` is unchanged: dailies already projects each active note. Nightly gates on the showrunner account's note and starts with `CLAUDE_*` stripped.
+- Alerts name label and role (`Quota alert: claude 3 (unit directors) at 4%`); a unit-account alert adds `swap: /showrunner:accounts swap unit "<label>"` for the fit spare with the most remaining, or `no spare account has more left`. In multi-account mode an episode closes only on that account's recovery or reset, never on a role change; a low spare opens no episode.
+- `whoami.py` prints each active Claude account with its role. `run_out.py` is unchanged: dailies already projects each active note. Nightly gates on the showrunner account's note and starts with `CLAUDE_*` stripped (changed 2026-10-11: it gates on the unit role's account, Phase 7).
 - `accounts.py burn --since <ISO> [--until]`: per account, points per day from `readings.jsonl`, labelled by the role served (`roles.jsonl` plus `~/.claude`'s login, matched by each dir's note label); a weekly reset starts a new span; an unreadable historical dir identity makes burn refuse.
 
 **Files:**
@@ -268,7 +271,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 - `shutdown.py down --restart [--only IDS]` stores `then: restart` at `begin` on both machines (remote `begin --then restart`). `record.py` holds `ShutdownContinuation = Literal["stop", "restart"]` and `continuation(record)`; an absent `then` reads as `stop` and keeps the legacy wire shape. An external requester gets the result but holds no readiness. The `conduct` dispatcher restarts only when the local record, and the peer record unless `--here`, is a final `down` with `then: restart` (`--here` runs `up` locally). A peer record that is unreachable, unavailable or unreadable alerts `<label>: automatic restart skipped` with the runnable `restart <label>` command, through `alert_user(..., notify_selected=True)`.
 - A complete stop under restart tells the requester `The sessions restart automatically: units on the unit account, other sessions on the account they ran on.` A partial stop keeps the `/shutdown restart` line and adds `settle.shutdown_command("down", <label>, "--restart")`, which is also its action.
 - Rerunning `down <label> --restart` on a `down` or `stop partial` restart record reuses it: same `--only` scope, peer `down`, `stop partial` or `settling` with that scope; it prints `shutdown of <label> resumed; /shutdown status to watch`. The conductor runs the hidden `shutdown.py retry-stop <login>` on the peer, then `settle.retry_stop` locally, which resets `stop failed` entries to `waiting`. Under restart, `stop._retry_owner_cleanup` retries unconfirmed Codex and unit-tmux cleanup on owners already stopped.
-- `commands/accounts.md` is `/accounts [status | setup "claude N" | swap unit "claude N" | swap unit default]`: it runs the verb and shows its output unchanged; switching the default account remains `/login` in a `~/.claude` session.
+- `commands/accounts.md` is `/showrunner:accounts [status | setup "claude N" | swap unit "claude N" | swap unit default]`: it runs the verb and shows its output unchanged; switching the default account remains `/login` in a `~/.claude` session.
 
 **Files:**
 - `scripts/accounts/accounts.py` — `swap`, its outcome and inventory types, `set_role` identity check, `account_label` on role history.
@@ -278,7 +281,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 - `scripts/shutdown/shutdown.py` — `down --restart`, `begin --then`, `retry-stop`, the restart dispatcher in `conduct`.
 - `scripts/shutdown/stop.py` — `_retry_owner_cleanup`.
 - `scripts/shutdown/test_record.py`, `test_settle.py`, `test_shutdown_cli.py`, `test_stop.py` — the above.
-- `commands/accounts.md` — `/accounts`.
+- `commands/accounts.md` — `/showrunner:accounts`.
 - `docs/as-built/shutdown-and-restart.md` — `--restart`, partial-stop retry, automatic restart, swap.
 
 **Binds later work:** The user's guide describes what the user sees: swap's two closing lines, each refusal before any write, the partial-stop alert's runnable `down <label> --restart` retry, and the skipped-restart alert's runnable `restart <label>`; `commands/accounts.md` exists and the guide only adds a pointer to it. A rule added to `check` reaches swap's target refusal, and an unreadable unit account refuses swap. A `down … --only <ids> --restart` without `--here` starts a record on both machines, so automatic restart also needs the peer record to reach `down` with the same scope; the cutover moves natedev units with `down --here --only <ids> --restart`. `burn` reads `account_label` from role history; the one-week readout depends on it.
@@ -291,7 +294,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 #### As-built
 
-- `accounts.py exec <claude N | unit> [claude args…]` (`exec_account(label, arguments) -> None`) discards `CLAUDE_CODE_OAUTH_TOKEN` in every branch, then calls `os.execvpe("claude", ["claude", *arguments], env)`. A `claude N` whose note `login:` equals `~/.claude`'s login, and `unit` with no role, run plain `claude` with `CLAUDE_CONFIG_DIR` removed; any other target runs with `CLAUDE_CONFIG_DIR=~/.claudeN`. It starts on ready or logged out (so `/login` runs through it); otherwise it exits 2 without starting `claude` and prints the first problem, among them `accounts: ~/.claudeN is not set up; /accounts setup "claude N" first` and `accounts: ~/.claudeN is logged in as <login>, not claude N; see Log out and in in ~/.claude/docs/accounts.md`.
+- `accounts.py exec <claude N | unit> [claude args…]` (`exec_account(label, arguments) -> None`) discards `CLAUDE_CODE_OAUTH_TOKEN` in every branch, then calls `os.execvpe("claude", ["claude", *arguments], env)`. A `claude N` whose note `login:` equals `~/.claude`'s login, and `unit` with no role, run plain `claude` with `CLAUDE_CONFIG_DIR` removed; any other target runs with `CLAUDE_CONFIG_DIR=~/.claudeN`. It starts on ready or logged out (so `/login` runs through it); otherwise it exits 2 without starting `claude` and prints the first problem, among them `accounts: ~/.claudeN is not set up; /showrunner:accounts setup "claude N" first` and `accounts: ~/.claudeN is logged in as <login>, not claude N; see Log out and in in ~/.claude/docs/accounts.md`.
 - `account_directory_readiness(label) -> AccountDirectoryReadiness` returns one frozen tagged value: `AccountDirectoryReady(login)`, `AccountDirectoryLoggedOut`, `AccountDirectoryWrongLogin(login)`, `AccountDirectoryNotSetUp`, `AccountDirectoryBrokenLinks` or `AccountDirectoryUnreadable`, each carrying every coexisting problem. It reads the dir's `.claude.json` (`ClaudeDirectoryLogin | ClaudeDirectoryLoggedOut | UnreadableClaudeDirectoryIdentity`) and the label's note (`ExpectedClaudeLogin | MissingClaudeAccountNote | UnreadableClaudeAccountNote`) at the filesystem boundary. `exec` and `check` both read it; `check(label)` returns its problems, so only ready passes.
 - `check` requires the dir's login to match `login:` in the requested label's note (case-insensitive); a dir with no `claude N` note is a problem. Through the selection, a mismatched dir leaves `named_accounts`, a mismatched unit dir makes `unit_account` an `UnreadableClaudeAccount` (unit launch and swap refuse), and `multiple_accounts` stays true; `account_identity` still reports the dir's actual login.
 - `setup` creates the missing always-linked shared targets (`projects`, `sessions`) under `~/.claude` before linking; `_link_problems` inspects a named entry even when its optional source is gone and reports a dangling expected link as `accounts: <path> is broken`. `note_file.read_note` returns None for a non-UTF-8 note.
@@ -306,7 +309,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 - `scripts/shutdown/test_shutdown_cli.py` — the fail-closed launch test injects a resolver `RuntimeError`.
 - `docs/accounts.md` — the user's guide; `commands/accounts.md` — dispatch plus a pointer to the guide.
 
-**Binds later work:** a named dir's session starts through `claudeN` / `accounts.py exec 'claude N'`, which drops an inherited OAuth token, refuses a wrong login and passes claude's arguments through. The guide's "Log out and in" is the login procedure: `claudeN`, then `/login` as claude N; a dir on the wrong login starts with `CLAUDE_CONFIG_DIR=~/.claudeN claude`, then `/logout` and `/login`. `setup` may create missing shared targets under `~/.claude`.
+**Binds later work:** a named dir's session starts through `claudeN` / `accounts.py exec 'claude N'`, which drops an inherited OAuth token, refuses a wrong login and passes claude's arguments through. The guide's "Log out and in" is the login procedure: `claudeN`, then `/login` as claude N; a dir on the wrong login starts with `env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=~/.claudeN claude`, then `/logout` and `/login`. `setup` may create missing shared targets under `~/.claude`.
 
 **Gotchas:**
 - A raw `CLAUDE_CONFIG_DIR=~/.claudeN claude` keeps an inherited `CLAUDE_CODE_OAUTH_TOKEN`, which wins over the dir's login; `exec` discards it.
@@ -316,7 +319,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 **Ruled out:** comparing the requested label with `account_identity(...).label` (the dir's login is compared with the note's `login:`); forwarding `account_identity`'s `UnreadableClaudeAccount` into readiness, which joins a logout and a read failure; fixing the non-UTF-8 note crash in `accounts.py` instead of `note_file.read_note`.
 
-### Phase 6 — Live proof on claude 3  · status: todo · gated by G1
+### Phase 6 — Live proof on claude 3  · status: done · gated by G1
 
 #### Work Order
 
@@ -343,6 +346,19 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 If (b), (c) or (e) fails, stop and bring the failing check to the showrunner with the fix it needs in Phases 1–5. Those three are what the symlink design rests on.
 
+#### Results (2026-10-11, natedev)
+
+- **Setup and login.** The user ran `accounts.py setup "claude 3"` (this session's run of it was refused by Claude Code's auto-mode permission check) and logged in through `claude3`; `accounts.py check "claude 3"` passes. `setup`'s closing hint printed the raw `CLAUDE_CONFIG_DIR=… claude`, which keeps an inherited OAuth token; it and the guide's wrong-login step now print `env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=… claude`. `exec` is not the hint: for a label whose login is `~/.claude`'s, it skips the dir, so `/login` would change `~/.claude`.
+- **Probe.** `acct-probe`, pid 3024638, session `bbbeeb94-1cbc-4f15-a434-51ceefae97fc`, tmux `acct-probe`, cwd `/tmp/claude/acct-probe`. The first start stops on the folder-trust prompt.
+- **(a) Logins — pass.** `claude auth status`: `~/.claude3` is `rubrics.dogwood-1f@icloud.com`, `~/.claude` is `browses31_perks@icloud.com`. `~/.claude/.credentials.json` mtime is 10:08, before the login.
+- **(b) Registry and transcripts — pass.** `~/.claude/sessions/3024638.json` and `~/.claude/projects/-tmp-claude-acct-probe/bbbeeb94-….jsonl`. The status line reads `claude 3 | 5-hour 100% left | weekly 100% left` once the first prompt redraws it; `~/.claude3/account-label` is written by the SessionStart hook 7 s after start.
+- **(c) Messaging — pass.** `ListAgents` lists the probe; SendMessage reaches it and its SendMessage reply returns; `send.py --to acct-probe` delivers and its reply returns; `send.py` from the probe delivers here. That relay runs on `~/.claude`'s account and briefly shows in claude 2's `shutdown.py status` as `unknown account · <relay pid> acct-probe · process start mismatch`. The `notify_when_idle` notice fired for the probe's 17:42 turn; it reached this session at its next turn boundary, not mid-turn.
+- **(d) Shutdown attribution — pass.** `account.py --pid 3024638` names claude 3; `shutdown.py status "claude 3"` lists `acct-probe` and `natepiano-91` (the user's login session); claude 2's status lists neither. Claude Code's auto-mode permission check refused this session's `shutdown.py down` ("Interfere With Workloads"), so the user ran `shutdown.py down 'claude 3' --here --only 'bbbeeb94-…' --restart` at 17:49:38. Its record has scope `selected` with only the probe, one entry (`config_dir` `~/.claude3`), and ended `up` and archived. The probe came back as pid 3277165 via `claude --resume bbbeeb94-… -n acct-probe --remote-control acct-probe --model claude-opus-5-5`, on claude 3, with the same transcript (entries 21:41–21:50Z) and its history. All 27 claude 2 baseline sessions kept running. `natepiano-91` exited outside the shutdown: the user closed it, no record names it, and its transcript last wrote 14 s before the stop was requested.
+- **(e) Resume across accounts — pass.** A print-mode session started on `~/.claude` resumed under `accounts.py exec 'claude 3' --resume <id>` with its history (pid and status line both claude 3), then resumed on `~/.claude` and listed every word from both accounts' turns.
+- **(f) Links survive writes — pass, with a shared-model finding.** After `/model` to Sonnet and back and a prompt, `~/.claude3/settings.json` and `history.jsonl` are still links and the prompt was appended to the shared history. `/model` writes `model` through the link into `~/.claude/settings.json`, so a model choice in any account changes the default for every account, as a plain `~/.claude` session's does. The file was restored byte for byte.
+- **(g) Remote Control.** The phone's app, signed into the main account (claude 2), lists nothing called `acct-probe`. Opening its direct link on the phone, signed into the main account, says "this session is not available". A claude 3 session is neither listed in nor reachable from the main account's Remote Control: the phone reaches units on claude 3 only by signing into claude 3, and showrunners relay as planned.
+- **Cleanup.** The probe exited and its tmux session closed; `~/.claude/projects/-tmp-claude-acct-probe` and `-tmp-claude-acct-resume` and the scratch dirs are deleted. `~/.claude3` stays for Phase 7. No unit role or existing claude 2 session changed.
+
 **Files:**
 
 - `docs/plans/build-followups-two-accounts.md` — the result of each check.
@@ -355,23 +371,25 @@ If (b), (c) or (e) fails, stop and bring the failing check to the showrunner wit
 
 **Acceptance gate:** (a)–(e) pass, the selected local stop and automatic resume in (d) included, and (f) and (g) are recorded. No existing session or unit role changes. Any source fix has its regression and passing accounts tests and lint before the proof resumes.
 
-### Phase 7 — Cutover  · status: todo · gated by G2
+### Phase 7 — Cutover  · status: in progress · gated by G2
 
 #### Work Order
 
-**Goal:** units run on the chosen unit account, showrunners on `~/.claude`'s account, and every spare dir is logged in.
+**Goal:** the unit directors the user names run on the chosen unit account, new units start there, showrunners stay on `~/.claude`'s account, and every spare dir is logged in.
 
 **Spec:** the director runs it with the user.
 
 1. `accounts.py setup` for each account the user has, except the one `~/.claude` is logged in to. The Phase 6 dir already exists.
 2. The user logs in each new dir (G2): `claudeN` (or `accounts.py exec 'claude N'`), then `/login` as claude N, per the guide's "Log out and in".
 3. `accounts.py status`: every dir passes `check`.
-4. Pause new unit dispatches and let launches in flight finish (`add_unit.py` fixes its account before it spawns). Record the previous unit role and the default login's note label, confirm the target passes `check`, and run `accounts.py set-role unit "<label>"`. Collect the natedev unit directors' session ids on the default account; inventory brings their owned seats along. With no such units, skip the shutdown. Otherwise run `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py down '<default note label>' --here --only '<non-empty comma-separated unit session ids>' --restart`. `--here` keeps the Mac out, since units run only on natedev. Never send an empty `--only`: it means every session on the account.
-   - A nonzero exit from this `down` stopped nothing: restore the previous role with `accounts.py set-role unit '<previous role>'`, fix the refusal, and repeat the cutover; record no T0.
-   - After an accepted request, keep the new role while the saved units resume. Watch `shutdown.py status '<default note label>' --here` and the target's inventory.
-   - On `stop partial`, retry `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py down '<default note label>' --here --restart`. It keeps the saved `--only` scope and refuses a different one. The printed retry omits `--here`; add it, because no peer record exists. Follow any manual-resume notice for the old account's record, and confirm completion before resuming unit dispatches.
-   - `/accounts swap` is not used here: swap moves units between unit accounts and refuses the showrunners and top-level sessions that share the default account. It is for every later move.
-5. Confirm each unit's status line label and `shutdown.py status "<label>"`. Confirm the showrunner reaches each unit by message.
+4. Fixer follow-up 30 lands first: inventory must class build-followups units as units, or `down --restart` resumes them as top-level sessions on the account they ran on (the trial below). Record the previous unit role as `accounts.py role unit` prints it (`default` while units run on `~/.claude`) and the default login's note label, confirm the target passes `check`, and run `accounts.py set-role unit "<label>"`, so new units start there and a restarted unit resumes there. Then move each unit director the user names, one at a time and only on the user's word (user, 2026-10-11): `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py down '<default note label>' --here --only '<unit session id>' --restart`. Inventory brings the director's owned seats along. `--here` keeps the Mac out, since units run only on natedev. Never send an empty `--only`: it means every session on the account.
+   - A nonzero exit from this `down` stopped nothing: fix the refusal and run it again. `accounts.py set-role unit '<previous role>'` undoes the role.
+   - After an accepted request, watch `shutdown.py status '<default note label>' --here` and the target's inventory.
+   - On `stop partial`, retry `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py down '<default note label>' --here --restart`. It keeps the saved `--only` scope and refuses a different one. The printed retry omits `--here`; add it, because no peer record exists. Follow any manual-resume notice for the old account's record, and confirm completion before the next unit.
+   - Role commands name `~/.claude` only as `default`. `set-role` refuses the default login's note label, and any dir logged in to that login, with `<label> is the default account; use default`, as swap does. Before this refusal `set-role unit 'claude 2'` pointed at a missing `~/.claude2` and failed as `account identity for claude 2 is unreadable` (showrunner, 2026-10-11).
+   - Trial, 2026-10-11: the showrunner moved mul_add to claude 3 by hand (`/exit`, then `accounts.py exec 'claude 3' --resume <id>` in its tmux) after `down --restart` resumed it on claude 2: inventory classed it top-level, and restart resumes a top-level session on the account it ran on. Messaging to and from it passed. The unit role is back to `default`.
+   - `/showrunner:accounts swap` is not used here: it moves every unit on one account at once and refuses the showrunners and top-level sessions that share the default account. It is for a later move of all units.
+5. Confirm each unit's status line label and `shutdown.py status "<label>"`. Confirm the showrunner reaches each unit by message. Then check messaging across machines and accounts with `send.py`, since the user requires that any Claude reach any other on both machines: a unit on the target account and a session on the Mac each reach the other, and each reply comes back. Direct SendMessage to the other machine goes through Remote Control, which is per account (Phase 6 (g)); `send.py` resolves through the roster and crosses machines over ssh, and on one machine a relay on either account delivers to a session on either (Phase 6 (c)). The Mac relay's `~/.config/claude/oauth-token.gpg` belongs to an account nobody has recorded; any valid login delivers, but its quota gates every Mac relay. Record its account by having the user run on the Mac `CLAUDE_CODE_OAUTH_TOKEN="$(gpg --quiet --decrypt ~/.config/claude/oauth-token.gpg)" claude auth status | grep email`.
 6. Record here the cutover time T0 with its timezone, the default account's login and note label, and `threshold_percent`.
 
 **Files:**
@@ -380,7 +398,93 @@ If (b), (c) or (e) fails, stop and bring the failing check to the showrunner wit
 
 **Acceptance gate:** re-inventory the saved session ids for their resumed pids. Every unit director's process shows the target account (`account.py --pid`), the selected local shutdown is complete, and every pre-cutover showrunner and top-level session still runs on its own account. Messages reach each unit and unit timers are restored. T0 is recorded only after these checks pass.
 
-### Phase 8 — One-week readout  · status: todo · gated by G3
+#### Results so far (2026-10-11)
+
+- **T0: 2026-10-11 16:27 PDT**, when the last unit director resumed on claude 3. The default account is claude 2 (`browses31_perks@icloud.com`); the unit account is claude 3 (`rubrics.dogwood-1f@icloud.com`); `accounts.py role unit` prints `claude 3`; `threshold_percent` is 2 (`~/.claude/config/showrunners.json`).
+- **Moves, all on the user's word (times from the showrunner):** mul_add by hand at about 15:1x PDT; phase-tables at 16:18 PDT, by hand after its restart failed on a plan-path mismatch (routed to the shutdown unit); then builder-report, feature-log, model-study, screenshot, showrunner-fixer, shutdown, test-threads and two-accounts through `shutdown.py down --only … --restart`, 16:21–16:27 PDT. two-accounts stopped at 16:21 and resumed at 16:24 with its conversation intact.
+- **Checked after the moves:** `account.py --pid` shows claude 3 for all ten unit directors' live processes. Showrunners stay on claude 2.
+- **Seen from claude 3:** SendMessage to the bare name `natedev` is refused as ambiguous, because that account's Remote Control list also holds an offline `natedev` row from an earlier session of that name. Fixed 2026-10-11 by sending to the session's address on this machine; see the section on it below.
+- **Still open:** steps 1–2 for the spare (`~/.claude1` is not set up or logged in); step 5's check that the showrunner reaches each unit, and the `send.py` check across machines and accounts.
+
+#### Defect found after the cutover: memory writes ask on a named account (2026-10-11)
+
+- **Seen:** five hana unit directors on claude 3 (trunk, startup, widget, lfo, cables) each stopped on a "Do you want to create <memory file>?" form. On claude 2 these writes never asked.
+- **Cause, read in Claude Code 2.1.296 and reproduced:** Claude Code saves a memory file without asking only when the path as written and the path after links are resolved both sit inside the account's memory folder. `~/.claude3/projects` is a link to `~/.claude/projects`, so the resolved path lands under `~/.claude` and the exemption fails. The write then meets the "sensitive file" check for anything under a `.claude` folder. That check runs before allow rules, so `Edit(~/.claude/**)` cannot clear it, and no permission-settings change would help.
+- **Reproduced:** a scratch session on claude 3 in the default permission mode was refused with "… which is a sensitive file … resolves through a symlink to /home/natepiano/.claude/projects/…".
+- **Fix, approved by the user 2026-10-11 22:4x PDT and built:** start every named-account session with `CLAUDE_CODE_REMOTE_MEMORY_DIR=$HOME/.claude` beside `CLAUDE_CONFIG_DIR`. Claude Code then uses `~/.claude/projects/<project>/memory/` itself, the folder the default account uses, with no link in the path. The same scratch write then went through. Three launch points set it through `account.named_account_environment` (`scripts/whoami/account.py`): `accounts.py exec`, the account prefix `add_unit.py` uses, and the resume command in `scripts/shutdown/restart.py`. A launch on the default account drops it, the nightly review launch included.
+- **Why it waited on the user:** the change stops a permission prompt, so it was theirs to approve; the session's permission check refused the edit until they did. The variable is also absent from Claude Code's public documentation, so a later release could change it; the scratch test is the check to rerun after an update. One side effect: "local" memory for custom subagents would move under `~/.claude/projects`; nothing here uses it.
+- **Rejected:** an allow rule (the check runs first); `autoMemoryDirectory` (one folder for every project); a real `projects` folder per account (breaks resume across accounts and splits memory).
+- **Rollout:** a session on a named account that started before the fix asks on each memory write until it is restarted; each restart is on the user's word. To list the ones still to restart, look for a live Claude process whose environment has `CLAUDE_CONFIG_DIR` and no `CLAUDE_CODE_REMOTE_MEMORY_DIR`.
+
+#### Added after the cutover: one nightly review session, on the unit account (2026-10-11)
+
+Asked for by the user through the showrunner at 23:00 PDT. The systemd timer in `/etc/nixos` is the showrunner's and is unchanged: it still runs `nightly_review.py launch`.
+
+- **One session a night.** `nightly-review` replaces `nightly-config` and `nightly-rust`. Its first prompt is `/nightly_review config rust`; `commands/nightly_review.md` does the modes one at a time in the order given, each still writing `NIGHT/<mode>.md` and messaging natedev before the next starts. It works in `~/rust` with `/etc/nixos` and `~/.claude` added.
+- **Account.** `nightly_review.tonight()` reads `accounts.role_account("unit")`. A named account launches through `accounts.account_prefix`, the prefix units use, so the memory variable comes with it; with no role set the launch is the default-login one as before. An account that fails `accounts.check` skips the night with `skipped: unit account <label>: <problem>` in `launch.log`.
+- **Gates read the same account.** The shutdown check gets that account's `CLAUDE_CONFIG_DIR`, and `quota_for_selection` reads the note whose login holds the `unit directors` role, which is the default login when no role is set. A shutdown or low quota on the other account no longer decides the night.
+- **Replacing last night's session** keeps the guards: left running while the user is attached; skipped when a session no nightly review started holds the name. The two old session names are retired under the same guards and never block the night.
+- **Not done:** no launch by hand. The first timer run after merge is the check, and the showrunner reads its `launch.log`.
+- **Account folders are in the review's deny list (2026-10-12).** `scripts/nightly_review/settings.json` denies edits under `~/.claude1`, `~/.claude2` and `~/.claude3` beside `~/.claude`, `~/rust` and `/etc/nixos`. The user said yes to this through the showrunner on 2026-10-12. Before it, links in an account folder were covered because they resolve into `~/.claude`, and the folder's own login files were covered only by Claude Code's sensitive-file check. A fourth account folder needs its own line; a test holds the three lines to the names `accounts.account_dir` gives.
+
+#### `/showrunner:accounts` replaces `/accounts` (2026-10-12)
+
+Asked for by the user through the showrunner. Text above this section that names `/showrunner:accounts` was written as `/accounts`.
+
+- **One table.** `accounts.py status`, which `/showrunner:accounts` runs with no argument, prints one Markdown table: a row for `~/.claude`, each `~/.claudeN` on disk, and each `claude N` account that has a note and is in no folder (`not set up`). Columns: folder, label, login or `not logged in`, role (`showrunners`, `unit directors`, `spare`), 5-hour and weekly left with their reset times, and when the numbers were read. A named folder keeps its own label whatever login it holds. What the old report listed per folder (check problems, unclassified entries, MCP server differences) prints as lines under the table, only when there is something to say.
+- **Numbers are saved readings, not a live read.** The usage service refused 103 reads in 174 runs of the two-minute updater over six hours (HTTP 429). `scripts/whoami/usage_store.py` keeps each login's last good 5-hour and weekly window in `~/.local/state/agent-notes/usage.json`; `agent_notes.update_for_selection` saves every read that succeeds. The table reads the store, and reads a logged-in folder live only when it holds no reading from the last 10 minutes (`STALE_AFTER`). A read that succeeded with no 5-hour window stores 100% left and no reset. A window whose reset has passed shows `unavailable`.
+- **Zone.** Times use the first registered showrunner's User zone, else this machine's zone.
+- **Codex rows (2026-10-12, the user: "i was expecting to see codex in the accounts list and was expecting to see if we were running on credits or not").** Under the Claude rows: the Codex home (`~/.codex`, role `seats`), then each `codex N` account with a note that the home does not hold (`not logged in`). Two columns before `Read`: `On credits` and `Credits left`; Claude rows show a dash. `On credits` is `yes` when a window the reading holds has 0% left and credits remain: in `readings.jsonl` the Codex balance fell 243 times, 242 with weekly at 0% just before and 1 right after a reset. The 5-hour half of that rule is not measured: codex 2 (plan `promax`) has only a weekly window, so its 5-hour cells show a dash. `usage_store` keeps Codex readings under `codex:<login>` with a `credits` entry, and no `five_hour` entry for an account with no such window. `account/rateLimits/read` also returns `ordinaryUsageAllowed`, unused here.
+- **After the user's first run (2026-10-12).** `accounts.py` with no action runs `status`; before, it exited 2. An account the default folder holds gets no `not set up` row for its own missing folder, so each label appears once unless two folders hold one login. `cache` and `.last-cleanup`, which Claude Code writes in every folder, are known per-folder names and no longer print as unclassified.
+- **`/accounts` is retired**, with no forwarding command. `setup` and `swap` are arguments of `/showrunner:accounts`. The add_unit refusal, the `accounts.py exec` refusal, the quota alert's swap line and the docs name the new command.
+- **Files:** `scripts/accounts/accounts.py`, `scripts/whoami/usage_store.py` (new), `scripts/whoami/agent_notes.py`, `commands/showrunner/accounts.md` (new), `commands/accounts.md` (deleted), `docs/accounts.md`, `docs/quota_alerts.md`, `docs/production_format.md`, and the tests beside each script.
+
+#### Messages reach the session on this machine by its address (2026-10-11)
+
+- **Seen:** `SendMessage` refuses a bare name when the sender's account lists two sessions under it. A session that moves to another account leaves an offline Remote Control row behind, so the cutover made `natedev` ambiguous for every unit on claude 3, and any later move does the same to the moved session's name.
+- **Fix, approved by the showrunner:** the refusal is Claude Code's, so the change is on our side of the lookup. `sessions.py address <session:id|name>` prints `uds:<socket>` for the live session on this machine, which `SendMessage` takes as `to`. `showrunners.py address <slug>` prints it for a production's showrunner, by session id. The unit launch prompt and `docs/production_format.md` tell a unit to send there, looked up before each message, and the nightly command uses `sessions.py address natedev`.
+- **Checked live:** a message sent from this unit to the looked-up address arrived, and the showrunner answered it.
+- **Never reply to a message's `from` socket.** A showrunner's messages arrive through `send.py`'s relay process, which ends at once, so that socket is gone by the time a reply is written.
+- **Rollout:** units started before this keep the old prompt and need the row's ref until they restart. The showrunner's own sends to units by name can hit the same refusal; `sessions.py address <unit session name>` serves it, and whether it adopts that is its call.
+
+### Phase 8 — Move one session to any account  · status: todo · waits on the user's go
+
+#### Work Order
+
+**Goal:** one command moves any one session (showrunner, unit director or top-level) to any account and keeps its conversation. The unit role only picks the account for new unit launches. User, 2026-10-11: "we can run out of account usage on a showrunner too so we need the ability to move arbitrary sessions to arbitrary accounts."
+
+**Constraints from prior phases:** today only the unit role is selectable; showrunners and top-level sessions run on `~/.claude`'s login, and swap moves only units. `shutdown.py down <account> --only <ids> --restart` already stops sessions safely (each records where it was, then exits) and resumes them in their recorded host: tmux respawns the pane, ghostty and zed open a window, a unit relaunches through `add_unit.py --resume`, and an unknown host prints `manual restart <name>: <command>`. Restart resumes a non-unit session on the config dir its process ran with (`Session.config_dir`), and `add_unit.py --resume` takes the unit role. Inventory finds units only through registered showrunners, so a build-followups unit is classed top-level (fixer follow-up 30); it moves through its tmux pane either way. Same-machine messaging works across accounts, and Remote Control is per account (Phase 6 (c), (g)). The hand move the showrunner ran for mul_add was `/exit`, then `accounts.py exec 'claude 3' --resume <id>` in its tmux. Phase 7 moves units with the role and `down --restart`; once a unit resume keeps the account it ran on (spec 4), a later move of every unit goes through swap's `--to`.
+
+**Spec:**
+
+1. `accounts.py move <session id | name> <claude N | default>`, also `/showrunner:accounts move`. It finds the live session in this machine's session registry by id, or by the name it runs under, and reads its current account from its process's config dir. A name two live sessions share refuses and lists their ids.
+2. Before any change it refuses and names the cause:
+   - no live session by that id or name on this machine (a session on the other machine moves from there);
+   - a seat (`seats move with their unit director`);
+   - a target that fails `check` (its first problem);
+   - a target that is already the session's login (`<name> is already on <label>`);
+   - the default login's note label, or a dir logged in to that login (`<label> is the default account; use default`), as set-role and swap refuse it;
+   - a shutdown already open on the session's account.
+3. Otherwise it runs `shutdown.py down '<current account note label>' --here --only <id> --restart --to '<target>'`. `--to` (also on `begin`, and forwarded to the peer's `begin`) stores the target on every scoped record entry; without it an entry has none. The session stops as any shutdown stops it.
+4. Restart resumes an entry that has a target through `accounts.py exec '<target>'`, with restart's usual resume arguments: `--resume <id> -n <name> --remote-control <name>`, the model, and the restart note (or `/showrunner:produce <doc> resume` for a showrunner). So an inherited `CLAUDE_CODE_OAUTH_TOKEN` is dropped and the target is checked again at launch. `exec` accepts `default`: plain `claude` with `CLAUDE_CONFIG_DIR` removed. An entry with no target resumes on the account it ran on, as today. By host:
+   - tmux: respawns its own pane, as restart does now.
+   - unit: `add_unit.py --resume … --account '<target>'`. A unit resume without `--account` keeps the account it ran on; `add_unit.py` reads the unit role only for a new unit.
+   - ghostty, zed or Terminal: reopens its window, as restart does now.
+   - unknown: move prints the one resume line before the stop starts, with `run this once <name> has exited`, and restart reports the same line as `manual restart <name>: <line>`.
+5. A session may move itself. Its own request is recorded as the requester, as for any shutdown it asks for.
+6. `swap` keeps its refusals and becomes `set-role` plus `down '<old>' --restart --to '<new>'`, because a unit resume no longer reads the role.
+7. A moved session keeps its name, so `send.py` and same-machine SendMessage reach it on either account. Its Remote Control registers on the target account, and the old account's phone app no longer lists it.
+
+**Files:**
+
+- `scripts/accounts/accounts.py` — `move`, `exec default`, swap's `--to`; `scripts/accounts/test_accounts.py`.
+- `scripts/shutdown/shutdown.py`, `settle.py`, `record.py`, `restart.py` — `--to` on `down` and `begin`, the entry's target, resume through `exec` in every host; their tests.
+- `scripts/production/add_unit.py` — `--account` on `--resume`, and a resume keeps the account it ran on; its tests.
+- `docs/accounts.md` — "Move a session", with every refusal; `commands/accounts.md` — the argument hint; `docs/as-built/shutdown-and-restart.md`.
+
+**Acceptance gate:** the accounts, shutdown, production and whoami suites and the scoped lint pass. Live on natedev with a scratch probe in tmux: move it claude 2 → claude 3 → `default`. After each move it answers a question about its earlier turns, its status line and `account.py --pid` show the target, and `send.py` reaches it and its reply comes back. A second probe with no known host gets exactly one printed resume line, and running that line resumes it on the target. `swap unit … --dry-run` prints `down … --to`. `~/.claude/.credentials.json` is unchanged and no other session moved.
+
+### Phase 9 — One-week readout  · status: todo · gated by G3
 
 #### Work Order
 
@@ -395,7 +499,7 @@ If (b), (c) or (e) fails, stop and bring the failing check to the showrunner wit
 - each swap's time
 - whether the default account went below `threshold_percent`
 
-Recommend whether any change is needed, for example moving the nightly review to the unit role.
+Recommend whether any change is needed. The nightly review already moved to the unit role on 2026-10-11, so include what it spent there.
 
 **Files:**
 

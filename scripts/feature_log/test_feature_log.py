@@ -151,7 +151,26 @@ class AmendEvent(TypedDict):
     releases_added: list[str]
 
 
-FeatureLogEvent = AddEvent | SupersedeEvent | LegacyAmendEvent | AmendEvent
+class ReleaseEvent(TypedDict):
+    at: str
+    verb: Literal["release"]
+    project: str
+    crate: str
+    version: str
+    titles: list[str]
+
+
+FeatureLogEvent = AddEvent | SupersedeEvent | LegacyAmendEvent | AmendEvent | ReleaseEvent
+
+
+class ChangelogSelectionJson(TypedDict):
+    section: str
+    titles: list[str]
+
+
+class ReviewedReleaseContents(TypedDict):
+    crate: str
+    titles: list[str]
 
 
 class ProposalArguments(TypedDict):
@@ -255,6 +274,41 @@ class RecordingGitRunner:
             stdout=self.stdout,
             stderr="",
         )
+
+
+@final
+class RecordingForwardedReader:
+    def __init__(
+        self, result: feature_log.ChangelogSelection | feature_log.ForwardFailed,
+    ) -> None:
+        self.result = result
+        self.commands: list[list[str]] = []
+
+    def __call__(
+        self, command: list[str],
+    ) -> feature_log.ChangelogSelection | feature_log.ForwardFailed:
+        self.commands.append(command.copy())
+        return self.result
+
+
+class ForwardedReleaseCall(NamedTuple):
+    command: list[str]
+    contents: ReviewedReleaseContents
+
+
+@final
+class RecordingReleaseForwarder:
+    def __init__(self) -> None:
+        self.calls: list[ForwardedReleaseCall] = []
+
+    def __call__(
+        self, command: list[str], contents: feature_log.ReviewedReleaseContents,
+    ) -> int:
+        reviewed: ReviewedReleaseContents = {
+            "crate": contents["crate"], "titles": contents["titles"].copy(),
+        }
+        self.calls.append(ForwardedReleaseCall(command.copy(), reviewed))
+        return 0
 
 
 class FeatureLogTests(unittest.TestCase):
@@ -2348,6 +2402,821 @@ class FeatureLogTests(unittest.TestCase):
         self.assertIn("+ current event — Current summary.", result.stdout)
         self.assertIn("1 changes since 2026-10-10 00:00 PDT", result.stdout)
         self.assertFalse((self.state / "digest.json").exists())
+
+
+    def add_crate_note(
+        self,
+        title: str,
+        summary: str,
+        *,
+        kind: str = "feature",
+        crates: tuple[str, ...] = ("cargo-mend",),
+        releases: tuple[str, ...] = (),
+        backfill: bool = False,
+    ) -> None:
+        arguments = self.add_arguments(
+            project="cargo-liner", title=title, summary=summary,
+            kind=kind, crates=crates,
+        ) + ["--separate-result"]
+        for release in releases:
+            arguments.extend(("--release", release))
+        if backfill:
+            arguments.append("--backfill")
+        result = self.cli(arguments)
+        self.assertEqual(result.status, 0, result.stderr)
+
+    def supersede_crate_note(
+        self, old: str, title: str, summary: str,
+        *, crates: tuple[str, ...] = ("cargo-mend",),
+    ) -> None:
+        arguments = self.add_arguments(
+            project="cargo-liner", title=title, summary=summary, crates=crates,
+            link=SHA_TWO,
+        )
+        arguments[0] = "supersede"
+        arguments.extend(("--old", old, "--separate-result"))
+        result = self.cli(arguments)
+        self.assertEqual(result.status, 0, result.stderr)
+
+    def compare_arguments(
+        self, crate: str, changelog: Path, *, contents: Path | None = None,
+    ) -> list[str]:
+        arguments = [
+            "changelog", "--crate", crate, "--version", "Unreleased",
+            "--compare", str(changelog),
+        ]
+        if contents is not None:
+            arguments.extend(("--save", str(contents)))
+        return arguments
+
+    def save_match(self, crate: str, section: str) -> Path:
+        changelog = self.root / f"{crate}-CHANGELOG.md"
+        contents = self.state / "release" / f"{crate}.json"
+        _ = changelog.write_text(section, encoding="utf-8")
+        result = self.cli(self.compare_arguments(crate, changelog, contents=contents))
+        self.assertEqual(result, CliResult(0, "match\n", ""))
+        self.assertTrue(contents.is_file())
+        return contents
+
+    def release_arguments(
+        self, crate: str, version: str, contents: Path,
+    ) -> list[str]:
+        return [
+            "release", "--crate", crate, "--version", version,
+            "--contents", str(contents),
+        ]
+
+    def reviewed_contents(self, path: Path) -> ReviewedReleaseContents:
+        return cast(ReviewedReleaseContents, json.loads(path.read_text(encoding="utf-8")))
+
+    def off_host_cli(
+        self, arguments: list[str], reader: feature_log.ForwardedReader,
+        forwarder: feature_log.ReleaseForwarder,
+    ) -> CliResult:
+        ssh_runner = RecordingSshRunner(returncode=99)
+        with patch.dict(os.environ, {}, clear=False):
+            _ = os.environ.pop("FEATURE_LOG_VAULT")
+            with (
+                patch.object(socket, "gethostname", return_value="macbook.local"),
+                patch.object(feature_log, "vault_dir", return_value=self.vault),
+            ):
+                result = self.capture_cli(lambda: feature_log.main(
+                    arguments, ssh_runner=ssh_runner, forwarded_reader=reader,
+                    release_forwarder=forwarder,
+                ))
+        self.assertEqual(ssh_runner.commands, [], "compare/release used the ordinary SSH runner")
+        return result
+
+    def remote_arguments(self, command: list[str]) -> list[str]:
+        self.assertEqual(command[:2], ["ssh", "natedev"])
+        self.assertEqual(len(command), 3)
+        words = shlex.split(command[2])
+        self.assertEqual(words[:2], [
+            "~/.claude/scripts/lib/py", "~/.claude/scripts/feature_log/feature_log.py",
+        ])
+        return words[2:]
+
+    def releases(self, title: str) -> list[str]:
+        return feature_log.parse_note(self.note("cargo-liner", title))["release"]
+
+    def release_events(self) -> list[ReleaseEvent]:
+        return [event for event in self.events() if event["verb"] == "release"]
+
+    def test_changelog_maps_every_kind_and_sorts_unchanged_summaries(self) -> None:
+        records = (
+            ("security fix", "security", "Close the credential leak."),
+            ("ordinary fix", "fix", "Repair a `mend` pass without changing its input."),
+            ("removed switch", "removal", "Remove the obsolete switch."),
+            ("deprecated switch", "deprecation", "Deprecate the old switch."),
+            ("faster passes", "perf", "Zulu passes finish sooner."),
+            ("changed passes", "change", "Alpha passes use the new order."),
+            ("zulu feature", "feature", "Zulu output includes [a guide](https://example.test/guide)."),
+            ("alpha feature", "feature", "Alpha output keeps **its emphasis**."),
+        )
+        for title, kind, summary in records:
+            self.add_crate_note(title, summary, kind=kind)
+
+        result = self.cli(["changelog", "--crate", "cargo-mend", "--version", "Unreleased"])
+
+        expected = (
+            "## [Unreleased]\n\n### Added\n\n"
+            + "- Alpha output keeps **its emphasis**.\n"
+            + "- Zulu output includes [a guide](https://example.test/guide).\n\n"
+            + "### Changed\n\n- Alpha passes use the new order.\n"
+            + "- Zulu passes finish sooner.\n\n"
+            + "### Deprecated\n\n- Deprecate the old switch.\n\n"
+            + "### Removed\n\n- Remove the obsolete switch.\n\n"
+            + "### Fixed\n\n- Repair a `mend` pass without changing its input.\n\n"
+            + "### Security\n\n- Close the credential leak.\n"
+        )
+        self.assertEqual(result, CliResult(0, expected, ""))
+
+    def test_cargo_mend_proposal_example_is_exact(self) -> None:
+        self.add_crate_note(
+            "mend stops after the last useful pass", "Stop after the last useful mend pass.",
+            kind="fix", releases=("cargo-mend@0.23.0",), backfill=True,
+        )
+        result = self.cli(["changelog", "--crate", "cargo-mend", "--version", "0.23.0"])
+        self.assertEqual(
+            result,
+            CliResult(0, "## [0.23.0]\n\n### Fixed\n\n- Stop after the last useful mend pass.\n", ""),
+        )
+
+    def test_changelog_requires_matching_crate_and_release_for_shared_result(self) -> None:
+        self.add_crate_note(
+            "shared result", "Share the useful result.",
+            crates=("cargo-mend", "cargo-port"),
+            releases=("cargo-mend@1.2.3", "cargo-port@2.3.4"), backfill=True,
+        )
+        self.add_crate_note(
+            "other crate result", "Use the other crate.", crates=("cargo-tile",),
+            releases=("cargo-tile@1.2.3",), backfill=True,
+        )
+        for crate, version, expected in (
+            ("cargo-mend", "1.2.3", "## [1.2.3]\n\n### Added\n\n- Share the useful result.\n"),
+            ("cargo-port", "2.3.4", "## [2.3.4]\n\n### Added\n\n- Share the useful result.\n"),
+            ("cargo-port", "1.2.3", "## [1.2.3]\n"),
+            ("cargo-mend", "Unreleased", "## [Unreleased]\n"),
+        ):
+            with self.subTest(crate=crate, version=version):
+                result = self.cli(["changelog", "--crate", crate, "--version", version])
+                self.assertEqual(result, CliResult(0, expected, ""))
+
+    def test_released_section_keeps_a_superseded_shipped_result(self) -> None:
+        self.add_crate_note(
+            "shipped result", "Use the originally shipped behavior.",
+            releases=("cargo-mend@1.2.3",), backfill=True,
+        )
+        self.supersede_crate_note("shipped result", "current result", "Use the current behavior.")
+
+        result = self.cli(["changelog", "--crate", "cargo-mend", "--version", "1.2.3"])
+
+        self.assertEqual(result, CliResult(
+            0, "## [1.2.3]\n\n### Added\n\n- Use the originally shipped behavior.\n", "",
+        ))
+        current = self.cli(["changelog", "--crate", "cargo-mend", "--version", "Unreleased"])
+        self.assertEqual(current, CliResult(
+            0, "## [Unreleased]\n\n### Added\n\n- Use the current behavior.\n", "",
+        ))
+
+    def test_unpublished_crate_prints_nothing(self) -> None:
+        for crate in ("cargo-berth", "hana", "obsidian_knife", "unknown-crate"):
+            with self.subTest(crate=crate):
+                result = self.cli(["changelog", "--crate", crate, "--version", "Unreleased"])
+                self.assertEqual(result.status, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertTrue(result.stderr)
+
+    def test_compare_uses_bullet_sets_within_unreleased_headings(self) -> None:
+        self.add_crate_note("alpha feature", "Alpha result.")
+        self.add_crate_note("zulu feature", "Zulu result.")
+        self.add_crate_note("fixed result", "Repair the result.", kind="fix")
+        changelog = self.root / "CHANGELOG.md"
+        _ = changelog.write_text(
+            "# Changelog\n\nA preamble.\n\n## [Unreleased]\n\n"
+            + "### Fixed\n\n- Repair the result.\n\n"
+            + "### Added\n\n- Zulu result.\n- Alpha result.\n- Alpha result.\n\n"
+            + "### Security\n\n## [1.0.0] - 2026-01-01\n\n"
+            + "### Added\n\n- This historical bullet is ignored.\n\n"
+            + "[Unreleased]: https://example.test/compare\n",
+            encoding="utf-8",
+        )
+        before = self.vault_snapshot()
+
+        result = self.cli(self.compare_arguments("cargo-mend", changelog))
+
+        self.assertEqual(result, CliResult(0, "match\n", ""))
+        self.assertEqual(self.vault_snapshot(), before)
+
+    def test_compare_reports_missing_extra_and_misheaded_bullets(self) -> None:
+        self.add_crate_note("added result", "Add the result.")
+        self.add_crate_note("fixed result", "Repair the result.", kind="fix")
+        changelog = self.root / "CHANGELOG.md"
+        _ = changelog.write_text(
+            "## [Unreleased]\n\n### Changed\n\n- Add the result.\n\n"
+            + "### Fixed\n\n- A hand-written extra.\n", encoding="utf-8",
+        )
+
+        result = self.cli(self.compare_arguments("cargo-mend", changelog))
+
+        self.assertEqual(result.status, 1, result.stderr)
+        self.assertNotEqual(result.stdout, "match\n")
+        for detail in ("Added", "Changed", "Fixed", "Add the result.", "Repair the result.", "A hand-written extra."):
+            self.assertIn(detail, result.stdout)
+
+    def test_selection_contains_rendered_section_and_only_selected_titles(self) -> None:
+        self.add_crate_note("old result", "Use the old result.")
+        self.supersede_crate_note("old result", "new result", "Use the new result.")
+        self.add_crate_note("other crate", "Use another crate.", crates=("cargo-port",))
+
+        result = self.cli([
+            "changelog", "--crate", "cargo-mend", "--version", "Unreleased", "--selection",
+        ])
+
+        self.assertEqual(result.status, 0, result.stderr)
+        selection = cast(ChangelogSelectionJson, json.loads(result.stdout))
+        self.assertEqual(selection, {
+            "section": "## [Unreleased]\n\n### Added\n\n- Use the new result.\n",
+            "titles": ["new result"],
+        })
+
+    def test_release_stamps_reviewed_contents_and_repeat_is_unchanged(self) -> None:
+        self.add_crate_note("reviewed result", "Use the reviewed result.", kind="fix")
+        contents = self.save_match(
+            "cargo-mend", "## [Unreleased]\n\n### Fixed\n\n- Use the reviewed result.\n",
+        )
+        self.assertEqual(self.reviewed_contents(contents), {
+            "crate": "cargo-mend", "titles": ["reviewed result"],
+        })
+        arguments = self.release_arguments("cargo-mend", "1.2.3", contents)
+
+        result = self.cli(arguments)
+
+        self.assertEqual(result.status, 0, result.stderr)
+        self.assertEqual(self.releases("reviewed result"), ["cargo-mend@1.2.3"])
+        self.assertEqual(self.release_events(), [{
+            "at": EVENT_TIME, "verb": "release", "project": "cargo-liner",
+            "crate": "cargo-mend", "version": "1.2.3", "titles": ["reviewed result"],
+        }])
+        before = self.vault_snapshot()
+        event_bytes = (self.state / "events.jsonl").read_bytes()
+        repeated = self.cli(arguments)
+        self.assertEqual(repeated.status, 0, repeated.stderr)
+        self.assertIn("unchanged", repeated.stdout)
+        self.assertEqual(self.vault_snapshot(), before)
+        self.assertEqual((self.state / "events.jsonl").read_bytes(), event_bytes)
+        self.assert_no_temporary_files()
+
+    def test_release_preserves_other_versions_and_other_crates_on_shared_note(self) -> None:
+        self.add_crate_note(
+            "shared result", "Use the shared result.", crates=("cargo-mend", "cargo-port"),
+            releases=("cargo-mend@0.9.0",),
+        )
+        contents = self.save_match(
+            "cargo-mend", "## [Unreleased]\n\n### Added\n\n- Use the shared result.\n",
+        )
+
+        result = self.cli(self.release_arguments("cargo-mend", "1.0.0", contents))
+
+        self.assertEqual(result.status, 0, result.stderr)
+        self.assertCountEqual(self.releases("shared result"), [
+            "cargo-mend@0.9.0", "cargo-mend@1.0.0", "cargo-port@Unreleased",
+        ])
+
+    def test_note_added_after_snapshot_keeps_unreleased_on_stamp_and_retry(self) -> None:
+        self.add_crate_note("reviewed result", "Use the reviewed result.")
+        contents = self.save_match(
+            "cargo-mend", "## [Unreleased]\n\n### Added\n\n- Use the reviewed result.\n",
+        )
+        self.add_crate_note("later result", "Use the later result.")
+        arguments = self.release_arguments("cargo-mend", "1.2.3", contents)
+
+        result = self.cli(arguments)
+
+        self.assertEqual(result.status, 0, result.stderr)
+        self.assertEqual(self.releases("reviewed result"), ["cargo-mend@1.2.3"])
+        self.assertEqual(self.releases("later result"), ["cargo-mend@Unreleased"])
+        self.add_crate_note("retry time result", "Use new work during a publish retry.")
+        before = self.vault_snapshot()
+        events_before = self.events()
+        retry = self.cli(arguments)
+        self.assertEqual(retry.status, 0, retry.stderr)
+        self.assertIn("unchanged", retry.stdout)
+        self.assertEqual(self.vault_snapshot(), before)
+        self.assertEqual(self.events(), events_before)
+        self.assertEqual(self.releases("retry time result"), ["cargo-mend@Unreleased"])
+
+    def test_note_superseded_after_snapshot_is_stamped(self) -> None:
+        self.add_crate_note("reviewed result", "Use the reviewed result.")
+        contents = self.save_match(
+            "cargo-mend", "## [Unreleased]\n\n### Added\n\n- Use the reviewed result.\n",
+        )
+        self.supersede_crate_note("reviewed result", "replacement result", "Use the replacement result.")
+
+        result = self.cli(self.release_arguments("cargo-mend", "1.2.3", contents))
+
+        self.assertEqual(result.status, 0, result.stderr)
+        self.assertEqual(self.releases("reviewed result"), ["cargo-mend@1.2.3"])
+        self.assertEqual(self.releases("replacement result"), ["cargo-mend@Unreleased"])
+        released = self.cli(["changelog", "--crate", "cargo-mend", "--version", "1.2.3"])
+        self.assertEqual(released, CliResult(
+            0, "## [1.2.3]\n\n### Added\n\n- Use the reviewed result.\n", "",
+        ))
+
+    def test_release_retry_leaves_later_superseded_pending_work_unchanged(self) -> None:
+        self.add_crate_note("reviewed result", "Use the reviewed result.")
+        contents = self.save_match(
+            "cargo-mend", "## [Unreleased]\n\n### Added\n\n- Use the reviewed result.\n",
+        )
+        arguments = self.release_arguments("cargo-mend", "1.2.3", contents)
+        stamped = self.cli(arguments)
+        self.assertEqual(stamped.status, 0, stamped.stderr)
+        self.add_crate_note("next result", "Use new work after publication.")
+        self.supersede_crate_note("next result", "next replacement", "Use its newer replacement.")
+        before = self.vault_snapshot()
+        events = self.events()
+
+        repeated = self.cli(arguments)
+
+        self.assertEqual(repeated.status, 0, repeated.stderr)
+        self.assertIn("unchanged", repeated.stdout)
+        self.assertEqual(self.vault_snapshot(), before)
+        self.assertEqual(self.events(), events)
+        self.assertEqual(self.releases("reviewed result"), ["cargo-mend@1.2.3"])
+        self.assertEqual(self.releases("next result"), ["cargo-mend@Unreleased"])
+        self.assertEqual(self.releases("next replacement"), ["cargo-mend@Unreleased"])
+
+    def test_empty_snapshot_release_records_one_event_and_repeat_preserves_new_work(self) -> None:
+        contents = self.save_match("cargo-mend", "## [Unreleased]\n")
+        arguments = self.release_arguments("cargo-mend", "1.2.3", contents)
+
+        stamped = self.cli(arguments)
+
+        self.assertEqual(stamped.status, 0, stamped.stderr)
+        self.assertEqual(self.release_events(), [{
+            "at": EVENT_TIME, "verb": "release", "project": "cargo-liner",
+            "crate": "cargo-mend", "version": "1.2.3", "titles": [],
+        }])
+        self.add_crate_note("new pending result", "Use work added after the empty release.")
+        before = self.vault_snapshot()
+        events = self.events()
+        repeated = self.cli(arguments)
+        self.assertEqual(repeated.status, 0, repeated.stderr)
+        self.assertIn("unchanged", repeated.stdout)
+        self.assertEqual(self.vault_snapshot(), before)
+        self.assertEqual(self.events(), events)
+        self.assertEqual(self.releases("new pending result"), ["cargo-mend@Unreleased"])
+        self.assertEqual(len(self.release_events()), 1)
+
+    def test_note_added_and_superseded_after_comparison_loses_pending_at_first_stamp(self) -> None:
+        self.add_crate_note("reviewed result", "Use the reviewed result.")
+        contents = self.save_match(
+            "cargo-mend", "## [Unreleased]\n\n### Added\n\n- Use the reviewed result.\n",
+        )
+        self.add_crate_note("new pending result", "Use work added after comparison.")
+        self.supersede_crate_note(
+            "new pending result", "new pending replacement", "Use the replacement added after comparison.",
+        )
+
+        stamped = self.cli(self.release_arguments("cargo-mend", "1.2.3", contents))
+
+        self.assertEqual(stamped.status, 0, stamped.stderr)
+        self.assertEqual(self.releases("reviewed result"), ["cargo-mend@1.2.3"])
+        self.assertEqual(self.releases("new pending result"), [])
+        self.assertEqual(self.releases("new pending replacement"), ["cargo-mend@Unreleased"])
+        events = self.release_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["titles"], ["new pending result", "reviewed result"])
+        unreleased = self.cli(["changelog", "--crate", "cargo-mend", "--version", "Unreleased"])
+        self.assertEqual(unreleased, CliResult(
+            0, "## [Unreleased]\n\n### Added\n\n- Use the replacement added after comparison.\n", "",
+        ))
+        released = self.cli(["changelog", "--crate", "cargo-mend", "--version", "1.2.3"])
+        self.assertEqual(released, CliResult(
+            0, "## [1.2.3]\n\n### Added\n\n- Use the reviewed result.\n", "",
+        ))
+
+    def test_precomparison_superseded_note_is_absent_and_loses_unreleased(self) -> None:
+        self.add_crate_note(
+            "old result", "Use the old result.", crates=("cargo-mend", "cargo-port"),
+            releases=("cargo-mend@0.9.0",),
+        )
+        self.supersede_crate_note("old result", "current result", "Use the current result.")
+        contents = self.save_match(
+            "cargo-mend", "## [Unreleased]\n\n### Added\n\n- Use the current result.\n",
+        )
+        self.assertEqual(self.reviewed_contents(contents), {
+            "crate": "cargo-mend", "titles": ["current result"],
+        })
+        selection = self.cli([
+            "changelog", "--crate", "cargo-mend", "--version", "Unreleased", "--selection",
+        ])
+        self.assertEqual(selection.status, 0, selection.stderr)
+        selected = cast(ChangelogSelectionJson, json.loads(selection.stdout))
+        self.assertEqual(selected["titles"], ["current result"])
+
+        result = self.cli(self.release_arguments("cargo-mend", "1.2.3", contents))
+
+        self.assertEqual(result.status, 0, result.stderr)
+        self.assertCountEqual(self.releases("old result"), ["cargo-mend@0.9.0", "cargo-port@Unreleased"])
+        self.assertEqual(self.releases("current result"), ["cargo-mend@1.2.3"])
+        self.assertEqual(len(self.release_events()), 1)
+        self.assertCountEqual(self.release_events()[0]["titles"], ["old result", "current result"])
+
+    def test_mixed_workspace_stamps_only_crate_with_matching_saved_contents(self) -> None:
+        self.add_crate_note("shared result", "Use the shared result.", crates=("cargo-mend", "cargo-port"))
+        section = "## [Unreleased]\n\n### Added\n\n- Use the shared result.\n"
+        mend_contents = self.save_match("cargo-mend", section)
+        port_changelog = self.root / "cargo-port-CHANGELOG.md"
+        port_contents = self.state / "release/cargo-port.json"
+        _ = port_changelog.write_text("## [Unreleased]\n", encoding="utf-8")
+        mismatch = self.cli(self.compare_arguments("cargo-port", port_changelog, contents=port_contents))
+        self.assertEqual(mismatch.status, 1, mismatch.stderr)
+        self.assertFalse(port_contents.exists())
+
+        stamped = self.cli(self.release_arguments("cargo-mend", "1.2.3", mend_contents))
+
+        self.assertEqual(stamped.status, 0, stamped.stderr)
+        self.assertCountEqual(self.releases("shared result"), ["cargo-mend@1.2.3", "cargo-port@Unreleased"])
+        self.assertEqual([event["crate"] for event in self.release_events()], ["cargo-mend"])
+
+    def test_partial_publish_keeps_earlier_stamp_and_retry_stamps_remaining_crate(self) -> None:
+        self.add_crate_note("shared result", "Use the shared result.", crates=("cargo-mend", "cargo-port"))
+        section = "## [Unreleased]\n\n### Added\n\n- Use the shared result.\n"
+        mend_contents = self.save_match("cargo-mend", section)
+        port_contents = self.save_match("cargo-port", section)
+        mend_arguments = self.release_arguments("cargo-mend", "1.2.3", mend_contents)
+        first_publish = self.cli(mend_arguments)
+        self.assertEqual(first_publish.status, 0, first_publish.stderr)
+        self.assertCountEqual(self.releases("shared result"), ["cargo-mend@1.2.3", "cargo-port@Unreleased"])
+        self.assertEqual([event["crate"] for event in self.release_events()], ["cargo-mend"])
+
+        # The port publish fails before invoking release. New work must survive its retry.
+        self.add_crate_note("next shared result", "Use the next result.", crates=("cargo-mend", "cargo-port"))
+        retry = self.cli(mend_arguments)
+        self.assertEqual(retry.status, 0, retry.stderr)
+        self.assertIn("unchanged", retry.stdout)
+        port_publish = self.cli(self.release_arguments("cargo-port", "2.3.4", port_contents))
+
+        self.assertEqual(port_publish.status, 0, port_publish.stderr)
+        self.assertCountEqual(self.releases("shared result"), ["cargo-mend@1.2.3", "cargo-port@2.3.4"])
+        self.assertCountEqual(self.releases("next shared result"), ["cargo-mend@Unreleased", "cargo-port@Unreleased"])
+        self.assertEqual([event["crate"] for event in self.release_events()], ["cargo-mend", "cargo-port"])
+
+    def test_differing_compare_removes_previous_match_file_and_cannot_stamp(self) -> None:
+        self.add_crate_note("reviewed result", "Use the reviewed result.")
+        contents = self.save_match(
+            "cargo-mend", "## [Unreleased]\n\n### Added\n\n- Use the reviewed result.\n",
+        )
+        self.add_crate_note("new result", "Use a newly added result.")
+        changelog = self.root / "cargo-mend-CHANGELOG.md"
+
+        mismatch = self.cli(self.compare_arguments("cargo-mend", changelog, contents=contents))
+
+        self.assertEqual(mismatch.status, 1, mismatch.stderr)
+        self.assertFalse(contents.exists())
+        before = self.vault_snapshot()
+        rejected = self.cli(self.release_arguments("cargo-mend", "1.2.3", contents))
+        self.assertEqual(rejected.status, 2)
+        self.assertEqual(rejected.stdout, "")
+        self.assertEqual(self.vault_snapshot(), before)
+        self.assertEqual(self.release_events(), [])
+
+    def test_failed_local_compare_removes_previous_saved_contents(self) -> None:
+        self.add_crate_note("reviewed result", "Use the reviewed result.")
+        contents = self.save_match(
+            "cargo-mend", "## [Unreleased]\n\n### Added\n\n- Use the reviewed result.\n",
+        )
+        result = self.cli(self.compare_arguments("cargo-mend", self.root / "missing.md", contents=contents))
+        self.assertEqual(result.status, 2)
+        self.assertFalse(contents.exists())
+
+    def test_release_rejects_wrong_crate_and_invalid_versions_without_mutation(self) -> None:
+        self.add_crate_note("reviewed result", "Use the reviewed result.")
+        contents = self.save_match(
+            "cargo-mend", "## [Unreleased]\n\n### Added\n\n- Use the reviewed result.\n",
+        )
+        for crate, version in (
+            ("cargo-port", "1.2.3"), ("cargo-berth", "1.2.3"),
+            ("cargo-mend", "Unreleased"), ("cargo-mend", "1.2"),
+            ("cargo-mend", "1.2.3-alpha..1"),
+        ):
+            with self.subTest(crate=crate, version=version):
+                before = self.vault_snapshot()
+                events = self.events()
+                result = self.cli(self.release_arguments(crate, version, contents))
+                self.assertEqual(result.status, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(self.vault_snapshot(), before)
+                self.assertEqual(self.events(), events)
+
+    def test_release_rejects_malformed_snapshot_without_stamps_or_pending_cleanup(self) -> None:
+        self.add_crate_note("old result", "Use the old result.")
+        self.supersede_crate_note("old result", "reviewed result", "Use the reviewed result.")
+        contents = self.root / "invalid-local-contents.json"
+        invalid_files = (
+            "not JSON", "[]", "{}",
+            '{"crate": "cargo-port", "titles": ["reviewed result"]}',
+            '{"crate": "cargo-mend", "titles": "reviewed result"}',
+            '{"crate": "cargo-mend", "titles": [1]}',
+            '{"crate": "cargo-mend", "titles": ["../escape"]}',
+        )
+        for raw in invalid_files:
+            with self.subTest(raw=raw):
+                _ = contents.write_text(raw, encoding="utf-8")
+                before = self.vault_snapshot()
+                events = self.events()
+                result = self.cli(self.release_arguments("cargo-mend", "1.2.3", contents))
+                self.assertEqual(result.status, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertTrue(result.stderr)
+                self.assertEqual(self.vault_snapshot(), before)
+                self.assertEqual(self.events(), events)
+                self.assertEqual(contents.read_text(encoding="utf-8"), raw)
+                self.assert_no_temporary_files()
+        self.assertEqual(self.releases("old result"), ["cargo-mend@Unreleased"])
+        self.assertEqual(self.releases("reviewed result"), ["cargo-mend@Unreleased"])
+        self.assertEqual(self.release_events(), [])
+
+    def test_release_rejects_unsorted_titles_without_stamps_or_pending_cleanup(self) -> None:
+        self.add_crate_note("old result", "Use the old result.")
+        self.supersede_crate_note("old result", "reviewed result", "Use the reviewed result.")
+        contents = self.root / "unsorted-local-contents.json"
+        raw = '{"crate": "cargo-mend", "titles": ["reviewed result", "old result"]}'
+        _ = contents.write_text(raw, encoding="utf-8")
+        before = self.vault_snapshot()
+        events = self.events()
+
+        result = self.cli(self.release_arguments("cargo-mend", "1.2.3", contents))
+
+        self.assertEqual(result.status, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("reviewed titles must be sorted with no duplicates", result.stderr)
+        self.assertEqual(self.vault_snapshot(), before)
+        self.assertEqual(self.events(), events)
+        self.assertEqual(contents.read_text(encoding="utf-8"), raw)
+        self.assertEqual(self.releases("old result"), ["cargo-mend@Unreleased"])
+        self.assertEqual(self.releases("reviewed result"), ["cargo-mend@Unreleased"])
+        self.assertEqual(self.release_events(), [])
+        self.assert_no_temporary_files()
+
+    def test_release_rejects_missing_reviewed_note_without_stamps_or_pending_cleanup(self) -> None:
+        self.add_crate_note("old result", "Use the old result.")
+        self.supersede_crate_note("old result", "reviewed result", "Use the reviewed result.")
+        contents = self.root / "missing-note-contents.json"
+        raw = '{"crate": "cargo-mend", "titles": ["reviewed result", "unknown result"]}'
+        _ = contents.write_text(raw, encoding="utf-8")
+        before = self.vault_snapshot()
+        events = self.events()
+
+        result = self.cli(self.release_arguments("cargo-mend", "1.2.3", contents))
+
+        self.assertEqual(result.status, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("reviewed note unknown result does not exist", result.stderr)
+        self.assertEqual(self.vault_snapshot(), before)
+        self.assertEqual(self.events(), events)
+        self.assertEqual(contents.read_text(encoding="utf-8"), raw)
+        self.assertEqual(self.releases("old result"), ["cargo-mend@Unreleased"])
+        self.assertEqual(self.releases("reviewed result"), ["cargo-mend@Unreleased"])
+        self.assertEqual(self.release_events(), [])
+        self.assert_no_temporary_files()
+
+    def test_digest_shows_release_event_and_advances_past_it(self) -> None:
+        self.add_crate_note("reviewed result", "Use the reviewed result.")
+        contents = self.save_match(
+            "cargo-mend", "## [Unreleased]\n\n### Added\n\n- Use the reviewed result.\n",
+        )
+        first_digest = self.cli(["digest"])
+        self.assertEqual(first_digest.status, 0, first_digest.stderr)
+        stamped = self.cli(self.release_arguments("cargo-mend", "1.2.3", contents))
+        self.assertEqual(stamped.status, 0, stamped.stderr)
+
+        result = self.cli(["digest"])
+
+        self.assertEqual(result, CliResult(
+            0, "cargo-liner:\n= cargo-mend@1.2.3 (1 notes)\n"
+            + "1 changes since 2026-10-10 12:34 PDT\n", "",
+        ))
+        self.assertEqual(self.digest_cursor()["line"], len(self.events()))
+        repeated = self.cli(["digest"])
+        self.assertEqual(repeated.status, 0, repeated.stderr)
+        self.assertNotIn("= cargo-mend", repeated.stdout)
+
+    def test_off_host_compare_forwards_one_selection_and_compares_local_path(self) -> None:
+        section = "## [Unreleased]\n\n### Added\n\n- Use the remote result.\n"
+        reader = RecordingForwardedReader(feature_log.ChangelogSelection(section, ["remote result"]))
+        forwarder = RecordingReleaseForwarder()
+        changelog = self.root / "caller changelog.md"
+        _ = changelog.write_text(section, encoding="utf-8")
+
+        result = self.off_host_cli(self.compare_arguments("cargo-mend", changelog), reader, forwarder)
+
+        self.assertEqual(result, CliResult(0, "match\n", ""))
+        self.assertEqual(len(reader.commands), 1)
+        self.assertEqual(self.remote_arguments(reader.commands[0]), [
+            "changelog", "--crate", "cargo-mend", "--version", "Unreleased", "--selection",
+        ])
+        self.assertNotIn(str(changelog), reader.commands[0][2])
+        self.assertEqual(forwarder.calls, [])
+        self.assertFalse(self.vault.exists())
+
+    def test_off_host_compare_difference_removes_caller_saved_contents(self) -> None:
+        section = "## [Unreleased]\n\n### Fixed\n\n- Repair the remote result.\n"
+        reader = RecordingForwardedReader(feature_log.ChangelogSelection(section, ["remote fix"]))
+        forwarder = RecordingReleaseForwarder()
+        changelog = self.root / "caller CHANGELOG.md"
+        _ = changelog.write_text(section, encoding="utf-8")
+        contents = self.root / "caller-only" / "reviewed.json"
+        arguments = self.compare_arguments("cargo-mend", changelog, contents=contents)
+        match = self.off_host_cli(arguments, reader, forwarder)
+        self.assertEqual(match, CliResult(0, "match\n", ""))
+        self.assertEqual(self.reviewed_contents(contents), {"crate": "cargo-mend", "titles": ["remote fix"]})
+        _ = changelog.write_text("## [Unreleased]\n", encoding="utf-8")
+
+        mismatch = self.off_host_cli(arguments, reader, forwarder)
+
+        self.assertEqual(mismatch.status, 1, mismatch.stderr)
+        self.assertIn("Repair the remote result.", mismatch.stdout)
+        self.assertFalse(contents.exists())
+        self.assertEqual(len(reader.commands), 2)
+        self.assertEqual(forwarder.calls, [])
+        self.assertFalse(self.vault.exists())
+
+    def test_failed_forwarded_read_exits_two_with_remote_error_and_no_saved_file(self) -> None:
+        reader = RecordingForwardedReader(feature_log.ForwardFailed(7, "remote vault unavailable\n"))
+        forwarder = RecordingReleaseForwarder()
+        changelog = self.root / "caller CHANGELOG.md"
+        _ = changelog.write_text("## [Unreleased]\n", encoding="utf-8")
+        contents = self.root / "previous-match.json"
+        _ = contents.write_text('{"crate": "cargo-mend", "titles": ["stale result"]}', encoding="utf-8")
+
+        result = self.off_host_cli(
+            self.compare_arguments("cargo-mend", changelog, contents=contents), reader, forwarder,
+        )
+
+        self.assertEqual(result.status, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("remote vault unavailable", result.stderr)
+        self.assertFalse(contents.exists())
+        self.assertEqual(len(reader.commands), 1)
+        self.assertEqual(forwarder.calls, [])
+
+    def test_off_host_release_validates_contents_before_forwarding(self) -> None:
+        reader = RecordingForwardedReader(feature_log.ForwardFailed(2, "unexpected reader call"))
+        forwarder = RecordingReleaseForwarder()
+        contents = self.root / "invalid-contents.json"
+        invalid_files = (
+            "not JSON", "[]", "{}",
+            '{"crate": "cargo-port", "titles": []}',
+            '{"crate": "cargo-mend", "titles": "a title"}',
+            '{"crate": "cargo-mend", "titles": [1]}',
+            '{"crate": "cargo-mend", "titles": ["../escape"]}',
+        )
+        for raw in invalid_files:
+            with self.subTest(raw=raw):
+                _ = contents.write_text(raw, encoding="utf-8")
+                result = self.off_host_cli(
+                    self.release_arguments("cargo-mend", "1.2.3", contents), reader, forwarder,
+                )
+                self.assertEqual(result.status, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertTrue(result.stderr)
+        contents.unlink()
+        missing = self.off_host_cli(self.release_arguments("cargo-mend", "1.2.3", contents), reader, forwarder)
+        self.assertEqual(missing.status, 2)
+        self.assertEqual(reader.commands, [])
+        self.assertEqual(forwarder.calls, [])
+
+    def test_off_host_release_sends_validated_json_instead_of_caller_path(self) -> None:
+        reader = RecordingForwardedReader(feature_log.ForwardFailed(2, "unexpected reader call"))
+        forwarder = RecordingReleaseForwarder()
+        contents = self.root / "caller-only.json"
+        _ = contents.write_text(
+            '{"crate": "cargo-mend", "titles": ["reviewed result"]}', encoding="utf-8",
+        )
+
+        result = self.off_host_cli(self.release_arguments("cargo-mend", "1.2.3", contents), reader, forwarder)
+
+        self.assertEqual(result.status, 0, result.stderr)
+        self.assertEqual(reader.commands, [])
+        self.assertEqual(len(forwarder.calls), 1)
+        call = forwarder.calls[0]
+        self.assertEqual(call.contents, {"crate": "cargo-mend", "titles": ["reviewed result"]})
+        remote = self.remote_arguments(call.command)
+        self.assertEqual(remote[:5], ["release", "--crate", "cargo-mend", "--version", "1.2.3"])
+        self.assertNotIn("--contents", remote)
+        self.assertNotIn(str(contents), call.command[2])
+        self.assertFalse(self.vault.exists())
+
+    def test_off_host_compare_save_release_uses_two_separate_filesystems(self) -> None:
+        remote_vault = self.root / "vault-host" / "vault"
+        remote_state_home = self.root / "vault-host" / "state"
+        remote_environment = {
+            "FEATURE_LOG_VAULT": str(remote_vault), "XDG_STATE_HOME": str(remote_state_home),
+        }
+        with patch.dict(os.environ, remote_environment):
+            self.add_crate_note("remote reviewed result", "Use the remote reviewed result.")
+
+        section = "## [Unreleased]\n\n### Added\n\n- Use the remote reviewed result.\n"
+        changelog = self.root / "calling-host" / "CHANGELOG.md"
+        changelog.parent.mkdir(parents=True)
+        _ = changelog.write_text(section, encoding="utf-8")
+        contents = self.root / "calling-host" / "release" / "cargo-mend.json"
+        read_commands: list[list[str]] = []
+        release_calls: list[ForwardedReleaseCall] = []
+
+        def read_remote(command: list[str]) -> feature_log.ChangelogSelection | feature_log.ForwardFailed:
+            read_commands.append(command.copy())
+            arguments = self.remote_arguments(command)
+            self.assertEqual(arguments, [
+                "changelog", "--crate", "cargo-mend", "--version", "Unreleased", "--selection",
+            ])
+            self.assertNotIn(str(changelog), command[2])
+            self.assertNotIn(str(contents), command[2])
+            with (
+                patch.dict(os.environ, remote_environment),
+                patch.object(feature_log, "vault_dir", return_value=remote_vault),
+            ):
+                selected = self.cli(arguments)
+            self.assertEqual(selected.status, 0, selected.stderr)
+            value = cast(ChangelogSelectionJson, json.loads(selected.stdout))
+            return feature_log.ChangelogSelection(value["section"], value["titles"])
+
+        def release_remote(command: list[str], reviewed: feature_log.ReviewedReleaseContents) -> int:
+            release_calls.append(ForwardedReleaseCall(command.copy(), {
+                "crate": reviewed["crate"], "titles": reviewed["titles"].copy(),
+            }))
+            self.assertTrue(contents.is_file())
+            self.assertEqual(list((self.root / "vault-host").rglob("cargo-mend.json")), [])
+            arguments = self.remote_arguments(command)
+            self.assertNotIn("--contents", arguments)
+            self.assertNotIn(str(contents), command[2])
+            with (
+                patch.dict(os.environ, remote_environment),
+                patch.object(feature_log, "vault_dir", return_value=remote_vault),
+                patch.object(sys, "stdin", StringIO(json.dumps(reviewed))),
+            ):
+                return feature_log.main(arguments)
+
+        compared = self.off_host_cli(
+            self.compare_arguments("cargo-mend", changelog, contents=contents), read_remote, release_remote,
+        )
+        self.assertEqual(compared, CliResult(0, "match\n", ""))
+        self.assertEqual(self.reviewed_contents(contents), {
+            "crate": "cargo-mend", "titles": ["remote reviewed result"],
+        })
+
+        stamped = self.off_host_cli(
+            self.release_arguments("cargo-mend", "1.2.3", contents), read_remote, release_remote,
+        )
+
+        self.assertEqual(stamped.status, 0, stamped.stderr)
+        self.assertEqual(len(read_commands), 1)
+        self.assertEqual(len(release_calls), 1)
+        self.assertFalse(self.vault.exists())
+        remote_note = remote_vault / "feature-log/cargo-liner/remote reviewed result.md"
+        self.assertEqual(feature_log.parse_note(remote_note)["release"], ["cargo-mend@1.2.3"])
+        remote_events = remote_state_home / "claude/feature-log/events.jsonl"
+        events = [cast(FeatureLogEvent, json.loads(line)) for line in remote_events.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(events[-1], {
+            "at": EVENT_TIME, "verb": "release", "project": "cargo-liner", "crate": "cargo-mend",
+            "version": "1.2.3", "titles": ["remote reviewed result"],
+        })
+
+    def test_off_host_release_transport_writes_json_to_stdin(self) -> None:
+        contents = self.root / "caller-release.json"
+        _ = contents.write_text(
+            '{"crate": "cargo-mend", "titles": ["reviewed result"]}', encoding="utf-8",
+        )
+        commands: list[list[str]] = []
+        payloads: list[ReviewedReleaseContents] = []
+
+        def remote_process(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            commands.append(command.copy())
+            raw = options.get("input")
+            if not isinstance(raw, str):
+                self.fail("release transport must send JSON on stdin")
+            payloads.append(cast(ReviewedReleaseContents, json.loads(raw)))
+            self.assertIs(options.get("text"), True)
+            return subprocess.CompletedProcess[str](command, 0)
+
+        ssh_runner = RecordingSshRunner(returncode=99)
+        with patch.dict(os.environ, {}, clear=False):
+            _ = os.environ.pop("FEATURE_LOG_VAULT")
+            with (
+                patch.object(socket, "gethostname", return_value="macbook.local"),
+                patch.object(feature_log, "vault_dir", return_value=self.vault),
+                patch.object(subprocess, "run", side_effect=remote_process),
+            ):
+                result = self.cli_with_runner(self.release_arguments("cargo-mend", "1.2.3", contents), ssh_runner)
+
+        self.assertEqual(result.status, 0, result.stderr)
+        self.assertEqual(ssh_runner.commands, [])
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(payloads, [{"crate": "cargo-mend", "titles": ["reviewed result"]}])
+        self.assertNotIn("--contents", self.remote_arguments(commands[0]))
+        self.assertNotIn(str(contents), commands[0][2])
 
 
 if __name__ == "__main__":

@@ -17,9 +17,11 @@ nothing; when the doc's Updates line reads `on demand`, say updates are on deman
    `**Updates:** every N minutes` line and `every N minutes` in `PROMPT_FILE`.
    Run `NOTIFIER interval UPDATES <minutes>`; it restarts the instance and
    prints `next_due`. When it refuses (exit 2), report what it names and stop.
-   A doc whose line read `on demand` has no instance: commit the doc first
-   (step 2), then run `update_registration.py register` as `/showrunner:produce`
-   does at start, which makes the instance and prints `next_due`.
+   A doc whose line read `on demand` has a stopped instance: commit the doc
+   first (step 2), run `update_registration.py register` as
+   `/showrunner:produce` does at start, which rewrites `PROMPT_FILE` and sets
+   the interval, then `NOTIFIER start UPDATES`, which starts the instance and
+   prints `next_due`.
 2. **Commit** the production doc in `CHECKOUT` as
    `production(<name>): updates every <minutes> minutes`. It goes out with the
    next push of the merge branch.

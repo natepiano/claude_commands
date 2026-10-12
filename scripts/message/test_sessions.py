@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
+from test_support import ShutdownTestCase
 import sessions
 
 
@@ -23,7 +25,7 @@ STAT_WITH_TRUNCATED_PROCESS_NAME = b"4242 (with ) spaces \xc3) " + b" ".join(
 )
 
 
-class SessionLookupTests(unittest.TestCase):
+class SessionLookupTests(ShutdownTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -33,6 +35,7 @@ class SessionLookupTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.sessions = self.root / "sessions"
         self.sessions.mkdir()
@@ -66,6 +69,9 @@ class SessionLookupTests(unittest.TestCase):
         self.record("one.json", name="showrunner", session_id="sid-123")
         self.assertEqual(self.run_cli("socket", "showrunner").stdout.strip(), str(self.socket_path))
         self.assertEqual(self.run_cli("socket", "session:sid-123").stdout.strip(), str(self.socket_path))
+        # The address is what `SendMessage` takes: this machine's session, by its socket.
+        self.assertEqual(self.run_cli("address", "showrunner").stdout, f"uds:{self.socket_path}\n")
+        self.assertEqual(self.run_cli("address", "session:sid-123").stdout, f"uds:{self.socket_path}\n")
         self.assertEqual(self.run_cli("id", "showrunner").stdout.strip(), "sid-123")
         self.assertEqual(self.run_cli("id", str(os.getpid())).stdout.strip(), "sid-123")
 
@@ -82,7 +88,7 @@ class SessionLookupTests(unittest.TestCase):
     def test_dead_pid_and_missing_socket_return_absent(self) -> None:
         self.record("dead.json", pid=2**29 + os.getpid())
         self.record("missing-socket.json", socket_path=self.root / "absent.sock")
-        for args in (("socket", "agent"), ("id", "agent")):
+        for args in (("socket", "agent"), ("address", "agent"), ("id", "agent")):
             result = self.run_cli(*args)
             self.assertEqual(
                 (result.returncode, result.stdout, result.stderr), (1, "", "")
@@ -117,6 +123,46 @@ class SessionLookupTests(unittest.TestCase):
             live = sessions.live_sessions()
         self.assertEqual(live, [record])
         accepts.assert_called_once_with(record)
+
+    def test_record_with_socket_and_wrong_process_start_is_not_running(self) -> None:
+        self.record("reused.json", pid=4242, proc_start="recorded start")
+        registered = sessions.read_session(self.sessions / "reused.json")
+        assert not isinstance(registered, sessions.UnreadableSessionRecord)
+        self.assertTrue(sessions.messaging_socket_exists(registered))
+        with (
+            mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}),
+            mock.patch.object(os, "kill"),
+            mock.patch.object(sessions, "process_start", return_value="new process start") as start,
+        ):
+            self.assertFalse(sessions.running_session(registered))
+            self.assertFalse(sessions.live_session(registered))
+            self.assertEqual(sessions.running_sessions(), [])
+            self.assertEqual(sessions.live_sessions(), [])
+        self.assertTrue(start.called)
+        for call in start.call_args_list:
+            self.assertEqual(call.args, (4242,))
+
+    def test_record_with_socket_and_matching_process_start_is_live(self) -> None:
+        self.record("matching.json", pid=4242, proc_start="recorded start")
+        registered = sessions.read_session(self.sessions / "matching.json")
+        assert not isinstance(registered, sessions.UnreadableSessionRecord)
+        with (
+            mock.patch.object(os, "kill"),
+            mock.patch.object(sessions, "process_start", return_value="recorded start"),
+        ):
+            self.assertTrue(sessions.running_session(registered))
+            self.assertTrue(sessions.live_session(registered))
+
+    def test_record_with_socket_and_unreadable_process_start_is_not_running(self) -> None:
+        self.record("unknown.json", pid=4242, proc_start="recorded start")
+        registered = sessions.read_session(self.sessions / "unknown.json")
+        assert not isinstance(registered, sessions.UnreadableSessionRecord)
+        with (
+            mock.patch.object(os, "kill"),
+            mock.patch.object(sessions, "process_start", return_value=None),
+        ):
+            self.assertFalse(sessions.running_session(registered))
+            self.assertFalse(sessions.live_session(registered))
 
     def test_socketless_record_with_another_process_start_is_not_running(self) -> None:
         self.record("reused.json", socket_path=self.root / "absent.sock", proc_start="another start")
@@ -215,11 +261,11 @@ class SessionLookupTests(unittest.TestCase):
         self.assertEqual((result.returncode, result.stdout.strip()), (0, str(self.socket_path)))
 
     def test_usage_errors(self) -> None:
-        for args in ((), ("socket",), ("id",), ("unknown", "agent")):
+        for args in ((), ("socket",), ("address",), ("id",), ("unknown", "agent")):
             self.assertEqual(self.run_cli(*args).returncode, 2)
 
 
-class ProcessStartTests(unittest.TestCase):
+class ProcessStartTests(ShutdownTestCase):
     def test_linux_start_survives_a_process_name_cut_inside_a_utf8_character(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         stat_path = root / "stat"

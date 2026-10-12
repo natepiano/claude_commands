@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 import quota_alert
 from agent_accounts import ClaudeAccountSelection
@@ -225,7 +226,7 @@ class QuotaAlertTests(unittest.TestCase):
         config["threshold_percent"] = 4
         text = quota_alert.message(notes[0], notes, config)
         self.assertTrue(text.startswith("Quota alert: claude 3 (unit directors) at 1%"))
-        self.assertIn('swap: /accounts swap unit "claude 4"', text)
+        self.assertIn('swap: /showrunner:accounts swap unit "claude 4"', text)
         self.assertIn("Sessions on claude 3 start no new Claude work", text)
         self.assertIn("Showrunners relay this notice to their units on that account.", text)
         self.assertNotIn("@", text)
@@ -488,12 +489,15 @@ class QuotaAlertTests(unittest.TestCase):
             self.assertNotIn("push", state["episodes"]["claude 2"])
 
     def test_claude_push_names_refill_and_reset_count_at_decision_priority(self) -> None:
-        resets = "2026-10-12 09:00"
+        # Ahead of the real clock, which decides whether a reset is still to come.
+        refill = (datetime.now().astimezone() + timedelta(days=2)).replace(second=0, microsecond=0)
+        resets = refill.strftime("%Y-%m-%d %H:%M")
         note = self.note("claude 2.md", "active", "0", resets, limit_reset_count="3")
         _ = quota_alert.alert([note], self.now)
         self.assertEqual(self.pushed, [(
             "claude 2 weekly limit",
-            "claude 2 has 0% of its weekly usage left; it refills Mon 10-12 06:00 PDT.",
+            "claude 2 has 0% of its weekly usage left; it refills "
+            + f"{refill.astimezone(ZoneInfo('America/Los_Angeles')):%a %m-%d %H:%M %Z}.",
             quota_alert.Ask("decision", "Log in to another Claude account, or redeem a limit reset (3 available)."),
         )])
 

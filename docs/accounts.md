@@ -8,13 +8,29 @@ The status line's second row shows this session's account label. To print it:
 ~/.claude/scripts/lib/py ~/.claude/scripts/whoami/account.py
 ```
 
-`/whoami` shows each account in use with its role (`showrunners`, `unit directors`), omitting spares. It does not identify this session's account. To see every account directory and its login:
+`/whoami` shows each account in use with its role (`showrunners`, `unit directors`), omitting spares. It does not identify this session's account.
+
+## Every account in one table
+
+`/showrunner:accounts` prints one table: a row for `~/.claude` and each `~/.claudeN`, logged in or not, then a row for each Codex account. In a terminal:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py status
 ```
 
-Inside a session, `/accounts status` shows the same report.
+| Column | Shows |
+| --- | --- |
+| Label | The account's label. A named folder keeps its own label whatever login it holds. |
+| Login | The login, `not logged in`, or `not set up` for an account that has a note and is in no folder. |
+| Role | `showrunners`, `unit directors`, or `spare`; `seats` for the Codex account. |
+| 5-hour left, Weekly left | Percent of each window left, each with its reset time. A dash when the account has no such window. |
+| On credits | Codex only: `yes` when a window is used up and the account's credits now pay for the work. |
+| Credits left | Codex only: the credit balance, or `unlimited`. |
+| Read | When those numbers were read. |
+
+Codex has one home, `~/.codex`, so one Codex account is signed in at a time. Each other Codex account that has a note gets a `not logged in` row with no numbers.
+
+Times are in the running production's User zone, or this machine's zone when no production runs. The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Lines under the table name anything wrong or unusual in a folder: a failed check, unclassified entries, MCP servers that differ from `~/.claude`.
 
 ## Starting a session
 
@@ -37,15 +53,26 @@ These aliases come from natedev's shell configuration after a rebuild; the Mac h
 
 Arguments after the label pass through to `claude`.
 
-Units started by showrunners pick their account themselves. A named alias whose login matches the default runs on `~/.claude`, with `CLAUDE_CONFIG_DIR` removed. Today that is `claude2`; other named aliases use their own `~/.claudeN` directory. Plain `claude` is unchanged.
+Units started by showrunners pick their account themselves. A named alias whose login matches the default runs on `~/.claude`, with `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_REMOTE_MEMORY_DIR` removed. Today that is `claude2`; other named aliases use their own `~/.claudeN` directory. Plain `claude` is unchanged.
 
 A missing directory refuses without starting Claude, for example:
 
 ```text
-accounts: ~/.claude3 is not set up; /accounts setup "claude 3" first
+accounts: ~/.claude3 is not set up; /showrunner:accounts setup "claude 3" first
 ```
 
 Broken shared links or unreadable identity files also refuse. A directory that is set up but logged out can start so you can log in.
+
+### Memory on a named account
+
+A session on `~/.claudeN` starts with two variables: `CLAUDE_CONFIG_DIR=~/.claudeN` and `CLAUDE_CODE_REMOTE_MEMORY_DIR=~/.claude`. The aliases, unit launches and `/shutdown restart` all set both.
+
+The second one is why memory writes do not ask. Claude Code saves a memory file without asking only when no link sits in the file's path, and `~/.claudeN/projects` is a link to `~/.claude/projects`. With the variable, the session uses `~/.claude/projects/<project>/memory/` itself, the folder every account shares.
+
+- A session started with `CLAUDE_CONFIG_DIR` alone asks on each memory write ("… which is a sensitive file"). No allow rule clears it: that check runs before allow rules. Restart the session through an alias or `/shutdown restart`.
+- A session started before this change keeps asking until it is restarted.
+- The variable is not in Claude Code's public documentation. After a Claude Code update that brings the prompt back, check it first: in a scratch folder run `claude3 -p --permission-mode default` and ask it to write one `.md` file into the memory folder its prompt names.
+- Memory that a custom subagent keeps in its `local` scope is stored under `~/.claude/projects/<project>/agent-memory-local/` in these sessions, not in the project's `.claude/`.
 
 ## Log out and in
 
@@ -69,10 +96,10 @@ If the directory holds another login, the alias refuses with:
 accounts: ~/.claude3 is logged in as <login>, not claude 3; see Log out and in in ~/.claude/docs/accounts.md
 ```
 
-Start that directory directly, then log out and log in as claude 3:
+Start that directory directly, then log out and log in as claude 3. `env -u` drops an inherited `CLAUDE_CODE_OAUTH_TOKEN`, which would otherwise override the directory's login:
 
 ```sh
-CLAUDE_CONFIG_DIR=~/.claude3 claude
+env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=~/.claude3 claude
 ```
 
 ```text
@@ -80,14 +107,18 @@ CLAUDE_CONFIG_DIR=~/.claude3 claude
 /login
 ```
 
-Never `/logout` in a unit director's session: every unit on that account stops working. After any login, run `/accounts status`; every directory must match its label.
+Never `/logout` in a unit director's session: every unit on that account stops working. After any login, run `/showrunner:accounts`; every directory must match its label.
 
 ## Swapping the unit account
+
+The unit account runs the unit directors and the nightly review. A swap moves both: the next night's review starts on the new account.
+
+The review cannot edit any account folder: its settings deny edits under `~/.claude1`, `~/.claude2` and `~/.claude3` as well as `~/.claude`. A new account folder needs its own line in `scripts/nightly_review/settings.json`.
 
 Run the swap from a session on another account, normally plain `claude`, or from a terminal. This example moves units from claude 3 to claude 1:
 
 ```text
-/accounts swap unit "claude 1"
+/showrunner:accounts swap unit "claude 1"
 ```
 
 The terminal equivalent is:
@@ -113,7 +144,7 @@ accounts: cannot swap <old>: <machine> <kind> <name> would not move
 accounts: cannot swap <old>: <machine> unattributed session <name> (pid <pid>)
 ```
 
-An unfit target reports its first `/accounts status` problem. Fix account readiness there; for a logged-out account, use its alias and `/login` as that account. Close ordinary sessions on the outgoing unit account before retrying a session refusal. Only units and their director-owned seats on natedev move; any session on the Mac refuses. Swap needs the Mac reachable even if its inventory is empty. A Mac outage refuses with the role unchanged. Swap takes no `--here`.
+An unfit target reports its first `/showrunner:accounts` problem. Fix account readiness there; for a logged-out account, use its alias and `/login` as that account. Close ordinary sessions on the outgoing unit account before retrying a session refusal. Only units and their director-owned seats on natedev move; any session on the Mac refuses. Swap needs the Mac reachable even if its inventory is empty. A Mac outage refuses with the role unchanged. Swap takes no `--here`.
 
 `unit account unchanged: still claude 3` means shutdown refused and the old role is back. Fix the printed refusal, then run the same swap again.
 
@@ -136,7 +167,7 @@ Both recovery commands name the **old note label** printed in the alert, even th
 To undo:
 
 ```text
-/accounts swap unit default
+/showrunner:accounts swap unit default
 ```
 
 Moving units off the default account, which showrunners share, uses the cutover's selected-unit procedure. Swap refuses showrunners and top-level sessions.
@@ -146,10 +177,10 @@ Moving units off the default account, which showrunners share, uses the cutover'
 For claude 3, run inside a session:
 
 ```text
-/accounts setup "claude 3"
+/showrunner:accounts setup "claude 3"
 ```
 
-Then start `claude3` in a terminal, run `/login` as claude 3, and check `/accounts status`. Setup links shared content to `~/.claude`; it reports existing real files or directories rather than replacing them. Login stays separate for each directory.
+Then start `claude3` in a terminal, run `/login` as claude 3, and check `/showrunner:accounts`. Setup links shared content to `~/.claude`; it reports existing real files or directories rather than replacing them. Login stays separate for each directory.
 
 ## Low-quota alerts
 
@@ -160,7 +191,7 @@ Acknowledging an account's low-quota alert keeps it quiet across swaps. Made spa
 A showrunner's launch refuses with:
 
 ```text
-add_unit: unit account <label>: <problem>; /accounts status
+add_unit: unit account <label>: <problem>; /showrunner:accounts
 ```
 
-Run `/accounts status`, fix what it names (most often the account's alias and `/login` as that account), then launch again.
+Run `/showrunner:accounts`, fix what it names (most often the account's alias and `/login` as that account), then launch again.

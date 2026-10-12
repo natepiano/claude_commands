@@ -1125,7 +1125,10 @@ def peer_roster(environment: Mapping[str, str]) -> Roster:
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
                '\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/message/roster.py\" --here --snapshot']
     try:
+        # ssh forwards its input to the peer. It gets none, so it never waits on the caller's
+        # input or takes text the caller was meant to read.
         done = subprocess.run(command, capture_output=True, text=True, timeout=20, check=False,
+                              stdin=subprocess.DEVNULL,
                               env={key: value for key, value in environment.items()
                                    if key not in {"CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"}})
     except (OSError, subprocess.TimeoutExpired) as error:

@@ -657,6 +657,16 @@ print("SENT: delivered")
         self.assertEqual(resumed.stdout, "nothing was paused\n")
         self.assertTrue((stopped / "state").read_text().startswith("ENABLED=0\n"))
 
+    def test_a_stopped_showrunner_timer_is_never_recorded_or_resumed(self) -> None:
+        # A production on demand keeps its showrunner timer stopped. The pause still turns its footer
+        # off, but never records the timer, so a resume leaves it stopped.
+        showrunner = self.create_instance("showrunner-show", enabled=False)
+        result = self.run_prompt("hello")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.record()["instances"], [])
+        _ = self.run_cli("resume")
+        self.assertTrue((showrunner / "state").read_text().startswith("ENABLED=0\n"))
+
     def test_existing_pause_adds_a_report_that_was_turned_on_later(self) -> None:
         first = self.create_instance("delegate-abc")
         _ = self.parsed_reply(self.run_prompt("first", now=100))
