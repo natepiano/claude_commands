@@ -127,7 +127,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **Ruled out:** per-target claim, block and backoff storage for a second ssh machine (no consumer today); a separate expiry comparison inside `target_state` (it disagrees with `claim`).
 
-### Phase 2 — A seat's build counts as its owning session's admission  · status: todo
+### Phase 2 — A seat's build counts as its owning session's admission  · status: done
 
 #### Work Order
 

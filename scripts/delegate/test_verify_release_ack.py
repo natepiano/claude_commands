@@ -5,17 +5,43 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
-from typing import cast, override
+from typing import TypedDict, cast, override
 
 from scripts.delegate import test_verify_untested_examples
 
 
 INVOKE = Path(__file__).resolve().parent.parent / "lint" / "invoke.sh"
 CYCLE_ID = "b" * 32
+
+
+class MemoryWaitObservation(TypedDict):
+    state: str
+    wait_started_at: str
+
+
+class WorkspaceTarget(TypedDict):
+    name: str
+    kind: list[str]
+    src_path: str
+    test: bool
+
+
+class WorkspacePackage(TypedDict):
+    id: str
+    name: str
+    manifest_path: str
+    features: dict[str, list[str]]
+    targets: list[WorkspaceTarget]
+
+
+class WorkspaceMetadata(TypedDict):
+    packages: list[WorkspacePackage]
+    workspace_members: list[str]
 
 
 class VerifyReleaseAckTests(unittest.TestCase):
@@ -67,6 +93,11 @@ PY
             "XDG_RUNTIME_DIR": str(self.root),
             "BUILD_HOLD_DIR": str(holders),
             "BUILD_HOLD_RELEASE_DIR": str(release),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+            "PLAN_DELEGATE_BOARD_DIR": "",
+            "PLAN_DELEGATE_SESSION_DIR": "",
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+            "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_MEMINFO": str(meminfo),
             "BUILDLOG_MEM_POLL_S": "1",
             "BUILDLOG_OFF": "1",
@@ -99,11 +130,20 @@ PY
 
     def invoke(self, *command: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["bash", "-c", 'source "$INVOKE_SCRIPT"; sweep_after_step() { :; }; run_once "$@"', "bash", *command],
+            ["bash", "-c", 'set -euo pipefail; source "$INVOKE_SCRIPT"; sweep_after_step() { :; }; run_once "$@"', "bash", *command],
+            cwd=self.root,
             env=self.environment, capture_output=True, text=True, check=False, timeout=10,
         )
 
-    def test_wait_start_and_return_precede_compiling_command(self) -> None:
+    def set_owner_marker(self) -> None:
+        run = self.root / "delegate-run"
+        active = Path(self.environment["PLAN_DELEGATE_ACTIVE_DIR"])
+        active.mkdir()
+        _ = (active / "unit-director").write_text(str(run) + "\n")
+        self.environment["PLAN_DELEGATE_BOARD_DIR"] = str(run)
+        self.environment["CLAUDE_CODE_SESSION_ID"] = "stale-session"
+
+    def release_memory_after_poll(self) -> None:
         _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 8388608 kB\n")
         sleeper = self.root / "stubs" / "sleep"
         _ = sleeper.write_text(r'''#!/bin/sh
@@ -118,12 +158,14 @@ printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"
         sleeper.chmod(0o755)
         self.environment["WAIT_STATE_LOG"] = str(self.root / "wait-states")
 
+    def test_wait_start_and_return_precede_compiling_command(self) -> None:
+        self.release_memory_after_poll()
         result = self.invoke(str(self.root / "stubs" / "compile"))
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        waiting = cast(dict[str, object], json.loads((self.root / "wait-states").read_text()))
+        waiting = cast(MemoryWaitObservation, json.loads((self.root / "wait-states").read_text()))
         self.assertEqual(waiting["state"], "WaitingForMemory")
-        self.assertIsNotNone(datetime.fromisoformat(cast(str, waiting["wait_started_at"])).tzinfo)
+        self.assertIsNotNone(datetime.fromisoformat(waiting["wait_started_at"]).tzinfo)
         self.assertEqual((self.root / "step-states").read_text().splitlines(), ["MemoryGateReturned"])
         self.assertEqual(self.entry()["outcome"], "Granted")
         self.assertTrue(self.entry()["wait_ended_at"])
@@ -146,17 +188,65 @@ printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.entry()["state"], "ReleasedAwaitingAdmission")
 
-    def test_seat_uses_director_session_id_and_missing_id_writes_nothing(self) -> None:
+    def test_seat_with_stale_shell_id_marks_owner_after_memory_grant(self) -> None:
+        self.set_owner_marker()
+        result = self.invoke(str(self.root / "stubs" / "compile"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.entry()["session_id"], "unit-director")
+        self.assertEqual(self.entry()["state"], "MemoryGateReturned")
+        self.assertEqual(self.entry()["outcome"], "Granted")
+        self.assertEqual((self.root / "step-states").read_text().splitlines(), ["MemoryGateReturned"])
+
+    def test_seat_memory_wait_and_return_mark_owner_before_compiling(self) -> None:
+        self.set_owner_marker()
+        self.release_memory_after_poll()
+        result = self.invoke(str(self.root / "stubs" / "compile"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        waiting = cast(MemoryWaitObservation, json.loads((self.root / "wait-states").read_text()))
+        self.assertEqual(waiting["state"], "WaitingForMemory")
+        self.assertEqual(self.entry()["session_id"], "unit-director")
+        self.assertEqual(self.entry()["state"], "MemoryGateReturned")
+        self.assertEqual((self.root / "step-states").read_text().splitlines(), ["MemoryGateReturned"])
+
+    def test_seat_without_shell_id_still_marks_owner(self) -> None:
+        self.set_owner_marker()
+        self.environment["CLAUDE_CODE_SESSION_ID"] = ""
         result = self.invoke(str(self.root / "stubs" / "compile"))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.entry()["session_id"], "unit-director")
         self.assertEqual(self.entry()["state"], "MemoryGateReturned")
 
-        self.reset_cycle()
+    def test_call_without_session_or_run_writes_no_admission_mark(self) -> None:
         self.environment["CLAUDE_CODE_SESSION_ID"] = ""
+        self.environment["BUILDLOG_CALL_ID"] = "unowned-call"
+        before = self.cycle_file.read_bytes()
         no_id = self.invoke(str(self.root / "stubs" / "compile"))
         self.assertEqual(no_id.returncode, 0, no_id.stdout + no_id.stderr)
-        self.assertEqual(self.entry()["state"], "ReleasedAwaitingAdmission")
+        self.assertEqual(self.cycle_file.read_bytes(), before)
+        self.assertEqual((self.root / "step-states").read_text().splitlines(), ["ReleasedAwaitingAdmission"])
+
+    def test_unowned_call_with_empty_holder_directory_and_nullglob_returns(self) -> None:
+        (Path(self.environment["BUILD_HOLD_DIR"]) / "holder").unlink()
+        self.environment["CLAUDE_CODE_SESSION_ID"] = ""
+        python_calls = self.root / "python-calls"
+        before = self.cycle_file.read_bytes()
+        result = subprocess.run(
+            ["bash", "-c", r'''set -euo pipefail
+shopt -s nullglob
+source "$INVOKE_SCRIPT"
+python3() { printf 'called\n' > "$PYTHON_CALL_LOG"; return 99; }
+build_hold_mark MemoryGateReturned Granted
+printf 'returned\n'
+'''],
+            cwd=self.root,
+            env={**self.environment, "PYTHON_CALL_LOG": str(python_calls)},
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "returned\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(python_calls.exists())
+        self.assertEqual(self.cycle_file.read_bytes(), before)
 
 
 class VerifyRoutingTests(unittest.TestCase):
@@ -190,12 +280,68 @@ class VerifyRoutingTests(unittest.TestCase):
         self.reset_cycle()
         self.fixture.environment.update({
             "HOME": str(root),
-            "REAL_CARGO": subprocess.check_output(["rustup", "which", "cargo"], text=True).strip(),
-            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
+            "CLAUDE_PYTHON": sys.executable,
             "BUILD_HOLD_DIR": str(holders),
             "BUILD_HOLD_RELEASE_DIR": str(release),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+            "PLAN_DELEGATE_BOARD_DIR": "",
+            "PLAN_DELEGATE_TEAM_ROLE": "",
+            "NOTIFIER_SESSIONS_DIR": str(root / "sessions"),
+            "MAC_TEST_STATE_DIR": str(root / "mac-state"),
+            "VERIFY_MAC_RUNNER": str(root / "no-mac-runner"),
             "CLAUDE_CODE_SESSION_ID": "unit-director",
         })
+        self.write_command_stand_ins()
+
+    def write_command_stand_ins(self) -> None:
+        root = self.fixture.root
+        metadata: WorkspaceMetadata = {
+            "packages": [{
+                "id": "sample-package", "name": "sample",
+                "manifest_path": str(root / "Cargo.toml"), "features": {},
+                "targets": [
+                    {"name": "sample", "kind": ["lib"],
+                     "src_path": str(root / "src" / "lib.rs"), "test": True},
+                    {"name": "demo", "kind": ["example"],
+                     "src_path": str(root / "examples" / "demo.rs"), "test": False},
+                ],
+            }],
+            "workspace_members": ["sample-package"],
+        }
+        metadata_file = root / "metadata.json"
+        _ = metadata_file.write_text(json.dumps(metadata) + "\n")
+        self.fixture.environment["PACKAGE_METADATA"] = str(metadata_file)
+        _ = self.fixture.environment.pop("REAL_CARGO", None)
+        cargo = root / "stubs" / "cargo"
+        _ = cargo.write_text(r'''#!/bin/sh
+if [ "$1" = metadata ]; then
+    printf 'metadata\n' >> "$METADATA_CALLS"
+    cat "$PACKAGE_METADATA"
+    exit 0
+fi
+printf '%s\n' "$*" >> "$CARGO_CALLS"
+case "$1 $2" in
+    "nextest --version"|"nextest run"|"+nightly fmt") exit 0 ;;
+    *) exit 97 ;;
+esac
+''')
+        for name, source in (
+            ("rustc", "#!/bin/sh\nprintf 'test compiler\\n'\n"),
+            ("ssh", "#!/bin/sh\nexit 99\n"),
+            ("rsync", "#!/bin/sh\nexit 99\n"),
+        ):
+            command = root / "stubs" / name
+            _ = command.write_text(source)
+            command.chmod(0o755)
+
+    def set_owner_marker(self) -> None:
+        run = self.fixture.root / "delegate-run"
+        run.mkdir()
+        active = Path(self.fixture.environment["PLAN_DELEGATE_ACTIVE_DIR"])
+        active.mkdir()
+        _ = (active / "unit-director").write_text(str(run) + "\n")
+        self.fixture.environment["PLAN_DELEGATE_BOARD_DIR"] = str(run)
+        self.fixture.environment["CLAUDE_CODE_SESSION_ID"] = "stale-session"
 
     def reset_cycle(self) -> None:
         now = datetime.now().astimezone().isoformat()
@@ -238,6 +384,37 @@ class VerifyRoutingTests(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertIn("PASS (recorded)", second.stdout)
         self.assertEqual(self.state(), "ReleasedAwaitingAdmission")
+
+    def test_seat_with_stale_shell_id_marks_marker_owner_through_verify(self) -> None:
+        _ = self.fixture.package()
+        _ = self.fixture.example(source="fn main() {}\n")
+        self.set_owner_marker()
+
+        result = self.fixture.verify("test", "sample")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any(call.startswith("nextest run ") for call in self.fixture.calls_made()))
+        self.assertEqual(self.state(), "MemoryGateReturned")
+        cycle = cast(dict[str, object], json.loads(self.cycle_file.read_text()))
+        entries = cast(list[dict[str, object]], cycle["entries"])
+        self.assertEqual(entries[0]["session_id"], "unit-director")
+        self.assertEqual(entries[0]["outcome"], "Granted")
+
+    def test_call_without_session_or_run_writes_no_admission_mark_through_verify(self) -> None:
+        _ = self.fixture.package()
+        _ = self.fixture.example(source="fn main() {}\n")
+        self.fixture.environment.update({
+            "CLAUDE_CODE_SESSION_ID": "",
+            "PLAN_DELEGATE_BOARD_DIR": "",
+            "PLAN_DELEGATE_SESSION_DIR": "",
+        })
+        before = self.cycle_file.read_bytes()
+
+        result = self.fixture.verify("test", "sample")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any(call.startswith("nextest run ") for call in self.fixture.calls_made()))
+        self.assertEqual(self.cycle_file.read_bytes(), before)
 
 
 if __name__ == "__main__":

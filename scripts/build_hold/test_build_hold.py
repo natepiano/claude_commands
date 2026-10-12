@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import cast, override
@@ -48,12 +49,237 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             # No test reads the machine's own session records, or passes for the session that runs it.
             "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "",
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.scratch / "active"),
+            "PLAN_DELEGATE_BOARD_DIR": "",
+            "PLAN_DELEGATE_SESSION_DIR": "",
         }))
 
 
 class ImportTests(IsolatedBuildHoldTest):
     def test_helper_imports_from_its_sibling_directory(self) -> None:
         self.assertEqual(build_hold.__name__, "build_hold")
+
+
+class OwningSessionTests(IsolatedBuildHoldTest):
+    active: Path = Path()
+    delegate_run: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.active = self.scratch / "active"
+        self.active.mkdir()
+        self.delegate_run = self.scratch / "run"
+
+    def marker(self, session_id: str, run: Path) -> Path:
+        marker = self.active / session_id
+        _ = marker.write_text(str(run) + "\n")
+        return marker
+
+    def test_board_marker_wins_over_inherited_session_id(self) -> None:
+        _ = self.marker("run-owner", self.delegate_run)
+        with mock.patch.dict(os.environ, {
+            "PLAN_DELEGATE_BOARD_DIR": str(self.delegate_run),
+            "CLAUDE_CODE_SESSION_ID": "stale-session",
+        }):
+            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("run-owner"))
+
+    def test_board_directory_takes_priority_over_session_directory(self) -> None:
+        other_run = self.scratch / "other-run"
+        _ = self.marker("board-owner", self.delegate_run)
+        newer = self.marker("session-owner", other_run)
+        os.utime(newer, ns=(2_000_000_000_000_000_000, 2_000_000_000_000_000_000))
+        with mock.patch.dict(os.environ, {
+            "PLAN_DELEGATE_BOARD_DIR": str(self.delegate_run),
+            "PLAN_DELEGATE_SESSION_DIR": str(other_run),
+        }):
+            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("board-owner"))
+
+    def test_marker_content_ignores_surrounding_whitespace(self) -> None:
+        marker = self.marker("run-owner", self.delegate_run)
+        _ = marker.write_text(f" \t{self.delegate_run}\n \t")
+        with mock.patch.dict(os.environ, {"PLAN_DELEGATE_BOARD_DIR": str(self.delegate_run)}):
+            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("run-owner"))
+
+    def test_session_directory_is_used_when_board_directory_is_unset_or_empty(self) -> None:
+        _ = self.marker("run-owner", self.delegate_run)
+        with mock.patch.dict(os.environ, {"PLAN_DELEGATE_SESSION_DIR": str(self.delegate_run)}):
+            for board_is_set in (False, True):
+                with self.subTest(board_is_set=board_is_set):
+                    if board_is_set:
+                        os.environ["PLAN_DELEGATE_BOARD_DIR"] = ""
+                    else:
+                        _ = os.environ.pop("PLAN_DELEGATE_BOARD_DIR", None)
+                    self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("run-owner"))
+
+    def test_no_matching_marker_falls_back_to_shell_session(self) -> None:
+        _ = self.marker("another-owner", self.scratch / "another-run")
+        with mock.patch.dict(os.environ, {
+            "PLAN_DELEGATE_BOARD_DIR": str(self.delegate_run),
+            "CLAUDE_CODE_SESSION_ID": "shell-session",
+        }):
+            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
+
+    def test_no_run_uses_shell_session_without_marker_lookup(self) -> None:
+        _ = self.marker("another-owner", self.delegate_run)
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "shell-session"}):
+            with mock.patch.object(Path, "iterdir", side_effect=AssertionError("No run needs no marker lookup")):
+                self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
+
+    def test_no_matching_marker_and_no_shell_session_has_no_owner(self) -> None:
+        _ = self.marker("another-owner", self.scratch / "another-run")
+        with mock.patch.dict(os.environ, {"PLAN_DELEGATE_BOARD_DIR": str(self.delegate_run)}):
+            self.assertEqual(build_hold.owning_session(), build_hold.NoOwningSession())
+
+    def test_no_run_and_no_shell_session_has_no_owner(self) -> None:
+        self.assertEqual(build_hold.owning_session(), build_hold.NoOwningSession())
+
+    def test_newest_matching_marker_wins(self) -> None:
+        older = self.marker("z-earlier-owner", self.delegate_run)
+        newer = self.marker("a-later-owner", self.delegate_run)
+        _ = self.marker("other-run-owner", self.scratch / "other-run")
+        os.utime(older, ns=(1_000_000_000_000_000_000, 1_000_000_000_000_000_000))
+        os.utime(newer, ns=(1_100_000_000_000_000_000, 1_100_000_000_000_000_000))
+        with mock.patch.dict(os.environ, {"PLAN_DELEGATE_BOARD_DIR": str(self.delegate_run)}):
+            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("a-later-owner"))
+
+    def test_missing_active_directory_is_skipped(self) -> None:
+        missing = self.scratch / "missing-active"
+        with mock.patch.dict(os.environ, {
+            "PLAN_DELEGATE_ACTIVE_DIR": str(missing),
+            "PLAN_DELEGATE_BOARD_DIR": str(self.delegate_run),
+            "CLAUDE_CODE_SESSION_ID": "shell-session",
+        }):
+            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
+        self.assertFalse(missing.exists())
+
+    def test_unreadable_active_directory_is_skipped(self) -> None:
+        with mock.patch.dict(os.environ, {
+            "PLAN_DELEGATE_BOARD_DIR": str(self.delegate_run),
+            "CLAUDE_CODE_SESSION_ID": "shell-session",
+        }):
+            with mock.patch.object(Path, "iterdir", side_effect=PermissionError("active directory denied")):
+                self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
+
+    def test_unreadable_marker_is_skipped(self) -> None:
+        _ = self.marker("run-owner", self.delegate_run)
+        with mock.patch.dict(os.environ, {
+            "PLAN_DELEGATE_BOARD_DIR": str(self.delegate_run),
+            "CLAUDE_CODE_SESSION_ID": "shell-session",
+        }):
+            with mock.patch.object(Path, "read_text", side_effect=PermissionError("marker denied")):
+                self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
+
+    def test_invalid_marker_encoding_does_not_hide_readable_marker(self) -> None:
+        _ = (self.active / "invalid-marker").write_bytes(b"\xff")
+        _ = self.marker("run-owner", self.delegate_run)
+        with mock.patch.dict(os.environ, {"PLAN_DELEGATE_BOARD_DIR": str(self.delegate_run)}):
+            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("run-owner"))
+
+    def test_marker_subdirectories_are_skipped(self) -> None:
+        (self.active / "not-a-marker").mkdir()
+        with mock.patch.dict(os.environ, {
+            "PLAN_DELEGATE_BOARD_DIR": str(self.delegate_run),
+            "CLAUDE_CODE_SESSION_ID": "shell-session",
+        }):
+            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
+
+    def test_owner_results_are_frozen(self) -> None:
+        for owner in (build_hold.OwningSession("run-owner"), build_hold.NoOwningSession()):
+            with self.subTest(owner=type(owner).__name__):
+                with self.assertRaises(FrozenInstanceError):
+                    setattr(owner, "session_id", "changed")
+
+
+class OwningSessionMarkTests(IsolatedBuildHoldTest):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        active = self.scratch / "active"
+        active.mkdir()
+        run = self.scratch / "run"
+        _ = (active / "run-owner").write_text(str(run) + "\n")
+        self.enterContext(mock.patch.dict(os.environ, {
+            "PLAN_DELEGATE_BOARD_DIR": str(run),
+            "CLAUDE_CODE_SESSION_ID": "stale-session",
+        }))
+        now = datetime.now().astimezone()
+        folder = self.scratch / "holders"
+        folder.mkdir()
+        _ = write_holder(folder, "holder", now.isoformat(), "admission test")
+        cycle = build_hold.open_cycle(now)
+        cycle["holders"] = {"holder": {"since": now.isoformat(), "released_at": ""}}
+        cycle["release_started_at"] = now.isoformat()
+        cycle["recipients"] = {"run-owner": "owner", "stale-session": "stale"}
+        cycle["entries"] = [build_hold.new_entry("run-owner", "owner"), build_hold.new_entry("stale-session", "stale")]
+        for entry in cycle["entries"]:
+            build_hold.store_release_state(entry, build_hold.ReleasedAwaitingAdmission(now))
+        build_hold.save_cycle(cycle)
+
+    def entries(self) -> list[build_hold.ReleaseEntry]:
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        return cycle["entries"]
+
+    def command(self, *arguments: str) -> tuple[int, str]:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = build_hold.main(list(arguments))
+        return code, output.getvalue().strip()
+
+    def test_mark_without_explicit_id_credits_owner_for_wait_and_return(self) -> None:
+        self.assertEqual(self.command("mark", "--state", "WaitingForMemory"),
+                         (0, "run-owner: WaitingForMemory"))
+        self.assertEqual([entry["state"] for entry in self.entries()],
+                         ["WaitingForMemory", "ReleasedAwaitingAdmission"])
+        self.assertEqual(self.command("mark", "--state", "MemoryGateReturned", "--outcome", "Granted"),
+                         (0, "run-owner: MemoryGateReturned"))
+        self.assertEqual([entry["state"] for entry in self.entries()],
+                         ["MemoryGateReturned", "ReleasedAwaitingAdmission"])
+        self.assertEqual(self.entries()[0].get("outcome"), "Granted")
+
+    def test_explicit_mark_id_wins_without_resolving_owner(self) -> None:
+        with mock.patch.object(build_hold, "owning_session", side_effect=AssertionError("Explicit id wins")):
+            self.assertEqual(self.command("mark", "--session-id", "stale-session", "--state", "WaitingForMemory"),
+                             (0, "stale-session: WaitingForMemory"))
+        self.assertEqual([entry["state"] for entry in self.entries()],
+                         ["ReleasedAwaitingAdmission", "WaitingForMemory"])
+
+    def test_explicit_empty_mark_id_does_not_use_owner(self) -> None:
+        self.assertEqual(self.command("mark", "--session-id", "", "--state", "WaitingForMemory"),
+                         (0, "NoSessionId"))
+        self.assertEqual([entry["state"] for entry in self.entries()],
+                         ["ReleasedAwaitingAdmission", "ReleasedAwaitingAdmission"])
+
+    def test_mark_without_owner_prints_no_session_and_keeps_cycle_unchanged(self) -> None:
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        path = self.scratch / "release" / cycle["id"] / "cycle.json"
+        before = path.read_bytes()
+        with mock.patch.dict(os.environ, {
+            "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
+            "CLAUDE_CODE_SESSION_ID": "", "BUILDLOG_CALL_ID": "unowned-call",
+        }):
+            self.assertEqual(self.command("mark", "--state", "MemoryGateReturned", "--outcome", "Granted"),
+                             (0, "NoSessionId"))
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_wait_still_registers_shell_session(self) -> None:
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        cycle["entries"] = []
+        build_hold.save_cycle(cycle)
+        code, output = self.command("wait")
+        self.assertEqual(code, 0)
+        self.assertIn("registered stale-session", output)
+        self.assertEqual([entry["session_id"] for entry in self.entries()], ["stale-session"])
+
+    def test_nothing_to_build_still_answers_for_shell_session(self) -> None:
+        code, output = self.command("nothing-to-build")
+        self.assertEqual(code, 0)
+        self.assertIn("[stale-session]: NothingToBuild", output)
+        self.assertEqual([entry["state"] for entry in self.entries()],
+                         ["ReleasedAwaitingAdmission", "NothingToBuild"])
 
 
 class HolderTests(IsolatedBuildHoldTest):
