@@ -312,7 +312,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **Ruled out:** a new constant, setting or flag for the shorter limit (`RELEASE_SETTLE_S` already holds the value); sending the release to more than one session at a time (four sessions once started builds within 73 s of one release, `docs/as-built/build-memory-admission.md`).
 
-### Phase 8 — A lost Mac run keeps the Mac busy until its leftovers are gone  · status: todo
+### Phase 8 — A lost Mac run keeps the Mac busy until its leftovers are gone  · status: done
 
 #### Work Order
 

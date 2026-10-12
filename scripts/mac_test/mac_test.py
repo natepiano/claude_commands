@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Literal, TypedDict, cast
+from typing import Literal, TypeGuard, TypedDict, cast
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
@@ -31,14 +31,34 @@ class StateReadError(ValueError):
     """A Mac coordination record cannot be read or decoded."""
 
 
-class RunRecord(TypedDict):
-    """A process that currently owns Mac test capacity."""
+class ClaimOwnerRecord(TypedDict):
+    """The process identity and job details retained by either kind of claim."""
 
     pid: int
     proc_start: str
     what: str
     worktree: str
     since: str
+
+
+class ProcessBoundClaim(ClaimOwnerRecord):
+    """Mac capacity held only while the claiming process lives."""
+
+
+class RemoteJobClaim(ClaimOwnerRecord):
+    """Mac capacity held until the named host's job is known to have ended."""
+
+    remote_host: str
+
+
+RunRecord = ProcessBoundClaim | RemoteJobClaim
+
+
+class NoRemoteJob:
+    """A claim requested for the calling process alone."""
+
+
+NO_REMOTE_JOB = NoRemoteJob()
 
 
 CiSwitch = Literal[
@@ -305,6 +325,7 @@ class CliArguments(argparse.Namespace):
         self.what: str = ""
         self.worktree: str = ""
         self.wait: float = 0.0
+        self.remote: str | NoRemoteJob = NO_REMOTE_JOB
         self.holder: str = ""
         self.reason: str = ""
         self.hours: str = ""
@@ -411,13 +432,20 @@ def read_run(path: Path) -> RunState:
     ):
         raise StateReadError(f"{path} has an invalid run record")
     _ = aware_timestamp(since, path, "since")
-    return {
+    record: ProcessBoundClaim = {
         "pid": pid,
         "proc_start": proc_start,
         "what": what,
         "worktree": worktree,
         "since": since,
     }
+    if "remote_host" not in values:
+        return record
+    host = values["remote_host"]
+    if not isinstance(host, str) or not host.strip():
+        raise StateReadError(f"{path} has an invalid remote_host")
+    remote: RemoteJobClaim = {**record, "remote_host": host}
+    return remote
 
 
 def aware_timestamp(value: object, path: Path, field: str) -> datetime:
@@ -647,7 +675,11 @@ def process_start_time(pid: int) -> str | None:
 
 
 def run_is_live(run: RunRecord) -> bool:
-    return process_start_time(run["pid"]) == run["proc_start"]
+    return "remote_host" in run or process_start_time(run["pid"]) == run["proc_start"]
+
+
+def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
+    return "remote_host" in run and process_start_time(run["pid"]) != run["proc_start"]
 
 
 def live_run(paths: StatePaths) -> RunState:
@@ -1361,6 +1393,17 @@ def command_claim(args: CliArguments, paths: StatePaths) -> int:
             except (OSError, StateReadError):
                 print(f"state unreadable: {paths.run}")
                 return 12
+            if isinstance(run, dict) and run_is_kept(run) and isinstance(args.remote, str):
+                proc_start = process_start_time(args.pid)
+                if proc_start is None:
+                    print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
+                    return 1
+                kept = run
+                kept["pid"] = args.pid
+                kept["proc_start"] = proc_start
+                write_json(paths.run, kept)
+                print(f"leftovers: {kept['remote_host']}")
+                return 13
             try:
                 block = read_claim_block(paths)
             except (OSError, StateReadError):
@@ -1384,6 +1427,9 @@ def command_claim(args: CliArguments, paths: StatePaths) -> int:
                     "worktree": args.worktree,
                     "since": timestamp(utc_now()),
                 }
+                if isinstance(args.remote, str):
+                    remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
+                    claimed = remote_claim
                 write_json(paths.run, claimed)
                 print("claimed")
                 return 0
@@ -1391,6 +1437,11 @@ def command_claim(args: CliArguments, paths: StatePaths) -> int:
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            if run_is_kept(busy_run):
+                kept = busy_run
+                print(f"busy: leftovers of {kept['what']} on {kept['remote_host']} since "
+                      + f"{local_time(kept['since'], include_zone=False)}")
+                return 11
             print(
                 f"busy: {busy_run['what']} since "
                 + f"{local_time(busy_run['since'], include_zone=False)}"
@@ -1647,6 +1698,10 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
         )
         if isinstance(outcome.run, NoRun):
             print("free")
+        elif run_is_kept(outcome.run):
+            kept = outcome.run
+            print(f"running: leftovers of {kept['what']} on {kept['remote_host']} "
+                  + f"since {local_time(kept['since'])}, kept under pid {kept['pid']}")
         else:
             print(
                 f"running: {outcome.run['what']} ({outcome.run['worktree']}) "
@@ -1708,6 +1763,12 @@ def command_watch(paths: StatePaths, config: MacTestConfig) -> int:
             time.sleep(watch_interval())
 
 
+def remote_host_argument(value: str) -> str:
+    if not value.strip():
+        raise argparse.ArgumentTypeError("remote host must not be empty")
+    return value
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
@@ -1717,6 +1778,7 @@ def parser() -> argparse.ArgumentParser:
     _ = claim.add_argument("--what", required=True)
     _ = claim.add_argument("--worktree", default=os.getcwd())
     _ = claim.add_argument("--wait", type=float, default=0.0)
+    _ = claim.add_argument("--remote", type=remote_host_argument, default=NO_REMOTE_JOB)
 
     release = commands.add_parser("release")
     _ = release.add_argument("--pid", type=int, required=True)
