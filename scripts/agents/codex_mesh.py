@@ -36,6 +36,9 @@ Verbs:
   compact
          Compact a finished named thread and print its context size before and
          after compaction.
+         A compaction that does not finish in time is interrupted, so the
+         seat can still take a follow-up (exit 1). Exit 3 means a turn is
+         still live on the thread and no follow-up can be sent.
   send   Queue a message for a named delegate, delivered at its next turn.
   steer  Inject into a named delegate's running turn.
   end    Finish a resident delegate: drop its queued messages, interrupt its
@@ -86,6 +89,12 @@ RETIRED_FILE = "mesh_retired.json"
 LOCK_FILE = "mesh_server.lock"
 CONNECT_TIMEOUT_SECS = 20
 CALL_TIMEOUT_SECS = 300
+# How long `compact` waits for a thread to read idle: after it interrupts a compaction turn that
+# did not finish, and before it refuses a finished seat that still has a live turn.
+COMPACT_IDLE_WAIT_SECS = 60
+COMPACT_IDLE_POLL_SECS = 1
+# `compact` exits with this when the thread still has a live turn, so no follow-up can be sent.
+COMPACT_TURN_STILL_LIVE = 3
 SERVER_START_TIMEOUT_SECS = 30
 # How long to keep watching after a turn ends for a queued turn already in flight.
 QUEUE_GRACE_SECS = 3.0
@@ -1682,6 +1691,15 @@ def command_follow(args: argparse.Namespace) -> int:
             client.close()
 
 
+class CompactionTimedOut(Exception):
+    """The compaction turn did not finish in time, and may still be live on the thread."""
+
+    def __init__(self, message: str, turn_id: str) -> None:
+        super().__init__(message)
+        # Empty when the server never named the compaction turn.
+        self.turn_id: str = turn_id
+
+
 def _compact_thread(client: Client, thread_id: str) -> KnownContextSize:
     """Start compaction and return the usage update for its compact turn.
 
@@ -1695,6 +1713,7 @@ def _compact_thread(client: Client, thread_id: str) -> KnownContextSize:
     )
     deadline = time.time() + CALL_TIMEOUT_SECS
     compacted_turn = ""
+    started_turn = ""
     sizes_by_turn: dict[str, KnownContextSize] = {}
     completed_turns: set[str] = set()
     while time.time() < deadline:
@@ -1710,6 +1729,8 @@ def _compact_thread(client: Client, thread_id: str) -> KnownContextSize:
             usage_turn = _as_str(params.get("turnId"))
             if isinstance(size, KnownContextSize) and usage_turn:
                 sizes_by_turn[usage_turn] = size
+        elif method == "turn/started":
+            started_turn = _as_str(_as_dict(params.get("turn")).get("id")) or started_turn
         elif method == "thread/compacted":
             compacted_turn = _as_str(params.get("turnId"))
         elif method == "item/completed":
@@ -1727,14 +1748,48 @@ def _compact_thread(client: Client, thread_id: str) -> KnownContextSize:
         ):
             return sizes_by_turn[compacted_turn]
     if compacted_turn and compacted_turn in sizes_by_turn:
-        raise SystemExit(
-            f"thread {thread_id}: compaction turn {compacted_turn} did not complete"
+        raise CompactionTimedOut(
+            f"thread {thread_id}: compaction turn {compacted_turn} did not complete", compacted_turn
         )
     if compacted_turn:
-        raise SystemExit(
-            f"thread {thread_id}: compacted without a final token-usage update"
+        raise CompactionTimedOut(
+            f"thread {thread_id}: compacted without a final token-usage update", compacted_turn
         )
-    raise SystemExit(f"thread {thread_id}: no thread/compacted within {CALL_TIMEOUT_SECS}s")
+    raise CompactionTimedOut(
+        f"thread {thread_id}: no thread/compacted within {CALL_TIMEOUT_SECS}s", started_turn
+    )
+
+
+def _wait_for_idle(client: Client, thread_id: str) -> ThreadState:
+    """Read the thread until it is idle or `COMPACT_IDLE_WAIT_SECS` pass; returns the last state read."""
+    deadline = time.time() + COMPACT_IDLE_WAIT_SECS
+    while True:
+        state = _read_live_turn(client, thread_id)
+        if isinstance(state, (ThreadIdle, ThreadStateUnknown)) or time.time() >= deadline:
+            return state
+        time.sleep(COMPACT_IDLE_POLL_SECS)
+
+
+def _abandon_compaction(client: Client, name: str, thread_id: str, timeout: CompactionTimedOut) -> int:
+    """Interrupt a compaction turn that did not finish, so the seat can take its follow-up.
+
+    A compaction left live refuses every later follow-up and compaction of the seat.
+    """
+    state = _interruptible_turn_id(client, thread_id, _read_live_turn(client, thread_id))
+    interrupted = False
+    # A live turn that is not the compaction's belongs to someone else and is left alone.
+    if isinstance(state, ThreadLive) and timeout.turn_id in ("", state.turn_id):
+        # Best effort, as in `end`: a turn that finished since the read answers with an error.
+        _ = client.call("turn/interrupt", {"threadId": thread_id, "turnId": state.turn_id})
+        interrupted = True
+        state = _wait_for_idle(client, thread_id)
+    if isinstance(state, ThreadIdle):
+        how = "interrupted the compaction turn, " if interrupted else ""
+        print(f"codex_mesh: {name}: {timeout}; {how}the seat is idle and not compacted", file=sys.stderr)
+        return 1
+    reason = state.reason if isinstance(state, ThreadStateUnknown) else "a turn is still live on the thread"
+    print(f"codex_mesh: {name}: {timeout}; {reason}", file=sys.stderr)
+    return COMPACT_TURN_STILL_LIVE
 
 
 def command_compact(args: argparse.Namespace) -> int:
@@ -1767,12 +1822,18 @@ def command_compact(args: argparse.Namespace) -> int:
             client.call("thread/resume", {"threadId": state.thread_id}),
             "thread/resume",
         )
-        live = _read_live_turn(client, state.thread_id)
-        if not isinstance(live, ThreadIdle):
-            reason = live.reason if isinstance(live, ThreadStateUnknown) else "thread has a live turn"
-            print(f"codex_mesh: {name}: {reason}; compact refused", file=sys.stderr)
+        # A finished seat with a live turn is finishing one nobody waits on; give it time to end.
+        live = _wait_for_idle(client, state.thread_id)
+        if isinstance(live, ThreadStateUnknown):
+            print(f"codex_mesh: {name}: {live.reason}; compact refused", file=sys.stderr)
             return 2
-        after = _compact_thread(client, state.thread_id)
+        if not isinstance(live, ThreadIdle):
+            print(f"codex_mesh: {name}: thread has a live turn; compact refused", file=sys.stderr)
+            return COMPACT_TURN_STILL_LIVE
+        try:
+            after = _compact_thread(client, state.thread_id)
+        except CompactionTimedOut as timeout:
+            return _abandon_compaction(client, name, state.thread_id, timeout)
         _update_roster(
             session_dir,
             name,
