@@ -312,7 +312,7 @@ each thing that changed; the user asks for `simple` to see every unit's section.
 A `/showrunner:dailies` the user runs takes the next tick's slot: it runs the
 script, and then runs `NOTIFIER restart UPDATES` so the next tick comes N minutes after
 that report (`/showrunner:dailies` → Status check and clock).
-`/showrunner:interval <minutes>` changes N.
+`/showrunner:report_interval <minutes>` changes N.
 
 Log `UPDATES` and its `next_due`. Read the quota alert protocol (<QuotaAlert/>).
 
