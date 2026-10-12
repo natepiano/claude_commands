@@ -149,7 +149,7 @@ On the showrunner's go, the phases run in order in this worktree. Each ends with
 
 **Acceptance gate:** the gate. Tests use two-level and three-level trees, an unreadable file and a root with no children, whose footer and count must not change by a character. Live: with tool-based-ui attached, an item hana records raises natedev's count by one and appears in its list under `tool-based-ui`, and both drop when hana clears it.
 
-### Phase 3 — The parent's dailies show each child as one row  · status: todo
+### Phase 3 — The parent's dailies show each child as one row  · status: done · live check waits on promotion and on tool-based-ui's next dailies
 
 #### Work Order
 
@@ -167,6 +167,22 @@ On the showrunner's go, the phases run in order in this worktree. Each ends with
 **Files:** `scripts/production/dailies_input.py`, `dailies_render.py` and their tests; `commands/showrunner/dailies.md`.
 
 **Acceptance gate:** the gate. Tests cover a current child, a stale child, a child with no file, `expand` and a three-level tree. A production with no children renders exactly as before. Live: natedev's dailies show tool-based-ui as one row.
+
+#### As-built
+
+- `scripts/production/dailies_render.py`: `Child`, `ChildReport`, `NoChildReport`; `Report.children` and `Report.reports_to`, from the input keys `children` and `reports_to`; `Row.note`; `child_row`, `unit_rows`, `last_report`, `parse_child_report`, `due`, `zone_named`. The label column is as wide as the longest row name, so a report with no child keeps its nine columns.
+- `scripts/production/dailies_input.py`: `--expand <child|all>`, `child_fields`, `save_last_report`, `last_report_path`. It reads the tree through `showrunners.py` and the lists through `update_registration.outstanding_file`.
+- `commands/showrunner/dailies.md`: usage, the builder flag, the two input keys, and what the renderer writes for a production below.
+- Spec 1: the file also carries `zone` and `interval`, which the parent needs to move times into its own zone and to tell an old report from a current one. "Held" counts units whose checkpoint is not merged, the meaning `held` already has in a report.
+- Spec 2: the row sits in the chart, after the unit rows. A child that reports on demand always shows `as of HH:MM`, since nothing refreshes its file on a schedule. A child with no file reads `?  no report yet`: the `?` is the chart's mark for no ETA.
+- Spec 2, the needs-user mark: `<n> open questions`, the count of due items in the child's list and the lists below it. The items are printed nowhere in the report.
+- Spec 4: `expand` is taken with any length, not only `simple`. An expanded child shows its units and one row for each production below it.
+- What Phase 2 left: the full report's footer now covers the lists below (`nothing needed`, the unreadable bullet) and names the root.
+- Not built: a build-hold mark on a child's row. A hold is machine-wide and already in the parent's footer, and a mark from an old file could outlive the hold.
+
+**Binds later work:** `dailies_last.json` is what a parent knows of a child between messages; Phase 5's stop and Phase 6's failure paths can read `written` and `interval` from it to tell a child that has gone quiet.
+
+**Gotchas:** the file is local, like the tree, so both showrunners must be on one machine. A child's row reads `no report yet` until that child's builder has run once with this code.
 
 ### Phase 4 — A showrunner starts a lower showrunner in tmux, on the showrunner account  · status: todo · live check gated by G1
 

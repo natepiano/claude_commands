@@ -138,6 +138,12 @@ State:
     carries `reports to <root>`. As a root, `<slug>: needs-user list
     unreadable` means that production's list could not be counted: tell its
     showrunner to store it again.
+  - **Your dailies show each production directly below you as one row**, from
+    the report it last saved: its units, how many have a checkpoint not
+    merged, its latest ETA, `as of HH:MM` when that report is old, and how
+    many open questions it holds. Gather nothing for it. `/showrunner:dailies
+    expand <child|all>` adds its own rows. A row that reads `no report yet`
+    fills in at that showrunner's next dailies.
 - **What reaches the user:**
   - a unit director's `— decision:` that only the user can settle (**Designs
     and add-ons** below), shown in the unit director's words, with the answer
