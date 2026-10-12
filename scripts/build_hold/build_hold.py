@@ -40,6 +40,16 @@ LOOKUP_RETRY_S = 1.0
 GateOutcome = Literal["Granted", "TimedOut", "MeminfoUnavailable"]
 
 
+@dataclass(frozen=True)
+class OwningSession:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class NoOwningSession:
+    pass
+
+
 class ReleaseEntry(TypedDict, total=False):
     session_id: Required[str]
     name: Required[str]
@@ -298,6 +308,28 @@ class Quiet:
 @dataclass(frozen=True)
 class Busy:
     reasons: tuple[str, ...]
+
+
+def owning_session() -> OwningSession | NoOwningSession:
+    """Find the session that owns this run before using the shell's session id."""
+    run = os.environ.get("PLAN_DELEGATE_BOARD_DIR", "") or os.environ.get("PLAN_DELEGATE_SESSION_DIR", "")
+    if run:
+        active = Path(os.environ.get("PLAN_DELEGATE_ACTIVE_DIR", "/tmp/claude/delegate/active"))
+        try:
+            markers = tuple(active.iterdir())
+        except OSError:
+            markers = ()
+        matches: list[tuple[int, str]] = []
+        for marker in markers:
+            try:
+                if marker.is_file() and marker.read_text().strip() == run:
+                    matches.append((marker.stat().st_mtime_ns, marker.name))
+            except (OSError, UnicodeError):
+                continue
+        if matches:
+            return OwningSession(max(matches)[1])
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    return OwningSession(session_id) if session_id else NoOwningSession()
 
 
 def holder_directory() -> Path:
@@ -898,7 +930,7 @@ def main(arguments: list[str]) -> int:
     mark = commands.add_parser("mark")
     _ = mark.add_argument("--state", required=True, choices=["WaitingForMemory", "MemoryGateReturned"])
     _ = mark.add_argument("--outcome", choices=["Granted", "TimedOut", "MeminfoUnavailable"], default="")
-    _ = mark.add_argument("--session-id", default="")
+    _ = mark.add_argument("--session-id", default=argparse.SUPPRESS)
     recipient = commands.add_parser("record-recipient")
     _ = recipient.add_argument("--session-id", required=True)
     _ = recipient.add_argument("--name", required=True)
@@ -939,7 +971,9 @@ def main(arguments: list[str]) -> int:
         elif action == "nothing-to-build":
             print(answer_nothing_to_build(os.environ.get("CLAUDE_CODE_SESSION_ID", "")))
         elif action == "mark":
-            print(mark_gate(cast(str, options.session_id) or os.environ.get("CLAUDE_CODE_SESSION_ID", ""), cast(str, options.state), cast(str, options.outcome)))
+            owner = OwningSession(cast(str, options.session_id)) if hasattr(options, "session_id") else owning_session()
+            session_id = owner.session_id if isinstance(owner, OwningSession) else ""
+            print(mark_gate(session_id, cast(str, options.state), cast(str, options.outcome)))
         elif action == "record-recipient":
             record_recipients([(cast(str, options.name), cast(str, options.session_id))])
         else:

@@ -19,16 +19,15 @@ buildlog_memory_python() {
 }
 
 build_hold_mark() {
-    [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]] || return 0
-    local holder_dir="${BUILD_HOLD_DIR:-$HOME/.local/state/build-hold}" holder
+    local holder_dir="${BUILD_HOLD_DIR:-$HOME/.local/state/build-hold}" holder=""
     for holder in "$holder_dir"/* "$holder_dir"/.[!.]* "$holder_dir"/..?*; do
         [[ -f "$holder" ]] && break
     done
     [[ -f "$holder" ]] || return 0
     if [[ -n "${2:-}" ]]; then
-        python3 "$BUILD_HOLD_MARK_SCRIPT" mark --session-id "$CLAUDE_CODE_SESSION_ID" --state "$1" --outcome "$2" >/dev/null 2>&1 || true
+        python3 "$BUILD_HOLD_MARK_SCRIPT" mark --state "$1" --outcome "$2" >/dev/null 2>&1 || true
     else
-        python3 "$BUILD_HOLD_MARK_SCRIPT" mark --session-id "$CLAUDE_CODE_SESSION_ID" --state "$1" >/dev/null 2>&1 || true
+        python3 "$BUILD_HOLD_MARK_SCRIPT" mark --state "$1" >/dev/null 2>&1 || true
     fi
 }
 
