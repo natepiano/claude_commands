@@ -13,6 +13,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast, final, override
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 import mac_test
@@ -1039,6 +1040,74 @@ class MacTestCommandTests(unittest.TestCase):
         )
         self.assertFalse((self.state_directory / "block.json").exists())
         self.assertNotIn("could not lift", recovered.stdout)
+
+    def test_claim_block_reader_keeps_expired_block_without_writes(self) -> None:
+        now = datetime.now(timezone.utc)
+        _ = self.write_block(
+            since=now - timedelta(hours=2),
+            expires=now - timedelta(minutes=1),
+            free_message={"kind": "not_needed"},
+        )
+        paths = mac_test.StatePaths(self.state_directory)
+        before = paths.block.read_bytes()
+        with mock.patch("subprocess.run", side_effect=AssertionError("State reading stays local")):
+            with mock.patch("subprocess.Popen", side_effect=AssertionError("State reading stays local")):
+                block = mac_test.read_claim_block(paths)
+        self.assertIsInstance(block, mac_test.ActiveMacBlock)
+        if isinstance(block, mac_test.ActiveMacBlock):
+            self.assertLess(block.expires, now)
+        self.assertEqual(paths.block.read_bytes(), before)
+        self.assertEqual(tuple(self.state_directory.iterdir()), (paths.block,))
+        paths.block.unlink()
+        self.assertIsInstance(mac_test.read_claim_block(paths), mac_test.NoMacBlock)
+        self.assertEqual(tuple(self.state_directory.iterdir()), ())
+
+    def test_invalid_claim_block_raises_native_state_read_error(self) -> None:
+        self.state_directory.mkdir()
+        paths = mac_test.StatePaths(self.state_directory)
+        _ = paths.block.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(mac_test.StateReadError, "invalid block record"):
+            _ = mac_test.read_claim_block(paths)
+
+    def test_invalid_claim_record_raises_native_state_read_error(self) -> None:
+        self.state_directory.mkdir()
+        paths = mac_test.StatePaths(self.state_directory)
+        _ = paths.run.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(mac_test.StateReadError, "invalid run record"):
+            _ = mac_test.read_run(paths.run)
+
+    def test_claim_refuses_expired_block_until_ci_restore_lifts_it(self) -> None:
+        now = datetime.now(timezone.utc)
+        block = self.write_block(
+            since=now - timedelta(hours=2),
+            expires=now - timedelta(minutes=1),
+            free_message={"kind": "not_needed"},
+        )
+        self.gh["failures"] = [
+            {"match": "variable set", "line": "authentication required", "status": 1}
+        ]
+        self.sync_gh()
+        stuck = self.command("status")
+        self.assertEqual(stuck.returncode, 0, stuck.stdout + stuck.stderr)
+        self.assertEqual(self.block_state(), block)
+        self.assert_command(
+            self.command("claim", "--pid", str(os.getpid()), "--what", "nextest hana"),
+            10,
+            "blocked by alice: release work\n",
+        )
+        self.assertEqual(self.block_state(), block)
+        self.assertFalse((self.state_directory / "run.json").exists())
+
+        self.gh["failures"] = []
+        self.sync_gh()
+        lifted = self.command("status")
+        self.assertEqual(lifted.returncode, 0, lifted.stdout + lifted.stderr)
+        self.assertFalse((self.state_directory / "block.json").exists())
+        self.assert_command(
+            self.command("claim", "--pid", str(os.getpid()), "--what", "nextest hana"),
+            0,
+            "claimed\n",
+        )
 
     def test_unblock_lifts_owned_switch_when_repository_is_removed(self) -> None:
         self.write_config(ci_repo="")
