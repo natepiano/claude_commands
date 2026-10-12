@@ -192,6 +192,10 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/berth/install/hooks/berth_session_start.sh\""
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-agents-log.py\""
           }
         ]
       },
@@ -223,6 +227,16 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-showrunner-footer.py\""
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-agents-log.py\""
           }
         ]
       }
