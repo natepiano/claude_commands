@@ -431,6 +431,26 @@ class ReportTests(unittest.TestCase):
         self.assertCountEqual(upgrade_report.changes(self.current),
                               ["- new: new dependency", "- removed: no longer a dependency"])
 
+    def test_waiting_counts_only_git_ready_entries_without_an_answer(self) -> None:
+        approved, declined = self.branch_entry(), self.branch_entry()
+        approved["answer"] = {"answer": "approved", "at": "2026-10-12", "words": "yes"}
+        declined["answer"] = {"answer": "declined", "at": "2026-10-12", "words": "wait"}
+        done, path, release = self.branch_entry(), self.branch_entry(), self.branch_entry()
+        done["bevy"] = "0.20.0"
+        path["pin"] = {"source": "path", "version": "1.0.0", "path": "vendor/adapter"}
+        release["crates_io"] = self.checked_entry(ready="1.0.0")["crates_io"]
+        self.current["dependencies"] = {
+            "ask": self.branch_entry(), "approved": approved, "declined": declined,
+            "done": done, "path": path, "release": release, "old": self.branch_entry("^0.19"),
+        }
+        self.assertEqual(upgrade_report.waiting(self.current), 1)
+        self.assertIn("3 git ready (1 waiting for your answer)",
+                      upgrade_report.line(self.current, ZoneInfo("UTC"), NOW, None, ""))
+        del self.current["dependencies"]["ask"]
+        self.assertEqual(upgrade_report.waiting(self.current), 0)
+        self.assertNotIn("waiting for your answer",
+                         upgrade_report.line(self.current, ZoneInfo("UTC"), NOW, None, ""))
+
     def test_line_counts_states_in_order_and_unanswered_git_ready(self) -> None:
         done = self.checked_entry()
         done["bevy"] = "0.20.0"
