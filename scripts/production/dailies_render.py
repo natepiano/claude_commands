@@ -4,6 +4,7 @@
 Usage: dailies_render.py [<input.json>] [--chart default|ascii] [--state <state.json>] [--log <log.md>] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>]
        dailies_render.py --footer --zone <IANA zone> [--next-run <HH:MM[+N]>]
                          [--nothing-needed] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>]
+                         [--below <outstanding.json>]... [--reports-to <root slug>]
 Both forms take [--outstanding <outstanding.json>].
 
 The input gives each subject's fields; this script owns the layout, so no line
@@ -40,6 +41,13 @@ production's own plumbing words (PLUMBING).
          ` - nothing needed`; the showrunner's Waiting on block, which this
          renderer does not print, shows only their count. A missing file is an
          empty list.
+--below  With --footer, once per production below a root showrunner: that
+         production's list. Its due items count with --outstanding. A list
+         that cannot be read adds the bullet `<slug>: needs-user list
+         unreadable`, where the slug is the file's name, and never fails the
+         footer.
+--reports-to  With --footer, for a showrunner under a root: adds the bullet
+         `reports to <root slug>`.
 
 The input format is in ~/.claude/commands/showrunner/dailies.md.
 """
@@ -50,6 +58,7 @@ import math
 import re
 import sys
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -84,6 +93,8 @@ THEN_PHASE_LABEL = re.compile(r"^(\d+(?:\s*[-–]\s*\d+)?)\s*:")
 COUNT = re.compile(r"\b(\d+) [a-z]")
 EXAMPLES = re.compile(r"\bsuch as\b|\be\.g\.|\bfor example\b")
 STARTED = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
+# What a footer and the open-items list say of a lower production's list that cannot be read.
+UNREADABLE_LIST = "needs-user list unreadable"
 # Words for the production's own coordination, which you never see in the app
 # (user, 2026-10-02: "i have no idea what a stale file holds from the merged
 # work are released even means"; "retaking every view" and "file clashes get
@@ -1378,9 +1389,13 @@ def agent_section(now: datetime, zone: ZoneInfo, *, at: str | None = None) -> li
 def footer(
     now: datetime, zone: ZoneInfo, zone_name: str, next_run: str | None,
     hold: HoldState, mac_block: MacBlockFooterState, outstanding: list[Outstanding], *,
-    nothing_needed: bool, agent_lines: list[str]
+    nothing_needed: bool, agent_lines: list[str], unreadable: Sequence[str] = (), root: str = ""
 ) -> list[str]:
-    """The separated update footer shared by replies and dailies reports."""
+    """The separated update footer shared by replies and dailies reports.
+
+    `outstanding` already holds the lower productions' items for a root. `unreadable` names each
+    lower production whose list could not be read, and `root` the root a lower showrunner is under.
+    """
     items: list[str] = []
     if isinstance(hold, ActiveHolders):
         try:
@@ -1395,11 +1410,15 @@ def footer(
     if not isinstance(mac_block, NoMacBlock):
         items.append(mac_block_line(mac_block, zone))
     items.extend(line.removeprefix("- ") for line in agent_lines if line and line != "### Agents")
+    items.extend(f"{slug}: {UNREADABLE_LIST}" for slug in unreadable)
+    if root:
+        items.append(f"reports to {root}")
     # An item the user deferred stays hidden until its `after` time, in the report's zone.
     local_now = now.astimezone(zone).replace(tzinfo=None) if now.tzinfo else now
     outstanding = [item for item in outstanding if item.after is None or item.after <= local_now]
     schedule = f"next dailies: {range_clock(parse_time(next_run, now), now)} {zone_name}" if next_run else "no dailies scheduled"
-    quiet = nothing_needed and not outstanding
+    # A list that cannot be read may hold an item, so the footer never calls that quiet.
+    quiet = nothing_needed and not outstanding and not unreadable
     items.append(f"{schedule}{' - nothing needed' if quiet else ''}")
     return ["", "---", f"{now:%H:%M} {zone_name} update:", "",
             *(f"{item[:2]}* {item[2:]}" if item.startswith("  ") else f"* {item}" for item in items)]
@@ -1602,7 +1621,9 @@ def local_now(zone: str, where: str, at: str | None) -> tuple[datetime, str]:
     return aware.replace(second=0, microsecond=0, tzinfo=None), aware.strftime("%Z")
 
 
-def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_path: Path | None, *, nothing_needed: bool) -> int:
+def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_path: Path | None, *,
+                nothing_needed: bool, below: Sequence[Path] = (), root: str = "") -> int:
+    unreadable: list[str] = []
     try:
         if next_run is not None and not TIME.match(next_run):
             raise InputError(f"--next-run: {next_run!r} is not HH:MM or HH:MM+N")
@@ -1613,8 +1634,15 @@ def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_pat
     except (InputError, json.JSONDecodeError, OSError) as error:
         print(f"dailies_render: {error}", file=sys.stderr)
         return 2
+    # A lower production's bad list is named in the footer; it never takes the root's footer down.
+    for path in below:
+        try:
+            outstanding.extend(read_outstanding(path))
+        except (InputError, ValueError, OSError):
+            unreadable.append(path.stem)
     print("\n".join(footer(now, ZoneInfo(zone), abbreviation, next_run, hold, mac_block, outstanding,
-                           nothing_needed=nothing_needed, agent_lines=agent_section(now, ZoneInfo(zone), at=at))))
+                           nothing_needed=nothing_needed, agent_lines=agent_section(now, ZoneInfo(zone), at=at),
+                           unreadable=unreadable, root=root)))
     return 0
 
 
@@ -1630,6 +1658,9 @@ def main(arguments: list[str]) -> int:
     _ = parser.add_argument("--next-run", help="with --footer: the next scheduled report, HH:MM or HH:MM+N; leave it out when none is scheduled")
     _ = parser.add_argument("--nothing-needed", action="store_true", help="with --footer: no subject needs a follow-up nobody has started")
     _ = parser.add_argument("--outstanding", type=Path, help="JSON list of what waits on the user; suppresses nothing needed when due")
+    _ = parser.add_argument("--below", type=Path, action="append", default=[],
+                            help="with --footer, once per lower production: its list, counted with --outstanding; one that cannot be read is named")
+    _ = parser.add_argument("--reports-to", default="", help="with --footer: the root production a lower showrunner is under")
     options = parser.parse_args(arguments)
     input_path = cast(Path | None, options.input)
     chart = cast(str | None, options.chart)
@@ -1640,14 +1671,18 @@ def main(arguments: list[str]) -> int:
     next_run = cast(str | None, options.next_run)
     nothing_needed = cast(bool, options.nothing_needed)
     outstanding_path = cast(Path | None, options.outstanding)
+    below = cast(list[Path], options.below)
+    reports_to = cast(str, options.reports_to)
     if cast(bool, options.footer):
         if input_path is not None or chart is not None or state_path is not None or log_path is not None:
             parser.error("--footer takes no input file, --chart, --state or --log")
         if zone is None:
             parser.error("--footer needs --zone")
-        return footer_main(zone, next_run, at, outstanding_path, nothing_needed=nothing_needed)
-    if zone is not None or next_run is not None or nothing_needed:
-        parser.error("--zone, --next-run and --nothing-needed go with --footer; a report takes them from its input")
+        return footer_main(zone, next_run, at, outstanding_path, nothing_needed=nothing_needed,
+                           below=below, root=reports_to)
+    if zone is not None or next_run is not None or nothing_needed or below or reports_to:
+        parser.error("--zone, --next-run, --nothing-needed, --below and --reports-to go with --footer; "
+                     + "a report takes them from its input")
     if chart is not None:
         write_chart(CHART_CONF, chart)
         print(f"dailies chart: {chart} ({CHART_CONF})", file=sys.stderr)

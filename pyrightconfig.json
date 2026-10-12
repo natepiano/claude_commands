@@ -33,7 +33,8 @@
       "extraPaths": [
         "scripts/hooks",
         "scripts/message",
-        "scripts/notify"
+        "scripts/notify",
+        "scripts/production"
       ]
     },
     {

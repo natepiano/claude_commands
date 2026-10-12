@@ -240,6 +240,28 @@ class ReportFooterTests(unittest.TestCase):
         self.assertEqual(before[-1], "* next dailies: 11:30 PDT - nothing needed")
         self.assertEqual(after, [*FOOTER_HEAD, *AGENT_LINES, "* next dailies: 11:30 PDT"])
 
+    def test_root_footer_counts_lower_lists_and_names_one_it_cannot_read(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            kid, grandkid = Path(scratch) / "kid.json", Path(scratch) / "grandkid.json"
+            _ = kid.write_text(json.dumps([{"since": "2026-10-03T09:05", "text": "send the Bevy PR"}]))
+            counted = self.lines(footer("--next-run", "11:30", "--nothing-needed", "--below", str(kid),
+                                        "--below", str(grandkid)))
+            _ = kid.write_text("[]")
+            _ = grandkid.write_text("{bad")
+            unread = self.lines(footer("--next-run", "11:30", "--nothing-needed", "--below", str(kid),
+                                       "--below", str(grandkid)))
+            _ = grandkid.write_text("[]")
+            quiet = self.lines(footer("--next-run", "11:30", "--nothing-needed", "--below", str(kid),
+                                      "--below", str(grandkid)))
+        self.assertEqual(counted, [*FOOTER_HEAD, *AGENT_LINES, "* next dailies: 11:30 PDT"])
+        self.assertEqual(unread, [*FOOTER_HEAD, *AGENT_LINES, "* grandkid: needs-user list unreadable",
+                                  "* next dailies: 11:30 PDT"])
+        self.assertEqual(quiet, [*FOOTER_HEAD, *AGENT_LINES, "* next dailies: 11:30 PDT - nothing needed"])
+
+    def test_lower_showrunner_footer_names_its_root(self) -> None:
+        self.assertEqual(self.lines(footer("--next-run", "11:30", "--reports-to", "build-followups")),
+                         [*FOOTER_HEAD, *AGENT_LINES, "* reports to build-followups", "* next dailies: 11:30 PDT"])
+
     def test_held_unit_has_no_section_line(self) -> None:
         lines = self.lines(render(report(True), holders=[holder("2026-10-04T11:15:00-07:00")]))
         section = lines[: lines.index(FENCE)]

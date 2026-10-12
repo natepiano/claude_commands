@@ -18,7 +18,7 @@
 
 **What the user gets.**
 
-- One showrunner, the root, talks with the user. Its footer and its dailies show every production below it, and every item that needs the user appears there once.
+- The root is the user's one place to see everything: its footer and its dailies show every production below it, and every item that needs the user appears there once. The user may still work with any showrunner directly, and one below a root answers them in its own pane as a root does (user, 2026-10-12: "have them available for direct interaction from me but also have a natural home under an L1"). This replaced "only the root talks with the user", which Phase 1 built and the first live check showed to be wrong.
 - A showrunner starts a lower showrunner with one command. The lower showrunner runs in its own detached tmux session, as a unit does.
 - Every showrunner, at any depth, runs on the showrunner account. Unit directors stay on the unit account.
 - A unit whose work has grown into a production of its own is promoted with one command: it stops, and comes back as a showrunner on the showrunner account with its conversation kept.
@@ -113,7 +113,22 @@ On the showrunner's go, the phases run in order in this worktree. Each ends with
 
 **Acceptance gate:** the gate. Tests cover attach, each refusal, an edge to a production with no timer, the root walk at three levels and a cycle written by hand into the state dir. Live, with the showrunner's go: attach tool-based-ui under build-followups, read `showrunners.py tree`, and hana sends one test item to the root.
 
-### Phase 2 — The root's count covers every item that needs the user  · status: todo
+### Phase 2 — The root's count covers every item that needs the user  · status: done · live check waits on tool-based-ui being attached
+
+#### As-built
+
+- `scripts/production/showrunners.py`: `Place(root, below)` and `place_of(slug)`, one reading of the tree; `descendants_of(slug)`; `user_facing(slug)`, the productions whose items a showrunner counts and lists.
+- `scripts/production/dailies_render.py --footer`: `--below <list>` once per lower production and `--reports-to <root>`. `footer_main(..., below=, root=)` and `footer(..., unreadable=, root=)` default to nothing, so a root with nothing attached renders the same bytes.
+- `scripts/hooks/showrunner_footer.py`: `place_of`, `render_footer(..., place, ...)`, `open_questions(productions, below)`. `block_reason` reads each production's place once.
+- `scripts/production/update_registration.py`: `footer` passes the lower lists and the root; new verb `open --production <doc>` (`open_items`), which prints the list a showrunner shows when the user asks what the open questions are.
+- `pyrightconfig.json`: `scripts/hooks` can now see `scripts/production`.
+- Spec 2 was built as the bullet `reports to <root's production slug>`, not the root's session name: the slug is what `showrunners.py address` takes, and it still reads right while the root is restarting or down. A showrunner under a root keeps its own count of its own items.
+- Spec 4, and one thing the Work Order did not say: while a lower list cannot be read the root's footer never says `nothing needed`, because that list may hold an item. A due item in a lower list also drops `nothing needed` from the root's footer.
+- Not built here: the dailies report still reads only its own list. Phase 3 owns the report.
+
+**Binds later work:** Phase 3 reads the same lists for each child row's needs-user mark; `place_of(slug).below` is the list of productions to read, and `UNREADABLE_LIST` in `dailies_render.py` is the one wording for a list that cannot be read.
+
+**Gotchas:** `scripts/production` imports the hook module at import time, so the hook imports `showrunners` late, inside `place_of`. A test that calls `showrunner_footer.open_questions` in process passes `below` itself and so never reads the live tree. The hook reads needs-user lists under `$HOME`, and the tree under `SHOWRUNNER_STATE_DIR`, so a hook test sets both.
 
 #### Work Order
 

@@ -49,7 +49,8 @@ must not drift from it:
   the merge branch.
 - **Parent, child and root showrunner** — a production's showrunner may report
   to another production's (`/showrunner:attach`). The one at the top of a tree is
-  the root, and only the root talks with the user. A child showrunner is never a
+  the root: it shows every item that needs the user from the productions below
+  it, and the user may still work with any showrunner directly. A child showrunner is never a
   unit: it keeps its own production doc, merge branch and units, and has no row
   in its parent's Units table. Which production reports to which is state on the
   machine, `~/.local/state/showrunner/<child slug>/parent`, and no line in either
