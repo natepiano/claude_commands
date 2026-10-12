@@ -158,8 +158,6 @@ class ReadyToLaunch(NamedTuple):
     launch: UnitLaunch
     row: NoUnitRow | ExistingUnitRow
     director: DirectorAgent
-    # Printed once the unit has started, so a failed launch's first stderr line stays its reason.
-    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -495,23 +493,6 @@ def worktree_on_branch(request: UnitLaunch) -> bool:
     return True
 
 
-def restore_warnings(launch: UnitLaunch) -> tuple[str, ...]:
-    """Where a restored session's recorded cwd departs from its Units row, one line per differing cell.
-
-    The transcript lives under the recorded cwd, so the session resumes there whatever the row says.
-    """
-    cwd, unit = launch.session_cwd, launch.identity.unit
-    warnings: list[str] = []
-    if cwd != launch.worktree.resolve():
-        warnings.append(f"unit {unit} Worktree is {str(launch.worktree)!r}; restoring in the recorded {str(cwd)!r}")
-    checked_out = subprocess.run(["git", "-C", str(cwd), "branch", "--show-current"],
-                                 text=True, capture_output=True, check=False).stdout.strip()
-    if checked_out != launch.branch:
-        found = f"is on {checked_out!r}" if checked_out else "has no branch checked out"
-        warnings.append(f"unit {unit} Branch is {launch.branch!r}; the recorded {str(cwd)!r} {found}")
-    return tuple(warnings)
-
-
 def tmux_live(tmux: str, name: str) -> bool:
     result = subprocess.run([tmux, "has-session", "-t", f"={name}"], capture_output=True, text=True, check=False)
     return result.returncode == 0
@@ -570,7 +551,7 @@ def preflight(request: RequestedUnitLaunch) -> ReadyToLaunch:
         # A restore adopts the row it matched and creates nothing: how the unit was first added, whether
         # its Plan cell still names a live plan rather than its as-built, and whether its worktree and
         # branch are free all describe new work, not the session it resumes.
-        return ReadyToLaunch(launch, existing, director_agent(launch), restore_warnings(launch))
+        return ReadyToLaunch(launch, existing, director_agent(launch))
     if isinstance(existing, ExistingUnitRow) and recorded_mode(launch, existing) != launch.mode_name:
         raise Refusal(f"unit name {launch.identity.unit} is already taken in Units table")
     has_worktree = worktree_on_branch(launch)
@@ -917,8 +898,6 @@ def main(argv: list[str]) -> int:
             _ = barrier.__exit__(None, None, None)
         launched = wait_for_remote_control(request, tmux)
         record(request)
-        for warning in ready.warnings:
-            print(f"add_unit: warning: {warning}", file=sys.stderr)
         print(f"{request.identity.unit} started: tmux attach -t {launched.label}")
         return 0
     except Refusal as error:
