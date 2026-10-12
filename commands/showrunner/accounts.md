@@ -6,7 +6,7 @@ argument-hint: '[setup "claude N" | swap unit "claude N" | swap unit default]'
 # Accounts
 
 Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/accounts/accounts.py" $ARGUMENTS`
-(no arguments means `status`) and print its output exactly as it comes, with nothing added.
+and print its output exactly as it comes, with nothing added.
 
 - No arguments: one Markdown table, a row for `~/.claude` and each `~/.claudeN`,
   logged in or not, then a line for anything wrong in a folder.

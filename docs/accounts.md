@@ -21,7 +21,7 @@ The status line's second row shows this session's account label. To print it:
 | Column | Shows |
 | --- | --- |
 | Label | The account's label. A named folder keeps its own label whatever login it holds. |
-| Login | The login, `not logged in`, or `not set up` for a label that has an account note and no folder yet. |
+| Login | The login, `not logged in`, or `not set up` for an account that has a note and is in no folder. |
 | Role | `showrunners`, `unit directors`, or `spare`. |
 | 5-hour left, Weekly left | Percent of each window left, each with its reset time. |
 | Read | When those numbers were read. |

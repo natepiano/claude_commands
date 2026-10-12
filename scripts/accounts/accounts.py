@@ -88,6 +88,8 @@ KNOWN_PRIVATE_NAMES = frozenset(
         "daemon",
         "jobs",
         "backups",
+        "cache",
+        ".last-cleanup",
     }
 )
 IDENTITY_ENTRIES = (".credentials.json", ".claude.json", "account-label")
@@ -1408,7 +1410,7 @@ def _noted_labels() -> set[str]:
 
 
 def account_statuses() -> list[AccountStatus]:
-    """Inspect the default account, every named account on disk, and every noted label with no folder yet."""
+    """Inspect the default account, every named account on disk, and every noted account that no folder holds."""
     default_dir = main_config_dir()
     default_problems: list[str] = []
     if not default_dir.exists():
@@ -1424,6 +1426,9 @@ def account_statuses() -> list[AccountStatus]:
         named = on_disk.get(label)
         if named is not None:
             statuses.append(_status_for(named.dir, folder, named, check(label)))
+            continue
+        if label == statuses[0].label:
+            # The default folder holds this account; a second row would repeat its label.
             continue
         statuses.append(AccountStatus(
             folder=folder,
@@ -1566,7 +1571,8 @@ def status_report() -> str:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest="action", required=True)
+    commands = parser.add_subparsers(dest="action")
+    parser.set_defaults(action="status")
     for action in ("setup", "check"):
         command = commands.add_parser(action)
         _ = command.add_argument("label")
