@@ -21,6 +21,8 @@ from typing import Literal, TypeGuard, TypedDict, cast
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
+import override_guard
 import sweep
 
 
@@ -1798,6 +1800,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    override_guard.refuse_overrides(Path(__file__), "mac_test/mac_test.py")
     args = parser().parse_args(namespace=CliArguments())
     paths = state_paths()
     if args.command == "claim":

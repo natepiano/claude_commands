@@ -752,7 +752,14 @@ def _validate_release_values(project: str, crates: list[str], releases: list[str
         if not VERSION_RE.fullmatch(version):
             raise FeatureLogError(f"invalid release version {version}")
         validated.add(release)
-    return sorted(validated)
+    sorted_releases = sorted(validated)
+    for release in sorted_releases:
+        crate, _, version = release.partition("@")
+        if version != "Unreleased" and f"{crate}@Unreleased" in validated:
+            raise FeatureLogError(
+                f"release cannot hold both {crate}@Unreleased and {release}"
+            )
+    return sorted_releases
 
 
 def _canonical_link(project: str, value: str) -> str:
@@ -1768,10 +1775,12 @@ def _run_amend(arguments: argparse.Namespace) -> int:
                 ]
                 changed.append("crate")
         validated_releases = _validate_release_values(project, updated["crate"], release_additions)
-        pending_crates: set[str] = set()
         for release in validated_releases:
             crate, _, version = release.partition("@")
             if version != "Unreleased":
+                pending_release = f"{crate}@Unreleased"
+                if pending_release in note["release"]:
+                    raise FeatureLogError(f"{title} already holds {pending_release}")
                 continue
             if note["state"] != "live":
                 raise FeatureLogError("a superseded note cannot be pending")
@@ -1779,13 +1788,6 @@ def _run_amend(arguments: argparse.Namespace) -> int:
                 existing_crate, _, existing_version = existing_release.partition("@")
                 if existing_crate == crate and existing_version != "Unreleased":
                     raise FeatureLogError(f"{title} already holds {existing_release}")
-            pending_crates.add(crate)
-        for release in validated_releases:
-            crate, _, version = release.partition("@")
-            if version != "Unreleased" and crate in pending_crates:
-                raise FeatureLogError(
-                    f"--release cannot add both {crate}@Unreleased and {release}"
-                )
         releases = sorted(set(updated["release"]) | set(validated_releases))
         if releases != updated["release"]:
             updated["release"] = releases

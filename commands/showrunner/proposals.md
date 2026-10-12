@@ -20,13 +20,14 @@ production from this session's update timer and prints one Markdown table,
 - **Proposal docs**: each `docs/plans/proposal-*.md` in the trunk and unit
   worktrees, while its `> **Status:` line says PROPOSAL. A doc with no status
   line counts as open.
-- **Add-ons**: each entry a unit's run holds for the user's decision, under the
+- **Add-ons**: each entry a unit's run holds until it has an answer, under the
   unit's name. Its date is the day the unit last changed its list.
 
-State says what the user can do: `waiting for your review`, `deferred until
-you ask for it`, or for an add-on `your call: build, save for later, or drop`.
-An add-on is decided in its unit's session, at the unit's next stop or with
-`/unit:add_ons`.
+State says what the user can do: `waiting for your review` or `deferred until
+you ask for it`. An add-on is not the user's to decide, so its State says who
+does: `the showrunner decides: build, save for later, or drop`. The unit sends
+its add-ons to the showrunner, whose answer settles each one
+(`/showrunner:produce` → Throughout → Designs and add-ons).
 
 The table prints what the units and the index say. When a row cannot be
 understood as it reads, ask its unit to reword the entry's title as one plain
