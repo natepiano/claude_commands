@@ -1,6 +1,6 @@
 # Build targets: each machine takes jobs by its own rules, and a hold stops one machine
 
-> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** Each machine that can run a build job becomes a build target with its own rules. natedev runs many jobs under the limits it already has (memory gate, cargo token, build-folder turns). The Mac runs one job at a time. A future machine is added by config. A hold names one target: hana's timing runs hold natedev, while tests keep running on the Mac. `verify.sh` enforces holds itself, so no agent has to stop by hand. A job waits for a target it may use and never falls back to a held one.
+> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** Each machine that can run a build job becomes a build target with its own rules. natedev runs many jobs under the limits it already has (memory gate, cargo token, build-folder turns). The Mac runs one job at a time. A future machine gets a config entry; a second ssh machine also needs its own lock storage, which this plan does not build. A hold names one target: hana's timing runs hold natedev, while tests keep running on the Mac. `verify.sh` enforces holds itself, so no agent has to stop by hand. A job waits for a target it may use and never falls back to a held one.
 
 > **As-built disposition: create**
 
@@ -21,15 +21,15 @@ Measured on 2026-10-11, from midnight to about 13:00 PDT: 87 of about 700 `verif
 
 **Targets.** `config/build_targets.conf` lists them. Each has a name, a platform (`linux` | `macos`) and a kind:
 - `local`: runs on this machine and takes as many jobs as natedev's limits admit (the memory gate, the cargo token, build-folder turns). These limits are unchanged.
-- `ssh`: runs over ssh and takes one job at a time. The one-job lock is `mac_test.py claim`, generalized per target, and its state lives under a per-target directory.
+- `ssh`: runs over ssh and takes one job at a time. The one-job lock is `mac_test.py claim`. Its claim, block and backoff state is the Mac's own (`~/.local/state/mac-test`), shared by every `ssh` target.
 
-The Mac's own settings (mirror, size budgets, CI switch, battery and disk floors) stay in `config/mac_test.conf`, named from its target entry. A future `ssh` target is a new entry plus its settings file. It reuses the same runner: probe, copy the tree, run, release.
+The Mac's own settings (mirror, size budgets, CI switch, battery and disk floors) stay in `config/mac_test.conf`, named from its target entry. A future `ssh` target is a new entry plus its settings file, and it reuses the same runner: probe, copy the tree, run, release. A second `ssh` target also needs its own claim, block and backoff storage before it can run beside the Mac; no phase here builds that, because no second machine exists yet.
 
 **Holds.** Every target can be held, and a hold names its target:
 - natedev's hold is the existing build hold (`~/.local/state/build-hold`, `build_hold.py`).
 - The Mac's hold is the existing Mac block (`mac_test.py block`, which also turns CI's Mac switch off).
 - `/build_hold hold <why> [target <name>]` defaults to natedev; `target mac` places a Mac block.
-- `build_targets.py status` shows every target on one line each: free, running (what and since when), held (by whom, why, until), or unreachable.
+- `build_targets.py status` shows every target on one line each: free, running (what and since when), held (by whom, why, until), unreachable, or state unreadable (with the reason).
 
 **Enforcement moves into the tools.** Today a hold is a broadcast asking every session to stop all cargo and `verify.sh`, so Mac work stops too. After this plan:
 - `verify.sh` checks natedev's hold before any local step and waits, printing who holds natedev and why.
@@ -101,46 +101,64 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 ### Phase 1 — Build targets exist, and one command shows each target's state  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `build_targets.py status` prints one line per target (natedev, mac): free, running, held or unreachable, with who, why and since when.
-
-**Spec:**
-- `config/build_targets.conf`, in the `key=value` form `sweep.config_values` reads:
-  ```
-  # Machines that can run build jobs, in the order a job tries them.
-  targets=mac,natedev
-  kind.natedev=local
-  platform.natedev=linux
-  kind.mac=ssh
-  platform.mac=macos
-  settings.mac=mac_test.conf
-  ```
-- `scripts/build_targets/targets.py`:
-  - `Platform = Literal["linux", "macos"]`.
-  - `LocalTarget(name, platform)` and `SshTarget(name, platform, settings: Path)`, frozen dataclasses; `Target = LocalTarget | SshTarget`.
-  - `read_targets(path=None) -> tuple[Target, ...]`, in the config's order. `BUILD_TARGETS_CONFIG` overrides the path, for tests. An unknown kind, a missing platform or a missing settings file is a `ConfigError` naming the key.
-  - `TargetState = Free | Running(what, since) | Held(holder, reason, since, end: HoldEnd) | Unreachable(reason)`, frozen dataclasses.
-  - `HoldEnd = ExpiresAt(when) | ReleaseEstimated(when) | UntilReleased`, frozen dataclasses. A Mac block lapses by itself (`ExpiresAt`); a natedev hold with an eta carries the holder's estimate (`ReleaseEstimated`); a hold with neither is `UntilReleased`. The status line prints `until <time>`, `release expected <time>`, or nothing.
-  - `target_state(target) -> TargetState`. natedev is `Held` when `build_hold.py`'s holder files name a holder (reuse `read_holders`). The Mac is `Held` when `mac_test.py`'s block is active, `Running` when its claim names a live run, and otherwise `Free`. Reachability is not probed here; `status --probe` adds the Mac probe.
-- `scripts/build_targets/build_targets.py status [--probe]` prints `natedev: free` / `mac: held by hana since 13:05 PDT until 15:05 PDT — <why>` / `mac: running nextest hana since 13:20 PDT`, in local time.
-- Add `scripts/build_targets` to `pyrightconfig.json` the way `scripts/mac_test` is listed.
+- `config/build_targets.conf`, in the `key=value` form `sweep.config_values` reads, lists the machines that can run build jobs in the order a job tries them: `targets=mac,natedev`; natedev is `kind=local`, `platform=linux`; mac is `kind=ssh`, `platform=macos`, `settings=mac_test.conf`.
+- `targets.py` holds `Platform = Literal["linux", "macos"]`, the frozen dataclasses `LocalTarget(name, platform)` and `SshTarget(name, platform, settings: Path)`, and `Target = LocalTarget | SshTarget`. `read_targets(path=None) -> tuple[Target, ...]` returns them in the config's order; `BUILD_TARGETS_CONFIG` replaces the path, for tests; a missing or unsupported key is a `ConfigError` naming the key.
+- `target_state(target) -> TargetState` writes nothing and opens no connection. `TargetState = Free | Running(what, since) | Held(holder, reason, since, end: HoldEnd) | Unreachable(reason) | StateUnreadable(reason)` and `HoldEnd = ExpiresAt(when) | ReleaseEstimated(when) | UntilReleased | AwaitingBlockRemoval`, all frozen dataclasses.
+- natedev is `Held` when `build_hold.read_holders` names a holder: `ReleaseEstimated` when the hold carries an eta, otherwise `UntilReleased`. The Mac is `Held` whenever a block record exists (`ExpiresAt` before its expiry, `AwaitingBlockRemoval` once the record has outlived it), `Running` when its claim names a live run, otherwise `Free`. `StateUnreadable` means a state directory or file cannot be accessed. `Unreachable` is produced only by `status --probe`.
+- `build_targets.py status [--probe]` prints one line per target in local time through `format_state`: `natedev: free`, `mac: held by hana since 13:05 PDT until 15:05 PDT — <why>`, `mac: running nextest hana since 13:20 PDT`, `<name>: state unreadable — <error>`. The hold's end prints as `until <time>`, `release expected <time>`, or nothing for `UntilReleased` and `AwaitingBlockRemoval`. `--probe` adds a read-only ssh check for each `ssh` target.
+- `mac_test.py` has `StateReadError`, `read_claim_block(paths)` and a `read_run` that validates `since`. `offload.py` has `read_config(path)` and `probe_reachability(controller, config) -> ReachableHost | UnreachableHost`, which runs ssh `true` and writes nothing on the remote.
 
 **Files:**
-- `config/build_targets.conf` — new.
-- `scripts/build_targets/targets.py`, `scripts/build_targets/build_targets.py` — new.
-- `scripts/build_targets/test_targets.py`, `scripts/build_targets/test_build_targets.py` — new.
-- `pyrightconfig.json` — one entry.
+- `config/build_targets.conf` — the target list.
+- `scripts/build_targets/targets.py` — target types, config reader, state reader.
+- `scripts/build_targets/build_targets.py` — the `status` command and `format_state`.
+- `scripts/build_targets/test_targets.py`, `scripts/build_targets/test_build_targets.py` — config parsing and its errors, each state read from stand-in holder, block and claim files under temporary directories, the status lines.
+- `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py` and their tests — the typed read error, the shared block reader, the reachability probe.
+- `pyrightconfig.json` — the `scripts/build_targets` entry.
+
+**Binds later work:** Every reader of `TargetState` handles five cases, and code that picks a target counts `StateUnreadable` and `Held(end=AwaitingBlockRemoval)` as not free. `StateUnreadable` clears when the file named in its error is fixed; `AwaitingBlockRemoval` clears through the existing `mac_test.py` stuck-block message. `Unreachable` has no routing consumer yet. `offload.probe_mac` still counts `procs` and still creates the mirror; `probe_reachability` sits beside it.
+
+**Gotchas:**
+- `mac_test.py claim` refuses on any block record and never settles an expired one. `target_state` reads the block through the same `read_claim_block`, so the two cannot disagree, and status never settles a block either.
+- `build_hold.read_holder` keeps a holder file it cannot decode an active hold by design; status agrees: `Held`, reason `unreadable holder file`.
+- Every `ssh` target reads the Mac's one coordination directory.
+
+**Ruled out:** per-target claim, block and backoff storage for a second ssh machine (no consumer today); a separate expiry comparison inside `target_state` (it disagrees with `claim`).
+
+### Phase 2 — A seat's build counts as its owning session's admission  · status: todo
+
+#### Work Order
+
+**Goal:** After a release, a build that a Codex seat runs is credited to the Claude session that owns the seat's run, so the release moves on at once instead of waiting 15 min on that session.
+
+**Spec:**
+- `build_hold.py` gets one resolver, `owning_session() -> OwningSession | NoOwningSession` (frozen dataclasses; `OwningSession(session_id: str)`), in this order:
+  1. the Claude session that owns the delegate run the call belongs to: the file under `/tmp/claude/delegate/active/` (`PLAN_DELEGATE_ACTIVE_DIR` overrides the directory) whose content, stripped of surrounding whitespace, is `PLAN_DELEGATE_BOARD_DIR`, or `PLAN_DELEGATE_SESSION_DIR` when the board directory is unset; its file name is the session id; the most recently modified file when several match;
+  2. `CLAUDE_CODE_SESSION_ID`;
+  3. `NoOwningSession`.
+  The run's marker comes first because a seat's shell carries the `CLAUDE_CODE_SESSION_ID` of the session that started its Codex server, and that id goes stale when the session restarts (measured 2026-10-11: trunk's seat build marked admission under a pre-restart id, the mark was ignored, and the release sat on trunk for 10 min while every other held session waited). A missing active directory or a marker that cannot be read is skipped, never an error.
+- `build_hold.py mark` with no `--session-id` marks the session the resolver returns; `NoOwningSession` prints `NoSessionId`, as an empty id does today. A given `--session-id` still wins, so existing callers keep working.
+- `memory_gate.sh` `build_hold_mark`: stop passing `--session-id`, and drop the early return on an empty `CLAUDE_CODE_SESSION_ID`; the resolver decides. Keep the holder-file check that avoids starting Python when nothing is held, and keep every failure silent.
+- `wait` and `nothing-to-build` are unchanged: a session calls them from its own shell, where `CLAUDE_CODE_SESSION_ID` is current.
+- The release's 15 min admission limit is unchanged (natedev, 2026-10-11: "the fix removes the cause").
+
+**Files:**
+- `scripts/build_hold/build_hold.py` — the resolver and `mark`.
+- `scripts/lint/memory_gate.sh` — `build_hold_mark`.
+- `scripts/build_hold/test_build_hold.py` — tests.
+- `scripts/delegate/test_verify_release_ack.py` — tests.
 
 **Seats:** 1 writer + 1 tester
-- `impl` — `config/build_targets.conf`, `scripts/build_targets/targets.py`, `scripts/build_targets/build_targets.py`, `pyrightconfig.json`
-- `test` — `scripts/build_targets/test_targets.py` and `test_build_targets.py` from the Spec: config parsing and its errors, each state read from stand-in holder, block and claim files under temporary directories, and the status lines.
+- `impl` — `build_hold.py`, `memory_gate.sh`
+- `test` — the two test files. The cases: a marker matching `PLAN_DELEGATE_BOARD_DIR` wins over another session's `CLAUDE_CODE_SESSION_ID`; `PLAN_DELEGATE_SESSION_DIR` is used when the board directory is unset; no matching marker falls back to `CLAUDE_CODE_SESSION_ID`; neither gives `NoOwningSession`; of several matching markers the newest wins; a missing active directory and an unreadable marker are skipped; `mark` with no `--session-id`, from a shell carrying another session's id, moves the owner's released entry to `WaitingForMemory` and then `MemoryGateReturned`; a given `--session-id` wins; through `verify.sh`, a seat-shaped environment (stale id, board directory set, marker present) marks the owner, and a call with no id and no run writes nothing.
 
-**Constraints from prior phases:** 81f216e removed the Mac's load cutoff; the probe no longer reads load.
+**Constraints from prior phases:** Phase 1's `scripts/build_targets/targets.py` imports `build_hold` and uses `holder_directory`, `read_holders`, `NoHolders`, `KnownReleaseEta` and the `Holder` fields `name`, `purpose`, `since`, `release`; keep each as it is.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/build_targets -p 'test_*.py'` green; basedpyright clean on the new files. Running `python3 scripts/build_targets/build_targets.py status` prints a line for natedev and one for the Mac.
+**Acceptance gate:** `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'`, `python3 -m unittest discover -s scripts/build_targets -p 'test_*.py'` and `python3 -m unittest discover -s scripts/delegate -p 'test_verify_release_ack.py'` green; basedpyright clean; `bash -n scripts/lint/memory_gate.sh`.
 
-### Phase 2 — verify.sh and app launches wait out a natedev hold by themselves  · status: todo
+### Phase 3 — verify.sh and app launches wait out a natedev hold by themselves  · status: todo
 
 #### Work Order
 
@@ -148,72 +166,91 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **Spec:**
 - `build_targets.py wait-local --call-id <id>` returns at once with exit 0 when natedev is not held. When natedev is held, it does the following:
-  - Registers the waiter in the hold's release cycle. The key is `CLAUDE_CODE_SESSION_ID` when set, or `verify:<call id>` otherwise; reuse `register_wait` and widen its key handling.
+  - Registers the waiter in the hold's release cycle under its waiter key; reuse `register_wait` and widen its key handling. The key comes from `build_hold.waiter_key(call_id)`, new in this phase: the session Phase 2's `owning_session()` resolves, else `verify:<call id>`. The owner key groups its callers in one entry: the entry lists each pending call id with the call's pid and process-start identity, and holds one active admission turn at a time. A release authorizes the entry's active call; the gate's marks are bound to that call and cycle; when its turn ends, the next pending call of the same key rejoins the queue while a hold remains. A call that registers after its key's entry reached `NothingToBuild`, `MemoryGateReturned`, `NoAdmissionAck`, `NoRegistration`, `RecipientGone` or `DeliveryFailed` rejoins the queue the same way.
   - Prints `verify.sh: natedev is held by <holder> for <why>; waiting (tests that can run on the Mac keep running there).`
-  - Polls every 15 s until its own direct release. A `verify:` waiter's release is a file written by the release driver under the cycle directory, not a socket message; `advance_release` writes it in place of `send_release` for those keys.
+  - Polls its entry in the cycle record every 15 s. The record authorizes admission for every key; a socket message only notifies a Claude session, and a `verify:` key gets none (`advance_release` marks it released without `send_release`). Per state: `AwaitingRelease` waits; `DeliveryQueued` and `ReleasedAwaitingAdmission` authorize the active call; `WaitingForMemory` belongs to that already-authorized call; `MemoryGateReturned` completes its admission.
+  - The admission read returns typed results, never strings or `HoldCycle | None`: `NoCycle` (wait on the hold itself until it clears), `AwaitingTurn`, `AdmittedTurn`, and a read-error case that prints its diagnostic and exits 12. A changed cycle id means register again.
   - Exits 0 when released.
   - After 2 h it prints `verify.sh: natedev has been held for 2 h by <holder>; ask them.` and keeps waiting.
-  - SIGINT and SIGTERM exit 130 and 143 and leave the registration to the release's existing gone-recipient handling.
-- In `verify.sh`, call `wait-local` once per call, before the cargo token (926) and after the Mac attempt (899-904), so a Mac run is never delayed by a natedev hold. Record the seconds waited as `BUILDLOG_HOLD_WAIT_S`; Phase 4 adds the column.
-- The memory gate's `build_hold_mark` already acknowledges admission for `CLAUDE_CODE_SESSION_ID`. Extend it to the `verify:<call id>` key, so the driver moves on after the waiter's gate returns, as it does for sessions today.
-- `pre-tool-use-brp-launch-gate.sh`: when natedev is held and this session has not been released, return a PreToolUse deny with the reason `natedev is held by <holder> for <why>; launch after the release.` A released session passes through as today.
-- The hold notice text is unchanged in this phase (natedev, 2026-10-11: the notice reaches hana and every showrunner, so the old notice keeps working until Phase 5 lands). `wait` and `nothing-to-build` keep working for sessions that still call them.
+  - SIGINT and SIGTERM remove this call from its entry and exit 130 and 143. The driver checks each pending call's pid and process-start identity before granting or awaiting its admission and drops a call whose process is gone or whose pid was reused, without touching other calls under the same key.
+- In `verify.sh`, call `wait-local` once per call, before the cargo token (926) and after the Mac attempt (899-904), so a Mac run is never delayed by a natedev hold. A hold can begin after that first wait, so `scripts/lint/invoke.sh` revalidates admission against the current hold cycle before each local compiling step, beside its `build_hold_mark` call. Record the seconds waited as `BUILDLOG_HOLD_WAIT_S`; Phase 5 adds the column.
+- The memory gate's `build_hold_mark` passes the call id (`mark --call-id <id>`), and `build_hold.py mark` marks the key `waiter_key` resolves and binds the mark to that call, so the driver moves on after the waiter's gate returns, for a session's own call, a seat's call and a `verify:` call alike.
+- `pre-tool-use-brp-launch-gate.sh`: when natedev is held and this session has not been released, return a PreToolUse deny with the reason `natedev is held by <holder> for <why>; launch after the release.` A released session passes through as today. The hook uses the same admission decision as `wait-local`: it denies `StateUnreadable` with its diagnostic, and does no memory admission and no mark when it denies.
+- The hold notice text is unchanged in this phase (natedev, 2026-10-11: the notice reaches hana and every showrunner, so the old notice keeps working until Phase 6 lands). `wait` and `nothing-to-build` keep working for sessions that still call them.
 
 **Files:**
 - `scripts/build_targets/build_targets.py` — `wait-local`.
-- `scripts/build_hold/build_hold.py` — waiter keys, the release-file delivery, the notice text.
+- `scripts/build_hold/build_hold.py` — `waiter_key`, grouped entries with call ids, the typed admission read, the driver's abandoned-call check.
 - `scripts/delegate/verify.sh` — the `wait-local` call and `BUILDLOG_HOLD_WAIT_S`.
-- `scripts/lint/memory_gate.sh` — `build_hold_mark` for `verify:` keys.
+- `scripts/lint/memory_gate.sh` — `build_hold_mark` passes the call id.
+- `scripts/lint/invoke.sh` — the admission check before each local compiling step.
 - `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — the deny.
-- Tests: `scripts/build_targets/test_build_targets.py`, `scripts/build_hold/test_build_hold.py`, `scripts/delegate/test_verify_hold_wait.py` (new), `scripts/hooks/test_brp_launch_gate.py`.
+- `scripts/build_targets/test_build_targets.py` — tests.
+- `scripts/build_hold/test_build_hold.py` — tests.
+- `scripts/delegate/test_verify_hold_wait.py` — tests, a new file.
+- `scripts/delegate/test_verify_release_ack.py` — tests.
+- `scripts/hooks/test_brp_launch_gate.py` — tests.
 
-**Seats:** 2 writers + 1 tester
-- `impl` — `build_targets.py`, `build_hold.py`; hub: `build_hold.py` (the cycle format both sides read)
-- `impl-shell` — `verify.sh`, `memory_gate.sh`, `pre-tool-use-brp-launch-gate.sh`
-- `test` — the four test files from the Spec. The cases: an unheld call does not wait; a held call waits, then runs after its release; a `--filter` test passes on the Mac during a hold without waiting; the BRP deny, and its pass-through after release; the 2 h line (with an injected clock); the notice text unchanged.
+**Seats:** 1 writer + 1 tester
+- `impl` — `build_targets.py`, `build_hold.py`, `verify.sh`, `memory_gate.sh`, `invoke.sh`, `pre-tool-use-brp-launch-gate.sh`; sole owner of the cycle format
+- `test` — the five test files from the Files list. The cases: two calls under one owner key at once; a seat's call after its owner answered `nothing-to-build`; a call arriving after its key's turn finished; every entry state, queued delivery included; SIGINT, SIGTERM, a vanished process and a reused pid; a missing, changed and unreadable cycle record; a hold that begins between two compiling steps; the BRP deny for unreadable state; an unheld call does not wait; a held call waits, then runs after its release; a `--filter` test passes on the Mac during a hold without waiting; the BRP deny, and its pass-through after release; the 2 h line (with an injected clock); the notice text unchanged; a call from a delegate run whose shell carries another session's `CLAUDE_CODE_SESSION_ID` registers and marks under the run's owning session; a call with no run and no session id uses `verify:<call id>`; unreadable hold state exits 12 without waiting.
 
-**Constraints from prior phases:** Phase 1's `target_state` decides "held"; don't read holder files a second way.
+**Constraints from prior phases:**
+- Phase 1's `target_state` decides "held"; don't read holder files a second way.
+- Phase 2's `owning_session()` is the only place that decides which session owns a call; `waiter_key` wraps it and adds nothing but the `verify:<call id>` fallback.
+- `TargetState = Free | Running | Held | Unreachable | StateUnreadable` (`scripts/build_targets/targets.py`). For natedev, `target_state` returns `Held` for any holder file, also one whose content cannot be decoded (`build_hold.read_holder` keeps such a file an active hold), and `StateUnreadable(reason)` when the holder directory or a holder file cannot be accessed. `Unreachable` comes only from `status --probe`.
+- `wait-local` on `StateUnreadable`: print `verify.sh: natedev's hold state cannot be read (<reason>); not starting.` and exit 12, the code `mac_test.py claim` uses for unreadable state. A build never starts on a hold state nobody can read.
+- `HoldEnd = ExpiresAt | ReleaseEstimated | UntilReleased | AwaitingBlockRemoval`; a natedev hold carries `ReleaseEstimated` or `UntilReleased`.
+- `build_targets.format_state` collapses whitespace in every displayed field; reuse it for the holder and reason in the waiting line.
 
-**Acceptance gate:** the unittest discover lines for `scripts/build_targets`, `scripts/build_hold`, `scripts/delegate` and `scripts/hooks` green; basedpyright clean; `bash -n` on the three shell files.
+**Acceptance gate:** the unittest discover lines for `scripts/build_targets`, `scripts/build_hold`, `scripts/delegate` and `scripts/hooks` green; basedpyright clean; `bash -n` on the four shell files.
 
-### Phase 3 — A test goes to the first free target it may use, and waits instead of falling back  · status: todo
+### Phase 4 — A test goes to the first free target it may use, and waits instead of falling back  · status: todo
 
 #### Work Order
 
 **Goal:** `verify.sh test` runs on the Mac when the Mac is free, otherwise on natedev unless natedev is held. When every eligible target is held or full, it waits for the first to free up. The Mac's probe no longer turns tests away for others' processes.
 
 **Spec:**
-- `targets.py` `eligible_targets(repo_root, package, local_reason) -> tuple[Target, ...]`:
-  - `macos` targets are left out when the repo has no `linux_only.<repo>` key in its settings, when the package is listed there, or when `local_reason` is set.
+- `targets.py` `eligible_targets(repo_root, package, routing) -> tuple[Target, ...]`, where `routing` is `AnyEligibleTarget | LocalRequired(reason)`, frozen dataclasses:
+  - `macos` targets are left out when the repo has no `linux_only.<repo>` key in its settings, when the package is listed there, or when `routing` is `LocalRequired`.
   - `linux` targets are always eligible.
   - Order follows `targets=`.
+- `build_targets.py eligible --repo-root <path> --package <name> [--local "<reason>"]` prints the eligible target names in that order, one per line. `verify.sh` routes from this output, tries targets in the order printed, and passes the chosen `SshTarget.settings` to `offload.read_config` through `offload.py run --settings <path>`.
 - `offload.py`:
   - Remove the `procs` count from `probe_script`, `parse_probe` and `ProbeSnapshot`, and the `mac_busy` decline in `claimed_run`.
   - Keep `mac_busy` in the reason list for old build-log rows.
-  - Add `run --wait-s <seconds>`: when the claim is busy (11), keep trying the claim until the wait ends. `verify.sh` passes the wait only when natedev is held.
+  - Add `run --settings <path>`: the settings file of the target being tried, passed to `read_config`. Without it the Mac's default settings apply, as today. A busy claim (11) still returns at once; `verify.sh` paces the retries.
 - `verify.sh` test routing, replacing the bare `try_mac_test` call at 899-904:
   1. With the Mac eligible, try it (no wait). `passed`, `failed` and `lost` are handled as today.
-  2. If the Mac declined with `busy` or `blocked` and natedev is held, wait on whichever frees first: re-try the Mac claim with `--wait-s 60` in a loop, and check natedev's state between tries. When natedev's hold lifts first, continue to `wait-local` (Phase 2) and run locally.
-  3. Otherwise, `wait-local`, then the token, as Phase 2 left it.
+  2. If the Mac declined with `busy` or `blocked` and natedev is held, wait on whichever frees first. Register local demand through Phase 3's waiter and poll its admission decision between Mac tries; never watch the holder file, which stays in place while a release admits callers one at a time. Re-try the Mac claim without blocking, paced 15 s apart. When local admission comes first, run locally; when a `--filter` run finishes on the Mac, withdraw the pending local demand.
+  3. Otherwise, `wait-local`, then the token, as Phase 3 left it.
   4. Print the target in one line: `verify.sh: running on the Mac` / `verify.sh: running on natedev`.
-- Record `BUILDLOG_TARGET` (`mac` | `natedev`), the target the tests ran on. For a full test that passed on the Mac and then confirmed on natedev, it is `natedev`; `BUILDLOG_MAC=passed` stays.
+- Record `BUILDLOG_TARGET` (`mac` | `natedev`), the target the tests ran on. For a full test that passed on the Mac and then confirmed on natedev, it is `natedev`; `BUILDLOG_MAC=passed` stays. `BUILDLOG_HOLD_WAIT_S` adds up every wait caused by a hold: the routing loop's waits and `wait-local`'s. It survives an interruption and leaves out time spent running tests.
 
 **Files:**
 - `scripts/build_targets/targets.py` — `eligible_targets`.
-- `scripts/mac_test/offload.py` — the probe and `--wait-s`.
+- `scripts/build_targets/build_targets.py` — the `eligible` command.
+- `scripts/build_targets/test_build_targets.py` — tests.
+- `scripts/mac_test/offload.py` — the probe and `--settings`.
 - `scripts/delegate/verify.sh` — the routing.
-- Tests: `scripts/build_targets/test_targets.py`, `scripts/mac_test/test_offload.py`, `scripts/delegate/test_verify_mac_offload.py`.
+- `scripts/build_targets/test_targets.py` — tests.
+- `scripts/mac_test/test_offload.py` — tests.
+- `scripts/delegate/test_verify_mac_offload.py` — tests.
 
 **Seats:** 2 writers + 1 tester
-- `impl` — `targets.py`, `offload.py`
+- `impl` — `targets.py`, `build_targets.py`, `offload.py`
 - `impl-shell` — `verify.sh`
-- `test` — the three test files. The cases: the eligibility table; a Mac busy with another of our tests while natedev is free runs locally, as today; a Mac busy while natedev is held waits, then runs on the Mac when the claim frees; natedev's hold lifting first runs locally; a Mac blocked while natedev is held waits on natedev; a probe that sees others' cargo no longer declines.
+- `test` — the four test files. The cases: the eligibility table; a Mac busy with another of our tests while natedev is free runs locally, as today; a Mac busy while natedev is held waits, then runs on the Mac when the claim frees; natedev's hold lifting first runs locally; a Mac blocked while natedev is held waits on natedev; a probe that sees others' cargo no longer declines; reversed `targets=` order and an alternate settings file are honored; local admission arriving while the holder file remains runs locally; unreadable Mac state, a retained expired block and a failed probe each route to natedev with the diagnostic printed; the hold wait is summed across routing and local waits.
 
-**Constraints from prior phases:** Phase 2's `wait-local` is the only way `verify.sh` waits on natedev; Phase 1's `read_targets` order decides what is tried first.
+**Constraints from prior phases:**
+- Phase 3's `wait-local` and its admission decision are the only way `verify.sh` waits on natedev; Phase 1's `read_targets` order decides what is tried first.
+- `TargetState = Free | Running | Held | Unreachable | StateUnreadable`. `StateUnreadable` prevents admission and prints its diagnostic; `Held(end=AwaitingBlockRemoval)` stays held until the Mac block record is removed. Decide "blocked" with `mac_test.read_claim_block`; never add an expiry rule.
+- `offload.read_config(path)` takes a settings path. `offload.probe_reachability(controller, config)` only checks that ssh answers and writes nothing; `offload.probe_mac` is the resource probe this phase changes. A failed probe keeps the existing unreachable backoff.
 
 **Acceptance gate:** the unittest discover lines for `scripts/build_targets`, `scripts/mac_test` and `scripts/delegate` green; basedpyright clean; `bash -n scripts/delegate/verify.sh`.
 
-### Phase 4 — The build report shows tests by target and time spent waiting on holds  · status: todo
+### Phase 5 — The build report shows tests by target and time spent waiting on holds  · status: todo
 
 #### Work Order
 
@@ -222,23 +259,28 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 **Spec:**
 - `record.py call` records `target` (from `BUILDLOG_TARGET`) and `hold_wait_s` (from `BUILDLOG_HOLD_WAIT_S`). `index.py` adds both columns and bumps `SCHEMA_VERSION` to 13. `buildlog schema` describes them.
 - `report.py`:
-  - "Tests on the Mac" becomes "Tests by target". It has one row per package, with columns Mac (ran, passed, failed, Mac p50), natedev (ran, p50), and "Did not reach the Mac" (busy with our test, blocked, unreachable, Linux-only or `--local`, no Mac entry).
-  - Rows recorded before `target` existed read `mac` from the `mac` column as today.
+  - "Tests on the Mac" becomes "Tests by target". It has one row per package, with columns Mac (ran, passed, failed, Mac p50), natedev (ran, p50), and "Did not reach the Mac" (busy with our test, blocked, unreachable, state unreadable, Linux-only or `--local`, no Mac entry; the historical `mac_busy` stays visible for old rows).
+  - It selects every relevant test call, a package that only ever ran on natedev included. Mac execution is counted from the call's Mac outcome and natedev execution from its nextest steps, so a full test that passed on the Mac and then confirmed on natedev counts once on each. A step that reused a cached result is not an execution.
+  - Rows recorded before `target` existed are counted by the same inference: `mac` from the `mac` column, natedev from the nextest steps.
 - The Waiting table gains a row `Held target`: Longest, Over 5 min, Waited (calls), Total (seat-hours), Worst — from `hold_wait_s`.
 
 **Files:**
-- `scripts/buildlog/record.py`, `scripts/buildlog/index.py`, `scripts/buildlog/report.py`.
-- Tests: `scripts/buildlog/test_record.py`, `test_index.py`, `test_report.py`.
+- `scripts/buildlog/record.py`
+- `scripts/buildlog/index.py`
+- `scripts/buildlog/report.py`
+- `scripts/buildlog/test_record.py` — tests.
+- `scripts/buildlog/test_index.py` — tests.
+- `scripts/buildlog/test_report.py` — tests.
 
 **Seats:** 1 writer + 1 tester
 - `impl` — the three buildlog files
-- `test` — the three test files: the new columns, the schema rebuild, both report sections, and old rows without `target`.
+- `test` — the three test files: the new columns, the schema rebuild, both report sections, old rows without `target`, a package that ran only on natedev, a full Mac pass followed by a natedev confirmation, a full Mac pass whose confirmation was interrupted, a cached step, and each decline reason, unreadable state and `mac_busy` included.
 
-**Constraints from prior phases:** Phase 2 exports `BUILDLOG_HOLD_WAIT_S`; Phase 3 exports `BUILDLOG_TARGET`.
+**Constraints from prior phases:** Phase 3 exports `BUILDLOG_HOLD_WAIT_S` and Phase 4 adds the routing loop's waits to it; Phase 4 exports `BUILDLOG_TARGET`, which names where the tests last ran and cannot by itself say that a call also ran on the Mac.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` green; basedpyright clean. `TZ=America/Los_Angeles ~/.claude/scripts/buildlog/buildlog report` renders both sections against the live index.
+**Acceptance gate:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` green; basedpyright clean. `python3 scripts/buildlog/cli.py report`, run from the worktree root with `BUILDLOG_DIR` set to a temporary directory the tests populated, renders both sections. The installed `~/.claude/scripts/buildlog/buildlog` runs another checkout's code, so it is no gate for this phase; rendering against the live index is a separate check after the merge.
 
-### Phase 5 — `/build_hold` takes a target, and the commands and records say how holds work now  · status: todo
+### Phase 6 — `/build_hold` takes a target, and the commands and records say how holds work now  · status: todo
 
 #### Work Order
 
@@ -251,20 +293,29 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
   - Recipients do nothing for a natedev hold, because `verify.sh` and app launches wait by themselves. `build_hold.py wait` remains for a session about to run cargo outside `verify.sh`.
   - `quiet` is unchanged.
   - `target mac` places the Mac's hold.
-- `commands/mac_test.md`: the block is the Mac's hold; `/build_hold hold <why> target mac` is the same thing.
+- `commands/mac_test.md`: the block is the Mac's hold; `/build_hold hold <why> target mac` is the same thing. A block stays in force after its expiry time until its record is removed; name the existing command that clears a stuck block.
+- `commands/build_hold.md` and `commands/mac_test.md` both point to `build_targets.py status` as the one place to read every target's state, and say what to do for each state a reader can act on: `state unreadable` names the file to repair or remove; `unreachable` says to check the ssh connection (`status --probe`). `status` only reads: it never settles a block or changes a record.
 - `commands/builds.md`: no change unless the report's section names appear in it.
-- `docs/as-built/mac-test-offload.md`: the probe without process checks, `--wait-s`, routing.
+- `docs/as-built/mac-test-offload.md`: the probe without process checks, `--settings`, routing.
 - `docs/as-built/build-memory-admission.md`: the hold section says `verify.sh` waits by itself.
 
 **Files:**
-- `scripts/build_hold/build_hold.py`, `scripts/build_hold/test_build_hold.py`.
-- `commands/build_hold.md`, `commands/mac_test.md`, `commands/builds.md`.
-- `docs/as-built/mac-test-offload.md`, `docs/as-built/build-memory-admission.md`.
+- `scripts/build_hold/build_hold.py`
+- `scripts/build_hold/test_build_hold.py`
+- `commands/build_hold.md`
+- `commands/mac_test.md`
+- `commands/builds.md`
+- `docs/as-built/mac-test-offload.md`
+- `docs/as-built/build-memory-admission.md`
 
 **Seats:** 1 writer + 1 tester
 - `impl` — `build_hold.py`, the commands and the docs
 - `test` — `test_build_hold.py`: `--target mac` calls block and unblock through a stand-in `mac_test.py`; an unknown target fails, listing the targets; the default target is natedev.
 
-**Constraints from prior phases:** Phases 1–4 as built.
+**Constraints from prior phases:**
+- `build_targets.py status` prints five states: free, running, held, unreachable, state unreadable. `status --probe` adds a read-only ssh check (`offload.probe_reachability`); the resource probe (`offload.probe_mac`) runs only inside a test run.
+- A build's waiter is keyed by the session that owns its delegate run (the run's active marker), then `CLAUDE_CODE_SESSION_ID`, then `verify:<call id>` (Phases 2 and 3).
+- Admission is automatic: `verify.sh` and the BRP launch gate wait or refuse by themselves, and an unreadable hold state stops a build with exit 12 (Phase 3). Routing sends a test to natedev when the Mac's state cannot be read (Phase 4).
+- The report's sections are "Tests by target" and the Waiting table's `Held target` row (Phase 5).
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'` green; basedpyright clean.
