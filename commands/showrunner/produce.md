@@ -41,6 +41,9 @@ State:
 - `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<slug>.json`, written
   by `update_registration.py footer --state` when `SHOWRUNNER_STATE` includes
   `open_for_user`. Omitting that key leaves the durable list unchanged.
+- `LOG` backups — `~/.local/state/showrunner/<slug>/log-backups/log-<YYYYmmddTHHMM>.md`,
+  one copy per update tick, the newest 48 kept (`log_backup.py`). To restore
+  `LOG`, copy the wanted file back over it.
 
 `<DecisionEconomy/>` is defined by this import:
 
