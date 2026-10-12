@@ -48,6 +48,7 @@ Evidence, outside the repository, read-only: `~/.local/state/mul-add-hook/reach-
 ## Delegation Context
 
 - **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts; this plan changes the multiply-add PostToolUse hook. Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add` on branch `build-followups-mul-add` (unit `mul_add-unit` of production `build-followups`).
+- **Project started:** 2026-10-12T16:27:56.610+00:00
 - **Stack:** Python 3.13, standard library only.
 - **Layout:**
   - `scripts/hooks/fn_length_lib.py` — shared by the function-length and multiply-add hooks: the edit parser (`AppliedRustEdits`, `IgnoredEdit`, `applied_patch_rust_files`, `applied_rust_edits`, lines 66–125), the Rust scanner (`tokenize_rust`, `pair_delimiters`), the Cargo lint reader
@@ -83,7 +84,7 @@ Evidence, outside the repository, read-only: `~/.local/state/mul-add-hook/reach-
 
 ## Phases
 
-### Phase 1 — Report only on lines the edit wrote  · status: todo
+### Phase 1 — Report only on lines the edit wrote  · status: done
 
 #### Work Order
 
@@ -96,10 +97,11 @@ Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`,
 1. **The parser carries what each edit wrote** (`scripts/hooks/fn_length_lib.py`). `AppliedRustEdits` gains one slot, parallel to `files`:
 
    ```python
-   replacements: tuple[tuple[tuple[str, str], ...], ...]
+   type Replacement = tuple[str, str]  # the (old, new) text of one applied replacement
+   replacements: tuple[tuple[Replacement, ...], ...]
    ```
 
-   For each file, the `(old, new)` text pairs the edit applied, in payload order. `applied_rust_edits` fills it:
+   For each file, the `(old, new)` text pairs the edit applied, in payload order. Every line split in this phase is on `"\n"` alone, never `splitlines()`: only `"\n"` ends a line, as in the detector, so a U+2028 or a form feed inside a Rust string neither cuts a patch line nor moves a line number. The patch reader first turns each `"\r\n"` into `"\n"`, so a patch with Windows line ends still names its files. `applied_rust_edits` fills it:
    - Claude `Edit`: one pair `(tool_input.old_string, tool_input.new_string)`.
    - Claude `MultiEdit`: one pair per entry of `tool_input.edits`, from its `old_string` and `new_string`.
    - Claude `Write`: one pair `("", tool_input.content)`.
@@ -111,11 +113,13 @@ Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`,
 2. **Written lines** (`scripts/hooks/fn_length_lib.py`):
 
    ```python
-   def written_lines(source: str, replacements: tuple[tuple[str, str], ...]) -> frozenset[int]:
+   def written_lines(source: str, replacements: tuple[Replacement, ...]) -> frozenset[int]:
        """1-based numbers of the lines of source that the edit wrote."""
    ```
 
-   For each pair `(old, new)`: drop from `new` the longest prefix it shares with `old`, then the longest suffix it shares with what is left of `old`; the rest is the core, at offset `p` in `new`. An empty core writes no line. For each occurrence of `new` in `source` (left to right, not overlapping), every line touched by `[at + p, at + p + len(core))` is written. When `new` does not occur in `source`, every line of `source` whose stripped text is non-empty and equals the stripped text of a line of `new` that is not a line of `old` is written. Known limit, accepted: unchanged lines between two changed parts of one pair count as written.
+   For each pair `(old, new)`: split both on `"\n"`. Drop the leading lines the two share, then the trailing lines `new` shares with what is left of `old`; the remaining lines of `new` are the changed lines, the first at line offset `k` in `new`. A changed line with no text writes nothing. For each occurrence of `new` in `source` (left to right, not overlapping), with `L` the 1-based line of the occurrence's first character, the changed line at offset `k + i` writes source line `L + k + i`. When `new` does not occur in `source`, every line of `source` whose stripped text is non-empty and equals the stripped text of a line of `new` that is not a line of `old` is written. Line numbers come from counting `"\n"` from one occurrence to the next, never from a per-character index of the whole file. Known limit, accepted: unchanged lines between two changed parts of one pair count as written.
+
+   Measured in review, 2026-10-12: the first rule compared characters. An added line shares its indentation with the line beside it, so that unchanged neighbour counted as written, and an old multiply-add next to an added line was reported. Lines are compared whole for that reason.
 
 3. **The detector filters by line** (`scripts/hooks/mul_add_lib.py`):
 
@@ -127,7 +131,7 @@ Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`,
 
    `None` keeps every finding. Otherwise a finding is kept when any source line from the first to the last line of its expression is in `written`. Nothing else in the detector changes in this phase.
 
-4. **The hook passes them** (`scripts/hooks/post-tool-use-mul-add.py`). For each file, after reading `source`: `written = written_lines(source, <that file's pairs>)`; with no written line, skip the file before the detector is imported; otherwise call `float_mul_add_findings(file, written)`. The block text, the log record and the error path do not change.
+4. **The hook passes them** (`scripts/hooks/post-tool-use-mul-add.py`). For each file, after reading `source` and after the existing text check for `*` and `+` or `-`: `written = written_lines(source, <that file's pairs>)`; with no written line, skip the file before the detector is imported; otherwise call `float_mul_add_findings(file, written)`. The block text, the log record and the error path do not change.
 
 5. **Tests** (`scripts/hooks/test_mul_add.py`; parser cases beside the existing `apply_patch` header test). `run_hook` sends, by default, a `Write` payload whose `content` is the file's text, so every existing test still treats the whole file as written. New cases, each through the real hook process unless it names a function:
    - an `Edit` whose `new_string` is a whole new line with a provable float multiply-add blocks;
@@ -138,7 +142,11 @@ Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`,
    - an `apply_patch` update blocks for a `+` line and passes when the old multiply-add is a context line;
    - an `apply_patch` add blocks; a move carries its pairs to the new path;
    - `written_lines`: an empty core writes nothing; two occurrences of `new` both count; `new` absent from `source` falls back to line text;
-   - a payload with no `new_string` passes.
+   - a payload with no `new_string` passes;
+   - an old multiply-add beside an added line passes, in three shapes: an `Edit` that appends a line after it (`old_string` that line, `new_string` that line and a new one), an `Edit` that inserts a line before it, and an `apply_patch` update that adds one line between context lines with the old multiply-add as the context line after it;
+   - the same three shapes block when the added line is itself a multiply-add, and name the added line's number;
+   - a Rust string holding U+2028 neither cuts an `apply_patch` `+` line nor moves a line number in `written_lines`.
+   - an `apply_patch` payload with `"\r\n"` line ends still reports the multiply-add it adds.
 
    Each test is named for the behavior it pins.
 

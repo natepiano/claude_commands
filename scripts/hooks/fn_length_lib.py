@@ -63,20 +63,28 @@ _RUST_KEYWORDS = frozenset(
 )
 
 
+type Replacement = tuple[str, str]  # the (old, new) text of one applied replacement
+
+
 class AppliedRustEdits:
     """Rust files left by one successful edit, in payload order."""
 
-    __slots__: tuple[str, ...] = ("agent", "tool", "cwd", "files")
+    __slots__: tuple[str, ...] = ("agent", "tool", "cwd", "files", "replacements")
     agent: str
     tool: str
     cwd: str
     files: tuple[str, ...]
+    replacements: tuple[tuple[Replacement, ...], ...]
 
-    def __init__(self, agent: str, tool: str, cwd: str, files: tuple[str, ...]) -> None:
+    def __init__(
+        self, agent: str, tool: str, cwd: str, files: tuple[str, ...],
+        replacements: tuple[tuple[Replacement, ...], ...],
+    ) -> None:
         self.agent = agent
         self.tool = tool
         self.cwd = cwd
         self.files = files
+        self.replacements = replacements
 
 
 class IgnoredEdit:
@@ -85,19 +93,57 @@ class IgnoredEdit:
     __slots__: tuple[str, ...] = ()
 
 
-def applied_patch_rust_files(patch: str) -> tuple[str, ...]:
-    files: list[str] = []
+def _patch_update_replacements(lines: list[str]) -> tuple[Replacement, ...]:
+    pairs: list[Replacement] = []
+    old: list[str] = []
+    new: list[str] = []
+    for line in [*lines, "*** End Patch"]:
+        if not line or line[0] in " -+":
+            text = line[1:] if line else ""
+            if not line or line[0] in " -":
+                old.append(text)
+            if not line or line[0] in " +":
+                new.append(text)
+        elif old or new:
+            pairs.append(("\n".join(old), "\n".join(new)))
+            old.clear()
+            new.clear()
+    return tuple(pairs)
+
+
+def _patch_file_replacements(patch: str) -> dict[str, tuple[Replacement, ...]]:
+    sections: list[tuple[str, bool, list[str]]] = []
+    section_index = -1
     update_index = -1
-    for line in patch.splitlines():
+    for line in patch.replace("\r\n", "\n").removesuffix("\n").split("\n"):
         if line.startswith("*** Add File: ") or line.startswith("*** Update File: "):
-            files.append(line.split(": ", 1)[1])
-            update_index = len(files) - 1 if line.startswith("*** Update File: ") else -1
+            added = line.startswith("*** Add File: ")
+            sections.append((line.split(": ", 1)[1], added, []))
+            section_index = len(sections) - 1
+            update_index = -1 if added else section_index
         elif line.startswith("*** Move to: ") and update_index >= 0:
-            files[update_index] = line.removeprefix("*** Move to: ")
+            _, added, lines = sections[update_index]
+            lines.append(line)
+            sections[update_index] = (line.removeprefix("*** Move to: "), added, lines)
             update_index = -1
         elif line.startswith("*** Delete File: "):
+            section_index = -1
             update_index = -1
-    return tuple(dict.fromkeys(path for path in files if path.endswith(".rs")))
+        elif section_index >= 0:
+            sections[section_index][2].append(line)
+    replacements: dict[str, tuple[Replacement, ...]] = {}
+    for path, added, lines in sections:
+        if not path.endswith(".rs"):
+            continue
+        pairs = (("", "\n".join(line[1:] for line in lines if line.startswith("+"))),) if added else (
+            _patch_update_replacements(lines)
+        )
+        replacements[path] = replacements.get(path, ()) + pairs
+    return replacements
+
+
+def applied_patch_rust_files(patch: str) -> tuple[str, ...]:
+    return tuple(_patch_file_replacements(patch))
 
 
 def applied_rust_edits(raw: str) -> AppliedRustEdits | IgnoredEdit:
@@ -116,12 +162,64 @@ def applied_rust_edits(raw: str) -> AppliedRustEdits | IgnoredEdit:
     inputs = cast(dict[str, object], tool_input)
     if tool == "apply_patch":
         patch = inputs.get("command")
-        files = applied_patch_rust_files(patch) if isinstance(patch, str) else ()
-        return AppliedRustEdits("codex", tool, cwd, files) if files else IgnoredEdit()
+        replacements = _patch_file_replacements(patch) if isinstance(patch, str) else {}
+        return AppliedRustEdits(
+            "codex", tool, cwd, tuple(replacements), tuple(replacements.values()),
+        ) if replacements else IgnoredEdit()
     file_path = inputs.get("file_path")
     if tool in {"Edit", "MultiEdit", "Write"} and isinstance(file_path, str) and file_path.endswith(".rs"):
-        return AppliedRustEdits("claude", tool, cwd, (file_path,))
+        pairs: list[Replacement] = []
+        if tool == "Write":
+            content = inputs.get("content")
+            if isinstance(content, str):
+                pairs.append(("", content))
+        else:
+            entries = inputs.get("edits") if tool == "MultiEdit" else [inputs]
+            if isinstance(entries, list):
+                for entry in cast(list[object], entries):
+                    if not isinstance(entry, dict):
+                        continue
+                    fields = cast(dict[str, object], entry)
+                    old, new = fields.get("old_string"), fields.get("new_string")
+                    if isinstance(old, str) and isinstance(new, str):
+                        pairs.append((old, new))
+        return AppliedRustEdits("claude", tool, cwd, (file_path,), (tuple(pairs),))
     return IgnoredEdit()
+
+
+def written_lines(source: str, replacements: tuple[Replacement, ...]) -> frozenset[int]:
+    """1-based numbers of the lines of source that the edit wrote."""
+    written: set[int] = set()
+    for old, new in replacements:
+        old_lines, new_lines = old.split("\n"), new.split("\n")
+        prefix = 0
+        limit = min(len(old_lines), len(new_lines))
+        while prefix < limit and old_lines[prefix] == new_lines[prefix]:
+            prefix += 1
+        suffix = 0
+        while suffix < limit - prefix and old_lines[-suffix - 1] == new_lines[-suffix - 1]:
+            suffix += 1
+        changed_offsets = tuple(
+            offset for offset in range(prefix, len(new_lines) - suffix) if new_lines[offset]
+        )
+        if not changed_offsets:
+            continue
+        at = source.find(new)
+        if at < 0:
+            added_lines = {line.strip() for line in new_lines} - {line.strip() for line in old_lines}
+            written.update(
+                line_number for line_number, line in enumerate(source.split("\n"), 1)
+                if line.strip() and line.strip() in added_lines
+            )
+            continue
+        line_number = 1
+        previous_at = 0
+        while at >= 0:
+            line_number += source.count("\n", previous_at, at)
+            written.update(line_number + offset for offset in changed_offsets)
+            previous_at = at
+            at = source.find(new, at + len(new))
+    return frozenset(written)
 
 
 def count_body_lines(body: str) -> int:
