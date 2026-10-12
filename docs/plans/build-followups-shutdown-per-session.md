@@ -17,6 +17,7 @@ The showrunner's account of that morning, 2026-10-12 (claude 3, 20 sessions, `do
 ## Delegation Context
 
 - **Project:** `~/.claude` config repo: the scripts every Claude session runs. This plan rewrites `scripts/shutdown/` around one record per session. Worktree `/home/natepiano/worktrees/claude-build-followups-shutdown`, branch `build-followups-shutdown` (unit `shutdown-unit`); name both in every dispatch.
+- **Project started:** 2026-10-12T14:42:22.129+00:00
 - **Stack:** Python 3 standard library (`fcntl`, `json`, `subprocess`, `concurrent.futures`, `argparse`, `unittest`), checked by basedpyright; `TypedDict` wire types tagged by `kind`; frozen dataclasses for in-process results.
 - **Layout:** `scripts/shutdown/` (`record.py`, `settle.py`, `stop.py`, `restart.py`, `shutdown.py`, `launch_permission.py`, `remote.py`, `inventory.py`, tests beside them) · `scripts/production/add_unit.py` (owner enh-showrunner-unit) · `scripts/message/sessions.py` · `commands/shutdown.md` · `docs/as-built/shutdown-and-restart.md`. State on disk: `SHUTDOWN_STATE_DIR` (default `~/.local/state/shutdown`) `/<login case-folded>/`.
 - **Key files:**
@@ -58,7 +59,7 @@ The showrunner's account of that morning, 2026-10-12 (claude 3, 20 sessions, `do
 
 ## Phases
 
-### Phase 1 — Restarts launch in parallel and are confirmed by the session registry  · status: todo
+### Phase 1 — Restarts launch in parallel and are confirmed by the session registry  · status: done
 
 #### Work Order
 
