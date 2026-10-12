@@ -127,11 +127,13 @@ The terminal equivalent is:
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py swap unit "claude 1"
 ```
 
-It shows shutdown's output unchanged, followed by `units come back on claude 1 when claude 3 is down`. This confirms acceptance; shutdown and restart may still be running. Watch `/shutdown status`, then check the resumed units' account labels. After a complete stop, the requester gets:
+It shows shutdown's output unchanged, followed by `units come back on claude 1 when claude 3 is down`. Shutdown prints one `<name>: added` line for each unit it will stop, then `shutdown of claude 3 started; /shutdown status to watch, /shutdown cancel to undo`. This confirms acceptance; the stops and restarts are still running. Each unit stops when it reaches a safe point and comes back on claude 1 by itself, without waiting for the others. Watch `/shutdown status "claude 3"`, then check the resumed units' account labels. When every unit is back, a session that ran the swap gets:
 
 ```text
-The sessions restart automatically: units on the unit account, other sessions on the account they ran on.
+claude 3 is back
 ```
+
+The message names the old account, because the request was a shutdown of claude 3; the units are on claude 1. A swap run from a terminal gets no message.
 
 Before changing the role, swap refuses and names the cause. Reported values replace the angle brackets below:
 
@@ -148,15 +150,15 @@ An unfit target reports its first `/showrunner:accounts` problem. Fix account re
 
 `unit account unchanged: still claude 3` means shutdown refused and the old role is back. Fix the printed refusal, then run the same swap again.
 
-If shutdown ends `stop partial`, the new role stays selected and nothing restarts. Use the alert's runnable retry to stop the rest and then resume the saved sessions. For this example:
+If a unit's stop fails, the result is `claude 3: stop partial`, and the alert names the unit. The new role stays selected. Units that stopped are already back on claude 1; the failed one is still on claude 3. Retry its stop, naming the old account and the unit from the alert:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py down 'claude 3' --restart
+~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now 'claude 3' --only '<unit name>'
 ```
 
-The retry prints `shutdown of claude 3 resumed; /shutdown status to watch`. It preserves the saved sessions, timers and scope. A different `--only` refuses with `shutdown: retry must keep the original --only scope`. A peer that is not ready refuses with `shutdown: peer is not ready to retry stopping; nothing was shut down`. The alert also keeps its manual `/shutdown restart` guidance for a session on the old account.
+It prints `<unit name>: stopping now`. The unit stops without waiting to be idle and comes back on claude 1. Without `--only`, `now` also stops every unit that is still finishing its work. Repeating `down` retries nothing: each unit prints `<name>: already in progress`.
 
-`claude 3: automatic restart skipped` means the peer record could not be read after a complete stop. Restore access, then run the alert's command:
+`claude 3 is not fully back` means a unit stopped and did not fully come back. Run the alert's command:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart 'claude 3'

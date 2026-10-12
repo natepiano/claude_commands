@@ -191,88 +191,52 @@ class Entry(TypedDict): crates_io: CratesIoUnread | CratesIoRead | CratesIoUnlis
 
 ### Phase 4 — The check runs every four hours and tells the showrunner only what changed  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** Starting a watch schedules its check; a scheduled check is silent unless a dependency's state changed, and the watch closes itself when every dependency is on the target.
-
-**Spec:**
-Work only in the worktree and branch the Delegation Context names.
-
-`scripts/bevy_upgrade/upgrade_schedule.py`:
+A watch keeps one notifier job, `bevy-upgrade-<slug>`, that runs `check --scheduled` every 240 minutes. A scheduled check tells the showrunner only what differs from what it was last told, and a check that finds every dependency on the target closes the watch.
 
 ```python
-def instance(slug: str) -> str: ...                           # "bevy-upgrade-<slug>"
+# upgrade_schedule.py
+def instance(slug: str) -> str: ...                    # "bevy-upgrade-<slug>"
 def ensure_job(record: Record) -> None: ...
 def remove_job(slug: str) -> None: ...
-def next_check(slug: str) -> datetime | None: ...             # from `notifier.sh status <instance>`; None when the notifier has no such job
-def tell_showrunner(slug: str, summary: str, text: str) -> bool: ...   # True when the message was handed to the showrunner
-```
-
-- The notifier is `BEVY_UPGRADE_NOTIFIER` when set, else `scripts/message/notifier.sh` beside this repo's `scripts/`; it runs as `zsh <notifier> …`. `send.py` is `BEVY_UPGRADE_SEND` when set, else `scripts/message/send.py`.
-- `ensure_job` runs `new <instance> --every 240 --timeout 300 --run "<py> <bevy_upgrade.py> --production <doc> check --scheduled"`, each word of the run command passed through `shlex.quote`, `<py>` being `scripts/lib/py`. `new` keeps an existing instance's clock, so calling it again is safe.
-- `tell_showrunner` sends to `showrunners.current_address(slug)` with `--from bevy-upgrade --key bevy-upgrade-<slug> --summary <summary> --text <text>`. It returns `True` only when `send.py` exits 0 and its output line starts with `SENT:`. With an empty address it sends nothing and returns `False`. `SKIPPED:` (exit 0: the key was acknowledged with `send.py ack`), `QUEUED:` (exit 1), `REFUSED:` (exit 2) and `FAILED:` (exit 3) return `False` too. For every `False` it prints `bevy_upgrade: the showrunner was not told: <the outcome line, or "no showrunner session">` on stderr, which the notifier keeps in the job's log. A queued message is the latest for its key, so the next check's message replaces it.
-
-`upgrade_record.py` grows:
-
-```python
-class Announced(TypedDict):      # what the showrunner was last told about one crate
-    state: str                   # the state word it was told
-    repository: str              # the GitHub repository the items were read from; "" when the entry has no read branch
-    items: dict[str, str]        # item number → the item state it was told
-class Record(TypedDict):         # added field
-    announced: dict[str, Announced] | None   # None until a table or a message has reached the showrunner
-```
-
-`announced` is the one place a state word is stored, the exception the Delegation Context names. It records what the showrunner was told, never what is true now; every state shown is still derived when printed. `load` gives a record without the field `None`; a present field is validated.
-
-`upgrade_report.py`:
-
-```python
+def next_check(slug: str) -> datetime | None: ...      # None when the notifier has no such job
+def tell_showrunner(slug: str, summary: str, text: str) -> bool: ...   # True only for exit 0 and a `SENT:` line
+def retire_message(slug: str) -> None: ...
+# upgrade_record.py
+class Announced(TypedDict): state: str; repository: str; items: dict[str, str]   # what the showrunner was last told about one crate
+class Record(TypedDict): announced: dict[str, Announced] | None   # added field; None until a table or a message reached the showrunner
+# upgrade_report.py
 def announcement(entry: Entry, target: str) -> Announced: ...
 def changes(record: Record) -> list[str]: ...
 def line(record: Record, zone: ZoneInfo, now: datetime, next_due: datetime | None, pins_error: str) -> str: ...
 ```
 
-- `changes` compares each entry's `announcement` with `record["announced"]` and returns one line per difference: `- <crate>: <old state> → <new state>` when the state word changed, with ` (<ready> on Bevy <requirement>)` after `release ready` and ` (<branch name> @ <rev 7>)` after `git ready`; `- <crate>: PR #<n> <old> → <new>` or `- <crate>: new PR #<n> <state>: <title>` for an item, with `issue #<n>` in place of `PR #<n>` when the item's `kind` is `issue`; `- <crate>: new dependency` and `- <crate>: no longer a dependency` for entries that came or went. `announced` of `None` gives no lines. An announced item the entry no longer holds gives no line: a check drops stored items only when the crate's repository changed. `announcement` takes `repository` from the entry's read branch. When it differs from the announced `repository`, the announced items are another repository's: every item the entry holds is a new item, and none is a transition.
-- `line` is one sentence for a report: `Bevy <target> upgrade: <d> of <n> done`, then each other state with a non-zero count in `STATE_ORDER` as `, <count> <state>`, with ` (<k> waiting for your answer)` after `git ready` when k entries there have no answer, then `; checked <HH:MM zone>` and `, next check <HH:MM zone>` when `next_due` is not `None`. When the table would say stale, it ends `; upstream last checked <YYYY-MM-DD HH:MM zone> (stale)` instead, and while `checked` is `None`, `; no complete upstream check yet`. When `pins_error` is not `""` the sentence ends with `; pins not re-read since <YYYY-MM-DD HH:MM zone>`, from `pins_read`.
-
-`bevy_upgrade.py`:
-
-- The baseline. Every verb that prints the table (`start`, `status`, `check` by hand, `approve`, `decline`, `forget`, `note`, `stop`) prints `Changed since the last report:` and the `changes` lines above the table when there are any, and stores every entry's `announcement` in `announced` before the one save. So `start` leaves a baseline, and from this phase `status` always saves. A closed record prints no change lines.
-- `line` prints only the sentence. It takes no lock and saves nothing: `save` replaces the file whole, so a reader never sees half a record. It loads, re-reads pins, applies them in memory and prints. It never touches `announced`. With a failed pins read it prints the sentence with its pins clause and nothing else on stdout.
-- `check --scheduled` prints nothing on stdout. It re-reads pins, runs the check and saves once. With a failed pins read it makes no lookup, sends nothing, saves nothing and never closes; it prints one `bevy_upgrade: pins could not be re-read: <reason>` line on stderr and exits 1. With `announced` of `None` it stores the baseline and sends nothing. With `changes` it sends `tell_showrunner(slug, "Bevy <target> upgrade: <N> changes", <the change lines, then the line sentence, then "Full table: /showrunner:bevy_upgrade">)` and stores `announced` only when the send returned `True`, so a change found while the showrunner is away is sent by a later check.
-- Closing. When every entry is `done` after a pins re-read that succeeded in the same run, `check` closes the watch. By hand it sets `closed`, removes the job and prints `Bevy <target> upgrade: every dependency is on Bevy <target>. The watch is closed.` above the table. Scheduled, it sends the change lines, if any, then that sentence, with the summary `Bevy <target> upgrade: done`; only when that send returned `True` does it store `announced`, set `closed` and remove the job. Otherwise the record stays open and the job stays, so the next scheduled check sends it. `remove_job` runs after the save.
-- `stop` sets `closed`, removes the job and prints the table. On a closed record `status` prints the table under `This watch closed <YYYY-MM-DD>.`, `check` by hand refuses with `bevy_upgrade: the watch is closed; start a new one`, and `check --scheduled` removes the job and exits 0 with no message, so a job that outlived its watch removes itself.
-- `line` prints nothing and exits 0 when the production has no record or the record is closed.
-- `start` calls `ensure_job` after its save. `status`, `check` and `line` call it too whenever the record is open, so a job that went missing comes back.
-
-The command file gains `stop`, `line`, and: the scheduled check writes to this session only when something changed; show those lines to the user in the next reply.
+- **Job.** `ensure_job` runs `zsh <notifier> new <instance> --every 240 --timeout 300 --run "<scripts/lib/py> <bevy_upgrade.py> --production <doc> check --scheduled"`, each word of the run command through `shlex.quote`; `new` keeps an existing instance's clock. The notifier is `BEVY_UPGRADE_NOTIFIER`, else `scripts/message/notifier.sh`; the sender is `BEVY_UPGRADE_SEND`, else `scripts/message/send.py`. `start`, `status` and a hand `check` call `ensure_job` on an open record, and a closing run calls `remove_job`, both inside the record lock, directly after the one save.
+- **Messages.** `tell_showrunner` sends to `showrunners.current_address(slug)` with `--from bevy-upgrade --key bevy-upgrade-<slug> --summary <summary> --text <text>`. An empty address, `SKIPPED:`, `QUEUED:`, `REFUSED:` and `FAILED:` return `False` and print `bevy_upgrade: the showrunner was not told: <the outcome line, or "no showrunner session">` on stderr. `retire_message` runs `send.py retire --to <address> --from bevy-upgrade --key bevy-upgrade-<slug>`: silent on success, nothing run for an empty address, and `bevy_upgrade: could not retire the queued message: <outcome>` on stderr for a non-zero exit or an `OSError`, one from the address lookup included. A failed retire changes neither the exit code nor the table.
+- **Baseline.** Every verb that prints the table (`start`, `status`, a hand `check`, `approve`, `decline`, `forget`, `note`, `stop`) prints `Changed since the last report:` and the `changes` lines above the table when there are any, stores every entry's `announcement` in `announced` before the save, and calls `retire_message` after it, inside the lock, so a queued message never repeats what the table showed. `status` therefore always saves. A closed record prints no change lines.
+- **Change lines.** `changes` compares each entry's `announcement` with `announced`: `- <crate>: <old state> → <new state>`, with ` (<ready> on Bevy <requirement>)` after `release ready` and ` (<branch name> @ <rev 7>)` after `git ready`; `- <crate>: PR #<n> <old> → <new>` and `- <crate>: new PR #<n> <state>: <title>`, with `issue #<n>` for an item of kind `issue`; `- <crate>: new dependency` and `- <crate>: no longer a dependency`. `announced` of `None` gives no lines, and an announced item the entry no longer holds gives none. `announcement` takes `repository` from the entry's read branch; when it differs from the announced one, every item the entry holds is a new item and none is a transition.
+- **Scheduled check.** `check --scheduled` prints nothing on stdout, re-reads pins, runs the check and saves once. With `announced` of `None` it stores the baseline and sends nothing. With changes it sends the summary `Bevy <target> upgrade: 1 change` or `Bevy <target> upgrade: <N> changes` and, as text, the change lines, the `line` sentence and `Full table: /showrunner:bevy_upgrade`; it stores `announced` only when the send returned `True`, so a change found while the showrunner is away is sent by a later check. With a failed pins read it makes no lookup, sends nothing, saves nothing and never closes: one `bevy_upgrade: pins could not be re-read: <reason>` line on stderr, exit 1. It never calls `retire_message`.
+- **Closing.** When every entry is `done` after a pins re-read that succeeded in the same run, `check` closes the watch. By hand it sets `closed`, removes the job and prints `Bevy <target> upgrade: every dependency is on Bevy <target>. The watch is closed.` above the table. Scheduled, it sends the change lines, if any, then that sentence under the summary `Bevy <target> upgrade: done`, and only when that send returned `True` does it store `announced`, set `closed` and remove the job. `stop` sets `closed`, removes the job and prints the table. On a closed record `status` prints the table under `This watch closed <YYYY-MM-DD>.`, a hand `check` refuses with `bevy_upgrade: the watch is closed; start a new one` (exit 2), and `check --scheduled` removes the job and exits 0 with no message.
+- **`line`.** One sentence for a report: `Bevy <target> upgrade: <d> of <n> done`, then each other state with a non-zero count in `STATE_ORDER` as `, <count> <state>`, with ` (<k> waiting for your answer)` after `git ready` when k entries there have no answer, then `; checked <HH:MM zone>` and `, next check <HH:MM zone>` when `next_due` is not `None`. When the table would say stale it ends `; upstream last checked <YYYY-MM-DD HH:MM zone> (stale)` instead, and while `checked` is `None`, `; no complete upstream check yet`. With a failed pins read the sentence ends `; pins not re-read since <YYYY-MM-DD HH:MM zone>` and is all that stdout holds. The verb prints nothing and exits 0 for no record or a closed one.
 
 **Files:**
-- `scripts/bevy_upgrade/upgrade_schedule.py` — new: the notifier job and the message to the showrunner.
-- `scripts/bevy_upgrade/upgrade_record.py` — the `announced` field, its starting value and validation.
+- `scripts/bevy_upgrade/upgrade_schedule.py` — the notifier job, the message to the showrunner and the retire call.
+- `scripts/bevy_upgrade/upgrade_record.py` — `Announced` and `Record.announced`; `load` gives a record without the field `None` and validates a present one.
 - `scripts/bevy_upgrade/upgrade_report.py` — `announcement`, `changes` and `line`.
 - `scripts/bevy_upgrade/bevy_upgrade.py` — `stop`, `line`, `check --scheduled`, the baseline, the job upkeep and the closing rule.
-- `scripts/bevy_upgrade/test_upgrade_schedule.py` — new: the notifier and send commands, through stub scripts.
-- `scripts/bevy_upgrade/test_upgrade_record.py` — `announced` in a record without it and with a wrong type.
-- `scripts/bevy_upgrade/test_upgrade_report.py` — `announcement`, `changes` and `line`.
-- `scripts/bevy_upgrade/test_cli.py` — `stop`, `line`, `check --scheduled`, the baseline and the closing rule.
-- `commands/showrunner/bevy_upgrade.md` — `stop`, `line`, and what a scheduled message means.
+- `scripts/bevy_upgrade/test_upgrade_schedule.py`, `test_upgrade_record.py`, `test_upgrade_report.py`, `test_cli.py`, `test_upgrade_check.py` — their tests.
+- `commands/showrunner/bevy_upgrade.md` — `stop`, `line`, and the scheduled message as the one exception to the same-turn rule: its lines are shown in the next reply as received, and anything beyond them needs `status` first.
 
-**Seats:** 1 writer + 1 tester — the CLI ties the schedule, the changes and the closing rule together.
-- `impl` — `upgrade_schedule.py`, `upgrade_record.py`, `upgrade_report.py`, `bevy_upgrade.py`, `commands/showrunner/bevy_upgrade.md`.
-- `test` — `test_upgrade_schedule.py` and the additions to `test_upgrade_record.py`, `test_upgrade_report.py` and `test_cli.py`, from the Spec. The notifier and `send.py` stubs append their arguments to a file the test reads; a stub that exits non-zero stands for a showrunner that is away.
+**Binds later work:**
+- `line` takes no lock, saves nothing and never changes `announced`, so a reader never waits behind a running check. For an open record it still makes two notifier calls, `ensure_job` and `next_check`, and no sender call.
+- `announced` is the one stored state word. It records what the showrunner was told, never what is true now.
+- In `test_cli.py` the notifier and sender stand-ins record every call with its arguments, whether the record lock was held and the saved `announced` and `closed`: `tool_calls(kind)`, `tool_args(kind)` (sends only for `send`), `retire_calls()`, `retire_arguments()`, `clear_calls()`.
+- A new required `Record` field also needs the record fixture in `test_upgrade_check.py`.
 
-**Constraints from prior phases:** `run_check(record, pins, fetch, clock) -> CheckPass` updates the record and never raises for a failed lookup or a spent budget; its 180 s budget plus one request's 30 s timeout stays inside this phase's 300 s job limit. `upgrade_report.state` returns all seven states and `STATE_ORDER` orders them. `Entry.items` holds `number`, `kind`, `state`, `title`, `updated` and `head`; `Entry.branch` is `BranchUnread | BranchRead` (`repository`, `name`, `rev`, `committed`, `requirement`); `Entry.crates_io` is `CratesIoUnread | CratesIoRead | CratesIoUnlisted`: a read one holds `checked`, `releases`, `newest`, `ready`, `repository`, an unlisted one `checked` and `repository`. `Entry.answer` is `None` or holds `answer`, `at`, `words`. The stale rule is the table's: `checked` older than eight hours, any entry with `error`, or `target_error` not `""`.
-- Every CLI verb re-reads pins before it prints. When that fails, a verb other than `start` prints `pins could not be re-read: <reason>; showing pins read <HH:MM zone>` above the table, and `check` then makes no lookup and exits 1.
-- The CLI does all its work inside one `with upgrade_record.locked(slug):` block and saves once, at the block's end; a refused verb raises before the save. Before this phase a `status` whose pins re-read failed saves nothing, and `test_cli.py` asserts it through `run_cli(..., count_saves=True)`.
-- `bevy_upgrade.py` uses `fixture_fetch` when `BEVY_UPGRADE_FIXTURES` names a JSON file of URL to body, and `test_cli.py` sets it in `setUp`.
-- `test_cli.py`'s `write_fixtures()` holds the GitHub answers for `example/adapter` (the repository, `commits/main`, the raw manifest as a string, the issues list with open PR #7, and `pulls/7`), so a check with no ready release prints `port in PR | wait for PR #7`; `write_fixtures(ready=True)` makes no GitHub request. A second check of the same entry asks only `commits/main` and the issues list. A fixture body of `null` answers not found.
-- The type rule: a value that can be missing in two ways, or values that are present or missing together, is a `TypedDict` union tagged by `status`; one field whose absence has one meaning keeps an empty value or `None` with a comment that says what it means.
-- `send.py` prints one outcome line and exits by it: `SENT:` 0, `SKIPPED:` 0, `QUEUED:` 1, `REFUSED:` 2, `FAILED:` 3 (`EXIT` in `scripts/message/send.py`).
-- A module here needs a name no other `scripts/*/` directory uses, because `add_unit` puts those directories first on `sys.path`; `upgrade_schedule` is free (checked 2026-10-12).
+**Gotchas:** The notifier takes its own lock only around its state edits and releases it before running a stored command, so a notifier call made under the record lock cannot deadlock with a firing job. `line` calls `ensure_job` outside the lock; a job it re-creates for a watch closed in that instant removes itself at its next run. A watch with zero dependencies closes at its first check. `next_check` raises `ValueError` for a `next_due=` line it cannot parse. A scheduled check for a production with no record exits 0 and leaves its job.
 
-**Acceptance gate:** the Delegation Context **Test** and **Lint** commands pass. The tests cover: the exact `new` command and its quoting for a doc path with a space; `next_check` read from a stub's `next_due=` line and `None` for exit 1; `start`, then a scheduled check with a change sends once, and a second run sends nothing; a scheduled check with no change sends nothing; a record whose `announced` is `None` gets its baseline from a scheduled check, which sends nothing; with an empty address `announced` stays and the next run sends; `status` clears pending changes; `line` leaves them and leaves the record file byte for byte as it was; all entries `done` closes the watch and removes the job; all entries `done` with a failing send leaves the record open and the job in place, and the next scheduled check sends and closes; a scheduled check with a failed pins read prints nothing on stdout, exits 1 and does not close; `line` with a failed pins read prints one sentence; `stop`; `check` by hand refused on a closed record, and a scheduled one removing the job; a `send.py` stub that prints `SKIPPED:` and exits 0 leaves `announced` as it was and an all-`done` watch open; a scheduled check in which an entry turns `git ready` sends `- <crate>: port in PR → git ready (<branch name> @ <rev 7>)` and a sentence with `(1 waiting for your answer)`; an entry whose GitHub lookup failed keeps its stored facts and `line` ends `(stale)`; the same item number under a changed repository gives a `new PR` line and no transition; an issue's line says `issue #<n>`. `bash -n` is not needed (no shell file changes).
+**Ruled out:** Job upkeep after the lock is released: a `start` between a closing run's save and its job removal lost its new job. Retiring a queued message only when changes were pending: every saving hand verb retires, one rule with no state to read. `<N> changes` for a single line.
 
 ### Phase 5 — The dailies carries the upgrade as a topic read from the record  · status: todo
 
@@ -305,7 +269,7 @@ Work only in the worktree and branch the Delegation Context names. This phase ed
 - `impl` — `scripts/bevy_upgrade/bevy_upgrade.py`, `scripts/bevy_upgrade/test_cli.py`.
 - `test` opens as impl — `scripts/production/dailies_input.py`, `scripts/production/test_dailies_input.py`, `commands/showrunner/dailies.md`. It codes against the JSON object above and a stub script set through `DAILIES_BEVY_UPGRADE`, the way `watch_stubs` in `test_dailies_input.py` replaces `review_regime.py`.
 
-**Constraints from prior phases:** `bevy_upgrade.py line` prints one sentence for an open record and nothing otherwise. It takes no lock, saves nothing and never changes `announced`, so the dailies never waits behind a running check. `upgrade_report.line(record, zone, now, next_due, pins_error)` builds that sentence; with a failed pins read it ends `; pins not re-read since <YYYY-MM-DD HH:MM zone>`. A `git ready` entry's `answer` is `None` until the user approves or declines. `test_cli.py` sets `BEVY_UPGRADE_FIXTURES` in `setUp`, and its subprocess rejects real network access. In `dailies_input.py`, `report(step, state, detail)` (line 237) prints `<step>: <state> — <detail>`; the states in use are `ok`, `unavailable`, and `failed`, which is printed only before `return 2`.
+**Constraints from prior phases:** `bevy_upgrade.py line` prints one sentence for an open record and nothing otherwise. It takes no lock, saves nothing and never changes `announced`, so the dailies never waits behind a running check. `_line(production, now)` in `bevy_upgrade.py` is that verb: for an open record it calls `upgrade_schedule.ensure_job` and `upgrade_schedule.next_check`, two notifier calls through `BEVY_UPGRADE_NOTIFIER`, and never the sender. Every other hand verb that saves makes one `send.py retire` call after its save; `line` makes none and `line --json` must make none. In `test_cli.py` the stand-ins record each call: `tool_args("notifier")` and `tool_args("send")` give the argument lists, `retire_calls()` the retire calls, and `clear_calls()` empties them. `upgrade_report.line(record, zone, now, next_due, pins_error)` builds that sentence; with a failed pins read it ends `; pins not re-read since <YYYY-MM-DD HH:MM zone>`. A `git ready` entry's `answer` is `None` until the user approves or declines. `test_cli.py` sets `BEVY_UPGRADE_FIXTURES` in `setUp`, and its subprocess rejects real network access. In `dailies_input.py`, `report(step, state, detail)` (line 237) prints `<step>: <state> — <detail>`; the states in use are `ok`, `unavailable`, and `failed`, which is printed only before `return 2`.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/bevy_upgrade -p 'test_*.py'` and `python3 -m unittest discover -s scripts/production -p 'test_dailies_input.py'` pass. `basedpyright scripts/bevy_upgrade scripts/production/dailies_input.py scripts/production/test_dailies_input.py` prints `0 errors, 0 warnings, 0 notes`. The CLI tests cover `line --json` output that parses as one JSON object when the pins re-read failed. The dailies tests cover the topic with `needs_user` true and false, no topic for empty output, and the `unavailable` form for a non-zero exit: the builder exits 0, prints `bevy upgrade: unavailable — …` and writes the input with the topic. Before the checkpoint notice, trial-merge the owner's tip per the production contract (item 9) and run the dailies tests.
 

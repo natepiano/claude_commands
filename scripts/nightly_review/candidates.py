@@ -13,16 +13,24 @@ The ledger is the one record, and every candidate is a line of its own:
 A line is open while it ends `— proposed` or `— deferred`. The gain is measured user-visible time
 (`38 min waiting`, `2.5 h red CI`) or a share of tokens (`3.1% of tokens`); a line with no tag is
 unmeasured. Time ranks before tokens and unmeasured comes last, as /nightly_next ranks them.
+
+The note at ~/rust/hanadocs/nightly improvement list.md copies the ledger's table.
+NIGHTLY_REVIEW_NOTE replaces that path; both commands rewrite the note.
 """
 from __future__ import annotations
 
 import os
 import re
+import socket
 import sys
+import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
+from zoneinfo import ZoneInfo
 
 ROOT = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "nightly-review"
+ZONE = ZoneInfo("America/New_York")
 # A title longer than this is cut, so one long sentence cannot widen the whole table.
 TITLE_WIDTH = 90
 
@@ -145,6 +153,40 @@ def table(candidates: list[Candidate]) -> str:
     return "\n".join(lines)
 
 
+def now() -> datetime:
+    return datetime.now(ZONE)
+
+
+def write_note(body: str) -> None:
+    value = os.environ.get("NIGHTLY_REVIEW_NOTE")
+    note = Path(value).expanduser() if value else Path.home() / "rust" / "hanadocs" / "nightly improvement list.md"
+    temporary: Path | None = None
+    try:
+        if not note.parent.is_dir() or not (ROOT / "ledger.md").is_file():
+            return
+        moment = now().astimezone(ZONE)
+        host = socket.gethostname().split(".", 1)[0]
+        read_line = (
+            f"Read {moment:%Y-%m-%d %H:%M} {moment:%Z} from the nightly review's ledger on {host}. "
+            "The nightly review rewrites this note; edits made here are lost."
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=note.parent, prefix=f".{note.name}.", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            _ = handle.write(f"{read_line}\n\n{body}\n")
+            os.fchmod(handle.fileno(), 0o644)
+        os.replace(temporary, note)
+    except OSError as error:
+        print(f"candidates: cannot write {note}: {error}", file=sys.stderr)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def gain_words(value: str) -> str:
     """A report's gain as a tag's words; empty when the report calls it unmeasured or leaves it out."""
     text = value.strip().rstrip(".")
@@ -195,14 +237,16 @@ def record(report: Path) -> int:
     new = [each.line for each in candidates if not any(line.startswith(each.head) for line in known)]
     if not new:
         print("nothing new to record")
-        return 0
-    try:
-        with ledger.open("a", encoding="utf-8") as handle:
-            _ = handle.write("".join(f"{line}\n" for line in new))
-    except OSError as error:
-        print(f"candidates: {error}", file=sys.stderr)
-        return 1
-    print("\n".join(new))
+    else:
+        try:
+            with ledger.open("a", encoding="utf-8") as handle:
+                _ = handle.write("".join(f"{line}\n" for line in new))
+        except OSError as error:
+            print(f"candidates: {error}", file=sys.stderr)
+            return 1
+        print("\n".join(new))
+    open_candidates = ranked(read_lines(ledger))
+    write_note(table(open_candidates) if open_candidates else "no open candidates")
     return 0
 
 
@@ -210,7 +254,9 @@ def main(arguments: list[str]) -> int:
     match arguments:
         case []:
             candidates = ranked(read_lines(ROOT / "ledger.md"))
-            print(table(candidates) if candidates else "no open candidates")
+            body = table(candidates) if candidates else "no open candidates"
+            print(body)
+            write_note(body)
             return 0
         case ["record", report]:
             return record(Path(report).expanduser())

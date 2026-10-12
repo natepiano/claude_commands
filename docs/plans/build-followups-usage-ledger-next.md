@@ -4,7 +4,7 @@
 
 - [ ] **Periodic app-server sweep on natedev and the Mac**
   - Target: a 30-minute timer (a systemd user timer on natedev, launchd on the Mac) running `codex_mesh.py sweep --root /tmp/claude/delegate --stop`
-  - Why needed: orphan Codex app-servers from crashed or killed runs never reach phase cleanup or `end_session.sh`, so they live for days (5 found on 2026-10-10)
+  - Why needed: each app-server's own watcher already stops it once unused (`idle-stop`, shipped 2026-10-08); a periodic sweep covers a server whose watcher is missing or has exited (5 orphans found on 2026-10-10)
   - Completion condition: an orphan older than the idle window is gone within 30 minutes on both machines, and no live run's server is stopped
   - Revealed by: Phase 2
 
