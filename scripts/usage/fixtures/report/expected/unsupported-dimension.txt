@@ -1,0 +1,1 @@
+usage_report: metric 'account_switches' cannot group by 'role'; accepted: day, machine

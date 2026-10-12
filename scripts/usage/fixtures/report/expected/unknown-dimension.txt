@@ -1,0 +1,1 @@
+usage_report: invalid dimensions 'absent-dimension'; accepted: day, role, lens, model, effort, machine, unit (once each)

@@ -56,7 +56,7 @@ Family = Literal["claude", "codex"]
 LogFamily = Literal["claude", "codex", "history"]
 SourceFamily = Literal["claude", "codex", "history", "checkpoints", "readings", "account_roles"]
 LOG_FAMILIES: tuple[LogFamily, ...] = ("claude", "codex", "history")
-STORE_VERSION = 6
+STORE_VERSION = 7
 MAX_SQLITE_INTEGER = (1 << 63) - 1
 
 
@@ -179,11 +179,17 @@ class Edit:
 
 
 @dataclass(frozen=True)
+class Folder:
+    agent: Agent
+    folder: str
+
+
+@dataclass(frozen=True)
 class NoMeasurement:
     pass
 
 
-ThreadMeasurement = Turn | Compaction | Opening | Edit
+ThreadMeasurement = Turn | Compaction | Opening | Edit | Folder
 Measurement = ThreadMeasurement | NoMeasurement
 
 
@@ -274,6 +280,8 @@ class CodexContext:
         if not isinstance(self.agent, CodexThread):
             return ()
         values: list[ThreadMeasurement] = []
+        if record.get("type") == "session_meta" and isinstance(payload.get("cwd"), str):
+            values.append(Folder(self.agent, cast(str, payload["cwd"])))
         opening = self.lifecycle.opening
         if isinstance(opening, KnownThreadOpening) and opening != previous_opening:
             values.append(Opening(self.agent, opening.at))
@@ -380,6 +388,8 @@ CREATE TABLE IF NOT EXISTS turns (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS claude_message ON turns (machine, turn_key)
     WHERE family = 'claude';
+CREATE INDEX IF NOT EXISTS turns_at ON turns (at);
+CREATE INDEX IF NOT EXISTS turns_agent_at ON turns (machine, family, parent_id, agent_id, at);
 CREATE TABLE IF NOT EXISTS compactions (
     machine TEXT NOT NULL, family TEXT NOT NULL, parent_id TEXT NOT NULL,
     agent_id TEXT NOT NULL, at TEXT NOT NULL,
@@ -400,6 +410,11 @@ CREATE TABLE IF NOT EXISTS turn_sources (
 CREATE TABLE IF NOT EXISTS openings (
     machine TEXT NOT NULL, family TEXT NOT NULL, parent_id TEXT NOT NULL,
     agent_id TEXT NOT NULL, at TEXT NOT NULL,
+    PRIMARY KEY (machine, family, parent_id, agent_id)
+);
+CREATE TABLE IF NOT EXISTS folders (
+    machine TEXT NOT NULL, family TEXT NOT NULL, parent_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL, folder TEXT NOT NULL,
     PRIMARY KEY (machine, family, parent_id, agent_id)
 );
 CREATE TABLE IF NOT EXISTS edits (
@@ -536,6 +551,12 @@ def save_measurement(db: sqlite3.Connection, value: Measurement, resolver: RoleR
     if isinstance(value, NoMeasurement):
         return 0
     machine, family, kind, parent_id, agent_id = identity_columns(value.agent)
+    if isinstance(value, Folder):
+        _ = db.execute("INSERT INTO folders VALUES (?, ?, ?, ?, ?) " +
+                       "ON CONFLICT(machine, family, parent_id, agent_id) DO UPDATE SET folder = excluded.folder " +
+                       "WHERE folders.family = 'codex' AND folders.folder != excluded.folder",
+                       (machine, family, parent_id, agent_id, value.folder))
+        return 0
     if isinstance(value, Opening):
         # Codex metadata can revise its opening; Claude keeps its first timestamp.
         _ = db.execute("INSERT INTO openings VALUES (?, ?, ?, ?, ?) " +
@@ -620,6 +641,7 @@ def read_file(machine: str, path: Path, family: Family,
     agent = claude_identity(machine, path)
     edit_seen = False
     opening_seen = False
+    folder_seen = False
     completed = 0
     with path.open("rb") as source:
         # Changed files replay their prefix to recover context and the first edit.
@@ -629,6 +651,10 @@ def read_file(machine: str, path: Path, family: Family,
             try:
                 if family == "claude":
                     record = json_fields(line)
+                    cwd = record.get("cwd")
+                    if not folder_seen and isinstance(cwd, str):
+                        values.append(Folder(agent, cwd))
+                        folder_seen = True
                     edited = claude_edit(record)
                     edit_seen = edit_seen or edited
                     at = parse_timestamp(record.get("timestamp"))
@@ -978,6 +1004,9 @@ def agent_record(agent: Agent) -> dict[str, object]:
 
 
 def measurement_record(value: ThreadMeasurement) -> dict[str, object]:
+    if isinstance(value, Folder):
+        return {"type": "measurement", "kind": "folder", "agent": agent_record(value.agent),
+                "folder": value.folder}
     kind = ("turn" if isinstance(value, Turn) else "compaction" if isinstance(value, Compaction)
             else "opening" if isinstance(value, Opening) else "edit")
     record: dict[str, object] = {
@@ -1140,10 +1169,15 @@ def remote_measurement(record: dict[str, object], machine: str, family: Family) 
     if (family == "claude" and isinstance(agent, CodexThread)
             or family == "codex" and not isinstance(agent, CodexThread)):
         raise RemoteReadFailed("invalid remote agent kind")
+    measurement_kind = remote_string(record, "kind")
+    if measurement_kind == "folder":
+        folder = record.get("folder")
+        if not isinstance(folder, str):
+            raise RemoteReadFailed("remote folder missing or invalid")
+        return Folder(agent, folder)
     at = parse_timestamp(remote_string(record, "at"))
     if at is None:
         raise RemoteReadFailed("invalid remote measurement time")
-    measurement_kind = remote_string(record, "kind")
     if measurement_kind == "compaction":
         return Compaction(agent, at)
     if measurement_kind == "opening":
@@ -1397,6 +1431,10 @@ def collect_mac(db: sqlite3.Connection) -> None:
         source_line(machine, "agents", 0, SourceState.UNREACHABLE, detail)
 
 
+def store_path() -> Path:
+    return state_dir() / "usage.db"
+
+
 class CommandLine(argparse.Namespace):
     db: Path
     machine: str
@@ -1411,7 +1449,7 @@ class CommandLine(argparse.Namespace):
 
     def __init__(self, readings: Path, account_roles: Path, claude_repo: Path, production_docs: Path) -> None:
         super().__init__()
-        self.db = state_dir() / "usage.db"
+        self.db = store_path()
         self.machine = "natedev"
         self.claude_root = Path.home() / ".claude/projects"
         self.codex_root = Path.home() / ".codex/sessions"

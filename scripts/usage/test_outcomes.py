@@ -25,7 +25,7 @@ THREAD = "outcome-thread"
 CORRECTED_THREAD = "opening-correction-thread"
 OUTCOME_TABLES = ("runs", "phases", "passes", "findings", "repair_rounds")
 DATA_TABLES = (*OUTCOME_TABLES, "checkpoints", "account_readings", "account_role_changes",
-               "turns", "compactions", "openings", "edits", "cursors")
+               "turns", "compactions", "openings", "edits", "folders", "cursors")
 
 WEIGHTED_CHECKPOINTS = """
 WITH used AS (
@@ -113,6 +113,60 @@ class OutcomeFixture(CollectorFixture):
 
 
 class OutcomeTests(OutcomeFixture):
+    def test_folder_schema_version_and_turn_time_index(self) -> None:
+        _ = self.collect()
+        columns = self.rows("PRAGMA table_info(folders)")
+        self.assertEqual(self.values(columns, "name"),
+                         [("machine",), ("family",), ("parent_id",), ("agent_id",), ("folder",)])
+        self.assertEqual(self.values(columns, "pk"), [(1,), (2,), (3,), (4,), (0,)])
+        self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), 7)
+        self.assertEqual(self.values(self.rows("PRAGMA index_info(turns_at)"), "name"), [("at",)])
+
+    def test_claude_folder_uses_first_cwd_even_after_saved_cursor(self) -> None:
+        path = self.claude_root / "project/folder-session.jsonl"
+        lines = (FIXTURES / "updates/claude-folders.jsonl").read_bytes().splitlines(keepends=True)
+        _ = path.write_bytes(b"".join(lines[:2]))
+        _ = self.collect()
+        self.assertEqual(self.values(self.rows("SELECT * FROM folders WHERE agent_id = 'folder-session'"), "folder"),
+                         [("/invented/first",)])
+        self.append_bytes(path, lines[2])
+        _ = self.collect()
+        self.assertEqual(self.values(self.rows("SELECT * FROM folders WHERE agent_id = 'folder-session'"), "folder"),
+                         [("/invented/first",)])
+
+    def test_codex_folder_follows_latest_metadata_in_one_read_and_after_cursor(self) -> None:
+        path = self.codex_root / "2026/10/10/rollout-folder.jsonl"
+        lines = (FIXTURES / "updates/codex-folders.jsonl").read_bytes().splitlines(keepends=True)
+        _ = path.write_bytes(b"".join(lines))
+        _ = self.collect()
+        self.assertEqual(self.values(self.rows("SELECT * FROM folders WHERE agent_id = 'folder-thread'"), "folder"),
+                         [("/invented/later",)])
+        self.append_bytes(path, lines[0])
+        _ = self.collect()
+        self.assertEqual(self.values(self.rows("SELECT * FROM folders WHERE agent_id = 'folder-thread'"), "folder"),
+                         [("/invented/first",)])
+        before = self.all_values(self.rows("SELECT * FROM folders"))
+        _ = self.collect()
+        self.assertEqual(self.all_values(self.rows("SELECT * FROM folders")), before)
+
+    def test_version_six_store_replays_folders_once_and_preserves_turns(self) -> None:
+        path = self.claude_root / "project/folder-session.jsonl"
+        _ = shutil.copyfile(FIXTURES / "updates/claude-folders.jsonl", path)
+        _ = self.collect()
+        turns = self.all_values(self.rows("SELECT * FROM turns ORDER BY family, agent_id, turn_key"))
+        with closing(sqlite3.connect(self.db_path)) as database, database:
+            _ = database.execute("DROP TABLE folders")
+            _ = database.execute("DROP INDEX turns_at")
+            _ = database.execute("PRAGMA user_version = 6")
+        _ = self.collect()
+        self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), 7)
+        self.assertEqual(self.values(self.rows("SELECT * FROM folders"), "agent_id", "folder"),
+                         [("folder-session", "/invented/first")])
+        self.assertEqual(self.all_values(self.rows("SELECT * FROM turns ORDER BY family, agent_id, turn_key")), turns)
+        before = self.snapshot()
+        _ = self.collect()
+        self.assertEqual(self.snapshot(), before)
+
     def test_outcome_schema_keeps_identity_and_source_event_without_finding_details(self) -> None:
         _ = self.collect()
         expected = {
@@ -543,6 +597,67 @@ class MacOutcomeTests(OutcomeFixture):
 
     def remote_history(self) -> Path:
         return self.mac_home / ".local/state/plan-delegate/runs/fixture-run.jsonl"
+
+    def add_folder_files(self, home: Path) -> tuple[Path, Path]:
+        claude = home / ".claude/projects/project/folder-session.jsonl"
+        codex = home / ".codex/sessions/2026/10/10/rollout-folder.jsonl"
+        _ = shutil.copyfile(FIXTURES / "updates/claude-folders.jsonl", claude)
+        _ = shutil.copyfile(FIXTURES / "updates/codex-folders.jsonl", codex)
+        return claude, codex
+
+    def test_mac_folders_match_local_first_claude_and_latest_codex_metadata(self) -> None:
+        _ = self.add_folder_files(self.root)
+        _ = self.add_folder_files(self.mac_home)
+        run = self.mac_collect()
+        self.assertEqual(run.stream["folder_records"], 3)
+        for machine in ("natedev", "mac"):
+            rows = self.rows("SELECT * FROM folders WHERE machine = ? ORDER BY family", (machine,))
+            self.assertEqual(self.values(rows, "family", "parent_id", "agent_id", "folder"), [
+                ("claude", "", "folder-session", "/invented/first"),
+                ("codex", "", "folder-thread", "/invented/later"),
+            ])
+        before = self.all_values(self.rows("SELECT * FROM folders ORDER BY machine, family"))
+        repeated = self.mac_collect()
+        self.assertEqual(repeated.stream["folder_records"], 0)
+        self.assertEqual(self.all_values(self.rows("SELECT * FROM folders ORDER BY machine, family")), before)
+
+    def test_mac_folder_update_after_cursor_keeps_claude_and_changes_codex(self) -> None:
+        claude, codex = self.add_folder_files(self.mac_home)
+        _ = self.mac_collect()
+        claude_lines = (FIXTURES / "updates/claude-folders.jsonl").read_bytes().splitlines(keepends=True)
+        codex_lines = (FIXTURES / "updates/codex-folders.jsonl").read_bytes().splitlines(keepends=True)
+        self.append_bytes(claude, claude_lines[2])
+        self.append_bytes(codex, codex_lines[0])
+        _ = self.mac_collect()
+        self.assertEqual(self.values(self.rows("SELECT * FROM folders WHERE machine = 'mac' ORDER BY family"), "folder"),
+                         [("/invented/first",), ("/invented/first",)])
+
+    def test_mac_folder_record_requires_a_string_folder_and_rolls_back_file(self) -> None:
+        _ = self.add_folder_files(self.mac_home)
+        for behavior in ("missing_folder", "invalid_folder"):
+            with self.subTest(behavior=behavior):
+                self.db_path = self.state / f"{behavior}.db"
+                run = self.mac_collect(behavior)
+                self.assertEqual(run.stream["altered_lifecycle_records"], 1)
+                self.assertFalse(self.rows("SELECT * FROM folders WHERE machine = 'mac'"))
+                self.assertFalse(self.rows("SELECT * FROM cursors WHERE machine = 'mac' AND path = ?",
+                                           (str(self.mac_home / '.claude/projects/project/folder-session.jsonl'),)))
+                self.assert_family_state(run.output, "mac", "claude", "partial")
+
+    def test_version_six_mac_store_replays_folders_once_without_new_turns(self) -> None:
+        _ = self.add_folder_files(self.mac_home)
+        _ = self.mac_collect()
+        turns = self.all_values(self.rows("SELECT * FROM turns ORDER BY machine, family, agent_id, turn_key"))
+        with closing(sqlite3.connect(self.db_path)) as database, database:
+            _ = database.execute("DELETE FROM folders")
+            _ = database.execute("PRAGMA user_version = 6")
+        replayed = self.mac_collect()
+        self.assertEqual(replayed.stream["folder_records"], 3)
+        self.assertEqual(len(self.rows("SELECT * FROM folders WHERE machine = 'mac'")), 2)
+        self.assertEqual(self.all_values(self.rows("SELECT * FROM turns ORDER BY machine, family, agent_id, turn_key")), turns)
+        repeated = self.mac_collect()
+        self.assertEqual(repeated.stream["folder_records"], 0)
+        self.assertEqual(repeated.stream["measurement_records"], 0)
 
     def test_mac_outcomes_and_lifecycle_equal_local_rows_without_remote_checkout(self) -> None:
         before = {str(path.relative_to(self.mac_home)): path.read_bytes()

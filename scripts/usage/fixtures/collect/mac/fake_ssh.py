@@ -40,6 +40,7 @@ class StreamReport(TypedDict):
     compaction_records: int
     opening_records: int
     edit_records: int
+    folder_records: int
     outcome_records: int
     history_cursor_records: int
     altered_outcome_records: int
@@ -52,7 +53,7 @@ class StreamReport(TypedDict):
     altered_evidence_records: int
 
 
-StreamKind = Literal["turn", "compaction", "opening", "edit", "cursor", "other"]
+StreamKind = Literal["turn", "compaction", "opening", "edit", "folder", "cursor", "other"]
 
 
 def stream_kind(value: object) -> StreamKind:
@@ -61,7 +62,7 @@ def stream_kind(value: object) -> StreamKind:
     fields = cast(dict[str, object], value)
     for name in ("kind", "type"):
         tag = fields.get(name)
-        if tag in ("turn", "compaction", "opening", "edit", "cursor"):
+        if tag in ("turn", "compaction", "opening", "edit", "folder", "cursor"):
             return cast(StreamKind, tag)
     for child in fields.values():
         kind = stream_kind(child)
@@ -98,7 +99,7 @@ def main() -> int:
         "measurement_records": 0, "cursor_records": 0, "forwarded_bytes": 0,
         "stdin_bytes": len(stdin), "options": sys.argv[1:-1],
         "turn_records": 0, "compaction_records": 0,
-        "opening_records": 0, "edit_records": 0, "outcome_records": 0, "history_cursor_records": 0,
+        "opening_records": 0, "edit_records": 0, "folder_records": 0, "outcome_records": 0, "history_cursor_records": 0,
         "altered_outcome_records": 0, "altered_lifecycle_records": 0,
         "role_snapshots": [],
         "director_records": 0, "history_file_records": 0, "history_chunks": 0,
@@ -180,12 +181,17 @@ def main() -> int:
                         line = json.dumps(fields).encode("utf-8") + b"\n"
                         report["altered_outcome_records"] += 1
                     if not changed_record and ((behavior == "missing_opening_time" and kind == "opening")
-                                               or (behavior == "invalid_edit_time" and kind == "edit")):
+                                               or (behavior == "invalid_edit_time" and kind == "edit")
+                                               or (behavior in ("missing_folder", "invalid_folder") and kind == "folder")):
                         changed_record = True
                         if behavior == "missing_opening_time":
                             del fields["at"]
-                        else:
+                        elif behavior == "invalid_edit_time":
                             fields["at"] = "invalid-time"
+                        elif behavior == "missing_folder":
+                            del fields["folder"]
+                        else:
+                            fields["folder"] = []
                         line = json.dumps(fields).encode("utf-8") + b"\n"
                         report["altered_lifecycle_records"] += 1
                     if behavior in ("malformed_record", "unknown_measurement", "missing_output",
@@ -209,7 +215,7 @@ def main() -> int:
                                     tokens["output"] = 2**63
                             line = json.dumps(record).encode("utf-8") + b"\n"
                     report["forwarded_bytes"] += len(line)
-                    if kind in ("turn", "compaction", "opening", "edit"):
+                    if kind in ("turn", "compaction", "opening", "edit", "folder"):
                         report["measurement_records"] += 1
                     if kind == "turn":
                         report["turn_records"] += 1
@@ -221,6 +227,8 @@ def main() -> int:
                         report["opening_records"] += 1
                     elif kind == "edit":
                         report["edit_records"] += 1
+                    elif kind == "folder":
+                        report["folder_records"] += 1
                     elif kind == "cursor":
                         if history_file:
                             report["history_cursor_records"] += 1
