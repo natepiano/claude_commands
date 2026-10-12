@@ -9,7 +9,7 @@ import shlex
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
@@ -137,6 +137,11 @@ class UnitLaunchConfiguration:
             return "plan"
         return "brief" if isinstance(self.plan, BriefGiven) else "standby"
 
+    @property
+    def session_cwd(self) -> Path:
+        """Where the session runs: a resumed one where its transcript lives, a new one in the worktree."""
+        return self.session.cwd if isinstance(self.session, ResumedSession) else self.worktree
+
 
 @dataclass(frozen=True, kw_only=True)
 class RequestedUnitLaunch(UnitLaunchConfiguration):
@@ -153,6 +158,8 @@ class ReadyToLaunch(NamedTuple):
     launch: UnitLaunch
     row: NoUnitRow | ExistingUnitRow
     director: DirectorAgent
+    # Printed once the unit has started, so a failed launch's first stderr line stays its reason.
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -418,6 +425,9 @@ def desired_row(request: UnitLaunch, headings: list[str]) -> str:
 
 
 def row_is_present(request: RequestedUnitLaunch, lines: list[str]) -> NoUnitRow | ExistingUnitRow:
+    # A restore creates no worktree or branch, so the naming pattern behind `request.worktree` and
+    # `request.branch` neither reserves them against other rows nor has to match the unit's own row.
+    restoring = isinstance(request.launch_kind, UnitRestoreLaunch)
     matching: list[ExistingUnitRow] = []
     for cells in unit_table(lines):
         fields = {heading: cell_value(cell) for heading, cell in cells.items()}
@@ -427,16 +437,17 @@ def row_is_present(request: RequestedUnitLaunch, lines: list[str]) -> NoUnitRow 
                                                 fields["Port"], fields["Owns"]))
             except KeyError as error:
                 raise Refusal(f"unit {request.unit} has an invalid Units row") from error
-        elif fields.get("Worktree") == str(request.worktree) or fields.get("Branch") == request.branch:
+        elif not restoring and (fields.get("Worktree") == str(request.worktree)
+                                or fields.get("Branch") == request.branch):
             raise Refusal(f"branch or worktree for {request.unit} is already used in Units table")
     if len(matching) > 1:
         raise Refusal(f"unit name {request.unit} is already taken in Units table")
     if not matching:
         return NoUnitRow()
     existing = matching[0]
-    for cell, actual, expected in (("Plan", existing.plan, request.plan_cell),
-                                   ("Worktree", existing.worktree, str(request.worktree)),
-                                   ("Branch", existing.branch, request.branch)):
+    pattern_cells = () if restoring else (("Worktree", existing.worktree, str(request.worktree)),
+                                          ("Branch", existing.branch, request.branch))
+    for cell, actual, expected in (("Plan", existing.plan, request.plan_cell), *pattern_cells):
         if actual != expected:
             raise Refusal(f"unit {request.unit} {cell} is {actual!r}; expected {expected!r}")
     for cell, actual, supplied in (("Port", existing.port, request.port),
@@ -484,6 +495,23 @@ def worktree_on_branch(request: UnitLaunch) -> bool:
     return True
 
 
+def restore_warnings(launch: UnitLaunch) -> tuple[str, ...]:
+    """Where a restored session's recorded cwd departs from its Units row, one line per differing cell.
+
+    The transcript lives under the recorded cwd, so the session resumes there whatever the row says.
+    """
+    cwd, unit = launch.session_cwd, launch.identity.unit
+    warnings: list[str] = []
+    if cwd != launch.worktree.resolve():
+        warnings.append(f"unit {unit} Worktree is {str(launch.worktree)!r}; restoring in the recorded {str(cwd)!r}")
+    checked_out = subprocess.run(["git", "-C", str(cwd), "branch", "--show-current"],
+                                 text=True, capture_output=True, check=False).stdout.strip()
+    if checked_out != launch.branch:
+        found = f"is on {checked_out!r}" if checked_out else "has no branch checked out"
+        warnings.append(f"unit {unit} Branch is {launch.branch!r}; the recorded {str(cwd)!r} {found}")
+    return tuple(warnings)
+
+
 def tmux_live(tmux: str, name: str) -> bool:
     result = subprocess.run([tmux, "has-session", "-t", f"={name}"], capture_output=True, text=True, check=False)
     return result.returncode == 0
@@ -520,8 +548,12 @@ def preflight(request: RequestedUnitLaunch) -> ReadyToLaunch:
         raise Refusal("production doc must be inside Showrunner checkout") from error
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     existing = row_is_present(request, lines)
-    if isinstance(request.launch_kind, UnitRestoreLaunch) and isinstance(existing, NoUnitRow):
-        raise Refusal(f"unit {request.unit} has no Units row; a restore never adds one")
+    restoring = isinstance(request.launch_kind, UnitRestoreLaunch)
+    if restoring:
+        if isinstance(existing, NoUnitRow):
+            raise Refusal(f"unit {request.unit} has no Units row; a restore never adds one")
+        # Its row, not the naming pattern, names a restored unit's worktree and branch.
+        request = replace(request, worktree=Path(existing.worktree), branch=existing.branch)
     launch = UnitLaunch(
         production=request.production,
         identity=UnitIdentity(request.unit, request.requested_name),
@@ -534,10 +566,12 @@ def preflight(request: RequestedUnitLaunch) -> ReadyToLaunch:
         launch_kind=request.launch_kind,
         timeout=request.timeout,
     )
-    # A restore adopts the row it matched: how the unit was first added, and whether its Plan cell
-    # still names a live plan rather than its as-built, describe new work, not the session it resumes.
-    restoring = isinstance(launch.launch_kind, UnitRestoreLaunch) and isinstance(existing, ExistingUnitRow)
-    if isinstance(existing, ExistingUnitRow) and not restoring and recorded_mode(launch, existing) != launch.mode_name:
+    if restoring:
+        # A restore adopts the row it matched and creates nothing: how the unit was first added, whether
+        # its Plan cell still names a live plan rather than its as-built, and whether its worktree and
+        # branch are free all describe new work, not the session it resumes.
+        return ReadyToLaunch(launch, existing, director_agent(launch), restore_warnings(launch))
+    if isinstance(existing, ExistingUnitRow) and recorded_mode(launch, existing) != launch.mode_name:
         raise Refusal(f"unit name {launch.identity.unit} is already taken in Units table")
     has_worktree = worktree_on_branch(launch)
     if has_worktree and isinstance(existing, NoUnitRow):
@@ -547,7 +581,7 @@ def preflight(request: RequestedUnitLaunch) -> ReadyToLaunch:
     if (local_branch or remote_head(production, request.branch)) and not (
             isinstance(existing, ExistingUnitRow) and has_worktree):
         raise Refusal(f"branch {request.branch} already exists")
-    if isinstance(launch.plan, PlanGiven) and not restoring:
+    if isinstance(launch.plan, PlanGiven):
         result = git(production, "show", f"{production.merge_branch}:{launch.plan.path.as_posix()}", check=False)
         if result.returncode != 0 or not any(line.startswith("> **Production:") for line in result.stdout.splitlines()):
             raise Refusal(f"plan {launch.plan.path} is missing on {production.merge_branch} or lacks the Production header")
@@ -694,12 +728,11 @@ def launch_session(
     argv.extend(["--remote-control", session_name, "-n", session_name,
                  "--settings", '{"disableAgentView": true}', prompt])
     command = account_prefix(selected) + "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
-    cwd = request.session.cwd if isinstance(request.session, ResumedSession) else request.worktree
     environment = launch_environment()
     scope_name = re.sub(r"[^A-Za-z0-9_.-]", "-", tmux_session)
     scope = f"--unit={scope_name}-{int(time.time())}"
     _ = subprocess.run(["systemd-run", "--user", "--scope", scope, tmux,
-                        "new-session", "-d", "-s", tmux_session, "-c", str(cwd),
+                        "new-session", "-d", "-s", tmux_session, "-c", str(request.session_cwd),
                         *(argument for name, value in marks.items() for argument in ("-e", f"{name}={value}")),
                         "zsh", "-ic", command],
                        env=environment, text=True, capture_output=True, check=True)
@@ -870,7 +903,9 @@ def main(argv: list[str]) -> int:
             write_stub(request)
             append_row(request, ready.row)
             commit_unit(request)
-            ensure_worktree(request)
+            # A restore resumes in the recorded cwd and creates no worktree or branch.
+            if not isinstance(request.launch_kind, UnitRestoreLaunch):
+                ensure_worktree(request)
             if isinstance(marked_unit, NoMarkedUnit):
                 prompt = prompt_for(request)
                 if isinstance(request.launch_kind, UnitRestoreLaunch):
@@ -882,6 +917,8 @@ def main(argv: list[str]) -> int:
             _ = barrier.__exit__(None, None, None)
         launched = wait_for_remote_control(request, tmux)
         record(request)
+        for warning in ready.warnings:
+            print(f"add_unit: warning: {warning}", file=sys.stderr)
         print(f"{request.identity.unit} started: tmux attach -t {launched.label}")
         return 0
     except Refusal as error:

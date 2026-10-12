@@ -1770,6 +1770,9 @@ class RestartTests(ShutdownTestCase):
             patch.object(restart, "_retire"),
             patch.object(restart, "_live_session_ids", return_value=frozenset()),
             patch.object(
+                restart, "_session_liveness", return_value=restart.SessionNotLive()
+            ),
+            patch.object(
                 restart,
                 "_launch_session",
                 side_effect=subprocess.CalledProcessError(
@@ -1785,6 +1788,82 @@ class RestartTests(ShutdownTestCase):
         if failed["kind"] != "restart failed":
             self.fail("expected restart failure")
         self.assertEqual(failed["reason"], "launcher refused")
+
+    def test_a_launch_that_fails_with_its_session_live_is_restarted_not_failed(
+        self,
+    ) -> None:
+        record.create(shutdown_record([
+            entry(top_level("launched", host=inventory.TerminalHost(kind="terminal")))
+        ]))
+        output = io.StringIO()
+
+        with (
+            patch.object(restart, "_retire"),
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(
+                restart, "_session_liveness", return_value=restart.SessionLive()
+            ),
+            patch.object(restart, "wait_for_session", return_value=True),
+            patch.object(
+                restart,
+                "_launch_session",
+                side_effect=subprocess.CalledProcessError(
+                    1,
+                    ["add_unit"],
+                    stderr="launched: /remote-control did not become active\npane",
+                ),
+            ) as launch,
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(restart.up(LOGIN), 0)
+            self.assertEqual(restart.up(LOGIN), 0)
+
+        launch.assert_called_once()
+        self.assertEqual(record.find_live(LOGIN)["kind"], "no shutdown")
+        self.assertIn(
+            "natedev: launched is live; its launch reported: "
+            + "launched: /remote-control did not become active",
+            output.getvalue(),
+        )
+        self.assertNotIn("restart failed", output.getvalue())
+
+    def test_a_launch_that_fails_with_liveness_unknown_is_left_unfinished(
+        self,
+    ) -> None:
+        record.create(shutdown_record([
+            entry(top_level("unknown", host=inventory.TerminalHost(kind="terminal")))
+        ]))
+        output = io.StringIO()
+
+        with (
+            patch.object(restart, "_retire"),
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(
+                restart,
+                "_session_liveness",
+                return_value=restart.SessionLivenessUnknown(
+                    "session registry unreadable: denied"
+                ),
+            ),
+            patch.object(
+                restart,
+                "_launch_session",
+                side_effect=subprocess.CalledProcessError(
+                    9, ["open"], stderr="launcher refused\ndetail"
+                ),
+            ),
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(restart.up(LOGIN), 1)
+
+        self.assertEqual(self.stored_record()["entries"][0]["progress"]["kind"], "stopped")
+        self.assertIn(
+            "natedev: unknown restart unfinished: launcher refused; "
+            + "session registry unreadable: denied",
+            output.getvalue(),
+        )
 
     def test_restart_note_recording_failure_prevents_the_launch(self) -> None:
         record.create(shutdown_record([
