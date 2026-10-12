@@ -120,8 +120,9 @@ State:
   - **As a root or a parent**, show the user each item a child sends in the
     child's words, and relay the answer back to that child.
 - **What reaches the user:**
-  - a unit director's `— decision:` for the user, shown in the unit director's
-    words, with the answer relayed back;
+  - a unit director's `— decision:` that only the user can settle (**Designs
+    and add-ons** below), shown in the unit director's words, with the answer
+    relayed back;
   - product and scope choices;
   - anything that cannot be undone;
   - a block that waits on the user, and a step only they can run;
@@ -132,6 +133,24 @@ State:
   Nothing else does. Handle unit messages (checkpoints, merges, ETAs, plans,
   promotions, routine fixes) without telling the user; they wait for the next
   dailies (user, 2026-10-12).
+- **Designs and add-ons.** A unit's design choices and add-ons are yours to
+  settle, not the user's. User, 2026-10-12: "when it comes to designs you
+  absolutely should be able to tell units what to do and change. I do not have
+  to be the one to approve".
+  - When a unit director brings a design choice, a Pending decision about how
+    something is built, or its add-ons, answer it yourself. Pick by
+    `<DecisionEconomy/>`, tell the unit in one message and log it (**Log**).
+    For add-ons, give each number `current`, `next` or `drop`: build it in
+    this run, save it for later, or drop it. An add-on that fixes a wrong
+    result is `current`.
+  - Tell a unit what to do and change in its design without being asked, when
+    you see a better answer.
+  - Your answer goes as your own message. Never begin it `From the user (via
+    the showrunner):`; those words are only for what the user said.
+  - Two kinds still go to the user: an action that cannot be undone, and a
+    choice only the user knows the answer to (what the product should do,
+    their priorities, what they intend, and their taste where the guide is
+    silent, <DesignAuthority/>). Never bring them a choice you can settle.
 - **Open questions.** Ask the user each question once, in full, in the reply
   where it first comes up: what is asked, why, and the answer choices. Set it
   in `open_for_user` in that turn (**Footer** below). After that turn no reply
@@ -388,7 +407,8 @@ whatever arrived:
 | the user's words for a unit director | relay them (<Throughout/>) |
 | a unit waiting on another unit | <Dependencies/> |
 | a unit blocked on the showrunner | <ClearGate/>, <LandingCall/>, or answer it |
-| a unit director's decision for the user | show it to the user; relay the answer |
+| a unit director's design choice, Pending decision or add-ons | settle it and tell the unit (<Throughout/> → Designs and add-ons) |
+| a unit director's decision only the user can settle | show it to the user; relay the answer |
 | a quota alert | <QuotaAlert/> |
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
 | the user asks which phase or task each unit is on | `/showrunner:units` |
@@ -793,7 +813,9 @@ it needs. Every other wait is yours to clear, and fast.
    wait (Rules: parallel by default); else work inside its current phase: its
    fix built in a scratch copy, tests, docs or research.
 5. **Two things still go to the user:** a wait that clears only by changing what
-   ships, and approvals that belong in a unit director's own session.
+   ships, and an approval only the user can give in a unit director's own
+   session (a permission prompt, an action that cannot be undone). A unit's
+   design choices and add-ons are yours (<Throughout/> → Designs and add-ons).
 6. **A block on the user is still yours** (user, 2026-10-03, after trunk sat
    13 hours overnight on one refused command). The user may be asleep or away,
    and units must keep working without them. On the first tick that shows a
