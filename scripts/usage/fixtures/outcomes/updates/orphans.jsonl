@@ -1,0 +1,5 @@
+{"event_id":"orphan-run","event_type":"run_finished","timestamp":"2026-10-10T22:00:00Z","status":"complete"}
+{"event_id":"orphan-phase","event_type":"phase_finished","timestamp":"2026-10-10T22:00:00Z","phase_instance_id":"absent-phase","status":"complete"}
+{"event_id":"orphan-pass","event_type":"pass_finished","timestamp":"2026-10-10T22:00:00Z","pass_instance_id":"absent-pass","status":"complete"}
+{"event_id":"orphan-finding","event_type":"finding_verdict","timestamp":"2026-10-10T22:00:00Z","phase_instance_id":"absent-phase","finding_id":"absent-finding","resulting_state":"closed"}
+{"event_id":"orphan-round","event_type":"finding_batch_landed","timestamp":"2026-10-10T22:00:00Z","phase_instance_id":"absent-phase","round":9}

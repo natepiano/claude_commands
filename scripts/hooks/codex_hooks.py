@@ -118,14 +118,15 @@ def _install_file(path: str) -> None:
         return
     for hook in missing:
         groups.append({"matcher": "apply_patch", "hooks": [hook.handler()]})
-    directory = os.path.dirname(path)
+    destination = os.path.realpath(path) if os.path.islink(path) else path
+    directory = os.path.dirname(destination)
     os.makedirs(directory, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=".hooks-", suffix=".json", dir=directory)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
             json.dump(document, output, indent=2)
             _ = output.write("\n")
-        os.replace(temporary, path)
+        os.replace(temporary, destination)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)

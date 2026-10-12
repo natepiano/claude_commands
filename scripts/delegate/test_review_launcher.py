@@ -63,6 +63,9 @@ if verb == 'start':
     pathlib.Path(option('--log-file')).write_text('stub mesh log\\n')
     entry['status'] = 'done'
 elif verb == 'compact':
+    if (roster_path.parent / 'compact_still_live').exists():
+        print('stub turn still live', file=sys.stderr)
+        sys.exit(3)
     before = entry.get('context_tokens', 0)
     entry['context_tokens'] = 12000
     roster_path.write_text(json.dumps(roster))
@@ -732,6 +735,23 @@ class ReviewLauncherPassTests(unittest.TestCase):
         )
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn(f"compacted {seat}: 100001 -> 12000 tokens", board)
+
+    def test_a_seat_left_with_a_live_turn_by_compaction_gets_no_review_follow_up(self) -> None:
+        session_dir = self.start_implementation("compact-still-live")
+        self.finish_implementation(session_dir)
+        seat = self.open_seat(session_dir, context_tokens=100001)
+        (session_dir / "compact_still_live").touch()
+
+        result = self.run_seated_review(session_dir, seat)
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("still has a live turn after compaction; end the seat", result.stderr)
+        self.assertEqual(
+            (session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
+            ["compact"],
+        )
+        board = (session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertIn("follow-up not sent", board)
 
     def test_both_lenses_run_at_once_without_overwriting_each_other(self) -> None:
         """The whole reason the lens exists: two reviewers, one session dir.

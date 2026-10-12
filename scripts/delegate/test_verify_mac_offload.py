@@ -11,8 +11,14 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
+from collections.abc import Generator
+from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, cast, final, override
+from unittest import mock
+
+from scripts.build_hold import build_hold
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -26,6 +32,21 @@ class CargoEvent(TypedDict):
 class RunnerEvent(TypedDict):
     args: list[str]
     token_held: bool
+    registered: bool
+    at: float
+
+
+class RoutingEvent(TypedDict):
+    command: str
+    status: int
+    at: float
+    pid: int
+
+
+class RoutingRecord(TypedDict):
+    target: str
+    hold_wait_s: float
+    mem_wait_s: str
 
 
 class CallRecord(TypedDict):
@@ -138,6 +159,7 @@ import os
 from pathlib import Path
 import signal
 import sys
+import time
 
 arguments = sys.argv[1:]
 root = Path(os.environ["TEST_RUNNER_STATE"])
@@ -145,10 +167,31 @@ result = Path(arguments[arguments.index("--result") + 1])
 event = {
     "args": arguments,
     "token_held": Path(os.environ["TEST_TOKEN_RECORD"]).exists(),
+    "registered": Path(os.environ["BUILDLOG_HOLD_REGISTRATION_FILE"]).exists(),
+    "at": time.monotonic(),
 }
 with (root / "runner-events.jsonl").open("a", encoding="utf-8") as output:
     output.write(json.dumps(event) + "\n")
 (root / "runner-started").write_text("started\n", encoding="utf-8")
+
+attempt = len((root / "runner-events.jsonl").read_text().splitlines())
+last_decline = arguments[arguments.index("--last-decline") + 1] if "--last-decline" in arguments else ""
+
+def decline(reason: str, seconds: str) -> None:
+    result.write_text("mac=declined\nreason=" + reason + "\nseconds=" + seconds + "\n")
+    if reason not in ("busy", "blocked") or reason != last_decline:
+        print("claim diagnostic: " + reason, file=sys.stderr, flush=True)
+        print("mac_test: not running on the Mac (" + reason + ")", flush=True)
+
+if os.environ.get("TEST_RUNNER_BUSY_UNTIL") and not Path(os.environ["TEST_RUNNER_BUSY_UNTIL"]).exists():
+    reason_file = root / "busy-reason"
+    reason = reason_file.read_text().strip() if reason_file.exists() else os.environ.get("TEST_RUNNER_BUSY_REASON", "busy")
+    decline(reason, os.environ.get("TEST_DECLINED_RETRY_SECONDS", "0") if attempt > 1 else "0")
+    raise SystemExit(75)
+if attempt > 1 and os.environ.get("TEST_RUNNER_PAUSE_RETRY") == "1":
+    (root / "retry-running").write_text("running\n")
+    while not (root / "continue-retry").exists():
+        time.sleep(0.01)
 
 if os.environ.get("TEST_RUNNER_HOLD") == "1":
     def stop(signum: int, _frame: object) -> None:
@@ -161,6 +204,8 @@ if os.environ.get("TEST_RUNNER_HOLD") == "1":
         signal.pause()
 
 mode = os.environ.get("TEST_RUNNER_MAC", "declined")
+if mode in ("passed", "failed", "lost"):
+    print("mac_test: running on the Mac (macOS, host Mac); tree copied in 0.0 s", flush=True)
 if mode == "none":
     result.unlink(missing_ok=True)
 elif mode == "empty":
@@ -175,10 +220,84 @@ else:
         + "seconds=" + os.environ.get("TEST_RUNNER_SECONDS", "3.25") + "\n",
         encoding="utf-8",
     )
+if mode == "declined":
+    decline(os.environ.get("TEST_RUNNER_REASON", ""), os.environ.get("TEST_RUNNER_SECONDS", "3.25"))
 output = os.environ.get("TEST_RUNNER_OUTPUT", "")
-if output:
+if output and not (mode == "declined" and last_decline in ("busy", "blocked") and last_decline == os.environ.get("TEST_RUNNER_REASON", "")):
     print(output, flush=True)
 raise SystemExit(int(os.environ.get("TEST_RUNNER_STATUS", "75")))
+'''
+
+
+TARGETS_WRAPPER = r'''
+import json
+import os
+from pathlib import Path
+import runpy
+import sys
+import time
+
+command = sys.argv[1]
+root = Path(os.environ["TEST_RUNNER_STATE"])
+if command == "wait-local" and os.environ.get("TEST_LOCAL_WAIT_SECONDS") and not (root / "local-wait-added").exists():
+    with Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"]).open("a") as output:
+        output.write(os.environ["TEST_LOCAL_WAIT_SECONDS"] + "\n")
+    (root / "local-wait-added").write_text("added\n")
+sys.path.insert(0, str(Path(os.environ["TEST_REAL_TARGETS"]).parent))
+status = 0
+try:
+    runpy.run_path(os.environ["TEST_REAL_TARGETS"], run_name="__main__")
+except SystemExit as result:
+    status = result.code or 0
+event = {"command": command, "status": status, "at": time.monotonic(),
+         "pid": int(sys.argv[sys.argv.index("--pid") + 1]) if "--pid" in sys.argv else 0}
+with (root / "routing-events.jsonl").open("a") as output:
+    output.write(json.dumps(event) + "\n")
+if command == "register-local" and status == 10:
+    (root / "registered").write_text("registered\n")
+raise SystemExit(status)
+'''
+
+
+SLEEP_STUB = r'''
+import os
+from pathlib import Path
+import sys
+import time
+
+root = Path(os.environ["TEST_RUNNER_STATE"])
+with (root / "sleep-events").open("a") as output:
+    output.write(sys.argv[1] + "\n")
+if os.environ.get("TEST_STEP_ROUTING_SLEEP") == "1":
+    step = len((root / "sleep-events").read_text().splitlines())
+    (root / "routing-sleep").write_text("sleeping\n")
+    (root / ("routing-sleep-" + str(step))).write_text("sleeping\n")
+    while not (root / ("continue-sleep-" + str(step))).exists():
+        time.sleep(0.01)
+elif os.environ.get("TEST_PAUSE_ROUTING_SLEEP") == "1":
+    (root / "routing-sleep").write_text("sleeping\n")
+    while not (root / "continue-sleep").exists():
+        time.sleep(0.01)
+else:
+    time.sleep(min(float(sys.argv[1]), 0.05))
+'''
+
+
+RECORD_WRAPPER = r'''
+import json
+import os
+from pathlib import Path
+import runpy
+import sys
+
+if sys.argv[1:2] == ["call"]:
+    event = {"target": os.environ.get("BUILDLOG_TARGET", ""),
+             "hold_wait_s": float(os.environ.get("BUILDLOG_HOLD_WAIT_S", "0")),
+             "mem_wait_s": os.environ.get("BUILDLOG_MEM_WAIT_S", "0")}
+    with (Path(os.environ["TEST_RUNNER_STATE"]) / "routing-records.jsonl").open("a") as output:
+        output.write(json.dumps(event) + "\n")
+sys.path.insert(0, str(Path(os.environ["TEST_REAL_RECORD"]).parent))
+runpy.run_path(os.environ["TEST_REAL_RECORD"], run_name="__main__")
 '''
 
 
@@ -200,9 +319,16 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
         self.home.mkdir()
-        (self.home / ".claude").symlink_to(
-            VERIFY.parent.parent.parent, target_is_directory=True
-        )
+        claude = self.home / ".claude"
+        scripts = claude / "scripts"
+        scripts.mkdir(parents=True)
+        (claude / "config").symlink_to(VERIFY.parent.parent.parent / "config", target_is_directory=True)
+        for source in VERIFY.parent.parent.iterdir():
+            if source.name != "buildlog":
+                (scripts / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        log = scripts / "buildlog"
+        log.mkdir()
+        self.write_executable(log / "record.py", RECORD_WRAPPER)
         self.bin_directory = self.root / "bin"
         self.bin_directory.mkdir()
         self.board = self.root / "board"
@@ -243,6 +369,11 @@ class VerifyMacOffloadTests(unittest.TestCase):
         _ = source.write_text("pub fn value() -> u8 { 1 }\n", encoding="utf-8")
         meminfo = self.root / "meminfo"
         _ = meminfo.write_text("MemAvailable: 67108864 kB\n", encoding="utf-8")
+        settings = self.root / "mac settings.conf"
+        _ = settings.write_text(f"offload=on\nlinux_only.{self.root.name}=\n")
+        config = self.root / "targets.conf"
+        _ = config.write_text("targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\n"
+                              + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
         metadata: CargoMetadata = {
             "workspace_members": ["sample-id"],
             "packages": [
@@ -294,6 +425,19 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "BUILDLOG_OFF": "1",
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
+            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+            "BUILD_TARGETS_SCRIPT": str(VERIFY.parent.parent / "build_targets" / "build_targets.py"),
+            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+            "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+            "BUILDLOG_HOLD_REGISTRATION_FILE": str(self.root / "registration"),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+            "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
+            "BUILD_TARGETS_CONFIG": str(config),
+            "MAC_TEST_CONFIG": str(settings),
+            "CLAUDE_CODE_SESSION_ID": "", "BUILD_TARGETS_NOW": "",
+            "BUILD_TARGETS_POLL_S": "0.05",
             "LINT_CONFIG_READER": str(reader),
             "LINT_CONFIG_FILE": str(reader),
             "PLAN_DELEGATE_BOARD_DIR": str(self.board),
@@ -304,6 +448,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "TEST_TOKEN_RECORD": str(self.board / "locks" / "cargo.d" / "owned"),
             "TEST_METADATA": json.dumps(metadata),
             "TEST_RUNNER_SECONDS": "3.25",
+            "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
 
     def write_executable(self, path: Path, source: str) -> None:
@@ -389,6 +534,359 @@ class VerifyMacOffloadTests(unittest.TestCase):
                 return
             time.sleep(0.01)
         self.fail(f"timed out waiting for {path}")
+
+    def routing_fixture(self) -> Path:
+        wrapper = self.root / "targets-wrapper.py"
+        self.write_executable(wrapper, TARGETS_WRAPPER)
+        self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)
+        self.environment.update({"BUILD_TARGETS_SCRIPT": str(wrapper),
+                                 "TEST_REAL_TARGETS": str(VERIFY.parent.parent / "build_targets" / "build_targets.py")})
+        with self.hold_environment():
+            holders = Path(self.environment["BUILD_HOLD_DIR"])
+            _ = build_hold.start_hold(holders, "hana", "render checks", build_hold.NoReleaseEta(), datetime.now().astimezone())
+            cycle = build_hold.read_cycle()
+            assert cycle is not None
+            return self.root / "release" / cycle["id"] / "cycle.json"
+
+    @contextmanager
+    def hold_environment(self) -> Generator[None, None, None]:
+        with mock.patch.dict(os.environ, {name: self.environment[name] for name in (
+            "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "PLAN_DELEGATE_ACTIVE_DIR")}), \
+             mock.patch.dict(os.environ, {"PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
+                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": ""}), \
+             mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
+             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
+            yield
+
+    def release_local_turn(self) -> None:
+        with self.hold_environment(), build_hold.release_lock():
+            cycle = build_hold.read_cycle()
+            assert cycle is not None
+            now = datetime.now().astimezone()
+            cycle["release_started_at"] = now.isoformat()
+            build_hold.save_cycle(cycle)
+            _ = build_hold.advance_release(cycle, now, clock=lambda: now)
+
+    def routing_events(self) -> list[RoutingEvent]:
+        path = self.runner_state / "routing-events.jsonl"
+        return [cast(RoutingEvent, json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def routing_record(self) -> RoutingRecord:
+        records = (self.runner_state / "routing-records.jsonl").read_text().splitlines()
+        self.assertTrue(records)
+        return cast(RoutingRecord, json.loads(records[-1]))
+
+    def stop_verify(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+        _ = process.communicate(timeout=5)
+
+    def start_routing(self, reason: str = "busy", *, pause_retry: bool = False,
+                      step_sleep: bool = False) -> subprocess.Popen[str]:
+        process = self.start_verify("test", "sample", "--filter", "alpha", "--no-cache", extra={
+            "TEST_RUNNER_BUSY_UNTIL": str(self.runner_state / "mac-free"),
+            "TEST_RUNNER_BUSY_REASON": reason, "TEST_PAUSE_ROUTING_SLEEP": "1",
+            "TEST_RUNNER_PAUSE_RETRY": "1" if pause_retry else "0",
+            "TEST_STEP_ROUTING_SLEEP": "1" if step_sleep else "0",
+            "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0",
+        })
+        self.addCleanup(self.stop_verify, process)
+        self.wait_for_path(self.runner_state / "routing-sleep")
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(len(self.runner_events()), 1)
+        self.assertIsNone(process.poll())
+        return process
+
+    def assert_no_pending_calls(self, cycle_path: Path) -> None:
+        cycle = cast(build_hold.HoldCycle, json.loads(cycle_path.read_text()))
+        self.assertFalse(any(entry["calls"] or entry["active_call_id"] for entry in cycle["entries"]))
+
+    def test_local_first_target_runs_without_trying_free_mac(self) -> None:
+        config = Path(self.environment["BUILD_TARGETS_CONFIG"])
+        _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=natedev,mac"))
+        result = self.verify("test", "sample", "--no-cache")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.runner_events(), [])
+        self.assertEqual(len(self.local_runs()), 1)
+        self.assertIn("verify.sh: running on natedev", result.stdout)
+        self.assertEqual(self.routing_record()["target"], "natedev")
+
+    def test_alternate_target_settings_are_passed_to_runner(self) -> None:
+        alternate = self.root / "alternate Mac.conf"
+        _ = alternate.write_text(f"linux_only.{self.root.name}=\n")
+        config = Path(self.environment["BUILD_TARGETS_CONFIG"])
+        _ = config.write_text(config.read_text().replace("mac settings.conf", alternate.name))
+        result = self.verify("test", "sample", "--filter", "alpha", "--no-cache",
+                             extra={"TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        arguments = self.runner_events()[0]["args"]
+        self.assertEqual(arguments[arguments.index("--settings") + 1], str(alternate))
+        self.assertIn("mac_test: running on the Mac (macOS, host Mac); tree copied in 0.0 s", result.stdout)
+        self.assertNotIn("verify.sh: running on the Mac", result.stdout + result.stderr)
+        self.assertEqual(self.routing_record()["target"], "mac")
+
+    def test_excluded_mac_reason_is_recorded_without_calling_offload(self) -> None:
+        for settings, reason in (("", "repo"), (f"linux_only.{self.root.name}=sample\n", "linux_only")):
+            with self.subTest(reason=reason):
+                self.clear_observations()
+                _ = Path(self.environment["MAC_TEST_CONFIG"]).write_text(settings)
+                result = self.verify("test", "sample", "--no-cache")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.runner_events(), [])
+                self.assertEqual(self.last_call()["local_reason"], reason)
+                self.assertEqual(self.routing_record()["target"], "natedev")
+
+    def test_declined_mac_attempt_announces_only_local_execution(self) -> None:
+        for reason in ("busy", "blocked", "battery"):
+            with self.subTest(reason=reason):
+                self.clear_observations()
+                result = self.verify("test", "sample", "--no-cache", extra={
+                    "TEST_RUNNER_MAC": "declined", "TEST_RUNNER_REASON": reason, "TEST_RUNNER_STATUS": "75"})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("verify.sh: running on the Mac", result.stdout + result.stderr)
+                self.assertNotIn("mac_test: running on the Mac", result.stdout + result.stderr)
+                self.assertIn("verify.sh: running on natedev", result.stdout)
+                self.assertEqual(len(self.local_runs()), 1)
+
+    def test_unreadable_local_first_route_still_tries_the_eligible_mac(self) -> None:
+        config = Path(self.environment["BUILD_TARGETS_CONFIG"])
+        _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=natedev,mac"))
+        damaged = self.root / "damaged-holders"
+        _ = damaged.write_text("a file cannot be a hold directory\n")
+        self.environment["BUILD_HOLD_DIR"] = str(damaged)
+        for outcome, reason, status, expected in (("passed", "", "0", 0), ("declined", "busy", "75", 12)):
+            with self.subTest(outcome=outcome):
+                self.clear_observations()
+                result = self.verify("test", "sample", "--filter", "alpha", "--no-cache", extra={
+                    "TEST_RUNNER_MAC": outcome, "TEST_RUNNER_REASON": reason, "TEST_RUNNER_STATUS": status})
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                self.assertEqual(len(self.runner_events()), 1)
+                self.assertEqual(self.local_runs(), [])
+                self.assertIn("natedev's hold state cannot be read", result.stderr)
+
+    def test_unreadable_local_first_route_without_eligible_mac_exits_twelve(self) -> None:
+        config = Path(self.environment["BUILD_TARGETS_CONFIG"])
+        _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=natedev,mac"))
+        _ = Path(self.environment["MAC_TEST_CONFIG"]).write_text(f"linux_only.{self.root.name}=sample\n")
+        damaged = self.root / "damaged-holders"
+        _ = damaged.write_text("a file cannot be a hold directory\n")
+        self.environment["BUILD_HOLD_DIR"] = str(damaged)
+        result = self.verify("test", "sample", "--filter", "alpha", "--no-cache")
+        self.assertEqual(result.returncode, 12, result.stdout + result.stderr)
+        self.assertEqual(self.runner_events(), [])
+        self.assertEqual(self.local_runs(), [])
+        self.assertIn("natedev's hold state cannot be read", result.stderr)
+
+    def resume_routing_sleep(self, step: int) -> None:
+        _ = (self.runner_state / f"continue-sleep-{step}").write_text("continue\n")
+        self.wait_for_path(self.runner_state / f"routing-sleep-{step + 1}")
+
+    def test_repeated_routing_wait_shows_each_unchanged_diagnostic_once(self) -> None:
+        _ = self.routing_fixture()
+        self.environment["BUILD_TARGETS_ESCALATE_S"] = "0"
+        process = self.start_routing(step_sleep=True)
+        for step in range(1, 4):
+            self.resume_routing_sleep(step)
+        _ = (self.runner_state / "mac-free").write_text("free\n")
+        _ = (self.runner_state / "continue-sleep-4").write_text("continue\n")
+        output, errors = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual(errors.count("verify.sh: natedev is held by hana for render checks.\n"), 1)
+        self.assertEqual(errors.count("verify.sh: natedev has been held for 2 h by hana; ask them.\n"), 1)
+        self.assertEqual(errors.count("verify.sh: waiting for the Mac (busy) or natedev's release.\n"), 1)
+        self.assertEqual(errors.count("claim diagnostic: busy\n"), 1)
+        self.assertEqual(output.count("mac_test: not running on the Mac (busy)\n"), 1)
+        self.assertNotIn("verify.sh: running on the Mac", output + errors)
+        attempts = self.runner_events()
+        self.assertEqual(len(attempts), 5)
+        self.assertNotIn("--last-decline", attempts[0]["args"])
+        for event in attempts[1:]:
+            arguments = event["args"]
+            self.assertEqual(arguments[arguments.index("--last-decline") + 1], "busy")
+
+    def test_routing_wait_shows_changed_holder_and_decline_reason_once(self) -> None:
+        _ = self.routing_fixture()
+        process = self.start_routing(step_sleep=True)
+        with self.hold_environment():
+            holders = Path(self.environment["BUILD_HOLD_DIR"])
+            _ = build_hold.start_hold(holders, "julian", "restore CI", build_hold.NoReleaseEta(), datetime.now().astimezone())
+            (holders / "hana").unlink()
+        self.resume_routing_sleep(1)
+        self.resume_routing_sleep(2)
+        _ = (self.runner_state / "busy-reason").write_text("blocked\n")
+        self.resume_routing_sleep(3)
+        self.resume_routing_sleep(4)
+        _ = (self.runner_state / "mac-free").write_text("free\n")
+        _ = (self.runner_state / "continue-sleep-5").write_text("continue\n")
+        output, errors = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 0, output + errors)
+        for line in ("verify.sh: natedev is held by hana for render checks.\n",
+                     "verify.sh: natedev is held by julian for restore CI.\n",
+                     "verify.sh: waiting for the Mac (busy) or natedev's release.\n",
+                     "verify.sh: waiting for the Mac (blocked) or natedev's release.\n"):
+            self.assertEqual(errors.count(line), 1, output + errors)
+        self.assertEqual(output.count("mac_test: not running on the Mac (busy)\n"), 1)
+        self.assertEqual(output.count("mac_test: not running on the Mac (blocked)\n"), 1)
+        attempts = self.runner_events()
+        self.assertEqual([event["args"][event["args"].index("--last-decline") + 1] for event in attempts[1:]],
+                         ["busy", "busy", "busy", "blocked", "blocked"])
+
+    def test_hold_wait_includes_declined_retry_seconds_and_excludes_running_retry(self) -> None:
+        _ = self.routing_fixture()
+        self.environment.update({"TEST_DECLINED_RETRY_SECONDS": "4.5", "TEST_RUNNER_SECONDS": "20"})
+        process = self.start_routing(step_sleep=True)
+        self.resume_routing_sleep(1)
+        _ = (self.runner_state / "mac-free").write_text("free\n")
+        _ = (self.runner_state / "continue-sleep-2").write_text("continue\n")
+        output, errors = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual(len(self.runner_events()), 3)
+        self.assertGreaterEqual(self.routing_record()["hold_wait_s"], 4.5)
+        self.assertLess(self.routing_record()["hold_wait_s"], 6.5)
+        self.assertEqual(self.last_call()["mac_s"], 20)
+
+    def test_busy_mac_and_held_local_wait_then_use_first_free_mac(self) -> None:
+        cycle = self.routing_fixture()
+        process = self.start_routing()
+        _ = (self.runner_state / "mac-free").write_text("free\n")
+        _ = (self.runner_state / "continue-sleep").write_text("continue\n")
+        output, errors = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertIn("waiting", errors)
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(len(self.runner_events()), 2)
+        self.assertFalse(self.runner_events()[1]["registered"])
+        self.assert_no_pending_calls(cycle)
+        commands = [event["command"] for event in self.routing_events()]
+        self.assertLess(commands.index("finish-local"), len(commands))
+        registrations = [event for event in self.routing_events() if event["command"] == "register-local"]
+        self.assertTrue(registrations)
+        self.assertTrue(all(event["pid"] == process.pid for event in registrations))
+        self.assertEqual(self.routing_record()["target"], "mac")
+        self.assertGreater(self.routing_record()["hold_wait_s"], 0)
+
+    def test_local_release_or_admission_wins_before_another_mac_attempt(self) -> None:
+        for held_file_remains in (False, True):
+            with self.subTest(held_file_remains=held_file_remains):
+                # This test owns a separate fixture for each release variant.
+                fixture = VerifyMacOffloadTests("runTest")
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                cycle = fixture.routing_fixture()
+                process = fixture.start_routing()
+                if held_file_remains:
+                    fixture.release_local_turn()
+                else:
+                    (Path(fixture.environment["BUILD_HOLD_DIR"]) / "hana").unlink()
+                _ = (fixture.runner_state / "continue-sleep").write_text("continue\n")
+                output, errors = process.communicate(timeout=15)
+                self.assertEqual(process.returncode, 0, output + errors)
+                self.assertEqual(len(fixture.runner_events()), 1)
+                self.assertEqual(len(fixture.local_runs()), 1)
+                self.assertEqual((Path(fixture.environment["BUILD_HOLD_DIR"]) / "hana").exists(), held_file_remains)
+                fixture.assert_no_pending_calls(cycle)
+                self.assertEqual(fixture.routing_record()["target"], "natedev")
+
+    def test_blocked_mac_and_held_local_wait_for_local_release(self) -> None:
+        cycle = self.routing_fixture()
+        process = self.start_routing("blocked")
+        self.release_local_turn()
+        _ = (self.runner_state / "continue-sleep").write_text("continue\n")
+        output, errors = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertIn("blocked", errors)
+        self.assertEqual(len(self.runner_events()), 1)
+        self.assertEqual(len(self.local_runs()), 1)
+        self.assert_no_pending_calls(cycle)
+
+    def test_mac_run_withdraws_local_demand_before_another_waiter_is_released(self) -> None:
+        cycle_path = self.routing_fixture()
+        process = self.start_routing(pause_retry=True)
+        _ = (self.runner_state / "mac-free").write_text("free\n")
+        _ = (self.runner_state / "continue-sleep").write_text("continue\n")
+        self.wait_for_path(self.runner_state / "retry-running")
+        self.assert_no_pending_calls(cycle_path)
+        with self.hold_environment():
+            _ = build_hold.register_wait("verify:peer-call", call_id="peer-call", pid=os.getpid())
+        self.release_local_turn()
+        with self.hold_environment():
+            self.assertIsInstance(build_hold.read_admission("verify:peer-call", "peer-call"), build_hold.AdmittedTurn)
+        self.assertIsNone(process.poll())
+        self.assertFalse(self.runner_events()[-1]["registered"])
+        _ = (self.runner_state / "continue-retry").write_text("continue\n")
+        output, errors = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual(self.local_runs(), [])
+
+    def test_interrupted_mac_retry_withdraws_registration_and_preserves_only_wait_time(self) -> None:
+        cycle_path = self.routing_fixture()
+        process = self.start_routing(pause_retry=True)
+        time.sleep(0.1)
+        _ = (self.runner_state / "mac-free").write_text("free\n")
+        _ = (self.runner_state / "continue-sleep").write_text("continue\n")
+        self.wait_for_path(self.runner_state / "retry-running")
+        remote_started = time.monotonic()
+        time.sleep(0.5)
+        process.send_signal(signal.SIGTERM)
+        output, errors = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 143, output + errors)
+        self.assert_no_pending_calls(cycle_path)
+        record = self.routing_record()
+        self.assertGreater(record["hold_wait_s"], 0)
+        records = [event for event in self.routing_events() if event["command"] == "register-local"]
+        self.assertLess(record["hold_wait_s"], remote_started - records[0]["at"] + 0.15)
+        self.assertEqual(self.last_call()["outcome"], "interrupted")
+
+    def test_routing_wait_and_local_wait_are_summed_without_test_runtime(self) -> None:
+        _ = self.routing_fixture()
+        self.environment["TEST_LOCAL_WAIT_SECONDS"] = "7.25"
+        process = self.start_routing()
+        time.sleep(0.15)
+        self.release_local_turn()
+        _ = (self.runner_state / "continue-sleep").write_text("continue\n")
+        output, errors = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 0, output + errors)
+        record = self.routing_record()
+        self.assertGreater(record["hold_wait_s"], 7.25)
+        self.assertLess(record["hold_wait_s"], 9.25)
+        self.assertEqual(record["mem_wait_s"], "0")
+
+    def test_default_routing_retry_is_paced_fifteen_seconds(self) -> None:
+        _ = self.routing_fixture()
+        _ = self.environment.pop("BUILD_TARGETS_POLL_S")
+        process = self.start_routing()
+        self.assertEqual((self.runner_state / "sleep-events").read_text().splitlines(), ["15"])
+        self.release_local_turn()
+        _ = (self.runner_state / "continue-sleep").write_text("continue\n")
+        output, errors = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 0, output + errors)
+
+    def test_interrupted_routing_sleep_records_wait_and_cleans_pending_call(self) -> None:
+        cycle = self.routing_fixture()
+        process = self.start_routing()
+        time.sleep(0.1)
+        process.send_signal(signal.SIGTERM)
+        output, errors = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 143, output + errors)
+        self.assert_no_pending_calls(cycle)
+        self.assertGreater(self.routing_record()["hold_wait_s"], 0)
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(self.last_call()["outcome"], "interrupted")
+        self.assertEqual(list((self.root / "tmp").glob("verify-hold.*")), [])
+
+    def test_mac_state_and_probe_diagnostics_survive_local_fallback(self) -> None:
+        for reason, diagnostic in (("state", "mac state cannot be read: invalid block"),
+                                   ("blocked", "retained expired block; waiting for removal"),
+                                   ("unreachable", "ssh probe failed")):
+            with self.subTest(reason=reason):
+                self.clear_observations()
+                result = self.verify("test", "sample", "--no-cache", extra={
+                    "TEST_RUNNER_REASON": reason, "TEST_RUNNER_OUTPUT": diagnostic})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(diagnostic, result.stdout + result.stderr)
+                self.assertEqual(len(self.local_runs()), 1)
+                self.assertEqual(self.last_call()["mac_reason"], reason)
+                self.assertEqual(self.routing_record()["target"], "natedev")
 
     def test_decline_runs_same_nextest_words_locally_after_runner(self) -> None:
         result = self.verify(
@@ -552,6 +1050,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         record = self.last_call()
         self.assertEqual(record["mac"], "passed")
         self.assertEqual(record["mac_s"], 3.25)
+        self.assertEqual(self.routing_record()["target"], "natedev")
 
     def test_filtered_mac_pass_ends_without_local_run_or_pass_record(self) -> None:
         result = self.verify(

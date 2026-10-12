@@ -75,6 +75,10 @@ ROLE_DESC="${5:-blind review of the current diff against its spec}"
 PASS_ACTIVITY="${6:-reviewing the current diff against its work order}"
 PASS_INDEX="${7:-1}"
 LENS="${8:-}"
+LENS_ARGS=()
+if [[ -n "${LENS}" ]]; then
+  LENS_ARGS=(--lens "${LENS}")
+fi
 EARLY_READY_FILE="${9:-}"
 TASK="delegate.${SUBTASK}"
 
@@ -228,7 +232,7 @@ fi
 
 claim_follow() {
   "$PY" - "${SESSION_DIR}" "${FOLLOW_TO}" "${SCRIPT_DIR}/../agents/codex_mesh.py" \
-    "${BOARD_HELPER}" "${COMPACT_ABOVE_TOKENS}" <<'PY'
+    "${BOARD_HELPER}" "${COMPACT_ABOVE_TOKENS}" "${LENS}" <<'PY'
 import fcntl
 import json
 import os
@@ -236,7 +240,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-root_text, name, mesh_script, board_helper, compact_above_text = sys.argv[1:]
+root_text, name, mesh_script, board_helper, compact_above_text, lens = sys.argv[1:]
 root = Path(root_text)
 compact_above = int(compact_above_text)
 
@@ -271,11 +275,18 @@ with (root / "impl_seat_claim.lock").open("a+") as lock:
         else:
             detail = (compact.stderr.strip() or compact.stdout.strip()
                       or f"exit {compact.returncode}").splitlines()[-1]
+            # Exit 3: a turn is still live on the seat's thread, so a follow-up would be refused.
+            if compact.returncode == 3:
+                post(f"launcher: {name} still has a live turn after compaction: {detail}; "
+                     "follow-up not sent")
+                print(f"review.sh: {name} still has a live turn after compaction; end the seat "
+                      f"(codex_mesh.py end --to {name}) and start a fresh one", file=sys.stderr)
+                raise SystemExit(2)
             post(f"launcher: compaction failed for {name}: {detail}; continuing follow-up")
     checked = subprocess.run(
         [sys.executable, mesh_script, "can-follow", "--session-dir", root_text,
          "--to", name, "--claim-pid", os.environ["FOLLOW_LAUNCHER_PID"],
-         "--role", "review"],
+         "--role", "review", *(["--lens", lens] if lens else [])],
         capture_output=True,
         text=True,
     )
@@ -467,14 +478,14 @@ bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMI
 if [[ -n "${FOLLOW_TO}" ]]; then
   "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" follow \
     --session-dir "${SESSION_DIR}" --to "${FOLLOW_TO}" \
-    --claim-pid "${FOLLOW_LAUNCHER_PID}" --role review \
+    --claim-pid "${FOLLOW_LAUNCHER_PID}" --role review "${LENS_ARGS[@]}" \
     --message-file "${PROMPT_FILE}" --summary-file "${FINDINGS_FILE}" \
     --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
     --model "${AGENT_MODEL}" --effort "${AGENT_EFFORT:-}" \
     --service-tier "${AGENT_SERVICE_TIER:-}" &
 elif [[ -n "${NEW_SLOT}" ]]; then
   "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" start \
-    --session-dir "${SESSION_DIR}" --name "${REVIEW_SEAT}" --role review \
+    --session-dir "${SESSION_DIR}" --name "${REVIEW_SEAT}" --role review "${LENS_ARGS[@]}" \
     --cwd "${WORKING_DIR}" --prompt-file "${PROMPT_FILE}" \
     --summary-file "${FINDINGS_FILE}" --reply-file "${REPLY_FILE}" \
     --log-file "${LOG_FILE}" --model "${AGENT_MODEL}" \

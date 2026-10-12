@@ -13,6 +13,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast, final, override
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 import mac_test
@@ -35,6 +36,7 @@ class RunState(TypedDict):
     what: str
     worktree: str
     since: str
+    remote_host: NotRequired[str]
 
 
 class WaitingState(TypedDict):
@@ -282,6 +284,10 @@ class MacTestCommandTests(unittest.TestCase):
             "MAC_TEST_STUB_DIR": str(self.stub_directory),
             "MAC_TEST_WATCH_INTERVAL_S": "0.05",
             "TZ": "America/New_York",
+            "BUILD_HOLD_DIR": str(self.root / "holders"),
+            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         }
         self.children = []
 
@@ -603,6 +609,110 @@ class MacTestCommandTests(unittest.TestCase):
         self.assertEqual(self.logged_arguments("gh"), [])
         self.assertEqual(self.logged_arguments("send"), [])
         self.assertFalse((self.state_directory / "run.json").exists())
+
+    def kept_claim(self, host: str = "previous-mac") -> RunState:
+        owner = self.start_child()
+        claimed = self.command("claim", "--pid", str(owner.pid), "--what", "older tests",
+                               "--worktree", str(self.root / "older"), "--remote", host)
+        self.assert_command(claimed, 0, "claimed\n")
+        record = self.run_state()
+        self.assertEqual(record.get("remote_host"), host)
+        self.stop_child(owner)
+        return record
+
+    def test_remote_claim_outlives_its_owner_and_remains_live_to_state_readers(self) -> None:
+        record = self.kept_claim()
+        paths = mac_test.StatePaths(self.state_directory)
+        with mock.patch("subprocess.run", side_effect=AssertionError("State reads stay local")), \
+             mock.patch("subprocess.Popen", side_effect=AssertionError("State reads stay local")):
+            decoded = mac_test.read_run(paths.run)
+            self.assertNotIsInstance(decoded, mac_test.NoRun)
+            if not isinstance(decoded, mac_test.NoRun):
+                self.assertTrue(mac_test.run_is_live(decoded))
+                self.assertEqual(decoded["what"], record["what"])
+                self.assertEqual(decoded["since"], record["since"])
+            self.assertNotIsInstance(mac_test.live_run(paths), mac_test.NoRun)
+        self.assertEqual(self.run_state(), record)
+
+    def test_process_claim_lapses_after_its_owner_ends(self) -> None:
+        owner = self.start_child()
+        self.claim(owner)
+        self.assertNotIn("remote_host", self.run_state())
+        self.stop_child(owner)
+        self.write_config(ci_repo="")
+        self.assert_command(self.command("status"), 0, "free\nno block\nCI's Mac switch: not configured\n")
+        self.assertFalse((self.state_directory / "run.json").exists())
+
+    def test_remote_takeover_preserves_job_fields_and_refuses_a_second_live_taker(self) -> None:
+        previous = self.kept_claim()
+        taker, other = self.start_child(), self.start_child()
+        taken = self.command("claim", "--pid", str(taker.pid), "--what", "new tests",
+                             "--worktree", str(self.root / "new"), "--remote", "new-mac")
+        self.assertEqual(taken.returncode, 13, taken.stdout + taken.stderr)
+        self.assertEqual(taken.stdout + taken.stderr, "leftovers: previous-mac\n")
+        after = self.run_state()
+        self.assertEqual(after["pid"], taker.pid)
+        self.assertEqual(after["proc_start"], mac_test.process_start_time(taker.pid))
+        self.assertEqual({key: value for key, value in after.items() if key not in ("pid", "proc_start")},
+                         {key: value for key, value in previous.items() if key not in ("pid", "proc_start")})
+        refused = self.command("claim", "--pid", str(other.pid), "--what", "third tests", "--remote", "third-mac")
+        self.assertEqual(refused.returncode, 11, refused.stdout + refused.stderr)
+        self.assertTrue(refused.stdout.startswith("busy: older tests since "), refused.stdout)
+        self.assertEqual(self.run_state(), after)
+
+    def test_process_claim_waits_for_kept_remote_claim_and_reports_leftovers(self) -> None:
+        record = self.kept_claim()
+        since = datetime.fromisoformat(record["since"]).astimezone(LOCAL_ZONE).strftime("%H:%M")
+        self.assert_command(self.command("claim", "--pid", str(os.getpid()), "--what", "local tests", "--wait", "0.05"),
+                            11, f"busy: leftovers of older tests on previous-mac since {since}\n")
+        self.assertEqual(self.run_state(), record)
+
+    def test_status_names_kept_claim_and_matching_release_ends_it(self) -> None:
+        record = self.kept_claim()
+        self.write_config(ci_repo="")
+        status = self.command("status")
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertIn(f"running: leftovers of older tests on previous-mac since {self.local_time(record['since'])}, "
+                      + f"kept under pid {record['pid']}\n", status.stdout)
+        self.assert_command(self.command("release", "--pid", str(os.getpid())), 0, "")
+        self.assertEqual(self.run_state(), record)
+        self.assert_command(self.command("release", "--pid", str(record["pid"])), 0, "")
+        self.assertFalse((self.state_directory / "run.json").exists())
+
+    def test_pending_block_waits_for_kept_claim_and_takeover_precedes_block_refusal(self) -> None:
+        record = self.kept_claim()
+        block = self.command("block", "--holder", "alice", "--for", "render work")
+        self.assertEqual(block.returncode, 0, block.stdout + block.stderr)
+        self.assertIn("Block pending for alice: older tests is running on the Mac.", block.stdout)
+        self.assertEqual(self.block_state()["state"], "pending")
+        status = self.command("status")
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertEqual(self.block_state()["state"], "pending")
+        self.assertEqual(self.run_state(), record)
+        taker = self.start_child()
+        taken = self.command("claim", "--pid", str(taker.pid), "--what", "new tests", "--remote", "new-mac")
+        self.assertEqual(taken.returncode, 13, taken.stdout + taken.stderr)
+        self.assertEqual(taken.stdout + taken.stderr, "leftovers: previous-mac\n")
+        self.assertEqual(self.block_state()["state"], "pending")
+        self.assertEqual(self.run_state()["pid"], taker.pid)
+
+    def test_run_record_without_remote_host_still_decodes_with_mapping_access(self) -> None:
+        started = mac_test.process_start_time(os.getpid())
+        self.assertIsNotNone(started)
+        assert started is not None
+        record: RunState = {"pid": os.getpid(), "proc_start": started, "what": "legacy tests",
+                            "worktree": str(self.root), "since": datetime.now(timezone.utc).isoformat()}
+        self.state_directory.mkdir()
+        path = self.state_directory / "run.json"
+        _ = path.write_text(json.dumps(record))
+        before = path.read_bytes()
+        decoded = mac_test.read_run(path)
+        self.assertNotIsInstance(decoded, mac_test.NoRun)
+        if not isinstance(decoded, mac_test.NoRun):
+            self.assertTrue(mac_test.run_is_live(decoded))
+            for key in ("pid", "proc_start", "what", "worktree", "since"):
+                self.assertEqual(decoded[key], record[key])
+        self.assertEqual(path.read_bytes(), before)
 
     def test_claim_reports_damaged_block_state(self) -> None:
         self.state_directory.mkdir()
@@ -1039,6 +1149,74 @@ class MacTestCommandTests(unittest.TestCase):
         )
         self.assertFalse((self.state_directory / "block.json").exists())
         self.assertNotIn("could not lift", recovered.stdout)
+
+    def test_claim_block_reader_keeps_expired_block_without_writes(self) -> None:
+        now = datetime.now(timezone.utc)
+        _ = self.write_block(
+            since=now - timedelta(hours=2),
+            expires=now - timedelta(minutes=1),
+            free_message={"kind": "not_needed"},
+        )
+        paths = mac_test.StatePaths(self.state_directory)
+        before = paths.block.read_bytes()
+        with mock.patch("subprocess.run", side_effect=AssertionError("State reading stays local")):
+            with mock.patch("subprocess.Popen", side_effect=AssertionError("State reading stays local")):
+                block = mac_test.read_claim_block(paths)
+        self.assertIsInstance(block, mac_test.ActiveMacBlock)
+        if isinstance(block, mac_test.ActiveMacBlock):
+            self.assertLess(block.expires, now)
+        self.assertEqual(paths.block.read_bytes(), before)
+        self.assertEqual(tuple(self.state_directory.iterdir()), (paths.block,))
+        paths.block.unlink()
+        self.assertIsInstance(mac_test.read_claim_block(paths), mac_test.NoMacBlock)
+        self.assertEqual(tuple(self.state_directory.iterdir()), ())
+
+    def test_invalid_claim_block_raises_native_state_read_error(self) -> None:
+        self.state_directory.mkdir()
+        paths = mac_test.StatePaths(self.state_directory)
+        _ = paths.block.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(mac_test.StateReadError, "invalid block record"):
+            _ = mac_test.read_claim_block(paths)
+
+    def test_invalid_claim_record_raises_native_state_read_error(self) -> None:
+        self.state_directory.mkdir()
+        paths = mac_test.StatePaths(self.state_directory)
+        _ = paths.run.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(mac_test.StateReadError, "invalid run record"):
+            _ = mac_test.read_run(paths.run)
+
+    def test_claim_refuses_expired_block_until_ci_restore_lifts_it(self) -> None:
+        now = datetime.now(timezone.utc)
+        block = self.write_block(
+            since=now - timedelta(hours=2),
+            expires=now - timedelta(minutes=1),
+            free_message={"kind": "not_needed"},
+        )
+        self.gh["failures"] = [
+            {"match": "variable set", "line": "authentication required", "status": 1}
+        ]
+        self.sync_gh()
+        stuck = self.command("status")
+        self.assertEqual(stuck.returncode, 0, stuck.stdout + stuck.stderr)
+        self.assertEqual(self.block_state(), block)
+        self.assert_command(
+            self.command("claim", "--pid", str(os.getpid()), "--what", "nextest hana"),
+            10,
+            "blocked by alice: release work\n",
+        )
+        self.assertEqual(self.block_state(), block)
+        self.assertFalse((self.state_directory / "run.json").exists())
+
+        self.gh["failures"] = []
+        self.sync_gh()
+        lifted = self.command("status")
+        self.assertEqual(lifted.returncode, 0, lifted.stdout + lifted.stderr)
+        self.assertFalse((self.state_directory / "block.json").exists())
+        self.assert_command(
+            self.command("claim", "--pid", str(os.getpid()), "--what", "nextest hana"),
+            0,
+            "claimed\n",
+        )
 
     def test_unblock_lifts_owned_switch_when_repository_is_removed(self) -> None:
         self.write_config(ci_repo="")

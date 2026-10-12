@@ -38,6 +38,8 @@ elif args[0] == "new":
     print("next_due=1791334500 (2026-10-06 17:55 PDT)")
 elif args[0] == "remove":
     instance.unlink(missing_ok=True)
+elif args[0] == "stop":
+    _ = instance.write_text("stopped", encoding="utf-8")
 else:
     raise SystemExit(2)
 '''
@@ -76,6 +78,7 @@ class RegistrationTests(unittest.TestCase):
         self.env = {**os.environ, "HOME": str(self.home), "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
                     "REGISTRATION_TEST_STATE": str(self.state), "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
+                    "USAGE_STATE_DIR": str(self.state / "usage"),
                     "MAC_TEST_STATE_DIR": str(self.state / "mac-test"),
                     # No test here may ask a real tmux which unit sessions exist.
                     "UNIT_LOOKUP_TMUX": str(self.root / "no-tmux"),
@@ -124,7 +127,7 @@ class RegistrationTests(unittest.TestCase):
     def copied_command(self) -> Path:
         tree = Path(tempfile.mkdtemp(prefix="command-copy-", dir=self.root))
         _ = shutil.copytree(SCRIPT.parent, tree / "scripts/production")
-        for name in ("build_hold", "lint", "mac_test", "message", "whoami"):
+        for name in ("build_hold", "lint", "mac_test", "message", "usage", "whoami"):
             _ = shutil.copytree(SCRIPT.parent.parent / name, tree / "scripts" / name)
         hooks = tree / "scripts/hooks"
         hooks.mkdir(parents=True)
@@ -168,7 +171,46 @@ class RegistrationTests(unittest.TestCase):
         for instance in ("stall-watch", "tmux-names"):
             self.assertEqual(len([call for call in calls if call[:2] == ["new", instance]]), 1)
 
-    def test_on_demand_registers_no_dailies_schedule_and_removes_an_old_one(self) -> None:
+    def test_register_reports_unexpected_usage_write_failure_and_completes(self) -> None:
+        harness = """
+import runpy
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+script, *arguments = sys.argv[1:]
+sys.path.insert(0, str(Path(script).parent))
+sys.path.insert(0, str(Path(script).parents[2]))
+from scripts.usage import agents_log
+sys.argv = [script, *arguments]
+with patch.object(agents_log, 'append', side_effect=RuntimeError('recording failed\\ntry later')):
+    runpy.run_path(script, run_name='__main__')
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", harness, str(SCRIPT), "register", "--production", str(self.doc)],
+            cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "agents_log: recording failed try later\n")
+        self.assertIn("register: ok", result.stdout)
+        self.assertEqual(len([call for call in self.notifier_calls()
+                              if call[:2] == ["new", "showrunner-example"]]), 1)
+
+    def test_copied_command_registers_and_records_showrunner_usage(self) -> None:
+        result = self.run_copy(self.copied_command(), "register")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("register: ok", result.stdout)
+        ledger = self.state / "usage/agents.jsonl"
+        records = [cast(dict[str, object], json.loads(line))
+                   for line in ledger.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(records), 1)
+        self.assertEqual((records[0]["id"], records[0]["role"]), ("current-session-id", "showrunner"))
+        self.assertNotIn("lens", records[0])
+
+    def test_on_demand_keeps_a_stopped_timer_as_the_showrunners_record(self) -> None:
         first = self.run_command("register")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         doc = self.doc.read_text(encoding="utf-8")
@@ -180,13 +222,16 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
         self.assertIn("register: ok — showrunner-example on demand: no scheduled dailies", resumed.stdout)
         calls = self.notifier_calls()[before:]
-        self.assertNotIn(["new", "showrunner-example"], [call[:2] for call in calls])
-        self.assertIn(["remove", "showrunner-example"], calls)
-        self.assertFalse((self.state / "instance-showrunner-example").exists())
+        self.assertIn(["new", "showrunner-example"], [call[:2] for call in calls])
+        self.assertIn(["stop", "showrunner-example"], calls)
+        self.assertNotIn(["remove", "showrunner-example"], calls)
+        self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
         again = self.run_command("register")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        # A re-register retargets the timer and stops it again, so it stays stopped.
         self.assertEqual([call[0] for call in self.notifier_calls()[before + len(calls):]],
-                         ["status", "status", "status"])
+                         ["new", "stop", "status", "status"])
+        self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
 
     def test_register_requires_the_environment_session_id(self) -> None:
         without_id = {key: value for key, value in self.env.items() if key != "CLAUDE_CODE_SESSION_ID"}

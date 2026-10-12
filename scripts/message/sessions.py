@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Find a live Claude session's socket or session ID."""
+"""Find a live Claude session's socket, `SendMessage` address or session ID."""
 
 from __future__ import annotations
 
@@ -104,17 +104,17 @@ def process_start(pid: int) -> str | None:
 
 
 def running_session(record: SessionRecord) -> bool:
-    """The pid runs and a socket or matching start identifies it as this session."""
+    """The pid runs with its recorded start, or an older record has its socket."""
     try:
         os.kill(record["pid"], 0)
     except PermissionError:
         pass
     except (ProcessLookupError, OverflowError):
         return False
-    if messaging_socket_exists(record):
-        return True
     recorded_start = record.get("procStart", "")
-    return bool(recorded_start) and recorded_start == process_start(record["pid"])
+    if recorded_start:
+        return recorded_start == process_start(record["pid"])
+    return messaging_socket_exists(record)
 
 
 def messaging_socket_exists(record: SessionRecord) -> bool:
@@ -174,8 +174,11 @@ def addressed(to: str, records: list[SessionRecord]) -> SessionRecord | None:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3 or argv[1] not in {"socket", "id"} or not argv[2]:
-        print("usage: sessions.py socket <session:id|name> | id <pid|name>", file=sys.stderr)
+    if len(argv) != 3 or argv[1] not in {"socket", "address", "id"} or not argv[2]:
+        print(
+            "usage: sessions.py socket <session:id|name> | address <session:id|name> | id <pid|name>",
+            file=sys.stderr,
+        )
         return 2
 
     command, target = argv[1:]
@@ -192,9 +195,9 @@ def main(argv: list[str]) -> int:
     reads = [read_session(path) for path in paths]
     unreadable = any(read is UnreadableSessionRecord.FOUND for read in reads)
     records = (read for read in reads if not isinstance(read, UnreadableSessionRecord))
-    if command == "socket" and target.startswith("session:"):
+    if command != "id" and target.startswith("session:"):
         matches = (record for record in records if record["sessionId"] == target[8:])
-    elif command == "socket":
+    elif command != "id":
         matches = (record for record in records if record["name"] == target)
     elif target.isascii() and target.isdigit():
         matches = (record for record in records if record["pid"] == int(target))
@@ -209,7 +212,13 @@ def main(argv: list[str]) -> int:
             print("sessions: one or more registry files could not be read", file=sys.stderr)
             return 3
         return 1
-    print(newest["messagingSocketPath"] if command == "socket" else newest["sessionId"])
+    # `SendMessage` takes the address as its `to`: the session on this machine,
+    # whatever other sessions the sender's account lists under the same name.
+    print({
+        "socket": newest["messagingSocketPath"],
+        "address": f"uds:{newest['messagingSocketPath']}",
+        "id": newest["sessionId"],
+    }[command])
     return 0
 
 

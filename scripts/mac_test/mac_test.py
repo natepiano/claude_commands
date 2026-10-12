@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Literal, TypedDict, cast
+from typing import Literal, TypeGuard, TypedDict, cast
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
@@ -27,14 +27,38 @@ import sweep
 MESSAGE_TIMEOUT_S = 30.0
 
 
-class RunRecord(TypedDict):
-    """A process that currently owns Mac test capacity."""
+class StateReadError(ValueError):
+    """A Mac coordination record cannot be read or decoded."""
+
+
+class ClaimOwnerRecord(TypedDict):
+    """The process identity and job details retained by either kind of claim."""
 
     pid: int
     proc_start: str
     what: str
     worktree: str
     since: str
+
+
+class ProcessBoundClaim(ClaimOwnerRecord):
+    """Mac capacity held only while the claiming process lives."""
+
+
+class RemoteJobClaim(ClaimOwnerRecord):
+    """Mac capacity held until the named host's job is known to have ended."""
+
+    remote_host: str
+
+
+RunRecord = ProcessBoundClaim | RemoteJobClaim
+
+
+class NoRemoteJob:
+    """A claim requested for the calling process alone."""
+
+
+NO_REMOTE_JOB = NoRemoteJob()
 
 
 CiSwitch = Literal[
@@ -301,6 +325,7 @@ class CliArguments(argparse.Namespace):
         self.what: str = ""
         self.worktree: str = ""
         self.wait: float = 0.0
+        self.remote: str | NoRemoteJob = NO_REMOTE_JOB
         self.holder: str = ""
         self.reason: str = ""
         self.hours: str = ""
@@ -382,8 +407,10 @@ def read_json_object(path: Path) -> dict[str, object] | None:
         decoded = cast(object, json.loads(path.read_text(encoding="utf-8")))
     except FileNotFoundError:
         return None
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise StateReadError(f"{path}: {error}") from error
     if not isinstance(decoded, dict):
-        raise ValueError(f"{path} does not contain a JSON object")
+        raise StateReadError(f"{path} does not contain a JSON object")
     return cast(dict[str, object], decoded)
 
 
@@ -403,32 +430,40 @@ def read_run(path: Path) -> RunState:
         or not isinstance(worktree, str)
         or not isinstance(since, str)
     ):
-        raise ValueError(f"{path} has an invalid run record")
-    return {
+        raise StateReadError(f"{path} has an invalid run record")
+    _ = aware_timestamp(since, path, "since")
+    record: ProcessBoundClaim = {
         "pid": pid,
         "proc_start": proc_start,
         "what": what,
         "worktree": worktree,
         "since": since,
     }
+    if "remote_host" not in values:
+        return record
+    host = values["remote_host"]
+    if not isinstance(host, str) or not host.strip():
+        raise StateReadError(f"{path} has an invalid remote_host")
+    remote: RemoteJobClaim = {**record, "remote_host": host}
+    return remote
 
 
 def aware_timestamp(value: object, path: Path, field: str) -> datetime:
     if not isinstance(value, str):
-        raise ValueError(f"{path} has an invalid {field}")
+        raise StateReadError(f"{path} has an invalid {field}")
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError as error:
-        raise ValueError(f"{path} has an invalid {field}") from error
+        raise StateReadError(f"{path} has an invalid {field}") from error
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError(f"{path} has an invalid {field}")
+        raise StateReadError(f"{path} has an invalid {field}")
     return parsed
 
 
 def required_string(values: dict[str, object], key: str, path: Path) -> str:
     value = values.get(key)
     if not isinstance(value, str):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     return value
 
 
@@ -436,7 +471,7 @@ def decoded_delivery(session: object, holder: str, path: Path) -> MessageDeliver
     if session is None:
         return HolderQueue(holder)
     if not isinstance(session, str):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     return RecordedSession(session, holder)
 
 
@@ -444,7 +479,7 @@ def decoded_showrunner(showrunner: object, path: Path) -> Showrunner:
     if showrunner is None:
         return NO_SHOWRUNNER
     if not isinstance(showrunner, str):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     return NamedShowrunner(showrunner)
 
 
@@ -456,13 +491,13 @@ def decoded_ci(value: object, path: Path) -> CiSwitch:
         "still_on",
         "off_unconfirmed",
     ):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     return value
 
 
 def decode_waiting(value: object, path: Path) -> WaitingOn:
     if not isinstance(value, dict):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     item = cast(dict[str, object], value)
     kind = item.get("kind")
     if kind == "local_run" and set(item) == {"kind", "what"}:
@@ -473,12 +508,12 @@ def decode_waiting(value: object, path: Path) -> WaitingOn:
         return WAITING_ON_CI_JOB
     if kind == "ci_unknown" and set(item) == {"kind"}:
         return WAITING_ON_UNKNOWN_CI
-    raise ValueError(f"{path} has an invalid block record")
+    raise StateReadError(f"{path} has an invalid block record")
 
 
 def decode_free_message(value: object, path: Path) -> FreeMessage:
     if not isinstance(value, dict):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     item = cast(dict[str, object], value)
     kind = item.get("kind")
     if kind == "not_needed" and set(item) == {"kind"}:
@@ -489,13 +524,13 @@ def decode_free_message(value: object, path: Path) -> FreeMessage:
         what = item.get("what")
         if isinstance(what, str):
             return FreeMessageOwed(what, aware_timestamp(item.get("ended"), path, "ended"))
-    raise ValueError(f"{path} has an invalid block record")
+    raise StateReadError(f"{path} has an invalid block record")
 
 
 def decode_legacy_block(values: dict[str, object], path: Path) -> MacBlockState:
     required = {"holder", "session", "for", "since", "state"}
     if set(values) != required:
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     holder = required_string(values, "holder", path)
     reason = required_string(values, "for", path)
     since = aware_timestamp(values.get("since"), path, "since")
@@ -511,7 +546,7 @@ def decode_legacy_block(values: dict[str, object], path: Path) -> MacBlockState:
             holder, reason, since, since + timedelta(hours=48), delivery,
             NO_SHOWRUNNER, "still_on", FREE_MESSAGE_NOT_NEEDED,
         )
-    raise ValueError(f"{path} has an invalid block record")
+    raise StateReadError(f"{path} has an invalid block record")
 
 
 def read_block(path: Path) -> MacBlockState:
@@ -527,7 +562,7 @@ def read_block(path: Path) -> MacBlockState:
     }
     expected_keys = common_keys | ({"waiting_on"} if state == "pending" else {"free_message"})
     if values.get("version") != 2 or set(values) != expected_keys:
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     holder = required_string(values, "holder", path)
     reason = required_string(values, "for", path)
     since = aware_timestamp(values.get("since"), path, "since")
@@ -545,7 +580,12 @@ def read_block(path: Path) -> MacBlockState:
             holder, reason, since, expires, delivery, showrunner, ci,
             decode_free_message(values.get("free_message"), path),
         )
-    raise ValueError(f"{path} has an invalid block record")
+    raise StateReadError(f"{path} has an invalid block record")
+
+
+def read_claim_block(paths: StatePaths) -> MacBlockState:
+    """Read the block that refuses new claims until its record is removed."""
+    return read_block(paths.block)
 
 
 def timestamp(value: datetime) -> str:
@@ -635,7 +675,11 @@ def process_start_time(pid: int) -> str | None:
 
 
 def run_is_live(run: RunRecord) -> bool:
-    return process_start_time(run["pid"]) == run["proc_start"]
+    return "remote_host" in run or process_start_time(run["pid"]) == run["proc_start"]
+
+
+def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
+    return "remote_host" in run and process_start_time(run["pid"]) != run["proc_start"]
 
 
 def live_run(paths: StatePaths) -> RunState:
@@ -1346,12 +1390,23 @@ def command_claim(args: CliArguments, paths: StatePaths) -> int:
         with locked(paths.lock):
             try:
                 run = live_run(paths)
-            except (OSError, ValueError):
+            except (OSError, StateReadError):
                 print(f"state unreadable: {paths.run}")
                 return 12
+            if isinstance(run, dict) and run_is_kept(run) and isinstance(args.remote, str):
+                proc_start = process_start_time(args.pid)
+                if proc_start is None:
+                    print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
+                    return 1
+                kept = run
+                kept["pid"] = args.pid
+                kept["proc_start"] = proc_start
+                write_json(paths.run, kept)
+                print(f"leftovers: {kept['remote_host']}")
+                return 13
             try:
-                block = read_block(paths.block)
-            except (OSError, ValueError):
+                block = read_claim_block(paths)
+            except (OSError, StateReadError):
                 print(f"state unreadable: {paths.block}")
                 return 12
             if not isinstance(block, NoMacBlock):
@@ -1372,6 +1427,9 @@ def command_claim(args: CliArguments, paths: StatePaths) -> int:
                     "worktree": args.worktree,
                     "since": timestamp(utc_now()),
                 }
+                if isinstance(args.remote, str):
+                    remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
+                    claimed = remote_claim
                 write_json(paths.run, claimed)
                 print("claimed")
                 return 0
@@ -1379,6 +1437,11 @@ def command_claim(args: CliArguments, paths: StatePaths) -> int:
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            if run_is_kept(busy_run):
+                kept = busy_run
+                print(f"busy: leftovers of {kept['what']} on {kept['remote_host']} since "
+                      + f"{local_time(kept['since'], include_zone=False)}")
+                return 11
             print(
                 f"busy: {busy_run['what']} since "
                 + f"{local_time(busy_run['since'], include_zone=False)}"
@@ -1635,6 +1698,10 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
         )
         if isinstance(outcome.run, NoRun):
             print("free")
+        elif run_is_kept(outcome.run):
+            kept = outcome.run
+            print(f"running: leftovers of {kept['what']} on {kept['remote_host']} "
+                  + f"since {local_time(kept['since'])}, kept under pid {kept['pid']}")
         else:
             print(
                 f"running: {outcome.run['what']} ({outcome.run['worktree']}) "
@@ -1696,6 +1763,12 @@ def command_watch(paths: StatePaths, config: MacTestConfig) -> int:
             time.sleep(watch_interval())
 
 
+def remote_host_argument(value: str) -> str:
+    if not value.strip():
+        raise argparse.ArgumentTypeError("remote host must not be empty")
+    return value
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
@@ -1705,6 +1778,7 @@ def parser() -> argparse.ArgumentParser:
     _ = claim.add_argument("--what", required=True)
     _ = claim.add_argument("--worktree", default=os.getcwd())
     _ = claim.add_argument("--wait", type=float, default=0.0)
+    _ = claim.add_argument("--remote", type=remote_host_argument, default=NO_REMOTE_JOB)
 
     release = commands.add_parser("release")
     _ = release.add_argument("--pid", type=int, required=True)

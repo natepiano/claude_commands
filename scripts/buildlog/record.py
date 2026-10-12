@@ -344,6 +344,8 @@ def call(args: list[str]) -> None:
         "mac_reason": os.environ.get("BUILDLOG_MAC_REASON", ""),
         "local_reason": os.environ.get("BUILDLOG_LOCAL_REASON", ""),
         "mac_s": optional_nonnegative_number(os.environ.get("BUILDLOG_MAC_S", "")),
+        "target": os.environ.get("BUILDLOG_TARGET", ""),
+        "hold_wait_s": optional_nonnegative_number(os.environ.get("BUILDLOG_HOLD_WAIT_S", "")),
         "wall_s": optional_int(wall) or 0,
         "build_s": optional_int(build),
         "saved_s": optional_int(saved) or 0,

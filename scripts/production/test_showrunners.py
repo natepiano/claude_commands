@@ -153,19 +153,31 @@ raise SystemExit(1)
             # A timer whose check names no production doc is not a showrunner's: it is left out.
             f"show\tfirst-name\t{LOS_ANGELES}\t{self.doc}"])
         self.assertEqual(self.successful("name", "show"), "first-name\n")
+        # A unit messages the showrunner's session on this machine, whoever else has its name.
+        self.assertEqual(self.successful("address", "show"), f"uds:{self.root / 'live-id.sock'}\n")
         # A rename is written in one place, the session's own record, and every reader sees it.
         _ = self.record("renamed", "live-id", pid=pid)
         self.assertIn("show\trenamed\t", self.successful("list"))
         self.assertEqual(self.successful("name", "show"), "renamed\n")
         self.assertFalse(self.config.exists())
 
-    def test_name_refuses_a_showrunner_that_is_not_running_or_has_no_timer(self) -> None:
+    def test_a_stopped_timer_still_names_its_showrunner(self) -> None:
+        # A production on demand keeps its timer stopped, and the timer is still the showrunner's record.
         self.instance("showrunner-show", doc=self.doc)
-        for slug in ("show", "absent"):
-            with self.subTest(slug=slug):
-                result = self.cli("name", slug)
-                self.assertEqual((result.returncode, result.stdout), (1, ""))
-                self.assertIn(f"the showrunner of {slug} is not running", result.stderr)
+        _ = (self.notifier / "showrunner-show" / "state").write_text(
+            "ENABLED=0\nNEXT_DUE=0\nLAST_SENT=0\nLAST_RESTART=0\nLAST_TARGET=\n", encoding="utf-8")
+        _ = self.record("on-demand", "live-id")
+        self.assertEqual(self.successful("name", "show"), "on-demand\n")
+        self.assertIn("show\ton-demand\t", self.successful("list"))
+
+    def test_name_and_address_refuse_a_showrunner_that_is_not_running_or_has_no_timer(self) -> None:
+        self.instance("showrunner-show", doc=self.doc)
+        for verb in ("name", "address"):
+            for slug in ("show", "absent"):
+                with self.subTest(verb=verb, slug=slug):
+                    result = self.cli(verb, slug)
+                    self.assertEqual((result.returncode, result.stdout), (1, ""))
+                    self.assertIn(f"the showrunner of {slug} is not running", result.stderr)
 
     def test_unreadable_session_records_are_an_error_not_a_stopped_showrunner(self) -> None:
         self.instance("showrunner-show", doc=self.doc)
