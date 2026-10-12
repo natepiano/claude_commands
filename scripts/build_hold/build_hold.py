@@ -1201,7 +1201,17 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
             queue_told_sessions(cycle, now)
         elif isinstance(state, (ReleasedAwaitingAdmission, DeliveryQueued)):
             started_at = state.released_at if isinstance(state, ReleasedAwaitingAdmission) else state.attempted_at
-            if (now - started_at).total_seconds() < NO_ADMISSION_ACK_S:
+            turn_limit_s = NO_ADMISSION_ACK_S
+            if (not entry["active_call_id"]
+                and any(isinstance(read_release_state(other), AwaitingRelease) for other in entries if other is not entry)):
+                turn_limit_s = RELEASE_SETTLE_S
+            if (now - started_at).total_seconds() < turn_limit_s:
+                if not entry["active_call_id"] and isinstance(socket_for(entry["session_id"]), RecipientGone):
+                    entry["session_pending"] = False
+                    store_release_state(entry, RecipientGone())
+                    save_cycle(cycle)
+                    queue_told_sessions(cycle, now)
+                    continue
                 return False, entry_text(entry)
             entry["active_call_id"] = ""
             entry["session_pending"] = False

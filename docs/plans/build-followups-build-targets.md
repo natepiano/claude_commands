@@ -282,7 +282,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **Ruled out:** a settings key for the value (nothing needs a second value); rustflags or an rpath argument in the remote command (the deployment target fixes every crate in one place, and the crates named above already emit that rpath for their own binaries).
 
-### Phase 7 — A silent or gone session never holds the builds behind it  · status: todo
+### Phase 7 — A silent or gone session never holds the builds behind it  · status: done
 
 #### Work Order
 

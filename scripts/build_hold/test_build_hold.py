@@ -974,7 +974,7 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
     def advance(self, now: datetime) -> tuple[bool, str]:
         cycle = build_hold.read_cycle()
         assert cycle is not None
-        return build_hold.advance_release(cycle, now)
+        return build_hold.advance_release(cycle, now, clock=lambda: now)
 
     def test_same_name_sessions_receive_distinct_direct_sends_in_arrival_order(self) -> None:
         now = self.begin("session-a", "session-b")
@@ -1011,7 +1011,7 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
                 ("session-b", "/tmp/session-b.sock"),
             ])
 
-    def test_delayed_first_build_keeps_next_session_held(self) -> None:
+    def test_delayed_unbound_build_yields_to_next_session_after_one_minute(self) -> None:
         now = self.begin("first", "second")
         sent: list[str] = []
 
@@ -1022,18 +1022,10 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
              mock.patch.object(build_hold, "send_release", side_effect=deliver):
             _ = self.advance(now)
-            cycle = build_hold.read_cycle()
-            assert cycle is not None
-            cycle["entries"][0]["released_at"] = (now - timedelta(minutes=10)).isoformat()
-            build_hold.save_cycle(cycle)
-            _ = self.advance(now)
             self.assertEqual(sent, ["first"])
-            self.assertEqual(self.entries()[0]["state"], "ReleasedAwaitingAdmission")
-            _ = build_hold.mark_gate("first", "MemoryGateReturned", "Granted")
-            returned = build_hold.aware_instant(self.entries()[0].get("wait_ended_at", ""))
-            _ = self.advance(returned + timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1))
-            self.assertEqual(sent, ["first"])
-            _ = self.advance(returned + timedelta(seconds=build_hold.RELEASE_SETTLE_S))
+            _ = self.advance(now + timedelta(minutes=10))
+            self.assertEqual(build_hold.read_release_state(self.entries()[0]), build_hold.NoAdmissionAck(now))
+            self.assertFalse(self.entries()[0]["session_pending"])
             self.assertEqual(sent, ["first", "second"])
 
     def test_memory_wait_past_five_minutes_still_blocks_next_release(self) -> None:
@@ -1079,10 +1071,11 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
              mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
             _ = self.advance(now)
             released = build_hold.aware_instant(self.entries()[0].get("released_at", ""))
-            _ = self.advance(released + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S - 1))
+            _ = self.advance(released + timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1))
             self.assertEqual(self.entries()[0]["state"], "ReleasedAwaitingAdmission")
-            _ = self.advance(released + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S))
-            self.assertEqual(self.entries()[0]["state"], "NoAdmissionAck")
+            self.assertEqual(self.entries()[1]["state"], "AwaitingRelease")
+            _ = self.advance(released + timedelta(seconds=build_hold.RELEASE_SETTLE_S))
+            self.assertEqual(build_hold.read_release_state(self.entries()[0]), build_hold.NoAdmissionAck(released))
             self.assertEqual(self.entries()[1]["state"], "ReleasedAwaitingAdmission")
 
     def test_unreadable_session_records_are_a_failed_delivery_not_a_gone_session(self) -> None:
@@ -1583,11 +1576,13 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                 elif ending == "nothing":
                     self.assertIn("NothingToBuild", build_hold.answer_nothing_to_build("z-first"))
                 else:
-                    self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S - 1)
+                    self.now += timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1)
                     _ = self.advance()
                     self.assertEqual(self.sent(), ["z-first"])
                     self.now += timedelta(seconds=1)
                 _ = self.advance()
+                if ending == "timeout":
+                    self.assertEqual(self.entry("z-first")["state"], "NoAdmissionAck")
                 self.assertEqual(self.sent(), ["z-first", "a-second"])
                 self.assertEqual(self.entry("m-third")["state"], "AwaitingRelease")
                 _ = build_hold.answer_nothing_to_build("a-second")
@@ -1595,6 +1590,182 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                 self.assertEqual(self.sent(), ["z-first", "a-second", "m-third"])
                 _ = build_hold.answer_nothing_to_build("m-third")
                 self.assertTrue(self.advance()[0])
+
+    def test_departed_session_ends_turn_on_next_poll_without_changing_delivery(self) -> None:
+        for queued in (False, True):
+            with self.subTest(queued=queued):
+                self.begin("first", "second")
+                self.release_mocks["lookup"].side_effect = None
+                self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
+                                                           else build_hold.ReleaseDelivered())
+                _ = self.advance()
+                delivery = self.entry("first")["delivery"].copy()
+                self.assertEqual(delivery["outcome"], "QueuedUnconfirmed" if queued else "Delivered")
+
+                def lookup(key: str) -> build_hold.RecipientGone | build_hold.RecipientLive:
+                    return build_hold.RecipientGone() if key == "first" else build_hold.RecipientLive("/test/socket")
+
+                self.release_mocks["lookup"].reset_mock()
+                self.release_mocks["lookup"].side_effect = lookup
+                self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
+                self.assertFalse(self.advance()[0])
+                self.assertEqual(self.entry("first")["state"], "RecipientGone")
+                self.assertFalse(self.entry("first")["session_pending"])
+                self.assertEqual(self.entry("first")["delivery"], delivery)
+                self.assertEqual(self.sent(), ["first", "second"])
+                self.assertEqual(self.release_mocks["lookup"].call_args_list,
+                                 [mock.call("first"), mock.call("second")])
+                _ = build_hold.answer_nothing_to_build("second")
+                self.assertTrue(self.advance()[0])
+                line = self.final_line()
+                if queued:
+                    self.assertIn("Not reached, tell them yourself: name first (queued, no answer)", line)
+                    self.assertNotIn("session gone", line)
+                else:
+                    self.assertNotIn("Not reached", line)
+
+    def test_lookup_failure_preserves_silent_turn_until_normal_deadline_without_waiters(self) -> None:
+        for queued in (False, True):
+            with self.subTest(queued=queued):
+                self.begin("owner")
+                self.release_mocks["lookup"].return_value = build_hold.RecipientLive("/test/socket")
+                self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
+                                                           else build_hold.ReleaseDelivered())
+                started = self.now
+                _ = self.advance()
+                delivery = self.entry("owner")["delivery"].copy()
+                self.release_mocks["lookup"].reset_mock()
+                self.release_mocks["lookup"].return_value = build_hold.RecipientLookupFailed("registry denied")
+                output, errors = io.StringIO(), io.StringIO()
+                with redirect_stdout(output), redirect_stderr(errors):
+                    for elapsed in (build_hold.RELEASE_POLL_S, build_hold.RELEASE_SETTLE_S,
+                                    build_hold.NO_ADMISSION_ACK_S - 1):
+                        self.now = started + timedelta(seconds=elapsed)
+                        self.assertFalse(self.advance()[0])
+                        self.assertEqual(self.entry("owner")["state"], "DeliveryQueued" if queued else "ReleasedAwaitingAdmission")
+                        self.assertEqual(self.entry("owner")["delivery"], delivery)
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(errors.getvalue(), "")
+                self.assertEqual(self.release_mocks["lookup"].call_args_list, [mock.call("owner")] * 3)
+                self.release_mocks["lookup"].reset_mock()
+                self.now = started + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
+                self.assertTrue(self.advance()[0])
+                self.release_mocks["lookup"].assert_not_called()
+                self.assertEqual(build_hold.read_release_state(self.entry("owner")), build_hold.NoAdmissionAck(started))
+                self.assertFalse(self.entry("owner")["session_pending"])
+                self.assertEqual(self.entry("owner")["delivery"], delivery)
+                self.assertEqual(self.sent(), ["owner"])
+
+    def test_silent_delivered_and_queued_turns_yield_at_one_minute_without_deadline_lookup(self) -> None:
+        for queued in (False, True):
+            with self.subTest(queued=queued):
+                self.begin("first", "second")
+                self.release_mocks["lookup"].side_effect = None
+                self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
+                                                           else build_hold.ReleaseDelivered())
+                started = self.now
+                _ = self.advance()
+                self.now += timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1)
+                self.assertFalse(self.advance()[0])
+                self.assertEqual(self.entry("first")["state"], "DeliveryQueued" if queued else "ReleasedAwaitingAdmission")
+                self.assertEqual(self.entry("second")["state"], "AwaitingRelease")
+                self.assertEqual(self.sent(), ["first"])
+
+                def lookup(key: str) -> build_hold.RecipientLive:
+                    self.assertNotEqual(key, "first", "The expired turn must end before a session lookup")
+                    return build_hold.RecipientLive("/test/socket")
+
+                self.release_mocks["lookup"].reset_mock()
+                self.release_mocks["lookup"].side_effect = lookup
+                self.now += timedelta(seconds=1)
+                self.assertFalse(self.advance()[0])
+                self.assertEqual(build_hold.read_release_state(self.entry("first")), build_hold.NoAdmissionAck(started))
+                self.assertFalse(self.entry("first")["session_pending"])
+                self.assertEqual(self.sent(), ["first", "second"])
+                self.assertEqual(self.release_mocks["lookup"].call_args_list, [mock.call("second")])
+
+    def test_last_silent_turn_shortens_when_a_waiting_call_arrives(self) -> None:
+        for queued in (False, True):
+            with self.subTest(queued=queued):
+                self.begin("owner")
+                self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
+                                                           else build_hold.ReleaseDelivered())
+                started = self.now
+                _ = self.advance()
+                self.now += timedelta(seconds=build_hold.RELEASE_SETTLE_S + build_hold.RELEASE_POLL_S)
+                self.assertFalse(self.advance()[0])
+                self.assertEqual(self.entry("owner")["state"], "DeliveryQueued" if queued else "ReleasedAwaitingAdmission")
+                self.assertEqual(self.sent(), ["owner"])
+                self.call("late", "waiting-call")
+                self.assertIsInstance(build_hold.read_admission("late", "waiting-call"), build_hold.AwaitingTurn)
+                _ = self.advance()
+                self.assertEqual(build_hold.read_release_state(self.entry("owner")), build_hold.NoAdmissionAck(started))
+                self.assertEqual(self.sent(), ["owner", "late"])
+                self.assertIsInstance(build_hold.read_admission("late", "waiting-call"), build_hold.AdmittedTurn)
+
+    def test_bound_call_keeps_full_turn_and_skips_session_lookups(self) -> None:
+        for queued in (False, True):
+            for ending in ("gate", "timeout"):
+                with self.subTest(queued=queued, ending=ending):
+                    self.begin("owner", "peer")
+                    self.release_mocks["lookup"].side_effect = None
+                    self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
+                                                               else build_hold.ReleaseDelivered())
+                    started = self.now
+                    _ = self.advance()
+                    self.call("owner", "building-call")
+                    self.assertIsInstance(build_hold.read_admission("owner", "building-call"), build_hold.AdmittedTurn)
+                    self.release_mocks["lookup"].reset_mock()
+                    self.release_mocks["lookup"].side_effect = AssertionError("A bound call needs no session lookup")
+                    for elapsed in (build_hold.RELEASE_SETTLE_S, build_hold.NO_ADMISSION_ACK_S - 1):
+                        self.now = started + timedelta(seconds=elapsed)
+                        self.assertFalse(self.advance()[0])
+                        self.assertEqual(self.entry("owner")["active_call_id"], "building-call")
+                        self.assertEqual(self.entry("peer")["state"], "AwaitingRelease")
+                        self.assertEqual(self.sent(), ["owner"])
+                    if ending == "gate":
+                        self.now = self.returned("owner", "building-call") + timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1)
+                        self.assertFalse(self.advance()[0])
+                        self.assertEqual(self.sent(), ["owner"])
+                        self.now += timedelta(seconds=1)
+                    else:
+                        self.now = started + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
+                    self.release_mocks["lookup"].assert_not_called()
+                    self.release_mocks["lookup"].side_effect = None
+                    _ = self.advance()
+                    if ending == "timeout":
+                        self.assertEqual(build_hold.read_release_state(self.entry("owner")), build_hold.NoAdmissionAck(started))
+                    self.assertEqual(self.entry("owner")["active_call_id"], "")
+                    self.assertEqual(self.sent(), ["owner", "peer"])
+                    self.assertEqual(self.release_mocks["lookup"].call_args_list, [mock.call("peer")])
+
+    def test_call_after_silent_turn_is_cut_rejoins_queue_without_second_message(self) -> None:
+        for queued in (False, True):
+            with self.subTest(queued=queued):
+                self.begin("owner", "peer")
+                self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
+                                                           else build_hold.ReleaseDelivered())
+                _ = self.advance()
+                delivery = self.entry("owner")["delivery"].copy()
+                self.now += timedelta(seconds=build_hold.RELEASE_SETTLE_S)
+                _ = self.advance()
+                self.assertEqual(self.entry("owner")["state"], "NoAdmissionAck")
+                self.call("owner", "late-build")
+                self.assertIsInstance(build_hold.read_admission("owner", "late-build"), build_hold.AwaitingTurn)
+                self.assertEqual(self.entry("owner")["state"], "AwaitingRelease")
+                self.assertEqual([entry["session_id"] for entry in self.cycle()["entries"]], ["peer", "owner"])
+                _ = self.advance()
+                self.assertEqual(self.sent(), ["owner", "peer"])
+                _ = build_hold.answer_nothing_to_build("peer")
+                _ = self.advance()
+                self.assertIsInstance(build_hold.read_admission("owner", "late-build"), build_hold.AdmittedTurn)
+                self.assertEqual(self.entry("owner")["state"], "ReleasedAwaitingAdmission")
+                self.assertEqual(self.entry("owner")["active_call_id"], "late-build")
+                self.assertEqual(self.entry("owner")["delivery"], delivery)
+                self.assertEqual(self.sent(), ["owner", "peer"])
+                self.now = self.returned("owner", "late-build") + timedelta(seconds=build_hold.RELEASE_SETTLE_S)
+                self.assertTrue(self.advance()[0])
+                self.assertEqual(self.sent().count("owner"), 1)
 
     def test_later_registrations_cannot_pass_told_sessions_already_queued(self) -> None:
         self.begin("first", "second", "third")
@@ -1843,10 +2014,16 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
 
     def test_delivered_silent_sessions_are_reached_without_final_warning(self) -> None:
         self.begin("first", "second")
+        started = self.now
         _ = self.advance()
-        self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
+        self.now += timedelta(seconds=build_hold.RELEASE_SETTLE_S)
         _ = self.advance()
-        self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
+        self.assertEqual(build_hold.read_release_state(self.entry("first")), build_hold.NoAdmissionAck(started))
+        self.assertEqual(self.sent(), ["first", "second"])
+        self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S - 1)
+        self.assertFalse(self.advance()[0])
+        self.assertEqual(self.entry("second")["state"], "ReleasedAwaitingAdmission")
+        self.now += timedelta(seconds=1)
         self.assertTrue(self.advance()[0])
         self.assertEqual([entry["state"] for entry in self.cycle()["entries"]], ["NoAdmissionAck", "NoAdmissionAck"])
         self.assertEqual(self.sent(), ["first", "second"])
