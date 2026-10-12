@@ -219,22 +219,25 @@ def changes(record: Record) -> list[str]:
     return lines
 
 
+def waiting(record: Record) -> int:
+    return sum(state(entry, record["target"]) == "git ready" and entry["answer"] is None
+               for entry in record["dependencies"].values())
+
+
 def line(record: Record, zone: ZoneInfo, now: datetime,
          next_due: datetime | None, pins_error: str) -> str:
     """None means there is no scheduled next check to report."""
     counts = {word: 0 for word in STATE_ORDER}
-    waiting = 0
+    awaiting_answer = waiting(record)
     for entry in record["dependencies"].values():
         word = state(entry, record["target"])
         counts[word] += 1
-        if word == "git ready" and entry["answer"] is None:
-            waiting += 1
     text = f"Bevy {record['target']} upgrade: {counts['done']} of {len(record['dependencies'])} done"
     for word in STATE_ORDER:
         if word != "done" and counts[word]:
             text += f", {counts[word]} {word}"
-            if word == "git ready" and waiting:
-                text += f" ({waiting} waiting for your answer)"
+            if word == "git ready" and awaiting_answer:
+                text += f" ({awaiting_answer} waiting for your answer)"
     checked = record["checked"]
     if checked is None:
         text += "; no complete upstream check yet"
