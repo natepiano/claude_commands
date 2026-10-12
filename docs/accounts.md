@@ -8,13 +8,25 @@ The status line's second row shows this session's account label. To print it:
 ~/.claude/scripts/lib/py ~/.claude/scripts/whoami/account.py
 ```
 
-`/whoami` shows each account in use with its role (`showrunners`, `unit directors`), omitting spares. It does not identify this session's account. To see every account directory and its login:
+`/whoami` shows each account in use with its role (`showrunners`, `unit directors`), omitting spares. It does not identify this session's account.
+
+## Every account in one table
+
+`/showrunner:accounts` prints one table with a row for `~/.claude` and each `~/.claudeN`, logged in or not. In a terminal:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py status
 ```
 
-Inside a session, `/accounts status` shows the same report.
+| Column | Shows |
+| --- | --- |
+| Label | The account's label. A named folder keeps its own label whatever login it holds. |
+| Login | The login, `not logged in`, or `not set up` for a label that has an account note and no folder yet. |
+| Role | `showrunners`, `unit directors`, or `spare`. |
+| 5-hour left, Weekly left | Percent of each window left, each with its reset time. |
+| Read | When those numbers were read. |
+
+Times are in the running production's User zone, or this machine's zone when no production runs. The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and a folder with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Lines under the table name anything wrong or unusual in a folder: a failed check, unclassified entries, MCP servers that differ from `~/.claude`.
 
 ## Starting a session
 
@@ -42,7 +54,7 @@ Units started by showrunners pick their account themselves. A named alias whose 
 A missing directory refuses without starting Claude, for example:
 
 ```text
-accounts: ~/.claude3 is not set up; /accounts setup "claude 3" first
+accounts: ~/.claude3 is not set up; /showrunner:accounts setup "claude 3" first
 ```
 
 Broken shared links or unreadable identity files also refuse. A directory that is set up but logged out can start so you can log in.
@@ -91,7 +103,7 @@ env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=~/.claude3 claude
 /login
 ```
 
-Never `/logout` in a unit director's session: every unit on that account stops working. After any login, run `/accounts status`; every directory must match its label.
+Never `/logout` in a unit director's session: every unit on that account stops working. After any login, run `/showrunner:accounts`; every directory must match its label.
 
 ## Swapping the unit account
 
@@ -102,7 +114,7 @@ The review cannot edit any account folder: its settings deny edits under `~/.cla
 Run the swap from a session on another account, normally plain `claude`, or from a terminal. This example moves units from claude 3 to claude 1:
 
 ```text
-/accounts swap unit "claude 1"
+/showrunner:accounts swap unit "claude 1"
 ```
 
 The terminal equivalent is:
@@ -128,7 +140,7 @@ accounts: cannot swap <old>: <machine> <kind> <name> would not move
 accounts: cannot swap <old>: <machine> unattributed session <name> (pid <pid>)
 ```
 
-An unfit target reports its first `/accounts status` problem. Fix account readiness there; for a logged-out account, use its alias and `/login` as that account. Close ordinary sessions on the outgoing unit account before retrying a session refusal. Only units and their director-owned seats on natedev move; any session on the Mac refuses. Swap needs the Mac reachable even if its inventory is empty. A Mac outage refuses with the role unchanged. Swap takes no `--here`.
+An unfit target reports its first `/showrunner:accounts` problem. Fix account readiness there; for a logged-out account, use its alias and `/login` as that account. Close ordinary sessions on the outgoing unit account before retrying a session refusal. Only units and their director-owned seats on natedev move; any session on the Mac refuses. Swap needs the Mac reachable even if its inventory is empty. A Mac outage refuses with the role unchanged. Swap takes no `--here`.
 
 `unit account unchanged: still claude 3` means shutdown refused and the old role is back. Fix the printed refusal, then run the same swap again.
 
@@ -151,7 +163,7 @@ Both recovery commands name the **old note label** printed in the alert, even th
 To undo:
 
 ```text
-/accounts swap unit default
+/showrunner:accounts swap unit default
 ```
 
 Moving units off the default account, which showrunners share, uses the cutover's selected-unit procedure. Swap refuses showrunners and top-level sessions.
@@ -161,10 +173,10 @@ Moving units off the default account, which showrunners share, uses the cutover'
 For claude 3, run inside a session:
 
 ```text
-/accounts setup "claude 3"
+/showrunner:accounts setup "claude 3"
 ```
 
-Then start `claude3` in a terminal, run `/login` as claude 3, and check `/accounts status`. Setup links shared content to `~/.claude`; it reports existing real files or directories rather than replacing them. Login stays separate for each directory.
+Then start `claude3` in a terminal, run `/login` as claude 3, and check `/showrunner:accounts`. Setup links shared content to `~/.claude`; it reports existing real files or directories rather than replacing them. Login stays separate for each directory.
 
 ## Low-quota alerts
 
@@ -175,7 +187,7 @@ Acknowledging an account's low-quota alert keeps it quiet across swaps. Made spa
 A showrunner's launch refuses with:
 
 ```text
-add_unit: unit account <label>: <problem>; /accounts status
+add_unit: unit account <label>: <problem>; /showrunner:accounts
 ```
 
-Run `/accounts status`, fix what it names (most often the account's alias and `/login` as that account), then launch again.
+Run `/showrunner:accounts`, fix what it names (most often the account's alias and `/login` as that account), then launch again.

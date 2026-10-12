@@ -447,7 +447,7 @@ def unit_swap_line(note: AgentNote, notes: list[AgentNote], selection: ClaudeAcc
     if not choices:
         return "no spare account has more left"
     _, label = max(choices, key=lambda choice: (choice[0], choice[1]))
-    return f"swap: /accounts swap unit {json.dumps(label)}"
+    return f"swap: /showrunner:accounts swap unit {json.dumps(label)}"
 
 
 def credit_line(note: AgentNote) -> str:

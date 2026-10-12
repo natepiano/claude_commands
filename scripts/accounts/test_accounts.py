@@ -10,15 +10,18 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timezone, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from collections.abc import Callable
 from typing import Self, cast, final, override
-from unittest.mock import call, patch
+from unittest.mock import MagicMock, call, patch
+from zoneinfo import ZoneInfo
 
 from scripts.accounts import accounts
+from scripts.production import showrunners
 import account
 import agent_accounts
+import usage_store
 
 
 def named_environment(config_dir: Path) -> dict[str, str]:
@@ -77,6 +80,9 @@ class AccountsTests(unittest.TestCase):
         self.root = Path()
         self.home = Path()
         self.main_dir = Path()
+        # The live reading the status table gets for a folder; a folder without one cannot be read.
+        self.live: dict[Path, agent_accounts.Report] = {}
+        self.live_reads = MagicMock()
 
     @override
     def setUp(self) -> None:
@@ -97,6 +103,26 @@ class AccountsTests(unittest.TestCase):
             self.enterContext(patch.dict(os.environ, environment, clear=True)),
         )
         del environment_context
+        self.live = {}
+        self.live_reads = self.enterContext(patch.object(agent_accounts, "claude_live", side_effect=self.live_report))
+        _ = self.enterContext(patch.object(showrunners, "registered_showrunners", return_value=[
+            showrunners.Showrunner(session="fixture", socket="", slug="fixture", zone="America/Los_Angeles", doc=""),
+        ]))
+
+    def live_report(self, config_dir: Path) -> agent_accounts.Report:
+        return self.live.get(config_dir, agent_accounts.Report(
+            "Claude", problem="Account unavailable (claude auth status failed)",
+        ))
+
+    def status_rows(self) -> list[tuple[str, ...]]:
+        """The status table's rows after its heading, each a tuple of its cells, then nothing else."""
+        result, stdout, stderr = self.run_cli("status")
+        self.assertEqual((result, stderr), (0, ""))
+        table = stdout.split("\n\n")[0].splitlines()
+        self.assertEqual(
+            [cell.strip() for cell in table[0].strip("|").split("|")], list(accounts.TABLE_HEADINGS),
+        )
+        return [tuple(cell.strip() for cell in line.strip("|").split("|")) for line in table[2:]]
 
     def run_cli(self, *arguments: str) -> tuple[int, str, str]:
         stdout = io.StringIO()
@@ -200,7 +226,7 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude 2", "main@example.invalid", default=True)
         with patch.object(os, "execvpe") as launch:
             result = self.run_cli("exec", "claude 3", "--version")
-        self.assertEqual(result, (2, "", 'accounts: ~/.claude3 is not set up; /accounts setup "claude 3" first\n'))
+        self.assertEqual(result, (2, "", 'accounts: ~/.claude3 is not set up; /showrunner:accounts setup "claude 3" first\n'))
         launch.assert_not_called()
         self.assertFalse(accounts.account_dir("claude 3").exists())
 
@@ -331,7 +357,7 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual(self.run_cli("exec", "claude 3"), (2, "", line + "\n"))
         launch.assert_not_called()
         result = self.run_cli("status")
-        self.assertIn("login: other@example.invalid", result[1])
+        self.assertIn("| claude 3 | other@example.invalid ", result[1])
         self.assertIn(line, result[1])
         self.assertEqual(accounts.account_identity(accounts.account_dir("claude 3")), agent_accounts.KnownClaudeAccount("other@example.invalid", "other@example.invalid"))
 
@@ -464,9 +490,9 @@ class AccountsTests(unittest.TestCase):
         _ = (Path(os.environ["AGENT_NOTES_DIR"]) / "claude 3.md").write_bytes(b"\xff")
         result = self.run_cli("status")
         self.assertEqual((result[0], result[2]), (0, ""))
-        self.assertIn("login: unit@example.invalid", result[1])
+        self.assertIn("| claude 3 | unit@example.invalid ", result[1])
         self.assertIn("could not read", result[1])
-        self.assertIn("login: spare@example.invalid", result[1])
+        self.assertIn("| claude 4 | spare@example.invalid ", result[1])
         selection = accounts.claude_account_selection()
         self.assertEqual([named.identity.label for named in selection.named_accounts], ["claude 4"])
         self.assertIsInstance(selection.unit_account, agent_accounts.UnreadableClaudeAccount)
@@ -1479,11 +1505,9 @@ class AccountsTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(stderr, "")
-        self.assertIn(str(self.main_dir), stdout)
-        self.assertIn("claude 2", stdout)
-        self.assertIn("owner@example.invalid", stdout)
-        self.assertIn("unit", stdout)
+        self.assertIn("| ~/.claude | claude 2 | owner@example.invalid | showrunners, unit directors |", stdout)
         self.assertNotIn("unclassified:", stdout)
+        self.assertNotIn("mcpServers:", stdout)
         self.assertEqual(set(self.home.iterdir()), before)
         self.assertFalse(any(self.home.glob(".claude[0-9]*")))
 
@@ -1507,7 +1531,8 @@ class AccountsTests(unittest.TestCase):
             + "an account dir must be a real directory",
             stdout,
         )
-        self.assertIn("mcpServers: unavailable", stdout)
+        self.assertIn("| ~/.claude2 | claude 2 | unavailable ", stdout)
+        self.assertNotIn("mcpServers:", stdout)
         self.assertEqual(
             login_read.call_args_list,
             [call(self.main_dir), call(self.main_dir)],
@@ -1544,11 +1569,123 @@ class AccountsTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(stderr, "")
-        self.assertIn("unit", stdout)
-        self.assertIn("not logged in", stdout.lower())
-        self.assertIn("unclassified: mystery-cache", stdout)
-        self.assertIn("brp", stdout)
-        self.assertIn("account-only", stdout)
+        self.assertIn("| ~/.claude2 | claude 2 | not logged in | unit directors |", stdout)
+        self.assertIn("\n~/.claude2: unclassified: mystery-cache\n", stdout)
+        self.assertIn("\n~/.claude2: mcpServers: - brp, + account-only\n", stdout)
+
+    def reading(
+        self, login: str, five_hour: agent_accounts.Quota | None, weekly: agent_accounts.Quota,
+    ) -> agent_accounts.Report:
+        return agent_accounts.Report("Claude", email=login, quotas=[weekly], five_hour=five_hour)
+
+    def test_status_table_has_a_row_for_every_folder_logged_in_or_not(self) -> None:
+        self.write_main_config()
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        self.select_named_unit("claude 3")
+        # A folder set up and never logged in, and labels with a note and no folder: claude 1,
+        # and claude 2, whose login is the default folder's.
+        self.assertEqual(accounts.setup("claude 4"), [])
+        self.write_note("claude 1", "spare@example.invalid")
+        now = datetime.now(timezone.utc)
+        read = now - timedelta(minutes=1)
+        soon, later = now + timedelta(hours=2), now + timedelta(days=3)
+        usage_store.save([
+            self.reading("Main@example.invalid", agent_accounts.Quota("5-hour", 36.0, soon),
+                         agent_accounts.Quota("Weekly", 29.4, later)),
+            # No 5-hour window is open on this one.
+            self.reading("unit@example.invalid", None, agent_accounts.Quota("Weekly", 88.0, later)),
+        ], read)
+        zone = ZoneInfo("America/Los_Angeles")
+        read_cell = read.astimezone(zone).strftime("%H:%M %Z")
+        weekly_cell = later.astimezone(zone).strftime("%a %m-%d %H:%M %Z")
+
+        self.assertEqual(self.status_rows(), [
+            ("~/.claude", "claude 2", "main@example.invalid", "showrunners",
+             "64%", soon.astimezone(zone).strftime("%H:%M %Z"), "71%", weekly_cell, read_cell),
+            ("~/.claude1", "claude 1", "not set up", "—", "—", "—", "—", "—", "—"),
+            ("~/.claude2", "claude 2", "not set up", "—", "—", "—", "—", "—", "—"),
+            ("~/.claude3", "claude 3", "unit@example.invalid", "unit directors",
+             "100%", "—", "12%", weekly_cell, read_cell),
+            ("~/.claude4", "claude 4", "not logged in", "spare", "—", "—", "—", "—", "—"),
+        ])
+        self.assertIn("PDT", read_cell + weekly_cell)
+        self.live_reads.assert_not_called()
+        self.assertFalse(accounts.account_dir("claude 1").exists())
+        self.assertFalse(accounts.account_dir("claude 2").exists())
+
+    def test_status_table_is_padded_markdown_and_a_folder_in_order_adds_no_line(self) -> None:
+        self.write_main_config()
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+
+        result, stdout, stderr = self.run_cli("status")
+
+        self.assertEqual((result, stderr), (0, ""))
+        lines = stdout.splitlines()
+        # The heading, the rule, the default folder, and claude 2's own folder, which is not set up.
+        self.assertEqual(len(lines), 4)
+        self.assertEqual(len({len(line) for line in lines}), 1)
+        self.assertEqual(set(lines[1]), {"|", " ", "-"})
+        self.assertTrue(lines[2].startswith("| ~/.claude  | claude 2 | main@example.invalid | showrunners, unit directors | "))
+
+    def test_status_reads_live_only_when_no_reading_is_recent_and_keeps_what_it_read(self) -> None:
+        self.write_main_config()
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        later = datetime.now(timezone.utc) + timedelta(days=3)
+        self.live[self.main_dir] = self.reading(
+            "main@example.invalid", agent_accounts.Quota("5-hour", 10.0, later), agent_accounts.Quota("Weekly", 40.0, later),
+        )
+
+        first = self.status_rows()[0]
+        second = self.status_rows()[0]
+
+        self.assertEqual((first[4], first[6]), ("90%", "60%"))
+        self.assertNotEqual(first[8], "—")
+        self.assertEqual(second, first)
+        self.live_reads.assert_called_once_with(self.main_dir)
+
+    def test_status_keeps_the_last_good_reading_when_the_service_refuses_a_read(self) -> None:
+        self.write_main_config()
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        now = datetime.now(timezone.utc)
+        read = now - timedelta(minutes=45)
+        usage_store.save([self.reading(
+            "main@example.invalid",
+            # This 5-hour window has ended since it was read.
+            agent_accounts.Quota("5-hour", 80.0, now - timedelta(minutes=5)),
+            agent_accounts.Quota("Weekly", 25.0, now + timedelta(days=2)),
+        )], read)
+        self.live[self.main_dir] = agent_accounts.Report(
+            "Claude", email="main@example.invalid",
+            quota_problem="Weekly quota: unavailable (HTTP 429; try Claude /usage)",
+        )
+
+        rows = self.status_rows()
+
+        self.assertEqual(rows[0][4:7], ("unavailable", "unavailable", "75%"))
+        self.assertEqual(rows[0][8], read.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z"))
+        # claude 3 is logged in and has never been read.
+        self.assertEqual(rows[2][2:], ("unit@example.invalid", "spare", "unavailable", "unavailable", "unavailable", "unavailable", "—"))
+        self.assertEqual(self.live_reads.call_count, 2)
+
+    def test_status_times_use_this_machines_zone_when_no_production_runs_or_none_can_be_read(self) -> None:
+        self.write_main_config()
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        resets = datetime.now(timezone.utc) + timedelta(days=3)
+        usage_store.save([self.reading(
+            "main@example.invalid", agent_accounts.Quota("5-hour", 50.0, resets), agent_accounts.Quota("Weekly", 50.0, resets),
+        )], datetime.now(timezone.utc))
+        local = resets.astimezone().strftime("%a %m-%d %H:%M %Z")
+
+        with patch.object(showrunners, "registered_showrunners", return_value=[]):
+            self.assertEqual(self.status_rows()[0][7], local)
+        with patch.object(showrunners, "registered_showrunners", side_effect=OSError("session records unreadable")):
+            self.assertEqual(self.status_rows()[0][7], local)
+        self.assertEqual(
+            self.status_rows()[0][7],
+            resets.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%a %m-%d %H:%M %Z"),
+        )
 
     def test_absent_role_configuration_uses_default_account(self) -> None:
         resolved = accounts.role_account("unit")

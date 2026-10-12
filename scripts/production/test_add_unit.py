@@ -1224,7 +1224,7 @@ class AddUnitTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
                 self.assertEqual(
                     result.stderr,
-                    f"add_unit: unit account claude 3: accounts: {directory} is missing; /accounts status\n",
+                    f"add_unit: unit account claude 3: accounts: {directory} is missing; /showrunner:accounts\n",
                 )
                 self.assert_no_launch_change(document, head)
                 self.assertFalse(Path(self.env["SHUTDOWN_STATE_DIR"]).exists())
@@ -1240,7 +1240,7 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(
             result.stderr,
-            f"add_unit: unit account claude 3: accounts: {directory / 'projects'} is missing; /accounts status\n",
+            f"add_unit: unit account claude 3: accounts: {directory / 'projects'} is missing; /showrunner:accounts\n",
         )
         self.assert_no_launch_change(document, head)
         self.assertFalse(Path(self.env["SHUTDOWN_STATE_DIR"]).exists())
