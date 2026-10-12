@@ -80,7 +80,7 @@ Evidence, outside the repository, read-only: `~/.local/state/mul-add-hook/reach-
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
 | G1 | Phase 3 | Phase 2's checkpoint in the live configuration | `git -C ~/.claude merge-base --is-ancestor <Phase 2 checkpoint> HEAD` succeeds |
-| G2 | Phase 4 | 96 hours after T_reach (Phase 3's As-built) | the clock |
+| G2 | Phase 4 | 96 hours after T_reach (2026-10-12 11:13:42 PDT) | the clock reads 2026-10-16 11:13:42 PDT or later |
 
 ## Phases
 
@@ -158,39 +158,25 @@ Measured with `python3 ~/.local/state/mul-add-hook/reach-2026-10-12/gate.py scri
 
 ### Phase 3 — Live check  · status: done
 
-**Blocked by:** G1 — Phase 2's checkpoint is in `~/.claude` on natedev.
+#### As-built
 
-#### Work Order
+The wider detector is confirmed live on natedev for both agents. T_reach, the time it reached the live hooks, is 2026-10-12 11:13:42 PDT (2026-10-12T18:13:42Z): the committer time of the merge that brought the every-likely-multiply-add checkpoint into `~/.claude`.
 
-**Goal:** A real Claude edit and a real Codex `apply_patch` on natedev each receive the conditional block, and an edit that leaves such a line untouched receives none.
-
-**Spec:**
-
-Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`, branch `build-followups-mul-add`. The scratch crate lives in the seat's scratch folder, outside every repository.
-
-1. Make a scratch workspace: `Cargo.toml` with `[workspace] members = ["crate"]` and `[workspace.lints.clippy] nursery = "deny"`; `crate/Cargo.toml` with `[lints] workspace = true`; `crate/src/lib.rs` with one function holding `let top = 1.0_f32;`.
-2. Codex: with `apply_patch`, add the line `let centre_row = top + metrics.button.height * 0.5;`. The seat receives one block whose text holds `if top + metrics.button.height * 0.5 is f32 or f64 arithmetic, write metrics.button.height.mul_add(0.5, top) (clippy::suboptimal_flops)`.
-3. Codex: with a second `apply_patch`, change the `let top` line only. No block arrives.
-4. Claude: the unit director repeats steps 2 and 3 in its own scratch crate with `Edit`, and records what it received.
-5. `python3 scripts/hooks/codex_hooks.py check` exits 0.
-6. `~/.local/state/mul-add-hook/blocks.jsonl` gained one record per block, with `agent` `codex` and `claude`.
-7. Record T_reach: the committer time, in PDT, of the commit that brought Phase 2's checkpoint into `~/.claude` (`git -C ~/.claude log -1 --format=%cI <that commit>`).
-8. Write the result under "Measured outcome" in `docs/as-built/build-followups-mul-add.md`: a short "Detector reach, live check" paragraph with T_reach, both agents' block text and the two no-block results.
+- In a scratch workspace that denies `nursery`, a Codex `apply_patch` and a Claude `Edit` that each add `let centre_row = top + metrics.button.height * 0.5;` receive one block reading `<file>:3: if top + metrics.button.height * 0.5 is f32 or f64 arithmetic, write metrics.button.height.mul_add(0.5, top) (clippy::suboptimal_flops). Leave integer and vector arithmetic as it is. The edit was applied.`
+- A second edit that changes only the `let top` line receives no block, for both agents.
+- `python3 scripts/hooks/codex_hooks.py check` exits 0 and reports both Codex handlers trusted.
+- The live `~/.local/state/mul-add-hook/blocks.jsonl` holds one record per block: `agent` `claude`, `tool` `Edit`, at 2026-10-12T18:18:04Z; `agent` `codex`, `tool` `apply_patch`, at 2026-10-12T18:21:28Z; both with `line` 3 and `expression` `top + metrics.button.height * 0.5`.
 
 **Files:**
-- `docs/as-built/build-followups-mul-add.md` — the "Detector reach, live check" paragraph
+- `docs/as-built/build-followups-mul-add.md` — the "Detector reach, live check" paragraph, first under "Measured outcome"
 
-**Seats:** 1 writer — one doc paragraph and one live check; nothing splits.
-- `impl` — `docs/as-built/build-followups-mul-add.md`, and the Codex half of the live check
-- `test` — opens as impl; no file
+**Binds later work:** the re-measure's window runs from T_reach to 2026-10-16 11:13:42 PDT. The two records above sit inside it and come from scratch crates (`file` under `live_check_claude/` and `live_check_codex/`), so they are no part of any block count. The re-measure's table and paragraph follow the live-check paragraph.
 
-**Constraints from prior phases:** Phase 2 renamed the entry to `mul_add_findings` and set the message text in Spec step 2 above. Phase 1 made the hook report only on written lines, which step 3 checks. The unit director ran the detector alone on step 1's crate at Phase 2's checkpoint: step 2's line gives exactly `top + metrics.button.height * 0.5` with the rewrite `metrics.button.height.mul_add(0.5, top)`, and an edit that writes only the `let top` line gives no finding. The hook reads text and never compiles, so the scratch function need not build. A `blocks.jsonl` record holds `at` (UTC), `agent`, `tool`, `cwd`, `file`, `line` and `expression`.
-
-**Acceptance gate:** steps 2–6 observed and recorded; the doc paragraph holds T_reach with its zone.
+**Gotchas:** the hook reads text and never compiles, so the scratch function need not build. The block log writes one record per reported expression, each with its own `at`; the records of one hook response share no id.
 
 ### Phase 4 — Re-measure  · status: todo
 
-**Blocked by:** G2 — 96 hours after T_reach.
+**Blocked by:** G2 — 96 hours after T_reach: 2026-10-16 11:13:42 PDT.
 
 #### Work Order
 
@@ -200,13 +186,13 @@ Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`,
 
 Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`, branch `build-followups-mul-add`. Read-only measurement; saved output stays under a few MB.
 
-1. Window: T_reach to T_reach + 96 h. Source: the buildlog index `~/.local/state/buildlog/index.sqlite` (table `steps`) and its gzip logs. Method and scripts: the "Measured outcome" section of `docs/as-built/build-followups-mul-add.md`, with `~/.local/state/mul-add-hook/reach-2026-10-12/remeasure/` (`clippy_fail_lints.py`, `cost.py`, `loop.py`, `totals.py`, `derive.py`) and `extract.py` beside it. Copy the scripts to scratch before changing a window constant; never edit the evidence folder.
+1. Window: T_reach to T_reach + 96 h, with both ends applied to every query (compare `datetime(started_at)` in UTC). Source: the buildlog index `~/.local/state/buildlog/index.sqlite` (table `steps`) and its gzip logs. Method: the "Measured outcome" section of `docs/as-built/build-followups-mul-add.md`. The first re-measure's scripts in `~/.local/state/mul-add-hook/reach-2026-10-12/remeasure/` (`clippy_fail_lints.py`, `cost.py`, `loop.py`, `totals.py`, `derive.py`, `scan_residuals.py`) and `extract.py` beside that folder are a reference for the log parsing and the cost definitions, not a ready pipeline: `extract.py` has a start time and no end; `clippy_fail_lints.py`, `cost.py` and `loop.py` look back a number of days from now; `totals.py` holds its own window; `derive.py` reads `totals.json` and `residuals_scanned.json`; `scan_residuals.py`, which writes the second, imports `float_mul_add_findings`, now `mul_add_findings`. Copy what is needed to scratch, give every copy the same two bounds, trace each input file to the script that writes it before running anything, and never edit the evidence folder.
 2. Report, for `clippy::suboptimal_flops`:
    - failed steps per 100 hana clippy steps: limit 1.979 (baseline 7.916; first re-measure 8.126; since go-live 8.67);
    - sole-cause seat-hours per day: limit 0.100 (baseline 0.402; first re-measure 0.576);
-   - of the window's warnings, how many had an earlier block for the same file and expression in `~/.local/state/mul-add-hook/blocks.jsonl`, how many had none, and for those with none, which rule skipped them (run the detector on a stub, as `gate.py` does);
-   - blocks in the window: total, by agent, and how many were followed by a `mul_add` on that line in the next commit touching the file (a sample of 30 is enough).
-3. Each limit gets PASS or FAIL. A FAIL names its largest remaining cause with counts.
+   - of the window's warnings, how many had an earlier record for the same file and expression in `~/.local/state/mul-add-hook/blocks.jsonl`, and how many had none. Split those with none in two by running the detector on a stub, as `gate.py` does: the stub is reported, so today's detector sees the shape and the hook stayed silent for a cause the log cannot name (the line was not written by the edit, the edit came from outside the hooks, or the log write failed), counted as unknown; or the stub is not reported, counted under the rule that skips it on the stub;
+   - blocks in the window, where one block is one record in `blocks.jsonl`, that is one reported expression (a hook response that reports several expressions writes several records, each with its own `at` and no shared id): total, by agent, and how many were followed by a `mul_add` on that line in the next commit touching the file (a sample of 30 is enough).
+3. Each limit gets PASS or FAIL. A FAIL names its largest remaining cause with counts. A window with no sole-cause failure, or with failures and no later lint call, still gives its sums and a verdict: write the median and the percentile as unavailable, never computed from an empty sample (`cost.py` and `loop.py` compute them unconditionally).
 4. Write the result as a "Detector reach, re-measure" table and paragraph under "Measured outcome" in `docs/as-built/build-followups-mul-add.md`.
 
 **Files:**
@@ -216,7 +202,7 @@ Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`,
 - `impl` — `docs/as-built/build-followups-mul-add.md`
 - `test` — opens as impl; no file
 
-**Constraints from prior phases:** T_reach is in Phase 3's As-built. Phase 2 changed the block's wording, so match blocks to warnings by `file` and `expression` in `blocks.jsonl`, never by message text. From Phase 2 on, `expression` is the detector's `expr`: the sum's source text with each run of whitespace outside string and char literals collapsed to one space and comments left out; a record from before T_reach holds the raw source slice. To compare a clippy warning with a record, run `mul_add_lib.mul_add_findings(path)` on the warning's stub as `gate.py` does (it returns the lint scope and a list of findings with `line`, `expr` and `rewrite`) and compare `expr`. On Phase 2's checkpoint `gate.py` reports 160 of the 168 recorded warnings; the `VECTOR` pattern in `mul_add_lib.py` skips the other eight (a `.min(` or `.max(` call with an argument, three; a `.left` member, three; a `.size()` call, one; a `Transform` type token, one).
+**Constraints from prior phases:** T_reach is 2026-10-12 11:13:42 PDT (2026-10-12T18:13:42Z), the committer time of the merge that brought Phase 2's checkpoint into `~/.claude`; the window ends 2026-10-16 11:13:42 PDT (2026-10-16T18:13:42Z). Phase 3's live check wrote two records into `blocks.jsonl` inside the window, at 2026-10-12T18:18:04Z (`agent` `claude`) and 2026-10-12T18:21:28Z (`agent` `codex`), both with `expression` `top + metrics.button.height * 0.5` and a `file` under `live_check_claude/` or `live_check_codex/`; they come from scratch crates, so leave them out of every block count and say so beside the counts. "Measured outcome" in the as-built doc opens with Phase 3's "Detector reach, live check" paragraph; put the re-measure's table and paragraph directly after it. Phase 2 changed the block's wording, so match blocks to warnings by `file` and `expression` in `blocks.jsonl`, never by message text. From Phase 2 on, `expression` is the detector's `expr`: the sum's source text with each run of whitespace outside string and char literals collapsed to one space and comments left out; a record from before T_reach holds the raw source slice. To compare a clippy warning with a record, run `mul_add_lib.mul_add_findings(path)` on the warning's stub as `gate.py` does (it returns the lint scope and a list of findings with `line`, `expr` and `rewrite`) and compare `expr`. On Phase 2's checkpoint `gate.py` reports 160 of the 168 recorded warnings; the `VECTOR` pattern in `mul_add_lib.py` skips the other eight (a `.min(` or `.max(` call with an argument, three; a `.left` member, three; a `.size()` call, one; a `Transform` type token, one).
 
 **Acceptance gate:** both limits reported with PASS or FAIL from the 96-hour window; every number traces to a query the report names.
 
