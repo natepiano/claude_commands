@@ -980,9 +980,10 @@ class AddUnitTests(unittest.TestCase):
                     if cast(list[str], record["args"])[:1] == ["new-session"])
         command = cast(list[str], tmux["args"])[-1]
         prompt = (f"You are alpha-unit in production build-followups (doc {self.doc}), "
-                  "under the showrunner, whose session name `~/.claude/scripts/lib/py "
-                  "~/.claude/scripts/production/showrunners.py name build-followups` prints (look it up "
-                  f"before each message: the name can change), on standby. Work only in your worktree {worktree}, "
+                  "under the showrunner, whose `SendMessage` address `~/.claude/scripts/lib/py "
+                  "~/.claude/scripts/production/showrunners.py address build-followups` prints (look it up "
+                  "before each message: it changes when the showrunner restarts), on standby. "
+                  f"Work only in your worktree {worktree}, "
                   "branch build-followups-alpha. Do nothing until the showrunner sends you work.")
         self.assertIn(prompt, command)
         self.assert_director_flags("opus", "xhigh")

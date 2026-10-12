@@ -219,6 +219,13 @@ def current_name(slug: str) -> str:
     return next((runner["session"] for runner in registered_showrunners() if runner["slug"] == slug), "")
 
 
+def current_address(slug: str) -> str:
+    """Where `SendMessage` reaches the production's showrunner now: its session on this machine.
+    Empty while it is not running or has no update timer."""
+    socket = next((runner["socket"] for runner in registered_showrunners() if runner["slug"] == slug), "")
+    return f"uds:{socket}" if socket else ""
+
+
 def named(showrunner: str) -> Showrunner:
     """The showrunner called `showrunner` now, or whose production has that slug."""
     for runner in registered_showrunners():
@@ -236,6 +243,8 @@ def main(argv: list[str]) -> int:
     _ = making_ready.add_argument("--unit", action="append")
     naming = commands.add_parser("name")
     _ = naming.add_argument("slug")
+    addressing = commands.add_parser("address")
+    _ = addressing.add_argument("slug")
     # Does nothing: a unit's run state is read from its run records. Delete once no session started before that is left.
     setting_status = commands.add_parser("status")
     _ = setting_status.add_argument("session", nargs="?")
@@ -249,11 +258,12 @@ def main(argv: list[str]) -> int:
             for runner in registered_showrunners():
                 print(f"{runner['slug']}\t{runner['session'] or '<not running>'}\t{runner['zone']}"
                       + f"\t{runner['doc']}")
-        elif action == "name":
-            name = current_name(cast(str, args.slug))
-            if not name:
-                raise ValueError(f"the showrunner of {cast(str, args.slug)} is not running")
-            print(name)
+        elif action in ("name", "address"):
+            slug = cast(str, args.slug)
+            found = current_name(slug) if action == "name" else current_address(slug)
+            if not found:
+                raise ValueError(f"the showrunner of {slug} is not running")
+            print(found)
     except (OSError, ValueError, KeyError) as error:
         print(f"showrunners: {error}", file=sys.stderr)
         return 1

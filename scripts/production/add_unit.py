@@ -654,10 +654,11 @@ def ensure_worktree(request: UnitLaunch) -> None:
 def prompt_for(request: UnitLaunch) -> str:
     production = request.production
     doc = str(production.doc)
-    # The showrunner's name is written nowhere: a unit looks it up, since a rename changes it.
-    showrunner = ("the showrunner, whose session name `~/.claude/scripts/lib/py "
-                  f"~/.claude/scripts/production/showrunners.py name {production.slug}` prints (look it up "
-                  "before each message: the name can change)")
+    # The showrunner's address is written nowhere: a unit looks it up, since a restart changes it.
+    # It is the session on this machine, so no other session of the same name can be meant.
+    showrunner = ("the showrunner, whose `SendMessage` address `~/.claude/scripts/lib/py "
+                  f"~/.claude/scripts/production/showrunners.py address {production.slug}` prints (look it up "
+                  "before each message: it changes when the showrunner restarts)")
     if isinstance(request.plan, Standby):
         return (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under "
                 f"{showrunner}, on standby. Work only in your worktree "

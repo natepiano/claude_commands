@@ -66,6 +66,9 @@ class SessionLookupTests(unittest.TestCase):
         self.record("one.json", name="showrunner", session_id="sid-123")
         self.assertEqual(self.run_cli("socket", "showrunner").stdout.strip(), str(self.socket_path))
         self.assertEqual(self.run_cli("socket", "session:sid-123").stdout.strip(), str(self.socket_path))
+        # The address is what `SendMessage` takes: this machine's session, by its socket.
+        self.assertEqual(self.run_cli("address", "showrunner").stdout, f"uds:{self.socket_path}\n")
+        self.assertEqual(self.run_cli("address", "session:sid-123").stdout, f"uds:{self.socket_path}\n")
         self.assertEqual(self.run_cli("id", "showrunner").stdout.strip(), "sid-123")
         self.assertEqual(self.run_cli("id", str(os.getpid())).stdout.strip(), "sid-123")
 
@@ -82,7 +85,7 @@ class SessionLookupTests(unittest.TestCase):
     def test_dead_pid_and_missing_socket_return_absent(self) -> None:
         self.record("dead.json", pid=2**29 + os.getpid())
         self.record("missing-socket.json", socket_path=self.root / "absent.sock")
-        for args in (("socket", "agent"), ("id", "agent")):
+        for args in (("socket", "agent"), ("address", "agent"), ("id", "agent")):
             result = self.run_cli(*args)
             self.assertEqual(
                 (result.returncode, result.stdout, result.stderr), (1, "", "")
@@ -215,7 +218,7 @@ class SessionLookupTests(unittest.TestCase):
         self.assertEqual((result.returncode, result.stdout.strip()), (0, str(self.socket_path)))
 
     def test_usage_errors(self) -> None:
-        for args in ((), ("socket",), ("id",), ("unknown", "agent")):
+        for args in ((), ("socket",), ("address",), ("id",), ("unknown", "agent")):
             self.assertEqual(self.run_cli(*args).returncode, 2)
 
 
