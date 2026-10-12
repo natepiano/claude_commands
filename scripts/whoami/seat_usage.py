@@ -157,7 +157,47 @@ def credit_balance(value: object) -> CreditBalance:
     return UnknownCreditBalance()
 
 
-def switches_per_week(readings: Iterable[AccountReading], window: Window) -> SwitchRate:
+@dataclass(frozen=True)
+class HistoryBeginsAt:
+    at: datetime
+
+
+@dataclass(frozen=True)
+class NoStoredHistory:
+    pass
+
+
+HistoryStart = HistoryBeginsAt | NoStoredHistory
+
+
+@dataclass(frozen=True)
+class RoleSwitchHistory:
+    start: HistoryStart
+    switches: tuple[datetime, ...]
+
+
+def store_switch_history(db: sqlite3.Connection) -> RoleSwitchHistory:
+    from scripts.accounts import accounts
+
+    row = cast(sqlite3.Row, db.execute("SELECT min(at) FROM account_role_changes").fetchone())
+    start = cast(object, row[0])
+    if not isinstance(start, str):
+        return RoleSwitchHistory(NoStoredHistory(), ())
+    rows = cast(Iterable[sqlite3.Row], db.execute(
+        "SELECT at FROM (SELECT at, label, lag(label) OVER "
+        + "(PARTITION BY machine ORDER BY at, label) AS previous_label "
+        + "FROM account_role_changes WHERE role = ?) "
+        + "WHERE previous_label IS NOT NULL AND label != previous_label ORDER BY at, label",
+        (accounts.CODEX_ROLE,)))
+    return RoleSwitchHistory(HistoryBeginsAt(datetime.fromisoformat(start)),
+                             tuple(datetime.fromisoformat(cast(str, row[0])) for row in rows))
+
+
+NO_ROLE_HISTORY = RoleSwitchHistory(NoStoredHistory(), ())
+
+
+def switches_per_week(readings: Iterable[AccountReading], window: Window,
+                      history: RoleSwitchHistory = NO_ROLE_HISTORY) -> SwitchRate:
     ordered = sorted((reading for reading in readings if reading.at < window.end), key=lambda item: item.at)
     prior = [reading for reading in ordered if reading.at < window.start]
     within = [reading for reading in ordered if reading.at >= window.start]
@@ -167,13 +207,16 @@ def switches_per_week(readings: Iterable[AccountReading], window: Window) -> Swi
     coverage_end = within[-1].at
     if coverage_end <= coverage_start:
         return SwitchHistoryUnavailable()
-    previous_account = prior[-1].account if prior else within[0].account
+    previous = prior[-1] if prior else within[0]
     observations = within if prior else within[1:]
     switches = 0
     for reading in observations:
-        if reading.account != previous_account:
+        before_history = (isinstance(history.start, NoStoredHistory)
+                          or previous.at < history.start.at and reading.at < history.start.at)
+        if before_history and reading.account != previous.account:
             switches += 1
-        previous_account = reading.account
+        previous = reading
+    switches += sum(coverage_start <= at <= coverage_end for at in history.switches)
     coverage_days = (coverage_end - coverage_start).total_seconds() / 86_400
     return KnownSwitchRate(switches * 7.0 / coverage_days)
 
@@ -449,6 +492,7 @@ def stored_window_usage(db: sqlite3.Connection, window: Window) -> StoredWindowU
 
 def build_report(windows: WindowPair, db: sqlite3.Connection) -> str:
     readings = store_readings(db)
+    history = store_switch_history(db)
     pieces = (*window_pieces(db, WindowName.BEFORE, windows.before),
               *window_pieces(db, WindowName.AFTER, windows.after))
     measured = tuple((piece, stored_window_usage(db, piece.window)) for piece in pieces)
@@ -461,7 +505,7 @@ def build_report(windows: WindowPair, db: sqlite3.Connection) -> str:
         lines.append(f"| {piece.text()} | {usage.threads_opened} | {format_number(usage.weighted)} | "
                      + f"{format_percent(known_rate(usage.before_edit_weighted, usage.edited_weighted))} | "
                      + f"{usage.compactions} ({format_rate(known_rate(usage.compactions, usage.active_threads))}) | "
-                     + f"{usage.checkpoints} | {format_switches(switches_per_week(readings, piece.window))} | "
+                     + f"{usage.checkpoints} | {format_switches(switches_per_week(readings, piece.window, history))} | "
                      + f"{format_credits(credits_per_day(readings, piece.window))} |")
         for model, count in usage.unweighted.items():
             unweighted[model] = unweighted.get(model, 0) + count

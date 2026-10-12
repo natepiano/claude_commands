@@ -273,7 +273,7 @@ The store is at `PRAGMA user_version` 6 (`STORE_VERSION`) and holds what the wor
 
 **Ruled out:** function-level imports to hide the import cycle, and an ignore comment or a `pyrightconfig.json` edit for it; a re-read rule for stores built by older code (the version check already clears the cursors); a spliced comparison to keep the expected report files byte-identical; a clock-hour timer with catch-up and a pinned PATH (the timer follows the NixOS repository's own job form).
 
-### Phase 9 — Seat roster and switch-count repairs · status: todo
+### Phase 9 — Seat roster and switch-count repairs · status: done
 
 #### Work Order
 
