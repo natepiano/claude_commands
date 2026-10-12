@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import closing
 from dataclasses import dataclass
@@ -35,11 +36,40 @@ READABLE_SESSION = "11223344-3333-4333-8333-333333333333"
 BLOCKED_SESSION = "55667788-4444-4444-8444-444444444444"
 SshBehavior = Literal["complete", "cut_after_first_cursor", "cut_inside_second_file",
                       "cut_inside_first_file", "cut_before_status", "cut_inside_record",
-                      "unreachable", "python_error", "malformed_record", "unknown_measurement",
+                      "unreachable", "early_disconnect", "wait_for_release", "python_error", "malformed_record", "unknown_measurement",
                       "missing_output", "oversized_output", "missing_evidence_field", "malformed_evidence_field",
                       "cut_inside_history", "cut_after_history_cursor", "missing_outcome_field",
-                      "missing_opening_time", "invalid_edit_time"]
+                      "missing_opening_time", "invalid_edit_time", "missing_folder", "invalid_folder"]
 SourceState = Literal["ready", "missing", "unreadable", "partial", "skipped", "unreachable"]
+
+
+SNAPSHOT_COMMIT_SCRIPT = """
+import sqlite3
+import sys
+from contextlib import closing
+from unittest.mock import patch
+original_connect = sqlite3.connect
+database_path = sys.argv[sys.argv.index('--db') + 1]
+with closing(original_connect(database_path)) as writer:
+    assert writer.execute('PRAGMA journal_mode=WAL').fetchone()[0] == 'wal'
+changed = False
+class CommitBetweenQueries(sqlite3.Connection):
+    def execute(self, sql, parameters=()):
+        global changed
+        cursor = super().execute(sql, parameters)
+        if not changed and sql.lstrip().upper().startswith('SELECT'):
+            changed = True
+            with closing(original_connect(database_path)) as writer:
+                with writer:
+                    writer.execute("DELETE FROM turns WHERE family = 'codex'")
+                    writer.execute("DELETE FROM compactions WHERE family = 'codex'")
+                    writer.execute("UPDATE turn_sources SET state = 'unreachable', "
+                                   "last_complete_at = '2026-10-12T18:41:59+00:00' WHERE family = 'codex'")
+        return cursor
+def snapshot_connect(*args, **kwargs):
+    kwargs['factory'] = CommitBetweenQueries
+    return original_connect(*args, **kwargs)
+"""
 
 
 class CommittedRoleSnapshot(TypedDict):
@@ -58,6 +88,7 @@ class MacStreamReport(TypedDict):
     compaction_records: int
     opening_records: int
     edit_records: int
+    folder_records: int
     outcome_records: int
     history_cursor_records: int
     altered_outcome_records: int
@@ -109,9 +140,9 @@ class CollectorFixture(unittest.TestCase):
         self.codex_root = destination / "codex"
         self.agents_path = destination / "agents.jsonl"
 
-    def cli(self, *, db: Path, machine: str = "natedev",
+    def collector_invocation(self, *, db: Path, machine: str = "natedev",
             history_override: Literal["configured", "empty"] = "configured",
-            mac_pass: Literal["skipped", "fixture"] = "skipped") -> subprocess.CompletedProcess[str]:
+            mac_pass: Literal["skipped", "fixture"] = "skipped") -> tuple[list[str], dict[str, str]]:
         environment = os.environ.copy()
         environment["USAGE_STATE_DIR"] = str(self.state)
         environment["HOME"] = str(self.root)
@@ -123,6 +154,7 @@ class CollectorFixture(unittest.TestCase):
                    "--machine", machine, "--claude-root", str(self.claude_root),
                    "--codex-root", str(self.codex_root), "--agents-log", str(self.agents_path),
                    "--readings", str(self.root / "readings.jsonl"),
+                   "--baseline-readings", str(self.root / "baseline-readings.jsonl"),
                    "--account-roles", str(self.root / "account-roles.jsonl"),
                    "--claude-repo", str(self.root / "fixture-repository"),
                    "--production-docs", str(self.root / "production-docs")]
@@ -133,6 +165,13 @@ class CollectorFixture(unittest.TestCase):
             self.assertTrue(configuration.is_file(), "Mac tests require the fake SSH configuration")
             self.assertTrue((self.root / "bin/ssh").is_file(), "Mac tests require the fake SSH executable")
             environment["USAGE_TEST_SSH_CONFIG"] = str(configuration)
+        return command, environment
+
+    def cli(self, *, db: Path, machine: str = "natedev",
+            history_override: Literal["configured", "empty"] = "configured",
+            mac_pass: Literal["skipped", "fixture"] = "skipped") -> subprocess.CompletedProcess[str]:
+        command, environment = self.collector_invocation(db=db, machine=machine,
+                                                        history_override=history_override, mac_pass=mac_pass)
         return subprocess.run(
             command,
             cwd=REPOSITORY,
@@ -227,6 +266,61 @@ class CollectorFixture(unittest.TestCase):
 
 
 class CollectTests(CollectorFixture):
+    def test_held_pass_lock_exits_without_opening_or_changing_the_store(self) -> None:
+        _ = self.collect()
+        before = self.db_path.read_bytes()
+        holder = """
+import fcntl
+import sys
+with open(sys.argv[1], 'a') as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    print('locked', flush=True)
+    sys.stdin.read()
+"""
+        environment = os.environ.copy()
+        environment.update(HOME=str(self.root), USAGE_STATE_DIR=str(self.state), PYTHONDONTWRITEBYTECODE="1")
+        with subprocess.Popen([sys.executable, "-c", holder, str(self.db_path) + ".lock"],
+                              env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) as process:
+            try:
+                assert process.stdout is not None
+                self.assertEqual(process.stdout.readline(), "locked\n")
+                result = self.cli(db=self.db_path)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "usage collect: another pass is running\n")
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(self.db_path.read_bytes(), before)
+                _ = self.db_path.write_bytes(b"fixture store must not be opened")
+                result = self.cli(db=self.db_path)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "usage collect: another pass is running\n")
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(self.db_path.read_bytes(), b"fixture store must not be opened")
+                _ = self.db_path.write_bytes(before)
+                assert process.stdin is not None
+                process.stdin.close()
+                self.assertEqual(process.wait(timeout=5), 0)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    _ = process.wait(timeout=5)
+        _ = self.collect()
+
+    def test_pass_uses_wal_and_finishes_while_a_reader_holds_its_snapshot(self) -> None:
+        _ = self.collect()
+        self.assertEqual(self.values(self.rows("PRAGMA journal_mode"), "journal_mode"), [("wal",)])
+        with closing(sqlite3.connect(self.db_path)) as reader:
+            _ = reader.execute("BEGIN")
+            before = cast(int, reader.execute("SELECT count(*) FROM turns").fetchone()[0])
+            path = self.source_path("claude")
+            line = {"type": "assistant", "timestamp": "2026-10-12T00:00:00Z",
+                    "message": {"id": "new-reader-held-turn", "model": "claude-opus-4-6",
+                                "usage": {"input_tokens": 1, "output_tokens": 0}}}
+            self.append_bytes(path, (json.dumps(line) + "\n").encode())
+            _ = self.collect()
+            self.assertEqual(reader.execute("SELECT count(*) FROM turns").fetchone()[0], before)
+        self.assertEqual(self.rows("SELECT count(*) AS turns FROM turns")[0]["turns"], before + 1)
+
     def test_unlistable_local_project_marks_claude_partial_and_keeps_complete_time(self) -> None:
         _ = self.collect()
         previous = self.values(self.rows(
@@ -915,6 +1009,59 @@ class MacCollectTests(CollectorFixture):
         report = cast(MacStreamReport, json.loads(report_path.read_text(encoding="utf-8")))
         report_path.unlink()
         return MacRun(output, report)
+
+    def test_running_pass_keeps_its_lock_through_the_mac_read_until_exit(self) -> None:
+        report = self.root / "ssh-report.json"
+        waiting = report.with_suffix(".waiting")
+        release = report.with_suffix(".release")
+        configuration = {"home": str(self.mac_home), "execution_directory": str(self.execution_directory),
+                         "report": str(report), "behavior": "wait_for_release", "database": str(self.db_path),
+                         "previous_role_read_at": ""}
+        _ = (self.root / "ssh-configuration.json").write_text(json.dumps(configuration), encoding="utf-8")
+        command, environment = self.collector_invocation(db=self.db_path, mac_pass="fixture")
+        with subprocess.Popen(command, env=environment, cwd=REPOSITORY, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) as process:
+            try:
+                deadline = time.monotonic() + 10
+                while not waiting.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(waiting.exists(), "The fixture pass must reach its Mac read")
+                before = {cast(str, row["name"]): self.all_values(self.rows('SELECT * FROM "' + cast(str, row["name"]) + '"'))
+                          for row in self.rows("SELECT name FROM sqlite_master WHERE type = 'table'")}
+                for attempt in range(2):
+                    with self.subTest(attempt=attempt):
+                        result = self.cli(db=self.db_path)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout, "usage collect: another pass is running\n")
+                        self.assertEqual(result.stderr, "")
+                        self.assertIsNone(process.poll())
+                        for table, rows in before.items():
+                            self.assertEqual(self.all_values(self.rows('SELECT * FROM "' + table + '"')), rows, table)
+                _ = release.write_bytes(b"")
+                output, errors = process.communicate(timeout=15)
+                self.assertEqual(process.returncode, 0, output + errors)
+            finally:
+                _ = release.touch()
+                if process.poll() is None:
+                    process.terminate()
+                    _ = process.communicate(timeout=5)
+        self.assertTrue(report.is_file())
+        _ = cast(object, json.loads(report.read_text(encoding="utf-8")))
+        report.unlink()
+        waiting.unlink()
+        release.unlink()
+        _ = self.mac_collect()
+
+    def test_ssh_first_nonempty_stderr_line_is_the_reason_even_when_the_pipe_breaks(self) -> None:
+        for behavior in ("unreachable", "early_disconnect"):
+            with self.subTest(behavior=behavior):
+                run = self.mac_collect(behavior)
+                for line in run.output.splitlines():
+                    if line.startswith("mac "):
+                        self.assertIn("fixture SSH is unreachable", line)
+                        self.assertNotIn("Broken pipe", line)
+                        self.assertNotIn("second fixture diagnostic", line)
+                self.assert_source_states(run.output, "mac", "unreachable")
 
     def mac_transcript(self, agent_id: str) -> Path:
         return self.mac_home / ".claude/projects/project" / f"{agent_id}.jsonl"

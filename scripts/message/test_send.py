@@ -24,6 +24,7 @@ import record as shutdown_record
 import restart
 import roster
 import settle
+from test_support import ShutdownTestCase, ShutdownSendLeaf
 from user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired
 
 
@@ -52,7 +53,7 @@ def local_options(arguments: list[str]) -> send.Options:
     return send.parse([*([] if "--machine" in arguments else ["--here"]), *arguments])
 
 
-class SendTests(unittest.TestCase):
+class SendTests(ShutdownTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -61,6 +62,7 @@ class SendTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
@@ -364,31 +366,16 @@ class SendTests(unittest.TestCase):
         real_send = Path(__file__).resolve().parent / "send.py"
         child_state = self.root / "child-state"
 
-        def shutdown_fixture(
-            session_id: str,
-        ) -> tuple[shutdown_record.ShutdownRecord, shutdown_record.ShutdownSessionEntry]:
-            session = cast(
-                object,
-                {"session_id": session_id, "name": session_id, "kind": "top-level"},
-            )
-            current_entry = cast(
-                shutdown_record.ShutdownSessionEntry,
-                cast(object, {
-                    "session": session,
-                    "timers": [],
-                    "settle_message": shutdown_record.SettleMessageNotSent(kind="not sent"),
-                }),
-            )
-            current = cast(
-                shutdown_record.ShutdownRecord,
-                cast(object, {
-                    "login": "owner@example.com",
-                    "label": "claude 2",
-                    "requested_at": "2026-10-09T21:49:10+00:00",
-                    "entries": [current_entry],
-                }),
-            )
-            return current, current_entry
+        def shutdown_fixture(session_id: str) -> shutdown_record.SessionShutdown:
+            from test_restart import entry, top_level
+
+            saved = entry(top_level(session_id), state=shutdown_record.SessionWaiting(kind="waiting"))
+            self.assertTrue(shutdown_record.create_session(saved))
+            return saved
+
+        self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
+        self.allow_leaf(ShutdownSendLeaf.RETIRE_SHUTDOWN_MESSAGES)
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
 
         with (
             mock.patch.object(send, "STATE", child_state / "message"),
@@ -397,35 +384,37 @@ class SendTests(unittest.TestCase):
                 {
                     "XDG_STATE_HOME": str(child_state),
                     "SHUTDOWN_SEND": str(real_send),
+                    "SHUTDOWN_STATE_DIR": str(child_state / "shutdown"),
                 },
             ),
         ):
-            cancelled, cancel_entry = shutdown_fixture("cancelled")
-            settle._send_settle_message(cancelled, cancel_entry)  # pyright: ignore[reportPrivateUsage]
+            cancelled = shutdown_fixture("cancelled")
+            settle._send_settle_message(cancelled)  # pyright: ignore[reportPrivateUsage]
             old_cancel = settle.send_message(
                 "session:cancelled",
                 "old settle",
                 "Old unkeyed settle instruction: run /shutdown ready.",
             )
             self.assertEqual(old_cancel["kind"], "queued")
+            cancelled = shutdown_record.find_session(cancelled["login"], "cancelled")
+            assert cancelled is not None
             settle._restore_record(cancelled)  # pyright: ignore[reportPrivateUsage]
             self.session("cancelled", "cancel-recipient")
             cancel_pending = send.pending("cancel-recipient")
             self.assertNotIn("settle instruction", cancel_pending)
             self.assertIn("cancelled by the user", cancel_pending)
 
-            restarted, restart_entry = shutdown_fixture("restarted")
-            settle._send_settle_message(restarted, restart_entry)  # pyright: ignore[reportPrivateUsage]
+            restarted = shutdown_fixture("restarted")
+            settle._send_settle_message(restarted)  # pyright: ignore[reportPrivateUsage]
             old_restart = settle.send_message(
                 "session:restarted",
                 "old settle",
                 "Old unkeyed settle instruction: run /shutdown ready.",
             )
             self.assertEqual(old_restart["kind"], "queued")
-            restart._retire(restarted, restart_entry, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+            restart._retire(restarted, dry_run=False)  # pyright: ignore[reportPrivateUsage]
             delivery = restart._send_restart_note(  # pyright: ignore[reportPrivateUsage]
                 restarted,
-                restart_entry,
                 "Restarted; continue.",
                 dry_run=False,
             )
@@ -945,7 +934,7 @@ class SendTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 2, argv)
 
 
-class PeerSendTests(unittest.TestCase):
+class PeerSendTests(ShutdownTestCase):
     root: Path = Path()
     local: roster.Roster = roster.Roster([], [])
     ssh_log: Path = Path()
@@ -955,6 +944,7 @@ class PeerSendTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         binaries = self.root / "bin"
         binaries.mkdir()
@@ -1206,7 +1196,7 @@ class PeerSendTests(unittest.TestCase):
                     self.assertEqual(len(self.forwarded()), before)
 
 
-class ReadRelayTests(unittest.TestCase):
+class ReadRelayTests(ShutdownTestCase):
     def test_delivered_verbatim(self) -> None:
         result = send.read_relay(stream(INIT, call("hello\n"), answer(OK)), "hello")
         self.assertEqual(result.outcome, "sent")

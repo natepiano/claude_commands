@@ -33,7 +33,8 @@
       "extraPaths": [
         "scripts/hooks",
         "scripts/message",
-        "scripts/notify"
+        "scripts/notify",
+        "scripts/production"
       ]
     },
     {
@@ -81,6 +82,7 @@
       "root": "scripts/buildlog",
       "extraPaths": [
         "scripts/buildlog",
+        "scripts/build_hold",
         "scripts/lint"
       ]
     },
@@ -88,6 +90,7 @@
       "root": "scripts/mac_test",
       "extraPaths": [
         "scripts/mac_test",
+        "scripts/build_hold",
         "scripts/lint"
       ]
     },

@@ -7,6 +7,10 @@
 # 431 ms, cached poll 102 ms, and release 97 ms (temporary ledger and real
 # read-only index, 2026-10-06 PDT).
 
+BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
+[[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
+source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
+build_override_refusal "${BASH_SOURCE[0]}" lint/memory_gate.sh || exit 2
 BUILD_HOLD_MARK_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_hold" && pwd)/build_hold.py"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
 BUILDLOG_MEM_ADMIT_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/memory_admit.py"

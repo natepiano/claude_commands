@@ -66,6 +66,25 @@ word, the run is ending through <RunSummary/>, or the user typed
 `/unit:add_ons`. Automatic mode never stops for this; a run the user has
 walked away from accumulates and stays silent.
 
+**In a production unit the showrunner settles add-ons, not the user**
+(`~/.claude/docs/production_format.md` → <ProductionUnit/> item 2; user,
+2026-10-12), and no interactive point is needed. At <PhaseEnd/>'s add-on
+check, when `${NEXT_ITEMS_PENDING}` holds an item not yet sent, send the
+showrunner one message and keep working:
+
+```
+From <unit>: <n> add-ons for your call.
+1. <title> — recommend current|next|drop: <reason>
+```
+
+Add `Sent: <HH:MM zone>` under each item sent, so no item is sent twice. The
+answer names a disposition for each number. Apply each as the list below says
+when it arrives, with no `/adhoc_review` and no question to the user; at
+<RunSummary/> the choices are `next` and `drop`. Never stop the run to wait
+for the answer, and never hold an add-on for the user: one that only the user
+can judge is the showrunner's to take to them. The rest of this contract is
+for a run outside a production, where the user is the one who answers.
+
 At a stop for a decision, resolve that decision first. Then say
 `<n> add-ons accumulated since Phase <id>.` and invoke `/adhoc_review` over the
 pending items with these settings: no working-doc question, since each

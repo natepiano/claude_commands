@@ -1,0 +1,2 @@
+{"timestamp":"2026-10-10T21:34:00Z","type":"session_meta","payload":{"id":"report-no-turn","cwd":"/invented/no-turn"}}
+{"timestamp":"2026-10-10T21:36:05Z","type":"event_msg","payload":{"type":"contextCompaction"}}

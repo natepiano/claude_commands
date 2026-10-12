@@ -21,8 +21,12 @@ is the third reader:
 The `craft` lens is off since 2026-10-04 (user: review trial ended); the run's
 style review still audits style.
 
-Each lens gets a different open seat. Prefer a seat that did not write the
-files it reviews. When the other seats are busy, a writer may take the
+When the production doc names a review pool and the phase's arm is `pool`,
+the launcher allocates each lens's reviewer; the seat choice and role
+reassignment below do not apply.
+
+Otherwise each lens gets a different open seat. Prefer a seat that did not
+write the files it reviews. When the other seats are busy, a writer may take the
 `adversary` lens on its own work and argue against its choices. Move each seat
 under <RoleReassignment/>; if every open seat is busy, open a role-named review
 seat and keep it for reuse.
@@ -46,7 +50,14 @@ the same few hunks.
 </TeamReview>
 
 <ReviewPromptContract>
-Every review prompt opens with the selected seat's role switch:
+When the production doc names a review pool and the phase's arm is `pool`,
+every code review prompt opens with:
+
+```
+You are a pooled reviewer for <unit>, phase <N>. Edit nothing. Your first command is git -C <worktree> rev-parse HEAD; if it is not <head>, report error. Re-read the tree; trust nothing from memory about its state.
+```
+
+Otherwise every review prompt opens with the selected seat's role switch:
 
 ```
 You are slot <slot>, now working as a reviewer. Edit nothing. Read the diff
@@ -54,9 +65,10 @@ cold as if someone else wrote it. If you wrote any of the code, argue against
 your own choices as an adversary would.
 ```
 
-In a run, the opening also gives the concrete `board.sh role ... review`
-command for the seat's first tool call. The reviewer narrates each activity as
-a short output line so the wrapper heartbeat remains live. It receives no
+In a run's own-seat review, the opening also gives the concrete
+`board.sh role ... review` command for the seat's first tool call. The reviewer
+narrates each activity as a short output line so the wrapper heartbeat remains
+live. It receives no
 heartbeat path and never receives `${IMPL_SUMMARY}`. `review.sh` verifies that
 the working tree did not change.
 
@@ -65,9 +77,11 @@ may run one specific omitted check only when a plausible regression lies outside
 the listed gate, and must name that command. Broad reviews apply
 <TypeDesignContract/>; closure reviews apply only <ClosureReview/>.
 
-Every review prompt carries the inline Three Gods sentence and the Type Design
-Contract: verbatim for a new seat, or by <WritePromptContract/> item 7's pointer
-for a follow-up.
+For a pool review, the Three Gods and Type Design Contract sections each hold
+the one line `As in your standing instructions.` and name no file; this also
+applies to the broad and closure prompt forms below. Otherwise every review
+prompt carries the inline Three Gods sentence and the Type Design Contract: verbatim
+for a new seat, or by <WritePromptContract/> item 7's pointer for a follow-up.
 
 A broad review's prompt names its lens per <TeamReview/> and asks that lens's
 questions and no others; a closure review names no lens.
@@ -161,12 +175,26 @@ of reviewing the partial diff.
    `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the two
    lenses of <TeamReview/> over <BroadReviewPrompt/>; later passes are one
    reviewer over one repair, per <ClosureReview/>.
-2. Apply <ReviewDiffContract/>. Choose each lens's open seat under
+2. Apply <ReviewDiffContract/>. On the pool arm of a production whose doc
+   names a review pool, create each prompt with <ReviewPromptContract/>'s
+   pooled opening. Otherwise choose each lens's open seat under
    <TeamReview/>, apply <RoleReassignment/> when its role changes, and create
    the prompt with that slot's role-switch opening.
 3. Launch each reviewer under <DispatchContract/>, pass 1's in one message so
    they run concurrently — `contract` alone when the adversary was armed early,
-   both otherwise. For an open seat:
+   both otherwise. When the production doc names a review pool and the
+   phase's arm is `pool`:
+
+   ```sh
+   bash ~/.claude/scripts/delegate/review.sh --pool code \
+     --lease "<slug>/<unit>/<phase>" \
+     "${SESSION_DIR}" "${WORKING_DIR}" \
+     "${SESSION_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
+     "<responsibility>" "<activity>" "${REVIEW_PASS}" <lens>
+   ```
+
+   A pool closure uses `review_prompt_${REVIEW_PASS}.md` and omits the lens.
+   Otherwise, for an open seat:
 
    ```sh
    bash ~/.claude/scripts/delegate/review.sh --to "<full-seat-name>" \
@@ -213,8 +241,12 @@ of reviewing the partial diff.
    while blind reviewers remain active, read each log once, cancel them all, and
    close each one's own pass with
    `PLAN_DELEGATE_TEAM_ROLE=<seat> … finish-pass --status canceled
-   --orphaned-launcher` per <PassOwnership/>, using each selected review slot,
-   then open and gate the finding and apply <FixDispatch/> with useful
+   --orphaned-launcher` per <PassOwnership/>, using each selected review slot
+   unless the phase's arm is `pool`. On the pool arm, read each
+   review's slot from the one line in `${SESSION_DIR}/review_slot_<lens>`;
+   for a closure, use `${SESSION_DIR}/review_slot`. A missing file means that
+   launcher opened no pass, so skip its cancel call. Then open and gate the
+   finding and apply <FixDispatch/> with useful
    partial-review evidence. Preempt at most once per phase; never edit while an
    old-diff review remains active. A canceled review supplies no verdict or
    direct-fix agreement.

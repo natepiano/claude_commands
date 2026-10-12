@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-10-10T21:30:00Z","cwd":"/invented/director"}
+{"type":"assistant","timestamp":"2026-10-10T21:35:12Z","requestId":"director-turn","message":{"id":"director-turn","model":"claude-opus-4-6","usage":{"input_tokens":1000,"output_tokens":0}}}
