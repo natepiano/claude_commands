@@ -1734,7 +1734,7 @@ class StopTests(ShutdownTestCase):
             patch.object(restart_work, "restart") as restart,
         ):
             self.assertEqual(shutdown.main(["conduct", LOGIN]), 0)
-        remote.assert_called_once_with(["records", "--json", "--here"])
+        remote.assert_called_once_with(["slot-records", "--json", "--here"])
         restart.assert_not_called()
 
     def test_conduct_restarts_both_completed_machine_records_by_login(self) -> None:

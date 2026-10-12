@@ -889,7 +889,7 @@ print("rc=0")
         )
         self.assertIn(
             "Work: waiting · message queued: no live session",
-            "\n".join(settle.status_record_lines(refreshed["record"])),
+            "\n".join(settle.status_record_lines(record.session_records(LOGIN)[0])),
         )
 
     def test_queued_settle_message_retries_only_after_five_minutes(self) -> None:
@@ -1362,7 +1362,7 @@ print("rc=0")
         ) -> tuple[int, str]:
             self.assertEqual(stdin, "")
             self.assertEqual(limit, remote.STANDARD_TIME_LIMIT)
-            if arguments == ["records", "--json", "--here"]:
+            if arguments == ["slot-records", "--json", "--here"]:
                 with patch.dict(
                     os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
                 ):

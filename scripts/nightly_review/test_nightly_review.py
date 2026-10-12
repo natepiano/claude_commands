@@ -425,7 +425,7 @@ class NightlyReviewTests(unittest.TestCase):
             self.skipped_by_shutdown(),
             [
                 "skipped: claude 2 is held by a shutdown "
-                + "(down since 2026-10-09 14:49 PDT)"
+                + "(since 2026-10-09 14:49 PDT)"
             ],
         )
 
@@ -439,7 +439,7 @@ class NightlyReviewTests(unittest.TestCase):
             self.skipped_by_shutdown(),
             [
                 "skipped: claude 3 is held by a shutdown "
-                + "(down since 2026-10-09 14:49 PDT)"
+                + "(since 2026-10-09 14:49 PDT)"
             ],
         )
 
