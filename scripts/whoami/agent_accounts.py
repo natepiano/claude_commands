@@ -9,9 +9,8 @@ Two kinds of source, and callers pick by cost:
   `.claude.json`; Codex keeps an OIDC id_token in `auth.json` whose payload carries
   the email. Free to read, so safe on a two-minute timer.
 
-These default credential stores describe the current login. Historical usage
-is not a live reading of an inactive account; agent_notes preserves observations
-made while an account was active without retaining its credentials.
+Each credential store describes its home's current login. Every signed-in Codex
+home can be read live; saved usage remains an observation, without credentials.
 
 Nothing here returns or prints a credential: tokens are read only to be sent to
 the endpoint that issued them, or decoded for the email claim.
@@ -26,6 +25,7 @@ import http.client
 import json
 import os
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -115,8 +115,15 @@ class ClaudeDirectorySource:
 
 
 @dataclass(frozen=True)
+class CodexHomeSource:
+    """A Codex reading obtained using this account home."""
+
+    home: Path
+
+
+@dataclass(frozen=True)
 class AccountSourceUnspecified:
-    """The report does not identify a Claude account directory."""
+    """The report does not identify an account directory or home."""
 
 
 @dataclass
@@ -136,7 +143,7 @@ class Report:
     # Codex credits that carry work past the weekly allowance: whole credits, "unlimited", or "null"
     # when the rate limits were read and report none. None means they were not read.
     credit_balance: str | None = None
-    source: ClaudeDirectorySource | AccountSourceUnspecified = field(default_factory=AccountSourceUnspecified)
+    source: ClaudeDirectorySource | CodexHomeSource | AccountSourceUnspecified = field(default_factory=AccountSourceUnspecified)
 
     @property
     def weekly_reset(self) -> datetime | None:
@@ -307,6 +314,41 @@ def claude_config_file(config_dir: Path | None = None) -> Path:
 
 def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+
+
+def codex_home_display(home: Path) -> str:
+    """Display an account home's path using ~ within the user's home directory."""
+    user_home = Path.home()
+    if home == user_home:
+        return "~"
+    return f"~/{home.relative_to(user_home)}" if home.is_relative_to(user_home) else str(home)
+
+
+def codex_homes() -> list[Path]:
+    """The default home, existing numbered homes, and any other home in use."""
+    default = Path.home() / ".codex"
+    numbered: list[tuple[int, Path]] = []
+    try:
+        for child in Path.home().iterdir():
+            match = re.fullmatch(r"\.codex([1-9][0-9]*)", child.name)
+            if match is not None and child.is_dir():
+                numbered.append((int(match.group(1)), child))
+    except OSError:
+        pass
+    homes = [default, *(home for _, home in sorted(numbered))]
+    current = codex_home()
+    if current not in homes:
+        homes.append(current)
+    return homes
+
+
+def codex_report_in_use(report: Report) -> bool:
+    """Select the seats' home; an older report without a source needs a single home."""
+    if report.tool.lower() != "codex":
+        return False
+    if isinstance(report.source, CodexHomeSource):
+        return report.source.home == codex_home()
+    return isinstance(report.source, AccountSourceUnspecified) and len(codex_homes()) == 1
 
 
 # --- Claude ------------------------------------------------------------------
@@ -569,14 +611,15 @@ def codex_five_hour(usage: CodexRateLimits) -> Quota | None:
     return None
 
 
-async def codex_live() -> Report:
-    report = Report("Codex")
+async def codex_live(home: Path) -> Report:
+    report = Report("Codex", source=CodexHomeSource(home))
     server: CodexServer | None = None
     try:
         server = CodexServer(await asyncio.create_subprocess_exec(
             executable("codex"), "app-server", "--listen", "stdio://",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env={**os.environ, "CODEX_HOME": str(home)},
         ))
         _ = await server.request(1, "initialize", {"clientInfo": {"name": "whoami", "version": "1.0"}})
         await server.send({"method": "initialized"})
@@ -637,11 +680,14 @@ def reset_credits(report: Report, summary: object) -> None:
 
 
 async def live_reports(selection: ClaudeAccountSelection) -> list[Report]:
-    """Live Claude directories and the Codex account, fetched concurrently."""
+    """Live Claude directories and every Codex home, fetched concurrently."""
+    homes = codex_homes()
     if not selection.multiple_accounts:
-        return list(await asyncio.gather(asyncio.to_thread(claude_live), codex_live()))
+        return list(await asyncio.gather(
+            asyncio.to_thread(claude_live), *(codex_live(home) for home in homes),
+        ))
     directories = [Path.home() / ".claude", *(named.directory for named in selection.named_accounts)]
     return list(await asyncio.gather(
         *(asyncio.to_thread(claude_live, directory) for directory in directories),
-        codex_live(),
+        *(codex_live(home) for home in homes),
     ))

@@ -97,8 +97,14 @@ State:
     words, with the answer relayed back;
   - product and scope choices;
   - anything that cannot be undone;
+  - a block that waits on the user, and a step only they can run;
+  - a fault they would see;
   - a quota alert (<QuotaAlert/>);
   - the discussion agenda (<Agenda/>).
+
+  Nothing else does. Handle unit messages (checkpoints, merges, ETAs, plans,
+  promotions, routine fixes) without telling the user; they wait for the next
+  dailies (user, 2026-10-12).
 - **Long commands** run in the background. The task notification is the wait;
   never poll.
 - **Helpers.** Stop each named helper agent once its report is read.
@@ -312,7 +318,7 @@ each thing that changed; the user asks for `simple` to see every unit's section.
 A `/showrunner:dailies` the user runs takes the next tick's slot: it runs the
 script, and then runs `NOTIFIER restart UPDATES` so the next tick comes N minutes after
 that report (`/showrunner:dailies` → Status check and clock).
-`/showrunner:interval <minutes>` changes N.
+`/showrunner:report_interval <minutes>` changes N.
 
 Log `UPDATES` and its `next_due`. Read the quota alert protocol (<QuotaAlert/>).
 
@@ -342,6 +348,8 @@ whatever arrived:
 | a quota alert | <QuotaAlert/> |
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
 | the user asks which phase or task each unit is on | `/showrunner:units` |
+| the user asks which proposals are open | `/showrunner:proposals` |
+| the user asks for the nightly improvement list | `/showrunner:nightly` |
 
 A unit repairing failing tests that split by file runs parallel repair seats
 (`/unit:direct` → <FixDispatch/>); one that runs a lone seat on them gets

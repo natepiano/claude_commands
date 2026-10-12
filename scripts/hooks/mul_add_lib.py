@@ -448,7 +448,9 @@ def _find_in_body(
     return findings
 
 
-def float_mul_add_findings(rs_file: os.PathLike[str] | str) -> tuple[SuboptimalFlopsLintScope, list[FloatMulAddFinding]]:
+def float_mul_add_findings(
+    rs_file: os.PathLike[str] | str, written: frozenset[int] | None = None,
+) -> tuple[SuboptimalFlopsLintScope, list[FloatMulAddFinding]]:
     """Return only expressions whose scalar float types can be proved locally."""
     scope = suboptimal_flops_scope(rs_file)
     if not scope.enabled:
@@ -492,4 +494,9 @@ def float_mul_add_findings(rs_file: os.PathLike[str] | str) -> tuple[SuboptimalF
         results.extend(_find_in_body(source, visible, fn_start, start, end,
                                      scalar_fields, nonfloat_fields, file_floats, file_nonfloats,
                                      nested, const_ranges))
+    if written is not None:
+        results = [finding for finding in results
+                   if any(line in written for line in range(
+                       finding.line, finding.line + finding.expr.count("\n") + 1,
+                   ))]
     return scope, results

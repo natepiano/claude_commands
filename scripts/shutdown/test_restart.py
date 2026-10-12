@@ -262,6 +262,21 @@ def shutdown_record(
     )
 
 
+def session_shutdown(
+    session_id: str, *, machine: str = "natedev", hold: Literal["account", "session"] = "account",
+) -> record.SessionShutdown:
+    old = shutdown_record([entry(top_level(session_id))], machine=machine)
+    item = old["entries"][0]
+    return record.SessionShutdown(
+        login=old["login"], label=old["label"], machine=machine,
+        requested_at=old["requested_at"], requested_by=old["requested_by"],
+        hold=hold, then="stop", force=old["force"], alerts="user",
+        session=item["session"], seats=[], timers=item["timers"],
+        settle_message=item["settle_message"], where=item["where"],
+        progress=item["progress"], stop_issues=item["stop_issues"],
+    )
+
+
 @final
 class CommandRecorder:
     calls: list[list[str]]
@@ -2525,7 +2540,9 @@ class RestartTests(ShutdownTestCase):
             limit: remote_transport.RemoteCallLimit = remote_transport.STANDARD_TIME_LIMIT,
         ) -> tuple[int, str]:
             del stdin, limit
-            return (0, "[]") if args == ["records", "--json", "--here"] else (0, "")
+            return (0, "[]") if args in (
+                ["records", "--json", "--here"], ["holds", "--json", "--here"],
+            ) else (0, "")
 
         with (
             patch.object(restart, "own_claude_account", unreadable),
@@ -3367,8 +3384,48 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(alerts[0][0], f"{LABEL} is not fully back")
         self.assertIn(incomplete, alerts[0][1])
 
+    def test_local_restart_scope_combines_selected_session_ids(self) -> None:
+        for session_id in ("second", "first"):
+            self.assertTrue(record.create_session(session_shutdown(session_id, hold="session")))
+        scope_for = cast(
+            Callable[[str], restart.RestartScopeKnown | restart.RestartScopeNotFoundLocally],
+            getattr(restart, "_local_restart_scope"),
+        )
+        found = scope_for(LOGIN)
+        self.assertEqual(found, restart.RestartScopeKnown(record.SelectedSessions(
+            kind="selected", session_ids=["first", "second"],
+        )))
+
+    def test_local_restart_scope_uses_an_account_hold_without_sessions(self) -> None:
+        record.set_account_hold(record.AccountHold(
+            login=LOGIN, label=LABEL, machine="natedev", requested_at=STOPPED,
+            requested_by=record.FromTerminal(kind="terminal"), then="restart",
+        ))
+        scope_for = cast(
+            Callable[[str], restart.RestartScopeKnown | restart.RestartScopeNotFoundLocally],
+            getattr(restart, "_local_restart_scope"),
+        )
+        self.assertEqual(scope_for(LOGIN), restart.RestartScopeKnown(
+            record.AllAccountSessions(kind="all account sessions"),
+        ))
+
+    def test_account_choice_ignores_waiting_and_completed_session_records(self) -> None:
+        waiting = session_shutdown("waiting")
+        waiting["login"] = "other@example.com"
+        waiting["progress"] = record.SessionWaiting(kind="waiting")
+        complete = session_shutdown("done")
+        complete["login"] = "third@example.com"
+        complete["progress"] = record.SessionRestarted(kind="restarted", at=RESTARTED)
+        stopped = session_shutdown("stopped")
+        with (
+            patch.object(restart, "all_session_records", return_value=[waiting, complete, stopped]),
+            patch.object(restart, "run_remote", return_value=(0, "[]")),
+        ):
+            account_from_records = cast(Callable[[], Account], getattr(restart, "_account_from_records"))
+            self.assertEqual(account_from_records(), Account("claude", LOGIN, LABEL))
+
     def test_partial_restart_preserves_a_selected_local_scope(self) -> None:
-        saved = shutdown_record([])
+        saved = shutdown_record([entry(top_level("selected"))])
         saved["scope"] = record.SelectedSessions(
             kind="selected", session_ids=["selected"]
         )
@@ -3419,10 +3476,7 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(user_alerts, [])
 
     def test_partial_restart_uses_a_selected_scope_from_the_other_machine(self) -> None:
-        remote_record = shutdown_record([], machine="Mac")
-        remote_record["scope"] = record.SelectedSessions(
-            kind="selected", session_ids=["remote-selected"]
-        )
+        remote_record = session_shutdown("remote-selected", machine="Mac", hold="session")
         calls: list[list[str]] = []
         scopes: list[record.ShutdownScope] = []
         user_alerts: list[str] = []
@@ -3477,7 +3531,7 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(
             calls, [["up", LOGIN], ["records", "--json", "--here"]]
         )
-        self.assertEqual(scopes, [remote_record["scope"]])
+        self.assertEqual(scopes, [record.SelectedSessions(kind="selected", session_ids=["remote-selected"])])
         self.assertEqual(user_alerts, [])
 
     def test_partial_restart_defaults_to_account_wide_when_scope_is_unreadable(self) -> None:
@@ -3515,7 +3569,7 @@ class RestartTests(ShutdownTestCase):
             ),
             patch.object(
                 restart,
-                "find_live",
+                "session_records",
                 side_effect=record.InvalidRecord("unreadable local record"),
             ),
             patch.object(restart, "run_remote", run_remote),
@@ -3561,7 +3615,7 @@ class RestartTests(ShutdownTestCase):
             ),
             patch.object(
                 restart,
-                "find_live",
+                "session_records",
                 side_effect=AssertionError("scope must not be read"),
             ),
             patch.object(restart, "run_remote", run_remote),
@@ -3668,22 +3722,29 @@ class RestartTests(ShutdownTestCase):
         alert_user.assert_not_called()
 
     def test_multiple_record_accounts_need_a_choice(self) -> None:
-        record.create(shutdown_record([]))
-        remote_record = shutdown_record([], machine="Mac")
+        record.create(shutdown_record([entry(top_level("local"))]))
+        remote_record = session_shutdown("remote", machine="Mac")
         remote_record["login"] = "other@example.com"
         remote_record["label"] = "claude other"
 
         def unreadable() -> Account:
             raise UnreadableAccount("this process has no readable account")
 
+        def run_remote(
+            args: list[str],
+            stdin: str = "",
+            limit: remote_transport.RemoteCallLimit = remote_transport.STANDARD_TIME_LIMIT,
+        ) -> tuple[int, str]:
+            del stdin, limit
+            if args == ["records", "--json", "--here"]:
+                return 0, json.dumps([remote_record])
+            self.assertEqual(args, ["holds", "--json", "--here"])
+            return 0, "[]"
+
         output = io.StringIO()
         with (
             patch.object(restart, "own_claude_account", unreadable),
-            patch.object(
-                restart,
-                "run_remote",
-                return_value=(0, json.dumps([remote_record])),
-            ),
+            patch.object(restart, "run_remote", run_remote),
             patch.object(settle, "alert_user") as alert_user,
             redirect_stdout(output),
             redirect_stderr(io.StringIO()),
@@ -3697,12 +3758,47 @@ class RestartTests(ShutdownTestCase):
                 1,
             )
 
-        self.assertIn(f"natedev: {LABEL} down", output.getvalue())
-        self.assertIn("Mac: claude other down", output.getvalue())
+        self.assertIn(f"natedev: {LABEL} local: stopped", output.getvalue())
+        self.assertIn("Mac: claude other remote: stopped", output.getvalue())
+        self.assertNotIn("is held by a shutdown", output.getvalue())
         alert_user.assert_not_called()
 
-    def test_an_unreadable_process_account_uses_the_only_down_record_on_either_machine(self) -> None:
-        remote_record = shutdown_record([], machine="Mac")
+    def test_bare_restart_selects_an_empty_local_shutdown_when_own_account_is_unreadable(self) -> None:
+        saved = shutdown_record([])
+        record.create(saved)
+        calls: list[list[str]] = []
+
+        def run_remote(
+            args: list[str],
+            stdin: str = "",
+            limit: remote_transport.RemoteCallLimit = remote_transport.STANDARD_TIME_LIMIT,
+        ) -> tuple[int, str]:
+            del stdin, limit
+            calls.append(args)
+            if args in (["records", "--json", "--here"], ["holds", "--json", "--here"]):
+                return 0, "[]"
+            self.assertEqual(args, ["up", LOGIN])
+            return 0, ""
+
+        with (
+            patch.object(restart, "own_claude_account", side_effect=UnreadableAccount("no readable process account")),
+            patch.object(restart, "_up", return_value=restart.MachineRestartResult("natedev", LABEL, "done")) as up,
+            patch.object(restart, "run_remote", run_remote),
+            patch.object(settle, "alert_user") as alert_user,
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(shutdown.main(["restart"]), 0)
+
+        up.assert_called_once_with(LOGIN, False)
+        self.assertEqual(calls, [
+            ["records", "--json", "--here"], ["holds", "--json", "--here"], ["up", LOGIN],
+        ])
+        self.assertEqual(self.stored_record(), saved)
+        alert_user.assert_not_called()
+
+    def test_bare_restart_selects_the_peer_account_from_its_stopped_session_when_own_account_is_unreadable(self) -> None:
+        remote_record = session_shutdown("remote", machine="Mac")
         calls: list[list[str]] = []
 
         def run_remote(
@@ -3714,6 +3810,8 @@ class RestartTests(ShutdownTestCase):
             calls.append(args)
             if args == ["records", "--json", "--here"]:
                 return 0, json.dumps([remote_record])
+            if args == ["holds", "--json", "--here"]:
+                return 0, "[]"
             self.assertEqual(args, ["up", LOGIN])
             return 0, "Mac: 0 restarted, 0 seats available on demand"
 
@@ -3727,19 +3825,149 @@ class RestartTests(ShutdownTestCase):
             patch.object(settle, "alert_user") as alert_user,
             redirect_stdout(io.StringIO()),
         ):
-            self.assertEqual(
-                restart.restart(
-                    restart.AccountNotNamed(),
-                    dry_run=False,
-                    alerts=restart.AlertWhenNotBack(),
-                ),
-                0,
-            )
+            self.assertEqual(shutdown.main(["restart"]), 0)
 
         self.assertEqual(calls, [
             ["records", "--json", "--here"],
+            ["holds", "--json", "--here"],
             ["up", LOGIN],
         ])
+        alert_user.assert_not_called()
+
+    def test_bare_restart_selects_the_peer_account_hold_when_own_account_is_unreadable(self) -> None:
+        remote_hold = record.AccountHold(
+            login=LOGIN, label=LABEL, machine="Mac", requested_at=STOPPED,
+            requested_by=record.FromTerminal(kind="terminal"), then="restart",
+        )
+        calls: list[list[str]] = []
+
+        def run_remote(
+            args: list[str],
+            stdin: str = "",
+            limit: remote_transport.RemoteCallLimit = remote_transport.STANDARD_TIME_LIMIT,
+        ) -> tuple[int, str]:
+            del stdin, limit
+            calls.append(args)
+            if args == ["records", "--json", "--here"]:
+                return 0, "[]"
+            if args == ["holds", "--json", "--here"]:
+                return 0, json.dumps([remote_hold])
+            self.assertEqual(args, ["up", LOGIN])
+            return 0, "Mac: 0 restarted, 0 seats available on demand"
+
+        def unreadable() -> Account:
+            raise UnreadableAccount("this process has no readable account")
+
+        with (
+            patch.object(restart, "own_claude_account", unreadable),
+            patch.object(restart, "named_claude_account", return_value=self.account),
+            patch.object(restart, "run_remote", run_remote),
+            patch.object(settle, "alert_user") as alert_user,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(shutdown.main(["restart"]), 0)
+
+        self.assertEqual(calls, [
+            ["records", "--json", "--here"],
+            ["holds", "--json", "--here"],
+            ["up", LOGIN],
+        ])
+        alert_user.assert_not_called()
+
+    def test_bare_restart_lists_accounts_known_only_by_holds_in_pacific_time(self) -> None:
+        record.create(shutdown_record([]))
+        remote_hold = record.AccountHold(
+            login="other@example.com", label="claude other", machine="Mac",
+            requested_at="2026-01-15T17:30:00+00:00",
+            requested_by=record.FromTerminal(kind="terminal"), then="stop",
+        )
+
+        def run_remote(
+            args: list[str],
+            stdin: str = "",
+            limit: remote_transport.RemoteCallLimit = remote_transport.STANDARD_TIME_LIMIT,
+        ) -> tuple[int, str]:
+            del stdin, limit
+            if args == ["records", "--json", "--here"]:
+                return 0, "[]"
+            self.assertEqual(args, ["holds", "--json", "--here"])
+            return 0, json.dumps([remote_hold])
+
+        output = io.StringIO()
+        with (
+            patch.object(restart, "own_claude_account", side_effect=UnreadableAccount("no readable process account")),
+            patch.object(restart, "_up") as up,
+            patch.object(restart, "run_remote", run_remote),
+            patch.object(settle, "alert_user") as alert_user,
+            redirect_stdout(output),
+            redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(shutdown.main(["restart"]), 1)
+
+        self.assertEqual(output.getvalue().splitlines(), [
+            f"natedev: {LABEL} is held by a shutdown (since 2026-10-09 14:49 PDT)",
+            "Mac: claude other is held by a shutdown (since 2026-01-15 09:30 PST)",
+        ])
+        up.assert_not_called()
+        alert_user.assert_not_called()
+
+    def test_bare_restart_refuses_unreadable_peer_holds_before_resuming(self) -> None:
+        record.create(shutdown_record([]))
+
+        def run_remote(
+            args: list[str],
+            stdin: str = "",
+            limit: remote_transport.RemoteCallLimit = remote_transport.STANDARD_TIME_LIMIT,
+        ) -> tuple[int, str]:
+            del stdin, limit
+            if args == ["records", "--json", "--here"]:
+                return 0, "[]"
+            self.assertEqual(args, ["holds", "--json", "--here"])
+            return 0, "{"
+
+        error = io.StringIO()
+        with (
+            patch.object(restart, "own_claude_account", side_effect=UnreadableAccount("no readable process account")),
+            patch.object(restart, "_up") as up,
+            patch.object(restart, "run_remote", run_remote),
+            patch.object(settle, "alert_user") as alert_user,
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(error),
+        ):
+            self.assertEqual(shutdown.main(["restart"]), 1)
+
+        self.assertIn("shutdown: account holds is not valid JSON", error.getvalue())
+        up.assert_not_called()
+        alert_user.assert_not_called()
+
+    def test_unreadable_account_and_unreachable_peer_holds_require_an_account_name(self) -> None:
+        record.create(shutdown_record([]))
+
+        def run_remote(
+            args: list[str],
+            stdin: str = "",
+            limit: remote_transport.RemoteCallLimit = remote_transport.STANDARD_TIME_LIMIT,
+        ) -> tuple[int, str]:
+            del stdin, limit
+            if args == ["records", "--json", "--here"]:
+                return 0, "[]"
+            self.assertEqual(args, ["holds", "--json", "--here"])
+            return 255, ""
+
+        output = io.StringIO()
+        with (
+            patch.object(restart, "own_claude_account", side_effect=UnreadableAccount("no readable process account")),
+            patch.object(restart, "_up") as up,
+            patch.object(restart, "run_remote", run_remote),
+            patch.object(restart, "other_machine", return_value="Mac"),
+            patch.object(settle, "alert_user") as alert_user,
+            redirect_stdout(output),
+            redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(shutdown.main(["restart"]), 1)
+
+        self.assertIn("Mac not reached; name the account to restart", output.getvalue())
+        up.assert_not_called()
         alert_user.assert_not_called()
 
 

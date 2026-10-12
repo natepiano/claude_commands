@@ -1,6 +1,6 @@
 # Two accounts: showrunners on one Claude account, unit directors on another
 
-> **Status: IMPLEMENTATION PLAN — phases 1–6 are done; the cutover (Phase 7) moved all ten build-followups unit directors to claude 3 on 2026-10-11, with the spare dir and the cross-machine message check still open; Phase 8 (move any one session) waits on the user's go.** Phases 1–5 built everything and initiated nothing: no account dir, no login, no role. Phase 6 proved `~/.claude3` live. The design: each account the user has gets its own config dir, `~/.claude1`, `~/.claude2` and `~/.claude3`. Each holds only that account's login, and everything else is a symlink into `~/.claude`. Unit directors launch with `CLAUDE_CONFIG_DIR` set to the unit account's dir. Showrunners and every other session stay on `~/.claude`'s own login, as today. When the unit account runs low, one command swaps every unit onto a spare account through `/shutdown`'s safe stop and resume. Any one session, a showrunner included, moves to any account the same way with `/showrunner:accounts move` (Phase 8). Phased, delegate-ready once approved.
+> **Status: IMPLEMENTATION PLAN — phases 1–6 are done; the cutover (Phase 7) moved all ten build-followups unit directors to claude 3 on 2026-10-11, with the spare dir and the cross-machine message check still open; Phase 8 (move any one session) waits on the user's go; Phases 10–12 add the Codex accounts: a home per account, one account for all seats with a swap, and alerts per account.** Phases 1–5 built everything and initiated nothing: no account dir, no login, no role. Phase 6 proved `~/.claude3` live. The design: each account the user has gets its own config dir, `~/.claude1`, `~/.claude2` and `~/.claude3`. Each holds only that account's login, and everything else is a symlink into `~/.claude`. Unit directors launch with `CLAUDE_CONFIG_DIR` set to the unit account's dir. Showrunners and every other session stay on `~/.claude`'s own login, as today. When the unit account runs low, one command swaps every unit onto a spare account through `/shutdown`'s safe stop and resume. Any one session, a showrunner included, moves to any account the same way with `/showrunner:accounts move` (Phase 8). Phased, delegate-ready once approved.
 
 > **As-built disposition: create**
 
@@ -506,3 +506,142 @@ Recommend whether any change is needed. The nightly review already moved to the 
 - `docs/plans/build-followups-two-accounts.md` — the readout.
 
 **Acceptance gate:** the readout cites its window, account identities, observed days, assignment and move evidence, and the observed quota minimum. It tells rolled-back or unconfirmed attempts from completed swaps, reports coverage gaps, and is in this plan and sent to the showrunner.
+
+### Phase 10 — A home per Codex account  · status: done
+
+#### As-built
+
+- `~/.codexN` is the home of `codex N`. `~/.codex` stays the default home, and the seats run on it.
+- `accounts.py setup "codex N"` needs the account's note. It builds the home (0700) and links the shared entries (`CODEX_SHARED`: `config.toml`, `hooks.json`, `AGENTS.md`, `skills`, `rules`, `plugins`, `sessions`, `archived_sessions`, `session_index.jsonl`, `history.jsonl`, `models_cache.json`) to `~/.codex`. It never links or copies the sign-in file. When another home already holds the note's login it refuses before it creates anything, with one line naming the account and that home. It prints `CODEX_HOME=~/.codexN codex login` only when setup reported no problem.
+- `accounts.py check "codex N"` reports a broken or replaced link, an entry it does not know, a login that is not the note's, and a login another home holds.
+- `agent_accounts.live_reports` returns one Codex report per home, and each Codex `Report` names its home in `CodexHomeSource(home)`.
+- `agent_notes`: every signed-in home's note gets its numbers. `UnknownAccountActivity` leaves every Codex note's state as it is when the login of the home in use cannot be read. The 5-hour watch gets only the report of the home in use. With one home the behavior is the same as without numbered homes.
+- `/whoami` prints one block per home. With several homes the block of the home in use is marked `seats`, and a block with no account is headed `Codex (~/.codexN)` or `Codex (~/.codex, seats)`. A spare home that is set up and not signed in reads `Codex (~/.codexN): Not logged in` in the `/whoami` header and in the updater's messages.
+- The table has one row per home (`seats` on the home in use, `spare` on the others), then a `not set up` row for each noted `codex N` whose home is not listed and whose login no home holds, also when a file or dead link sits at the path. Check problems print under the table, and `setup` is the repair.
+- The hook installer writes to the file a linked `hooks.json` leads to, with its temporary file beside that target, and the link stays, so numbered homes keep sharing the default home's hooks.
+
+**Files:**
+- `scripts/accounts/accounts.py` — Codex `setup` and `check`, `codex_statuses`, the table rows.
+- `scripts/accounts/test_accounts.py` — tests of a home's setup state and of setup refused for a held login.
+- `scripts/whoami/agent_accounts.py` — the home functions and one Codex report per home.
+- `scripts/whoami/agent_notes.py` — numbers per signed-in home; `active` from the sign-in on disk of the home in use; `UnknownAccountActivity`.
+- `scripts/whoami/test_agent_notes.py` — tests of a spare home not signed in and of an unreadable in-use login.
+- `scripts/whoami/whoami.py` — one block per home.
+- `scripts/whoami/test_codex_homes.py` — tests of the Codex homes, a spare home not signed in among them.
+- `scripts/hooks/codex_hooks.py` — the installer that keeps a linked `hooks.json`.
+- `scripts/hooks/test_codex_hooks.py` — tests that the installer keeps a linked `hooks.json`.
+- `docs/accounts.md` — the Codex homes: `setup`, `check`, the setup states in the table.
+- `commands/showrunner/accounts.md` — the `/showrunner:accounts` command text for Codex homes.
+
+**Binds later work:**
+- The home functions live in `agent_accounts`: `codex_home()` (this process's `CODEX_HOME`, else `~/.codex`), `codex_homes()` (the default, the numbered directories in number order, the process home), `codex_live(home)` (app-server child with `CODEX_HOME=<home>`), `CodexHomeSource(home)`, `codex_report_in_use(report)`, `codex_email_on_disk(home)`, `codex_home_display(home)` (the `~/.codexN` text for messages and headers).
+- The home in use is this process's `CODEX_HOME`, else `~/.codex`, and four places read it: `agent_accounts.codex_report_in_use` (the `/whoami` `seats` mark and the 5-hour watch input), `agent_accounts.codex_homes` (it adds the home in use to the list), `agent_notes.update_for_selection` (which Codex note is `active`), `accounts.codex_statuses` (the table's `seats`). All four must follow the `seats` role in "One Codex account for all seats, and a swap", with tests for an unset and a conflicting `CODEX_HOME`: the updater runs with no `CODEX_HOME`, so while the readers stay on the process home a swap leaves the old account's note `active` and the alerts on an account no seat runs on.
+- A Codex note is `active` only for the login of the home in use, read from that home's sign-in on disk. Quota alerts read `active` notes, so "Alerts per Codex account" gets no alert from a spare.
+- `check` has no form for the default home. The swap in "One Codex account for all seats, and a swap" refuses a target that fails `check`, so it needs one.
+
+**Gotchas:**
+- Which login the home in use holds comes from the sign-in on disk (`codex_email_on_disk(codex_home())`), never from the live report: a failed live read must change no note's state. Read from the report, a failed read marks every Codex note `inactive` and clears the alert episode of the account the seats run on.
+- `codex_homes()` lists directories only; a file or dead link at `~/.codexN` is reported by the `not set up` row and its `check` problems.
+- Hand check, codex-cli 0.162.1: Codex writes through a linked `config.toml` and the link stays a link. Not yet checked, each needing an account signed in at `~/.codex1` (that home exists, built 2026-10-12): that `CODEX_HOME=~/.codexN codex login` leaves `~/.codex/auth.json` untouched; that usage is readable under a second home while seats run on the first; and the live half of the acceptance gate (both Codex accounts shown with numbers read in the last 10 minutes).
+- Lint exits 3 with `0 errors, 0 warnings, 0 notes` in this worktree, because `pyrightconfig.json` names an absent `.venv`.
+
+**Ruled out:**
+- Linking or copying the sign-in file into a numbered home: two homes on one login break token refresh.
+- An empty login set for "the in-use login is unknown": it would mean "no account is in use" and mark every note inactive.
+- Splitting "One Codex account for all seats, and a swap" in two: a role the mesh does not follow would make the table wrong.
+
+### Phase 11 — One Codex account for all seats, and a swap  · status: todo
+
+#### Work Order
+
+**Goal:** the `seats` role names the Codex account every unit's seats run on, everything that shows or reads the seats' account follows it, and `/showrunner:accounts swap seats "codex N"` moves them.
+
+**Constraints from prior phases:**
+
+- Homes. `~/.codexN` is the home of `codex N`, `~/.codex` the default. In `agent_accounts`: `codex_home()` is this process's home (`CODEX_HOME`, else `~/.codex`); `codex_homes()` lists the default, the numbered directories and the process home; `codex_live(home)` reads one home; a Codex `Report.source` is `CodexHomeSource(home)`; `codex_email_on_disk(home)` reads a home's login with no network call; `codex_home_display(home)` gives `~/.codexN`.
+- Today the seats' home means the process home, read in four places: `agent_accounts.codex_report_in_use` (line 345: the `/whoami` `seats` mark and the 5-hour watch input), `agent_accounts.codex_homes`, `agent_notes.update_for_selection` (line 281: which Codex note is `active`, with `UnknownAccountActivity` when the login cannot be read) and `accounts.codex_statuses` (line 1612: the table's `seats`). The updater runs with no `CODEX_HOME`.
+- The role store. `accounts._read_accounts_configuration` and `_validate_role` know only `unit`. `_write_unit_role` (line 1231) replaces the whole file. The history reader (line 1086) rejects an entry that is not `unit`. `claude_account_selection` (line 979) turns Claude role mode on whenever the file exists. `CODEX_ROLE = "seats"` is a constant already. `accounts.py` imports `agent_accounts`, so `agent_accounts` never imports it back; `agent_notes.update()` imports `scripts.accounts.accounts` at call time for the Claude selection.
+- `check("codex N")` (line 863) covers numbered homes only and expects their shared entries to link into `~/.codex`. `setup` refuses a login another home holds.
+- The mesh. `codex_mesh._start_server` starts a run's server with the unit director session's environment, and `mesh_server.json` holds only the port and pid. The retire path compares the caller's sign-in timestamp (lines 1157, 3224), which a move between two signed-in homes does not change. New turns also start at line 2155 (automatic continuation) and line 2252 (after a capacity wait), and line 2445 queues a message on a retired server while its launcher lives. The move at line 2315 returns `MovedSeat | None`, where `None` means both "a turn is live" and "the thread state could not be read" (line 2323).
+- The daemon. `scripts/message/roster.py:1105` treats daemon sessions as freestanding; `codex_daemon.py:74` picks their socket and line 296 queues through the caller's environment.
+- Lint ends `0 errors, 0 warnings, 0 notes` and exits 3 in this worktree, because `pyrightconfig.json` names an absent `.venv`. That is a pass.
+
+**Spec:**
+
+1. Role `seats` in `~/.claude/config/accounts.json` (absent means `~/.codex`), with `role seats`, `set-role seats "codex N" | default` and the role history, as `unit` has. Each role write keeps the other role, also when it selects the default. The unit history reader accepts `seats` entries and leaves them out of its own sums. A file that holds only `seats` leaves Claude selection as it is today.
+2. One seats selection per operation. A caller resolves the role's home once and passes it down. Home listing, note activity, the 5-hour watch input, the `/whoami` mark and the table's roles all use that one value, whatever `CODEX_HOME` says, and a role change in the middle of an operation does not split it. The login still comes from the home's sign-in on disk, and `UnknownAccountActivity` stays. Name the value for what it is, the seats' home, not for where it came from.
+3. `codex_mesh` starts a run's server with `CODEX_HOME` set to the role's home, whatever the caller's environment, and records the home in `mesh_server.json`. `ensure_server` retires a server whose recorded home is not the role's, whatever the sign-in timestamps say. Sign-in checks use the server's recorded home, and a sign-in notice touches only servers on that home. A record with no home is retired without interrupting a live turn. The `codex exec` fallback gets the same home.
+4. The home check runs at every new-turn boundary: a launcher's turn, an automatic continuation, a retry after a capacity wait, and a queued message. A message that arrives while the outgoing turn finishes is held for the move; steering the live turn still works.
+5. Hand check first, result recorded here: a thread started under one home continues under another when `sessions` is shared (`thread/resume`, line 2338). If it does not, the move replaces the seat with a new thread and says so. The move's result is a named type with three cases: moved, waiting on a live turn, thread state unknown. Unknown never starts a replacement turn.
+6. `swap seats "codex N" | default [--dry-run]` refuses a target that fails its check, that is already the role, or that cannot work. The check for `default`: a real home, a readable sign-in, no other home on the same login; its real shared entries are right as they are. "Can work" is one function with named results (allowance or credits available; used up with no credits; unknown) that reads both windows and the credits, and an unknown or expired reading is not allowance. It lives in `scripts/whoami/` so the alerts can import it. A refusal changes neither the role nor the history. A swap writes the role, retires every run's server, and sends each affected unit director one line. A seat mid-turn finishes first; its next turn runs under the new home. `--dry-run` prints what would move.
+7. `scripts/message/codex_daemon.py` serves freestanding sessions, so it follows its own process home, never the seats role: `ROSTER_CODEX_SOCKET`, else `CODEX_HOME`, else `~/.codex`, for discovery and for queueing alike.
+
+One Codex account serves all seats at a time, as one Claude account serves all unit directors. A single unit on its own Codex account belongs with Phase 8.
+
+**Files:**
+
+- `scripts/accounts/accounts.py` — the `seats` role, the default-home check and `swap seats`.
+- `scripts/accounts/test_accounts.py`
+- `scripts/whoami/agent_accounts.py` — the seats' home passed in; the "can work" function.
+- `scripts/whoami/agent_notes.py` — note activity and the watch input follow the role.
+- `scripts/whoami/whoami.py` — the `seats` mark follows the role.
+- `scripts/whoami/test_agent_notes.py`
+- `scripts/whoami/test_codex_homes.py`
+- `scripts/agents/codex_mesh.py` — the server starts under the role's home and records it; the check at every new turn; the named move result.
+- `scripts/agents/test_codex_mesh.py`
+- `scripts/agents/agent_exec.sh`
+- `scripts/agents/test_agent_exec.sh`
+- `scripts/message/codex_daemon.py`
+- `scripts/message/test_codex_daemon.py`
+- `docs/accounts.md`
+- `commands/showrunner/accounts.md`
+
+**Seats:** 1 writer + 1 tester — the public commands and the subprocess boundaries let tests be written from this Spec before the code exists.
+
+- `impl` — every production and doc file above; hub: `scripts/whoami/agent_accounts.py` (the accounts tool, the notes and `/whoami` all call it).
+- `test` — every `test_*.py` above and `scripts/agents/test_agent_exec.sh`: role, launch, move, routing and display tests from the Spec.
+
+**Acceptance gate:** lint over every changed Python folder, `scripts/agents` included, and the accounts, whoami, agents and message suites pass, with `bash scripts/agents/test_agent_exec.sh`. Tests cover: an unset and a conflicting `CODEX_HOME`; a failed login read; interleaved role writes, a rolled-back write, mixed history, and a file with only `seats`; a valid default target, one with an unreadable sign-in, and one whose login another home holds, with role and history unchanged on refusal; a home change with unchanged sign-in timestamps, a record with no home, and two servers under different homes; a swap during a capacity wait, during an automatic continuation and with a queued message, each next turn starting under the target home exactly once; the three move results; the default daemon still reachable while the role names a numbered home. Live, after Phase 10's two sign-in checks are done and recorded: the thread-resume hand check, then one swap to codex 1 and back while a seat works; the seat continues, `mesh_server.json` names the home, and the table shows the role moved.
+
+### Phase 12 — Alerts per Codex account  · status: todo
+
+#### Work Order
+
+**Goal:** every Codex alert names its account and follows a swap.
+
+**Constraints from prior phases:**
+
+- After Phase 11 the seats' home comes from the `seats` role, resolved once per operation, and a Codex note is `active` only for the account in the role, so a spare already raises no alert. The "can work" function with named results is in `scripts/whoami/`, and `swap seats` uses it.
+- `quota_alert` keys episodes by note, and its text says "the active Codex account". `recovered()` (line 300) deletes a Codex episode when its note stops being `active`, which breaks what `docs/accounts.md` promises: "Acknowledging an account's low-quota alert keeps it quiet across swaps."
+- One `switch` (line 137) moves every Codex assignment to Claude. It has no owner, and its recovery (line 389) waits for every Codex episode to go.
+- `codex_mesh` reports a refusal with no account (line 1552), and `blocked` takes the first used-up note.
+- `five_hour` keys its hold by tool (`five-hour-codex`) and closes only the report it is given (line 39); `scripts/message/escalate.py:258` later delivers every pending hold, whatever account is selected.
+- `accounts.codex_statuses` labels the default home from its login's note (line 1607), so a note label alone does not say which swap target to name.
+
+**Spec:**
+
+1. Alerts read the account in the `seats` role and name it. A spare Codex account raises no alert. Weekly episodes stay keyed by note. Making an account spare stops delivery and keeps its episode and acknowledgement until its own quota recovers or resets; selected again while still low, it stays quiet.
+2. A low or used-up alert carries a swap line when another checked, signed-in home can work, by the same function `swap seats` uses: the command (`swap seats default` for the default home, the numbered label otherwise), that account's weekly left and its credits. An unknown or expired reading recommends nothing.
+3. The 5-hour hold and its relay are keyed by account. On a known change of the seats account, the outgoing account's pending escalation is cancelled without a recovery message, and the old `five-hour-codex` hold is retired. Unknown account identity leaves hold state as it is.
+4. `codex_mesh` takes the refusing account from the server that served the failed turn and gives it to `blocked`; the alert names it. Only a refusal from the account in the role opens the Codex-to-Claude fallback. The fallback is a named type, `CodexQuotaFallback`, with its owning account and a stated unknown-owner case for records written before this phase. Owed assignments are restored when the account in the role can work, by allowance or by credits, whatever the low-quota episodes say.
+
+**Files:**
+
+- `scripts/whoami/quota_alert.py`
+- `scripts/whoami/test_quota_alert.py`
+- `scripts/whoami/five_hour.py`
+- `scripts/whoami/test_five_hour.py`
+- `scripts/whoami/agent_notes.py`
+- `scripts/whoami/test_agent_notes.py`
+- `scripts/agents/codex_mesh.py` — gives `blocked` the account that refused.
+- `scripts/agents/test_codex_mesh.py`
+- `docs/quota_alerts.md`
+
+**Seats:** 1 writer + 1 tester — the alert and transition functions take fixtures, so tests can be written from this Spec.
+
+- `impl` — `quota_alert.py`, `five_hour.py`, `agent_notes.py`, `codex_mesh.py` and `docs/quota_alerts.md`; hub: `scripts/whoami/quota_alert.py` (the refusal and fallback types every other file here uses).
+- `test` — `test_quota_alert.py`, `test_five_hour.py`, `test_agent_notes.py` and `test_codex_mesh.py`: account selection, the swap line, acknowledgement, hold and fallback tests from the Spec.
+
+**Acceptance gate:** suites and lint pass, with fixtures of two signed-in Codex accounts: one in the role and low, one spare. Tests cover: acknowledge A, swap to B, return to a still-low A with no second alert; a spare on the default home, a spare with its 5-hour window used up and no credits, and a spare with credits; A's hold pending, a swap to B before it is due, then no alert for A and B's own alert still allowed; a late refusal from the outgoing account, a target with credits and a low weekly window, a fallback record with no owner, and assignments the user changed in the meantime.
+
+Left out of the 2026-10-09 proposal: moving seats to another Codex account automatically when Codex refuses work (every swap stays the user's call), and the Mac.

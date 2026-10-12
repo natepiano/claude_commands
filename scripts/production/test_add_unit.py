@@ -462,7 +462,7 @@ class AddUnitTests(ShutdownTestCase):
                     0 if live else 1,
                     (
                         "claude 2 is held by a shutdown "
-                        + "(down since 2026-10-09 14:49 PDT)\n"
+                        + "(since 2026-10-09 14:49 PDT)\n"
                         if live
                         else ""
                     ),
@@ -583,7 +583,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(
             result.stderr,
             "add_unit: claude 2 is held by a shutdown "
-            + "(down since 2026-10-09 14:49 PDT); /shutdown restart first\n",
+            + "(since 2026-10-09 14:49 PDT); /shutdown restart first\n",
         )
         self.assert_no_launch_change(document, head)
 
@@ -1143,7 +1143,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(
             result.stderr,
             "add_unit: claude 3 is held by a shutdown "
-            + "(down since 2026-10-09 14:49 PDT); /shutdown restart first\n",
+            + "(since 2026-10-09 14:49 PDT); /shutdown restart first\n",
         )
         self.assert_no_launch_change(document, head)
 

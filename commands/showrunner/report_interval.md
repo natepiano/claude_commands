@@ -3,13 +3,13 @@ description: Change how often a running production's scheduled updates come, and
 argument-hint: "[minutes]"
 ---
 
-# Interval
+# Report interval
 
 Changes how often the scheduled updates come. Run it in the showrunner session
 during `/showrunner:produce`, whose state (`PRODUCTION_DOC`, `PROMPT_FILE`,
 `LOG`, `ZONE`, `CHECKOUT`, `NOTIFIER`, `UPDATES`) it uses.
 
-**Usage:** `/showrunner:interval [minutes]`. With no argument, run
+**Usage:** `/showrunner:report_interval [minutes]`. With no argument, run
 `NOTIFIER status UPDATES`, report the interval and the next tick, and change
 nothing; when the doc's Updates line reads `on demand`, say updates are on demand. With anything but a whole number of minutes above 0, say so and stop.
 

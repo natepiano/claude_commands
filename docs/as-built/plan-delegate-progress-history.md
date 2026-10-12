@@ -496,7 +496,7 @@ restart that fails, the recorder falls
 back to a still-future deadline in `${SESSION_DIR}/progress_timer`, then to now
 plus `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `delegate.conf`. That key sets
 the Codex poll timeout and the default interval of a Claude unit's notifier
-instance; `/unit:interval` changes one run's interval. An unusable interval
+instance; `/unit:report_interval` changes one run's interval. An unusable interval
 drops the clause instead of stopping the header.
 
 `aggregate` calibrates phase estimates by

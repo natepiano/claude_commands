@@ -37,7 +37,7 @@ def main() -> None:
     raw = sys.stdin.read()
     if ".rs" not in raw and "\\u" not in raw:
         return
-    from fn_length_lib import IgnoredEdit, applied_rust_edits
+    from fn_length_lib import IgnoredEdit, applied_rust_edits, written_lines
 
     try:
         edit = applied_rust_edits(raw)
@@ -53,7 +53,7 @@ def main() -> None:
         descriptions: list[str] = []
         affected: list[tuple[str, int]] = []
         records: list[tuple[str, list[dict[str, str | int]]]] = []
-        for file_path in edit.files:
+        for file_path, replacements in zip(edit.files, edit.replacements):
             file = os.path.realpath(os.path.join(root, file_path))
             if not os.path.isfile(file):
                 continue
@@ -61,9 +61,12 @@ def main() -> None:
                 source = edited.read()
             if "*" not in source or ("+" not in source and "-" not in source):
                 continue
+            written = written_lines(source, replacements)
+            if not written:
+                continue
             from mul_add_lib import float_mul_add_findings
 
-            _, findings = float_mul_add_findings(file)
+            _, findings = float_mul_add_findings(file, written)
             if not findings:
                 continue
             try:
