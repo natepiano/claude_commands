@@ -108,27 +108,20 @@ Today, each question needs its own scratch script (`seat_usage.py`, `api_cost.py
 
 ### Phase 3 — Every other Claude session records itself · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** every Claude session and every subagent records its role in `agents.jsonl` as it starts, by registering Phase 2's hook in `settings.json`.
-
-**Spec:**
-- `settings.json`, `hooks.SessionStart`: in the entry with no `matcher` (it fires for startup, resume, clear and compact), append one command hook, written like its neighbours: `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/session-start-agents-log.py"`. Do not touch the `compact` entry or any other hook.
-- `settings.json`, `hooks.SubagentStart`: a new event key holding one entry with no `matcher` and the same command. Live check 2026-10-11 (Claude Code 2.1.296): `SubagentStart` delivers `agent_id` (form `a` + 16 hex, e.g. `a4008deac73c98365`) and `agent_type`; the hook wrote `subagent` at 21:01:02Z and the subagent's first assistant turn came at 21:01:03.685Z. `SessionStart` does not fire for a subagent. `SubagentStop` also carries `agent_id` but fires after the work, so it is not registered.
-- No change to the hook or `agents_log.py`; the edit is JSON only, keys and formatting kept as the file has them (two-space indent).
-- The showrunner's merge check refuses settings diffs: this checkpoint goes to main only after the user approves it in this session. The user approved it on 2026-10-11 at about 23:15 PDT, relayed by the showrunner.
+- `settings.json` registers the command `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/session-start-agents-log.py"` twice: in the `hooks.SessionStart` entry that has no `matcher` (it fires for startup, resume, clear and compact), and in a new `hooks.SubagentStart` key with one entry that has no `matcher`.
+- Every Claude session then records itself as `interactive` in `agents.jsonl` as it starts, and every subagent as `subagent`, unless a line already names it.
+- `SubagentStart` delivers the parent `session_id`, `agent_id` (form `a` + 16 hex) and `agent_type` before the subagent's first turn. `SessionStart` does not fire for a subagent. `SubagentStop` also carries `agent_id` but fires after the work, so it is not registered.
+- Three activation tests load the repository's `settings.json`, require exactly those two registrations and no other event naming the hook, and run each registered command through `sh -c` from an unrelated working directory, with `HOME` at a temporary directory whose `.claude` links to the repository and `USAGE_STATE_DIR` at a temporary directory. A second delivery writes nothing.
 
 **Files:**
-- `settings.json` — two hook registrations.
-- `scripts/usage/test_session_start_hook.py` — activation tests.
+- `settings.json` — the two hook registrations.
+- `scripts/usage/test_session_start_hook.py` — the activation tests, beside the hook's own tests.
 
-**Seats:** `1 writer + 1 tester`.
-- `impl` — `settings.json`; hub: `settings.json`.
-- `test` — activation tests in `scripts/usage/test_session_start_hook.py`, from this Spec alone: load the repo's `settings.json`; exactly one `SessionStart` command and exactly one `SubagentStart` command name `scripts/hooks/session-start-agents-log.py`, the first in the matcher-less entry; no other event names it; running each registered command line through `sh -c` with `HOME` set so `$HOME/.claude` resolves to the repo root (a temp dir holding a `.claude` symlink to the repo), `USAGE_STATE_DIR` at a temp dir and a fixture payload on stdin, from an unrelated working directory, writes one `interactive` line for a SessionStart payload and one `subagent` line for a SubagentStart payload; a second delivery writes none.
+**Binds later work:** `agents.jsonl` holds `interactive` and `subagent` lines only for sessions started after this registration reached a machine's `~/.claude`; an earlier turn has no line and is unassigned. The live check stays owed after the merge: a new session and a new subagent each appear in the real log within a second, the subagent's line dated before its first turn.
 
-**Constraints from prior phases:** the hook registers a non-empty `agent_id` as `subagent`, else `session_id` as `interactive`, prints one `agents_log:` stderr line and exits 0 on any failure, and writes nothing for an id already named (exact, or by a recorded 8-hex worker prefix). Hook commands in `settings.json` run through `$HOME/.claude/scripts/lib/py`. Tests never write to the real `~/.local/state/usage-model/`.
-
-**Acceptance gate:** `python3 -m unittest scripts.usage.test_agents_log scripts.usage.test_session_start_hook` green; basedpyright 0/0/0 on `scripts/usage scripts/hooks/session-start-agents-log.py`, test files included; `python3 -m json.tool settings.json` parses; the settings diff holds only the two registrations. Live, after the user approves and the merge reaches `~/.claude`: a new Claude session and a new subagent each appear in `agents.jsonl` within a second of starting, the subagent's line dated before its first turn.
+**Gotchas:** the showrunner's merge check refuses settings diffs, so a change to `settings.json` needs the user's approval before main; the user approved this one on 2026-10-11. Hook commands in `settings.json` run through `$HOME/.claude/scripts/lib/py`.
 
 ### Phase 4 — One store of every model turn · status: todo
 
