@@ -38,6 +38,56 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# Sibling scripts and package callers must share the same account identity classes.
+if __name__ == "agent_accounts":
+    _ = sys.modules.setdefault("scripts.whoami.agent_accounts", sys.modules[__name__])
+elif __name__ == "scripts.whoami.agent_accounts":
+    _ = sys.modules.setdefault("agent_accounts", sys.modules[__name__])
+
+@dataclass(frozen=True)
+class KnownCodexAccount:
+    home: Path
+    login: str
+    label: str
+
+
+@dataclass(frozen=True)
+class UnknownCodexAccount:
+    home: Path
+    reason: str
+
+
+RefusingCodexAccount = KnownCodexAccount | UnknownCodexAccount
+
+
+class StoredCodexAccount(TypedDict):
+    home: str
+    login: str
+    label: str
+
+
+def codex_account(home: Path) -> RefusingCodexAccount:
+    from scripts.whoami.note_file import AGENTS_DIR, read_note
+
+    login = codex_email_on_disk(home)
+    if not login:
+        return UnknownCodexAccount(home, "the home's sign-in cannot be read")
+    notes = Path(os.environ.get("AGENT_NOTES_DIR", str(AGENTS_DIR)))
+    for path in sorted(notes.glob("*.md")):
+        if not path.stem.casefold().startswith("codex"):
+            continue
+        note = read_note(path)
+        if note is not None and (note.get("login") or "").casefold() == login.casefold():
+            return KnownCodexAccount(home, login, path.stem)
+    return UnknownCodexAccount(home, "the signed-in account has no named note")
+
+
+def codex_home_role_label(home: Path) -> str:
+    """The seats command's label for a default or numbered home."""
+    return "default" if home == Path.home() / ".codex" else f"codex {home.name.removeprefix('.codex')}"
+
+
 ClaudeRole = Literal["showrunners", "unit directors"]
 
 
