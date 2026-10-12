@@ -167,7 +167,7 @@ State:
   ---
   11:37 PDT update:
 
-  * build hold: <holder> since 11:34 PDT, for the frame-time lane's breakdown of what each added tool costs - release eta: 11:40 PDT (3 minutes)
+  * build hold: <holder> holds builds since 11:34 PDT for the frame-time lane's breakdown of what each added tool costs; expected to release 11:40 PDT (in 3 minutes)
   * Mac block: <holder> since 11:35 PDT, for the Mac-only test run - lifts Wed 12:35 PDT
   * claude 1: …
   * next dailies: 11:53 PDT - nothing needed
