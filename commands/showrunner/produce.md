@@ -97,8 +97,14 @@ State:
     words, with the answer relayed back;
   - product and scope choices;
   - anything that cannot be undone;
+  - a block that waits on the user, and a step only they can run;
+  - a fault they would see;
   - a quota alert (<QuotaAlert/>);
   - the discussion agenda (<Agenda/>).
+
+  Nothing else does. Handle unit messages (checkpoints, merges, ETAs, plans,
+  promotions, routine fixes) without telling the user; they wait for the next
+  dailies (user, 2026-10-12).
 - **Long commands** run in the background. The task notification is the wait;
   never poll.
 - **Helpers.** Stop each named helper agent once its report is read.
