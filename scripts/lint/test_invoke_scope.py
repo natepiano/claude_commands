@@ -114,7 +114,15 @@ class BuildScopeTests(unittest.TestCase):
                 ["bash", "-c", 'source "$1"; parent=$BASHPID; buildlog_sample_anon "$2" "$3" "$parent" & printf "%s\\n" "$!"; wait',
                  "sampler-test", str(INVOKE), str(root / "scope.cgroup"), str(root / "maximum")],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                env={**os.environ, "HOME": directory, "LINT_CONFIG_READER": str(root / "missing-config")},
+                env={**os.environ,
+                     "BUILD_HOLD_DIR": str(root / "holders"),
+                     "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                     "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                     "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                     "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                     "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                     "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                     "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": directory, "LINT_CONFIG_READER": str(root / "missing-config")},
             )
             sampler_pid = 0
             try:
@@ -171,7 +179,15 @@ class BuildScopeTests(unittest.TestCase):
             result = subprocess.run(
                 ["bash", "-c", shell, "sidecar-test", str(INVOKE), command],
                 capture_output=True, text=True, check=False,
-                env={**os.environ, "HOME": directory, "TMPDIR": directory,
+                env={**os.environ,
+                     "BUILD_HOLD_DIR": str(root / "holders"),
+                     "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                     "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                     "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                     "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                     "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                     "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                     "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": directory, "TMPDIR": directory,
                      "LINT_CONFIG_READER": str(root / "missing-config")},
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

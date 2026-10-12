@@ -1172,6 +1172,8 @@ class RosterTests(unittest.TestCase):
             calls.append(command)
             self.assertEqual(command[0], "ssh")
             self.assertEqual(options["timeout"], 20)
+            # The caller's input is never handed to ssh, which would wait on it or consume it.
+            self.assertEqual(options["stdin"], subprocess.DEVNULL)
             environment = cast(dict[str, str], options["env"])
             self.assertNotIn("CODEX_THREAD_ID", environment)
             self.assertNotIn("CLAUDE_CODE_SESSION_ID", environment)

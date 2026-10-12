@@ -1,0 +1,4 @@
+{"event_type":"run_started","timestamp":"2026-10-10T21:34:57Z","run_started_at":1791668097,"run_id":"invented-handoff","main_agent":{"family":"claude","session_id":"facefeed-4444-4444-8444-444444444444"}}
+{"event_type":"activity_started","timestamp":"2026-10-10T21:35:02Z","run_started_at":1791668097,"run_id":"invented-handoff","main_agent":{"family":"claude","session_id":"a1b2c3d4-1111-4111-8111-111111111111"}}
+{"event_type":"pass_started","timestamp":"2026-10-10T21:35:03Z","run_started_at":1791668097,"run_id":"invented-handoff","main_agent":{"family":"claude","session_id":"a1b2c3d4-1111-4111-8111-111111111111"}}
+{"event_type":"activity_started","timestamp":"2026-10-10T21:35:05Z","run_started_at":1791668097,"run_id":"invented-handoff","main_agent":{"family":"claude","session_id":"a1b2c3d4-1111-4111-8111-111111111111"}}

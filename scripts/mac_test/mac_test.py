@@ -27,6 +27,10 @@ import sweep
 MESSAGE_TIMEOUT_S = 30.0
 
 
+class StateReadError(ValueError):
+    """A Mac coordination record cannot be read or decoded."""
+
+
 class RunRecord(TypedDict):
     """A process that currently owns Mac test capacity."""
 
@@ -382,8 +386,10 @@ def read_json_object(path: Path) -> dict[str, object] | None:
         decoded = cast(object, json.loads(path.read_text(encoding="utf-8")))
     except FileNotFoundError:
         return None
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise StateReadError(f"{path}: {error}") from error
     if not isinstance(decoded, dict):
-        raise ValueError(f"{path} does not contain a JSON object")
+        raise StateReadError(f"{path} does not contain a JSON object")
     return cast(dict[str, object], decoded)
 
 
@@ -403,7 +409,8 @@ def read_run(path: Path) -> RunState:
         or not isinstance(worktree, str)
         or not isinstance(since, str)
     ):
-        raise ValueError(f"{path} has an invalid run record")
+        raise StateReadError(f"{path} has an invalid run record")
+    _ = aware_timestamp(since, path, "since")
     return {
         "pid": pid,
         "proc_start": proc_start,
@@ -415,20 +422,20 @@ def read_run(path: Path) -> RunState:
 
 def aware_timestamp(value: object, path: Path, field: str) -> datetime:
     if not isinstance(value, str):
-        raise ValueError(f"{path} has an invalid {field}")
+        raise StateReadError(f"{path} has an invalid {field}")
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError as error:
-        raise ValueError(f"{path} has an invalid {field}") from error
+        raise StateReadError(f"{path} has an invalid {field}") from error
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError(f"{path} has an invalid {field}")
+        raise StateReadError(f"{path} has an invalid {field}")
     return parsed
 
 
 def required_string(values: dict[str, object], key: str, path: Path) -> str:
     value = values.get(key)
     if not isinstance(value, str):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     return value
 
 
@@ -436,7 +443,7 @@ def decoded_delivery(session: object, holder: str, path: Path) -> MessageDeliver
     if session is None:
         return HolderQueue(holder)
     if not isinstance(session, str):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     return RecordedSession(session, holder)
 
 
@@ -444,7 +451,7 @@ def decoded_showrunner(showrunner: object, path: Path) -> Showrunner:
     if showrunner is None:
         return NO_SHOWRUNNER
     if not isinstance(showrunner, str):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     return NamedShowrunner(showrunner)
 
 
@@ -456,13 +463,13 @@ def decoded_ci(value: object, path: Path) -> CiSwitch:
         "still_on",
         "off_unconfirmed",
     ):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     return value
 
 
 def decode_waiting(value: object, path: Path) -> WaitingOn:
     if not isinstance(value, dict):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     item = cast(dict[str, object], value)
     kind = item.get("kind")
     if kind == "local_run" and set(item) == {"kind", "what"}:
@@ -473,12 +480,12 @@ def decode_waiting(value: object, path: Path) -> WaitingOn:
         return WAITING_ON_CI_JOB
     if kind == "ci_unknown" and set(item) == {"kind"}:
         return WAITING_ON_UNKNOWN_CI
-    raise ValueError(f"{path} has an invalid block record")
+    raise StateReadError(f"{path} has an invalid block record")
 
 
 def decode_free_message(value: object, path: Path) -> FreeMessage:
     if not isinstance(value, dict):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     item = cast(dict[str, object], value)
     kind = item.get("kind")
     if kind == "not_needed" and set(item) == {"kind"}:
@@ -489,13 +496,13 @@ def decode_free_message(value: object, path: Path) -> FreeMessage:
         what = item.get("what")
         if isinstance(what, str):
             return FreeMessageOwed(what, aware_timestamp(item.get("ended"), path, "ended"))
-    raise ValueError(f"{path} has an invalid block record")
+    raise StateReadError(f"{path} has an invalid block record")
 
 
 def decode_legacy_block(values: dict[str, object], path: Path) -> MacBlockState:
     required = {"holder", "session", "for", "since", "state"}
     if set(values) != required:
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     holder = required_string(values, "holder", path)
     reason = required_string(values, "for", path)
     since = aware_timestamp(values.get("since"), path, "since")
@@ -511,7 +518,7 @@ def decode_legacy_block(values: dict[str, object], path: Path) -> MacBlockState:
             holder, reason, since, since + timedelta(hours=48), delivery,
             NO_SHOWRUNNER, "still_on", FREE_MESSAGE_NOT_NEEDED,
         )
-    raise ValueError(f"{path} has an invalid block record")
+    raise StateReadError(f"{path} has an invalid block record")
 
 
 def read_block(path: Path) -> MacBlockState:
@@ -527,7 +534,7 @@ def read_block(path: Path) -> MacBlockState:
     }
     expected_keys = common_keys | ({"waiting_on"} if state == "pending" else {"free_message"})
     if values.get("version") != 2 or set(values) != expected_keys:
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     holder = required_string(values, "holder", path)
     reason = required_string(values, "for", path)
     since = aware_timestamp(values.get("since"), path, "since")
@@ -545,7 +552,12 @@ def read_block(path: Path) -> MacBlockState:
             holder, reason, since, expires, delivery, showrunner, ci,
             decode_free_message(values.get("free_message"), path),
         )
-    raise ValueError(f"{path} has an invalid block record")
+    raise StateReadError(f"{path} has an invalid block record")
+
+
+def read_claim_block(paths: StatePaths) -> MacBlockState:
+    """Read the block that refuses new claims until its record is removed."""
+    return read_block(paths.block)
 
 
 def timestamp(value: datetime) -> str:
@@ -1346,12 +1358,12 @@ def command_claim(args: CliArguments, paths: StatePaths) -> int:
         with locked(paths.lock):
             try:
                 run = live_run(paths)
-            except (OSError, ValueError):
+            except (OSError, StateReadError):
                 print(f"state unreadable: {paths.run}")
                 return 12
             try:
-                block = read_block(paths.block)
-            except (OSError, ValueError):
+                block = read_claim_block(paths)
+            except (OSError, StateReadError):
                 print(f"state unreadable: {paths.block}")
                 return 12
             if not isinstance(block, NoMacBlock):

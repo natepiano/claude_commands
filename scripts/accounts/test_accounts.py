@@ -21,6 +21,21 @@ import account
 import agent_accounts
 
 
+def named_environment(config_dir: Path) -> dict[str, str]:
+    """What a session on a named account's directory starts with."""
+    return {
+        "CLAUDE_CONFIG_DIR": str(config_dir),
+        "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(Path.home() / ".claude"),
+    }
+
+
+def named_prefix(config_dir: Path) -> str:
+    return "".join(
+        f"{name}={shlex.quote(value)} "
+        for name, value in named_environment(config_dir).items()
+    )
+
+
 EXPECTED_SHARED = (
     "settings.json",
     "CLAUDE.md",
@@ -193,7 +208,7 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "unit@example.invalid")
         with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "inherited", "UNCHANGED": "value"}), patch.object(os, "execvpe") as launch:
-            environment = {**os.environ, "CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude 3"))}
+            environment = {**os.environ, **named_environment(accounts.account_dir("claude 3"))}
             result = self.run_cli("exec", "claude 3", "--resume", "conversation id", "-p", "a prompt")
         self.assertEqual(result, (0, "", ""))
         launch.assert_called_once_with("claude", ["claude", "--resume", "conversation id", "-p", "a prompt"], environment)
@@ -230,7 +245,7 @@ class AccountsTests(unittest.TestCase):
         self.select_named_unit("claude 3")
         with patch.object(os, "execvpe") as launch:
             self.assertEqual(self.run_cli("exec", "unit"), (0, "", ""))
-        launch.assert_called_once_with("claude", ["claude"], {**os.environ, "CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude 3"))})
+        launch.assert_called_once_with("claude", ["claude"], {**os.environ, **named_environment(accounts.account_dir("claude 3"))})
 
     def test_exec_named_alias_of_default_login_uses_plain_claude(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
@@ -259,6 +274,7 @@ class AccountsTests(unittest.TestCase):
                     patch.dict(os.environ, {
                         "CLAUDE_CODE_OAUTH_TOKEN": "another-account-token",
                         "CLAUDE_CONFIG_DIR": "inherited",
+                        "CLAUDE_CODE_REMOTE_MEMORY_DIR": "inherited",
                         "UNCHANGED": "value",
                     }),
                     patch.object(os, "execvpe") as launch,
@@ -266,9 +282,10 @@ class AccountsTests(unittest.TestCase):
                     expected_environment = dict(os.environ)
                     del expected_environment["CLAUDE_CODE_OAUTH_TOKEN"]
                     if config_dir:
-                        expected_environment["CLAUDE_CONFIG_DIR"] = config_dir
+                        expected_environment.update(named_environment(Path(config_dir)))
                     else:
                         del expected_environment["CLAUDE_CONFIG_DIR"]
+                        del expected_environment["CLAUDE_CODE_REMOTE_MEMORY_DIR"]
                     self.assertEqual(self.run_cli("exec", label, "--version"), (0, "", ""))
                     launch.assert_called_once_with(
                         "claude", ["claude", "--version"], expected_environment,
@@ -291,7 +308,7 @@ class AccountsTests(unittest.TestCase):
                 self.assertIn("not logged in", "\n".join(accounts.check("claude 3")))
                 with patch.object(os, "execvpe") as launch:
                     self.assertEqual(self.run_cli("exec", "claude 3"), (0, "", ""))
-                launch.assert_called_once_with("claude", ["claude"], {**os.environ, "CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude 3"))})
+                launch.assert_called_once_with("claude", ["claude"], {**os.environ, **named_environment(accounts.account_dir("claude 3"))})
 
     def test_exec_allows_login_before_a_new_label_has_a_note(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
@@ -1552,11 +1569,11 @@ class AccountsTests(unittest.TestCase):
 
         self.assertEqual(
             accounts.account_prefix(selected),
-            f"CLAUDE_CONFIG_DIR={shlex.quote(str(self.home / '.claude3'))} ",
+            named_prefix(self.home / ".claude3"),
         )
         self.assertEqual(
             accounts.launch_prefix("unit"),
-            f"CLAUDE_CONFIG_DIR={shlex.quote(str(self.home / '.claude1'))} ",
+            named_prefix(self.home / ".claude1"),
         )
 
     def test_default_account_prefix_is_empty_without_reading_role_configuration(self) -> None:
@@ -1590,8 +1607,11 @@ class AccountsTests(unittest.TestCase):
         assert isinstance(resolved, accounts.NamedAccount)
         self.assertEqual(resolved.label, "claude 3")
         self.assertEqual(resolved.dir, self.home / ".claude3")
-        expected = (
+        expected = named_prefix(self.home / ".claude3")
+        self.assertEqual(
+            expected,
             f"CLAUDE_CONFIG_DIR={shlex.quote(str(self.home / '.claude3'))} "
+            + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(self.home / '.claude'))} ",
         )
         self.assertEqual(accounts.launch_prefix("unit"), expected)
         self.assertEqual(self.run_cli("role", "unit"), (0, "claude 3\n", ""))

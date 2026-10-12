@@ -89,6 +89,14 @@ class RecordTests(unittest.TestCase):
             if name not in AMBIENT and not name.startswith("PLAN_DELEGATE_")
         }
         environment["BUILDLOG_DIR"] = str(self.root)
+        environment["BUILD_HOLD_DIR"] = str(self.base / "holders")
+        environment["BUILD_HOLD_RELEASE_DIR"] = str(self.base / "release")
+        environment["PLAN_DELEGATE_ACTIVE_DIR"] = str(self.base / "active")
+        environment["BUILDLOG_CALL_ID"] = environment["BUILDLOG_CALLER"] = ""
+        environment["BUILDLOG_HOLD_WAIT_FILE"] = environment["BUILDLOG_HOLD_ADMISSION_FILE"] = ""
+        environment["BUILDLOG_HOLD_STARTED_FILE"] = environment["BUILDLOG_HOLD_WAITER_FILE"] = ""
+        environment["BUILDLOG_HOLD_REGISTRATION_FILE"] = str(self.base / "registration")
+        environment["MAC_TEST_STATE_DIR"] = str(self.base / "mac-state")
         # No signing, hooks or identity from the user's own git config.
         environment["GIT_CONFIG_GLOBAL"] = os.devnull
         environment["GIT_CONFIG_NOSYSTEM"] = "1"

@@ -193,6 +193,19 @@ def registered_showrunners(state_dir: Path | None = None) -> list[Showrunner]:
     return found
 
 
+def production_of(session_id: str, state_dir: Path | None = None) -> Path | None:
+    """The production doc of the showrunner whose update timer is addressed to `session_id`."""
+    for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
+        try:
+            target = _fields(instance / "conf").get("TARGET")
+        except (OSError, UnicodeError):
+            continue
+        doc = checked_doc(instance)
+        if session_id and target == f"session:{session_id}" and isinstance(doc, CheckedDoc):
+            return doc.path
+    return None
+
+
 def production_slug(doc: str) -> str:
     """The slug a production's units are marked with: its doc's name without the suffix."""
     slug = Path(doc).name.removesuffix("-production.md")
@@ -204,6 +217,13 @@ def production_slug(doc: str) -> str:
 def current_name(slug: str) -> str:
     """The name now of the production's showrunner. Empty while it is not running or has no update timer."""
     return next((runner["session"] for runner in registered_showrunners() if runner["slug"] == slug), "")
+
+
+def current_address(slug: str) -> str:
+    """Where `SendMessage` reaches the production's showrunner now: its session on this machine.
+    Empty while it is not running or has no update timer."""
+    socket = next((runner["socket"] for runner in registered_showrunners() if runner["slug"] == slug), "")
+    return f"uds:{socket}" if socket else ""
 
 
 def named(showrunner: str) -> Showrunner:
@@ -223,6 +243,8 @@ def main(argv: list[str]) -> int:
     _ = making_ready.add_argument("--unit", action="append")
     naming = commands.add_parser("name")
     _ = naming.add_argument("slug")
+    addressing = commands.add_parser("address")
+    _ = addressing.add_argument("slug")
     # Does nothing: a unit's run state is read from its run records. Delete once no session started before that is left.
     setting_status = commands.add_parser("status")
     _ = setting_status.add_argument("session", nargs="?")
@@ -236,11 +258,12 @@ def main(argv: list[str]) -> int:
             for runner in registered_showrunners():
                 print(f"{runner['slug']}\t{runner['session'] or '<not running>'}\t{runner['zone']}"
                       + f"\t{runner['doc']}")
-        elif action == "name":
-            name = current_name(cast(str, args.slug))
-            if not name:
-                raise ValueError(f"the showrunner of {cast(str, args.slug)} is not running")
-            print(name)
+        elif action in ("name", "address"):
+            slug = cast(str, args.slug)
+            found = current_name(slug) if action == "name" else current_address(slug)
+            if not found:
+                raise ValueError(f"the showrunner of {slug} is not running")
+            print(found)
     except (OSError, ValueError, KeyError) as error:
         print(f"showrunners: {error}", file=sys.stderr)
         return 1

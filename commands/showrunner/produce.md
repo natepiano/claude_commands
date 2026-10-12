@@ -341,6 +341,7 @@ whatever arrived:
 | a unit director's decision for the user | show it to the user; relay the answer |
 | a quota alert | <QuotaAlert/> |
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
+| the user asks which phase or task each unit is on | `/showrunner:units` |
 
 A unit repairing failing tests that split by file runs parallel repair seats
 (`/unit:direct` → <FixDispatch/>); one that runs a lone seat on them gets

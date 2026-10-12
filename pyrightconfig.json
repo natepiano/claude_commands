@@ -92,6 +92,16 @@
       ]
     },
     {
+      "root": "scripts/build_targets",
+      "extraPaths": [
+        "scripts/build_targets",
+        "scripts/build_hold",
+        "scripts/mac_test",
+        "scripts/lint",
+        "scripts/message"
+      ]
+    },
+    {
       "root": "scripts/lint",
       "extraPaths": [
         "scripts/lint"
@@ -109,6 +119,7 @@
         ".",
         "scripts/production",
         "scripts/build_hold",
+        "scripts/delegate",
         "scripts/hooks",
         "scripts/mac_test",
         "scripts/message",

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""The nightly review: two read-only agents, one improvement proposal each, queued for the user.
+"""The nightly review: one read-only session, one improvement proposal per mode, queued for the user.
 
 `launch` runs from the nightly-review timer on natedev (/etc/nixos/modules/linux/nightly-review.nix).
-It starts `/nightly_review config` and `/nightly_review rust` in named, detached tmux sessions with
-Remote Control under the same names, replacing the previous night's unless the user is attached to
-it. A session under that name that no nightly review started is left running, and that review skips
-the night. Each agent writes NIGHT/<mode>.md and messages natedev, which distills the proposals into
-NIGHT/digest.md and the ledger (/watcher). The night is skipped while the active Claude account has
-less than MIN_REMAINING percent of its weekly usage left.
+It starts `/nightly_review config rust` in one named, detached tmux session with Remote Control under
+the same name, replacing the previous night's unless the user is attached to it. A session under that
+name that no nightly review started is left running, and the review skips the night. The session runs
+on the account the unit role names, started as a unit is, or on the default login when no role is set.
+It does the modes in order; for each it writes NIGHT/<mode>.md and messages natedev, which distills
+the proposals into NIGHT/digest.md and the ledger (/watcher). The night is skipped while that account
+is shut down, is not fit to launch, or has less than MIN_REMAINING percent of its weekly usage left.
 
 Nothing offers the proposals: the ledger's queue grows until the user asks for /nightly_next
 (user, 2026-10-10).
@@ -35,19 +36,24 @@ from launch_permission import (  # noqa: E402
     launch_barrier,
     launch_permission,
 )
+from account import NAMED_ACCOUNT_VARIABLES  # noqa: E402
 from agent_accounts import ClaudeAccountSelection  # noqa: E402
 import note_file  # noqa: E402
 from quota_alert import ahead, remaining  # noqa: E402
 
 ROOT = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "nightly-review"
-MODES = {"config": Path("/etc/nixos"), "rust": Path.home() / "rust"}
+MODES = ("config", "rust")
+SESSION = "nightly-review"
+# The two sessions a night had before one session ran every mode.
+LEGACY_SESSIONS = tuple(f"nightly-{mode}" for mode in MODES)
+PROMPT = "/nightly_review " + " ".join(MODES)
 SETTINGS = Path(__file__).with_name("settings.json")
 MIN_REMAINING = 10.0
 
 
 @dataclass(frozen=True)
 class QuotaClear:
-    """The active Claude account has enough weekly quota to launch work."""
+    """The account the review launches on has enough weekly quota to launch work."""
 
 
 @dataclass(frozen=True)
@@ -64,10 +70,6 @@ def night_dir(day: date) -> Path:
     return ROOT / day.isoformat()
 
 
-def session(mode: str) -> str:
-    return f"nightly-{mode}"
-
-
 def tmux(*args: str) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(["tmux", *args], capture_output=True, text=True, check=False)
@@ -75,8 +77,8 @@ def tmux(*args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(["tmux", *args], 127, "", "tmux is not installed")
 
 
-def running(mode: str) -> bool:
-    return tmux("has-session", "-t", f"={session(mode)}").returncode == 0
+def running(name: str) -> bool:
+    return tmux("has-session", "-t", f"={name}").returncode == 0
 
 
 def quota_permission() -> QuotaPermission:
@@ -86,11 +88,11 @@ def quota_permission() -> QuotaPermission:
 
 
 def quota_for_selection(selection: ClaudeAccountSelection) -> QuotaPermission:
-    """Whether the default Claude login has enough weekly quota to run."""
+    """Whether the account the review launches on has enough weekly quota to run."""
     for note in note_file.read_notes():
         left = remaining(note)
         launch_account = (
-            selection.is_default_login(note.get("login") or "")
+            "unit directors" in selection.roles_for_login(note.get("login") or "")
             if selection.multiple_accounts else note.get("state") == "active"
         )
         if (note.tool == "claude" and launch_account and left is not None
@@ -103,43 +105,95 @@ def quota_for_selection(selection: ClaudeAccountSelection) -> QuotaPermission:
     return QuotaClear()
 
 
-def start(mode: str) -> str:
-    from scripts.accounts import accounts
+@dataclass(frozen=True)
+class LeftRunning:
+    """A session under a review name stays, with the line that says why."""
 
-    return start_for_selection(mode, accounts.claude_account_selection())
+    line: str
 
 
-def start_for_selection(mode: str, selection: ClaudeAccountSelection) -> str:
-    name = session(mode)
-    if running(mode):
-        if tmux("list-clients", "-t", f"={name}").stdout.strip():
-            return f"{name}: you are attached, so last night's session was left running"
-        # A session promoted out of a nightly review keeps its tmux name.
-        if f"/nightly_review {mode}" not in tmux("list-panes", "-F", "#{pane_start_command}", "-t", f"={name}:").stdout:
-            return f"{name}: another session holds this name, so tonight's review did not start"
-        _ = tmux("kill-session", "-t", f"={name}")
-    claude = shlex.join(["claude", "--remote-control", name, "-n", name, "--add-dir", str(Path.home() / ".claude"),
-                         "--settings", str(SETTINGS), f"/nightly_review {mode}"])
+@dataclass(frozen=True)
+class NameFree:
+    """No session holds the name now."""
+
+
+def retire(name: str, attached: str, foreign: str) -> LeftRunning | NameFree:
+    """End a past night's session unless the user is attached or no review started it."""
+    if not running(name):
+        return NameFree()
+    if tmux("list-clients", "-t", f"={name}").stdout.strip():
+        return LeftRunning(f"{name}: {attached}")
+    # A session promoted out of a nightly review keeps its tmux name.
+    if "/nightly_review " not in tmux("list-panes", "-F", "#{pane_start_command}", "-t", f"={name}:").stdout:
+        return LeftRunning(f"{name}: {foreign}")
+    _ = tmux("kill-session", "-t", f"={name}")
+    return NameFree()
+
+
+def start(selection: ClaudeAccountSelection, prefix: str) -> list[str]:
+    """Replace last night's session with tonight's; `prefix` selects a named account."""
+    lines = [
+        left.line for name in LEGACY_SESSIONS
+        if isinstance(left := retire(
+            name, "you are attached, so it was left running",
+            "another session holds this name, so it was left running",
+        ), LeftRunning)
+    ]
+    last_night = retire(
+        SESSION, "you are attached, so last night's session was left running",
+        "another session holds this name, so tonight's review did not start",
+    )
+    if isinstance(last_night, LeftRunning):
+        return [*lines, last_night.line]
+    # The session works in ~/rust; the config mode also reads /etc/nixos and ~/.claude.
+    home = Path.home()
+    argv = ["claude", "--remote-control", SESSION, "-n", SESSION,
+            "--add-dir", "/etc/nixos", "--add-dir", str(home / ".claude"),
+            "--settings", str(SETTINGS), PROMPT]
     # A scope of its own, so a tmux server this starts outlives the timer's oneshot unit.
-    command = f"ENABLE_TOOL_SEARCH=true command {claude}; exec zsh"
+    command = f"{prefix}ENABLE_TOOL_SEARCH=true command {shlex.join(argv)}; exec zsh"
     if selection.multiple_accounts:
-        # tmux may supply a named account from its server environment. Clear
-        # both authentication selectors inside the command before Claude runs.
-        command = "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN; " + command
-    argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "tmux", "new-session", "-d", "-s", name,
-            "-c", str(MODES[mode]), "zsh", "-ic", command]
+        # tmux may supply another account from its server environment. Clear
+        # its variables and the token inside the command before Claude runs.
+        command = f"unset {' '.join(NAMED_ACCOUNT_VARIABLES)} CLAUDE_CODE_OAUTH_TOKEN; " + command
+    spawn = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "tmux", "new-session", "-d", "-s", SESSION,
+             "-c", str(home / "rust"), "zsh", "-ic", command]
     if selection.multiple_accounts:
-        started = subprocess.run(argv, capture_output=True, text=True, check=False,
+        started = subprocess.run(spawn, capture_output=True, text=True, check=False,
                                  env=launch_environment(selection))
     else:
-        started = subprocess.run(argv, capture_output=True, text=True, check=False)
-    return f"{name}: started" if started.returncode == 0 else f"{name}: failed to start: {started.stderr.strip()}"
+        started = subprocess.run(spawn, capture_output=True, text=True, check=False)
+    outcome = "started" if started.returncode == 0 else f"failed to start: {started.stderr.strip()}"
+    return [*lines, f"{SESSION}: {outcome}"]
 
 
 def launch_environment(selection: ClaudeAccountSelection) -> dict[str, str]:
-    """The default account's launch environment, retaining legacy inheritance."""
+    """The launch environment without an inherited account, retaining legacy inheritance."""
     return {key: value for key, value in os.environ.items()
             if not selection.multiple_accounts or not key.startswith("CLAUDE_")}
+
+
+def tonight(selection: ClaudeAccountSelection) -> list[str]:
+    """Start the review on the unit role's account, or give the one line that says why not."""
+    from scripts.accounts import accounts
+
+    selected = accounts.role_account("unit")
+    environment = launch_environment(selection)
+    if isinstance(selected, accounts.NamedAccount):
+        problems = accounts.check(selected.label)
+        if problems:
+            return [f"skipped: unit account {selected.label}: {problems[0]}"]
+        # The shutdown check reads the account the review will run on.
+        environment["CLAUDE_CONFIG_DIR"] = str(selected.dir)
+    permission = launch_permission(environment, NewWorkLaunchPurpose())
+    if isinstance(permission, BlockedByShutdown):
+        return [f"skipped: {permission.reason}"]
+    if isinstance(permission, ShutdownStateUnreadable):
+        return [f"skipped: shutdown state unreadable: {permission.detail}"]
+    quota = quota_for_selection(selection)
+    if isinstance(quota, QuotaBelowFloor):
+        return [f"skipped: {quota.reason}"]
+    return start(selection, accounts.account_prefix(selected))
 
 
 def launch(today: date) -> list[str]:
@@ -157,20 +211,7 @@ def launch(today: date) -> list[str]:
         ]
     else:
         try:
-            permission = launch_permission(launch_environment(selection), NewWorkLaunchPurpose())
-            if isinstance(permission, BlockedByShutdown):
-                lines = [f"skipped: {permission.reason}"]
-            elif isinstance(permission, ShutdownStateUnreadable):
-                lines = [
-                    f"skipped: shutdown state unreadable: {permission.detail}"
-                ]
-            else:
-                quota = quota_for_selection(selection)
-                lines = (
-                    [f"skipped: {quota.reason}"]
-                    if isinstance(quota, QuotaBelowFloor)
-                    else [start_for_selection(mode, selection) for mode in MODES]
-                )
+            lines = tonight(selection)
         finally:
             _ = barrier.__exit__(None, None, None)
     _ = (directory / "launch.log").write_text("\n".join(lines) + "\n", encoding="utf-8")

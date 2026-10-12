@@ -26,6 +26,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 import sweep
 
 
+# Version the mirrored repository's development shell exports on the Mac.
+MACOSX_DEPLOYMENT_TARGET = "14.0"
+
+
 MacDeclineReason = Literal[
     "off",
     "repo",
@@ -89,7 +93,7 @@ class LostMacRun:
 
 @dataclass(frozen=True)
 class DeclinedMacRun:
-    """A run kept on natedev before a Mac test command began."""
+    """An attempt declined before a Mac test command began."""
 
     reason: MacDeclineReason
     seconds: float
@@ -116,6 +120,30 @@ NO_RESULT_FILE = NoResultFile()
 
 
 @dataclass(frozen=True)
+class NoPriorMacDecline:
+    """This call has not shown a busy or blocked decline for this target."""
+
+
+@dataclass(frozen=True)
+class PriorMacDecline:
+    """The decline already shown by this target's previous attempt."""
+
+    reason: Literal["busy", "blocked"]
+
+
+LastMacDecline = NoPriorMacDecline | PriorMacDecline
+NO_PRIOR_MAC_DECLINE = NoPriorMacDecline()
+
+
+@dataclass(frozen=True)
+class DefaultMacSettings:
+    """Select settings through MAC_TEST_CONFIG or its existing default."""
+
+
+DEFAULT_MAC_SETTINGS = DefaultMacSettings()
+
+
+@dataclass(frozen=True)
 class OffloadConfig:
     """Settings that govern one Mac offload decision."""
 
@@ -138,13 +166,13 @@ class OffloadRequest:
     call_id: str
     result: ResultDestination
     nextest_words: tuple[str, ...]
+    last_decline: LastMacDecline = NO_PRIOR_MAC_DECLINE
 
 
 @dataclass(frozen=True)
 class ProbeSnapshot:
     """Mac availability values returned by one remote probe."""
 
-    processes: int
     power: MacPower
     free_gib: float
     hostname: str
@@ -233,6 +261,21 @@ ProbeResult = ProbeSnapshot | UnavailableProbe
 UNAVAILABLE_PROBE = UnavailableProbe()
 
 
+@dataclass(frozen=True)
+class ReachableHost:
+    """The host completed a command over SSH."""
+
+
+@dataclass(frozen=True)
+class UnreachableHost:
+    """The host could not complete the reachability probe."""
+
+    reason: str
+
+
+HostReachability = ReachableHost | UnreachableHost
+
+
 class NoBackoff:
     """No active unreachable interval exists."""
 
@@ -266,6 +309,8 @@ class CliArguments(argparse.Namespace):
         self.call_id: str = ""
         self.filter_run: bool = False
         self.result: str | None = None
+        self.settings: str = ""
+        self.last_decline: str = ""
         self.nextest_words: list[str] = []
 
 
@@ -382,8 +427,9 @@ def positive_number(values: dict[str, str], key: str, default: float) -> float:
     return value if math.isfinite(value) and value > 0 else default
 
 
-def read_config() -> OffloadConfig:
-    values = sweep.config_values(str(config_path()))
+def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> OffloadConfig:
+    settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
+    values = sweep.config_values(str(settings))
     return OffloadConfig(
         enabled=values.get("offload") == "on",
         host=values.get("host", "mac"),
@@ -419,7 +465,15 @@ def declined(reason: MacDeclineReason, started: float) -> DeclinedMacRun:
     return DeclinedMacRun(reason, elapsed_seconds(started))
 
 
-def write_result(result: MacOffloadResult, destination: ResultDestination) -> int:
+def decline_already_shown(reason: MacDeclineReason, last_decline: LastMacDecline) -> bool:
+    return isinstance(last_decline, PriorMacDecline) and reason == last_decline.reason
+
+
+def write_result(
+    result: MacOffloadResult,
+    destination: ResultDestination,
+    last_decline: LastMacDecline = NO_PRIOR_MAC_DECLINE,
+) -> int:
     """Write the wire form and return the exit status for one outcome."""
     if isinstance(result, PassedOnMac):
         mac = "passed"
@@ -448,7 +502,8 @@ def write_result(result: MacOffloadResult, destination: ResultDestination) -> in
         mac = "declined"
         reason = result.reason
         status = 75
-        print(f"mac_test: staying on natedev ({reason})")
+        if not decline_already_shown(result.reason, last_decline):
+            print(f"mac_test: not running on the Mac ({reason})")
     if isinstance(destination, ResultFile):
         _ = destination.path.write_text(
             f"mac={mac}\nreason={reason}\nseconds={result.seconds:.6f}\n",
@@ -522,13 +577,11 @@ def probe_script(repository: KnownRepository) -> str:
     return "\n".join(
         (
             f'mkdir -p "$HOME"/{mirror} || exit 1',
-            "procs=$( (pgrep -x cargo; pgrep -x rustc; "
-            + "pgrep -x cargo-nextest) 2>/dev/null | wc -l | tr -d ' ')",
             "case \"$(pmset -g batt | head -1)\" in "
             + "*\"AC Power\"*) power=ac ;; *) power=battery ;; esac",
             "free_gib=$(df -g \"$HOME\" | awk 'NR == 2 {print $4}')",
-            "printf 'procs=%s\\npower=%s\\nfree_gib=%s\\nhost=%s\\nrc=0\\n' "
-            + '"$procs" "$power" "$free_gib" "$(hostname -s)"',
+            "printf 'power=%s\\nfree_gib=%s\\nhost=%s\\nrc=0\\n' "
+            + '"$power" "$free_gib" "$(hostname -s)"',
         )
     )
 
@@ -542,20 +595,18 @@ def parse_probe(output: str) -> ProbeResult:
     if values.get("rc") != "0":
         return UNAVAILABLE_PROBE
     try:
-        processes = int(values["procs"])
         free_gib = float(values["free_gib"])
         power = values["power"]
         hostname = values["host"]
     except (KeyError, ValueError):
         return UNAVAILABLE_PROBE
     if (
-        processes < 0
-        or not math.isfinite(free_gib)
+        not math.isfinite(free_gib)
         or power not in ("ac", "battery")
         or not hostname
     ):
         return UNAVAILABLE_PROBE
-    return ProbeSnapshot(processes, power, free_gib, hostname)
+    return ProbeSnapshot(power, free_gib, hostname)
 
 
 def claim_arguments(request: OffloadRequest) -> list[str]:
@@ -584,6 +635,20 @@ def release_claim(controller: ProcessController) -> None:
     )
 
 
+def probe_reachability(
+    controller: ProcessController,
+    config: OffloadConfig,
+) -> HostReachability:
+    """Check SSH reachability without creating or inspecting a repository."""
+    result = controller.capture(
+        [*ssh_prefix(config), "true"],
+        CommandTimeLimit(config.probe_timeout_s),
+    )
+    if isinstance(result, CommandOutput) and result.status == 0:
+        return ReachableHost()
+    return UnreachableHost(f"SSH probe failed for {config.host}")
+
+
 def probe_mac(
     controller: ProcessController,
     config: OffloadConfig,
@@ -593,9 +658,19 @@ def probe_mac(
         [*ssh_prefix(config), probe_script(repository)],
         CommandTimeLimit(config.probe_timeout_s),
     )
-    if not isinstance(result, CommandOutput) or result.status == 255:
-        return UNAVAILABLE_PROBE
-    return parse_probe(result.stdout)
+    if isinstance(result, CommandTimedOut):
+        reason = f"SSH probe timed out after {config.probe_timeout_s:g} s"
+    elif isinstance(result, CommandCouldNotStart):
+        reason = f"SSH probe could not start (time limit {config.probe_timeout_s:g} s)"
+    elif result.status != 0:
+        reason = " ".join(result.stderr.split()) or f"SSH probe exited with status {result.status}"
+    else:
+        probe = parse_probe(result.stdout)
+        if isinstance(probe, ProbeSnapshot):
+            return probe
+        reason = "the probe answer could not be read"
+    print(f"mac_test: could not reach the Mac: {reason}", file=sys.stderr, flush=True)
+    return UNAVAILABLE_PROBE
 
 
 def ignored_paths(
@@ -704,6 +779,7 @@ def remote_test_command(
         f"BUILDLOG_CALL_ID={shlex.quote(request.call_id)} "
         "BUILDLOG_SYNC=1 "
         f"LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "
+        f"MACOSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET} "
         f"~/.claude/scripts/lint/lint {invocation}; echo mac_exit=$?"
     )
 
@@ -737,8 +813,6 @@ def claimed_run(
         if isinstance(probe, UnavailableProbe):
             write_backoff(time.time() + config.unreachable_backoff_s)
             return declined("unreachable", started)
-        if probe.processes > 0:
-            return declined("mac_busy", started)
         if probe.power == "battery":
             return declined("battery", started)
         if probe.free_gib < config.free_floor_gib:
@@ -802,11 +876,15 @@ def run_offload(
             return declined("state", started)
         if claim.status != 0:
             release_may_be_needed = False
-            if claim.status == 10:
-                return declined("blocked", started)
-            if claim.status == 11:
-                return declined("busy", started)
-            return declined("state", started)
+            reason: MacDeclineReason = (
+                "blocked" if claim.status == 10 else "busy" if claim.status == 11 else "state"
+            )
+            if not decline_already_shown(reason, request.last_decline):
+                if claim.stdout:
+                    print(claim.stdout, end="" if claim.stdout.endswith("\n") else "\n", file=sys.stderr, flush=True)
+                if claim.stderr:
+                    print(claim.stderr, end="" if claim.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
+            return declined(reason, started)
         return claimed_run(controller, config, request, repository, started)
     finally:
         if release_may_be_needed:
@@ -845,6 +923,8 @@ def parser() -> argparse.ArgumentParser:
     _ = run.add_argument("--repo-root", required=True)
     _ = run.add_argument("--package", required=True)
     _ = run.add_argument("--call-id", required=True)
+    _ = run.add_argument("--settings", default="")
+    _ = run.add_argument("--last-decline", choices=("busy", "blocked"), default="")
     _ = run.add_argument("--filter-run", action="store_true")
     _ = run.add_argument("--result")
     _ = run.add_argument("nextest_words", nargs=argparse.REMAINDER)
@@ -855,12 +935,18 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
     words = arguments.nextest_words
     if words[:1] == ["--"]:
         words = words[1:]
+    last_decline: LastMacDecline = NO_PRIOR_MAC_DECLINE
+    if arguments.last_decline == "busy":
+        last_decline = PriorMacDecline("busy")
+    elif arguments.last_decline == "blocked":
+        last_decline = PriorMacDecline("blocked")
     return OffloadRequest(
         repo_root=Path(arguments.repo_root).resolve(),
         package=arguments.package,
         call_id=arguments.call_id,
         result=result_destination(arguments.result),
         nextest_words=tuple(words),
+        last_decline=last_decline,
     )
 
 
@@ -876,13 +962,13 @@ def main() -> int:
     arguments = parser().parse_args(namespace=CliArguments())
     restore_ignored_interrupt_default(arguments)
     request = request_from_arguments(arguments)
-    config = read_config()
+    config = read_config(Path(arguments.settings)) if arguments.settings else read_config()
     controller = ProcessController()
     started = time.monotonic()
     try:
         with interrupt_handlers(controller):
             result = run_offload(controller, config, request, started)
-        return write_result(result, request.result)
+        return write_result(result, request.result, request.last_decline)
     except OffloadInterrupted as interrupted:
         return 128 + interrupted.signal_number
     except Exception:
