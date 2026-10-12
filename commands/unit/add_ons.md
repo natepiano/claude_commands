@@ -39,7 +39,9 @@ Handle current-phase defects under <PhaseEnd/> step 3; in `single`, return them
 to <Synthesize/>.
 
 Each new candidate is an `add` proposal with title, target, need, completion
-condition, source phase, and `Class: gate`. Import each architect proposal with
+condition, source phase, and `Class: gate`. Write the title as one plain
+sentence saying what changes for the user, with no file, type or phase name:
+`/showrunner:proposals` shows it to the user as written. Import each architect proposal with
 its exact `Action`, `Current`, `Target`, `Proposed`, `Why`, source phase, and
 `Class`, then delete its amendment artifact. Deduplicate all proposals by action,
 target, and observable outcome against `${NEXT_ITEMS_PATH}` and
