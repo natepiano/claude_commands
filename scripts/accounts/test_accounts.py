@@ -1978,7 +1978,7 @@ class AccountsTests(unittest.TestCase):
             ("~/.codex", "codex 1", "MAIN-CODEX@example.invalid", "seats"),
             ("~/.codex2", "codex 2", "spare@example.invalid", "spare"),
             ("~/.codex4", "—", "unknown@example.invalid", "spare"),
-            ("~/.codex10", "—", "not logged in", "spare"),
+            ("~/.codex10", "codex 10", "not logged in", "spare"),
             ("~/.codex3", "codex 3", "not set up", "—"),
         ])
 
@@ -2011,6 +2011,17 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(os.readlink(home), str(target))
         self.assertFalse(target.exists())
         self.codex_reads.assert_not_awaited()
+
+    def test_logged_out_numbered_home_names_the_account_to_sign_in(self) -> None:
+        self.write_note("codex 1", "spare@example.invalid")
+        (self.home / ".codex1").mkdir(mode=0o700)
+        rows = self.status_rows()
+        row = next(row for row in rows if row[0] == "~/.codex1")
+        self.assertEqual(row[:4], ("~/.codex1", "codex 1", "not logged in", "spare"))
+        report = self.run_cli("status")[1]
+        self.assertIn("codex 1", report.split("\n\n", 1)[1])
+        self.assertIn("sign in", report.split("\n\n", 1)[1].lower())
+        self.assertEqual(accounts.codex_home_label(self.home / ".codex1"), "codex 1")
 
     def test_status_assigns_seats_to_the_selected_codex_home(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)

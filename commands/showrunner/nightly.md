@@ -19,6 +19,8 @@ of every improvement the nightly review found that is still open: each line of
 - **Area**: `config` or `rust/<target>`. `, also found` and `, noted` mark a
   smaller finding of that night.
 
-With nothing open it prints `no open candidates`. It reads only and writes
-nothing. The ledger is kept on natedev, so run it there. To act on a row, use
+With nothing open it prints `no open candidates`. The script rewrites
+`~/rust/hanadocs/nightly improvement list.md` (`NIGHTLY_REVIEW_NOTE` replaces
+the path) and changes nothing else. The ledger is kept on natedev, so run it
+there. To act on a row, use
 `/nightly_next`.

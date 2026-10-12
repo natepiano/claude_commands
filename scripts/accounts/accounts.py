@@ -1424,7 +1424,7 @@ def set_role(role: str, label: str) -> None:
     _validate_role(role)
     if role == "seats":
         home = _seats_home()
-        target = _seats_target(label, home)
+        target = check_codex_target(label, home)
         _ = _write_role(role, label, target.label)
         return
     if label == "default":
@@ -1549,7 +1549,7 @@ def _shutdown_argv(*arguments: str) -> tuple[str, ...]:
     return (sys.executable, str(SCRIPTS / "shutdown" / "shutdown.py"), *arguments)
 
 
-def _seats_target(label: str, seats_home: Path) -> SelectableCodexAccount:
+def check_codex_target(label: str, seats_home: Path) -> SelectableCodexAccount:
     home = accounts_home() / ".codex" if label == "default" else codex_account_home(label)
     problems = (_check_default_codex_home(seats_home) if label == "default"
                 else _check_codex_home(label, seats_home))
@@ -1562,15 +1562,25 @@ def _seats_target(label: str, seats_home: Path) -> SelectableCodexAccount:
     return SelectableCodexAccount(home, login, account.label_for("Codex", login))
 
 
-def _retire_seats_servers(home: Path, label: str, *, dry_run: bool) -> list[str]:
-    from scripts.agents import codex_mesh
+def codex_home_label(home: Path, login: str | None = None) -> str:
+    """The signed-in account's note label, or the numbered home's intended account."""
+    if login:
+        return account.label_for("Codex", login)
+    match = re.fullmatch(r"\.codex([1-9][0-9]*)", home.name)
+    if home.parent == accounts_home() and match:
+        return agent_accounts.codex_home_role_label(home)
+    return NO_VALUE
 
-    return codex_mesh.retire_seats_servers(home, label, dry_run=dry_run)
+
+def _retire_seats_servers(home: Path, label: str, *, dry_run: bool) -> list[str]:
+    from scripts.agents.codex_mesh import retire_seats_servers
+
+    return retire_seats_servers(home, label, dry_run=dry_run)
 
 
 def _swap_seats(label: str, *, dry_run: bool) -> SeatsSwapOutcome:
     seats_home = _seats_home()
-    target = _seats_target(label, seats_home)
+    target = check_codex_target(label, seats_home)
     account_label, target_home = target.label, target.home
     if target_home == seats_home:
         raise AccountsError(f"accounts: {account_label} ({_codex_folder(target_home)}) already serves seats; choose another account")
@@ -1810,9 +1820,11 @@ def codex_statuses(seats_home: Path) -> list[CodexStatus]:
         folder = _codex_folder(home)
         safe = not home.is_symlink() and not (home / "auth.json").is_symlink()
         login = _codex_home_login(home)
-        label = account.label_for("Codex", login) if login else NO_VALUE
+        label = codex_home_label(home, login or None)
         match = re.fullmatch(r"\.codex([1-9][0-9]*)", home.name) if home.parent == accounts_home() else None
         problems = _check_codex_home(f"codex {match.group(1)}", seats_home) if match else []
+        if match and not login:
+            problems.append(f"accounts: sign in as {label} at {folder}")
         statuses.append(CodexStatus(
             folder, home, True, safe, NO_VALUE if label == login else label, login,
             CODEX_ROLE if home == seats_home else "spare", tuple(problems),

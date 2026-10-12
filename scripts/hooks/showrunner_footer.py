@@ -12,8 +12,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+if TYPE_CHECKING:
+    from showrunners import Place
 
 
 STAMP_WINDOW = timedelta(minutes=5)
@@ -202,9 +205,24 @@ def stamp(lines: list[str], now: datetime) -> tuple[datetime | None, bool]:
     return None, nothing_needed
 
 
-def render_footer(production: Production, minute: datetime, at: datetime | None, *, nothing_needed: bool) -> list[str]:
+def place_of(slug: str) -> Place:
+    """Where `slug` sits among the showrunners: the root above it, or the productions below it."""
+    production_scripts = str(DAILIES.parent)
+    if production_scripts not in sys.path:
+        sys.path.insert(0, production_scripts)
+    # The tree lives with the production scripts. They import this module, so this one imports late.
+    import showrunners
+    return showrunners.place_of(slug)
+
+
+def render_footer(production: Production, minute: datetime, at: datetime | None, place: Place, *,
+                  nothing_needed: bool) -> list[str]:
     command = [sys.executable, str(DAILIES), "--footer", "--zone", production.zone,
                "--outstanding", str(outstanding_path(production.slug))]
+    for slug in place.below:
+        command.extend(["--below", str(outstanding_path(slug))])
+    if place.root:
+        command.extend(["--reports-to", place.root])
     if isinstance(production.schedule, ScheduledDailies):
         command.extend(["--next-run", next_run_text(production.schedule.next_due, minute,
                                                     ZoneInfo(production.zone))])
@@ -238,27 +256,33 @@ def count_sentence(count: int) -> str:
     return "There is 1 open question for you." if count == 1 else f"There are {count} open questions for you."
 
 
-def open_questions(productions: list[Production]) -> int | None:
+def open_questions(productions: list[Production], below: dict[str, list[str]]) -> int | None:
     """How many items now wait on the user across these productions; None when a list cannot be read.
 
-    An item the user deferred is not counted until its `after` time, as the footer's own
-    `nothing needed` is decided.
+    `below` names the productions under each root showrunner. A root's count covers them, since
+    the root is where the user sees everything below it. An item the user deferred is not counted until its `after`
+    time, as the footer's own `nothing needed` is decided.
     """
-    count = 0
+    # One user, one zone: a lower production's `after` is judged in the zone of the one that counts it.
+    zones: dict[str, str] = {}
     for production in productions:
-        path = outstanding_path(production.slug)
+        for slug in (production.slug, *below.get(production.slug, [])):
+            _ = zones.setdefault(slug, production.zone)
+    count = 0
+    for slug, zone in zones.items():
+        path = outstanding_path(slug)
         if not path.exists():
             continue
         try:
             entries = cast(object, json.loads(path.read_text(encoding="utf-8")))
-            now = datetime.now(ZoneInfo(production.zone)).strftime("%Y-%m-%dT%H:%M")
+            now = datetime.now(ZoneInfo(zone)).strftime("%Y-%m-%dT%H:%M")
         except (OSError, ValueError, KeyError):
             return None
         if not isinstance(entries, list):
             return None
         for entry in cast(list[object], entries):
             after = cast(dict[str, object], entry).get("after") if isinstance(entry, dict) else None
-            # Both are `YYYY-MM-DDTHH:MM` in the production's zone, so they compare as text.
+            # Both are `YYYY-MM-DDTHH:MM` in that zone, so they compare as text.
             if not isinstance(after, str) or after <= now:
                 count += 1
     return count
@@ -324,7 +348,8 @@ def block_reason(instance_dirs: list[str], reply: str,
     lines = reply_lines(reply)
     waiting = waiting_bullets(lines)
     footer_lines, bullets = waiting if waiting is not None else ([], [])
-    counted = open_questions(productions)
+    places = {production.slug: place_of(production.slug) for production in productions}
+    counted = open_questions(productions, {slug: place.below for slug, place in places.items()})
     if waiting is not None:
         for production in productions:
             now = datetime.now(ZoneInfo(production.zone)).replace(second=0, microsecond=0)
@@ -351,7 +376,8 @@ def block_reason(instance_dirs: list[str], reply: str,
         now = datetime.now(ZoneInfo(production.zone)).replace(second=0, microsecond=0)
         at, nothing_needed = stamp(lines, now)
         stamp_state = StampState.MISSING if at is None else StampState.PRESENT
-        expected = render_footer(production, at or now, at, nothing_needed=nothing_needed)
+        place = places[production.slug]
+        expected = render_footer(production, at or now, at, place, nothing_needed=nothing_needed)
         if waiting is not None:
             found = unoccupied_match(expected)
             if found is None and len(sections) > 1:
@@ -361,7 +387,7 @@ def block_reason(instance_dirs: list[str], reply: str,
                     if section_state is StampState.MISSING or (section_at, section_quiet) == (at, nothing_needed):
                         continue
                     assert section_at is not None
-                    candidate = render_footer(production, section_at, section_at,
+                    candidate = render_footer(production, section_at, section_at, place,
                                               nothing_needed=section_quiet)
                     found = unoccupied_match(candidate)
                     if found is not None:
@@ -376,6 +402,7 @@ def block_reason(instance_dirs: list[str], reply: str,
         return None
     current = (first_comparison.expected if first_comparison.stamp_state is StampState.MISSING else
                render_footer(first_comparison.production, first_comparison.minute, None,
+                             places[first_comparison.production.slug],
                              nothing_needed=first_comparison.nothing_needed))
     sample = f"* {count_sentence(counted)}\n* <item>" if counted else "* <item>"
     return REASON_HEAD + "\n\n" + "\n".join(current) + "\n\n\nWaiting on:\n\n" + sample

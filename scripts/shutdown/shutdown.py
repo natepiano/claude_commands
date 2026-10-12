@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypedDict, cast
@@ -40,10 +42,16 @@ from record import (
     InvalidRecord,
     SessionShutdown,
     ShutdownContinuation,
-    account_hold,
+    AccountHeld,
+    ShutdownFound,
+    ConductorRunning,
+    ConductorNotRunning,
+    ConductorUnavailable,
+    conductor_status,
+    lookup_account_hold,
+    lookup_session,
     all_account_holds,
     all_session_records,
-    find_session,
     parse_session_records,
     session_records,
 )
@@ -191,34 +199,26 @@ def _unavailable(machine: str, rc: int, reason: str) -> UnavailableMachine:
     }
 
 
-def _status(
-    selected: Account, here: bool
-) -> tuple[list[MachineStatusReport], list[str]]:
+def _status(selected: Account, here: bool) -> list[MachineStatusReport]:
     local = inventory(selected.login)
     reports: list[MachineStatusReport] = [local]
-    lines = _inventory_lines(local)
     if here:
-        return reports, lines
-
+        return reports
     status, output = run_remote(["status", selected.login, "--json", "--here"])
     machine = other_machine()
     if status == 255:
         reports.append({"machine": machine, "unreachable": True})
-        lines.append(f"{machine}: unreachable")
-        return reports, lines
+        return reports
     if status != 0:
         reports.append(_unavailable(machine, status, output))
-        lines.append(f"{machine}: unavailable (rc {status})")
-        return reports, lines
+        return reports
     try:
         remote = parse_inventory(output)
     except InvalidInventory as error:
         reports.append(_unavailable(machine, status, str(error)))
-        lines.append(f"{machine}: unavailable (rc {status})")
-        return reports, lines
+        return reports
     reports.append(remote)
-    lines.extend(_inventory_lines(remote))
-    return reports, lines
+    return reports
 
 
 def _local_time(value: str) -> str:
@@ -241,10 +241,11 @@ def launch_blocked(selected: Account, purpose: LaunchPurpose) -> int:
     """A stopped session permits its restore; only an account hold blocks new work."""
     try:
         _ = session_records(selected.login)
-        hold = account_hold(selected.login)
+        hold = lookup_account_hold(selected.login)
         if isinstance(purpose, ShutdownUnitRestoreLaunchPurpose):
-            restoring = find_session(selected.login, purpose.session_id)
-            if restoring is not None:
+            found = lookup_session(selected.login, purpose.session_id)
+            if isinstance(found, ShutdownFound):
+                restoring = found.record
                 if restoring["progress"]["kind"] in {
                     "stopped", "already gone", "process identity lost", "restarting",
                     "restart failed", "manual restart",
@@ -256,10 +257,10 @@ def launch_blocked(selected: Account, purpose: LaunchPurpose) -> int:
     except (InvalidRecord, OSError, ValueError) as error:
         print(f"shutdown state unreadable: {error}", file=sys.stderr)
         return 3
-    if hold is None:
+    if not isinstance(hold, AccountHeld):
         return 1
-    hold_time = _shutdown_hold_time(hold["requested_at"])
-    print(f"{hold['label']} is held by a shutdown (since {hold_time})")
+    hold_time = _shutdown_hold_time(hold.hold["requested_at"])
+    print(f"{hold.hold['label']} is held by a shutdown (since {hold_time})")
     return 0
 
 
@@ -337,21 +338,133 @@ def _observed_owner(record: SessionShutdown, observations: tuple[Inventory, ...]
     return stop_work.SessionAbsent(kind="session absent")
 
 
-def _status_record_lines(
-    selected: Account, here: bool, local_machine: str, observations: tuple[Inventory, ...] = (),
-) -> list[str]:
-    lines = _shutdown_record_lines(
-        _local_shutdown_records(selected.login, local_machine), observations,
-    )
-    if not here:
-        lines.extend(_shutdown_record_lines(_remote_shutdown_records(selected.login), observations, local_observation=False))
+
+@dataclass(frozen=True)
+class _SelectableSession:
+    session_id: str
+    name: str
+    machine: str
+
+
+class SessionSelectionError(ValueError):
+    """The requested items do not identify exactly one account session."""
+
+
+def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False) -> list[str]:
+    """Resolve exact names and ids, counting inventory and records once."""
+    requested = list(dict.fromkeys(items))
+    if not requested or any(not item for item in requested):
+        raise SessionSelectionError("--only needs a session id or exact name")
+    local_report = inventory(login)
+    local: dict[str, _SelectableSession] = {}
+    for saved in session_records(login):
+        owner = saved["session"]
+        local[owner["session_id"]] = _SelectableSession(owner["session_id"], owner["name"], saved["machine"])
+    for owner in local_report["sessions"]:
+        if owner["kind"] != "seat":
+            local[owner["session_id"]] = _SelectableSession(owner["session_id"], owner["name"], local_report["machine"])
+    candidates = dict(local)
+    peer_unavailable = False
+    needs_peer = not here and any(item not in local for item in requested)
+    if needs_peer:
+        peer = _remote_shutdown_records(login)
+        if peer["kind"] != "records":
+            peer_unavailable = True
+        else:
+            for saved in peer["records"]:
+                owner = saved["session"]
+                _ = candidates.setdefault(owner["session_id"], _SelectableSession(owner["session_id"], owner["name"], saved["machine"]))
+            status, output = run_remote(["status", login, "--json", "--here"])
+            if status != 0:
+                peer_unavailable = True
+            else:
+                try:
+                    report = parse_inventory(output)
+                    if report["login"].casefold() != login.casefold():
+                        raise InvalidInventory("peer inventory is for another account")
+                except InvalidInventory:
+                    peer_unavailable = True
+                else:
+                    for owner in report["sessions"]:
+                        if owner["kind"] != "seat":
+                            _ = candidates.setdefault(owner["session_id"], _SelectableSession(owner["session_id"], owner["name"], report["machine"]))
+        if peer_unavailable:
+            print(f"{other_machine()}: not reached; names checked on {local_report['machine']} only", file=sys.stderr)
+    result: list[str] = []
+    for item in requested:
+        if item in local:
+            matches = [local[item]]
+        elif item in candidates:
+            matches = [candidates[item]]
+        else:
+            matches = [session for session in candidates.values() if session.name == item]
+        if len(matches) != 1:
+            reason = "matches no session" if not matches else "matches more than one session"
+            missing = f"; {other_machine()} not reached" if peer_unavailable else ""
+            listed = matches or list(candidates.values())
+            lines = [f"{item}: {reason}{missing}"]
+            lines.extend(f"  {session.machine}: {session.name} ({session.session_id})" for session in listed)
+            raise SessionSelectionError("\n".join(lines))
+        if matches[0].session_id not in result:
+            result.append(matches[0].session_id)
+    return result
+
+
+def _remote_conductor_status(login: str) -> ConductorRunning | ConductorNotRunning | ConductorUnavailable:
+    status, output = run_remote(["conductor-status", login, "--json", "--here"])
+    if status != 0:
+        return ConductorUnavailable(f"{other_machine()}: not reached")
+    try:
+        value = cast(object, json.loads(output))
+        if not isinstance(value, dict):
+            raise ValueError("invalid conductor response")
+        fields = cast(dict[str, object], value)
+        if fields.get("kind") == "running":
+            return ConductorRunning()
+        if fields.get("kind") == "not running":
+            return ConductorNotRunning()
+        if fields.get("kind") == "unavailable" and isinstance(fields.get("reason"), str):
+            return ConductorUnavailable(cast(str, fields["reason"]))
+        raise ValueError("invalid conductor response")
+    except (ValueError, TypeError) as error:
+        return ConductorUnavailable(str(error))
+
+
+def _status_actions(records: list[SessionShutdown], ownership: ConductorRunning | ConductorNotRunning | ConductorUnavailable) -> list[str]:
+    lines: list[str] = []
+    take_out: list[str] = []
+    stop_now: list[str] = []
+    bring_back: list[str] = []
+    waiting = any(saved["progress"]["kind"] in {"waiting", "ready"} for saved in records)
+    if waiting:
+        if isinstance(ownership, ConductorNotRunning):
+            lines.append("  no conductor running; /shutdown --only <name> resumes one, /shutdown cancel --only <name> takes it out")
+        elif isinstance(ownership, ConductorUnavailable):
+            lines.append(f"  conductor ownership unavailable: {ownership.reason}")
+    for saved in records:
+        name = saved["session"]["name"]
+        progress = saved["progress"]["kind"]
+        if progress in {"waiting", "ready"}:
+            take_out.append(name)
+            stop_now.append(name)
+        elif progress == "stop failed":
+            take_out.append(name)
+            stop_now.append(name)
+            bring_back.append(name)
+        elif progress in {"stopped", "already gone", "process identity lost", "restart failed", "manual restart", "timers pending", "restarting"}:
+            if saved["stop_issues"] and progress in {"stopped", "already gone", "process identity lost"}:
+                stop_now.append(name)
+            bring_back.append(name)
+    for label, verb, names in (("take out", "cancel", take_out), ("stop now", "now", stop_now), ("bring back", "restart", bring_back)):
+        if names:
+            lines.append(f"  {label}: /shutdown {verb} --only <name> · {', '.join(names)}")
     return lines
 
 
 def _only_ids(value: str | None) -> tuple[str, ...]:
     if value is None:
         return ()
-    return tuple(dict.fromkeys(item for item in value.split(",") if item))
+    return tuple(dict.fromkeys(item.strip() for item in value.split(",")))
 
 
 def _records(here: bool) -> tuple[list[MachineRecordReport], list[str]]:
@@ -403,7 +516,7 @@ def main(arguments: list[str] | None = None) -> int:
     down = commands.add_parser("down", help="start a safe account shutdown")
     _ = down.add_argument("account", nargs="?")
     _ = down.add_argument("--here", action="store_true")
-    _ = down.add_argument("--only", help=argparse.SUPPRESS)
+    _ = down.add_argument("--only", metavar="NAME[,NAME...]", help="session ids or exact names, separated by commas")
     _ = down.add_argument("--restart", action="store_true")
     _ = down.add_argument("--requested-by", help=argparse.SUPPRESS)
     _ = down.add_argument("--request-id", default="", help=argparse.SUPPRESS)
@@ -426,14 +539,18 @@ def main(arguments: list[str] | None = None) -> int:
     cancel = commands.add_parser("cancel", help="undo a settling shutdown")
     _ = cancel.add_argument("account", nargs="?")
     _ = cancel.add_argument("--here", action="store_true")
+    _ = cancel.add_argument("--only", metavar="NAME[,NAME...]", help="session ids or exact names, separated by commas")
     now = commands.add_parser("now", help="stop without waiting for idle sessions")
     _ = now.add_argument("account", nargs="?")
     _ = now.add_argument("--here", action="store_true", help=argparse.SUPPRESS)
+    _ = now.add_argument("--only", metavar="NAME[,NAME...]", help="session ids or exact names, separated by commas")
     restart = commands.add_parser(
         "restart", help="bring back every session stopped for one account"
     )
     _ = restart.add_argument("account", nargs="?")
     _ = restart.add_argument("--dry-run", action="store_true")
+    _ = restart.add_argument("--only", metavar="NAME[,NAME...]", help="session ids or exact names, separated by commas")
+    _ = restart.add_argument("--here", action="store_true")
     _ = restart.add_argument(
         "--no-alert", action="store_true", help=argparse.SUPPRESS
     )
@@ -443,6 +560,13 @@ def main(arguments: list[str] | None = None) -> int:
     up = commands.add_parser("up")
     _ = up.add_argument("account")
     _ = up.add_argument("--dry-run", action="store_true")
+    _ = up.add_argument("--only")
+    _ = up.add_argument("--here", action="store_true")
+    _ = up.add_argument("--json", action="store_true", dest="as_json")
+    ownership = commands.add_parser("conductor-status")
+    _ = ownership.add_argument("account")
+    _ = ownership.add_argument("--json", action="store_true", dest="as_json")
+    _ = ownership.add_argument("--here", action="store_true")
     _ = commands.add_parser("held-sessions")
     options = cast(CommandLine, parser.parse_args(arguments))
 
@@ -474,8 +598,20 @@ def main(arguments: list[str] | None = None) -> int:
         except Exception as error:
             return _unexpected_launch_blocked_error(error)
 
+    if options.command == "conductor-status":
+        observed = conductor_status(options.account or "")
+        response = ({"kind": "running"} if isinstance(observed, ConductorRunning) else
+                    {"kind": "not running"} if isinstance(observed, ConductorNotRunning) else
+                    {"kind": "unavailable", "reason": observed.reason})
+        print(json.dumps(response, sort_keys=True))
+        return 0
+
     if options.command == "up":
-        return restart_work.up(options.account or "", options.dry_run)
+        if options.as_json:
+            result = restart_work.up_result(options.account or "", options.dry_run, _only_ids(options.only))
+            print(json.dumps(result, sort_keys=True))
+            return 1 if result["outcome"] == "partial" or result["refused"] else 0
+        return restart_work.up(options.account or "", options.dry_run, _only_ids(options.only))
 
     if options.command == "restart":
         requested: restart_work.AccountNamed | restart_work.AccountNotNamed = (
@@ -488,9 +624,26 @@ def main(arguments: list[str] | None = None) -> int:
             if options.no_alert
             else restart_work.AlertWhenNotBack()
         )
-        return restart_work.restart(
-            requested, dry_run=options.dry_run, alerts=alerts
-        )
+        restart_ids: list[str] = []
+        if options.only is not None:
+            try:
+                selected = restart_work.select_account(requested)
+            except UnknownAccountName as error:
+                print(f"shutdown: {error}", file=sys.stderr)
+                return 2
+            except (restart_work.RestartAccountNotDetermined, UnreadableAccount, InvalidRecord, OSError, ValueError) as error:
+                print(f"shutdown: {error}", file=sys.stderr)
+                return 1
+            try:
+                restart_ids = resolve_sessions(selected.login, _only_ids(options.only), here=options.here)
+            except SessionSelectionError as error:
+                print(f"shutdown: {error}", file=sys.stderr)
+                return 2
+            except (InvalidRecord, InvalidInventory, OSError) as error:
+                print(f"shutdown: {error}", file=sys.stderr)
+                return 3
+            requested = restart_work.AccountNamed(selected.login)
+        return restart_work.restart(requested, dry_run=options.dry_run, alerts=alerts, only=restart_ids, here=options.here)
 
     if options.command == "holds":
         try:
@@ -512,41 +665,65 @@ def main(arguments: list[str] | None = None) -> int:
             print("\n".join(lines))
         return 0
 
-    if options.command == "conduct":
-        return settle.conduct(options.account or "")
-
-    if options.command == "ready":
-        return settle.ready(options.where)
-
     try:
-        selected = _selected_account(options.account)
-    except (UnreadableAccount, UnknownAccountName) as error:
+        if options.command == "conduct":
+            return settle.conduct(options.account or "")
+
+        if options.command == "ready":
+            return settle.ready(options.where)
+
+        try:
+            selected = _selected_account(options.account)
+        except (UnreadableAccount, UnknownAccountName) as error:
+            print(f"shutdown: {error}", file=sys.stderr)
+            return 2
+        ids: tuple[str, ...] = ()
+        if options.command in {"down", "now", "cancel"} and options.only is not None:
+            try:
+                ids = tuple(resolve_sessions(selected.login, _only_ids(options.only), here=options.here))
+            except SessionSelectionError as error:
+                print(f"shutdown: {error}", file=sys.stderr)
+                return 2
+            except (InvalidRecord, InvalidInventory, OSError) as error:
+                print(f"shutdown: {error}", file=sys.stderr)
+                return 3
+        if options.command == "down":
+            return settle.down(
+                selected, options.here, ids,
+                then="restart" if options.restart else "stop",
+                alerts="none" if options.no_alert else "user",
+                requested_by=options.requested_by, request_id=options.request_id,
+            )
+        if options.command == "now":
+            return settle.now(selected, options.here, ids)
+        if options.command == "cancel":
+            return settle.cancel(selected, options.here, ids)
+        reports = _status(selected, options.here)
+        if options.as_json:
+            print(json.dumps(reports[0] if options.here else reports, sort_keys=True))
+        else:
+            print(f"{selected.label} · {selected.login}")
+            observations = tuple(report for report in reports if "sessions" in report)
+            for index, report in enumerate(reports):
+                if "sessions" in report:
+                    print("\n".join(_inventory_lines(report)))
+                elif "unreachable" in report:
+                    print(f"{report['machine']}: unreachable")
+                else:
+                    print(f"{report['machine']}: unavailable (rc {report['rc']})")
+                outcome = (_local_shutdown_records(selected.login, report["machine"]) if index == 0
+                           else _remote_shutdown_records(selected.login))
+                record_lines = _shutdown_record_lines(outcome, observations, local_observation=index == 0)
+                if outcome["kind"] == "records":
+                    waiting = any(saved["progress"]["kind"] in {"waiting", "ready"} for saved in outcome["records"])
+                    ownership = (conductor_status(selected.login) if index == 0 else _remote_conductor_status(selected.login)) if waiting else ConductorNotRunning()
+                    record_lines.extend(_status_actions(outcome["records"], ownership))
+                if record_lines:
+                    print("\n".join(record_lines))
+        return 0
+    except InvalidRecord as error:
         print(f"shutdown: {error}", file=sys.stderr)
-        return 2
-    if options.command == "down":
-        return settle.down(
-            selected, options.here, _only_ids(options.only),
-            then="restart" if options.restart else "stop",
-            alerts="none" if options.no_alert else "user",
-            requested_by=options.requested_by, request_id=options.request_id,
-        )
-    if options.command == "now":
-        return settle.now(selected, options.here)
-    if options.command == "cancel":
-        return settle.cancel(selected, options.here)
-    reports, lines = _status(selected, options.here)
-    if options.as_json:
-        print(json.dumps(reports[0] if options.here else reports, sort_keys=True))
-    else:
-        print(f"{selected.label} · {selected.login}")
-        print("\n".join(lines))
-        record_lines = _status_record_lines(
-            selected, options.here, reports[0]["machine"],
-            tuple(report for report in reports if "sessions" in report),
-        )
-        if record_lines:
-            print("\n".join(record_lines))
-    return 0
+        return 3
 
 
 if __name__ == "__main__":

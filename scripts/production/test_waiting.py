@@ -1056,6 +1056,10 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
 
         self.assertIn("listed first in every Waiting on block", " ".join(quota.split()))
         self.assertIn("led by `quota: `", " ".join(quota.split()))
+        nested = " ".join(produce.split("- **Nested showrunners.**", 1)[1].split("- **What reaches the user:**", 1)[0].split())
+        # A lower showrunner's item lives only in its owner's list, so clearing it there is all it takes.
+        self.assertIn("never copy a lower showrunner's item into your own `open_for_user`", nested)
+        self.assertIn("The root's count drops by itself: send the root nothing to drop it.", nested)
         self.assertIn("held quota alerts", open_topics)
         self.assertIn("`- HH:MM <zone>: agenda: <item>`", agenda_words)
         self.assertEqual(agenda_words.count("`For discussion with you`"), 1)

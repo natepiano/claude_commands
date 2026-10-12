@@ -31,10 +31,13 @@ import codex_pacer
 import five_hour
 import note_file
 from note_file import FIELD, Note
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 from agent_accounts import (ClaudeAccountSelection, ClaudeDirectorySource, CodexHomeSource, EASTERN, Report,
-                            codex_email_on_disk, codex_home_display, codex_homes,
+                            codex_home_display, codex_homes,
                             codex_report_in_use, live_reports, seats_home as resolve_seats_home)
-from quota_alert import AgentNote, alert, blocked, current_session, refresh
+from quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
+                         codex_alert_pass)
 from run_out import READINGS_LOG
 import usage_store
 
@@ -259,14 +262,26 @@ def update() -> list[str]:
 
 
 def update_for_selection(selection: ClaudeAccountSelection, seats_home: Path) -> list[str]:
-    """Use one run's role identities for every note and live report."""
+    """Update notes and watch using one live pass."""
+    return list(update_alert_pass(selection, seats_home).messages)
+
+
+@dataclass(frozen=True)
+class UpdatedAgentNotes:
+    messages: tuple[str, ...]
+    codex_readings: CodexAlertPassReadings
+
+
+def update_alert_pass(selection: ClaudeAccountSelection, seats_home: Path) -> UpdatedAgentNotes:
+    """Build the alert readings before writing any note."""
     notes = note_file.read_notes()
-    if not notes:
-        return [f"no agent notes in {note_file.AGENTS_DIR}"]
     multiple_codex_homes = len(codex_homes(seats_home)) > 1
     reports = asyncio.run(live_reports(selection, seats_home))
     checked_at = datetime.now(timezone.utc)
+    codex_readings = codex_alert_pass(seats_home, reports, checked_at)
     messages: list[str] = []
+    if not notes:
+        messages.append(f"no agent notes in {note_file.AGENTS_DIR}")
     try:
         usage_store.save(reports, checked_at)
     except (OSError, ValueError) as error:
@@ -279,7 +294,8 @@ def update_for_selection(selection: ClaudeAccountSelection, seats_home: Path) ->
             if note.tool == "claude" and (login := note.get("login"))
             and selection.roles_for_login(login)
         ))
-    in_use_login = codex_email_on_disk(seats_home)
+    selected_account = codex_readings.selected_account
+    in_use_login = selected_account.login if isinstance(selected_account, KnownCodexAccount) else None
     codex_activity: AccountActivity = (RoleAccountActivity(frozenset({in_use_login.casefold()}))
                                       if in_use_login else UnknownAccountActivity())
     for account in reports:
@@ -289,19 +305,18 @@ def update_for_selection(selection: ClaudeAccountSelection, seats_home: Path) ->
             multiple_codex_homes=multiple_codex_homes,
         )
     try:
-        # The existing 5-hour watcher has one episode per tool. Keep its default
-        # Claude input and the Codex home in use; weekly episodes belong to quota_alert.
+        # Keep the default Claude input; Codex ownership comes from the frozen pass.
         watch_reports = [report for report in reports
                          if (report.tool.lower() != "codex" or codex_report_in_use(report, seats_home))
                          and (report.tool.lower() != "claude" or not selection.multiple_accounts
                               or (report.source.directory == Path.home() / ".claude"
                                   if isinstance(report.source, ClaudeDirectorySource)
                                   else selection.is_default_login(report.email or "")))]
-        messages += five_hour.watch(watch_reports)
+        messages += five_hour.watch(watch_reports, codex_readings=codex_readings)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         # The 5-hour watch must never cost the notes or the weekly alerts.
         messages.append(f"5-hour watch did not run: {error!r}")
-    return messages
+    return UpdatedAgentNotes(tuple(messages), codex_readings)
 
 
 def mark_tier(plan: codex_pacer.Plan) -> None:
@@ -315,8 +330,15 @@ def mark_tier(plan: codex_pacer.Plan) -> None:
 
 
 def main() -> None:
-    if sys.argv[1:] == ["blocked"]:
-        for line in blocked(list(note_file.read_notes())):
+    if sys.argv[1:2] == ["blocked"]:
+        arguments = sys.argv[2:]
+        if len(arguments) == 3:
+            identity = KnownCodexAccount(Path(arguments[0]), arguments[1], arguments[2])
+        elif len(arguments) == 2:
+            identity = UnknownCodexAccount(Path(arguments[0]), arguments[1])
+        else:
+            sys.exit("usage: agent_notes.py blocked HOME LOGIN LABEL | blocked HOME REASON")
+        for line in blocked(list(note_file.read_notes()), identity):
             print(line)
         return
     if sys.argv[1:] not in ([], ["refresh"]):
@@ -326,11 +348,12 @@ def main() -> None:
 
     selection = accounts.claude_account_selection()
     seats_home = resolve_seats_home()
-    for line in update_for_selection(selection, seats_home):
+    updated = update_alert_pass(selection, seats_home)
+    for line in updated.messages:
         print(line)
     notes: list[AgentNote] = list(note_file.read_notes())
-    for line in (refresh(notes, current_session(), selection=selection) if sys.argv[1:]
-                 else alert(notes, selection=selection)):
+    for line in (refresh(notes, current_session(), selection=selection, codex_readings=updated.codex_readings) if sys.argv[1:]
+                 else alert(notes, selection=selection, codex_readings=updated.codex_readings)):
         print(line)
     try:
         mark_tier(codex_pacer.tick(notes))

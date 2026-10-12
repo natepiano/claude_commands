@@ -71,9 +71,13 @@ elif verb == 'compact':
         print('stub turn still live', file=sys.stderr)
         sys.exit(3)
     before = entry.get('context_tokens', 0)
-    entry['context_tokens'] = 12000
+    entry['context_tokens'] = ('not_measured_since_compaction'
+                              if (session / 'compact_reports_zero').exists() else 12000)
     roster_path.write_text(json.dumps(roster))
-    print(f'compacted {name}: {before} -> 12000 tokens')
+    if (session / 'compact_reports_zero').exists():
+        print(f'compacted {name}: {before} tokens, size not measured until its next turn')
+    else:
+        print(f'compacted {name}: {before} -> 12000 tokens')
 elif verb == 'can-follow':
     if entry.get('status') not in ('done', 'failed'):
         print(f'codex_mesh: {name}: seat is busy or not followable; follow refused',
@@ -1181,6 +1185,37 @@ while True:
         )
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn(f"compacted {seat}: 100001 -> 12000 tokens", board)
+
+    def test_review_of_an_unmeasured_seat_does_not_compact_again(self) -> None:
+        session_dir = self.start_implementation("unmeasured-review")
+        self.finish_implementation(session_dir)
+        seat = self.open_seat(session_dir)
+        path = session_dir / "mesh_roster.json"
+        roster = cast(dict[str, dict[str, object]], json.loads(path.read_text(encoding="utf-8")))
+        roster[seat]["context_tokens"] = "not_measured_since_compaction"
+        _ = path.write_text(json.dumps(roster), encoding="utf-8")
+
+        result = self.run_seated_review(session_dir, seat)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
+                         ["can-follow", "follow"])
+        stored = cast(dict[str, dict[str, object]], json.loads(path.read_text(encoding="utf-8")))
+        self.assertEqual(stored[seat]["context_tokens"], "not_measured_since_compaction")
+
+    def test_review_posts_the_unmeasured_compaction_line_unchanged(self) -> None:
+        session_dir = self.start_implementation("compact-unmeasured-line")
+        self.finish_implementation(session_dir)
+        seat = self.open_seat(session_dir, context_tokens=100001)
+        (session_dir / "compact_reports_zero").touch()
+
+        result = self.run_seated_review(session_dir, seat)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
+                         ["compact", "can-follow", "follow"])
+        board = (session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertIn(f"launcher: compacted {seat}: 100001 tokens, size not measured until its next turn", board)
 
     def test_a_seat_left_with_a_live_turn_by_compaction_gets_no_review_follow_up(self) -> None:
         session_dir = self.start_implementation("compact-still-live")

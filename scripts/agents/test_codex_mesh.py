@@ -16,6 +16,7 @@ import argparse
 import base64
 import contextlib
 import dataclasses
+import fcntl
 import io
 import json
 import os
@@ -775,6 +776,204 @@ class MeshCommandTests(unittest.TestCase):
         self.assertTrue(opened, "the failed request must use a client")
         self.assertCountEqual(opened, closed)
 
+    def replacement_record(self) -> dict[str, object]:
+        return {"thread_id": "replacement-thread", "status": "running", "turn_id": "replacement-turn",
+                "context_tokens": 777, "role": "test", "launcher_pid": os.getpid(),
+                "port": self.server.port, "instructions_file": "replacement-instructions.txt"}
+
+    def replace_seat(self, name: str = "seat") -> dict[str, object]:
+        entries = self.roster()
+        previous = _as_test_dict(entries.get(name))
+        entries[name] = {**previous, "status": "ended"}
+        self.write_pool_roster(entries)
+        replacement = self.replacement_record()
+        entries[name] = replacement
+        self.write_pool_roster(entries)
+        return replacement
+
+    def test_old_launcher_normal_end_preserves_the_replacement_roster(self) -> None:
+        replacement = self.replacement_record()
+        def replace_at_end(_port: int, _thread_id: str, _log_path: Path) -> codex_mesh.RelaunchAllowed:
+            self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
+            self.assertEqual(self.replace_seat(), replacement)
+            return codex_mesh.RelaunchAllowed()
+        with patch.object(codex_mesh, "_end_unwatched_turn", side_effect=replace_at_end):
+            code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record(), replacement)
+
+    def test_old_launcher_exception_preserves_the_replacement_roster(self) -> None:
+        original = codex_mesh.Client.next_frame
+        replacement = self.replacement_record()
+        failed = [False]
+        def fail_after_replacement(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            if not failed[0]:
+                failed[0] = True
+                self.assertEqual(self.replace_seat(), replacement)
+                raise ConnectionError("invented stream failure")
+            return original(client, deadline)
+        with patch.object(codex_mesh.Client, "next_frame", fail_after_replacement):
+            code, errors = self.run_start()
+        self.assertEqual(code, 1)
+        self.assertIn("invented stream failure", errors)
+        self.assertEqual(self.seat_record(), replacement)
+
+    def test_old_thread_start_and_token_notices_preserve_every_replacement_field(self) -> None:
+        original = codex_mesh.Client.next_frame
+        replacement = self.replacement_record()
+        notices = [
+            codex_mesh.RpcMessage(method="turn/started", params={"threadId": THREAD_ID, "turn": {"id": "turn-1"}}),
+            codex_mesh.RpcMessage(method="thread/tokenUsage/updated", params={"threadId": THREAD_ID, "turnId": "turn-1",
+                                 "tokenUsage": {"last": {"inputTokens": 99999}, "total": {"inputTokens": 0}}}),
+        ]
+        observed: list[dict[str, object]] = []
+        def next_frame(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            if len(notices) == 2:
+                self.assertEqual(self.replace_seat(), replacement)
+            else:
+                observed.append(self.seat_record())
+            if notices:
+                return notices.pop(0)
+            return original(client, deadline)
+        with patch.object(codex_mesh.Client, "next_frame", next_frame):
+            code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertGreaterEqual(len(observed), 2)
+        for entry in observed:
+            self.assertEqual(entry, replacement)
+        self.assertEqual(self.seat_record(), replacement)
+
+    def test_compaction_reply_after_replacement_preserves_its_context_and_identity(self) -> None:
+        self.context_sizes = [150000]
+        self.assertEqual(self.run_start()[0], 0)
+        replacement = self.replacement_record()
+        respond = self.respond
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            frames = respond(request)
+            if request.get("method") == "thread/compact/start":
+                self.assertEqual(self.replace_seat(), replacement)
+            return frames
+        self.server.respond = reply
+        code, output, errors = self.run_mesh(["compact", "--to", "seat"])
+        self.assertEqual((code, output, errors), (0, "compacted seat: 150000 -> 20000 tokens\n", ""))
+        self.assertEqual(self.seat_record(), replacement)
+
+    def test_compaction_checks_ownership_after_acquiring_the_roster_lock(self) -> None:
+        self.context_sizes = [150000]
+        self.assertEqual(self.run_start()[0], 0)
+        replacement = self.replacement_record()
+        armed = [False]
+        writes = [0]
+        flock = fcntl.flock
+        respond = self.respond
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            frames = respond(request)
+            if request.get("method") == "thread/compact/start":
+                armed[0] = True
+            return frames
+        def acquire(descriptor: int, operation: int) -> None:
+            path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+            if armed[0] and operation == fcntl.LOCK_EX and path.name == codex_mesh.ROSTER_FILE:
+                armed[0] = False
+                with path.open("r+") as other:
+                    flock(other.fileno(), fcntl.LOCK_EX)
+                    entries = cast(dict[str, object], json.loads(other.read()))
+                    entries["seat"] = replacement
+                    _ = other.seek(0)
+                    _ = other.truncate()
+                    _ = other.write(json.dumps(entries))
+                    other.flush()
+                    flock(other.fileno(), fcntl.LOCK_UN)
+                writes[0] += 1
+            flock(descriptor, operation)
+        self.server.respond = reply
+        with patch.object(fcntl, "flock", acquire):
+            code, output, errors = self.run_mesh(["compact", "--to", "seat"])
+        self.assertEqual((code, output, errors), (0, "compacted seat: 150000 -> 20000 tokens\n", ""))
+        self.assertEqual(writes[0], 1)
+        self.assertEqual(self.seat_record(), replacement)
+
+    def test_steer_on_the_same_thread_keeps_fields_and_records_the_live_turn(self) -> None:
+        original = {**self.replacement_record(), "thread_id": THREAD_ID, "turn_id": "stale-turn"}
+        self.write_pool_roster({"seat": original})
+        calls = [0]
+        respond = self.respond
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/steer":
+                calls[0] += 1
+                if calls[0] == 1:
+                    return [{"id": request["id"], "error": {"message": "expected turn, but found `live-turn`"}}]
+                return [_reply(request, {})]
+            return respond(request)
+        self.server.respond = reply
+        code, output, errors = self.run_mesh(["steer", "--to", "seat", "--message", "invented correction"])
+        self.assertEqual((code, output, errors), (0, "steered seat\n", ""))
+        self.assertEqual(self.seat_record(), {**original, "turn_id": "live-turn"})
+
+    def test_steer_reply_after_replacement_preserves_its_context_and_identity(self) -> None:
+        self.write_pool_roster({"seat": {"thread_id": THREAD_ID, "status": "running",
+                                      "turn_id": "stale-turn", "context_tokens": 150000,
+                                      "port": self.server.port}})
+        replacement = self.replacement_record()
+        calls = [0]
+        respond = self.respond
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/steer":
+                calls[0] += 1
+                if calls[0] == 1:
+                    return [{"id": request["id"], "error": {"message": "expected turn, but found `live-turn`"}}]
+                self.assertEqual(self.replace_seat(), replacement)
+                return [_reply(request, {})]
+            return respond(request)
+        self.server.respond = reply
+        code, output, errors = self.run_mesh(["steer", "--to", "seat", "--message", "invented correction"])
+        self.assertEqual((code, output, errors), (0, "steered seat\n", ""))
+        self.assertEqual(calls[0], 2)
+        self.assertEqual(self.seat_record(), replacement)
+
+    def taken_fork(self, *, release_unknown: bool, initially_absent: bool = False) -> tuple[int, str, str]:
+        entries: dict[str, object] = {"template": {"thread_id": THREAD_ID, "status": "done"}}
+        if not initially_absent:
+            entries["reviewer"] = {"thread_id": "ended-thread", "status": "ended"}
+        self.write_pool_roster(entries)
+        self.server.requests.clear()
+        marker = self.session_dir / "reviewer.end"
+        pending = self.session_dir / "reviewer.pending.json"
+        _ = marker.write_text("replacement marker\n", encoding="utf-8")
+        _ = pending.write_text('{"messages": ["replacement message"]}\n', encoding="utf-8")
+        respond = self.respond
+        replacement = self.replacement_record()
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            frames = respond(request)
+            if request.get("method") == "thread/name/set":
+                self.assertEqual(self.replace_seat("reviewer"), replacement)
+            if request.get("method") == "thread/unsubscribe" and release_unknown:
+                return [{"id": request["id"], "error": {"message": "invented release refusal"}}]
+            return frames
+        self.server.respond = reply
+        result = self.run_mesh(["fork", "--from", "template", "--name", "reviewer"])
+        self.assertEqual(self.roster()["reviewer"], replacement)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "replacement marker\n")
+        self.assertEqual(pending.read_text(encoding="utf-8"), '{"messages": ["replacement message"]}\n')
+        self.assertEqual([_as_test_dict(request["params"]).get("threadId")
+                          for request in self.methods("thread/unsubscribe")], [self.fork_thread_id])
+        return result
+
+    def test_fork_taken_during_request_releases_only_its_new_thread_and_refuses(self) -> None:
+        for initially_absent in (False, True):
+            with self.subTest(initially_absent=initially_absent):
+                code, output, errors = self.taken_fork(release_unknown=False, initially_absent=initially_absent)
+                self.assertEqual((code, output, errors), (2, "",
+                                 "codex_mesh: reviewer: name was taken while the fork ran; fork refused\n"))
+
+    def test_fork_taken_during_request_reports_unconfirmed_release_without_touching_replacement(self) -> None:
+        code, output, errors = self.taken_fork(release_unknown=True)
+        self.assertEqual((code, output), (1, ""))
+        self.assertEqual(errors, f"codex_mesh: reviewer: name was taken while the fork ran; "
+                         + f"fork thread {self.fork_thread_id} not released: "
+                         + 'old thread release could not be confirmed: codex_mesh: thread/unsubscribe failed: '
+                         + '{"message": "invented release refusal"}\n')
+
     def test_prime_creates_and_names_a_read_only_review_template_without_a_turn(self) -> None:
         arguments = self.prime_cli("--model", "gpt-test", "--service-tier", "fast")
         instructions = (self.session_dir / "review-instructions.txt").read_text(encoding="utf-8")
@@ -795,6 +994,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(requests[1]["params"], {"threadId": THREAD_ID, "name": "template"})
         self.assert_review_record("template", THREAD_ID)
         self.assertEqual(self.roster()["other"], {"thread_id": "other-thread", "status": "done"})
+        self.assertEqual(_as_test_dict(self.roster()["template"]).get("context_tokens"), 0)
         self.assertEqual(self.methods("turn/start"), [])
 
     def test_prime_accepts_omitted_model_and_service_tier(self) -> None:
@@ -1568,6 +1768,87 @@ class MeshCommandTests(unittest.TestCase):
         follow_params = cast("dict[str, object]", starts[1]["params"])
         self.assertEqual(follow_params["model"], "gpt-test")
 
+    def follow_with_name_taken(self, take_at: str, *, release_unknown: bool = False) -> tuple[int, str]:
+        self.write_pool_roster({"seat": {"thread_id": "old-follow-thread", "status": "done",
+                                       "role": "impl", "context_tokens": 123, "port": self.server.port}})
+        replacement = self.replacement_record()
+        marker = self.session_dir / "seat.end"
+        pending = self.session_dir / "seat.pending.json"
+        marker_text = "new owner's end marker\n"
+        pending_text = json.dumps({"thread_id": replacement["thread_id"], "messages": ["new owner's message"]})
+        respond = self.respond
+        taken = [False]
+
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            method = request.get("method")
+            if method == take_at:
+                taken[0] = True
+                self.assertEqual(self.replace_seat(), replacement)
+                _ = marker.write_text(marker_text, encoding="utf-8")
+                _ = pending.write_text(pending_text, encoding="utf-8")
+            if method == "thread/resume":
+                return [{"id": request["id"], "error": {"message": "invented resume refusal"}}]
+            if method == "thread/unsubscribe" and release_unknown:
+                return [{"id": request["id"], "error": {"message": "invented release refusal"}}]
+            return respond(request)
+
+        self.server.respond = reply
+        result = self.run_follow()
+        self.assertTrue(taken[0])
+        self.assertEqual(self.seat_record(), replacement)
+        self.assertEqual(marker.read_text(encoding="utf-8"), marker_text)
+        self.assertEqual(pending.read_text(encoding="utf-8"), pending_text)
+        self.assertEqual([_as_test_dict(request["params"]).get("threadId")
+                          for request in self.methods("thread/unsubscribe")], [THREAD_ID])
+        self.assertEqual(self.methods("turn/start"), [])
+        self.assertNotIn(THREAD_ID, [record["id"] for record in self.usage_records()])
+        if take_at == "thread/resume":
+            self.assertEqual(self.methods("thread/name/set"), [])
+            board = self.session_dir / "board.log"
+            self.assertNotIn("seat continues as new thread", board.read_text() if board.exists() else "")
+        return result
+
+    def test_follow_name_taken_during_resume_releases_fallback_without_touching_new_owner(self) -> None:
+        code, errors = self.follow_with_name_taken("thread/resume")
+        self.assertEqual((code, errors), (1, "codex_mesh: seat: name was taken while the follow-up ran; "
+                                         + "follow-up did not start\n"))
+
+    def test_follow_name_taken_after_fallback_is_named_releases_it_without_starting_a_turn(self) -> None:
+        code, errors = self.follow_with_name_taken("thread/name/set")
+        self.assertEqual((code, errors), (1, "codex_mesh: seat: name was taken while the follow-up ran; "
+                                         + "follow-up did not start\n"))
+
+    def test_follow_name_taken_reports_unconfirmed_fallback_release_and_keeps_new_owner(self) -> None:
+        code, errors = self.follow_with_name_taken("thread/resume", release_unknown=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(errors, "codex_mesh: seat: name was taken while the follow-up ran; "
+                         + f"replacement thread {THREAD_ID} not released: "
+                         + "old thread release could not be confirmed: codex_mesh: thread/unsubscribe failed: "
+                         + '{"message": "invented release refusal"}\n')
+
+    def test_follow_refused_resume_without_replacement_owner_runs_on_the_fallback_thread(self) -> None:
+        self.write_pool_roster({"seat": {"thread_id": "old-follow-thread", "status": "done",
+                                       "role": "impl", "context_tokens": 123, "port": self.server.port}})
+        respond = self.respond
+
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/resume":
+                return [{"id": request["id"], "error": {"message": "invented resume refusal"}}]
+            return respond(request)
+
+        self.server.respond = reply
+        self.assertEqual(self.run_follow(), (0, ""))
+        self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertEqual(self.seat_record()["context_tokens"], 123)
+        self.assertEqual([_as_test_dict(request["params"]).get("threadId")
+                          for request in self.methods("thread/name/set")], [THREAD_ID])
+        self.assertEqual([_as_test_dict(request["params"]).get("threadId")
+                          for request in self.methods("turn/start")], [THREAD_ID])
+        self.assertEqual([record["id"] for record in self.usage_records()], ["old-follow-thread", THREAD_ID])
+        self.assertIn(f"seat continues as new thread {THREAD_ID}",
+                      (self.session_dir / "board.log").read_text(encoding="utf-8"))
+
     def test_start_records_the_assigned_role(self) -> None:
         code, errors = self.run_start()
 
@@ -1819,6 +2100,83 @@ class MeshCommandTests(unittest.TestCase):
         self.assertIn("compact requires a finished seat", errors.getvalue())
         self.assertEqual(self.methods("thread/compact/start"), [])
 
+    def compact_with_zero_usage(self) -> dict[str, object]:
+        self.context_sizes = [150000]
+        self.compact_after_tokens = 0
+        self.assertEqual(self.run_start()[0], 0)
+        code, output, errors = self.run_mesh(["compact", "--to", "seat"])
+        self.assertEqual((code, output, errors), (
+            0, "compacted seat: 150000 tokens, size not measured until its next turn\n", "",
+        ))
+        record = self.seat_record()
+        self.assertEqual(record.get("context_tokens"), "not_measured_since_compaction")
+        return record
+
+    def test_zero_compaction_reports_an_unmeasured_size_and_list_keeps_three_fields(self) -> None:
+        _ = self.compact_with_zero_usage()
+        code, output, errors = self.run_mesh(["list"])
+        self.assertEqual((code, output, errors), (0, f"seat\tdone\t{THREAD_ID}\n", ""))
+
+    def test_next_turn_usage_replaces_the_unmeasured_compaction_size(self) -> None:
+        _ = self.compact_with_zero_usage()
+        self.context_sizes = [23456]
+        self.assertEqual(self.run_follow(), (0, ""))
+        self.assertEqual(self.seat_record()["context_tokens"], 23456)
+
+    def test_follow_up_without_usage_keeps_the_unmeasured_compaction_size(self) -> None:
+        original = self.compact_with_zero_usage()
+        self.assertEqual(self.run_follow(), (0, ""))
+        self.assertEqual(self.seat_record().get("context_tokens"), original.get("context_tokens"))
+
+    def test_roster_writes_without_size_preserve_the_unmeasured_compaction_state(self) -> None:
+        original = self.compact_with_zero_usage()
+        codex_mesh._update_roster(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "failed",
+        })
+        self.assertEqual(self.seat_record(), {**original, "status": "failed"})
+        self.assertTrue(codex_mesh._update_roster_if_expected(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "done",
+        }, codex_mesh.RosterOnThread(THREAD_ID)))
+        self.assertEqual(self.seat_record(), original)
+        codex_mesh._update_roster(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "ended",
+        })
+        ended = self.seat_record()
+        self.assertTrue(codex_mesh._update_roster_if_expected(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "done",
+        }, codex_mesh.RosterOnThread(THREAD_ID)))
+        self.assertEqual(self.seat_record(), ended)
+        self.assertEqual(ended.get("context_tokens"), original.get("context_tokens"))
+
+    def test_reset_replaces_unmeasured_compaction_state_with_measured_zero(self) -> None:
+        _ = self.compact_with_zero_usage()
+        code, _output, errors = self.run_mesh(["reset", "--to", "seat"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["context_tokens"], 0)
+
+    def test_failed_compaction_keeps_the_complete_recorded_size(self) -> None:
+        self.context_sizes = [150000]
+        self.assertEqual(self.run_start()[0], 0)
+        original = self.seat_record()
+        self.failing_method = "thread/compact/start"
+        code, output, errors = self.run_mesh(["compact", "--to", "seat"])
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("scripted request failure", errors)
+        self.assertEqual(self.seat_record(), original)
+
+    def test_roster_writes_without_size_keep_a_measured_size(self) -> None:
+        self.context_sizes = [150000]
+        self.assertEqual(self.run_start()[0], 0)
+        original = self.seat_record()
+        codex_mesh._update_roster(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "failed",
+        })
+        self.assertEqual(self.seat_record(), {**original, "status": "failed"})
+        self.assertTrue(codex_mesh._update_roster_if_expected(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "done",
+        }, codex_mesh.RosterOnThread(THREAD_ID)))
+        self.assertEqual(self.seat_record(), original)
+
     def test_compact_waits_for_compaction_and_records_the_smaller_context(self) -> None:
         self.context_sizes = [150000]
         self.compact_after_tokens = 18000
@@ -1950,6 +2308,277 @@ class MeshCommandTests(unittest.TestCase):
         )
         board = (self.session_dir / "board.log").read_text(encoding="utf-8")
         self.assertEqual(board.count("context window filled; sent"), 1)
+
+    def prepare_refusing_account(self) -> agent_accounts.KnownCodexAccount:
+        home = self.session_dir / "account-home"
+        home.mkdir()
+        notes = home / "notes"
+        notes.mkdir()
+        _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"HOME": str(home), "AGENT_NOTES_DIR": str(notes)})))
+        selected = home / ".codex"
+        selected.mkdir()
+        login = "serving@example.invalid"
+        claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
+        _ = (selected / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        _ = (notes / "codex 2.md").write_text(f"---\nlogin: {login}\n---\n")
+        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
+            "port": self.server.port, "pid": os.getpid(), "codex_home": str(selected),
+        }))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, True)))
+        return agent_accounts.KnownCodexAccount(selected, login, "codex 2")
+
+    def quota_completion(self, request: dict[str, object]) -> list[dict[str, object]]:
+        params = cast(dict[str, object], request["params"])
+        return [_reply(request, {"turn": {"id": "quota-turn"}}),
+                _notice("turn/completed", {"threadId": params["threadId"],
+                    "turn": {"id": "quota-turn", "error": {"message": USAGE_LIMIT}}})]
+
+    def assert_reset_failure_names_serving_account(self, method: str) -> None:
+        account = self.prepare_refusing_account()
+        self.write_pool_roster({"seat": {
+            "thread_id": THREAD_ID, "status": "done", "role": "review", "context_tokens": 9876,
+        }})
+        self.failing_method = method
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            code, _output, errors = self.run_mesh(["reset", "--to", "seat"])
+        self.assertEqual(code, 1, errors)
+        self.assertIn(account.label, errors)
+        self.assertIn(agent_accounts.codex_home_display(account.home), errors)
+        self.assertIn("scripted request failure", errors)
+        self.assertEqual(self.seat_record()["context_tokens"], 9876)
+        self.assertNotIn("launcher_pid", self.seat_record())
+        report.assert_not_called()
+
+    def test_reset_thread_read_failure_names_the_serving_account_and_home(self) -> None:
+        self.assert_reset_failure_names_serving_account("thread/read")
+
+    def test_reset_turn_list_failure_names_the_serving_account_and_home(self) -> None:
+        self.assert_reset_failure_names_serving_account("thread/turns/list")
+
+    def test_client_without_a_binding_uses_a_named_server_state(self) -> None:
+        account = self.prepare_refusing_account()
+        client = codex_mesh.Client(self.server.port, "seat")
+        try:
+            self.assertIsInstance(client.serving, codex_mesh.NotBoundCodexServer)
+            self.assertEqual(client.serving.home, account.home)
+        finally:
+            client.close()
+
+    def test_refusal_without_a_server_record_retains_an_unknown_account_at_the_selected_home(self) -> None:
+        account = self.prepare_refusing_account()
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            return self.quota_completion(request) if request.get("method") == "turn/start" else original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            self.assertEqual(self.run_start()[0], 1)
+        report.assert_called_once()
+        serving = cast(codex_mesh.CodexServingState, cast(object, report.call_args.args[1]))
+        self.assertIsInstance(serving, codex_mesh.NotBoundCodexServer)
+        self.assertIsInstance(serving.account, agent_accounts.UnknownCodexAccount)
+        self.assertEqual(serving.account.home, account.home)
+        self.assertNotEqual(str(serving.account.home), ".")
+
+    def test_attaching_to_a_fresh_server_keeps_start_tracking_unchanged(self) -> None:
+        _ = self.prepare_refusing_account()
+        started: set[tuple[int, int]] = set()
+        with patch.object(codex_mesh, "_STARTED_SERVERS", started):
+            self.assertEqual(self.run_start()[0], 0)
+        self.assertEqual(started, set())
+
+    def test_started_refusal_keeps_the_account_after_its_server_record_disappears(self) -> None:
+        account = self.prepare_refusing_account()
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+                return self.quota_completion(request)
+            return original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            code, _errors = self.run_start()
+        self.assertEqual(code, 1)
+        report.assert_called_once()
+        serving = cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1]))
+        self.assertEqual(serving.account, account)
+        self.assertEqual((serving.port, serving.pid, serving.home), (self.server.port, os.getpid(), account.home))
+
+    def test_late_refusal_keeps_the_outgoing_account_when_a_port_record_is_reused(self) -> None:
+        account = self.prepare_refusing_account()
+        next_home = account.home.parent / ".codex1"
+        next_home.mkdir()
+        login = "next@example.invalid"
+        claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
+        _ = (next_home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        _ = (account.home.parent / "notes" / "codex 1.md").write_text(f"---\nlogin: {login}\n---\n")
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+                _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
+                    "port": self.server.port, "pid": os.getpid() + 1, "codex_home": str(next_home),
+                }))
+                return self.quota_completion(request)
+            return original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            self.assertEqual(self.run_start()[0], 1)
+        report.assert_called_once()
+        self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account, account)
+        self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).pid, os.getpid())
+        self.assertEqual(agent_accounts.seats_home(), next_home)
+
+    def test_followed_turn_reports_its_refusing_account_once(self) -> None:
+        account = self.prepare_refusing_account()
+        self.assertEqual(self.run_start()[0], 0)
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            return self.quota_completion(request) if request.get("method") == "turn/start" else original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            self.assertEqual(self.run_follow()[0], 1)
+        report.assert_called_once()
+        self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account, account)
+
+    def test_parked_message_turn_reports_its_refusing_account_once(self) -> None:
+        account = self.prepare_refusing_account()
+        original = self.respond
+        starts = [0]
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                starts[0] += 1
+                if starts[0] == 2:
+                    _ = (self.session_dir / "seat.end").write_text("end")
+                    return self.quota_completion(request)
+            return original(request)
+        self.server.respond = respond
+        next_frame = codex_mesh.Client.next_frame
+        parked = [False]
+        def park(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            frame = next_frame(client, deadline)
+            if frame and frame.get("method") == "turn/completed" and not parked[0]:
+                parked[0] = True
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(codex_mesh.command_send(argparse.Namespace(
+                        session_dir=str(self.session_dir), to="seat", message="Parked task", message_file="")), 0)
+            return frame
+        args = self.start_args()
+        args.resident = True
+        args.timeout = 1
+        with patch.object(codex_mesh.Client, "next_frame", park), \
+                patch.object(codex_mesh, "_report_quota_refusal") as report, contextlib.redirect_stderr(io.StringIO()):
+            _ = codex_mesh.command_start(args)
+        self.assertEqual(starts[0], 2)
+        report.assert_called_once()
+        self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account, account)
+        self.assertIn("Parked task", str(self.methods("turn/start")[1]))
+
+    def test_submission_refusal_reports_the_serving_account_once(self) -> None:
+        account = self.prepare_refusing_account()
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                return [{"id": request["id"], "error": {"message": USAGE_LIMIT}}]
+            return original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            self.assertEqual(self.run_start()[0], 1)
+        report.assert_called_once()
+        self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account, account)
+
+    def test_failed_fork_preserves_the_account_without_reporting_a_turn_refusal(self) -> None:
+        _ = self.prepare_refusing_account()
+        self.write_pool_roster({"template": {"thread_id": THREAD_ID, "status": "done"}})
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/fork":
+                return [{"id": request["id"], "error": {"message": USAGE_LIMIT}}]
+            return original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            code, _out, errors = self.run_mesh(["fork", "--from", "template", "--name", "reviewer"])
+        self.assertEqual(code, 1)
+        self.assertIn(USAGE_LIMIT, errors)
+        report.assert_not_called()
+
+    def test_unproven_fast_refusal_does_not_report_or_open_fallback(self) -> None:
+        _ = self.prepare_refusing_account()
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            return self.quota_completion(request) if request.get("method") == "turn/start" else original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, False)), \
+                patch.object(codex_mesh, "_report_quota_refusal") as report:
+            self.assertEqual(self.run_start()[0], 1)
+        report.assert_not_called()
+
+    def test_unreadable_serving_sign_in_reports_an_explicit_unknown_account(self) -> None:
+        account = self.prepare_refusing_account()
+        (account.home / "auth.json").unlink()
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            return self.quota_completion(request) if request.get("method") == "turn/start" else original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            self.assertEqual(self.run_start()[0], 1)
+        report.assert_called_once()
+        unknown = cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account
+        self.assertIsInstance(unknown, agent_accounts.UnknownCodexAccount)
+        self.assertEqual(unknown.home, account.home)
+
+    def test_replacement_conversations_first_refusal_names_the_target_account(self) -> None:
+        target, new = self.prepare_seats_move()
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/resume":
+                return [{"id": request["id"], "error": {"message": "thread cannot resume"}}]
+            if request.get("method") == "turn/start":
+                return self.quota_completion(request)
+            return original(request)
+        new.respond = respond
+        def wait(seconds: float) -> None:
+            self.wait(seconds)
+            self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+            self.next_thread_id = "replacement-thread"
+        self.outcomes = ["capacity"]
+        with patch.object(codex_mesh, "_capacity_sleep", side_effect=wait), \
+                patch.object(codex_mesh, "_report_quota_refusal") as report:
+            self.assertEqual(self.run_start()[0], 1)
+        report.assert_called_once()
+        serving = cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1]))
+        self.assertEqual(serving.home, target)
+        self.assertIsInstance(serving.account, agent_accounts.KnownCodexAccount)
+        assert isinstance(serving.account, agent_accounts.KnownCodexAccount)
+        self.assertEqual(serving.account.label, "codex 1")
+        target_starts = [request for request in new.requests if request.get("method") == "turn/start"]
+        self.assertEqual(len(target_starts), 1)
+        self.assertIn("replacement-thread", str(target_starts[0]))
+
+    def test_release_refusal_does_not_report_a_provider_turn_refusal(self) -> None:
+        _target, new = self.prepare_seats_move()
+        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "seat": {"thread_id": THREAD_ID, "port": self.server.port, "status": "running"},
+        }))
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/unsubscribe":
+                return [{"id": request["id"], "error": {"message": USAGE_LIMIT}}]
+            if request.get("method") == "thread/loaded/list":
+                return [_reply(request, {"data": [THREAD_ID]})]
+            return original(request)
+        self.server.respond = respond
+        client = codex_mesh.Client(self.server.port, "seat")
+        try:
+            with patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", 0.02), \
+                    patch.object(codex_mesh, "_report_quota_refusal") as report:
+                result = codex_mesh._move_resident(self.start_args(), str(self.session_dir), "seat", THREAD_ID, client)  # pyright: ignore[reportPrivateUsage]
+        finally:
+            client.close()
+        self.assertIsInstance(result, codex_mesh.SeatThreadStateUnknown)
+        report.assert_not_called()
+        self.assertFalse(any(request.get("method") == "turn/start" for request in new.requests))
 
     def prepare_seats_move(self) -> tuple[Path, StubAppServer]:
         home = self.session_dir / "home"
@@ -3320,17 +3949,19 @@ class QuotaRefusalTests(unittest.TestCase):
         self.assertFalse(self.refused(codex_mesh.CapacityRetriesExhausted(THREAD_ID, 3, 20), tested=True))
 
     def test_the_report_runs_the_blocked_verb_and_survives_its_failure(self) -> None:
+        identity = agent_accounts.KnownCodexAccount(Path.home() / ".codex", "serving@example.invalid", "codex 1")
+        serving = codex_mesh.ServingCodexServer(4001, 99, identity.home, identity)
         done = subprocess.CompletedProcess([], 0, "switched to claude for codex 1: delegate\n", "")
         with patch.object(subprocess, "run", return_value=done) as run, \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
-            codex_mesh._report_quota_refusal("seat")  # pyright: ignore[reportPrivateUsage]
+            codex_mesh._report_quota_refusal("seat", serving)  # pyright: ignore[reportPrivateUsage]
         command = cast("list[str]", run.call_args.args[0])
-        self.assertEqual(command[1:], [str(codex_mesh.QUOTA_REPORT), "blocked"])
+        self.assertEqual(command[1:], [str(codex_mesh.QUOTA_REPORT), "blocked", str(identity.home), identity.login, identity.label])
         self.assertTrue(codex_mesh.QUOTA_REPORT.is_file())
         self.assertIn("codex_mesh: seat: quota: switched to claude for codex 1: delegate", errors.getvalue())
         with patch.object(subprocess, "run", side_effect=OSError("no interpreter")), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
-            codex_mesh._report_quota_refusal("seat")  # pyright: ignore[reportPrivateUsage]
+            codex_mesh._report_quota_refusal("seat", serving)  # pyright: ignore[reportPrivateUsage]
         self.assertIn("quota refusal not reported: no interpreter", errors.getvalue())
 
 
@@ -4154,6 +4785,11 @@ class SignInChangeTests(unittest.TestCase):
 
             def __init__(self, port: int, _name: str) -> None:
                 self.port = port
+                home = Path("/fixture/codex")
+                self.serving: codex_mesh.ServingCodexServer = codex_mesh.ServingCodexServer(
+                    port, 0, home, agent_accounts.UnknownCodexAccount(home, "fixture has no sign-in"))
+                self.name: str = _name
+                self.turn_submitted_at: float = 0.0
                 self.closed = False
                 clients.append(self)
 
@@ -4230,6 +4866,11 @@ class SignInChangeTests(unittest.TestCase):
         class ResumeClient:
             def __init__(self, port: int, _name: str) -> None:
                 self.port: int = port
+                home = Path("/fixture/codex")
+                self.serving: codex_mesh.ServingCodexServer = codex_mesh.ServingCodexServer(
+                    port, 0, home, agent_accounts.UnknownCodexAccount(home, "fixture has no sign-in"))
+                self.name: str = _name
+                self.turn_submitted_at: float = 0.0
             def call(self, method: str, _params: dict[str, object], **_options: object) -> dict[str, object]:
                 calls.append((self.port, method))
                 if method == "thread/read":
@@ -4278,6 +4919,11 @@ class SignInChangeTests(unittest.TestCase):
         class MigrationClient:
             def __init__(self, port: int, _name: str) -> None:
                 self.port: int = port
+                home = Path("/fixture/codex")
+                self.serving: codex_mesh.ServingCodexServer = codex_mesh.ServingCodexServer(
+                    port, 0, home, agent_accounts.UnknownCodexAccount(home, "fixture has no sign-in"))
+                self.name: str = _name
+                self.turn_submitted_at: float = 0.0
             def call(self, method: str, params: dict[str, object], **_options: object) -> dict[str, object]:
                 calls.append((self.port, method))
                 if method == "thread/read":
@@ -4313,6 +4959,12 @@ class SignInChangeTests(unittest.TestCase):
         calls: list[str] = []
         class HeldClient:
             port: int = 4001
+            def __init__(self) -> None:
+                home = Path("/fixture/codex")
+                self.serving: codex_mesh.ServingCodexServer = codex_mesh.ServingCodexServer(
+                    self.port, 0, home, agent_accounts.UnknownCodexAccount(home, "fixture has no sign-in"))
+                self.name: str = "seat"
+                self.turn_submitted_at: float = 0.0
             def call(self, method: str, params: dict[str, object], **_options: object) -> dict[str, object]:
                 calls.append(method)
                 if method == "thread/read":

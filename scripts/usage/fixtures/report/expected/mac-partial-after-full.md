@@ -32,6 +32,7 @@ Not read in full:
 | mac | codex | partial | {{mac.codex.complete}} |  |
 | mac | history | partial | {{mac.history.complete}} |  |
 | mac | role log | missing | {{mac.roles.read}} |  |
+| natedev | baseline_readings | missing | never |  |
 
 | machine | family | state | last read | details |
 | --- | --- | --- | --- | --- |

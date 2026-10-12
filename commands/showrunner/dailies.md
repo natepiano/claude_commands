@@ -1,6 +1,6 @@
 ---
 description: Report a running production's state to the executive producer (the user) — every unit and every open topic — at one of four lengths, gantt (default: the chart, with only what needs the user and what changed), simple, page or elaborate.
-argument-hint: "[gantt|simple|page|elaborate] [default|ascii]"
+argument-hint: "[gantt|simple|page|elaborate] [default|ascii] [expand <child|all>]"
 ---
 
 # Dailies
@@ -11,7 +11,7 @@ producer: the user. Run it in the showrunner session during `/showrunner:produce
 whose state (`PRODUCTION_DOC`, `LOG`, `ZONE`, `UNITS`, `CHECKOUT`,
 `MERGE_BRANCH`, `NOTIFIER`, `UPDATES`) it uses.
 
-**Usage:** `/showrunner:dailies [gantt|simple|page|elaborate] [default|ascii]`. With
+**Usage:** `/showrunner:dailies [gantt|simple|page|elaborate] [default|ascii] [expand <child|all>]`. With
 no length, `gantt`. With any other argument, name the choices and stop.
 
 **Chart mode.** `default` draws the timeline in coloured squares; `ascii`
@@ -22,6 +22,15 @@ reads, so no session remembers it. A mode argument sets it before the report:
 run `python3 ~/.claude/scripts/production/dailies_render.py --chart <mode>`.
 So do your words: "ascii mode", "switch back to default". It holds until
 changed. User, 2026-10-03.
+
+**Productions below this one.** When other showrunners report to yours
+(`/showrunner:attach`), the chart ends with one row for each production
+directly below you, drawn from the report that production last saved. You
+gather nothing for it and write it no judgment entry. `expand <child>` adds
+that production's own rows under its row, as `<child>/<row>`; `expand all`
+does it for every one. Pass each as `--expand <child>` or `--expand all` to
+the input builder, which refuses a name that is not directly below you and
+lists the ones that are. User, 2026-10-09.
 
 ## Status check and clock
 
@@ -66,7 +75,10 @@ Read the current state, not memory, and check what you state the way
    stays as stated, unless a new one was already asked for before the hold:
    that one is not brought back. A unit whose run has finished and that shows
    no form and no open question needs no entry: the builder leaves it out of the report and
-   names it in a `left out` line. Supply the phase, started time, current update, and ETA
+   names it in a `left out` line. When it leaves out every unit, the report
+   still renders: in place of the chart it says `No unit is working: every run
+   has finished.`, and it keeps its topics, a row for each production below
+   you and its footer. Supply the phase, started time, current update, and ETA
    numbers from the unit's plan and reports. Text after `❯` may be a prompt
    suggestion, not the user's draft:
    `capture-pane -e` shows a suggestion dimmed (`ESC[2m`).
@@ -108,7 +120,7 @@ python3 ~/.claude/scripts/production/dailies_input.py \
   --production <PRODUCTION_DOC> --status <scratchpad>/unit_status.txt \
   --judgment <scratchpad>/dailies_judgment.json --state-dir <scratchpad>/dailies_input_state \
   --out <scratchpad>/dailies_input.json --length <gantt|simple|page|elaborate> \
-  --render-state <scratchpad>/dailies_state.json [--user-run]
+  --render-state <scratchpad>/dailies_state.json [--user-run] [--expand <child|all>]
 python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_input.json \
   --state <scratchpad>/dailies_state.json --log <LOG> --outstanding <OUTSTANDING>
 ```
@@ -121,6 +133,12 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
   that report shows no change notes.
 - `--log` appends the `dailies ETAs:` line to `LOG`, so the next report can
   compare. Write no such line by hand.
+- Every builder run also saves
+  `~/.local/state/showrunner/<slug>/dailies_last.json`: this report's chart
+  rows, its count of units and of units with a checkpoint not merged, and when
+  it was written. The showrunner above yours draws your row from it. It prints
+  `saved report: ok`; `saved report: unavailable` costs only that row, never
+  your report.
 
 ### Input
 
@@ -177,6 +195,8 @@ The builder's output, which the renderer consumes:
 | `zone` | `ZONE`, as an IANA name. |
 | `next_run` | The next scheduled run, `HH:MM` in `ZONE`, after any restart. Leave it out when no schedule runs. |
 | `counts` | The builder's, from `~/.claude/config/dailies.conf`: each `label` with its `count`, or `not_found: true` when its file is missing. Leave it to the builder; a production with no lines there has none. |
+| `children` | The builder's, when productions report to this one: each one's `name`, its saved `report`, `open` (due items for the user in its list and the lists below it), `unreadable` (lists that could not be read) and `expand`. Leave it to the builder. |
+| `reports_to` | The builder's, when this showrunner is under a root: the root's production. Leave it to the builder. |
 | `unit` | The Units table's unit id, never the session's current name. The builder joins on this id. |
 | `name` | The plan the unit runs, when its session name does not say it (a lane that took on another plan): `hana_organon`. Defaults to `unit`. |
 | `label` | The timeline row name, at most 8 characters. Defaults to the unit name without `-unit`. |
@@ -186,7 +206,8 @@ The builder's output, which the renderer consumes:
 | `started` | When the phase started, `YYYY-MM-DDTHH:MM` in `ZONE`. A matching numbered open phase supplies it from the run record; a judgment value wins. Otherwise use the unit director or `LOG`. The timeline row starts there. |
 | `held` | Required. When the phase's checkpoint waits unmerged, the reason alone, in a few words, written to follow "not merged, because": `the design check found 16 defects`. `null` when no checkpoint waits. No examples here; the renderer refuses `such as`. |
 | `idle` | Only while the unit waits on a clock gate, a data window or another unit and nothing of its runs: no seats, no helpers, no build or test. `waits_for` is what it waits for, one short line of at most 80 characters; `until` is when it comes back, `YYYY-MM-DDTHH:MM` in `ZONE`, from the unit director's own statement or `LOG`, never made up. Remove it once the unit works again; the renderer refuses an `until` that has passed. A unit with no known return time gets no `idle`. |
-| unit `build_hold` | `true` while the unit is under a `/build_hold` (its unit director told to stop builds); leave it out otherwise. A holder's own unit is never marked. It ends the unit's timeline row with `build hold`. Holder files in `~/.local/state/build-hold/` supply one footer line per active holder. A Mac block has no unit row or input key; its file in `~/.local/state/mac-test/` supplies its footer line. The renderer refuses a marker with no holder file and active files with no marked unit. No marker means not held (user, 2026-10-03: "Without that marker I will assume it is not held"). |
+| unit `build_hold` | `true` while the unit is under a `/build_hold` (its unit director told to stop builds); leave it out otherwise. A holder's own unit is never marked. It ends the unit's timeline row with `build hold`. Holder files in `~/.local/state/build-hold/` supply one footer line per active holder. A Mac block has no unit row or input key; its file in `~/.local/state/mac-test/` supplies its footer line. The renderer refuses a marker with no holder file. It refuses active files with no marked unit only when some unit in the report does not hold the builds itself: a report with no units, or whose only units are holders, has none to mark. No marker means not held (user, 2026-10-03: "Without that marker I will assume it is not held"). |
+| unit `holds_builds` | Leave it to the builder: `true` on a unit whose own session holds the builds. A holder is named by its session, which only the builder can match to a unit. It shows nowhere in the report; a unit that carries it is never marked `build_hold`. |
 | `held_examples` | Optional examples for `held`, written to follow a comma: `such as a main bar clipped in small windows`. In a `simple` report the renderer prints them only the first time that reason appears for the phase; `page` and `elaborate` always print them. |
 | `update` | What the unit is doing now, one line. The length sets how long (below). A unit waiting on another unit says so, with the wait's start and expected clear times from `LOG` (`/showrunner:produce` → Dependencies). |
 | `eta` | The unit's latest phase ETA, in `ZONE`. A matching numbered open phase supplies its absent values from the run record; no `Phase ETA:` line is needed in the status capture, and each judgment value wins. A judgment `time` or `none` decides the ETA entirely. Otherwise the status capture supplies the time. `time` is `HH:MM`, `+1` for tomorrow (`11:21+1`); add `earliest` and `latest` when the unit director gave a range; each is read on the ETA's own day, earliest at or before it and latest at or after. The builder omits both ends of a recorded range when the renderer would place either on the wrong day. With no ETA, `none` in place of `time`, one of: `none measured - requested` (after sending that unit director `/unit:eta` in this turn, the unmeasured-ETA rule in `/showrunner:produce`), `none measured`, `no ETA stated yet`. Never make one up. `percent` is required with `time`: the unit director's phase percent done (the recorder's phase `%`, 0–100), or `null` when it stated none. `detail` is an optional short note on what the time covers (`checks and build included`). It never says where the ETA came from: no `from the recorder`, no `from past runs` (user, 2026-10-02); the renderer refuses a `detail` that starts with `from`. `why` says in a few words why the ETA moved since the last report, from the unit director's own reports (`the four remaining app tests need a new floor anchor`); the renderer prints it after `because` and refuses a move of 15 minutes or more without it (user, 2026-10-01). |
@@ -274,10 +295,23 @@ unless it names another plan's document. User, 2026-10-02.
   phase runs, a heavy `━━` from the earliest time to the latest, `●` at the
   ETA, and no `(earliest–latest)` text, so the row fits. User, 2026-10-03.
   Only glyphs the app's Anthropic Mono has: it lacks `┼` and `┤`.
+- **Productions below:** after the unit rows, one row for each production
+  directly below this one: a bar from its earliest phase start to its latest
+  ETA, then `<n> units, <k> held` (its units, and how many have a checkpoint
+  not merged), with the productions below it counted in. `as of HH:MM` follows
+  once its saved report is older than two of its update intervals, and always
+  for a production that reports on demand. `<n> open questions` follows when
+  its list, or a list below it, holds a due item for the user; the items stay
+  in their own lists and are printed nowhere here. A production that has saved
+  no report reads `?  no report yet`. A row from `expand` is
+  `<child>/<row>`, with no plan bar. The label column widens to the longest
+  name. A showrunner with nothing below it gets none of this.
 - **Agents:** after the chart and any build-hold and Mac-block lines, one line per active account shows its week used, when it runs out at its current pace (each rise weighted by half per 12 hours of age, across refills, `scripts/whoami/run_out.py`), whether it reaches its refill first, and its available resets. With no pace, it says the account does not run out at this pace; when exhausted, it says the account ran out: `- claude 1: 40%; runs out about Tue 07:10 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22` (user, 2026-10-05; wording updated 2026-10-06).
 - **Footer:** the reply footer (`/showrunner:produce` → Footer), from
   `next_run`, the build-holder files, the Mac block file, `OUTSTANDING` and whether
-  any subject has `needed:`. The report ends with that footer. The Waiting on
+  any subject has `needed:`. A due item below this production also keeps it
+  from saying `nothing needed`, and the two tree bullets (`reports to <root>`,
+  `<slug>: needs-user list unreadable`) appear as in a reply. The report ends with that footer. The Waiting on
   block follows it, as in every reply.
 
 ## Length

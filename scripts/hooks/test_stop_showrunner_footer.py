@@ -125,12 +125,17 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
             f"ENABLED={int(enabled)}\nNEXT_DUE={int(self.next_due.timestamp())}\n"
         )
 
-    def footer(self, *, at: datetime | None = None, nothing_needed: bool = False) -> str:
+    def footer(self, *, at: datetime | None = None, nothing_needed: bool = False,
+               below: tuple[str, ...] = (), reports_to: str = "") -> str:
         minute = at or datetime.now(ZoneInfo(ZONE))
         days = (self.next_due.date() - minute.date()).days
         next_run = f"{self.next_due:%H:%M}" + (f"+{days}" if days > 0 else "")
         args = [sys.executable, str(DAILIES), "--footer", "--zone", ZONE,
                 "--outstanding", str(self.outstanding)]
+        for slug in below:
+            args.extend(["--below", str(self.outstanding.with_name(f"{slug}.json"))])
+        if reports_to:
+            args.extend(["--reports-to", reports_to])
         if (self.instance / "state").read_text().startswith("ENABLED=1"):
             args.extend(["--next-run", next_run])
         if nothing_needed:
@@ -510,10 +515,76 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         quiet = showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED
         productions = [showrunner_footer.Production(slug, self.doc, ZONE, quiet) for slug in ("demo", "other", "absent")]
         with patch.dict(os.environ, self.environment):
-            self.assertEqual(showrunner_footer.open_questions(productions), 2)
+            self.assertEqual(showrunner_footer.open_questions(productions, {}), 2)
             _ = self.outstanding.with_name("other.json").write_text("{bad")
-            self.assertIsNone(showrunner_footer.open_questions(productions))
+            self.assertIsNone(showrunner_footer.open_questions(productions, {}))
         self.assertIsNone(showrunner_footer.open_questions_error(["you: choose the path"], None))
+
+    def timer(self, slug: str) -> None:
+        """Another production with a complete update timer, run by some other session."""
+        instance = self.notifier / f"showrunner-{slug}"
+        instance.mkdir()
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {self.doc}\n")
+
+    def attach(self, child: str, parent: str) -> None:
+        edge = self.root / "showrunner-state" / child / "parent"
+        edge.parent.mkdir(parents=True, exist_ok=True)
+        _ = edge.write_text(parent + "\n")
+
+    def write_open_for(self, slug: str, *texts: str) -> None:
+        _ = self.outstanding.with_name(f"{slug}.json").write_text(json.dumps(
+            [{"since": "2026-10-06T08:00", "text": text} for text in texts]))
+
+    def test_root_count_covers_every_production_below_it(self) -> None:
+        for slug in ("kid", "grandkid", "stranger"):
+            self.timer(slug)
+            self.write_open_for(slug, f"{slug}: merge today?")
+        self.attach("kid", "demo")
+        self.attach("grandkid", "kid")
+        footer = self.write_open({"since": "2026-10-06T08:00", "text": "choose the path"})
+        three = "There are 3 open questions for you."
+        self.assert_passes(self.run_hook(self.waiting(footer, three)))
+        self.assertIn(f"`* {three}`", self.reason(self.waiting(footer, ONE_OPEN)))
+        self.write_open_for("grandkid")
+        self.assert_passes(self.run_hook(self.waiting(footer, TWO_OPEN)))
+
+    def test_a_showrunner_below_a_root_counts_only_its_own_items(self) -> None:
+        for slug in ("top", "kid"):
+            self.timer(slug)
+            self.write_open_for(slug, f"{slug}: merge today?")
+        self.attach("demo", "top")
+        self.attach("kid", "demo")
+        alone = self.write_open({"since": "2026-10-06T08:00", "text": "choose the path"})
+        footer = self.footer(at=datetime.now(ZoneInfo(ZONE)), reports_to="top")
+        self.assertIn("* reports to top", footer.splitlines())
+        self.assert_passes(self.run_hook(self.waiting(footer, ONE_OPEN)))
+        self.assertIn(f"`* {ONE_OPEN}`", self.reason(self.waiting(footer, TWO_OPEN)))
+        self.assertIn("* reports to top", self.reason(self.waiting(alone, ONE_OPEN)).splitlines())
+
+    def test_an_unreadable_list_below_the_root_skips_the_count_check(self) -> None:
+        self.timer("kid")
+        self.attach("kid", "demo")
+        alone = self.write_open({"since": "2026-10-06T08:00", "text": "choose the path"})
+        _ = self.outstanding.with_name("kid.json").write_text("{bad")
+        footer = self.footer(at=datetime.now(ZoneInfo(ZONE)), below=("kid",))
+        self.assertIn("* kid: needs-user list unreadable", footer.splitlines())
+        for count in (ONE_OPEN, TWO_OPEN):
+            with self.subTest(count=count):
+                self.assert_passes(self.run_hook(self.waiting(footer, count)))
+        # The root's footer must name the list it could not read.
+        self.assertIn("* kid: needs-user list unreadable", self.reason(self.waiting(alone, ONE_OPEN)).splitlines())
+
+    def test_a_lower_item_keeps_the_root_footer_from_saying_nothing_needed(self) -> None:
+        self.timer("kid")
+        self.attach("kid", "demo")
+        quiet = self.footer(at=datetime.now(ZoneInfo(ZONE)), nothing_needed=True)
+        self.assertTrue(quiet.endswith(" - nothing needed"))
+        self.assert_passes(self.run_hook(self.waiting(quiet, "no ETA measured - x")))
+        self.write_open_for("kid", "kid: merge today?")
+        busy = self.footer(at=datetime.now(ZoneInfo(ZONE)), nothing_needed=True, below=("kid",))
+        self.assertFalse(busy.endswith(" - nothing needed"))
+        self.assert_passes(self.run_hook(self.waiting(busy, ONE_OPEN)))
 
     def test_produce_states_the_count_rule_in_the_hook_s_words(self) -> None:
         produce = " ".join((SETTINGS.parent / "commands/showrunner/produce.md").read_text(encoding="utf-8").split())

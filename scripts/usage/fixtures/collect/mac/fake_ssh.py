@@ -93,7 +93,7 @@ def save_stream_report(path: Path, report: StreamReport) -> None:
 def main() -> int:
     configuration = cast(SshConfiguration, json.loads(
         Path(os.environ["USAGE_TEST_SSH_CONFIG"]).read_text(encoding="utf-8")))
-    stdin = sys.stdin.buffer.read()
+    stdin = b"" if configuration["behavior"] == "early_disconnect" else sys.stdin.buffer.read()
     output = cast(BinaryIO, sys.stdout.buffer)
     report: StreamReport = {
         "measurement_records": 0, "cursor_records": 0, "forwarded_bytes": 0,
@@ -107,8 +107,16 @@ def main() -> int:
     }
     behavior = configuration["behavior"]
     try:
-        if behavior == "unreachable":
-            print("fixture SSH is unreachable", file=sys.stderr)
+        if behavior == "wait_for_release":
+            marker = Path(configuration["report"])
+            _ = marker.with_suffix(".waiting").write_bytes(b"")
+            deadline = time.monotonic() + 15
+            while not marker.with_suffix(".release").exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("fixture pass was never released")
+                time.sleep(0.01)
+        if behavior in ("unreachable", "early_disconnect"):
+            print("\nfixture SSH is unreachable\nsecond fixture diagnostic", file=sys.stderr)
             return 255
         if behavior == "python_error":
             print("fixture remote Python error", file=sys.stderr)

@@ -1,6 +1,6 @@
 ---
 description: Track a production's Bevy upgrade, current dependency pins, and the user's answers.
-argument-hint: "[status | check | start <version> | approve <crate> <words> | decline <crate> <words> | forget <crate> | note <crate> [<text>]]"
+argument-hint: "[status | line | check | stop | start <version> | approve <crate> <words> | decline <crate> <words> | forget <crate> | note <crate> [<text>]]"
 ---
 
 # Bevy upgrade
@@ -18,3 +18,11 @@ report its error in one line.
 - Use `note` for what a script cannot look up, such as why a pull request's CI
   fails. With no text, it clears the note.
 - A report says `stale` when the table does.
+- `line` prints one sentence for a report and changes nothing; it prints
+  nothing when no watch is open. `stop` ends the watch and its scheduled check.
+- When a row says `ask the user: git pin?`, ask once, then record the answer
+  with `approve` or `decline`. Pinning an unmerged PR's branch needs the same answer.
+- A scheduled check writes to this session only when something changed. Its
+  message is this command's output and the one exception to the same-turn rule
+  above: show its lines to the user in the next reply as received. To say
+  anything beyond those lines, run `status` first.
