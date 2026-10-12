@@ -1,6 +1,6 @@
 ---
 description: Report a running production's state to the executive producer (the user) — every unit and every open topic — at one of four lengths, gantt (default: the chart, with only what needs the user and what changed), simple, page or elaborate.
-argument-hint: "[gantt|simple|page|elaborate] [default|ascii]"
+argument-hint: "[gantt|simple|page|elaborate] [default|ascii] [expand <child|all>]"
 ---
 
 # Dailies
@@ -11,7 +11,7 @@ producer: the user. Run it in the showrunner session during `/showrunner:produce
 whose state (`PRODUCTION_DOC`, `LOG`, `ZONE`, `UNITS`, `CHECKOUT`,
 `MERGE_BRANCH`, `NOTIFIER`, `UPDATES`) it uses.
 
-**Usage:** `/showrunner:dailies [gantt|simple|page|elaborate] [default|ascii]`. With
+**Usage:** `/showrunner:dailies [gantt|simple|page|elaborate] [default|ascii] [expand <child|all>]`. With
 no length, `gantt`. With any other argument, name the choices and stop.
 
 **Chart mode.** `default` draws the timeline in coloured squares; `ascii`
@@ -22,6 +22,15 @@ reads, so no session remembers it. A mode argument sets it before the report:
 run `python3 ~/.claude/scripts/production/dailies_render.py --chart <mode>`.
 So do your words: "ascii mode", "switch back to default". It holds until
 changed. User, 2026-10-03.
+
+**Productions below this one.** When other showrunners report to yours
+(`/showrunner:attach`), the chart ends with one row for each production
+directly below you, drawn from the report that production last saved. You
+gather nothing for it and write it no judgment entry. `expand <child>` adds
+that production's own rows under its row, as `<child>/<row>`; `expand all`
+does it for every one. Pass each as `--expand <child>` or `--expand all` to
+the input builder, which refuses a name that is not directly below you and
+lists the ones that are. User, 2026-10-09.
 
 ## Status check and clock
 
@@ -108,7 +117,7 @@ python3 ~/.claude/scripts/production/dailies_input.py \
   --production <PRODUCTION_DOC> --status <scratchpad>/unit_status.txt \
   --judgment <scratchpad>/dailies_judgment.json --state-dir <scratchpad>/dailies_input_state \
   --out <scratchpad>/dailies_input.json --length <gantt|simple|page|elaborate> \
-  --render-state <scratchpad>/dailies_state.json [--user-run]
+  --render-state <scratchpad>/dailies_state.json [--user-run] [--expand <child|all>]
 python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_input.json \
   --state <scratchpad>/dailies_state.json --log <LOG> --outstanding <OUTSTANDING>
 ```
@@ -121,6 +130,12 @@ python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_inpu
   that report shows no change notes.
 - `--log` appends the `dailies ETAs:` line to `LOG`, so the next report can
   compare. Write no such line by hand.
+- Every builder run also saves
+  `~/.local/state/showrunner/<slug>/dailies_last.json`: this report's chart
+  rows, its count of units and of units with a checkpoint not merged, and when
+  it was written. The showrunner above yours draws your row from it. It prints
+  `saved report: ok`; `saved report: unavailable` costs only that row, never
+  your report.
 
 ### Input
 
@@ -177,6 +192,8 @@ The builder's output, which the renderer consumes:
 | `zone` | `ZONE`, as an IANA name. |
 | `next_run` | The next scheduled run, `HH:MM` in `ZONE`, after any restart. Leave it out when no schedule runs. |
 | `counts` | The builder's, from `~/.claude/config/dailies.conf`: each `label` with its `count`, or `not_found: true` when its file is missing. Leave it to the builder; a production with no lines there has none. |
+| `children` | The builder's, when productions report to this one: each one's `name`, its saved `report`, `open` (due items for the user in its list and the lists below it), `unreadable` (lists that could not be read) and `expand`. Leave it to the builder. |
+| `reports_to` | The builder's, when this showrunner is under a root: the root's production. Leave it to the builder. |
 | `unit` | The Units table's unit id, never the session's current name. The builder joins on this id. |
 | `name` | The plan the unit runs, when its session name does not say it (a lane that took on another plan): `hana_organon`. Defaults to `unit`. |
 | `label` | The timeline row name, at most 8 characters. Defaults to the unit name without `-unit`. |
@@ -274,10 +291,23 @@ unless it names another plan's document. User, 2026-10-02.
   phase runs, a heavy `━━` from the earliest time to the latest, `●` at the
   ETA, and no `(earliest–latest)` text, so the row fits. User, 2026-10-03.
   Only glyphs the app's Anthropic Mono has: it lacks `┼` and `┤`.
+- **Productions below:** after the unit rows, one row for each production
+  directly below this one: a bar from its earliest phase start to its latest
+  ETA, then `<n> units, <k> held` (its units, and how many have a checkpoint
+  not merged), with the productions below it counted in. `as of HH:MM` follows
+  once its saved report is older than two of its update intervals, and always
+  for a production that reports on demand. `<n> open questions` follows when
+  its list, or a list below it, holds a due item for the user; the items stay
+  in their own lists and are printed nowhere here. A production that has saved
+  no report reads `?  no report yet`. A row from `expand` is
+  `<child>/<row>`, with no plan bar. The label column widens to the longest
+  name. A showrunner with nothing below it gets none of this.
 - **Agents:** after the chart and any build-hold and Mac-block lines, one line per active account shows its week used, when it runs out at its current pace (each rise weighted by half per 12 hours of age, across refills, `scripts/whoami/run_out.py`), whether it reaches its refill first, and its available resets. With no pace, it says the account does not run out at this pace; when exhausted, it says the account ran out: `- claude 1: 40%; runs out about Tue 07:10 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22` (user, 2026-10-05; wording updated 2026-10-06).
 - **Footer:** the reply footer (`/showrunner:produce` → Footer), from
   `next_run`, the build-holder files, the Mac block file, `OUTSTANDING` and whether
-  any subject has `needed:`. The report ends with that footer. The Waiting on
+  any subject has `needed:`. A due item below this production also keeps it
+  from saying `nothing needed`, and the two tree bullets (`reports to <root>`,
+  `<slug>: needs-user list unreadable`) appear as in a reply. The report ends with that footer. The Waiting on
   block follows it, as in every reply.
 
 ## Length

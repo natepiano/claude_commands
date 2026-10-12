@@ -14,7 +14,7 @@ from typing import ClassVar, cast, override
 from unittest import mock
 
 from dailies_render import (NoLastReportedEta, StateClear, StateRefused,
-                            check_render_state, load_state)
+                            check_render_state, last_report, load_state)
 
 SCRIPT = Path(__file__).with_name("dailies_render.py")
 AT = "2026-10-04T11:00"
@@ -955,6 +955,144 @@ class GanttTests(unittest.TestCase):
     def test_a_unit_the_last_report_had_and_this_one_lacks_is_named(self) -> None:
         state = {"widget-enhancements": self.last_report(), "retired-unit": self.last_report()}
         self.assertEqual(self.above_chart(self.gantt([unit(False)], state)), ["- retired-unit: no longer in the report"])
+
+
+def saved_row(name: str, started: str = "", eta: str = "") -> dict[str, object]:
+    """One row of a lower production's saved report; with no times, a row whose ETA is not known."""
+    if not eta:
+        return {"name": name}
+    return {"name": name, "started": started, "eta": eta, "earliest": eta, "latest": eta}
+
+
+def saved(written: str, *rows: dict[str, object], units: int = 2, held: int = 0, interval: int | None = 30,
+          zone: str = ZONE) -> dict[str, object]:
+    return {"written": written, "zone": zone, "interval": interval, "units": units, "held": held, "rows": list(rows)}
+
+
+def child(name: str, saved_report: dict[str, object] | None = None, **fields: object) -> dict[str, object]:
+    lower: dict[str, object] = {"name": name, "open": 0, **fields}
+    if saved_report is not None:
+        lower["report"] = saved_report
+    return lower
+
+
+class LowerProductionTests(unittest.TestCase):
+    """A showrunner's report shows each production directly below it as one row."""
+
+    ROWS: ClassVar[tuple[dict[str, object], ...]] = (
+        saved_row("fps", "2026-10-04T09:10", "2026-10-04T13:20"),
+        saved_row("docs", "2026-10-04T10:05", "2026-10-04T14:40"),
+        saved_row("idle"),
+    )
+    lines: list[str] = []
+    # The chart opens at 06:00 for the unit's 08:50 start, so a 09:10 start sits three empty cells in.
+    LEAD: ClassVar[str] = "  " * 3
+
+    def rows(self, *children: dict[str, object], reports_to: str = "") -> list[str]:
+        fields: dict[str, object] = {**report(False), "children": list(children)}
+        if reports_to:
+            fields["reports_to"] = reports_to
+        result = render(fields)
+        self.assertEqual(result.code, 0, result.error)
+        self.lines = result.lines
+        return timeline(result.lines)[2:]
+
+    def refused(self, message: str, *children: dict[str, object]) -> None:
+        result = render({**report(False), "children": list(children)})
+        self.assertEqual(result.code, 2)
+        self.assertIn(message, result.error)
+
+    def test_a_production_with_nothing_below_it_renders_as_before(self) -> None:
+        plain = render(report(False))
+        self.assertEqual(render({**report(False), "children": []}).lines, plain.lines)
+        self.assertEqual(timeline(plain.lines)[1][:9], "widget   ")
+
+    def test_a_current_child_is_one_row_from_its_earliest_start_to_its_latest_eta(self) -> None:
+        rows = self.rows(child("tool-based-ui", saved("2026-10-04T10:40", *self.ROWS, units=3, held=1)))
+        self.assertEqual(rows, [f"tool-based-ui {self.LEAD}⬜⬜⬜⬜⬜🟦 14:40  3 units, 1 held"])
+        # The label column widens for the name, and the unit's row keeps its plan column.
+        self.assertTrue(timeline(self.lines)[1].startswith("widget          "), timeline(self.lines)[1])
+        self.assertIn("Phase 2 of 3", timeline(self.lines)[1])
+
+    def test_a_stale_child_says_when_its_report_is_from(self) -> None:
+        # Two intervals old is still current; a minute more is not.
+        self.assertEqual(self.rows(child("kid", saved("2026-10-04T10:00", *self.ROWS))),
+                         [f"kid      {self.LEAD}⬜⬜⬜⬜⬜🟦 14:40  2 units, 0 held"])
+        self.assertEqual(self.rows(child("kid", saved("2026-10-04T09:59", *self.ROWS))),
+                         [f"kid      {self.LEAD}⬜⬜⬜⬜⬜🟦 14:40  2 units, 0 held, as of 09:59"])
+        self.assertTrue(self.rows(child("kid", saved("2026-10-03T21:15", *self.ROWS, units=1)))[0]
+                        .endswith("  1 unit, 0 held, as of Sat 21:15"))
+
+    def test_a_child_that_reports_on_demand_always_says_when(self) -> None:
+        self.assertEqual(self.rows(child("kid", saved("2026-10-04T10:58", *self.ROWS, interval=None))),
+                         [f"kid      {self.LEAD}⬜⬜⬜⬜⬜🟦 14:40  2 units, 0 held, as of 10:58"])
+
+    def test_a_child_with_no_saved_report_reads_no_report_yet(self) -> None:
+        self.assertEqual(self.rows(child("kid")), ["kid      ?  no report yet"])
+
+    def test_a_child_with_no_eta_keeps_its_counts(self) -> None:
+        self.assertEqual(self.rows(child("kid", saved("2026-10-04T10:40", saved_row("idle"), units=1))),
+                         ["kid      ?  1 unit, 0 held"])
+
+    def test_times_come_over_from_the_child_s_zone(self) -> None:
+        eastern = saved("2026-10-04T13:40", saved_row("fps", "2026-10-04T12:10", "2026-10-04T17:40"),
+                        zone="America/New_York")
+        self.assertEqual(self.rows(child("kid", eastern)),
+                         [f"kid      {self.LEAD}⬜⬜⬜⬜⬜🟦 14:40  2 units, 0 held"])
+
+    def test_expand_prints_the_child_s_rows_under_its_own(self) -> None:
+        rows = self.rows(child("kid", saved("2026-10-04T10:40", *self.ROWS), expand=True),
+                         child("other", saved("2026-10-04T10:40", *self.ROWS)))
+        self.assertEqual(rows, [f"kid      {self.LEAD}⬜⬜⬜⬜⬜🟦 14:40  2 units, 0 held",
+                                f"kid/fps  {self.LEAD}⬜⬜⬜⬜🟦 13:20",
+                                f"kid/docs {self.LEAD}  ⬜⬜⬜⬜🟦 14:40",
+                                "kid/idle ?",
+                                f"other    {self.LEAD}⬜⬜⬜⬜⬜🟦 14:40  2 units, 0 held"])
+
+    def test_what_waits_on_the_user_below_marks_the_row_and_the_footer(self) -> None:
+        quiet = self.rows(child("kid", saved("2026-10-04T10:40", *self.ROWS)))
+        self.assertEqual(after_timeline(self.lines)[-1], "* next dailies: 11:30 PDT - nothing needed")
+        self.assertNotIn("open question", quiet[0])
+        marked = self.rows(child("kid", saved("2026-10-04T10:40", *self.ROWS), open=1), child("new", open=2),
+                           reports_to="top")
+        self.assertTrue(marked[0].endswith("  2 units, 0 held, 1 open question"), marked[0])
+        self.assertEqual(marked[1], "new      ?  no report yet, 2 open questions")
+        self.assertEqual(after_timeline(self.lines)[-2:], ["* reports to top", "* next dailies: 11:30 PDT"])
+
+    def test_a_list_below_that_cannot_be_read_is_named_in_the_footer(self) -> None:
+        _ = self.rows(child("other", unreadable=["other"]),
+                      child("kid", saved("2026-10-04T10:40", *self.ROWS), unreadable=["leaf", "kid"]))
+        self.assertEqual(after_timeline(self.lines)[-4:],
+                         ["* kid: needs-user list unreadable", "* leaf: needs-user list unreadable",
+                          "* other: needs-user list unreadable", "* next dailies: 11:30 PDT"])
+
+    def test_a_saved_report_carries_the_counts_and_one_row_of_each_production_below(self) -> None:
+        # Three levels: this production saves the leaf's counts inside its own, so its parent reads one file.
+        middle = {**report(False), "children": [child("leaf", saved("2026-10-04T10:40", *self.ROWS, units=3, held=1),
+                                                      expand=True)]}
+        with tempfile.TemporaryDirectory() as scratch:
+            summary = last_report(middle, Path(scratch) / "none.json", AT, 30)
+        self.assertEqual({key: summary[key] for key in ("written", "zone", "interval", "units", "held")},
+                         {"written": AT, "zone": ZONE, "interval": 30, "units": 4, "held": 1})
+        self.assertEqual(summary["rows"], [
+            {"name": "widget", "started": "2026-10-04T08:50", "eta": "2026-10-04T12:40",
+             "earliest": "2026-10-04T12:40", "latest": "2026-10-04T12:40"},
+            {"name": "leaf", "started": "2026-10-04T09:10", "eta": "2026-10-04T14:40",
+             "earliest": "2026-10-04T14:40", "latest": "2026-10-04T14:40"}])
+        # The top reads that file as it is and draws the middle with the leaf inside its numbers.
+        rows = self.rows(child("middle", summary, expand=True))
+        self.assertEqual(rows, ["middle            ⬜⬜⬜⬜⬜⬜🟦 14:40  4 units, 1 held",
+                                "middle/widget     ⬜⬜⬜⬜🟦 12:40",
+                                f"middle/leaf   {self.LEAD}⬜⬜⬜⬜⬜🟦 14:40"])
+
+    def test_a_malformed_child_is_refused(self) -> None:
+        self.refused("children: widget is also a unit's label", child("widget"))
+        self.refused("children[0].open: a whole number of 0 or more", {"name": "kid"})
+        self.refused("children[0].report.written: required", child("kid", {"zone": ZONE}))
+        self.refused("children[0].report.zone: 'Mars/Base' is not an IANA zone name",
+                     child("kid", saved("2026-10-04T10:40", zone="Mars/Base")))
+        self.refused("children[0].report.rows[0].eta: required",
+                     child("kid", saved("2026-10-04T10:40", {"name": "fps", "started": "2026-10-04T09:10"})))
 
 
 if __name__ == "__main__":
