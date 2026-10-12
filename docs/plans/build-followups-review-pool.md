@@ -7,6 +7,7 @@
 ## Delegation Context
 
 - **Project:** `~/.claude` — the Claude Code configuration repository: commands, the `/unit:direct` launchers and the Codex mesh.
+- **Project started:** 2026-10-12T18:56:58.313+00:00
 - **Stack:** Python 3.10+ run through `scripts/lib/py`, `unittest`, basedpyright; bash launchers; Codex CLI 0.162 `app-server` over a local websocket.
 - **Layout:** `scripts/agents/` (the mesh), `scripts/delegate/` (launchers, pool, report), `commands/unit/`, `commands/showrunner/`, `commands/review/` (new), `docs/delegate/`, `docs/production_format.md`, `config/`.
 - **Worktree:** `/home/natepiano/worktrees/claude-build-followups-review-pool`, branch `build-followups-review-pool`. Every seat works only there.
@@ -39,7 +40,7 @@
 
 ## Phases
 
-### Phase 1 — Mesh verbs for pooled threads, proved live  · status: todo
+### Phase 1 — Mesh verbs for pooled threads, proved live  · status: done
 
 #### Work Order
 
