@@ -44,27 +44,21 @@ The unit director's call, 2026-10-12: `add --backfill` and `supersede --backfill
 
 ### Phase 1 — No write can leave an entry both pending and released for one crate  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** every verb refuses, before any write, a release list that names one crate both as `Unreleased` and at an exact version, and `check` reports a stored note that holds both.
-
-**Spec:**
-
-- **One rule, in the validator.** `_validate_release_values` refuses a list that holds `X@Unreleased` and an exact `X@<version>`: `release cannot hold both X@Unreleased and X@<version>`, naming the first exact version of X in sorted order. It runs after the per-value checks, so an invalid value, an unpublished crate or a crate missing from `--crate` is still reported first, with today's wording. Every caller gets it:
-  - `add --backfill`, `supersede --backfill` and `amend --backfill` with both values in one call are refused before any write. For `supersede` the old note stays live.
-  - `validate_note` refuses a stored note that holds both, so `check` prints `<relative path>: release cannot hold both X@Unreleased and X@<version>` and exits 1. No note in the live vault holds both today; the acceptance gate proves it.
-  - It replaces the one-call loop in `_run_amend` (1783-1788) and its wording `--release cannot add both …`; delete that loop.
-- **A correction against the stored list.** `amend --backfill --release X@<version>` on a note whose `release` holds `X@Unreleased` is refused: `<title> already holds X@Unreleased`. It mirrors the pending mark's refusal `<title> already holds X@<version>` (1778-1781) and sits with it, before the event is journaled. No other flag of the call is applied.
-- **Unchanged.** An exact version of another crate on a note pending for X is accepted. A second exact version of X on a note that holds only exact versions of X is accepted: six bevy_brp notes hold one crate at two released versions. The pending mark's two refusals keep their wording. `release` still replaces `X@Unreleased` with the version in one write. A live `add` still marks the note pending for each published crate of `--crate`. A value the note already holds prints `unchanged`.
+- `_validate_release_values` refuses a release list that holds `X@Unreleased` and an exact `X@<version>`: `release cannot hold both X@Unreleased and X@<version>`. It runs after the per-value checks, so an invalid value, an unpublished crate or a crate missing from `--crate` is still reported first. The amend-only one-call loop and its wording `--release cannot add both …` no longer exist.
+- Every caller gets it: `add`, `supersede`, `amend` and a landing proposal are refused before any write (the old note of a `supersede` stays live), and `validate_note` refuses a stored note, so `check` prints `<relative path>: release cannot hold both X@Unreleased and X@<version>` and exits 1.
+- `_run_amend` refuses an exact version onto a note whose stored `release` holds `X@Unreleased`: `<title> already holds X@Unreleased`, before the event is journaled, beside the pending mark's refusal `<title> already holds X@<version>`. No other flag of the call is applied.
+- Accepted: an exact version of another crate on a note pending for X, and a second exact version of X on a note that holds only exact versions of X.
 
 **Files:**
-- `scripts/feature_log/feature_log.py` — `_validate_release_values`, `_run_amend`.
-- `scripts/feature_log/test_feature_log.py` — the cases below, and the changed wording in the one-call case at 1498.
+- `scripts/feature_log/feature_log.py` — the rule in `_validate_release_values`; the stored-list refusal in `_run_amend`.
+- `scripts/feature_log/test_feature_log.py` — 147 cases: both refusals, the accepted neighbours, three older fixtures that use `--backfill`.
 
-**Seats:** `1 writer + 1 tester` — one function and one call site; each rule above is concrete enough to test first.
-- `impl` — `scripts/feature_log/feature_log.py`.
-- `test` — `scripts/feature_log/test_feature_log.py`: an exact version onto a note pending for the same crate refused with `<title> already holds X@Unreleased`, alone and with `--summary` and `--kind` in the same call, leaving vault, `events.jsonl` and temp files unchanged; the same call for another crate of the note accepted; a second exact version of one crate on a note that holds only an exact version accepted; the one-call `amend` case at 1498 expecting `release cannot hold both hana_lagrange@Unreleased and hana_lagrange@1.2.3` in all four argument orders; `add --backfill` with both values refused with that line and no note, event or temp file; `supersede --backfill` with both values refused and the old note still live; a stored note holding both reported by `check` with its path and that reason (a new fixture beside those at 2047); a list with two exact versions of one crate plus `Unreleased` naming the lower version; a pending note still stamped by `release`.
+**Gotchas:**
+- A new entry without `--backfill` is pending for each published crate of `--crate`, so an exact `--release` of one of them is refused by the shared line; pass `--backfill` to record a released version.
+- The version the refusal names is the first exact version of X in string order of the sorted list.
 
-**Constraints from prior phases:** none. From the earlier feature-log runs (as-built): a refusal test asserts the vault, `events.jsonl` and temp files are unchanged; an `AmendEvent` is journaled before its note is written, so a refusal must come before the event.
+**Ruled out:**
+- A separate refusal naming `--backfill` for a new entry: one rule and one wording stays.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/feature_log -p 'test_*.py'` green; `basedpyright scripts/feature_log` ends `0 errors, 0 warnings, 0 notes`; `python3 scripts/feature_log/feature_log.py check` from the worktree root prints `ok: <n> notes` for the live vault.
