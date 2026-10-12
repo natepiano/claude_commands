@@ -35,6 +35,7 @@ Not read in full:
 | mac | claude | skipped | never |  |
 | mac | codex | skipped | never |  |
 | mac | history | skipped | never |  |
+| natedev | baseline_readings | missing | never |  |
 
 | machine | family | state | last read | details |
 | --- | --- | --- | --- | --- |

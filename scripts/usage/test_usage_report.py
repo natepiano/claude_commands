@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from zoneinfo import ZoneInfo
 
-from scripts.usage.test_collect import FIXTURES as COLLECT_FIXTURES, MacStreamReport, REPOSITORY, SshBehavior
+from scripts.usage.test_collect import FIXTURES as COLLECT_FIXTURES, MacStreamReport, REPOSITORY, SNAPSHOT_COMMIT_SCRIPT, SshBehavior
 from scripts.usage.test_outcomes import OutcomeFixture
 
 
@@ -78,6 +78,11 @@ class ReportFixture(OutcomeFixture):
 
     def expected_report(self, name: str, zone: str = "America/Los_Angeles") -> str:
         expected = (FIXTURES / "expected" / f"{name}.md").read_text(encoding="utf-8")
+        if "Sources\n" in expected:
+            self.assertEqual(self.values(self.rows(
+                "SELECT state, last_complete_at FROM turn_sources " +
+                "WHERE machine = 'natedev' AND family = 'baseline_readings'"), "state", "last_complete_at"),
+                [("missing", None)])
         for row in self.rows("SELECT machine, family, last_complete_at FROM turn_sources"):
             stamp = cast(object, row["last_complete_at"])
             if isinstance(stamp, str):
@@ -127,6 +132,28 @@ class ReportFixture(OutcomeFixture):
 
 @final
 class UsageReportTests(ReportFixture):
+    def test_report_reader_keeps_working_in_the_previous_journal_mode(self) -> None:
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(db.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+        self.assert_report("weighted", "weighted")
+
+    def test_report_figures_and_sources_share_one_snapshot_during_a_writer_commit(self) -> None:
+        expected = self.expected_report("weighted")
+        script = SNAPSHOT_COMMIT_SCRIPT + """
+from scripts.usage import usage_report
+with patch.object(sqlite3, 'connect', snapshot_connect):
+    result = usage_report.main(sys.argv[1:])
+assert changed
+raise SystemExit(result)
+"""
+        result = self.report_script(script, "weighted")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout, expected)
+        self.assertEqual(self.rows("SELECT count(*) AS turns FROM turns WHERE family = 'codex'")[0]["turns"], 0)
+        self.assertEqual(self.rows("SELECT state FROM turn_sources WHERE machine = 'natedev' AND family = 'codex'")[0]["state"],
+                         "unreachable")
+
     def test_list_names_each_metric_with_its_description(self) -> None:
         self.assert_report("list", "list")
 

@@ -248,7 +248,7 @@ The store is at `PRAGMA user_version` 6 (`STORE_VERSION`) and holds what the wor
 
 **Ruled out:** moving the showrunner's dailies onto the store (`dailies_render.py` shows no token figure and reads only the live account readings through `run_out.read_readings`); weighting each turn through the Python function from `weights.register(db)`, in the report or in the seat readout (the per-turn cost above); a registered function for the local day (the same cost).
 
-### Phase 8 — Kept up to date by itself · status: todo
+### Phase 8 — Kept up to date by itself · status: done
 
 #### Work Order
 

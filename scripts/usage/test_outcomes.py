@@ -9,10 +9,12 @@ import shutil
 import sqlite3
 import subprocess
 import unittest
+import tempfile
 from contextlib import closing
 from pathlib import Path
 from typing import Protocol, cast, final, override
 
+from scripts.usage import outcomes
 from scripts.usage.test_collect import (
     CollectorFixture, FIXTURES as COLLECT_FIXTURES, MacRun, MacStreamReport, SshBehavior,
 )
@@ -112,7 +114,62 @@ class OutcomeFixture(CollectorFixture):
         self.assertEqual(self.values(rows, "parent_id", "agent_id", "at"), [("", CORRECTED_THREAD, at)])
 
 
+class ProductionPathsTests(unittest.TestCase):
+    def test_production_documents_contribute_repositories_and_worktrees(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        document = Path(directory.name) / "sample-production.md"
+        _ = document.write_text(
+            "".join((
+                "# Production\n\n- **Repository:** `/repo/main`\n\n",
+                "## Units\n\n| Unit | Worktree |\n| --- | --- |\n",
+                "| a | `/repo/worktree` |\n",
+            )),
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            outcomes.production_paths(document),
+            (Path("/repo/main"), Path("/repo/worktree")),
+        )
+
+
 class OutcomeTests(OutcomeFixture):
+    def test_baseline_only_reading_has_its_own_source_and_cursor(self) -> None:
+        baseline = self.root / "baseline-readings.jsonl"
+        _ = baseline.write_text('{"account":"codex fixture","at":"2026-10-03T18:17:00Z",' +
+                                '"remaining":70,"credits":100}\n', encoding="utf-8")
+        output = self.collect()
+        self.assertEqual(self.values(self.rows("SELECT * FROM account_readings WHERE account = 'codex fixture'"),
+                                     "machine", "account", "at", "remaining", "credits"),
+                         [("natedev", "codex fixture", "2026-10-03T18:17:00+00:00", 70.0, 100.0)])
+        self.assert_outcomes_added(output, "baseline_readings", 1)
+        self.assert_family_state(output, "natedev", "baseline_readings", "ready")
+        self.assertEqual(self.cursor_for(baseline), baseline.stat().st_size)
+
+    def test_live_reading_wins_over_baseline_in_both_file_read_orders(self) -> None:
+        baseline = self.root / "baseline-readings.jsonl"
+        live = self.root / "readings.jsonl"
+        baseline_line = ('{"account":"codex fixture","at":"2026-10-03T18:17:00Z",'
+                         '"remaining":70,"credits":100}\n')
+        live_line = ('{"account":"codex fixture","at":"2026-10-03T18:17:00Z",'
+                     '"remaining":60,"credits":80}\n')
+        for first in ("baseline", "live"):
+            with self.subTest(first=first):
+                self.db_path: Path = self.state / f"{first}-first.db"
+                _ = baseline.write_text(baseline_line if first == "baseline" else "", encoding="utf-8")
+                _ = live.write_text(live_line if first == "live" else "", encoding="utf-8")
+                _ = self.collect()
+                if first == "baseline":
+                    self.append_bytes(live, live_line.encode())
+                else:
+                    self.append_bytes(baseline, baseline_line.encode())
+                _ = self.collect()
+                self.assertEqual(self.values(self.rows("SELECT * FROM account_readings"), "remaining", "credits"),
+                                 [(60.0, 80.0)])
+                before = self.all_values(self.rows("SELECT * FROM account_readings"))
+                _ = self.collect()
+                self.assertEqual(self.all_values(self.rows("SELECT * FROM account_readings")), before)
+
     def test_folder_schema_version_and_turn_time_index(self) -> None:
         _ = self.collect()
         columns = self.rows("PRAGMA table_info(folders)")
