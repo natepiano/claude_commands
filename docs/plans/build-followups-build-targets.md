@@ -6,7 +6,7 @@
 
 > **Production: build-followups** — unit `build-report-unit`; production doc `docs/plans/build-followups-production.md`
 
-> **Renumbered:** 2026-10-12, three insertions, all after the last `done` phase (Phase 5), so no `done` phase moved; Phases 1-5 name no later phase by number. First, "A test binary built on the Mac finds the Swift runtime" became Phase 6: the build report phase 6 → 7, the `/build_hold` target and docs phase 7 → 8. Second, "A lost Mac run keeps the Mac busy until its leftovers are gone" became Phase 7: the build report phase 7 → 8, the `/build_hold` target and docs phase 8 → 9. Third, "A silent or gone session never holds the builds behind it" became Phase 7: the lost Mac run phase 7 → 8, the build report phase 8 → 9, the `/build_hold` target and docs phase 9 → 10. Fourth, on 2026-10-12, "A build cannot point the hold check at another directory" became Phase 10: the `/build_hold` target and docs phase 10 → 11, retitled "The build commands are one group"; Phase 9 was widened and retitled in place.
+> **Renumbered:** 2026-10-12, three insertions, all after the last `done` phase (Phase 5), so no `done` phase moved; Phases 1-5 name no later phase by number. First, "A test binary built on the Mac finds the Swift runtime" became Phase 6: the build report phase 6 → 7, the `/build_hold` target and docs phase 7 → 8. Second, "A lost Mac run keeps the Mac busy until its leftovers are gone" became Phase 7: the build report phase 7 → 8, the `/build_hold` target and docs phase 8 → 9. Third, "A silent or gone session never holds the builds behind it" became Phase 7: the lost Mac run phase 7 → 8, the build report phase 8 → 9, the `/build_hold` target and docs phase 9 → 10. Fourth, on 2026-10-12, "A build cannot point the hold check at another directory" became Phase 10: the `/build_hold` target and docs phase 10 → 11, retitled "The build commands are one group"; Phase 9 was widened and retitled in place. Fifth, on 2026-10-12, the build report phase was split, and no `done` phase moved: Phase 9 keeps its number and title and holds the two reports and their commands, built from what the log already records; the records it gave up became "The Mac report shows who held the Mac and when it was blocked or held", Phase 11, after the hold-directory phase (still Phase 10); "The build commands are one group" phase 11 → 12.
 
 ## Source
 
@@ -62,6 +62,8 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **The build commands.** One group, `commands/build/`, each command backed by one script that answers in about a second: `/build:report` (the build report, opening with the few facts that matter most), `/build:mac_report` (how reliably tests reach the Mac when it is usable), `/build:hold`, `/build:mac` and `/build:targets`. The old names `/builds`, `/build_hold` and `/mac_test` are deleted with no stub, and every pointer moves in the phase that deletes the name (the showrunner, 2026-10-12). A hold directory override is honored only for a test fixture.
 
+**What the reports read.** Both reports are built first from rows the build log already holds, plus two columns on a call row (`target`, `hold_wait_s`) whose values `verify.sh` already exports. Where the log cannot answer, the Mac report prints a lower bound and names what is not recorded. A later phase records who held the Mac on a `busy` decline and one event for each beginning and end of a target's hold (the Mac's block and natedev's hold alike); the reports then read those, and older rows keep reading as not recorded.
+
 ## Delegation Context
 
 - **Project:** `~/.claude` config repo: the scripts every Claude session runs. This plan turns natedev and the Mac into build targets with per-target holds, enforced by `verify.sh` and the BRP launch gate, and routes `verify.sh test` to the first free eligible target. Worktree `/home/natepiano/worktrees/claude-build-followups-build-report`, branch `build-followups-build-report` (unit `build-report-unit`); name both in every dispatch.
@@ -80,11 +82,11 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
   - `docs/as-built/` (`mac-test-offload.md`, `build-memory-admission.md`)
 - **Key files:**
   - `scripts/delegate/verify.sh`:
-    - `try_mac_test` 698-775 calls `offload.py run`; exit 75 means run locally. A Mac `passed` on a `--filter` run exits 0; a full `passed` prints "now confirming on natedev, which is the gate"; `failed` exits with the Mac's status.
-    - Its call site is 899-904, before the cargo token.
-    - The cargo token is taken at 926-936 (`TOKEN_WAIT_S`); `buildlog_exec` is at 997 and `release_token` at 1006.
-    - `note_event` 656-680 passes `BUILDLOG_MAC*` to `record.py call`.
-  - `scripts/mac_test/offload.py`: `OffloadConfig` 118, `ProbeSnapshot` 144, `probe_script` 523, `parse_probe` 540, `claimed_run` 733 (probe, then decline reasons `unreachable`, `mac_busy`, `battery`, `disk`), `run_offload` 782 (`off`, `repo`, `linux_only`, `backoff`, then claim exit 10 → `blocked`, 11 → `busy`).
+    - `try_mac_test` 758-843 calls `offload.py run`; exit 75 means run locally. A Mac `passed` on a `--filter` run exits 0; a full `passed` prints "now confirming on natedev, which is the gate"; `failed` exits with the Mac's status.
+    - `route_test` 869-958 calls it and runs at 1105, before the cargo token.
+    - The cargo token is taken at 1137-1145 (`TOKEN_WAIT_S`); `buildlog_exec` is at 1206 and `release_token` at 1215.
+    - `note_event` 714-734 passes `BUILDLOG_MAC*` to `record.py call`.
+  - `scripts/mac_test/offload.py`: `OffloadConfig` 147, `ProbeSnapshot` 173, `write_result` 562 (the result file `verify.sh` reads: `mac=`, `reason=`, `seconds=`), `probe_script` 665, `parse_probe` 679, `claimed_run` 1000 (probe, then decline reasons `unreachable`, `battery`, `disk`, `copy`), `run_offload` 1057 (`off`, `repo`, `linux_only`, `backoff`, then claim exit 10 → `blocked`, 11 → `busy`).
   - `scripts/mac_test/mac_test.py`: `command_claim` 1343 (`--wait` polls every 2 s; 10 blocked, 11 busy, 12 unreadable), `command_release` 1390, `command_block` 1434, `command_unblock` 1547, `command_status` 1627; the state lives under `~/.local/state/mac-test`.
   - `scripts/build_hold/build_hold.py`:
     - The holder files live in `holder_directory()` 303, read by `read_holders` 385.
@@ -350,116 +352,262 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **Ruled out:** bringing the probe's process count back; a new decline reason for leftovers; reading `run.json` from `offload.py` to learn a takeover's host (the claim's reply names it).
 
-### Phase 9 — `/build:report` and `/build:mac_report` answer from the build log in about a second  · status: todo
+### Phase 9 — `/build:report` and `/build:mac_report` answer from the build log in about a second  · status: done
 
 #### Work Order
 
-**Goal:** `/build:report` opens with the three to five facts that matter most about the builds, shows tests by target and time waited on a held target, and `/build:mac_report` says how reliably tests reach the Mac when it is usable; each answer comes from one script in about a second, with no research step.
+**Goal:** `/build:report` opens with the three to five facts that matter most about the builds, shows tests by target and time waited on a held target, and `/build:mac_report` says how reliably tests reach the Mac when it is usable; each answer comes from one script in about a second, with no research step, from rows the build log holds once this phase lands.
 
 **Spec:**
 - Work only in worktree `/home/natepiano/worktrees/claude-build-followups-build-report`, branch `build-followups-build-report`.
-- Records the build log lacks today, and how older rows read. Every new writer goes through `store.append_line` (`store.py` 60) and never fails its caller (`record.py` 450).
-  - `calls` gains `target` (`BUILDLOG_TARGET`) and `hold_wait_s` (`BUILDLOG_HOLD_WAIT_S`), read in `record.call` (329-353). Old rows: NULL; the target is inferred as below.
-  - `calls` gains `mac_tries`: a JSON list with one entry per Mac try of the call, in order, each `{result, reason, s}`. Today only the last try is kept (`mac`, `mac_reason`, `mac_s`). Old rows: NULL, read as one try from those three columns.
-  - `calls` gains `mac_holder`: for a `busy` try, the `what` of the claim that held the Mac, from the claim's `busy: <what> since <HH:MM>` line (`mac_test.py` `command_claim` 1387), a kept claim's `busy: leftovers of ...` line included. Old rows: NULL, shown as `holder not recorded`.
-  - `calls` gains `after_decline`: `waited` when the call then waited on natedev's hold, `natedev` when it started there at once, empty otherwise. Old rows: NULL, read from `hold_wait_s` when present, else `not recorded`.
-  - A new record kind `mac_event` and table `mac_events` (`at`, `host`, `event`, `holder`, `reason`, `until`): `blocked` and `unblocked` written by `mac_test.py` where a block record is written and removed; `unreachable` where `offload.py` writes the backoff (`write_backoff`) and `reachable` at the first probe that answers after one; `battery` and `disk` at a probe that declines for them. A stretch is the time from an opening event to its closing one. Before the first `mac_event` row there are none: the report then estimates a stretch from runs of declines with one reason and prints `estimated from declines` beside it.
-  - A new record kind `hold` and table `holds` (`started_at`, `released_at`, `holder`, `reason`, `target`): written by `build_hold.py` when a hold starts and when its final release line prints. Today natedev's holds live only in the cycle files under `~/.local/state/build-hold-release`. Old days: no rows, and the report says `holds not recorded before <first row's day>`.
-  - The local flag stays free text (`local_reason`). The report counts those runs apart, lists the most repeated reasons, and counts the ones whose text says the Mac was unavailable, by a fixed pattern list in the module.
-  - `index.py`: `SCHEMA_VERSION` 12 → 13 (33), the new `CALL_COLUMNS` (116), the two tables in `TABLES` (243) and `ADDERS` (517); a version change rebuilds the index from the JSON lines. `buildlog schema` describes each new column in these words.
-- `verify.sh` exports what `record.py` reads: `BUILDLOG_MAC_TRIES`, `BUILDLOG_MAC_HOLDER`, `BUILDLOG_AFTER_DECLINE`. It already exports `BUILDLOG_TARGET` and `BUILDLOG_HOLD_WAIT_S`.
+- Scope, chosen when this phase was split on 2026-10-12 so that the two commands work first: every figure comes from rows the log holds once this phase lands. This phase adds no `mac_holder` column and no record of when a block or a hold began and ended, and it edits none of `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py`, `scripts/build_hold/build_hold.py` and `scripts/delegate/verify.sh`. "The Mac report shows who held the Mac and when it was blocked or held" adds those.
+- Two new columns on a call row:
+  - `calls` gains `target` and `hold_wait_s`, read in `record.call` (`record.py` 329-353) from `BUILDLOG_TARGET` and `BUILDLOG_HOLD_WAIT_S`; `hold_wait_s` goes through `optional_nonnegative_number`, as `mac_s` does (346). The write goes through `store.append_line` (`store.py` 60) and never fails its caller (`record.py` 450).
+  - `verify.sh` exports both names already (read on 2026-10-12): `BUILDLOG_TARGET` at 674 (empty), 776 (`mac`), 817 and 826 (empty again) and 1325 (`natedev`); `BUILDLOG_HOLD_WAIT_S` at 613 (`0`) and 632-633, where `collect_hold_wait` (629) sums the wait file. `note_event` (714) calls `collect_hold_wait` before it runs `record.py call`, so the record gets the final sum.
+  - Old rows hold NULL in both columns and print as `not recorded`.
+  - `index.py`: `SCHEMA_VERSION` 12 → 13 (33) and the two columns in `CALL_COLUMNS` (116); a version change rebuilds the index from the JSON lines. `buildlog schema` describes them in these words: `target`, "where the call was when it ended: mac, natedev, or empty"; `hold_wait_s`, "seconds waited on a held target, each declined Mac retry included; memory waits are not counted".
+- Speed, measured on 2026-10-12 against the live index (29,138 calls, 36,462 steps): `buildlog report` took 8.2 s. `report.report` was 7.7 s of it, and `mac_tests_section` 5.8 s of that, in two queries (`reported_mac_calls` 893, `package_natedev_tests` 933) whose `call_ran_on_natedev()` subquery (380) searches `steps` by host for every call, because no index covers `steps.call_id`. `launches.collect()` (`cli.py` 185) took 0.40 s and `index.update()` 0.07 s. The same 175 rows came back in 0.001 s when the day was a `started_at` range and `steps` was read once.
+  - `create_schema` (`index.py` 331) gains `CREATE INDEX steps_call ON steps (call_id)`; the version change builds it.
+  - The two slow queries are repaired here, so `/build:report` answers in about a second too. `reported_mac_calls` and `package_natedev_tests`, or what replaces them under "Tests by target", select the day's calls by a `started_at` range computed in Python from `day` in the caller's `TZ` (the `calls_started` index), read the day's `steps` once, and decide in Python whether a call ran on natedev. Neither runs `call_ran_on_natedev()` as a subquery per call. The repair changes how rows are selected, never which rows.
+  - By the same measurement about 2.4 s is left after that repair (8.2 less 5.8): 1.9 s in the other sections of `report.report`, 0.40 s in `launches.collect()` and 0.07 s in `index.update()`. No section of that 1.9 s has a time of its own yet. The writer of `report.py` times each section on the timed fixture (see the gate) and gives every section above 0.2 s the same repair, until `report` meets the gate. `launches.collect()` stays in `report`.
+  - `mac-report` calls `index.update()` and never `launches.collect()`. It selects calls by a `started_at` range computed in Python from the window in the caller's `TZ` (the `calls_started` index), never by `date(started_at, 'localtime')`, and runs no subquery per call.
 - `scripts/buildlog/mac_report.py` (new), reached as `buildlog mac-report [--hours N]` from `cli.py` (`main` 223). One pass over the index, times in the caller's `TZ`. Default window: the last 24 hours, then one row for each of the last 3 local days.
   - A candidate is a `verify.sh test` call that reached the Mac decision for a package the Mac may run. Cache reuses, local-flag runs and repositories or packages the Mac may not run (`repo`, `linux_only`) are not candidates; each is shown as its own count.
   - Per window: candidates; finished on the Mac (passed, failed); lost mid-run; declined, by reason. Reasons seen in the data: `busy`, `mac_busy` (none since 04:38 PDT on 2026-10-12), `backoff`, `unreachable`, `battery`, `blocked`, `runner`; `disk`, `state`, `copy` and `no_tests` are printed when they occur.
-  - The reliability figure: of the candidates made while the Mac was usable, the share that finished on the Mac. Set aside as not usable: `blocked`, `backoff`, `unreachable`, `battery`, `disk`, and a held target. Counted against the figure: `busy`, `mac_busy`, lost and `runner`. The line names both lists. Measured by hand for the 24 hours before 08:09 PDT on 2026-10-12: 72 of 330.
-  - The largest causes of a usable Mac going unused, largest first, `busy` split by `mac_holder`.
+  - The share line: of the candidates made while the Mac was usable, the share that finished on the Mac. Set aside as not usable: `blocked` (the Mac's hold), `backoff`, `unreachable`, `battery` and `disk`. Counted against the share: `busy`, `mac_busy`, lost and `runner`. The line names both lists. A hand count for the 24 hours before 08:09 PDT on 2026-10-12 gave 72 of 330; it is a figure to compare with, not a test value.
+  - `usable_share(connection, start, end)` computes that share for a `started_at` range and returns a frozen dataclass `UsableShare` with `finished` and `candidates`; `start` and `end` have the type `calls.started_at` is stored in. The build report's lead block calls it.
+  - The largest causes of a usable Mac going unused, largest first. `busy` is one line; its split by holder arrives with the `mac_holder` column.
   - Mac failures that are the environment and not the code: lost runs, `runner`, and a Mac failure whose natedev run of the same tree passed.
-  - How much of each day the Mac was blocked or unreachable, from `mac_events`.
-- `report.py` (shared with other units; whoever lands second resolves conflicts):
-  - A lead block of three to five lines above every section, built from values the report already computes plus the new ones: the reliability figure with its counts; the longest wait of the day and its cause (memory, cargo token, build folder, held target); failed steps and flaky tests; time saved by pass records; a line for a Mac blocked or unreachable now. A line with nothing to say is left out.
+  - Runs sent to natedev with the local flag (`mac_reason=local_flag`, the caller's words in `local_reason`, which stays free text): their count, the most repeated reasons, and the count whose text says the Mac was unavailable, by a fixed pattern list in the module.
+  - Blocked and unreachable stretches for each day, read from clusters of declines. A cluster is a run of candidate calls that declined for one cause (`blocked`; or `unreachable` and `backoff` together) with no candidate between them that got another answer; it lasts from its first decline to its last. Each total prints as `at least <h:mm>` with the words `lower bound, from declines`, because a stretch in which no test was tried leaves no row.
+  - The last line names what the log does not record yet: `Not recorded yet: who held the Mac on a busy decline, and when a block or a hold began and ended.`
+- `report.py` (the production doc lists it and `test_report.py` under this unit; a unit that lands a change to it second resolves the conflict):
+  - A lead block of three to five lines above every section, built from values the report already computes plus the new ones: the share with its two counts (`usable_share` for the report's day); the longest wait of the day and its cause (memory, cargo token, build folder, held target); failed steps and flaky tests; time saved by pass records; and, when the day's latest candidate call declined `blocked`, `backoff` or `unreachable`, the line `Mac blocked as of <HH:MM>` or `Mac unreachable as of <HH:MM>` with that call's time. A line with nothing to say is left out.
   - "Tests on the Mac" (`mac_tests_section` 993, `reported_mac_calls` 893) becomes "Tests by target": one row per package, columns Mac (ran, passed, failed, Mac p50), natedev (ran, p50), and "Did not reach the Mac" (busy with our test, blocked, unreachable, state unreadable, Linux-only or `--local`, no Mac entry; `mac_busy` stays for old rows). It selects every relevant test call, a package that only ran on natedev included. Mac execution is counted from the call's Mac outcome and natedev execution from its nextest steps, so a full test that passed on the Mac and confirmed on natedev counts once on each. A cached step is no execution.
   - No count is taken from `target` alone: it names the target the call was sent to when it ended. An interrupted first Mac attempt can have an empty `mac` column and is counted in no column. An interrupted retry keeps the earlier `busy` or `blocked` decline and its seconds; it is counted under that decline, in no Mac column and no Mac time. A completed Mac pass still counts when its confirmation is interrupted.
   - `offload_record` (402) reads a declined row with no `mac_s` for `repo` and `linux_only` too.
-  - The Waiting table (`waiting_section` 548, `wait_row` 448) gains `Held target`: Longest, Over 5 min, Waited (calls), Total (seat-hours), Worst.
+  - The Waiting table (`waiting_section` 548, `wait_row` 448) gains `Held target`, from `hold_wait_s`: Longest, Over 5 min, Waited (calls), Total (seat-hours), Worst.
 - Commands. No stub is left: a running session picks up the new name when it restarts.
-  - `commands/build/report.md`: today's `commands/builds.md` text, same script; its Owner session text schedules `/build:report`.
+  - `commands/build/report.md`: today's `commands/builds.md` text, same script. Its Owner session text keeps the notifier instance `report-builds` and changes the message to `Scheduled report (builds, every 4 hours): run /build:report with no argument and show its output unchanged. Do nothing else for this message.`
   - `commands/build/mac_report.md`: runs `TZ=America/Los_Angeles ~/.claude/scripts/buildlog/buildlog mac-report` and shows the output unchanged.
   - `commands/builds.md` is deleted, and every pointer moves in this phase:
-    - this unit's: `commands/watcher.md` (29), `docs/as-built/build-report-session.md` (5, 16, 22, 24, 28, 29);
-    - `scripts/buildlog/memory.py` (332; owner followups-unit, run done);
-    - `commands/showrunner/produce.md` (460; hub, owner stalls-unit);
-    - `docs/plans/build-followups-screenshot.md` (51; owner screenshot-unit);
+    - this unit's: `commands/watcher.md` (29), `docs/as-built/build-report-session.md` (5, 16, 22, 24, 28, 29; lines 16 and 29 hold the message text);
+    - `commands/showrunner/produce.md` (460; hub, owner stalls-unit, with enh-showrunner-unit also on it in the production doc's hub table): no seat edits it. Another unit is changing that file, so the director moves this one line before the checkpoint, after that change is on the merge branch and merged into this branch;
+    - `docs/plans/build-followups-screenshot.md` (51; owner screenshot-unit): not edited here, because its unit is mid-edit; the showrunner routes the pointer to that unit when this phase merges;
     - `docs/plans/build-followups-production.md` (the showrunner's; not edited here, the notice asks for it).
-  - Each file of another unit goes in the checkpoint notice as `also touches <path> (owner <unit>)`. Before editing one, the director checks whether another unit's branch or worktree has it in flight and tells the showrunner. `commands/showrunner/produce.md`, `commands/unit/direct.md` and `docs/production_format.md` are under edit by another unit until about 09:45 PDT on 2026-10-12: merge `build-followups` into this branch before touching one.
+  - `scripts/buildlog/memory.py` 332 is no pointer and is not edited: `"/builds.slice"` there is a cgroup name.
+  - The live schedule keeps the old message until its instance is made again. The checkpoint notice asks the session that owns `report-builds` to run the Owner session command once after the merge.
+  - Each file of another unit goes in the checkpoint notice as `also touches <path> (owner <unit>)`. Before editing one, the director checks whether another unit's branch or worktree has it in flight and tells the showrunner. That check also covers `scripts/buildlog/record.py` and `test_record.py`, which the production doc lists under mul_add-unit as well (Codex session precedence). `commands/showrunner/produce.md`, `commands/unit/direct.md` and `docs/production_format.md` are under edit by another unit until about 09:45 PDT on 2026-10-12: merge `build-followups` into this branch before touching one.
 
 **Files:**
 - `scripts/buildlog/record.py`, `scripts/buildlog/index.py`, `scripts/buildlog/cli.py`
 - `scripts/buildlog/mac_report.py` — new.
 - `scripts/buildlog/report.py`
-- `scripts/buildlog/memory.py` — one pointer.
 - `scripts/buildlog/test_record.py`, `scripts/buildlog/test_index.py`, `scripts/buildlog/test_report.py`, `scripts/buildlog/test_mac_report.py` — tests; the last is new.
-- `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py`, `scripts/mac_test/test_mac_test.py`, `scripts/mac_test/test_offload.py` — the `mac_event` records and the holder of a `busy` try.
-- `scripts/build_hold/build_hold.py`, `scripts/build_hold/test_build_hold.py` — the `hold` records.
-- `scripts/delegate/verify.sh`, `scripts/delegate/test_verify_mac_offload.py` — the three exports.
-- `commands/build/report.md`, `commands/build/mac_report.md` — new; `commands/builds.md` — deleted.
-- `commands/watcher.md`, `docs/as-built/build-report-session.md`, `commands/showrunner/produce.md`, `docs/plans/build-followups-screenshot.md` — pointers.
+- `commands/build/report.md`, `commands/build/mac_report.md` — new.
+- `commands/builds.md` — deleted.
+- `commands/watcher.md`, `docs/as-built/build-report-session.md` — pointers.
+- `commands/showrunner/produce.md` — pointer; the director's one-line edit before the checkpoint, never a seat's.
 
-**Seats:** 2 writers, split by who writes a record and who reads it
-- `impl` — the records: `record.py`, `index.py`, `mac_test.py`, `offload.py`, `build_hold.py`, `verify.sh` and their tests; hub: `scripts/buildlog/index.py` (the column and table names both writers use) and `scripts/buildlog/cli.py`.
-- `test` — opens as `impl`: `mac_report.py`, `report.py`, `memory.py`, `test_report.py`, `test_mac_report.py`, the command files and every pointer.
+**Seats:** 2 writers, split by report: the log and the Mac report on one line, the build report and the commands on the other
+- `impl` — `record.py`, `index.py`, `cli.py`, `mac_report.py`, `test_record.py`, `test_index.py`, `test_mac_report.py`; hub: `scripts/buildlog/index.py` (the two column names and the `steps_call` index that the build report's queries read). The other writer also reads `mac_report.py`, for `usable_share` only.
+- `test` — opens as `impl`: `report.py`, `test_report.py`, `commands/build/report.md`, `commands/build/mac_report.md`, the deletion of `commands/builds.md`, and the two pointer files `commands/watcher.md` and `docs/as-built/build-report-session.md`.
 
 **Constraints from prior phases:**
 - From the unit director, 2026-10-12: until 18:05 PDT on 2026-10-12 no edit to `scripts/lint/memory_admit.py` or `scripts/buildlog/width_trial.py`, and nothing in `scripts/lint/invoke.sh` near `LINT_TEST_WIDTH`, `require_nextest` or `nextest_physical_cores`; ask the showrunner before touching lint's nextest wrapper. Python passes basedpyright with zero errors and warnings, no `Any`, no file-level ignore. A file outside this unit's list is edited only where this Work Order names it and its owner. Seats never contact the Mac and never run `verify.sh`.
 - `BUILDLOG_TARGET` is `mac` (the call ended on the Mac, an interruption after the Mac was chosen included), `natedev` (tests started locally) or empty. `BUILDLOG_HOLD_WAIT_S` is a non-negative decimal of seconds waited on a hold, the seconds of each declined Mac retry included, never memory waits; test a 0.4 s wait.
 - A Mac that routing excluded is `mac=declined` with `mac_reason` and `local_reason` both `repo` or `linux_only` and no `mac_s`; `--local "<why>"` keeps `mac_reason=local_flag` with the caller's words in `local_reason`.
 - Since the lost-run work: a lost or interrupted run keeps the Mac's claim until a leftover check counts none. A try that meets leftovers declines `busy`; a check that cannot run declines `unreachable` and writes the backoff. `stream_mac_run` reads a printed `mac_exit=<n>` line as a finished run whatever ssh returned. `claim --remote` exits 13 on a takeover.
-- `build_hold.py` changes go to the live machine only while natedev is free and no release runs; the notice says so. The hold notice text and the release record's format do not change in this phase.
 - `scripts/buildlog/test_record.py` runs on temporary hold directories; keep that setup.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'`, `python3 -m unittest discover -s scripts/mac_test -p 'test_*.py'`, `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'` and `python3 -m unittest discover -s scripts/delegate -p 'test_verify_mac_offload.py'` green; `bash -n scripts/delegate/verify.sh`; `basedpyright scripts/buildlog scripts/mac_test scripts/build_hold` reporting `0 errors, 0 warnings` (exit 3 for the absent `.venv` is a pass). With `BUILDLOG_DIR` set to a directory the tests filled, `python3 scripts/buildlog/cli.py report` and `python3 scripts/buildlog/cli.py mac-report` each print in under 2 s, and `mac-report` prints the reliability line with both lists. `grep -rnE '(^|[^a-z_/])/builds\b|commands/builds\.md' commands scripts docs/as-built` prints nothing. Then the director's check after the merge: `mac-report` against the live index, timed.
+**Acceptance gate:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` green; `basedpyright scripts/buildlog` reporting `0 errors, 0 warnings` (exit 3 for the absent `.venv` is a pass). Two timed cases, one in `test_report.py` and one in `test_mac_report.py`: each fills a temporary `BUILDLOG_DIR` with 29,138 calls and 36,462 steps (the live index's size on 2026-10-12), builds the index, then runs `python3 scripts/buildlog/cli.py report` or `python3 scripts/buildlog/cli.py mac-report` as a subprocess, prints the seconds it took, and fails above 2 s. On that fixture `mac-report` prints the share line with both lists, a stretch marked `lower bound, from declines`, and the closing `Not recorded yet:` line. `git status --short scripts/mac_test scripts/build_hold scripts/delegate` prints nothing. `grep -rnE '(^|[^a-z_/])/builds\b|commands/builds\.md' commands scripts docs/as-built | grep -v 'builds\.slice'` prints nothing. Then the director's check after the merge: `buildlog report` and `buildlog mac-report` against the live index, each timed.
 
 ### Phase 10 — A build cannot point the hold check at another directory  · status: todo
 
 #### Work Order
 
-**Goal:** A seat, or any caller that is not a test, cannot make `verify.sh` or an app launch read natedev's hold from another directory; tests keep their override.
+**Goal:** A build started through the installed scripts stops with one line when a variable would point its hold check, its release record or the Mac's block state somewhere else; tests keep setting those variables, because they run a checkout's scripts.
 
 **Spec:**
-- The defect, reported by hana through the showrunner at 07:32 PDT on 2026-10-12: at 03:40 PDT a trunk Codex seat set `BUILD_HOLD_DIR` for its own process and its `verify.sh` passed a hold wait, after its unit's direct release, while the holder file was still present. `holder_directory()` (`build_hold.py` 529) returns `BUILD_HOLD_DIR` with no check of who set it, so any process that sets it sees an empty hold directory. The release directory (`BUILD_HOLD_RELEASE_DIR`, 690) is read the same way.
-- Every reader and writer, from a search of `scripts`, `commands`, `docs` and `config` on 2026-10-12:
-  - `scripts/build_hold/build_hold.py` 529 and 690 — the two reads.
-  - `scripts/lint/memory_gate.sh` 23 — `build_hold_mark` reads `BUILD_HOLD_DIR` in shell.
-  - `scripts/production/dailies_input.py` 698-709 — sets and restores `BUILD_HOLD_DIR` in its own process (owner phase-tables-unit); `scripts/production/dailies_render.py` 35 names it in a comment (owner stalls-unit).
-  - 22 test files under `scripts` set one or both for a temporary directory.
-  - `scripts/delegate/verify.sh` and `scripts/hooks/*.sh` name neither.
-- The rule: an override is honored only for a test fixture. A directory is a test fixture when it lies under the system temporary root and holds the marker file `.build-hold-test-fixture`. Any other value is ignored: the default directory is read, and one line goes to stderr, `build hold: BUILD_HOLD_DIR ignored (<path> is no test fixture)`.
-- One resolver in `build_hold.py` decides this for both directories and returns a named result (the default directory, a test fixture's directory, an ignored override with its path); no `Path | None`. `memory_gate.sh` asks the resolver or applies the same two tests in shell; it never reads the variable bare.
-- Each test that sets an override writes the marker through one shared helper, so the 22 files change in one line each.
-- `dailies_input.py` needs a holder directory of its own choosing in production: it passes the directory as an argument to the reader it calls and sets no variable. Name that edit in the notice as `also touches scripts/production/dailies_input.py (owner phase-tables-unit)`.
-- A `verify.sh` call that ran under an honored override records `hold_dir_override` = 1 in its call row, and the build report's lead block prints the count when it is above zero, so a seat that writes the marker by hand is seen.
-- Unchanged: the names `NoAdmissionAck` and `DeliveryFailed` (another unit imports them), the old hold notice text, every exit code. The checkpoint notice says whether the release record's format changed; this Work Order changes none.
+- **The defect**, reported by hana through the showrunner on 2026-10-12: at 03:40 PDT a trunk Codex seat set `BUILD_HOLD_DIR` for its own process and its `verify.sh` passed a hold wait while the holder file was still present. `holder_directory()` (`scripts/build_hold/build_hold.py` 528-529) returns `BUILD_HOLD_DIR` with no check of who set it. The same holds for `release_directory()` (689-690), `build_hold_mark` (`scripts/lint/memory_gate.sh` 23), the Mac's state (`scripts/mac_test/mac_test.py` 347-349, `scripts/mac_test/offload.py` 507-509) and the other reads listed below. Every default is under `$HOME`, so `HOME=<other>` moves all of them: `ln -s ~/.claude /tmp/x/.claude; HOME=/tmp/x bash ~/.claude/scripts/delegate/verify.sh ...` runs installed files only and reads an empty state directory.
+- **The rule.** An installed script refuses to run when a listed variable is set or `HOME` is not the user's home directory. A checkout's script runs with them as it does today. An earlier design (installed code reads no variable, about 25 test files move to a per-process copy of `scripts/`) was rejected by the director: too many files, and a Python start added to every build step.
+- **The list, in this order, held once in Python and once in shell:** `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR`, `MAC_TEST_STATE_DIR`, `MAC_TEST_CONFIG`, `BUILD_TARGETS_SCRIPT`, `BUILD_TARGETS_CONFIG`, `BUILD_TARGETS_NOW`, `PLAN_DELEGATE_ACTIVE_DIR`. Where they are read: `build_hold.py` 394, 529, 690; `memory_gate.sh` 11, 23; `scripts/delegate/verify.sh` 134; `scripts/build_targets/targets.py` 128; `scripts/build_targets/build_targets.py` 140; `mac_test.py` 348, 353; `offload.py` 503, 508; `scripts/mac_test/audit.py` 342. A variable counts as set when it is in the environment, an empty value included: Python reads `BUILD_HOLD_DIR=` as the current directory. `HOME` is the ninth case and is not in the list: it is refused when it is set and is not the same directory as the home in the password database.
+- **Installed** means: the file is the same file (device and inode, links followed) as `<home>/.claude/scripts/<its directory name>/<its file name>`, where `<home>` comes from the password database and never from `HOME`. Shell tests it with `[[ a -ef b ]]`, Python with `os.path.samefile`; a missing file is "not installed". A fixture `HOME` whose `.claude/scripts` is a link to a checkout is therefore a checkout, and a link or hard link to an installed file is installed.
+- **The refusal line**, on standard error, the same text from shell and Python, then exit status 2:
+  `<file name>: <NAME> is set to '<value>'; the installed scripts under <home>/.claude/scripts do not run with it. Unset it and run again.`
+  Example: `verify.sh: BUILD_HOLD_DIR is set to '/tmp/empty'; the installed scripts under /home/natepiano/.claude/scripts do not run with it. Unset it and run again.` The first set name in list order is reported, `HOME` last. The line does not mention checkouts. Status 2 is `verify.sh`'s "usage error" (its header, 120-121) and is the status with which a PreToolUse hook blocks its tool call, so `scripts/hooks/pre-tool-use-brp-launch-gate.sh` (which sources `memory_gate.sh` at line 6) blocks the launch and shows the line with no edit.
+- **`scripts/build_hold/override_guard.sh` (new).** Sourced, never run. bash 3.2 syntax only (the Mac; see `scripts/lint/invoke.sh` 56 and 441), no command substitution, no external command. Complete text, measured on natedev (bash 5.3.9, `PATH` naming an empty directory) at 0.05 ms a call with nothing set; put that number in its header comment:
+  ```bash
+  BUILD_OVERRIDE_VARIABLES="BUILD_HOLD_DIR BUILD_HOLD_RELEASE_DIR MAC_TEST_STATE_DIR MAC_TEST_CONFIG BUILD_TARGETS_SCRIPT BUILD_TARGETS_CONFIG BUILD_TARGETS_NOW PLAN_DELEGATE_ACTIVE_DIR"
+
+  # build_override_refusal <file> <its path under scripts/> [<user home>]
+  build_override_refusal() {
+      local file="$1" relative="$2" user_home="${3:-}" name found="" home_now="${HOME:-}" IFS=$' \t\n'
+      for name in $BUILD_OVERRIDE_VARIABLES; do
+          if [[ -n "${!name+x}" ]]; then found="$name"; break; fi
+      done
+      if [[ -z "$user_home" ]]; then
+          unset HOME; user_home=~; export HOME="$home_now"
+      fi
+      if [[ -z "$found" && "$home_now" != "$user_home" ]]; then
+          [[ "$home_now" -ef "$user_home" ]] || found=HOME
+      fi
+      [[ -n "$found" ]] || return 0
+      [[ "$file" -ef "$user_home/.claude/scripts/$relative" ]] || return 0
+      printf "%s: %s is set to '%s'; the installed scripts under %s do not run with it. Unset it and run again.\n" \
+          "${file##*/}" "$found" "${!found}" "$user_home/.claude/scripts" >&2
+      return 1
+  }
+  ```
+  The list is a plain assignment, so a value from the environment is replaced. With `HOME` unset, bash expands `~` from the password database; the function restores and re-exports `HOME` on the next word. The third argument exists for tests only: no installed file passes it.
+- **Shell callers**, four lines each, identical but for the last argument:
+  ```bash
+  BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
+  [[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
+  source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
+  build_override_refusal "${BASH_SOURCE[0]}" delegate/verify.sh || exit 2
+  ```
+  - `scripts/delegate/verify.sh`: after line 123 (`set -euo pipefail`) and before line 128, the first line that reads `HOME`. Lines 133 and 134 stay as they are: with `HOME` checked, line 133 sources the installed `invoke.sh`.
+  - `scripts/lint/memory_gate.sh`: before line 10, with `lint/memory_gate.sh` as the last argument. It must stay above line 11, which assigns `BUILD_TARGETS_SCRIPT` in the shell; a guard below it would see the name set. `invoke.sh` 85 sources this file for every build step, `scripts/lint/lint` 10 and `scripts/release/pre_release_checks.sh` 59 reach it through `invoke.sh`, and the BRP hook sources it directly. No line of `invoke.sh`, `lint` or the hook changes.
+- **`scripts/build_hold/override_guard.py` (new, standard library only, imports nothing from this repo):**
+  - `OVERRIDE_VARIABLES: tuple[str, ...]` — the eight names in the order above. `REFUSED_STATUS = 2`.
+  - `user_home() -> Path` — `Path(pwd.getpwuid(os.getuid()).pw_dir)`, cached.
+  - `refusal(script: Path, home: Path, environment: Mapping[str, str]) -> str` — the refusal line, or `""`. Finds the first listed name present in `environment`; with none, `HOME` when it is present, differs from `str(home)` and is not the same directory; with neither, returns `""` having read no file. Then returns `""` unless `script` is the same file as `home / ".claude" / "scripts" / script.parent.name / script.name`.
+  - `refuse_overrides(script: Path) -> None` — `refusal(script, user_home(), os.environ)`; a non-empty line is printed to standard error and `SystemExit(REFUSED_STATUS)` raised. Measured 1.3 microseconds a call with nothing set.
+- **Python callers.** `override_guard.refuse_overrides(Path(__file__))` is the first statement of each function below, and `import override_guard` joins the file's imports:
+  - `build_hold.py` `main` (1392). The module sits beside it; import after line 25.
+  - `build_targets.py` `main` (420); import after line 40 (`targets.py` 14-16 already puts `scripts/build_hold` on the path).
+  - `mac_test.py` `main` (1800), `offload.py` `main` (1170), `audit.py` `main` (477). Each adds `sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))` beside its `lint` line (`mac_test.py` 23, `offload.py` 25, `audit.py` 18).
+  - `scripts/production/dailies_input.py` `main` (946); import after line 27, whose path line 26 already serves it. Lines 697-709 and the `--holders` flag stay.
+  - `scripts/buildlog/rust_release.py` `build_hold_active` (135), which `scripts/buildlog/cli.py` 210 reaches each hour. It reads no listed variable, only `Path.home()` (25), so this is the `HOME` case. Add the `sys.path` line and the import after line 21.
+  - `pyrightconfig.json`: the `scripts/buildlog` root (81-86) and the `scripts/mac_test` root (88-93) gain `scripts/build_hold`; add the same entry to any other root basedpyright reports.
+- **The guard runs at the start of an entry point and never inside a function that reads a directory.** `dailies_input.py` 699 sets `BUILD_HOLD_DIR` in its own process on every run (callers 893 and 920) and reads it back through `dailies_render.read_dailies_hold` (`scripts/production/dailies_render.py` 754); a guard in `holder_directory()` would refuse every dailies run.
+- **Nothing installed sets a listed variable for a guarded script.** `scripts/delegate/prepare_session.sh` 38 sets `PLAN_DELEGATE_ACTIVE_DIR` to its default for `unit_notifier.sh`, which starts `scripts/message/notifier.sh`; its `systemd-run` (420-423) passes `HOME`, `PATH` and `NOTIFIER_STATE_DIR` only, and neither script is guarded. `start_watcher` (`mac_test.py` 1148-1172) copies the `MAC_TEST_` variables already present and adds none; an installed `main` has refused before it runs. The command `offload.py` sends to the Mac (887-892) sets five `BUILDLOG_`, `LINT_` and `MACOSX_` variables and no listed one.
+- **Tests keep their variables and fixtures unchanged.** The five files that start `verify.sh` with a hold variable give the child a `HOME` whose `.claude/scripts` leads to the checkout (`scripts/delegate/test_verify_mac_offload.py` 326-328 and `test_verify_hold_wait.py` through it, `test_verify_token_wait.py` 40, `test_verify_untested_examples.py` 65 and `test_verify_release_ack.py` through it); the files that source `invoke.sh` or `memory_gate.sh` name them from `Path(__file__)`. No existing test file is edited.
+- **New cases, `scripts/build_hold/test_override_guard.py` (new).** Each "installed" case builds `<temp>/home/.claude/scripts/<dir>/<file>` and passes `<temp>/home` as the `home` argument (Python) or the third argument (shell); the installed root is never chosen through the environment. Shell cases run `bash -c 'source "$1"; build_override_refusal "$2" "$3" "$4"'`.
+  - `OverrideGuardPythonTests`: `test_installed_script_refuses_each_listed_variable` (one sub-test per name, asserting the exact line); `test_installed_script_refuses_an_empty_value`; `test_installed_script_refuses_a_changed_home`; `test_installed_script_runs_when_nothing_is_set`; `test_checkout_script_accepts_every_variable_and_a_changed_home` (script is this checkout's `build_hold.py`); `test_a_link_to_the_installed_script_is_installed`; `test_user_home_ignores_HOME`; `test_refuse_overrides_exits_2_and_prints_the_line` (patch `override_guard.user_home`); `test_nothing_set_reads_no_file` (`os.path.samefile` patched to raise).
+  - `OverrideGuardShellTests`: the same first six cases against `override_guard.sh`; `test_shell_and_python_lists_are_equal` (the words of `$BUILD_OVERRIDE_VARIABLES` printed by bash equal `list(OVERRIDE_VARIABLES)`); `test_shell_and_python_print_the_same_line`; `test_home_lookup_ignores_HOME` (no third argument, `HOME=/nonexistent`: the checkout's file gives status 0 with `HOME` still `/nonexistent` and exported afterwards; and, skipped when `<password-database home>/.claude/scripts/lint/memory_gate.sh` is absent, that file gives status 1 and a line naming `<password-database home>/.claude/scripts`); `test_nothing_set_starts_no_process` (bash started by absolute path with `PATH` naming an empty directory and `set -e`, 2000 calls with no third argument: status 0, nothing on standard error, under 2 seconds in all).
+  - `GuardCallSiteTests.test_every_guarded_file_calls_the_guard`: the call line is present in `verify.sh` before the first line containing `HOME=` or `$HOME`, in `memory_gate.sh` before the first line containing `BUILD_TARGETS_SCRIPT`, and as the first statement of the seven Python functions above.
+- **Docs.** `docs/as-built/build-memory-admission.md` 143, 160 and 240-241, `docs/as-built/mac-test-offload.md` 11 and 66, `docs/as-built/session-notifier.md` 193 and `config/README.md` 64 name a listed variable: each says the installed scripts refuse to run with it set and that tests set it for a checkout's scripts.
+- **Not closed here**, by this Work Order's own choice, and listed in the checkpoint notice:
+  - A checkout or any other copy of the scripts accepts the variables. A seat that runs a copy still passes a hold; nothing the installed scripts read does it.
+  - Report-only programs are not guarded: `dailies_render.py` `main` (1620, owner stalls-unit) and the hooks and production scripts that import `build_hold` to show a hold line. A variable changes what they print; they start no build.
+  - Variables outside the list (`VERIFY_MAC_RUNNER` at `verify.sh` 736, `LINT_CONFIG_READER` at `invoke.sh` 26, `MAC_TEST_SESSIONS` and `MAC_TEST_SEND` at `mac_test.py` 717 and 746, the `BUILDLOG_HOLD_` files) were not examined.
+- **No build-log column.** Nothing is honored and nothing is counted; `scripts/buildlog/record.py`, `index.py` and `report.py` are not edited and `SCHEMA_VERSION` does not move.
+- **Unchanged:** the names `NoAdmissionAck` and `DeliveryFailed` in `build_hold.py`, the hold notice text, every command, argument and exit code of `build_hold.py`, `build_targets.py` and `mac_test.py` when nothing is set, and the release record's format. The checkpoint notice says the release record's format did not change.
+
+- **Callers under another user.** The CI runners on natedev and the hana-ci runner on the Mac run as their own users. For such a caller a script under another user's `.claude/scripts` is not the same file as `<its own home>/.claude/scripts/...`, so the guard treats it as a checkout and refuses nothing, and its `HOME` equals its own password-database home. Before the seats start, the director checks whether any runner calls an installed script and names each one found in the checkpoint notice; a runner that would be refused narrows the `HOME` rule before any code is written.
+- **The width trial.** The showrunner cleared `scripts/lint/memory_gate.sh`'s four guard lines to land inside the trial window (2026-10-12): they add no wait. At the checkpoint the director tells test-threads-unit-unit which lines changed.
+- **Read, never edited:** `scripts/lint/invoke.sh`, `scripts/lint/lint`, `scripts/lint/memory_admit.py`, `scripts/buildlog/width_trial.py`, `scripts/buildlog/cli.py`, `scripts/hooks/pre-tool-use-brp-launch-gate.sh`, `scripts/build_targets/targets.py`, `scripts/production/dailies_render.py`, `scripts/delegate/prepare_session.sh`, `scripts/message/notifier.sh`, and every existing `test_*.py`.
 
 **Files:**
-- `scripts/build_hold/build_hold.py`, `scripts/build_hold/test_build_hold.py`
-- `scripts/lint/memory_gate.sh`
-- `scripts/production/dailies_input.py` — owner phase-tables-unit.
-- `scripts/buildlog/record.py`, `scripts/buildlog/index.py`, `scripts/buildlog/report.py` — the override count.
-- `scripts/delegate/test_verify_hold_wait.py` — the marker, one line through the shared helper; the same line in each of the other test files under `scripts` that set an override (22 in all).
+- `scripts/build_hold/override_guard.sh` — new: the shell list and `build_override_refusal`.
+- `scripts/build_hold/override_guard.py` — new: the Python list, `user_home`, `refusal`, `refuse_overrides`.
+- `scripts/build_hold/test_override_guard.py` — new: the cases above.
+- `scripts/build_hold/build_hold.py` — one import, one line in `main` (1392).
+- `scripts/build_targets/build_targets.py` — one import, one line in `main` (420).
+- `scripts/mac_test/mac_test.py` — 23, one import, one line in `main` (1800).
+- `scripts/mac_test/offload.py` — 25, one import, one line in `main` (1170).
+- `scripts/mac_test/audit.py` — 18, one import, one line in `main` (477).
+- `pyrightconfig.json` — 81-86, 88-93.
+- `docs/as-built/build-memory-admission.md`
+- `docs/as-built/mac-test-offload.md`
+- `scripts/delegate/verify.sh` — also touches (owner test-threads-unit-unit); four lines after 123.
+- `scripts/lint/memory_gate.sh` — also touches (owner test-threads-unit-unit); four lines before 10.
+- `scripts/production/dailies_input.py` — also touches (owner phase-tables-unit); one import after 27, one line in `main` (946).
+- `scripts/buildlog/rust_release.py` — this unit's own file (buildlog), named in the notice all the same; two lines after 21, one line in `build_hold_active` (135).
+- `docs/as-built/session-notifier.md` — also touches (owner showrunner-fixer); 193.
+- `config/README.md` — also touches (no owner; the showrunner gave it to this unit); 64.
 
-**Seats:** 1 writer + 1 tester
-- `impl` — `build_hold.py`, `memory_gate.sh`, `dailies_input.py`, the three buildlog files
-- `test` — the shared marker helper and every test file that sets an override; new cases: an override with no marker is ignored and the real hold still holds; one outside the temporary root is ignored; a fixture is honored; the stderr line; `build_hold_mark` in shell follows the same rule.
+**Seats:** 1 writer + 1 tester. The code is two new files and one call in each of nine files; the Spec gives signatures, the list and the exact line, so the cases can be written first.
+- `impl` — `override_guard.sh`, `override_guard.py`, `build_hold.py`, `build_targets.py`, `mac_test.py`, `offload.py`, `audit.py`, `verify.sh`, `memory_gate.sh`, `dailies_input.py`, `rust_release.py`, `pyrightconfig.json`, the three docs and `config/README.md`. No hub file: the tester's one file sits in the existing `scripts/build_hold` root.
+- `test` — `scripts/build_hold/test_override_guard.py`, written from the Spec alone.
 
 **Constraints from prior phases:**
 - The director's constraints listed under the report phase apply here unchanged.
-- Every fixture that can reach the hold wait needs temporary `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR` and `PLAN_DELEGATE_ACTIVE_DIR`; a fixture that reaches the installed scripts through the real HOME rewrites the live release record.
+- Set by the showrunner: until 18:05 PDT on 2026-10-12 there is no edit to `scripts/lint/memory_admit.py` or `scripts/buildlog/width_trial.py`, and in `scripts/lint/invoke.sh` no change to the wait or width lines (`LINT_TEST_WIDTH`, `require_nextest`, `nextest_physical_cores`). This Work Order edits none of the three files. `memory_gate.sh` is sourced by `invoke.sh` 85 and gains four lines that start no process: the director tells the trial's owner before it is installed, or installs after 18:05.
+- Set by the user for this phase: no new process on a build step when no listed variable is set. The shell guard uses builtins only; `memory_gate.sh` 10-12 keep their existing command substitutions and gain none.
+- Set by the director: `build_hold.py` and the files installed with it go to the live machine only while natedev is free and no release runs. `memory_gate.sh` and `verify.sh` source `override_guard.sh`, so all of this phase arrives in one commit; a tree with the callers and without that file refuses every build. `mac_test.py` and `offload.py` also run on the Mac, whose checkout takes the same commit before the next Mac test.
+- Set by the production: a file owned by another unit is named in the checkpoint notice as `also touches <path> (owner <unit>)`, as in Files.
+- The suites run from a worktree. Run inside `~/.claude`, every case that sets a listed variable ends with the refusal line. No timer, hook or command file runs them there (checked 2026-10-12).
+- Every fixture that can reach the hold wait still sets `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR` and `PLAN_DELEGATE_ACTIVE_DIR`. A fixture that reaches the installed scripts through the real `HOME` used to rewrite the live release record; it now stops with the refusal line.
+- The Mac runs bash 3.2 (`invoke.sh` 56, 441): `override_guard.sh` and the four caller lines use no array, no `${var@P}`, no `[[ -v ]]`.
 - `build_hold_mark` runs under `set -u` with `nullglob` and stays silent on every failure.
-- The report phase adds the call columns and bumps `SCHEMA_VERSION` to 13; this phase adds one column and bumps it again.
-- `build_hold.py` goes to the live machine only while natedev is free and no release runs.
+- `NoAdmissionAck` and `DeliveryFailed` in `scripts/build_hold/build_hold.py` keep their names (another unit imports them into `dailies_render.py` 63). The release record's format does not change.
+- Python passes basedpyright with zero errors and zero warnings, no `Any`, no file-level ignore, no `Path | None`.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'`, `python3 -m unittest discover -s scripts/build_targets -p 'test_*.py'`, `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` and `python3 -m unittest discover -s scripts/production -p 'test_dailies*.py'` green; `bash -n scripts/lint/memory_gate.sh`; `basedpyright scripts/build_hold scripts/buildlog scripts/production` reporting `0 errors, 0 warnings`. The director runs the full `scripts/delegate` suite once (about 12.5 minutes).
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'`
+- `python3 -m unittest discover -s scripts/build_targets -p 'test_*.py'`
+- `python3 -m unittest discover -s scripts/mac_test -p 'test_*.py'`
+- `python3 -m unittest discover -s scripts/lint -p 'test_*.py'`
+- `python3 -m unittest discover -s scripts/hooks -p 'test_*.py'`
+- `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'`
+- `python3 -m unittest discover -s scripts/production -p 'test_*.py'`
+- `python3 -m unittest discover -s scripts/delegate -p 'test_*.py'`, run once by the director (about 12.5 minutes). All eight green with no existing test file edited: that is the proof a checkout accepts the variables.
+- Named cases pass: `test_override_guard.OverrideGuardShellTests.test_installed_script_refuses_each_listed_variable`, `OverrideGuardPythonTests.test_installed_script_refuses_each_listed_variable`, both `test_checkout_script_accepts_every_variable_and_a_changed_home`, `OverrideGuardShellTests.test_shell_and_python_lists_are_equal`, and `OverrideGuardShellTests.test_nothing_set_starts_no_process`.
+- `bash -n scripts/build_hold/override_guard.sh`, `bash -n scripts/lint/memory_gate.sh`, `bash -n scripts/delegate/verify.sh`.
+- `basedpyright scripts/build_hold scripts/build_targets scripts/mac_test scripts/buildlog scripts/production scripts/lint scripts/hooks scripts/delegate` ends with the line `0 errors, 0 warnings` (exit 3 for the absent `.venv` is a pass).
+- Before install, the director feeds the guard to the Mac's own bash; it reads the Mac's existing file and changes nothing: `{ cat scripts/build_hold/override_guard.sh; printf '%s\n' 'export BUILD_HOLD_DIR=/tmp' 'build_override_refusal ~/.claude/scripts/lint/memory_gate.sh lint/memory_gate.sh; echo "status=$?"'; } | ssh <host from config/mac_test.conf> /bin/bash -s` prints the refusal line for `memory_gate.sh` and `status=1`; without the `export` line it prints `status=0`.
+- On natedev after install, with no hold in force: `BUILD_HOLD_DIR=/tmp/empty bash ~/.claude/scripts/delegate/verify.sh check x; echo $?` prints the `verify.sh:` refusal line and `2`; `HOME=/tmp bash ~/.claude/scripts/delegate/verify.sh check x; echo $?` prints the line naming `HOME` and `2`; `BUILD_HOLD_DIR=/tmp/empty python3 ~/.claude/scripts/build_hold/build_hold.py status; echo $?` prints the `build_hold.py:` line and `2`; `python3 ~/.claude/scripts/build_hold/build_hold.py status` prints what it printed before the phase.
 
-### Phase 11 — The build commands are one group: `/build:hold`, `/build:mac`, `/build:targets`  · status: todo
+### Phase 11 — The Mac report shows who held the Mac and when it was blocked or held  · status: todo
+
+#### Work Order
+
+**Goal:** `/build:mac_report` splits `busy` declines by what held the Mac and shows when the Mac's block and natedev's hold began and ended, and the build report's lead block names a block or a hold in force now; both read records, and the line that listed these as not recorded is gone.
+
+**Spec:**
+- Work only in worktree `/home/natepiano/worktrees/claude-build-followups-build-report`, branch `build-followups-build-report`.
+- `mac_holder`, a new column on a call row: for a `busy` decline, the `what` of the claim that held the Mac.
+  - The claim prints it as `busy: <what> since <HH:MM>`, a kept claim's `busy: leftovers of ...` line included (`mac_test.py` `command_claim` 1387).
+  - `run_offload` holds that text as `MacClaimNotConfirmed.stdout` (`offload.py` 1091-1097). `write_result` (562) adds a `holder=` line to the result file, and `try_mac_test` (`verify.sh` 792-801) reads it beside `mac=`, `reason=` and `seconds=` and exports `BUILDLOG_MAC_HOLDER`. `record.call` reads that name.
+  - A `busy` decline after a takeover (`offload.py` 1085-1090) has no claim text and records `leftovers`.
+  - Old rows: NULL, shown as `holder not recorded`.
+- One record kind, `hold_event`, written when a target's hold begins and when it ends. It serves the Mac's block and natedev's hold alike; `target` tells them apart.
+  - Table `hold_events`: `at`, `host`, `target` (`mac` or `natedev`), `event` (`began` or `ended`), `holder`, `reason`, `until` (the planned end; empty when none was given).
+  - One row per event, never one row per hold. `forget` (`index.py` 521) deletes every row that came from one source file, so a row that a later event from another file had filled in would outlive half of what it says.
+  - A view `holds` pairs the rows (`VIEWS`, `index.py` 262): `target`, `holder`, `reason`, `began_at`, `ended_at`, `until`. A `began` row pairs with the first `ended` row at or after it for the same `target` and `holder`, provided that row comes before the same holder's next `began`. A `began` with no such row is open: its `ended_at` is NULL and the hold is in force.
+  - The writer: `record.py` gains the command `hold-event <began|ended> <target> <holder> <reason> [<until>]`, dispatched in `main` beside `call`. It writes through `store.append_line` (`store.py` 60), returns 0 and never fails its caller (`record.py` 450). `mac_test.py` and `build_hold.py` find it from their own location (`../buildlog/record.py`), run it as a subprocess, discard its output and ignore its exit status, as `note_event` does in `verify.sh`.
+  - The Mac's events: `began` where a block starts to turn tests away, `ended` where the block's record is removed. The functions to read in `mac_test.py` are `command_block`, `write_block`, `activate_block`, `expire_block` and `command_unblock`; none is confirmed, so no line number is given.
+  - natedev's events: `began` where a hold starts (`start_hold` and `write_hold` in `build_hold.py`), `ended` where the release prints its last line (`release_cycle` and `advance_release`); none is confirmed, so no line number is given.
+  - `index.py`: `SCHEMA_VERSION` goes up by one from the value the hold-directory phase left; `mac_holder` joins `CALL_COLUMNS`, `hold_events` joins `TABLES` and `ADDERS`, `holds` joins `VIEWS`. `buildlog schema` describes each in the words above.
+- For the compose step to confirm before dispatch, and to write into this Work Order with line numbers:
+  - which of the five `mac_test.py` functions write the block record and which remove it, whether a pending block already turns tests away, and on which machine `mac_test.py` runs when a block is placed from natedev, so that the event reaches the index the report reads;
+  - where `build_hold.py` starts a hold and where the release prints its last line, and whether a hold can end another way (a holder file removed by hand, a second holder that stays).
+- The reports read the new records:
+  - `mac_report.py`: the `busy` cause is split by `mac_holder`. Blocked time for each day comes from `holds` for target `mac`, and held time for natedev from the same view. A hold still open is counted up to now and marked `open`. The closing `Not recorded yet:` line is removed.
+  - Days before the first `hold_events` row keep the lower bound from clusters of declines, under the words `holds not recorded before <first row's day>`. Unreachable stretches stay lower bounds from declines on every day.
+  - `report.py`: the lead block's line for a blocked Mac reads the open row of `holds` and prints `Mac blocked by <holder> for <reason> since <HH:MM>`; a held natedev gets a line of the same form. The unreachable line stays as the report phase left it.
+- The tree a Mac test ran: a Mac test step records the tree key of the tree natedev sent. natedev computes the key when it copies the tree (the Mac's copy has no `.git`, `scripts/mac_test/offload.py` 830, so `treekey.tree_key` returns nothing on the Mac) and the Mac's nextest step row carries it. Until then `/build:mac_report` prints `0 recorded, N without a tree key` for Mac failures with a natedev pass of the same tree: on 2026-10-12 none of the 283 `verify-mac` nextest steps in the log held a key. Gate: in a test with a fixture, and in one live run after install, a `verify-mac` nextest step holds the same key as a natedev step of that tree, and the Mac report's line counts that pair.
+- Not built, a choice made when the report phase was split on 2026-10-12: `mac_tries` and `after_decline` (no report line reads them, and `target` with `hold_wait_s` answers the same question), and the `unreachable`, `reachable`, `battery` and `disk` events (a call row already records each of those declines at the moment it happens).
+- Unchanged: the names `NoAdmissionAck` and `DeliveryFailed` in `build_hold.py` (another unit imports them), the hold notice text, every exit code.
+
+**Files:**
+- `scripts/mac_test/offload.py`, `scripts/mac_test/test_offload.py` — the `holder=` line.
+- `scripts/mac_test/mac_test.py`, `scripts/mac_test/test_mac_test.py` — the Mac's two events.
+- `scripts/build_hold/build_hold.py`, `scripts/build_hold/test_build_hold.py` — natedev's two events.
+- `scripts/delegate/verify.sh`, `scripts/delegate/test_verify_mac_offload.py` — reads `holder=` and exports `BUILDLOG_MAC_HOLDER`; `verify.sh` belongs to another unit.
+- `scripts/buildlog/record.py`, `scripts/buildlog/index.py`, `scripts/buildlog/mac_report.py`, `scripts/buildlog/report.py`
+- `scripts/buildlog/test_record.py`, `scripts/buildlog/test_index.py`, `scripts/buildlog/test_mac_report.py`, `scripts/buildlog/test_report.py` — tests.
+
+**Seats:** 2 writers, split by directory: the build log on one line, the scripts that feed it on the other
+- `impl` — `record.py`, `index.py`, `mac_report.py`, `report.py` and their four tests; hub: `scripts/buildlog/record.py` (the `hold-event` command line and the name `BUILDLOG_MAC_HOLDER`, which the other writer's scripts call and export).
+- `test` — opens as `impl`: `offload.py`, `mac_test.py`, `build_hold.py`, `verify.sh`, `test_offload.py`, `test_mac_test.py`, `test_build_hold.py`, `test_verify_mac_offload.py`.
+
+**Constraints from prior phases:**
+- From the unit director, 2026-10-12: until 18:05 PDT on 2026-10-12 no edit to `scripts/lint/memory_admit.py` or `scripts/buildlog/width_trial.py`, and nothing in `scripts/lint/invoke.sh` near `LINT_TEST_WIDTH`, `require_nextest` or `nextest_physical_cores`; ask the showrunner before touching lint's nextest wrapper. Python passes basedpyright with zero errors and warnings, no `Any`, no file-level ignore. A file outside this unit's list is edited only where this Work Order names it and its owner. Seats never contact the Mac and never run `verify.sh`. No stub is left for an old command name.
+- `scripts/delegate/verify.sh` belongs to test-threads-unit-unit, which is active. Before a seat edits it, the director checks that unit's branch and worktree for work in flight on the file and tells the showrunner; the checkpoint notice names it as `also touches scripts/delegate/verify.sh (owner <unit>)`.
+- A change to `build_hold.py` is promoted to the live machine only while natedev is free and no release runs. The checkpoint notice says so, and says whether the release record's format changed; this Work Order changes none.
+- The report phase left: `calls.target` and `calls.hold_wait_s`, `SCHEMA_VERSION` 13 and the `steps_call` index; `mac_report.py` with `usable_share`, the stretches read from clusters of declines and the closing `Not recorded yet:` line; in `report.py` the lead block, "Tests by target" and the Waiting table's `Held target` row. Both reports answer in under 2 s at the live index's size, so no query added here reads `steps` or `calls` once per call or selects by `date(started_at, 'localtime')`.
+- The hold-directory phase left: `hold_dir_override` on `calls` with one more `SCHEMA_VERSION` step, and one resolver for the hold directory in `build_hold.py`, which this phase does not change. A test's hold directory is honored only with the marker file `.build-hold-test-fixture`, written through the shared helper.
+- Every fixture that can reach the hold wait needs temporary `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR` and `PLAN_DELEGATE_ACTIVE_DIR`; a fixture that reaches the installed scripts through the real HOME rewrites the live release record. A test that can reach a `hold-event` write also sets a temporary `BUILDLOG_DIR`, so no test adds a row to the live log.
+- Since the lost-run work: a try that meets leftovers declines `busy`; `claim --remote` exits 13 on a takeover; the claim answers `FreshMacClaim | TakenOverMacClaim | TakeoverHostUnreadable | MacClaimNotConfirmed`.
+- `scripts/buildlog/test_record.py` runs on temporary hold directories; keep that setup.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'`, `python3 -m unittest discover -s scripts/mac_test -p 'test_*.py'`, `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'` and `python3 -m unittest discover -s scripts/delegate -p 'test_verify_mac_offload.py'` green; `bash -n scripts/delegate/verify.sh`; `basedpyright scripts/buildlog scripts/mac_test scripts/build_hold` reporting `0 errors, 0 warnings` (exit 3 for the absent `.venv` is a pass). Named cases: a `busy` decline carries the claim's `what` from `offload.py` to the call row; a `began` and an `ended` row from two source files pair in `holds`, and `forget` of either file leaves the other row whole; a `began` with no `ended` reads as open; a call row with NULL `mac_holder` prints `holder not recorded`. The two timed cases of the report phase still pass under 2 s, and on that fixture `mac-report` prints no `Not recorded yet:` line. Then the director's check after the promotion: `buildlog mac-report` against the live index, timed, and the first hold or block placed afterwards shows in it with both times.
+
+### Phase 12 — The build commands are one group: `/build:hold`, `/build:mac`, `/build:targets`  · status: todo
 
 #### Work Order
 
@@ -484,7 +632,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
   - A hold directory override is honored only for a test fixture (the hold-directory phase).
 - `commands/build/mac.md`: the block is the Mac's hold, and `/build:hold hold <why> target mac` is the same thing. A block stays in force after its expiry until its record is removed; name the command that clears a stuck block. A kept claim: what it is, the `status` line `running: leftovers of <what> on <host> since <time>, kept under pid <pid>`, and `release --pid <pid>` as the way out by hand. Its section on taking the Mac for a job of one's own says the lock is tied to the process only for a claim without `--remote`.
 - `hold.md`, `mac.md` and `targets.md` say what to do for each state a reader can act on: `state unreadable` names the file to repair or remove; `unreachable` says to check the ssh connection (`status --probe`). `status` only reads.
-- `docs/as-built/mac-test-offload.md`: the probe without process checks, `--settings`, `--last-decline`, routing, the lines a test call prints, and the deployment target (`MACOSX_DEPLOYMENT_TARGET=14.0` in `remote_test_command`, why, and that a changed value costs one rebuild). Correct line 13 (`run.json` gains `remote_host`), 14 (`--remote`, exit 13), 28-30 (usage, the decline line, no process count), 33, 75 and 87 (the kept claim, the leftover check and its two selectors, the takeover, the two stderr lines), 40 (an interrupted Mac call writes a call record), 53 and 55 (the schema and the report as the report phase leaves them), 68 (a job that dies frees the lock only without `--remote`). Add: a printed `mac_exit=<n>` line is a finished run whatever ssh returned; a signal while the claim call is in flight lets it answer first.
+- `docs/as-built/mac-test-offload.md`: the probe without process checks, `--settings`, `--last-decline`, routing, the lines a test call prints, and the deployment target (`MACOSX_DEPLOYMENT_TARGET=14.0` in `remote_test_command`, why, and that a changed value costs one rebuild). Correct line 13 (`run.json` gains `remote_host`), 14 (`--remote`, exit 13), 28-30 (usage, the decline line, no process count), 33, 75 and 87 (the kept claim, the leftover check and its two selectors, the takeover, the two stderr lines), 40 (an interrupted Mac call writes a call record), 53 and 55 (the schema and the reports as the report phase and the Mac-records phase leave them), 68 (a job that dies frees the lock only without `--remote`). Add: a printed `mac_exit=<n>` line is a finished run whatever ssh returned; a signal while the claim call is in flight lets it answer first.
 - `docs/as-built/build-memory-admission.md`: `verify.sh` waits by itself and an app launch is refused until the release; a mark needs no session id (53); the launch hook does not always go on to memory admission (61); the hold recheck after each memory admission; hold time recorded apart from memory waits; the release record grouped by session with its holder generation; the delivery outcomes and the not-reached clause; the promote rule. At 162-168: `NoPendingTurn` joins the release states; `socket_for` returns `RecipientLookupFailed`; a told session is released registered or not; a turn with no bound call ends after `RELEASE_SETTLE_S` while another entry is `AwaitingRelease`, and as `RecipientGone` when the session left; a bound call keeps `NO_ADMISSION_ACK_S`.
 - `write_hold` and `start_hold` in `build_hold.py` take `label: str | None = None`; the notice change passes through both, so replace that parameter with one resolved holder identity (its key and the name to show). Callers outside `scripts/build_hold`: `scripts/build_targets/test_build_targets.py` (two calls) and `scripts/delegate/test_verify_mac_offload.py` (two calls), each with five positional arguments and no label.
 
@@ -492,7 +640,8 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 - `scripts/build_hold/build_hold.py`, `scripts/build_hold/test_build_hold.py`
 - `scripts/build_targets/test_build_targets.py` — the launch after a cut turn; its two `start_hold` calls.
 - `scripts/delegate/test_verify_mac_offload.py` — its two `start_hold` calls.
-- `commands/build/hold.md`, `commands/build/mac.md`, `commands/build/targets.md` — new; `commands/build_hold.md`, `commands/mac_test.md` — deleted.
+- `commands/build/hold.md`, `commands/build/mac.md`, `commands/build/targets.md` — new.
+- `commands/build_hold.md`, `commands/mac_test.md` — deleted.
 - `scripts/lint/memory_gate.sh`, `config/README.md`, `commands/showrunner/dailies.md`, `scripts/production/dailies_render.py`, `scripts/production/test_dailies_render.py`, `scripts/production/test_dailies_render_holds.py`, `docs/as-built/buildlog-tests-per-edit-rust-release.md` — pointers.
 - `docs/as-built/mac-test-offload.md`, `docs/as-built/build-memory-admission.md`
 
@@ -508,5 +657,6 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 - After a cut turn, `check-local` prints `natedev is held by <holder> for <why>; launch after the release.` and registers the session with no call; that turn opens as `ReleasedAwaitingAdmission` with no message. No test takes that path through `command_check_local` yet; `WaitLocalTests` in `test_build_targets.py` has the fixtures (`begin_hold`, `release_turn`, stand-ins for `socket_for` and `send_release`).
 - The lost-run work: `mac_test.py` has `RunRecord = ProcessBoundClaim | RemoteJobClaim` and `run_is_kept`; `offload.py` has `check_leftovers`, `LeftoversEnded | LeftoversRemain | LeftoverCheckFailed`, and the claim answers `FreshMacClaim | TakenOverMacClaim | TakeoverHostUnreadable | MacClaimNotConfirmed`.
 - The report's sections are the lead block, "Tests by target" and the Waiting table's `Held target` row; the Mac report is `buildlog mac-report`.
+- The Mac-records phase ("The Mac report shows who held the Mac and when it was blocked or held") writes a `hold_event` record where a hold starts and ends in `build_hold.py` and where a block is written and removed in `mac_test.py`; its `holder` is the name the hold notice shows. `hold --target mac` goes through `mac_test.py block` and `unblock`, so `build_hold.py` writes no event of its own for the Mac.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'`, `python3 -m unittest discover -s scripts/build_targets -p 'test_*.py'`, `python3 -m unittest discover -s scripts/production -p 'test_dailies_render*.py'` and `python3 -m unittest discover -s scripts/delegate -p 'test_verify_mac_offload.py'` green; `basedpyright scripts/build_hold scripts/build_targets scripts/delegate scripts/production` reporting `0 errors, 0 warnings` (exit 3 for the absent `.venv` is a pass). `grep -rnE '(^|[^a-z_/])/build_hold\b|(^|[^a-z_/.~])/mac_test\b|commands/(build_hold|mac_test)\.md' commands scripts docs/as-built config` prints nothing.

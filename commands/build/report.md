@@ -19,7 +19,7 @@ Otherwise:
 In the build-report session, point the schedule at the running session and check its status:
 
 ```sh
-zsh ~/.claude/scripts/message/notifier.sh new report-builds --to "session:$CLAUDE_CODE_SESSION_ID" --every 240 --from report-builds --command 'Scheduled report (builds, every 4 hours): run /builds with no argument and show its output unchanged. Do nothing else for this message.'
+zsh ~/.claude/scripts/message/notifier.sh new report-builds --to "session:$CLAUDE_CODE_SESSION_ID" --every 240 --from report-builds --command 'Scheduled report (builds, every 4 hours): run /build:report with no argument and show its output unchanged. Do nothing else for this message.'
 zsh ~/.claude/scripts/message/notifier.sh status report-builds
 ```
 
