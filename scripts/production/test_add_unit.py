@@ -642,7 +642,7 @@ class AddUnitTests(unittest.TestCase):
                 )
                 self.assert_no_launch_change(document, head)
 
-    def test_restore_in_a_cwd_other_than_the_row_worktree_launches_there_with_one_warning(self) -> None:
+    def test_restore_in_a_cwd_other_than_the_row_worktree_launches_there(self) -> None:
         self.commit_prepared_row(self.unit_row())
         worktree = self.root / "project-alpha"
         recorded = self.root / "prior-session"
@@ -652,17 +652,13 @@ class AddUnitTests(unittest.TestCase):
         result = self.restore("alpha", recorded)
 
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertEqual(
-            result.stderr,
-            f"add_unit: warning: unit alpha-unit Worktree is {str(worktree)!r}; "
-            + f"restoring in the recorded {str(recorded)!r}\n",
-        )
+        self.assertEqual(result.stderr, "")
         tmux = self.new_sessions()[0]
         self.assertEqual(tmux[tmux.index("-c") + 1], str(recorded))
         self.assertEqual(self.repository_state(), before)
         self.assertFalse(worktree.exists())
 
-    def test_restore_in_the_row_worktree_on_another_branch_launches_with_one_warning(self) -> None:
+    def test_restore_in_the_row_worktree_on_another_branch_launches(self) -> None:
         self.commit_prepared_row(self.unit_row())
         worktree = self.root / "project-alpha"
         _ = self.git("worktree", "add", str(worktree), "-b", "other-branch")
@@ -671,11 +667,7 @@ class AddUnitTests(unittest.TestCase):
         result = self.restore("alpha", worktree)
 
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertEqual(
-            result.stderr,
-            "add_unit: warning: unit alpha-unit Branch is 'build-followups-alpha'; "
-            + f"the recorded {str(worktree)!r} is on 'other-branch'\n",
-        )
+        self.assertEqual(result.stderr, "")
         self.assertEqual(self.repository_state(), before)
 
     def test_restart_restore_is_refused_when_record_is_down(self) -> None:
