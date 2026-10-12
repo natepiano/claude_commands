@@ -26,6 +26,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 import sweep
 
 
+# Version the mirrored repository's development shell exports on the Mac.
+MACOSX_DEPLOYMENT_TARGET = "14.0"
+
+
 MacDeclineReason = Literal[
     "off",
     "repo",
@@ -775,6 +779,7 @@ def remote_test_command(
         f"BUILDLOG_CALL_ID={shlex.quote(request.call_id)} "
         "BUILDLOG_SYNC=1 "
         f"LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "
+        f"MACOSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET} "
         f"~/.claude/scripts/lint/lint {invocation}; echo mac_exit=$?"
     )
 
