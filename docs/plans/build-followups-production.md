@@ -10,7 +10,7 @@
 - **Showrunner checkout:** `/home/natepiano/worktrees/claude-build-followups-trunk`
 - **Showrunner session:** natedev
 - **Log:** `docs/plans/build-followups-log.md` — git-excluded; one line per event
-- **User zone:** America/Los_Angeles — every time the showrunner reports is in this zone only (user, 2026-10-04: "operate in PDT going forward")
+- **User zone:** America/New_York — every time the showrunner reports is in this zone only (user, 2026-10-12: "switch all showrunners and units to return to communicating in EDT"; PDT from 2026-10-04)
 - **Updates:** on demand (user, 2026-10-10: dailies only when the user asks); each dailies lists every unit; a simple dailies gives each waiting, idle unit one line
 - **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` and `basedpyright scripts/buildlog` (pass is its `0 errors, 0 warnings` line: it exits 3 because pyrightconfig names a `.venv` no checkout has), run in the showrunner checkout
 - **Push:** git
