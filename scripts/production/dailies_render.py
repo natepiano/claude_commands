@@ -37,8 +37,9 @@ production's own plumbing words (PLUMBING).
          ~/.local/state/mac-test.
 --outstanding  JSON list of what waits on the user, `[{"since":
          "YYYY-MM-DDTHH:MM", "text": "..."}]`; outstanding items suppress
-         ` - nothing needed` and belong in the showrunner's Waiting on block,
-         which this renderer does not print. A missing file is an empty list.
+         ` - nothing needed`; the showrunner's Waiting on block, which this
+         renderer does not print, shows only their count. A missing file is an
+         empty list.
 
 The input format is in ~/.claude/commands/showrunner/dailies.md.
 """

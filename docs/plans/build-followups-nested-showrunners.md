@@ -113,25 +113,26 @@ On the showrunner's go, the phases run in order in this worktree. Each ends with
 
 **Acceptance gate:** the gate. Tests cover attach, each refusal, an edge to a production with no timer, the root walk at three levels and a cycle written by hand into the state dir. Live, with the showrunner's go: attach tool-based-ui under build-followups, read `showrunners.py tree`, and hana sends one test item to the root.
 
-### Phase 2 — The root shows every item that needs the user  · status: todo
+### Phase 2 — The root's count covers every item that needs the user  · status: todo
 
 #### Work Order
 
-**Goal:** the user reads one footer, at the root, and misses nothing a lower showrunner needs from them.
+**Goal:** the user reads one count, at the root, and misses nothing a lower showrunner needs from them.
 
-**Constraints from prior phases:** `root`, `children` and the edge file from Phase 1.
+**Constraints from prior phases:** `root`, `children` and the edge file from Phase 1. The open questions rule (user, 2026-10-12, built as a follow-up between Phases 1 and 2): a reply shows what waits on the user only as `There are {n} open questions for you.`, the Stop hook checks n against the needs-user file, and the full list is given only on request. This phase was first written to print each descendant's items in the root's footer; the rule replaces that.
 
 **Spec:**
 
-1. Each needs-user file holds only its own showrunner's items. The root's footer reads its own file and every descendant's, and prints each descendant's items under `<slug>:`.
+1. Each needs-user file holds only its own showrunner's items. The root's count covers its own due items and every descendant's, and the Stop hook checks it against all of those files. No item's text is printed in a reply.
+1a. On request the root lists every item in full, oldest first, each led by its owner's slug. One command prints that list (`update_registration.py open --production <doc>`), so the root reads no other showrunner's file by hand.
 2. A showrunner that is not a root keeps its own footer and adds one line, `reports to <root's session name>`.
 3. The user answers at the root. The root relays the answer down, and the showrunner that owns the item clears it from its own file.
-4. A descendant whose file cannot be read is named in the root's footer (`<slug>: needs-user list unreadable`), never skipped in silence.
+4. A descendant whose file cannot be read is named in the root's footer and in the list (`<slug>: needs-user list unreadable`), never skipped in silence. The hook skips the count check while a file is unreadable.
 5. `produce.md`: an item for the user goes to the root and into the owner's file, and the phone push comes from the owner with its usual key.
 
-**Files:** `scripts/production/update_registration.py`, `dailies_render.py` (`read_outstanding`, `footer_main`) and their tests; `commands/showrunner/produce.md`; `commands/showrunner/footer.md`.
+**Files:** `scripts/hooks/showrunner_footer.py` (`open_questions`), `scripts/production/update_registration.py`, `dailies_render.py` (`read_outstanding`, `footer_main`) and their tests; `commands/showrunner/produce.md`; `commands/showrunner/footer.md`.
 
-**Acceptance gate:** the gate. Tests use two-level and three-level trees, an unreadable file and a root with no children, whose footer must not change by a character. Live: with tool-based-ui attached, an item hana records shows in natedev's footer, and clears when hana clears it.
+**Acceptance gate:** the gate. Tests use two-level and three-level trees, an unreadable file and a root with no children, whose footer and count must not change by a character. Live: with tool-based-ui attached, an item hana records raises natedev's count by one and appears in its list under `tool-based-ui`, and both drop when hana clears it.
 
 ### Phase 3 — The parent's dailies show each child as one row  · status: todo
 

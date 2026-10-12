@@ -129,6 +129,17 @@ State:
   Nothing else does. Handle unit messages (checkpoints, merges, ETAs, plans,
   promotions, routine fixes) without telling the user; they wait for the next
   dailies (user, 2026-10-12).
+- **Open questions.** Ask the user each question once, in full, in the reply
+  where it first comes up: what is asked, why, and the answer choices. Set it
+  in `open_for_user` in that turn (**Footer** below). After that turn no reply
+  restates the question or its choices. The Waiting on block says only
+  `There are {n} open questions for you.` (`There is 1 open question for you.`
+  for one), where n counts every `OUTSTANDING` item now due: everything that
+  waits on the user, a step only they can run included. List the questions in
+  full only when the user asks what they are: oldest first, each with its
+  choices. A dailies report still lists what needs the user in full, because
+  it is a report the user asked for. User, 2026-10-12, replacing the
+  2026-10-06 rule that restated the user's items in every Waiting on block.
 - **Long commands** run in the background. The task notification is the wait;
   never poll.
 - **Helpers.** Stop each named helper agent once its report is read.
@@ -143,7 +154,7 @@ State:
   director answered without a time, message it yourself, because
   the command will not repeat the request. Report `none measured - requested`
   until it answers.
-- **Waiting on block.** When footers are on, after the footer leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. The user's items come first. Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. The footer hook checks the shape and item order. User, 2026-10-06.
+- **Waiting on block.** When footers are on, after the footer leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. What waits on the user shows only as its count (**Open questions** above): while any item is due, the first bullet is `There are {n} open questions for you.`, and no bullet restates one. A held quota alert comes next, led by `quota: ` (<QuotaAlert/>). Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. The footer hook checks the block's form, the count and the item order. User, 2026-10-06; count rule 2026-10-12.
 - **Footer.** Run `python3 ~/.claude/scripts/production/update_registration.py
   footer --production PRODUCTION_DOC` for the footer, adding
   `--state SHOWRUNNER_STATE` once that file exists. Paste the rendered footer
@@ -155,7 +166,8 @@ State:
   When the footer switch is off, the command says `footers off`; omit both the
   footer and the Waiting on block. The command reads the switch, the notifier's
   next due time, and open-for-the-user items from `OUTSTANDING`. Keep each
-  item specific enough to recall what, where and why without memory. Remove
+  item complete enough to stand alone when the user asks for the list: what
+  is asked, where, why and the choices. Remove
   an item only when the user addresses it and tells you; defer an item with
   `after` when the user asks. Build holds come from holder files in
   `~/.local/state/build-hold/`, and a dailies input marks each held unit. A
@@ -163,8 +175,9 @@ State:
 
   `scripts/hooks/stop-showrunner-footer.py` checks each reply in the session
   targeted by `UPDATES`. When footers are on, a missing or outdated footer or
-  Waiting on block blocks the reply with the exact footer lines and Waiting on
-  shape. End the reply with those lines and the Waiting on block. The hook
+  Waiting on block blocks the reply with the exact footer lines and the Waiting on
+  block's form. A block that restates a user item, or whose count differs from the
+  `OUTSTANDING` items now due, blocks it with the count line to write. End the reply with those lines and the Waiting on block. The hook
   passes a reply after any Stop-hook block and passes on errors.
 
   `/showrunner:footer off` and `/showrunner:footer on` pause and resume the
@@ -207,6 +220,8 @@ State:
 
   * <item>
   ```
+  With two questions open, the last footer bullet drops ` - nothing needed`
+  and the block's first bullet is `* There are 2 open questions for you.`.
   A dailies report ends with the same footer.
 </Throughout>
 
@@ -375,6 +390,7 @@ whatever arrived:
 | the user asks which proposals are open | `/showrunner:proposals` |
 | the user asks for the nightly improvement list | `/showrunner:nightly` |
 | the user asks to put a showrunner under another, or asks for the tree | `/showrunner:attach` |
+| the user asks what the open questions are | list every `OUTSTANDING` item now due in full, oldest first, each with its choices; name any deferred item and its time in one line (<Throughout/> → Open questions) |
 | a child showrunner's item for the user | show it in the child's words; relay the answer to that child (<Throughout/> → Nested showrunners) |
 | the user's words for a production below this one | relay them to the child that holds it (<Throughout/> → Nested showrunners) |
 
@@ -946,8 +962,10 @@ the rest, and reports a unit whose account cannot be read as not told:
   function moved: delegation continues on Claude. A Claude notice, or a Codex one
   whose switch failed: start no new delegate work on that tool; running seats
   finish and the unit director does the rest itself. Hold the alert as one
-  item per account, listed first in every Waiting on block with the percent left
-  and the reset time, until it is acknowledged or restored.
+  line per account, led by `quota: ` and listed first in every Waiting on block
+  after the open-questions count, with the percent left and the reset time,
+  until it is acknowledged or restored. It is a status, not a question: keep it
+  out of `open_for_user`.
 - `Quota alert acknowledged:` — drop the held item. Paused work stays paused.
 - `Quota restored:` — tell every unit director that delegation on that tool,
   or work on that Claude account, can resume, and drop the held item.
