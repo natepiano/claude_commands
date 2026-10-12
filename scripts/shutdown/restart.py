@@ -40,6 +40,7 @@ from inventory import (  # noqa: E402
     WindowHost,
 )
 from record import (  # noqa: E402
+    AccountHold,
     AllAccountSessions,
     InvalidRecord,
     NoLiveRecord,
@@ -47,6 +48,8 @@ from record import (  # noqa: E402
     ShutdownRecord,
     ShutdownScope,
     ShutdownSessionEntry,
+    SessionShutdown,
+    SelectedSessions,
     SessionRestoredTimersPending,
     SessionNeedsManualRestart,
     SessionProgress,
@@ -55,13 +58,16 @@ from record import (  # noqa: E402
     SeatAvailableOnDemand,
     TimerRestore,
     ShutdownInProgress,
-    account_records,
+    account_hold,
+    all_account_holds,
+    all_session_records,
     archive,
     find_live,
-    live_records,
     park,
     parked,
-    parse_records,
+    parse_account_holds,
+    parse_session_records,
+    session_records,
     unpark,
     update,
 )
@@ -242,7 +248,7 @@ class DesktopLaunchState:
 
 class RemoteRecordsRead(TypedDict):
     kind: Literal["records read"]
-    records: list[ShutdownRecord]
+    records: list[SessionShutdown]
 
 
 class RemoteMachineNotReached(TypedDict):
@@ -251,6 +257,14 @@ class RemoteMachineNotReached(TypedDict):
 
 
 RemoteRecordLookup = RemoteRecordsRead | RemoteMachineNotReached
+
+
+class RemoteHoldsRead(TypedDict):
+    kind: Literal["holds read"]
+    holds: list[AccountHold]
+
+
+RemoteHoldLookup = RemoteHoldsRead | RemoteMachineNotReached
 
 
 def _send_command() -> list[str]:
@@ -1549,33 +1563,70 @@ def up(login: str, dry_run: bool = False) -> int:
         return 1
 
 
-def _eligible_records(records: list[ShutdownRecord]) -> list[ShutdownRecord]:
-    return [record for record in records if record["state"] in RESTARTABLE_STATES]
+def _eligible_records(records: list[SessionShutdown]) -> list[SessionShutdown]:
+    return [record for record in records if record["progress"]["kind"] in {
+        "stopped", "already gone", "process identity lost", "restarting",
+        "restart failed", "manual restart", "timers pending", "stop failed",
+    }]
 
 
 def _remote_records() -> RemoteRecordLookup:
     status, output = run_remote(["records", "--json", "--here"])
     if status != 0:
         return {"kind": "machine not reached", "machine": other_machine()}
-    return {"kind": "records read", "records": parse_records(output)}
+    return {"kind": "records read", "records": parse_session_records(output)}
+
+
+def _remote_holds() -> RemoteHoldLookup:
+    status, output = run_remote(["holds", "--json", "--here"])
+    if status != 0:
+        return {"kind": "machine not reached", "machine": other_machine()}
+    return {"kind": "holds read", "holds": parse_account_holds(output)}
+
+
+def _account_candidate_lines(
+    records: list[SessionShutdown], holds: list[AccountHold],
+) -> list[str]:
+    lines = [
+        f"{record['machine']}: {record['label']} {record['session']['name']}: {record['progress']['kind']}"
+        for record in records
+    ]
+    session_logins = {record["login"].casefold() for record in records}
+    for hold in holds:
+        if hold["login"].casefold() not in session_logins:
+            since = datetime.fromisoformat(hold["requested_at"]).astimezone(PACIFIC).strftime(
+                "%Y-%m-%d %H:%M %Z"
+            )
+            lines.append(f"{hold['machine']}: {hold['label']} is held by a shutdown (since {since})")
+    return lines
 
 
 def _account_from_records() -> Account:
-    local = _eligible_records(live_records())
+    local = _eligible_records(all_session_records())
+    local_holds = all_account_holds()
     remote = _remote_records()
     if remote["kind"] == "machine not reached":
-        for record in local:
-            print(f"{record['machine']}: {record['label']} {record['state']}")
+        for line in _account_candidate_lines(local, local_holds):
+            print(line)
         print(f"{remote['machine']} not reached; name the account to restart")
         raise RestartAccountNotDetermined("name the account to restart")
+    remote_holds = _remote_holds()
+    if remote_holds["kind"] == "machine not reached":
+        for line in _account_candidate_lines(local, local_holds):
+            print(line)
+        print(f"{remote_holds['machine']} not reached; name the account to restart")
+        raise RestartAccountNotDetermined("name the account to restart")
     candidates = [*local, *_eligible_records(remote["records"])]
-    logins = {record["login"].casefold(): record for record in candidates}
+    holds = [*local_holds, *remote_holds["holds"]]
+    logins = {
+        record["login"].casefold(): Account("claude", record["login"], record["label"])
+        for record in [*holds, *candidates]
+    }
     if len(logins) == 1:
-        only = next(iter(logins.values()))
-        return Account("claude", only["login"], only["label"])
-    if candidates:
-        for record in candidates:
-            print(f"{record['machine']}: {record['label']} {record['state']}")
+        return next(iter(logins.values()))
+    if logins:
+        for line in _account_candidate_lines(candidates, holds):
+            print(line)
     else:
         print("no shutdown record is ready to restart")
     raise RestartAccountNotDetermined("choose the account to restart")
@@ -1592,12 +1643,12 @@ def _selected_account(requested: AccountNamed | AccountNotNamed) -> Account:
                 return _account_from_records()
 
 
-def _widest_scope(records: list[ShutdownRecord]) -> ShutdownScope:
+def _widest_scope(records: list[SessionShutdown]) -> ShutdownScope:
     """The scope an alert covers for several records: account-wide when any record is."""
-    scopes = [record["scope"] for record in records]
-    return next(
-        (scope for scope in scopes if scope["kind"] == "all account sessions"),
-        scopes[0],
+    if any(record["hold"] == "account" for record in records):
+        return AllAccountSessions(kind="all account sessions")
+    return SelectedSessions(
+        kind="selected", session_ids=sorted({record["session"]["session_id"] for record in records}),
     )
 
 
@@ -1605,9 +1656,12 @@ def _local_restart_scope(
     login: str,
 ) -> RestartScopeKnown | RestartScopeNotFoundLocally:
     try:
-        records = account_records(login)
+        records = session_records(login)
+        hold = account_hold(login)
     except (InvalidRecord, OSError, ValueError):
         return RestartScopeNotFoundLocally()
+    if hold is not None:
+        return RestartScopeKnown(AllAccountSessions(kind="all account sessions"))
     if records:
         return RestartScopeKnown(_widest_scope(records))
     return RestartScopeNotFoundLocally()

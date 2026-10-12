@@ -29,6 +29,7 @@ from record import (
     MachineStopFailed,
     OrchestrationStopIssue,
     ShutdownSessionEntry,
+    SessionShutdown,
     NoFooter,
     NoLiveRecord,
     ShutdownRecord,
@@ -1712,10 +1713,10 @@ def _preflight_inventories(
 def _live_on_other(login: str) -> RemoteRecordOutcome:
     """The peer's first record for `login`: its slot record when it has one.
 
-    `records` lists each account's slot record before its parked ones, and a
+    `slot-records` lists each account's slot record before its parked ones, and a
     parked record is always `restart partial`.
     """
-    status, output = run_remote(["records", "--json", "--here"])
+    status, output = run_remote(["slot-records", "--json", "--here"])
     machine = other_machine()
     if status == 255:
         return {"kind": "unreachable", "machine": machine}
@@ -1894,38 +1895,30 @@ def down(
     return 0
 
 
-def status_record_lines(record: ShutdownRecord) -> list[str]:
-    """Render the settling state appended to user-facing status output."""
-    lines = [f"{record['machine']}: shutdown {record['state']}"]
-    if record["scope"]["kind"] == "selected":
-        lines.append("  selected: " + ", ".join(record["scope"]["session_ids"]))
-    for entry in record["entries"]:
-        entry_progress = entry["progress"]
-        progress = entry_progress["kind"]
-        if progress == "ready" and entry["where"]["kind"] == "said":
-            progress += f" ({entry['where']['text']})"
-        if entry_progress["kind"] == "restart failed":
-            progress += f" — {entry_progress['reason']}"
-        elif entry_progress["kind"] == "timers pending":
-            timers = "; ".join(
-                f"{timer['instance']}: {timer['reason']}"
-                for timer in entry_progress["timers"]
-            )
-            progress += f" — {timers}"
-        elif entry_progress["kind"] == "manual restart":
-            progress += f" — run: {entry_progress['command']}"
-        settle_message = entry["settle_message"]
-        if settle_message["kind"] == "sent":
-            message = " · message sent"
-        elif settle_message["kind"] == "queued":
-            message = f" · message queued: {settle_message['reason']}"
-        else:
-            message = ""
-        lines.append(f"  {entry['session']['name']}: {progress}{message}")
-        lines.extend(
-            f"    {stop_issue_text(issue)}" for issue in entry["stop_issues"]
+def status_record_lines(record: SessionShutdown) -> list[str]:
+    """Render one session's progress and issues after the inventory."""
+    entry_progress = record["progress"]
+    progress = entry_progress["kind"]
+    where = record["where"]
+    if progress == "ready" and where["kind"] == "said":
+        progress += f" — {where['text']}"
+    if entry_progress["kind"] == "restart failed" or entry_progress["kind"] == "stop failed":
+        progress += f" — {entry_progress['reason']}"
+    elif entry_progress["kind"] == "timers pending":
+        timers = "; ".join(
+            f"{timer['instance']}: {timer['reason']}"
+            for timer in entry_progress["timers"]
         )
-    lines.extend(f"  {stop_issue_text(issue)}" for issue in record["stop_issues"])
-    if record["state"] == "restart partial":
-        lines.append("  run /shutdown restart again to finish")
+        progress += f" — {timers}"
+    elif entry_progress["kind"] == "manual restart":
+        progress += f" — run: {entry_progress['command']}"
+    settle_message = record["settle_message"]
+    if settle_message["kind"] == "sent":
+        message = " · message sent"
+    elif settle_message["kind"] == "queued":
+        message = f" · message queued: {settle_message['reason']}"
+    else:
+        message = ""
+    lines = [f"  {record['session']['name']}: {progress}{message}"]
+    lines.extend(f"    {stop_issue_text(issue)}" for issue in record["stop_issues"])
     return lines

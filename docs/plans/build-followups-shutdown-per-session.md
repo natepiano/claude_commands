@@ -98,7 +98,7 @@ The showrunner's account of that morning, 2026-10-12 (claude 3, 20 sessions, `do
 - Reporting a session that is back without remote control from `confirm_entry`: no session was in that state.
 - A timing line on a dry run: the dry run prints exactly its former lines.
 
-### Phase 2 — One record per session: the store, the read verbs and the launch check  · status: todo
+### Phase 2 — One record per session: the store, the read verbs and the launch check  · status: done
 
 #### Work Order
 
