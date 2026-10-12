@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect and, in later phases, stop or restart one Claude account's sessions."""
+"""Inspect, stop and restore each Claude session of one account."""
 
 from __future__ import annotations
 
@@ -38,21 +38,19 @@ from launch_permission import (
 )
 from record import (
     InvalidRecord,
-    NoLiveRecord,
-    ShutdownRecord,
-    ShutdownInProgress,
-    StopTiming,
+    SessionShutdown,
     ShutdownContinuation,
-    account_records,
-    continuation,
-    find_live,
-    live_records,
-    parse_records,
+    account_hold,
+    all_account_holds,
+    all_session_records,
+    find_session,
+    parse_session_records,
+    session_records,
 )
 from remote import other_machine, run_remote
 import settle
-import restart as restart_work
 import stop as stop_work
+import restart as restart_work
 
 
 class CommandLine(argparse.Namespace):
@@ -61,6 +59,7 @@ class CommandLine(argparse.Namespace):
     as_json: bool = False
     here: bool = False
     only: str | None = None
+    request_id: str = ""
     requested_by: str | None = None
     message: list[str] | None = None
     where: str = ""
@@ -86,14 +85,14 @@ class UnavailableMachine(TypedDict):
 
 
 MachineStatusReport = Inventory | UnreachableMachine | UnavailableMachine
-MachineRecordReport = ShutdownRecord | UnreachableMachine | UnavailableMachine
+MachineRecordReport = SessionShutdown | UnreachableMachine | UnavailableMachine
 
 
 class AccountShutdownRecords(TypedDict):
-    """One machine's records for an account: its slot record, then parked ones oldest first."""
+    """One machine's session shutdowns for an account, oldest first."""
 
     kind: Literal["records"]
-    records: list[ShutdownRecord]
+    records: list[SessionShutdown]
 
 
 class UnreadableShutdownRecord(TypedDict):
@@ -120,8 +119,6 @@ RemoteShutdownRecordOutcome = (
     | UnreachableShutdownRecord
     | UnavailableShutdownRecord
 )
-
-
 def _selected_account(requested: str | None) -> Account:
     return own_claude_account() if requested is None else named_claude_account(requested)
 
@@ -240,55 +237,29 @@ def _shutdown_hold_time(value: str) -> str:
     ).strftime("%Y-%m-%d %H:%M %Z")
 
 
-def _restore_launch_allowed(
-    records: list[ShutdownRecord], purpose: ShutdownUnitRestoreLaunchPurpose
-) -> bool:
-    """The newest record holding the unit decides; a later shutdown supersedes an earlier entry."""
-    for record in sorted(records, key=lambda item: item["requested_at"], reverse=True):
-        for entry in record["entries"]:
-            session = entry["session"]
-            if (
-                session["session_id"] != purpose.session_id
-                or session["kind"] != "unit"
-            ):
-                continue
-            progress = entry["progress"]["kind"]
-            if record["state"] == "restarting":
-                return progress not in {
-                    "restarted",
-                    "seat available on demand",
-                    "manual restart",
-                }
-            if record["state"] == "restart partial":
-                return progress == "manual restart"
-            return False
-    return False
-
-
 def launch_blocked(selected: Account, purpose: LaunchPurpose) -> int:
-    """Report whether shutdown state, slot or parked, holds one local launch."""
+    """A stopped session permits its restore; only an account hold blocks new work."""
     try:
-        records = account_records(selected.login)
+        _ = session_records(selected.login)
+        hold = account_hold(selected.login)
+        if isinstance(purpose, ShutdownUnitRestoreLaunchPurpose):
+            restoring = find_session(selected.login, purpose.session_id)
+            if restoring is not None:
+                if restoring["progress"]["kind"] in {
+                    "stopped", "already gone", "process identity lost", "restarting",
+                    "restart failed", "manual restart",
+                }:
+                    return 1
+                hold_time = _shutdown_hold_time(restoring["requested_at"])
+                print(f"{restoring['session']['name']} is held by a shutdown (since {hold_time})")
+                return 0
     except (InvalidRecord, OSError, ValueError) as error:
         print(f"shutdown state unreadable: {error}", file=sys.stderr)
         return 3
-    if not records:
+    if hold is None:
         return 1
-    for record in records:
-        if record["state"] in {"cancelled", "up"}:
-            state = record["state"]
-            print(
-                f"shutdown state unreadable: live record in state {state} was not archived",
-                file=sys.stderr,
-            )
-            return 3
-    if isinstance(purpose, ShutdownUnitRestoreLaunchPurpose) and _restore_launch_allowed(
-        records, purpose
-    ):
-        return 1
-    record = records[0]
-    hold_time = _shutdown_hold_time(record["requested_at"])
-    print(f"{record['label']} is held by a shutdown ({record['state']} since {hold_time})")
+    hold_time = _shutdown_hold_time(hold["requested_at"])
+    print(f"{hold['label']} is held by a shutdown (since {hold_time})")
     return 0
 
 
@@ -300,10 +271,10 @@ def _unexpected_launch_blocked_error(error: Exception) -> int:
     return 3
 
 
-def _record_line(record: ShutdownRecord) -> str:
+def _record_line(record: SessionShutdown) -> str:
     return (
-        f"{record['machine']} {record['label']} {record['state']} "
-        f"since {_local_time(record['requested_at'])}"
+        f"{record['machine']} {record['label']} {record['session']['name']}: {record['progress']['kind']} "
+        + f"since {_local_time(record['requested_at'])}"
     )
 
 
@@ -311,7 +282,7 @@ def _local_shutdown_records(
     login: str, machine: str
 ) -> LocalShutdownRecordOutcome:
     try:
-        return {"kind": "records", "records": account_records(login)}
+        return {"kind": "records", "records": session_records(login)}
     except InvalidRecord as error:
         return {"kind": "unreadable", "machine": machine, "reason": str(error)}
 
@@ -324,24 +295,26 @@ def _remote_shutdown_records(login: str) -> RemoteShutdownRecordOutcome:
     if status != 0:
         return {"kind": "unavailable", "machine": machine, "rc": status}
     try:
-        records = parse_records(output)
+        records = parse_session_records(output)
     except InvalidRecord as error:
         return {"kind": "unreadable", "machine": machine, "reason": str(error)}
     return {
         "kind": "records",
-        "records": [record for record in records if record["login"] == login],
+        "records": [record for record in records if record["login"].casefold() == login.casefold()],
     }
 
 
 def _shutdown_record_lines(
     outcome: LocalShutdownRecordOutcome | RemoteShutdownRecordOutcome,
+    observations: tuple[Inventory, ...] = (),
+    *, local_observation: bool = True,
 ) -> list[str]:
     match outcome["kind"]:
         case "records":
             return [
                 line
                 for record in outcome["records"]
-                for line in settle.status_record_lines(record)
+                for line in settle.status_record_lines(record, _observed_owner(record, observations), local_observation=local_observation)
             ]
         case "unreachable":
             return [
@@ -357,14 +330,21 @@ def _shutdown_record_lines(
             ]
 
 
+def _observed_owner(record: SessionShutdown, observations: tuple[Inventory, ...]) -> stop_work.FreshSession:
+    for report in observations:
+        if report["machine"].casefold() == record["machine"].casefold() and report["login"].casefold() == record["login"].casefold():
+            return stop_work.fresh_session(record["session"], report)
+    return stop_work.SessionAbsent(kind="session absent")
+
+
 def _status_record_lines(
-    selected: Account, here: bool, local_machine: str
+    selected: Account, here: bool, local_machine: str, observations: tuple[Inventory, ...] = (),
 ) -> list[str]:
     lines = _shutdown_record_lines(
-        _local_shutdown_records(selected.login, local_machine)
+        _local_shutdown_records(selected.login, local_machine), observations,
     )
     if not here:
-        lines.extend(_shutdown_record_lines(_remote_shutdown_records(selected.login)))
+        lines.extend(_shutdown_record_lines(_remote_shutdown_records(selected.login), observations, local_observation=False))
     return lines
 
 
@@ -375,7 +355,7 @@ def _only_ids(value: str | None) -> tuple[str, ...]:
 
 
 def _records(here: bool) -> tuple[list[MachineRecordReport], list[str]]:
-    local = live_records()
+    local = all_session_records()
     reports: list[MachineRecordReport] = list(local)
     lines = [_record_line(item) for item in local]
     if here:
@@ -392,7 +372,7 @@ def _records(here: bool) -> tuple[list[MachineRecordReport], list[str]]:
         lines.append(f"{machine}: unavailable (rc {status})")
         return reports, lines
     try:
-        remote = parse_records(output)
+        remote = parse_session_records(output)
     except InvalidRecord as error:
         reports.append(_unavailable(machine, status, str(error)))
         lines.append(f"{machine}: unavailable (rc {status})")
@@ -404,20 +384,11 @@ def _records(here: bool) -> tuple[list[MachineRecordReport], list[str]]:
 
 def held_session_ids() -> list[str]:
     """Return sessions whose run folders must survive shutdown and restart."""
-    held_states = {
-        "settling",
-        "stopping",
-        "down",
-        "stop partial",
-        "restarting",
-        "restart partial",
-    }
     return sorted(
         {
-            entry["session"]["session_id"]
-            for record in live_records()
-            if record["state"] in held_states
-            for entry in record["entries"]
+            session["session_id"]
+            for record in all_session_records()
+            for session in [record["session"], *record["seats"]]
         }
     )
 
@@ -434,6 +405,9 @@ def main(arguments: list[str] | None = None) -> int:
     _ = down.add_argument("--here", action="store_true")
     _ = down.add_argument("--only", help=argparse.SUPPRESS)
     _ = down.add_argument("--restart", action="store_true")
+    _ = down.add_argument("--requested-by", help=argparse.SUPPRESS)
+    _ = down.add_argument("--request-id", default="", help=argparse.SUPPRESS)
+    _ = down.add_argument("--no-alert", action="store_true", help=argparse.SUPPRESS)
     status = commands.add_parser("status", help="show what runs for one Claude account")
     _ = status.add_argument("account", nargs="?")
     _ = status.add_argument("--json", action="store_true", dest="as_json")
@@ -441,16 +415,9 @@ def main(arguments: list[str] | None = None) -> int:
     records = commands.add_parser("records")
     _ = records.add_argument("--json", action="store_true", dest="as_json")
     _ = records.add_argument("--here", action="store_true")
-    begin = commands.add_parser("begin")
-    _ = begin.add_argument("account")
-    _ = begin.add_argument("--requested-by")
-    _ = begin.add_argument("--only", help=argparse.SUPPRESS)
-    _ = begin.add_argument("--then", choices=("stop", "restart"), default="stop")
-    retry_stop = commands.add_parser("retry-stop")
-    _ = retry_stop.add_argument("account")
-    refresh = commands.add_parser("refresh")
-    _ = refresh.add_argument("account")
-    _ = refresh.add_argument("--message", nargs="*")
+    holds = commands.add_parser("holds")
+    _ = holds.add_argument("--json", action="store_true", dest="as_json")
+    _ = holds.add_argument("--here", action="store_true")
     conduct = commands.add_parser("conduct")
     _ = conduct.add_argument("account")
     _ = conduct.add_argument("--here", action="store_true")
@@ -462,16 +429,6 @@ def main(arguments: list[str] | None = None) -> int:
     now = commands.add_parser("now", help="stop without waiting for idle sessions")
     _ = now.add_argument("account", nargs="?")
     _ = now.add_argument("--here", action="store_true", help=argparse.SUPPRESS)
-    stop = commands.add_parser("stop")
-    _ = stop.add_argument("account")
-    claim_stop = commands.add_parser("claim-stop")
-    _ = claim_stop.add_argument("account")
-    _ = claim_stop.add_argument(
-        "--force", required=True, choices=("wait for ready", "now")
-    )
-    close_failed_stop = commands.add_parser("close-failed-stop")
-    _ = close_failed_stop.add_argument("account")
-    _ = close_failed_stop.add_argument("--reason", required=True)
     restart = commands.add_parser(
         "restart", help="bring back every session stopped for one account"
     )
@@ -535,29 +492,12 @@ def main(arguments: list[str] | None = None) -> int:
             requested, dry_run=options.dry_run, alerts=alerts
         )
 
-    if options.command == "stop":
+    if options.command == "holds":
         try:
-            report = stop_work.stop(options.account or "")
-        except (NoLiveRecord, InvalidRecord, OSError, RuntimeError, ValueError) as error:
+            print(json.dumps(all_account_holds(), sort_keys=True))
+        except InvalidRecord as error:
             print(f"shutdown: {error}", file=sys.stderr)
-            return 1
-        print(json.dumps(report, sort_keys=True))
-        return 0
-
-    if options.command == "claim-stop":
-        force = cast(StopTiming, options.force)
-        return 0 if stop_work.claim_stop_as_peer(options.account or "", force) else 1
-
-    if options.command == "close-failed-stop":
-        stop_work.close_failed_stop(
-            options.account or "",
-            {
-                "kind": "machine stop failed",
-                "at": settle.record_time(),
-                "machine": settle.local_machine(),
-                "reason": options.reason,
-            },
-        )
+            return 3
         return 0
 
     if options.command == "records":
@@ -572,72 +512,8 @@ def main(arguments: list[str] | None = None) -> int:
             print("\n".join(lines))
         return 0
 
-    if options.command == "begin":
-        try:
-            _ = settle.begin(
-                options.account or "",
-                options.requested_by,
-                _only_ids(options.only),
-                then=options.then,
-            )
-        except (ShutdownInProgress, ValueError, RuntimeError) as error:
-            print(f"shutdown: {error}", file=sys.stderr)
-            return 1
-        return 0
-
-    if options.command == "refresh":
-        try:
-            refreshed = settle.refresh(
-                options.account or "", options.message or ()
-            )
-        except (NoLiveRecord, ValueError, RuntimeError) as error:
-            print(f"shutdown: {error}", file=sys.stderr)
-            return 1
-        print(json.dumps([refreshed], sort_keys=True))
-        return 0
-
-    if options.command == "retry-stop":
-        try:
-            settle.retry_stop(options.account or "")
-        except (NoLiveRecord, InvalidRecord, OSError, ValueError) as error:
-            print(f"shutdown: {error}", file=sys.stderr)
-            return 1
-        return 0
-
     if options.command == "conduct":
-        login = options.account or ""
-        result = settle.conduct(login, options.here)
-        try:
-            found = find_live(login)
-            if (
-                found["kind"] != "live"
-                or found["record"]["state"] != "down"
-                or continuation(found["record"]) != "restart"
-            ):
-                return result
-            if not options.here:
-                peer = _remote_shutdown_records(login)
-                if peer["kind"] != "records":
-                    settle.report_restart_skipped(
-                        found["record"], "\n".join(_shutdown_record_lines(peer)),
-                    )
-                    return result
-                # A parked record is always restart partial, so a down one is the peer's slot.
-                if not any(
-                    record["state"] == "down" and continuation(record) == "restart"
-                    for record in peer["records"]
-                ):
-                    return result
-        except (InvalidRecord, OSError, ValueError) as error:
-            print(f"shutdown: {error}", file=sys.stderr)
-            return 1
-        if options.here:
-            return restart_work.up(login)
-        return restart_work.restart(
-            restart_work.AccountNamed(login),
-            dry_run=False,
-            alerts=restart_work.AlertWhenNotBack(),
-        )
+        return settle.conduct(options.account or "")
 
     if options.command == "ready":
         return settle.ready(options.where)
@@ -648,11 +524,12 @@ def main(arguments: list[str] | None = None) -> int:
         print(f"shutdown: {error}", file=sys.stderr)
         return 2
     if options.command == "down":
-        if options.restart:
-            return settle.down(
-                selected, options.here, _only_ids(options.only), then="restart"
-            )
-        return settle.down(selected, options.here, _only_ids(options.only))
+        return settle.down(
+            selected, options.here, _only_ids(options.only),
+            then="restart" if options.restart else "stop",
+            alerts="none" if options.no_alert else "user",
+            requested_by=options.requested_by, request_id=options.request_id,
+        )
     if options.command == "now":
         return settle.now(selected, options.here)
     if options.command == "cancel":
@@ -664,7 +541,8 @@ def main(arguments: list[str] | None = None) -> int:
         print(f"{selected.label} · {selected.login}")
         print("\n".join(lines))
         record_lines = _status_record_lines(
-            selected, options.here, reports[0]["machine"]
+            selected, options.here, reports[0]["machine"],
+            tuple(report for report in reports if "sessions" in report),
         )
         if record_lines:
             print("\n".join(record_lines))

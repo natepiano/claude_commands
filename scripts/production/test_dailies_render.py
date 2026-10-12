@@ -171,25 +171,25 @@ class ReportFooterTests(unittest.TestCase):
     def test_hold_line_and_unit_marker(self) -> None:
         lines = self.lines(render(report(True), holders=[holder("2026-10-04T11:15:00-07:00")]))
         self.assertIn("12:40 build hold", next(row for row in timeline(lines) if row.startswith("widget")))
-        self.assertEqual(after_timeline(lines), ["", *FOOTER_HEAD, f"* build hold: frame-time since 10:56 PDT, for {FOR} - release eta: 11:15 PDT (15 minutes)", *AGENT_LINES, "* next dailies: 11:30 PDT - nothing needed"])
+        self.assertEqual(after_timeline(lines), ["", *FOOTER_HEAD, f"* build hold: frame-time holds builds since 10:56 PDT for {FOR}; expected to release 11:15 PDT (in 15 minutes)", *AGENT_LINES, "* next dailies: 11:30 PDT - nothing needed"])
 
     def test_one_minute_is_singular(self) -> None:
         tail = self.tail(render(report(True), holders=[holder("2026-10-04T11:01:00-07:00")]))
-        self.assertIn(f"* build hold: frame-time since 10:56 PDT, for {FOR} - release eta: 11:01 PDT (1 minute)", tail)
+        self.assertIn(f"* build hold: frame-time holds builds since 10:56 PDT for {FOR}; expected to release 11:01 PDT (in 1 minute)", tail)
 
     def test_at_the_time_counts_zero(self) -> None:
         tail = self.tail(render(report(True), holders=[holder("2026-10-04T11:00:00-07:00")]))
-        self.assertIn(f"* build hold: frame-time since 10:56 PDT, for {FOR} - release eta: 11:00 PDT (0 minutes)", tail)
+        self.assertIn(f"* build hold: frame-time holds builds since 10:56 PDT for {FOR}; expected to release 11:00 PDT (now)", tail)
 
     def test_one_minute_overdue_is_singular(self) -> None:
         tail = self.tail(render(report(True), holders=[holder("2026-10-04T10:59:00-07:00")]))
-        self.assertIn(f"* build hold: frame-time since 10:56 PDT, for {FOR} - release eta: 10:59 PDT (overdue 1 minute)", tail)
+        self.assertIn(f"* build hold: frame-time holds builds since 10:56 PDT for {FOR}; expected to release 10:59 PDT (1 minute overdue)", tail)
 
     def test_release_countdown_crosses_clock_change(self) -> None:
         fields = {**report(True), "zone": "America/New_York"}
         record = holder("2026-11-01T02:30:00-05:00", since="2026-11-01T00:15:00-04:00")
         tail = self.tail(render(fields, at="2026-11-01T00:30", holders=[record]))
-        self.assertTrue(any("release eta: 02:30 EST (180 minutes)" in line for line in tail))
+        self.assertTrue(any("expected to release 02:30 EST (in 180 minutes)" in line for line in tail))
 
     def test_plumbing_in_holder_purpose_is_refused_in_report_and_footer(self) -> None:
         record = holder(purpose="the writer's timings")
@@ -204,8 +204,8 @@ class ReportFooterTests(unittest.TestCase):
         lines = self.lines(footer("--next-run", "11:30", holders=records))
         holds = [line for line in lines if line.startswith("* build hold:")]
         self.assertEqual(len(holds), 2)
-        self.assertIn("release eta: unknown", holds[0])
-        self.assertIn("release eta: 10:54 PDT (overdue 6 minutes)", holds[1])
+        self.assertIn("no release time given", holds[0])
+        self.assertIn("expected to release 10:54 PDT (6 minutes overdue)", holds[1])
 
     def test_report_and_footer_match(self) -> None:
         records = [holder("2026-10-04T11:01:00-07:00")]

@@ -37,8 +37,9 @@ production's own plumbing words (PLUMBING).
          ~/.local/state/mac-test.
 --outstanding  JSON list of what waits on the user, `[{"since":
          "YYYY-MM-DDTHH:MM", "text": "..."}]`; outstanding items suppress
-         ` - nothing needed` and belong in the showrunner's Waiting on block,
-         which this renderer does not print. A missing file is an empty list.
+         ` - nothing needed`; the showrunner's Waiting on block, which this
+         renderer does not print, shows only their count. A missing file is an
+         empty list.
 
 The input format is in ~/.claude/commands/showrunner/dailies.md.
 """
@@ -60,7 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mac_test"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 import run_out
 from run_out import READINGS_LOG, Reading
-from build_hold import ActiveHolders, HoldState, KnownReleaseEta, NoHolders, Holder, ReleaseRecordReadError, cycle_status_lines, holder_directory, read_cycle, read_holders, release_record_error_line
+from build_hold import NO_ADMISSION_ACK_S, ActiveHolders, DeliveryFailed, HoldCycle, HoldState, KnownReleaseEta, MemoryGateReturned, NoAdmissionAck, NoHolders, Holder, NothingToBuild, RecipientGone, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, read_release_state, release_record_error_line
 from mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
 
 # The longest update line of each length. `gantt` is the default: the chart, with only what needs the user and
@@ -1190,14 +1191,51 @@ def release_text(release: KnownReleaseEta, now: datetime, zone: ZoneInfo) -> str
     moment = local.replace(tzinfo=None)
     minutes = round((release.at.timestamp() - now.replace(tzinfo=zone).timestamp()) / 60)
     count = f"{abs(minutes)} minute{'' if abs(minutes) == 1 else 's'}"
-    return f"{range_clock(moment, now)} {local:%Z} ({'overdue ' if minutes < 0 else ''}{count})"
+    when = f"{count} overdue" if minutes < 0 else f"in {count}" if minutes else "now"
+    return f"{range_clock(moment, now)} {local:%Z} ({when})"
 
 
-def hold_line(holder: Holder, now: datetime, zone: ZoneInfo) -> str:
-    """A holder's line, shared by reports and reply footers."""
+def release_progress(cycle: HoldCycle, zone: ZoneInfo) -> str:
+    """Where a started release stands: when it began and how many sessions are free to build again."""
+    started = datetime.fromisoformat(cycle["release_started_at"]).astimezone(zone)
+    states = [read_release_state(entry) for entry in cycle["entries"]]
+    # A session that has gone is no longer one to bring back.
+    expected = [state for state in states if not isinstance(state, RecipientGone)]
+    words = f"released {started:%H:%M} {started:%Z}"
+    if not expected:
+        return words
+    free = sum(isinstance(state, (MemoryGateReturned, NothingToBuild)) for state in expected)
+    return f"{words}; {free} of {len(expected)} session{'' if len(expected) == 1 else 's'} free to build again"
+
+
+def hold_line(holder: Holder, now: datetime, zone: ZoneInfo, cycle: HoldCycle | None = None) -> str:
+    """A holder's line, shared by reports and reply footers: who holds builds, why, since when and until when."""
     since = holder.since.astimezone(zone)
-    release = release_text(holder.release, now, zone) if isinstance(holder.release, KnownReleaseEta) else "unknown"
-    return f"{BUILD_HOLD_MARK}: {holder.name} since {since:%H:%M} {since:%Z}, for {holder.purpose} - release eta: {release}"
+    head = f"{BUILD_HOLD_MARK}: {holder.name} holds builds since {since:%H:%M} {since:%Z} for {holder.purpose}"
+    if cycle is not None and cycle["release_started_at"] and holder.key in cycle["holders"]:
+        return f"{head}; {release_progress(cycle, zone)}"
+    if isinstance(holder.release, KnownReleaseEta):
+        return f"{head}; expected to release {release_text(holder.release, now, zone)}"
+    return f"{head}; no release time given"
+
+
+def released_session(entry: ReleaseEntry) -> str:
+    """A released session by its name, never by its id."""
+    name = entry["name"]
+    return name if name and name != entry["session_id"] else "an unnamed session"
+
+
+def hold_action_lines(cycle: HoldCycle) -> list[str]:
+    """One line for each session a release could not bring back, so that someone looks at it."""
+    lines: list[str] = []
+    for entry in cycle["entries"]:
+        state = read_release_state(entry)
+        if isinstance(state, NoAdmissionAck):
+            lines.append(f"{released_session(entry)} has not answered the release for "
+                         + f"{NO_ADMISSION_ACK_S // 60} minutes; check it")
+        elif isinstance(state, DeliveryFailed):
+            lines.append(f"{released_session(entry)} could not be told builds are released; tell it")
+    return lines
 
 
 def mac_block_line(
@@ -1343,15 +1381,17 @@ def footer(
     nothing_needed: bool, agent_lines: list[str]
 ) -> list[str]:
     """The separated update footer shared by replies and dailies reports."""
-    items = [hold_line(holder, now, zone) for holder in hold.holders] if isinstance(hold, ActiveHolders) else []
+    items: list[str] = []
     if isinstance(hold, ActiveHolders):
         try:
             cycle = read_cycle()
         except ReleaseRecordReadError as error:
+            items = [hold_line(holder, now, zone) for holder in hold.holders]
             items.append(f"  {release_record_error_line(error)}")
         else:
+            items = [hold_line(holder, now, zone, cycle) for holder in hold.holders]
             if cycle is not None and any(holder.key in cycle["holders"] for holder in hold.holders):
-                items.extend(f"  {line}" for line in cycle_status_lines(cycle, now, zone))
+                items.extend(f"  {line}" for line in hold_action_lines(cycle))
     if not isinstance(mac_block, NoMacBlock):
         items.append(mac_block_line(mac_block, zone))
     items.extend(line.removeprefix("- ") for line in agent_lines if line and line != "### Agents")

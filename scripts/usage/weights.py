@@ -26,6 +26,32 @@ MODEL_WEIGHTS = (
 )
 
 
+@dataclass(frozen=True)
+class DatedWeightRelation:
+    entries: str
+    active_entry: str
+
+
+def sql_weights(model: str, at: str) -> DatedWeightRelation:
+    """Describe the dated weights for a read-only SQL query, without row callbacks."""
+    rows: list[str] = []
+    choices: list[str] = []
+    for index, entry in enumerate(MODEL_WEIGHTS):
+        rows.append(f"SELECT {index} AS weight_entry, {entry.cached!r} AS cached, "
+                    + f"{entry.cache_write_5m!r} AS write_5m, {entry.cache_write_1h!r} AS write_1h, "
+                    + f"{entry.output!r} AS output")
+    for index, entry in sorted(enumerate(MODEL_WEIGHTS),
+                               key=lambda item: item[1].effective_from, reverse=True):
+        quoted = "'" + entry.model.replace("'", "''") + "'"
+        match = (f"substr({model}, 1, 7) = 'claude-'" if entry.model == "claude-*"
+                 else f"{model} = {quoted}")
+        start = entry.effective_from.astimezone(timezone.utc).isoformat()
+        choices.append(f"WHEN ({match}) AND {at} >= '{start}' THEN {index}")
+    empty = "SELECT NULL AS weight_entry, 0 AS cached, 0 AS write_5m, 0 AS write_1h, 0 AS output WHERE 0"
+    return DatedWeightRelation(" UNION ALL ".join(rows) or empty,
+                               "CASE " + " ".join(choices) + " ELSE NULL END" if choices else "NULL")
+
+
 class UnweightedModel(ValueError):
     """No weight entry covers this model at the requested time."""
 
@@ -57,3 +83,19 @@ def weighted(turn_row: Mapping[str, object] | sqlite3.Row, at: datetime | str) -
             raise ValueError(f"invalid token count for {column}")
         total += count * coefficient
     return total
+
+
+def register(db: sqlite3.Connection) -> None:
+    def weighted_tokens(model: object, at: object, input: object, cache_write_5m: object,
+                        cache_write_1h: object, cache_read: object, output: object) -> float | None:
+        # SQLite's NULL is returned only at this SQL boundary.
+        if not isinstance(at, str):
+            raise ValueError("invalid turn time")
+        row = {"model": model, "input": input, "cache_write_5m": cache_write_5m,
+               "cache_write_1h": cache_write_1h, "cache_read": cache_read, "output": output}
+        try:
+            return weighted(row, at)
+        except UnweightedModel:
+            return None
+
+    db.create_function("weighted_tokens", 7, weighted_tokens, deterministic=True)

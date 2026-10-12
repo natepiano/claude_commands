@@ -1,0 +1,6 @@
+{"at":"2026-10-10T21:00:00Z","role":"primary","label":"fixture-a"}
+{"at":"2026-10-10T21:00:01Z","role":"secondary","label":"fixture-a"}
+{"at":"2026-10-10T21:01:00Z","role":"primary","label":"fixture-a"}
+{"at":"2026-10-10T21:36:00Z","role":"primary","label":"fixture-b"}
+{"at":"2026-10-10T21:37:00Z","role":"secondary","label":"fixture-b"}
+{"at":"2026-10-11T07:00:00Z","role":"primary","label":"fixture-a"}

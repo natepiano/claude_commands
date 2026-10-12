@@ -1,0 +1,2 @@
+{"type":"user","message":{"content":"No time reported"}}
+{"type":"assistant","message":{"id":"no-time-message","usage":{"input_tokens":1,"output_tokens":1}}}

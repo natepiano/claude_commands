@@ -577,7 +577,7 @@ stops updates, use `/unit:report off` for Claude; Codex keeps polling without
 reports. A message the user types pauses these status reports on its own; later
 a `conversation-pause:` message asks you to put its question to the user word
 for word. Never answer it for them. Resume Claude updates with
-`/unit:report on`. Change one unit's interval with `/unit:interval <min>`.
+`/unit:report on`. Change one unit's interval with `/unit:report_interval <min>`.
 </ProgressContract>
 
 <AuthorizationContract>

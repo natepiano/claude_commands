@@ -1,0 +1,4 @@
+{"event_type":"run_started","timestamp":"2026-10-10T21:35:12Z","run_started_at":1791668112,"main_agent":{"family":"claude","session_id":"00000002-2222-4222-8222-222222222222"}}
+{"event_type":"activity_started","timestamp":"2026-10-10T21:35:14Z","run_started_at":1791668112,"main_agent":{"family":"claude","session_id":"00000002-2222-4222-8222-222222222222"}}
+{"event_type":"pass_started","timestamp":"2026-10-10T21:35:18Z","run_started_at":1791668112,"main_agent":{"family":"codex","session_id":"00000003-3333-4333-8333-333333333333"}}
+{"event_type":"activity_started","timestamp":"2026-10-10T21:35:23Z","run_started_at":1791668112,"main_agent":{"family":"codex","session_id":"00000003-3333-4333-8333-333333333333"}}

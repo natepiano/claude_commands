@@ -1,0 +1,15 @@
+{"event_id":"run-create","event_type":"run_started","timestamp":"2026-10-10T21:00:00Z","run_id":"ignored-payload-id","plan_doc":"docs/plans/fixture-plan.md","worktree":"/invented/worktree","branch":"fixture-branch","main_agent":{"family":"claude","session_id":"12345678-1111-4111-8111-111111111111"}}
+{"event_id":"phase-create","event_type":"phase_started","timestamp":"2026-10-10T21:01:00Z","phase_instance_id":"fixture-phase","phase_id":"6","phase_title":"Store outcomes"}
+{"event_id":"pass-create","event_type":"pass_started","timestamp":"2026-10-10T21:02:00Z","phase_instance_id":"fixture-phase","pass_instance_id":"fixture-pass","pass_kind":"review","called_task":"delegate.review","team_slot":"test","fix_pass":0}
+{"event_id":"finding-one-create","event_type":"finding_opened","timestamp":"2026-10-10T21:03:00Z","phase_instance_id":"fixture-phase","finding_id":"one","severity":"blocker","caught_by":"test","lens":"adversary","round":1,"title":"Invented finding title","file":"invented.py","detail":"Invented finding detail"}
+{"event_id":"finding-two-create","event_type":"finding_opened","timestamp":"2026-10-10T21:04:00Z","phase_instance_id":"fixture-phase","finding_id":"two","severity":"minor","caught_by":"impl","lens":"contract","round":1}
+{"event_id":"finding-three-create","event_type":"finding_opened","timestamp":"2026-10-10T21:05:00Z","phase_instance_id":"fixture-phase","finding_id":"three","severity":"nit","caught_by":"test","round":2}
+{"event_id":"round-one-create","event_type":"finding_batch_dispatched","timestamp":"2026-10-10T21:06:00Z","phase_instance_id":"fixture-phase","round":1,"covered":["one","two"]}
+{"event_id":"round-one-finish","event_type":"finding_batch_landed","timestamp":"2026-10-10T21:07:00Z","phase_instance_id":"fixture-phase","round":1,"covered":["one","two"]}
+{"event_id":"finding-one-close","event_type":"finding_verdict","timestamp":"2026-10-10T21:08:00Z","phase_instance_id":"fixture-phase","finding_id":"one","resulting_state":"closed"}
+{"event_id":"finding-two-close","event_type":"finding_verdict","timestamp":"2026-10-10T21:09:00Z","phase_instance_id":"fixture-phase","finding_id":"two","resulting_state":"closed"}
+{"event_id":"round-two-create","event_type":"finding_batch_dispatched","timestamp":"2026-10-10T21:10:00Z","phase_instance_id":"fixture-phase","round":2,"covered":["three"]}
+{"event_id":"round-two-abandon","event_type":"finding_batch_abandoned","timestamp":"2026-10-10T21:11:00Z","phase_instance_id":"fixture-phase","round":2}
+{"event_id":"pass-finish","event_type":"pass_finished","timestamp":"2026-10-10T21:12:00Z","phase_instance_id":"fixture-phase","pass_instance_id":"fixture-pass","status":"passed"}
+{"event_id":"pass-open","event_type":"pass_started","timestamp":"2026-10-10T21:13:00Z","phase_instance_id":"fixture-phase","pass_instance_id":"unfinished-pass"}
+{"event_id":"ignored-progress","event_type":"progress_reported","timestamp":"2026-10-10T21:14:00Z","phase_instance_id":"fixture-phase","percent":80}

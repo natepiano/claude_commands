@@ -17,7 +17,7 @@ Every memory (`~/.claude/projects/*/memory/`; the Mac's over `ssh mac` if it ans
 </Scope>
 
 <Scope mode="rust">
-One target a night, by weight: hana 12, cargo-liner 3, bevy_brp 2, showrunner 1, obsidian_knife 1, nateroids 1 (of 20). Over LEDGER's last 20 `rust/` entries (N of them), take the target with the largest `weight × N / 20 − its count`; ties go to the heavier weight, then this order.
+One target a night, by weight: hana 12, cargo-liner 3, bevy_brp 2, showrunner 1, obsidian_knife 1, nateroids 1 (of 20). Over LEDGER's last 20 `rust/` proposals (N of them; a line marked `, also found` or `, noted` is no proposal), take the target with the largest `weight × N / 20 − its count`; ties go to the heavier weight, then this order.
 - A project: its code against its conventions and `~/rust/nate_style`, and style rules that cost more than they catch.
 - `showrunner`: the showrunner, producer and unit commands under `~/.claude/commands/` with their docs and scripts, against run history (`/history`) and delegate progress logs: steps that repeat work, stall, or wait on the user without need.
 </Scope>
@@ -30,10 +30,13 @@ For each mode, pick the single change with the largest measurable gain for its c
 **Target:** config | rust/<target>
 **Innovation:** <the change, one or two sentences>
 **Measurable improvement:** <metric>: <baseline tonight> → <target>, measured by <command or method>
+**Gain per week:** <`N min` or `N h` of user-visible time (waiting, red CI, failed runs) and what it is, else `N% of tokens`, from tonight's numbers; `unmeasured` when neither can be measured>
 **Evidence:** <files and lines, measurements>
 **Cost:** <what implementing takes and risks>
-**Also found:** <up to three one-line runners-up>
+**Also found:** <up to three one-line runners-up, each `- **<title>.** <one line> [gain/week: 12 min red CI]` or `[gain/week: 0.4% of tokens]`; leave the tag off an unmeasured one>
 ```
+
+LEDGER gets one line for the proposal and one for each Also found item, with these gains, and `/nightly_next` and `/showrunner:nightly` rank by them. Write each gain as a week's worth in the form shown, so a script can read it. Anything that is no candidate (what was denied tonight, a note on the target choice) goes below the items under a plain line of its own, which closes the list.
 
 Then `SendMessage` to the address `python3 ~/.claude/scripts/message/sessions.py address natedev` prints, which is natedev's session on this machine: first line `Nightly proposal ready: DIR/<mode>.md`, second line the title. If it prints nothing, natedev is not running: skip the message; `/nightly_next` reads every night's reports. After the last mode, stay open: the user may attach to ask about it.
 </Proposal>

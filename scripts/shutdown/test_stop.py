@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
-"""Behavioral tests for stopping an account's sessions and resources."""
+"""Tests for one session's stop claim, signals and resources."""
 
 from __future__ import annotations
 
+import copy
 import io
 import json
 import os
@@ -10,62 +10,25 @@ import signal
 import subprocess
 import tempfile
 import threading
-import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timezone
+from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, TypedDict, cast, final, override
+from collections.abc import Callable
+from typing import cast, final, override
 from unittest.mock import patch
 
 from test_support import ShutdownTestCase
+from account import Account
 import inventory
 import record
-import restart as restart_work
-import remote as remote_transport
 import settle
-import shutdown
 import stop
-from account import Account
-from user_action import ActionRequired
-from record import (
-    LiveShutdownRecord,
-    PassiveSeatReadyToStop,
-    SessionAlreadyGone,
-    SessionNeedsManualRestart,
-    SessionProgress,
-    SessionReadyToStop,
-    SessionRestarted,
-    SessionRestartFailed,
-    SessionStopFailed,
-    SessionStopped,
-    SessionWaiting,
-    SettleMessageNotSent,
-    SettleMessageQueued,
-    SettleMessageSent,
-    ShutdownRecord,
-    ShutdownScope,
-    ShutdownSessionEntry,
-    ShutdownState,
-    StopTiming,
-    WhereNotSaid,
-    WhereSaid,
-)
-
 
 LOGIN = "owner@example.com"
 LABEL = "claude 2"
 NOW = "2026-10-09T21:49:10+00:00"
-NOW_UTC = datetime(2026, 10, 9, 21, 49, 10, tzinfo=timezone.utc)
-
-
-class AlertCall(TypedDict):
-    recipient: str
-    summary: str
-    text: str
-    machine: str
-    key: str
-
+NOW_UTC = datetime.fromisoformat(NOW)
 
 @final
 class FreshInventorySequence:
@@ -79,7 +42,7 @@ class FreshInventorySequence:
         self.calls = 0
 
     def __call__(
-        self, _login: str, _scope: ShutdownScope
+        self, _login: str, _only: frozenset[str]
     ) -> inventory.Inventory:
         index = min(self.calls, len(self.reports) - 1)
         self.calls += 1
@@ -225,638 +188,242 @@ def server(
     )
 
 
-def entry(
-    session: inventory.Session,
-    progress: Literal["waiting", "ready", "passive seat ready"] = "ready",
-) -> ShutdownSessionEntry:
-    if progress == "waiting":
-        session_progress: SessionProgress = SessionWaiting(kind="waiting")
-    elif progress == "passive seat ready":
-        session_progress = PassiveSeatReadyToStop(
-            kind="passive seat ready", at=NOW
-        )
-    else:
-        session_progress = SessionReadyToStop(kind="ready", at=NOW)
-    return ShutdownSessionEntry(
-        session=session,
-        timers=[],
-        settle_message=SettleMessageNotSent(kind="not sent"),
-        where=WhereNotSaid(kind="not said"),
-        progress=session_progress,
-        stop_issues=[],
+def entry(session: inventory.Session, progress: str = "ready") -> record.SessionShutdown:
+    state: record.SessionProgress = (
+        record.SessionWaiting(kind="waiting") if progress == "waiting"
+        else record.SessionReadyToStop(kind="ready", at=NOW)
+    )
+    return record.SessionShutdown(
+        login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW,
+        request_id="request", requested_by=record.FromTerminal(kind="terminal"),
+        hold="session", then="stop", force="wait for ready", alerts="none",
+        session=session, seats=[], timers=[], settle_message=record.SettleMessageNotSent(kind="not sent"),
+        where=record.WhereNotSaid(kind="not said"), progress=state, stop_issues=[],
     )
 
 
-def shutdown_record(
-    entries: list[ShutdownSessionEntry],
-    *,
-    machine: str = "natedev",
-    state: ShutdownState = "stopping",
-    force: StopTiming = "wait for ready",
-    requester: str | None = None,
-) -> ShutdownRecord:
-    requested_by: record.RequestOrigin = (
-        record.FromSession(kind="session", session_id=requester)
-        if requester is not None
-        else record.FromTerminal(kind="terminal")
-    )
-    return ShutdownRecord(
-        login=LOGIN,
-        label=LABEL,
-        machine=machine,
-        state=state,
-        requested_at=NOW,
-        requested_by=requested_by,
-        scope=record.AllAccountSessions(kind="all account sessions"),
-        conductor=record.ConductorNotStarted(kind="not started"),
-        force=force,
-        entries=entries,
-        stop_issues=[],
-    )
+def records_for_test(
+    entries: list[record.SessionShutdown], *, force: record.StopTiming = "wait for ready", state: str = "",
+) -> list[record.SessionShutdown]:
+    del state
+    for item in entries:
+        item["force"] = force
+    return entries
 
 
 def machine_inventory(
-    sessions: list[inventory.Session],
-    *,
-    machine: str = "natedev",
-    unattributed: list[inventory.UnattributedSession] | None = None,
+    sessions: list[inventory.Session], *, unattributed: list[inventory.UnattributedSession] | None = None,
 ) -> inventory.Inventory:
     return inventory.Inventory(
-        machine=machine,
-        login=LOGIN,
-        label=LABEL,
-        sessions=sessions,
-        unattributed=list(unattributed or []),
-    )
-
-
-def refresh_report(current: ShutdownRecord) -> settle.RefreshReport:
-    return settle.RefreshReport(record=current, verdicts=[])
-
-
-def stop_report(
-    current: ShutdownRecord,
-    *,
-    unattributed: list[inventory.UnattributedSession] | None = None,
-) -> stop.StopReport:
-    counts: dict[str, int] = {}
-    for entry in current["entries"]:
-        kind = entry["session"]["kind"]
-        counts[kind] = counts.get(kind, 0) + 1
-    return stop.StopReport(
-        record=current,
-        unattributed=list(unattributed or []),
-        counts=counts,
+        machine="natedev", login=LOGIN, label=LABEL,
+        sessions=sessions, unattributed=list(unattributed or []),
     )
 
 
 @final
 class StopTests(ShutdownTestCase):
     root: Path = Path()
-    state_root: Path = Path()
-    account = Account("claude", LOGIN, LABEL)
 
     @override
     def setUp(self) -> None:
         super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.state_root = self.root / "shutdown"
-        environment_context: object = cast(
-            object,
-            self.enterContext(
-                patch.dict(
-                    os.environ,
-                    {
-                        **os.environ,
-                        "HOME": str(self.root),
-                        "SHUTDOWN_STATE_DIR": str(self.state_root),
-                        "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
-                        "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
-                        "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "pause"),
-                        "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "delegate"),
-                        "SHUTDOWN_DELEGATE_ROOT": str(self.root / "delegate"),
-                        "AGENT_NOTES_DIR": str(self.root / "notes"),
-                    },
-                    clear=True,
-                )
-            ),
-        )
-        del environment_context
+        environment = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+        })))
+        del environment
+        _ = self.enterContext(patch.object(settle, "record_time", return_value=NOW))
 
-    def stored_record(self) -> ShutdownRecord:
-        found = record.find_live(LOGIN)
-        self.assertEqual(found["kind"], "live")
-        if found["kind"] != "live":
-            self.fail("expected a live shutdown record")
-        return found["record"]
+    def create(self, records: list[record.SessionShutdown]) -> None:
+        for item in records:
+            self.assertTrue(record.create_session(item))
 
-    def test_phase_six_record_type_names_keep_the_wire_kinds(self) -> None:
-        progress: list[SessionProgress] = [
-            SessionWaiting(kind="waiting"),
-            SessionReadyToStop(kind="ready", at=NOW),
-            PassiveSeatReadyToStop(kind="passive seat ready", at=NOW),
-            SessionStopped(kind="stopped", at=NOW),
-            SessionAlreadyGone(kind="already gone", at=NOW),
-            SessionStopFailed(kind="stop failed", at=NOW, reason="still alive"),
-            SessionRestarted(kind="restarted", at=NOW),
-            SessionRestartFailed(
-                kind="restart failed", at=NOW, reason="could not launch"
-            ),
-            SessionNeedsManualRestart(kind="manual restart", command="resume"),
-        ]
-        messages = [
-            SettleMessageNotSent(kind="not sent"),
-            SettleMessageSent(kind="sent", at=NOW),
-            SettleMessageQueued(kind="queued", at=NOW, reason="offline"),
-        ]
-        where = [
-            WhereNotSaid(kind="not said"),
-            WhereSaid(kind="said", text="tmux", at=NOW),
-        ]
-        states: list[ShutdownState] = ["settling", "stopping", "down"]
-        scope: ShutdownScope = record.AllAccountSessions(
-            kind="all account sessions"
-        )
-        timing: StopTiming = "wait for ready"
-        shutdown = shutdown_record([])
-        live = LiveShutdownRecord(kind="live", record=shutdown)
+    def stored_record(self) -> record.SessionShutdown:
+        return record.session_records(LOGIN)[0]
 
-        self.assertEqual(
-            [item["kind"] for item in progress],
-            [
-                "waiting",
-                "ready",
-                "passive seat ready",
-                "stopped",
-                "already gone",
-                "stop failed",
-                "restarted",
-                "restart failed",
-                "manual restart",
-            ],
-        )
-        self.assertEqual([item["kind"] for item in messages], ["not sent", "sent", "queued"])
-        self.assertEqual([item["kind"] for item in where], ["not said", "said"])
-        self.assertEqual(states, ["settling", "stopping", "down"])
-        self.assertEqual(scope["kind"], "all account sessions")
-        self.assertEqual(timing, "wait for ready")
-        self.assertIs(live["record"], shutdown)
-
-    def test_public_stop_report_parser_round_trips_the_wire_shape(self) -> None:
-        expected = stop_report(shutdown_record([], state="down"))
-
-        parsed = stop.parse_stop_report(json.dumps(expected))
-
-        self.assertEqual(parsed, expected)
-
-    def test_second_stop_waits_for_the_first_then_returns_without_effects(
-        self,
-    ) -> None:
-        stored = top_level("owner", 101)
-        record.create(shutdown_record([entry(stored)]))
-        first_signalled = threading.Event()
-        release_first = threading.Event()
-        second_finished = threading.Event()
-        first_reports: list[stop.StopReport] = []
-        second_reports: list[stop.StopReport] = []
-        thread_errors: list[BaseException] = []
-
-        def blocking_kill(_pid: int, _signal: int) -> None:
-            first_signalled.set()
-            if not release_first.wait(5):
-                raise AssertionError("first stop was not released")
-
-        def run_first() -> None:
-            try:
-                first_reports.append(
-                    stop.stop(
-                        LOGIN,
-                        kill=blocking_kill,
-                        is_alive=lambda _pid: False,
-                        fresh_inventory=lambda _login, _scope: machine_inventory(
-                            [stored]
-                        ),
-                        clock=lambda: NOW_UTC,
-                        codex_mesh=lambda _arguments: 0,
-                        tmux=lambda _arguments: 1,
-                        sleep=lambda _seconds: None,
-                    )
-                )
-            except BaseException as error:
-                thread_errors.append(error)
-
-        def unexpected_effect(_value: object) -> int:
-            raise AssertionError("the completed stop must not run another effect")
-
-        def unexpected_kill(_pid: int, _signal: int) -> None:
-            raise AssertionError("the completed stop must not signal a process")
-
-        def run_second() -> None:
-            try:
-                second_reports.append(
-                    stop.stop(
-                        LOGIN,
-                        kill=unexpected_kill,
-                        is_alive=lambda _pid: False,
-                        fresh_inventory=lambda _login, _scope: machine_inventory(
-                            []
-                        ),
-                        clock=lambda: NOW_UTC,
-                        codex_mesh=unexpected_effect,
-                        tmux=unexpected_effect,
-                        sleep=lambda _seconds: None,
-                    )
-                )
-            except BaseException as error:
-                thread_errors.append(error)
-            finally:
-                second_finished.set()
-
-        first = threading.Thread(target=run_first)
-        second = threading.Thread(target=run_second)
-        first.start()
-        self.assertTrue(first_signalled.wait(2))
-        second.start()
-        self.assertFalse(second_finished.wait(0.1))
-        release_first.set()
-        first.join(2)
-        second.join(2)
-
-        self.assertFalse(first.is_alive())
-        self.assertFalse(second.is_alive())
-        self.assertEqual(thread_errors, [])
-        self.assertEqual(len(first_reports), 1)
-        self.assertEqual(len(second_reports), 1)
-        self.assertEqual(first_reports[0]["record"]["state"], "down")
-        self.assertEqual(second_reports[0]["record"]["state"], "down")
-
-    def test_stop_partial_returns_its_report_without_running_effects(self) -> None:
-        current = shutdown_record(
-            [entry(top_level("left", 101))], state="stop partial"
-        )
-        current["entries"][0]["stop_issues"] = [
-            record.NotReadyToStop(
-                kind="not ready to stop",
-                at=NOW,
-                status="busy",
-                progress="ready",
-            )
-        ]
-        record.create(current)
-
-        def unexpected_effect(_value: object) -> int:
-            raise AssertionError("a finished stop must not signal or run a command")
-
-        def unexpected_kill(_pid: int, _signal: int) -> None:
-            raise AssertionError("a finished stop must not signal a process")
-
-        report = stop.stop(
-            LOGIN,
-            kill=unexpected_kill,
-            is_alive=lambda _pid: False,
-            fresh_inventory=lambda _login, _scope: machine_inventory([]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=unexpected_effect,
-            tmux=unexpected_effect,
+    def perform(self, saved: record.SessionShutdown) -> record.SessionShutdown:
+        return stop.stop_session(
+            saved, kill=lambda _pid, _signal: None, is_alive=lambda _pid: False,
+            session_record_exists=lambda _pid: False,
+            fresh_inventory=lambda _login, _only: machine_inventory([saved['session'], *saved['seats']]),
+            clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0,
+            tmux=lambda args: 1 if args[0] == 'has-session' else 0,
             sleep=lambda _seconds: None,
         )
 
-        self.assertEqual(report, stop_report(current))
+    def test_stop_claim_is_persisted_before_the_first_signal(self) -> None:
+        saved = entry(top_level('owner', 101))
+        self.create([saved])
+        sent: list[int] = []
 
-    def test_conductor_claim_only_moves_settling_and_keeps_force(self) -> None:
-        states: list[ShutdownState] = [
-            "settling",
-            "stopping",
-            "down",
-            "stop partial",
-            "restarting",
-            "restart partial",
-            "cancelled",
-            "up",
-        ]
+        def kill(pid: int, sent_signal: int) -> None:
+            self.assertEqual(self.stored_record()['progress'], {'kind': 'stopping', 'at': NOW})
+            self.assertEqual(pid, 101)
+            sent.append(sent_signal)
 
-        for index, state in enumerate(states):
-            with self.subTest(state=state), patch.dict(
-                os.environ,
-                {"SHUTDOWN_STATE_DIR": str(self.root / f"claim-{index}")},
-            ):
-                record.create(shutdown_record([], state=state, force="now"))
+        finished = stop.stop_session(
+            saved, kill=kill, is_alive=lambda _pid: False,
+            session_record_exists=lambda _pid: False,
+            fresh_inventory=lambda _login, _only: machine_inventory([saved['session']]),
+            clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0,
+            tmux=lambda _args: 1, sleep=lambda _seconds: None,
+        )
+        self.assertEqual(sent, [signal.SIGTERM])
+        self.assertEqual(finished['progress']['kind'], 'stopped')
 
-                claimed = stop.claim_stop_as_conductor(LOGIN)
+    def test_recent_stop_claim_has_no_signal_or_cleanup_effect(self) -> None:
+        saved = entry(unit('owner', 101))
+        saved['progress'] = record.SessionStopping(kind='stopping', at=NOW)
+        self.create([saved])
+        finished = stop.stop_session(
+            saved, kill=lambda _pid, _sent: self.fail('a claimed owner was signalled'),
+            fresh_inventory=lambda _login, _only: self.fail('a claimed owner was inspected'),
+            clock=lambda: NOW_UTC + timedelta(seconds=119),
+            codex_mesh=lambda _args: self.fail('claimed cleanup was repeated'),
+            tmux=lambda _args: self.fail('claimed cleanup was repeated'),
+        )
+        self.assertEqual(finished, saved)
 
-                self.assertEqual(claimed, state == "settling")
-                current = self.stored_record()
-                self.assertEqual(
-                    current["state"], "stopping" if state == "settling" else state
+    def test_stale_stop_claim_retries_an_idle_owner(self) -> None:
+        saved = entry(top_level('owner', 101))
+        saved['progress'] = record.SessionStopping(kind='stopping', at=(NOW_UTC - timedelta(seconds=120)).isoformat())
+        self.create([saved])
+        self.assertEqual(self.perform(saved)['progress']['kind'], 'stopped')
+
+    def test_cleanup_retry_only_repeats_unconfirmed_resources_without_a_signal(self) -> None:
+        pending = str(self.root / "pending")
+        saved = entry(unit('owner', 101, run_dirs=[str(self.root / "clean"), pending]))
+        saved['progress'] = record.SessionStopped(kind='stopped', at=NOW)
+        saved['stop_issues'] = [record.CodexServerLeftRunning(
+            kind='codex server left running', at=NOW, run_dir=pending, cause='stop not confirmed',
+        ), record.UnitTmuxLeftRunning(
+            kind='unit tmux session left running', at=NOW, tmux_session='tmux-owner', cause='stop not confirmed',
+        )]
+        self.create([saved])
+        codex: list[list[str]] = []
+        tmux: list[list[str]] = []
+        finished = stop.stop_session(
+            saved, kill=lambda _pid, _sent: self.fail('a stopped owner was signalled'),
+            is_alive=lambda _pid: False, clock=lambda: NOW_UTC,
+            codex_mesh=lambda args: codex.append(args) or 0,
+            tmux=lambda args: tmux.append(args) or (1 if args[0] == 'has-session' else 0),
+        )
+        self.assertEqual(codex, [['stop', '--session-dir', pending]])
+        self.assertEqual(tmux, [['kill-session', '-t', '=tmux-owner'], ['has-session', '-t', '=tmux-owner']])
+        self.assertEqual(finished['stop_issues'], [])
+        self.assertEqual(finished['progress'], saved['progress'])
+
+    def test_fresh_session_reports_owned_seats_and_preserves_the_recorded_identity(self) -> None:
+        owner = top_level('owner', 101)
+        worker = seat('worker', 102, owner='owner')
+        unrelated = seat('other', 103, owner='elsewhere')
+        observed = stop.fresh_session(owner, machine_inventory([owner, worker, unrelated]))
+        self.assertEqual(observed, {'kind': 'matching session', 'session': owner, 'seats': [worker]})
+        changed = copy.deepcopy(owner)
+        changed['pid'] = 201
+        self.assertEqual(stop.fresh_session(owner, machine_inventory([changed])), {'kind': 'session identity lost'})
+        self.assertEqual(owner['pid'], 101)
+
+    def test_busy_seat_holds_its_owner_until_it_is_idle_and_is_never_signalled(self) -> None:
+        saved = entry(top_level('owner', 101))
+        worker = seat('worker', 102, owner='owner')
+        worker['status'] = 'busy'
+        saved['seats'] = [worker]
+        self.create([saved])
+        self.assertEqual(self.perform(saved)['progress']['kind'], 'stop failed')
+        worker['status'] = 'idle'
+        saved['seats'] = [worker]
+        self.assertEqual(self.perform(saved)['progress']['kind'], 'stopped')
+
+    def test_cancel_during_a_stop_claim_keeps_its_record_and_timers(self) -> None:
+        saved = entry(top_level('owner', 101))
+        saved['timers'] = [record.TimerRestore(instance='owner-timer', was_enabled=True, footer=record.NoFooter(kind='no footer'))]
+        self.create([saved])
+        entered = threading.Event()
+        release = threading.Event()
+        failures: list[BaseException] = []
+
+        def kill(_pid: int, _sent: int) -> None:
+            entered.set()
+            self.assertTrue(release.wait(0.8))
+
+        def worker() -> None:
+            try:
+                _ = stop.stop_session(
+                    saved, kill=kill, is_alive=lambda _pid: False,
+                    session_record_exists=lambda _pid: False,
+                    fresh_inventory=lambda _login, _only: machine_inventory([saved['session']]),
+                    clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0,
+                    tmux=lambda _args: 1, sleep=lambda _seconds: None,
                 )
-                self.assertEqual(current["force"], "now")
+            except BaseException as error:
+                failures.append(error)
 
-    def test_peer_claim_replays_stopping_and_only_upgrades_timing(self) -> None:
-        record.create(
-            shutdown_record([], state="settling", force="wait for ready")
-        )
+        thread = threading.Thread(target=worker)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(0.8))
+            with patch.object(settle, 'run_notifier') as timers, patch.object(settle, 'send_message') as send, redirect_stdout(io.StringIO()):
+                _ = settle.cancel(Account('claude', LOGIN, LABEL), here=True)
+            timers.assert_not_called()
+            send.assert_not_called()
+            self.assertEqual(self.stored_record()['progress']['kind'], 'stopping')
+            self.assertEqual(self.stored_record()['timers'], saved['timers'])
+        finally:
+            release.set()
+            thread.join(0.8)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(failures, [])
 
-        self.assertTrue(stop.claim_stop_as_peer(LOGIN, "wait for ready"))
-        self.assertTrue(stop.claim_stop_as_peer(LOGIN, "now"))
-        self.assertTrue(stop.claim_stop_as_peer(LOGIN, "wait for ready"))
-        current = self.stored_record()
-        self.assertEqual(current["state"], "stopping")
-        self.assertEqual(current["force"], "now")
-
-    def test_wait_peer_claim_replays_after_now_upgrade_without_downgrading(
-        self,
-    ) -> None:
-        record.create(
-            shutdown_record([], state="settling", force="wait for ready")
-        )
-        self.assertTrue(stop.claim_stop_as_peer(LOGIN, "wait for ready"))
-
-        def upgrade_to_now(current: ShutdownRecord) -> None:
-            current["force"] = "now"
-
-        _ = record.update(LOGIN, upgrade_to_now)
-
-        self.assertTrue(stop.claim_stop_as_peer(LOGIN, "wait for ready"))
-        self.assertEqual(self.stored_record()["force"], "now")
-
-    def test_close_failed_stop_closes_only_claimed_or_finished_stops(self) -> None:
-        states: list[ShutdownState] = [
-            "settling",
-            "stopping",
-            "down",
-            "stop partial",
-            "cancelled",
-        ]
-        issue = record.MachineStopFailed(
-            kind="machine stop failed",
-            at=NOW,
-            machine="natedev",
-            reason="inventory failed",
-        )
-
-        for index, state in enumerate(states):
-            with self.subTest(state=state), patch.dict(
-                os.environ,
-                {"SHUTDOWN_STATE_DIR": str(self.root / f"close-{index}")},
-            ):
-                record.create(shutdown_record([], state=state))
-
-                stop.close_failed_stop(LOGIN, issue)
-
-                current = self.stored_record()
-                changed = state in {"stopping", "down", "stop partial"}
-                self.assertEqual(
-                    current["state"], "stop partial" if changed else state
-                )
-                self.assertEqual(current["stop_issues"], [issue] if changed else [])
-
-    def test_close_failed_stop_deduplicates_a_retried_issue(self) -> None:
-        record.create(shutdown_record([], state="stopping"))
-        first = record.MachineStopFailed(
-            kind="machine stop failed",
-            at=NOW,
-            machine="Mac",
-            reason="ssh reply was lost",
-        )
-        retried = record.MachineStopFailed(
-            kind="machine stop failed",
-            at="2026-10-09T21:49:25+00:00",
-            machine="Mac",
-            reason="ssh reply was lost",
-        )
-
-        stop.close_failed_stop(LOGIN, first)
-        stop.close_failed_stop(LOGIN, retried)
-
-        current = self.stored_record()
-        self.assertEqual(current["state"], "stop partial")
-        self.assertEqual(current["stop_issues"], [first])
-
-    def test_conductor_runners_receive_arguments_without_the_executable(
-        self,
-    ) -> None:
-        systemctl_calls: list[list[str]] = []
-        launchctl_calls: list[list[str]] = []
-
-        stop.stop_conductor(
-            record.SystemdConductor(kind="systemd", unit="shutdown-owner"),
-            systemctl=lambda arguments: systemctl_calls.append(arguments) or 5,
-            launchctl=lambda arguments: launchctl_calls.append(arguments) or 5,
-        )
-        stop.stop_conductor(
-            record.LaunchdConductor(kind="launchd", label="shutdown.owner"),
-            systemctl=lambda arguments: systemctl_calls.append(arguments) or 5,
-            launchctl=lambda arguments: launchctl_calls.append(arguments) or 5,
-        )
-
-        self.assertEqual(
-            systemctl_calls, [["--user", "stop", "shutdown-owner"]]
-        )
-        self.assertEqual(launchctl_calls, [["remove", "shutdown.owner"]])
-
-    def test_stops_units_then_showrunners_then_top_level_and_requester_last(
-        self,
-    ) -> None:
-        requester = top_level("requester", 104)
-        ordinary = top_level("ordinary", 103)
-        runner = showrunner("runner", 102)
-        director = unit("director", 101)
-        sessions: list[inventory.Session] = [requester, ordinary, runner, director]
-        record.create(
-            shutdown_record(
-                [entry(item) for item in sessions], requester="requester"
-            )
-        )
-        killed: list[int] = []
-
-        report = stop.stop(
-            LOGIN,
-            kill=lambda pid, _signal: killed.append(pid),
-            is_alive=lambda _pid: False,
-            fresh_inventory=lambda _login, _scope: machine_inventory(sessions),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 0,
-            tmux=lambda arguments: 1 if arguments[0] == "has-session" else 0,
-            sleep=lambda _seconds: None,
-        )
-
-        self.assertEqual(killed, [101, 102, 103, 104])
-        self.assertEqual(report["record"]["state"], "down")
 
     def test_busy_entry_is_refused_without_now(self) -> None:
-        stored = top_level("busy", 101)
-        current = top_level("busy", 101, status="busy")
-        record.create(shutdown_record([entry(stored)]))
+        stored = top_level('busy', 101)
+        current = top_level('busy', 101, status='busy')
+        self.create(records_for_test([entry(stored)]))
         killed: list[int] = []
-
-        report = stop.stop(
-            LOGIN,
-            kill=lambda pid, _signal: killed.append(pid),
-            is_alive=lambda _pid: False,
-            fresh_inventory=lambda _login, _scope: machine_inventory([current]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 0,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
-
+        report = stop.stop_session(self.stored_record(), kill=lambda pid, _signal: killed.append(pid), is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([current]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0, tmux=lambda _arguments: 1, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
         self.assertEqual(killed, [])
-        self.assertEqual(report["record"]["state"], "stop partial")
-        self.assertEqual(
-            report["record"]["entries"][0]["stop_issues"],
-            [
-                record.NotReadyToStop(
-                    kind="not ready to stop",
-                    at=NOW,
-                    status="busy",
-                    progress="ready",
-                )
-            ],
-        )
+        self.assertNotEqual(report['progress']['kind'], 'stopping')
+        self.assertEqual(report['stop_issues'], [record.NotReadyToStop(kind='not ready to stop', at=NOW, status='busy', progress='ready')])
 
-    def test_account_unreadable_entry_is_not_signalled_and_keeps_an_issue(
-        self,
-    ) -> None:
-        stored = top_level("unreadable", 101)
-        record.create(shutdown_record([entry(stored)]))
+    def test_account_unreadable_entry_is_not_signalled_and_keeps_an_issue(self) -> None:
+        stored = top_level('unreadable', 101)
+        self.create(records_for_test([entry(stored)]))
         killed: list[int] = []
-        unattributed = inventory.UnattributedSession(
-            pid=101,
-            name="unreadable",
-            reason="account unreadable",
-        )
-
-        report = stop.stop(
-            LOGIN,
-            kill=lambda pid, _signal: killed.append(pid),
-            is_alive=lambda _pid: True,
-            fresh_inventory=lambda _login, _scope: machine_inventory(
-                [], unattributed=[unattributed]
-            ),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 0,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
-
+        unattributed = inventory.UnattributedSession(pid=101, name='unreadable', reason='account unreadable')
+        report = stop.stop_session(self.stored_record(), kill=lambda pid, _signal: killed.append(pid), is_alive=lambda _pid: True, fresh_inventory=lambda _login, _scope: machine_inventory([], unattributed=[unattributed]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0, tmux=lambda _arguments: 1, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
         self.assertEqual(killed, [])
-        self.assertEqual(
-            report["record"]["entries"][0]["stop_issues"],
-            [
-                record.AccountUnreadableAtStop(
-                    kind="account unreadable", at=NOW
-                )
-            ],
-        )
-        self.assertEqual(report["record"]["state"], "stop partial")
+        self.assertEqual(report['stop_issues'], [record.AccountUnreadableAtStop(kind='account unreadable', at=NOW)])
+        self.assertNotEqual(report['progress']['kind'], 'stopping')
 
     def test_now_ends_busy_codex_seats_before_stopping_their_owner(self) -> None:
-        run_dir = str(self.root / "run")
-        owned_server = server(run_dir, 900, busy_seats=["impl", "test"])
-        stored = top_level(
-            "busy",
-            101,
-            status="busy",
-            run_dirs=[run_dir],
-            codex_servers=[owned_server],
-        )
-        record.create(shutdown_record([entry(stored)], force="now"))
+        run_dir = str(self.root / 'run')
+        owned_server = server(run_dir, 900, busy_seats=['impl', 'test'])
+        stored = top_level('busy', 101, status='busy', run_dirs=[run_dir], codex_servers=[owned_server])
+        self.create(records_for_test([entry(stored)], force='now'))
         events: list[str] = []
 
         def codex(arguments: list[str]) -> int:
-            events.append("codex " + " ".join(arguments))
+            events.append('codex ' + ' '.join(arguments))
             return 0
-
-        report = stop.stop(
-            LOGIN,
-            kill=lambda pid, sent: events.append(f"kill {pid} {sent}"),
-            is_alive=lambda _pid: False,
-            fresh_inventory=lambda _login, _scope: machine_inventory([stored]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=codex,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
-
-        self.assertEqual(
-            events[:3],
-            [
-                f"codex end --session-dir {run_dir} --to impl",
-                f"codex end --session-dir {run_dir} --to test",
-                f"kill 101 {signal.SIGTERM}",
-            ],
-        )
-        self.assertEqual(report["record"]["state"], "down")
-
-    def test_now_accepted_mid_stop_applies_to_the_next_busy_entry(self) -> None:
-        first = top_level("first", 101)
-        later = top_level("later", 102, status="busy")
-        record.create(
-            shutdown_record([entry(first), entry(later, "waiting")])
-        )
-        killed: list[int] = []
-
-        def kill(pid: int, _sent_signal: int) -> None:
-            killed.append(pid)
-            if pid != 101:
-                return
-
-            def force_now(current: ShutdownRecord) -> None:
-                current["force"] = "now"
-
-            _ = record.update(LOGIN, force_now)
-
-        report = stop.stop(
-            LOGIN,
-            kill=kill,
-            is_alive=lambda _pid: False,
-            fresh_inventory=lambda _login, _scope: machine_inventory(
-                [first, later]
-            ),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 0,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
-
-        self.assertEqual(killed, [101, 102])
-        self.assertEqual(report["record"]["state"], "down")
+        report = stop.stop_session(self.stored_record(), kill=lambda pid, sent: events.append(f'kill {pid} {sent}'), is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([stored]), clock=lambda: NOW_UTC, codex_mesh=codex, tmux=lambda _arguments: 1, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
+        self.assertEqual(events[:3], [f'codex end --session-dir {run_dir} --to impl', f'codex end --session-dir {run_dir} --to test', f'kill 101 {signal.SIGTERM}'])
+        self.assertNotEqual(report['progress']['kind'], 'stopping')
 
     def test_absent_entry_is_not_signalled_or_refused_for_readiness(self) -> None:
-        stored = top_level("gone", 101)
-        record.create(shutdown_record([entry(stored, "waiting")]))
+        stored = top_level('gone', 101)
+        self.create(records_for_test([entry(stored, 'waiting')]))
         killed: list[int] = []
-
-        report = stop.stop(
-            LOGIN,
-            kill=lambda pid, _signal: killed.append(pid),
-            is_alive=lambda _pid: False,
-            fresh_inventory=lambda _login, _scope: machine_inventory([]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 0,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
-
+        report = stop.stop_session(self.stored_record(), kill=lambda pid, _signal: killed.append(pid), is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0, tmux=lambda _arguments: 1, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
         self.assertEqual(killed, [])
-        self.assertEqual(
-            report["record"]["entries"][0]["progress"]["kind"],
-            "already gone",
-        )
-        self.assertEqual(report["record"]["state"], "down")
+        self.assertEqual(report['progress']['kind'], 'already gone')
+        self.assertNotEqual(report['progress']['kind'], 'stopping')
 
-    def test_absent_unit_stops_each_run_once_and_its_exact_tmux_session(
-        self,
-    ) -> None:
-        run_dir = str(self.root / "run")
-        stored = unit(
-            "gone-unit",
-            101,
-            tmux_session="exact-unit-pane",
-            run_dirs=[run_dir],
-            codex_servers=[server(run_dir, 900)],
-        )
-        record.create(shutdown_record([entry(stored, "waiting")]))
+    def test_absent_unit_stops_each_run_once_and_its_exact_tmux_session(self) -> None:
+        run_dir = str(self.root / 'run')
+        stored = unit('gone-unit', 101, tmux_session='exact-unit-pane', run_dirs=[run_dir], codex_servers=[server(run_dir, 900)])
+        self.create(records_for_test([entry(stored, 'waiting')]))
         codex_calls: list[list[str]] = []
         tmux_calls: list[list[str]] = []
 
@@ -866,123 +433,42 @@ class StopTests(ShutdownTestCase):
 
         def tmux(arguments: list[str]) -> int:
             tmux_calls.append(arguments)
-            return 1 if arguments[0] == "has-session" else 0
+            return 1 if arguments[0] == 'has-session' else 0
+        report = stop.stop_session(self.stored_record(), kill=lambda _pid, _signal: self.fail('an absent owner was signalled'), is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([]), clock=lambda: NOW_UTC, codex_mesh=codex, tmux=tmux, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
+        self.assertEqual(codex_calls, [['stop', '--session-dir', run_dir]])
+        self.assertEqual(tmux_calls, [['kill-session', '-t', '=exact-unit-pane'], ['has-session', '-t', '=exact-unit-pane']])
+        self.assertNotEqual(report['progress']['kind'], 'stopping')
 
-        report = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: self.fail("an absent owner was signalled"),
-            is_alive=lambda _pid: False,
-            fresh_inventory=lambda _login, _scope: machine_inventory([]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=codex,
-            tmux=tmux,
-            sleep=lambda _seconds: None,
-        )
-
-        self.assertEqual(
-            codex_calls, [["stop", "--session-dir", run_dir]]
-        )
-        self.assertEqual(
-            tmux_calls,
-            [
-                ["kill-session", "-t", "=exact-unit-pane"],
-                ["has-session", "-t", "=exact-unit-pane"],
-            ],
-        )
-        self.assertEqual(report["record"]["state"], "down")
-
-    def test_process_identity_changed_before_first_signal_is_left_running(
-        self,
-    ) -> None:
-        run_dir = str(self.root / "run")
-        stored = unit(
-            "reused",
-            101,
-            tmux_session="reused-unit",
-            run_dirs=[run_dir],
-        )
-        changed = unit(
-            "reused",
-            202,
-            tmux_session="reused-unit",
-            run_dirs=[run_dir],
-        )
-        record.create(shutdown_record([entry(stored)]))
+    def test_process_identity_changed_before_first_signal_is_left_running(self) -> None:
+        run_dir = str(self.root / 'run')
+        stored = unit('reused', 101, tmux_session='reused-unit', run_dirs=[run_dir])
+        changed = unit('reused', 202, tmux_session='reused-unit', run_dirs=[run_dir])
+        self.create(records_for_test([entry(stored)]))
         killed: list[int] = []
         codex_calls: list[list[str]] = []
-
-        report = stop.stop(
-            LOGIN,
-            kill=lambda pid, _signal: killed.append(pid),
-            is_alive=lambda _pid: True,
-            fresh_inventory=lambda _login, _scope: machine_inventory([changed]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda arguments: codex_calls.append(arguments) or 0,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
-
+        report = stop.stop_session(self.stored_record(), kill=lambda pid, _signal: killed.append(pid), is_alive=lambda _pid: True, fresh_inventory=lambda _login, _scope: machine_inventory([changed]), clock=lambda: NOW_UTC, codex_mesh=lambda arguments: codex_calls.append(arguments) or 0, tmux=lambda _arguments: 1, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
         self.assertEqual(killed, [])
         self.assertEqual(codex_calls, [])
-        self.assertEqual(
-            report["record"]["entries"][0]["progress"]["kind"],
-            "process identity lost",
-        )
-        self.assertEqual(
-            report["record"]["entries"][0]["stop_issues"],
-            [
-                record.CodexServerLeftRunning(
-                    kind="codex server left running",
-                    at=NOW,
-                    run_dir=run_dir,
-                    cause="owner identity lost",
-                ),
-                record.UnitTmuxLeftRunning(
-                    kind="unit tmux session left running",
-                    at=NOW,
-                    tmux_session="reused-unit",
-                    cause="owner identity lost",
-                ),
-            ],
-        )
-        self.assertEqual(report["record"]["state"], "down")
+        self.assertEqual(report['progress']['kind'], 'process identity lost')
+        self.assertEqual(report['stop_issues'], [record.CodexServerLeftRunning(kind='codex server left running', at=NOW, run_dir=run_dir, cause='owner identity lost'), record.UnitTmuxLeftRunning(kind='unit tmux session left running', at=NOW, tmux_session='reused-unit', cause='owner identity lost')])
+        self.assertNotEqual(report['progress']['kind'], 'stopping')
 
-    def test_process_identity_changed_before_second_signal_is_not_signalled_again(
-        self,
-    ) -> None:
-        stored = top_level("reused", 101)
-        changed = top_level("reused", 202)
-        inventories = FreshInventorySequence(
-            [machine_inventory([stored]), machine_inventory([changed]), machine_inventory([])]
-        )
-        record.create(shutdown_record([entry(stored)]))
+    def test_process_identity_changed_before_second_signal_is_not_signalled_again(self) -> None:
+        stored = top_level('reused', 101)
+        changed = top_level('reused', 202)
+        inventories = FreshInventorySequence([machine_inventory([stored]), machine_inventory([changed]), machine_inventory([])])
+        self.create(records_for_test([entry(stored)]))
         killed: list[int] = []
-
-        report = stop.stop(
-            LOGIN,
-            kill=lambda pid, _signal: killed.append(pid),
-            is_alive=lambda _pid: True,
-            fresh_inventory=inventories,
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 0,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
-
+        report = stop.stop_session(self.stored_record(), kill=lambda pid, _signal: killed.append(pid), is_alive=lambda _pid: True, fresh_inventory=inventories, clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0, tmux=lambda _arguments: 1, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
         self.assertEqual(killed, [101])
-        self.assertEqual(
-            report["record"]["entries"][0]["progress"]["kind"],
-            "process identity lost",
-        )
-        self.assertEqual(report["record"]["state"], "down")
+        self.assertEqual(report['progress']['kind'], 'process identity lost')
+        self.assertNotEqual(report['progress']['kind'], 'stopping')
 
     def test_second_sigterm_uses_identity_without_rechecking_readiness(self) -> None:
-        stored = top_level("became-busy", 101)
-        busy = top_level("became-busy", 101, status="busy")
-        inventories = FreshInventorySequence(
-            [machine_inventory([stored]), machine_inventory([busy])]
-        )
-        record.create(shutdown_record([entry(stored)]))
+        stored = top_level('became-busy', 101)
+        busy = top_level('became-busy', 101, status='busy')
+        inventories = FreshInventorySequence([machine_inventory([stored]), machine_inventory([busy])])
+        self.create(records_for_test([entry(stored)]))
         sent: list[int] = []
         alive = True
 
@@ -991,1252 +477,507 @@ class StopTests(ShutdownTestCase):
             sent.append(sent_signal)
             if len(sent) == 2:
                 alive = False
-
-        report = stop.stop(
-            LOGIN,
-            kill=kill,
-            is_alive=lambda _pid: alive,
-            fresh_inventory=inventories,
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 0,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
-
+        report = stop.stop_session(self.stored_record(), kill=kill, is_alive=lambda _pid: alive, fresh_inventory=inventories, clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0, tmux=lambda _arguments: 1, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
         self.assertEqual(sent, [signal.SIGTERM, signal.SIGTERM])
-        self.assertEqual(
-            report["record"]["entries"][0]["progress"]["kind"], "stopped"
-        )
+        self.assertEqual(report['progress']['kind'], 'stopped')
 
     def test_pid_surviving_two_sigterms_is_failed_without_sigkill(self) -> None:
-        stored = top_level("stuck", 101)
-        record.create(shutdown_record([entry(stored)]))
+        stored = top_level('stuck', 101)
+        self.create(records_for_test([entry(stored)]))
         sent: list[int] = []
-
-        report = stop.stop(
-            LOGIN,
-            kill=lambda _pid, sent_signal: sent.append(sent_signal),
-            is_alive=lambda _pid: True,
-            fresh_inventory=lambda _login, _scope: machine_inventory([stored]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 0,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
-
+        report = stop.stop_session(self.stored_record(), kill=lambda _pid, sent_signal: sent.append(sent_signal), is_alive=lambda _pid: True, fresh_inventory=lambda _login, _scope: machine_inventory([stored]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0, tmux=lambda _arguments: 1, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
         self.assertEqual(sent, [signal.SIGTERM, signal.SIGTERM])
         self.assertNotIn(signal.SIGKILL, sent)
-        progress = report["record"]["entries"][0]["progress"]
-        self.assertEqual(progress["kind"], "stop failed")
-        if progress["kind"] != "stop failed":
-            self.fail("expected stop failure")
-        self.assertEqual(progress["reason"], "alive after two SIGTERMs")
-        self.assertEqual(
-            report["record"]["entries"][0]["stop_issues"],
-            [
-                record.StillRunningAfterStop(
-                    kind="still running",
-                    at=NOW,
-                    reason="alive after two SIGTERMs",
-                )
-            ],
-        )
-        self.assertEqual(report["record"]["state"], "stop partial")
+        progress = report['progress']
+        self.assertEqual(progress['kind'], 'stop failed')
+        if progress['kind'] != 'stop failed':
+            self.fail('expected stop failure')
+        self.assertEqual(progress['reason'], 'alive after two SIGTERMs')
+        self.assertEqual(report['stop_issues'], [record.StillRunningAfterStop(kind='still running', at=NOW, reason='alive after two SIGTERMs')])
+        self.assertNotEqual(report['progress']['kind'], 'stopping')
 
     def test_a_new_stop_pass_replaces_an_entrys_previous_issues(self) -> None:
-        stored = top_level("stuck", 101)
+        stored = top_level('stuck', 101)
         stored_entry = entry(stored)
-        stored_entry["stop_issues"] = [
-            record.AccountUnreadableAtStop(kind="account unreadable", at=NOW)
-        ]
-        record.create(shutdown_record([stored_entry], state="stopping"))
-
-        report = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: None,
-            is_alive=lambda _pid: True,
-            fresh_inventory=lambda _login, _scope: machine_inventory([stored]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 0,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
-
-        self.assertEqual(
-            report["record"]["entries"][0]["stop_issues"],
-            [
-                record.StillRunningAfterStop(
-                    kind="still running",
-                    at=NOW,
-                    reason="alive after two SIGTERMs",
-                )
-            ],
-        )
-
-    def test_rerun_leaves_a_stop_failed_entry_and_its_reason_untouched(self) -> None:
-        stored = top_level("stuck", 101, run_dirs=[str(self.root / "run")])
-        failed = entry(stored)
-        failed["progress"] = SessionStopFailed(
-            kind="stop failed", at=NOW, reason="alive after two SIGTERMs"
-        )
-        failed["stop_issues"] = [
-            record.StillRunningAfterStop(
-                kind="still running",
-                at=NOW,
-                reason="alive after two SIGTERMs",
-            )
-        ]
-        record.create(shutdown_record([failed], state="stopping"))
-        codex_calls: list[list[str]] = []
-
-        report = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: self.fail("a terminal entry was signalled"),
-            is_alive=lambda _pid: True,
-            fresh_inventory=lambda _login, _scope: machine_inventory([]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda arguments: codex_calls.append(arguments) or 0,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
-
-        progress = report["record"]["entries"][0]["progress"]
-        self.assertEqual(progress, failed["progress"])
-        self.assertEqual(codex_calls, [])
-        self.assertEqual(report["record"]["state"], "stop partial")
+        stored_entry['stop_issues'] = [record.AccountUnreadableAtStop(kind='account unreadable', at=NOW)]
+        self.create(records_for_test([stored_entry], state='stopping'))
+        report = stop.stop_session(self.stored_record(), kill=lambda _pid, _signal: None, is_alive=lambda _pid: True, fresh_inventory=lambda _login, _scope: machine_inventory([stored]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0, tmux=lambda _arguments: 1, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
+        self.assertEqual(report['stop_issues'], [record.StillRunningAfterStop(kind='still running', at=NOW, reason='alive after two SIGTERMs')])
 
     def test_showrunner_codex_server_is_stopped_once_after_exit(self) -> None:
-        run_dir = str(self.root / "showrunner-run")
-        stored = showrunner(
-            "runner",
-            101,
-            run_dirs=[run_dir],
-            codex_servers=[server(run_dir, 900)],
-        )
-        record.create(shutdown_record([entry(stored)]))
+        run_dir = str(self.root / 'showrunner-run')
+        stored = showrunner('runner', 101, run_dirs=[run_dir], codex_servers=[server(run_dir, 900)])
+        self.create(records_for_test([entry(stored)]))
         codex_calls: list[list[str]] = []
-
-        report = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: None,
-            is_alive=lambda _pid: False,
-            fresh_inventory=lambda _login, _scope: machine_inventory([stored]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda arguments: codex_calls.append(arguments) or 0,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
-
-        self.assertEqual(
-            codex_calls, [["stop", "--session-dir", run_dir]]
-        )
-        self.assertEqual(report["record"]["state"], "down")
+        report = stop.stop_session(self.stored_record(), kill=lambda _pid, _signal: None, is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([stored]), clock=lambda: NOW_UTC, codex_mesh=lambda arguments: codex_calls.append(arguments) or 0, tmux=lambda _arguments: 1, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
+        self.assertEqual(codex_calls, [['stop', '--session-dir', run_dir]])
+        self.assertEqual(report['progress'], record.SessionStopped(kind='stopped', at=NOW))
+        self.assertEqual(report['stop_issues'], [])
 
     def test_unconfirmed_codex_server_and_unit_tmux_leave_stop_partial(self) -> None:
-        run_dir = str(self.root / "unit-run")
-        stored = unit(
-            "unit",
-            101,
-            tmux_session="unit-exact",
-            run_dirs=[run_dir],
+        run_dir = str(self.root / 'unit-run')
+        stored = unit('unit', 101, tmux_session='unit-exact', run_dirs=[run_dir])
+        self.create(records_for_test([entry(stored)]))
+        report = stop.stop_session(self.stored_record(), kill=lambda _pid, _signal: None, is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([stored]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 1, tmux=lambda _arguments: 0, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
+        self.assertEqual(report['progress'], record.SessionStopped(kind='stopped', at=NOW))
+        self.assertEqual(report['stop_issues'], [record.CodexServerLeftRunning(kind='codex server left running', at=NOW, run_dir=run_dir, cause='stop not confirmed'), record.UnitTmuxLeftRunning(kind='unit tmux session left running', at=NOW, tmux_session='unit-exact', cause='stop not confirmed')])
+
+    def test_second_stop_retries_only_the_cleanup_left_by_the_first_stop(self) -> None:
+        runs = [str(self.root / name) for name in ("resolved", "pending")]
+        saved = entry(unit("owner", 101, run_dirs=runs))
+        self.create([saved])
+        first_codex: list[list[str]] = []
+
+        def codex(args: list[str]) -> int:
+            first_codex.append(args)
+            return 1 if args[-1] == runs[1] else 0
+
+        first = stop.stop_session(
+            saved, kill=lambda _pid, _sent: None, is_alive=lambda _pid: False,
+            session_record_exists=lambda _pid: False,
+            fresh_inventory=lambda _login, _only: machine_inventory([saved["session"]]),
+            clock=lambda: NOW_UTC, codex_mesh=codex, tmux=lambda _args: 0,
         )
-        record.create(shutdown_record([entry(stored)]))
-
-        report = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: None,
-            is_alive=lambda _pid: False,
-            fresh_inventory=lambda _login, _scope: machine_inventory([stored]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 1,
-            tmux=lambda _arguments: 0,
-            sleep=lambda _seconds: None,
-        )
-
-        self.assertEqual(report["record"]["state"], "stop partial")
-        self.assertEqual(
-            report["record"]["entries"][0]["stop_issues"],
-            [
-                record.CodexServerLeftRunning(
-                    kind="codex server left running",
-                    at=NOW,
-                    run_dir=run_dir,
-                    cause="stop not confirmed",
-                ),
-                record.UnitTmuxLeftRunning(
-                    kind="unit tmux session left running",
-                    at=NOW,
-                    tmux_session="unit-exact",
-                    cause="stop not confirmed",
-                ),
-            ],
-        )
-
-    def test_restart_retry_finishes_leftover_cleanup_before_automatic_resume(self) -> None:
-        for owner_present in (True, False):
-            with self.subTest(owner_present=owner_present), patch.dict(
-                os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / str(owner_present))}
-            ):
-                run_dir = str(self.root / "unit-run")
-                stored = unit("unit", 101, tmux_session="unit-exact", run_dirs=[run_dir])
-                owned_seat = seat("seat", 102, owner="unit")
-                current = shutdown_record([entry(stored), entry(owned_seat, "passive seat ready")])
-                current["then"] = "restart"
-                record.create(current)
-                inventories = FreshInventorySequence([
-                    machine_inventory([stored, owned_seat] if owner_present else []),
-                    machine_inventory([]),
-                ])
-                first = stop.stop(
-                    LOGIN,
-                    kill=lambda _pid, _signal: None,
-                    is_alive=lambda _pid: False,
-                    session_record_exists=lambda _pid: False,
-                    fresh_inventory=inventories,
-                    clock=lambda: NOW_UTC,
-                    codex_mesh=lambda _arguments: 1,
-                    tmux=lambda _arguments: 0,
-                    sleep=lambda _seconds: None,
-                )
-                self.assertEqual(first["record"]["state"], "stop partial")
-                self.assertEqual(len(first["record"]["entries"][0]["stop_issues"]), 2)
-                settle.retry_stop(LOGIN)
-                codex_calls: list[list[str]] = []
-                tmux_calls: list[list[str]] = []
-
-                def codex(arguments: list[str]) -> int:
-                    codex_calls.append(arguments)
-                    return 0
-
-                def tmux(arguments: list[str]) -> int:
-                    tmux_calls.append(arguments)
-                    return 1 if arguments[0] == "has-session" else 0
-
-                def finish(login: str, _reports: list[settle.RefreshReport]) -> tuple[list[stop.StopReport], list[record.OrchestrationStopIssue]]:
-                    stopped = stop.stop(
-                        login,
-                        kill=lambda _pid, _signal: self.fail("a stopped owner was signalled"),
-                        is_alive=lambda _pid: False,
-                        session_record_exists=lambda _pid: False,
-                        fresh_inventory=lambda _login, _scope: machine_inventory([]),
-                        clock=lambda: NOW_UTC,
-                        codex_mesh=codex,
-                        tmux=tmux,
-                        sleep=lambda _seconds: None,
-                    )
-                    return [stopped], []
-
-                def resume(login: str) -> int:
-                    self.assertEqual(login, LOGIN)
-                    completed = self.stored_record()
-                    self.assertEqual(completed["state"], "down")
-                    self.assertTrue(all(not item["stop_issues"] for item in completed["entries"]))
-                    return 0
-
-                with (
-                    patch.object(settle, "conduct_cycle", return_value=settle.ReadyToStop(kind="ready to stop", reports=[refresh_report(self.stored_record())])),
-                    patch.object(settle, "_stop_machines", side_effect=finish),
-                    patch.object(settle, "report_stop"),
-                    patch.object(restart_work, "up", side_effect=resume) as up,
-                ):
-                    self.assertEqual(shutdown.main(["conduct", LOGIN, "--here"]), 0)
-                up.assert_called_once_with(LOGIN)
-                self.assertEqual(codex_calls, [["stop", "--session-dir", run_dir]])
-                self.assertEqual(tmux_calls, [
-                    ["kill-session", "-t", "=unit-exact"],
-                    ["has-session", "-t", "=unit-exact"],
-                ])
-
-    def test_restart_retry_cleans_only_resources_still_unconfirmed(self) -> None:
-        run_dir = str(self.root / "leftover-run")
-        stored = unit("unit", 101, run_dirs=[str(self.root / "clean-run"), run_dir])
-        stopped = entry(stored)
-        stopped["progress"] = record.SessionStopped(kind="stopped", at=NOW)
-        stopped["stop_issues"] = [
-            record.CodexServerLeftRunning(kind="codex server left running", at=NOW, run_dir=run_dir, cause="stop not confirmed"),
-            record.UnitTmuxLeftRunning(kind="unit tmux session left running", at=NOW, tmux_session="tmux-unit", cause="stop not confirmed"),
+        expected_issues = [
+            record.CodexServerLeftRunning(kind="codex server left running", at=NOW, run_dir=runs[1], cause="stop not confirmed"),
+            record.UnitTmuxLeftRunning(kind="unit tmux session left running", at=NOW, tmux_session="tmux-owner", cause="stop not confirmed"),
         ]
-        current = shutdown_record([stopped], state="stop partial")
-        current["then"] = "restart"
-        record.create(current)
-        codex_calls: list[list[str]] = []
-
-        def codex(arguments: list[str]) -> int:
-            codex_calls.append(arguments)
-            return 0
-
-        settle.retry_stop(LOGIN)
-        first = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: self.fail("a stopped owner was signalled"),
-            is_alive=lambda _pid: False,
-            session_record_exists=lambda _pid: False,
-            fresh_inventory=lambda _login, _scope: machine_inventory([]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=codex,
-            tmux=lambda _arguments: 0,
-            sleep=lambda _seconds: None,
-        )
-        self.assertEqual(first["record"]["state"], "stop partial")
-        self.assertEqual([issue["kind"] for issue in first["record"]["entries"][0]["stop_issues"]], ["unit tmux session left running"])
-        self.assertEqual(codex_calls, [["stop", "--session-dir", run_dir]])
-        settle.retry_stop(LOGIN)
-        second = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: self.fail("a stopped owner was signalled"),
-            is_alive=lambda _pid: False,
-            session_record_exists=lambda _pid: False,
-            fresh_inventory=lambda _login, _scope: machine_inventory([]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: self.fail("confirmed cleanup was repeated"),
-            tmux=lambda arguments: 1 if arguments[0] == "has-session" else 0,
-            sleep=lambda _seconds: None,
-        )
-        self.assertEqual(second["record"]["state"], "down")
-        self.assertEqual(second["record"]["entries"][0]["stop_issues"], [])
-
-    def test_stop_without_restart_does_not_retry_stopped_owner_cleanup(self) -> None:
-        stopped = entry(unit("unit", 101))
-        stopped["progress"] = record.SessionStopped(kind="stopped", at=NOW)
-        stopped["stop_issues"] = [record.UnitTmuxLeftRunning(
-            kind="unit tmux session left running", at=NOW,
-            tmux_session="tmux-unit", cause="stop not confirmed",
-        )]
-        current = shutdown_record([stopped])
-        record.create(current)
-        completed = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: self.fail("a stopped owner was signalled"),
-            is_alive=lambda _pid: False,
-            session_record_exists=lambda _pid: False,
-            fresh_inventory=lambda _login, _scope: machine_inventory([]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: self.fail("legacy cleanup was repeated"),
-            tmux=lambda _arguments: self.fail("legacy cleanup was repeated"),
-            sleep=lambda _seconds: None,
-        )
-        self.assertEqual(completed["record"]["state"], "stop partial")
-        self.assertEqual(completed["record"]["entries"], current["entries"])
-
-    def test_retry_repeats_cleanup_when_first_cleanup_dies_before_completion(
-        self,
-    ) -> None:
-        run_dir = str(self.root / "unit-run")
-        stored = unit(
-            "unit",
-            101,
-            tmux_session="unit-exact",
-            run_dirs=[run_dir],
-        )
-        record.create(shutdown_record([entry(stored)]))
-        inventories = FreshInventorySequence(
-            [machine_inventory([stored]), machine_inventory([])]
-        )
-        codex_calls: list[list[str]] = []
+        self.assertEqual(first["progress"], record.SessionStopped(kind="stopped", at=NOW))
+        self.assertEqual(first["stop_issues"], expected_issues)
+        self.assertEqual(first_codex, [["stop", "--session-dir", run] for run in runs])
+        calls: list[list[str]] = []
         tmux_calls: list[list[str]] = []
-
-        def codex(arguments: list[str]) -> int:
-            codex_calls.append(arguments)
-            return 1
-
-        def tmux(arguments: list[str]) -> int:
-            tmux_calls.append(arguments)
-            if len(tmux_calls) == 1:
-                raise RuntimeError("stop process died")
-            return 1 if arguments[0] == "has-session" else 0
-
-        with self.assertRaisesRegex(RuntimeError, "stop process died"):
-            _ = stop.stop(
-                LOGIN,
-                kill=lambda _pid, _signal: None,
-                is_alive=lambda _pid: False,
-                session_record_exists=lambda _pid: False,
-                fresh_inventory=inventories,
-                clock=lambda: NOW_UTC,
-                codex_mesh=codex,
-                tmux=tmux,
-                sleep=lambda _seconds: None,
-            )
-
-        interrupted = self.stored_record()["entries"][0]
-        self.assertEqual(interrupted["progress"]["kind"], "ready")
-        self.assertEqual(interrupted["stop_issues"], [])
-
-        report = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: self.fail("an absent owner was signalled"),
+        second = stop.stop_session(
+            first, kill=lambda _pid, _sent: self.fail("a stopped owner was signalled"),
             is_alive=lambda _pid: False,
-            session_record_exists=lambda _pid: False,
-            fresh_inventory=inventories,
-            clock=lambda: NOW_UTC,
-            codex_mesh=codex,
-            tmux=tmux,
-            sleep=lambda _seconds: None,
+            fresh_inventory=lambda _login, _only: self.fail("cleanup retry inspected the owner"),
+            clock=lambda: NOW_UTC + timedelta(seconds=1),
+            codex_mesh=lambda args: calls.append(args) or 0,
+            tmux=lambda args: tmux_calls.append(args) or (1 if args[0] == "has-session" else 0),
         )
-
-        self.assertEqual(
-            codex_calls,
-            [
-                ["stop", "--session-dir", run_dir],
-                ["stop", "--session-dir", run_dir],
-            ],
-        )
-        self.assertEqual(report["record"]["state"], "stop partial")
-        self.assertEqual(
-            report["record"]["entries"][0]["stop_issues"],
-            [
-                record.CodexServerLeftRunning(
-                    kind="codex server left running",
-                    at=NOW,
-                    run_dir=run_dir,
-                    cause="stop not confirmed",
-                )
-            ],
-        )
+        self.assertEqual(calls, [["stop", "--session-dir", runs[1]]])
+        self.assertEqual(tmux_calls, [["kill-session", "-t", "=tmux-owner"], ["has-session", "-t", "=tmux-owner"]])
+        self.assertEqual(second["progress"], first["progress"])
+        self.assertEqual(second["stop_issues"], [])
 
     def test_deleted_server_record_does_not_hide_a_surviving_server_pid(self) -> None:
-        run_dir = self.root / "live-server"
+        run_dir = self.root / 'live-server'
         run_dir.mkdir()
-        server_file = run_dir / "mesh_server.json"
-        _ = server_file.write_text(json.dumps({"pid": 900}), encoding="utf-8")
-        stored = showrunner("runner", 101, run_dirs=[str(run_dir)])
-        record.create(shutdown_record([entry(stored)]))
+        server_file = run_dir / 'mesh_server.json'
+        _ = server_file.write_text(json.dumps({'pid': 900}), encoding='utf-8')
+        stored = showrunner('runner', 101, run_dirs=[str(run_dir)])
+        self.create(records_for_test([entry(stored)]))
 
         def codex(arguments: list[str]) -> int:
-            self.assertEqual(arguments, ["stop", "--session-dir", str(run_dir)])
+            self.assertEqual(arguments, ['stop', '--session-dir', str(run_dir)])
             server_file.unlink()
             return 0
-
-        report = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: None,
-            is_alive=lambda pid: pid == 900,
-            fresh_inventory=lambda _login, _scope: machine_inventory([stored]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=codex,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
-
-        self.assertEqual(report["record"]["state"], "stop partial")
-        self.assertEqual(
-            report["record"]["entries"][0]["stop_issues"],
-            [
-                record.CodexServerLeftRunning(
-                    kind="codex server left running",
-                    at=NOW,
-                    run_dir=str(run_dir),
-                    cause="stop not confirmed",
-                )
-            ],
-        )
+        report = stop.stop_session(self.stored_record(), kill=lambda _pid, _signal: None, is_alive=lambda pid: pid == 900, fresh_inventory=lambda _login, _scope: machine_inventory([stored]), clock=lambda: NOW_UTC, codex_mesh=codex, tmux=lambda _arguments: 1, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
+        self.assertNotEqual(report['progress']['kind'], 'stopping')
+        self.assertEqual(report['stop_issues'], [record.CodexServerLeftRunning(kind='codex server left running', at=NOW, run_dir=str(run_dir), cause='stop not confirmed')])
 
     def test_tmux_runner_error_leaves_the_unit_session_unconfirmed(self) -> None:
-        stored = unit("gone-unit", 101, tmux_session="unit-on-nix")
-        record.create(shutdown_record([entry(stored, "waiting")]))
+        stored = unit('gone-unit', 101, tmux_session='unit-on-nix')
+        self.create(records_for_test([entry(stored, 'waiting')]))
 
         def unavailable_tmux(_arguments: list[str]) -> int:
-            raise OSError("tmux is not on PATH")
-
-        report = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: self.fail("an absent unit was signalled"),
-            is_alive=lambda _pid: False,
-            fresh_inventory=lambda _login, _scope: machine_inventory([]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 0,
-            tmux=unavailable_tmux,
-            sleep=lambda _seconds: None,
-        )
-
-        self.assertEqual(report["record"]["state"], "stop partial")
-        self.assertEqual(
-            report["record"]["entries"][0]["stop_issues"],
-            [
-                record.UnitTmuxLeftRunning(
-                    kind="unit tmux session left running",
-                    at=NOW,
-                    tmux_session="unit-on-nix",
-                    cause="stop not confirmed",
-                )
-            ],
-        )
+            raise OSError('tmux is not on PATH')
+        report = stop.stop_session(self.stored_record(), kill=lambda _pid, _signal: self.fail('an absent unit was signalled'), is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0, tmux=unavailable_tmux, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
+        self.assertNotEqual(report['progress']['kind'], 'stopping')
+        self.assertEqual(report['stop_issues'], [record.UnitTmuxLeftRunning(kind='unit tmux session left running', at=NOW, tmux_session='unit-on-nix', cause='stop not confirmed')])
 
     def test_ghostty_shell_with_a_different_parent_gets_no_sighup(self) -> None:
-        host = inventory.WindowHost(
-            kind="ghostty",
-            window_shell=901,
-            desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"),
-        )
-        stored = top_level("window", 101, host=host)
-        record.create(shutdown_record([entry(stored)]))
+        host = inventory.WindowHost(kind='ghostty', window_shell=901, desktop=inventory.DesktopNotInSnapshot(kind='not in snapshot'))
+        stored = top_level('window', 101, host=host)
+        self.create(records_for_test([entry(stored)]))
         signals: list[tuple[int, int]] = []
-        ps_rows: list[subprocess.CompletedProcess[str]] = [
-            subprocess.CompletedProcess(
-                args=["ps"], returncode=0, stdout="801 zsh\n", stderr=""
-            ),
-            subprocess.CompletedProcess(
-                args=["ps"], returncode=0, stdout="1 bash\n", stderr=""
-            ),
-        ]
-
-        with patch("stop.subprocess.run", side_effect=ps_rows) as ps:
-            report = stop.stop(
-                LOGIN,
-                kill=lambda pid, sent_signal: signals.append((pid, sent_signal)),
-                is_alive=lambda pid: pid == 901,
-                fresh_inventory=lambda _login, _scope: machine_inventory([stored]),
-                clock=lambda: NOW_UTC,
-                codex_mesh=lambda _arguments: 0,
-                tmux=lambda _arguments: 1,
-                sleep=lambda _seconds: None,
-            )
-
+        ps_rows: list[subprocess.CompletedProcess[str]] = [subprocess.CompletedProcess(args=['ps'], returncode=0, stdout='801 zsh\n', stderr=''), subprocess.CompletedProcess(args=['ps'], returncode=0, stdout='1 bash\n', stderr='')]
+        with patch('stop.subprocess.run', side_effect=ps_rows) as ps:
+            report = stop.stop_session(self.stored_record(), kill=lambda pid, sent_signal: signals.append((pid, sent_signal)), is_alive=lambda pid: pid == 901, fresh_inventory=lambda _login, _scope: machine_inventory([stored]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0, tmux=lambda _arguments: 1, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
         self.assertEqual(signals, [(101, signal.SIGTERM)])
         self.assertEqual(ps.call_count, 2)
-        self.assertEqual(report["record"]["state"], "down")
+        self.assertNotEqual(report['progress']['kind'], 'stopping')
 
-    def test_seat_is_stopped_when_its_owner_stops(self) -> None:
-        owner = unit("owner", 101)
-        owned_seat = seat("seat", 201, owner="owner")
-        sessions: list[inventory.Session] = [owner, owned_seat]
-        record.create(
-            shutdown_record(
-                [entry(owner), entry(owned_seat, "passive seat ready")]
+    def test_stop_failed_record_can_be_retried_after_the_owner_becomes_idle(self) -> None:
+        saved = entry(top_level("owner", 101))
+        saved["progress"] = record.SessionStopFailed(kind="stop failed", at=NOW, reason="busy")
+        self.create([saved])
+        self.assertEqual(self.perform(saved)["progress"]["kind"], "stopped")
+
+    def test_interrupted_cleanup_is_retried_when_the_claim_is_stale(self) -> None:
+        pending = str(self.root / "pending")
+        saved = entry(unit("owner", 101, run_dirs=[pending]))
+        self.create([saved])
+        with self.assertRaisesRegex(RuntimeError, "interrupted"):
+            _ = stop.stop_session(
+                saved, kill=lambda _pid, _sent: None, is_alive=lambda _pid: False,
+                session_record_exists=lambda _pid: False,
+                fresh_inventory=lambda _login, _only: machine_inventory([saved["session"]]),
+                clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0,
+                tmux=lambda _args: (_ for _ in ()).throw(RuntimeError("interrupted")),
             )
+        interrupted = self.stored_record()
+        self.assertEqual(interrupted["progress"]["kind"], "stopping")
+        calls: list[list[str]] = []
+        finished = stop.stop_session(
+            interrupted, kill=lambda _pid, _sent: self.fail("an absent owner was signalled"),
+            is_alive=lambda _pid: False, session_record_exists=lambda _pid: False,
+            fresh_inventory=lambda _login, _only: machine_inventory([]),
+            clock=lambda: NOW_UTC + timedelta(seconds=120),
+            codex_mesh=lambda args: calls.append(args) or 0,
+            tmux=lambda args: 1 if args[0] == "has-session" else 0,
         )
+        self.assertEqual(calls, [["stop", "--session-dir", pending]])
+        self.assertEqual(finished["progress"]["kind"], "already gone")
 
-        report = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: None,
-            is_alive=lambda _pid: False,
-            fresh_inventory=lambda _login, _scope: machine_inventory(sessions),
+    def test_process_disappearing_at_first_signal_is_already_gone(self) -> None:
+        saved = entry(top_level("owner", 101))
+        self.create([saved])
+        def kill(_pid: int, _sent: int) -> None:
+            raise ProcessLookupError()
+        finished = stop.stop_session(
+            saved, kill=kill, is_alive=lambda _pid: False,
+            fresh_inventory=lambda _login, _only: machine_inventory([saved["session"]]),
+            clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0, tmux=lambda _args: 1,
+        )
+        self.assertEqual(finished["progress"]["kind"], "already gone")
+
+    def test_signal_permission_failure_keeps_a_named_failure_and_no_cleanup(self) -> None:
+        saved = entry(unit("owner", 101))
+        self.create([saved])
+        def kill(_pid: int, _sent: int) -> None:
+            raise PermissionError("signal refused")
+        finished = stop.stop_session(
+            saved, kill=kill, fresh_inventory=lambda _login, _only: machine_inventory([saved["session"]]),
             clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 0,
-            tmux=lambda arguments: 1 if arguments[0] == "has-session" else 0,
+            codex_mesh=lambda _args: self.fail("cleanup followed a refused signal"),
+            tmux=lambda _args: self.fail("cleanup followed a refused signal"),
+        )
+        self.assertEqual(finished["progress"], {"kind": "stop failed", "at": NOW, "reason": "signal refused"})
+
+    def test_account_becoming_unreadable_before_second_signal_is_not_signalled_again(self) -> None:
+        saved = entry(top_level("owner", 101))
+        self.create([saved])
+        report = FreshInventorySequence([
+            machine_inventory([saved["session"]]),
+            machine_inventory([], unattributed=[inventory.UnattributedSession(pid=101, name="owner", reason="account unreadable")]),
+        ])
+        signals: list[int] = []
+        finished = stop.stop_session(
+            saved, kill=lambda _pid, sent: signals.append(sent), is_alive=lambda _pid: True,
+            session_record_exists=lambda _pid: False, fresh_inventory=report,
+            clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0, tmux=lambda _args: 1,
             sleep=lambda _seconds: None,
         )
+        self.assertEqual(signals, [signal.SIGTERM])
+        self.assertEqual(finished["progress"]["kind"], "stop failed")
+        self.assertEqual(finished["stop_issues"], [{"kind": "account unreadable", "at": NOW}])
 
-        seat_progress = next(
-            item["progress"]["kind"]
-            for item in report["record"]["entries"]
-            if item["session"]["kind"] == "seat"
-        )
-        self.assertEqual(seat_progress, "stopped")
-        self.assertEqual(report["record"]["state"], "down")
-
-    def test_identity_lost_owner_live_under_new_pid_keeps_seat_live(self) -> None:
-        stored_owner = top_level("owner", 101)
-        current_owner = top_level("owner", 102)
-        owned_seat = seat("seat", 201, owner="owner")
-        record.create(
-            shutdown_record(
-                [entry(stored_owner), entry(owned_seat, "passive seat ready")]
+    def test_a_matching_ghostty_parent_closes_only_the_recorded_shell(self) -> None:
+        saved = entry(top_level("owner", 101, host=inventory.WindowHost(
+            kind="ghostty", window_shell=901, desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"),
+        )))
+        self.create([saved])
+        signals: list[tuple[int, int]] = []
+        with patch.object(stop, "_ghostty_still_owns_shell", return_value=True):
+            finished = stop.stop_session(
+                saved, kill=lambda pid, sent: signals.append((pid, sent)), is_alive=lambda pid: pid == 901,
+                session_record_exists=lambda _pid: False,
+                fresh_inventory=lambda _login, _only: machine_inventory([saved["session"]]),
+                clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0, tmux=lambda _args: 1,
+                sleep=lambda _seconds: None,
             )
-        )
-        inventories = FreshInventorySequence(
-            [
-                machine_inventory([current_owner]),
-                machine_inventory([current_owner]),
-            ]
-        )
+        self.assertEqual(signals, [(101, signal.SIGTERM), (901, signal.SIGHUP)])
+        self.assertEqual(finished["progress"]["kind"], "stopped")
 
-        report = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: self.fail(
-                "an identity-lost owner was signalled"
-            ),
-            is_alive=lambda _pid: True,
-            fresh_inventory=inventories,
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 0,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
 
-        owner_entry, seat_entry = report["record"]["entries"]
-        self.assertEqual(owner_entry["progress"]["kind"], "process identity lost")
-        self.assertEqual(seat_entry["progress"]["kind"], "passive seat ready")
-        self.assertEqual(
-            seat_entry["stop_issues"],
-            [record.SeatStillLive(kind="seat still live", at=NOW)],
+    def test_stop_snapshot_cannot_claim_a_new_request_for_the_same_session(self) -> None:
+        old = entry(top_level("owner", 101))
+        self.create([old])
+        record.archive_session(LOGIN, "owner")
+        current = entry(top_level("owner", 101))
+        current["request_id"] = "new-request"
+        self.create([current])
+        signals: list[int] = []
+        result = stop.stop_session(
+            old, kill=lambda _pid, sent: signals.append(sent),
+            is_alive=lambda _pid: False, session_record_exists=lambda _pid: False,
+            fresh_inventory=lambda _login, _only: machine_inventory([current["session"]]),
+            clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0,
+            tmux=lambda _args: 1, sleep=lambda _seconds: None,
         )
-        self.assertEqual(report["record"]["state"], "stop partial")
+        self.assertEqual(signals, [])
+        self.assertEqual(result, current)
+        self.assertEqual(self.stored_record(), current)
 
-    def test_identity_lost_owner_gone_releases_its_absent_seat(self) -> None:
-        stored_owner = top_level("owner", 101)
-        owned_seat = seat("seat", 201, owner="owner")
-        record.create(
-            shutdown_record(
-                [entry(stored_owner), entry(owned_seat, "passive seat ready")]
+    def test_late_stop_outcome_leaves_a_replacement_relaunch_claim_unchanged(self) -> None:
+        saved = entry(top_level("owner", 101))
+        self.create([saved])
+        replacement = record.SessionRestarting(
+            kind="restarting", at=(NOW_UTC + timedelta(seconds=121)).isoformat(),
+            prior=record.SessionStopped(kind="stopped", at=NOW),
+        )
+        real_update = record.update_session
+        updates = 0
+
+        def update(login: str, session_id: str, change: Callable[[record.SessionShutdown], None]) -> record.SessionShutdown:
+            nonlocal updates
+            updates += 1
+            if updates == 2:
+                def replace(current: record.SessionShutdown) -> None:
+                    current["progress"] = replacement
+                _ = real_update(login, session_id, replace)
+            return real_update(login, session_id, change)
+
+        changed = top_level("owner", 202)
+        with patch.object(stop, "update_session", update):
+            finished = stop.stop_session(
+                saved, kill=lambda _pid, _sent: self.fail("a replaced owner was signalled"),
+                fresh_inventory=lambda _login, _only: machine_inventory([changed]),
+                clock=lambda: NOW_UTC,
+                codex_mesh=lambda _args: self.fail("a replaced owner was cleaned"),
+                tmux=lambda _args: self.fail("a replaced owner was cleaned"),
             )
+        self.assertEqual(finished["progress"], replacement)
+        self.assertEqual(finished["stop_issues"], [])
+        self.assertEqual(self.stored_record(), finished)
+
+    def test_late_stop_cleanup_leaves_a_replacement_request_untouched(self) -> None:
+        saved = entry(unit("owner", 101, run_dirs=[str(self.root / "run")]))
+        self.create([saved])
+
+        def report(_login: str, _only: frozenset[str]) -> inventory.Inventory:
+            def replace(current: record.SessionShutdown) -> None:
+                current["request_id"] = "replacement"
+                current["progress"] = record.SessionReadyToStop(kind="ready", at=NOW)
+            _ = record.update_session(LOGIN, "owner", replace)
+            return machine_inventory([])
+
+        finished = stop.stop_session(
+            saved, kill=lambda _pid, _sent: self.fail("a replaced owner was signalled"),
+            fresh_inventory=report, clock=lambda: NOW_UTC,
+            codex_mesh=lambda _args: self.fail("stale Codex cleanup ran"),
+            tmux=lambda _args: self.fail("stale tmux cleanup ran"),
         )
-        mismatch = inventory.UnattributedSession(
-            pid=101,
-            name="unrelated",
-            reason="process start mismatch",
-        )
-        inventories = FreshInventorySequence(
-            [machine_inventory([], unattributed=[mismatch]), machine_inventory([])]
-        )
+        self.assertEqual(finished["request_id"], "replacement")
+        self.assertEqual(finished["progress"], {"kind": "ready", "at": NOW})
+        self.assertEqual(finished["stop_issues"], [])
 
-        report = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: self.fail(
-                "an identity-lost owner was signalled"
-            ),
-            is_alive=lambda _pid: True,
-            fresh_inventory=inventories,
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 0,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
+    def test_expired_stop_worker_returns_the_replacement_workers_relaunch(self) -> None:
+        saved = entry(unit("owner", 101, run_dirs=[str(self.root / "run")]))
+        self.create([saved])
+        paused = threading.Event()
+        release = threading.Event()
+        returned: list[record.SessionShutdown] = []
+        errors: list[BaseException] = []
 
-        owner_entry, seat_entry = report["record"]["entries"]
-        self.assertEqual(owner_entry["progress"]["kind"], "process identity lost")
-        self.assertEqual(seat_entry["progress"]["kind"], "stopped")
-        self.assertEqual(seat_entry["stop_issues"], [])
-        self.assertEqual(report["record"]["state"], "down")
+        def report(_login: str, _only: frozenset[str]) -> inventory.Inventory:
+            paused.set()
+            if not release.wait(2):
+                raise RuntimeError("stop worker was not released")
+            return machine_inventory([])
 
-    def test_orphan_seat_stops_only_after_fresh_inventory_shows_no_process(
-        self,
-    ) -> None:
-        orphan = seat("orphan", 201, owner=None)
-        record.create(
-            shutdown_record([entry(orphan, "passive seat ready")])
-        )
+        def first_worker() -> None:
+            try:
+                returned.append(stop.stop_session(
+                    saved, kill=lambda _pid, _sent: self.fail("expired worker sent a signal"),
+                    fresh_inventory=report, clock=lambda: NOW_UTC,
+                    codex_mesh=lambda _args: self.fail("expired worker cleaned a server"),
+                    tmux=lambda _args: self.fail("expired worker cleaned tmux"),
+                ))
+            except BaseException as error:
+                errors.append(error)
 
-        report = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: self.fail("a passive seat was signalled"),
-            is_alive=lambda _pid: False,
-            fresh_inventory=lambda _login, _scope: machine_inventory([]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 0,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
+        worker = threading.Thread(target=first_worker)
+        worker.start()
+        try:
+            self.assertTrue(paused.wait(2))
+            replacement_time = NOW_UTC + timedelta(seconds=record.CLAIM_STALE_SECONDS)
+            stopped = stop.stop_session(
+                self.stored_record(), kill=lambda _pid, _sent: None,
+                is_alive=lambda _pid: False, session_record_exists=lambda _pid: False,
+                fresh_inventory=lambda _login, _only: machine_inventory([saved["session"]]),
+                clock=lambda: replacement_time, codex_mesh=lambda _args: 0,
+                tmux=lambda args: 1 if args[0] == "has-session" else 0,
+            )
+            self.assertEqual(stopped["progress"]["kind"], "stopped")
+            prior = record.SessionStopped(kind="stopped", at=replacement_time.isoformat())
 
-        self.assertEqual(
-            report["record"]["entries"][0]["progress"]["kind"], "stopped"
-        )
-        self.assertEqual(report["record"]["state"], "down")
+            def relaunch(current: record.SessionShutdown) -> None:
+                current["progress"] = record.SessionRestarting(kind="restarting", at=replacement_time.isoformat(), prior=prior)
 
-    def test_orphan_seat_stays_unstopped_while_fresh_inventory_lists_it(
-        self,
-    ) -> None:
-        owner = top_level("live-owner", 101)
-        orphan = seat("orphan", 201, owner="live-owner")
-        record.create(
-            shutdown_record([entry(orphan, "passive seat ready")])
-        )
+            replacement = record.update_session(LOGIN, "owner", relaunch)
+        finally:
+            release.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(returned, [replacement])
+        self.assertEqual(self.stored_record(), replacement)
 
-        report = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: self.fail("a passive seat was signalled"),
-            is_alive=lambda _pid: True,
-            fresh_inventory=lambda _login, _scope: machine_inventory(
-                [owner, orphan]
-            ),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 0,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
+    def test_stop_cleanup_rechecks_ownership_between_codex_servers_and_tmux(self) -> None:
+        runs = [str(self.root / name) for name in ("first", "second")]
+        saved = entry(unit("owner", 101, run_dirs=runs))
+        saved["progress"] = record.SessionStopped(kind="stopped", at=NOW)
+        issues: list[record.SessionStopIssue] = [
+            record.CodexServerLeftRunning(kind="codex server left running", at=NOW, run_dir=run, cause="stop not confirmed")
+            for run in runs
+        ]
+        issues.append(record.UnitTmuxLeftRunning(kind="unit tmux session left running", at=NOW, tmux_session="tmux-owner", cause="stop not confirmed"))
+        saved["stop_issues"] = issues
+        self.create([saved])
+        calls: list[list[str]] = []
+        replacement = record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW))
 
-        self.assertEqual(
-            report["record"]["entries"][0]["progress"]["kind"],
-            "passive seat ready",
-        )
-        self.assertEqual(
-            report["record"]["entries"][0]["stop_issues"],
-            [record.SeatStillLive(kind="seat still live", at=NOW)],
-        )
-        self.assertEqual(report["record"]["state"], "stop partial")
-
-    def test_empty_record_goes_down(self) -> None:
-        record.create(shutdown_record([]))
-
-        report = stop.stop(
-            LOGIN,
-            kill=lambda _pid, _signal: self.fail("nothing should be signalled"),
-            is_alive=lambda _pid: False,
-            fresh_inventory=lambda _login, _scope: machine_inventory([]),
-            clock=lambda: NOW_UTC,
-            codex_mesh=lambda _arguments: 0,
-            tmux=lambda _arguments: 1,
-            sleep=lambda _seconds: None,
-        )
-
-        self.assertEqual(report["record"]["state"], "down")
-
-    def test_conduct_restarts_only_after_persisting_a_completed_stop(self) -> None:
-        current = shutdown_record([], state="settling")
-        current["then"] = "restart"
-        record.create(current)
-        events: list[str] = []
-
-        def finish(_login: str, _reports: list[settle.RefreshReport]) -> tuple[list[stop.StopReport], list[record.OrchestrationStopIssue]]:
-            def down(changing: ShutdownRecord) -> None:
-                changing["state"] = "down"
-            stopped = record.update(LOGIN, down)
-            events.append("down")
-            return [stop_report(stopped)], []
-
-        def resume(login: str) -> int:
-            self.assertEqual(login, LOGIN)
-            self.assertEqual(self.stored_record()["state"], "down")
-            events.append("restart")
+        def codex(args: list[str]) -> int:
+            calls.append(args)
+            def replace(current: record.SessionShutdown) -> None:
+                current["progress"] = replacement
+            _ = record.update_session(LOGIN, "owner", replace)
             return 0
 
-        with (
-            patch.object(settle, "conduct_cycle", return_value=settle.ReadyToStop(kind="ready to stop", reports=[refresh_report(current)])),
-            patch.object(settle, "_stop_machines", side_effect=finish),
-            patch.object(settle, "report_stop"),
-            patch.object(restart_work, "up", side_effect=resume) as up,
-        ):
-            self.assertEqual(shutdown.main(["conduct", LOGIN, "--here"]), 0)
-        up.assert_called_once_with(LOGIN)
-        self.assertEqual(events, ["down", "restart"])
-
-    def test_conduct_does_not_restart_cancelled_partial_or_unfinished_records(self) -> None:
-        for state in ("cancelled", "stop partial", "settling", "stopping"):
-            with self.subTest(state=state), patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / state)}):
-                current = shutdown_record([], state=cast(ShutdownState, state))
-                current["then"] = "restart"
-                record.create(current)
-                with patch.object(settle, "conduct", return_value=0), patch.object(restart_work, "up") as up, patch.object(restart_work, "restart") as restart:
-                    self.assertEqual(shutdown.main(["conduct", LOGIN, "--here"]), 0)
-                up.assert_not_called()
-                restart.assert_not_called()
-
-    def test_conduct_keeps_legacy_and_explicit_stop_records_down(self) -> None:
-        for explicit in (False, True):
-            with self.subTest(explicit=explicit), patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / str(explicit))}):
-                current = shutdown_record([], state="down")
-                if explicit:
-                    current["then"] = "stop"
-                record.create(current)
-                with patch.object(settle, "conduct", return_value=0), patch.object(restart_work, "up") as up:
-                    self.assertEqual(shutdown.main(["conduct", LOGIN, "--here"]), 0)
-                up.assert_not_called()
-
-    def test_conduct_requires_the_peer_to_be_down_before_restarting(self) -> None:
-        current = shutdown_record([], state="down")
-        current["then"] = "restart"
-        record.create(current)
-        peer = shutdown_record([], machine="Mac", state="stop partial")
-        peer["then"] = "restart"
-        with (
-            patch.object(settle, "conduct", return_value=0),
-            patch.object(shutdown, "run_remote", return_value=(0, json.dumps([peer]))) as remote,
-            patch.object(restart_work, "restart") as restart,
-        ):
-            self.assertEqual(shutdown.main(["conduct", LOGIN]), 0)
-        remote.assert_called_once_with(["records", "--json", "--here"])
-        restart.assert_not_called()
-
-    def test_conduct_restarts_both_completed_machine_records_by_login(self) -> None:
-        current = shutdown_record([], state="down")
-        current["then"] = "restart"
-        record.create(current)
-        peer = shutdown_record([], machine="Mac", state="down")
-        peer["then"] = "restart"
-        with (
-            patch.object(settle, "conduct", return_value=0),
-            patch.object(shutdown, "run_remote", return_value=(0, json.dumps([peer]))),
-            patch.object(restart_work, "restart", return_value=0) as restart,
-        ):
-            self.assertEqual(shutdown.main(["conduct", LOGIN]), 0)
-        restart.assert_called_once_with(
-            restart_work.AccountNamed(LOGIN), dry_run=False,
-            alerts=restart_work.AlertWhenNotBack(),
+        finished = stop.stop_session(
+            saved, kill=lambda _pid, _sent: self.fail("a stopped owner was signalled"),
+            is_alive=lambda _pid: False, clock=lambda: NOW_UTC, codex_mesh=codex,
+            tmux=lambda _args: self.fail("stale tmux cleanup ran"),
         )
+        self.assertEqual(calls, [["stop", "--session-dir", runs[0]]])
+        self.assertEqual(finished["progress"], replacement)
+        self.assertEqual(finished["stop_issues"], saved["stop_issues"])
 
-    def test_conduct_alerts_when_peer_record_cannot_authorize_automatic_restart(self) -> None:
-        for code, output, reason in ((255, "", "unreachable"), (7, "refused", "unavailable"), (0, "invalid JSON", "unreadable")):
-            with self.subTest(reason=reason), patch.dict(
-                os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / reason)}
-            ):
-                current = shutdown_record([], state="down")
-                current["then"] = "restart"
-                record.create(current)
-                with (
-                    patch.object(settle, "conduct", return_value=0),
-                    patch.object(shutdown, "run_remote", return_value=(code, output)),
-                    patch.object(shutdown, "other_machine", return_value="Mac"),
-                    patch.object(settle, "_machine", return_value="natedev"),
-                    patch.object(settle, "alert_user") as alert,
-                    patch.object(restart_work, "restart") as restart,
-                    patch.object(restart_work, "up") as up,
-                ):
-                    self.assertEqual(shutdown.main(["conduct", LOGIN]), 0)
-                restart.assert_not_called()
-                up.assert_not_called()
-                alert.assert_called_once()
-                self.assertEqual(alert.call_args.args[0], current["scope"])
-                self.assertEqual(alert.call_args.args[1], f"{LABEL}: automatic restart skipped")
-                text = cast(str, cast(object, alert.call_args.args[2]))
-                resume = "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart 'claude 2'"
-                self.assertIn(reason, text)
-                self.assertIn(f"{LABEL} is down", text)
-                self.assertIn(resume, text.splitlines())
-                self.assertEqual(alert.call_args.args[3], ActionRequired(f"Run {resume}."))
-                self.assertEqual(self.stored_record(), current)
+    def test_stop_rechecks_ownership_after_readiness_before_the_first_signal(self) -> None:
+        saved = entry(top_level("owner", 101))
+        self.create([saved])
+        replacement = record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW))
 
-    def test_conduct_stops_other_machine_then_reports_to_requesting_session(
-        self,
-    ) -> None:
-        requester = top_level("requester", 101)
-        local = shutdown_record(
-            [entry(requester)], machine="natedev", state="settling", requester="requester"
-        )
-        remote = shutdown_record([], machine="Mac", state="settling")
-        local_down = shutdown_record(
-            [entry(requester)], machine="natedev", state="down", requester="requester"
-        )
-        remote_down = shutdown_record([], machine="Mac", state="down")
-        record.create(local)
-        events: list[str] = []
-        alerts: list[AlertCall] = []
+        def blocker(_session: inventory.Session) -> record.ReadinessCheck:
+            def replace(current: record.SessionShutdown) -> None:
+                current["progress"] = replacement
+            _ = record.update_session(LOGIN, "owner", replace)
+            return record.ReadinessClear(kind="clear")
 
-        def remote_stop(_login: str) -> settle.RemoteStopOutcome:
-            events.append("Mac")
-            return settle.RemoteStopped(
-                kind="stopped", report=stop_report(remote_down)
+        with patch.object(settle, "blocker", blocker):
+            finished = stop.stop_session(
+                saved, kill=lambda _pid, _sent: self.fail("stale first signal ran"),
+                fresh_inventory=lambda _login, _only: machine_inventory([saved["session"]]),
+                clock=lambda: NOW_UTC,
+                codex_mesh=lambda _args: self.fail("stale cleanup ran"),
+                tmux=lambda _args: self.fail("stale cleanup ran"),
             )
+        self.assertEqual(finished["progress"], replacement)
 
-        def local_stop(_login: str) -> stop.StopReport:
-            events.append("natedev")
-            return stop_report(local_down)
+    def test_stop_rechecks_ownership_before_the_second_signal(self) -> None:
+        saved = entry(top_level("owner", 101))
+        self.create([saved])
+        replacement = record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW))
+        inventories = 0
+        signals: list[int] = []
 
-        def send_alert(
-            recipient: str,
-            summary: str,
-            text: str,
-            *,
-            machine: str = "",
-            key: str = "",
-        ) -> settle.MessageDelivery:
-            alerts.append(
-                AlertCall(
-                    recipient=recipient,
-                    summary=summary,
-                    text=text,
-                    machine=machine,
-                    key=key,
-                )
+        def report(_login: str, _only: frozenset[str]) -> inventory.Inventory:
+            nonlocal inventories
+            inventories += 1
+            if inventories == 2:
+                def replace(current: record.SessionShutdown) -> None:
+                    current["progress"] = replacement
+                _ = record.update_session(LOGIN, "owner", replace)
+            return machine_inventory([saved["session"]])
+
+        finished = stop.stop_session(
+            saved, kill=lambda _pid, sent: signals.append(sent), is_alive=lambda _pid: True,
+            session_record_exists=lambda _pid: False, fresh_inventory=report,
+            clock=lambda: NOW_UTC, sleep=lambda _seconds: None,
+            codex_mesh=lambda _args: self.fail("stale cleanup ran"),
+            tmux=lambda _args: self.fail("stale cleanup ran"),
+        )
+        self.assertEqual(signals, [signal.SIGTERM])
+        self.assertEqual(finished["progress"], replacement)
+
+    def test_stop_rechecks_ownership_between_forced_codex_seats(self) -> None:
+        run = str(self.root / "run")
+        saved = entry(unit("owner", 101, codex_servers=[server(run, 900, busy_seats=["one", "two"])]))
+        saved["force"] = "now"
+        self.create([saved])
+        replacement = record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW))
+        calls: list[list[str]] = []
+
+        def codex(args: list[str]) -> int:
+            calls.append(args)
+            def replace(current: record.SessionShutdown) -> None:
+                current["progress"] = replacement
+            _ = record.update_session(LOGIN, "owner", replace)
+            return 0
+
+        finished = stop.stop_session(
+            saved, kill=lambda _pid, _sent: self.fail("a replaced owner was signalled"),
+            fresh_inventory=lambda _login, _only: machine_inventory([saved["session"]]),
+            clock=lambda: NOW_UTC, codex_mesh=codex, tmux=lambda _args: self.fail("stale cleanup ran"),
+        )
+        self.assertEqual(calls, [["end", "--session-dir", run, "--to", "one"]])
+        self.assertEqual(finished["progress"], replacement)
+
+    def test_stop_cleanup_rechecks_ownership_before_the_ghostty_signal(self) -> None:
+        host = inventory.WindowHost(kind="ghostty", window_shell=901, desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"))
+        saved = entry(top_level("owner", 101, host=host))
+        self.create([saved])
+        replacement = record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW))
+
+        def shell_owner(_pid: int) -> bool:
+            def replace(current: record.SessionShutdown) -> None:
+                current["progress"] = replacement
+            _ = record.update_session(LOGIN, "owner", replace)
+            return True
+
+        signals: list[tuple[int, int]] = []
+        with patch.object(stop, "_ghostty_still_owns_shell", shell_owner):
+            finished = stop.stop_session(
+                saved, kill=lambda pid, sent: signals.append((pid, sent)), is_alive=lambda pid: pid == 901,
+                session_record_exists=lambda _pid: False,
+                fresh_inventory=lambda _login, _only: machine_inventory([saved["session"]]),
+                clock=lambda: NOW_UTC, codex_mesh=lambda _args: self.fail("stale cleanup ran"), tmux=lambda _args: 1,
             )
-            return settle.MessageSent(kind="sent")
+        self.assertEqual(signals, [(101, signal.SIGTERM)])
+        self.assertEqual(finished["progress"], replacement)
 
-        with (
-            patch.object(
-                settle,
-                "conduct_cycle",
-                return_value=settle.ReadyToStop(
-                    kind="ready to stop",
-                    reports=[refresh_report(local), refresh_report(remote)]
-                ),
-            ),
-            patch.object(stop, "claim_stop_as_conductor", return_value=True),
-            patch.object(
-                settle,
-                "claim_remote_stop",
-                return_value=settle.RemoteStopClaimed(kind="claimed"),
-            ),
-            patch.object(settle, "stop_remote", side_effect=remote_stop),
-            patch.object(stop, "stop", side_effect=local_stop),
-            patch.object(settle, "send_message", side_effect=send_alert),
-        ):
-            result = settle.conduct(LOGIN)
+    def test_stop_cleanup_rechecks_ownership_after_the_tmux_command(self) -> None:
+        saved = entry(unit("owner", 101))
+        saved["progress"] = record.SessionStopped(kind="stopped", at=NOW)
+        saved["stop_issues"] = [record.UnitTmuxLeftRunning(kind="unit tmux session left running", at=NOW, tmux_session="tmux-owner", cause="stop not confirmed")]
+        self.create([saved])
+        replacement = record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW))
+        calls: list[list[str]] = []
 
-        self.assertEqual(result, 0)
-        self.assertEqual(events, ["Mac", "natedev"])
-        self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0]["recipient"], "session:requester")
-        self.assertEqual(alerts[0]["summary"], f"{LABEL} is down")
-        self.assertEqual(alerts[0]["key"], f"shutdown-result-{LOGIN}")
-        self.assertIn("/shutdown restart", alerts[0]["text"])
+        def tmux(args: list[str]) -> int:
+            calls.append(args)
+            def replace(current: record.SessionShutdown) -> None:
+                current["progress"] = replacement
+            _ = record.update_session(LOGIN, "owner", replace)
+            return 0
 
-    def test_conduct_claims_peer_with_conductor_force_before_any_stop(
-        self,
-    ) -> None:
-        local = shutdown_record([], state="settling", force="now")
-        remote_busy = top_level("remote-busy", 202, status="busy")
-        remote = shutdown_record(
-            [entry(remote_busy, "waiting")],
-            machine="Mac",
-            state="settling",
+        finished = stop.stop_session(
+            saved, kill=lambda _pid, _sent: self.fail("a stopped owner was signalled"),
+            clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0, tmux=tmux,
         )
-        remote_down = shutdown_record(
-            [entry(remote_busy, "waiting")],
-            machine="Mac",
-            state="down",
-            force="now",
+        self.assertEqual(calls, [["kill-session", "-t", "=tmux-owner"]])
+        self.assertEqual(finished["progress"], replacement)
+        self.assertEqual(finished["stop_issues"], saved["stop_issues"])
+
+    def test_stop_timestamps_and_claim_age_use_the_injected_clock(self) -> None:
+        saved = entry(unit("owner", 101, run_dirs=[str(self.root / "run")]))
+        self.create([saved])
+        instant = datetime(2030, 2, 3, 4, 5, 6, 789, tzinfo=timezone(timedelta(hours=2)))
+        expected = "2030-02-03T02:05:06+00:00"
+
+        def kill(_pid: int, _sent: int) -> None:
+            self.assertEqual(self.stored_record()["progress"], {"kind": "stopping", "at": expected})
+
+        finished = stop.stop_session(
+            saved, kill=kill, is_alive=lambda _pid: False,
+            session_record_exists=lambda _pid: False,
+            fresh_inventory=lambda _login, _only: machine_inventory([saved["session"]]),
+            clock=lambda: instant, codex_mesh=lambda _args: 1, tmux=lambda _args: 0,
         )
-        remote_down["entries"][0]["progress"] = SessionStopped(
-            kind="stopped", at=NOW
-        )
-        record.create(local)
-        events: list[str] = []
-
-        def claim_remote(_login: str, force: str) -> settle.RemoteStopClaimOutcome:
-            events.append(f"claim Mac {force}")
-            remote["state"] = "stopping"
-            remote["force"] = cast(StopTiming, force)
-            return settle.RemoteStopClaimed(kind="claimed")
-
-        def remote_stop(_login: str) -> settle.RemoteStopOutcome:
-            self.assertEqual(remote["state"], "stopping")
-            self.assertEqual(remote["force"], "now")
-            events.append("stop Mac busy entry")
-            return settle.RemoteStopped(
-                kind="stopped", report=stop_report(remote_down)
-            )
-
-        def local_stop(_login: str) -> stop.StopReport:
-            current = self.stored_record()
-            self.assertEqual(current["state"], "stopping")
-            self.assertEqual(current["force"], "now")
-            events.append("stop natedev")
-            local_down = shutdown_record([], state="down", force="now")
-            return stop_report(local_down)
-
-        with (
-            patch.object(
-                settle,
-                "conduct_cycle",
-                return_value=settle.ReadyToStop(
-                    kind="ready to stop",
-                    reports=[refresh_report(local), refresh_report(remote)],
-                ),
-            ),
-            patch.object(settle, "claim_remote_stop", side_effect=claim_remote),
-            patch.object(settle, "stop_remote", side_effect=remote_stop),
-            patch.object(stop, "stop", side_effect=local_stop),
-            patch.object(settle, "report_stop"),
-        ):
-            result = settle.conduct(LOGIN)
-
-        self.assertEqual(result, 0)
-        self.assertEqual(
-            events,
-            ["claim Mac now", "stop Mac busy entry", "stop natedev"],
-        )
-        self.assertEqual(
-            remote_down["entries"][0]["progress"]["kind"], "stopped"
-        )
-
-    def test_claim_stop_command_copies_force_while_claiming(self) -> None:
-        record.create(shutdown_record([], state="settling"))
-
-        result = shutdown.main(
-            ["claim-stop", LOGIN, "--force", "now"]
-        )
-
-        self.assertEqual(result, 0)
-        current = self.stored_record()
-        self.assertEqual(current["state"], "stopping")
-        self.assertEqual(current["force"], "now")
-
-    def test_conduct_retries_a_peer_claim_after_its_success_response_is_lost(
-        self,
-    ) -> None:
-        local = shutdown_record([], state="settling", force="now")
-        remote = shutdown_record(
-            [], machine="Mac", state="settling", force="wait for ready"
-        )
-        remote_root = self.root / "remote-shutdown"
-        record.create(local)
-        with patch.dict(
-            os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
-        ):
-            record.create(remote)
-
-        real_stop = stop.stop
-        claim_attempts = 0
-
-        def remote_command(
-            arguments: list[str],
-            stdin: str = "",
-            limit: remote_transport.RemoteCallLimit = remote_transport.STANDARD_TIME_LIMIT,
-        ) -> tuple[int, str]:
-            nonlocal claim_attempts
-            del stdin, limit
-            with patch.dict(
-                os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
-            ):
-                if arguments[0] == "claim-stop":
-                    result = shutdown.main(arguments)
-                    claim_attempts += 1
-                    return (255, "") if claim_attempts == 1 else (result, "")
-                self.assertEqual(arguments, ["stop", LOGIN])
-                report = real_stop(
-                    LOGIN,
-                    fresh_inventory=lambda _login, _scope: machine_inventory(
-                        [], machine="Mac"
-                    ),
-                )
-                return 0, json.dumps(report)
-
-        def local_stop(login: str) -> stop.StopReport:
-            return real_stop(
-                login,
-                fresh_inventory=lambda _login, _scope: machine_inventory([]),
-            )
-
-        with (
-            patch.object(
-                settle,
-                "conduct_cycle",
-                return_value=settle.ReadyToStop(
-                    kind="ready to stop",
-                    reports=[refresh_report(local), refresh_report(remote)],
-                ),
-            ),
-            patch.object(settle, "run_remote", side_effect=remote_command),
-            patch.object(time, "sleep"),
-            patch.object(stop, "stop", side_effect=local_stop),
-            patch.object(settle, "report_stop") as alert,
-        ):
-            result = settle.conduct(LOGIN)
-
-        with patch.dict(
-            os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
-        ):
-            remote_record = record.find_live(LOGIN)
-        self.assertEqual(result, 0)
-        self.assertEqual(claim_attempts, 2)
-        self.assertEqual(remote_record["kind"], "live")
-        if remote_record["kind"] != "live":
-            self.fail("expected the peer shutdown record to remain live")
-        self.assertEqual(remote_record["record"]["state"], "down")
-        self.assertEqual(remote_record["record"]["force"], "now")
-        self.assertEqual(self.stored_record()["state"], "down")
-        alert.assert_called_once()
-
-    def test_cancelled_record_ends_conduct_without_stopping(self) -> None:
-        record.create(shutdown_record([], state="cancelled"))
-
-        with (
-            patch.object(stop, "claim_stop_as_conductor") as claim,
-            patch.object(stop, "stop") as stop_local,
-        ):
-            result = settle.conduct(LOGIN, here=True)
-
-        self.assertEqual(result, 0)
-        claim.assert_not_called()
-        stop_local.assert_not_called()
-
-    def test_stop_wins_claim_and_cancel_changes_nothing(self) -> None:
-        record.create(shutdown_record([], state="settling"))
-        self.assertTrue(stop.claim_stop_as_conductor(LOGIN))
-        output = io.StringIO()
-
-        with redirect_stdout(output):
-            result = settle.cancel(self.account, here=True)
-
-        self.assertEqual(result, 1)
-        self.assertEqual(self.stored_record()["state"], "stopping")
-        self.assertEqual(
-            output.getvalue(),
-            f"shutdown of {LABEL} is already stopping; "
-            + "/shutdown restart brings it back once it is down\n",
-        )
-
-    def test_cancel_wins_claim_and_later_stop_changes_nothing(self) -> None:
-        record.create(shutdown_record([], state="settling"))
-
-        with (
-            patch.object(settle, "_stop_conductor"),
-            patch.object(settle, "_restore_record"),
-        ):
-            cancelled = settle.cancel(self.account, here=True)
-
-        self.assertEqual(cancelled, 0)
-        self.assertFalse(stop.claim_stop_as_conductor(LOGIN))
-        self.assertEqual(
-            record.find_live(LOGIN), record.NoShutdown(kind="no shutdown")
-        )
-
-    def test_cancel_with_an_already_gone_conductor_prints_no_service_noise(
-        self,
-    ) -> None:
-        current = shutdown_record([], state="settling")
-        current["conductor"] = record.SystemdConductor(
-            kind="systemd", unit="shutdown-owner"
-        )
-        record.create(current)
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        service_calls: list[list[str]] = []
-        real_stop_conductor = stop.stop_conductor
-
-        def already_gone(arguments: list[str]) -> int:
-            service_calls.append(arguments)
-            return 5
-
-        def stop_without_noise(conductor: record.Conductor) -> None:
-            real_stop_conductor(conductor, systemctl=already_gone)
-
-        with (
-            patch.object(
-                stop, "stop_conductor", side_effect=stop_without_noise
-            ) as stopped,
-            redirect_stdout(stdout),
-            redirect_stderr(stderr),
-        ):
-            result = settle.cancel(self.account, here=True)
-
-        self.assertEqual(result, 0)
-        stopped.assert_called_once_with(current["conductor"])
-        self.assertEqual(
-            service_calls, [["--user", "stop", "shutdown-owner"]]
-        )
-        self.assertNotIn("Failed to stop", stdout.getvalue() + stderr.getvalue())
-
-    def test_alert_counts_unattributed_sessions_as_left_running(self) -> None:
-        current = shutdown_record([], state="stop partial")
-        record.create(shutdown_record([], state="settling"))
-        report = stop_report(
-            current,
-            unattributed=[
-                inventory.UnattributedSession(
-                    pid=801, name="unknown", reason="account unreadable"
-                ),
-                inventory.UnattributedSession(
-                    pid=802, name="reused", reason="process start mismatch"
-                ),
-            ],
-        )
-        alerts: list[AlertCall] = []
-
-        def send_alert(
-            scope: record.ShutdownScope,
-            summary: str,
-            text: str,
-            action: ActionRequired,
-            *,
-            machine: str = "",
-        ) -> None:
-            del scope, action
-            alerts.append(
-                AlertCall(
-                    recipient="user",
-                    summary=summary,
-                    text=text,
-                    machine=machine,
-                    key="",
-                )
-            )
-
-        with (
-            patch.object(
-                settle,
-                "conduct_cycle",
-                return_value=settle.ReadyToStop(
-                    kind="ready to stop",
-                    reports=[refresh_report(current)]
-                ),
-            ),
-            patch.object(stop, "claim_stop_as_conductor", return_value=True),
-            patch.object(
-                settle, "_stop_machines", return_value=([report], [])
-            ),
-            patch.object(settle, "alert_user", side_effect=send_alert),
-        ):
-            self.assertEqual(settle.conduct(LOGIN, here=True), 0)
-
-        self.assertEqual(len(alerts), 1)
-        self.assertIn(
-            f"left running, not attributed to {LABEL}: 2 ", alerts[0]["text"]
-        )
-        self.assertIn("1 account unreadable", alerts[0]["text"])
-        self.assertIn("1 process start mismatch", alerts[0]["text"])
-        self.assertNotIn("stopped unknown", alerts[0]["text"])
-
-    def test_stop_alert_route_comes_from_the_conductor_machine(self) -> None:
-        natedev_record = shutdown_record(
-            [], machine="natedev", state="stop partial"
-        )
-        mac_record = shutdown_record([], machine="Mac", state="stop partial")
-        natedev = stop_report(natedev_record)
-        mac = stop_report(mac_record)
-        alerts: list[AlertCall] = []
-
-        def send_alert(
-            scope: record.ShutdownScope,
-            summary: str,
-            text: str,
-            action: ActionRequired,
-            *,
-            machine: str = "",
-        ) -> None:
-            del scope, action
-            alerts.append(
-                AlertCall(
-                    recipient="user",
-                    summary=summary,
-                    text=text,
-                    machine=machine,
-                    key="",
-                )
-            )
-
-        with patch.object(settle, "alert_user", side_effect=send_alert):
-            with patch.object(settle, "_machine", return_value="Mac"):
-                settle.report_stop(natedev_record, [natedev, mac], [])
-            with patch.object(settle, "_machine", return_value="natedev"):
-                settle.report_stop(mac_record, [mac, natedev], [])
-
-        self.assertEqual(
-            [alert["machine"] for alert in alerts], ["natedev", ""]
-        )
-
-    def test_local_stop_exception_sends_a_partial_alert(self) -> None:
-        current = shutdown_record([], state="settling")
-        record.create(current)
-        alerts: list[AlertCall] = []
-
-        def send_alert(
-            scope: record.ShutdownScope,
-            summary: str,
-            text: str,
-            action: ActionRequired,
-            *,
-            machine: str = "",
-        ) -> None:
-            del scope, action
-            alerts.append(
-                AlertCall(
-                    recipient="user",
-                    summary=summary,
-                    text=text,
-                    machine=machine,
-                    key="",
-                )
-            )
-
-        with (
-            patch.object(
-                settle,
-                "conduct_cycle",
-                return_value=settle.ReadyToStop(
-                    kind="ready to stop", reports=[refresh_report(current)]
-                ),
-            ),
-            patch.object(stop, "stop", side_effect=OSError("inventory failed")),
-            patch.object(settle, "alert_user", side_effect=send_alert),
-            patch.object(settle, "_machine", return_value="natedev"),
-        ):
-            result = settle.conduct(LOGIN, here=True)
-
-        self.assertEqual(result, 0)
-        self.assertEqual(alerts[0]["summary"], f"{LABEL}: stop partial")
-        self.assertIn(
-            "natedev: stop failed: inventory failed", alerts[0]["text"]
-        )
+        self.assertEqual(finished["progress"], {"kind": "stopped", "at": expected})
+        self.assertEqual([issue["at"] for issue in finished["stop_issues"]], [expected, expected])
 
 
 if __name__ == "__main__":

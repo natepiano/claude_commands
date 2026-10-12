@@ -1,0 +1,7 @@
+{"timestamp":"2026-10-10T21:35:16Z","type":"session_meta","payload":{"id":"00000003-3333-4333-8333-333333333333","cwd":"/invented/worktree"}}
+{"timestamp":"2026-10-10T21:35:16Z","type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"medium"}}
+{"timestamp":"2026-10-10T21:35:17Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":30,"cached_input_tokens":10,"output_tokens":2}}}}
+{"timestamp":"2026-10-10T21:35:18Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** Add File: invented.py\n+value = 1\n*** End Patch"}}
+{"timestamp":"2026-10-10T21:35:19Z","type":"turn_context","payload":{"model":"gpt-6.1-sol","effort":"low"}}
+{"timestamp":"2026-10-10T21:35:20Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":40,"cached_input_tokens":15,"output_tokens":3}}}}
+{"timestamp":"2026-10-10T21:35:21Z","type":"compacted","payload":{}}

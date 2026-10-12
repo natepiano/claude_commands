@@ -7,28 +7,25 @@ import json
 import os
 import subprocess
 import tempfile
+import sys
+import threading
 import time
+from concurrent.futures import Future, wait as wait_futures
 import unittest
-from collections.abc import Callable
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from collections.abc import Callable, Generator
 from datetime import datetime, timedelta, timezone
-from inspect import Parameter, signature
 from pathlib import Path
 from typing import TypedDict, cast, final, override
-from unittest.mock import ANY, call, patch
+from unittest.mock import call, patch
 
-from test_support import ShutdownSendLeaf, ShutdownTestCase
+from test_support import ShutdownTestCase
 import inventory
 import record
 import restart as restart_work
-import remote
 import settle
-import shutdown
 import stop as stop_work
-import showrunner_footer
-import conversation_pause
 from account import Account
-from user_action import ActionRequired
 
 
 LOGIN = "owner@example.com"
@@ -185,2664 +182,858 @@ def machine_inventory(
     )
 
 
-def empty_shutdown_record(
-    machine: str,
-    scope: record.ShutdownScope,
-) -> record.ShutdownRecord:
-    return record.ShutdownRecord(
-        login=LOGIN,
-        label=LABEL,
-        machine=machine,
-        state="settling",
-        requested_at=NOW,
-        requested_by=record.FromTerminal(kind="terminal"),
-        scope=scope,
-        conductor=record.ConductorNotStarted(kind="not started"),
-        force="wait for ready",
-        entries=[],
-        stop_issues=[],
+
+def session_shutdown(session: inventory.Session, *, progress: record.SessionProgress | None = None,
+                     request_id: str = "request-one", requester: str = "", then: record.ShutdownContinuation = "stop") -> record.SessionShutdown:
+    return record.SessionShutdown(
+        login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW, request_id=request_id,
+        requested_by={"kind": "session", "session_id": requester} if requester else {"kind": "terminal"},
+        hold="session", then=then, force="wait for ready", alerts="user", session=session,
+        seats=[], timers=[], settle_message={"kind": "not sent"}, where={"kind": "not said"},
+        progress=progress or {"kind": "waiting"}, stop_issues=[],
     )
 
 
-def empty_refresh_report(machine: str, scope: record.ShutdownScope) -> settle.RefreshReport:
-    return settle.RefreshReport(
-        record=empty_shutdown_record(machine, scope),
-        verdicts=[],
-    )
-
-
-def completed_stop_report(current: record.ShutdownRecord) -> stop_work.StopReport:
-    counts: dict[str, int] = {}
-    for entry in current["entries"]:
-        kind = entry["session"]["kind"]
-        counts[kind] = counts.get(kind, 0) + 1
-    return stop_work.StopReport(
-        record=current,
-        unattributed=[],
-        counts=counts,
-    )
+class PassObserved(Exception):
+    """The test has observed one complete conducting pass."""
 
 
 @final
 class SettleTests(ShutdownTestCase):
     root: Path = Path()
-    state_root: Path = Path()
-    notifier_root: Path = Path()
-    pause_root: Path = Path()
-    send_log: Path = Path()
-    notifier_log: Path = Path()
-    notifier_stub: Path = Path()
-    send_stub: Path = Path()
-    ssh_stub: Path = Path()
-    account = Account("claude", LOGIN, LABEL)
 
     @override
     def setUp(self) -> None:
         super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.state_root = self.root / "shutdown"
-        self.notifier_root = self.root / "notifier"
-        self.pause_root = self.root / "conversation-pause"
-        self.send_log = self.root / "send.jsonl"
-        self.notifier_log = self.root / "notifier.jsonl"
-        self.notifier_root.mkdir()
-        binary_root = self.root / "bin"
-        binary_root.mkdir()
-        self.notifier_stub = binary_root / "notifier"
-        _ = self.notifier_stub.write_text(
-            """#!/usr/bin/env python3
-import json
-import os
-from pathlib import Path
-import sys
+        context = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.root / "state")})))
+        del context
+        _ = self.enterContext(patch.object(settle, "now_utc", return_value=NOW_UTC))
+        _ = self.enterContext(patch.object(settle, "merge_in_progress", return_value=False))
+        _ = self.enterContext(patch.object(settle, "_showing_form", return_value=False))
 
-args = sys.argv[1:]
-with Path(os.environ["SHUTDOWN_NOTIFIER_LOG"]).open("a") as output:
-    output.write(json.dumps(args) + "\\n")
-verb, instance = args
-state = Path(os.environ["NOTIFIER_STATE_DIR"]) / instance / "state"
-if state.exists() and verb in {"start", "stop"}:
-    enabled = "1" if verb == "start" else "0"
-    lines = state.read_text().splitlines()
-    state.write_text("\\n".join(
-        f"ENABLED={enabled}" if line.startswith("ENABLED=") else line
-        for line in lines
-    ) + "\\n")
-""",
-            encoding="utf-8",
-        )
-        self.notifier_stub.chmod(0o755)
-        self.send_stub = binary_root / "send"
-        _ = self.send_stub.write_text(
-            """#!/usr/bin/env python3
-import json
-import os
-from pathlib import Path
-import sys
+    def save(self, saved: record.SessionShutdown) -> None:
+        self.assertTrue(record.create_session(saved))
 
-call = {"args": sys.argv[1:], "text": sys.stdin.read()}
-with Path(os.environ["SHUTDOWN_SEND_LOG"]).open("a") as output:
-    output.write(json.dumps(call) + "\\n")
-printed = os.environ.get("SHUTDOWN_SEND_OUTPUT", "")
-if printed:
-    print(printed)
-sys.exit(int(os.environ.get("SHUTDOWN_SEND_EXIT", "0")))
-""",
-            encoding="utf-8",
-        )
-        self.send_stub.chmod(0o755)
-        self.ssh_stub = binary_root / "ssh"
-        _ = self.ssh_stub.write_text(
-            """#!/usr/bin/env python3
-import os
-import sys
+    def run_conductor(self, login: str, _label: str) -> None:
+        self.assertEqual(login, LOGIN)
+        self.assertEqual(settle.conduct(login), 0)
 
-mode = os.environ.get("FAKE_SSH_MODE", "unreachable")
-if mode == "unreachable":
-    sys.exit(255)
-if mode == "unavailable":
-    print("remote refused")
-    print("rc=7")
-    sys.exit(0)
-print(os.environ.get("FAKE_SSH_OUTPUT", ""))
-print("rc=0")
-""",
-            encoding="utf-8",
-        )
-        self.ssh_stub.chmod(0o755)
-        environment = {
-            **os.environ,
-            "HOME": str(self.root),
-            "PATH": f"{binary_root}{os.pathsep}{os.environ.get('PATH', '')}",
-            "SHUTDOWN_STATE_DIR": str(self.state_root),
-            "NOTIFIER_STATE_DIR": str(self.notifier_root),
-            "CONVERSATION_PAUSE_STATE_DIR": str(self.pause_root),
-            "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner"),
-            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "runs"),
-            "SHUTDOWN_DELEGATE_ROOT": str(self.root / "delegate"),
-            "AGENT_NOTES_DIR": str(self.root / "notes"),
-            "SHUTDOWN_NOTIFIER": str(self.notifier_stub),
-            "SHUTDOWN_NOTIFIER_LOG": str(self.notifier_log),
-            "SHUTDOWN_SEND": str(self.send_stub),
-            "SHUTDOWN_SEND_LOG": str(self.send_log),
-        }
-        environment_context: object = cast(
-            object,
-            self.enterContext(patch.dict(os.environ, environment, clear=True)),
-        )
-        del environment_context
-        self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
-        self.allow_leaf(ShutdownSendLeaf.RETIRE_SHUTDOWN_MESSAGES)
-        self.allow_leaf(ShutdownSendLeaf.RUN_NOTIFIER)
+    def matching(self, saved: record.SessionShutdown) -> stop_work.FreshSession:
+        return stop_work.MatchingSession(kind="matching session", session=saved["session"], seats=saved["seats"])
 
-    def write_instance(
-        self,
-        name: str,
-        session_id: str,
-        *,
-        enabled: bool,
-    ) -> Path:
-        instance = self.notifier_root / name
-        instance.mkdir()
-        _ = (instance / "conf").write_text(
-            f"TARGET=session:{session_id}\nEVERY=5\nCOMMAND=report\n",
-            encoding="utf-8",
-        )
-        _ = (instance / "state").write_text(
-            f"ENABLED={int(enabled)}\nNEXT_DUE=100\n",
-            encoding="utf-8",
-        )
-        return instance
-
-    def found_record(self) -> record.ShutdownRecord:
-        found = record.find_live(LOGIN)
-        self.assertEqual(found["kind"], "live")
-        if found["kind"] != "live":
-            self.fail("expected a live shutdown record")
-        return found["record"]
-
-    def logged_calls(self, path: Path) -> list[list[str]]:
-        if not path.exists():
-            return []
-        calls: list[list[str]] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            value = cast(object, json.loads(line))
-            if not isinstance(value, list):
-                raise AssertionError("notifier log entry is not a list")
-            calls.append(cast(list[str], value))
-        return calls
-
-    def sent_calls(self) -> list[SentCall]:
-        if not self.send_log.exists():
-            return []
-        calls: list[SentCall] = []
-        for line in self.send_log.read_text(encoding="utf-8").splitlines():
-            value = cast(object, json.loads(line))
-            if not isinstance(value, dict):
-                raise AssertionError("send log entry is not an object")
-            fields = cast(dict[str, object], value)
-            args = fields.get("args")
-            text = fields.get("text")
-            if not isinstance(args, list) or not isinstance(text, str):
-                raise AssertionError("send log entry is invalid")
-            raw_args = cast(list[object], args)
-            if not all(isinstance(item, str) for item in raw_args):
-                raise AssertionError("send arguments are invalid")
-            calls.append(
-                SentCall(args=cast(list[str], cast(object, raw_args)), text=text)
-            )
-        return calls
-
-    def pause_record(
-        self,
-        session_id: str,
-        *,
-        instance: str | None = None,
-        footer: str | None = None,
-        kept_off: bool,
-    ) -> Path:
-        self.pause_root.mkdir(parents=True, exist_ok=True)
-        path = self.pause_root / f"{session_id}.json"
-        phase: dict[str, object] = (
-            {"kind": "kept_off"}
-            if kept_off
-            else {"kind": "replying", "user_wrote_at": 100}
-        )
-        _ = path.write_text(
-            json.dumps(
-                {
-                    "session_id": session_id,
-                    "instances": [instance] if instance is not None else [],
-                    "footers": [footer] if footer is not None else [],
-                    "phase": phase,
-                }
-            ),
-            encoding="utf-8",
-        )
-        return path
-
-    def test_alert_user_forwards_the_callers_action_for_account_wide_scope(
-        self,
-    ) -> None:
-        action = ActionRequired("Follow the alert text.")
-        with patch.object(
-            settle,
-            "_deliver_message",
-            return_value=settle.MessageSent(kind="sent"),
-        ) as deliver:
-            settle.alert_user(
-                record.AllAccountSessions(kind="all account sessions"),
-                "action needed",
-                "fix it",
-                action,
-                machine="natedev",
-            )
-            settle.alert_user(
-                record.SelectedSessions(
-                    kind="selected", session_ids=["scratch"]
-                ),
-                "scoped action needed",
-                "fix it",
-                action,
-            )
-
-        deliver.assert_called_once_with(
-            [
-                ANY,
-                "--to",
-                "user",
-                "--from",
-                "shutdown",
-                "--summary",
-                "action needed",
-                "--need",
-                "decision",
-                "--action",
-                action.text,
-                "--machine",
-                "natedev",
-            ],
-            "user",
-            "fix it",
-        )
-
-    def test_session_send_has_no_user_action_and_rejects_user_recipient(
-        self,
-    ) -> None:
-        self.assertNotIn("action", signature(settle.send_message).parameters)
-        with self.assertRaisesRegex(ValueError, "user messages require alert_user"):
-            _ = settle.send_message("user", "summary", "text")
-
-    def test_user_alert_cannot_omit_its_action(self) -> None:
-        action = signature(settle.alert_user).parameters["action"]
-        self.assertIs(cast(object, action.default), Parameter.empty)
-
-    def test_clean_stop_reports_to_requesting_session_without_paging_user(
-        self,
-    ) -> None:
-        claimed = empty_shutdown_record(
-            "natedev", record.AllAccountSessions(kind="all account sessions")
-        )
-        claimed["requested_by"] = record.FromSession(
-            kind="session", session_id="requester"
-        )
-        stopped = empty_shutdown_record(
-            "natedev", record.AllAccountSessions(kind="all account sessions")
-        )
-        stopped["state"] = "down"
-
-        settle.report_stop(claimed, [completed_stop_report(stopped)], [])
-
-        calls = self.sent_calls()
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(
-            calls[0]["args"],
-            [
-                "--to",
-                "session:requester",
-                "--from",
-                "shutdown",
-                "--summary",
-                f"{LABEL} is down",
-                "--key",
-                f"shutdown-result-{LOGIN}",
-            ],
-        )
-        self.assertIn("/shutdown restart", calls[0]["text"])
-
-    def test_clean_stop_requested_from_terminal_sends_nothing(self) -> None:
-        claimed = empty_shutdown_record(
-            "natedev", record.AllAccountSessions(kind="all account sessions")
-        )
-        stopped = empty_shutdown_record(
-            "natedev", record.AllAccountSessions(kind="all account sessions")
-        )
-        stopped["state"] = "down"
-
-        settle.report_stop(claimed, [completed_stop_report(stopped)], [])
-
-        self.assertEqual(self.sent_calls(), [])
-
-    def test_partial_stop_alert_names_the_account_restart_action(
-        self,
-    ) -> None:
-        claimed = empty_shutdown_record(
-            "natedev", record.AllAccountSessions(kind="all account sessions")
-        )
-        claimed["requested_by"] = record.FromSession(
-            kind="session", session_id="requester"
-        )
-        stopped = empty_shutdown_record(
-            "natedev", record.AllAccountSessions(kind="all account sessions")
-        )
-        stopped["state"] = "stop partial"
-
-        settle.report_stop(claimed, [completed_stop_report(stopped)], [])
-
-        calls = self.sent_calls()
-        self.assertEqual(
-            [call["args"][1] for call in calls],
-            ["user", "session:requester"],
-        )
-        self.assertIn("--need", calls[0]["args"])
-        self.assertIn("decision", calls[0]["args"])
-        action_index = calls[0]["args"].index("--action")
-        self.assertEqual(
-            calls[0]["args"][action_index + 1],
-            f"Run /shutdown restart on {LABEL}.",
-        )
-        self.assertIn(f"shutdown-result-{LOGIN}", calls[1]["args"])
-        self.assertIn(f"{LABEL}: stop partial", calls[1]["args"])
-
-    def test_partial_stop_pages_when_requester_delivery_fails(self) -> None:
-        claimed = empty_shutdown_record(
-            "natedev", record.AllAccountSessions(kind="all account sessions")
-        )
-        claimed["requested_by"] = record.FromSession(
-            kind="session", session_id="requester"
-        )
-        stopped = empty_shutdown_record(
-            "natedev", record.AllAccountSessions(kind="all account sessions")
-        )
-        stopped["state"] = "stop partial"
-        events: list[str] = []
-
-        def record_alert(
-            _scope: record.ShutdownScope,
-            _summary: str,
-            _text: str,
-            action: ActionRequired,
-            *,
-            machine: str = "",
-        ) -> None:
-            del action, machine
-            events.append("user alert")
-
-        def fail_requester_delivery(
-            _recipient: str,
-            _summary: str,
-            _text: str,
-            *,
-            machine: str = "",
-            key: str = "",
-        ) -> settle.MessageDelivery:
-            del machine, key
-            events.append("requester result")
-            raise RuntimeError("requester delivery failed")
-
-        with (
-            patch.object(
-                settle, "alert_user", side_effect=record_alert
-            ) as alert,
-            patch.object(
-                settle,
-                "send_message",
-                side_effect=fail_requester_delivery,
-            ) as send,
-            self.assertRaisesRegex(RuntimeError, "requester delivery failed"),
-        ):
-            settle.report_stop(claimed, [completed_stop_report(stopped)], [])
-
-        self.assertEqual(events, ["user alert", "requester result"])
-        alert.assert_called_once()
-        send.assert_called_once_with(
-            "session:requester",
-            f"{LABEL}: stop partial",
-            ANY,
-            key=f"shutdown-result-{LOGIN}",
-        )
-
-    def test_partial_stop_reports_to_requester_when_user_alert_fails(
-        self,
-    ) -> None:
-        claimed = empty_shutdown_record(
-            "natedev", record.AllAccountSessions(kind="all account sessions")
-        )
-        claimed["requested_by"] = record.FromSession(
-            kind="session", session_id="requester"
-        )
-        stopped = empty_shutdown_record(
-            "natedev", record.AllAccountSessions(kind="all account sessions")
-        )
-        stopped["state"] = "stop partial"
-        events: list[str] = []
-
-        def fail_user_alert(
-            _scope: record.ShutdownScope,
-            _summary: str,
-            _text: str,
-            action: ActionRequired,
-            *,
-            machine: str = "",
-        ) -> None:
-            del action, machine
-            events.append("user alert")
-            raise RuntimeError("user alert failed")
-
-        def record_requester_delivery(
-            _recipient: str,
-            _summary: str,
-            _text: str,
-            *,
-            machine: str = "",
-            key: str = "",
-        ) -> settle.MessageDelivery:
-            del machine, key
-            events.append("requester result")
-            return settle.MessageSent(kind="sent")
-
-        with (
-            patch.object(
-                settle,
-                "alert_user",
-                side_effect=fail_user_alert,
-            ) as alert,
-            patch.object(
-                settle,
-                "send_message",
-                side_effect=record_requester_delivery,
-            ) as send,
-            self.assertRaisesRegex(RuntimeError, "user alert failed"),
-        ):
-            settle.report_stop(claimed, [completed_stop_report(stopped)], [])
-
-        self.assertEqual(events, ["user alert", "requester result"])
-        alert.assert_called_once()
-        send.assert_called_once_with(
-            "session:requester",
-            f"{LABEL}: stop partial",
-            ANY,
-            key=f"shutdown-result-{LOGIN}",
-        )
-
-    def test_partial_scoped_stop_reports_only_to_requester(self) -> None:
-        scope = record.SelectedSessions(
-            kind="selected", session_ids=["requester"]
-        )
-        claimed = empty_shutdown_record("natedev", scope)
-        claimed["requested_by"] = record.FromSession(
-            kind="session", session_id="requester"
-        )
-        stopped = empty_shutdown_record("natedev", scope)
-        stopped["state"] = "stop partial"
-
-        settle.report_stop(claimed, [completed_stop_report(stopped)], [])
-
-        calls = self.sent_calls()
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["args"][1], "session:requester")
-
-    def test_scoped_holdout_reports_only_to_requester(self) -> None:
-        current = empty_shutdown_record(
-            "natedev",
-            record.SelectedSessions(kind="selected", session_ids=["requester"]),
-        )
-        current["requested_by"] = record.FromSession(
-            kind="session", session_id="requester"
-        )
-        report = settle.RefreshReport(
-            record=current,
-            verdicts=[
-                settle.EntryVerdict(
-                    session_id="requester",
-                    verdict=settle.Holdout(
-                        kind="holdout",
-                        line="natedev top-level requester: busy",
-                    ),
-                )
-            ],
-        )
-
-        settle._send_holdout_alert([report], {})  # pyright: ignore[reportPrivateUsage]
-
-        calls = self.sent_calls()
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["args"][1], "session:requester")
-
-    def test_begin_stops_only_enabled_timers_in_the_account_set(self) -> None:
-        selected = self.write_instance(
-            "selected-report", "selected", enabled=True
-        )
-        other_account = self.write_instance(
-            "other-account-report", "other-account", enabled=True
-        )
-        report = machine_inventory(
-            [top_level("selected", "Selected", timers=[selected.name])]
-        )
-
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            created = settle.begin(LOGIN)
-
-        self.assertEqual(created["state"], "settling")
-        self.assertTrue((selected / "state").read_text().startswith("ENABLED=0\n"))
-        self.assertTrue(
-            (other_account / "state").read_text().startswith("ENABLED=1\n")
-        )
-        self.assertEqual(
-            self.logged_calls(self.notifier_log),
-            [["stop", selected.name]],
-        )
-        self.assertEqual(
-            created["entries"][0]["timers"],
-            [
-                record.TimerRestore(
-                    instance=selected.name,
-                    was_enabled=True,
-                    footer=record.NoFooter(kind="no footer"),
-                )
-            ],
-        )
-
-    def test_a_stopped_showrunner_timer_is_recorded_off_and_never_stopped(self) -> None:
-        # A production on demand keeps its showrunner timer stopped, so a restart has nothing to start.
-        stopped = self.write_instance("showrunner-show", "selected", enabled=False)
-        report = machine_inventory(
-            [top_level("selected", "Selected", timers=[stopped.name])]
-        )
-
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            created = settle.begin(LOGIN)
-
-        self.assertTrue((stopped / "state").read_text().startswith("ENABLED=0\n"))
-        self.assertEqual(self.logged_calls(self.notifier_log), [])
-        self.assertEqual(
-            [timer["was_enabled"] for timer in created["entries"][0]["timers"]],
-            [False],
-        )
-
-    def test_cancel_keeps_a_released_kept_off_pause_off(self) -> None:
-        paused = self.write_instance("delegate-paused", "session", enabled=False)
-        pause_path = self.pause_record(
-            "session", instance=paused.name, kept_off=True
-        )
-        report = machine_inventory(
-            [top_level("session", "Paused", timers=[paused.name])]
-        )
-
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            created = settle.begin(LOGIN)
-            cancel_result = settle.cancel(self.account, here=True)
-
-        self.assertEqual(cancel_result, 0)
-        self.assertFalse(pause_path.exists())
-        self.assertEqual(created["entries"][0]["timers"][0]["was_enabled"], False)
-        self.assertTrue((paused / "state").read_text().startswith("ENABLED=0\n"))
-        self.assertEqual(self.logged_calls(self.notifier_log), [])
-
-    def test_cancel_asks_the_conductor_machine_before_touching_local_state(
-        self,
-    ) -> None:
-        local = empty_shutdown_record(
-            "natedev", record.AllAccountSessions(kind="all account sessions")
-        )
-        record.create(local)
-        stopping_line = (
-            f"shutdown of {LABEL} is already stopping; "
-            + "/shutdown restart brings it back once it is down"
-        )
-        output = io.StringIO()
-
-        with (
-            patch.object(
-                settle, "run_remote", return_value=(1, stopping_line)
-            ) as remote,
-            patch.object(settle, "_cancel_local") as cancel_local,
-            redirect_stdout(output),
-        ):
-            result = settle.cancel(self.account)
-
-        self.assertEqual(result, 1)
-        remote.assert_called_once_with(["cancel", LOGIN, "--here"])
-        cancel_local.assert_not_called()
-        self.assertEqual(self.found_record()["state"], "settling")
-        self.assertEqual(output.getvalue(), stopping_line + "\n")
-
-    def test_showrunner_message_waits_until_every_unit_is_ready(self) -> None:
-        runner = showrunner("runner", "Showrunner")
-        director = unit("unit", "Unit")
-        report = machine_inventory([runner, director])
-        remote = empty_refresh_report(
-            "Mac", record.AllAccountSessions(kind="all account sessions")
-        )
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.object(
-                settle,
-                "_remote_record",
-                return_value=settle.RemoteRefresh(kind="refresh", report=remote),
-            ),
-        ):
-            _ = settle.begin(LOGIN)
-            first_outcome = settle.conduct_cycle(LOGIN, {})
-
-            def mark_unit_ready(current: record.ShutdownRecord) -> None:
-                entry = next(
-                    item
-                    for item in current["entries"]
-                    if item["session"]["session_id"] == "unit"
-                )
-                entry["progress"] = record.SessionReadyToStop(kind="ready", at=NOW)
-
-            _ = record.update(LOGIN, mark_unit_ready)
-            second_outcome = settle.conduct_cycle(LOGIN, {})
-
-        self.assertEqual(first_outcome["kind"], "settlement pending")
-        self.assertEqual(second_outcome["kind"], "settlement pending")
-        recipients = [
-            call["args"][call["args"].index("--to") + 1]
-            for call in self.sent_calls()
+    def test_next_step_covers_request_delivery_stop_restore_and_terminal_states(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"))
+        cases: list[tuple[record.SessionProgress, str, record.ShutdownContinuation, type[settle.Step]]] = [
+            ({"kind": "waiting"}, "idle", "stop", settle.SendSettleMessage),
+            ({"kind": "ready", "at": NOW}, "idle", "stop", settle.StopSession),
+            ({"kind": "ready", "at": NOW}, "busy", "stop", settle.Hold),
+            ({"kind": "stopped", "at": NOW}, "idle", "restart", settle.RelaunchSession),
+            ({"kind": "already gone", "at": NOW}, "idle", "restart", settle.RelaunchSession),
+            ({"kind": "process identity lost", "at": NOW}, "idle", "restart", settle.RelaunchSession),
+            ({"kind": "stopped", "at": NOW}, "idle", "stop", settle.Finished),
+            ({"kind": "already gone", "at": NOW}, "idle", "stop", settle.Finished),
+            ({"kind": "process identity lost", "at": NOW}, "idle", "stop", settle.Finished),
+            ({"kind": "restarted", "at": NOW}, "idle", "restart", settle.Finished),
+            ({"kind": "restart failed", "at": NOW, "reason": "launch"}, "idle", "restart", settle.Hold),
+            ({"kind": "stop failed", "at": NOW, "reason": "busy"}, "idle", "stop", settle.Hold),
+            ({"kind": "manual restart", "command": "resume"}, "idle", "restart", settle.Hold),
+            ({"kind": "timers pending", "at": NOW, "timers": []}, "idle", "restart", settle.Hold),
+            ({"kind": "stopping", "at": NOW}, "idle", "stop", settle.Hold),
+            ({"kind": "restarting", "at": NOW, "prior": {"kind": "stopped", "at": NOW}}, "idle", "restart", settle.Hold),
         ]
-        self.assertEqual(recipients, ["session:unit", "session:runner"])
+        for progress, status, then, expected in cases:
+            with self.subTest(progress=progress["kind"], status=status, then=then):
+                saved["progress"], saved["then"], saved["session"]["status"] = progress, then, status
+                self.assertIsInstance(settle.next_step(saved, self.matching(saved), [saved], NOW_UTC), expected)
 
-    def test_queued_settle_message_records_reason_and_status(self) -> None:
-        report = machine_inventory([top_level("session", "Work")])
+    def test_next_step_keeps_unreadable_owner_held_and_missing_identity_unsignalled(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "ready", "at": NOW})
+        self.assertEqual(settle.next_step(saved, stop_work.SessionAccountUnreadable(kind="session account unreadable"), [], NOW_UTC), settle.Hold("account unreadable"))
+        for owner in (stop_work.SessionAbsent(kind="session absent"), stop_work.SessionIdentityLost(kind="session identity lost")):
+            self.assertIsInstance(settle.next_step(saved, owner, [], NOW_UTC), settle.StopSession)
+
+    def test_seat_becoming_idle_allows_the_owner_to_stop(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "ready", "at": NOW})
+        worker = seat("seat", "Seat", owner="owner", status="busy")
+        observed = stop_work.fresh_session(saved["session"], machine_inventory([saved["session"], worker]))
+        self.assertEqual(settle.next_step(saved, observed, [], NOW_UTC), settle.Hold("Codex seat Seat is still running"))
+        worker["status"] = "idle"
+        self.assertIsInstance(settle.next_step(saved, stop_work.fresh_session(saved["session"], machine_inventory([saved["session"], worker])), [], NOW_UTC), settle.StopSession)
+
+    def test_showrunner_ready_does_not_wait_for_a_waiting_unit(self) -> None:
+        runner = session_shutdown(showrunner("runner", "Runner"), progress={"kind": "ready", "at": NOW})
+        director = session_shutdown(unit("unit", "Unit"))
+        self.assertIsInstance(settle.next_step(runner, self.matching(runner), [runner, director], NOW_UTC), settle.StopSession)
+
+    def test_requester_waits_for_its_own_request_through_restore_confirmation(self) -> None:
+        requester = session_shutdown(top_level("requester", "Requester"), progress={"kind": "ready", "at": NOW}, requester="requester", then="restart")
+        other = session_shutdown(top_level("other", "Other"), progress={"kind": "stopped", "at": NOW}, requester="requester", then="restart")
+        self.assertEqual(settle.next_step(requester, self.matching(requester), [other], NOW_UTC), settle.Hold("requester goes last"))
+        other["progress"] = {"kind": "restarted", "at": NOW}
+        self.assertIsInstance(settle.next_step(requester, self.matching(requester), [other], NOW_UTC), settle.StopSession)
+
+    def test_two_selected_requests_in_one_second_do_not_wait_on_each_other(self) -> None:
+        first = session_shutdown(top_level("first", "First"), progress={"kind": "ready", "at": NOW}, requester="first", request_id="one")
+        second = session_shutdown(top_level("second", "Second"), progress={"kind": "ready", "at": NOW}, requester="second", request_id="two")
+        for current in (first, second):
+            self.assertIsInstance(settle.next_step(current, self.matching(current), [first, second], NOW_UTC), settle.StopSession)
+
+    def test_queued_message_retries_only_after_five_minutes_and_showrunner_is_immediate(self) -> None:
+        saved = session_shutdown(showrunner("runner", "Runner"))
+        self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.SendSettleMessage)
+        saved["settle_message"] = {"kind": "queued", "at": NOW, "reason": "no live session"}
+        self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC + timedelta(seconds=299)), settle.Hold)
+        self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC + timedelta(seconds=300)), settle.SendSettleMessage)
+
+    def test_begin_attaches_owned_seats_and_second_request_adds_only_new_owner(self) -> None:
+        first, second = top_level("first", "First"), top_level("second", "Second")
+        worker = seat("worker", "Worker", owner="first")
+        orphan = seat("orphan", "Orphan", owner=None)
+        with patch.object(settle, "run_inventory", return_value=machine_inventory([first, worker, orphan])):
+            added = settle.begin(LOGIN, only=["first"], request_id="one")
+        self.assertEqual(len(added), 1)
+        self.assertEqual(added[0]["seats"], [worker])
+        original = record.find_session(LOGIN, "first")
+        with patch.object(settle, "run_inventory", return_value=machine_inventory([first, second])):
+            added = settle.begin(LOGIN, only=["first", "second"], request_id="two", then="restart")
+        self.assertEqual([saved["session"]["session_id"] for saved in added], ["second"])
+        self.assertEqual(record.find_session(LOGIN, "first"), original)
+        self.assertIsNone(record.find_session(LOGIN, "orphan"))
+
+    def test_begin_timer_stop_failure_takes_only_that_owner_out(self) -> None:
+        first, second = top_level("first", "First", timers=["timer-first"]), top_level("second", "Second")
+        def snapshot(owner: inventory.Session) -> list[record.TimerRestore]:
+            return [record.TimerRestore(instance="timer-first", was_enabled=True, footer={"kind": "no footer"})] if owner["session_id"] == "first" else []
         with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.dict(
-                os.environ,
-                {
-                    "SHUTDOWN_SEND_EXIT": "1",
-                    "SHUTDOWN_SEND_OUTPUT": "QUEUED: no live session",
-                },
-            ),
-        ):
-            _ = settle.begin(LOGIN)
-            refreshed = settle.refresh(LOGIN, ["session"])
-
-        entry = refreshed["record"]["entries"][0]
-        self.assertEqual(
-            entry["settle_message"],
-            record.SettleMessageQueued(
-                kind="queued", at=NOW, reason="no live session"
-            ),
-        )
-        self.assertIn(
-            "Work: waiting · message queued: no live session",
-            "\n".join(settle.status_record_lines(refreshed["record"])),
-        )
-
-    def test_queued_settle_message_retries_only_after_five_minutes(self) -> None:
-        report = machine_inventory([top_level("session", "Work")])
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            _ = settle.begin(LOGIN)
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.dict(
-                os.environ,
-                {
-                    "SHUTDOWN_SEND_EXIT": "1",
-                    "SHUTDOWN_SEND_OUTPUT": "QUEUED: no live session",
-                },
-            ),
-        ):
-            _ = settle.refresh(LOGIN, ["session"])
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(
-                settle,
-                "now_utc",
-                return_value=NOW_UTC + timedelta(seconds=299),
-            ),
-            patch.dict(
-                os.environ,
-                {"SHUTDOWN_SEND_EXIT": "0", "SHUTDOWN_SEND_OUTPUT": "SENT: Work"},
-            ),
-        ):
-            too_soon = settle.refresh(LOGIN, ["session"])
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(
-                settle,
-                "now_utc",
-                return_value=NOW_UTC + timedelta(seconds=300),
-            ),
-            patch.dict(
-                os.environ,
-                {"SHUTDOWN_SEND_EXIT": "0", "SHUTDOWN_SEND_OUTPUT": "SENT: Work"},
-            ),
-        ):
-            delivered = settle.refresh(LOGIN, ["session"])
-
-        self.assertEqual(
-            too_soon["record"]["entries"][0]["settle_message"]["kind"],
-            "queued",
-        )
-        self.assertEqual(
-            delivered["record"]["entries"][0]["settle_message"],
-            record.SettleMessageSent(kind="sent", at="2026-10-09T21:54:10+00:00"),
-        )
-        self.assertEqual(len(self.sent_calls()), 2)
-
-    def test_conductor_reconsiders_a_queued_message_for_delivery(self) -> None:
-        report = machine_inventory([top_level("session", "Work")])
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            _ = settle.begin(LOGIN)
-
-        def mark_queued(current: record.ShutdownRecord) -> None:
-            current["entries"][0]["settle_message"] = record.SettleMessageQueued(
-                kind="queued", at=NOW, reason="no live session"
-            )
-
-        _ = record.update(LOGIN, mark_queued)
-        with (
-            patch.object(settle, "run_inventory", return_value=report) as inventories,
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            outcome = settle.conduct_cycle(LOGIN, {}, here=True)
-
-        self.assertEqual(outcome["kind"], "settlement pending")
-        self.assertEqual(inventories.call_count, 2)
-        self.assertEqual(self.sent_calls(), [])
-
-    def test_remote_stop_waits_past_the_old_owner_timeout_in_one_call(self) -> None:
-        remote_record = empty_shutdown_record(
-            "Mac", record.AllAccountSessions(kind="all account sessions")
-        )
-        remote_record["state"] = "down"
-        elapsed_seconds = 0
-        calls: list[remote.RemoteCallLimit] = []
-
-        def delayed_remote(
-            arguments: list[str],
-            stdin: str = "",
-            limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT,
-        ) -> tuple[int, str]:
-            nonlocal elapsed_seconds
-            self.assertEqual(arguments, ["stop", LOGIN])
-            self.assertEqual(stdin, "")
-            calls.append(limit)
-            elapsed_seconds = 201
-            return (
-                0,
-                json.dumps(
-                    {
-                        "record": remote_record,
-                        "unattributed": [],
-                        "counts": {},
-                    }
-                ),
-            )
-
-        with patch.object(settle, "run_remote", side_effect=delayed_remote):
-            outcome = settle.stop_remote(LOGIN)
-
-        self.assertGreater(elapsed_seconds, max(120, 60 + 20 * 7))
-        self.assertEqual(
-            calls, [remote.WhileLinkAlive(kind="while link alive")]
-        )
-        self.assertEqual(outcome["kind"], "stopped")
-
-    def test_conductor_decisions_drive_poll_stop_and_exit_actions(self) -> None:
-        scope = record.AllAccountSessions(kind="all account sessions")
-        session = top_level("work", "Work")
-        with (
-            patch.dict(
-                os.environ,
-                {"SHUTDOWN_STATE_DIR": str(self.root / "decision-pending")},
-            ),
-            patch.object(
-                settle, "run_inventory", return_value=machine_inventory([session])
-            ),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            _ = settle.begin(LOGIN)
-            pending = settle.conduct_cycle(LOGIN, {}, here=True)
-
-        with (
-            patch.dict(
-                os.environ,
-                {"SHUTDOWN_STATE_DIR": str(self.root / "decision-ready")},
-            ),
-            patch.object(
-                settle, "run_inventory", return_value=machine_inventory([])
-            ),
-        ):
-            record.create(empty_shutdown_record("natedev", scope))
-            ready = settle.conduct_cycle(LOGIN, {}, here=True)
-
-        with patch.dict(
-            os.environ,
-            {"SHUTDOWN_STATE_DIR": str(self.root / "decision-ended")},
-        ):
-            ended = settle.conduct_cycle(LOGIN, {}, here=True)
-
-        self.assertEqual(
-            [pending["kind"], ready["kind"], ended["kind"]],
-            ["settlement pending", "ready to stop", "settlement ended"],
-        )
-
-        action_root = self.root / "decision-actions"
-        action_record = empty_shutdown_record("natedev", scope)
-        action_report = settle.RefreshReport(record=action_record, verdicts=[])
-        decisions: list[settle.ConductorDecision] = [
-            settle.SettlementPending(
-                kind="settlement pending", reports=[action_report]
-            ),
-            settle.ReadyToStop(kind="ready to stop", reports=[action_report]),
-        ]
-        with patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(action_root)}):
-            record.create(action_record)
-            with (
-                patch.object(settle, "conduct_cycle", side_effect=decisions) as cycle,
-                patch.object(time, "sleep") as sleep,
-                patch.object(
-                    stop_work, "claim_stop_as_conductor", return_value=True
-                ) as claim,
-                patch.object(settle, "_stop_machines", return_value=([], [])) as stop,
-                patch.object(settle, "report_stop") as alert,
-            ):
-                self.assertEqual(settle.conduct(LOGIN, here=True), 0)
-        self.assertEqual(cycle.call_count, 2)
-        # `time.sleep` is patched process-wide, so a timed subprocess wait under load
-        # adds its own short polls; only the settle-interval sleeps belong to `conduct`.
-        settle_sleeps = [
-            sleep_call
-            for sleep_call in sleep.call_args_list
-            if sleep_call == call(settle.SETTLE_INTERVAL_SECONDS)
-        ]
-        self.assertEqual(settle_sleeps, [call(settle.SETTLE_INTERVAL_SECONDS)])
-        claim.assert_called_once_with(LOGIN)
-        stop.assert_called_once_with(LOGIN, [action_report])
-        alert.assert_called_once()
-
-        with (
-            patch.object(
-                settle,
-                "conduct_cycle",
-                return_value=settle.SettlementEnded(
-                    kind="settlement ended", reason="cancelled"
-                ),
-            ),
-            patch.object(stop_work, "claim_stop_as_conductor") as ended_claim,
-        ):
-            self.assertEqual(settle.conduct(LOGIN, here=True), 0)
-        ended_claim.assert_not_called()
-
-    def test_peer_claim_failure_closes_local_before_alert_without_stopping(
-        self,
-    ) -> None:
-        scope = record.AllAccountSessions(kind="all account sessions")
-        local = empty_shutdown_record("natedev", scope)
-        remote_record = empty_shutdown_record("Mac", scope)
-        remote_root = self.root / "peer-claim-remote"
-        record.create(local)
-        with patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}):
-            record.create(remote_record)
-        reports = [
-            settle.RefreshReport(record=local, verdicts=[]),
-            settle.RefreshReport(record=remote_record, verdicts=[]),
-        ]
-        alerted = False
-
-        def check_alert(
-            claimed: record.ShutdownRecord,
-            _reports: list[stop_work.StopReport],
-            issues: list[record.OrchestrationStopIssue],
-        ) -> None:
-            nonlocal alerted
-            alerted = True
-            self.assertEqual(claimed["label"], LABEL)
-            local_closed = self.found_record()
-            self.assertEqual(local_closed["state"], "stop partial")
-            self.assertEqual(local_closed["stop_issues"], issues)
-            with patch.dict(
-                os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
-            ):
-                peer = record.find_live(LOGIN)
-            self.assertEqual(peer["kind"], "live")
-            if peer["kind"] == "live":
-                self.assertEqual(peer["record"]["state"], "settling")
-
-        with (
-            patch.object(
-                settle,
-                "conduct_cycle",
-                return_value=settle.ReadyToStop(
-                    kind="ready to stop", reports=reports
-                ),
-            ),
-            patch.object(
-                settle,
-                "claim_remote_stop",
-                return_value=settle.RemoteStopClaimFailed(
-                    kind="failed", reason="rc 4"
-                ),
-            ),
-            patch.object(settle, "other_machine", return_value="Mac"),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.object(settle, "report_stop", side_effect=check_alert),
-            patch.object(settle, "stop_remote") as remote_stop,
-            patch.object(stop_work, "stop") as local_stop,
-        ):
-            result = settle.conduct(LOGIN)
-
-        self.assertEqual(result, 0)
-        self.assertTrue(alerted)
-        remote_stop.assert_not_called()
-        local_stop.assert_not_called()
-        self.assertEqual(
-            self.found_record()["stop_issues"],
-            [
-                record.StopClaimFailed(
-                    kind="stop claim failed",
-                    at=NOW,
-                    machine="Mac",
-                    reason="rc 4",
-                )
-            ],
-        )
-
-    def test_local_stop_exception_closes_local_after_peer_finishes_before_alert(
-        self,
-    ) -> None:
-        scope = record.AllAccountSessions(kind="all account sessions")
-        local = empty_shutdown_record("natedev", scope)
-        remote_record = empty_shutdown_record("Mac", scope)
-        remote_root = self.root / "local-failure-remote"
-        record.create(local)
-        with patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}):
-            record.create(remote_record)
-        reports = [
-            settle.RefreshReport(record=local, verdicts=[]),
-            settle.RefreshReport(record=remote_record, verdicts=[]),
-        ]
-
-        def claim_peer(
-            _login: str, timing: record.StopTiming
-        ) -> settle.RemoteStopClaimOutcome:
-            with patch.dict(
-                os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
-            ):
-                self.assertTrue(stop_work.claim_stop_as_peer(LOGIN, timing))
-            return settle.RemoteStopClaimed(kind="claimed")
-
-        def stop_peer(_login: str) -> settle.RemoteStopOutcome:
-            def finish(current: record.ShutdownRecord) -> None:
-                current["state"] = "down"
-
-            with patch.dict(
-                os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
-            ):
-                finished = record.update(LOGIN, finish)
-            return settle.RemoteStopped(
-                kind="stopped", report=completed_stop_report(finished)
-            )
-
-        def check_alert(
-            claimed: record.ShutdownRecord,
-            _reports: list[stop_work.StopReport],
-            issues: list[record.OrchestrationStopIssue],
-            *,
-            failed_records: list[record.ShutdownRecord],
-        ) -> None:
-            self.assertEqual(claimed["label"], LABEL)
-            self.assertEqual(
-                [failed["machine"] for failed in failed_records], ["natedev"]
-            )
-            self.assertEqual(self.found_record()["stop_issues"], issues)
-            self.assertEqual(self.found_record()["state"], "stop partial")
-            with patch.dict(
-                os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
-            ):
-                peer = record.find_live(LOGIN)
-            self.assertEqual(peer["kind"], "live")
-            if peer["kind"] == "live":
-                self.assertEqual(peer["record"]["state"], "down")
-
-        with (
-            patch.object(
-                settle,
-                "conduct_cycle",
-                return_value=settle.ReadyToStop(
-                    kind="ready to stop", reports=reports
-                ),
-            ),
-            patch.object(settle, "claim_remote_stop", side_effect=claim_peer),
-            patch.object(settle, "stop_remote", side_effect=stop_peer),
-            patch.object(stop_work, "stop", side_effect=OSError("inventory failed")),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.object(settle, "report_stop", side_effect=check_alert),
-        ):
-            result = settle.conduct(LOGIN)
-
-        self.assertEqual(result, 0)
-        self.assertEqual(
-            self.found_record()["stop_issues"],
-            [
-                record.MachineStopFailed(
-                    kind="machine stop failed",
-                    at=NOW,
-                    machine="natedev",
-                    reason="inventory failed",
-                )
-            ],
-        )
-
-    def test_local_stop_exception_alert_includes_persisted_session_issue(
-        self,
-    ) -> None:
-        scope = record.AllAccountSessions(kind="all account sessions")
-        local = empty_shutdown_record("natedev", scope)
-        local["entries"] = [
-            record.ShutdownSessionEntry(
-                session=top_level("work", "Work"),
-                timers=[],
-                settle_message=record.SettleMessageNotSent(kind="not sent"),
-                where=record.WhereNotSaid(kind="not said"),
-                progress=record.SessionWaiting(kind="waiting"),
-                stop_issues=[],
-            )
-        ]
-        record.create(local)
-        report = settle.RefreshReport(record=local, verdicts=[])
-
-        def fail_after_persisting_issue(_login: str) -> stop_work.StopReport:
-            def save_issue(current: record.ShutdownRecord) -> None:
-                current["entries"][0]["stop_issues"] = [
-                    record.NotReadyToStop(
-                        kind="not ready to stop",
-                        at=NOW,
-                        status="idle",
-                        progress="waiting",
-                    )
-                ]
-
-            _ = record.update(LOGIN, save_issue)
-            raise OSError("inventory failed")
-
-        with (
-            patch.object(
-                settle,
-                "conduct_cycle",
-                return_value=settle.ReadyToStop(
-                    kind="ready to stop", reports=[report]
-                ),
-            ),
-            patch.object(stop_work, "stop", side_effect=fail_after_persisting_issue),
-            patch.object(settle, "record_time", return_value=NOW),
-        ):
-            self.assertEqual(settle.conduct(LOGIN, here=True), 0)
-
-        alert = self.sent_calls()[0]["text"]
-        self.assertIn("natedev:\n  Work: not stopped: idle, waiting", alert)
-        self.assertIn("natedev: stop failed: inventory failed", alert)
-
-    def test_close_failed_stop_uses_shared_record_time(self) -> None:
-        current = empty_shutdown_record(
-            "natedev", record.AllAccountSessions(kind="all account sessions")
-        )
-        current["state"] = "stopping"
-        record.create(current)
-        timestamp = "2026-10-10T01:02:03+00:00"
-
-        with (
-            patch.object(settle, "record_time", return_value=timestamp) as clock,
-            patch.object(settle, "local_machine", return_value="natedev"),
-        ):
-            self.assertEqual(
-                shutdown.main(
-                    ["close-failed-stop", LOGIN, "--reason", "inventory failed"]
-                ),
-                0,
-            )
-
-        clock.assert_called_once_with()
-        self.assertEqual(self.found_record()["stop_issues"][0]["at"], timestamp)
-
-    def test_remote_stop_failure_closes_both_and_records_failed_close_status(
-        self,
-    ) -> None:
-        scope = record.AllAccountSessions(kind="all account sessions")
-        local = empty_shutdown_record("natedev", scope)
-        remote_record = empty_shutdown_record("Mac", scope)
-        remote_root = self.root / "remote-failure-peer"
-        record.create(local)
-        with patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}):
-            record.create(remote_record)
-        reports = [
-            settle.RefreshReport(record=local, verdicts=[]),
-            settle.RefreshReport(record=remote_record, verdicts=[]),
-        ]
-
-        def claim_peer(_login: str, timing: record.StopTiming) -> settle.RemoteStopClaimOutcome:
-            with patch.dict(
-                os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
-            ):
-                self.assertTrue(stop_work.claim_stop_as_peer(LOGIN, timing))
-            return settle.RemoteStopClaimed(kind="claimed")
-
-        def stop_local(_login: str) -> stop_work.StopReport:
-            def finish(current: record.ShutdownRecord) -> None:
-                current["state"] = "down"
-
-            return completed_stop_report(record.update(LOGIN, finish))
-
-        def close_peer(
-            arguments: list[str],
-            stdin: str = "",
-            limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT,
-        ) -> tuple[int, str]:
-            self.assertEqual(stdin, "")
-            self.assertEqual(limit, remote.STANDARD_TIME_LIMIT)
-            if arguments == ["records", "--json", "--here"]:
-                with patch.dict(
-                    os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
-                ):
-                    peer = record.find_live(LOGIN)
-                self.assertEqual(peer["kind"], "live")
-                if peer["kind"] != "live":
-                    self.fail("expected peer shutdown record")
-                return 0, json.dumps([peer["record"]])
-            self.assertEqual(
-                arguments,
-                ["close-failed-stop", LOGIN, "--reason", "rc 9"],
-            )
-            with (
-                patch.dict(
-                    os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
-                ),
-                patch.object(settle, "local_machine", return_value="Mac"),
-                patch.object(settle, "now_utc", return_value=NOW_UTC),
-            ):
-                self.assertEqual(shutdown.main(arguments), 0)
-            return 6, ""
-
-        def check_alert(
-            claimed: record.ShutdownRecord,
-            _reports: list[stop_work.StopReport],
-            issues: list[record.OrchestrationStopIssue],
-            *,
-            failed_records: list[record.ShutdownRecord],
-        ) -> None:
-            self.assertEqual(claimed["label"], LABEL)
-            self.assertEqual(
-                [failed["machine"] for failed in failed_records], ["Mac"]
-            )
-            local_closed = self.found_record()
-            self.assertEqual(local_closed["state"], "stop partial")
-            self.assertEqual(local_closed["stop_issues"], issues)
-            self.assertEqual(
-                issues[0]["reason"],
-                "rc 9; its record could not be closed (rc 6)",
-            )
-            with patch.dict(
-                os.environ, {"SHUTDOWN_STATE_DIR": str(remote_root)}
-            ):
-                peer = record.find_live(LOGIN)
-            self.assertEqual(peer["kind"], "live")
-            if peer["kind"] == "live":
-                self.assertEqual(peer["record"]["state"], "stop partial")
-                self.assertEqual(peer["record"]["stop_issues"][0]["reason"], "rc 9")
-
-        with (
-            patch.object(
-                settle,
-                "conduct_cycle",
-                return_value=settle.ReadyToStop(
-                    kind="ready to stop", reports=reports
-                ),
-            ),
-            patch.object(settle, "claim_remote_stop", side_effect=claim_peer),
-            patch.object(
-                settle,
-                "stop_remote",
-                return_value=settle.RemoteStopFailed(kind="failed", reason="rc 9"),
-            ),
-            patch.object(stop_work, "stop", side_effect=stop_local),
-            patch.object(settle, "run_remote", side_effect=close_peer),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.object(settle, "report_stop", side_effect=check_alert),
-        ):
-            result = settle.conduct(LOGIN)
-
-        self.assertEqual(result, 0)
-
-    def test_cancel_notifies_an_entry_with_a_queued_settle_message(self) -> None:
-        report = machine_inventory([top_level("session", "Work")])
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            _ = settle.begin(LOGIN)
-
-        def mark_queued(current: record.ShutdownRecord) -> None:
-            current["entries"][0]["settle_message"] = record.SettleMessageQueued(
-                kind="queued", at=NOW, reason="no live session"
-            )
-
-        _ = record.update(LOGIN, mark_queued)
-        result = settle.cancel(self.account, here=True)
-
-        self.assertEqual(result, 0)
-        calls = self.sent_calls()
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0]["args"][0], "retire")
-        self.assertIn("cancelled by the user", calls[1]["text"])
-
-    def test_ready_rechecks_an_ahead_checkout_and_accepts_after_push(self) -> None:
-        ahead = machine_inventory([top_level("session", "Work", ahead=2)])
-        pushed = machine_inventory([top_level("session", "Work", ahead=0)])
-        errors = io.StringIO()
-        output = io.StringIO()
-        with (
-            patch.object(
-                settle,
-                "run_inventory",
-                side_effect=[ahead, ahead, pushed],
-            ),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "session"}),
-        ):
-            _ = settle.begin(LOGIN)
-            with redirect_stderr(errors):
-                refused = settle.ready("phase 5: push next")
-            with redirect_stdout(output):
-                accepted = settle.ready("phase 5: push next")
-
-        self.assertEqual(refused, 2)
-        self.assertEqual(accepted, 0)
-        self.assertEqual(errors.getvalue(), "push work first\n")
-        self.assertIn("ready for shutdown", output.getvalue())
-        current = self.found_record()
-        self.assertEqual(current["entries"][0]["progress"]["kind"], "ready")
-        self.assertEqual(
-            current["entries"][0]["where"],
-            record.WhereSaid(kind="said", text="phase 5: push next", at=NOW),
-        )
-
-    def test_showrunner_with_merge_in_progress_does_not_count_ready(self) -> None:
-        runner = showrunner("runner", "Showrunner")
-        report = machine_inventory([runner])
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            _ = settle.begin(LOGIN)
-
-        def mark_ready(current: record.ShutdownRecord) -> None:
-            current["entries"][0]["progress"] = record.SessionReadyToStop(
-                kind="ready", at=NOW
-            )
-
-        current = record.update(LOGIN, mark_ready)
-        remote = empty_refresh_report(
-            "Mac", record.AllAccountSessions(kind="all account sessions")
-        )
-        with (
-            patch.object(settle, "merge_in_progress", return_value=True),
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(
-                settle,
-                "_remote_record",
-                return_value=settle.RemoteRefresh(kind="refresh", report=remote),
-            ),
-        ):
-            outcome = settle.conduct_cycle(LOGIN, {})
-
-        self.assertEqual(outcome["kind"], "settlement pending")
-        self.assertEqual(current["entries"][0]["progress"]["kind"], "ready")
-
-    def test_remote_verdict_keeps_its_merge_and_form_holdout_without_local_tmux(
-        self,
-    ) -> None:
-        runner = showrunner("remote-runner", "Remote Showrunner")
-        remote_record = empty_shutdown_record(
-            "Mac", record.AllAccountSessions(kind="all account sessions")
-        )
-        remote_record["requested_by"] = record.FromSession(
-            kind="session", session_id="remote-runner"
-        )
-        remote_record["entries"] = [
-            record.ShutdownSessionEntry(
-                session=runner,
-                timers=[],
-                settle_message=record.SettleMessageNotSent(kind="not sent"),
-                where=record.WhereNotSaid(kind="not said"),
-                progress=record.SessionReadyToStop(kind="ready", at=NOW),
-                stop_issues=[],
-            )
-        ]
-        line = "Mac showrunner Remote Showrunner: idle, showing a form, merge in progress"
-        remote_report = settle.RefreshReport(
-            record=remote_record,
-            verdicts=[
-                settle.EntryVerdict(
-                    session_id="remote-runner",
-                    verdict=settle.Holdout(kind="holdout", line=line),
-                )
-            ],
-        )
-        tmux_log = self.root / "tmux-called"
-        tmux = self.root / "tmux"
-        _ = tmux.write_text(
-            f"#!/bin/sh\ntouch {tmux_log}\nprintf 'form\\n'\n",
-            encoding="utf-8",
-        )
-        tmux.chmod(0o755)
-        local = machine_inventory([])
-        with (
-            patch.object(settle, "run_inventory", return_value=local),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.object(
-                settle,
-                "_remote_record",
-                return_value=settle.RemoteRefresh(
-                    kind="refresh", report=remote_report
-                ),
-            ),
-            patch.dict(os.environ, {"SHUTDOWN_TMUX": str(tmux)}),
-        ):
-            _ = settle.begin(LOGIN)
-            outcome = settle.conduct_cycle(LOGIN, {})
-
-        self.assertEqual(outcome["kind"], "settlement pending")
-        pending = cast(settle.SettlementPending, outcome)
-        holdout_lines: list[str] = []
-        for report in pending["reports"]:
-            for result in report["verdicts"]:
-                verdict = result["verdict"]
-                if verdict["kind"] == "holdout":
-                    holdout_lines.append(verdict["line"])
-        self.assertEqual(
-            holdout_lines,
-            [line],
-        )
-        self.assertFalse(tmux_log.exists())
-
-    def test_busy_seat_holds_then_becomes_passive_without_a_message(self) -> None:
-        owner = top_level("owner", "Owner")
-        busy = seat("seat", "Seat", owner="owner", status="busy")
-        idle = seat("seat", "Seat", owner="owner", status="idle")
-        busy_report = machine_inventory([owner, busy])
-        idle_report = machine_inventory([owner, idle])
-        with (
-            patch.object(
-                settle,
-                "run_inventory",
-                side_effect=[busy_report, busy_report, idle_report],
-            ),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            _ = settle.begin(LOGIN)
-
-            def mark_owner_ready(current: record.ShutdownRecord) -> None:
-                current["entries"][0]["progress"] = record.SessionReadyToStop(
-                    kind="ready", at=NOW
-                )
-
-            _ = record.update(LOGIN, mark_owner_ready)
-            held = settle.refresh(LOGIN)
-            ready = settle.refresh(LOGIN, ["owner", "seat"])
-
-        held_seat = next(
-            entry
-            for entry in held["record"]["entries"]
-            if entry["session"]["session_id"] == "seat"
-        )
-        ready_seat = next(
-            entry
-            for entry in ready["record"]["entries"]
-            if entry["session"]["session_id"] == "seat"
-        )
-        self.assertEqual(held_seat["progress"]["kind"], "waiting")
-        self.assertEqual(ready_seat["progress"]["kind"], "passive seat ready")
-        recipients = [
-            call["args"][call["args"].index("--to") + 1]
-            for call in self.sent_calls()
-        ]
-        self.assertEqual(recipients, ["session:owner"])
-
-    def test_unattributed_session_is_status_only(self) -> None:
-        timer = self.write_instance("unknown-report", "unknown", enabled=True)
-        report = machine_inventory(
-            [],
-            unattributed=[
-                inventory.UnattributedSession(
-                    pid=999,
-                    name="Unknown",
-                    reason="account unreadable",
-                )
-            ],
-        )
-        errors = io.StringIO()
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "unknown"}),
-        ):
-            created = settle.begin(LOGIN)
-            with redirect_stderr(errors):
-                ready_result = settle.ready("not attributable")
-
-        self.assertEqual(created["entries"], [])
-        self.assertEqual(ready_result, 1)
-        self.assertIn("no shutdown in progress", errors.getvalue())
-        self.assertTrue((timer / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertEqual(self.logged_calls(self.notifier_log), [])
-        self.assertEqual(self.sent_calls(), [])
-
-    def test_ready_refuses_a_session_missing_from_the_fresh_inventory(self) -> None:
-        original = top_level("session", "Work")
-        errors = io.StringIO()
-        with (
-            patch.object(
-                settle,
-                "run_inventory",
-                side_effect=[machine_inventory([original]), machine_inventory([])],
-            ),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "session"}),
-        ):
-            _ = settle.begin(LOGIN)
-            with redirect_stderr(errors):
-                result = settle.ready("done")
-
-        self.assertEqual(result, 2)
-        self.assertEqual(
-            errors.getvalue(),
-            "this session is not in a fresh inventory of claude 2: not found\n",
-        )
-        self.assertEqual(
-            self.found_record()["entries"][0]["progress"]["kind"], "waiting"
-        )
-
-    def test_ready_refuses_an_unattributed_copy_of_the_session(self) -> None:
-        original = top_level("session", "Work")
-        unknown = machine_inventory(
-            [],
-            unattributed=[
-                inventory.UnattributedSession(
-                    pid=original["pid"],
-                    name="Work",
-                    reason="process start mismatch",
-                )
-            ],
-        )
-        errors = io.StringIO()
-        with (
-            patch.object(
-                settle,
-                "run_inventory",
-                side_effect=[machine_inventory([original]), unknown],
-            ),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "session"}),
-        ):
-            _ = settle.begin(LOGIN)
-            with redirect_stderr(errors):
-                result = settle.ready("done")
-
-        self.assertEqual(result, 2)
-        self.assertIn("process start mismatch", errors.getvalue())
-        self.assertEqual(
-            self.found_record()["entries"][0]["progress"]["kind"], "waiting"
-        )
-
-    def test_refresh_keeps_an_unattributed_entry_as_a_reasoned_holdout(self) -> None:
-        original = top_level("session", "Work")
-        unknown = machine_inventory(
-            [],
-            unattributed=[
-                inventory.UnattributedSession(
-                    pid=original["pid"],
-                    name="Work",
-                    reason="account unreadable",
-                )
-            ],
-        )
-        with (
-            patch.object(
-                settle,
-                "run_inventory",
-                side_effect=[machine_inventory([original]), unknown],
-            ),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            _ = settle.begin(LOGIN)
-            refreshed = settle.refresh(LOGIN, ["session"])
-
-        entry = refreshed["record"]["entries"][0]
-        self.assertEqual(entry["progress"]["kind"], "waiting")
-        self.assertEqual(entry["settle_message"]["kind"], "not sent")
-        self.assertEqual(
-            refreshed["verdicts"][0]["verdict"],
-            settle.Holdout(
-                kind="holdout",
-                line="natedev top-level Work: account unreadable",
-            ),
-        )
-
-    def test_refresh_marks_a_gone_entry_settled_and_conduct_completes(self) -> None:
-        original = top_level("session", "Work")
-        gone = machine_inventory([])
-        with (
-            patch.object(
-                settle,
-                "run_inventory",
-                side_effect=[machine_inventory([original]), gone, gone],
-            ),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            _ = settle.begin(LOGIN)
-            refreshed = settle.refresh(LOGIN)
-            outcome = settle.conduct_cycle(LOGIN, {}, here=True)
-
-        self.assertEqual(
-            refreshed["record"]["entries"][0]["progress"]["kind"],
-            "already gone",
-        )
-        self.assertEqual(
-            refreshed["verdicts"][0]["verdict"]["kind"], "counts ready"
-        )
-        self.assertEqual(outcome["kind"], "ready to stop")
-
-    def test_refresh_returns_a_reappearing_entry_to_waiting(self) -> None:
-        original = top_level("session", "Work")
-        present = machine_inventory([original])
-        with (
-            patch.object(
-                settle,
-                "run_inventory",
-                side_effect=[present, machine_inventory([]), present],
-            ),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            _ = settle.begin(LOGIN)
-            _ = settle.refresh(LOGIN)
-            returned = settle.refresh(LOGIN)
-
-        self.assertEqual(
-            returned["record"]["entries"][0]["progress"]["kind"], "waiting"
-        )
-
-    def test_seat_cannot_mark_itself_ready(self) -> None:
-        worker = seat("seat", "Seat", owner=None)
-        errors = io.StringIO()
-        with (
-            patch.object(settle, "run_inventory", return_value=machine_inventory([worker])),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "seat"}),
-        ):
-            _ = settle.begin(LOGIN)
-            with redirect_stderr(errors):
-                result = settle.ready("done")
-
-        self.assertEqual(result, 2)
-        self.assertIn("a seat is ready on its own", errors.getvalue())
-        self.assertEqual(
-            self.found_record()["entries"][0]["progress"]["kind"], "waiting"
-        )
-
-    def test_ordinary_ready_progress_never_settles_a_seat(self) -> None:
-        worker = seat("seat", "Seat", owner=None, status="busy")
-        report = machine_inventory([worker])
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            _ = settle.begin(LOGIN)
-
-            def mark_ordinary_ready(current: record.ShutdownRecord) -> None:
-                current["entries"][0]["progress"] = record.SessionReadyToStop(
-                    kind="ready", at=NOW
-                )
-
-            _ = record.update(LOGIN, mark_ordinary_ready)
-            refreshed = settle.refresh(LOGIN)
-
-        self.assertEqual(refreshed["verdicts"][0]["verdict"]["kind"], "holdout")
-
-    def test_begin_with_no_sessions_still_creates_settling_record(self) -> None:
-        report = machine_inventory([])
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            created = settle.begin(LOGIN)
-
-        self.assertEqual(created["state"], "settling")
-        self.assertEqual(created["entries"], [])
-        self.assertEqual(self.found_record(), created)
-
-    def test_now_reports_forced_and_peer_with_nothing_to_force(self) -> None:
-        current = empty_shutdown_record(
-            "natedev", record.AllAccountSessions(kind="all account sessions")
-        )
-        record.create(current)
-        output = io.StringIO()
-
-        with (
-            patch.object(settle, "_machine", return_value="natedev"),
-            patch.object(
-                settle,
-                "run_remote",
-                return_value=(0, "Mac: no shutdown in progress"),
-            ),
-            redirect_stdout(output),
-        ):
-            result = settle.now(self.account)
-
-        self.assertEqual(result, 0)
-        self.assertEqual(
-            output.getvalue(),
-            "natedev: stopping now\nMac: no shutdown in progress\n",
-        )
-
-    def test_now_with_nothing_to_force_on_either_machine_exits_one(self) -> None:
-        output = io.StringIO()
-
-        with (
-            patch.object(settle, "_machine", return_value="natedev"),
-            patch.object(
-                settle,
-                "run_remote",
-                return_value=(0, "Mac: no shutdown in progress"),
-            ),
-            redirect_stdout(output),
-        ):
-            result = settle.now(self.account)
-
-        self.assertEqual(result, 1)
-        self.assertEqual(
-            output.getvalue(),
-            "natedev: no shutdown in progress\n"
-            + "Mac: no shutdown in progress\n",
-        )
-
-    def test_now_reports_an_unreached_peer_and_exits_one(self) -> None:
-        current = empty_shutdown_record(
-            "natedev", record.AllAccountSessions(kind="all account sessions")
-        )
-        record.create(current)
-        output = io.StringIO()
-        errors = io.StringIO()
-
-        with (
-            patch.object(settle, "_machine", return_value="natedev"),
-            patch.object(settle, "other_machine", return_value="Mac"),
-            patch.object(settle, "run_remote", return_value=(255, "")),
-            redirect_stdout(output),
-            redirect_stderr(errors),
-        ):
-            result = settle.now(self.account)
-
-        self.assertEqual(result, 1)
-        self.assertEqual(output.getvalue(), "natedev: stopping now\n")
-        self.assertEqual(
-            errors.getvalue(),
-            "Mac not reached: run /shutdown now there when it is back\n",
-        )
-    def test_begin_releases_a_pause_through_the_python_api(self) -> None:
-        report = machine_inventory([top_level("session", "Work")])
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.object(
-                conversation_pause,
-                "release",
-                return_value=conversation_pause.NoPauseRecord.ABSENT,
-            ) as release,
-        ):
-            _ = settle.begin(LOGIN)
-
-        release.assert_called_once_with("session")
-
-    def test_footer_only_pause_restores_footer_without_enabling_disabled_timer(
-        self,
-    ) -> None:
-        timer = self.write_instance("showrunner-demo", "session", enabled=False)
-        pause_path = self.pause_record(
-            "session", footer="demo", kept_off=False
-        )
-        showrunner_footer.set_footer_state("demo", showrunner_footer.FooterState.OFF)
-        report = machine_inventory([top_level("session", "Work")])
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            created = settle.begin(LOGIN)
-            result = settle.cancel(self.account, here=True)
-
-        restore = created["entries"][0]["timers"][0]
-        self.assertEqual(restore["instance"], timer.name)
-        self.assertFalse(restore["was_enabled"])
-        self.assertEqual(restore["footer"]["kind"], "footer")
-        self.assertEqual(result, 0)
-        self.assertFalse(pause_path.exists())
-        self.assertFalse((timer / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertIs(
-            showrunner_footer.footer_state("demo"), showrunner_footer.FooterState.ON
-        )
-
-    def test_kept_off_footer_only_pause_stays_off_after_cancel(self) -> None:
-        timer = self.write_instance("showrunner-demo", "session", enabled=False)
-        _ = self.pause_record("session", footer="demo", kept_off=True)
-        showrunner_footer.set_footer_state("demo", showrunner_footer.FooterState.OFF)
-        report = machine_inventory([top_level("session", "Work")])
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            created = settle.begin(LOGIN)
-            _ = settle.cancel(self.account, here=True)
-
-        restore = created["entries"][0]["timers"][0]
-        self.assertEqual(restore["instance"], timer.name)
-        self.assertEqual(restore["footer"]["kind"], "no footer")
-        self.assertIs(
-            showrunner_footer.footer_state("demo"), showrunner_footer.FooterState.OFF
-        )
-
-    def test_begin_records_all_timer_states_before_a_stop_failure_and_rolls_back(
-        self,
-    ) -> None:
-        first = self.write_instance("first", "session", enabled=True)
-        second = self.write_instance("second", "session", enabled=True)
-        report = machine_inventory(
-            [top_level("session", "Work", timers=[first.name, second.name])]
-        )
-        real_run_notifier = settle.run_notifier
-        stops = 0
-
-        def fail_second_stop(verb: str, instance: str) -> None:
-            nonlocal stops
-            if verb == "stop":
-                stops += 1
-                if stops == 2:
-                    raise RuntimeError("stop failed")
-            real_run_notifier(verb, instance)
-
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.object(settle, "run_notifier", side_effect=fail_second_stop),
-            self.assertRaisesRegex(RuntimeError, "stop failed"),
-        ):
-            _ = settle.begin(LOGIN)
-
-        self.assertTrue((first / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertTrue((second / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertEqual(
-            record.find_live(LOGIN), record.NoShutdown(kind="no shutdown")
-        )
-
-    def test_refresh_commits_timer_stops_before_cancel_can_restore_them(self) -> None:
-        original = top_level("session", "Work")
-        timer = self.write_instance("new-report", "new", enabled=True)
-        newcomer = top_level("new", "New", timers=[timer.name])
-        with (
-            patch.object(
-                settle,
-                "run_inventory",
-                return_value=machine_inventory([original]),
-            ),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            _ = settle.begin(LOGIN)
-
-        real_update = record.update
-        cancelled = False
-
-        def update_then_cancel(
-            login: str, change: Callable[[record.ShutdownRecord], None]
-        ) -> record.ShutdownRecord:
-            nonlocal cancelled
-            current = real_update(login, change)
-            if not cancelled:
-                cancelled = True
-                _ = settle.cancel(self.account, here=True)
-            return current
-
-        with (
-            patch.object(
-                settle,
-                "run_inventory",
-                return_value=machine_inventory([original, newcomer]),
-            ),
-            patch.object(settle, "update", side_effect=update_then_cancel),
-        ):
-            _ = settle.refresh(LOGIN)
-
-        self.assertTrue((timer / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertEqual(
-            record.find_live(LOGIN), record.NoShutdown(kind="no shutdown")
-        )
-
-    def test_refresh_persists_every_timer_before_raising_a_stop_failure(self) -> None:
-        original = top_level("session", "Work")
-        first = self.write_instance("first-new", "new", enabled=True)
-        second = self.write_instance("second-new", "new", enabled=True)
-        newcomer = top_level(
-            "new", "New", timers=[first.name, second.name]
-        )
-        with (
-            patch.object(
-                settle,
-                "run_inventory",
-                return_value=machine_inventory([original]),
-            ),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            _ = settle.begin(LOGIN)
-
-        real_run_notifier = settle.run_notifier
-        stops = 0
-
-        def fail_second_stop(verb: str, instance: str) -> None:
-            nonlocal stops
-            if verb == "stop":
-                stops += 1
-                if stops == 2:
-                    raise RuntimeError("stop failed")
-            real_run_notifier(verb, instance)
-
-        with (
-            patch.object(
-                settle,
-                "run_inventory",
-                return_value=machine_inventory([original, newcomer]),
-            ),
-            patch.object(settle, "run_notifier", side_effect=fail_second_stop),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "stop failed"):
-                _ = settle.refresh(LOGIN)
-            new_entry = next(
-                entry
-                for entry in self.found_record()["entries"]
-                if entry["session"]["session_id"] == "new"
-            )
-            self.assertEqual(
-                [timer["instance"] for timer in new_entry["timers"]],
-                [first.name, second.name],
-            )
-            self.assertTrue(
-                (first / "state").read_text().startswith("ENABLED=0\n")
-            )
-            _ = settle.cancel(self.account, here=True)
-
-        self.assertTrue((first / "state").read_text().startswith("ENABLED=1\n"))
-
-    def test_cancel_stops_conductor_before_reading_the_restoration_snapshot(
-        self,
-    ) -> None:
-        report = machine_inventory([top_level("session", "Work")])
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            _ = settle.begin(LOGIN)
-        order: list[str] = []
-        real_update = record.update
-
-        def ordered_update(
-            login: str, change: Callable[[record.ShutdownRecord], None]
-        ) -> record.ShutdownRecord:
-            order.append("snapshot")
-            return real_update(login, change)
-
-        def stopped(_conductor: record.Conductor) -> None:
-            order.append("stop")
-
-        def restored(_record: record.ShutdownRecord) -> None:
-            order.append("restore")
-
-        with (
-            patch.object(
-                settle, "_stop_conductor", side_effect=stopped
-            ),
-            patch.object(settle, "update", side_effect=ordered_update),
-            patch.object(
-                settle, "_restore_record", side_effect=restored
-            ),
-        ):
-            _ = settle.cancel(self.account, here=True)
-
-        self.assertEqual(order, ["stop", "snapshot", "restore"])
-
-    def test_refresh_after_cancel_flip_refuses_without_stopping_a_timer(self) -> None:
-        original = top_level("session", "Work")
-        newcomer = top_level("new", "New", timers=["new-timer"])
-        with (
-            patch.object(settle, "run_inventory", return_value=machine_inventory([original])),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            _ = settle.begin(LOGIN)
-
-        def flip(current: record.ShutdownRecord) -> None:
-            current["state"] = "cancelled"
-
-        _ = record.update(LOGIN, flip)
-        with (
-            patch.object(settle, "run_inventory", return_value=machine_inventory([newcomer])),
-            patch.object(settle, "run_notifier") as notifier,
-            self.assertRaises(record.NoLiveRecord),
-        ):
-            _ = settle.refresh(LOGIN)
-
-        notifier.assert_not_called()
-
-    def test_conduct_cycle_ends_cleanly_when_local_record_is_cancelled(self) -> None:
-        report = machine_inventory([top_level("session", "Work")])
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            _ = settle.begin(LOGIN)
-
-        def flip(current: record.ShutdownRecord) -> None:
-            current["state"] = "cancelled"
-
-        _ = record.update(LOGIN, flip)
-        outcome = settle.conduct_cycle(LOGIN, {}, here=True)
-
-        self.assertEqual(outcome["kind"], "settlement ended")
-
-    def test_selected_scope_excludes_new_unselected_sessions_on_refresh(self) -> None:
-        selected = top_level("selected", "Selected")
-        unselected = top_level("unselected", "Unselected")
-        seen_scopes: list[record.ShutdownScope] = []
-
-        def scoped_inventory(login: str, scope: record.ShutdownScope) -> inventory.Inventory:
-            self.assertEqual(login, LOGIN)
-            seen_scopes.append(scope)
-            wanted: frozenset[str] = (
-                frozenset(scope["session_ids"])
-                if scope["kind"] == "selected"
-                else frozenset[str]()
-            )
-            sessions: list[inventory.Session] = [selected, unselected]
-            if wanted:
-                sessions = [
-                    session
-                    for session in sessions
-                    if session["session_id"] in wanted
-                ]
-            return machine_inventory(sessions)
-
-        with (
-            patch.object(settle, "run_inventory", side_effect=scoped_inventory),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            result = shutdown.main(["begin", LOGIN, "--only", "selected"])
-            created = self.found_record()
-            refreshed = settle.refresh(LOGIN)
-
-        self.assertEqual(result, 0)
-        expected_scope = record.SelectedSessions(
-            kind="selected", session_ids=["selected"]
-        )
-        self.assertEqual(created["scope"], expected_scope)
-        self.assertEqual(seen_scopes, [expected_scope, expected_scope])
-        self.assertEqual(
-            [
-                entry["session"]["session_id"]
-                for entry in refreshed["record"]["entries"]
-            ],
-            ["selected"],
-        )
-
-    def test_down_refuses_unreachable_or_unavailable_peer_without_changes(
-        self,
-    ) -> None:
-        self.allow_leaf(ShutdownSendLeaf.RUN_REMOTE)
-        local = machine_inventory([])
-        for mode, expected in (
-            ("unreachable", "Mac is unreachable"),
-            ("unavailable", "Mac is unavailable (rc 7)"),
-        ):
-            with self.subTest(mode=mode):
-                errors = io.StringIO()
-                with (
-                    patch.object(settle, "_warm", return_value=True),
-                    patch.object(settle, "run_inventory", return_value=local),
-                    patch.object(settle, "other_machine", return_value="Mac"),
-                    patch.dict(os.environ, {"FAKE_SSH_MODE": mode}),
-                    redirect_stderr(errors),
-                ):
-                    result = settle.down(self.account)
-
-                self.assertEqual(result, 1)
-                self.assertIn(expected, errors.getvalue())
-                self.assertIn("nothing was shut down", errors.getvalue())
-                self.assertEqual(
-                    record.find_live(LOGIN), record.NoShutdown(kind="no shutdown")
-                )
-                self.assertEqual(self.logged_calls(self.notifier_log), [])
-
-    def test_restart_intent_exists_before_timers_are_stopped(self) -> None:
-        session = unit("unit-a", "Alpha")
-        def snapshot(_session: inventory.Session) -> list[record.TimerRestore]:
-            self.assertEqual(record.continuation(self.found_record()), "restart")
-            return []
-        with (
-            patch.object(settle, "run_inventory", return_value=machine_inventory([session])),
+            patch.object(settle, "run_inventory", return_value=machine_inventory([first, second])),
+            patch.object(settle, "_notifier_enabled", return_value=True),
             patch.object(settle, "_session_timer_snapshot", side_effect=snapshot),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            created = settle.begin(LOGIN, "external-requester", ("unit-a",), then="restart")
-        self.assertEqual(record.continuation(created), "restart")
-
-    def test_down_persists_restart_intent_on_both_machines_before_launch(self) -> None:
-        local = machine_inventory([], machine="natedev")
-        peer = machine_inventory([], machine="Mac")
-        peer_state = self.root / "peer-shutdown"
-        remote_commands: list[list[str]] = []
-
-        def remote_command(arguments: list[str]) -> tuple[int, str]:
-            remote_commands.append(arguments)
-            with patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(peer_state)}):
-                return shutdown.main(arguments), ""
-
-        def launch(login: str, label: str, here: bool) -> None:
-            self.assertEqual((login, label, here), (LOGIN, LABEL, False))
-            self.assertEqual(record.continuation(self.found_record()), "restart")
-            with patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(peer_state)}):
-                self.assertEqual(record.continuation(self.found_record()), "restart")
-
-        with (
-            patch.object(settle, "_warm", return_value=True),
-            patch.object(settle, "_preflight_inventories", return_value=settle.PreflightReady(kind="ready", reports=[local, peer])),
-            patch.object(settle, "_live_on_other", return_value=settle.NoRemoteRecord(kind="no shutdown")),
-            patch.object(settle, "run_inventory", return_value=local),
-            patch.object(settle, "run_remote", side_effect=remote_command),
-            patch.object(settle, "_launch_conductor", side_effect=launch),
-            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "external-requester"}),
-            redirect_stdout(io.StringIO()),
-        ):
-            self.assertEqual(settle.down(self.account, only=("unit-a",), then="restart"), 0)
-        self.assertEqual(remote_commands, [["begin", LOGIN, "--requested-by", "external-requester", "--only", "unit-a", "--then", "restart"]])
-
-    def test_remote_begin_refusal_cancels_restart_record_before_any_stop(self) -> None:
-        local = machine_inventory([])
-        with (
-            patch.object(settle, "_warm", return_value=True),
-            patch.object(settle, "_preflight_inventories", return_value=settle.PreflightReady(kind="ready", reports=[local, machine_inventory([], machine="Mac")])),
-            patch.object(settle, "_live_on_other", return_value=settle.NoRemoteRecord(kind="no shutdown")),
-            patch.object(settle, "run_inventory", return_value=local),
-            patch.object(settle, "run_remote", return_value=(1, "refused")),
-            patch.object(settle, "_launch_conductor") as launch,
-            patch.object(stop_work, "stop") as stop,
-            redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()),
-        ):
-            self.assertEqual(settle.down(self.account, then="restart"), 1)
-        self.assertEqual(record.find_live(LOGIN), record.NoShutdown(kind="no shutdown"))
-        launch.assert_not_called()
-        stop.assert_not_called()
-
-    def test_restart_shutdown_does_not_wait_for_an_external_requester(self) -> None:
-        session = unit("unit-a", "Alpha")
-        with (
-            patch.object(settle, "run_inventory", return_value=machine_inventory([session])),
-            patch.object(settle, "_session_timer_snapshot", return_value=[]),
-            patch.object(settle, "_send_settle_message") as send,
-            patch.object(settle, "_blocker", return_value=settle.ReadinessClear(kind="clear")),
-            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "unit-a"}),
-            redirect_stdout(io.StringIO()),
-        ):
-            _ = settle.begin(LOGIN, "external-requester", then="restart")
-            self.assertEqual(settle.ready("all work saved"), 0)
-            outcome = settle.conduct_cycle(LOGIN, {}, here=True)
-        self.assertEqual(outcome["kind"], "ready to stop")
-        self.assertEqual([entry["session"]["session_id"] for entry in self.found_record()["entries"]], ["unit-a"])
-        send.assert_not_called()
-
-    def test_failed_restart_conductor_launch_leaves_no_live_record(self) -> None:
-        with (
-            patch.object(settle, "_warm", return_value=True),
-            patch.object(settle, "run_inventory", return_value=machine_inventory([])),
-            patch.object(settle, "_launch_conductor", side_effect=RuntimeError("launch refused")),
-            patch.object(stop_work, "stop") as stop,
-            redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()),
-        ):
-            self.assertEqual(settle.down(self.account, here=True, then="restart"), 1)
-        self.assertEqual(record.find_live(LOGIN), record.NoShutdown(kind="no shutdown"))
-        stop.assert_not_called()
-
-    def test_down_succeeds_when_the_started_conductor_already_archived_its_record(self) -> None:
-        self.allow_leaf(ShutdownSendLeaf.LAUNCH_CONDUCTOR)
-        events: list[str] = []
-
-        def complete(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            self.assertIn(command[0], ("systemd-run", "launchctl"))
-            self.assertEqual(command[-3:], ["conduct", LOGIN, "--here"])
-            events.append("launched")
-
-            def stopped(current: record.ShutdownRecord) -> None:
-                self.assertEqual(record.continuation(current), "restart")
-                current["state"] = "down"
-            _ = record.update(LOGIN, stopped)
-            events.append("down")
-
-            def resumed(current: record.ShutdownRecord) -> None:
-                current["state"] = "up"
-            _ = record.update(LOGIN, resumed)
-            record.archive(LOGIN)
-            events.append("archived")
-            return subprocess.CompletedProcess(command, 0, "", "")
-
-        output = io.StringIO()
-        with (
-            patch.object(settle, "_warm", return_value=True),
-            patch.object(settle, "run_inventory", return_value=machine_inventory([])),
-            patch.object(subprocess, "run", side_effect=complete),
-            patch.object(settle, "_cancel_local") as cancel,
-            redirect_stdout(output),
-        ):
-            self.assertEqual(settle.down(self.account, here=True, then="restart"), 0)
-        self.assertEqual(events, ["launched", "down", "archived"])
-        self.assertIn(f"shutdown of {LABEL} started", output.getvalue())
-        self.assertEqual(record.find_live(LOGIN), record.NoShutdown(kind="no shutdown"))
-        cancel.assert_not_called()
-
-    def test_partial_restart_alert_keeps_manual_resume_and_adds_runnable_retry(self) -> None:
-        claimed = empty_shutdown_record("natedev", record.AllAccountSessions(kind="all account sessions"))
-        claimed["then"] = "restart"
-        claimed["requested_by"] = record.FromSession(kind="session", session_id="outside")
-        stopped = dict(claimed)
-        stopped["state"] = "stop partial"
-        with patch.object(settle, "alert_user") as alert, patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as send:
-            settle.report_stop(claimed, [completed_stop_report(cast(record.ShutdownRecord, cast(object, stopped)))], [])
-        expected = "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py down 'claude 2' --restart"
-        alert_text = cast(str, cast(object, alert.call_args.args[2]))
-        manual_resume = f"/shutdown restart in any Claude session on {LABEL}, or in a terminal ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart"
-        self.assertIn(manual_resume, alert_text.splitlines())
-        self.assertIn(expected, alert_text.splitlines())
-        self.assertEqual(alert.call_args.args[3], ActionRequired(f"Run {expected}."))
-        requester_text = cast(str, cast(object, send.call_args.args[2]))
-        self.assertIn(manual_resume, requester_text.splitlines())
-        self.assertIn(expected, requester_text.splitlines())
-
-    def test_complete_restart_stop_tells_requester_that_resume_is_automatic(self) -> None:
-        claimed = empty_shutdown_record("natedev", record.AllAccountSessions(kind="all account sessions"))
-        claimed["then"] = "restart"
-        claimed["requested_by"] = record.FromSession(kind="session", session_id="outside")
-        stopped = claimed.copy()
-        stopped["state"] = "down"
-        with (
-            patch.object(settle, "alert_user") as alert,
-            patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as send,
-        ):
-            settle.report_stop(claimed, [completed_stop_report(stopped)], [])
-        requester_text = cast(str, cast(object, send.call_args.args[2]))
-        self.assertIn("The sessions restart automatically: units on the unit account, other sessions on the account they ran on.", requester_text.splitlines())
-        self.assertNotIn("/shutdown restart", requester_text)
-        self.assertNotIn("shutdown.py restart", requester_text)
-        alert.assert_not_called()
-
-    def test_skipped_automatic_restart_notifies_user_for_a_selected_shutdown(self) -> None:
-        current = empty_shutdown_record("natedev", record.SelectedSessions(kind="selected", session_ids=["unit-a"]))
-        current["state"] = "down"
-        current["then"] = "restart"
-        settle.report_restart_skipped(current, "Mac: shutdown record not reached (unreachable)")
-        calls = self.sent_calls()
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["args"][1], "user")
-        self.assertIn(f"{LABEL}: automatic restart skipped", calls[0]["args"])
-        self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart 'claude 2'", calls[0]["text"])
-
-    def test_partial_restart_retry_preserves_stopped_entries_and_scope(self) -> None:
-        selected = record.SelectedSessions(kind="selected", session_ids=["unit-a", "unit-b"])
-        with patch.object(settle, "run_inventory", return_value=machine_inventory([unit("unit-a", "Alpha"), unit("unit-b", "Beta")])), patch.object(settle, "_session_timer_snapshot", return_value=[]):
-            _ = settle.begin(LOGIN, "outside", selected["session_ids"], then="restart")
-        def partial(current: record.ShutdownRecord) -> None:
-            current["state"] = "stop partial"
-            current["entries"][0]["progress"] = record.SessionStopped(kind="stopped", at=NOW)
-            current["entries"][1]["progress"] = record.SessionStopFailed(kind="stop failed", at=NOW, reason="still running")
-            current["entries"][1]["stop_issues"] = [record.StillRunningAfterStop(kind="still running", at=NOW, reason="still running")]
-        previous = record.update(LOGIN, partial)
-        with (
-            patch.object(settle, "_warm", return_value=True),
-            patch.object(settle, "_preflight_inventories", return_value=settle.PreflightReady(kind="ready", reports=[machine_inventory([])])),
-            patch.object(settle, "_launch_conductor") as launch,
-            redirect_stdout(io.StringIO()),
-        ):
-            self.assertEqual(settle.down(self.account, here=True, then="restart"), 0)
-        launch.assert_called_once_with(LOGIN, LABEL, True)
-        self.assertEqual(self.found_record(), previous)
-        settle.retry_stop(LOGIN)
-        current = self.found_record()
-        self.assertEqual(current["scope"], selected)
-        self.assertEqual(current["state"], "settling")
-        self.assertEqual([entry["progress"]["kind"] for entry in current["entries"]], ["stopped", "waiting"])
-        self.assertEqual(current["entries"][1]["stop_issues"], [])
-
-    def test_retry_conductor_prepares_both_records_before_settling(self) -> None:
-        current = empty_shutdown_record("natedev", record.AllAccountSessions(kind="all account sessions"))
-        current["state"] = "stop partial"
-        current["then"] = "restart"
-        record.create(current)
-        def ended(_login: str, _unreached: dict[str, datetime], _here: bool) -> settle.ConductorDecision:
-            self.assertEqual(self.found_record()["state"], "settling")
-            return settle.SettlementEnded(kind="settlement ended", reason="test completed")
-        with patch.object(settle, "run_remote", return_value=(0, "")) as peer, patch.object(settle, "conduct_cycle", side_effect=ended):
-            self.assertEqual(settle.conduct(LOGIN), 0)
-        peer.assert_called_once_with(["retry-stop", LOGIN])
-
-    def test_restart_retry_refuses_a_changed_scope_without_record_changes(self) -> None:
-        current = empty_shutdown_record("natedev", record.SelectedSessions(kind="selected", session_ids=["unit-a"]))
-        current["state"] = "stop partial"
-        current["then"] = "restart"
-        record.create(current)
-        with (
-            patch.object(settle, "_warm", return_value=True),
-            patch.object(settle, "_preflight_inventories", return_value=settle.PreflightReady(kind="ready", reports=[machine_inventory([])])),
-            patch.object(settle, "_launch_conductor") as launch,
+            patch.object(settle, "run_notifier", side_effect=[RuntimeError("stop failed"), None]) as notifier,
+            patch.object(settle, "_retire_shutdown_messages"),
             redirect_stderr(io.StringIO()),
         ):
-            self.assertEqual(settle.down(self.account, here=True, only=("unit-b",), then="restart"), 1)
-        self.assertEqual(self.found_record(), current)
-        launch.assert_not_called()
+            added = settle.begin(LOGIN, only=["first", "second"], request_id="one")
+        self.assertEqual([saved["session"]["session_id"] for saved in added], ["second"])
+        self.assertIsNone(record.find_session(LOGIN, "first"))
+        self.assertEqual(notifier.call_args_list, [call("stop", "timer-first"), call("start", "timer-first")])
 
-    def test_failed_peer_retry_keeps_partial_state_without_stopping_or_restarting(self) -> None:
-        current = empty_shutdown_record("natedev", record.AllAccountSessions(kind="all account sessions"))
-        current["state"] = "stop partial"
-        current["then"] = "restart"
-        record.create(current)
+    def test_down_starts_local_conductor_before_unreachable_peer_and_keeps_local_records(self) -> None:
+        events: list[str] = []
+        def launch(_login: str, _label: str) -> None:
+            events.append("local conductor")
+        def remote_call(arguments: list[str]) -> tuple[int, str]:
+            events.append("peer down")
+            self.assertEqual(arguments[0], "down")
+            self.assertIn("--request-id", arguments)
+            return 255, ""
         with (
-            patch.object(settle, "run_remote", return_value=(1, "retry refused")),
-            patch.object(settle, "other_machine", return_value="Mac"),
-            patch.object(settle, "report_stop") as alert,
-            patch.object(settle, "conduct_cycle") as cycle,
-            patch.object(restart_work, "restart") as restart,
+            patch.object(settle, "_warm", return_value=True),
+            patch.object(settle, "run_inventory", return_value=machine_inventory([top_level("owner", "Owner")])),
+            patch.object(settle, "_launch_conductor", side_effect=launch),
+            patch.object(settle, "run_remote", side_effect=remote_call),
+            redirect_stderr(io.StringIO()),
         ):
-            self.assertEqual(shutdown.main(["conduct", LOGIN]), 0)
-        self.assertEqual(self.found_record()["state"], "stop partial")
-        self.assertEqual(self.found_record()["stop_issues"][0]["kind"], "machine stop failed")
-        alert.assert_called_once()
-        cycle.assert_not_called()
-        restart.assert_not_called()
+            self.assertEqual(settle.down(Account("claude", LOGIN, LABEL)), 0)
+        self.assertEqual(events, ["local conductor", "peer down"])
+        self.assertIsNotNone(record.find_session(LOGIN, "owner"))
 
-    def test_restart_retry_accepts_peer_settling_after_its_reply_was_lost(self) -> None:
-        scope = record.SelectedSessions(kind="selected", session_ids=["unit-a"])
-        current = empty_shutdown_record("natedev", scope)
-        current["state"] = "stop partial"
-        current["then"] = "restart"
-        record.create(current)
-        peer_root = self.root / "peer-shutdown"
-        peer = current.copy()
-        peer["machine"] = "Mac"
-        with patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(peer_root)}):
-            record.create(peer)
-
-        def lost_reply(arguments: list[str]) -> tuple[int, str]:
-            self.assertEqual(arguments, ["retry-stop", LOGIN])
-            with patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(peer_root)}):
-                settle.retry_stop(LOGIN)
-            return 255, "reply lost"
-
+    def test_down_resumes_conductor_when_all_requested_sessions_already_have_records(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"))
+        self.save(saved)
+        before = record.find_session(LOGIN, "owner")
         with (
-            patch.object(settle, "run_remote", side_effect=lost_reply),
-            patch.object(settle, "other_machine", return_value="Mac"),
+            patch.object(settle, "_warm", return_value=True),
+            patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])),
+            patch.object(settle, "_launch_conductor") as launch,
+        ):
+            self.assertEqual(settle.down(Account("claude", LOGIN, LABEL), True, ["owner"], then="restart"), 0)
+        launch.assert_called_once_with(LOGIN, LABEL)
+        self.assertEqual(record.find_session(LOGIN, "owner"), before)
+
+    def test_cancel_keeps_stopped_and_stopping_records_and_their_timers(self) -> None:
+        stopped = session_shutdown(top_level("stopped", "Stopped"), progress={"kind": "stopped", "at": NOW})
+        stopping = session_shutdown(top_level("stopping", "Stopping"), progress={"kind": "stopping", "at": NOW})
+        waiting = session_shutdown(top_level("waiting", "Waiting"))
+        for saved in (stopped, stopping, waiting):
+            saved["timers"] = [record.TimerRestore(instance=saved["session"]["session_id"], was_enabled=True, footer={"kind": "no footer"})]
+            self.save(saved)
+        with patch.object(settle, "run_notifier") as notifier, patch.object(settle, "_retire_shutdown_messages"):
+            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True), 1)
+        notifier.assert_called_once_with("start", "waiting")
+        self.assertEqual(record.find_session(LOGIN, "stopped"), stopped)
+        self.assertEqual(record.find_session(LOGIN, "stopping"), stopping)
+        self.assertIsNone(record.find_session(LOGIN, "waiting"))
+
+    def test_cancel_after_stop_claim_leaves_paused_worker_and_timers_intact(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "ready", "at": NOW})
+        saved["timers"] = [record.TimerRestore(instance="timer", was_enabled=True, footer={"kind": "no footer"})]
+        self.save(saved)
+        entered, release = threading.Event(), threading.Event()
+        def kill(_pid: int, _signal: int) -> None:
+            entered.set()
+            self.assertTrue(release.wait(1))
+        errors: list[Exception] = []
+        def worker() -> None:
+            try:
+                _ = stop_work.stop_session(saved, kill=kill, is_alive=lambda _pid: False,
+                    session_record_exists=lambda _pid: False,
+                    fresh_inventory=lambda _login, _only: machine_inventory([saved["session"]]),
+                    clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0, tmux=lambda _args: 0, sleep=lambda _seconds: None)
+            except Exception as error:
+                errors.append(error)
+        thread = threading.Thread(target=worker)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            with patch.object(settle, "run_notifier") as notifier:
+                self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True), 1)
+                notifier.assert_not_called()
+            current = record.find_session(LOGIN, "owner")
+            self.assertIsNotNone(current)
+            if current is not None:
+                self.assertEqual(current["progress"]["kind"], "stopping")
+        finally:
+            release.set()
+            thread.join(1)
+        self.assertEqual(errors, [])
+
+    def test_now_marks_a_failed_stop_for_its_conductor(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "stop failed", "at": NOW, "reason": "still running"})
+        self.save(saved)
+        with patch.object(stop_work, "stop_session") as stop, patch.object(settle, "_launch_conductor") as launch:
+            self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), True), 0)
+        stop.assert_not_called()
+        current = record.find_session(LOGIN, "owner")
+        self.assertIsNotNone(current)
+        if current is not None:
+            self.assertEqual(current["force"], "now")
+        launch.assert_called_once_with(LOGIN, LABEL)
+
+    def test_now_conductor_retries_failed_stops_together_before_reporting(self) -> None:
+        for session_id in ("first", "second"):
+            self.save(session_shutdown(top_level(session_id, session_id), progress={"kind": "stop failed", "at": NOW, "reason": "still running"}))
+        entered = threading.Barrier(2)
+        completed: list[str] = []
+        def stop(saved: record.SessionShutdown) -> record.SessionShutdown:
+            self.assertEqual(saved["force"], "now")
+            _ = entered.wait(2)
+            result = self.fake_stop(saved)
+            completed.append(saved["session"]["session_id"])
+            return result
+        def report(_records: list[record.SessionShutdown]) -> None:
+            self.assertCountEqual(completed, ["first", "second"])
+        owners = [saved["session"] for saved in record.session_records(LOGIN)]
+        with patch.object(stop_work, "stop_session", side_effect=stop), patch.object(settle, "_launch_conductor", side_effect=self.run_conductor), patch.object(settle, "run_inventory", return_value=machine_inventory(owners)), patch.object(settle, "report_stop", side_effect=report):
+            self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), True), 0)
+        self.assertEqual([saved["progress"]["kind"] for saved in record.session_records(LOGIN)], ["stopped", "stopped"])
+
+    @staticmethod
+    def all_live(ids: frozenset[str], _timeout: float) -> frozenset[str]:
+        return ids
+
+    def fake_stop(self, saved: record.SessionShutdown) -> record.SessionShutdown:
+        def stop(current: record.SessionShutdown) -> None:
+            current["progress"] = {"kind": "stopped", "at": NOW}
+        return record.update_session(LOGIN, saved["session"]["session_id"], stop)
+
+    def fake_launch(self, saved: record.SessionShutdown, *, dry_run: bool, desktop_state: restart_work.DesktopLaunchState) -> record.SessionShutdown:
+        del desktop_state
+        self.assertFalse(dry_run)
+        def launch(current: record.SessionShutdown) -> None:
+            prior = current["progress"]
+            if prior["kind"] == "restarting":
+                prior = prior["prior"]
+            current["progress"] = {"kind": "restarting", "at": NOW, "prior": prior}
+        return record.update_session(LOGIN, saved["session"]["session_id"], launch)
+
+    def fake_confirm(self, saved: record.SessionShutdown, _at: str, live: bool) -> None:
+        self.assertTrue(live)
+        saved["progress"] = {"kind": "restarted", "at": NOW}
+        def confirm(current: record.SessionShutdown) -> None:
+            current["progress"] = saved["progress"]
+        _ = record.update_session(LOGIN, saved["session"]["session_id"], confirm)
+
+    def test_form_blocked_owner_holds_while_two_others_stop_and_return_in_one_pass(self) -> None:
+        owners: list[inventory.Session] = [top_level(name, name) for name in ("blocked", "first", "second")]
+        for owner in owners:
+            self.save(session_shutdown(owner, progress={"kind": "ready", "at": NOW}, then="restart"))
+        def end_pass(_seconds: float) -> None:
+            self.assertIsNone(record.find_session(LOGIN, "first"))
+            self.assertIsNone(record.find_session(LOGIN, "second"))
+            blocked = record.find_session(LOGIN, "blocked")
+            self.assertIsNotNone(blocked)
+            if blocked is not None:
+                self.assertEqual(blocked["progress"]["kind"], "ready")
+            raise PassObserved()
+        def form(owner: inventory.Session) -> bool:
+            return owner["session_id"] == "blocked"
+        with (
+            patch.object(settle, "run_inventory", return_value=machine_inventory(owners)),
+            patch.object(settle, "_showing_form", side_effect=form),
+            patch.object(stop_work, "stop_session", side_effect=self.fake_stop),
+            patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch),
+            patch.object(restart_work, "wait_for_sessions", side_effect=self.all_live) as wait,
+            patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm),
+            patch.object(time, "sleep", side_effect=end_pass),
+            self.assertRaises(PassObserved),
+        ):
+            _ = settle.conduct(LOGIN)
+        wait.assert_called_once_with(frozenset({"first", "second"}), restart_work.SESSION_WAIT_SECONDS)
+
+    def test_conductor_archives_restarted_without_launching_and_clears_only_its_hold(self) -> None:
+        done = session_shutdown(top_level("done", "Done"), progress={"kind": "restarted", "at": NOW})
+        self.save(done)
+        hold = record.AccountHold(login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW,
+                                  requested_by={"kind": "terminal"}, request_id="request-one", then="restart")
+        record.set_account_hold(hold)
+        with patch.object(settle, "report_stop"), patch.object(restart_work, "relaunch_session") as launch:
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        launch.assert_not_called()
+        self.assertEqual(record.session_records(LOGIN), [])
+        self.assertIsNone(record.account_hold(LOGIN))
+
+    def test_conductor_does_not_confirm_a_stale_claim_lost_to_another_caller(self) -> None:
+        old = (NOW_UTC - timedelta(seconds=121)).isoformat(timespec="seconds")
+        saved = session_shutdown(top_level("owner", "Owner"), progress={
+            "kind": "restarting", "at": old, "prior": {"kind": "stopped", "at": old},
+        }, then="restart")
+        self.save(saved)
+        def lose(current: record.SessionShutdown, *, dry_run: bool, desktop_state: restart_work.DesktopLaunchState) -> record.SessionShutdown:
+            del dry_run, desktop_state
+            def other_claim(changing: record.SessionShutdown) -> None:
+                progress = changing["progress"]
+                if progress["kind"] == "restarting":
+                    changing["progress"] = {"kind": "restarting", "at": NOW, "prior": progress["prior"]}
+            _ = record.update_session(LOGIN, "owner", other_claim)
+            return current
+        with (
+            patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])),
+            patch.object(restart_work, "relaunch_session", side_effect=lose),
+            patch.object(restart_work, "wait_for_sessions") as wait,
+            patch.object(restart_work, "confirm_entry") as confirm,
+            patch.object(time, "sleep", side_effect=PassObserved()),
+            self.assertRaises(PassObserved),
+        ):
+            _ = settle.conduct(LOGIN)
+        wait.assert_not_called()
+        confirm.assert_not_called()
+        latest = record.find_session(LOGIN, "owner")
+        self.assertIsNotNone(latest)
+        if latest is not None:
+            self.assertEqual(latest["progress"], {"kind": "restarting", "at": NOW, "prior": {"kind": "stopped", "at": old}})
+
+    def test_conductor_launches_eighth_before_waiting_for_missing_registry_entries(self) -> None:
+        owners: list[inventory.Session] = [top_level(str(index), str(index)) for index in range(8)]
+        for owner in owners:
+            self.save(session_shutdown(owner, progress={"kind": "stopped", "at": NOW}, then="restart"))
+        launches: list[str] = []
+        def launch(saved: record.SessionShutdown, *, dry_run: bool, desktop_state: restart_work.DesktopLaunchState) -> record.SessionShutdown:
+            launches.append(saved["session"]["session_id"])
+            return self.fake_launch(saved, dry_run=dry_run, desktop_state=desktop_state)
+        def wait(ids: frozenset[str], _timeout: float) -> frozenset[str]:
+            self.assertCountEqual(launches, [str(index) for index in range(8)])
+            self.assertEqual(ids, frozenset(launches))
+            return frozenset({"7"})
+        def confirm(saved: record.SessionShutdown, _at: str, live: bool) -> None:
+            saved["progress"] = ({"kind": "restarted", "at": NOW} if live
+                                 else {"kind": "restart failed", "at": NOW, "reason": "not live"})
+            def save(current: record.SessionShutdown) -> None:
+                current["progress"] = saved["progress"]
+            _ = record.update_session(LOGIN, saved["session"]["session_id"], save)
+        with (
+            patch.object(settle, "run_inventory", return_value=machine_inventory(owners)),
+            patch.object(restart_work, "relaunch_session", side_effect=launch),
+            patch.object(restart_work, "wait_for_sessions", side_effect=wait) as registry,
+            patch.object(restart_work, "confirm_entry", side_effect=confirm),
             patch.object(settle, "report_stop"),
         ):
             self.assertEqual(settle.conduct(LOGIN), 0)
-        self.assertEqual(self.found_record()["state"], "stop partial")
-        with patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(peer_root)}):
-            ready_peer = self.found_record()
-            self.assertEqual(ready_peer["state"], "settling")
-        with (
-            patch.object(settle, "_warm", return_value=True),
-            patch.object(settle, "_preflight_inventories", return_value=settle.PreflightReady(kind="ready", reports=[machine_inventory([]), machine_inventory([], machine="Mac")])),
-            patch.object(settle, "_live_on_other", return_value=settle.RemoteRecordFound(kind="live", record=ready_peer)),
-            patch.object(settle, "_launch_conductor") as launch,
-            redirect_stdout(io.StringIO()),
-        ):
-            self.assertEqual(settle.down(self.account, then="restart"), 0)
-        launch.assert_called_once_with(LOGIN, LABEL, False)
-        self.assertEqual(self.found_record()["scope"], scope)
+        registry.assert_called_once()
+        self.assertIsNone(record.find_session(LOGIN, "7"))
+        self.assertEqual(len(record.session_records(LOGIN)), 7)
+        self.assertTrue(all(saved["progress"]["kind"] == "restart failed" for saved in record.session_records(LOGIN)))
 
-    def test_restart_retry_refuses_a_settling_peer_with_another_scope(self) -> None:
-        current = empty_shutdown_record("natedev", record.SelectedSessions(kind="selected", session_ids=["unit-a"]))
-        current["state"] = "stop partial"
-        current["then"] = "restart"
-        record.create(current)
-        peer = current.copy()
-        peer["machine"] = "Mac"
-        peer["state"] = "settling"
-        peer["scope"] = record.SelectedSessions(kind="selected", session_ids=["unit-b"])
-        with (
-            patch.object(settle, "_warm", return_value=True),
-            patch.object(settle, "_preflight_inventories", return_value=settle.PreflightReady(kind="ready", reports=[machine_inventory([])])),
-            patch.object(settle, "_live_on_other", return_value=settle.RemoteRecordFound(kind="live", record=peer)),
-            patch.object(settle, "_launch_conductor") as launch,
-            redirect_stderr(io.StringIO()),
-        ):
-            self.assertEqual(settle.down(self.account, then="restart"), 1)
-        self.assertEqual(self.found_record(), current)
-        launch.assert_not_called()
-
-    def test_down_parks_an_unfinished_restart_and_starts_the_next_shutdown(self) -> None:
-        unfinished = empty_shutdown_record("natedev", record.SelectedSessions(kind="selected", session_ids=["unit-a"]))
-        unfinished["state"] = "restart partial"
-        record.create(unfinished)
-        peer = unfinished.copy()
-        peer["machine"] = "Mac"
-        output = io.StringIO()
-        with (
-            patch.object(settle, "_warm", return_value=True),
-            patch.object(settle, "_preflight_inventories", return_value=settle.PreflightReady(kind="ready", reports=[machine_inventory([])])),
-            patch.object(settle, "_live_on_other", return_value=settle.RemoteRecordFound(kind="live", record=peer)),
-            patch.object(settle, "run_inventory", return_value=machine_inventory([unit("unit-b", "Beta")])),
-            patch.object(settle, "_session_timer_snapshot", return_value=[]),
-            patch.object(settle, "run_remote", return_value=(0, "")),
-            patch.object(settle, "_launch_conductor") as launch,
-            redirect_stdout(output),
-        ):
-            self.assertEqual(settle.down(self.account, only=("unit-b",), then="restart"), 0)
-        launch.assert_called_once_with(LOGIN, LABEL, False)
-        self.assertEqual(record.parked(LOGIN), [unfinished])
-        self.assertEqual(self.found_record()["state"], "settling")
-        self.assertEqual([entry["session"]["session_id"] for entry in self.found_record()["entries"]], ["unit-b"])
-        self.assertIn(
-            f"shutdown: parked the unfinished restart of {LABEL} from 2026-10-09 14:49 PDT; /shutdown restart finishes it",
-            output.getvalue(),
-        )
-
-    def test_down_still_refuses_every_other_held_state_here_or_on_the_peer(self) -> None:
-        for state in ("settling", "stopping", "down", "stop partial", "restarting"):
-            held = empty_shutdown_record("natedev", record.AllAccountSessions(kind="all account sessions"))
-            held["state"] = cast(record.ShutdownState, state)
-            peer = held.copy()
-            peer["machine"] = "Mac"
-            for where in ("here", "peer"):
-                with self.subTest(state=state, where=where):
-                    if where == "here":
-                        record.create(held)
-                    output = io.StringIO()
-                    with (
-                        patch.object(settle, "_warm", return_value=True),
-                        patch.object(settle, "_preflight_inventories", return_value=settle.PreflightReady(kind="ready", reports=[machine_inventory([])])),
-                        patch.object(settle, "_live_on_other", return_value=settle.RemoteRecordFound(kind="live", record=peer)),
-                        patch.object(settle, "_launch_conductor") as launch,
-                        redirect_stdout(output), redirect_stderr(io.StringIO()),
-                    ):
-                        self.assertEqual(settle.down(self.account), 1)
-                    machine = "natedev" if where == "here" else "Mac"
-                    self.assertIn(f"shutdown: {machine} is already {state}", output.getvalue())
-                    launch.assert_not_called()
-                    self.assertEqual(record.parked(LOGIN), [])
-                    if where == "here":
-                        self.assertEqual(self.found_record(), held)
-                        (self.state_root / LOGIN / "record.json").unlink()
-
-    def test_begin_parks_only_an_unfinished_restart(self) -> None:
-        """The peer runs `begin` alone, so it parks and refuses without `down`'s checks."""
-        report = machine_inventory([unit("unit-b", "Beta")])
-        for state in ("settling", "stopping", "down", "stop partial", "restarting"):
-            with self.subTest(state=state):
-                held = empty_shutdown_record("natedev", record.AllAccountSessions(kind="all account sessions"))
-                held["state"] = cast(record.ShutdownState, state)
-                record.create(held)
-                with (
-                    patch.object(settle, "run_inventory", return_value=report),
-                    self.assertRaises(record.ShutdownInProgress),
-                ):
-                    _ = settle.begin(LOGIN)
-                self.assertEqual(record.account_records(LOGIN), [held])
-                (self.state_root / LOGIN / "record.json").unlink()
-        unfinished = empty_shutdown_record("natedev", record.AllAccountSessions(kind="all account sessions"))
-        unfinished["state"] = "restart partial"
-        record.create(unfinished)
-        output = io.StringIO()
+    def test_unreadable_account_keeps_record_held_without_stopping_or_sending(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "ready", "at": NOW})
+        self.save(saved)
+        report = machine_inventory([], unattributed=[inventory.UnattributedSession(pid=saved["session"]["pid"], name=saved["session"]["name"], reason="account unreadable")])
         with (
             patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "_session_timer_snapshot", return_value=[]),
-            patch.object(settle, "record_time", return_value="2026-10-10T01:02:03+00:00"),
-            redirect_stdout(output),
-        ):
-            created = settle.begin(LOGIN, then="restart")
-        self.assertEqual(record.account_records(LOGIN), [created, unfinished])
-        self.assertEqual((created["state"], created["requested_at"]), ("settling", "2026-10-10T01:02:03+00:00"))
-        self.assertEqual(
-            output.getvalue(),
-            f"shutdown: parked the unfinished restart of {LABEL} from 2026-10-09 14:49 PDT; /shutdown restart finishes it\n",
-        )
-
-    def test_down_names_the_account_on_its_first_output_line(self) -> None:
-        output = io.StringIO()
-        report = machine_inventory([])
-        with (
-            patch.object(settle, "_warm", return_value=True),
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "_launch_conductor"),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-            redirect_stdout(output),
-        ):
-            result = settle.down(self.account, here=True)
-
-        self.assertEqual(result, 0)
-        self.assertEqual(
-            output.getvalue().splitlines()[0],
-            "Account: claude 2 (owner@example.com)",
-        )
-
-    def test_failed_conductor_launch_cancels_local_and_remote_records(self) -> None:
-        local = machine_inventory([], machine="natedev")
-        remote = machine_inventory([], machine="Mac")
-        remote_commands: list[list[str]] = []
-
-        def remote_command(arguments: list[str]) -> tuple[int, str]:
-            remote_commands.append(arguments)
-            return 0, ""
-
-        with (
-            patch.object(settle, "_warm", return_value=True),
-            patch.object(
-                settle,
-                "_preflight_inventories",
-                return_value=settle.PreflightReady(
-                    kind="ready", reports=[local, remote]
-                ),
-            ),
-            patch.object(
-                settle,
-                "_live_on_other",
-                return_value=settle.NoRemoteRecord(kind="no shutdown"),
-            ),
-            patch.object(settle, "run_inventory", return_value=local),
-            patch.object(settle, "run_remote", side_effect=remote_command),
-            patch.object(
-                settle,
-                "_launch_conductor",
-                side_effect=RuntimeError("launch failed"),
-            ),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-        ):
-            result = settle.down(self.account)
-
-        self.assertEqual(result, 1)
-        self.assertEqual(
-            record.find_live(LOGIN), record.NoShutdown(kind="no shutdown")
-        )
-        self.assertIn(["cancel", LOGIN, "--here"], remote_commands)
-
-    def test_unreached_machine_keeps_conduct_settling_and_is_alerted(self) -> None:
-        report = machine_inventory([top_level("session", "Work")])
-        unreached: dict[str, datetime] = {}
-        failure = settle.RemoteUnreachable(kind="unreachable", machine="Mac")
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
-            patch.object(settle, "_remote_record", return_value=failure),
-            patch.object(settle, "merge_in_progress", return_value=False),
-        ):
-            _ = settle.begin(LOGIN)
-            outcome = settle.conduct_cycle(LOGIN, unreached)
-
-        self.assertEqual(outcome["kind"], "settlement pending")
-        pending = cast(settle.SettlementPending, outcome)
-        self.assertEqual(len(pending["reports"]), 1)
-        self.assertEqual(self.found_record()["state"], "settling")
-        self.assertEqual(unreached, {"Mac": NOW_UTC})
-
-        with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(
-                settle,
-                "now_utc",
-                return_value=NOW_UTC + timedelta(minutes=20),
-            ),
-            patch.object(settle, "_remote_record", return_value=failure),
-            patch.object(settle, "merge_in_progress", return_value=False),
-            patch.object(time, "sleep", side_effect=StopIteration),
-            self.assertRaises(StopIteration),
+            patch.object(stop_work, "stop_session") as stop,
+            patch.object(settle, "send_message") as send,
+            patch.object(time, "sleep", side_effect=PassObserved()),
+            self.assertRaises(PassObserved),
         ):
             _ = settle.conduct(LOGIN)
+        stop.assert_not_called()
+        send.assert_not_called()
+        self.assertEqual(record.find_session(LOGIN, "owner"), saved)
 
-        alert = self.sent_calls()[-1]
-        self.assertIn("Mac: not reached since", alert["text"])
-        self.assertIn("/shutdown now", alert["text"])
-        self.assertIn("/shutdown cancel", alert["text"])
+    def test_second_conductor_returns_without_observing_or_advancing_records(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"))
+        self.save(saved)
+        with record.conductor_lock(LOGIN), patch.object(settle, "run_inventory") as observe:
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        observe.assert_not_called()
+        self.assertEqual(record.find_session(LOGIN, "owner"), saved)
 
-    def test_holdout_alert_names_the_now_or_cancel_action_at_twenty_minutes(
-        self,
-    ) -> None:
-        report = machine_inventory([top_level("session", "Work")])
+    def test_running_stop_does_not_prevent_a_new_inventory_or_another_ready_owner(self) -> None:
+        slow = session_shutdown(top_level("slow", "Slow"), progress={"kind": "ready", "at": NOW})
+        fast = session_shutdown(top_level("fast", "Fast"))
+        self.save(slow)
+        self.save(fast)
+        entered, release, fast_done = threading.Event(), threading.Event(), threading.Event()
+        elapsed = [0.0]
+        calls = [0]
+        def stop(saved: record.SessionShutdown) -> record.SessionShutdown:
+            if saved["session"]["session_id"] == "slow":
+                entered.set()
+                self.assertTrue(release.wait(1))
+            result = self.fake_stop(saved)
+            if saved["session"]["session_id"] == "fast":
+                self.assertFalse(release.is_set())
+                fast_done.set()
+            return result
+        def tick(futures: list[Future[object]], *, timeout: float, return_when: str) -> tuple[set[Future[object]], set[Future[object]]]:
+            del timeout
+            calls[0] += 1
+            if calls[0] == 1:
+                self.assertTrue(entered.wait(1))
+                def ready(current: record.SessionShutdown) -> None:
+                    current["progress"] = {"kind": "ready", "at": NOW}
+                _ = record.update_session(LOGIN, "fast", ready)
+                elapsed[0] = 16.0
+            else:
+                self.assertTrue(fast_done.wait(1))
+                release.set()
+            return wait_futures(futures, timeout=0.01, return_when=return_when)
         with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.object(settle, "run_inventory", return_value=machine_inventory([slow["session"], fast["session"]])) as observe,
+            patch.object(stop_work, "stop_session", side_effect=stop),
+            patch.object(settle, "_send_settle_message"),
+            patch.object(settle, "report_stop"),
+            patch.object(time, "monotonic", side_effect=lambda: elapsed[0]),
+            patch.object(settle, "wait", side_effect=tick),
         ):
-            live = settle.begin(LOGIN)
-        twenty_minutes_later = NOW_UTC + timedelta(minutes=20)
+            try:
+                self.assertEqual(settle.conduct(LOGIN), 0)
+            finally:
+                release.set()
+        self.assertEqual(observe.call_count, 2)
 
-        with (
-            patch.object(
-                settle,
-                "conduct_cycle",
-                return_value=settle.SettlementPending(
-                    kind="settlement pending",
-                    reports=[
-                        settle.RefreshReport(
-                            record=live,
-                            verdicts=[
-                                settle.EntryVerdict(
-                                    session_id="session",
-                                    verdict=settle.Holdout(
-                                        kind="holdout",
-                                        line="natedev top-level Work: idle",
-                                    ),
-                                )
-                            ],
-                        )
-                    ],
-                ),
-            ),
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=twenty_minutes_later),
-            patch.object(settle, "merge_in_progress", return_value=False),
-            patch.object(time, "sleep", side_effect=StopIteration),
-            self.assertRaises(StopIteration),
-        ):
+    def test_desktop_restores_when_conducting_raises(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"))
+        self.save(saved)
+        with patch.object(settle, "run_inventory", side_effect=RuntimeError("inventory failed")), patch.object(restart_work.DesktopLaunchState, "restore") as restore, self.assertRaisesRegex(RuntimeError, "inventory failed"):
             _ = settle.conduct(LOGIN)
+        restore.assert_called_once_with(dry_run=False)
 
-        alert = self.sent_calls()[-1]
-        self.assertIn("Shutdown of claude 2: 1 not ready", alert["args"])
-        self.assertIn("decision", alert["args"])
-        action_index = alert["args"].index("--action")
-        self.assertEqual(
-            alert["args"][action_index + 1],
-            "Run /shutdown now to stop them anyway, or /shutdown cancel.",
-        )
-        self.assertIn("natedev top-level Work: idle", alert["text"])
-
-    def test_cancel_restores_only_recorded_enabled_states_and_names_peer(
-        self,
-    ) -> None:
-        enabled = self.write_instance("enabled", "session", enabled=True)
-        disabled = self.write_instance("disabled", "session", enabled=False)
-        report = machine_inventory(
-            [
-                top_level(
-                    "session",
-                    "Work",
-                    timers=[enabled.name, disabled.name],
-                )
-            ]
-        )
+    def test_registry_wait_does_not_prevent_another_owner_becoming_ready(self) -> None:
+        slow = session_shutdown(top_level("slow", "Slow"), progress={"kind": "stopped", "at": NOW}, then="restart")
+        fast = session_shutdown(top_level("fast", "Fast"), then="restart")
+        self.save(slow)
+        self.save(fast)
+        registry_entered, release, fast_confirmed = threading.Event(), threading.Event(), threading.Event()
+        elapsed = [0.0]
+        advanced = [False]
+        def registry(ids: frozenset[str], _timeout: float) -> frozenset[str]:
+            if ids == frozenset({"slow"}):
+                registry_entered.set()
+                self.assertTrue(release.wait(1))
+            else:
+                self.assertEqual(ids, frozenset({"fast"}))
+            return ids
+        def confirm(saved: record.SessionShutdown, at: str, live: bool) -> None:
+            if saved["session"]["session_id"] == "fast":
+                self.assertFalse(release.is_set())
+                fast_confirmed.set()
+                release.set()
+            self.fake_confirm(saved, at, live)
+        def tick(futures: list[Future[object]], *, timeout: float, return_when: str) -> tuple[set[Future[object]], set[Future[object]]]:
+            del timeout
+            if registry_entered.is_set() and not advanced[0]:
+                def ready(current: record.SessionShutdown) -> None:
+                    current["progress"] = {"kind": "ready", "at": NOW}
+                _ = record.update_session(LOGIN, "fast", ready)
+                elapsed[0], advanced[0] = 16.0, True
+            return wait_futures(futures, timeout=0.01, return_when=return_when)
         with (
-            patch.object(settle, "run_inventory", return_value=report),
-            patch.object(settle, "now_utc", return_value=NOW_UTC),
+            patch.object(settle, "run_inventory", return_value=machine_inventory([slow["session"], fast["session"]])) as observe,
+            patch.object(stop_work, "stop_session", side_effect=self.fake_stop),
+            patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch),
+            patch.object(restart_work, "wait_for_sessions", side_effect=registry),
+            patch.object(restart_work, "confirm_entry", side_effect=confirm),
+            patch.object(settle, "_send_settle_message"),
+            patch.object(settle, "report_stop"),
+            patch.object(time, "monotonic", side_effect=lambda: elapsed[0]),
+            patch.object(settle, "wait", side_effect=tick),
         ):
-            _ = settle.begin(LOGIN)
+            try:
+                self.assertEqual(settle.conduct(LOGIN), 0)
+            finally:
+                release.set()
+        self.assertTrue(fast_confirmed.is_set())
+        self.assertEqual(observe.call_count, 2)
 
-        def message_was_sent(current: record.ShutdownRecord) -> None:
-            current["entries"][0]["settle_message"] = record.SettleMessageSent(
-                kind="sent", at=NOW
-            )
-
-        _ = record.update(LOGIN, message_was_sent)
-
-        def start_conductor(current: record.ShutdownRecord) -> None:
-            current["conductor"] = record.SystemdConductor(
-                kind="systemd", unit="shutdown-test"
-            )
-
-        _ = record.update(LOGIN, start_conductor)
-        errors = io.StringIO()
+    def test_conductor_window_launches_share_desktop_state_on_the_calling_thread(self) -> None:
+        first, second, third = top_level("a", "a"), top_level("b", "b"), top_level("c", "c")
+        first["host"] = inventory.WindowHost(kind="ghostty", window_shell=1, desktop=inventory.NamedDesktop(kind="named", name="Work"))
+        second["host"] = inventory.WindowHost(kind="zed", window_shell=2, desktop=inventory.NamedDesktop(kind="named", name="Work"))
+        third["host"] = inventory.TerminalHost(kind="terminal")
+        owners: list[inventory.Session] = [third, second, first]
+        for owner in owners:
+            self.save(session_shutdown(owner, progress={"kind": "stopped", "at": NOW}, then="restart"))
+        caller = threading.get_ident()
+        launches: list[str] = []
+        states: list[restart_work.DesktopLaunchState] = []
+        def launch(saved: record.SessionShutdown, *, dry_run: bool, desktop_state: restart_work.DesktopLaunchState) -> record.SessionShutdown:
+            self.assertEqual(threading.get_ident(), caller)
+            launches.append(saved["session"]["session_id"])
+            states.append(desktop_state)
+            return self.fake_launch(saved, dry_run=dry_run, desktop_state=desktop_state)
         with (
-            patch.object(settle, "run_remote", return_value=(255, "")),
-            patch.object(settle, "other_machine", return_value="Mac"),
-            patch.object(settle, "_stop_conductor"),
-            redirect_stderr(errors),
+            patch.object(settle, "run_inventory", return_value=machine_inventory(owners)),
+            patch.object(restart_work, "relaunch_session", side_effect=launch),
+            patch.object(restart_work, "wait_for_sessions", side_effect=self.all_live),
+            patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm),
+            patch.object(settle, "report_stop"),
         ):
-            result = settle.cancel(self.account)
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        self.assertEqual(launches, ["a", "b", "c"])
+        self.assertTrue(all(state is states[0] for state in states))
 
-        self.assertEqual(result, 1)
-        self.assertIn(
-            "Mac not reached: run /shutdown cancel there when it is back",
-            errors.getvalue(),
-        )
-        self.assertTrue((enabled / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertTrue((disabled / "state").read_text().startswith("ENABLED=0\n"))
-        self.assertEqual(
-            self.logged_calls(self.notifier_log),
-            [["stop", enabled.name], ["start", enabled.name]],
-        )
-        self.assertEqual(
-            record.find_live(LOGIN), record.NoShutdown(kind="no shutdown")
-        )
-        sent = self.sent_calls()
-        self.assertEqual(len(sent), 2)
-        self.assertEqual(sent[0]["args"][0], "retire")
-        self.assertIn("cancelled by the user", sent[1]["text"])
+    def test_cancel_restores_enabled_timers_footers_and_retires_queued_messages(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"))
+        saved["settle_message"] = {"kind": "queued", "at": NOW, "reason": "busy"}
+        saved["timers"] = [record.TimerRestore(instance="enabled", was_enabled=True, footer={"kind": "footer", "slug": "production"}),
+                           record.TimerRestore(instance="off", was_enabled=False, footer={"kind": "no footer"})]
+        self.save(saved)
+        with patch.object(settle, "run_notifier") as timers, patch.object(settle, "_restore_footer") as footer, patch.object(settle, "_retire_shutdown_messages") as retire, patch.object(settle, "send_message", return_value={"kind": "sent"}) as send:
+            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True), 0)
+        timers.assert_called_once_with("start", "enabled")
+        footer.assert_called_once_with("production")
+        retire.assert_called_once_with(LOGIN, "owner")
+        self.assertIn("cancelled by the user: continue where you were", cast(str, send.call_args.args[2]))
+        self.assertIsNone(record.find_session(LOGIN, "owner"))
+
+    def test_ready_preserves_the_recorded_process_identity_and_where_contract(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"))
+        self.save(saved)
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "owner"}), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])):
+            self.assertEqual(settle.ready("next test"), 0)
+        changed = record.find_session(LOGIN, "owner")
+        self.assertIsNotNone(changed)
+        if changed is not None:
+            self.assertEqual(changed["session"], saved["session"])
+            self.assertEqual(changed["where"], {"kind": "said", "at": NOW, "text": "next test"})
+            self.assertEqual(changed["progress"], {"kind": "ready", "at": NOW})
+
+    def test_stop_only_account_with_no_owner_keeps_its_hold_until_restore(self) -> None:
+        hold = record.AccountHold(login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW,
+                                  requested_by={"kind": "terminal"}, request_id="empty", then="stop")
+        record.set_account_hold(hold)
+        with patch.object(settle, "report_stop"):
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        self.assertEqual(record.account_hold(LOGIN), hold)
+
+    def test_one_request_finishing_does_not_clear_a_different_requests_hold(self) -> None:
+        done = session_shutdown(top_level("done", "Done"), progress={"kind": "restarted", "at": NOW}, request_id="one")
+        stopped = session_shutdown(top_level("stopped", "Stopped"), progress={"kind": "stopped", "at": NOW}, request_id="two")
+        for saved in (done, stopped):
+            self.save(saved)
+        hold = record.AccountHold(login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW,
+                                  requested_by={"kind": "terminal"}, request_id="two", then="stop")
+        record.set_account_hold(hold)
+        with patch.object(settle, "report_stop"):
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        self.assertEqual(record.account_hold(LOGIN), hold)
+
+    def test_conductor_confirms_other_owners_before_stopping_the_requester(self) -> None:
+        owners: list[inventory.Session] = [top_level("other", "Other"), top_level("requester", "Requester")]
+        for owner in owners:
+            self.save(session_shutdown(owner, progress={"kind": "ready", "at": NOW}, requester="requester", then="restart"))
+        def stop(saved: record.SessionShutdown) -> record.SessionShutdown:
+            if saved["session"]["session_id"] == "requester":
+                self.assertIsNone(record.find_session(LOGIN, "other"))
+            return self.fake_stop(saved)
+        with (
+            patch.object(settle, "run_inventory", return_value=machine_inventory(owners)),
+            patch.object(stop_work, "stop_session", side_effect=stop),
+            patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch),
+            patch.object(restart_work, "wait_for_sessions", side_effect=self.all_live),
+            patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm),
+            patch.object(time, "sleep"),
+            patch.object(settle, "report_stop"),
+        ):
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        self.assertEqual(record.session_records(LOGIN), [])
+
+    def test_fake_sender_reads_message_input_but_retire_and_pending_leave_stdin_open(self) -> None:
+        sender = self.root / "sender.py"
+        _ = sender.write_text('import sys\nverb = sys.argv[1]\nif verb not in {"retire", "pending"}:\n    print(sys.stdin.read())\n')
+        for verb in ("retire", "pending"):
+            with subprocess.Popen([sys.executable, str(sender), verb], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+                self.assertEqual(process.wait(timeout=0.8), 0)
+        result = subprocess.run([sys.executable, str(sender), "send"], input="body", capture_output=True, text=True, check=False, timeout=0.8)
+        self.assertEqual(result.stdout, "body\n")
+
+    def test_report_stop_lists_peer_waiting_and_alerts_only_requested_failures(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "stop failed", "at": NOW, "reason": "busy"}, requester="requester")
+        saved["hold"] = "account"
+        peer = session_shutdown(top_level("peer", "Peer"))
+        peer["machine"] = "Mac"
+        with patch.object(settle, "run_remote", return_value=(0, json.dumps([peer]))), patch.object(settle, "send_message", return_value={"kind": "sent"}) as send, patch.object(settle, "alert_user") as alert:
+            settle.report_stop([saved])
+        self.assertIn("Mac Peer: waiting", cast(str, send.call_args.args[2]))
+        self.assertEqual(send.call_args.kwargs["key"], f"shutdown-result-{LOGIN}")
+        alert.assert_called_once()
+        saved["alerts"] = "none"
+        with patch.object(settle, "run_remote", return_value=(255, "")), patch.object(settle, "send_message", return_value={"kind": "sent"}), patch.object(settle, "alert_user") as alert:
+            settle.report_stop([saved])
+        alert.assert_not_called()
+
+    def test_conductor_rechecks_ready_work_added_after_its_final_snapshot(self) -> None:
+        saved = session_shutdown(top_level("late", "Late"), progress={"kind": "ready", "at": NOW})
+        read = record.session_records
+        added = False
+        def snapshot(login: str) -> list[record.SessionShutdown]:
+            nonlocal added
+            records = read(login)
+            if not added:
+                added = True
+                self.save(saved)
+                self.assertEqual(settle.conduct(login), 0)
+            return records
+        with patch.object(record, "session_records", side_effect=snapshot), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])), patch.object(stop_work, "stop_session", side_effect=self.fake_stop) as stop, patch.object(settle, "report_stop"):
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        stop.assert_called_once()
+        current = record.find_session(LOGIN, "late")
+        self.assertIsNotNone(current)
+        if current is not None:
+            self.assertEqual(current["progress"]["kind"], "stopped")
+
+    def test_conductor_handoff_keeps_work_owned_across_release_interleavings(self) -> None:
+        for moment in ("before release", "after release", "after recheck"):
+            with self.subTest(moment=moment):
+                saved = session_shutdown(top_level(moment.replace(" ", "-"), moment), progress={"kind": "ready", "at": NOW})
+                saved["request_id"] = moment
+                real_lock, read = record.conductor_lock, record.session_records
+                inserted, released, deferred = False, False, False
+                def add() -> None:
+                    nonlocal inserted
+                    inserted = True
+                    self.save(saved)
+                @contextmanager
+                def handoff(login: str) -> Generator[record.ConductorAcquired | record.ConductorAlreadyRunning, None, None]:
+                    nonlocal released
+                    with real_lock(login) as ownership:
+                        yield ownership
+                        if isinstance(ownership, record.ConductorAcquired) and not inserted and moment == "before release":
+                            add()
+                            self.assertEqual(settle.conduct(login), 0)
+                    if isinstance(ownership, record.ConductorAcquired):
+                        released = True
+                        if not inserted and moment == "after release":
+                            add()
+                            self.assertEqual(settle.conduct(login), 0)
+                def snapshot(login: str) -> list[record.SessionShutdown]:
+                    nonlocal deferred
+                    records = read(login)
+                    if released and not inserted and moment == "after recheck":
+                        add()
+                        deferred = True
+                    return records
+                with patch.object(record, "conductor_lock", side_effect=handoff), patch.object(record, "session_records", side_effect=snapshot), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])), patch.object(stop_work, "stop_session", side_effect=self.fake_stop) as stop, patch.object(settle, "report_stop"):
+                    self.assertEqual(settle.conduct(LOGIN), 0)
+                    if deferred:
+                        self.assertEqual(settle.conduct(LOGIN), 0)
+                stop.assert_called_once()
+                current = record.find_session(LOGIN, saved["session"]["session_id"])
+                self.assertIsNotNone(current)
+                if current is not None:
+                    self.assertEqual(current["progress"]["kind"], "stopped")
+                record.archive_session(LOGIN, saved["session"]["session_id"])
+
+    def test_begin_stops_timers_before_a_waiting_cancel_can_restore_them(self) -> None:
+        owner = top_level("owner", "Owner", timers=["timer"])
+        saved_snapshot = threading.Event()
+        cancelled = threading.Event()
+        events: list[str] = []
+        failures: list[Exception] = []
+        update = record.update_session
+        def save_snapshot(login: str, session_id: str, change: object) -> record.SessionShutdown:
+            result = update(login, session_id, cast('Callable[[record.SessionShutdown], None]', change))
+            saved_snapshot.set()
+            self.assertTrue(cancelled.wait(2))
+            return result
+        def cancel_waiter() -> None:
+            try:
+                self.assertTrue(saved_snapshot.wait(2))
+                _ = settle.cancel(Account("claude", LOGIN, LABEL), True)
+            except Exception as error:
+                failures.append(error)
+            finally:
+                cancelled.set()
+        def notifier(verb: str, _instance: str) -> None:
+            events.append(verb)
+        with patch.object(settle, "run_inventory", return_value=machine_inventory([owner])), patch.object(settle, "_notifier_enabled", return_value=True), patch.object(record, "update_session", side_effect=save_snapshot), patch.object(settle, "run_notifier", side_effect=notifier), patch.object(settle, "_retire_shutdown_messages"):
+            worker = threading.Thread(target=cancel_waiter)
+            worker.start()
+            try:
+                _ = settle.begin(LOGIN, only=["owner"], request_id="timer-request")
+            finally:
+                worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(events, ["stop", "start"])
+        self.assertIsNone(record.find_session(LOGIN, "owner"))
+
+    def test_cancel_clears_account_hold_while_retaining_stopped_and_stopping_sessions(self) -> None:
+        for kind in ("stopped", "stopping"):
+            self.save(session_shutdown(top_level(kind, kind), progress=cast(record.SessionProgress, cast(object, {"kind": kind, "at": NOW}))))
+        record.set_account_hold(record.AccountHold(login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW,
+            requested_by={"kind": "terminal"}, request_id="request-one", then="stop"))
+        self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True), 1)
+        self.assertIsNone(record.account_hold(LOGIN))
+        self.assertEqual(len(record.session_records(LOGIN)), 2)
+
+    def test_cancel_names_each_retained_records_actual_progress(self) -> None:
+        progress: list[record.SessionProgress] = [
+            {"kind": "stopped", "at": NOW}, {"kind": "stopping", "at": NOW},
+            {"kind": "restarting", "at": NOW, "prior": {"kind": "stopped", "at": NOW}},
+            {"kind": "restarted", "at": NOW}, {"kind": "restart failed", "at": NOW, "reason": "not live"},
+            {"kind": "manual restart", "command": "resume owner"},
+            {"kind": "timers pending", "at": NOW, "timers": [{"instance": "timer", "reason": "not started"}]},
+            {"kind": "stop failed", "at": NOW, "reason": "busy"},
+        ]
+        for index, item in enumerate(progress):
+            self.save(session_shutdown(top_level(str(index), str(index)), progress=item))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True), 1)
+        for index, item in enumerate(progress):
+            line = output.getvalue().splitlines()[index]
+            self.assertTrue(line.startswith(f"{index} was not cancelled: {item['kind']}"))
+            self.assertTrue(line.endswith("; /shutdown restart brings it back"))
+        self.assertIn("restart failed — not live", output.getvalue())
+        self.assertIn("manual restart — run: resume owner", output.getvalue())
+
+    def test_request_added_just_after_cancel_keeps_its_settle_instruction(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"))
+        saved["settle_message"] = {"kind": "sent", "at": NOW}
+        self.save(saved)
+        key = f"shutdown-{LOGIN}-owner"
+        queue: dict[str, str] = {key: "old instruction"}
+        delivered: list[str] = []
+        withdraw = record.withdraw_session
+        def send(_recipient: str, _summary: str, text: str, *, key: str) -> settle.MessageDelivery:
+            queue[key] = text
+            delivered.append(text)
+            return {"kind": "sent"}
+        def retire(_login: str, _session_id: str) -> None:
+            queue.clear()
+        def withdraw_then_request(login: str, session_id: str, restore: Callable[[record.SessionShutdown], None]) -> record.SessionWithdrawn | record.SessionRetained:
+            outcome = withdraw(login, session_id, restore)
+            added = settle.begin(LOGIN, only=["owner"], request_id="new-request")
+            self.assertEqual(len(added), 1)
+            settle._send_settle_message(added[0])  # pyright: ignore[reportPrivateUsage]
+            return outcome
+        with patch.object(record, "withdraw_session", side_effect=withdraw_then_request), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])), patch.object(settle, "_retire_shutdown_messages", side_effect=retire), patch.object(settle, "send_message", side_effect=send):
+            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True), 0)
+        current = record.find_session(LOGIN, "owner")
+        assert current is not None
+        self.assertEqual(current["request_id"], "new-request")
+        self.assertEqual(current["progress"]["kind"], "waiting")
+        self.assertIn("cancelled by the user", delivered[0])
+        self.assertEqual(queue[key], delivered[-1])
+        self.assertIn("ready", queue[key])
+        self.assertNotIn("cancelled by the user", queue[key])
+
+    def test_status_and_hold_reason_keep_delivery_text_separate_from_observed_details(self) -> None:
+        for status in ("idle", "busy"):
+            with self.subTest(status=status):
+                saved = session_shutdown(top_level("owner", "Owner", status=status))
+                saved["settle_message"] = {"kind": "queued", "at": NOW, "reason": "delivery pending, retry later"}
+                owner = self.matching(saved)
+                queued = "message queued: delivery pending, retry later"
+                expected_reason = queued if status == "idle" else f"busy, {queued}"
+                self.assertEqual(settle.hold_reason(saved, owner), expected_reason)
+                detail = "" if status == "idle" else " — busy"
+                self.assertEqual(settle.status_record_lines(saved, owner), [f"  Owner: waiting{detail} · {queued}"])
+
+    def test_conductor_drops_records_cancelled_before_its_result(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"), requester="requester")
+        self.save(saved)
+        def cancelled(_login: str, _only: object = ()) -> inventory.Inventory:
+            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True), 0)
+            return machine_inventory([])
+        with patch.object(settle, "run_inventory", side_effect=cancelled), patch.object(settle, "_retire_shutdown_messages"), patch.object(stop_work, "stop_session", side_effect=record.NoLiveRecord("cancelled")), patch.object(settle, "report_stop") as report:
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        self.assertEqual(report.call_args.args[0], [])
+
+    def test_conductor_drops_records_archived_by_another_restore_caller(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "stopped", "at": NOW}, then="restart")
+        self.save(saved)
+        def resumed(_login: str, _only: object = ()) -> inventory.Inventory:
+            def complete(current: record.SessionShutdown) -> None:
+                current["progress"] = {"kind": "restarted", "at": NOW}
+            _ = record.update_session(LOGIN, "owner", complete)
+            record.archive_session(LOGIN, "owner")
+            return machine_inventory([])
+        with patch.object(settle, "run_inventory", side_effect=resumed), patch.object(restart_work, "relaunch_session", side_effect=record.NoLiveRecord("finished elsewhere")), patch.object(settle, "report_stop") as report:
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        self.assertEqual(report.call_args.args[0], [])
+
+    def test_report_stop_treats_owner_resource_issues_as_a_partial_stop(self) -> None:
+        for kind in ("stopped", "already gone", "process identity lost"):
+            for alerts in ("user", "none"):
+                saved = session_shutdown(top_level("owner", "Owner"), progress=cast(record.SessionProgress, cast(object, {"kind": kind, "at": NOW})), requester="requester")
+                saved["hold"], saved["alerts"] = "account", alerts
+                saved["stop_issues"] = [record.UnitTmuxLeftRunning(kind="unit tmux session left running", at=NOW, tmux_session="unit", cause="stop not confirmed")]
+                with patch.object(settle, "run_remote", return_value=(0, "[]")), patch.object(settle, "send_message", return_value={"kind": "sent"}) as send, patch.object(settle, "alert_user") as alert:
+                    settle.report_stop([saved])
+                self.assertEqual(send.call_args.args[1], f"{LABEL}: stop partial")
+                self.assertIn("/shutdown now retries the failed stop", cast(str, send.call_args.args[2]))
+                self.assertEqual(alert.call_count, int(alerts == "user"))
+
+    def test_now_leaves_failed_stop_retries_to_the_conductor(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "stop failed", "at": NOW, "reason": "still running"})
+        self.save(saved)
+        with patch.object(stop_work, "stop_session") as stop, patch.object(settle, "_launch_conductor") as launch:
+            self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), True), 0)
+        stop.assert_not_called()
+        launch.assert_called_once_with(LOGIN, LABEL)
+
+    def test_now_retries_stopped_owner_resource_cleanup_in_its_conductor(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "stopped", "at": NOW})
+        saved["stop_issues"] = [record.CodexServerLeftRunning(kind="codex server left running", at=NOW, run_dir="/tmp/run", cause="stop not confirmed")]
+        self.save(saved)
+        def cleaned(current: record.SessionShutdown) -> None:
+            current["stop_issues"] = []
+        def cleanup(current: record.SessionShutdown) -> record.SessionShutdown:
+            self.assertEqual(current["force"], "now")
+            return record.update_session(LOGIN, "owner", cleaned)
+        with patch.object(settle, "_launch_conductor", side_effect=self.run_conductor), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])), patch.object(stop_work, "stop_session", side_effect=cleanup) as stop, patch.object(settle, "report_stop"):
+            self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), True), 0)
+        stop.assert_called_once()
+        current = record.find_session(LOGIN, "owner")
+        self.assertIsNotNone(current)
+        if current is not None:
+            self.assertEqual(current["stop_issues"], [])
+
+    def test_now_reports_a_persistent_cleanup_failure_after_one_owned_retry(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "already gone", "at": NOW})
+        saved["stop_issues"] = [record.UnitTmuxLeftRunning(kind="unit tmux session left running", at=NOW, tmux_session="unit", cause="stop not confirmed")]
+        self.save(saved)
+        def failed_cleanup(current: record.SessionShutdown) -> record.SessionShutdown:
+            return current
+        with patch.object(settle, "_launch_conductor", side_effect=self.run_conductor), patch.object(settle, "run_inventory", return_value=machine_inventory([])), patch.object(stop_work, "stop_session", side_effect=failed_cleanup) as stop, patch.object(settle, "report_stop") as report:
+            self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), True), 0)
+        stop.assert_called_once()
+        outcome = cast(list[record.SessionShutdown], report.call_args.args[0])[0]
+        self.assertTrue(record.stop_incomplete(outcome))
+        self.assertEqual(outcome["force"], "wait for ready")
 
 
 if __name__ == "__main__":
