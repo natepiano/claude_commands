@@ -384,6 +384,21 @@ raise SystemExit(1)
         for lookup in ("parent", "children", "root"):
             self.assertIn("gone has no update timer", self.refused(lookup, "gone"))
 
+    def test_a_root_s_place_holds_every_level_below_it_and_a_lower_one_names_its_root(self) -> None:
+        self.stored_parent("mid", "top")
+        self.stored_parent("other", "top")
+        self.stored_parent("leaf", "mid")
+        known = {"top", "mid", "other", "leaf", "alone"}
+        with (mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state),
+              mock.patch.object(showrunners, "timer_slugs", return_value=known)):
+            self.assertEqual(showrunners.place_of("top"), showrunners.Place("", ["mid", "other", "leaf"]))
+            self.assertEqual(showrunners.place_of("mid"), showrunners.Place("top", []))
+            self.assertEqual(showrunners.place_of("leaf"), showrunners.Place("top", []))
+            self.assertEqual(showrunners.place_of("alone"), showrunners.Place("", []))
+            self.assertEqual(showrunners.descendants_of("mid"), ["leaf"])
+            self.assertEqual(showrunners.user_facing("top"), ["top", "mid", "other", "leaf"])
+            self.assertEqual(showrunners.user_facing("mid"), ["mid"])
+
     def test_what_all_must_hear_once_goes_to_the_highest_running_showrunner_of_each_tree(self) -> None:
         def runner(slug: str, *, running: bool) -> showrunners.Showrunner:
             return showrunners.Showrunner(session=slug if running else "", socket=f"/{slug}.sock" if running else "",

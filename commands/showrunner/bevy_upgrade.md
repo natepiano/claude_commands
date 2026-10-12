@@ -18,3 +18,5 @@ report its error in one line.
 - Use `note` for what a script cannot look up, such as why a pull request's CI
   fails. With no text, it clears the note.
 - A report says `stale` when the table does.
+- When a row says `ask the user: git pin?`, ask once, then record the answer
+  with `approve` or `decline`. Pinning an unmerged PR's branch needs the same answer.

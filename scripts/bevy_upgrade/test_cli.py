@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, final
 from zoneinfo import ZoneInfo
@@ -360,6 +360,8 @@ class CliTests(unittest.TestCase):
 
     def write_fixtures(self, ready: bool = False) -> None:
         api = "https://crates.io/api/v1/crates"
+        github = "https://api.github.com/repos/example/adapter"
+        rev = "abcdef0123456789"
         bodies: dict[str, object] = {
             f"{api}/bevy/versions": {"versions": [{"num": "0.20.0", "created_at": "2026-10-12T00:00:00Z"}]},
             f"{api}/adapter": {"crate": {"repository": "https://github.com/example/adapter.git"},
@@ -368,7 +370,17 @@ class CliTests(unittest.TestCase):
                 {"crate_id": "bevy_ecs", "kind": "normal", "req": "^0.20" if ready else "^0.19"}]},
             f"{api}/adapter/1.2.3/dependencies": {"dependencies": [
                 {"crate_id": "bevy_ecs", "kind": "normal", "req": "^0.19"}]},
+            github: {"default_branch": "main"},
+            f"{github}/commits/main": {"sha": rev, "commit": {"committer": {"date": "2026-10-12T00:00:00Z"}}},
+            f"https://raw.githubusercontent.com/example/adapter/{rev}/Cargo.toml": '[dependencies]\nbevy = "^0.19"\n',
+            f"{github}/pulls/7": {"state": "open", "merged": False,
+                                 "head": {"ref": "port", "sha": "1234567890abcdef"}},
         }
+        for since in {"2026-10-12", datetime.now(timezone.utc).date().isoformat()}:
+            bodies[f"{github}/issues?state=all&since={since}T00:00:00Z&sort=updated&direction=desc&per_page=100"] = [
+                {"number": 7, "title": "Port to Bevy 0.20", "state": "open", "pull_request": {},
+                 "created_at": "2026-10-12T00:00:00Z", "updated_at": "2026-10-12T00:00:00Z"},
+            ]
         _ = (self.root / "fixtures.json").write_text(json.dumps(bodies), encoding="utf-8")
 
     def test_start_checks_from_fixtures_before_its_single_save(self) -> None:
@@ -399,11 +411,15 @@ class CliTests(unittest.TestCase):
         self.assert_table(result)
         self.assertEqual((self.root / "save-calls").read_text(encoding="utf-8"), "saved\n")
         self.assertEqual((self.root / "fetch-calls").read_text(encoding="utf-8").splitlines(),
-                         ["https://crates.io/api/v1/crates/adapter"])
+                         ["https://crates.io/api/v1/crates/adapter",
+                          "https://api.github.com/repos/example/adapter/commits/main",
+                          "https://api.github.com/repos/example/adapter/issues?state=all&since=2026-10-12T00:00:00Z&sort=updated&direction=desc&per_page=100"])
         current = self.read_record()
         self.assertEqual(current["dependencies"]["adapter"]["pin"]["version"], "1.2.4")
         self.assertEqual(current["dependencies"]["adapter"]["bevy"], "0.19.2")
         self.assertIsNotNone(current["checked"])
+        self.assertIn("| main @ abcdef0 on Bevy ^0.19; PR #7 open (port @ 1234567) | port in PR | wait for PR #7 |",
+                      result.stdout)
 
     def test_check_failed_pin_read_makes_no_request_or_save_and_exits_one(self) -> None:
         self.begin()
@@ -444,6 +460,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual((self.root / "save-calls").read_text(encoding="utf-8"), "saved\n")
         self.assertEqual((self.root / "fetch-calls").read_text(encoding="utf-8").splitlines(), [
             "https://crates.io/api/v1/crates/missing-fixture", "https://crates.io/api/v1/crates/adapter",
+            "https://api.github.com/repos/example/adapter/commits/main",
+            "https://api.github.com/repos/example/adapter/issues?state=all&since=2026-10-12T00:00:00Z&sort=updated&direction=desc&per_page=100",
         ])
 
     def test_start_succeeds_when_all_upstream_lookups_fail(self) -> None:

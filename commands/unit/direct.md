@@ -97,10 +97,16 @@ later implementation, repair, and follow-up work with `implement.sh --to
 seat in the same role when the next assignment fits; otherwise move it, even
 mid-phase, under <RoleReassignment/>. A finished turn leaves its thread open.
 
+When the production doc names a review pool and <ProductionUnit/>'s `arm`
+prints `pool`, send code reviews with
+`review.sh --pool code --lease <slug>/<unit>/<phase>` instead of `--to`.
+
 Compaction can erase earlier prompt text. Every opening, later-phase, repair,
 review, and follow-up prompt repeats the Three Gods sentence and carries the
 Type Design Contract verbatim or by its allowed pointer under
 <WritePromptContract/>.
+For the pool arm of a production whose doc names a review pool, review
+prompts use <ReviewPromptContract/>'s standing-instructions line.
 
 Before follow-up work, the launcher attempts to compact a seat whose recorded
 context is over `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (default `100000` in
@@ -262,6 +268,10 @@ Applies to every implementation, test, fix, and review launcher.
 </DispatchContract>
 
 <DelegateLaunchFailure>
+When the production doc names a review pool, on a pool review's `error` export
+`REVIEW_LEASE=<slug>/<unit>/<phase>` and retry with
+`review.sh --to <full-seat-name>` for that review.
+
 A dispatch that dies in seconds never reached the provider, and a provider
 message it prints is a message some earlier call received. Seats launched
 together that fail within seconds of each other carrying **byte-identical text,
@@ -896,10 +906,16 @@ At an eligible tick, in that same tick:
 3. Apply <ReviewDiffContract/> to the current partial tree. The delegate has
    named no created files yet, so that check is vacuous; the snapshot is
    expected to be incomplete.
-4. Select its seat under <TeamReview/> and save the slot as
-   `${EARLY_REVIEW_SLOT}`. Apply <RoleReassignment/> when the open seat's role
-   changes; when every open seat is busy, name a new `review` seat and keep it
-   after the turn. Write the applicable early-form prompt — the `adversary`
+4. When the production doc names a review pool and the phase's arm is `pool`,
+   select no seat. Otherwise select its seat under <TeamReview/>, save the
+   slot as `${EARLY_REVIEW_SLOT}`, and apply <RoleReassignment/> when the open
+   seat's role changes; when every open seat is busy, name a new `review` seat
+   and keep it after the turn. On the pool arm, read `${EARLY_REVIEW_SLOT}`
+   when a cancel call needs it:
+   the one line in `${SESSION_DIR}/review_slot_adversary` for pass 1, or
+   `${SESSION_DIR}/review_slot` for a closure. A missing file means the launcher
+   opened no pass, so record nothing.
+   Write the applicable early-form prompt — the `adversary`
    lens of
    <BroadReviewPrompt/> for pass 1, <ClosureReview/> for a fix — including the
    completion estimate, the partial diff, and the exact final-diff and
@@ -907,7 +923,9 @@ At an eligible tick, in that same tick:
    that gains most from the extra time, and arming both against a partial
    tree would double the exposure to the void verdict below; `contract`
    launches at completion under <DualReview/> step 3.
-5. Launch `review.sh` exactly as <DualReview/> step 3 does — with `--to` for an
+5. Launch `review.sh` exactly as <DualReview/> step 3 does — with
+   `--pool code --lease <slug>/<unit>/<phase>` when the production doc names
+   a review pool and the phase's arm is `pool`; otherwise with `--to` for an
    open seat or `--slot "${EARLY_REVIEW_SLOT}"` for the new seat, and
    `adversary` as its lens for pass 1 — appending one extra final argument:
    `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
@@ -937,7 +955,7 @@ always may — early launch is opportunistic, never required.
 | Event | Required action |
 | --- | --- |
 | Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${SESSION_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** |
-| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
+| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; on the pool arm, read the slot per step 4 and skip this call if the file is missing. Before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
 | Reviewer errors before delivery | Report it in one line, clear `${REVIEW_DISPATCH_HANDLE}` and `${EARLY_REVIEW_SLOT}`, set `EARLY_REVIEW=none`, and leave the numbered artifacts. The primary continues and is reviewed synchronously at completion under the next `${REVIEW_PASS}` index. |
 | A verdict arrives before delivery | **It is void.** The reviewer cannot have read a diff that does not exist yet, so discard its findings entirely rather than reading them as evidence: open nothing in the ledger, preempt nothing, route no blocker into a fix dispatch. Say in one line that it is discarded and why, then follow the reviewer-error row. A void verdict is often fluent and specific — a stale diff supports confident claims about missing work — so the check is the timing, never how convincing the text reads. |
 
@@ -1081,6 +1099,9 @@ question, never on a path. Select its open seat under <TeamReview/>, post the
 <RoleReassignment/> handoff when its role changes, and launch it with
 `review.sh --to`; when every open seat is busy, open and retain a role-named
 review seat with `review.sh --slot review` instead.
+When the production doc names a review pool and the phase's arm is `pool`,
+use `review.sh --pool code --lease <slug>/<unit>/<phase>` instead of selecting
+an open seat.
 
 On completion, `implemented` continues as above; `error` applies
 <DelegateLaunchFailure/>, and then, if the error survives it,

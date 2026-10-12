@@ -13,14 +13,16 @@ from pathlib import Path
 from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo
 
+import showrunners
 import unit_lookup
 from add_unit import Refusal, cell_value, live_unit_table, read_production, unit_table
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_counts import CountsFailure, production_counts
-from dailies_render import (InputError, StateRefused, as_list, as_map, check_render_state,
-                            local_now, parse_range_end, parse_report, parse_time)
+from dailies_render import (InputError, StateRefused, as_list, as_map, check_render_state, due, last_report,
+                            local_now, parse_child_report, parse_range_end, parse_report, parse_time,
+                            read_outstanding)
 from merge_checkpoint import NoMerge, git, merge_branch_history
-from update_registration import RegistrationFailure, UpdatesOnDemand, update_schedule
+from update_registration import RegistrationFailure, UpdatesOnDemand, outstanding_file, update_schedule
 from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
@@ -28,6 +30,8 @@ from build_hold import ActiveHolders, read_holders
 import override_guard
 
 JsonMap = dict[str, object]
+LAST_REPORT = "dailies_last.json"
+EXPAND_ALL = "all"
 
 
 class SessionGone(NamedTuple):
@@ -695,6 +699,48 @@ def next_due(output: str, now: datetime, zone: ZoneInfo) -> str:
     return due.strftime("%H:%M") + (f"+{days}" if days > 0 else "")
 
 
+def last_report_path(slug: str) -> Path:
+    """Where a production saves what the showrunner above it shows of it."""
+    return showrunners.SHOWRUNNER_STATE_DIR / slug / LAST_REPORT
+
+
+def child_fields(child: str, now: datetime, zone: ZoneInfo, *, expand: bool) -> JsonMap:
+    """One production directly below this one: its saved report, and what waits on the user in it and below it."""
+    fields: JsonMap = {"name": child, "expand": expand}
+    path = last_report_path(child)
+    try:
+        saved = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        _ = parse_child_report(saved, str(path), zone)
+    except FileNotFoundError:
+        pass
+    except (InputError, OSError, ValueError) as error:
+        # A saved report that cannot be used costs the row its numbers, never the parent its report.
+        report("children", "unavailable", f"{child}: {error}")
+    else:
+        fields["report"] = saved
+    waiting = 0
+    unreadable: list[str] = []
+    for slug in (child, *showrunners.descendants_of(child)):
+        try:
+            waiting += len(due(read_outstanding(outstanding_file(slug)), now))
+        except (InputError, OSError, ValueError):
+            unreadable.append(slug)
+    fields["open"] = waiting
+    if unreadable:
+        fields["unreadable"] = unreadable
+    return fields
+
+
+def save_last_report(slug: str, saved: JsonMap) -> Path:
+    path = last_report_path(slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Written beside the file and renamed, so the showrunner above never reads half of one.
+    scratch = path.with_name(f".{path.name}.{os.getpid()}")
+    _ = scratch.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
+    _ = scratch.replace(path)
+    return path
+
+
 def validate_report(result: JsonMap, holders_path: Path, judgment_path: Path) -> None:
     previous_holders = os.environ.get("BUILD_HOLD_DIR")
     os.environ["BUILD_HOLD_DIR"] = str(holders_path)
@@ -722,6 +768,7 @@ def run(args: argparse.Namespace) -> int:
     user_run = cast(bool, args.user_run)
     at = cast(str | None, args.at)
     render_state = cast(Path, args.render_state)
+    expand = cast(list[str], args.expand)
     production = read_production(production_path)
     prune_failure = prune_phase_tables(production.doc)
     if isinstance(prune_failure, PhaseTablesUnavailable):
@@ -882,6 +929,19 @@ def run(args: argparse.Namespace) -> int:
                            "eta": str(merge.get("eta") or "no ETA stated yet"), "needs_user": bool(merge.get("needs_user", False))})
     report("merge branch", "ok", "pushed" if pushed else "not pushed")
     result: JsonMap = {"length": length, "zone": str(production.zone), "units": units_out, "topics": topics_out}
+    root = showrunners.place_of(production.slug).root
+    if root:
+        result["reports_to"] = root
+    children = showrunners.children_of(production.slug)
+    strangers = [name for name in expand if name != EXPAND_ALL and name not in children]
+    if strangers:
+        raise DailiesFailure("expand", f"{', '.join(strangers)}: not directly below {production.slug}; "
+                             + (f"choose from {', '.join(children)} or {EXPAND_ALL}" if children
+                                else "no production reports to it"))
+    if children:
+        result["children"] = [child_fields(child, now, production.zone, expand=EXPAND_ALL in expand or child in expand)
+                              for child in children]
+        report("children", "ok", f"{len(children)} below: {', '.join(children)}")
     # A bad config line costs only the counts line, never the report.
     try:
         counts = production_counts(production.slug)
@@ -901,10 +961,10 @@ def run(args: argparse.Namespace) -> int:
         with production.log.open("a", encoding="utf-8"):
             pass
     try:
-        on_demand = isinstance(update_schedule(lines), UpdatesOnDemand)
+        schedule = update_schedule(lines)
     except RegistrationFailure as failure:
         raise DailiesFailure("clock", str(failure)) from failure
-    if on_demand:
+    if isinstance(schedule, UpdatesOnDemand):
         # No schedule runs, so there is no clock to restart and the report names no next run.
         report("clock", "ok", "on demand: no scheduled dailies")
     else:
@@ -941,6 +1001,14 @@ def run(args: argparse.Namespace) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     _ = out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     report("input", "ok", f"wrote {out}")
+    # What the showrunner above this one shows of it. Failing to save it never costs this report.
+    interval = None if isinstance(schedule, UpdatesOnDemand) else schedule.minutes
+    try:
+        saved_at = save_last_report(production.slug, last_report(result, render_state, at, interval))
+    except (InputError, OSError) as error:
+        report("saved report", "unavailable", str(error))
+    else:
+        report("saved report", "ok", f"wrote {saved_at}")
     return 0
 
 
@@ -955,6 +1023,8 @@ def main() -> int:
     _ = parser.add_argument("--render-state", required=True, type=Path)
     _ = parser.add_argument("--at")
     _ = parser.add_argument("--user-run", action="store_true")
+    _ = parser.add_argument("--expand", action="append", default=[], metavar="CHILD",
+                            help=f"also print this lower production's own rows; `{EXPAND_ALL}` for every one")
     args = parser.parse_args()
     try:
         return run(args)

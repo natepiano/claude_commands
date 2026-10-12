@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # review.sh — Invoke the configured delegate agent for a review.
 #
-# Usage: review.sh [--to <seat> | --slot <new-slot>] <session_dir>
+# Usage: review.sh [--to <seat> | --slot <new-slot> | --pool <type> --lease <slug>/<unit>/<phase>] <session_dir>
 #                  [working_dir] [prompt_file] [task]
 #                  [role_description] [pass_activity] [pass_index] [lens]
 #                  [early_ready_file]
@@ -56,16 +56,45 @@ set -euo pipefail
 
 FOLLOW_TO=""
 NEW_SLOT=""
-case "${1:-}" in
-  --to)
-    FOLLOW_TO="${2:?Usage: review.sh --to <seat> <session_dir> ...}"
-    shift 2
-    ;;
-  --slot)
-    NEW_SLOT="${2:?Usage: review.sh --slot <new-slot> <session_dir> ...}"
-    shift 2
-    ;;
-esac
+POOL_TYPE=""
+POOL_LEASE=""
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --to) FOLLOW_TO="${2:?--to requires a seat}" ;;
+    --slot) NEW_SLOT="${2:?--slot requires a slot}" ;;
+    --pool) POOL_TYPE="${2:?--pool requires a type}" ;;
+    --lease) POOL_LEASE="${2:?--lease requires slug/unit/phase}" ;;
+    *) echo "ERROR: unknown review option '$1'." >&2; exit 2 ;;
+  esac
+  shift 2
+done
+if [[ -n "${POOL_TYPE}" && ( -n "${FOLLOW_TO}" || -n "${NEW_SLOT}" ) ]]; then
+  echo "ERROR: --pool excludes --to and --slot." >&2
+  exit 2
+fi
+if [[ -n "${FOLLOW_TO}" && -n "${NEW_SLOT}" ]]; then
+  echo "ERROR: --to excludes --slot." >&2
+  exit 2
+fi
+POOL_PRODUCTION=""
+POOL_UNIT=""
+POOL_PHASE=""
+if [[ -n "${POOL_TYPE}" ]]; then
+  if [[ "${POOL_TYPE}" != code && "${POOL_TYPE}" != ui ]]; then
+    echo "ERROR: --pool requires code or ui." >&2
+    exit 2
+  fi
+  if [[ ! "${POOL_LEASE}" =~ ^([^/]+)/([^/]+)/([^/]+)$ ]]; then
+    echo "ERROR: --pool requires --lease slug/unit/phase." >&2
+    exit 2
+  fi
+  POOL_PRODUCTION="${BASH_REMATCH[1]}"
+  POOL_UNIT="${BASH_REMATCH[2]}"
+  POOL_PHASE="${BASH_REMATCH[3]}"
+elif [[ -n "${POOL_LEASE}" ]]; then
+  echo "ERROR: --lease requires --pool; use REVIEW_LEASE for an own review." >&2
+  exit 2
+fi
 
 SESSION_DIR="${1:?Usage: review.sh <session_dir> [working_dir] [prompt_file] [task] [role_description]}"
 WORKING_DIR="${2:-$(pwd)}"
@@ -95,8 +124,9 @@ case "${LENS}" in
   # No writer sits in `review` since the three-seat team was folded into two,
   # so the third lens takes it and its pass never closes a writer's window.
   craft) LENS_SLOT=review ;;
+  ux) LENS_SLOT=review ;;
   *)
-    echo "ERROR: unknown review lens '${LENS}' (adversary, contract, craft)" >&2
+    echo "ERROR: unknown review lens '${LENS}' (adversary, contract, craft, ux)" >&2
     exit 2
     ;;
 esac
@@ -144,10 +174,25 @@ fi
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.10.
 PY="${SCRIPT_DIR}/../lib/py"
+POOL_HELPER="${SCRIPT_DIR}/review_pool.py"
+MESH_SESSION_DIR="${SESSION_DIR}"
+POOL_ALLOCATED=0
+MESH_CLAIMED=0
+TURN_THREAD_ID=""
+LEASE_ORDINAL=0
+PRIME_HASH=""
+TURN_FINDINGS_READY=0
+TURN_RAISED=0
+TURN_COUNT_READY=0
+TURN_RECORD_STATUS="error"
 FINDINGS_FILE="${SESSION_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
 STATUS_FILE="${SESSION_DIR}/review_status${SUFFIX}"
+SLOT_FILE="${SESSION_DIR}/review_slot${SUFFIX}"
 LOG_FILE="${SESSION_DIR}/review_agent_${PASS_INDEX}${SUFFIX}.log"
 REPLY_FILE="${SESSION_DIR}/review_reply_${PASS_INDEX}${SUFFIX}.$$.txt"
+if [[ -n "${POOL_TYPE}" ]]; then
+  rm -f "${SLOT_FILE}"
+fi
 
 AGENT_FILE="${SESSION_DIR}/review_agent${SUFFIX}"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
@@ -167,6 +212,7 @@ initialize_review_artifacts() {
   rm -f "${AWAKE_FILE}" "${REPLY_FILE}"
   if [[ -n "${REVIEW_SEAT}" ]]; then
     : > "${FINDINGS_FILE}"
+    TURN_FINDINGS_READY=1
   fi
   echo "reviewing" > "${STATUS_FILE}"
   # Only meaningful while an early launch is showing in the progress report,
@@ -201,38 +247,13 @@ board_post() {
 # Preserve the old launcher's observable failure path: a solo review creates
 # its artifacts before agent resolution. A seated review claims first, so a
 # busy-seat refusal cannot overwrite another review's status or findings.
-if [[ -z "${REVIEW_SEAT}" ]]; then
+if [[ -z "${REVIEW_SEAT}" && -z "${POOL_TYPE}" ]]; then
   initialize_review_artifacts
 fi
 
-source "${SCRIPT_DIR}/../agents/agents_config.sh"
-if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
-  if [[ -z "${REVIEW_SEAT}" ]]; then
-    echo "error" > "${STATUS_FILE}"
-  fi
-  exit 1
-fi
-
-# implement.sh anchors a durable Codex identity to the implementation model
-# configured when that seat first opens. A seat opened by review.sh must use
-# the same anchor even though this turn runs the review model; otherwise the
-# first role switch back to implementation rejects its own retained thread.
-DURABLE_SEAT_MODEL="${AGENT_MODEL}"
-if [[ -n "${NEW_SLOT}" ]]; then
-  IMPLEMENTATION_PAIR="$(_agents_registry_get "delegate.${AGENT_FAMILY}" implementation)"
-  if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
-    IMPLEMENTATION_PAIR="$(_agents_registry_get "delegate.${AGENT_FAMILY}" impl)"
-  fi
-  if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
-    echo "ERROR: cannot record review seat ${REVIEW_SEAT}: no implementation model is configured." >&2
-    exit 2
-  fi
-  DURABLE_SEAT_MODEL="${IMPLEMENTATION_PAIR%%:*}"
-fi
-
 claim_follow() {
-  "$PY" - "${SESSION_DIR}" "${FOLLOW_TO}" "${SCRIPT_DIR}/../agents/codex_mesh.py" \
-    "${BOARD_HELPER}" "${COMPACT_ABOVE_TOKENS}" "${LENS}" <<'PY'
+  "$PY" - "${MESH_SESSION_DIR}" "${FOLLOW_TO}" "${SCRIPT_DIR}/../agents/codex_mesh.py" \
+    "${BOARD_HELPER}" "${COMPACT_ABOVE_TOKENS}" "${LENS}" "${SESSION_DIR}" "${TEAM_SLOT}" <<'PY'
 import fcntl
 import json
 import os
@@ -240,7 +261,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-root_text, name, mesh_script, board_helper, compact_above_text, lens = sys.argv[1:]
+root_text, name, mesh_script, board_helper, compact_above_text, lens, unit_dir, slot = sys.argv[1:]
 root = Path(root_text)
 compact_above = int(compact_above_text)
 
@@ -253,7 +274,7 @@ def read_roster():
 
 def post(message):
     subprocess.run(
-        ["bash", board_helper, "post", root_text, name.rsplit("-", 1)[-1],
+        ["bash", board_helper, "post", unit_dir, slot,
          "status", message],
         capture_output=True,
         text=True,
@@ -297,9 +318,9 @@ PY
 }
 
 cleanup_mesh_review() {
-  if [[ -n "${FOLLOW_TO}" ]]; then
+  if [[ "${MESH_CLAIMED}" -eq 1 ]]; then
     "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" release-follow \
-      --session-dir "${SESSION_DIR}" --to "${FOLLOW_TO}" \
+      --session-dir "${MESH_SESSION_DIR}" --to "${FOLLOW_TO}" \
       --claim-pid "${FOLLOW_LAUNCHER_PID}" >/dev/null 2>&1 || true
   fi
   rm -f "${REPLY_FILE}"
@@ -397,12 +418,205 @@ with (root / "impl_seat_claim.lock").open("a+") as lock:
 PY
 }
 
+count_turn_findings() {
+  [[ "${TURN_FINDINGS_READY}" -eq 1 && "${TURN_COUNT_READY}" -eq 0 ]] || return 0
+  TURN_RAISED="$("$PY" - "${FINDINGS_FILE}" <<'PY'
+import re
+import sys
+from pathlib import Path
+try:
+    findings = Path(sys.argv[1]).read_text(encoding="utf-8")
+except OSError:
+    findings = ""
+print(len(re.findall(r"^\s*\d+[.)]\s+", findings, re.MULTILINE)))
+PY
+)"
+  TURN_COUNT_READY=1
+}
+
+refresh_turn_thread_id() {
+  TURN_THREAD_ID="$("$PY" - "${MESH_SESSION_DIR}" "${REVIEW_SEAT}" \
+    "${TURN_THREAD_ID}" "${TURN_PROGRESS}" <<'PY'
+import json
+import sys
+from pathlib import Path
+root, reviewer, known, progress = sys.argv[1:]
+try:
+    roster = json.loads((Path(root) / "mesh_roster.json").read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    roster = {}
+print(roster.get(reviewer, {}).get("thread_id") or known or json.loads(progress).get("thread_id", ""))
+PY
+)"
+}
+
+write_turn_record() {
+  "$PY" - "${SESSION_DIR}" "${TURN_STARTED_AT}" "$$" "${TURN_RECORD_STATUS}" \
+    "${POOL_TYPE}" "${POOL_PRODUCTION}" "${REVIEW_SEAT}" "${TURN_THREAD_ID}" \
+    "${TURN_LEASE}" "${TURN_PROGRESS}" "${LENS}" "${PASS_INDEX}" \
+    "${LEASE_ORDINAL}" "${PRIME_HASH}" "${TURN_RAISED}" <<'PY'
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+(session, started, pid, status, pool_type, pool, reviewer, thread_id,
+ lease, progress, lens, number, ordinal, prime_hash, raised) = sys.argv[1:]
+metadata = json.loads(progress)
+thread_id = thread_id or metadata.get("thread_id", "")
+parts = lease.split("/")
+unit, phase = parts[1:] if len(parts) == 3 else ("", "")
+record = {
+    "arm": "pool" if pool_type else "own", "pool": pool,
+    "reviewer": reviewer, "thread_id": thread_id, "unit": unit, "phase": phase,
+    "phase_instance_id": metadata.get("phase_instance_id", ""),
+    "history_file": metadata.get("history_file", ""),
+    "kind": "ux" if lens == "ux" else "broad" if int(number) == 1 and lens else "closure",
+    "lens": lens, "pass": int(number), "started_at": int(started),
+    "finished_at": time.time(), "lease_ordinal": int(ordinal), "prime_hash": prime_hash,
+    "status": status, "raised": int(raised),
+}
+history = Path(os.environ.get("PLAN_DELEGATE_HISTORY_DIR", "~/.local/state/plan-delegate")).expanduser()
+root = history / "review_turns" / Path(session).name
+root.mkdir(parents=True, exist_ok=True)
+with (root / f"{started}-{pid}.json").open("x", encoding="utf-8") as output:
+    json.dump(record, output, ensure_ascii=False)
+    output.write("\n")
+PY
+}
+
+finish_review_exit() {
+  local code=$?
+  trap - EXIT
+  set +e
+  if [[ -n "${POOL_TYPE}" && "${code}" -ne 0 ]]; then
+    echo error > "${STATUS_FILE}"
+  fi
+  count_turn_findings
+  refresh_turn_thread_id
+  if ! write_turn_record; then
+    echo "ERROR: unable to write review turn record." >&2
+    code=1
+  fi
+  if [[ "${MESH_CLAIMED}" -eq 1 ]]; then
+    cleanup_mesh_review
+  fi
+  if [[ "${POOL_ALLOCATED}" -eq 1 ]]; then
+    "$PY" "${POOL_HELPER}" release --production "${POOL_PRODUCTION}" \
+      --reviewer "${REVIEW_SEAT}" --pid "$$" --thread-id "${TURN_THREAD_ID}" >>"${LOG_FILE}" 2>&1
+  fi
+  exit "${code}"
+}
+
+interrupt_pool_review() {
+  TURN_RECORD_STATUS="canceled"
+  # Stop the child before releasing the pool's ownership of its reviewer.
+  if [[ -n "${AGENT_PID:-}" ]]; then
+    kill "${AGENT_PID}" 2>/dev/null || true
+    wait "${AGENT_PID}" 2>/dev/null || true
+  fi
+  if [[ -n "${HEARTBEAT_LOOP_PID:-}" ]]; then
+    kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
+    wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
+  fi
+  count_turn_findings
+  exit "$1"
+}
+
+if [[ -n "${POOL_TYPE}" || -n "${FOLLOW_TO}" ]]; then
+  TURN_STARTED_AT="$(date +%s)"
+  TURN_LEASE="${POOL_LEASE:-${REVIEW_LEASE:-}}"
+  TURN_PROGRESS="$("$PY" - "${PROGRESS_STATE}" "${SESSION_DIR}" "${FOLLOW_TO}" <<'PY'
+import json
+import sys
+from pathlib import Path
+try:
+    state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    state = {}
+phase = state.get("phase") or {}
+try:
+    roster = json.loads((Path(sys.argv[2]) / "mesh_roster.json").read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    roster = {}
+print(json.dumps({"phase_instance_id": phase.get("instance_id", ""),
+                  "history_file": state.get("history_file", ""),
+                  "thread_id": roster.get(sys.argv[3], {}).get("thread_id", "")}))
+PY
+)"
+  trap finish_review_exit EXIT
+  if [[ -n "${POOL_TYPE}" ]]; then
+    trap 'interrupt_pool_review 143' TERM
+    trap 'interrupt_pool_review 130' INT
+    trap 'interrupt_pool_review 129' HUP
+  else
+    trap 'TURN_RECORD_STATUS=canceled; exit 143' TERM
+    trap 'TURN_RECORD_STATUS=canceled; exit 130' INT
+    trap 'TURN_RECORD_STATUS=canceled; exit 129' HUP
+  fi
+fi
+
+source "${SCRIPT_DIR}/../agents/agents_config.sh"
+if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
+  if [[ -z "${REVIEW_SEAT}" ]]; then
+    echo "error" > "${STATUS_FILE}"
+  fi
+  exit 1
+fi
+
+# implement.sh anchors a durable Codex identity to the implementation model
+# configured when that seat first opens. A seat opened by review.sh must use
+# the same anchor even though this turn runs the review model; otherwise the
+# first role switch back to implementation rejects its own retained thread.
+DURABLE_SEAT_MODEL="${AGENT_MODEL}"
+if [[ -n "${NEW_SLOT}" ]]; then
+  IMPLEMENTATION_PAIR="$(_agents_registry_get "delegate.${AGENT_FAMILY}" implementation)"
+  if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
+    IMPLEMENTATION_PAIR="$(_agents_registry_get "delegate.${AGENT_FAMILY}" impl)"
+  fi
+  if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
+    echo "ERROR: cannot record review seat ${REVIEW_SEAT}: no implementation model is configured." >&2
+    exit 2
+  fi
+  DURABLE_SEAT_MODEL="${IMPLEMENTATION_PAIR%%:*}"
+fi
+
 TREE_BASELINE_READY=0
 TREE_HEAD_BEFORE=""
 TREE_STATUS_BEFORE=""
 TREE_DIFF_HASH_BEFORE=""
 TREE_UNTRACKED_HASH_BEFORE=""
 TREE_PATHS_BEFORE=""
+
+if [[ -n "${POOL_TYPE}" ]]; then
+  CODEX_MESH="${PLAN_DELEGATE_CODEX_MESH:-$(_agents_registry_get delegate.options codex_mesh)}"
+  if [[ "${AGENT_FAMILY}" != codex || "${CODEX_MESH}" != 1 ]]; then
+    echo "ERROR: --pool requires the Codex mesh." >&2
+    exit 2
+  fi
+  if ! POOL_ALLOCATION="$("$PY" "${POOL_HELPER}" allocate \
+    --production "${POOL_PRODUCTION}" --type "${POOL_TYPE}" \
+    --unit "${POOL_UNIT}" --phase "${POOL_PHASE}" --pass "${PASS_INDEX}" \
+    "${LENS_ARGS[@]}" --pid "$$" 2>>"${LOG_FILE}")"; then
+    echo "ERROR: pool allocation failed; see ${LOG_FILE}." >&2
+    exit 1
+  fi
+  allocation_field() {
+    "$PY" -c 'import json, sys; print(json.loads(sys.argv[1])[sys.argv[2]])' \
+      "${POOL_ALLOCATION}" "$1"
+  }
+  REVIEW_SEAT="$(allocation_field reviewer)"
+  POOL_ALLOCATED=1
+  FOLLOW_TO="${REVIEW_SEAT}"
+  MESH_SESSION_DIR="$(allocation_field mesh_dir)"
+  TURN_THREAD_ID="$(allocation_field thread_id)"
+  LEASE_ORDINAL="$(allocation_field lease_ordinal)"
+  PRIME_HASH="$(allocation_field prime_hash)"
+  TEAM_SLOT="pool_${REVIEW_SEAT}"
+  printf '%s\n' "${TEAM_SLOT}" > "${SLOT_FILE}"
+  export PLAN_DELEGATE_TEAM_ROLE="${TEAM_SLOT}"
+fi
 
 if [[ -n "${REVIEW_SEAT}" ]]; then
   CODEX_MESH="${PLAN_DELEGATE_CODEX_MESH:-$(_agents_registry_get delegate.options codex_mesh)}"
@@ -424,8 +638,11 @@ if [[ -n "${REVIEW_SEAT}" ]]; then
     fi
     export FOLLOW_LAUNCHER_PID="$$"
     claim_follow
+    MESH_CLAIMED=1
   fi
-  trap cleanup_mesh_review EXIT
+  if [[ -n "${NEW_SLOT}" ]]; then
+    trap cleanup_mesh_review EXIT
+  fi
   if [[ -z "${EARLY_READY_FILE}" || -e "${EARLY_READY_FILE}" ]]; then
     capture_tree_baseline
   fi
@@ -475,10 +692,14 @@ fi
 
 bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset})" "${ROLE_DESC}" || true
 
+TURN_WORKTREE_ARGS=()
+if [[ -n "${POOL_TYPE}" ]]; then
+  TURN_WORKTREE_ARGS=(--cwd "${WORKING_DIR}" --read-only)
+fi
 if [[ -n "${FOLLOW_TO}" ]]; then
   "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" follow \
-    --session-dir "${SESSION_DIR}" --to "${FOLLOW_TO}" \
-    --claim-pid "${FOLLOW_LAUNCHER_PID}" --role review "${LENS_ARGS[@]}" \
+    --session-dir "${MESH_SESSION_DIR}" --to "${FOLLOW_TO}" \
+    --claim-pid "${FOLLOW_LAUNCHER_PID}" --role review "${LENS_ARGS[@]}" "${TURN_WORKTREE_ARGS[@]}" \
     --message-file "${PROMPT_FILE}" --summary-file "${FINDINGS_FILE}" \
     --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
     --model "${AGENT_MODEL}" --effort "${AGENT_EFFORT:-}" \
@@ -563,6 +784,11 @@ if [[ -n "${REVIEW_SEAT}" && "${TREE_BASELINE_READY}" -eq 1 ]]; then
   fi
 fi
 
+# The durable record stores this count before finish-pass closes the pass.
+if [[ -n "${POOL_TYPE}" || -n "${FOLLOW_TO}" ]]; then
+  count_turn_findings
+fi
+
 if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
   echo "reviewed" > "${STATUS_FILE}"
   # A completed early review is a real pass only once the sentinel exists: the
@@ -584,9 +810,11 @@ if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
     fi
   fi
   if [[ -n "${EARLY_READY_FILE}" && ! -e "${EARLY_READY_FILE}" ]]; then
+    TURN_RECORD_STATUS="void"
     bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper \
       "${BEAT_TAG} agent finished before delivery — no pass recorded, verdict void" || true
   else
+    TURN_RECORD_STATUS="reviewed"
     bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent finished" || true
   fi
   board_post done \

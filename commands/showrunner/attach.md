@@ -1,5 +1,5 @@
 ---
-description: Put one showrunner under another, or take it out again - the lower one then reports to the higher one, and the top of the tree talks with the user.
+description: Put one showrunner under another, or take it out again - the lower one then reports to the higher one, and the top of the tree shows everything below it that needs the user.
 argument-hint: "<child> [parent] | detach <child> | tree"
 ---
 
@@ -17,8 +17,8 @@ with the sandbox off, and print its output as it comes:
   no parent it uses the production this session runs. It tells both showrunners
   in one line each, and says when one of them is not running so you can tell it
   later.
-- `detach <child>` removes that. The child is a root again and talks with the
-  user itself.
+- `detach <child>` removes that. The child is a root again: no showrunner
+  above it shows its items for the user.
 - `tree` prints every showrunner on this machine, each child indented under its
   parent, with its session name now or `<not running>`.
 

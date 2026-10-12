@@ -511,6 +511,21 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertIsNone(after["busy_pid"])
         self.assertEqual(after["reviews"], 6)
         self.assertEqual(after["lease"], before["lease"])
+        self.assertEqual(after["thread_id"], before["thread_id"])
+
+    def test_release_updates_replaced_thread_only_for_matching_owner(self) -> None:
+        self.seed({"code1": {**self.idle("unit"), "busy_pid": os.getpid()}})
+        before = self.reviewer("code1")
+        _ = self.succeed("release", "--reviewer", "code1", "--pid", str(os.getpid() + 1),
+                         "--thread-id", "unowned-thread")
+        self.assertEqual(self.reviewer("code1"), before)
+        _ = self.succeed("release", "--reviewer", "code1", "--pid", str(os.getpid()),
+                         "--thread-id", "replacement-thread")
+        after = self.reviewer("code1")
+        self.assertEqual(after["thread_id"], "replacement-thread")
+        self.assertIsNone(after["busy_pid"])
+        self.assertEqual(after["reviews"], 6)
+        self.assertEqual(after["lease"], before["lease"])
 
     def test_stalled_fork_reservation_does_not_block_concurrent_allocation(self) -> None:
         self.seed({})

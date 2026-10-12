@@ -11,7 +11,7 @@ import sys
 from collections.abc import Iterator
 from enum import Enum
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 
 class SessionRecord(TypedDict):
@@ -73,6 +73,19 @@ def read_session(path: Path) -> RegistryEntry:
         )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return UnreadableSessionRecord.FOUND
+
+
+def remote_control(record: SessionRecord) -> Literal["active", "absent"]:
+    """Read only this confirmed session's Remote Control registry field."""
+    try:
+        value = cast(object, json.loads((sessions_dir() / f"{record['pid']}.json").read_text()))
+        if isinstance(value, dict):
+            bridge = cast(dict[str, object], value).get("bridgeSessionId")
+            if isinstance(bridge, str) and bridge:
+                return "active"
+    except (OSError, ValueError, TypeError):
+        pass
+    return "absent"
 
 
 def process_start(pid: int) -> str | None:
