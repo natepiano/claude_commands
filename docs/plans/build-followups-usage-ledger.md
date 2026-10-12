@@ -162,7 +162,7 @@ Today, each question needs its own scratch script (`seat_usage.py`, `api_cost.py
 - Source states as an enumerated type in this phase: no consumer yet; the type arrives with the stored source record.
 - Patching the whole-file Mac transport: the reader has to run on the Mac, a redesign.
 
-### Phase 5 — The Mac's turns are read on the Mac · status: todo
+### Phase 5 — The Mac's turns are read on the Mac · status: done
 
 #### Work Order
 
