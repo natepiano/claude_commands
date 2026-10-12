@@ -47,6 +47,14 @@ must not drift from it:
   named `trunk-unit`.
 - **Gate** — a unit phase that cannot start until another unit's checkpoint is on
   the merge branch.
+- **Parent, child and root showrunner** — a production's showrunner may report
+  to another production's (`/showrunner:attach`). The one at the top of a tree is
+  the root, and only the root talks with the user. A child showrunner is never a
+  unit: it keeps its own production doc, merge branch and units, and has no row
+  in its parent's Units table. Which production reports to which is state on the
+  machine, `~/.local/state/showrunner/<child slug>/parent`, and no line in either
+  production doc, so either side attaches without a commit in the other's
+  checkout. Look it up with `showrunners.py parent|children|root <slug>`.
 
 User, 2026-09-28: production, showrunner and unit were chosen because Hana is a
 DCC app and the film words are short.

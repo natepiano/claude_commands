@@ -92,6 +92,30 @@ State:
 - **As-built close-out** is the unit director's: it decides, reports what moved,
   and never asks (user, 2026-10-06). A scope change to the main plan is a
   product choice, not an as-built one.
+- **Nested showrunners.** A showrunner may report to another
+  (`/showrunner:attach`). `showrunners.py parent|children|root <slug>` and
+  `showrunners.py tree` say where a production sits; look it up each time, as
+  an attachment can change. The top of a tree is its root, and only the root
+  talks with the user. User, 2026-10-09: "showrunners manage showrunners - ad
+  hoc depth".
+  - **A child showrunner is never a unit.** It has no Units row, and you never
+    merge its branch, type into its pane or type into its units' panes.
+  - **A broadcast** (a build hold, a quota alert, an announcement) already
+    reaches every showrunner. Pass it to your own unit directors only, never
+    to a child showrunner.
+  - **The user's words for a production below you** go to your child that
+    holds it, by SendMessage, beginning `From the user (via <your name>): `.
+    That child relays them to its unit or to its own child. One level at a
+    time.
+  - **An item for the user**, when you are not the root, goes to the root:
+    `showrunners.py root <your slug>`, then `showrunners.py address <root>`,
+    and SendMessage beginning `From the showrunner of <your slug>, for the
+    user: `. Record it in your own outstanding items as always. If the root is
+    not running, keep it there and say so at your next footer.
+  - **A question between productions** (a Mac window, the order of two
+    promotions) goes to your parent, not to the root.
+  - **As a root or a parent**, show the user each item a child sends in the
+    child's words, and relay the answer back to that child.
 - **What reaches the user:**
   - a unit director's `— decision:` for the user, shown in the unit director's
     words, with the answer relayed back;
@@ -350,6 +374,9 @@ whatever arrived:
 | the user asks which phase or task each unit is on | `/showrunner:units` |
 | the user asks which proposals are open | `/showrunner:proposals` |
 | the user asks for the nightly improvement list | `/showrunner:nightly` |
+| the user asks to put a showrunner under another, or asks for the tree | `/showrunner:attach` |
+| a child showrunner's item for the user | show it in the child's words; relay the answer to that child (<Throughout/> → Nested showrunners) |
+| the user's words for a production below this one | relay them to the child that holds it (<Throughout/> → Nested showrunners) |
 
 A unit repairing failing tests that split by file runs parallel repair seats
 (`/unit:direct` → <FixDispatch/>); one that runs a lone seat on them gets
