@@ -84,7 +84,7 @@ class CheckTests(unittest.TestCase):
             "slug": "demo", "production": "", "checkout": "", "target": "0.20",
             "started": OLD.isoformat(), "closed": None, "bevy": ["0.19.1"],
             "pins_read": OLD.isoformat(), "dependencies": {}, "target_bevy": {"status": "unread"},
-            "target_error": "", "checked": None,
+            "target_error": "", "checked": None, "announced": None,
         }
         self.fetch = CheckFetch()
 

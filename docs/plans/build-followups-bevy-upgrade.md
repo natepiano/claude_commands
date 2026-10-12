@@ -189,7 +189,7 @@ class Entry(TypedDict): crates_io: CratesIoUnread | CratesIoRead | CratesIoUnlis
 
 **Ruled out:** GitHub's search for the title filter: it does not match `0.20` inside `v0.20.0` (Multirious/bevy_tween pull request 97, "Migrate to Bevy v0.20.0", checked 2026-10-12). The `gh` token: it sits behind gpg-agent, cold after every reboot, and a check failing then would leave the record stale. Filling `branch` and `items` in `apply_pins` for a stored entry: `load` fills them, and every record reaches `apply_pins` through `load`.
 
-### Phase 4 — The check runs every four hours and tells the showrunner only what changed  · status: todo
+### Phase 4 — The check runs every four hours and tells the showrunner only what changed  · status: done
 
 #### Work Order
 

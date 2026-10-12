@@ -78,6 +78,14 @@ class Entry(TypedDict):
     items: list[Item]
 
 
+class Announced(TypedDict):
+    """What the showrunner was last told about one dependency."""
+
+    state: str
+    repository: str  # Empty when no branch has been read.
+    items: dict[str, str]
+
+
 class Record(TypedDict):
     slug: str
     production: str
@@ -91,6 +99,7 @@ class Record(TypedDict):
     target_bevy: TargetBevy
     target_error: str
     checked: str | None  # None means no check has reached every entry yet.
+    announced: dict[str, Announced] | None  # None means no report has reached the showrunner.
 
 
 class RecordFailure(Exception):
@@ -213,6 +222,14 @@ def _validate(value: object) -> Record:
         if data[key] is not None:
             _ = datetime.fromisoformat(cast(str, data[key]))
     _upstream_fields(data)
+    _ = data.setdefault("announced", None)
+    if data["announced"] is not None:
+        for raw in _object(data["announced"], "announced").values():
+            announcement = _object(raw, "announcement")
+            _strings(announcement, "state", "repository")
+            for item_state in _object(announcement.get("items"), "announced items").values():
+                if not isinstance(item_state, str):
+                    raise ValueError("announced item states must be strings")
     _string_list(data.get("bevy"), "bevy")
     for name, raw in _object(data.get("dependencies"), "dependencies").items():
         entry = _object(raw, name)
@@ -294,7 +311,8 @@ def start(production: Production, target: str, pins: Pins, now: datetime) -> Rec
     return apply_pins(Record(slug=production.slug, production=str(production.doc),
                              checkout=str(production.checkout), target=target, started=_utc(now),
                              closed=None, bevy=[], pins_read=_utc(now), dependencies={},
-                             target_bevy=TargetUnread(status="unread"), target_error="", checked=None), pins, now)
+                             target_bevy=TargetUnread(status="unread"), target_error="", checked=None,
+                             announced=None), pins, now)
 
 
 def apply_pins(record: Record, pins: Pins, now: datetime) -> Record:
