@@ -3,9 +3,9 @@ description: Show or change this Claude unit's progress update interval.
 argument-hint: "[minutes]"
 ---
 
-# Unit interval
+# Unit report interval
 
-**Usage:** `/unit:interval [minutes]`
+**Usage:** `/unit:report_interval [minutes]`
 
 ## Steps
 
