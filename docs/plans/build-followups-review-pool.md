@@ -102,7 +102,7 @@
 
 **Ruled out:** one shared `mesh/` dir for every pool lifetime — a fork that finishes after `stop` writes into the roster the next lifetime reads; reusing the lowest free reviewer name — a process still attached to the retired thread can point the name back at it; clearing the unfinished-stop marker when the mesh stop fails — no later `stop` would reach the ended lifetime's server.
 
-### Phase 3 — Reviews go to the pool  · status: todo
+### Phase 3 — Reviews go to the pool  · status: done
 
 #### Work Order
 

@@ -41,7 +41,13 @@ must not drift from it:
   is needed, attempt compaction above `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` but
   continue after a failed attempt, press on after context overflow with
   `Continue where you stopped.`, open anew only when no open seat can take the
-  work, and end at `end_session.sh`. Reviews still open their own threads.
+  work, and end at `end_session.sh`. Reviews run on the unit's seats, or on the
+  production's review pool when its doc names one.
+- **Review pool** — a production's reusable reviewers, allocated by a script.
+- **Reviewer** — a read-only Codex thread in that pool, named `code1`, `ui2`, etc.
+- **Template** — a thread holding a type's standing prompt, forked into reviewers
+  and never leased.
+- **Lease** — one reviewer's assignment to one unit's phase, cleared at phase end.
 - **Merge branch** — the branch every unit's checkpoints merge into. cargo-berth
   calls it the trunk. In prose, call it by its branch name, because a unit may be
   named `trunk-unit`.
@@ -88,6 +94,7 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
 - **UX guide:** <path to the project's UX rules, e.g. `~/rust/hanadocs/ux`>; omit when
   nothing users see changes
+- **Review pool:** code (or `code, ui`); omit when the production has none
 - **Proposals:** <folder for finished proposals, e.g. `~/rust/hanadocs/proposals`>; its
   `index.md` holds one row for each, `| Date | Proposal | Unit | Summary | Status |`,
   added by the showrunner, and `/showrunner:proposals` shows every row whose Status is
@@ -358,4 +365,12 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     and the shots are no worse than the merge branch. A fix the showrunner asks
     for comes after that checkpoint, unless the waiting unit needs it. This is
     packaging under `<DecisionEconomy/>`; state it in one line.
+16. **Review pool.** With a `**Review pool:**` line in the production doc, at
+    each phase's start run
+    `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py arm --production <slug> --unit <unit> --phase <phase>`.
+    On `pool`, send that phase's code reviews through
+    `review.sh --pool code --lease <slug>/<unit>/<phase>` with the usual
+    positional arguments. On `own`, export
+    `REVIEW_LEASE=<slug>/<unit>/<phase>` and review as today. `<slug>` is the
+    production doc's file name without `-production.md`.
 </ProductionUnit>
