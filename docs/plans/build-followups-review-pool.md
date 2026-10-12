@@ -67,7 +67,7 @@
 
 **Ruled out:** ending a lease by retiring the pooled thread and forking a new one — the first request after a new fork costs five times the first after a reset; a sweep change to protect pooled threads — an idle server stop leaves them followable.
 
-### Phase 2 — The pool script  · status: todo
+### Phase 2 — The pool script  · status: done
 
 #### Work Order
 
