@@ -504,7 +504,7 @@ class IndexTests(unittest.TestCase):
             [("new", 13), ("old", 0)],
         )
 
-    def test_mac_call_fields_reach_index_and_old_records_read_as_null(self) -> None:
+    def test_offload_call_fields_reach_index_and_old_records_read_as_null(self) -> None:
         self.write(
             self.host_file,
             call("old"),
@@ -512,6 +512,7 @@ class IndexTests(unittest.TestCase):
                 "offloaded",
                 mac="declined",
                 mac_reason="no_tests",
+                local_reason="needs Linux filesystem semantics",
                 mac_s=12.5,
             ),
         )
@@ -520,14 +521,56 @@ class IndexTests(unittest.TestCase):
 
         self.assertEqual(
             self.rows(
-                "SELECT id, mac, mac_reason, mac_s FROM calls ORDER BY id"
+                "SELECT id, mac, mac_reason, local_reason, mac_s FROM calls ORDER BY id"
             ),
             [
-                ("offloaded", "declined", "no_tests", 12.5),
-                ("old", None, None, None),
+                (
+                    "offloaded",
+                    "declined",
+                    "no_tests",
+                    "needs Linux filesystem semantics",
+                    12.5,
+                ),
+                ("old", None, None, None, None),
             ],
         )
-        self.assertEqual(index.SCHEMA_VERSION, 11)
+        self.assertEqual(index.SCHEMA_VERSION, 13)
+
+    def test_schema_twelve_rebuilds_call_fields_from_json_lines(self) -> None:
+        self.write(self.host_file, call("recorded", target="mac", hold_wait_s=0.4))
+        _ = index.update()
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            _ = connection.execute("PRAGMA user_version = 12")
+            _ = connection.execute("UPDATE calls SET target = 'natedev', hold_wait_s = 99")
+            connection.commit()
+        self.assertEqual(index.update(), 1)
+        self.assertEqual(self.rows("PRAGMA user_version"), [(13,)])
+        self.assertEqual(self.rows("SELECT target, hold_wait_s FROM calls"), [("mac", 0.4)])
+
+    def test_old_calls_have_null_target_and_hold_wait_but_new_empty_target_is_preserved(self) -> None:
+        self.write(self.host_file, call("old"), call("empty", target="", hold_wait_s=0))
+        _ = index.update()
+        self.assertEqual(
+            self.rows("SELECT id, target, hold_wait_s FROM calls ORDER BY id"),
+            [("empty", "", 0.0), ("old", None, None)],
+        )
+
+    def test_steps_call_index_is_built_and_used(self) -> None:
+        self.write(self.host_file, step("step", call_id="call"))
+        _ = index.update()
+        self.assertEqual(self.rows("PRAGMA index_info(steps_call)"), [(0, 23, "call_id")])
+        self.assertIn("steps_call", str(self.rows("EXPLAIN QUERY PLAN SELECT id FROM steps WHERE call_id = ?", "call")))
+
+    def test_schema_describes_target_and_hold_wait(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"target\s+TEXT\s+where the call was when it ended: mac, natedev, or empty")
+        self.assertRegex(
+            result.stdout,
+            r"hold_wait_s\s+REAL\s+seconds waited on a held target, each declined Mac retry included; memory waits are not counted",
+        )
 
     def test_ci_skipped_and_zero_queue_jobs_have_distinct_states(self) -> None:
         same_stamp = "2026-10-02T12:00:00Z"

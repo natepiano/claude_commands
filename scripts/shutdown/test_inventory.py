@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
+from test_support import ShutdownTestCase
 import inventory
 import account
 import fake_tmux
@@ -42,7 +43,7 @@ FAKE_TMUX = Path(__file__).parents[1] / "production" / "fake_tmux.py"
 
 
 @final
-class InventoryTests(unittest.TestCase):
+class InventoryTests(ShutdownTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -64,6 +65,7 @@ class InventoryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
         self.notes = self.root / "agents"
@@ -437,6 +439,9 @@ elif "comm=" in joined:
         self.assertEqual(found["label"], "claude 2")
         by_id = {session["session_id"]: session for session in found["sessions"]}
         self.assertEqual(set(by_id), {DIRECTOR_ID, UNIT_ID, SEAT_ID, DESKTOP_ID})
+        self.assertTrue(
+            all(session.get("config_dir") == str(self.target_config) for session in by_id.values())
+        )
         self.assertNotIn(OTHER_ID, by_id)
         self.assertEqual(
             found["unattributed"],
@@ -543,6 +548,104 @@ elif "comm=" in joined:
         unit = next(session for session in found["sessions"] if session["session_id"] == UNIT_ID)
 
         self.assertEqual(unit["host"].get("tmux_session"), "unit-renamed")
+
+    def test_tmux_hosts_record_the_pane_or_an_explicit_absence(self) -> None:
+        def process_environment(pid: int) -> dict[str, str]:
+            if pid == self.director_pid:
+                return {"TMUX_PANE": "%8"}
+            if pid == DESKTOP_PID:
+                return {"TMUX_PANE": "%9"}
+            return {}
+
+        def tmux_details(
+            pane: str,
+        ) -> tuple[str, inventory.TmuxPane | inventory.PaneNotRecorded]:
+            if pane == "%8":
+                return "production work", {
+                    "kind": "pane",
+                    "pane_id": "%8",
+                    "pane_pid": 62_008,
+                }
+            if pane == "%9":
+                return "writing", {"kind": "not recorded"}
+            return "", {"kind": "not recorded"}
+
+        with (
+            patch("inventory._process_environment", side_effect=process_environment),
+            patch("inventory._tmux_session", side_effect=tmux_details),
+        ):
+            found = inventory.inventory(TARGET_LOGIN)
+
+        by_id = {session["session_id"]: session for session in found["sessions"]}
+        self.assertEqual(
+            by_id[DIRECTOR_ID]["host"],
+            {
+                "kind": "tmux",
+                "tmux_session": "production work",
+                "pane": {"kind": "pane", "pane_id": "%8", "pane_pid": 62_008},
+            },
+        )
+        self.assertEqual(
+            by_id[DESKTOP_ID]["host"],
+            {
+                "kind": "tmux",
+                "tmux_session": "writing",
+                "pane": {"kind": "not recorded"},
+            },
+        )
+
+    def test_tmux_discovery_reads_session_and_pane_pid_in_one_call(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=(), returncode=0, stdout="production work\t62008\n"
+        )
+        with (
+            patch.object(unit_lookup, "tmux_binary", return_value="/test/tmux"),
+            patch("inventory.subprocess.run", return_value=completed) as run,
+        ):
+            found = inventory._tmux_session("%8")  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(
+            found,
+            (
+                "production work",
+                {"kind": "pane", "pane_id": "%8", "pane_pid": 62_008},
+            ),
+        )
+        self.assertEqual(
+            run.call_args.args[0],
+            (
+                "/test/tmux",
+                "display",
+                "-p",
+                "-t",
+                "%8",
+                "#{session_name}\t#{pane_pid}",
+            ),
+        )
+
+    def test_tmux_discovery_preserves_spaces_in_session_name(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=(), returncode=0, stdout=" work \t62008\n"
+        )
+        with patch("inventory.subprocess.run", return_value=completed):
+            found = inventory._tmux_session("%8")  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(
+            found,
+            (
+                " work ",
+                {"kind": "pane", "pane_id": "%8", "pane_pid": 62_008},
+            ),
+        )
+
+    def test_tmux_discovery_keeps_session_when_pane_pid_is_unusable(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=(), returncode=0, stdout="writing\tnot-a-pid\n"
+        )
+        with patch("inventory.subprocess.run", return_value=completed):
+            found = inventory._tmux_session("%9")  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(found, ("writing", {"kind": "not recorded"}))
 
     def test_ghostty_host_carries_window_shell_between_terminal_and_claude(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
@@ -658,12 +761,113 @@ elif "comm=" in joined:
             },
         )
 
+    def test_config_dir_records_the_process_directory_for_the_same_login(self) -> None:
+        default_dir = self.home / ".claude"
+        default_dir.mkdir(exist_ok=True)
+        _ = (self.home / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": TARGET_LOGIN}}),
+            encoding="utf-8",
+        )
+
+        with patch.object(account, "process_config_dir", return_value=default_dir):
+            found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+
+        self.assertEqual(len(found["sessions"]), 1)
+        self.assertEqual(found["sessions"][0].get("config_dir"), str(default_dir))
+
+    def test_account_identity_and_config_dir_share_one_process_lookup(self) -> None:
+        """F007: capture the account and directory from the same environment read."""
+        looked_up: list[int] = []
+
+        def config_dir_for_pid(pid: int) -> Path:
+            looked_up.append(pid)
+            return self.target_config if len(looked_up) == 1 else self.other_config
+
+        with patch.object(account, "process_config_dir", side_effect=config_dir_for_pid):
+            found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+
+        self.assertEqual(len(found["sessions"]), 1)
+        self.assertEqual(found["sessions"][0].get("config_dir"), str(self.target_config))
+        self.assertEqual(looked_up, [DESKTOP_PID])
+
+    def test_unreadable_session_configuration_never_defaults_to_main(self) -> None:
+        """F007: unreadable environment or identity uses the same unattributed path."""
+        for reader in ("process_config_dir", "claude_account"):
+            with (
+                self.subTest(reader=reader),
+                patch.object(account, reader, return_value=None),
+            ):
+                found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+
+            self.assertEqual(found["sessions"], [])
+            self.assertEqual(
+                found["unattributed"],
+                [{"pid": DESKTOP_PID, "name": "notes", "reason": "account unreadable"}],
+            )
+
+    def test_parse_inventory_validates_config_dir_and_accepts_legacy_absence(self) -> None:
+        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+        session_values = cast(dict[str, object], cast(object, found["sessions"][0]))
+        session_values["config_dir"] = 123
+        with self.assertRaisesRegex(
+            inventory.InvalidInventory,
+            r"inventory\.sessions\[0\]\.config_dir must be a string",
+        ):
+            _ = inventory.parse_inventory(json.dumps(found))
+
+        del session_values["config_dir"]
+        self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
+
     def test_parse_inventory_accepts_inventory_output(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
 
         decoded = inventory.parse_inventory(json.dumps(found))
 
         self.assertEqual(decoded, found)
+
+    def test_parse_inventory_treats_a_legacy_tmux_host_as_pane_not_recorded(self) -> None:
+        found = inventory.inventory(TARGET_LOGIN)
+        document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
+        session_values = cast(list[object], document["sessions"])
+        desktop = next(
+            cast(dict[str, object], value)
+            for value in session_values
+            if cast(dict[str, object], value)["session_id"] == DESKTOP_ID
+        )
+        desktop["host"] = {"kind": "tmux", "tmux_session": "legacy"}
+
+        decoded = inventory.parse_inventory(json.dumps(document))
+        parsed = next(
+            session
+            for session in decoded["sessions"]
+            if session["session_id"] == DESKTOP_ID
+        )
+
+        self.assertEqual(
+            parsed["host"],
+            {
+                "kind": "tmux",
+                "tmux_session": "legacy",
+                "pane": {"kind": "not recorded"},
+            },
+        )
+
+    def test_parse_inventory_validates_a_recorded_tmux_pane(self) -> None:
+        found = inventory.inventory(TARGET_LOGIN)
+        document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
+        session_values = cast(list[object], document["sessions"])
+        first = cast(dict[str, object], session_values[0])
+        first["host"] = {
+            "kind": "tmux",
+            "tmux_session": "work",
+            "pane": {"kind": "pane", "pane_id": "%2", "pane_pid": "invalid"},
+        }
+
+        with self.assertRaisesRegex(
+            inventory.InvalidInventory,
+            r"inventory\.sessions\[0\]\.host\.pane\.pane_pid must be an integer",
+        ):
+            _ = inventory.parse_inventory(json.dumps(document))
 
     def test_parse_inventory_rejects_unknown_kind_and_missing_variant_field(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
@@ -695,23 +899,6 @@ elif "comm=" in joined:
             r"inventory\.sessions\[0\]\.host\.window_shell is missing",
         ):
             _ = inventory.parse_inventory(json.dumps(document))
-
-
-@final
-class DarwinProcessStartTests(unittest.TestCase):
-    def test_darwin_start_is_read_in_the_locale_and_zone_claude_records(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=(), returncode=0, stdout="Fri Oct  9 23:24:25 2026\n"
-        )
-        with (
-            patch("inventory.sys.platform", "darwin"),
-            patch("inventory.subprocess.run", return_value=completed) as run,
-        ):
-            started = inventory._process_start(4242)  # pyright: ignore[reportPrivateUsage]
-
-        self.assertEqual(started, "Fri Oct  9 23:24:25 2026")
-        environment = cast(dict[str, str], run.call_args.kwargs["env"])
-        self.assertEqual((environment["LC_ALL"], environment["TZ"]), ("C", "UTC"))
 
 
 if __name__ == "__main__":

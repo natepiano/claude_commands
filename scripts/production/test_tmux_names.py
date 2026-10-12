@@ -96,6 +96,7 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
                             "SHOWRUNNERS_SESSIONS": str(sessions_script),
                             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
                             "NOTIFIER_SESSIONS_DIR": str(self.sessions),
+                            "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner-state"),
                             "STALL_WATCH_STATE_DIR": str(self.root / "stall-state"),
                             "TMUX_NAMES_PROC_DIR": str(self.proc),
                             "TMUX_NAMES_TMUX": "tmux", "TMUX_NAMES_SEND": str(sender),
@@ -111,7 +112,7 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
             _ = child.wait(timeout=3)
 
     def session(self, name: str, pane: str, *, source: str = "user",
-                tmux_socket: str = TEST_TMUX_SOCKET) -> None:
+                tmux_socket: str = TEST_TMUX_SOCKET, parent: int | None = None) -> int:
         child = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.children.append(child)
         _ = (self.sessions / f"{child.pid}.json").write_text(json.dumps({
@@ -121,6 +122,9 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         _ = (directory / "environ").write_bytes(
             f"TMUX={tmux_socket},{child.pid},0\0TMUX_PANE={pane}\0".encode()
         )
+        if parent is not None:
+            _ = (directory / "status").write_text(f"Name:\tclaude\nPPid:\t{parent}\n")
+        return child.pid
 
     def tick(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT)], env=self.environment,
@@ -131,7 +135,7 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
 
     def test_unit_rename_changes_the_tmux_label_and_leaves_the_registry_alone(self) -> None:
         before = self.config.read_bytes()
-        self.session("new", "%1")
+        _ = self.session("new", "%1")
         result = self.tick()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.names(), {"new": ["%1"]})
@@ -139,25 +143,25 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         self.assertEqual(self.config.read_bytes(), before)
 
     def test_equal_name_does_nothing(self) -> None:
-        self.session("old", "%1")
+        _ = self.session("old", "%1")
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.names(), {"old": ["%1"]})
 
     def test_derived_and_peer_names_do_not_rename_tmux(self) -> None:
         for source in ("derived", "peer"):
             with self.subTest(source=source):
-                self.session("nixos-45", "%1", source=source)
+                _ = self.session("nixos-45", "%1", source=source)
                 self.assertEqual(self.tick().returncode, 0)
                 self.assertEqual(self.names(), {"old": ["%1"]})
 
     def test_rename_works_before_registry_has_been_created(self) -> None:
         self.config.unlink()
-        self.session("new", "%1")
+        _ = self.session("new", "%1")
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.names(), {"new": ["%1"]})
 
     def test_tmux_failure_is_finished_next_tick(self) -> None:
-        self.session("new", "%1")
+        _ = self.session("new", "%1")
         _ = (self.root / "rename-failure").touch()
         first = self.tick()
         self.assertIn("tmux session still names", first.stderr)
@@ -168,13 +172,30 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
 
     def test_rename_session_does_not_change_another_pane_session(self) -> None:
         _ = self.tmux.write_text(json.dumps({"old": ["%1"], "other": ["%2"]}))
-        self.session("new", "%1")
+        _ = self.session("new", "%1")
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.names(), {"new": ["%1"], "other": ["%2"]})
 
+    def test_a_claude_started_inside_the_pane_through_a_shell_is_not_counted(self) -> None:
+        outer = self.session("new", "%1")
+        shell = self.proc / "4000001"
+        shell.mkdir()
+        _ = (shell / "status").write_text(f"Name:\tbash\nPPid:\t{outer}\n")
+        _ = self.session("inner", "%1", parent=4000001)
+        self.assertEqual(self.tick().returncode, 0)
+        self.assertEqual(self.names(), {"new": ["%1"]})
+        self.assertFalse((self.root / "faults").exists())
+
+    def test_a_tmux_session_already_named_for_one_of_its_sessions_never_faults(self) -> None:
+        _ = self.session("old", "%1")
+        _ = self.session("another", "%1")
+        self.assertEqual(self.tick().returncode, 0)
+        self.assertEqual(self.names(), {"old": ["%1"]})
+        self.assertFalse((self.root / "faults").exists())
+
     def test_shared_pane_and_taken_name_are_skipped_and_fault_once(self) -> None:
-        self.session("new", "%1")
-        self.session("another", "%1")
+        _ = self.session("new", "%1")
+        _ = self.session("another", "%1")
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(self.names(), {"old": ["%1"]})
@@ -198,15 +219,20 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         self.assertIn("tmux-names: cannot tell whether director is running", errors.getvalue())
         self.assertEqual(list(state.iterdir()), [])
 
-    def test_a_fault_for_a_session_that_is_not_live_goes_to_every_running_showrunner_and_says_so(self) -> None:
+    def test_a_fault_for_a_session_that_is_not_live_goes_to_each_trees_highest_running_showrunner_and_says_so(self) -> None:
         settings = showrunners.ShowrunnerSettings(threshold_percent=90.0, repeat_minutes=1.0, stall_minutes=1.0,
                                                   faults_to="director", always=[])
         state = self.root / "fault-state"
         runners = [showrunners.Showrunner(session="one", socket="/tmp/one.sock", slug="one", zone="UTC", doc="/d"),
+                   showrunners.Showrunner(session="below", socket="/tmp/below.sock", slug="below", zone="UTC", doc="/d"),
                    showrunners.Showrunner(session="", socket="", slug="stopped", zone="UTC", doc="/d")]
+        # `below` reports to `one`, which runs, so only `one` is told.
+        (self.root / "tree" / "below").mkdir(parents=True)
+        _ = (self.root / "tree" / "below" / "parent").write_text("one\n")
         sent = subprocess.CompletedProcess[str]([], 0, "", "")
         errors = io.StringIO()
         with mock.patch.object(tmux_names, "FAULT_STATE_DIR", state), \
+                mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.root / "tree"), \
                 mock.patch.object(showrunners, "socket_for", return_value=None), \
                 mock.patch.object(showrunners, "registered_showrunners", return_value=runners), \
                 mock.patch.object(subprocess, "run", return_value=sent) as run:
@@ -215,7 +241,8 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
             self.assertEqual(run.call_count, 1)
             self.assertEqual(command[command.index("--to") + 1], "uds:/tmp/one.sock")
             self.assertIn("director, which", command[-1])
-            self.assertIn("is not a live session, so every running showrunner is told.", command[-1])
+            self.assertIn("is not a live session, so every running showrunner that reports to no running one is told.",
+                          command[-1])
             self.assertEqual(len(list(state.iterdir())), 1)
             # With no showrunner running either, the fault is printed and tried again at the next tick.
             with mock.patch.object(showrunners, "registered_showrunners", return_value=[]), redirect_stderr(errors):
@@ -224,9 +251,9 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         self.assertEqual(len(list(state.iterdir())), 1)
 
     def test_live_sessions_require_the_tmux_server_socket_to_match(self) -> None:
-        self.session("local", "%0")
-        self.session("stranger", "%0", tmux_socket="/tmp/tmux-test/other")
-        self.session("missing tmux", "%2")
+        _ = self.session("local", "%0")
+        _ = self.session("stranger", "%0", tmux_socket="/tmp/tmux-test/other")
+        _ = self.session("missing tmux", "%2")
         without_tmux = self.children[-1]
         _ = (self.proc / str(without_tmux.pid) / "environ").write_bytes(b"TMUX_PANE=%2\0")
         with mock.patch.dict(os.environ, self.environment, clear=True), \
@@ -240,8 +267,8 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
 
     def test_tick_uses_only_claude_session_on_its_tmux_server(self) -> None:
         _ = self.tmux.write_text(json.dumps({"old": ["%0"]}))
-        self.session("local", "%0")
-        self.session("stranger", "%0", tmux_socket="/tmp/tmux-test/other")
+        _ = self.session("local", "%0")
+        _ = self.session("stranger", "%0", tmux_socket="/tmp/tmux-test/other")
         result = self.tick()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.names(), {"local": ["%0"]})
@@ -249,7 +276,7 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
 
     def test_tick_does_not_rename_for_session_on_another_tmux_server(self) -> None:
         _ = self.tmux.write_text(json.dumps({"old": ["%0"]}))
-        self.session("stranger", "%0", tmux_socket="/tmp/tmux-test/other")
+        _ = self.session("stranger", "%0", tmux_socket="/tmp/tmux-test/other")
         result = self.tick()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.names(), {"old": ["%0"]})
@@ -257,5 +284,5 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
 
     def test_no_tmux_server_exits_zero(self) -> None:
         self.tmux.unlink()
-        self.session("new", "%1")
+        _ = self.session("new", "%1")
         self.assertEqual(self.tick().returncode, 0)

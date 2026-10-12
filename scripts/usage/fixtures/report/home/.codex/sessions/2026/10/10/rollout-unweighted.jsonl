@@ -1,0 +1,3 @@
+{"timestamp":"2026-10-10T21:34:00Z","type":"session_meta","payload":{"id":"report-unweighted"}}
+{"timestamp":"2026-10-10T21:34:00Z","type":"turn_context","payload":{"model":"gpt-6-sol"}}
+{"timestamp":"2026-10-10T21:35:20Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":5,"cached_input_tokens":1,"output_tokens":1}}}}

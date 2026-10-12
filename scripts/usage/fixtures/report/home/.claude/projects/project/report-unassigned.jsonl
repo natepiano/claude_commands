@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-10-10T21:30:00Z","cwd":"/invented/loose"}
+{"type":"assistant","timestamp":"2026-10-10T21:35:14Z","requestId":"unassigned-turn","message":{"id":"unassigned-turn","model":"claude-opus-4-6","usage":{"input_tokens":30,"output_tokens":4}}}

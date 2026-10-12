@@ -1,0 +1,2 @@
+{"type":"assistant","timestamp":"2026-10-10T21:35:10Z","requestId":"copied-request","message":{"id":"copied-message","model":"claude-opus-4-6","usage":{"input_tokens":20,"cache_creation_input_tokens":4,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":3},"cache_read_input_tokens":5,"output_tokens":73}}}
+{"type":"assistant","timestamp":"2026-10-10T21:35:12Z","requestId":"fork-request","message":{"id":"fork-message","model":"claude-haiku-4-5","usage":{"input_tokens":3,"output_tokens":4}}}

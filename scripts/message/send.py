@@ -4,13 +4,17 @@
 Agents holding the SendMessage tool call it directly; scripts call this. The rules
 every message follows are /message (~/.claude/commands/message.md).
 
-  send.py --to NAME|session:<id> [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
-          [--machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
+  send.py --to NAME|uds:<path>|session:<id>|seat:<run>/<seat>|codex:<thread>
+          [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
+          [--here | --machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
-  send.py --to user --summary TITLE [--need note|decision|blocked] ...   the user
+  send.py --to user --summary TITLE [--need note|decision|blocked]
+          (--action TEXT | --no-action) ...                              the user
   send.py ack KEY       later sends with KEY are skipped
   send.py reopen KEY    forget KEY: acknowledgement and repeat window
   send.py pending [NAME]  print and clear what is kept for this session, or for NAME's
+  send.py retire --to ADDRESS --from SENDER --key KEY
+                          remove obsolete queued messages for ADDRESS
 
 Delivery. The session-to-session channel is a tool, not a command, so a Claude
 recipient is reached through a headless `claude -p` relay whose one job is a
@@ -20,7 +24,10 @@ removed, so it never passes for the session that ran this. It is named --from,
 which is the sender name the recipient sees. Delivery is read from the
 SendMessage tool result in the relay's stream, never from what the model says;
 the last stream per recipient stays in STATE/relay/<to>.jsonl.
-`--codex` queues the text on a codex_mesh.py thread instead, and `--machine`
+`seat:` addresses queue through codex_mesh.py; `codex:` addresses queue through
+the shared Codex daemon. A unique roster name resolves to either. `--codex`
+with `--session-dir` still selects codex_mesh.py directly. Names and addresses
+resolve here first, then on the peer. `--here` keeps resolution here; `--machine`
 runs this script on HOST over ssh, where ~/.claude is this repo.
 
 `--to user` reaches the user wherever they are; `--summary` is the title. `--need`
@@ -42,8 +49,9 @@ message text as one JSON line in STATE/log.jsonl:
                  recipient's Claude session id, so a rename loses
                  nothing; under the name as given when no live
                  session answers to it, which the outcome says
-  FAILED: why    not delivered and not kept: a Codex seat, which  exit 3
-                 no queue reader reaches, the user, or ssh to HOST
+  FAILED: why    not delivered and not kept: a Codex recipient,   exit 3
+                 the user, or ssh to HOST
+  REFUSED: why   rejected before delivery; not kept              exit 2
 Usage errors, an unreadable --file and an empty message exit 2. STATE is $XDG_STATE_HOME/message, or ~/.local/state/message.
 """
 
@@ -61,12 +69,18 @@ import subprocess
 import sys
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 import sessions  # noqa: E402
+import codex_daemon  # noqa: E402
+import roster  # noqa: E402
+from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
+                         UserAction, parse_user_action)  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message"
 CLAUDE = Path.home() / ".local" / "bin" / "claude"
@@ -82,15 +96,40 @@ PERMISSION_MODE = "auto"
 TIMEOUT = 40
 KILL_GRACE = 10
 
-Outcome = Literal["sent", "skipped", "queued", "failed"]
+Outcome = Literal["sent", "skipped", "queued", "failed", "refused"]
 Need = Literal["note", "decision", "blocked"]
 CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "1", "blocked": "2"}
-EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3}
+EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2}
 
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str})
-Queued = TypedDict("Queued", {"time": str, "from": str, "to": str, "key": str | None, "summary": str,
-                              "text": str, "reason": str})
+KeyedMessage = TypedDict(
+    "KeyedMessage",
+    {
+        "time": str,
+        "from": str,
+        "to": str,
+        "key": str,
+        "summary": str,
+        "text": str,
+        "reason": str,
+    },
+)
+UnkeyedMessage = TypedDict(
+    "UnkeyedMessage",
+    {
+        "time": str,
+        "from": str,
+        "to": str,
+        "key": None,
+        "summary": str,
+        "text": str,
+        "reason": str,
+    },
+)
+
+
+QueuedMessage = KeyedMessage | UnkeyedMessage
 
 
 class KeyState(TypedDict):
@@ -126,19 +165,104 @@ class SessionIdWithoutLiveRecipient(NamedTuple):
 RelayPlan = RelayAttempt | SessionIdWithoutLiveRecipient
 
 
-class Options(NamedTuple):
+@dataclass(frozen=True)
+class NoUserRecipient:
+    pass
+
+
+MessageUserAction = UserAction | NoUserRecipient
+
+
+@dataclass(frozen=True)
+class ClaudeRecipient:
+    address: str
+
+
+@dataclass(frozen=True)
+class CodexSeatRecipient:
+    address: str
+    name: str
+    session_dir: str
+
+
+@dataclass(frozen=True)
+class CodexSessionRecipient:
+    address: str
+    thread_id: str
+    name: str
+
+
+SessionRecipient = ClaudeRecipient | CodexSeatRecipient | CodexSessionRecipient
+
+
+@dataclass(frozen=True)
+class UserDelivery:
+    """Deliver through the user-notification gate."""
+
+
+@dataclass(frozen=True)
+class RemoteDelivery:
+    host: str
+    address: str
+
+
+@dataclass(frozen=True)
+class RecipientLookupFailed:
+    reason: str
+
+
+DeliveryRoute = SessionRecipient | UserDelivery | RemoteDelivery | RecipientLookupFailed
+
+
+@dataclass(frozen=True)
+class LocalOnly:
+    """Resolve and deliver only here."""
+
+
+@dataclass(frozen=True)
+class LocalThenPeer:
+    """Ask the peer only after proving this machine has no match."""
+
+
+@dataclass(frozen=True)
+class NamedMachine:
+    host: str
+
+
+RecipientResolutionScope = LocalOnly | LocalThenPeer | NamedMachine
+LOCAL_THEN_PEER = LocalThenPeer()
+
+
+@dataclass(frozen=True)
+class RosterLookup:
     to: str
+
+
+@dataclass(frozen=True)
+class MeshSeat:
+    session_dir: str
+    seat: str
+
+
+RecipientSelection = RosterLookup | MeshSeat
+
+
+class Options(NamedTuple):
+    selection: RecipientSelection
     sender: str | None
     summary: str | None
     key: str | None
     repeat_minutes: float | None
-    machine: str | None
-    codex: bool
-    session_dir: str | None
+    scope: RecipientResolutionScope
     timeout: float
     need: Need
+    action: MessageUserAction
     text: str | None
     file: str | None
+
+    @property
+    def to(self) -> str:
+        return self.selection.to if isinstance(self.selection, RosterLookup) else self.selection.seat
 
 
 # ---------------------------------------------------------------------------
@@ -222,27 +346,105 @@ def queue_for(to: str) -> Path:
     Under the Claude session id of the live session `to` means, so the session finds it whatever it
     is called later. Under `to` itself when no live session answers to it: there is no id to look up.
     """
+    if to.startswith("session:") and len(to) > len("session:"):
+        return queue_path(f"session-{to.removeprefix('session:')}")
     session = sessions.addressed(to, sessions.live_sessions())
     return queue_path(session_key(session) if session is not None else to)
 
 
-def read_queue(path: Path) -> list[Queued]:
+def _queued_message(value: object) -> QueuedMessage | None:
+    values = as_dict(value)
+    string_fields = ("time", "from", "to", "summary", "text", "reason")
+    if not all(isinstance(values.get(field), str) for field in string_fields):
+        return None
+    key = values.get("key")
+    if key is None:
+        return cast(UnkeyedMessage, cast(object, values))
+    if isinstance(key, str):
+        return cast(KeyedMessage, cast(object, values))
+    return None
+
+
+def read_queue(path: Path) -> list[QueuedMessage]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
         return []
-    return [cast("Queued", cast("object", entry)) for line in lines if isinstance(entry := loads(line), dict)]
+    messages = (_queued_message(loads(line)) for line in lines)
+    return [message for message in messages if message is not None]
 
 
 def enqueue(message: Message, reason: str, at: datetime) -> None:
     """Keep a message that did not arrive; a later one with the same key replaces it."""
     path = queue_for(message.to)
-    entry: Queued = {"time": at.isoformat(), "from": message.sender, "to": message.to, "key": message.key,
-                     "summary": message.summary, "text": message.text, "reason": reason}
+    if message.key is None:
+        entry: QueuedMessage = UnkeyedMessage(
+            time=at.isoformat(),
+            to=message.to,
+            key=None,
+            summary=message.summary,
+            text=message.text,
+            reason=reason,
+            **{"from": message.sender},
+        )
+    else:
+        entry = KeyedMessage(
+            time=at.isoformat(),
+            to=message.to,
+            key=message.key,
+            summary=message.summary,
+            text=message.text,
+            reason=reason,
+            **{"from": message.sender},
+        )
     with locked():
         path.parent.mkdir(parents=True, exist_ok=True)
         kept = [old for old in read_queue(path) if message.key is None or old["key"] != message.key]
         write_atomic(path, "".join(json.dumps(item) + "\n" for item in [*kept, entry]))
+
+
+def _rewrite_queue(path: Path, kept: list[QueuedMessage]) -> None:
+    if kept:
+        write_atomic(path, "".join(json.dumps(item) + "\n" for item in kept))
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _queue_paths_for_address(to: str) -> list[Path]:
+    return list(dict.fromkeys((queue_for(to), queue_path(to))))
+
+
+def remove_queued_key(to: str, key: str) -> int:
+    """Remove a delivered keyed message's queued predecessor."""
+    paths = _queue_paths_for_address(to)
+    removed = 0
+    with locked():
+        for path in paths:
+            entries = read_queue(path)
+            kept = [entry for entry in entries if entry["key"] != key]
+            _rewrite_queue(path, kept)
+            removed += len(entries) - len(kept)
+    return removed
+
+
+def retire(to: str, sender: str, key: str) -> int:
+    """Remove obsolete shutdown messages queued for one address."""
+    paths = _queue_paths_for_address(to)
+    removed = 0
+    with locked():
+        for path in paths:
+            entries = read_queue(path)
+            kept = [
+                entry
+                for entry in entries
+                if not (
+                    entry["key"] == key
+                    or (entry["key"] is None and entry["from"] == sender)
+                )
+            ]
+            _rewrite_queue(path, kept)
+            removed += len(entries) - len(kept)
+    return removed
 
 
 def log(message: Message, result: Result, at: datetime) -> None:
@@ -326,6 +528,96 @@ def pending(to: str | None) -> str:
 # ---------------------------------------------------------------------------
 # Delivery
 # ---------------------------------------------------------------------------
+
+
+def _print_roster_problems(problems: list[str]) -> None:
+    for problem in problems:
+        print(f"send.py: roster: {problem}", file=sys.stderr)
+
+
+def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
+    if not isinstance(entry.reach, roster.Messageable):
+        raise AssertionError("a messageable recipient needs an address")
+    address = entry.reach.address
+    if address.startswith("seat:"):
+        if not isinstance(entry.assignment, roster.WorkerAssignment):
+            usage_error(f"{address} is not assigned to a Codex seat")
+        return CodexSeatRecipient(address, entry.name, entry.assignment.session_dir)
+    if address.startswith("codex:"):
+        return CodexSessionRecipient(
+            address,
+            address.removeprefix("codex:"),
+            entry.name,
+        )
+    return ClaudeRecipient(address)
+
+
+def _cannot_receive_message(entry: roster.RosterEntry) -> NoReturn:
+    usage_error(roster.cannot_receive_message_text(entry))
+
+
+def _ambiguous_name(name: str, entries: list[roster.RosterEntry]) -> NoReturn:
+    lines = [f"{name} matches {len(entries)} sessions:"]
+    for entry in entries:
+        recipient = (
+            entry.reach.address
+            if isinstance(entry.reach, roster.Messageable)
+            else f"(cannot take messages: {entry.reach.reason})"
+        )
+        lines.append(f"  {recipient} ({entry.role})")
+    usage_error("\n".join(lines))
+
+
+def _recipient_matches(to: str, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
+    if to.startswith(("session:", "seat:", "codex:")):
+        return [entry for entry in entries
+                if isinstance(entry.reach, roster.Messageable) and entry.reach.address == to]
+    return [entry for entry in entries if entry.name == to]
+
+
+def _matched_recipient(to: str, matches: list[roster.RosterEntry]) -> SessionRecipient:
+    if len(matches) > 1:
+        _ambiguous_name(to, matches)
+    entry = matches[0]
+    if isinstance(entry.reach, roster.CannotReceiveMessages):
+        _cannot_receive_message(entry)
+    return _messageable_recipient(entry)
+
+
+def resolve_recipient(
+    to: str, scope: RecipientResolutionScope = LOCAL_THEN_PEER,
+) -> DeliveryRoute:
+    """Resolve locally first; a remote row supplies the address sent to its machine."""
+    if to.startswith("uds:"):
+        return ClaudeRecipient(to)
+    if isinstance(scope, NamedMachine):
+        return RemoteDelivery(scope.host, to)
+    if to.startswith("codex:"):
+        thread_id = to.removeprefix("codex:")
+        if not thread_id:
+            usage_error("codex: needs a thread id")
+    result = roster.roster(os.environ, roster.ThisMachine())
+    _print_roster_problems(result.problems)
+    matches = _recipient_matches(to, result.entries)
+    if matches:
+        return _matched_recipient(to, matches)
+    addressed = to.startswith(("session:", "seat:", "codex:"))
+    if isinstance(scope, LocalThenPeer):
+        if result.problems and not addressed:
+            usage_error(f"absence of {to} here is not proven; use an address or --machine")
+        peer = roster.peer_roster(os.environ)
+        _print_roster_problems(peer.problems)
+        matches = _recipient_matches(to, peer.entries)
+        if matches:
+            recipient = _matched_recipient(to, matches)
+            return RemoteDelivery(roster.remote.other_machine(), recipient.address)
+        if peer.problems:
+            return RecipientLookupFailed("; ".join(peer.problems))
+    if to.startswith("seat:"):
+        usage_error(f"no roster session has address {to}")
+    if to.startswith("codex:"):
+        return CodexSessionRecipient(to, to.removeprefix("codex:"), to.removeprefix("codex:"))
+    return ClaudeRecipient(to)
 
 
 def run(command: list[str], stdin: str, timeout: float, env: dict[str, str] | None = None,
@@ -491,31 +783,58 @@ def codex(message: Message, session_dir: str, timeout: float) -> Result:
     return Result("failed", f"codex_mesh.py send: {why}")
 
 
-def user(message: Message, need: Need, timeout: float) -> Result:
+def codex_session(
+    message: Message,
+    recipient: CodexSessionRecipient,
+    timeout: float,
+) -> Result:
+    queued = codex_daemon.queue(recipient.thread_id, message.text, timeout=timeout)
+    if isinstance(queued, codex_daemon.Queued):
+        return Result("sent", f"queued on Codex session {recipient.name}")
+    if isinstance(queued, codex_daemon.QueueTimedOut):
+        return Result("failed", f"timed out after {queued.seconds:g} s")
+    return Result("failed", queued.reason)
+
+
+def action_arguments(action: UserAction) -> list[str]:
+    if isinstance(action, ActionRequired):
+        return ["--action", action.text]
+    return ["--no-action"]
+
+
+def user(message: Message, need: Need, action: UserAction, timeout: float) -> Result:
     """Reach the user. The channel is this function's business alone."""
-    command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], message.summary, message.text]
+    command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], "--source", message.sender,
+               *action_arguments(action), message.summary, message.text]
     code, out, err = run(command, "", timeout)
     if code == 0:
         return Result("sent", "to the user")
     why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
+    if code == 2 and f"{REFUSED_BEFORE_SENDING}:" in err:
+        return Result("refused", why)
     return Result("failed", f"the user was not reached: {why}")
 
 
 def remote(message: Message, host: str, options: Options) -> Result:
     """Run this script on host; its own log and queue record the attempt there."""
-    forwarded = ["--to", message.to, "--from", message.sender, "--summary", message.summary,
+    forwarded = ["--here", "--to", message.to, "--from", message.sender, "--summary", message.summary,
                  "--timeout", f"{options.timeout:g}"]
     if message.key is not None:
         forwarded += ["--key", message.key]
     if message.to == USER:
         forwarded += ["--need", options.need]
-    if options.session_dir is not None:
-        forwarded += ["--codex", "--session-dir", options.session_dir]
+        if isinstance(options.action, NoUserRecipient):
+            raise AssertionError("a user message must state its action")
+        forwarded += action_arguments(options.action)
+    if isinstance(options.selection, MeshSeat):
+        forwarded += ["--codex", "--session-dir", options.selection.session_dir]
+    if options.repeat_minutes is not None:
+        forwarded += ["--repeat-minutes", f"{options.repeat_minutes:g}"]
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"{REMOTE} {shlex.join(forwarded)}"]
     code, out, err = run(command, message.text, options.timeout + KILL_GRACE + 30)
     line = (out.strip().splitlines() or [""])[-1]
     word, _, detail = line.partition(": ")
-    outcome = cast(Outcome, word.lower()) if word in ("SENT", "SKIPPED", "QUEUED", "FAILED") else None
+    outcome = cast(Outcome, word.lower()) if word in ("SENT", "SKIPPED", "QUEUED", "FAILED", "REFUSED") else None
     if outcome is None:
         why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
         return Result("failed", f"ssh {host}: {why}")
@@ -551,16 +870,31 @@ def optional_float(value: object) -> float | None:
 
 def parse(argv: list[str]) -> Options:
     parser = argparse.ArgumentParser(prog="send.py",
-                                     description="Send one message to a Claude session, a Codex seat or the user.",
+                                     description=(
+                                         "Send one message to a roster name, uds:<path>, "
+                                         "session:<id>, seat:<run id>/<seat name>, "
+                                         "codex:<thread id>, or user."
+                                     ),
                                      epilog="Also: send.py ack KEY | reopen KEY | pending [NAME]")
-    _ = parser.add_argument("--to", required=True, help="the recipient's name as ListAgents prints it, or `user`")
+    _ = parser.add_argument(
+        "--to",
+        required=True,
+        help=(
+            "a roster name, uds:<path>, session:<id>, "
+            "seat:<run id>/<seat name>, codex:<thread id>, or user"
+        ),
+    )
     _ = parser.add_argument("--from", dest="sender", help="the sender name the recipient sees")
     _ = parser.add_argument("--summary", help="SendMessage's short label, default the first line; the title to `user`")
     _ = parser.add_argument("--need", choices=list(CHANNEL_PRIORITY), default="note",
                             help="to `user`: what they must do (default note: nothing)")
+    _ = parser.add_argument("--action", help="to `user`: what the user does")
+    _ = parser.add_argument("--no-action", action="store_true", help="to `user`: nothing is needed")
     _ = parser.add_argument("--key", help="names the message for --repeat-minutes, ack and the queue")
     _ = parser.add_argument("--repeat-minutes", type=float, help="skip a send with --key inside this window")
-    _ = parser.add_argument("--machine", help="deliver from this ssh host instead (mac)")
+    location = parser.add_mutually_exclusive_group()
+    _ = location.add_argument("--machine", help="deliver from this ssh host instead (mac)")
+    _ = location.add_argument("--here", action="store_true", help="resolve and deliver only here")
     _ = parser.add_argument("--codex", action="store_true", help="the recipient is a codex_mesh.py thread")
     _ = parser.add_argument("--session-dir", help="the codex_mesh.py session directory")
     _ = parser.add_argument("--timeout", type=float, default=TIMEOUT, help=f"delivery seconds (default {TIMEOUT})")
@@ -568,21 +902,64 @@ def parse(argv: list[str]) -> Options:
     _ = body.add_argument("--text")
     _ = body.add_argument("--file")
     args = parser.parse_args(argv)
-    get = {name: attr(args, name) for name in Options._fields}
-    options = Options(to=as_str(get["to"]), sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
+    to = as_str(attr(args, "to"))
+    action_text = optional_str(attr(args, "action"))
+    no_action = attr(args, "no_action") is True
+    if to != USER:
+        if action_text is not None or no_action:
+            parser.error("--action and --no-action go with --to user")
+        action: MessageUserAction = NoUserRecipient()
+    else:
+        parsed_action = parse_user_action(action_text, no_action)
+        if isinstance(parsed_action, ActionRefused):
+            parser.error(f"{parsed_action.reason}. {FIX}")
+        if isinstance(parsed_action, ActionUnstated):
+            parser.error(FIX)
+        action = parsed_action
+    session_dir = optional_str(attr(args, "session_dir"))
+    is_codex = attr(args, "codex") is True
+    if is_codex != (session_dir is not None):
+        parser.error("--codex and --session-dir go together")
+    selection: RecipientSelection = MeshSeat(session_dir, to) if session_dir is not None else RosterLookup(to)
+    host = optional_str(attr(args, "machine"))
+    scope: RecipientResolutionScope = (
+        NamedMachine(host) if host is not None else
+        LocalOnly() if attr(args, "here") is True else LocalThenPeer()
+    )
+    get = {name: attr(args, name) for name in Options._fields if name not in {"action", "selection", "scope"}}
+    options = Options(selection=selection, sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
-                      machine=optional_str(get["machine"]), codex=get["codex"] is True,
-                      session_dir=optional_str(get["session_dir"]), timeout=optional_float(get["timeout"]) or TIMEOUT,
-                      need=cast(Need, get["need"]), text=optional_str(get["text"]), file=optional_str(get["file"]))
-    if options.to == USER and (options.summary is None or options.codex):
+                      scope=scope, timeout=optional_float(get["timeout"]) or TIMEOUT,
+                      need=cast(Need, get["need"]), action=action, text=optional_str(get["text"]),
+                      file=optional_str(get["file"]))
+    if options.to == USER and (options.summary is None or isinstance(options.selection, MeshSeat)):
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
         parser.error("--need goes with --to user")
-    if options.codex != (options.session_dir is not None):
-        parser.error("--codex and --session-dir go together")
+    if options.to == USER and options.need != "note" and not isinstance(options.action, ActionRequired):
+        parser.error(f"--need {options.need} requires --action. {FIX}")
     if options.repeat_minutes is not None and options.key is None:
         parser.error("--repeat-minutes needs --key")
     return options
+
+
+class RetireRequest(NamedTuple):
+    to: str
+    sender: str
+    key: str
+
+
+def parse_retire(argv: list[str]) -> RetireRequest:
+    parser = argparse.ArgumentParser(prog="send.py retire")
+    _ = parser.add_argument("--to", required=True)
+    _ = parser.add_argument("--from", dest="sender", required=True)
+    _ = parser.add_argument("--key", required=True)
+    args = parser.parse_args(argv)
+    return RetireRequest(
+        as_str(attr(args, "to")),
+        as_str(attr(args, "sender")),
+        as_str(attr(args, "key")),
+    )
 
 
 def usage_error(text: str) -> NoReturn:
@@ -609,18 +986,42 @@ def send(options: Options) -> Result:
         usage_error("the message is empty")
     first = text.strip().splitlines()[0]
     summary = options.summary or (first if len(first) <= 60 else first[:59] + "…")
-    message = Message(options.to, options.sender or default_sender(), summary, text, options.key)
+    if isinstance(options.selection, MeshSeat):
+        route: DeliveryRoute = (
+            RemoteDelivery(options.scope.host, options.to) if isinstance(options.scope, NamedMachine)
+            else CodexSeatRecipient(options.to, options.to, options.selection.session_dir)
+        )
+    elif options.to == USER:
+        route = (RemoteDelivery(options.scope.host, USER) if isinstance(options.scope, NamedMachine)
+                 else UserDelivery())
+    else:
+        route = resolve_recipient(options.to, options.scope)
+    destination = route.address if isinstance(route, SessionRecipient | RemoteDelivery) else options.to
+    message = Message(destination, options.sender or default_sender(), summary, text, options.key)
     started = now()
     window = None if options.repeat_minutes is None else timedelta(minutes=options.repeat_minutes)
     skip = claim(message, window, started)
     if skip is not None:
         result = Result("skipped", skip)
-    elif options.machine is not None:
-        result = remote(message, options.machine, options)
-    elif message.to == USER:
-        result = user(message, options.need, options.timeout)
-    elif options.session_dir is not None:
-        result = codex(message, options.session_dir, options.timeout)
+    elif isinstance(route, RecipientLookupFailed):
+        result = Result("failed", route.reason)
+    elif isinstance(route, RemoteDelivery):
+        result = remote(message, route.host, options)
+    elif isinstance(route, UserDelivery):
+        if isinstance(options.action, NoUserRecipient):
+            raise AssertionError("a user message must state its action")
+        result = user(message, options.need, options.action, options.timeout)
+    elif isinstance(route, CodexSeatRecipient):
+        transport = Message(
+            route.name,
+            message.sender,
+            message.summary,
+            message.text,
+            message.key,
+        )
+        result = codex(transport, route.session_dir, options.timeout)
+    elif isinstance(route, CodexSessionRecipient):
+        result = codex_session(message, route, options.timeout)
     else:
         plan = relay_plan(message)
         if isinstance(plan, SessionIdWithoutLiveRecipient):
@@ -636,12 +1037,19 @@ def send(options: Options) -> Result:
                 if sessions.addressed(message.to, sessions.live_sessions()) is None:
                     result = Result("queued", f"{result.detail}; no live session answers to {message.to},"
                                     + " so it is kept under that name")
+    if result.outcome == "sent" and message.key is not None:
+        for recipient in dict.fromkeys((message.to, options.to)):
+            _ = remove_queued_key(recipient, message.key)
     log(message, result, started)
     return result
 
 
 def main(argv: list[str]) -> int:
     match argv:
+        case ["retire", *arguments]:
+            request = parse_retire(arguments)
+            removed = retire(request.to, request.sender, request.key)
+            print(f"retired {removed} queued message{'s' if removed != 1 else ''}")
         case ["ack", key]:
             print(acknowledge(key))
         case ["reopen", key]:

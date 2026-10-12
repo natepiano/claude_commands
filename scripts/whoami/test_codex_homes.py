@@ -1,0 +1,420 @@
+"""Codex home discovery, live read isolation, and account display."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import io
+import os
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from scripts.accounts import accounts
+from scripts.production import showrunners
+from typing import cast, override
+from unittest.mock import MagicMock, call, patch
+from zoneinfo import ZoneInfo
+
+import agent_accounts
+import note_file
+import whoami
+from agent_accounts import (
+    CheckedNamedClaudeAccount,
+    ClaudeAccountSelection,
+    CodexAccountResult,
+    CodexHomeSource,
+    CodexRateLimits,
+    KnownClaudeAccount,
+    Report,
+    UnreadableClaudeAccount,
+)
+
+
+class CodexHomesTests(unittest.TestCase):
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.home: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment_context = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home), "PATH": os.defpath,
+        }, clear=True)))
+        del environment_context
+        _ = self.enterContext(patch.object(note_file, "AGENTS_DIR", self.home))
+
+    def select_seats(self, label: str) -> Path:
+        home = self.home / f".codex{label.removeprefix('codex ')}"
+        home.mkdir(exist_ok=True)
+        login = "selected@example.invalid" if label == "codex 2" else "next@example.invalid"
+        claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
+        _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        _ = (self.home / f"{label}.md").write_text(f"---\nlogin: {login}\n---\n")
+        self.assertEqual(accounts.main(["set-role", "seats", label]), 0)
+        return home
+
+    def legacy_selection(self) -> ClaudeAccountSelection:
+        return ClaudeAccountSelection(UnreadableClaudeAccount(), UnreadableClaudeAccount(), False, ())
+
+    def live_fixture(self, home: Path) -> Report:
+        return Report("Codex", email=f"{home.name}@example.invalid", source=CodexHomeSource(home))
+
+    def test_shared_user_zone_uses_production_or_machine_local_time(self) -> None:
+        runner = showrunners.Showrunner(session="fixture", socket="", slug="fixture", zone="Asia/Tokyo", doc="")
+        with patch.object(showrunners, "registered_showrunners", return_value=[runner]):
+            self.assertEqual(agent_accounts.user_zone(), ZoneInfo("Asia/Tokyo"))
+        with patch.object(showrunners, "registered_showrunners", return_value=[]):
+            self.assertIsNone(agent_accounts.user_zone())
+        with patch.object(showrunners, "registered_showrunners", side_effect=OSError("records unreadable")):
+            self.assertIsNone(agent_accounts.user_zone())
+
+    def test_shared_user_zone_uses_machine_time_when_production_cannot_import(self) -> None:
+        with patch.dict("sys.modules", {"scripts.production": None}):
+            self.assertIsNone(agent_accounts.user_zone())
+
+    def test_discovery_includes_default_even_when_no_codex_home_exists(self) -> None:
+        self.assertEqual(agent_accounts.codex_homes(agent_accounts.seats_home()), [self.home / ".codex"])
+        self.assertEqual(agent_accounts.codex_home(), self.home / ".codex")
+        self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_discovery_orders_existing_numbered_directories_numerically(self) -> None:
+        for name in (".codex10", ".codex2", ".codex1", ".codex-other"):
+            (self.home / name).mkdir()
+        _ = (self.home / ".codex3").write_text("a file")
+
+        self.assertEqual(agent_accounts.codex_homes(agent_accounts.seats_home()), [
+            self.home / name for name in (".codex", ".codex1", ".codex2", ".codex10")
+        ])
+
+    def test_discovery_includes_the_home_in_use_once(self) -> None:
+        numbered = self.home / ".codex2"
+        numbered.mkdir()
+        for selected, expected in (
+            (numbered, [self.home / ".codex", numbered]),
+            (self.home / "custom codex", [self.home / ".codex", numbered, self.home / "custom codex"]),
+        ):
+            with self.subTest(selected=selected), patch.dict(os.environ, {"CODEX_HOME": str(selected)}):
+                self.assertEqual(agent_accounts.codex_home(), selected)
+                self.assertEqual(agent_accounts.codex_homes(selected), expected)
+
+    def test_live_read_sets_the_child_home_and_retains_report_source(self) -> None:
+        selected = self.home / ".codex2"
+        process = MagicMock(spec=asyncio.subprocess.Process)
+        process.returncode = 0
+        identity: CodexAccountResult = {
+            "account": {"type": "chatgpt", "email": "spare@example.invalid", "planType": "pro"},
+        }
+        usage: CodexRateLimits = {"rateLimits": {
+            "secondary": {"usedPercent": 12, "windowDurationMins": 10080},
+            "primary": {"usedPercent": 80, "windowDurationMins": 300},
+            "credits": {"balance": "23", "hasCredits": True},
+        }}
+        with (
+            patch.dict(os.environ, {"CODEX_HOME": str(self.home / ".codex"), "RETAIN_ENV": "fixture"}),
+            patch.object(agent_accounts, "executable", return_value="fixture-codex"),
+            patch.object(asyncio, "create_subprocess_exec", return_value=process) as launch,
+            patch.object(agent_accounts.CodexServer, "request", side_effect=[{}, identity, usage]),
+            patch.object(agent_accounts.CodexServer, "send"),
+        ):
+            before = dict(os.environ)
+            report = asyncio.run(agent_accounts.codex_live(selected))
+            self.assertEqual(dict(os.environ), before)
+
+        self.assertEqual(launch.call_args.args, ("fixture-codex", "app-server", "--listen", "stdio://"))
+        environment = cast(dict[str, str], launch.call_args.kwargs["env"])
+        self.assertEqual(environment, {**before, "CODEX_HOME": str(selected)})
+        self.assertEqual(report.source, CodexHomeSource(selected))
+        self.assertEqual(report.email, "spare@example.invalid")
+        self.assertEqual(report.weekly_remaining, 88)
+        self.assertIsNotNone(report.five_hour)
+        self.assertEqual(report.credit_balance, "23")
+
+    def test_logged_out_live_report_still_names_its_home(self) -> None:
+        selected = self.home / ".codex2"
+        process = MagicMock(spec=asyncio.subprocess.Process)
+        process.returncode = 0
+        with (
+            patch.object(agent_accounts, "executable", return_value="fixture-codex"),
+            patch.object(asyncio, "create_subprocess_exec", return_value=process),
+            patch.object(agent_accounts.CodexServer, "request", side_effect=[{}, {"account": None}]),
+            patch.object(agent_accounts.CodexServer, "send"),
+        ):
+            report = asyncio.run(agent_accounts.codex_live(selected))
+        self.assertEqual(report.source, CodexHomeSource(selected))
+        self.assertEqual(report.problem, "Not logged in")
+
+    def test_failed_live_report_still_names_its_home(self) -> None:
+        selected = self.home / ".codex2"
+        with (
+            patch.object(agent_accounts, "executable", return_value="fixture-codex"),
+            patch.object(asyncio, "create_subprocess_exec", side_effect=OSError("fixture")),
+        ):
+            report = asyncio.run(agent_accounts.codex_live(selected))
+        self.assertEqual(report.source, CodexHomeSource(selected))
+        self.assertIsNotNone(report.problem)
+
+    def test_live_reports_reads_each_home_in_order_in_both_claude_branches(self) -> None:
+        for name in (".codex10", ".codex2"):
+            (self.home / name).mkdir()
+        default = KnownClaudeAccount("main@example.invalid", "claude 1")
+        named = CheckedNamedClaudeAccount("claude 2", self.home / ".claude2",
+            KnownClaudeAccount("unit@example.invalid", "claude 2"))
+        selections = (
+            self.legacy_selection(),
+            ClaudeAccountSelection(default, named.identity, True, (named,)),
+        )
+        homes = [self.home / name for name in (".codex", ".codex2", ".codex10")]
+        for selection in selections:
+            with (
+                self.subTest(multiple=selection.multiple_accounts),
+                patch.object(agent_accounts, "claude_live", return_value=Report("Claude")) as claude,
+                patch.object(agent_accounts, "codex_live", side_effect=self.live_fixture) as codex,
+            ):
+                reports = asyncio.run(agent_accounts.live_reports(selection, agent_accounts.seats_home()))
+            self.assertEqual([report.source for report in reports if report.tool == "Codex"],
+                [CodexHomeSource(home) for home in homes])
+            self.assertCountEqual(codex.await_args_list, [call(home) for home in homes])
+            if selection.multiple_accounts:
+                self.assertCountEqual(claude.call_args_list, [call(self.home / ".claude"), call(named.directory)])
+            else:
+                claude.assert_called_once_with()
+
+    def test_whoami_prints_each_codex_account_and_marks_only_the_selected_home(self) -> None:
+        default = self.home / ".codex"
+        selected = self.home / ".codex2"
+        _ = self.select_seats("codex 2")
+        for label, login in (("codex 1", "default@example.invalid"), ("codex 2", "selected@example.invalid")):
+            _ = (self.home / f"{label}.md").write_text(f"---\nlogin: {login}\n---\n")
+        reports = [
+            Report("Codex", email="default@example.invalid", source=CodexHomeSource(default)),
+            Report("Codex", email="selected@example.invalid", source=CodexHomeSource(selected)),
+        ]
+        output = io.StringIO()
+        with (
+            patch.dict(os.environ, {"CODEX_HOME": str(selected)}),
+            patch.object(whoami, "live_reports", return_value=reports),
+            redirect_stdout(output),
+        ):
+            asyncio.run(whoami.main())
+        blocks = output.getvalue().strip().split("\n\n")
+        self.assertEqual(len(blocks), 2)
+        self.assertIn("Account: codex 1 — default@example.invalid", blocks[0])
+        self.assertNotIn("(seats)", blocks[0])
+        self.assertIn("Account: codex 2 (seats) — selected@example.invalid", blocks[1])
+
+    def test_whoami_with_one_codex_home_keeps_the_original_output(self) -> None:
+        _ = (self.home / "codex 1.md").write_text("---\nlogin: seats@example.invalid\n---\n")
+        report = Report("Codex", email="seats@example.invalid", source=CodexHomeSource(self.home / ".codex"))
+        self.assertEqual(whoami.render(report, self.legacy_selection(), agent_accounts.seats_home()), [
+            "Codex", "  Account: codex 1 — seats@example.invalid", "  Plan: unavailable",
+            "  Limit resets available: unavailable",
+        ])
+
+    def test_whoami_marks_the_selected_block_when_its_live_read_fails(self) -> None:
+        default = self.home / ".codex"
+        selected = self.home / ".codex2"
+        _ = self.select_seats("codex 2")
+        reports = [
+            Report("Codex", problem="default unavailable", source=CodexHomeSource(default)),
+            Report("Codex", problem="selected unavailable", source=CodexHomeSource(selected)),
+        ]
+        output = io.StringIO()
+        with (
+            patch.dict(os.environ, {"CODEX_HOME": str(selected)}),
+            patch.object(whoami, "live_reports", return_value=reports),
+            redirect_stdout(output),
+        ):
+            asyncio.run(whoami.main())
+        blocks = output.getvalue().strip().split("\n\n")
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks, [
+            "Codex (~/.codex)\n  default unavailable",
+            "Codex (~/.codex2, seats)\n  selected unavailable",
+        ])
+
+    def test_whoami_names_the_logged_out_spare_and_selected_codex_homes(self) -> None:
+        default = self.home / ".codex"
+        spare = self.home / ".codex1"
+        spare.mkdir()
+        reports = [
+            Report("Codex", problem="Not logged in", source=CodexHomeSource(default)),
+            Report("Codex", problem="Not logged in", source=CodexHomeSource(spare)),
+        ]
+        output = io.StringIO()
+        with patch.object(whoami, "live_reports", return_value=reports), redirect_stdout(output):
+            asyncio.run(whoami.main())
+        self.assertEqual(output.getvalue().strip().split("\n\n"), [
+            "Codex (~/.codex, seats)\n  Not logged in",
+            "Codex (~/.codex1)\n  Not logged in",
+        ])
+
+    def test_whoami_names_a_home_when_the_account_email_is_unavailable(self) -> None:
+        spare = self.home / ".codex1"
+        spare.mkdir()
+        report = Report("Codex", source=CodexHomeSource(spare))
+        self.assertEqual(whoami.render(report, self.legacy_selection(), agent_accounts.seats_home()), [
+            "Codex (~/.codex1)", "  Account: email unavailable", "  Plan: unavailable",
+            "  Limit resets available: unavailable",
+        ])
+
+    def test_whoami_uses_the_full_path_for_an_accountless_home_outside_user_home(self) -> None:
+        selected = self.home.parent / f"{self.home.name}-codex"
+        report = Report("Codex", problem="Not logged in", source=CodexHomeSource(selected))
+        with patch.dict(os.environ, {"CODEX_HOME": str(selected)}):
+            self.assertEqual(whoami.render(report, self.legacy_selection(), selected), [
+                f"Codex ({selected}, seats)", "  Not logged in",
+            ])
+
+    def test_whoami_with_one_failed_codex_home_keeps_the_original_output(self) -> None:
+        for problem in ("unavailable", "Not logged in"):
+            with self.subTest(problem=problem):
+                report = Report("Codex", problem=problem, source=CodexHomeSource(self.home / ".codex"))
+                self.assertEqual(whoami.render(report, self.legacy_selection(), agent_accounts.seats_home()), ["Codex", f"  {problem}"])
+
+    def test_whoami_uses_one_seats_role_when_it_changes_during_live_reads(self) -> None:
+        selected = self.select_seats("codex 2")
+        reports = [Report("Codex", email="selected@example.invalid", source=CodexHomeSource(selected)),
+            Report("Codex", problem="Not logged in", source=CodexHomeSource(self.home / ".codex"))]
+        async def read(_selection: ClaudeAccountSelection, home: Path) -> list[Report]:
+            self.assertEqual(home, selected)
+            _ = self.select_seats("codex 3")
+            return reports
+        output = io.StringIO()
+        with patch.dict(os.environ, {"CODEX_HOME": str(self.home / ".codex")}), patch.object(whoami, "live_reports", side_effect=read), redirect_stdout(output):
+            asyncio.run(whoami.main())
+        blocks = output.getvalue().strip().split("\n\n")
+        self.assertIn("(seats)", blocks[0])
+        self.assertNotIn("seats", blocks[1])
+        self.assertEqual(agent_accounts.seats_home(), self.home / ".codex3")
+
+    def test_selected_seats_home_is_listed_even_when_its_directory_is_missing(self) -> None:
+        selected = self.select_seats("codex 2")
+        (selected / "auth.json").unlink()
+        selected.rmdir()
+        with patch.dict(os.environ, {"CODEX_HOME": str(self.home / "caller")}):
+            self.assertEqual(agent_accounts.codex_homes(agent_accounts.seats_home()), [self.home / ".codex", selected])
+
+    def test_codex_work_readiness_reads_both_current_windows_and_credits(self) -> None:
+        now = datetime.now(timezone.utc)
+        future = now + timedelta(hours=1)
+        for weekly, five_hour, credits, expected in (
+            (20, 50, "0", agent_accounts.CodexWorkAvailable),
+            (100, 20, "0", agent_accounts.CodexWorkExhausted),
+            (20, 100, "0", agent_accounts.CodexWorkExhausted),
+            (100, 100, "3", agent_accounts.CodexWorkAvailable),
+            (100, 100, "unlimited", agent_accounts.CodexWorkAvailable),
+            (100, 20, None, agent_accounts.CodexWorkUnknown),
+        ):
+            with self.subTest(weekly=weekly, five_hour=five_hour, credits=credits):
+                report = Report("Codex", five_hour=agent_accounts.Quota("5-hour", five_hour, future),
+                    quotas=[agent_accounts.Quota("Weekly", weekly, future)], credit_balance=credits)
+                self.assertIsInstance(agent_accounts.codex_can_work(report, now), expected)
+
+    def test_codex_work_readiness_does_not_use_expired_or_missing_allowance(self) -> None:
+        now = datetime.now(timezone.utc)
+        future = now + timedelta(hours=1)
+        for report in (
+            Report("Codex", credit_balance="0"),
+            Report("Codex", five_hour=agent_accounts.Quota("5-hour", 0, now),
+                quotas=[agent_accounts.Quota("Weekly", 0, future)], credit_balance="0"),
+            Report("Codex", five_hour=agent_accounts.Quota("5-hour", 0, future),
+                quotas=[agent_accounts.Quota("Weekly", 0, now - timedelta(seconds=1))], credit_balance="0"),
+            Report("Codex", problem="usage failed", credit_balance="0"),
+        ):
+            with self.subTest(report=report):
+                self.assertIsInstance(agent_accounts.codex_can_work(report, now), agent_accounts.CodexWorkUnknown)
+
+    def test_home_preparation_restarts_an_unanswered_server_then_finishes_initialize(self) -> None:
+        home = self.home / ".codex1"
+        process = MagicMock(spec=asyncio.subprocess.Process)
+        process.returncode = 0
+        with (
+            patch.object(agent_accounts, "executable", return_value="fixture-codex"),
+            patch.object(asyncio, "create_subprocess_exec", return_value=process) as launch,
+            patch.object(agent_accounts.CodexServer, "request", side_effect=[agent_accounts.CodexServerClosed("provider exited before reply"), {}]) as request,
+            patch.object(agent_accounts.CodexServer, "send") as send,
+            patch.object(agent_accounts.CodexServer, "close") as close,
+            patch.object(asyncio, "sleep"),
+        ):
+            result = asyncio.run(agent_accounts.prepare_codex_home(home))
+        self.assertIsInstance(result, agent_accounts.CodexHomePrepared)
+        self.assertEqual(launch.await_count, 2)
+        self.assertEqual(request.await_count, 2)
+        self.assertEqual(close.await_count, 2)
+        self.assertGreater(agent_accounts.CODEX_HOME_PREPARATION_SECONDS, 925)
+        first_wait = cast(float, request.call_args_list[0].kwargs["timeout_seconds"])
+        self.assertGreater(first_wait, 925)
+        _ = send.assert_awaited_once_with({"method": "initialized"})
+        for invocation in launch.call_args_list:
+            environment = cast(dict[str, str], invocation.kwargs["env"])
+            self.assertEqual(environment["CODEX_HOME"], str(home))
+        self.assertTrue(all(invocation.args[1] == "initialize" for invocation in request.call_args_list))
+
+    def test_home_preparation_does_not_retry_an_error_that_mentions_closed(self) -> None:
+        process = MagicMock(spec=asyncio.subprocess.Process)
+        process.returncode = 0
+        with patch.object(asyncio, "create_subprocess_exec", return_value=process) as launch, \
+                patch.object(agent_accounts.CodexServer, "request", side_effect=[RuntimeError("request rejected: closed account"), {}]), \
+                patch.object(agent_accounts.CodexServer, "send"), patch.object(asyncio, "sleep"), \
+                patch.object(agent_accounts.CodexServer, "close"):
+            result = asyncio.run(agent_accounts.prepare_codex_home(self.home / ".codex1"))
+        self.assertIsInstance(result, agent_accounts.CodexHomePreparationFailed)
+        _ = launch.assert_awaited_once()
+
+    def test_server_output_eof_raises_the_named_closed_exception(self) -> None:
+        async def request() -> None:
+            process = MagicMock(spec=asyncio.subprocess.Process)
+            output = asyncio.StreamReader()
+            output.feed_eof()
+            process.stdout = output
+            process.stdin = MagicMock(spec=asyncio.StreamWriter)
+            server = agent_accounts.CodexServer(process)
+            _ = await server.request(1, "initialize", {})
+        with self.assertRaises(agent_accounts.CodexServerClosed):
+            asyncio.run(request())
+
+    def test_home_preparation_stops_at_its_limit_with_the_home_and_reason(self) -> None:
+        home = self.home / ".codex1"
+        process = MagicMock(spec=asyncio.subprocess.Process)
+        process.returncode = 0
+        with (
+            patch.object(agent_accounts, "executable", return_value="fixture-codex"),
+            patch.object(agent_accounts, "CODEX_HOME_PREPARATION_SECONDS", 1),
+            patch.object(asyncio, "create_subprocess_exec", return_value=process) as launch,
+            patch.object(agent_accounts.CodexServer, "request", side_effect=asyncio.TimeoutError),
+            patch.object(agent_accounts.CodexServer, "close") as close,
+        ):
+            result = asyncio.run(agent_accounts.prepare_codex_home(home))
+        self.assertIsInstance(result, agent_accounts.CodexHomePreparationFailed)
+        if not isinstance(result, agent_accounts.CodexHomePreparationFailed):
+            self.fail("Preparation must return its failure reason")
+        self.assertIn("~/.codex1", result.problem)
+        self.assertIn("1", result.problem)
+        self.assertIn("initialize", result.problem)
+        _ = launch.assert_awaited_once()
+        _ = close.assert_awaited_once()
+
+    def test_numbered_home_read_without_initialize_names_the_setup_command(self) -> None:
+        home = self.home / ".codex1"
+        process = MagicMock(spec=asyncio.subprocess.Process)
+        process.returncode = 0
+        with (
+            patch.object(agent_accounts, "executable", return_value="fixture-codex"),
+            patch.object(asyncio, "create_subprocess_exec", return_value=process),
+            patch.object(agent_accounts.CodexServer, "request", side_effect=asyncio.TimeoutError),
+            patch.object(agent_accounts.CodexServer, "close"),
+        ):
+            report = asyncio.run(agent_accounts.codex_live(home))
+        self.assertIsNotNone(report.problem)
+        self.assertIn("~/.codex1", report.problem or "")
+        self.assertIn('/showrunner:accounts setup "codex 1"', report.problem or "")
+        self.assertEqual(report.codex_startup, agent_accounts.CodexStartupFailure(
+            home, '/showrunner:accounts setup "codex 1"'))
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

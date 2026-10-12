@@ -17,6 +17,9 @@ from typing import Callable, NamedTuple, TypeVar, cast
 
 import showrunners
 import unit_lookup
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
+from account import account_of
 from add_unit import Production, Refusal, cell_value, live_unit_table, read_production, retired_units
 from merge_checkpoint import MergeEntry, NoMerge, Stop, git, merge_branch_history, report as merge_report
 
@@ -121,6 +124,23 @@ class RestoreQuotaAlerts(NamedTuple):
     tools: tuple[str, ...]
 
 
+class EveryUnit(NamedTuple):
+    pass
+
+
+class UnitsOnAccount(NamedTuple):
+    # The Claude note label an alert names when more than one Claude account is in use.
+    account: str
+
+
+QuotaRecipients = EveryUnit | UnitsOnAccount
+
+# quota_alert.account_line: "<account>, the active <Tool> account, has …" with one Claude account,
+# "<account> (<roles>) at <n>% of its weekly usage left …" for a Claude account once there are several.
+SINGLE_ACCOUNT_LINE = re.compile(r"(.+?), the active (\w+) account")
+ROLE_ACCOUNT_LINE = re.compile(r"(.+?) \([^)]*\) at .+? of its weekly usage left")
+
+
 class BerthOverlap(NamedTuple):
     scopes: tuple[str, ...]
     blocker: str
@@ -142,6 +162,8 @@ class Unit(NamedTuple):
     session: str
     branch: str
     worktree: Path
+    # The pid of the unit's live Claude; None when none runs.
+    pid: int | None
 
 
 class WaitingFailure(Exception):
@@ -171,8 +193,9 @@ def units_from_doc(production: Production) -> tuple[Unit, ...]:
             raise WaitingFailure("production", f"invalid Units row: {cells}")
         found = marked.get(row["Unit"])
         claude = found.claude if found is not None else None
-        units.append(Unit(row["Unit"], claude.name if isinstance(claude, unit_lookup.LiveClaude) else "",
-                          row["Branch"], Path(row["Worktree"]).expanduser()))
+        live = isinstance(claude, unit_lookup.LiveClaude)
+        units.append(Unit(row["Unit"], claude.name if live else "", row["Branch"],
+                          Path(row["Worktree"]).expanduser(), claude.pid if live else None))
     return tuple(units)
 
 
@@ -571,13 +594,23 @@ def quota(production: Production, notice: str, state_dir: Path) -> None:
     if not kind:
         raise WaitingFailure("quota", "expected a quota alert notice")
     path = state_dir / "quota_seen.json"
+    recipients: QuotaRecipients = EveryUnit()
     if kind == "Quota alert:":
-        named_account = re.match(r"Quota alert: (.+?), the active (\w+) account,", line)
-        if named_account is None:
+        account_text = line.removeprefix(kind).strip()
+        single = SINGLE_ACCOUNT_LINE.match(account_text)
+        role = ROLE_ACCOUNT_LINE.match(account_text)
+        if single is not None:
+            account, tool = single.group(1), single.group(2)
+        elif role is not None:
+            account, tool = role.group(1), "Claude"
+        else:
             raise WaitingFailure("quota", "expected a quota alert account line")
-        account, tool = named_account.group(1), named_account.group(2)
         change: HoldQuotaAlert | ClearQuotaAlerts | RestoreQuotaAlerts = HoldQuotaAlert(account, line)
-        if "Every function that ran on" in notice:
+        if role is not None:
+            recipients = UnitsOnAccount(account)
+            action = (f"{account}, the Claude account you run on, is low: start no new Claude work until a "
+                      + f"quota restored notice for {account}")
+        elif "Every function that ran on" in notice:
             action = f"delegation continues on Claude; rerun {tool} work in flight"
         elif "nothing was switched to Claude" in notice:
             action = (f"keep delegating on {tool}: its weekly allowance is used up and credits may be carrying the "
@@ -590,19 +623,39 @@ def quota(production: Production, notice: str, state_dir: Path) -> None:
         change = ClearQuotaAlerts(tuple(accounts))
         action = "keep delegation paused on the acknowledged account"
     else:
-        named_accounts = [match.group(1) for entry in lines[1:]
-                          if (match := re.match(r"(.+?), the active \w+ account", entry))]
+        named_accounts: list[str] = []
+        line_tools: list[str] = []
+        for entry in lines[1:]:
+            if single := SINGLE_ACCOUNT_LINE.match(entry):
+                named_accounts.append(single.group(1))
+                line_tools.append(single.group(2).lower())
+            elif role := ROLE_ACCOUNT_LINE.match(entry):
+                named_accounts.append(role.group(1))
+                line_tools.append("claude")
         named_tools = re.search(r"delegation on (.+?) can resume", line)
-        tools = named_tools.group(1) if named_tools else line.removeprefix(kind).strip()
-        change = RestoreQuotaAlerts(tuple(named_accounts), tuple(item.strip().lower()
-                                                                 for item in tools.split(" and ")))
-        action = f"delegation on {tools} can resume"
+        named_work = re.search(r"work on (.+?) can resume", line)
+        if named_tools is None and named_work is not None:
+            tools = tuple(sorted(set(line_tools)))
+            action = f"work on {named_work.group(1)} can resume"
+        else:
+            tool_names = named_tools.group(1) if named_tools else line.removeprefix(kind).strip()
+            tools = tuple(item.strip().lower() for item in tool_names.split(" and "))
+            action = f"delegation on {tool_names} can resume"
+        change = RestoreQuotaAlerts(tuple(named_accounts), tools)
     sender = shutil.which("send.py") or str(Path(__file__).resolve().parent.parent / "message/send.py")
     failures: list[str] = []
     for unit in units_from_doc(production):
         if not unit.session:
             failures.append(f"{unit.name}: no Claude is running in its session, so it was not told")
             continue
+        if isinstance(recipients, UnitsOnAccount):
+            found = account_of(unit.pid) if unit.pid is not None else None
+            if found is None:
+                failures.append(f"{unit.session}: its Claude account could not be read, so it was not told")
+                continue
+            if found.label.casefold() != recipients.account.casefold():
+                print(f"skip {unit.session}: it runs on {found.label}, not {recipients.account}")
+                continue
         try:
             delivered = subprocess.run([sys.executable, sender, "--to", unit.session,
                                         "--from", showrunners.current_name(production.slug) or "showrunner",
@@ -631,8 +684,10 @@ def quota(production: Production, notice: str, state_dir: Path) -> None:
             if not named_held:
                 for account, alert in tuple(held.items()):
                     alert_text = alert if isinstance(alert, str) else ""
-                    active_tool = re.search(r"the active (\w+) account", alert_text)
-                    tool = active_tool.group(1).lower() if active_tool else ""
+                    alert_account = alert_text.removeprefix("Quota alert:").strip()
+                    single = SINGLE_ACCOUNT_LINE.match(alert_account)
+                    tool = (single.group(2).lower() if single
+                            else "claude" if ROLE_ACCOUNT_LINE.match(alert_account) else "")
                     if tool in change.tools:
                         _ = held.pop(account, None)
         return held

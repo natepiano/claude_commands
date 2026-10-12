@@ -8,7 +8,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 
@@ -20,7 +20,14 @@ if TYPE_CHECKING:
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
     from showrunner_footer import FooterState, footer_state
-from dailies_render import footer_main, read_outstanding
+import showrunners
+from dailies_render import UNREADABLE_LIST, InputError, footer_main, read_outstanding
+
+if TYPE_CHECKING:
+    from ..usage import agents_log
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.usage import agents_log
 
 
 class InstancePresent(NamedTuple):
@@ -90,13 +97,27 @@ def instance(name: str) -> InstancePresent | InstanceAbsent:
     raise RegistrationFailure("notifier", result.stderr.strip() or result.stdout.strip() or f"status exit {result.returncode}")
 
 
-def update_interval(lines: list[str]) -> tuple[int, bool]:
+class ScheduledUpdates(NamedTuple):
+    minutes: int
+    aligned: bool
+
+
+DEFAULT_MINUTES = 15
+
+
+class UpdatesOnDemand(NamedTuple):
+    """The doc's Updates line reads `on demand`: a dailies runs only when the user asks for one."""
+
+
+def update_schedule(lines: list[str]) -> ScheduledUpdates | UpdatesOnDemand:
     line = next((line for line in lines if line.startswith("- **Updates:**")), "")
+    if re.search(r"\bon demand\b", line):
+        return UpdatesOnDemand()
     match = re.search(r"every (\d+) minutes", line)
-    minutes = int(match.group(1)) if match else 15
+    minutes = int(match.group(1)) if match else DEFAULT_MINUTES
     if minutes <= 0:
         raise RegistrationFailure("prompt", "Updates interval must be positive")
-    return minutes, "on the hour" in line
+    return ScheduledUpdates(minutes, "on the hour" in line)
 
 
 def scheduled_prompt(minutes: int, zone: str, doc: Path) -> str:
@@ -117,8 +138,16 @@ def register(production: Production) -> None:
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     if not session_id:
         raise RegistrationFailure("register", "CLAUDE_CODE_SESSION_ID is required")
+    try:
+        agents_log.append(session_id, "showrunner", None, datetime.now(timezone.utc))
+    except Exception as exc:
+        # Recording must never interrupt registration.
+        print("agents_log: " + " ".join(str(exc).splitlines()), file=sys.stderr)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
-    minutes, aligned = update_interval(lines)
+    schedule = update_schedule(lines)
+    # An on-demand timer is made at the default interval and stopped, so it stays the showrunner's record.
+    minutes, aligned = ((schedule.minutes, schedule.aligned) if isinstance(schedule, ScheduledUpdates)
+                        else (DEFAULT_MINUTES, False))
     prompt = scheduled_prompt(minutes, str(production.zone), production.doc)
     relative = production.doc.relative_to(production.checkout)
     dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
@@ -127,18 +156,23 @@ def register(production: Production) -> None:
     # Nothing registers the showrunner by name: its update timer, made below, is its one record.
     state_root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
     prompt_file = state_root / production.slug / "prompt.txt"
+    updates = f"showrunner-{production.slug}"
     prompt_file.parent.mkdir(parents=True, exist_ok=True)
     if not prompt_file.exists() or prompt_file.read_text(encoding="utf-8") != prompt:
         _ = prompt_file.write_text(prompt, encoding="utf-8")
-    updates = f"showrunner-{production.slug}"
     check = f"zsh {Path.home()}/.claude/scripts/production/production_check.sh {production.doc}"
     _ = notifier(["new", updates, "--to", f"session:{session_id}", "--every", str(minutes),
               "--prompt-file", str(prompt_file), "--from", f"showrunner-timer-{production.slug}",
               "--check", check, *(["--aligned"] if aligned else [])])
+    if isinstance(schedule, UpdatesOnDemand):
+        _ = notifier(["stop", updates])
     for name, script in (("stall-watch", "stall_watch.py"), ("tmux-names", "tmux_names.py")):
         if isinstance(instance(name), InstanceAbsent):
             run = f"{Path.home()}/.claude/scripts/lib/py {Path.home()}/.claude/scripts/production/{script}"
             _ = notifier(["new", name, "--every", "1", "--run", run])
+    if isinstance(schedule, UpdatesOnDemand):
+        report("register", "ok", f"{updates} on demand: no scheduled dailies")
+        return
     status = instance(updates)
     if isinstance(status, InstanceAbsent):
         raise RegistrationFailure("register", f"{updates} missing after new")
@@ -228,9 +262,48 @@ def judgment_state(path: Path | None, step: str) -> ShowrunnerState:
     return ShowrunnerState(tuple(units), tuple(cast(list[str], raw_held)), outstanding)
 
 
-def outstanding_path(production: Production) -> Path:
+def outstanding_file(slug: str) -> Path:
     root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
-    return root / "outstanding" / f"{production.slug}.json"
+    return root / "outstanding" / f"{slug}.json"
+
+
+def outstanding_path(production: Production) -> Path:
+    return outstanding_file(production.slug)
+
+
+# An item can wait longer than a week, so the day is named in full.
+WHEN = "%a %b %d %H:%M"
+
+
+def open_items(production: Production) -> None:
+    """Print in full what waits on the user: this production's items and, for a root, every lower one's.
+
+    Replies show only the count, so this list is what the showrunner gives when the user asks what
+    the open questions are. Each line is led by the production that owns the item.
+    """
+    now = datetime.now(production.zone).replace(tzinfo=None)
+    due: list[tuple[datetime, str, str]] = []
+    deferred: list[tuple[datetime, str, str]] = []
+    unreadable: list[str] = []
+    for slug in showrunners.user_facing(production.slug):
+        try:
+            items = read_outstanding(outstanding_file(slug))
+        except (InputError, OSError, ValueError):
+            unreadable.append(slug)
+            continue
+        for item in items:
+            if item.after is None or item.after <= now:
+                due.append((item.since, slug, item.text))
+            else:
+                deferred.append((item.after, slug, item.text))
+    for number, (since, slug, text) in enumerate(sorted(due), 1):
+        print(f"{number}. {slug}, since {since:{WHEN}}: {text}")
+    for after, slug, text in sorted(deferred):
+        print(f"deferred until {after:{WHEN}}: {slug}: {text}")
+    for slug in unreadable:
+        print(f"{slug}: {UNREADABLE_LIST}")
+    report("open", "ok", f"{len(due)} due, {len(deferred)} deferred"
+           + (f", {len(unreadable)} unreadable" if unreadable else ""))
 
 
 def state_block(production: Production, state: ShowrunnerState, timestamp: str) -> str:
@@ -268,9 +341,6 @@ def append_log(production: Production, event: str, path: Path | None, before_com
 
 
 def footer(production: Production, path: Path | None, nothing_needed: bool) -> None:
-    if footer_state(production.slug) is FooterState.OFF:
-        report("footer", "ok", "footers off")
-        return
     state = judgment_state(path, "footer")
     outstanding = outstanding_path(production)
     if isinstance(state.outstanding, ReplaceOutstanding):
@@ -296,6 +366,11 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
             entries.append(entry)
         outstanding.parent.mkdir(parents=True, exist_ok=True)
         _ = outstanding.write_text(json.dumps(entries) + "\n", encoding="utf-8")
+    # The switch hides the printed footer only. What waits on the user is stored above either way,
+    # so the dailies and the open-questions count still see it.
+    if footer_state(production.slug) is FooterState.OFF:
+        report("footer", "ok", "footers off")
+        return
     schedule = instance(f"showrunner-{production.slug}")
     next_run: str | None = None
     if isinstance(schedule, InstancePresent) and not schedule.output.splitlines()[0].endswith(", stopped"):
@@ -304,7 +379,9 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
             due = datetime.fromtimestamp(int(match.group(1)), production.zone)
             days = (due.date() - datetime.now(production.zone).date()).days
             next_run = due.strftime("%H:%M") + (f"+{days}" if days > 0 else "")
-    if footer_main(str(production.zone), next_run, None, outstanding, nothing_needed=nothing_needed):
+    place = showrunners.place_of(production.slug)
+    if footer_main(str(production.zone), next_run, None, outstanding, nothing_needed=nothing_needed,
+                   below=[outstanding_file(slug) for slug in place.below], root=place.root):
         raise RegistrationFailure("footer", "renderer refused the footer")
     report("footer", "ok", "rendered")
 
@@ -312,7 +389,7 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    for action in ("register", "time", "log", "footer"):
+    for action in ("register", "time", "log", "footer", "open"):
         subcommand = commands.add_parser(action)
         _ = subcommand.add_argument("--production", type=Path, required=True)
         if action == "register":
@@ -324,7 +401,7 @@ def main() -> int:
             _ = subcommand.add_argument("event")
             _ = subcommand.add_argument("--state", type=Path)
             _ = subcommand.add_argument("--before-compaction", action="store_true")
-        else:
+        elif action == "footer":
             _ = subcommand.add_argument("--state", type=Path)
             _ = subcommand.add_argument("--nothing-needed", action="store_true")
     args = parser.parse_args()
@@ -337,6 +414,8 @@ def main() -> int:
             report("time", "ok", production_time(production, cast(str, args.stamp)))
         elif action == "log":
             append_log(production, cast(str, args.event), cast(Path | None, args.state), cast(bool, args.before_compaction))
+        elif action == "open":
+            open_items(production)
         else:
             footer(production, cast(Path | None, args.state), cast(bool, args.nothing_needed))
         return 0

@@ -30,7 +30,7 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 13
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
@@ -136,7 +136,14 @@ CALL_COLUMNS: list[Column] = [
     ("token_wait_s", "INTEGER", "seconds spent acquiring the cargo token, a wait that timed out included; 0 when verify.sh sought none"),
     ("mac", "TEXT", "passed, passed_filter, failed, lost or declined when Mac offload ran or was considered"),
     ("mac_reason", "TEXT", "why Mac offload declined or had no usable result"),
+    (
+        "local_reason",
+        "TEXT",
+        "verify.sh test --local: why the test must run on Linux; empty otherwise",
+    ),
     ("mac_s", "REAL", "seconds spent deciding or running on the Mac"),
+    ("target", "TEXT", "where the call was when it ended: mac, natedev, or empty"),
+    ("hold_wait_s", "REAL", "seconds waited on a held target, each declined Mac retry included; memory waits are not counted"),
     ("wall_s", "INTEGER", "seconds the run took"),
     ("build_s", "INTEGER", "cargo's own build seconds, NULL when unmeasured"),
     ("saved_s", "INTEGER", "seconds a reused or replayed record saved"),
@@ -335,6 +342,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
     statements.append("CREATE INDEX steps_started ON steps (started_at)")
     statements.append("CREATE INDEX steps_host_started ON steps (host, started_at)")
     statements.append("CREATE INDEX steps_tree ON steps (worktree, step, tree_key)")
+    statements.append("CREATE INDEX steps_call ON steps (call_id)")
     statements.append("CREATE INDEX tests_step ON tests (step_id)")
     statements.append("CREATE INDEX calls_started ON calls (started_at)")
     statements.append("CREATE INDEX ci_jobs_run ON ci_jobs (run_id, attempt)")

@@ -19,7 +19,7 @@ message_arrived(
 ) -> HookReply
 ```
 
-`PromptSource` is `TYPED`, `PEER`, `SCHEDULED` or `NOTICE`. Every typed prompt pauses its own session. A peer message also pauses a unit director, but not a showrunner, whose routine unit traffic would otherwise keep dailies off. Scheduled prompts, notifier senders, task notices and system reminders do not pause anything. The Stop hook records `session_crons[].prompt`; the prompt hook recognizes the next scheduled prompt by exact text or its recorded clipped prefix. These records expire after `SCHEDULED_PROMPT_RETENTION_SECONDS`, eight days.
+`PromptSource` is `TYPED`, `PEER`, `SCHEDULED` or `NOTICE`. Every typed prompt pauses its own session. A peer message also pauses a unit director, but not a showrunner, whose routine unit traffic would otherwise keep dailies off. Scheduled prompts, notifier senders, task notices and system reminders do not pause anything; `JOB_SENDERS` includes `shutdown`, so `/shutdown` messages never pause a session. `/shutdown restart` and `add_unit.py` record a restored session's first prompt with `record_scheduled_prompts` before launch, so it is read as scheduled. The Stop hook records `session_crons[].prompt`; the prompt hook recognizes the next scheduled prompt by exact text or its recorded clipped prefix. These records expire after `SCHEDULED_PROMPT_RETENTION_SECONDS`, eight days.
 
 `scripts/hooks/user-prompt-submit-conversation-pause.py` classifies the prompt, stamps typed activity through `escalate.typed()`, and calls `message_arrived`. `scripts/hooks/stop-conversation-pause.py` calls:
 
@@ -39,6 +39,8 @@ PauseRecord(
     phase: PausePhase,
 )
 ```
+
+`release(session_id) -> PauseRecord | NoPauseRecord` deletes a session's record under `record_lock()` and returns it without resuming anything; `/shutdown` calls it so the tick does not restore a stopped session's instances, and records what the pause had switched off itself.
 
 `PausePhase` is `Replying | Quiet | QuestionPending | Asked | KeptOff | Returned`. `Asked` contains `QuestionNotRead | QuestionRead(replies_ended)`. The record lists only notifier instances and footers that this pause switched off.
 
@@ -102,13 +104,14 @@ Every repository phone alert calls:
 ```text
 scripts/message/send.py --to user \
   --need note|decision|blocked \
+  (--action "<what the user does>" | --no-action) \
   --summary "<title>" \
   --text "<message>"
 ```
 
-`send.py` owns the user channel and maps `note`, `decision` and `blocked` to priorities 0, 1 and 2. Callers do not invoke `scripts/notify/pushover.py` themselves. On the Mac they add `--machine natedev`.
+`send.py` owns the user channel and maps `note`, `decision` and `blocked` to priorities 0, 1 and 2. A user message names the user's action or says none is needed: without `--action` or `--no-action` `send.py` exits 2 with a usage error, and `decision` and `blocked` require `--action`. The gate itself is `scripts/notify/pushover.py` (`docs/as-built/session-roster.md`, "Messages to the user"); callers do not invoke it themselves. On the Mac they add `--machine natedev`.
 
-The direct Python callers are `ci_points.review_watch` with `--need decision`, `rust_release.send_release_text(title, message)` with `--need note`, and the phone branch of `sweep.send_floor_alert` with `--need note`. The showrunner, build-report and fix instructions use the same command.
+The direct Python callers are `ci_points.review_watch` (`--need decision --action "Acknowledge the review watch in this session."`), `rust_release.send_release_text(title, message)` (`--need note --action "Tell natedev to bump Rust or wait."`), the phone branch of `sweep.send_floor_alert` (`--need note --action "Free disk space outside build caches on natedev."`), `codex_winddown` through `broadcast.send` (`--need decision --action "Reset Codex, then run /codex_winddown clear."`), `escalate.py`'s held messages (the hold's own `--need` and action), and `settle.alert_user` (the only phone path in `scripts/shutdown/`; `--need decision --action <its ActionRequired text>`). The showrunner, build-report and fix instructions use the same command.
 
 ## Invariants
 
@@ -123,7 +126,7 @@ The direct Python callers are `ci_points.review_watch` with `--need decision`, `
 - Both hooks have a five-second budget, print at most one error line, and exit 0 so a prompt or reply cannot fail because the pause failed.
 - `unit_lookup.run_state`, not prose in a production row, is authoritative for whether the stall watch monitors a unit.
 - Correcting an as-built doc that contradicts the code is always allowed; cross-unit notice rules still apply.
-- Every scripted phone alert enters `scripts/message/send.py --to user`; channel choice stays inside `send.py`.
+- Every scripted phone alert enters `scripts/message/send.py --to user` with `--action` or `--no-action`; channel choice stays inside `send.py`.
 
 ## Gotchas
 
@@ -136,7 +139,7 @@ The direct Python callers are `ci_points.review_watch` with `--need decision`, `
 - A message after `KeptOff` begins another conversation cycle. When that exchange becomes quiet, the question can return.
 - An unreadable session record means "unknown," not "ended." A registry-list failure also prevents dead-session cleanup for that tick.
 - `progress` still restarts the unit notifier on the closed-phase reporting path. Its tables are read-only, but the next report time moves.
-- `send.py` prints `FAILED: ...` on stdout and exits 3 for an undelivered user alert. Callers reporting the cause must inspect stdout as well as stderr.
+- `send.py` prints `FAILED: ...` on stdout and exits 3 for an undelivered user alert, and `REFUSED: ...` with exit 2 when `pushover.py` refused it before sending. Callers reporting the cause must inspect stdout as well as stderr.
 
 ## Why
 
@@ -150,3 +153,5 @@ The direct Python callers are `ci_points.review_watch` with `--need decision`, `
 - The closed-phase report keeps final verification, documentation and other closing work visible without rewriting completed progress.
 - One user-message command centralizes urgency, remote delivery, logging, failure behavior and the phone channel.
 - Allowing stale as-built docs to be corrected keeps documentation aligned with shipped behavior wherever the contradiction is found.
+
+**On demand (2026-10-10).** Before a tick advances a pause, `_prune_unscheduled` drops each instance whose notifier folder is gone, and each footer whose `showrunner-<slug>` instance is gone, turning that footer back on. With nothing left it deletes the record and asks nothing, so a production switched to on demand is never asked "Return to automatic updates?". A pause that has already returned keeps its record for late answers.

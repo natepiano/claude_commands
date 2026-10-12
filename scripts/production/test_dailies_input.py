@@ -123,6 +123,7 @@ class DailiesInputTests(unittest.TestCase):
     phase_table: Path = Path()
     phase_table_json: Path = Path()
     phase_table_events: Path = Path()
+    showrunner_state: Path = Path()
     env: dict[str, str] = {}
 
     @override
@@ -154,6 +155,7 @@ class DailiesInputTests(unittest.TestCase):
         _ = self.phase_table.write_text(PHASE_TABLE_STUB.replace("__PYTHON__", sys.executable), encoding="utf-8")
         self.phase_table.chmod(0o755)
         _ = self.phase_table_json.write_text("{}\n", encoding="utf-8")
+        self.showrunner_state = self.root / "showrunner-state"
         self.env = {**os.environ, "HOME": str(self.home), "BUILD_HOLD_DIR": str(self.holders),
                     "MAC_TEST_STATE_DIR": str(self.root / "mac-test"),
                     "DAILIES_TEST_EVENTS": str(self.events), "DAILIES_TEST_FAIL": str(self.notifier_failure),
@@ -163,6 +165,7 @@ class DailiesInputTests(unittest.TestCase):
                     "PHASE_TABLE_VAULT": str(self.root / "vault"),
                     "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
                     "NOTIFIER_STATE_DIR": str(self.root / "notifier-state"),
+                    "SHOWRUNNER_STATE_DIR": str(self.showrunner_state),
                     # Unit sessions are looked up in this stand-in; with no state file it has no sessions.
                     "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
                     "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
@@ -1153,6 +1156,36 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(self.report()["next_run"], "17:55")
         self.assertIn("next_due=", (self.checkout / "production.log").read_text(encoding="utf-8"))
 
+    def test_on_demand_user_run_touches_no_clock_and_names_no_next_run(self) -> None:
+        doc = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(doc.replace("- **Updates:** every 15 minutes", "- **Updates:** on demand"),
+                                encoding="utf-8")
+        result = self.run_builder("--user-run")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.notifier_events(), [])
+        self.assertNotIn("next_run", self.report())
+        self.assertIn("clock: ok — on demand: no scheduled dailies", result.stdout)
+
+    def test_counts_configured_for_the_production_go_in_the_input(self) -> None:
+        config = self.home / ".claude/config/dailies.conf"
+        config.parent.mkdir(parents=True)
+        _ = (self.home / "ledger.md").write_text("- a — proposed\n- b — declined\n", encoding="utf-8")
+        _ = config.write_text("example.nightly-queue=lines ~/ledger.md — proposed$\nother.queue=files ~/*.md\n",
+                              encoding="utf-8")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.report()["counts"], [{"label": "nightly queue", "count": 1}])
+        self.assertIn("counts: ok — 1 from dailies.conf", result.stdout)
+
+    def test_a_bad_counts_line_leaves_the_counts_out_and_says_why(self) -> None:
+        config = self.home / ".claude/config/dailies.conf"
+        config.parent.mkdir(parents=True)
+        _ = config.write_text("example.queue=words ~/ledger.md\n", encoding="utf-8")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("counts", self.report())
+        self.assertIn("counts: unavailable — dailies.conf line 1: the count kind is lines or files", result.stdout)
+
     def test_scheduled_run_reads_notifier_status_without_restart(self) -> None:
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -1260,7 +1293,8 @@ class DailiesInputTests(unittest.TestCase):
         calls = self.watch_events(events)
         self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
         self.assertEqual([row for row in calls if row[0] == "send.py"], [[
-            "send.py", "--to", "user", "--need", "decision", "--summary", "Hana: review watch", "--text",
+            "send.py", "--to", "user", "--need", "decision", "--action",
+            "Acknowledge the review watch in this session.", "--summary", "Hana: review watch", "--text",
             "12 of 12 phases: report ready, waiting for your acknowledgment; the table is in this session",
         ]])
         self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
@@ -1278,7 +1312,8 @@ class DailiesInputTests(unittest.TestCase):
         calls = self.watch_events(events)
         self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
         self.assertEqual([row for row in calls if row[0] == "send.py"], [[
-            "send.py", "--to", "user", "--need", "decision", "--summary", "Hana: review watch", "--text",
+            "send.py", "--to", "user", "--need", "decision", "--action",
+            "Acknowledge the review watch in this session.", "--summary", "Hana: review watch", "--text",
             "12 of 12 phases: report ready, waiting for your acknowledgment; the table is in this session",
         ]])
         self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
@@ -1667,6 +1702,152 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(self.notifier_events(), [["restart", "showrunner-example"]])
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["why"],
                          "the unit found another panel repair")
+
+
+    def timer(self, slug: str) -> None:
+        """A production with a complete update timer, so the tree counts it."""
+        instance = self.root / "notifier-state" / f"showrunner-{slug}"
+        instance.mkdir(parents=True)
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
+
+    def attach(self, child: str, parent: str) -> None:
+        for slug in (child, parent):
+            if not (self.root / "notifier-state" / f"showrunner-{slug}").exists():
+                self.timer(slug)
+        edge = self.showrunner_state / child / "parent"
+        edge.parent.mkdir(parents=True, exist_ok=True)
+        _ = edge.write_text(parent + "\n", encoding="utf-8")
+
+    def saved_report(self, slug: str) -> Path:
+        return self.showrunner_state / slug / "dailies_last.json"
+
+    def write_saved_report(self, slug: str, **changed: object) -> None:
+        fields: dict[str, object] = {
+            "written": "2026-10-06T16:50", "zone": "America/Los_Angeles", "interval": 15, "units": 3, "held": 1,
+            "rows": [{"name": "fps", "started": "2026-10-06T15:10", "eta": "2026-10-06T19:20",
+                      "earliest": "2026-10-06T19:20", "latest": "2026-10-06T19:20"}, {"name": "docs"}],
+            **changed}
+        self.saved_report(slug).parent.mkdir(parents=True, exist_ok=True)
+        _ = self.saved_report(slug).write_text(json.dumps(fields), encoding="utf-8")
+
+    def write_open_for(self, slug: str, content: str) -> None:
+        path = self.showrunner_state / "outstanding" / f"{slug}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(content, encoding="utf-8")
+
+    def children(self) -> list[dict[str, object]]:
+        return cast(list[dict[str, object]], self.report()["children"])
+
+    def test_every_run_saves_what_the_showrunner_above_shows(self) -> None:
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"saved report: ok — wrote {self.saved_report('example')}", result.stdout)
+        saved = cast(dict[str, object], json.loads(self.saved_report("example").read_text(encoding="utf-8")))
+        self.assertEqual({key: saved[key] for key in ("written", "zone", "interval", "units", "held")},
+                         {"written": AT, "zone": "America/Los_Angeles", "interval": 15, "units": 1, "held": 0})
+        rows = cast(list[dict[str, object]], saved["rows"])
+        self.assertEqual([(row["name"], row["eta"]) for row in rows], [("alpha", "2026-10-06T23:40")])
+        # Alone, a production's input names nothing above or below it.
+        self.assertNotIn("children", self.report())
+        self.assertNotIn("reports_to", self.report())
+        self.assertEqual([path.name for path in self.saved_report("example").parent.iterdir()], ["dailies_last.json"])
+
+    def test_a_production_that_reports_on_demand_saves_no_interval(self) -> None:
+        doc = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(doc.replace("- **Updates:** every 15 minutes", "- **Updates:** on demand"),
+                                encoding="utf-8")
+        self.assertEqual(self.run_builder().returncode, 0)
+        saved = cast(dict[str, object], json.loads(self.saved_report("example").read_text(encoding="utf-8")))
+        self.assertIsNone(saved["interval"])
+
+    def test_a_production_below_is_read_into_the_input_with_what_waits_on_the_user(self) -> None:
+        self.attach("kid", "example")
+        self.attach("leaf", "kid")
+        self.write_saved_report("kid")
+        self.write_open_for("kid", json.dumps([{"since": "2026-10-06T09:00", "text": "pick a licence"},
+                                               {"since": "2026-10-06T09:00", "text": "later",
+                                                "after": "2026-10-07T09:00"}]))
+        self.write_open_for("leaf", json.dumps([{"since": "2026-10-06T10:00", "text": "name the release"}]))
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("children: ok — 1 below: kid", result.stdout)
+        kid = self.children()[0]
+        self.assertEqual({key: kid[key] for key in ("name", "open", "expand")},
+                         {"name": "kid", "open": 2, "expand": False})
+        self.assertEqual(cast(dict[str, object], kid["report"])["units"], 3)
+        self.assertNotIn("unreadable", kid)
+        # Its own saved report takes the lower production's counts in, and one row for it.
+        saved = cast(dict[str, object], json.loads(self.saved_report("example").read_text(encoding="utf-8")))
+        self.assertEqual((saved["units"], saved["held"]), (4, 1))
+        self.assertEqual([row["name"] for row in cast(list[dict[str, object]], saved["rows"])], ["alpha", "kid"])
+        rendered = self.run_renderer(AT)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        row = next(line for line in rendered.stdout.splitlines() if line.startswith("kid "))
+        self.assertTrue(row.endswith(" 19:20  3 units, 1 held, 2 open questions"), row)
+        self.assertNotIn("nothing needed", rendered.stdout)
+
+    def test_expand_names_a_production_directly_below_or_all(self) -> None:
+        self.attach("kid", "example")
+        self.attach("other", "example")
+        self.attach("leaf", "kid")
+        self.write_saved_report("kid")
+        self.assertEqual(self.run_builder("--expand", "kid").returncode, 0)
+        self.assertEqual([(child["name"], child["expand"]) for child in self.children()],
+                         [("kid", True), ("other", False)])
+        rendered = self.run_renderer(AT)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertEqual([line.split()[0] for line in rendered.stdout.splitlines() if line.startswith(("kid", "other"))],
+                         ["kid", "kid/fps", "kid/docs", "other"])
+        self.assertEqual(self.run_builder("--expand", "all").returncode, 0)
+        self.assertEqual([child["expand"] for child in self.children()], [True, True])
+        refused = self.run_builder("--expand", "leaf")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("expand: failed — leaf: not directly below example; choose from kid, other or all",
+                      refused.stdout)
+
+    def test_expand_is_refused_when_nothing_is_below(self) -> None:
+        refused = self.run_builder("--expand", "all")
+        self.assertEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        named = self.run_builder("--expand", "kid")
+        self.assertEqual(named.returncode, 2)
+        self.assertIn("expand: failed — kid: not directly below example; no production reports to it", named.stdout)
+
+    def test_a_lower_production_s_bad_files_cost_its_row_and_never_the_report(self) -> None:
+        self.attach("kid", "example")
+        self.attach("leaf", "kid")
+        self.write_saved_report("kid", written="yesterday")
+        self.write_open_for("leaf", "{not a list")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("children: unavailable — kid: ", result.stdout)
+        self.assertIn(".written: 'yesterday' is not YYYY-MM-DDTHH:MM", result.stdout)
+        kid = self.children()[0]
+        self.assertNotIn("report", kid)
+        self.assertEqual((kid["open"], kid["unreadable"]), (0, ["leaf"]))
+        rendered = self.run_renderer(AT)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertIn("kid      ?  no report yet", rendered.stdout)
+        self.assertIn("* leaf: needs-user list unreadable", rendered.stdout)
+        self.assertNotIn("nothing needed", rendered.stdout)
+
+    def test_a_showrunner_under_a_root_names_it_in_its_input(self) -> None:
+        self.attach("example", "middle")
+        self.attach("middle", "top")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.report()["reports_to"], "top")
+        rendered = self.run_renderer(AT)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertIn("* reports to top", rendered.stdout.splitlines())
+
+    def test_a_saved_report_that_cannot_be_written_never_fails_the_run(self) -> None:
+        self.showrunner_state.mkdir(parents=True)
+        _ = (self.showrunner_state / "example").write_text("a file where the folder goes\n", encoding="utf-8")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("saved report: unavailable — ", result.stdout)
+        self.assertTrue(self.output.exists())
 
 
 if __name__ == "__main__":

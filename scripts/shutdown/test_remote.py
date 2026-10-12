@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest.mock import patch
 
+from test_support import ShutdownSendLeaf, ShutdownTestCase
 import remote
 
 
@@ -20,7 +21,7 @@ class SshInvocation(TypedDict):
 
 
 @final
-class RemoteTests(unittest.TestCase):
+class RemoteTests(ShutdownTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -29,6 +30,7 @@ class RemoteTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.bin = self.root / "bin"
         self.bin.mkdir()
@@ -40,11 +42,13 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 Path(os.environ["SHUTDOWN_TEST_SSH_LOG"]).write_text(json.dumps({{
     "arguments": sys.argv[1:],
     "stdin": sys.stdin.read(),
 }}))
+time.sleep(float(os.environ.get("SHUTDOWN_TEST_DELAY", "0")))
 print(os.environ.get("SHUTDOWN_TEST_OUTPUT", "remote output"))
 status = os.environ.get("SHUTDOWN_TEST_REMOTE_STATUS")
 if status is not None:
@@ -64,6 +68,7 @@ raise SystemExit(int(os.environ.get("SHUTDOWN_TEST_SSH_STATUS", "0")))
             self.enterContext(patch.dict(os.environ, environment, clear=True)),
         )
         del patch_dict_context
+        self.allow_leaf(ShutdownSendLeaf.RUN_REMOTE)
 
     def invocation(self) -> SshInvocation:
         decoded = cast(object, json.loads(self.log.read_text(encoding="utf-8")))
@@ -97,6 +102,8 @@ raise SystemExit(int(os.environ.get("SHUTDOWN_TEST_SSH_STATUS", "0")))
             ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mac"],
         )
         self.assertEqual(called["stdin"], "request body")
+        self.assertNotIn("ServerAliveInterval=15", called["arguments"])
+        self.assertNotIn("ServerAliveCountMax=4", called["arguments"])
         command = called["arguments"][5]
         self.assertIn('"$HOME/.claude/scripts/lib/py"', command)
         self.assertIn('"$HOME/.claude/scripts/shutdown/shutdown.py"', command)
@@ -111,6 +118,49 @@ raise SystemExit(int(os.environ.get("SHUTDOWN_TEST_SSH_STATUS", "0")))
 
         self.assertEqual(status, 255)
         self.assertEqual(output, "partial output")
+
+    def test_while_link_alive_adds_keepalives_before_the_host(self) -> None:
+        os.environ["SHUTDOWN_TEST_REMOTE_STATUS"] = "0"
+
+        status, _ = remote.run_remote(
+            ["stop", "owner@example.com"],
+            limit=remote.WhileLinkAlive(kind="while link alive"),
+        )
+
+        self.assertEqual(status, 0)
+        called = self.invocation()
+        self.assertEqual(
+            called["arguments"][:9],
+            [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=4",
+                "mac",
+            ],
+        )
+
+    def test_while_link_alive_waits_for_remote_status_beyond_a_time_limit(
+        self,
+    ) -> None:
+        os.environ["SHUTDOWN_TEST_DELAY"] = "2"
+        os.environ["SHUTDOWN_TEST_REMOTE_STATUS"] = "7"
+
+        linked_status, _ = remote.run_remote(
+            ["stop", "owner@example.com"],
+            limit=remote.WhileLinkAlive(kind="while link alive"),
+        )
+        limited_status, _ = remote.run_remote(
+            ["stop", "owner@example.com"],
+            limit=remote.TimeLimit(kind="time limit", seconds=1),
+        )
+
+        self.assertEqual(linked_status, 7)
+        self.assertEqual(limited_status, 255)
 
 
 if __name__ == "__main__":

@@ -3185,6 +3185,50 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         self.assertNotIn("Agent 3", header)
 
+    def test_a_review2_pass_gets_its_own_progress_column(self) -> None:
+        started_at = 67_500
+        session_dir = self.start_run("review2-column", started_at)
+        self.start_phase(session_dir, started_at)
+        self.start_slot_pass(session_dir, "impl", "impl", started_at + 10)
+        self.finish_slot_pass(session_dir, "impl", "completed", started_at + 600)
+        self.start_slot_pass(
+            session_dir, "review2", "review", started_at + 700,
+            called_model="gpt-review2",
+        )
+        self.team_slot = ""
+
+        report = self.run_progress(session_dir, started_at + 1_000)
+
+        rows = self.table_rows(
+            report,
+            ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Agent 3", "Result"],
+        )
+        self.assertTrue(any("review" in row[5] for row in rows))
+        self.assertIn(
+            "- **Agent 3** (review2) gpt-review2 high",
+            report,
+        )
+
+    def test_a_fix2_handoff_gets_its_own_progress_column(self) -> None:
+        started_at = 67_800
+        session_dir = self.start_run("fix2-column", started_at)
+        self.start_phase(session_dir, started_at)
+        self.start_slot_pass(session_dir, "impl", "fix", started_at + 10, fix_pass=1)
+        self.run_board(
+            session_dir, "role", "fix2", "fix", "joining repair round",
+            at=started_at + 100,
+        )
+        self.team_slot = ""
+
+        report = self.run_progress(session_dir, started_at + 300)
+
+        rows = self.table_rows(
+            report,
+            ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Agent 3", "Result"],
+        )
+        self.assertTrue(any(row[5] == "fix" for row in rows))
+        self.assertIn("- **Agent 3** (fix2)", report)
+
     def test_review_trial_reports_the_phase_lens_counts_and_review_minutes(self) -> None:
         """The checkpoint notice line: one phase's ux and craft findings and review time."""
         self.write_full_config()

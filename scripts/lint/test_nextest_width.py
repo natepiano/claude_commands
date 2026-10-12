@@ -56,6 +56,14 @@ class NextestWidthTests(unittest.TestCase):
         buildlog.mkdir()
         self.environment = {
             **os.environ,
+            "BUILD_HOLD_DIR": str(self.root / "holders"),
+            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+            "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+            "BUILDLOG_HOLD_REGISTRATION_FILE": str(self.root / "registration"),
+            "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
             "BUILDLOG_DIR": str(buildlog),
             "BUILDLOG_OFF": "1",
             "LINT_CONFIG_READER": str(config_reader),

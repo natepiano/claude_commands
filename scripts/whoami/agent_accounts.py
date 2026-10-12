@@ -9,9 +9,8 @@ Two kinds of source, and callers pick by cost:
   `.claude.json`; Codex keeps an OIDC id_token in `auth.json` whose payload carries
   the email. Free to read, so safe on a two-minute timer.
 
-These default credential stores describe the current login. Historical usage
-is not a live reading of an inactive account; agent_notes preserves observations
-made while an account was active without retaining its credentials.
+Each credential store describes its home's current login. Every signed-in Codex
+home can be read live; saved usage remains an observation, without credentials.
 
 Nothing here returns or prints a credential: tokens are read only to be sent to
 the endpoint that issued them, or decoded for the email claim.
@@ -26,20 +25,135 @@ import http.client
 import json
 import os
 import math
+import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# Sibling scripts and package callers must share the same account identity classes.
+if __name__ == "agent_accounts":
+    _ = sys.modules.setdefault("scripts.whoami.agent_accounts", sys.modules[__name__])
+elif __name__ == "scripts.whoami.agent_accounts":
+    _ = sys.modules.setdefault("agent_accounts", sys.modules[__name__])
+
+@dataclass(frozen=True)
+class KnownCodexAccount:
+    home: Path
+    login: str
+    label: str
+
+
+@dataclass(frozen=True)
+class UnknownCodexAccount:
+    home: Path
+    reason: str
+
+
+RefusingCodexAccount = KnownCodexAccount | UnknownCodexAccount
+
+
+class StoredCodexAccount(TypedDict):
+    home: str
+    login: str
+    label: str
+
+
+def codex_account(home: Path) -> RefusingCodexAccount:
+    from scripts.whoami.note_file import AGENTS_DIR, read_note
+
+    login = codex_email_on_disk(home)
+    if not login:
+        return UnknownCodexAccount(home, "the home's sign-in cannot be read")
+    notes = Path(os.environ.get("AGENT_NOTES_DIR", str(AGENTS_DIR)))
+    for path in sorted(notes.glob("*.md")):
+        if not path.stem.casefold().startswith("codex"):
+            continue
+        note = read_note(path)
+        if note is not None and (note.get("login") or "").casefold() == login.casefold():
+            return KnownCodexAccount(home, login, path.stem)
+    return UnknownCodexAccount(home, "the signed-in account has no named note")
+
+
+def codex_home_role_label(home: Path) -> str:
+    """The seats command's label for a default or numbered home."""
+    return "default" if home == Path.home() / ".codex" else f"codex {home.name.removeprefix('.codex')}"
+
+
+ClaudeRole = Literal["showrunners", "unit directors"]
+
+
+@dataclass(frozen=True)
+class KnownClaudeAccount:
+    """The login and note label stored for a readable Claude directory."""
+
+    login: str
+    label: str
+
+
+@dataclass(frozen=True)
+class UnreadableClaudeAccount:
+    """A directory with no readable logged-in Claude identity."""
+
+
+@dataclass(frozen=True)
+class CheckedNamedClaudeAccount:
+    """A named directory fit to read, with its resolved login and note label."""
+
+    label: str
+    directory: Path
+    identity: KnownClaudeAccount
+
+
+@dataclass(frozen=True)
+class ClaudeAccountSelection:
+    """One run's role identities and fit named directories, fixed across role changes."""
+
+    default_account: KnownClaudeAccount | UnreadableClaudeAccount
+    unit_account: KnownClaudeAccount | UnreadableClaudeAccount
+    multiple_accounts: bool
+    named_accounts: tuple[CheckedNamedClaudeAccount, ...]
+
+    def is_default_login(self, login: str) -> bool:
+        return (
+            isinstance(self.default_account, KnownClaudeAccount)
+            and login.casefold() == self.default_account.login.casefold()
+        )
+
+    def roles_for_login(self, login: str) -> tuple[ClaudeRole, ...]:
+        roles: list[ClaudeRole] = []
+        if self.is_default_login(login):
+            roles.append("showrunners")
+        if (
+            isinstance(self.unit_account, KnownClaudeAccount)
+            and login.casefold() == self.unit_account.login.casefold()
+        ):
+            roles.append("unit directors")
+        return tuple(roles)
+
 
 WEEK_MINUTES = 7 * 24 * 60
 FIVE_HOUR_MINUTES = 5 * 60
 EASTERN = ZoneInfo("America/New_York")
+
+
+def user_zone() -> tzinfo | None:
+    """Use a running production's zone, or None for the machine's local zone."""
+    try:
+        from scripts.production import showrunners
+
+        zone = next((runner["zone"] for runner in showrunners.registered_showrunners()), "")
+    except (ImportError, OSError):
+        zone = ""
+    return ZoneInfo(zone) if zone else None
 
 
 @dataclass(frozen=True)
@@ -53,6 +167,45 @@ class Quota:
         if self.used_percent is None or not math.isfinite(self.used_percent):
             return None
         return max(0, min(100, 100 - self.used_percent))
+
+
+@dataclass(frozen=True)
+class ClaudeDirectorySource:
+    """A Claude reading obtained using this account directory."""
+
+    directory: Path
+
+
+@dataclass(frozen=True)
+class CodexHomeSource:
+    """A Codex reading obtained using this account home."""
+
+    home: Path
+
+
+@dataclass(frozen=True)
+class AccountSourceUnspecified:
+    """The report does not identify an account directory or home."""
+
+
+@dataclass(frozen=True)
+class NoCodexStartupFailure:
+    """No numbered-home startup failure was detected for this report."""
+
+
+@dataclass(frozen=True)
+class CodexStartupFailure:
+    """A numbered home did not answer initialize and needs setup."""
+
+    home: Path
+    setup_command: str
+
+    @property
+    def problem(self) -> str:
+        return f"Codex did not start at {codex_home_display(self.home)}; run {self.setup_command} and try again"
+
+
+CodexStartupStatus = NoCodexStartupFailure | CodexStartupFailure
 
 
 @dataclass
@@ -72,6 +225,8 @@ class Report:
     # Codex credits that carry work past the weekly allowance: whole credits, "unlimited", or "null"
     # when the rate limits were read and report none. None means they were not read.
     credit_balance: str | None = None
+    source: ClaudeDirectorySource | CodexHomeSource | AccountSourceUnspecified = field(default_factory=AccountSourceUnspecified)
+    codex_startup: CodexStartupStatus = field(default_factory=NoCodexStartupFailure)
 
     @property
     def weekly_reset(self) -> datetime | None:
@@ -214,8 +369,12 @@ def executable(name: str) -> str:
     return name
 
 
-def command_json(*args: str) -> object:
-    result = subprocess.run((executable(args[0]), *args[1:]), capture_output=True, text=True, timeout=15)
+def command_json(*args: str, environment: dict[str, str] | None = None) -> object:
+    command = (executable(args[0]), *args[1:])
+    if environment is None:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+    else:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=15, env=environment)
     if result.returncode:
         raise RuntimeError("account command failed")
     return cast(object, json.loads(result.stdout))
@@ -240,15 +399,116 @@ def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
 
 
+def seats_home() -> Path:
+    """Resolve the shared seats role without using this process's CODEX_HOME."""
+    path = Path.home() / ".claude" / "config" / "accounts.json"
+    try:
+        decoded = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return Path.home() / ".codex"
+    if not isinstance(decoded, dict):
+        raise ValueError(f"accounts: {path} must contain an object")
+    values = cast(dict[str, object], decoded)
+    if "seats" not in values:
+        return Path.home() / ".codex"
+    label = values["seats"]
+    if not isinstance(label, str) or re.fullmatch(r"codex [1-9][0-9]*", label) is None:
+        raise ValueError(f"accounts: {path} has an invalid seats account")
+    return Path.home() / f".codex{label.removeprefix('codex ')}"
+
+
+def codex_home_display(home: Path) -> str:
+    """Display an account home's path using ~ within the user's home directory."""
+    user_home = Path.home()
+    if home == user_home:
+        return "~"
+    return f"~/{home.relative_to(user_home)}" if home.is_relative_to(user_home) else str(home)
+
+
+def codex_homes(seats_home: Path) -> list[Path]:
+    """The default home, existing numbered homes, and any other home in use."""
+    default = Path.home() / ".codex"
+    numbered: list[tuple[int, Path]] = []
+    try:
+        for child in Path.home().iterdir():
+            match = re.fullmatch(r"\.codex([1-9][0-9]*)", child.name)
+            if match is not None and child.is_dir():
+                numbered.append((int(match.group(1)), child))
+    except OSError:
+        pass
+    homes = [default, *(home for _, home in sorted(numbered))]
+    if seats_home not in homes:
+        homes.append(seats_home)
+    return homes
+
+
+def codex_report_in_use(report: Report, seats_home: Path) -> bool:
+    """Select the seats' home; an older report without a source needs a single home."""
+    if report.tool.lower() != "codex":
+        return False
+    if isinstance(report.source, CodexHomeSource):
+        return report.source.home == seats_home
+    return isinstance(report.source, AccountSourceUnspecified) and len(codex_homes(seats_home)) == 1
+
+
+@dataclass(frozen=True)
+class CodexWorkAvailable:
+    """Both allowance windows have room, or credits can pay for work."""
+
+
+@dataclass(frozen=True)
+class CodexWorkExhausted:
+    """At least one current window is used up and no credits remain."""
+
+
+@dataclass(frozen=True)
+class CodexWorkUnknown:
+    """The reading cannot establish whether the account can work."""
+
+    problem: str
+
+
+CodexWorkReadiness = CodexWorkAvailable | CodexWorkExhausted | CodexWorkUnknown
+
+
+def codex_can_work(report: Report, now: datetime) -> CodexWorkReadiness:
+    """Decide from this live reading; an expired window supplies no allowance."""
+    if report.problem or report.tool.lower() != "codex":
+        return CodexWorkUnknown(report.problem or "not a Codex reading")
+    credits = report.credit_balance
+    if credits == "unlimited":
+        return CodexWorkAvailable()
+    try:
+        balance = float(credits) if credits is not None else math.nan
+    except ValueError:
+        balance = math.nan
+    if math.isfinite(balance) and balance > 0:
+        return CodexWorkAvailable()
+    weekly = next((quota for quota in report.quotas if quota.label == "Weekly"), None)
+    windows = (report.five_hour, weekly)
+    for window in windows:
+        if (window is None or window.remaining_percent is None or window.resets_at is None
+                or window.resets_at.tzinfo is None or window.resets_at <= now):
+            return CodexWorkUnknown("current 5-hour and weekly usage is unavailable; refresh and try again")
+    if all(window is not None and (window.remaining_percent or 0) > 0 for window in windows):
+        return CodexWorkAvailable()
+    if credits == "null" or math.isfinite(balance) and balance == 0:
+        return CodexWorkExhausted()
+    return CodexWorkUnknown("credit balance is unavailable; refresh and try again")
+
+
 # --- Claude ------------------------------------------------------------------
 
 
-def claude_credentials() -> ClaudeCredentials:
-    path = claude_config_dir() / ".credentials.json"
+def claude_credentials(config_dir: Path | None = None) -> ClaudeCredentials:
+    path = (claude_config_dir() if config_dir is None else config_dir) / ".credentials.json"
     if path.exists():
         return cast(ClaudeCredentials, json.loads(path.read_text()))
     # Claude Code uses the macOS login keychain for its default configuration.
-    if sys.platform == "darwin" and "CLAUDE_CONFIG_DIR" not in os.environ:
+    if sys.platform == "darwin" and (
+        config_dir == Path.home() / ".claude"
+        or (config_dir is None and "CLAUDE_CONFIG_DIR" not in os.environ)
+    ):
         return cast(ClaudeCredentials, command_json(
             "security", "find-generic-password", "-s", "Claude Code-credentials", "-w"))
     raise RuntimeError("usage credentials unavailable")
@@ -277,10 +537,19 @@ def claude_five_hour(usage: dict[str, object]) -> Quota | None:
     return Quota("5-hour", window.get("utilization"), parse_reset(window.get("resets_at")))
 
 
-def claude_live() -> Report:
-    report = Report("Claude")
+def claude_live(config_dir: Path | None = None) -> Report:
+    report = Report("Claude", source=ClaudeDirectorySource(
+        claude_config_dir() if config_dir is None else config_dir,
+    ))
     try:
-        account = cast(ClaudeAuthStatus, command_json("claude", "auth", "status"))
+        if config_dir is None:
+            status = command_json("claude", "auth", "status")
+        else:
+            environment = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")}
+            if config_dir != Path.home() / ".claude":
+                environment["CLAUDE_CONFIG_DIR"] = str(config_dir)
+            status = command_json("claude", "auth", "status", environment=environment)
+        account = cast(ClaudeAuthStatus, status)
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
         report.problem = "Account unavailable (claude auth status failed)"
         return report
@@ -293,8 +562,9 @@ def claude_live() -> Report:
         report.quota_problem = "Weekly quota: unavailable for this authentication method"
         return report
     try:
-        token = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-                 or claude_credentials().get("claudeAiOauth", {}).get("accessToken"))
+        token = ((os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") if config_dir is None else None)
+                 or (claude_credentials() if config_dir is None else claude_credentials(config_dir))
+                 .get("claudeAiOauth", {}).get("accessToken"))
         if not token:
             raise RuntimeError("usage credentials unavailable")
         request = urllib.request.Request(
@@ -407,6 +677,10 @@ def codex_email_on_disk(home: Path | None = None) -> str | None:
     return email if isinstance(email, str) and email else None
 
 
+class CodexServerClosed(RuntimeError):
+    """The server closed its output before answering a request."""
+
+
 class CodexServer:
     """A `codex app-server` over stdio, spoken to one JSON-RPC request at a time."""
 
@@ -422,7 +696,9 @@ class CodexServer:
         stdin.write((json.dumps(message) + "\n").encode())
         await stdin.drain()
 
-    async def request(self, identifier: int, method: str, params: dict[str, object]) -> object:
+    async def request(
+        self, identifier: int, method: str, params: dict[str, object], *, timeout_seconds: float = 20,
+    ) -> object:
         await self.send({"id": identifier, "method": method, "params": params})
         stdout = self.process.stdout
         if stdout is None:
@@ -435,9 +711,9 @@ class CodexServer:
                     if "error" in response:
                         raise RuntimeError("account API request failed")
                     return cast(object, response.get("result", {}))
-            raise RuntimeError("account API closed")
+            raise CodexServerClosed("account API closed")
 
-        return await asyncio.wait_for(receive(), timeout=20)
+        return await asyncio.wait_for(receive(), timeout=timeout_seconds)
 
     async def close(self) -> None:
         if self.process.returncode is not None:
@@ -487,16 +763,76 @@ def codex_five_hour(usage: CodexRateLimits) -> Quota | None:
     return None
 
 
-async def codex_live() -> Report:
-    report = Report("Codex")
+CODEX_HOME_PREPARATION_SECONDS = 1200.0
+
+
+@dataclass(frozen=True)
+class CodexHomePrepared:
+    """The home's server answered initialize after its startup work."""
+
+
+@dataclass(frozen=True)
+class CodexHomePreparationFailed:
+    """Startup could not finish within the setup limit."""
+
+    problem: str
+
+
+CodexHomePreparation = CodexHomePrepared | CodexHomePreparationFailed
+
+
+async def prepare_codex_home(home: Path) -> CodexHomePreparation:
+    """Let Codex finish its own session index, retrying servers that exit unanswered."""
+    deadline = time.monotonic() + CODEX_HOME_PREPARATION_SECONDS
+    reason = "initialize was not answered"
+    while deadline - time.monotonic() > 0:
+        server: CodexServer | None = None
+        try:
+            server = CodexServer(await asyncio.create_subprocess_exec(
+                executable("codex"), "app-server", "--listen", "stdio://",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                env={**os.environ, "CODEX_HOME": str(home)},
+            ))
+            _ = await server.request(
+                1, "initialize", {"clientInfo": {"name": "accounts-setup", "version": "1.0"}},
+                timeout_seconds=max(0.01, deadline - time.monotonic()),
+            )
+            await server.send({"method": "initialized"})
+            return CodexHomePrepared()
+        except asyncio.TimeoutError:
+            reason = "initialize was not answered"
+            break
+        except OSError as error:
+            return CodexHomePreparationFailed(f"Codex did not start at {codex_home_display(home)}: {error}")
+        except CodexServerClosed as error:
+            reason = str(error) or type(error).__name__
+        except (RuntimeError, ValueError, KeyError) as error:
+            reason = str(error) or type(error).__name__
+            break
+        finally:
+            if server is not None:
+                await server.close()
+        await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    return CodexHomePreparationFailed(
+        f"Codex did not start at {codex_home_display(home)} within {CODEX_HOME_PREPARATION_SECONDS:g}s: "
+        + f"{reason}; rerun setup to finish its session index"
+    )
+
+
+async def codex_live(home: Path) -> Report:
+    report = Report("Codex", source=CodexHomeSource(home))
     server: CodexServer | None = None
+    initialized = False
     try:
         server = CodexServer(await asyncio.create_subprocess_exec(
             executable("codex"), "app-server", "--listen", "stdio://",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env={**os.environ, "CODEX_HOME": str(home)},
         ))
         _ = await server.request(1, "initialize", {"clientInfo": {"name": "whoami", "version": "1.0"}})
+        initialized = True
         await server.send({"method": "initialized"})
         result = cast(CodexAccountResult, await server.request(2, "account/read", {"refreshToken": False}))
         account = result.get("account")
@@ -519,7 +855,13 @@ async def codex_live() -> Report:
         except (OSError, ValueError, KeyError, RuntimeError, asyncio.TimeoutError):
             report.quota_problem = "Weekly quota: unavailable (Codex usage API failed)"
     except (OSError, ValueError, KeyError, RuntimeError, asyncio.TimeoutError):
-        if report.email is None:
+        numbered = re.fullmatch(r"\.codex([1-9][0-9]*)", home.name)
+        if not initialized and home.parent == Path.home() and numbered is not None:
+            report.codex_startup = CodexStartupFailure(
+                home, f'/showrunner:accounts setup "codex {numbered.group(1)}"',
+            )
+            report.problem = report.codex_startup.problem
+        elif report.email is None:
             report.problem = "Account/weekly quota unavailable (Codex account API failed)"
         else:
             report.quota_problem = "Weekly quota: unavailable (Codex usage API failed)"
@@ -554,6 +896,15 @@ def reset_credits(report: Report, summary: object) -> None:
     report.limit_reset_expirations.sort()
 
 
-async def live_reports() -> list[Report]:
-    """The same live account and usage reads for /whoami and the snapshot timer."""
-    return list(await asyncio.gather(asyncio.to_thread(claude_live), codex_live()))
+async def live_reports(selection: ClaudeAccountSelection, seats_home: Path) -> list[Report]:
+    """Live Claude directories and every Codex home, fetched concurrently."""
+    homes = codex_homes(seats_home)
+    if not selection.multiple_accounts:
+        return list(await asyncio.gather(
+            asyncio.to_thread(claude_live), *(codex_live(home) for home in homes),
+        ))
+    directories = [Path.home() / ".claude", *(named.directory for named in selection.named_accounts)]
+    return list(await asyncio.gather(
+        *(asyncio.to_thread(claude_live, directory) for directory in directories),
+        *(codex_live(home) for home in homes),
+    ))
