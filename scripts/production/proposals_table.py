@@ -11,10 +11,11 @@ Without `--production`, the doc is the one held by the update timer of the calli
   2. the plan backlog: ledger lines ending `proposed` or `deferred`;
   3. proposal docs: `docs/plans/proposal-*.md` in the trunk and unit worktrees, while the doc's
      status line still says PROPOSAL;
-  4. add-ons: the entries each unit's runs hold for the user to build, save for later or drop.
+  4. add-ons: the entries each unit's runs hold until the showrunner says build, save for later
+     or drop.
 
-Each row says what the change is and what the user can do about it. It reads only, and writes
-nothing.
+Each row says what the change is and what the user can do about it, or for an add-on who decides
+it. It reads only, and writes nothing.
 """
 from __future__ import annotations
 
@@ -42,7 +43,8 @@ INDEX_NAME = "index.md"
 PROPOSALS_FIELD = "Proposals"
 # A state says what the user can do, in their terms.
 REVIEW_STATE = "waiting for your review"
-ADD_ON_STATE = "your call: build, save for later, or drop"
+# An add-on is the showrunner's to settle, not the user's (user, 2026-10-12).
+ADD_ON_STATE = "the showrunner decides: build, save for later, or drop"
 BACKLOG_STATES = {"proposed": REVIEW_STATE, "deferred": "deferred until you ask for it"}
 # An index row whose Status begins with one of these words is closed, and is not shown.
 CLOSED_WORDS = frozenset({
