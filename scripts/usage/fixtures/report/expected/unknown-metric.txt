@@ -1,0 +1,1 @@
+usage_report: unknown metric 'absent-metric'; accepted: weighted, weighted_per_checkpoint, before_first_edit_share, cache_read_share, output_share, compactions_per_thread, weighted_per_finding_closed, weighted_per_review_round, account_switches

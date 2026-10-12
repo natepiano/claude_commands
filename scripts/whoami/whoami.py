@@ -9,7 +9,9 @@ from datetime import datetime
 from pathlib import Path
 
 from account import label_for
-from agent_accounts import ClaudeAccountSelection, ClaudeRole, EASTERN, Quota, Report, live_reports
+from agent_accounts import (ClaudeAccountSelection, CodexHomeSource, EASTERN, Quota, Report,
+                            codex_home_display, codex_homes, codex_report_in_use, live_reports,
+                            seats_home as resolve_seats_home)
 import note_file
 
 
@@ -25,8 +27,15 @@ def quota_line(quota: Quota) -> str:
     return f"  {quota.label}: {remaining}; resets {reset_time(quota.resets_at)}"
 
 
-def render(report: Report, selection: ClaudeAccountSelection) -> list[str]:
-    lines = [report.tool]
+def render(report: Report, selection: ClaudeAccountSelection, seats_home: Path) -> list[str]:
+    multiple_codex_homes = report.tool == "Codex" and len(codex_homes(seats_home)) > 1
+    codex_seats = multiple_codex_homes and codex_report_in_use(report, seats_home)
+    header = report.tool
+    if (multiple_codex_homes and (report.problem or report.email is None)
+            and isinstance(report.source, CodexHomeSource)):
+        role = ", seats" if codex_seats else ""
+        header += f" ({codex_home_display(report.source.home)}{role})"
+    lines = [header]
     if report.problem:
         return lines + [f"  {report.problem}"]
     email = report.email
@@ -34,9 +43,11 @@ def render(report: Report, selection: ClaudeAccountSelection) -> list[str]:
         lines.append("  Account: email unavailable")
     else:
         label = label_for(report.tool, email)
-        roles: tuple[ClaudeRole, ...] = ()
+        roles: tuple[str, ...] = ()
         if report.tool == "Claude" and selection.multiple_accounts:
             roles = selection.roles_for_login(email)
+        elif codex_seats:
+            roles = ("seats",)
         role = f" ({', '.join(roles)})" if roles else ""
         lines.append(f"  Account: {label}{role} — {email}" if label != email else f"  Account: {email}{role}")
     lines.append(f"  Plan: {report.plan or 'unavailable'}")
@@ -69,12 +80,13 @@ async def main() -> None:
     from scripts.accounts import accounts
 
     selection = accounts.claude_account_selection()
-    reports = await live_reports(selection)
+    seats_home = resolve_seats_home()
+    reports = await live_reports(selection, seats_home)
     if selection.multiple_accounts:
         reports = [report for report in reports
                    if report.tool != "Claude" or report.email is None
                    or selection.roles_for_login(report.email)]
-    print("\n\n".join("\n".join(render(report, selection)) for report in reports))
+    print("\n\n".join("\n".join(render(report, selection, seats_home)) for report in reports))
 
 
 if __name__ == "__main__":

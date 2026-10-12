@@ -8,7 +8,7 @@
 
 ### State, lock and block — `scripts/mac_test/mac_test.py`
 
-- An `argparse` CLI (`claim`, `release`, `block`, `unblock`, `status`, `watch`) over a state directory, `MAC_TEST_STATE_DIR` (default `~/.local/state/mac-test/`). Records are written to a temp name, then `os.replace`. `state_paths()` names the files; `read_block(path) -> NoMacBlock | PendingMacBlock | ActiveMacBlock` decodes `block.json` and raises `ValueError` on a file it cannot decode. Both are importable with no side effects.
+- An `argparse` CLI (`claim`, `release`, `block`, `unblock`, `status`, `watch`) over a state directory, `MAC_TEST_STATE_DIR` (default `~/.local/state/mac-test/`). Installed scripts refuse to run with `MAC_TEST_STATE_DIR` set; tests set it for a checkout's scripts. Records are written to a temp name, then `os.replace`. `state_paths()` names the files; `read_block(path) -> NoMacBlock | PendingMacBlock | ActiveMacBlock` decodes `block.json` and raises `ValueError` on a file it cannot decode. Both are importable with no side effects.
 - Three locks: `state.lock` covers `claim` and `release` and never waits on `gh` or a message; `control.lock` covers `block`, `unblock`, `status` and each watcher pass; `watch.lock` keeps one watcher (a `systemd-run --user` unit named `mac-test-watch-<pid>`) at a time.
 - `run.json` is `{"pid", "proc_start", "what", "worktree", "since"}`; a run is live only while `/proc/<pid>/stat` field 22 equals `proc_start`.
 - `claim --pid PID --what TEXT [--worktree PATH] [--wait SECONDS]` exits 0 `claimed`, 10 `blocked by <holder>: <for>`, 11 `busy: <what> since <HH:MM>`, 12 `state unreadable: <path>`, 1 for a pid that is not running. `release --pid PID` removes its own `run.json`.
@@ -52,7 +52,7 @@ It claims the Mac after its reach probe (`mac_test.py claim --pid $$ --what "mac
 
 - The index is at schema 12. `calls` carries `mac` (`passed`, `passed_filter`, `failed`, `lost`, `declined`), `mac_reason`, `local_reason` and `mac_s`. The report decodes a flagged run as `LocalRunRequested(reason)` and shows its reasons, JSON-quoted, on the "Failed on the Mac, then passed on natedev with --local" line. The Mac's steps carry `caller = 'verify-mac'` (set by the remote command) and reach natedev's index through `buildlog sync`.
 - `COUNTED_FAILURE` (`status != 0 AND NOT (caller IS 'verify-mac' AND step IS 'nextest' AND status = 4)`) drives `step_days.failed` and the `failures` view, so a Mac "no tests to run" keeps raw status 4 without counting as a failure.
-- `report.py` keeps the Mac's steps out of natedev's tables (`natedev_step_predicate`), leaves out a call whose `mac` is `failed` or `passed_filter` (`natedev_call_predicate`), and decodes each call through `offload_record(mac, reason, seconds_value)`. `mac_tests_section(connection, day)` prints `Tests on the Mac`: `Package | Tried | Failed on the Mac | Passed there | Mac p50 | natedev p50 | Stayed local`, the natedev runs avoided, and `No test matched on the Mac:`.
+- `report.py` keeps the Mac's steps out of natedev's tables (`mac_outcome.natedev_step_predicate`), leaves out a call whose `mac` is `failed` or `passed_filter` (`natedev_call_predicate`), and decodes each call through `mac_outcome.offload_record(mac, reason, local_reason, seconds_value, outcome)`. `mac_tests_section(connection, day)` prints `Tests on the Mac`: `Package | Tried | Failed on the Mac | Passed there | Mac p50 | natedev p50 | Stayed local`, the natedev runs avoided, and `No test matched on the Mac:`.
 
 ## Config — `config/mac_test.conf`
 
@@ -63,7 +63,7 @@ It claims the Mac after its reach probe (`mac_test.py claim --pid $$ --what "mac
 - Any doubt means local: every Mac-side trouble except the tests' own exit status falls back to the natedev run, and a worker never waits on the Mac longer than the probe timeout.
 - natedev is the gate. Pass records are written only by the natedev run; a Mac pass never stands as one.
 - Never trust ssh's exit status (Tailscale SSH returns 0 whatever ran). Status is a printed `mac_exit=<n>` or `rc=<n>` line; ssh's own 255 or a timeout means unreachable.
-- Tests run nothing on the Mac: stand-in `ssh`, `rsync`, `gh` on `PATH`, state under `MAC_TEST_STATE_DIR`, config under `MAC_TEST_CONFIG`. A test reaching the footer sets `MAC_TEST_STATE_DIR` too.
+- Tests run nothing on the Mac: stand-in `ssh`, `rsync`, `gh` on `PATH`, state under `MAC_TEST_STATE_DIR`, config under `MAC_TEST_CONFIG`. Tests set these variables for a checkout's scripts; installed scripts refuse to run with either set. A test reaching the footer sets `MAC_TEST_STATE_DIR` too.
 - On the Mac the feature writes only under `~/.local/state/mac-test/`. Only step records are written there; call records are written on natedev only.
 - The lock lives on natedev, tied to the claiming process: a job that dies frees it, and a job started on the Mac cannot take it.
 

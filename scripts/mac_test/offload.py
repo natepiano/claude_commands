@@ -23,6 +23,8 @@ from typing import Literal, TextIO, cast, final
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
+import override_guard
 import sweep
 
 
@@ -1168,6 +1170,7 @@ def restore_ignored_interrupt_default(arguments: CliArguments) -> None:
 
 
 def main() -> int:
+    override_guard.refuse_overrides(Path(__file__), "mac_test/offload.py")
     arguments = parser().parse_args(namespace=CliArguments())
     restore_ignored_interrupt_default(arguments)
     request = request_from_arguments(arguments)

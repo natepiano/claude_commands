@@ -1,0 +1,4 @@
+{"type":"user","timestamp":"2026-10-10T17:00:00-04:00","message":{"content":"Invented opening"}}
+{"type":"assistant","timestamp":"2026-10-10T21:35:01Z","requestId":"outcome-request-one","message":{"id":"outcome-message-one","model":"claude-opus-4-6","usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2},"cache_read_input_tokens":20,"output_tokens":2}}}
+{"type":"assistant","timestamp":"2026-10-10T21:35:02Z","requestId":"edit-without-usage","message":{"id":"edit-message","model":"claude-opus-4-6","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"invented.py","old_string":"one","new_string":"two"}}]}}
+{"type":"assistant","timestamp":"2026-10-10T21:35:02Z","requestId":"edit-without-usage","message":{"id":"edit-message","content":[{"type":"tool_use","name":"Edit"}]}}

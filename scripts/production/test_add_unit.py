@@ -462,7 +462,7 @@ class AddUnitTests(ShutdownTestCase):
                     0 if live else 1,
                     (
                         "claude 2 is held by a shutdown "
-                        + "(down since 2026-10-09 14:49 PDT)\n"
+                        + "(since 2026-10-09 14:49 PDT)\n"
                         if live
                         else ""
                     ),
@@ -583,7 +583,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(
             result.stderr,
             "add_unit: claude 2 is held by a shutdown "
-            + "(down since 2026-10-09 14:49 PDT); /shutdown restart first\n",
+            + "(since 2026-10-09 14:49 PDT); /shutdown restart first\n",
         )
         self.assert_no_launch_change(document, head)
 
@@ -862,6 +862,22 @@ class AddUnitTests(ShutdownTestCase):
             add_unit.NoUnitRow(),
             add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
         )
+        old = self.shutdown_record("down")
+        owner = cast(list[dict[str, object]], old["entries"])[0]
+        session_shutdown: dict[str, object] = {
+            "login": old["login"],
+            "label": old["label"],
+            "machine": old["machine"],
+            "requested_at": old["requested_at"],
+            "requested_by": old["requested_by"],
+            "request_id": "launch-barrier-request",
+            "hold": "account",
+            "then": "stop",
+            "force": old["force"],
+            "alerts": "user",
+            "seats": [],
+            **owner,
+        }
         creator: subprocess.Popen[str] | None = None
 
         def start_shutdown(_request: add_unit.UnitLaunch) -> None:
@@ -870,12 +886,12 @@ class AddUnitTests(ShutdownTestCase):
                 [
                     sys.executable,
                     "-c",
-                    "import json, os, record; record.create(json.loads(os.environ['TEST_RECORD']))",
+                    "import os, record; assert record.create_session(record.parse_session_records(os.environ['TEST_RECORD'])[0])",
                 ],
                 cwd=Path(__file__).parents[1] / "shutdown",
                 env={
                     **self.env,
-                    "TEST_RECORD": json.dumps(self.shutdown_record("down")),
+                    "TEST_RECORD": json.dumps([session_shutdown]),
                 },
                 text=True,
                 stdout=subprocess.PIPE,
@@ -937,7 +953,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(result, 0, error.getvalue())
         wait.assert_not_called()
         account = Path(self.env["SHUTDOWN_STATE_DIR"]) / "owner@example.com"
-        self.assertTrue((account / "record.json").is_file())
+        self.assertTrue((account / "sessions" / "session-123.json").is_file())
 
     def test_restore_recording_failure_uses_one_stderr_line_and_does_not_launch(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
@@ -1143,7 +1159,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(
             result.stderr,
             "add_unit: claude 3 is held by a shutdown "
-            + "(down since 2026-10-09 14:49 PDT); /shutdown restart first\n",
+            + "(since 2026-10-09 14:49 PDT); /shutdown restart first\n",
         )
         self.assert_no_launch_change(document, head)
 

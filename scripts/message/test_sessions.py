@@ -65,6 +65,27 @@ class SessionLookupTests(ShutdownTestCase):
             capture_output=True, text=True, check=False,
         )
 
+    def test_remote_control_reads_present_missing_empty_and_unreadable_fields(self) -> None:
+        self.record(f"{os.getpid()}.json")
+        path = self.sessions / f"{os.getpid()}.json"
+        registered = sessions.read_session(path)
+        assert not isinstance(registered, sessions.UnreadableSessionRecord)
+        original = path.read_text()
+        for value, expected in (("bridge-id", "active"), ("", "absent"), (None, "absent"), (3, "absent")):
+            with self.subTest(value=value):
+                data = cast(dict[str, object], json.loads(original))
+                if value is not None:
+                    data["bridgeSessionId"] = value
+                _ = path.write_text(json.dumps(data))
+                with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+                    self.assertEqual(sessions.remote_control(registered), expected)
+        _ = path.write_text("broken JSON")
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            self.assertEqual(sessions.remote_control(registered), "absent")
+        path.unlink()
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            self.assertEqual(sessions.remote_control(registered), "absent")
+
     def test_live_name_session_id_and_pid_lookup(self) -> None:
         self.record("one.json", name="showrunner", session_id="sid-123")
         self.assertEqual(self.run_cli("socket", "showrunner").stdout.strip(), str(self.socket_path))

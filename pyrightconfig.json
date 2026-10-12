@@ -82,6 +82,7 @@
       "root": "scripts/buildlog",
       "extraPaths": [
         "scripts/buildlog",
+        "scripts/build_hold",
         "scripts/lint"
       ]
     },
@@ -89,6 +90,7 @@
       "root": "scripts/mac_test",
       "extraPaths": [
         "scripts/mac_test",
+        "scripts/build_hold",
         "scripts/lint"
       ]
     },
@@ -146,6 +148,13 @@
         "scripts/notify",
         "scripts/production",
         "scripts/hooks"
+      ]
+    },
+    {
+      "root": "scripts/bevy_upgrade",
+      "extraPaths": [
+        "scripts/bevy_upgrade",
+        "scripts/production"
       ]
     },
     {
