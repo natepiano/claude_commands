@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
@@ -222,6 +224,46 @@ class CodexHookInstallerTests(unittest.TestCase):
             {"matcher": "apply_patch", "hooks": [MUL_HANDLER]},
         ])
         self.assertEqual(len(self.groups()), 4)
+
+    def test_install_keeps_the_hooks_link_and_adds_missing_hooks_to_its_target(self) -> None:
+        shared = self.root / "shared"
+        shared.mkdir()
+        target = shared / "hooks.json"
+        existing = {"matcher": "apply_patch", "hooks": [FN_HANDLER]}
+        _ = target.write_text(json.dumps({"hooks": {"PostToolUse": [existing]}}))
+        self.hooks_file.symlink_to(Path("..") / "shared" / "hooks.json")
+        original_link = os.readlink(self.hooks_file)
+
+        result = self.run_installer("install")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(self.hooks_file.is_symlink())
+        self.assertEqual(os.readlink(self.hooks_file), original_link)
+        self.assertEqual(self.hooks_file.resolve(), target)
+        self.assertEqual(self.groups(), [existing,
+                         {"matcher": "apply_patch", "hooks": [MUL_HANDLER]}])
+        self.assertEqual(target.read_bytes(), self.hooks_file.read_bytes())
+        self.assertEqual(len(self.trust()), 2)
+        self.assertEqual({entry.name for entry in shared.iterdir()}, {"hooks.json"})
+
+    def test_install_creates_the_temporary_hooks_file_beside_the_link_target(self) -> None:
+        target = self.root / "shared" / "hooks.json"
+        self.hooks_file.symlink_to(target)
+        output = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, self.environment, clear=True),
+            mock.patch.object(sys, "argv", ["codex_hooks.py", "install"]),
+            mock.patch.object(tempfile, "mkstemp", wraps=tempfile.mkstemp) as create,
+            redirect_stdout(output),
+        ):
+            result = codex_hooks.main()
+        self.assertEqual(result, 0, output.getvalue())
+        create.assert_called_once_with(prefix=".hooks-", suffix=".json", dir=str(target.parent.resolve()))
+        self.assertTrue(self.hooks_file.is_symlink())
+        self.assertEqual(self.groups(), [
+            {"matcher": "apply_patch", "hooks": [FN_HANDLER]},
+            {"matcher": "apply_patch", "hooks": [MUL_HANDLER]},
+        ])
 
     def _assert_existing_fn_group_keeps_trust(self, old_groups: list[dict[str, object]]) -> None:
         fn_group = {"matcher": "apply_patch", "hooks": [FN_HANDLER]}

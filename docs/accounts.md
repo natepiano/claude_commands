@@ -1,4 +1,4 @@
-# Claude accounts
+# Claude and Codex accounts
 
 ## Which account am I on?
 
@@ -8,11 +8,11 @@ The status line's second row shows this session's account label. To print it:
 ~/.claude/scripts/lib/py ~/.claude/scripts/whoami/account.py
 ```
 
-`/whoami` shows each account in use with its role (`showrunners`, `unit directors`), omitting spares. It does not identify this session's account.
+`/whoami` shows Claude accounts in use with their roles (`showrunners`, `unit directors`), omitting Claude spares. It also shows every Codex home; with multiple homes, the home in use is marked `(seats)`. It does not identify this session's account.
 
 ## Every account in one table
 
-`/showrunner:accounts` prints one table: a row for `~/.claude` and each `~/.claudeN`, logged in or not, then a row for each Codex account. In a terminal:
+`/showrunner:accounts` prints one table: a row for `~/.claude` and each `~/.claudeN`, logged in or not, then a row for `~/.codex` and each `~/.codexN`. Noted accounts whose home is absent or blocked by a file or broken link, and whose login no home holds, get `not set up` rows. In a terminal:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py status
@@ -20,15 +20,15 @@ The status line's second row shows this session's account label. To print it:
 
 | Column | Shows |
 | --- | --- |
-| Label | The account's label. A named folder keeps its own label whatever login it holds. |
+| Label | The account's label. A named Claude folder keeps its own label; a Codex home shows the label of its login's note. |
 | Login | The login, `not logged in`, or `not set up` for an account that has a note and is in no folder. |
-| Role | `showrunners`, `unit directors`, or `spare`; `seats` for the Codex account. |
+| Role | `showrunners`, `unit directors`, or `spare`; `seats` for the Codex home in use, `spare` for the other Codex homes. |
 | 5-hour left, Weekly left | Percent of each window left, each with its reset time. A dash when the account has no such window. |
 | On credits | Codex only: `yes` when a window is used up and the account's credits now pay for the work. |
 | Credits left | Codex only: the credit balance, or `unlimited`. |
 | Read | When those numbers were read. |
 
-Codex has one home, `~/.codex`, so one Codex account is signed in at a time. Each other Codex account that has a note gets a `not logged in` row with no numbers.
+Each Codex account can stay signed in in its own home. Seats continue on `~/.codex` today. The table's `seats` role follows `CODEX_HOME`, or `~/.codex` when it is unset. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts.
 
 Times are in the running production's User zone, or this machine's zone when no production runs. The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Lines under the table name anything wrong or unusual in a folder: a failed check, unclassified entries, MCP servers that differ from `~/.claude`.
 
@@ -181,6 +181,28 @@ For claude 3, run inside a session:
 ```
 
 Then start `claude3` in a terminal, run `/login` as claude 3, and check `/showrunner:accounts`. Setup links shared content to `~/.claude`; it reports existing real files or directories rather than replacing them. Login stays separate for each directory.
+
+## Setting up a Codex home
+
+Create an account note with its login first (`~/rust/hanadocs/agents/codex N.md`). For codex 1:
+
+```text
+/showrunner:accounts setup "codex 1"
+```
+
+Setup creates `~/.codex1` with mode 0700 and links existing shared entries to `~/.codex`: configuration, hooks, instructions, skills, rules, plugins, sessions, archived sessions, the session index, history and the model cache. It reports real files or directories that prevent a link. Sign-in and Codex's home state stay separate; setup never links or copies `auth.json`.
+
+Setup refuses without changing files or printing a sign-in command when another home already holds the account's login, because two homes on one login break token refresh.
+
+Run the printed command in a terminal and sign in as codex 1:
+
+```sh
+CODEX_HOME=~/.codex1 codex login
+```
+
+Then run `/showrunner:accounts`. The new home's row shows `spare` and its own numbers; `~/.codex` continues to show `seats`. To check the home directly, use `/showrunner:accounts check "codex 1"`. Problems under the table name missing, broken or replaced shared links, unclassified entries, the wrong login, or a login held by another home. Keep each login in one home: two homes on one login break token refresh.
+
+The repository's hook installer keeps a linked `hooks.json` and adds missing hooks to its target, so numbered homes continue to share the default home's hooks.
 
 ## Low-quota alerts
 

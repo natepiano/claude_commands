@@ -507,7 +507,7 @@ Recommend whether any change is needed. The nightly review already moved to the 
 
 **Acceptance gate:** the readout cites its window, account identities, observed days, assignment and move evidence, and the observed quota minimum. It tells rolled-back or unconfirmed attempts from completed swaps, reports coverage gaps, and is in this plan and sent to the showrunner.
 
-### Phase 10 — A home per Codex account  · status: todo
+### Phase 10 — A home per Codex account  · status: done
 
 User, 2026-10-12, through the showrunner: "make the codex account half of this work as well". Phases 10–12 are that half. Source: the Codex half of `~/.local/state/plan-backlog/2026-10-09-per-session-accounts.md`.
 
@@ -523,7 +523,7 @@ User, 2026-10-12, through the showrunner: "make the codex account half of this w
 2. Hand checks first, results recorded here: Codex keeps a linked `config.toml` and `hooks.json` when it writes them; `CODEX_HOME=~/.codexN codex login` leaves `~/.codex/auth.json` untouched; usage is readable under a second home while seats run on the first.
 3. `accounts.py setup "codex N"` builds `~/.codexN` (0700), links the shared entries to `~/.codex` (`config.toml`, `hooks.json`, `AGENTS.md`, `skills`, `rules`, `plugins`, `sessions`, `archived_sessions`, `session_index.jsonl`, `history.jsonl`, `models_cache.json`), leaves the sign-in and Codex's own state in the home, and prints the sign-in command. `check "codex N"` reports a broken or replaced link, an entry it does not know, a login that is not the note's, and a login another home holds (two homes on one login break token refresh).
 4. `agent_accounts.codex_live(home)` runs the app-server with `CODEX_HOME=<home>`. `live_reports` returns one Codex report per home, and each report names its home.
-5. `agent_notes.apply`: a Codex note is `active` when any home holds its login. Quota alerts, the 5-hour hold and the pacer keep reading only the account the seats run on, until Phase 12.
+5. `agent_notes`: every signed-in home's note gets its numbers. A Codex note is `active` only when the home in use holds its login, as a Claude note is `active` only for an account with a role; a spare's note stays `inactive`. Quota alerts read `active` notes, and the 5-hour hold reads the report of the home in use, so both stay on the account the seats run on.
 6. The table: one row per Codex home, then a `not set up` row for each noted account in no home. Role `seats` on the home in use, `spare` on the others. Check problems print under the table.
 
 **Files:**
@@ -531,9 +531,12 @@ User, 2026-10-12, through the showrunner: "make the codex account half of this w
 - `scripts/accounts/accounts.py` — `setup` and `check` for a Codex home; a table row per home.
 - `scripts/accounts/test_accounts.py`
 - `scripts/whoami/agent_accounts.py` — `codex_live(home)`; one Codex report per home.
-- `scripts/whoami/agent_notes.py` — a Codex note is active when any home holds its login.
+- `scripts/whoami/agent_notes.py` — numbers for every signed-in home; `active` only for the home in use.
 - `scripts/whoami/test_agent_notes.py`
 - `scripts/whoami/whoami.py` — each Codex report under its account.
+- `scripts/whoami/test_codex_homes.py`
+- `scripts/hooks/codex_hooks.py` — the hook installer writes through a linked `hooks.json`.
+- `scripts/hooks/test_codex_hooks.py`
 - `docs/accounts.md`
 - `commands/showrunner/accounts.md`
 
