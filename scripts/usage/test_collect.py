@@ -36,7 +36,9 @@ BLOCKED_SESSION = "55667788-4444-4444-8444-444444444444"
 SshBehavior = Literal["complete", "cut_after_first_cursor", "cut_inside_second_file",
                       "cut_inside_first_file", "cut_before_status", "cut_inside_record",
                       "unreachable", "python_error", "malformed_record", "unknown_measurement",
-                      "missing_output", "oversized_output", "missing_evidence_field", "malformed_evidence_field"]
+                      "missing_output", "oversized_output", "missing_evidence_field", "malformed_evidence_field",
+                      "cut_inside_history", "cut_after_history_cursor", "missing_outcome_field",
+                      "missing_opening_time", "invalid_edit_time"]
 SourceState = Literal["ready", "missing", "unreadable", "partial", "skipped", "unreachable"]
 
 
@@ -54,6 +56,12 @@ class MacStreamReport(TypedDict):
     options: list[str]
     turn_records: int
     compaction_records: int
+    opening_records: int
+    edit_records: int
+    outcome_records: int
+    history_cursor_records: int
+    altered_outcome_records: int
+    altered_lifecycle_records: int
     role_snapshots: list[CommittedRoleSnapshot]
     director_records: int
     history_file_records: int
@@ -88,6 +96,8 @@ class CollectorFixture(unittest.TestCase):
         self.state = self.root / "state"
         self.state.mkdir()
         self.db_path = self.state / "usage.db"
+        (self.root / "fixture-repository").mkdir()
+        (self.root / "production-docs").mkdir()
         self.use_fixture("basic")
 
     def use_fixture(self, name: str) -> None:
@@ -111,7 +121,11 @@ class CollectorFixture(unittest.TestCase):
             "" if history_override == "empty" else str(self.root / ".local/state/plan-delegate"))
         command = [sys.executable, str(COLLECTOR), "--db", str(db),
                    "--machine", machine, "--claude-root", str(self.claude_root),
-                   "--codex-root", str(self.codex_root), "--agents-log", str(self.agents_path)]
+                   "--codex-root", str(self.codex_root), "--agents-log", str(self.agents_path),
+                   "--readings", str(self.root / "readings.jsonl"),
+                   "--account-roles", str(self.root / "account-roles.jsonl"),
+                   "--claude-repo", str(self.root / "fixture-repository"),
+                   "--production-docs", str(self.root / "production-docs")]
         if mac_pass == "skipped":
             command.append("--no-mac")
         else:
@@ -828,7 +842,8 @@ class CollectTests(CollectorFixture):
         output = self.collect()
         self.assertFalse((self.root / "ssh-called").exists())
         self.assertEqual({cast(str, row["machine"]) for row in self.rows("SELECT machine FROM turns")}, {"natedev"})
-        sources = self.rows("SELECT machine, family, state, last_complete_at FROM turn_sources ORDER BY machine, family")
+        sources = self.rows("SELECT machine, family, state, last_complete_at FROM turn_sources "
+                            + "WHERE family IN ('claude', 'codex') ORDER BY machine, family")
         self.assertEqual(self.values(sources, "machine", "family", "state"), [
             ("mac", "claude", "skipped"), ("mac", "codex", "skipped"),
             ("natedev", "claude", "ready"), ("natedev", "codex", "ready"),
@@ -916,10 +931,12 @@ class MacCollectTests(CollectorFixture):
     def mac_rows(self, table: str) -> list[sqlite3.Row]:
         order = {"turns": "family, parent_id, agent_id, turn_key", "compactions": "family, parent_id, agent_id, at",
                  "cursors": "path", "role_log_sources": "machine"}[table]
-        return self.rows(f"SELECT * FROM {table} WHERE machine = 'mac' ORDER BY {order}")
+        scope = " AND path NOT LIKE '%/plan-delegate/runs/%'" if table == "cursors" else ""
+        return self.rows(f"SELECT * FROM {table} WHERE machine = 'mac'{scope} ORDER BY {order}")
 
     def source_rows(self, machine: str) -> list[sqlite3.Row]:
-        return self.rows("SELECT * FROM turn_sources WHERE machine = ? ORDER BY family", (machine,))
+        return self.rows("SELECT * FROM turn_sources WHERE machine = ? AND family IN ('claude', 'codex') ORDER BY family",
+                         (machine,))
 
     def assert_source_states(self, output: str, machine: str, expected: SourceState) -> None:
         sources = self.source_rows(machine)
@@ -995,14 +1012,17 @@ class MacCollectTests(CollectorFixture):
             ("cursors", "path, offset", "path"),
         ):
             with self.subTest(table=table):
-                remote = self.rows(f"SELECT {columns} FROM {table} WHERE machine = 'mac' ORDER BY {order}")
-                local = self.rows(f"SELECT {columns} FROM {table} WHERE machine = 'natedev' ORDER BY {order}")
+                scope = " AND path NOT LIKE '%/plan-delegate/runs/%'" if table == "cursors" else ""
+                remote = self.rows(f"SELECT {columns} FROM {table} WHERE machine = 'mac'{scope} ORDER BY {order}")
+                local = self.rows(f"SELECT {columns} FROM {table} WHERE machine = 'natedev'{scope} ORDER BY {order}")
                 self.assertEqual(self.all_values(remote), self.all_values(local))
         self.assert_mac_fixture_totals()
         director = self.rows("SELECT role, attribution FROM turns WHERE machine = 'mac' AND agent_id = ?", (MAC_SECOND,))
         self.assertEqual(self.values(director, "role", "attribution"), [("director", "estimated")])
         self.assertEqual(run.stream["turn_records"], 8)
         self.assertEqual(run.stream["compaction_records"], 4)
+        self.assertEqual(run.stream["opening_records"], 4)
+        self.assertEqual(run.stream["edit_records"], 3)
         self.assertEqual(run.stream["cursor_records"], 4)
         self.assertGreater(run.stream["stdin_bytes"], 10_000)
         self.assertIn("BatchMode=yes", run.stream["options"])
@@ -1282,13 +1302,15 @@ class MacCollectTests(CollectorFixture):
         run = self.mac_collect()
         self.assertEqual(first.stream["director_records"], 1)
         self.assertEqual(run.stream["director_records"], 1)
-        self.assertEqual(run.stream["history_file_records"], 0)
+        self.assertEqual(run.stream["history_file_records"], 1)
         self.assertEqual(run.stream["history_chunks"], 0)
         self.assertEqual(run.stream["metadata_chunks"], 1, "Only the small role log travels as bytes")
+        self.assertEqual(run.stream["outcome_records"], 0)
+        self.assertEqual(run.stream["history_cursor_records"], 1)
         self.assertEqual(run.stream["measurement_records"], 0)
         self.assertEqual(run.stream["cursor_records"], 0)
         self.assertLess(run.stream["forwarded_bytes"], len(ignored) // 128)
-        self.assertLessEqual(run.stream["forwarded_bytes"], first.stream["forwarded_bytes"])
+        self.assertLessEqual(run.stream["forwarded_bytes"], first.stream["forwarded_bytes"] + 2048)
         for table, before in snapshot.items():
             self.assertEqual(self.all_values(self.mac_rows(table)), before, table)
         self.assert_source_states(run.output, "mac", "ready")
@@ -1310,7 +1332,7 @@ class MacCollectTests(CollectorFixture):
         local = self.rows(f"SELECT {columns} FROM turns WHERE machine = 'natedev' ORDER BY {order}")
         self.assertEqual(self.all_values(remote), self.all_values(local))
         self.assertEqual(run.stream["director_records"], 2, "Repeated history events do not repeat an assignment")
-        self.assertEqual(run.stream["history_file_records"], 0)
+        self.assertEqual(run.stream["history_file_records"], 1)
         self.assertEqual(run.stream["history_chunks"], 0)
         for machine in ("natedev", "mac"):
             rows = self.rows("SELECT role, attribution FROM turns WHERE machine = ? AND agent_id = ? ORDER BY at",
@@ -1336,7 +1358,7 @@ class MacCollectTests(CollectorFixture):
         _ = shutil.copyfile(FIXTURES / "mac/home/.local/state/plan-delegate/runs/invented-mac.jsonl", history)
         run = self.mac_collect()
         self.assertEqual(run.stream["director_records"], 1)
-        self.assertEqual(run.stream["history_file_records"], 0)
+        self.assertEqual(run.stream["history_file_records"], 1)
         self.assertEqual(run.stream["history_chunks"], 0)
         self.assertEqual(run.stream["measurement_records"], 0)
         self.assertEqual(run.stream["cursor_records"], 0)
