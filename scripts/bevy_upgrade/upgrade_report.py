@@ -6,7 +6,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 from pins import Pin
-from upgrade_record import Entry, Record, on_target, target_fit
+from upgrade_record import Announced, Entry, Record, on_target, target_fit
 
 State = Literal["git ready", "release ready", "re-vendor", "port in PR", "no port yet", "not checked", "done"]
 STATE_ORDER: tuple[State, ...] = (
@@ -112,6 +112,11 @@ def _next(entry: Entry, target: str, current: State) -> str:
     return "wait" if current == "no port yet" else "run check"
 
 
+def _stale(record: Record, now: datetime, checked: datetime) -> bool:
+    return (now - checked > timedelta(hours=8) or bool(record["target_error"])
+            or any(entry["error"] for entry in record["dependencies"].values()))
+
+
 def _upstream_line(record: Record, zone: ZoneInfo, now: datetime) -> str:
     target = record["target_bevy"]
     if target["status"] == "released":
@@ -126,8 +131,7 @@ def _upstream_line(record: Record, zone: ZoneInfo, now: datetime) -> str:
     if checked is None:
         return line + " Upstream: no complete check yet."
     read_at = datetime.fromisoformat(checked).astimezone(zone)
-    stale = (now - read_at > timedelta(hours=8) or bool(record["target_error"])
-             or any(entry["error"] for entry in record["dependencies"].values()))
+    stale = _stale(record, now, read_at)
     return line + (f" Upstream last checked {read_at:%Y-%m-%d %H:%M %Z} (stale)." if stale
                    else f" Upstream checked {read_at:%H:%M %Z}.")
 
@@ -171,3 +175,78 @@ def table(record: Record, zone: ZoneInfo, now: datetime) -> str:
     if notes:
         lines.extend(["", "Notes:", *notes])
     return "\n".join(lines)
+
+
+def announcement(entry: Entry, target: str) -> Announced:
+    branch = entry["branch"]
+    return Announced(state=state(entry, target),
+                     repository=branch["repository"] if branch["status"] == "read" else "",
+                     items={str(item["number"]): item["state"] for item in entry["items"]})
+
+
+def changes(record: Record) -> list[str]:
+    previous = record["announced"]
+    if previous is None:
+        return []
+    lines: list[str] = []
+    dependencies = record["dependencies"]
+    for name in sorted(set(dependencies) | set(previous)):
+        if name not in dependencies:
+            lines.append(f"- {name}: no longer a dependency")
+            continue
+        if name not in previous:
+            lines.append(f"- {name}: new dependency")
+            continue
+        entry = dependencies[name]
+        current = announcement(entry, record["target"])
+        old = previous[name]
+        if current["state"] != old["state"]:
+            detail = ""
+            facts, branch = entry["crates_io"], entry["branch"]
+            if current["state"] == "release ready" and facts["status"] == "read":
+                detail = f" ({facts['ready']} on Bevy {facts['releases'].get(facts['ready'], '')})"
+            elif current["state"] == "git ready" and branch["status"] == "read":
+                detail = f" ({branch['name']} @ {branch['rev'][:7]})"
+            lines.append(f"- {name}: {old['state']} → {current['state']}{detail}")
+        old_items = old["items"] if old["repository"] == current["repository"] else {}
+        for item in sorted(entry["items"], key=lambda item: item["number"], reverse=True):
+            number = str(item["number"])
+            label = "PR" if item["kind"] == "pr" else "issue"
+            if number not in old_items:
+                lines.append(f"- {name}: new {label} #{number} {item['state']}: {item['title']}")
+            elif item["state"] != old_items[number]:
+                lines.append(f"- {name}: {label} #{number} {old_items[number]} → {item['state']}")
+    return lines
+
+
+def line(record: Record, zone: ZoneInfo, now: datetime,
+         next_due: datetime | None, pins_error: str) -> str:
+    """None means there is no scheduled next check to report."""
+    counts = {word: 0 for word in STATE_ORDER}
+    waiting = 0
+    for entry in record["dependencies"].values():
+        word = state(entry, record["target"])
+        counts[word] += 1
+        if word == "git ready" and entry["answer"] is None:
+            waiting += 1
+    text = f"Bevy {record['target']} upgrade: {counts['done']} of {len(record['dependencies'])} done"
+    for word in STATE_ORDER:
+        if word != "done" and counts[word]:
+            text += f", {counts[word]} {word}"
+            if word == "git ready" and waiting:
+                text += f" ({waiting} waiting for your answer)"
+    checked = record["checked"]
+    if checked is None:
+        text += "; no complete upstream check yet"
+    else:
+        read_at = datetime.fromisoformat(checked).astimezone(zone)
+        if _stale(record, now, read_at):
+            text += f"; upstream last checked {read_at:%Y-%m-%d %H:%M %Z} (stale)"
+        else:
+            text += f"; checked {read_at:%H:%M %Z}"
+            if next_due is not None:
+                text += f", next check {next_due.astimezone(zone):%H:%M %Z}"
+    if pins_error:
+        pins_at = datetime.fromisoformat(record["pins_read"]).astimezone(zone)
+        text += f"; pins not re-read since {pins_at:%Y-%m-%d %H:%M %Z}"
+    return text

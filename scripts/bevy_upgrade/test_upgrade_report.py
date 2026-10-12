@@ -40,7 +40,7 @@ class ReportTests(unittest.TestCase):
             "slug": "demo", "production": "", "checkout": "", "target": "0.20",
             "started": NOW.isoformat(), "closed": None, "bevy": [],
             "pins_read": NOW.isoformat(), "dependencies": {},
-            "target_bevy": {"status": "unread"}, "target_error": "", "checked": None,
+            "target_bevy": {"status": "unread"}, "target_error": "", "checked": None, "announced": None,
         }
 
     @override
@@ -64,7 +64,7 @@ class ReportTests(unittest.TestCase):
             "slug": "demo", "production": str(doc), "checkout": str(checkout),
             "target": "0.20", "started": NOW.isoformat(), "closed": None,
             "bevy": ["0.19.1", "0.20.0"], "pins_read": NOW.isoformat(), "dependencies": {},
-            "target_bevy": {"status": "unread"}, "target_error": "", "checked": None,
+            "target_bevy": {"status": "unread"}, "target_error": "", "checked": None, "announced": None,
         }
 
     def render(self) -> str:
@@ -354,6 +354,128 @@ class ReportTests(unittest.TestCase):
         self.assertIn(f"| not on crates.io | main @ {REVISION[:7]} on Bevy ^0.20 | git ready |", text)
         self.assertNotIn("(stale)", text.splitlines()[1])
         self.assertNotIn("last check failed", text)
+
+
+    def baseline(self) -> None:
+        self.current["announced"] = {name: upgrade_report.announcement(value, "0.20")
+                                     for name, value in self.current["dependencies"].items()}
+
+    def test_announcement_records_derived_state_repository_and_item_states(self) -> None:
+        current = self.branch_entry()
+        current["items"] = [{"number": 7, "kind": "pr", "state": "open", "title": "Port",
+                             "updated": "today", "head": "port @ abcdef0"}]
+        self.assertEqual(upgrade_report.announcement(current, "0.20"), {
+            "state": "git ready", "repository": "owner/adapter", "items": {"7": "open"}})
+        current["branch"] = {"status": "unread"}
+        self.assertEqual(upgrade_report.announcement(current, "0.20")["repository"], "")
+
+    def test_no_baseline_and_unchanged_entries_have_no_changes(self) -> None:
+        self.current["dependencies"] = {"adapter": self.branch_entry()}
+        self.assertEqual(upgrade_report.changes(self.current), [])
+        self.baseline()
+        self.assertEqual(upgrade_report.changes(self.current), [])
+
+    def test_changed_state_includes_release_and_git_readiness_details(self) -> None:
+        current = self.checked_entry()
+        self.current["dependencies"] = {"adapter": current}
+        self.baseline()
+        current["crates_io"] = self.checked_entry(ready="1.0.0")["crates_io"]
+        self.assertEqual(upgrade_report.changes(self.current),
+                         ["- adapter: no port yet → release ready (1.0.0 on Bevy ^0.20)"])
+        self.baseline()
+        current["crates_io"] = self.checked_entry()["crates_io"]
+        current["branch"] = self.branch_entry()["branch"]
+        self.assertEqual(upgrade_report.changes(self.current),
+                         [f"- adapter: release ready → git ready (main @ {REVISION[:7]})"])
+
+    def test_changed_and_new_items_use_pr_or_issue_labels(self) -> None:
+        current = self.branch_entry("^0.19")
+        current["items"] = [{"number": 7, "kind": "pr", "state": "open", "title": "Port",
+                             "updated": "old", "head": "port @ abcdef0"},
+                            {"number": 8, "kind": "issue", "state": "open", "title": "Track",
+                             "updated": "old", "head": ""}]
+        self.current["dependencies"] = {"adapter": current}
+        self.baseline()
+        current["items"][0]["state"] = "merged"
+        current["items"][1]["state"] = "closed"
+        current["items"].extend([
+            {"number": 9, "kind": "pr", "state": "open", "title": "Next port", "updated": "new", "head": "next @ abcdef0"},
+            {"number": 10, "kind": "issue", "state": "open", "title": "Next issue", "updated": "new", "head": ""}])
+        self.assertCountEqual(upgrade_report.changes(self.current), [
+            "- adapter: PR #7 open → merged", "- adapter: issue #8 open → closed",
+            "- adapter: new PR #9 open: Next port", "- adapter: new issue #10 open: Next issue"])
+
+    def test_same_item_number_in_new_repository_is_new_not_a_transition(self) -> None:
+        current = self.branch_entry()
+        current["items"] = [{"number": 7, "kind": "pr", "state": "open", "title": "Old port",
+                             "updated": "old", "head": "port @ abcdef0"}]
+        self.current["dependencies"] = {"adapter": current}
+        self.baseline()
+        branch = current["branch"]
+        assert branch["status"] == "read"
+        branch["repository"] = "other/adapter"
+        current["items"][0]["state"] = "merged"
+        current["items"][0]["title"] = "New repository port"
+        self.assertEqual(upgrade_report.changes(self.current),
+                         ["- adapter: new PR #7 merged: New repository port"])
+
+    def test_new_removed_dependencies_and_missing_items_have_specified_changes(self) -> None:
+        current = self.branch_entry()
+        current["items"] = [{"number": 7, "kind": "issue", "state": "open", "title": "Track",
+                             "updated": "old", "head": ""}]
+        self.current["dependencies"] = {"adapter": current, "removed": self.checked_entry()}
+        self.baseline()
+        current["items"] = []
+        del self.current["dependencies"]["removed"]
+        self.current["dependencies"]["new"] = self.checked_entry()
+        self.assertCountEqual(upgrade_report.changes(self.current),
+                              ["- new: new dependency", "- removed: no longer a dependency"])
+
+    def test_line_counts_states_in_order_and_unanswered_git_ready(self) -> None:
+        done = self.checked_entry()
+        done["bevy"] = "0.20.0"
+        approved = self.branch_entry()
+        approved["answer"] = {"answer": "approved", "at": "2026-10-12", "words": "yes"}
+        pull = self.branch_entry("^0.19")
+        pull["items"] = [{"number": 7, "kind": "pr", "state": "open", "title": "Port",
+                          "updated": "now", "head": "port @ abcdef0"}]
+        self.current["dependencies"] = {"done": done, "ask": self.branch_entry(), "approved": approved,
+            "ready": self.checked_entry(ready="1.0.0"), "wait": self.checked_entry(), "pull": pull,
+            "path": entry({"source": "path", "version": "1.0.0", "path": "vendor/adapter"}),
+            "unread": entry({"source": "registry", "version": "1.0.0"})}
+        self.current["checked"] = NOW.isoformat()
+        next_due = NOW + timedelta(hours=4)
+        text = upgrade_report.line(self.current, ZoneInfo("America/New_York"), NOW, next_due, "")
+        self.assertEqual(text, "Bevy 0.20 upgrade: 1 of 8 done, 2 git ready (1 waiting for your answer), "
+                         + "1 release ready, 1 re-vendor, 1 port in PR, 1 no port yet, 1 not checked; "
+                         + "checked 15:08 EDT, next check 19:08 EDT")
+
+    def test_line_without_complete_check_and_without_next_job(self) -> None:
+        self.assertEqual(upgrade_report.line(self.current, ZoneInfo("UTC"), NOW, None, ""),
+                         "Bevy 0.20 upgrade: 0 of 0 done; no complete upstream check yet")
+        self.current["checked"] = NOW.isoformat()
+        self.assertEqual(upgrade_report.line(self.current, ZoneInfo("UTC"), NOW, None, ""),
+                         "Bevy 0.20 upgrade: 0 of 0 done; checked 19:08 UTC")
+
+    def test_line_stale_rule_matches_table_and_failed_pins_adds_only_time_clause(self) -> None:
+        current = self.checked_entry()
+        self.current["dependencies"] = {"adapter": current}
+        self.current["checked"] = NOW.isoformat()
+        for cause in ("age", "entry", "target"):
+            with self.subTest(cause=cause):
+                self.current["checked"] = (NOW - timedelta(hours=8, seconds=1)).isoformat() if cause == "age" else NOW.isoformat()
+                current["error"] = "api.github.com: HTTP 500" if cause == "entry" else ""
+                self.current["target_error"] = "crates.io: HTTP 500" if cause == "target" else ""
+                text = upgrade_report.line(self.current, ZoneInfo("UTC"), NOW, None, "")
+                self.assertTrue(text.endswith("(stale)"), text)
+                self.assertIn("upstream last checked", text)
+                self.assertIn("(stale)", self.render().splitlines()[1])
+        self.current["checked"] = NOW.isoformat()
+        current["error"] = ""
+        self.current["target_error"] = ""
+        text = upgrade_report.line(self.current, ZoneInfo("America/New_York"), NOW, None, "missing lock")
+        self.assertEqual(text, "Bevy 0.20 upgrade: 0 of 1 done, 1 no port yet; checked 15:08 EDT; "
+                         + "pins not re-read since 2026-10-12 15:08 EDT")
 
 
 if __name__ == "__main__":
