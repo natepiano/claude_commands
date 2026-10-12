@@ -144,6 +144,11 @@ State:
     many open questions it holds. Gather nothing for it. `/showrunner:dailies
     expand <child|all>` adds its own rows. A row that reads `no report yet`
     fills in at that showrunner's next dailies.
+  - **Start a lower showrunner only with `/showrunner:add_showrunner
+    <production doc>`**, never in your own pane and never as a unit. It gets
+    its own tmux session on the showrunner account and is attached to you
+    once it runs. User, 2026-10-12: "top level (L1) showrunners should make
+    sure to use tmux to start lower level showrunners".
 - **What reaches the user:**
   - a unit director's `— decision:` that only the user can settle (**Designs
     and add-ons** below), shown in the unit director's words, with the answer
