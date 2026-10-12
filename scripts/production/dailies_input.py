@@ -831,10 +831,13 @@ def run(args: argparse.Namespace) -> int:
         fields = by_session.get(unit.name, {})
         result = dict(fields)
         result["unit"] = unit.name
-        if "build_hold" in result:
-            raise DailiesFailure("build hold", f"{judgment_path}.units[{index}].build_hold: supplied by holder files")
-        if holder_names and unit.session not in holder_names and unit.name not in holder_names:
-            result["build_hold"] = True
+        for key in ("build_hold", "holds_builds"):
+            if key in result:
+                raise DailiesFailure("build hold", f"{judgment_path}.units[{index}].{key}: supplied by holder files")
+        # A holder is named by its session, which the renderer never sees: its own unit is marked as holding.
+        if holder_names:
+            holds = unit.session in holder_names or unit.name in holder_names
+            result["holds_builds" if holds else "build_hold"] = True
         if "needs_user" not in result and any(isinstance(flag, WAITS_ON_USER) for flag in block.flags):
             result["needs_user"] = True
         phase = fields.get("phase")
@@ -892,8 +895,6 @@ def run(args: argparse.Namespace) -> int:
         units_out.append(result)
     if missing:
         raise DailiesFailure("judgment", f"{judgment_path}: " + "; ".join(missing))
-    if bool(holder_names) != any(bool(unit.get("build_hold")) for unit in units_out):
-        raise DailiesFailure("build hold", "units.build_hold: holder files and unit markers disagree")
     report("build hold", "ok", f"{len(holder_names)} active holders checked")
     try:
         review = review_watch(production, state_dir)

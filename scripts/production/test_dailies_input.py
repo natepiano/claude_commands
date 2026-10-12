@@ -1137,13 +1137,36 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         units = cast(list[dict[str, object]], self.report()["units"])
         self.assertFalse(units[0].get("build_hold", False))
+        self.assertTrue(units[0]["holds_builds"])
         self.assertTrue(units[1]["build_hold"])
+        self.assertNotIn("holds_builds", units[1])
 
-    def test_holder_with_no_other_unit_is_refused(self) -> None:
+    def test_a_holder_with_no_other_unit_renders_with_no_marker(self) -> None:
         _ = (self.holders / ALPHA).write_text(json.dumps({"holder": ALPHA,
             "since": "2026-10-06T09:55:00-07:00", "for": "the panel timing check",
             "release_eta": "unknown"}) + "\n", encoding="utf-8")
-        _ = self.assert_refused_without_output(mention="build_hold")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        units = cast(list[dict[str, object]], self.report()["units"])
+        self.assertNotIn("build_hold", units[0])
+        self.assertTrue(units[0]["holds_builds"])
+
+    def test_a_supplied_holder_mark_is_refused(self) -> None:
+        self.judgment_file(alpha={"holds_builds": True})
+        _ = self.assert_refused_without_output(mention="holds_builds: supplied by holder files")
+
+    def test_a_hold_with_every_unit_left_out_still_renders(self) -> None:
+        # Seen 2026-10-12: the only unit's run had finished while another session held the builds.
+        self.finished_run(self.root / "alpha")
+        _ = self.judgment.write_text(json.dumps({"units": [], "topics": []}) + "\n", encoding="utf-8")
+        _ = (self.holders / "elsewhere").write_text(json.dumps({"holder": "elsewhere",
+            "since": "2026-10-06T09:55:00-07:00", "for": "a frame timing check",
+            "release_eta": "unknown"}) + "\n", encoding="utf-8")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.report()["units"], [])
+        self.assertIn(f"left out, run finished and nothing waiting on the user: {ALPHA}", result.stdout)
+        self.assertIn("build hold: ok — 1 active holders checked", result.stdout)
 
     def test_build_hold_marker_without_holder_file_is_refused(self) -> None:
         self.judgment_file(alpha={"build_hold": True})
