@@ -42,35 +42,30 @@
 
 ### Phase 1 — Mesh verbs for pooled threads, proved live  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `codex_mesh.py` can create a template thread, fork it, reset a fork to the template's state, and run a read-only turn in any worktree; a live probe records what each costs.
-
-**Spec:**
-- `prime --session-dir D --name N --instructions-file F --cwd C [--model M] [--service-tier T]`: `thread/start` with `developerInstructions` = the file's text, `sandbox: "read-only"`, `approvalPolicy: "never"`; then `thread/name/set`; then a roster entry `{thread_id, status: "done", role: "review"}`. It starts no turn. Prints the thread id.
-- `fork --session-dir D --from N --name M`: `thread/resume` the source, `thread/fork {threadId, sandbox: "read-only", approvalPolicy: "never"}`, `thread/name/set`, roster entry as above for `M`. Refuses a name already in the roster with a thread that is not `ended` (exit 2). Prints the new thread id.
-- `reset --session-dir D --to N`: refuses unless the roster state is followable and the thread reads idle (exit 2). `thread/resume`, read the thread's first turn id with `thread/turns/list`, and when one exists call `thread/revert {threadId, beforeTurnId}`. Sets the roster's `context_tokens` to 0. A thread with no turn is a success with no call.
-- `follow` gains `--cwd <dir>`, `--read-only` and `--image <path>` (repeatable). `_start_turn` passes `cwd`, `sandboxPolicy: {"type": "readOnly", "networkAccess": false}`, and one `{"type": "localImage", "path": …}` input per image after the text. Without the flags its request is unchanged.
-- Every new verb uses `ensure_server`, `Client` and `_require` as `follow` does, closes its client in `finally`, and prints failures as `codex_mesh: <name>: <reason>` with exit 1.
-- **Live probe**, run once by the `impl` seat against a scratch session dir under `/tmp/claude/delegate/`, then `stop`. Record each answer with its measured numbers in the probes doc:
-  1. First request after `reset` and first request after `fork`: `cached_input_tokens` and uncached input of each, read from the thread's rollout. State which is cheaper for lease end.
-  2. Whether `developerInstructions` are still obeyed after `compact`.
-  3. Whether per-turn `--cwd` and `--read-only` hold: the turn reads a second worktree and a write attempt fails.
-  4. Whether two `follow` calls on two threads of one server run at once.
-  5. Whether `fork` works when a new server has not loaded the template, and whether a 7 KB instructions file is accepted.
+- `prime --session-dir D --name N --instructions-file F --cwd C [--model M] [--service-tier T]` — `thread/start` with `developerInstructions` = the file's text, `sandbox: "read-only"`, `approvalPolicy: "never"`; then `thread/name/set`; then the roster entry `{thread_id, status: "done", role: "review", context_tokens: 0, instructions_file}`, where `instructions_file` is the file's absolute path. Starts no turn; prints the thread id.
+- `fork --session-dir D --from N --name M` — `thread/resume` the source, `thread/fork` with `sandbox: "read-only"`, `approvalPolicy: "never"`, `thread/name/set`, then the same roster entry for `M`, copying the source's `instructions_file`. Exit 2 when `M` already names a thread that is not `ended`. Prints the new thread id.
+- `reset --session-dir D --to N` — takes the roster claim `follow` takes (`starting` with its own pid, released on every exit), runs `thread/resume`, and calls `thread/revert {threadId, beforeTurnId}` with the first turn id from `thread/turns/list`; a thread with no turn succeeds with no revert. Sets `context_tokens` to 0 only while it still owns the claim. Exit 0 done, 1 request failed, 2 refused (busy, claimed, or not followable).
+- `follow` takes `--cwd <dir>` (a turn's working directory, stored as `turn_cwd`; `start` keeps its own `cwd`), `--read-only` (`sandboxPolicy: {"type": "readOnly", "networkAccess": false}` for that turn) and `--image <path>` (repeatable; one `{"type": "localImage", "path": …}` input per image after the text). Without the flags its request is unchanged.
+- `_resume_params` reads the roster's `instructions_file` and sends its text as `developerInstructions` on every `thread/resume` and on `thread/fork`, because the app-server drops standing instructions on both.
+- Each of the three verbs prints a failure as `codex_mesh: <name>: <reason>` and exits 1.
 
 **Files:**
-- `scripts/agents/codex_mesh.py` — the three verbs in one new block before `main`; `_start_turn` and the `follow` parser
-- `scripts/agents/test_codex_mesh.py` — tests for the verbs and flags
-- `docs/plans/build-followups-review-pool-probes.md` — new; the five answers
+- `scripts/agents/codex_mesh.py` — the three verbs, the three `follow` flags, `_resume_params`
+- `scripts/agents/test_codex_mesh.py` — tests for the verbs, the flags, and standing instructions restored on resume and fork
+- `docs/plans/build-followups-review-pool-probes.md` — five live probes with their measured numbers
 
-**Seats:** 1 writer + 1 tester — code and tests split by file.
-- `impl` — `scripts/agents/codex_mesh.py`, `docs/plans/build-followups-review-pool-probes.md`
-- `test` — `scripts/agents/test_codex_mesh.py`: from the Spec, each verb's requests in order, its roster entry, its refusals, and `follow`'s request with and without the new flags
+**Binds later work:**
+- The prompt cache is per thread. First request after a reset: 212 uncached / 23,552 cached / 9 output = 2,639 weighted; after a new fork: 12,372 / 11,392 / 8 = 13,575 weighted; reset 0.199 s, fork 0.189 s. The pool script ends a lease with `reset`, prefers an existing pooled thread to a new fork, and retires with `codex_mesh.py end` a thread whose `reset` exits 1 or 2.
+- `instructions_file` stays at its path for the life of every thread that names it; when the file is missing, `follow`, `fork`, `reset`, `compact` and `send` exit 1. The pool script keeps its `prime/` files in place while any thread uses them.
+- `codex_mesh.py stop` marks every roster name `ended`; `idle-stop` and `sweep --stop` do not. The pool script's `stop` therefore empties the pool.
+- A revert writes a new rollout file under the same thread id, and a compaction writes zero input and output counters. The trial report sums a thread's usage across all of its rollout files and has no readable cost for a compaction turn.
+- Standing instructions reach every turn of a thread. In Reviews go to the pool, the pool prompt can point at them; in The review unit director and review memory, a changed standing prompt is a new file and a new template, and threads forked from the old template retire at lease end.
 
-**Constraints from prior phases:** none.
+**Gotchas:** `reset` refuses a stale claim left by a killed launcher, where `follow` takes one over. `reset` also writes one role-assignment line to the usage log through its claim, though it runs no turn.
 
-**Acceptance gate:** `scripts/lib/py -m unittest discover -s scripts/agents -p 'test_codex_mesh.py'` green; `basedpyright scripts/agents/codex_mesh.py scripts/agents/test_codex_mesh.py` at 0 errors, 0 warnings; the probes doc answers all five with numbers; no scratch app-server left running.
+**Ruled out:** ending a lease by retiring the pooled thread and forking a new one — the first request after a new fork costs five times the first after a reset; a sweep change to protect pooled threads — an idle server stop leaves them followable.
 
 ### Phase 2 — The pool script  · status: todo
 
@@ -81,21 +76,23 @@
 **Spec:**
 - State in `~/.local/state/review-pool/<slug>/` (override the root with `REVIEW_POOL_STATE` for tests): `pool.json`, `pool.lock` (one `fcntl.flock` around every read-modify-write), `mesh/` (the mesh session dir the reviewers live in), `prime/` (standing prompt files, named by hash).
 - `pool.json`: `{"split": "hash"|"all"|"off", "templates": {type: {"name", "thread_id", "prime_hash"}}, "reviewers": {name: {"type", "thread_id", "prime_hash", "lease": {"unit", "phase", "ordinal"} | null, "busy_pid": int | null, "served": [[pass, lens]], "reviews": int}}}`. Reviewer names are `<type><n>`: `code1`, `ui2`. Types are `code` and `ui`.
-- `prime --production S --type T --instructions-file F`: copy `F` to `prime/<sha256>.md`; when the hash differs from the template's, call `codex_mesh.py prime` under the name `<type>-template-<hash8>` and record it. Prints the hash.
+- `prime --production S --type T --instructions-file F`: copy `F` to `prime/<sha256>.md`; when the hash differs from the template's, call `codex_mesh.py prime` under the name `<type>-template-<hash8>` with `--instructions-file` set to that copy's absolute path, and record it. Prints the hash. The mesh stores that path and re-reads the file on every later turn, fork, reset and compact of the template and its reviewers, so a file under `prime/` is never rewritten, and is deleted only once no template or reviewer in `pool.json` carries its hash.
 - `arm --production S --unit U --phase P`: prints `pool` or `own`. `split` `all` gives `pool`; `off`, a missing `pool.json`, or no primed `code` template gives `own`; `hash` gives `pool` when the first byte of `sha256("U\nP")` is even.
 - `split --production S --set hash|all|off`: stores it.
 - `allocate --production S --type T --unit U --phase P --pass N [--lens L] --pid PID`: under the lock, first match wins:
   1. an idle reviewer of the type whose lease is `(U, P)` and whose `served` has no entry with pass `N` and a different lens;
   2. an idle reviewer of the type with no lease; it takes the lease with `ordinal` 0;
-  3. a new reviewer: `codex_mesh.py fork` from the type's template, next free number.
+  3. a new reviewer: under the lock, reserve the next free name with `busy_pid` set and no thread id; outside the lock, `codex_mesh.py fork` from the type's template; under the lock again, record the thread id. A failed fork removes the reservation. A reserved name without a thread id is never chosen by rules 1 or 2.
 
-  A reviewer is idle when `busy_pid` is null or names a dead process. A reviewer whose `prime_hash` differs from the template's is skipped by rule 2. The chosen reviewer gets `busy_pid`, `[N, L]` appended to `served`, and `ordinal` raised by 1. Prints one JSON line: `{"reviewer", "thread_id", "mesh_dir", "lease_ordinal", "prime_hash"}`. No rule waits. Exit 1 with a reason only when the type has no template or the fork fails.
+  A reviewer is idle when `busy_pid` is null or names a dead process. A reviewer whose `prime_hash` differs from the template's is skipped by rule 2. The chosen reviewer gets `busy_pid`, `[N, L]` appended to `served`, and `ordinal` raised by 1. Prints one JSON line: `{"reviewer", "thread_id", "mesh_dir", "lease_ordinal", "prime_hash"}`. No rule waits. Exit 1 with a reason only when the type has no template or the fork fails. With `--fresh`, the chosen reviewer is reset (`codex_mesh.py reset`, outside the lock, under this allocation's own `busy_pid`) before the JSON line prints, and keeps its lease; a reviewer whose reset fails is retired as in `end-lease` and the rules run again.
 - `release --production S --reviewer R --pid PID`: clears `busy_pid` when it is `PID`, adds 1 to `reviews`; the lease stays.
-- `end-lease --production S --unit U [--phase P]`: for each reviewer leased to the unit (and phase, when given) that is idle, call `codex_mesh.py reset`, then clear `lease` and `served`. A reviewer whose `prime_hash` is old is marked ended in the mesh roster and removed. A busy reviewer is left and named on stderr. Exit 0 either way.
+- `end-lease --production S --unit U [--phase P]`: for each reviewer leased to the unit (and phase, when given) that is idle: under the lock set `busy_pid` to this process, so no `allocate` takes it mid-reset; outside the lock call `codex_mesh.py reset`; then under the lock clear `lease`, `served` and `busy_pid`. `reset` exits 0 when done, 1 when a request failed, 2 when the mesh refuses the reviewer (claimed, or not followable: a killed review can leave it so). On 1 or 2 the reviewer is retired: `codex_mesh.py end` on its name, removed from `pool.json`, named on stderr; the next `allocate` forks a new one. A reviewer whose `prime_hash` is old is retired the same way without a reset. A busy reviewer is left and named on stderr. Exit 0 either way.
 - `status --production S`: one line per reviewer: name, type, lease, busy or idle, reviews.
 - `health --production S [--stale-hours 12]`: ends leases whose reviewers have had no `allocate` for that long (keep a `last_allocated` stamp), and prints what it ended.
-- `stop --production S`: `codex_mesh.py stop` on `mesh/`.
-- Mesh calls are subprocess calls to `scripts/agents/codex_mesh.py`, made outside the lock except `fork` in rule 3, which holds it so two callers never fork the same name.
+- `stop --production S`: `codex_mesh.py stop` on `mesh/`, which ends every name in the mesh roster; so it also empties `templates` and `reviewers` in `pool.json` (keeping `split`), and the next `prime` starts new templates. It ends the pool; nothing uses it to restart a server.
+- Mesh calls are subprocess calls to `scripts/agents/codex_mesh.py`, and every one is made outside the lock: a mesh request can take minutes, and no `allocate` waits behind another caller's. `pool.json` carries a `generation` integer that `stop` raises. Each verb that makes a mesh call reads the generation under the lock before the call, and after it publishes its result only when the generation is unchanged; otherwise it drops the result and exits 1 naming the stop.
+- A new `pool.json` starts with `split: "hash"`, `generation: 0` and no templates or reviewers. The template's `--cwd` is `~/.local/state/review-pool/<slug>/cwd/`, created empty.
+- In code a lease and a reviewer's ownership are types, not optional fields: `Unleased` or `PhaseLease(unit, phase, ordinal)`; `IdleReviewer` or `ClaimedReviewer(pid)`. `null` appears only where `pool.json` is read and written.
 
 **Files:**
 - `scripts/delegate/review_pool.py` — new
@@ -104,9 +101,9 @@
 
 **Seats:** 1 writer + 1 tester — code and tests split by file.
 - `impl` — `scripts/delegate/review_pool.py`; hub: `pyrightconfig.json`
-- `test` — `scripts/delegate/test_review_pool.py`: from the Spec, with `REVIEW_POOL_STATE` in a temp dir and a stub `codex_mesh.py` on a path override (`REVIEW_POOL_MESH`): the three allocation rules in order, the other-lens exclusion, dead-pid idleness, two concurrent `allocate` calls getting two reviewers, `arm` for each `split`, `end-lease` on idle and busy reviewers, old-hash retirement
+- `test` — `scripts/delegate/test_review_pool.py`: from the Spec, with `REVIEW_POOL_STATE` in a temp dir and a stub `codex_mesh.py` on a path override (`REVIEW_POOL_MESH`): the three allocation rules in order, the other-lens exclusion, dead-pid idleness, two concurrent `allocate` calls getting two reviewers, a stalled `fork` that does not block a second `allocate`, `stop` during a delayed mesh call (the late result is dropped), `allocate --fresh`, `arm` for each `split`, `end-lease` on idle and busy reviewers and on each `reset` exit code, old-hash retirement, a `prime/` file kept while a reviewer carries its hash, a second `prime` with a changed file giving the next new lease the new hash. The stub rejects a mesh call with a missing required argument
 
-**Constraints from prior phases:** Mesh verbs `prime`, `fork`, `reset` exist with the arguments in Mesh verbs for pooled threads, proved live. If its probes doc found `fork` cheaper than `reset` for the first request, `end-lease` ends the reviewer and removes it in place of `reset`; the doc's line 1 decides.
+**Constraints from prior phases:** Mesh verbs, all in `scripts/agents/codex_mesh.py` (read each parser for its arguments): `prime --session-dir D --name N --instructions-file F --cwd C [--model M]` prints the thread id; `fork --session-dir D --from N --name M` prints the new thread id and refuses (exit 2) a name that belongs to a live thread; `reset --session-dir D --to N` (exit codes above) claims the reviewer itself while it runs; `end` ends one roster name; `stop` ends them all. Measured in `docs/plans/build-followups-review-pool-probes.md`: lease end is `reset`, because the first request after a reset costs 2,639 weighted tokens against 13,575 after a new fork (the cache is per thread, so a new fork reads about half its first request uncached); this is why rule 1 and rule 2 come before rule 3. The mesh's own idle watcher may stop the app-server after 30 minutes without use; reviewers stay followable and the next mesh call restarts it, so the pool script does nothing about it.
 
 **Acceptance gate:** `scripts/lib/py -m unittest discover -s scripts/delegate -p 'test_review_pool.py'` green; `basedpyright scripts/delegate/review_pool.py scripts/delegate/test_review_pool.py` at 0 errors, 0 warnings.
 
@@ -125,7 +122,8 @@
   5. The tree-unchanged check, `finish-pass` and the status file as the seated path does.
   6. An `EXIT` trap runs `review_pool.py release`.
 - The early-launch argument works as on the seated path.
-- **Turn record**, written for `--pool` and for `--to` alike at the end of the pass: `${SESSION_DIR}/review_turn_${PASS_INDEX}${SUFFIX}.json` = `{"arm": "pool"|"own", "pool", "reviewer", "thread_id", "unit", "phase", "kind": "broad"|"closure"|"ux", "lens", "pass", "started_at", "finished_at", "lease_ordinal", "prime_hash", "status"}`. `kind` is `broad` for pass 1 with a lens, `ux` for lens `ux`, else `closure`. For `--to`, `thread_id` comes from the unit's mesh roster, and `unit` and `phase` from `REVIEW_LEASE` when set, else empty.
+- **Turn record**, written for `--pool` and for `--to` alike at the end of every pass, a failed one included: a new file `<history root>/review_turns/<session dir name>/<started epoch>-<pid>.json`, never overwritten. The history root is `PLAN_DELEGATE_HISTORY_DIR` or `~/.local/state/plan-delegate`, the home of the run history: it outlives `/tmp`, and `clear_phase_review.sh` never reaches it. Fields: `{"arm": "pool"|"own", "pool", "reviewer", "thread_id", "unit", "phase", "phase_instance_id", "history_file", "kind": "broad"|"closure"|"ux", "lens", "pass", "started_at", "finished_at", "lease_ordinal", "prime_hash", "status", "raised"}`. `kind` is `ux` for lens `ux`; otherwise `broad` for pass 1 with a lens; otherwise `closure`. `raised` is the count of numbered items in the findings file, read before the pass ends, so the report needs no findings file. `phase_instance_id` and `history_file` come from `${SESSION_DIR}/progress_history_state.json` (read the file for the exact keys). For `--to`, `thread_id` comes from the unit's mesh roster, and `unit` and `phase` from `REVIEW_LEASE` when set, else empty.
+- Tests in `test_review_launcher.py`: the pool path reads the roster and takes compaction, claim and release in the pool's `mesh_dir` while its status, history and board lines go to `${SESSION_DIR}`; a compaction that exits 3 still refuses the review; two phases in a row leave both phases' records; a failed pool attempt followed by a `--to` retry leaves one record of each arm; pass 1 with lens `ux` is kind `ux`.
 - `docs/production_format.md`: Words gain **Review pool**, **Reviewer**, **Template**, **Lease** (proposal, section 1); Production Context gains `- **Review pool:** code` (or `code, ui`), omitted when the production has none; the **Seat** entry's last sentence becomes "Reviews run on the unit's seats, or on the production's review pool when its doc names one."; <ProductionUnit/> gains one item: with a `**Review pool:**` line, at each phase's start run `review_pool.py arm`, and on `pool` send that phase's code reviews with `--pool code --lease …`; on `own` export `REVIEW_LEASE` and review as today.
 - `commands/unit/direct.md` <LongLivedSeats/>, <EarlyReviewArm/> step 5 and <FixDispatch/>'s closure paragraph: name the pool form beside `--to`. A pool `error` falls back to `--to` for that review under <DelegateLaunchFailure/>, said in one line.
 - `docs/delegate/dual_review.md`: <TeamReview/> seat choice does not apply on the `pool` arm; <DualReview/> step 3 shows the pool call; <ReviewPromptContract/>: a pool prompt opens with `You are a pooled reviewer for <unit>, phase <N>. Edit nothing. Your first command is git -C <worktree> rev-parse HEAD; if it is not <head>, report error. Re-read the tree; trust nothing from memory about its state.` and carries the Three Gods sentence and the Type Design Contract by pointer to its standing prompt.
@@ -142,9 +140,9 @@
 - `impl` — `scripts/delegate/review.sh`, `scripts/delegate/test_review_launcher.py`
 - `test` — opens as impl: `config/review_pool/code.md`, `docs/production_format.md`, `commands/unit/direct.md`, `docs/delegate/dual_review.md`, `docs/delegate/phase_end.md`
 
-**Constraints from prior phases:** `review_pool.py` verbs and their output are in The pool script. `follow` takes `--cwd`, `--read-only` and a session dir any number of launchers share. Recorder slot names allow letters, digits and `_` only, hence `pool_<reviewer>`.
+**Constraints from prior phases:** `review_pool.py` verbs and their output are in The pool script. `follow` takes `--cwd`, `--read-only`, `--image` and a session dir any number of launchers share. Recorder slot names allow letters, digits and `_` only, hence `pool_<reviewer>`. Today `review.sh` (`claim_follow`, the compaction call, the claim release and the cleanup, near lines 233–303) reads the roster, compacts, claims and releases in `${SESSION_DIR}`; changing only the `follow` call's session dir is not enough. On the pool path each of those uses the pool's `mesh_dir`, and everything the unit reads back stays in its own `${SESSION_DIR}`: status file, findings, history, board. The mesh sends a reviewer's standing prompt again on every resume, so the prompt reaches every turn and a pool prompt may point at it.
 
-**Acceptance gate:** `scripts/lib/py -m unittest discover -s scripts/delegate -p 'test_review_launcher.py'` green; `bash -n scripts/delegate/review.sh`; a live check in this worktree: prime the code template from `config/review_pool/code.md` under a scratch slug, run one `--pool code` review of a two-line diff, and see findings, a `reviewed` status, a turn record and an idle reviewer with its lease; then `end-lease` and `stop`. After this merges to main, the showrunner asks Hana's showrunner to add `**Review pool:** code` and prime the template: the trial starts there.
+**Acceptance gate:** `scripts/lib/py -m unittest discover -s scripts/delegate -p 'test_review_launcher.py'` green; `basedpyright scripts/delegate/test_review_launcher.py` at 0 errors, 0 warnings; `bash -n scripts/delegate/review.sh`; a live check in this worktree: prime the code template from `config/review_pool/code.md` under a scratch slug, run one `--pool code` review of a two-line diff, and see findings, a `reviewed` status, a turn record and an idle reviewer with its lease; then `end-lease` and `stop`. After this merges to main, the showrunner asks Hana's showrunner to add `**Review pool:** code` and prime the template: the trial starts there.
 
 ### Phase 4 — The trial report  · status: todo
 
@@ -153,11 +151,11 @@
 **Goal:** One command prints weighted tokens per review for the pool arm and the own-seat arm, and the counts that show whether reviews improve.
 
 **Spec:**
-- `review_pool_report.py --since <date> [--root /tmp/claude/delegate] [--no-mac]`: read every `review_turn_*.json` under the root (and the Mac's, as `seat_usage.py` reads its rollouts), find each record's thread rollout, and sum the token usage between `started_at` and `finished_at`. Import `parse_rollout`, `local_rollouts`, `mac_rollouts` and the weights from `scripts/whoami/seat_usage.py`; do not edit that file.
+- `review_pool_report.py --since <date> [--root <history root>] [--no-mac]`: read every `review_turns/*/*.json` under the root (default `PLAN_DELEGATE_HISTORY_DIR` or `~/.local/state/plan-delegate`; and the Mac's, over ssh as `seat_usage.py` reaches the Mac), find every rollout file of each record's thread (a reset starts a new file under the same thread id), and sum the token usage between `started_at` and `finished_at` across them. Import `parse_rollout`, `is_compaction` and the weights from `scripts/whoami/seat_usage.py`; do not edit that file. Its `local_rollouts` and `mac_rollouts` return rollouts without their file path or thread id, so this script finds the files itself: each `*.jsonl` under `~/.codex/sessions/*/*/*/` modified since `--since`, keyed by the thread id in the file's first record (read a real rollout for the field), keeping machine, path and thread id beside each parsed rollout.
 - Print one table by arm (`pool`, `own`) and kind (`broad`, `closure`, `ux`): reviews, median and mean weighted tokens, share from cached input. For the pool, a second table by lease ordinal (1, 2, 3+).
-- `--quality`: per arm, raised (numbered items in the findings file), confirmed (ledger rows opened with that lens in that pass), precision, and escapes per phase (rows opened `--caught-by main` only, and merge holds from `review_regime.py`).
+- `--quality`: per arm, joined by phase instance: raised (the sum of `raised` over the phase's records), confirmed (`finding_opened` events in the records' `history_file` with that `phase_instance_id` and `caught_by` `delegate` or `both`; rows with lens `ux` count for kind `ux`, the rest for the code kinds), precision, and escapes per phase (`finding_opened` events with `caught_by` `main`, and merge holds from `review_regime.py`). A phase's arm is its records' arm. A phase with records of both arms (a pool review that fell back to an own seat) is `mixed`: counted in one line and left out of the comparison.
 - A final line: `pool reviews: N of 20 for the first reading` until 20, then `pool is at X% of own-seat tokens per review`.
-- A record whose rollout is missing is counted and named in one line, never dropped silently.
+- A record whose rollout is missing, or whose time window contains a compaction, is `cost incomplete`: left out of the medians and means, counted and named in one line, never shown as free and never dropped silently.
 
 **Files:**
 - `scripts/delegate/review_pool_report.py` — new
@@ -165,9 +163,9 @@
 
 **Seats:** 1 writer + 1 tester — code and tests split by file.
 - `impl` — `scripts/delegate/review_pool_report.py`
-- `test` — `scripts/delegate/test_review_pool_report.py`: from the Spec, fixture records and rollouts giving known sums per arm and kind, the time-window bounds, a missing rollout, the 20-review line on both sides of 20
+- `test` — `scripts/delegate/test_review_pool_report.py`: from the Spec, fixture records and rollouts giving known sums per arm and kind, the time-window bounds, two rollout files for one thread, an unrelated thread whose turns overlap the window, a missing rollout, a window containing a compaction, a `mixed` phase, the 20-review line on both sides of 20
 
-**Constraints from prior phases:** The turn record's fields are in Reviews go to the pool. Weights: uncached input 1, cached input 0.1, output 8.
+**Constraints from prior phases:** The turn record's fields and directory are in Reviews go to the pool. Weights: uncached input 1, cached input 0.1, output 8. A compaction writes zero input and output counters to the rollout, so its cost cannot be read. The ledger appends `finding_opened` events (`phase_instance_id`, `phase_id`, `caught_by`, `lens`, `round`) to the run's history file; `scripts/delegate/findings.py` `_append_event` shows the fields.
 
 **Acceptance gate:** `scripts/lib/py -m unittest discover -s scripts/delegate -p 'test_review_pool_report.py'` green; `basedpyright` on both files at 0 errors, 0 warnings; one run against the real root prints a table without a traceback.
 
@@ -178,7 +176,7 @@
 **Goal:** A production with a review pool runs one review unit director that keeps the pools primed and builds their review memory from closed findings; it is never on the path of a review.
 
 **Spec:**
-- `commands/review/direct.md` (new, `/review:direct <production doc>`): at start, build each type's standing prompt (the base file under `config/review_pool/` plus the memory's repository section) and run `review_pool.py prime`; on each merge line from the showrunner, read that phase's closed findings (`findings.py status` in the named session dir) and the design-check verdict, and record in memory a class seen twice or more, a ruling a unit director or the showrunner made, and a defect that got past review; each hour run `review_pool.py health`; at each dailies give `review_pool_report.py`'s tables. It dispatches no review and answers no allocation.
+- `commands/review/direct.md` (new, `/review:direct <production doc>`): at start, build each type's standing prompt (the base file under `config/review_pool/` plus the memory's repository section) and run `review_pool.py prime`; on each merge line from the showrunner, read that phase's findings from the run's history file, `<history root>/runs/<session dir name>.jsonl` (the `finding_opened` and verdict events whose `phase_id` is the merged phase; by then the unit has usually moved on, and `findings.py status` shows only its active phase), with the design-check verdict, and record in memory a class seen twice or more, a ruling a unit director or the showrunner made, and a defect that got past review; after each change to `memory/repository.md`, rebuild that type's standing prompt and run `review_pool.py prime` again (a changed prompt is a new hash and a new template; a leased reviewer finishes its lease on the old prompt and retires at `end-lease`); each hour run `review_pool.py health`; at each dailies give `review_pool_report.py`'s tables. It dispatches no review and answers no allocation.
 - Memory: `~/.local/state/review-pool/<slug>/memory/repository.md` (at most 4k tokens for code, 3k for ui) and `memory/<unit>.md`. Each entry carries its source and date. At the cap, prune the least-cited entry. Only this director writes memory (proposal, section 2).
 - `review_pool.py memory-version --production S` prints the repository file's entry count; `review.sh` stores it in the turn record as `memory_version`.
 - The unit's memory section is sent at lease start: `review.sh --pool` prepends `memory/<unit>.md` to the prompt when `lease_ordinal` is 1.
@@ -209,10 +207,11 @@
 
 **Spec:**
 - `config/review_pool/ui.md`, at most 6 KB: the role line, the Three Gods sentence, the UX checklist from `zsh ~/.claude/scripts/ux_style/load-ux-style.sh --checklist` with each rule file's path, and `commands/ux_eval.md`'s report format.
-- `review.sh --pool ui --lease …` with lens `ux`: `allocate --type ui`; before the turn, `review_pool.py end-lease` semantics apply to the chosen reviewer (reset first, so no earlier shot is in context); shots go as `--image` arguments read from `${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt`, one path per line.
-- `commands/unit/direct.md` <UXReview/> step 3: with `ui` in the production's `**Review pool:**` line and the file `~/.local/state/review-pool/<slug>/ui_shadow` present, also launch the pool review on the same shots, save its verdict as `ux_shadow_${PASS_INDEX}.txt`, and use only the Claude helper's verdict. Without the shadow file, the pool verdict replaces the helper's in steps 3, 5 and 6.
-- `review_pool_report.py --shadow`: per design check, the helper's defect rows, the pool's, and the rows the pool missed.
-- Leaving shadow is the user's decision, on the report after ten checks (proposal, section 7).
+- `review.sh --pool ui --lease …` with lens `ux`: `allocate --type ui --fresh`, so the reviewer is reset before the turn, no earlier shot is in its context, and it keeps its lease; a failed allocation is an `error` status and no turn runs. Shots go as `--image` arguments read from `${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt`, one path per line.
+- `commands/unit/direct.md` <UXReview/> step 3: with `ui` in the production's `**Review pool:**` line, also launch the pool review on the same shots. Both verdict tables are saved as a pair beside the turn records, in `<history root>/review_turns/<session dir name>/`: `ux_<phase>_<k>_helper.txt` and `ux_<phase>_<k>_pool.txt`, where `k` counts the phase's design checks from 1, a recheck after a repair included. The Claude helper's verdict is the one used in steps 3, 5 and 6, unless the file `~/.local/state/review-pool/<slug>/ui_adopted` exists; then the pool's verdict is used and no helper runs. No code creates that file: a missing file, a new pool and a new production all mean shadow.
+- `review_pool_report.py --shadow`: per design check (each `_helper` and `_pool` pair), the helper's defect rows, the pool's, and the rows the pool missed; a check with one file of its pair missing is named.
+- Leaving shadow is the user's decision, on the report after ten checks (proposal, section 7); `ui_adopted` is then created by hand.
+- Tests: `--pool ui` passes `--fresh` and one `--image` per listed shot; a failed allocation runs no turn; `--shadow` finds the missed rows in fixture pairs, a recheck pair included, and names an unpaired file.
 
 **Files:**
 - `config/review_pool/ui.md` — new
@@ -224,6 +223,6 @@
 - `impl` — `scripts/delegate/review.sh`, `scripts/delegate/test_review_launcher.py`
 - `test` — opens as impl: `scripts/delegate/review_pool_report.py`, `scripts/delegate/test_review_pool_report.py`, `config/review_pool/ui.md`, `commands/unit/direct.md`
 
-**Constraints from prior phases:** `follow --image` exists. The review unit director primes every type listed on the `**Review pool:**` line from `config/review_pool/<type>.md`.
+**Constraints from prior phases:** `follow --image` exists. `allocate --fresh` is in The pool script. The turn-record directory is in Reviews go to the pool. The review unit director primes every type listed on the `**Review pool:**` line from `config/review_pool/<type>.md`.
 
 **Acceptance gate:** `scripts/lib/py -m unittest discover -s scripts/delegate -p 'test_review_*.py'` green; `basedpyright` on the edited Python files at 0 errors, 0 warnings; `bash -n scripts/delegate/review.sh`; one live shadow check on a stored Hana shot returns `ux_eval`'s table.
