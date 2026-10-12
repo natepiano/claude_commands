@@ -264,6 +264,7 @@ class NightlyReviewTests(unittest.TestCase):
         caller_environment = {
             **os.environ,
             "CLAUDE_CONFIG_DIR": str(named),
+            "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(Path.home() / ".claude"),
             "CLAUDE_CODE_OAUTH_TOKEN": "fixture-named-token",
             "NIGHTLY_ENV_LOG": str(log),
             "PATH": f"{binary}:/usr/bin:/bin",
@@ -296,6 +297,7 @@ class NightlyReviewTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         launched_environment = cast(dict[str, str], json.loads(log.read_text(encoding="utf-8")))
         self.assertNotIn("CLAUDE_CONFIG_DIR", launched_environment)
+        self.assertNotIn("CLAUDE_CODE_REMOTE_MEMORY_DIR", launched_environment)
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", launched_environment)
 
     def test_unconfigured_nightly_launch_keeps_its_command_and_environment(self) -> None:

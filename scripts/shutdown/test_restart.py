@@ -51,6 +51,14 @@ STOPPED = "2026-10-09T21:49:10+00:00"
 RESTARTED = "2026-10-10T01:02:03+00:00"
 
 
+def named_prefix(config_dir: str) -> str:
+    """The assignments a session resumed on a named account's directory starts with."""
+    return (
+        f"CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} "
+        f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(Path.home() / '.claude'))} "
+    )
+
+
 def checkout() -> inventory.GitCheckout:
     return inventory.GitCheckout(
         kind="git",
@@ -643,11 +651,11 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(len(resume_commands), 4)
         for command in resume_commands:
             self.assertIn(
-                f"&& CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} ENABLE_TOOL_SEARCH=true command claude",
+                f"&& {named_prefix(config_dir)}ENABLE_TOOL_SEARCH=true command claude",
                 command,
             )
         self.assertIn(
-            f"CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} ENABLE_TOOL_SEARCH=true command claude",
+            f"{named_prefix(config_dir)}ENABLE_TOOL_SEARCH=true command claude",
             output.getvalue().split("manual restart named-manual:", 1)[1],
         )
         unit_argv = next(
@@ -682,7 +690,7 @@ class RestartTests(ShutdownTestCase):
 
         command = output.getvalue().split("manual restart moved-session:", 1)[1]
         self.assertIn(
-            f"CLAUDE_CONFIG_DIR={shlex.quote(new_dir)} ENABLE_TOOL_SEARCH=true command claude",
+            f"{named_prefix(new_dir)}ENABLE_TOOL_SEARCH=true command claude",
             command,
         )
         self.assertNotIn(old_dir, command)
@@ -788,6 +796,7 @@ class RestartTests(ShutdownTestCase):
         ):
             self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
 
+        memory_base = str(Path.home() / ".claude")
         launch_line = next(line for line in output.getvalue().splitlines() if "ghostty" in line)
         outer = shlex.split(launch_line)
         resume_command = outer[outer.index("-ic") + 1]
@@ -802,6 +811,7 @@ class RestartTests(ShutdownTestCase):
                 "from pathlib import Path",
                 "Path(os.environ['ARGV_LOG']).write_text(json.dumps(sys.argv[1:]))",
                 "Path(os.environ['CONFIG_LOG']).write_text(os.environ['CLAUDE_CONFIG_DIR'])",
+                "Path(os.environ['MEMORY_LOG']).write_text(os.environ['CLAUDE_CODE_REMOTE_MEMORY_DIR'])",
                 "",
             )),
             encoding="utf-8",
@@ -816,6 +826,7 @@ class RestartTests(ShutdownTestCase):
             **os.environ,
             "ARGV_LOG": str(argv_log),
             "CONFIG_LOG": str(self.root / "claude-config-dir"),
+            "MEMORY_LOG": str(self.root / "claude-memory-dir"),
             "CLAUDE_CONFIG_DIR": "/another-account-in-the-shell",
             "HOME": str(self.root),
             "PATH": f"{binary}:/usr/bin:/bin",
@@ -834,6 +845,10 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(
             (self.root / "claude-config-dir").read_text(encoding="utf-8"),
             config_dir,
+        )
+        self.assertEqual(
+            (self.root / "claude-memory-dir").read_text(encoding="utf-8"),
+            memory_base,
         )
         actual = cast(
             list[str],

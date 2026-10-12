@@ -35,6 +35,7 @@ from launch_permission import (  # noqa: E402
     launch_barrier,
     launch_permission,
 )
+from account import NAMED_ACCOUNT_VARIABLES  # noqa: E402
 from agent_accounts import ClaudeAccountSelection  # noqa: E402
 import note_file  # noqa: E402
 from quota_alert import ahead, remaining  # noqa: E402
@@ -124,8 +125,8 @@ def start_for_selection(mode: str, selection: ClaudeAccountSelection) -> str:
     command = f"ENABLE_TOOL_SEARCH=true command {claude}; exec zsh"
     if selection.multiple_accounts:
         # tmux may supply a named account from its server environment. Clear
-        # both authentication selectors inside the command before Claude runs.
-        command = "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN; " + command
+        # its variables and the token inside the command before Claude runs.
+        command = f"unset {' '.join(NAMED_ACCOUNT_VARIABLES)} CLAUDE_CODE_OAUTH_TOKEN; " + command
     argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "tmux", "new-session", "-d", "-s", name,
             "-c", str(MODES[mode]), "zsh", "-ic", command]
     if selection.multiple_accounts:
