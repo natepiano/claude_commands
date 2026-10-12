@@ -1545,6 +1545,9 @@ class AccountsTests(unittest.TestCase):
         account_dir = self.home / ".claude2"
         self.correct_links(account_dir)
         _ = (account_dir / "mystery-cache").mkdir()
+        # Claude Code's own entries in each folder are not reported.
+        _ = (account_dir / "cache").mkdir()
+        _ = (account_dir / ".last-cleanup").write_text("2026-10-12T00:00:00Z", encoding="utf-8")
         _ = (account_dir / ".claude.json").write_text(
             json.dumps(
                 {
@@ -1583,8 +1586,8 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "unit@example.invalid")
         self.select_named_unit("claude 3")
-        # A folder set up and never logged in, and labels with a note and no folder: claude 1,
-        # and claude 2, whose login is the default folder's.
+        # A folder set up and never logged in, and claude 1: a note, and no folder holds it.
+        # Claude 2 has no folder of its own and gets no second row: the default folder holds it.
         self.assertEqual(accounts.setup("claude 4"), [])
         self.write_note("claude 1", "spare@example.invalid")
         now = datetime.now(timezone.utc)
@@ -1604,7 +1607,6 @@ class AccountsTests(unittest.TestCase):
             ("~/.claude", "claude 2", "main@example.invalid", "showrunners",
              "64%", soon.astimezone(zone).strftime("%H:%M %Z"), "71%", weekly_cell, read_cell),
             ("~/.claude1", "claude 1", "not set up", "—", "—", "—", "—", "—", "—"),
-            ("~/.claude2", "claude 2", "not set up", "—", "—", "—", "—", "—", "—"),
             ("~/.claude3", "claude 3", "unit@example.invalid", "unit directors",
              "100%", "—", "12%", weekly_cell, read_cell),
             ("~/.claude4", "claude 4", "not logged in", "spare", "—", "—", "—", "—", "—"),
@@ -1614,6 +1616,16 @@ class AccountsTests(unittest.TestCase):
         self.assertFalse(accounts.account_dir("claude 1").exists())
         self.assertFalse(accounts.account_dir("claude 2").exists())
 
+    def test_no_action_means_status(self) -> None:
+        self.write_main_config()
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+
+        result, stdout, stderr = self.run_cli()
+
+        self.assertEqual((result, stderr), (0, ""))
+        self.assertEqual(stdout, self.run_cli("status")[1])
+        self.assertIn("| ~/.claude | claude 2 | main@example.invalid |", stdout)
+
     def test_status_table_is_padded_markdown_and_a_folder_in_order_adds_no_line(self) -> None:
         self.write_main_config()
         self.login_directory("claude 2", "main@example.invalid", default=True)
@@ -1622,11 +1634,11 @@ class AccountsTests(unittest.TestCase):
 
         self.assertEqual((result, stderr), (0, ""))
         lines = stdout.splitlines()
-        # The heading, the rule, the default folder, and claude 2's own folder, which is not set up.
-        self.assertEqual(len(lines), 4)
+        # The heading, the rule, and the default folder.
+        self.assertEqual(len(lines), 3)
         self.assertEqual(len({len(line) for line in lines}), 1)
         self.assertEqual(set(lines[1]), {"|", " ", "-"})
-        self.assertTrue(lines[2].startswith("| ~/.claude  | claude 2 | main@example.invalid | showrunners, unit directors | "))
+        self.assertTrue(lines[2].startswith("| ~/.claude | claude 2 | main@example.invalid | showrunners, unit directors | "))
 
     def test_status_reads_live_only_when_no_reading_is_recent_and_keeps_what_it_read(self) -> None:
         self.write_main_config()
@@ -1666,7 +1678,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(rows[0][4:7], ("unavailable", "unavailable", "75%"))
         self.assertEqual(rows[0][8], read.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z"))
         # claude 3 is logged in and has never been read.
-        self.assertEqual(rows[2][2:], ("unit@example.invalid", "spare", "unavailable", "unavailable", "unavailable", "unavailable", "—"))
+        self.assertEqual(rows[1][2:], ("unit@example.invalid", "spare", "unavailable", "unavailable", "unavailable", "unavailable", "—"))
         self.assertEqual(self.live_reads.call_count, 2)
 
     def test_status_times_use_this_machines_zone_when_no_production_runs_or_none_can_be_read(self) -> None:
