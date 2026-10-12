@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 import urllib.request
 from collections.abc import Callable
 from http.client import HTTPException, HTTPResponse
@@ -52,6 +53,24 @@ class FetchFailure(Exception):
     """A lookup failed; its text names the host and reason."""
 
 
+class NotFound(FetchFailure):
+    """The requested host answered HTTP 404."""
+
+
+class BranchHead(NamedTuple):
+    rev: str
+    committed: str
+
+
+class Item(TypedDict):
+    number: int
+    kind: Literal["pr", "issue"]
+    state: Literal["open", "closed", "merged"]
+    title: str
+    updated: str
+    head: str  # Empty for an issue, or before a PR's details are read.
+
+
 class CrateInfo(NamedTuple):
     versions: tuple[str, ...]
     repository: str  # Empty when the crate names no GitHub repository.
@@ -80,6 +99,8 @@ def http_fetch(url: str) -> bytes:
         with cast(HTTPResponse, urllib.request.urlopen(request, timeout=30)) as response:
             return response.read()
     except HTTPError as error:
+        if error.code == 404:
+            raise NotFound(f"{host}: HTTP 404") from error
         raise FetchFailure(f"{host}: HTTP {error.code}") from error
     except (HTTPException, OSError, ValueError) as error:
         raise FetchFailure(f"{host}: {error}") from error
@@ -100,6 +121,8 @@ def fixture_fetch(path: Path) -> Fetch:
         if url not in bodies:
             raise FetchFailure(f"{host}: no fixture")
         body = bodies[url]
+        if body is None:
+            raise NotFound(f"{host}: HTTP 404")
         return body.encode("utf-8") if isinstance(body, str) else json.dumps(body).encode("utf-8")
 
     return fetch
@@ -130,12 +153,10 @@ def _lookup(fetch: Fetch, url: str, read: Callable[[dict[str, object]], LookupRe
         raise FetchFailure(f"{urlsplit(url).hostname}: invalid response: {error}") from error
 
 
-def _repository(value: object) -> str:
-    if value is None or value == "":
-        return ""
-    url = urlsplit(_text(value))
-    parts = url.path.strip("/").split("/")
-    if url.hostname != "github.com" or len(parts) < 2 or not all(parts[:2]):
+def github_repository(url: str) -> str:
+    parsed = urlsplit(url)
+    parts = parsed.path.strip("/").split("/")
+    if parsed.hostname != "github.com" or len(parts) < 2 or not all(parts[:2]):
         return ""
     return f"{parts[0]}/{parts[1].removesuffix('.git')}"
 
@@ -158,7 +179,7 @@ def crate_info(fetch: Fetch, crate: str) -> CrateInfo:
     def read(data: dict[str, object]) -> CrateInfo:
         response = _crate_response(data)
         return CrateInfo(tuple(version["num"] for version in response["versions"] if not version["yanked"]),
-                         _repository(response["crate"]["repository"]))
+                         github_repository(response["crate"]["repository"] or ""))
 
     return _lookup(fetch, f"https://crates.io/api/v1/crates/{quote(crate, safe='')}", read)
 
@@ -215,3 +236,86 @@ def target_release(fetch: Fetch, target: str) -> TargetUnpublished | TargetPrere
         return TargetReleased(status="released", version=number, date=date, since=since)
 
     return _lookup(fetch, "https://crates.io/api/v1/crates/bevy/versions", read)
+
+
+def default_branch(fetch: Fetch, repository: str) -> str:
+    return _lookup(fetch, f"https://api.github.com/repos/{repository}",
+                   lambda data: _text(data["default_branch"]))
+
+
+def branch_head(fetch: Fetch, repository: str, branch: str) -> BranchHead:
+    def read(data: dict[str, object]) -> BranchHead:
+        committer = _object(_object(data["commit"])["committer"])
+        return BranchHead(_text(data["sha"]), _text(committer["date"])[:10])
+    return _lookup(fetch, f"https://api.github.com/repos/{repository}/commits/{quote(branch, safe='')}", read)
+
+
+def _manifest_version(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    dependency = _object(value)
+    if dependency.get("workspace") is True:
+        return ""  # Inheritance is resolved by the caller's dependency name.
+    version = dependency.get("version", "")
+    return _text(version)
+
+
+def manifest_requirement(fetch: Fetch, repository: str, rev: str, bevy_names: frozenset[str]) -> str:
+    url = f"https://raw.githubusercontent.com/{repository}/{quote(rev, safe='')}/Cargo.toml"
+    try:
+        document = cast(dict[str, object], tomllib.loads(fetch(url).decode("utf-8")))
+        workspace = _object(_object(document.get("workspace", {})).get("dependencies", {}))
+        dependencies = _object(document.get("dependencies", {}))
+        requirements: dict[str, str] = {}
+        for name in sorted(set(workspace) | set(dependencies)):
+            if name != "bevy" and name not in bevy_names:
+                continue
+            value = dependencies.get(name, workspace.get(name))
+            if not isinstance(value, str) and _object(value).get("workspace") is True:
+                value = workspace.get(name, {})
+            requirement = _manifest_version(value)
+            if requirement:
+                requirements[name] = requirement
+        return requirements.get("bevy", "") or (requirements[sorted(requirements)[0]] if requirements else "")
+    except NotFound:
+        return ""
+    except (ValueError, KeyError, TypeError) as error:
+        raise FetchFailure(f"raw.githubusercontent.com: invalid response: {error}") from error
+
+
+def _item_state(value: object) -> Literal["open", "closed", "merged"]:
+    if value not in ("open", "closed", "merged"):
+        raise ValueError("item state must be open, closed or merged")
+    return value
+
+
+def port_items(fetch: Fetch, repository: str, target: str, since: str) -> list[Item]:
+    url = (f"https://api.github.com/repos/{repository}/issues?state=all&since={since}T00:00:00Z"
+           "&sort=updated&direction=desc&per_page=100")
+    try:
+        items: list[Item] = []
+        for raw in _array(cast(object, json.loads(fetch(url)))):
+            data = _object(raw)
+            title = _text(data["title"])
+            if target not in title or _text(data["created_at"])[:10] < since:
+                continue
+            number = data["number"]
+            if not isinstance(number, int) or isinstance(number, bool):
+                raise ValueError("item number must be an integer")
+            items.append(Item(number=number, kind="pr" if "pull_request" in data else "issue",
+                              state=_item_state(data["state"]), title=title,
+                              updated=_text(data["updated_at"]), head=""))
+        return items
+    except (ValueError, KeyError, TypeError) as error:
+        raise FetchFailure(f"api.github.com: invalid response: {error}") from error
+
+
+def pull_state(fetch: Fetch, repository: str, number: int) -> tuple[Literal["open", "closed", "merged"], str]:
+    def read(data: dict[str, object]) -> tuple[Literal["open", "closed", "merged"], str]:
+        merged = data["merged"]
+        if not isinstance(merged, bool):
+            raise ValueError("merged must be a boolean")
+        head = _object(data["head"])
+        return ("merged" if merged else _item_state(data["state"]),
+                f"{_text(head['ref'])} @ {_text(head['sha'])[:7]}")
+    return _lookup(fetch, f"https://api.github.com/repos/{repository}/pulls/{number}", read)
