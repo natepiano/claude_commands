@@ -1951,6 +1951,277 @@ class MeshCommandTests(unittest.TestCase):
         board = (self.session_dir / "board.log").read_text(encoding="utf-8")
         self.assertEqual(board.count("context window filled; sent"), 1)
 
+    def prepare_refusing_account(self) -> agent_accounts.KnownCodexAccount:
+        home = self.session_dir / "account-home"
+        home.mkdir()
+        notes = home / "notes"
+        notes.mkdir()
+        _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"HOME": str(home), "AGENT_NOTES_DIR": str(notes)})))
+        selected = home / ".codex"
+        selected.mkdir()
+        login = "serving@example.invalid"
+        claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
+        _ = (selected / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        _ = (notes / "codex 2.md").write_text(f"---\nlogin: {login}\n---\n")
+        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
+            "port": self.server.port, "pid": os.getpid(), "codex_home": str(selected),
+        }))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, True)))
+        return agent_accounts.KnownCodexAccount(selected, login, "codex 2")
+
+    def quota_completion(self, request: dict[str, object]) -> list[dict[str, object]]:
+        params = cast(dict[str, object], request["params"])
+        return [_reply(request, {"turn": {"id": "quota-turn"}}),
+                _notice("turn/completed", {"threadId": params["threadId"],
+                    "turn": {"id": "quota-turn", "error": {"message": USAGE_LIMIT}}})]
+
+    def assert_reset_failure_names_serving_account(self, method: str) -> None:
+        account = self.prepare_refusing_account()
+        self.write_pool_roster({"seat": {
+            "thread_id": THREAD_ID, "status": "done", "role": "review", "context_tokens": 9876,
+        }})
+        self.failing_method = method
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            code, _output, errors = self.run_mesh(["reset", "--to", "seat"])
+        self.assertEqual(code, 1, errors)
+        self.assertIn(account.label, errors)
+        self.assertIn(agent_accounts.codex_home_display(account.home), errors)
+        self.assertIn("scripted request failure", errors)
+        self.assertEqual(self.seat_record()["context_tokens"], 9876)
+        self.assertNotIn("launcher_pid", self.seat_record())
+        report.assert_not_called()
+
+    def test_reset_thread_read_failure_names_the_serving_account_and_home(self) -> None:
+        self.assert_reset_failure_names_serving_account("thread/read")
+
+    def test_reset_turn_list_failure_names_the_serving_account_and_home(self) -> None:
+        self.assert_reset_failure_names_serving_account("thread/turns/list")
+
+    def test_client_without_a_binding_uses_a_named_server_state(self) -> None:
+        account = self.prepare_refusing_account()
+        client = codex_mesh.Client(self.server.port, "seat")
+        try:
+            self.assertIsInstance(client.serving, codex_mesh.NotBoundCodexServer)
+            self.assertEqual(client.serving.home, account.home)
+        finally:
+            client.close()
+
+    def test_refusal_without_a_server_record_retains_an_unknown_account_at_the_selected_home(self) -> None:
+        account = self.prepare_refusing_account()
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            return self.quota_completion(request) if request.get("method") == "turn/start" else original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            self.assertEqual(self.run_start()[0], 1)
+        report.assert_called_once()
+        serving = cast(codex_mesh.CodexServingState, cast(object, report.call_args.args[1]))
+        self.assertIsInstance(serving, codex_mesh.NotBoundCodexServer)
+        self.assertIsInstance(serving.account, agent_accounts.UnknownCodexAccount)
+        self.assertEqual(serving.account.home, account.home)
+        self.assertNotEqual(str(serving.account.home), ".")
+
+    def test_attaching_to_a_fresh_server_keeps_start_tracking_unchanged(self) -> None:
+        _ = self.prepare_refusing_account()
+        started: set[tuple[int, int]] = set()
+        with patch.object(codex_mesh, "_STARTED_SERVERS", started):
+            self.assertEqual(self.run_start()[0], 0)
+        self.assertEqual(started, set())
+
+    def test_started_refusal_keeps_the_account_after_its_server_record_disappears(self) -> None:
+        account = self.prepare_refusing_account()
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+                return self.quota_completion(request)
+            return original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            code, _errors = self.run_start()
+        self.assertEqual(code, 1)
+        report.assert_called_once()
+        serving = cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1]))
+        self.assertEqual(serving.account, account)
+        self.assertEqual((serving.port, serving.pid, serving.home), (self.server.port, os.getpid(), account.home))
+
+    def test_late_refusal_keeps_the_outgoing_account_when_a_port_record_is_reused(self) -> None:
+        account = self.prepare_refusing_account()
+        next_home = account.home.parent / ".codex1"
+        next_home.mkdir()
+        login = "next@example.invalid"
+        claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
+        _ = (next_home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        _ = (account.home.parent / "notes" / "codex 1.md").write_text(f"---\nlogin: {login}\n---\n")
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+                _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
+                    "port": self.server.port, "pid": os.getpid() + 1, "codex_home": str(next_home),
+                }))
+                return self.quota_completion(request)
+            return original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            self.assertEqual(self.run_start()[0], 1)
+        report.assert_called_once()
+        self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account, account)
+        self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).pid, os.getpid())
+        self.assertEqual(agent_accounts.seats_home(), next_home)
+
+    def test_followed_turn_reports_its_refusing_account_once(self) -> None:
+        account = self.prepare_refusing_account()
+        self.assertEqual(self.run_start()[0], 0)
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            return self.quota_completion(request) if request.get("method") == "turn/start" else original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            self.assertEqual(self.run_follow()[0], 1)
+        report.assert_called_once()
+        self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account, account)
+
+    def test_parked_message_turn_reports_its_refusing_account_once(self) -> None:
+        account = self.prepare_refusing_account()
+        original = self.respond
+        starts = [0]
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                starts[0] += 1
+                if starts[0] == 2:
+                    _ = (self.session_dir / "seat.end").write_text("end")
+                    return self.quota_completion(request)
+            return original(request)
+        self.server.respond = respond
+        next_frame = codex_mesh.Client.next_frame
+        parked = [False]
+        def park(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            frame = next_frame(client, deadline)
+            if frame and frame.get("method") == "turn/completed" and not parked[0]:
+                parked[0] = True
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(codex_mesh.command_send(argparse.Namespace(
+                        session_dir=str(self.session_dir), to="seat", message="Parked task", message_file="")), 0)
+            return frame
+        args = self.start_args()
+        args.resident = True
+        args.timeout = 1
+        with patch.object(codex_mesh.Client, "next_frame", park), \
+                patch.object(codex_mesh, "_report_quota_refusal") as report, contextlib.redirect_stderr(io.StringIO()):
+            _ = codex_mesh.command_start(args)
+        self.assertEqual(starts[0], 2)
+        report.assert_called_once()
+        self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account, account)
+        self.assertIn("Parked task", str(self.methods("turn/start")[1]))
+
+    def test_submission_refusal_reports_the_serving_account_once(self) -> None:
+        account = self.prepare_refusing_account()
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                return [{"id": request["id"], "error": {"message": USAGE_LIMIT}}]
+            return original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            self.assertEqual(self.run_start()[0], 1)
+        report.assert_called_once()
+        self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account, account)
+
+    def test_failed_fork_preserves_the_account_without_reporting_a_turn_refusal(self) -> None:
+        _ = self.prepare_refusing_account()
+        self.write_pool_roster({"template": {"thread_id": THREAD_ID, "status": "done"}})
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/fork":
+                return [{"id": request["id"], "error": {"message": USAGE_LIMIT}}]
+            return original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            code, _out, errors = self.run_mesh(["fork", "--from", "template", "--name", "reviewer"])
+        self.assertEqual(code, 1)
+        self.assertIn(USAGE_LIMIT, errors)
+        report.assert_not_called()
+
+    def test_unproven_fast_refusal_does_not_report_or_open_fallback(self) -> None:
+        _ = self.prepare_refusing_account()
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            return self.quota_completion(request) if request.get("method") == "turn/start" else original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, False)), \
+                patch.object(codex_mesh, "_report_quota_refusal") as report:
+            self.assertEqual(self.run_start()[0], 1)
+        report.assert_not_called()
+
+    def test_unreadable_serving_sign_in_reports_an_explicit_unknown_account(self) -> None:
+        account = self.prepare_refusing_account()
+        (account.home / "auth.json").unlink()
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            return self.quota_completion(request) if request.get("method") == "turn/start" else original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            self.assertEqual(self.run_start()[0], 1)
+        report.assert_called_once()
+        unknown = cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account
+        self.assertIsInstance(unknown, agent_accounts.UnknownCodexAccount)
+        self.assertEqual(unknown.home, account.home)
+
+    def test_replacement_conversations_first_refusal_names_the_target_account(self) -> None:
+        target, new = self.prepare_seats_move()
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/resume":
+                return [{"id": request["id"], "error": {"message": "thread cannot resume"}}]
+            if request.get("method") == "turn/start":
+                return self.quota_completion(request)
+            return original(request)
+        new.respond = respond
+        def wait(seconds: float) -> None:
+            self.wait(seconds)
+            self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+            self.next_thread_id = "replacement-thread"
+        self.outcomes = ["capacity"]
+        with patch.object(codex_mesh, "_capacity_sleep", side_effect=wait), \
+                patch.object(codex_mesh, "_report_quota_refusal") as report:
+            self.assertEqual(self.run_start()[0], 1)
+        report.assert_called_once()
+        serving = cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1]))
+        self.assertEqual(serving.home, target)
+        self.assertIsInstance(serving.account, agent_accounts.KnownCodexAccount)
+        assert isinstance(serving.account, agent_accounts.KnownCodexAccount)
+        self.assertEqual(serving.account.label, "codex 1")
+        target_starts = [request for request in new.requests if request.get("method") == "turn/start"]
+        self.assertEqual(len(target_starts), 1)
+        self.assertIn("replacement-thread", str(target_starts[0]))
+
+    def test_release_refusal_does_not_report_a_provider_turn_refusal(self) -> None:
+        _target, new = self.prepare_seats_move()
+        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "seat": {"thread_id": THREAD_ID, "port": self.server.port, "status": "running"},
+        }))
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/unsubscribe":
+                return [{"id": request["id"], "error": {"message": USAGE_LIMIT}}]
+            if request.get("method") == "thread/loaded/list":
+                return [_reply(request, {"data": [THREAD_ID]})]
+            return original(request)
+        self.server.respond = respond
+        client = codex_mesh.Client(self.server.port, "seat")
+        try:
+            with patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", 0.02), \
+                    patch.object(codex_mesh, "_report_quota_refusal") as report:
+                result = codex_mesh._move_resident(self.start_args(), str(self.session_dir), "seat", THREAD_ID, client)  # pyright: ignore[reportPrivateUsage]
+        finally:
+            client.close()
+        self.assertIsInstance(result, codex_mesh.SeatThreadStateUnknown)
+        report.assert_not_called()
+        self.assertFalse(any(request.get("method") == "turn/start" for request in new.requests))
+
     def prepare_seats_move(self) -> tuple[Path, StubAppServer]:
         home = self.session_dir / "home"
         home.mkdir()
@@ -3320,17 +3591,19 @@ class QuotaRefusalTests(unittest.TestCase):
         self.assertFalse(self.refused(codex_mesh.CapacityRetriesExhausted(THREAD_ID, 3, 20), tested=True))
 
     def test_the_report_runs_the_blocked_verb_and_survives_its_failure(self) -> None:
+        identity = agent_accounts.KnownCodexAccount(Path.home() / ".codex", "serving@example.invalid", "codex 1")
+        serving = codex_mesh.ServingCodexServer(4001, 99, identity.home, identity)
         done = subprocess.CompletedProcess([], 0, "switched to claude for codex 1: delegate\n", "")
         with patch.object(subprocess, "run", return_value=done) as run, \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
-            codex_mesh._report_quota_refusal("seat")  # pyright: ignore[reportPrivateUsage]
+            codex_mesh._report_quota_refusal("seat", serving)  # pyright: ignore[reportPrivateUsage]
         command = cast("list[str]", run.call_args.args[0])
-        self.assertEqual(command[1:], [str(codex_mesh.QUOTA_REPORT), "blocked"])
+        self.assertEqual(command[1:], [str(codex_mesh.QUOTA_REPORT), "blocked", str(identity.home), identity.login, identity.label])
         self.assertTrue(codex_mesh.QUOTA_REPORT.is_file())
         self.assertIn("codex_mesh: seat: quota: switched to claude for codex 1: delegate", errors.getvalue())
         with patch.object(subprocess, "run", side_effect=OSError("no interpreter")), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
-            codex_mesh._report_quota_refusal("seat")  # pyright: ignore[reportPrivateUsage]
+            codex_mesh._report_quota_refusal("seat", serving)  # pyright: ignore[reportPrivateUsage]
         self.assertIn("quota refusal not reported: no interpreter", errors.getvalue())
 
 
@@ -4154,6 +4427,11 @@ class SignInChangeTests(unittest.TestCase):
 
             def __init__(self, port: int, _name: str) -> None:
                 self.port = port
+                home = Path("/fixture/codex")
+                self.serving: codex_mesh.ServingCodexServer = codex_mesh.ServingCodexServer(
+                    port, 0, home, agent_accounts.UnknownCodexAccount(home, "fixture has no sign-in"))
+                self.name: str = _name
+                self.turn_submitted_at: float = 0.0
                 self.closed = False
                 clients.append(self)
 
@@ -4230,6 +4508,11 @@ class SignInChangeTests(unittest.TestCase):
         class ResumeClient:
             def __init__(self, port: int, _name: str) -> None:
                 self.port: int = port
+                home = Path("/fixture/codex")
+                self.serving: codex_mesh.ServingCodexServer = codex_mesh.ServingCodexServer(
+                    port, 0, home, agent_accounts.UnknownCodexAccount(home, "fixture has no sign-in"))
+                self.name: str = _name
+                self.turn_submitted_at: float = 0.0
             def call(self, method: str, _params: dict[str, object], **_options: object) -> dict[str, object]:
                 calls.append((self.port, method))
                 if method == "thread/read":
@@ -4278,6 +4561,11 @@ class SignInChangeTests(unittest.TestCase):
         class MigrationClient:
             def __init__(self, port: int, _name: str) -> None:
                 self.port: int = port
+                home = Path("/fixture/codex")
+                self.serving: codex_mesh.ServingCodexServer = codex_mesh.ServingCodexServer(
+                    port, 0, home, agent_accounts.UnknownCodexAccount(home, "fixture has no sign-in"))
+                self.name: str = _name
+                self.turn_submitted_at: float = 0.0
             def call(self, method: str, params: dict[str, object], **_options: object) -> dict[str, object]:
                 calls.append((self.port, method))
                 if method == "thread/read":
@@ -4313,6 +4601,12 @@ class SignInChangeTests(unittest.TestCase):
         calls: list[str] = []
         class HeldClient:
             port: int = 4001
+            def __init__(self) -> None:
+                home = Path("/fixture/codex")
+                self.serving: codex_mesh.ServingCodexServer = codex_mesh.ServingCodexServer(
+                    self.port, 0, home, agent_accounts.UnknownCodexAccount(home, "fixture has no sign-in"))
+                self.name: str = "seat"
+                self.turn_submitted_at: float = 0.0
             def call(self, method: str, params: dict[str, object], **_options: object) -> dict[str, object]:
                 calls.append(method)
                 if method == "thread/read":

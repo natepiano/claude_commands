@@ -551,7 +551,7 @@ Recommend whether any change is needed. The nightly review already moved to the 
 
 **Ruled out:** replacing a seat's conversation only for some reopen errors (any refused reopen gets a replacement, and every prompt is complete on its own); keeping observed note activity on a machine with one Codex home (activity follows the seats selection everywhere); moving the seats to another Codex account automatically when Codex refuses work (every swap stays the user's call).
 
-### Phase 12 — Alerts per Codex account  · status: todo
+### Phase 12 — Alerts per Codex account  · status: done
 
 #### Work Order
 
