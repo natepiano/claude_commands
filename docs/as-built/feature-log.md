@@ -12,7 +12,7 @@ The feature log is the current account of what six projects do: hana, natedev, c
 | --- | --- |
 | `scripts/feature_log/feature_log.py` | The only writer of feature notes. The CLI, plus the importable `PROJECTS`, `vault_dir`, `state_dir` and `locked`. |
 | `scripts/feature_log/inventory.py` | Read-only inventory of backfill evidence. Owns the frozen ledgers. |
-| `scripts/feature_log/test_feature_log.py` | 90 `unittest` cases on a temp vault and temp state. |
+| `scripts/feature_log/test_feature_log.py` | 110 `unittest` cases on a temp vault and temp state. |
 | `scripts/feature_log/test_inventory.py` | 31 cases on temp git repositories. |
 | `commands/feature_log.md` | `/feature_log digest [--since]` and `/feature_log live <project> [filters]`. Reads only. |
 | `commands/showrunner/produce.md` | `<ChangeReviewFeatureLog/>` inside `<MergeCheckpoint/>`, and `<CloseChangeReview/>`: the Hana close-out. |
@@ -147,13 +147,13 @@ Every write holds `locked()`, an exclusive `flock` on `state_dir()/"lock"`. A no
 | Verb | Arguments | Result | Prints |
 | --- | --- | --- | --- |
 | `add` | new-note flags, or `--review ROW` alone | one live note | `added: <path>` or `unchanged: <path>` |
-| `supersede` | new-note flags and `--old TITLE` (repeatable, at least one), or `--review ROW` alone | the replacement; each old note becomes `superseded` and gains the replacement in `replaced_by` | `added:` or `unchanged:`, then `superseded: <old> → <new>` per old note |
+| `supersede` | new-note flags and `--old TITLE` (repeatable, at least one), optional `--split`, or `--review ROW` alone | the replacement; each old note becomes `superseded` and gains the replacement in `replaced_by` | `added:` or `unchanged:`, then `superseded: <old> → <new>` per old note it changes |
 | `propose` | `--review ROW`, new-note flags, optional `--old TITLE` | every `add`/`supersede` check runs; no note; the proposal is saved | `proposed: <ROW> (<verb> <title>)` |
 | `drop` | `--review ROW --verdict TEXT` | an open proposal closes without a note | `dropped: <ROW>` or `unchanged: <ROW>` |
-| `amend` | `--project --title`, any of `--summary --behavior --see --area --kind --crate --evidence`; with `--backfill` also `--link` with `--completed`, `--release crate@version`, `--separate-result` | the note corrected in place | `amended: <path> (<fields>)` or `unchanged: <path>` |
+| `amend` | `--project --title`, any of `--summary --behavior --see --area --kind --crate --evidence`; with `--backfill` also `--link` with `--completed`, `--release crate@version` or `crate@Unreleased`, `--separate-result` | the note corrected in place | `amended: <path> (<fields>)` or `unchanged: <path>` |
 | `live` | `--project`, optional `--crate --area --kind --grep` | live notes, newest `completed_date` first | `<completed> <kind> <title> — <summary> [<crates>] (<area>) <link>` |
 | `digest` | optional `--since YYYY-MM-DD` | events by project | see Digest |
-| `changelog` | `--crate --version`, optional `--compare PATH`, optional `--save FILE` | a section rendered or compared | the section, `match`, or the differences |
+| `changelog` | `--crate --version`, optional `--compare PATH`, optional `--save FILE` | a section rendered or compared | the section, `match`, or the differences; a comparison can end with a `not compared:` line |
 | `release` | `--crate --version --contents FILE` | `X@Unreleased` becomes `X@V` | `released X@V (<n> notes)` or `unchanged` |
 | `project-of` | optional `PATH`, default `.` | maps `origin` to a project; exit 0 always | the project key or `none` |
 | `check` | none | every note in the six folders parsed and validated; every `replaced_by` target exists | `ok: <n> notes`, or one `<path>: <reason>` per error |
@@ -172,9 +172,21 @@ Repeats and the link rule:
 
 - `_same_repeat` compares a repeat with the stored note apart from `date_created` and `date_modified`, and apart from `completed_date` when `--completed` is omitted. Equal prints `unchanged`. Different fields fail with `use amend`. The same title under another link fails with `make the title more specific`.
 - `_reject_duplicate_link` allows one live note per link in a project. Another title on that link needs `--separate-result`. `supersede` may reuse the link of its own `--old` notes.
-- A repeated `supersede` finishes any `--old` note still live. An `--old` note superseded by something else is refused.
+- A repeated `supersede` finishes any `--old` note still live. An `--old` note superseded by something else is refused with `old note <title> is not live`.
+- `supersede --split` lifts that refusal: an `--old` note that is already superseded gains the new note in `replaced_by` and stays superseded, and the call prints `superseded: <old> → <new>`. On a live `--old` note the flag changes nothing. A repeat prints `unchanged:` for the new note and adds no event. Replacements of one note that share a link pass `--separate-result`, because the link rule exempts only the `--old` notes. `--split` with `--review` is refused (`--split cannot be combined with --review`), and `propose` does not take the flag. argparse turns it into `ReplacementPolicy = ReplaceLiveNotes | ExtendReplacementSet`.
 - `amend --evidence` skips items already stored. `amend --crate` drops `release` values of crates that left the list.
-- `amend --backfill --link <commit> --completed <date>` replaces both together (`_amend_provenance` returns `KeepAcceptingProvenance` or `CorrectAcceptingProvenance(link, completed)`) and runs the link rule again. `amend --backfill --release crate@version` adds exact versions; `Unreleased`, an unpublished crate, or a crate absent from the note is refused.
+- `amend --backfill --link <commit> --completed <date>` replaces both together (`_amend_provenance` returns `KeepAcceptingProvenance` or `CorrectAcceptingProvenance(link, completed)`) and runs the link rule again.
+- `amend --backfill --release` adds `crate@version` and `crate@Unreleased` values; an unpublished crate or a crate absent from the note is refused. `X@Unreleased` marks a live note pending for X. The same call takes `--summary` and `--kind`, so a backfilled note becomes the pending entry of its changelog bullet in one write. A value already stored prints `unchanged`.
+
+The pending mark has three refusals of its own, each checked before any write:
+
+| Case | stderr |
+| --- | --- |
+| the note is superseded | `feature_log: a superseded note cannot be pending` |
+| the note's `release` holds an exact version of X | `feature_log: <title> already holds X@<version>` |
+| one call names `X@Unreleased` and an exact version of X | `feature_log: --release cannot add both X@Unreleased and X@<version>` |
+
+`X@Unreleased` beside an exact version of another crate is accepted, in one call and in one note.
 
 ### Events
 
@@ -188,7 +200,7 @@ Repeats and the link rule:
 | `LegacyAmendEvent` | the first six `AmendEvent` keys; read only, for older lines |
 | `ReleaseEvent` | `at`, `verb`, `project`, `crate`, `version`, `titles` |
 
-`_parse_event` requires the exact key set for each verb. Write order is note, then event. A repeat whose note already matches appends the event when the log holds none for that verb, project and title, then prints `unchanged`. An amendment that changes link, completed date or releases reverses the order: `_journal_accepting_correction` appends the event, then the note is written; a retry whose event equals the latest amend event for that note, `at` aside, writes the note without a second event.
+`_parse_event` requires the exact key set for each verb. Write order is note, then event. A repeat whose note already matches appends the event when the log holds none for that verb, project and title, then prints `unchanged`. An amendment that changes link, completed date or releases reverses the order: `_journal_accepting_correction` appends the event, then the note is written; a retry whose event equals the latest amend event for that note, `at` aside, writes the note without a second event. A pending mark is such an amendment: its event has `backfill: true` and names `X@Unreleased` in `releases_added`. A split adds no key: each call appends one `SupersedeEvent` whose `old` holds that call's `--old` titles.
 
 ### Review rows
 
@@ -220,6 +232,7 @@ A verb that differs from the proposal's fails and names the right verb. `propose
 | `security` | Security |
 
 - `--compare PATH` (only with `--version Unreleased`) reads the CHANGELOG on the calling host and compares bullet sets per heading with its `## [Unreleased]` section. Order and wrapping do not count; the heading does. It prints `match`, or per heading `Only in feature log:` and `Only in changelog:` lists. argparse turns the request into `RenderSection` or `CompareSection`.
+- The comparison covers the six headings of `CHANGELOG_HEADINGS` and the bullets under no heading, which print as `Uncategorized`. Bullets under any other `###` heading of the hand-written section are not compared and are not a difference. When such bullets exist, the last stdout line is `not compared: <heading> (<n> bullets)`, `(1 bullet)` for one, with several headings sorted and joined by `, `. It follows `match` or the differences on either host and changes neither the exit status nor `--save`.
 - `--save FILE` (only with `--compare`) removes FILE before comparing. On a `match` it writes the selected note titles as `ReviewedReleaseContents`.
 - `--selection` is internal: the rendered section and the selected titles as JSON.
 - Exits: `0` section or `match`; `1` differences; `2` unpublished crate (stderr `feature_log: crate X is not published`, no stdout), missing section, or failed forwarded read.
@@ -231,7 +244,16 @@ A verb that differs from the proposal's fails and names the right verb. `propose
 3. Replaces `X@Unreleased` with `X@V` in every named note, superseded ones included. Drops `X@Unreleased` from superseded notes the contents do not name. Leaves live unnamed notes pending.
 4. Appends one `ReleaseEvent` whose `titles` are the notes it changed.
 
-`/release` wiring: for each published crate being released, the compare step runs `changelog --crate {crate_name} --version Unreleased --compare {crate_dir}/CHANGELOG.md --save ~/.local/state/claude/feature-log/release/{crate_name}.json`, with `{crate_name}` read from `{crate_dir}/Cargo.toml`. The release owner sees `match` or the differences and reconciles with `amend` or a changelog edit. A crate that still differs is reported, not blocked, and has no saved contents. The stamp step runs `release --crate ${PACKAGE_NAME} --version ${VERSION} --contents <saved file>` right after each crate's publish succeeds, only when the saved file exists, never on a dry run. A later failed publish leaves earlier stamps; a retry prints `unchanged`.
+`/release` wiring: for each published crate being released, the compare step runs `changelog --crate {crate_name} --version Unreleased --compare {crate_dir}/CHANGELOG.md --save ~/.local/state/claude/feature-log/release/{crate_name}.json`, with `{crate_name}` read from `{crate_dir}/Cargo.toml`. The release owner sees `match` or the differences and reconciles with `amend` or a changelog edit; an existing entry becomes pending with `amend --backfill --release {crate_name}@Unreleased`, plus `--summary` when its wording differs from the bullet. A `not compared:` line lists hand-written headings outside the six and never prevents a `match`. A crate that still differs is reported, not blocked, and has no saved contents. The stamp step runs `release --crate ${PACKAGE_NAME} --version ${VERSION} --contents <saved file>` right after each crate's publish succeeds, only when the saved file exists, never on a dry run. A later failed publish leaves earlier stamps; a retry prints `unchanged`.
+
+A hand-written `## [Unreleased]` bullet under one of the six headings is logged as exactly one live pending entry: its summary is the bullet's text, its kind maps to the bullet's heading, and its `release` holds `<crate>@Unreleased`. The entry stays pending until the crate's release stamps it.
+
+- A bullet no entry describes gets a new one: `add --backfill --release <crate>@Unreleased`.
+- A live note that describes that one bullet is amended in place (`amend --backfill --release <crate>@Unreleased --summary … --kind …`) and keeps its title, link and evidence.
+- A broad note that covers several bullets is split: each bullet's entry is written with `supersede --backfill --split --old <broad title>`, so the broad note ends superseded with every replacement in `replaced_by`.
+- A statement of the broad note that no bullet carries goes into a split remainder, a replacement with no release. `live` lists it and no release section does; it gains a release only when a later changelog bullet names its behavior.
+- A bullet the code contradicts gets no entry with that text. The crate's owner corrects the changelog, and the entry carries the corrected wording.
+- Prose under a heading outside the six, such as cargo-tile's `### Notes`, is not an entry. A true statement there goes into the behavior text of the entry it describes.
 
 ### Host forwarding
 
@@ -313,11 +335,11 @@ Rules the backfill followed, which bind any correction:
 - A note's link is the accepting commit: the earliest first-parent commit on the accepted line that descends from the introducing commit, or that commit itself when it is on the line. A link is valid only when `git rev-list --first-parent <audit ref>` contains it. The script checks only the repo and the 40-hex form.
 - A historical `crate@version` is set only when exactly one existing changelog bullet maps to the note. No old changelog is rewritten.
 - A commit with several results has one note per result (`--separate-result`); its record is `represented` into one, and the siblings cite the commit in Evidence.
-- A correction amends the existing note (`amend --backfill`), never writes a second one.
+- A correction amends the existing note (`amend --backfill`), never writes a second one. A broad note that several pending changelog bullets describe is the one exception: it is split, as Changelog export and release stamp describes.
 
 ### Tests
 
-`python3 -m unittest discover -s scripts/feature_log -p 'test_*.py'`. `test_feature_log.py` pins the two example notes byte for byte, every refusal leaving vault and events unchanged with no temp file, repeats, an interrupted supersede, amend corrections and retries, exact event keys, proposals, the digest cursor and lock, every changelog kind, release stamping, and forwarding through injected callables. `test_inventory.py` pins each record kind, an excluded range, non-ASCII paths, a repeat `collect` leaving the ledger byte-identical, claims, path prefixes, `mark` refusals, `status` exits, and that no command changes a repository.
+`python3 -m unittest discover -s scripts/feature_log -p 'test_*.py'`. `test_feature_log.py` pins the two example notes byte for byte, every refusal leaving vault and events unchanged with no temp file, repeats, an interrupted supersede, splits, amend corrections and retries, the pending mark and its refusals, exact event keys, proposals, the digest cursor and lock, every changelog kind, the headings a comparison covers, release stamping, and forwarding through injected callables. `test_inventory.py` pins each record kind, an excluded range, non-ASCII paths, a repeat `collect` leaving the ledger byte-identical, claims, path prefixes, `mark` refusals, `status` exits, and that no command changes a repository.
 
 ## Invariants
 
@@ -328,10 +350,14 @@ Rules the backfill followed, which bind any correction:
 - Project repositories are evidence: read at a recorded ref, never edited. `inventory.py` runs git with `GIT_OPTIONAL_LOCKS=0`.
 - `PROJECTS`, `vault_dir()`, `state_dir()` and `locked()` are the import surface. No other script reads a path constant. Every write to notes, events, proposals, the cursor and ledgers holds `locked()`.
 - A refusal writes nothing. Repeating a writing call adds no second note and no second event.
-- One live note per link per project unless `--separate-result`. A live note has `replaced_by: []`; a superseded note names a replacement that exists.
+- One live note per link per project unless `--separate-result`. A live note has `replaced_by: []`; a superseded note names at least one replacement, and every note it names exists.
+- A split loses nothing: every sentence of the old note is in a replacement or in a remainder that holds no release.
 - `--link`, `--completed` and `--release` on `amend` require `--backfill`; link and date travel together.
 - `events.jsonl` is append-only, and lines already on disk stay readable: a new key needs a reader that still accepts the old key set, as `LegacyAmendEvent` does.
 - The changelog emits summaries unchanged. A released section keeps superseded notes. An unpublished crate gets no output.
+- A note holds a crate as pending or as released, never both: the pending mark is refused on a note that holds a version of that crate.
+- One live pending entry per changelog bullet: no bullet is carried by two live entries of a crate, and no entry carries two bullets.
+- One entry is pending for two crates only when both changelogs hold the same bullet under the same heading.
 - `release` stamps only the notes the saved contents name, only after a successful publish, never on a dry run. Only a `match` leaves saved contents. A local path is never forwarded.
 - The crate's `CHANGELOG.md` stays the published record. The log never rewrites a changelog and never blocks a release.
 - A ledger is frozen: `collect` never rewrites one, and only `claim` and `outcome` change. A record holds a note or a reason, never both.
@@ -356,7 +382,8 @@ The script:
 - Note dates use the vault host's local date (natedev is America/New_York); event times are America/Los_Angeles.
 - A kill between a note and its event leaves a note with no event; the next identical call appends it. For link, date and release amendments the order is reversed: the event exists and the note lags until a retry.
 - `propose` checks a link against notes already written. Two open proposals for one merge cannot see each other, so the second is refused at landing unless every row carries `--separate-result`.
-- `--backfill` only omits the `@Unreleased` default; `add --backfill --release X@Unreleased` is accepted. `amend --release` refuses `Unreleased`, and no verb adds `X@Unreleased` to an existing note.
+- `--backfill` only omits the `@Unreleased` default; `add`, `supersede` and `amend` each accept `--backfill --release X@Unreleased`.
+- `amend` can still add an exact version of X to a note that already holds `X@Unreleased`. Only the stored-version case and the same-call mix are refused.
 - `amend` takes no `--production` or `--unit`; they belong to `add` and `supersede`.
 - A `live` read can fail once with `missing opening frontmatter delimiter` when it catches a note mid-rewrite while Obsidian runs on natedev. The script's own writes are atomic, and `.<name>.tmp` files are never globbed.
 - `obsidian-cli base:query` (natedev, Obsidian 1.14.4, enabled under Settings → General → Advanced) flattens grouped views; a group check reads its JSON output. An unresolved project link such as `[[natedev]]` still matches `project.contains(link("natedev"))`.
@@ -365,6 +392,11 @@ Changelog and release:
 
 - A crate whose changelog has hand-written Unreleased bullets and no logged entries never matches, so it is never stamped until those bullets are logged or released.
 - The compare joins a wrapped bullet's lines with one space, and folds an indented sub-bullet into its parent. A summary matches only a single top-level bullet with the same text under the same heading.
+- `_section_bullets` keeps the bullets of every heading. The loop in `_run_changelog` picks the six and the empty heading, and the `not compared:` line counts the rest.
+- A correction sent to a changelog owner carries the entry's summary character for character, copied from the comparison's `Only in feature log:` line. A paraphrase leaves both sides printing.
+- A summary can repeat its bullet's overstatement even when the bullet was read against the code. The correction goes into the entry and the changelog together.
+- A fix shared by two crates whose changelogs word it differently has one entry per crate: border motion has one for cargo-tile and one for tui_pane.
+- A split is checked by reading the old note's sentences against the union of its replacements, remainders included.
 - The saved contents hold titles only. A note added and superseded between the comparison and the stamp loses `X@Unreleased` at that stamp and is counted in the release event's `titles`. No changelog section differs: it never gets a version.
 - The saved contents file lives only on the calling host.
 
@@ -372,6 +404,7 @@ Ledgers and evidence:
 
 - `git ls-tree` without `-z` quotes non-ASCII paths, which then fall out of path filters. `fnmatch` `*` crosses `/`, so a whole-path glob matches nested files.
 - A ledger record has one target. A second result of a commit marked into another note or `internal` has no record and no `status` count reports it missing; each commit's diff is read for every result (cargo-liner `47eaf59f`, a perf commit, also fixed the sync-notification startup race).
+- A ledger record can name a superseded note. After a split only the pending bullets' records are re-marked to their entries, so other records of the broad note keep naming it; its `replaced_by` leads to the current entries.
 - Behavior from commit-only work has no structured record; only an audit of the current surface finds it. Changelogs omit CLI verbs, flags and some public API. Results that docs never mention sit in public APIs and registries: `stock_tools()`, derive macros, registration functions.
 - A changelog bullet, commit subject or doc comment can overstate behavior; a note describes the code. `bevy_brp_extras` 0.18.1 says `type_text` types one character per frame; the queue presses on one frame and releases on the next. Error claims hold only for the paths the code marks.
 - `git log -S` on a bullet's current wording finds the last commit that rewrapped it. cargo-liner's changelog rewrap `a5f4bf0b` (2026-09-16) is the known case: 48 notes link the pre-rewrap match, one links the rewrap, which added that bullet, and seven cargo-port notes link `d9558a79`, a summary rewrite later than the behavior.
@@ -393,6 +426,10 @@ Ledgers and evidence:
 - **Events are separate from notes.** The digest and event repair need history the notes do not hold. An accepting correction writes its event first because the event carries the old link and date, which exist nowhere else once the note is rewritten.
 - **`Unreleased` reads live notes only; a released version reads all.** A later replacement must not erase an older release's notes, and a pending entry replaced before release never shipped.
 - **Compare bullet sets, save titles, stamp after publish.** Hand-written changelogs differ in order and wrapping. Publishing happens after the comparison, so the stamp covers what was compared and leaves later work pending. `--save` removes the file first so an aborted earlier release never makes a crate eligible.
+- **Compare only the six change headings.** Keep a Changelog has six headings and each kind maps to one, so no entry can print under another. Prose a crate keeps under a heading of its own is counted in the `not compared:` line and never held against a `match`.
+- **One pending entry per changelog bullet.** A summary matches one bullet with the same text, so a broad note that covers several bullets can never match. It is split, because the log never rewrites a changelog.
+- **Pending or released, not both.** A released note's summary is that release's bullet. A pending bullet about the same behavior is a later change and gets its own entry.
+- **`--split` is a flag, not the default.** Without it the refusal for an already superseded `--old` note stands, so a live writer cannot replace a note someone else already replaced.
 - **A differing crate is reported, not blocked.** The crate changelog is the published record.
 - **Frozen ledgers.** Counts and dispositions cannot shift under a re-collect. Collection runs outside the lock because it is slow and the lock serializes every note write.
 - **Private by default.** Only what `inventory.py` imports is public; nothing else has a consumer.
@@ -407,18 +444,19 @@ Ruled out:
 - A separate nateroids note for inspector-first Escape: "trigger game and camera commands through brp" already describes it.
 - Storing the rendered section with the saved titles and refusing drift before the stamp: an amend a minute after stamping drifts the same way, so the check protects nothing lasting.
 - Recording the comparison boundary in the saved contents to date a later supersede: both rules print the same sections, and the note never gets a version under either.
+- Running builds or the apps to verify a pending changelog bullet: a bullet is verified by reading code and tests at a fixed commit.
 - A `status`, `name` or id field, and an `internal` or `docs` kind: `state`, the file name and the link already carry those facts, and internal work gets no entry.
 
 ## State of the data on 2026-10-12
 
-Measured on natedev. `feature_log.py check` prints `ok: 726 notes`: the 717 the backfill wrote, plus 9 hana entries landed through change review since.
+Measured on natedev. `feature_log.py check` prints `ok: 928 notes`: the 717 the backfill wrote, 11 hana entries landed through change review since, and 200 written for the hand-written `## [Unreleased]` bullets of five crates.
 
 | Project | Note files | Live | Ledger records | represented | combined | internal | not-current | Frozen ref | Audit ref |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| hana | 161 (152 from backfill) | 161 | 677 (261 structured, 416 merges) | 149 | 376 | 148 | 4 | hana `ce51498`, hana_catalyst `2408021` | hana_catalyst `bcd669367` |
+| hana | 200 (152 from backfill, 37 for pending bullets) | 199 | 677 (261 structured, 416 merges) | 149 | 376 | 148 | 4 | hana `ce51498`, hana_catalyst `2408021` | hana_catalyst `bcd669367` |
 | natedev | 121 | 121 | 978 | 106 | 182 | 674 | 16 | `/etc/nixos` `9d99e9e` | same |
-| cargo-liner | 302 | 298 | 3,043 (811 structured, 2,232 commits) | 286 | 1,353 | 1,362 | 42 | `9301628` | same |
-| bevy_brp | 73 | 73 | 2,804 (234 structured, 2,570 commits) | 70 | 364 | 2,305 | 65 | `e65064e` | `49089a51` |
+| cargo-liner | 464 (162 for pending bullets) | 426 | 3,043 (811 structured, 2,232 commits) | 414 | 1,227 | 1,360 | 42 | `9301628` | same |
+| bevy_brp | 74 (1 for a pending bullet) | 74 | 2,804 (234 structured, 2,570 commits) | 70 | 364 | 2,305 | 65 | `e65064e` | `49089a51` |
 | obsidian_knife | 28 | 28 | 564 | 27 | 104 | 408 | 25 | `5df4349` | same |
 | nateroids | 41 | 41 | 557 (2 structured, 555 commits) | 39 | 154 | 354 | 10 | `c7d6a51` | not recorded |
 
@@ -426,9 +464,14 @@ Measured on natedev. `feature_log.py check` prints `ok: 726 notes`: the 717 the 
 - The backfill is complete for all six projects: each was audited against its current surface.
 - Every backfilled hana note links a commit on `git rev-list --first-parent bcd669367`. 48 cargo-mend notes link cargo-mend's graft commit, and its 2026-08-30 work carries 2026-09-03. bevy_brp's pre-workspace history is accepted by its subtree imports `c0839f61` (`extras/`) and `344e15aa` (`mcp/`), both 2025-06-27.
 - Historical release values are exact versions only: cargo-liner 91 values on 90 notes, bevy_brp 66 values on 51 notes. natedev, obsidian_knife and nateroids carry none.
-- One note is pending: hana "palette toggle rows show on or off" holds `hana_rubric@Unreleased`.
-- `events.jsonl` holds 1,447 events: 715 backfill adds, 4 backfill supersedes, 719 backfill amends and 9 live adds, all hana. No release event exists, so no crate is stamped, and natedev holds no saved release contents and no `digest.json`.
-- `proposals/` holds rows `C17` to `C49`: 22 open, 9 landed, 2 dropped.
+- 218 live notes are pending. 217 carry a hand-written changelog bullet as their summary: cargo-tile 157, tui_pane 23, hana_clerestory 31, hana_rigging 5, bevy_brp_mcp 1. The other is hana "palette toggle rows show on or off", which holds `hana_rubric@Unreleased`. No note is pending for two crates.
+- Of the 217, 25 are backfilled cargo-liner notes amended in place and 192 are new: cargo-liner 155, hana 36, bevy_brp 1.
+- cargo-liner holds 38 superseded notes: 4 the backfill wrote, 33 broad notes split into two to fourteen replacements each, and 1 pending entry replaced by its corrected wording, "identify the backdrop window off the draw thread", which keeps `cargo-tile@Unreleased` until the cargo-tile stamp drops it. hana holds 1, split into two pending entries and a remainder.
+- 7 split remainders hold no release: 6 in cargo-liner and 1 in hana.
+- The pending entries were checked against code at cargo-liner `243e2cb7`, hana_catalyst `1e893c41` and bevy_brp `49089a51`. 28 bullets were false or overstated there: 19 in cargo-tile and tui_pane, 9 in the hana crates. Their owners corrected all 28 in the changelogs, so no entry carries a false line.
+- cargo-tile's `### Notes` heading holds six bullets. Five are in the behavior text of the entries they describe. The sixth was false at the audit ref and is in no entry; its correction belongs to the crate's owner.
+- `events.jsonl` holds 1,706 events: 758 backfill adds, 162 backfill supersedes, 775 backfill amends and 11 live adds, all hana. No release event exists, so no crate is stamped, and natedev holds no saved release contents and no `digest.json`.
+- `proposals/` holds rows `C17` to `C51`: 21 open, 11 landed, 3 dropped.
 
 Changelog comparison for the 13 published crates:
 
@@ -436,10 +479,10 @@ Changelog comparison for the 13 published crates:
 | --- | --- |
 | `hana_kana`, `hana_lagrange`, `hana_liminal`, `cargo-mend`, `cargo-port`, `bevy_brp_extras`, `bevy_brp_mcp_macros` | `match`, with nothing on either side |
 | `hana_rubric` | differs: 1 logged entry its changelog lacks |
-| `cargo-tile` | differs: 163 hand-written bullets with no logged entries |
-| `hana_clerestory` | differs: 31 hand-written bullets |
-| `tui_pane` | differs: 23 hand-written bullets |
-| `hana_rigging` | differs: 5 hand-written bullets |
-| `bevy_brp_mcp` | differs: 1 hand-written bullet |
+| `cargo-tile` | `match` on 157 bullets at cargo-liner `afcfc2e9`, then `not compared: Notes (6 bullets)` |
+| `tui_pane` | `match` on 23 bullets at cargo-liner `afcfc2e9` |
+| `hana_clerestory` | `match` on 31 bullets at hana_catalyst `ac040ff3f` |
+| `hana_rigging` | `match` on 5 bullets at hana_catalyst `ac040ff3f` |
+| `bevy_brp_mcp` | `match` on 1 bullet at bevy_brp `49089a51` |
 
-Until a crate's entries are logged, `changelog` prints only `## [Unreleased]` for it and `--compare` reports every hand-written bullet as a difference.
+The 217 entries stay pending until each crate's release stamps them.
