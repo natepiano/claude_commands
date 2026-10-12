@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Iterable
 import os
 import re
 import shlex
@@ -39,6 +40,7 @@ from inventory import (  # noqa: E402
     TmuxHost,
     TmuxPane,
     WindowHost,
+    inventory,
 )
 from record import (  # noqa: E402
     CLAIM_STALE_SECONDS,
@@ -53,12 +55,14 @@ from record import (  # noqa: E402
     SessionRestarted,
     SessionRestartFailed,
     TimerRestore,
-    account_hold,
+    lookup_account_hold,
+    AccountHeld,
     all_account_holds,
     all_session_records,
     archive_session,
-    clear_account_hold,
-    find_session,
+    clear_finished_account_hold,
+    lookup_session,
+    ShutdownFound,
     migrate,
     parse_account_holds,
     parse_session_records,
@@ -108,6 +112,7 @@ SEND = SCRIPTS / "message" / "send.py"
 SESSION_WAIT_SECONDS = 90.0
 SESSION_POLL_SECONDS = 0.5
 RESTART_LAUNCH_WORKERS = 6
+REFUSED_ONLY_EXIT = 4
 WINDOW_DELAY_SECONDS = 1.2
 PACIFIC = ZoneInfo("America/Los_Angeles")
 RESTARTABLE_PROGRESS = frozenset({"stopped", "already gone", "process identity lost", "manual restart", "restart failed", "timers pending"})
@@ -220,10 +225,12 @@ class MachineRestartResult:
     timers_not_started: tuple[TimerNotStarted, ...] = ()
     refusal_line: str = ""
     elapsed_seconds: float = 0.0
+    refused: bool = False
+    local_session_ids: frozenset[str] = frozenset()
 
     @property
     def exit_status(self) -> int:
-        return 0 if self.status in {"done", "nothing"} else 1
+        return 0 if self.status in {"done", "nothing"} and not self.refused else 1
 
 
 @dataclass
@@ -1095,8 +1102,11 @@ def confirm_entry(
     live: bool,
 ) -> None:
     """Finish an entry after its shared registry wait."""
-    current = find_session(record["login"], record["session"]["session_id"])
-    if current is None or current["request_id"] != record["request_id"]:
+    found = lookup_session(record["login"], record["session"]["session_id"])
+    if not isinstance(found, ShutdownFound):
+        return
+    current = found.record
+    if current["request_id"] != record["request_id"]:
         return
     if record["progress"]["kind"] == "restarting":
         if not _same_relaunch_claim(record, current):
@@ -1263,9 +1273,10 @@ def relaunch_session(
                     timers=[PendingTimer(instance=timer["instance"], reason="not yet restored after relaunch") for timer in changing["timers"]],
                 )
         current = update_session(current["login"], current["session"]["session_id"], reset_pending)
-    latest = find_session(current["login"], current["session"]["session_id"])
-    if latest is None:
+    found = lookup_session(current["login"], current["session"]["session_id"])
+    if not isinstance(found, ShutdownFound):
         return current if current["progress"]["kind"] != "restarting" else record
+    latest = found.record
     if latest["request_id"] != record["request_id"]:
         return record
     progress = latest["progress"]
@@ -1308,27 +1319,47 @@ def _confirm_entries(records: list[SessionShutdown]) -> None:
             archive_session(record["login"], record["session"]["session_id"])
 
 
-def _up(login: str, dry_run: bool) -> MachineRestartResult:
+def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartResult:
     if not dry_run:
         for line in migrate(login):
             print(line)
+    ids = tuple(only)
     all_records = session_records(login)
-    hold = account_hold(login)
+    hold_outcome = lookup_account_hold(login)
+    records = [saved for saved in all_records if not ids or saved["session"]["session_id"] in ids]
+    refused = False
+    local_ids = {saved["session"]["session_id"] for saved in all_records}
+    missing = frozenset(ids) - local_ids
+    if missing:
+        report = inventory(login, missing)
+        for owner in report["sessions"]:
+            if owner["session_id"] in missing and owner["kind"] != "seat":
+                local_ids.add(owner["session_id"])
+                print(f"{owner['name']}: no shutdown in progress")
+                refused = True
     at = datetime.fromisoformat(settle.record_time())
+    for saved in records:
+        if ids and saved["progress"]["kind"] in {"waiting", "ready", "stopping"}:
+            print(f"{saved['session']['name']} is {saved['progress']['kind']}, not stopped; nothing to restart")
+            refused = True
+        elif ids and saved["progress"]["kind"] == "restarting" and (
+            at - datetime.fromisoformat(saved["progress"]["at"])
+        ).total_seconds() < CLAIM_STALE_SECONDS:
+            print(f"{saved['session']['name']} is already restarting")
     eligible = [
-        record for record in all_records
+        record for record in records
         if record["progress"]["kind"] in RESTARTABLE_PROGRESS | {"restarted"}
         or (record["progress"]["kind"] == "restarting" and
             (at - datetime.fromisoformat(record["progress"]["at"])).total_seconds() >= CLAIM_STALE_SECONDS)
     ]
-    label = eligible[0]["label"] if eligible else hold["label"] if hold else login
-    machine = eligible[0]["machine"] if eligible else hold["machine"] if hold else settle.local_machine()
+    label = eligible[0]["label"] if eligible else hold_outcome.hold["label"] if isinstance(hold_outcome, AccountHeld) else login
+    machine = eligible[0]["machine"] if eligible else hold_outcome.hold["machine"] if isinstance(hold_outcome, AccountHeld) else settle.local_machine()
     if not eligible:
-        if not dry_run and hold is not None and not any(
-            item["request_id"] == hold["request_id"] for item in all_records
+        if not ids and not dry_run and isinstance(hold_outcome, AccountHeld) and not any(
+            item["request_id"] == hold_outcome.hold["request_id"] for item in all_records
         ):
-            clear_account_hold(login)
-        return MachineRestartResult(machine, label, "nothing")
+            clear_finished_account_hold(login)
+        return MachineRestartResult(machine, label, "nothing", refused=refused, local_session_ids=frozenset(local_ids))
     state = DesktopLaunchState()
     started_at = time.monotonic()
     attempted: list[SessionShutdown] = []
@@ -1337,10 +1368,10 @@ def _up(login: str, dry_run: bool) -> MachineRestartResult:
             for record in sorted(eligible, key=_dry_run_entry_order):
                 if record["progress"]["kind"] != "restarted":
                     _ = relaunch_session(record, dry_run=True, desktop_state=state)
-            return MachineRestartResult(machine, label, "done")
+            return MachineRestartResult(machine, label, "done", refused=refused, local_session_ids=frozenset(local_ids))
         ordered = sorted(eligible, key=_entry_order)
-        others = [record for record in ordered if not _entry_order(record)[0]]
-        requesters = [record for record in ordered if _entry_order(record)[0]]
+        others = [record for record in ordered if ids or not _entry_order(record)[0]]
+        requesters = [record for record in ordered if not ids and _entry_order(record)[0]]
         with ThreadPoolExecutor(max_workers=RESTART_LAUNCH_WORKERS) as executor:
             workers = [
                 (record, executor.submit(relaunch_session, record, dry_run=False, desktop_state=state))
@@ -1373,19 +1404,27 @@ def _up(login: str, dry_run: bool) -> MachineRestartResult:
             _confirm_entries([current])
             attempted.append(current)
         remaining = session_records(login)
-        if hold is not None and not any(item["request_id"] == hold["request_id"] for item in remaining):
-            clear_account_hold(login)
+        if isinstance(hold_outcome, AccountHeld) and not any(item["request_id"] == hold_outcome.hold["request_id"] for item in remaining):
+            finished_requests = tuple(item["request_id"] for item in attempted if item["progress"]["kind"] == "restarted")
+            if not ids:
+                clear_finished_account_hold(login)
+            elif finished_requests:
+                clear_finished_account_hold(login, request_ids=finished_requests)
         result = replace(_machine_result(attempted, machine, label), elapsed_seconds=time.monotonic() - started_at)
+        result = replace(result, refused=refused, local_session_ids=frozenset(local_ids))
         _print_result(result)
         return result
     finally:
         state.restore(dry_run=dry_run)
 
 
-def up(login: str, dry_run: bool = False) -> int:
+def up(login: str, dry_run: bool = False, only: Iterable[str] = ()) -> int:
     """Resume each eligible local session without waiting on another machine."""
     try:
-        return _up(login, dry_run).exit_status
+        result = _up(login, dry_run, only)
+        if result.refused and result.status in {"done", "nothing"}:
+            return REFUSED_ONLY_EXIT
+        return result.exit_status
     except (InvalidRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         print(f"{settle.local_machine()}: restart failed: {error}")
         return 1
@@ -1460,7 +1499,7 @@ def _account_from_records() -> Account:
     raise RestartAccountNotDetermined("choose the account to restart")
 
 
-def _selected_account(requested: AccountNamed | AccountNotNamed) -> Account:
+def select_account(requested: AccountNamed | AccountNotNamed) -> Account:
     match requested:
         case AccountNamed(text):
             return named_claude_account(text)
@@ -1471,22 +1510,27 @@ def _selected_account(requested: AccountNamed | AccountNotNamed) -> Account:
                 return _account_from_records()
 
 
-def _restart_alerts_enabled(login: str) -> bool:
+def _restart_alerts_enabled(login: str, only: Iterable[str] = (), *, here: bool = False) -> bool:
+    ids = tuple(only)
     try:
-        records = session_records(login)
+        records = [saved for saved in session_records(login)
+                   if not ids or saved["session"]["session_id"] in ids]
     except (InvalidRecord, OSError, ValueError):
         return True
+    if here:
+        return (not records and not ids) or any(saved["alerts"] == "user" for saved in _eligible_records(records))
     try:
         peer = _remote_records()
     except (InvalidRecord, OSError, ValueError):
-        return not records or any(saved["alerts"] == "user" for saved in records)
+        return (not records and not ids) or any(saved["alerts"] == "user" for saved in records)
     if peer["kind"] == "machine not reached":
-        return not records or any(saved["alerts"] == "user" for saved in records)
+        return (not records and not ids) or any(saved["alerts"] == "user" for saved in records)
     records.extend(
         saved for saved in peer["records"]
         if saved["login"].casefold() == login.casefold()
+        and (not ids or saved["session"]["session_id"] in ids)
     )
-    return not records or any(saved["alerts"] == "user" for saved in _eligible_records(records))
+    return (not records and not ids) or any(saved["alerts"] == "user" for saved in _eligible_records(records))
 
 
 def restart(
@@ -1494,10 +1538,12 @@ def restart(
     *,
     dry_run: bool,
     alerts: AlertWhenNotBack | NeverAlert,
+    only: Iterable[str] = (),
+    here: bool = False,
 ) -> int:
     """Resume an account's shutdown records on this and the other machine."""
     try:
-        selected = _selected_account(account)
+        selected = select_account(account)
     except UnknownAccountName as error:
         print(f"shutdown: {error}", file=sys.stderr)
         return 2
@@ -1509,9 +1555,11 @@ def restart(
         return 1
 
     notify = isinstance(alerts, AlertWhenNotBack) and not dry_run
-
+    ids = tuple(only)
+    local_ids: set[str] = set()
     try:
-        local = _up(selected.login, dry_run)
+        local = _up(selected.login, dry_run, ids)
+        local_ids = set(local.local_session_ids)
     except (
         InvalidRecord,
         OSError,
@@ -1532,13 +1580,16 @@ def restart(
     remote_args = ["up", selected.login]
     if dry_run:
         remote_args.append("--dry-run")
-    status, output = run_remote(
+    peer_ids = [identity for identity in ids if identity not in local_ids]
+    if ids:
+        remote_args.extend(("--only", ",".join(peer_ids)))
+    status, output = ((0, "") if here or (ids and not peer_ids) else run_remote(
         remote_args, limit={"kind": "while link alive"}
-    )
+    ))
     if output:
         print(output)
     remote_failure = ""
-    if status not in {0, 255} and not output.strip():
+    if status not in {0, 255, REFUSED_ONLY_EXIT} and not output.strip():
         remote_failure = (
             f"{other_machine()}: restart failed (exit {status})"
         )
@@ -1565,7 +1616,8 @@ def restart(
             and not remote_failure
             and not incomplete
         )
-        if notify and not fully_back and _restart_alerts_enabled(selected.login):
+        needs_alert = (local.status == "partial" or status not in {0, REFUSED_ONLY_EXIT}) if ids else not fully_back
+        if notify and not fully_back and needs_alert and _restart_alerts_enabled(selected.login, ids, here=here):
             lines.append(
                 "Fix what is named above, then run /shutdown restart again; "
                 + "it brings back only what is left."

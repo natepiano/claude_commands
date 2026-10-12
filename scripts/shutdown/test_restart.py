@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Literal, cast, final, override
@@ -251,6 +251,7 @@ class RestartTests(ShutdownTestCase):
         })))
         del environment
         _ = self.enterContext(patch.object(settle, "record_time", return_value=RESTARTED))
+        _ = self.enterContext(patch.object(restart, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])))
 
     def create(self, records: list[SessionShutdown]) -> None:
         for item in records:
@@ -666,7 +667,9 @@ class RestartTests(ShutdownTestCase):
     def test_restart_cli_builds_a_never_alert_policy(self) -> None:
         received: list[tuple[restart.AccountNamed | restart.AccountNotNamed, bool, restart.AlertWhenNotBack | restart.NeverAlert]] = []
 
-        def run_restart(account: restart.AccountNamed | restart.AccountNotNamed, *, dry_run: bool, alerts: restart.AlertWhenNotBack | restart.NeverAlert) -> int:
+        def run_restart(account: restart.AccountNamed | restart.AccountNotNamed, *, dry_run: bool, alerts: restart.AlertWhenNotBack | restart.NeverAlert, only: Iterable[str], here: bool) -> int:
+            self.assertEqual(tuple(only), ())
+            self.assertFalse(here)
             received.append((account, dry_run, alerts))
             return 0
         with patch.object(restart, 'restart', run_restart):
@@ -951,7 +954,7 @@ class RestartTests(ShutdownTestCase):
             request_id="request", requested_by=saved["requested_by"], then="restart",
         ))
         before = self.files()
-        with patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "migrate") as migrate, patch.object(restart, "update_session") as update, patch.object(restart, "archive_session") as archive, patch.object(restart, "clear_account_hold") as clear, redirect_stdout(io.StringIO()) as output:
+        with patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "migrate") as migrate, patch.object(restart, "update_session") as update, patch.object(restart, "archive_session") as archive, patch.object(restart, "clear_finished_account_hold") as clear, redirect_stdout(io.StringIO()) as output:
             self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
         for mutation in (migrate, update, archive, clear):
             mutation.assert_not_called()
@@ -993,7 +996,7 @@ class RestartTests(ShutdownTestCase):
         record.set_account_hold(hold)
         with patch.object(restart, "own_claude_account", side_effect=UnreadableAccount("unreadable")), patch.object(restart, "run_remote", return_value=(0, "[]")), patch.object(restart, "_up", return_value=restart.MachineRestartResult("natedev", LABEL, "nothing")) as up, redirect_stdout(io.StringIO()):
             self.assertEqual(restart.restart(restart.AccountNotNamed(), dry_run=False, alerts=restart.NeverAlert()), 0)
-        up.assert_called_once_with(LOGIN, False)
+        up.assert_called_once_with(LOGIN, False, ())
 
     def test_restart_account_choice_includes_a_peer_hold_without_sessions(self) -> None:
         hold = record.AccountHold(
@@ -1004,7 +1007,7 @@ class RestartTests(ShutdownTestCase):
             return (0, json.dumps([hold])) if args[0] == "holds" else (0, "[]") if args[0] == "records" else (0, "")
         with patch.object(restart, "own_claude_account", side_effect=UnreadableAccount("unreadable")), patch.object(restart, "run_remote", remote), patch.object(restart, "_up", return_value=restart.MachineRestartResult("natedev", LABEL, "nothing")) as up, redirect_stdout(io.StringIO()):
             self.assertEqual(restart.restart(restart.AccountNotNamed(), dry_run=False, alerts=restart.NeverAlert()), 0)
-        up.assert_called_once_with(LOGIN, False)
+        up.assert_called_once_with(LOGIN, False, ())
 
     def test_window_hosts_launch_serially_on_the_calling_thread_with_spacing(self) -> None:
         saved = [
@@ -1101,7 +1104,7 @@ class RestartTests(ShutdownTestCase):
         old = self.write_old_file([entry(top_level("owner"))])
         before = self.files()
         directories = sorted(str(path) for path in self.state_root.rglob("*") if path.is_dir())
-        with patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "migrate") as migrate, patch.object(restart, "update_session") as update, patch.object(restart, "archive_session") as archive, patch.object(restart, "clear_account_hold") as clear, redirect_stdout(io.StringIO()) as output:
+        with patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "migrate") as migrate, patch.object(restart, "update_session") as update, patch.object(restart, "archive_session") as archive, patch.object(restart, "clear_finished_account_hold") as clear, redirect_stdout(io.StringIO()) as output:
             self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
         for mutation in (migrate, update, archive, clear):
             mutation.assert_not_called()
@@ -1221,7 +1224,7 @@ class RestartTests(ShutdownTestCase):
         incomplete["alerts"] = "none"
         self.create([complete, incomplete])
 
-        def up(_login: str, _dry_run: bool) -> restart.MachineRestartResult:
+        def up(_login: str, _dry_run: bool, _only: Iterable[str]) -> restart.MachineRestartResult:
             record.archive_session(LOGIN, "complete")
             return restart.MachineRestartResult("natedev", LABEL, "partial", failed=1)
 
@@ -1446,6 +1449,81 @@ class RestartTests(ShutdownTestCase):
             result = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
         self.assertFalse(restart.owns_relaunch_claim(saved, result))
         self.assertEqual(self.stored_record()["progress"], replacement)
+
+
+    def test_selected_up_restores_requester_while_same_request_siblings_wait(self) -> None:
+        requester = entry(top_level("requester", name="Requester"))
+        requester["requested_by"] = record.FromSession(kind="session", session_id="requester")
+        waiting = entry(top_level("waiting"), state={"kind": "waiting"})
+        another_stopped = entry(top_level("another"))
+        self.create([requester, waiting, another_stopped])
+        launched: list[str] = []
+        def launch(saved: SessionShutdown, _note: str, _desktop: restart.DesktopLaunchState, *, dry_run: bool) -> restart.SessionLaunched:
+            self.assertFalse(dry_run)
+            launched.append(saved["session"]["session_id"])
+            return restart.SessionLaunched()
+        with patch.object(restart, "_launch_session", side_effect=launch), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "wait_for_sessions", side_effect=self.all_sessions_live), patch.object(restart, "_retire"), patch.object(restart, "_send_restart_note", return_value=settle.MessageSent(kind="sent")), redirect_stdout(io.StringIO()):
+            self.assertEqual(restart.up(LOGIN, only=["requester"]), 0)
+        self.assertEqual(launched, ["requester"])
+        self.assertIsNone(record.find_session(LOGIN, "requester"))
+        self.assertEqual(record.find_session(LOGIN, "waiting"), waiting)
+        self.assertEqual(record.find_session(LOGIN, "another"), another_stopped)
+
+    def test_selected_restart_routes_only_peer_id_and_preserves_flags(self) -> None:
+        waiting = entry(top_level("waiting"), state={"kind": "waiting"})
+        self.create([waiting])
+        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", return_value=(0, "Mac: restored Remote")) as peer, patch.object(restart, "_launch_session") as launch, patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO()):
+            self.assertEqual(restart.restart(restart.AccountNamed(LABEL), only=["remote-id"], dry_run=True, alerts=restart.NeverAlert()), 0)
+        peer.assert_called_once_with(["up", LOGIN, "--dry-run", "--only", "remote-id"], limit={"kind": "while link alive"})
+        launch.assert_not_called()
+        alert.assert_not_called()
+        self.assertEqual(record.find_session(LOGIN, "waiting"), waiting)
+
+    def test_selected_restart_dry_run_changes_no_file_or_other_session(self) -> None:
+        selected, other = entry(unit("selected")), entry(unit("other"))
+        self.create([selected, other])
+        before = {path.relative_to(self.state_root): path.read_bytes() for path in self.state_root.rglob("*") if path.is_file()}
+        output = io.StringIO()
+        with patch.object(restart, "_run", side_effect=CommandRecorder()), patch.object(restart, "_live_session_ids", return_value=frozenset()), redirect_stdout(output):
+            self.assertEqual(restart.up(LOGIN, dry_run=True, only=["selected"]), 0)
+        self.assertIn("--resume selected", output.getvalue())
+        self.assertNotIn("--resume other", output.getvalue())
+        self.assertEqual({path.relative_to(self.state_root): path.read_bytes() for path in self.state_root.rglob("*") if path.is_file()}, before)
+
+    def test_selected_up_refusal_adds_no_failed_or_restarted_count(self) -> None:
+        saved = entry(top_level("waiting", name="Waiting"), state={"kind": "waiting"})
+        self.create([saved])
+        output = io.StringIO()
+        with patch.object(restart, "_print_result") as summary, redirect_stdout(output):
+            result = restart._up(LOGIN, False, ["waiting"])  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((result.restarted, result.seats, result.manual, result.failed), (0, 0, 0, 0))
+        self.assertEqual(result.failed_sessions, ())
+        self.assertEqual(output.getvalue(), "Waiting is waiting, not stopped; nothing to restart\n")
+        summary.assert_not_called()
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(restart.up(LOGIN, only=["waiting"]), restart.REFUSED_ONLY_EXIT)
+
+    def test_selected_peer_restart_refusal_exits_one_without_phone_alert_or_summary(self) -> None:
+        line = "Peer is waiting, not stopped; nothing to restart"
+        output = io.StringIO()
+        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])), patch.object(restart, "run_remote", return_value=(restart.REFUSED_ONLY_EXIT, line)) as peer, patch.object(settle, "alert_user") as alert, patch.object(restart, "_print_result") as summary, redirect_stdout(output):
+            self.assertEqual(restart.restart(restart.AccountNamed(LABEL), only=["peer-id"], dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
+        self.assertEqual(output.getvalue(), line + "\n")
+        peer.assert_called_once_with(["up", LOGIN, "--only", "peer-id"], limit={"kind": "while link alive"})
+        alert.assert_not_called()
+        summary.assert_not_called()
+
+    def test_selected_peer_silent_restart_failure_ignores_untouched_local_alert_policy(self) -> None:
+        sibling = entry(top_level("sibling"))
+        self.create([sibling])
+        chosen = entry(top_level("peer", name="Peer"), state={"kind": "restart failed", "at": RESTARTED, "reason": "not live"})
+        chosen["machine"], chosen["alerts"] = "Mac", "none"
+        def remote(arguments: list[str], **_keywords: object) -> tuple[int, str]:
+            return (0, json.dumps([chosen])) if arguments[0] == "records" else (1, "Mac: Peer restart failed: not live")
+        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])), patch.object(restart, "run_remote", side_effect=remote), patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO()):
+            self.assertEqual(restart.restart(restart.AccountNamed(LABEL), only=["peer"], dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
+        alert.assert_not_called()
+        self.assertEqual(record.find_session(LOGIN, "sibling"), sibling)
 
 
 if __name__ == "__main__":

@@ -464,7 +464,7 @@ def begin(
     at = record_time()
     origin: store.RequestOrigin = ({"kind": "session", "session_id": requested_by}
                                    if requested_by else {"kind": "terminal"})
-    if not ids and store.account_hold(login) is None:
+    if not ids and isinstance(store.lookup_account_hold(login), store.AccountOpen):
         store.set_account_hold(store.AccountHold(
             login=login, label=report["label"], machine=report["machine"], requested_at=at,
             request_id=request_id, requested_by=origin, then=then,
@@ -671,24 +671,65 @@ def _restore_record(saved: SessionShutdown) -> None:
             key=f"shutdown-{saved['login']}-{saved['session']['session_id']}")
 
 
-def cancel(account: Account, here: bool = False) -> int:
+def _unrecorded_local_sessions(login: str, ids: tuple[str, ...], records: list[SessionShutdown]) -> dict[str, str]:
+    missing = frozenset(ids) - {saved["session"]["session_id"] for saved in records}
+    if not missing:
+        return {}
+    report = inventory(login, missing)
+    return {owner["session_id"]: owner["name"] for owner in report["sessions"]
+            if owner["session_id"] in missing and owner["kind"] != "seat"}
+
+
+def cancel(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
     """Withdraw waiting owners here, then ask the peer to withdraw its own."""
     for line in store.migrate(account.login):
         print(line)
     retained = False
-    for saved in store.session_records(account.login):
+    ids = tuple(only)
+    records = store.session_records(account.login)
+    missing = _unrecorded_local_sessions(account.login, ids, records)
+    local_ids = {saved["session"]["session_id"] for saved in records} | missing.keys()
+    for name in missing.values():
+        print(f"{name}: no shutdown in progress")
+        retained = True
+    withdrawn_requests: list[str] = []
+    def still_live(current: SessionShutdown) -> bool:
+        report = inventory(account.login, frozenset({current["session"]["session_id"]}))
+        return stop_work.fresh_session(current["session"], report)["kind"] == "matching session"
+    for saved in records:
+        if ids and saved["session"]["session_id"] not in ids:
+            continue
         try:
-            outcome = store.withdraw_session(account.login, saved["session"]["session_id"], _restore_record)
+            outcome = (store.withdraw_failed_stop(account.login, saved["session"]["session_id"], still_live, _restore_record)
+                       if ids else store.withdraw_session(account.login, saved["session"]["session_id"], _restore_record))
         except store.NoLiveRecord:
+            if ids:
+                print(f"{saved['session']['name']}: no shutdown in progress")
+                retained = True
             continue
         if isinstance(outcome, store.SessionRetained):
             retained = True
             name = outcome.record["session"]["name"]
             detail = _progress_text(outcome.record)
-            print(f"{name} was not cancelled: {detail}; /shutdown restart brings it back")
-    store.clear_account_hold(account.login)
-    if not here:
-        status, output = run_remote(["cancel", account.login, "--here"])
+            action = f"/shutdown restart --only {name}" if ids else "/shutdown restart"
+            print(f"{name} was not cancelled: {detail}; {action} brings it back")
+        else:
+            withdrawn_requests.append(outcome.record["request_id"])
+            if outcome.record["progress"]["kind"] == "stop failed":
+                print(f"{outcome.record['session']['name']}: taken out, still running")
+            elif ids:
+                print(f"{outcome.record['session']['name']}: taken out")
+    if ids:
+        if withdrawn_requests:
+            store.clear_finished_account_hold(account.login, request_ids=tuple(withdrawn_requests))
+    else:
+        store.clear_account_hold(account.login)
+    peer_ids = [identity for identity in ids if identity not in local_ids]
+    if not here and (not ids or peer_ids):
+        arguments = ["cancel", account.login, "--here"]
+        if ids:
+            arguments.extend(("--only", ",".join(peer_ids)))
+        status, output = run_remote(arguments)
         if output.strip():
             print(output.strip())
         if status not in {0, 1}:
@@ -698,30 +739,61 @@ def cancel(account: Account, here: bool = False) -> int:
     return 1 if retained else 0
 
 
-def now(account: Account, here: bool = False) -> int:
+def now(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
     """Force waiting owners and retry owners whose stop failed."""
     for line in store.migrate(account.login):
         print(line)
     changed = False
-    for saved in store.session_records(account.login):
-        if saved["progress"]["kind"] not in {"waiting", "ready"} and not store.stop_incomplete(saved):
+    refused = False
+    ids = tuple(only)
+    records = store.session_records(account.login)
+    missing = _unrecorded_local_sessions(account.login, ids, records)
+    local_ids = {saved["session"]["session_id"] for saved in records} | missing.keys()
+    for name in missing.values():
+        print(f"{name}: no shutdown in progress")
+        refused = True
+    for saved in records:
+        if ids and saved["session"]["session_id"] not in ids:
             continue
+        if not ids and saved["progress"]["kind"] not in {"waiting", "ready"} and not store.stop_incomplete(saved):
+            continue
+        forced = False
         def force(current: SessionShutdown) -> None:
+            nonlocal forced
             if current["progress"]["kind"] in {"waiting", "ready"} or store.stop_incomplete(current):
                 current["force"] = "now"
-        _ = store.update_session(account.login, saved["session"]["session_id"], force)
-        changed = True
+                forced = True
+        try:
+            current = store.update_session(account.login, saved["session"]["session_id"], force)
+        except store.NoLiveRecord:
+            if ids:
+                print(f"{saved['session']['name']}: no shutdown in progress")
+                refused = True
+            continue
+        changed = changed or forced
+        if ids:
+            if forced:
+                print(f"{current['session']['name']}: stopping now")
+            else:
+                print(f"{current['session']['name']} is {_progress_text(current)}; nothing to stop")
+                refused = True
     if changed:
         _launch_conductor(account.login, account.label)
-    print(f"{local_machine()}: stopping now" if changed else f"{local_machine()}: no shutdown in progress")
-    if not here:
-        status, output = run_remote(["now", account.login, "--here"])
+    if not ids:
+        print(f"{local_machine()}: stopping now" if changed else f"{local_machine()}: no shutdown in progress")
+    peer_ids = [identity for identity in ids if identity not in local_ids]
+    if not here and (not ids or peer_ids):
+        arguments = ["now", account.login, "--here"]
+        if ids:
+            arguments.extend(("--only", ",".join(peer_ids)))
+        status, output = run_remote(arguments)
         if output.strip():
             print(output.strip())
-        if status != 0:
+        if status not in {0, 1}:
             print(f"{other_machine()}: not reached; run /shutdown there", file=sys.stderr)
             return 1
-    return 0
+        refused = refused or status == 1
+    return 1 if refused else 0
 
 
 def _launch_conductor(login: str, label: str) -> None:
@@ -745,14 +817,17 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
     ids = tuple(only)
     origin = requested_by or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     identity = request_id or str(uuid4())
+    local_ids: set[str] = ({saved["session"]["session_id"] for saved in store.session_records(account.login)}
+                 | {session["session_id"] for session in inventory(account.login, frozenset(ids))["sessions"]}) if ids else set()
     _ = begin(account.login, origin, ids, then=then, alerts=alerts, request_id=identity)
     _launch_conductor(account.login, account.label)
-    if not here:
+    peer_ids = [session_id for session_id in ids if session_id not in local_ids]
+    if not here and (not ids or peer_ids):
         arguments = ["down", account.login, "--here", "--request-id", identity]
         if origin:
             arguments.extend(("--requested-by", origin))
         if ids:
-            arguments.extend(("--only", ",".join(ids)))
+            arguments.extend(("--only", ",".join(peer_ids)))
         if then == "restart":
             arguments.append("--restart")
         if alerts == "none":
@@ -870,11 +945,11 @@ def _complete_stop_action(saved: SessionShutdown) -> None:
 
 
 def _clear_finished_hold(login: str, seen: dict[str, SessionShutdown]) -> None:
-    hold = store.account_hold(login)
-    if hold is not None and any(saved["request_id"] == hold["request_id"]
+    outcome = store.lookup_account_hold(login)
+    if isinstance(outcome, store.AccountHeld) and any(saved["request_id"] == outcome.hold["request_id"]
         and saved["progress"]["kind"] == "restarted" for saved in seen.values()
-    ) and not any(saved["request_id"] == hold["request_id"] for saved in store.session_records(login)):
-        store.clear_account_hold(login)
+    ):
+        store.clear_finished_account_hold(login)
 
 
 def conduct(login: str) -> int:
@@ -971,10 +1046,9 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                             continue
                         except Exception as error:
                             _action_failed(saved, error, stopping=False)
-                        latest = store.find_session(login, saved["session"]["session_id"])
-                        if latest is not None:
-                            if latest["progress"]["kind"] == "restarted":
-                                archive(latest)
+                        found = store.lookup_session(login, saved["session"]["session_id"])
+                        if isinstance(found, store.ShutdownFound) and found.record["progress"]["kind"] == "restarted":
+                            archive(found.record)
 
                 records = store.session_records(login)
                 _clear_finished_hold(login, archived)

@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from typing import Literal, TypedDict, NotRequired, cast, final, override
@@ -830,6 +831,135 @@ class SessionRecordTests(ShutdownTestCase):
                 self.assertIsInstance(second, record.ConductorAlreadyRunning)
         with record.conductor_lock("owner@example.com") as third:
             self.assertIsInstance(third, record.ConductorAcquired)
+
+
+    def test_failed_stop_withdrawal_checks_identity_and_restores_under_account_lock(self) -> None:
+        saved = session_shutdown(progress={"kind": "stop failed", "at": NOW, "reason": "still live"})
+        self.assertTrue(record.create_session(saved))
+        events: list[str] = []
+        def check_lock() -> None:
+            with (self.directory / "lock").open("r") as lock:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        def identity(current: record.SessionShutdown) -> bool:
+            check_lock()
+            self.assertEqual(current, saved)
+            events.append("identity")
+            return True
+        def restore(current: record.SessionShutdown) -> None:
+            check_lock()
+            self.assertEqual(current, saved)
+            events.append("restore")
+        result = record.withdraw_failed_stop(saved["login"], "session-1", identity, restore)
+        self.assertIsInstance(result, record.SessionWithdrawn)
+        self.assertEqual(events, ["identity", "restore"])
+        self.assertIsNone(record.find_session(saved["login"], "session-1"))
+        self.assertEqual(len(list((self.directory / "history").glob("*.json"))), 1)
+
+    def test_failed_stop_withdrawal_keeps_unmatched_identity_without_resource_changes(self) -> None:
+        saved = session_shutdown(progress={"kind": "stop failed", "at": NOW, "reason": "still live"})
+        self.assertTrue(record.create_session(saved))
+        restore = Mock()
+        result = record.withdraw_failed_stop(saved["login"], "session-1", lambda _saved: False, restore)
+        self.assertIsInstance(result, record.SessionRetained)
+        restore.assert_not_called()
+        self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+
+    def test_failed_stop_withdrawal_loses_to_a_competing_stop_claim(self) -> None:
+        saved = session_shutdown(progress={"kind": "stop failed", "at": NOW, "reason": "still live"})
+        self.assertTrue(record.create_session(saved))
+        ready, finished = threading.Event(), threading.Event()
+        outcomes: list[record.SessionWithdrawn | record.SessionRetained] = []
+        failures: list[BaseException] = []
+        identity, restore = Mock(return_value=True), Mock()
+        def cancel() -> None:
+            try:
+                ready.set()
+                outcomes.append(record.withdraw_failed_stop(saved["login"], "session-1", identity, restore))
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                finished.set()
+        def claim(current: record.SessionShutdown) -> None:
+            worker.start()
+            self.assertTrue(ready.wait(2))
+            self.assertFalse(finished.wait(0.05))
+            current["progress"] = {"kind": "stopping", "at": LATER}
+        worker = threading.Thread(target=cancel)
+        try:
+            claimed = record.update_session(saved["login"], "session-1", claim)
+        finally:
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(len(outcomes), 1)
+        self.assertIsInstance(outcomes[0], record.SessionRetained)
+        identity.assert_not_called()
+        restore.assert_not_called()
+        self.assertEqual(record.find_session(saved["login"], "session-1"), claimed)
+
+    def test_conductor_status_observes_held_released_absent_and_unreadable_lock(self) -> None:
+        login = "owner@example.com"
+        self.assertIsInstance(record.conductor_status(login), record.ConductorNotRunning)
+        self.assertFalse(self.directory.exists())
+        with record.conductor_lock(login):
+            before = {path: path.read_bytes() for path in self.directory.iterdir()}
+            self.assertIsInstance(record.conductor_status(login), record.ConductorRunning)
+            self.assertEqual({path: path.read_bytes() for path in self.directory.iterdir()}, before)
+        self.assertIsInstance(record.conductor_status(login), record.ConductorNotRunning)
+        (self.directory / "conduct.lock").unlink()
+        self.assertIsInstance(record.conductor_status(login), record.ConductorNotRunning)
+        self.assertFalse((self.directory / "conduct.lock").exists())
+        (self.directory / "conduct.lock").mkdir()
+        self.assertIsInstance(record.conductor_status(login), record.ConductorUnavailable)
+
+    def test_named_shutdown_and_account_lookup_outcomes_preserve_domain_meaning(self) -> None:
+        login = "owner@example.com"
+        self.assertIsInstance(record.lookup_session(login, "session-1"), record.NoShutdown)
+        self.assertIsInstance(record.lookup_account_hold(login), record.AccountOpen)
+        saved, held = session_shutdown(), account_hold()
+        self.assertTrue(record.create_session(saved))
+        record.set_account_hold(held)
+        self.assertEqual(record.lookup_session(login, "session-1"), record.ShutdownFound(saved))
+        self.assertEqual(record.lookup_account_hold(login), record.AccountHeld(held))
+
+    def test_conductor_start_retries_a_brief_observation_lock(self) -> None:
+        login = "owner@example.com"
+        with record.conductor_lock(login):
+            pass
+        path = self.directory / "conduct.lock"
+        started = threading.Event()
+        outcomes: list[record.ConductorAcquired | record.ConductorAlreadyRunning] = []
+        failures: list[BaseException] = []
+        def start() -> None:
+            try:
+                started.set()
+                with record.conductor_lock(login) as outcome:
+                    outcomes.append(outcome)
+            except BaseException as error:
+                failures.append(error)
+        with path.open("r") as observation:
+            fcntl.flock(observation.fileno(), fcntl.LOCK_EX)
+            worker = threading.Thread(target=start)
+            worker.start()
+            self.assertTrue(started.wait(2))
+            time.sleep(0.05)
+            fcntl.flock(observation.fileno(), fcntl.LOCK_UN)
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(len(outcomes), 1)
+        self.assertIsInstance(outcomes[0], record.ConductorAcquired)
+
+    def test_conductor_start_rejects_a_persistent_owner_within_bounded_time(self) -> None:
+        login = "owner@example.com"
+        with record.conductor_lock(login):
+            started = time.monotonic()
+            with record.conductor_lock(login) as duplicate:
+                elapsed = time.monotonic() - started
+                self.assertIsInstance(duplicate, record.ConductorAlreadyRunning)
+        self.assertGreaterEqual(elapsed, 0.15)
+        self.assertLess(elapsed, 1.0)
 
 
 if __name__ == "__main__":
