@@ -62,7 +62,8 @@
         ".",
         "scripts/nightly_review",
         "scripts/shutdown",
-        "scripts/whoami"
+        "scripts/whoami",
+        "scripts/lib"
       ]
     },
     {

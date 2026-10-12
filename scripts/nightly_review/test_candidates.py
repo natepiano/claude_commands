@@ -17,6 +17,12 @@ from zoneinfo import ZoneInfo
 import candidates
 from candidates import Candidate, TimeGain, TokenGain, Unmeasured
 
+
+def setUpModule() -> None:
+    """The times these tests expect are Eastern; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
+
+
 LEDGER: str = """\
 - 2026-09-28 config: Put cargo on the job PATH — accepted, applied; from Also found: merge two hooks — accepted 2026-10-01
 - 2026-10-01 config: Say the handoff instruction once — proposed
