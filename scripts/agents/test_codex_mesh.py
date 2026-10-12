@@ -231,6 +231,8 @@ class MeshCommandTests(unittest.TestCase):
     interrupt_error_ends_turn: bool  # pyright: ignore[reportUninitializedInstanceVariable]
     hide_turn_id_from_steer: bool  # pyright: ignore[reportUninitializedInstanceVariable]
     hide_live_turn_id: bool  # pyright: ignore[reportUninitializedInstanceVariable]
+    stale_read_turn: str  # pyright: ignore[reportUninitializedInstanceVariable]
+    stale_reads: int  # pyright: ignore[reportUninitializedInstanceVariable]
     next_thread_id: str  # pyright: ignore[reportUninitializedInstanceVariable]
     auto_turn_starts: int  # pyright: ignore[reportUninitializedInstanceVariable]
     waits: list[float]  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -260,6 +262,8 @@ class MeshCommandTests(unittest.TestCase):
         self.interrupt_error_ends_turn = False
         self.hide_turn_id_from_steer = False
         self.hide_live_turn_id = False
+        self.stale_read_turn = ""
+        self.stale_reads = 0
         self.next_thread_id = THREAD_ID
         self.auto_turn_starts = 0
         self.waits = []
@@ -349,6 +353,27 @@ class MeshCommandTests(unittest.TestCase):
                 return [
                     *turn_submission_frames,
                     _notice("turn/completed", {"threadId": THREAD_ID, "turn": {}}),
+                ]
+            if outcome == "completed_then_instant_peer":
+                # A peer turn opens the instant the followed one ends. While it runs,
+                # a thread read still lists the followed turn as the one in progress.
+                self.live_turn = "peer-turn"
+                self.stale_read_turn = turn_id
+                return [
+                    *turn_submission_frames,
+                    _notice("turn/completed", {
+                        "threadId": THREAD_ID, "turn": {"id": turn_id}
+                    }),
+                    _notice("turn/started", {
+                        "threadId": THREAD_ID, "turn": {"id": "peer-turn"}
+                    }),
+                ]
+            if outcome == "answered_without_completion":
+                return [
+                    *turn_submission_frames,
+                    _notice("item/completed", {
+                        "threadId": THREAD_ID, "item": {"type": "agentMessage", "text": "late answer"}
+                    }),
                 ]
             if outcome == "completed_then_peer":
                 self.live_turn = "peer-turn"
@@ -549,6 +574,19 @@ class MeshCommandTests(unittest.TestCase):
             if self.read_failure == "timeout":
                 return []
             thread_id = cast("str", params.get("threadId", THREAD_ID))
+            if self.stale_read_turn:
+                self.stale_reads += 1
+                frames = [_reply(request, {"thread": {
+                    "id": thread_id, "status": {"type": "active"},
+                    "turns": [{"id": self.stale_read_turn, "status": "inProgress"}],
+                }})]
+                # The peer turn ends after the second read; no frame arrives unasked here.
+                if self.stale_reads == 2:
+                    frames.append(_notice("turn/completed", {
+                        "threadId": THREAD_ID, "turn": {"id": self.live_turn}
+                    }))
+                    self.stale_read_turn = self.live_turn = ""
+                return frames
             turns: list[dict[str, object]] = []
             if self.live_turn and not self.hide_live_turn_id:
                 turns.append({"id": self.live_turn, "status": "inProgress"})
@@ -1154,6 +1192,62 @@ class MeshCommandTests(unittest.TestCase):
 
         self.assertNotEqual(code, 0, errors)
         self.assertEqual(len(self.methods("turn/start")), 2)
+
+    def test_follow_sees_a_peer_turn_end_when_the_thread_read_still_names_the_followed_turn(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        self.outcomes = ["completed_then_instant_peer"]
+        self.start_args_timeout = 3
+
+        # The interval wake only makes the stand-in server hand over the peer turn's end.
+        with patch.object(codex_mesh, "UNSEEN_END_CHECK_SECS", 0.2):
+            code, errors = self.run_follow()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertEqual(self.methods("turn/interrupt"), [])
+
+    def test_a_launcher_finishes_when_the_thread_is_idle_and_no_completion_notice_came(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        self.outcomes = ["answered_without_completion"]
+        self.start_args_timeout = 5
+
+        with patch.object(codex_mesh, "UNSEEN_END_CHECK_SECS", 0.2):
+            code, errors = self.run_follow()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertIn("late answer", (self.session_dir / "summary.txt").read_text(encoding="utf-8"))
+        self.assertIn("thread is idle and no completion notice arrived",
+                      (self.session_dir / "seat.log").read_text(encoding="utf-8"))
+
+    def test_an_idle_thread_with_no_notice_and_no_answer_finishes_as_failed(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        self.outcomes = ["earlier_only"]
+        self.start_args_timeout = 5
+
+        with patch.object(codex_mesh, "UNSEEN_END_CHECK_SECS", 0.2):
+            code, errors = self.run_follow()
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("went idle with no completion notice and no answer", errors)
+        self.assertEqual(self.seat_record()["status"], "failed")
+
+    def test_a_thread_with_a_queued_message_or_a_live_turn_has_not_ended(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        client = codex_mesh.Client(self.server.port, "probe")
+        try:
+            ended = codex_mesh._ended_unseen  # pyright: ignore[reportPrivateUsage]
+            self.assertTrue(ended(client, THREAD_ID))
+            self.queued = [{"id": "queued-1", "input": [], "clientUserMessageId": "m1"}]
+            self.assertFalse(ended(client, THREAD_ID))
+            self.queued = []
+            self.live_turn = "peer-turn"
+            self.assertFalse(ended(client, THREAD_ID))
+            self.live_turn = ""
+            self.read_failure = "error"
+            self.assertFalse(ended(client, THREAD_ID))
+        finally:
+            client.close()
 
     def test_follow_failure_without_turn_id_finishes_as_failed(self) -> None:
         self.assertEqual(self.run_start()[0], 0)

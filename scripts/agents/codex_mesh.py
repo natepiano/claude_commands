@@ -101,6 +101,9 @@ QUEUE_GRACE_SECS = 3.0
 # A resident delegate sits between turns with nothing on the socket, so its loop
 # wakes this often to look for the end marker.
 RESIDENT_POLL_SECS = 1.0
+# A launcher waiting on a turn wakes this often to check that the turn has not ended unseen.
+UNSEEN_END_CHECK_SECS = 60.0
+UNSEEN_END_CALL_SECS = 10.0
 # How fast a failure has to arrive to be read as this machine's fault rather
 # than the provider's. An app-server that has wedged answers from what it
 # cached, without a round trip, so it fails in seconds; a refusal that travelled
@@ -1321,6 +1324,26 @@ def _describe_item(item: dict[str, object]) -> str:
     return kind or "working"
 
 
+def _ended_unseen(client: Client, thread_id: str) -> bool:
+    """True when the thread is idle with nothing queued, so no turn is left to end.
+
+    A launcher that reads this while it waits for a completion notice has missed
+    the notice. The read asks for no turns, so it stays small on a long thread.
+    A call that is refused or times out says nothing, and the launcher keeps waiting.
+    """
+    try:
+        listed = client.call("thread/queue/list", {"threadId": thread_id}, UNSEEN_END_CALL_SECS)
+        items = _as_dict(listed.get("result")).get("data")
+        if isinstance(items, list) and items:
+            return False
+        reply = client.call(
+            "thread/read", {"threadId": thread_id, "includeTurns": False}, UNSEEN_END_CALL_SECS)
+    except SystemExit:
+        return False
+    thread = _as_dict(_as_dict(reply.get("result")).get("thread"))
+    return _as_str(_as_dict(thread.get("status")).get("type")) == "idle"
+
+
 def _more_work_coming(client: Client, thread_id: str, deadline: float) -> bool:
     """True when a turn that just ended is not the delegate's last.
 
@@ -2041,10 +2064,21 @@ def _stream_turn(
             _ = log.write(f"[{_now_stamp()}] mesh: {name} thread {thread_id}\n")
             log.flush()
             while time.time() < deadline:
-                # A resident thread must wake to see `end` between turns.
-                wait_until = min(deadline, time.time() + RESIDENT_POLL_SECS) if resident else deadline
-                frame = client.next_frame(wait_until)
+                # A resident thread must wake to see `end` between turns. Any other
+                # wakes to check that its turn has not ended without the notice.
+                poll = RESIDENT_POLL_SECS if resident else UNSEEN_END_CHECK_SECS
+                frame = client.next_frame(min(deadline, time.time() + poll))
                 if frame is None:
+                    if not resident and time.time() < deadline:
+                        if not resume_owed and _ended_unseen(client, thread_id):
+                            _ = log.write(f"[{_now_stamp()}] mesh: {name} thread is idle and no "
+                                          + "completion notice arrived; finishing\n")
+                            log.flush()
+                            failure = followed_failure or (
+                                "" if final_answer
+                                else "the thread went idle with no completion notice and no answer")
+                            break
+                        continue
                     if end_marker.exists():
                         break
                     if resident and _record_port(session_dir) != port:
@@ -2094,6 +2128,10 @@ def _stream_turn(
                     notice_turn = _as_str(_as_dict(params.get("turn")).get("id"))
                     if follow and notice_turn and followed_turn and notice_turn != followed_turn:
                         continue
+                    # The followed turn has ended. A later turn names itself in its own
+                    # `turn/started`; a thread read at this moment can still name this one.
+                    if follow:
+                        followed_turn = ""
                     turn_outcome = _turn_outcome(method, params)
                     if isinstance(turn_outcome, TurnContextWindowExceeded):
                         if waiting_for_progress_after_overflow:
@@ -2228,12 +2266,6 @@ def _stream_turn(
                     if follow and isinstance(turn_outcome, TurnFailed) and not followed_failure:
                         followed_failure = turn_outcome.detail
                     if not resident and _more_work_coming(client, thread_id, deadline):
-                        if follow:
-                            live = _read_live_turn(client, thread_id)
-                            if isinstance(live, ThreadLive):
-                                followed_turn = live.turn_id
-                            else:
-                                followed_turn = ""
                         continue
                     failure = followed_failure or (turn_outcome.detail if isinstance(turn_outcome, TurnFailed) else "")
                     if not resident:
