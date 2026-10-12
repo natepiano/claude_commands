@@ -70,7 +70,7 @@ The problem it solves is the number of manual steps a showrunner has to carry. E
 - **Re-run.** A hash already merged reads `PushedTip | NotYetPushed` from origin, skips the push when pushed, and re-runs every promotion, each a no-op at the tip. A merge not yet pushed is one a killed run left untested, so the re-run runs its merge tests first, and red undoes the merge as on a first run. A failed promote is re-run with the same command.
 - **Overrides for tests:** `MERGE_CHECKPOINT_VERIFY`, `MERGE_CHECKPOINT_VALIDATE_AND_PUSH`, `MERGE_CHECKPOINT_REVIEW_REGIME`, `MERGE_CHECKPOINT_SCRATCH`.
 
-The showrunner still judges, before the call: the other units' overlap notice, new public items without a consumer, the design check. After it: `<ClearGate/>`, `<CrossUnitChange/>`, `<CIPoint/>` and the review watch. It sends the script's `send <unit>:` line and puts every `into:` line in the user update, adding one in the same form for each unit worktree it then merges the merge branch into.
+The showrunner still judges, before the call: the other units' overlap notice, new public items without a consumer, the design check. After it: `<ChangeReviewFeatureLog/>` for a merge in `~/rust/hana` or `~/rust/hana_catalyst` (one change-review row and one feature-log proposal per user-visible result; `docs/as-built/feature-log.md`), then `<ClearGate/>`, `<CrossUnitChange/>`, `<CIPoint/>` and the review watch. It sends the script's `send <unit>:` line and puts every `into:` line in the user update, adding one in the same form for each unit worktree it then merges the merge branch into.
 
 ### Production open, promote and wrap: `production_lifecycle.py`
 
