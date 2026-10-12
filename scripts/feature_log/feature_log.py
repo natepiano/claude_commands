@@ -252,6 +252,17 @@ class CorrectAcceptingProvenance(NamedTuple):
 AcceptingProvenanceAmendment = KeepAcceptingProvenance | CorrectAcceptingProvenance
 
 
+class ReplaceLiveNotes(NamedTuple):
+    """Replace live notes, allowing repeats of the same replacement."""
+
+
+class ExtendReplacementSet(NamedTuple):
+    """Add a replacement even when an old note is already superseded."""
+
+
+ReplacementPolicy = ReplaceLiveNotes | ExtendReplacementSet
+
+
 class ProposalArgs(TypedDict):
     project: str
     title: str
@@ -1292,7 +1303,9 @@ def _updated_replacement(note: Note, replacement: str) -> Note:
     return updated
 
 
-def _apply_supersede(note: Note, arguments: argparse.Namespace) -> list[str]:
+def _apply_supersede(
+    note: Note, arguments: argparse.Namespace, policy: ReplacementPolicy
+) -> list[str]:
     old_titles = [normalize_title(item) for item in cast(list[str], arguments.old)]
     old_titles = list(dict.fromkeys(old_titles))
     if note["title"] in old_titles:
@@ -1318,7 +1331,11 @@ def _apply_supersede(note: Note, arguments: argparse.Namespace) -> list[str]:
                 (old_path, _updated_replacement(old_note, note["title"]), old_title)
             )
         elif note["title"] not in old_note["replaced_by"]:
-            raise FeatureLogError(f"old note {old_title} is not live")
+            if isinstance(policy, ReplaceLiveNotes):
+                raise FeatureLogError(f"old note {old_title} is not live")
+            replacements.append(
+                (old_path, _updated_replacement(old_note, note["title"]), old_title)
+            )
 
     if write_new:
         _write_note(new_path, stored)
@@ -1335,10 +1352,10 @@ def _apply_supersede(note: Note, arguments: argparse.Namespace) -> list[str]:
     return outputs
 
 
-def _run_supersede(arguments: argparse.Namespace) -> int:
+def _run_supersede(arguments: argparse.Namespace, policy: ReplacementPolicy) -> int:
     note = _new_note(arguments)
     with locked():
-        outputs = _apply_supersede(note, arguments)
+        outputs = _apply_supersede(note, arguments, policy)
     for output in outputs:
         print(output)
     return 0
@@ -1605,7 +1622,7 @@ def _run_review_land(verb: Literal["add", "supersede"], row_value: str) -> int:
         outputs = (
             _apply_add(note, saved_arguments)
             if verb == "add"
-            else _apply_supersede(note, saved_arguments)
+            else _apply_supersede(note, saved_arguments, ReplaceLiveNotes())
         )
         landed: LandedProposal = {
             "row": row,
@@ -1750,10 +1767,26 @@ def _run_amend(arguments: argparse.Namespace) -> int:
                     if release.partition("@")[0] in crates
                 ]
                 changed.append("crate")
-        historical_releases = _validate_release_values(project, updated["crate"], release_additions)
-        if any(release.partition("@")[2] == "Unreleased" for release in historical_releases):
-            raise FeatureLogError("--release requires an exact historical version, not Unreleased")
-        releases = sorted(set(updated["release"]) | set(historical_releases))
+        validated_releases = _validate_release_values(project, updated["crate"], release_additions)
+        pending_crates: set[str] = set()
+        for release in validated_releases:
+            crate, _, version = release.partition("@")
+            if version != "Unreleased":
+                continue
+            if note["state"] != "live":
+                raise FeatureLogError("a superseded note cannot be pending")
+            for existing_release in note["release"]:
+                existing_crate, _, existing_version = existing_release.partition("@")
+                if existing_crate == crate and existing_version != "Unreleased":
+                    raise FeatureLogError(f"{title} already holds {existing_release}")
+            pending_crates.add(crate)
+        for release in validated_releases:
+            crate, _, version = release.partition("@")
+            if version != "Unreleased" and crate in pending_crates:
+                raise FeatureLogError(
+                    f"--release cannot add both {crate}@Unreleased and {release}"
+                )
+        releases = sorted(set(updated["release"]) | set(validated_releases))
         if releases != updated["release"]:
             updated["release"] = releases
             changed.append("release")
@@ -1887,9 +1920,9 @@ def _select_changelog(crate: str, version: str) -> ChangelogSelection:
     return ChangelogSelection("\n".join(lines) + "\n", sorted(note["title"] for note in notes))
 
 
-def _section_bullets(text: str, version: str) -> dict[str, set[str]]:
-    """Read the requested section's bullet sets, including wrapped bullets."""
-    headings: dict[str, set[str]] = {}
+def _section_bullets(text: str, version: str) -> dict[str, list[str]]:
+    """Read the requested section's bullets, including repeats and wrapped lines."""
+    headings: dict[str, list[str]] = {}
     in_section = False
     found = False
     heading = ""
@@ -1897,7 +1930,7 @@ def _section_bullets(text: str, version: str) -> dict[str, set[str]]:
 
     def finish_bullet() -> None:
         if bullet_parts:
-            headings.setdefault(heading, set()).add(" ".join(bullet_parts))
+            headings.setdefault(heading, []).append(" ".join(bullet_parts))
             bullet_parts.clear()
 
     for line in text.splitlines():
@@ -1962,10 +1995,11 @@ def _run_changelog(
     expected = _section_bullets(selection.section, request.version)
     actual = _section_bullets(changelog, request.version)
     different = False
-    headings = list(CHANGELOG_HEADINGS) + sorted((expected.keys() | actual.keys()) - set(CHANGELOG_HEADINGS))
-    for heading in headings:
-        missing = expected.get(heading, set()) - actual.get(heading, set())
-        extra = actual.get(heading, set()) - expected.get(heading, set())
+    for heading in (*CHANGELOG_HEADINGS, ""):
+        expected_bullets = set(expected.get(heading, []))
+        actual_bullets = set(actual.get(heading, []))
+        missing = expected_bullets - actual_bullets
+        extra = actual_bullets - expected_bullets
         if not missing and not extra:
             continue
         different = True
@@ -1978,16 +2012,22 @@ def _run_changelog(
             print("Only in changelog:")
             for summary in sorted(extra):
                 print(f"- {summary}")
-    if different:
-        return 1
-    if isinstance(request.saving, SaveReviewedContents):
-        contents: ReviewedReleaseContents = {"crate": request.crate, "titles": selection.titles}
-        try:
-            _write_json(request.saving.path, contents)
-        except (OSError, UnicodeError) as error:
-            raise FeatureLogError(f"cannot save reviewed release contents: {error}") from error
-    print("match")
-    return 0
+    if not different:
+        if isinstance(request.saving, SaveReviewedContents):
+            contents: ReviewedReleaseContents = {"crate": request.crate, "titles": selection.titles}
+            try:
+                _write_json(request.saving.path, contents)
+            except (OSError, UnicodeError) as error:
+                raise FeatureLogError(f"cannot save reviewed release contents: {error}") from error
+        print("match")
+    not_compared: list[str] = []
+    for heading in sorted(actual.keys() - set(CHANGELOG_HEADINGS) - {""}):
+        count = len(actual[heading])
+        noun = "bullet" if count == 1 else "bullets"
+        not_compared.append(f"{heading} ({count} {noun})")
+    if not_compared:
+        print(f"not compared: {', '.join(not_compared)}")
+    return 1 if different else 0
 
 
 def _reviewed_titles(value: object) -> list[str]:
@@ -2258,6 +2298,10 @@ def _parser() -> FeatureLogArgumentParser:
     supersede = subparsers.add_parser("supersede")
     _ = supersede.add_argument("--review")
     _ = supersede.add_argument("--old", action="append")
+    _ = supersede.add_argument(
+        "--split", dest="replacement_policy", action="store_const",
+        const=ExtendReplacementSet(), default=ReplaceLiveNotes(),
+    )
     _add_new_note_arguments(supersede, required=False)
 
     propose = subparsers.add_parser("propose")
@@ -2351,12 +2395,15 @@ def main(
             return _run_add(arguments)
         if command == "supersede":
             review = cast(str | None, arguments.review)
+            policy = cast(ReplacementPolicy, arguments.replacement_policy)
             if review is not None:
+                if isinstance(policy, ExtendReplacementSet):
+                    raise FeatureLogError("--split cannot be combined with --review")
                 return _run_review_land("supersede", review)
             _require_new_note_arguments(arguments)
             if cast(list[str] | None, arguments.old) is None:
                 raise FeatureLogError("the following arguments are required: --old")
-            return _run_supersede(arguments)
+            return _run_supersede(arguments, policy)
         if command == "propose":
             return _run_propose(arguments)
         if command == "drop":

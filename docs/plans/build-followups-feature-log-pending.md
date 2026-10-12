@@ -17,6 +17,7 @@ The showrunner's assignment, 2026-10-12 10:20 PDT (a peer's coordination, not th
 ## Delegation Context
 
 - **Project:** `~/.claude` config repo plus the feature log in the hanadocs vault. `docs/as-built/feature-log.md` describes the system this plan extends; read it for the note format, every verb and the backfill rules. Worktree `/home/natepiano/worktrees/claude-build-followups-feature-log-unit`, branch `build-followups-feature-log-unit` (unit `feature-log-unit-unit`); name both in every dispatch.
+- **Project started:** 2026-10-12T17:35:38.881+00:00
 - **Stack:** Python standard library only; `feature_log.py` and `inventory.py` stay importable on Python 3.10, and the tests run on natedev's `python3` 3.13. No YAML library: the script has its own frontmatter parser and writer. Markdown command files follow `commands/succinct_style.md`.
 - **Layout:**
   - `scripts/feature_log/` — `feature_log.py`, `inventory.py`, `test_feature_log.py`, `test_inventory.py`.
@@ -78,7 +79,7 @@ The showrunner's assignment, 2026-10-12 10:20 PDT (a peer's coordination, not th
 
 ## Phases
 
-### Phase 1 — An entry can be marked pending or split, and the comparison covers only change headings  · status: todo
+### Phase 1 — An entry can be marked pending or split, and the comparison covers only change headings  · status: done
 
 #### Work Order
 
