@@ -6,7 +6,7 @@
 
 > **Production: build-followups** — unit `build-report-unit`; production doc `docs/plans/build-followups-production.md`
 
-> **Renumbered:** 2026-10-12, two insertions, both after the last `done` phase (Phase 5), so no `done` phase moved; Phases 1-5 name no later phase by number. First, "A test binary built on the Mac finds the Swift runtime" became Phase 6: the build report phase 6 → 7, the `/build_hold` target and docs phase 7 → 8. Second, "A lost Mac run keeps the Mac busy until its leftovers are gone" became Phase 7: the build report phase 7 → 8, the `/build_hold` target and docs phase 8 → 9.
+> **Renumbered:** 2026-10-12, three insertions, all after the last `done` phase (Phase 5), so no `done` phase moved; Phases 1-5 name no later phase by number. First, "A test binary built on the Mac finds the Swift runtime" became Phase 6: the build report phase 6 → 7, the `/build_hold` target and docs phase 7 → 8. Second, "A lost Mac run keeps the Mac busy until its leftovers are gone" became Phase 7: the build report phase 7 → 8, the `/build_hold` target and docs phase 8 → 9. Third, "A silent or gone session never holds the builds behind it" became Phase 7: the lost Mac run phase 7 → 8, the build report phase 8 → 9, the `/build_hold` target and docs phase 9 → 10.
 
 ## Source
 
@@ -255,7 +255,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **Ruled out:** a `verify.sh: running on the Mac` line, and a signal from the runner to `verify.sh` to time one (the runner's own line already says it at the moment tests start there, after the claim and the copy).
 
-### Phase 6 — A test binary built on the Mac finds the Swift runtime  · status: todo
+### Phase 6 — A test binary built on the Mac finds the Swift runtime  · status: done
 
 #### Work Order
 
@@ -293,7 +293,58 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/mac_test -p 'test_*.py'` green; `basedpyright scripts/mac_test` reporting `0 errors, 0 warnings` (it exits 3 because the configured `.venv` is absent; that is a pass). Then the director's live run, after the seats finish: one `verify.sh test hana_origami --no-cache` from a hana checkout (`--no-cache` because a pass already recorded for that tree returns before the runner is called), with `VERIFY_MAC_RUNNER` set to this worktree's `scripts/mac_test/offload.py` (the runner installed under `~/.claude` is another checkout's code), that prints the runner's Mac line, lists its tests and runs them, with no `Library not loaded` line and no exit 104. If that run still shows the load error, the phase does not checkpoint, and the director, not a seat, reads `minos` of the test binary that run used, read-only. `11.0` means cargo kept the stale binary: the fix must then also make that relink happen for every stale binary, and that becomes this phase's repair, designed from the measured cause. `14.0` with the load error means the diagnosis in the Spec was wrong. Nothing in the Mac's mirror is deleted by hand.
 
-### Phase 7 — A lost Mac run keeps the Mac busy until its leftovers are gone  · status: todo
+### Phase 7 — A silent or gone session never holds the builds behind it  · status: todo
+
+#### Work Order
+
+**Goal:** During a release, a session that has left ends its turn at the next poll, and a session that stays silent ends its turn after one minute when a build waits behind it, so a waiting build is never held 15 minutes for a session that is not building.
+
+**Spec:**
+- Work only in worktree `/home/natepiano/worktrees/claude-build-followups-build-report`, branch `build-followups-build-report`.
+- The fault, in `scripts/build_hold/build_hold.py` at the Phase 5 checkpoint (`5dc430cf`):
+  - `release_cycle` (1296) calls `advance_release` (1157) under the release lock every `RELEASE_POLL_S` (15 s). The entry loop (1182) returns at the first entry still inside its turn, so entries take turns one at a time, and each turn has its own `NO_ADMISSION_ACK_S` (900 s).
+  - In the `(ReleasedAwaitingAdmission, DeliveryQueued)` branch (1202-1210) the wait reads the clock and nothing else. `socket_for` (1049-1065) is called once per session key per holder generation, when that key's first turn starts (1250).
+  - (a) A session that exits after its release message was sent is waited out for the full 900 s.
+  - (b) A live session that stays silent (idle on its user) holds every later entry for the full 900 s. Measured on 2026-10-12: one release cost live sessions 15 minutes for each silent session ahead of them.
+- This phase reverses the unit director's own earlier call. Phase 3's as-built lists "A shorter turn for a silent session" under Ruled out, and Phase 4's as-built says a told session that never answers holds the release for the full 15 minutes. Neither was a user rule. One turn at a time stays: four sessions once started builds within 73 s of one release (`docs/as-built/build-memory-admission.md` 247).
+- Both changes sit in that one branch and apply only to an entry with no `active_call_id` (a session turn with no call bound to it). The clock is read first, so a turn that has reached its limit ends as `NoAdmissionAck` with no lookup.
+- Change (b), the limit: for an entry with no `active_call_id`, the limit is `RELEASE_SETTLE_S` (60 s) while any other entry is `AwaitingRelease`, and `NO_ADMISSION_ACK_S` otherwise. An entry with a bound call always keeps `NO_ADMISSION_ACK_S`. At the limit the entry ends as today: `active_call_id` cleared, `session_pending` cleared, `NoAdmissionAck(started_at)` with `started_at` the release or attempt instant, save, `queue_told_sessions`, and the loop goes on, so the waiting entry is sent in the same poll. The limit is read at every poll: the last silent entry keeps 900 s until another entry registers, and then ends at once when its 60 s have passed.
+- Change (a), the gone session: while such an entry is inside its limit, call `socket_for(entry["session_id"])` at each poll. `RecipientGone`: clear `session_pending`, store `RecipientGone()`, save, `queue_told_sessions`, and `continue` to the next entry in the same poll. `RecipientLive` and `RecipientLookupFailed` leave the wait as it is and print nothing. `entry["delivery"]` is never changed here, so a session reached and then gone is not named in the final line, and one whose message was only queued still reads `queued, no answer`.
+- After the cut: a build that session starts later registers its call, the entry rejoins the end of the queue as `AwaitingRelease` (`register_wait` 921-928) and gets a later turn as `ReleasedAwaitingAdmission` with no second message (1247-1248). A launch it tries is refused and registers the session for a later turn (`build_targets.py` `command_check_local` 341). Builds still start one at a time. Cargo that session starts outside `verify.sh` after the cut is not counted; that is the cost accepted for the shorter turn.
+- Cost: one `sessions.py socket` process per poll for the one entry inside a turn with no bound call, under the release lock as the turn-start lookup is. A lookup that keeps failing retries `LOOKUP_TRIES` (3) times, `LOOKUP_RETRY_S` (1 s) apart, so it holds the lock about 2 s in each 15 s poll.
+- Unchanged: the release record's on-disk format (`RecipientGone` and `NoAdmissionAck` exist already), the final line's wording, `register_wait`, `mark_gate`, `answer_nothing_to_build`, `read_admission`, every exit code. No new setting, no boolean flag, no new constant, no new type.
+- Tests in `scripts/build_hold/test_build_hold.py`, in `ToldSessionReleaseTests` (1502) and its neighbours, on the stand-in clock (`self.now`, passed as `clock`) and the `socket_for` and `send_release` stand-ins:
+  - A session gone at the poll after delivery ends as `RecipientGone`, the next entry is sent in that same poll, and the final line has no `Not reached`.
+  - A failed lookup keeps `ReleasedAwaitingAdmission` until 900 s when nothing waits.
+  - An entry with a bound call makes no lookup.
+  - A silent entry with a waiter holds at 59 s, ends as `NoAdmissionAck` at 60 s, and the waiter is sent in that poll.
+  - The last silent entry, with nobody waiting, holds past 60 s; when a call registers behind it, it ends at the next poll.
+  - A bound call is never cut short: with a waiter behind it, it holds until its gate mark or 900 s.
+  - A call registered by a session after its turn was cut reads `AwaitingTurn`, then `AdmittedTurn` when its turn comes, and `send_release` is called once for that session.
+  - A turn at its limit makes no lookup.
+  - Rewrite the tests that pin the old limit: `test_delayed_first_build_keeps_next_session_held` (1014), `test_no_admission_ack_is_not_early` (1076), the `timeout` ending of `test_three_told_sessions_are_saved_together_and_serve_one_turn_at_a_time` (1586-1589) and `test_delivered_silent_sessions_are_reached_without_final_warning` (1844-1853).
+
+**Files:**
+- `scripts/build_hold/build_hold.py` — the limit and the lookup in `advance_release`.
+- `scripts/build_hold/test_build_hold.py` — tests.
+
+**Seats:** 1 writer + 1 tester
+- `impl` — `build_hold.py`
+- `test` — `test_build_hold.py`: the cases in the Spec, written from the Spec alone.
+
+**Constraints from prior phases:**
+- From the unit director, 2026-10-12: no seat runs a real hold, release, acknowledgement or message (no `build_hold.py` subcommand by hand), and none reads or writes `~/.local/state/build-hold-release` or `~/.local/state/build-hold`. Every test uses the stand-in clock and temporary directories. Seats never run cargo or `verify.sh`. Each seat's file is read-only to the other seat.
+- `build_hold.py` at the Phase 5 checkpoint, which Phase 6 did not edit: constants 31-38, `prune_calls` 483, `read_admission` 491, `register_wait` 882 (open-turn admission 912-918), `remove_call` 941, `mark_gate` 963, `socket_for` 1049, `release_queue_idle` 1113, `queue_told_sessions` 1124, `not_reached_detail` 1144, `advance_release` 1157, `release_cycle` 1296. The Delegation Context's numbers for this file are older; find each function by name.
+- A call that registers while its session's turn is open becomes that turn's `active_call_id` (Phase 4), so a session that builds through `verify.sh` during its turn has a bound call and is never cut short.
+- `prune_calls` and `remove_call` move an entry whose active call is gone to `AwaitingRelease` or `NoPendingTurn`, and a `verify:` key gets a turn only with a call, so a `verify:` key is never in this branch without `active_call_id` and neither change reaches one.
+- `RecipientGone` is one class used as a release state and as a lookup result (Phase 4). As a state with no bound call it ends the turn: the loop passes it, and `register_wait` requeues it when a call arrives.
+- `socket_for` returns `RecipientGone` only when `sessions.py` exits 1 (no live session) or prints no socket; a lookup that cannot read the session records is `RecipientLookupFailed`, which says nothing about the session (Phase 4).
+- `IsolatedBuildHoldTest` (36) sets `HOME`, `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR` and `NOTIFIER_SESSIONS_DIR` to a temporary directory. `ToldSessionReleaseTests` keeps its stand-ins in `release_mocks["lookup"]` and `release_mocks["send"]` and counts sends with `sent()`. `ReleaseStateTests` (956) patches both per test. Tests that count lookups today (1754-1764, 1927, 1968) have a bound call or one poll, and keep their counts.
+- A release driver keeps the code it started with (Phase 3). The showrunner installs a changed `build_hold.py` only while natedev is free and no release runs; no seat installs anything.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'` green on the final tree; `basedpyright scripts/build_hold` reporting `0 errors, 0 warnings` (it exits 3 because the configured `.venv` is absent; that is a pass). There is no live run: the release driver's state is shared by every session on natedev, and the showrunner installs the changed `build_hold.py` only while no hold or release runs.
+
+### Phase 8 — A lost Mac run keeps the Mac busy until its leftovers are gone  · status: todo
 
 #### Work Order
 
@@ -354,7 +405,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/mac_test -p 'test_*.py'` green; `basedpyright scripts/mac_test` reporting `0 errors, 0 warnings` (it exits 3 because the configured `.venv` is absent; that is a pass). Every check runs under the stand-in ssh; no seat contacts the Mac. Then the director's live run, after the seats finish and while the Mac is free: the leftover check once against the idle Mac, which must answer `leftovers=0` and `rc=0`; that shows the remote text runs under macOS, which no stand-in can.
 
-### Phase 8 — The build report shows tests by target and time spent waiting on holds  · status: todo
+### Phase 9 — The build report shows tests by target and time spent waiting on holds  · status: todo
 
 #### Work Order
 
@@ -385,7 +436,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` green; basedpyright clean. `python3 scripts/buildlog/cli.py report`, run from the worktree root with `BUILDLOG_DIR` set to a temporary directory the tests populated, renders both sections. The installed `~/.claude/scripts/buildlog/buildlog` runs another checkout's code, so it is no gate for this phase; rendering against the live index is a separate check after the merge.
 
-### Phase 9 — `/build_hold` takes a target, and the commands and records say how holds work now  · status: todo
+### Phase 10 — `/build_hold` takes a target, and the commands and records say how holds work now  · status: todo
 
 #### Work Order
 
@@ -398,14 +449,15 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
   - Recipients do nothing for a natedev hold: `verify.sh` waits by itself, and an app launch is refused with the holder and the reason (the launch gate returns a deny and schedules no retry), so the recipient launches again after the release. `build_hold.py wait` remains for a session about to run cargo outside `verify.sh`.
   - `quiet` is unchanged.
   - `target mac` places the Mac's hold.
+  - The release: a silent session's turn ends after one minute when a build waits behind it, and a session that left during its turn is skipped at once.
 - `commands/mac_test.md`: the block is the Mac's hold; `/build_hold hold <why> target mac` is the same thing. A block stays in force after its expiry time until its record is removed; name the existing command that clears a stuck block.
 - `commands/build_hold.md` and `commands/mac_test.md` both point to `build_targets.py status` as the one place to read every target's state, and say what to do for each state a reader can act on: `state unreadable` names the file to repair or remove; `unreachable` says to check the ssh connection (`status --probe`). `status` only reads: it never settles a block or changes a record.
 - `commands/builds.md`: no change unless the report's section names appear in it.
 - `docs/as-built/mac-test-offload.md`: the probe without process checks, `--settings`, `--last-decline`, routing, and the deployment target the remote command sets. Correct what Phase 5 made untrue there: line 28 gives the `run` usage without `--settings` and `--last-decline`; line 29 quotes the decline line as `mac_test: staying on natedev (<reason>)` and lists `mac_busy` among the probe's declines; line 30 says the probe counts `cargo`, `rustc` and `cargo-nextest` processes.
   - The failed probe: `mac_test: could not reach the Mac: <reason>` on stderr, then the `unreachable` decline; it writes the unreachable backoff (`unreachable_backoff_s`, 300 s by default), and until that time every run declines `backoff` before it claims or opens a connection.
-  - The lost run, as Phase 7 leaves it: lines 33, 75 and 87 say a signal or a lost run sends `pkill -f <mirror>` and releases, that leftovers make the next probe read `mac_busy`, and that a lost run keeps no claim. Replace them with the kept claim, the leftover check and its two selectors, the takeover (exit 13), the two stderr lines, the `status` and busy lines, and the release by hand; line 13 (`run.json`'s fields) and line 14 (`claim`'s usage and exits) gain `remote_host`, `--remote` and exit 13; the invariant at line 68 (a job that dies frees the lock) holds only for a claim made without `--remote`.
-  - Corrections that follow Phase 8: line 40 says an interrupted Mac call writes no call record, and it does (`note_event interrupted`, with `target` `mac`); line 53 gives schema 12 without `target` and `hold_wait_s` (schema 13, and `target` is the target the call was sent to when it ended, no proof of a test run there); line 55 describes the `Tests on the Mac` section, which is now "Tests by target" with the Waiting table's `Held target` row.
-- `docs/as-built/build-memory-admission.md`: the hold section says `verify.sh` waits by itself and an app launch is refused until the release. Also correct what Phases 2-4 made untrue there: a mark needs no session id in the shell (53; the owning session is resolved, and a call's mark is bound to its call id), and the launch hook no longer always goes on to memory admission (61). Add: the hold recheck after each memory admission, hold time recorded apart from memory waits, the release record grouped by session with its holder generation, the delivery outcomes and the final line's not-reached clause, and the promote rule (change `build_hold.py` only while natedev is free and no release runs).
+  - The lost run, as Phase 8 leaves it: lines 33, 75 and 87 say a signal or a lost run sends `pkill -f <mirror>` and releases, that leftovers make the next probe read `mac_busy`, and that a lost run keeps no claim. Replace them with the kept claim, the leftover check and its two selectors, the takeover (exit 13), the two stderr lines, the `status` and busy lines, and the release by hand; line 13 (`run.json`'s fields) and line 14 (`claim`'s usage and exits) gain `remote_host`, `--remote` and exit 13; the invariant at line 68 (a job that dies frees the lock) holds only for a claim made without `--remote`.
+  - Corrections that follow Phase 9: line 40 says an interrupted Mac call writes no call record, and it does (`note_event interrupted`, with `target` `mac`); line 53 gives schema 12 without `target` and `hold_wait_s` (schema 13, and `target` is the target the call was sent to when it ended, no proof of a test run there); line 55 describes the `Tests on the Mac` section, which is now "Tests by target" with the Waiting table's `Held target` row.
+- `docs/as-built/build-memory-admission.md`: the hold section says `verify.sh` waits by itself and an app launch is refused until the release. Also correct what Phases 2-4 made untrue there: a mark needs no session id in the shell (53; the owning session is resolved, and a call's mark is bound to its call id), and the launch hook no longer always goes on to memory admission (61). Add: the hold recheck after each memory admission, hold time recorded apart from memory waits, the release record grouped by session with its holder generation, the delivery outcomes and the final line's not-reached clause, and the promote rule (change `build_hold.py` only while natedev is free and no release runs). The release driver's line on `NO_ADMISSION_ACK_S` (167) also says that a silent session's turn ends after one minute (`RELEASE_SETTLE_S`) when a build waits behind it, and that a session that left during its turn is skipped at the next poll.
 
 **Files:**
 - `scripts/build_hold/build_hold.py`
@@ -424,8 +476,9 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 - `build_targets.py status` prints five states: free, running, held, unreachable, state unreadable. `status --probe` adds a read-only ssh check (`offload.probe_reachability`); the resource probe (`offload.probe_mac`) runs only inside a test run.
 - A build's waiter is keyed by the session that owns its delegate run (the run's active marker), then `CLAUDE_CODE_SESSION_ID`, then `verify:<call id>` (Phases 2 and 3).
 - Admission is automatic: `verify.sh` and the BRP launch gate wait or refuse by themselves, and an unreadable hold state stops a build with exit 12 (Phase 3). Routing sends a test to natedev when the Mac's state cannot be read (Phase 5). For a test whose route tries natedev first, an unreadable natedev hold state (`check-admission` exit 12) goes on to the next eligible target; the call exits 12 only when the test still has to start on natedev: no target took it, or a full pass on the Mac still needs its natedev confirmation (Phase 5).
-- The report's sections are "Tests by target" and the Waiting table's `Held target` row (Phase 8).
+- The report's sections are "Tests by target" and the Waiting table's `Held target` row (Phase 9).
 - A release reaches every session the hold told, registered or not, one at a time, and its final line names each session it could not reach (Phase 4). `commands/build_hold.md` says so where it describes the release. The final line reads `Not reached, tell them yourself: <session name> (<reason>)`, the reason one of `session gone`, `send failed` and `queued, no answer`. A session needs no `wait` for the release to reach it; a build it starts right after its release message takes its turn at once, and a session with nothing to build still answers `nothing-to-build` so the next one is released without the 15-minute wait.
+- Phase 7 ends a release turn that has no call bound to it as `NoAdmissionAck` after `RELEASE_SETTLE_S` (60 s) while another entry is `AwaitingRelease`, and as `RecipientGone` at the next poll once `socket_for` answers that the session is gone; such a session is not named in the final line when its message was delivered. With nothing waiting, or with a bound call, the turn keeps `NO_ADMISSION_ACK_S` (900 s), so the 15-minute wait named above remains only for the last silent session and for a bound call. A session cut short gets a later turn, with no second message, when it starts a build.
 - `build_targets.py` also has `wait-local`, `check-admission`, `check-local`, `interrupt-local` and `finish-local` (Phase 3), and `eligible` and `register-local` (Phase 5); `register-local` and `wait-local` refuse a `--pid` of zero or less with exit 2. The commands' docs name only `status`, which is the one a reader runs by hand.
 - What a test call prints since Phase 5, for the docs that quote it:
   - Its target, in one line. On the Mac that is the runner's own `mac_test: running on the Mac (macOS, host <host>); tree copied in <N> s`, printed when the tests start there; `verify.sh` prints no Mac line. On natedev it is `verify.sh: running on natedev`.
@@ -433,7 +486,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
   - While it waits on both targets (the Mac declined `busy` or `blocked` and natedev is held): `verify.sh: natedev is held by <holder> for <reason>.`, which is `register-local`'s line (`wait-local` keeps its longer `...; waiting (tests that can run on the Mac keep running there).`), and `verify.sh: waiting for the Mac (<reason>) or natedev's release.`. Each prints once, and again only when the holder, the hold's reason, the 2 h line or the Mac's reason changes.
 - The seconds of each declined Mac retry made during that wait are counted in `BUILDLOG_HOLD_WAIT_S`, with the waits between retries; the time tests ran never is.
 - Phase 6 makes the remote command carry `MACOSX_DEPLOYMENT_TARGET=14.0`, a constant in `offload.py`, so test binaries built in the Mac's mirror link for the macOS version the repository's development shell targets.
-- Phase 7 keeps the Mac's claim after a lost, interrupted or killed run until a leftover check counts no process of the mirror root: `mac_test.py claim --remote <host>` (exit 13 is a takeover of a kept claim), the busy line `busy: leftovers of <what> on <host> since <HH:MM>`, the `status` line `running: leftovers of <what> on <host> since <time>, kept under pid <pid>`, and `release --pid <pid>` as the way out by hand. `build_targets.py status` shows a kept claim as `mac: running <what> since <time>`. `commands/mac_test.md` says what a kept claim is and how it ends.
+- Phase 8 keeps the Mac's claim after a lost, interrupted or killed run until a leftover check counts no process of the mirror root: `mac_test.py claim --remote <host>` (exit 13 is a takeover of a kept claim), the busy line `busy: leftovers of <what> on <host> since <HH:MM>`, the `status` line `running: leftovers of <what> on <host> since <time>, kept under pid <pid>`, and `release --pid <pid>` as the way out by hand. `build_targets.py status` shows a kept claim as `mac: running <what> since <time>`. `commands/mac_test.md` says what a kept claim is and how it ends.
 - `write_hold` (659) and `start_hold` (847) in `build_hold.py` take `label: str | None = None`, where absence means "show the holder key as the name" (`label or name`, 672 and 674). The notice change passes through both, so this phase replaces that parameter with named variants or one resolved holder identity (its key and the name to show). Ownership by session id and the rename behavior stay as they are: the key is still the session id when one exists, and the name shown is still the holder's name now.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'` green; basedpyright clean.

@@ -700,6 +700,11 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(ssh[0]["args"][-2], "alternate-mac")
         self.assertEqual(ssh[1]["args"][-2], "alternate-mac")
         self.assertIn("LINT_SWEEP_BUDGET_GIB=8", ssh[1]["args"][-1])
+        remote_words = shlex.split(ssh[1]["args"][-1].rpartition("; echo mac_exit=$?")[0])
+        lint_index = remote_words.index("~/.claude/scripts/lint/lint")
+        self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
+        self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
+        self.assertEqual(remote_words[lint_index + 1 :], ["nextest"])
         self.assertIn("alternate-mac:.local/state/mac-test/mirror/hana/", self.events_for("rsync")[0]["args"])
 
     def test_battery_and_low_disk_decline_after_probe(self) -> None:
@@ -876,6 +881,18 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(len(self.events_for("rsync")), 1)
         self.assert_claimed_commands()
 
+    def test_remote_test_command_sets_development_deployment_target_before_nextest(self) -> None:
+        words = ("--no-fail-fast", "unit_case")
+        result = self.command(*words)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assert_wire("passed", "")
+        remote = self.events_for("ssh")[-1]["args"][-1]
+        remote_words = shlex.split(remote.rpartition("; echo mac_exit=$?")[0])
+        lint_index = remote_words.index("~/.claude/scripts/lint/lint")
+        self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
+        self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
+        self.assertEqual(remote_words[lint_index + 1 :], ["nextest", *words])
+
     def test_probe_copy_and_run_arguments_preserve_nextest_words(self) -> None:
         _ = (self.repository / ".gitignore").write_text(
             "generated/\n", encoding="utf-8"
@@ -947,9 +964,11 @@ class OffloadCommandTests(unittest.TestCase):
         remote_words = shlex.split(run_command)
         lint_index = remote_words.index("~/.claude/scripts/lint/lint")
         self.assertEqual(
-            remote_words[lint_index : lint_index + 2 + len(words)],
+            remote_words[lint_index :],
             ["~/.claude/scripts/lint/lint", "nextest", *words],
         )
+        self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
+        self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
         self.assertIn("PATH=$HOME/.cargo/bin:$PATH", remote_words)
         self.assertIn("BUILDLOG_CALLER=verify-mac", remote_words)
         self.assertIn("BUILDLOG_CALL_ID=call-17", remote_words)
