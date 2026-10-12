@@ -157,7 +157,7 @@ The showrunner's account of that morning, 2026-10-12 (claude 3, 20 sessions, `do
 
 **Ruled out:** sending cancel's message after releasing the account lock; `now` stopping or retrying anything itself.
 
-### Phase 4 — Acting on one session: take out, force, restart; what holds each one  · status: todo
+### Phase 4 — Acting on one session: take out, force, restart; what holds each one  · status: done
 
 #### Work Order
 

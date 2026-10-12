@@ -1036,5 +1036,142 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual(outcome["force"], "wait for ready")
 
 
+    def test_cancel_only_keeps_hold_until_last_record_of_its_request_leaves(self) -> None:
+        first, second, separate = [session_shutdown(top_level(identity, identity)) for identity in ("first", "second", "separate")]
+        separate["request_id"] = "another-request"
+        for saved in (first, second, separate):
+            self.save(saved)
+        held = record.AccountHold(login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW,
+            requested_by={"kind": "terminal"}, request_id="request-one", then="stop")
+        record.set_account_hold(held)
+        with patch.object(settle, "_retire_shutdown_messages"):
+            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True, only=["first"]), 0)
+            self.assertEqual(record.account_hold(LOGIN), held)
+            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True, only=["second"]), 0)
+        self.assertIsNone(record.account_hold(LOGIN))
+        self.assertEqual(record.session_records(LOGIN), [separate])
+
+    def test_cancel_only_keeps_hold_when_its_stopped_sibling_remains(self) -> None:
+        waiting = session_shutdown(top_level("waiting", "Waiting"))
+        stopped = session_shutdown(top_level("stopped", "Stopped"), progress={"kind": "stopped", "at": NOW})
+        self.save(waiting)
+        self.save(stopped)
+        held = record.AccountHold(login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW,
+            requested_by={"kind": "terminal"}, request_id="request-one", then="stop")
+        record.set_account_hold(held)
+        with patch.object(settle, "_retire_shutdown_messages"):
+            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True, only=["waiting"]), 0)
+        self.assertEqual(record.account_hold(LOGIN), held)
+        self.assertEqual(record.session_records(LOGIN), [stopped])
+
+    def test_cancel_only_live_failed_stop_restores_resources_and_names_running_session(self) -> None:
+        saved = session_shutdown(top_level("failed", "Failed"), progress={"kind": "stop failed", "at": NOW, "reason": "still live"})
+        saved["timers"] = [record.TimerRestore(instance="timer", was_enabled=True, footer={"kind": "no footer"})]
+        saved["settle_message"] = {"kind": "sent", "at": NOW}
+        sibling = session_shutdown(top_level("other", "Other"))
+        self.save(saved)
+        self.save(sibling)
+        output = io.StringIO()
+        with patch.object(settle, "inventory", return_value=machine_inventory([saved["session"]])), patch.object(settle, "run_notifier") as notifier, patch.object(settle, "_retire_shutdown_messages") as retire, patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as send, redirect_stdout(output):
+            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True, only=["failed"]), 0)
+        self.assertEqual(output.getvalue(), "Failed: taken out, still running\n")
+        notifier.assert_called_once_with("start", "timer")
+        retire.assert_called_once_with(LOGIN, "failed")
+        self.assertIn("cancelled by the user: continue where you were", cast(str, cast(object, send.call_args.args[2])))
+        self.assertIsNone(record.find_session(LOGIN, "failed"))
+        self.assertEqual(record.find_session(LOGIN, "other"), sibling)
+
+    def test_cancel_only_failed_stop_with_changed_process_identity_is_retained(self) -> None:
+        saved = session_shutdown(top_level("failed", "Failed"), progress={"kind": "stop failed", "at": NOW, "reason": "still live"})
+        self.save(saved)
+        reused = top_level("failed", "Failed")
+        reused["proc_start"] = "new-start"
+        with patch.object(settle, "inventory", return_value=machine_inventory([reused])), patch.object(settle, "_restore_record") as restore, redirect_stdout(io.StringIO()):
+            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True, only=["failed"]), 1)
+        restore.assert_not_called()
+        self.assertEqual(record.find_session(LOGIN, "failed"), saved)
+
+    def test_now_only_failed_stop_marks_force_and_delegates_retry_to_conductor(self) -> None:
+        saved = session_shutdown(top_level("failed", "Failed"), progress={"kind": "stop failed", "at": NOW, "reason": "still live"})
+        other = session_shutdown(top_level("other", "Other"))
+        self.save(saved)
+        self.save(other)
+        output = io.StringIO()
+        with patch.object(settle, "_launch_conductor") as conductor, patch.object(stop_work, "stop_session") as stop, redirect_stdout(output):
+            self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), True, only=["failed"]), 0)
+        self.assertEqual(output.getvalue(), "Failed: stopping now\n")
+        conductor.assert_called_once_with(LOGIN, LABEL)
+        stop.assert_not_called()
+        current = record.find_session(LOGIN, "failed")
+        assert current is not None
+        self.assertEqual(current["force"], "now")
+        self.assertIsInstance(settle.next_step(current, self.matching(current), [other], NOW_UTC), settle.StopSession)
+        self.assertEqual(record.find_session(LOGIN, "other"), other)
+
+    def test_cancel_only_failed_stop_lost_to_stop_claim_keeps_timers_and_names_stopping(self) -> None:
+        saved = session_shutdown(top_level("failed", "Failed"), progress={"kind": "stop failed", "at": NOW, "reason": "still live"})
+        saved["timers"] = [record.TimerRestore(instance="timer", was_enabled=True, footer={"kind": "no footer"})]
+        self.save(saved)
+        withdraw = record.withdraw_failed_stop
+        def stop_first(login: str, identity: str, check: Callable[[record.SessionShutdown], bool], restore: Callable[[record.SessionShutdown], None]) -> record.SessionWithdrawn | record.SessionRetained:
+            def claim(current: record.SessionShutdown) -> None:
+                current["progress"] = {"kind": "stopping", "at": NOW}
+            _ = record.update_session(login, identity, claim)
+            return withdraw(login, identity, check, restore)
+        output = io.StringIO()
+        with patch.object(record, "withdraw_failed_stop", side_effect=stop_first), patch.object(settle, "inventory") as observe, patch.object(settle, "run_notifier") as notifier, patch.object(settle, "_retire_shutdown_messages") as retire, redirect_stdout(output):
+            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True, only=["failed"]), 1)
+        self.assertEqual(output.getvalue(), "Failed was not cancelled: stopping; /shutdown restart --only Failed brings it back\n")
+        observe.assert_not_called()
+        notifier.assert_not_called()
+        retire.assert_not_called()
+        current = record.find_session(LOGIN, "failed")
+        assert current is not None
+        self.assertEqual(current["progress"], {"kind": "stopping", "at": NOW})
+        self.assertEqual(current["timers"], saved["timers"])
+
+    def test_now_only_stopped_owner_with_leftover_cleanup_is_retried_by_conductor(self) -> None:
+        saved = session_shutdown(top_level("partial", "Partial"), progress={"kind": "stopped", "at": NOW})
+        saved["stop_issues"] = [record.CodexServerLeftRunning(kind="codex server left running", at=NOW, run_dir="/tmp/run", cause="stop not confirmed")]
+        self.save(saved)
+        with patch.object(settle, "_launch_conductor") as conductor, patch.object(stop_work, "stop_session") as stop, redirect_stdout(io.StringIO()):
+            self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), True, only=["partial"]), 0)
+        conductor.assert_called_once_with(LOGIN, LABEL)
+        stop.assert_not_called()
+        current = record.find_session(LOGIN, "partial")
+        assert current is not None
+        self.assertEqual(current["force"], "now")
+        self.assertIsInstance(settle.next_step(current, self.matching(current), [], NOW_UTC), settle.StopSession)
+
+    def test_selected_cancel_of_peer_keeps_local_hold_even_when_peer_retains_record(self) -> None:
+        held = record.AccountHold(login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW,
+            requested_by={"kind": "terminal"}, request_id="held-request", then="stop")
+        record.set_account_hold(held)
+        with patch.object(settle, "inventory", return_value=machine_inventory([])), patch.object(settle, "run_remote", return_value=(1, "Peer was not cancelled: stopped")) as peer, redirect_stdout(io.StringIO()):
+            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), only=["peer-id"]), 1)
+        peer.assert_called_once_with(["cancel", LOGIN, "--here", "--only", "peer-id"])
+        self.assertEqual(record.account_hold(LOGIN), held)
+
+    def test_selected_cancel_of_another_request_keeps_local_account_hold(self) -> None:
+        saved = session_shutdown(top_level("selected", "Selected"))
+        saved["request_id"] = "selected-request"
+        self.save(saved)
+        held = record.AccountHold(login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW,
+            requested_by={"kind": "terminal"}, request_id="held-request", then="stop")
+        record.set_account_hold(held)
+        with patch.object(settle, "_retire_shutdown_messages"), redirect_stdout(io.StringIO()):
+            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True, only=["selected"]), 0)
+        self.assertIsNone(record.find_session(LOGIN, "selected"))
+        self.assertEqual(record.account_hold(LOGIN), held)
+
+    def test_selected_now_prints_peer_refusal_as_answer_without_not_reached_warning(self) -> None:
+        line = "Peer is stopping; nothing to stop"
+        output, error = io.StringIO(), io.StringIO()
+        with patch.object(settle, "inventory", return_value=machine_inventory([])), patch.object(settle, "run_remote", return_value=(1, line)) as peer, redirect_stdout(output), redirect_stderr(error):
+            self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), only=["peer-id"]), 1)
+        self.assertEqual((output.getvalue(), error.getvalue()), (line + "\n", ""))
+        peer.assert_called_once_with(["now", LOGIN, "--here", "--only", "peer-id"])
+
+
 if __name__ == "__main__":
     _ = unittest.main()
