@@ -1,0 +1,3 @@
+{"type":"assistant","timestamp":"2026-10-10T21:35:05Z","effort":"medium","requestId":"child-one","message":{"id":"message-one","model":"claude-haiku-4-5","usage":{"input_tokens":3,"cache_creation_input_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2},"cache_read_input_tokens":6,"output_tokens":1}}}
+{"type":"assistant","timestamp":"2026-10-10T21:35:06Z","requestId":"child-two","message":{"id":"message-two","model":"claude-haiku-4-5","content":[{"type":"tool_use","name":"NotebookEdit","input":{"notebook_path":"invented.ipynb"}}],"usage":{"input_tokens":4,"cache_creation_input_tokens":0,"cache_read_input_tokens":7,"output_tokens":2}}}
+{"type":"system","subtype":"compact_boundary","timestamp":"2026-10-10T21:35:07Z"}
