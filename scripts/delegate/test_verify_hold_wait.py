@@ -48,8 +48,8 @@ def grant_call(path: Path) -> None:
         "BUILD_HOLD_DIR": str(release.parent / "build-hold"),
         "BUILD_HOLD_RELEASE_DIR": str(release),
         "PLAN_DELEGATE_ACTIVE_DIR": str(release.parent / "active"),
-    }), mock.patch.object(build_hold, "socket_for", return_value="/test/socket"), \
-         mock.patch.object(build_hold, "send_release", return_value=0):
+    }), mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
+         mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
         with build_hold.release_lock():
             cycle = build_hold.read_cycle()
             assert cycle is not None
