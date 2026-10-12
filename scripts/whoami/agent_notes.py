@@ -34,6 +34,7 @@ from note_file import FIELD, Note
 from agent_accounts import ClaudeAccountSelection, ClaudeDirectorySource, EASTERN, Report, live_reports
 from quota_alert import AgentNote, alert, blocked, current_session, refresh
 from run_out import READINGS_LOG
+import usage_store
 
 RESET_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
@@ -251,6 +252,11 @@ def update_for_selection(selection: ClaudeAccountSelection) -> list[str]:
     reports = asyncio.run(live_reports(selection))
     checked_at = datetime.now(timezone.utc)
     messages: list[str] = []
+    try:
+        usage_store.save(reports, checked_at)
+    except (OSError, ValueError) as error:
+        # The saved readings must never cost the notes or the alerts.
+        messages.append(f"usage store: {error}")
     activity: AccountActivity = ObservedAccountActivity()
     if selection.multiple_accounts:
         activity = RoleAccountActivity(frozenset(
