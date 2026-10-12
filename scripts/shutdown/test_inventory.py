@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
+from test_support import ShutdownTestCase
 import inventory
 import account
 import fake_tmux
@@ -42,7 +43,7 @@ FAKE_TMUX = Path(__file__).parents[1] / "production" / "fake_tmux.py"
 
 
 @final
-class InventoryTests(unittest.TestCase):
+class InventoryTests(ShutdownTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -64,6 +65,7 @@ class InventoryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
         self.notes = self.root / "agents"
@@ -437,6 +439,9 @@ elif "comm=" in joined:
         self.assertEqual(found["label"], "claude 2")
         by_id = {session["session_id"]: session for session in found["sessions"]}
         self.assertEqual(set(by_id), {DIRECTOR_ID, UNIT_ID, SEAT_ID, DESKTOP_ID})
+        self.assertTrue(
+            all(session.get("config_dir") == str(self.target_config) for session in by_id.values())
+        )
         self.assertNotIn(OTHER_ID, by_id)
         self.assertEqual(
             found["unattributed"],
@@ -756,6 +761,63 @@ elif "comm=" in joined:
             },
         )
 
+    def test_config_dir_records_the_process_directory_for_the_same_login(self) -> None:
+        default_dir = self.home / ".claude"
+        default_dir.mkdir(exist_ok=True)
+        _ = (self.home / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": TARGET_LOGIN}}),
+            encoding="utf-8",
+        )
+
+        with patch.object(account, "process_config_dir", return_value=default_dir):
+            found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+
+        self.assertEqual(len(found["sessions"]), 1)
+        self.assertEqual(found["sessions"][0].get("config_dir"), str(default_dir))
+
+    def test_account_identity_and_config_dir_share_one_process_lookup(self) -> None:
+        """F007: capture the account and directory from the same environment read."""
+        looked_up: list[int] = []
+
+        def config_dir_for_pid(pid: int) -> Path:
+            looked_up.append(pid)
+            return self.target_config if len(looked_up) == 1 else self.other_config
+
+        with patch.object(account, "process_config_dir", side_effect=config_dir_for_pid):
+            found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+
+        self.assertEqual(len(found["sessions"]), 1)
+        self.assertEqual(found["sessions"][0].get("config_dir"), str(self.target_config))
+        self.assertEqual(looked_up, [DESKTOP_PID])
+
+    def test_unreadable_session_configuration_never_defaults_to_main(self) -> None:
+        """F007: unreadable environment or identity uses the same unattributed path."""
+        for reader in ("process_config_dir", "claude_account"):
+            with (
+                self.subTest(reader=reader),
+                patch.object(account, reader, return_value=None),
+            ):
+                found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+
+            self.assertEqual(found["sessions"], [])
+            self.assertEqual(
+                found["unattributed"],
+                [{"pid": DESKTOP_PID, "name": "notes", "reason": "account unreadable"}],
+            )
+
+    def test_parse_inventory_validates_config_dir_and_accepts_legacy_absence(self) -> None:
+        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+        session_values = cast(dict[str, object], cast(object, found["sessions"][0]))
+        session_values["config_dir"] = 123
+        with self.assertRaisesRegex(
+            inventory.InvalidInventory,
+            r"inventory\.sessions\[0\]\.config_dir must be a string",
+        ):
+            _ = inventory.parse_inventory(json.dumps(found))
+
+        del session_values["config_dir"]
+        self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
+
     def test_parse_inventory_accepts_inventory_output(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
 
@@ -837,23 +899,6 @@ elif "comm=" in joined:
             r"inventory\.sessions\[0\]\.host\.window_shell is missing",
         ):
             _ = inventory.parse_inventory(json.dumps(document))
-
-
-@final
-class DarwinProcessStartTests(unittest.TestCase):
-    def test_darwin_start_is_read_in_the_locale_and_zone_claude_records(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=(), returncode=0, stdout="Fri Oct  9 23:24:25 2026\n"
-        )
-        with (
-            patch("inventory.sys.platform", "darwin"),
-            patch("inventory.subprocess.run", return_value=completed) as run,
-        ):
-            started = inventory._process_start(4242)  # pyright: ignore[reportPrivateUsage]
-
-        self.assertEqual(started, "Fri Oct  9 23:24:25 2026")
-        environment = cast(dict[str, str], run.call_args.kwargs["env"])
-        self.assertEqual((environment["LC_ALL"], environment["TZ"]), ("C", "UTC"))
 
 
 if __name__ == "__main__":

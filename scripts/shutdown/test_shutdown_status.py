@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
+from test_support import ShutdownSendLeaf, ShutdownTestCase
 import shutdown
 import record as record_store
 from account import UnreadableAccount
@@ -89,7 +90,7 @@ def complete_record(machine: str = "natedev") -> ShutdownRecord:
 
 
 @final
-class ShutdownStatusTests(unittest.TestCase):
+class ShutdownStatusTests(ShutdownTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -98,6 +99,7 @@ class ShutdownStatusTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.notes = self.root / "agents"
         self.notes.mkdir()
@@ -164,6 +166,7 @@ else:
         return result, standard_output.getvalue(), standard_error.getvalue()
 
     def run_plain_status_with_ssh(self) -> tuple[int, str, str]:
+        self.allow_leaf(ShutdownSendLeaf.RUN_REMOTE)
         standard_output = io.StringIO()
         standard_error = io.StringIO()
         with (
@@ -556,6 +559,45 @@ else:
             output.getvalue().endswith(
                 "  run /shutdown restart again to finish\n"
             )
+        )
+
+    def test_status_and_records_list_a_parked_record_after_the_slot_record(self) -> None:
+        unfinished = complete_record()
+        unfinished["state"] = "restart partial"
+        unfinished["entries"][0]["session"]["name"] = "failed launch"
+        unfinished["entries"][0]["progress"] = record_store.SessionRestartFailed(
+            kind="restart failed",
+            at="2026-10-09T21:49:10+00:00",
+            reason="window did not open",
+        )
+        record_store.create(unfinished)
+        _ = record_store.park(LOGIN)
+        newer = complete_record()
+        newer["requested_at"] = "2026-10-10T01:02:03+00:00"
+        record_store.create(newer)
+
+        status_output = io.StringIO()
+        records_output = io.StringIO()
+        with patch.object(shutdown, "inventory", return_value=empty_inventory()):
+            with redirect_stdout(status_output):
+                self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+            with redirect_stdout(records_output):
+                self.assertEqual(shutdown.main(["records", "--here"]), 0)
+
+        self.assertTrue(
+            status_output.getvalue().endswith(
+                "natedev: shutdown settling\n"
+                + "  shutdown: waiting\n"
+                + "natedev: shutdown restart partial\n"
+                + "  failed launch: restart failed — window did not open\n"
+                + "  run /shutdown restart again to finish\n"
+            ),
+            status_output.getvalue(),
+        )
+        self.assertEqual(
+            records_output.getvalue(),
+            "natedev claude 2 settling since 2026-10-09 18:02:03 PDT\n"
+            + "natedev claude 2 restart partial since 2026-10-09 14:49:10 PDT\n",
         )
 
     def test_records_text_uses_los_angeles_time(self) -> None:

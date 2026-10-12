@@ -58,11 +58,26 @@ def _tmux_server_socket() -> TmuxServerSocket | TmuxServerUnavailable:
     return TmuxServerSocket(Path(socket_path))
 
 
+def _ancestors(pid: int) -> list[int]:
+    """The process's parent, its parent's parent, and so on, as far as /proc can be read."""
+    found: list[int] = []
+    while pid > 1:
+        try:
+            status = (PROC_DIR / str(pid) / "status").read_text(encoding="utf-8")
+        except OSError:
+            break
+        pid = next((int(line.split()[1]) for line in status.splitlines() if line.startswith("PPid:")), 0)
+        if pid <= 1 or pid in found:
+            break
+        found.append(pid)
+    return found
+
+
 def live_sessions() -> list[ClaudeSession] | TmuxServerUnavailable:
     server = _tmux_server_socket()
     if isinstance(server, TmuxServerUnavailable):
         return server
-    found: list[ClaudeSession] = []
+    found: dict[int, ClaudeSession] = {}
     for path in SESSIONS_DIR.glob("*.json"):
         try:
             pid = int(path.stem)
@@ -84,10 +99,13 @@ def live_sessions() -> list[ClaudeSession] | TmuxServerUnavailable:
             session_tmux = environ.get("TMUX")
             if (pane and session_tmux
                     and Path(session_tmux.split(",", 1)[0]) == server.path):
-                found.append(ClaudeSession(name, session_id, pane, record.get("nameSource") == "user"))
+                found[pid] = ClaudeSession(name, session_id, pane, record.get("nameSource") == "user")
         except (OSError, ValueError, TypeError):
             continue
-    return found
+    # A claude started inside another claude's pane, even through a shell, inherits its TMUX_PANE;
+    # the pane belongs to the outer one.
+    return [session for pid, session in found.items()
+            if not any(ancestor in found for ancestor in _ancestors(pid))]
 
 
 def _rename_session(pane: str, old: str, new: str, panes: dict[str, str]) -> SessionRenamed | RenameIncomplete:
@@ -183,12 +201,12 @@ def tick() -> None:
     names = set(panes.values())
     for old, hosted in by_tmux.items():
         new = hosted[0].name
+        if any(session.name == old for session in hosted):
+            continue
         if len(hosted) > 1:
             fault("more than one Claude session", old, new, settings)
             continue
         if not hosted[0].user_named:
-            continue
-        if old == new:
             continue
         if new in names:
             fault("name already taken", old, new, settings)

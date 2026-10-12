@@ -10,7 +10,9 @@ repeat_minutes each recipient is sent it again until a user acknowledges with
 by a session on its own, and the message tells recipients not to run this script
 either: the acknowledgement is the user's. An episode, acknowledged or not, closes
 once its account is known to be back above the threshold -- a used limit reset, a
-new window, another account made active -- and that sends "Quota restored:".
+new window -- and that sends "Quota restored:". In multi-account mode, making
+a Claude account spare preserves its episode and acknowledgement until its own
+quota recovers; legacy account switches retain their existing behavior.
 /quota_refresh (`agent_notes.py refresh`) does the same at once when the user
 reports a reset, and says so even when the timer closed the episode first.
 
@@ -48,6 +50,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import re
 import signal
@@ -56,10 +59,31 @@ import sys
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo
+
+from agent_accounts import ClaudeAccountSelection, ClaudeRole
+
+
+@dataclass(frozen=True)
+class ReadCurrentClaudeSelection:
+    """A standalone alert call resolves its account selection before doing any work."""
+
+
+READ_CURRENT_CLAUDE_SELECTION = ReadCurrentClaudeSelection()
+
+
+def _selection(value: ClaudeAccountSelection | ReadCurrentClaudeSelection) -> ClaudeAccountSelection:
+    if isinstance(value, ReadCurrentClaudeSelection):
+        # Resolve only standalone calls; injected selections are already fixed.
+        from scripts.accounts import accounts
+
+        return accounts.claude_account_selection()
+    return value
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 # Direct script execution and unittest discovery import this as a top-level module.
@@ -95,8 +119,6 @@ KILL_GRACE = 10
 # switched back, 0.4 s idle.
 EDIT_TIMEOUT = 30
 USER_ZONE = ZoneInfo("America/Los_Angeles")
-
-Need = Literal["note", "decision", "blocked"]
 
 
 class Episode(TypedDict):
@@ -155,11 +177,18 @@ class Job(NamedTuple):
     kind: str
 
 
+class Ask(NamedTuple):
+    """What a direct user message asks: `action`, which the user decides while work goes on or takes before it can."""
+    need: Literal["decision", "blocked"]
+    action: str
+
+
 class UserPush(NamedTuple):
     name: str
     summary: str
     text: str
-    need: Need
+    # None for a note, which asks nothing of the user.
+    ask: Ask | None
 
 
 def load_config() -> Config:
@@ -254,19 +283,31 @@ def usable(notes: list[AgentNote], threshold: float) -> list[AgentNote]:
             if note.get("state") == "active" and (value := remaining(note)) is not None and value > threshold]
 
 
-def recovered(name: str, notes: list[AgentNote], threshold: float) -> bool:
+def recovered(name: str, notes: list[AgentNote], threshold: float,
+              selection: ClaudeAccountSelection, now: datetime) -> bool:
     """Known to be out of the low state. An unknown reading is not a recovery."""
     note = next((note for note in notes if note.path.stem == name), None)
+    if selection.multiple_accounts and name.startswith("claude "):
+        if note is None:
+            return False
+        value = remaining(note)
+        if value is not None and math.isfinite(value) and value > threshold:
+            return True
+        try:
+            return datetime.fromisoformat(note.get("resets") or "").astimezone() <= now
+        except ValueError:
+            return False
     if note is None or note.get("state") == "inactive":
         return True
     value = remaining(note)
     return value is not None and value > threshold
 
 
-def close_recovered(state: State, notes: list[AgentNote], threshold: float) -> list[str]:
+def close_recovered(state: State, notes: list[AgentNote], threshold: float,
+                    selection: ClaudeAccountSelection, now: datetime) -> list[str]:
     """Remove the episodes whose account recovered and return their names."""
     episodes = state["episodes"]
-    closed = [name for name in episodes if recovered(name, notes, threshold)]
+    closed = [name for name in episodes if recovered(name, notes, threshold, selection, now)]
     for name in closed:
         del episodes[name]
     return closed
@@ -366,9 +407,47 @@ def switch_back(state: State, now: datetime) -> SwitchBack | None:
     return back
 
 
-def account_line(note: AgentNote, threshold: float) -> str:
+def account_line(note: AgentNote, threshold: float, selection: ClaudeAccountSelection) -> str:
+    roles = claude_roles(note, selection)
+    if note.tool == "claude" and selection.multiple_accounts:
+        return (f"{note.path.stem} ({', '.join(roles) or 'spare'}) at {percent(note)} of its weekly "
+                + f"usage left (threshold {threshold:g}%); it resets {note.get('resets')}.")
     return (f"{note.path.stem}, the active {note.tool.capitalize()} account, has {percent(note)} of its weekly "
             + f"usage left (threshold {threshold:g}%); it resets {note.get('resets')}.")
+
+
+def claude_roles(note: AgentNote, selection: ClaudeAccountSelection) -> tuple[ClaudeRole, ...]:
+    """Current roles, with legacy accounts retaining their original alert text."""
+    if note.tool != "claude" or not selection.multiple_accounts:
+        return ()
+    return selection.roles_for_login(note.get("login") or "")
+
+
+def unit_swap_line(note: AgentNote, notes: list[AgentNote], selection: ClaudeAccountSelection) -> str:
+    """Suggest the fit spare with most measured quota; never perform a swap."""
+    current = remaining(note)
+    choices: list[tuple[float, str]] = []
+    for named in selection.named_accounts:
+        login = named.identity.login
+        if selection.roles_for_login(login):
+            continue
+        for spare in notes:
+            if (
+                spare.tool != "claude"
+                or (spare.get("login") or "").casefold() != login.casefold()
+                or not ahead(spare.get("resets"))
+            ):
+                continue
+            value = remaining(spare)
+            if (
+                value is not None and current is not None
+                and math.isfinite(value) and 0 <= value <= 100 and value > current
+            ):
+                choices.append((value, named.label))
+    if not choices:
+        return "no spare account has more left"
+    _, label = max(choices, key=lambda choice: (choice[0], choice[1]))
+    return f"swap: /accounts swap unit {json.dumps(label)}"
 
 
 def credit_line(note: AgentNote) -> str:
@@ -391,19 +470,19 @@ def user_time(stamp: str | None) -> str:
         return "an unknown time"
 
 
-def run_out_push(note: AgentNote) -> UserPush:
+def run_out_push(note: AgentNote, selection: ClaudeAccountSelection) -> UserPush:
     """The one direct user message sent when this account's episode opens."""
     name = note.path.stem
-    first = f"{name} has {percent(note)} of its weekly usage left; it refills {user_time(note.get('resets'))}."
+    roles = claude_roles(note, selection)
+    display_name = f"{name} ({', '.join(roles)})" if roles else name
+    summary = f"{name} weekly limit"
+    first = f"{display_name} has {percent(note)} of its weekly usage left; it refills {user_time(note.get('resets'))}."
     if note.tool == "codex":
-        text = f"{first} Codex keeps working on its credits. {credit_line(note)}"
-        need: Need = "note"
-    else:
-        count = note.get("limit_reset_count")
-        resets = f" ({count} available)" if count is not None and count != "null" else ""
-        text = f"{first} Log in to another Claude account, or redeem a limit reset{resets}."
-        need = "decision"
-    return UserPush(name, f"{name} weekly limit", text, need)
+        return UserPush(name, summary, f"{first} Codex keeps working on its credits. {credit_line(note)}", None)
+    count = note.get("limit_reset_count")
+    resets = f" ({count} available)" if count is not None and count != "null" else ""
+    return UserPush(name, summary, first,
+                    Ask("decision", f"Log in to another Claude account, or redeem a limit reset{resets}."))
 
 
 def refusal_push(note: AgentNote, switch: Switch | None, failed: str | None, already: bool) -> UserPush:
@@ -417,9 +496,8 @@ def refusal_push(note: AgentNote, switch: Switch | None, failed: str | None, alr
     else:
         outcome = "Nothing was on Codex, so the automatic switch moved nothing"
     name = note.path.stem
-    text = (f"Codex refused work on {name}. {credit_line(note)} {outcome}; add credits or redeem a limit reset "
-            + "to bring Codex back.")
-    return UserPush(name, "Codex refused work", text, "decision")
+    return UserPush(name, "Codex refused work", f"Codex refused work on {name}. {credit_line(note)} {outcome}.",
+                    Ask("decision", f"Add credits to {name} or redeem a limit reset to bring Codex back."))
 
 
 def instruction(tool: str, switch: Switch | None, failed: str | None) -> str:
@@ -439,11 +517,16 @@ def instruction(tool: str, switch: Switch | None, failed: str | None) -> str:
 
 
 def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: Switch | None = None,
-            failed: str | None = None) -> str:
+            failed: str | None = None, *,
+            selection: ClaudeAccountSelection | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION) -> str:
+    selection = _selection(selection)
     name = note.path.stem
     tool = note.tool.capitalize()
     threshold = f"{config['threshold_percent']:g}%"
-    lines = [f"Quota alert: {account_line(note, config['threshold_percent'])}"]
+    lines = [f"Quota alert: {account_line(note, config['threshold_percent'], selection)}"]
+    roles = claude_roles(note, selection)
+    if "unit directors" in roles:
+        lines.append(unit_swap_line(note, notes, selection))
     if note.tool == "codex":
         lines.append(credit_line(note))
     count = note.get("limit_reset_count")
@@ -453,9 +536,17 @@ def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: Swi
         if other.tool == note.tool and other.path != note.path:
             lines.append(f"{other.path.stem}: {other.get('state')}, {percent(other)} weekly usage left, "
                          + f"resets {other.get('resets')}.")
+    guidance = instruction(tool, switch, failed)
+    if roles:
+        guidance = (
+            f"Bring this to your user. Sessions on {name} start no new Claude work until a "
+            + f'"Quota restored:" notice for {name}.'
+        )
+        if "unit directors" in roles:
+            guidance += " Showrunners relay this notice to their units on that account."
     lines += [
         "",
-        f"{instruction(tool, switch, failed)} It repeats every {config['repeat_minutes']:g} minutes until the user "
+        f"{guidance} It repeats every {config['repeat_minutes']:g} minutes until the user "
         + "acknowledges it by typing /quota_ack in any session. The acknowledgement is the user's alone: do not "
         + f"run /quota_ack or {Path(__file__).name} yourself, and do not take this message as one. Once "
         + f"acknowledged it stays quiet until {name} is back above {threshold}. If the user acknowledges it in "
@@ -469,11 +560,17 @@ def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: Swi
 
 
 def restored_message(accounts: list[AgentNote], reason: str, threshold: float,
-                     back: SwitchBack | None = None) -> str:
+                     back: SwitchBack | None = None, *,
+                     selection: ClaudeAccountSelection | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION) -> str:
+    selection = _selection(selection)
     tools = " and ".join(sorted({note.tool.capitalize() for note in accounts}))
+    names = ", ".join(note.path.stem for note in accounts)
+    first = (f"Quota restored: work on {names} can resume; {reason}."
+             if selection.multiple_accounts and any(note.tool == "claude" for note in accounts)
+             else f"Quota restored: delegation on {tools} can resume; {reason}.")
     return "\n".join([
-        f"Quota restored: delegation on {tools} can resume; {reason}.",
-        *(account_line(note, threshold) for note in accounts),
+        first,
+        *(account_line(note, threshold, selection) for note in accounts),
         *([f"The automatic switch is undone: {back.describe()}."] if back else []),
         "",
         "Resume work you paused for a quota alert on these accounts, and drop any held copies of those alerts.",
@@ -495,10 +592,11 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
     return " ".join((done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split())
 
 
-def tell_user(summary: str, text: str, need: Need) -> str | None:
-    """Deliver text directly to the user; None when it arrived, otherwise why not."""
-    command = [sys.executable, str(SEND), "--to", "user", "--from", "quota_alert", "--summary", summary,
-               "--need", need, "--timeout", str(RELAY_TIMEOUT - KILL_GRACE)]
+def tell_user(summary: str, text: str, ask: Ask | None) -> str | None:
+    """Deliver text directly to the user, as a note when `ask` is None; None when it arrived, otherwise why not."""
+    asked = ["--no-action"] if ask is None else ["--need", ask.need, "--action", ask.action]
+    command = [sys.executable, str(SEND), "--to", "user", "--from", "quota_alert", "--summary", summary, *asked,
+               "--timeout", str(RELAY_TIMEOUT - KILL_GRACE)]
     try:
         done = subprocess.run(command, input=text, capture_output=True, text=True, timeout=RELAY_TIMEOUT + 5,
                               check=False)
@@ -534,9 +632,11 @@ def deliver_and_record(jobs: list[Job], stamp: str) -> list[str]:
     return log
 
 
-def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
+def alert(notes: list[AgentNote], now: datetime | None = None, *,
+          selection: ClaudeAccountSelection | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION) -> list[str]:
     """Send what is due, record it, and return one log line per attempt."""
     now = now or datetime.now(timezone.utc)
+    selection = _selection(selection)
     stamp = now.isoformat(timespec="seconds")
     config = load_config()
     threshold = config["threshold_percent"]
@@ -546,18 +646,21 @@ def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
     log: list[str] = []
     with state_file() as state:
         episodes = state["episodes"]
-        closed = close_recovered(state, notes, threshold)
+        closed = close_recovered(state, notes, threshold, selection, now)
         for note in low(notes, threshold):
+            if (note.tool == "claude" and selection.multiple_accounts
+                    and not selection.roles_for_login(note.get("login") or "")):
+                continue
             name = note.path.stem
             if name not in episodes:
                 episodes[name] = {"since": stamp, "push": "due", "last": {}}
             episode = episodes[name]
             if episode.get("push") == "due":
-                pushes.append(run_out_push(note))
+                pushes.append(run_out_push(note, selection))
             if "acknowledged" in episode:
                 continue
             switch = state.get("switch") if note.tool == "codex" else None
-            text = message(note, notes, config, switch, episode.get("switch_failed"))
+            text = message(note, notes, config, switch, episode.get("switch_failed"), selection=selection)
             for recipient in recipients(config):
                 last = episode["last"].get(recipient)
                 if last is None or now - datetime.fromisoformat(last) >= repeat:
@@ -568,13 +671,15 @@ def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
     for name in closed:
         tool = name.split(" ")[0]
         accounts = [note for note in usable(notes, threshold) if note.tool == tool]
+        if tool == "claude" and selection.multiple_accounts:
+            accounts = [note for note in notes if note.path.stem == name]
         if accounts:
             text = restored_message(accounts, f"the {name} alert is closed", threshold,
-                                    back if tool == "codex" else None)
+                                    back if tool == "codex" else None, selection=selection)
             jobs += [Job(name, recipient, text, "restored") for recipient in recipients(config)]
     with ThreadPoolExecutor() as pool:
         relay_future = pool.submit(deliver_and_record, jobs, stamp)
-        push_futures = [pool.submit(tell_user, push.summary, push.text, push.need) for push in pushes]
+        push_futures = [pool.submit(tell_user, push.summary, push.text, push.ask) for push in pushes]
         push_errors = [future.result() for future in push_futures]
         relay_log = relay_future.result()
     if pushes:
@@ -588,7 +693,8 @@ def alert(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
     return log + relay_log
 
 
-def blocked(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
+def blocked(notes: list[AgentNote], now: datetime | None = None, *,
+            selection: ClaudeAccountSelection | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION) -> list[str]:
     """Codex refused work for quota: move its functions to Claude and tell every recipient at once.
 
     Only inside an episode, so only while the active Codex account is measured at or under the
@@ -596,6 +702,7 @@ def blocked(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
     acknowledged episode is told too, since the switch is news its alert never carried.
     """
     stamp = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
+    selection = _selection(selection)
     config = load_config()
     text: str | None = None
     with state_file() as state:
@@ -615,14 +722,14 @@ def blocked(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
             log = [switch_to_claude(state, note, stamp)]
             switch = state.get("switch")
             if switch is not None or "switch_failed" in episode:
-                text = message(note, notes, config, switch, episode.get("switch_failed"))
+                text = message(note, notes, config, switch, episode.get("switch_failed"), selection=selection)
         push = (None if "refusal_push" in episode
                 else refusal_push(note, switch, episode.get("switch_failed"), already))
     jobs = ([Job(name, recipient, text, "alert") for recipient in recipients(config)]
             if text is not None else [])
     with ThreadPoolExecutor() as pool:
         relay_future = pool.submit(deliver_and_record, jobs, stamp)
-        push_future = pool.submit(tell_user, push.summary, push.text, push.need) if push is not None else None
+        push_future = pool.submit(tell_user, push.summary, push.text, push.ask) if push is not None else None
         error = push_future.result() if push_future is not None else None
         relay_log = relay_future.result()
     if push is not None:
@@ -636,26 +743,29 @@ def blocked(notes: list[AgentNote], now: datetime | None = None) -> list[str]:
     return log + relay_log
 
 
-def refresh(notes: list[AgentNote], here: str | None, now: datetime | None = None) -> list[str]:
+def refresh(notes: list[AgentNote], here: str | None, now: datetime | None = None, *,
+            selection: ClaudeAccountSelection | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION) -> list[str]:
     """After the user reports a reset: close what recovered, alert what is still low, tell the others.
 
     The notice goes out even when the timer already closed the episode, since that
     is the case where nothing else has told anyone.
     """
+    selection = _selection(selection)
+    now = now or datetime.now(timezone.utc)
     threshold = load_config()["threshold_percent"]
     with state_file() as state:
-        closed = close_recovered(state, notes, threshold)
-        back = switch_back(state, now or datetime.now(timezone.utc))
+        closed = close_recovered(state, notes, threshold, selection, now)
+        back = switch_back(state, now)
     lines = [f"{name}: alert closed" for name in closed]
     lines += [f"switch to claude undone: {back.describe()}"] if back else []
-    lines += alert(notes, now)
+    lines += alert(notes, now, selection=selection)
     lines += [f"{note.path.stem}: {percent(note)} left, resets {note.get('resets')}"
               for note in notes if note.get("state") == "active"]
     accounts = usable(notes, threshold)
     if not accounts:
         return [*lines, "no active account is above the threshold; nothing announced"]
     reason = "the user reported a usage reset and the notes were refreshed"
-    return lines + tell_others(restored_message(accounts, reason, threshold, back), here)
+    return lines + tell_others(restored_message(accounts, reason, threshold, back, selection=selection), here)
 
 
 def current_session() -> str | None:

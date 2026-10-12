@@ -16,6 +16,8 @@ Run:
 ```
 
 Show the script's output. If it exits nonzero, show its message and stop.
+A name may be given with or without its `-unit` ending; `feature-log` and
+`feature-log-unit` both make unit `feature-log-unit`.
 An existing Units row is adopted; its Port and Owns values stand when omitted.
 Add `--check` to run preflight without launching or writing anything.
 The unit director launch takes its model and effort from `/agent production.director`.

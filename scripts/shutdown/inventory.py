@@ -12,16 +12,18 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("whoami", "message", "production"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
+import account
 import sessions
+from sessions import process_start as _process_start
 import showrunners
 import unit_lookup
-from account import Account, account_of, label_for
+from account import Account, label_for
 
 
 class PlanFromRunRecord(TypedDict):
@@ -169,6 +171,8 @@ class SessionFields(TypedDict):
     proc_start: str
     name: str
     cwd: str
+    # Records from before account-directory capture use the default directory.
+    config_dir: NotRequired[str]
     status: str
     model: LastModel
     checkout: CheckoutState
@@ -550,6 +554,10 @@ def parse_session(value: object, place: str) -> Session:
             _wire_required(data, "timers", place), f"{place}.timers"
         ),
     }
+    if "config_dir" in data:
+        parsed["config_dir"] = _wire_string(
+            data["config_dir"], f"{place}.config_dir"
+        )
     host = _parse_host(
         _wire_required(data, "host", place), f"{place}.host", kind == "unit"
     )
@@ -678,41 +686,33 @@ def _session_file(record: sessions.SessionRecord) -> SessionFile:
     return cast(SessionFile, cast(object, data))
 
 
-def _configuration_for_session(pid: int) -> Account | None:
+@dataclass(frozen=True)
+class AttributedSessionConfiguration:
+    """A session's readable account and the directory that supplied it."""
+
+    account: Account
+    config_dir: Path
+
+
+@dataclass(frozen=True)
+class UnreadableSessionConfiguration:
+    """A session whose process environment or account cannot be attributed."""
+
+
+def _configuration_for_session(
+    pid: int,
+) -> AttributedSessionConfiguration | UnreadableSessionConfiguration:
     """Keep account lookup at one boundary so an unreadable process stays unattributed."""
     try:
-        return account_of(pid)
+        config_dir = account.process_config_dir(pid)
+        if config_dir is None:
+            return UnreadableSessionConfiguration()
+        attributed = account.claude_account(config_dir)
+        if attributed is None:
+            return UnreadableSessionConfiguration()
+        return AttributedSessionConfiguration(attributed, config_dir)
     except (OSError, UnicodeError, ValueError, TypeError):
-        return None
-
-
-def _process_start(pid: int) -> str | None:
-    """The process identity stored in session records, in this platform's native units."""
-    if sys.platform == "darwin":
-        # Claude writes `procStart` from `ps` under this locale and zone; any other text never matches.
-        try:
-            result = subprocess.run(
-                ("ps", "-o", "lstart=", "-p", str(pid)),
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        started = result.stdout.strip()
-        return started if result.returncode == 0 and started else None
-    try:
-        fields = (
-            Path(f"/proc/{pid}/stat")
-            .read_text(encoding="utf-8")
-            .rpartition(")")[2]
-            .split()
-        )
-        return fields[19]
-    except (OSError, IndexError):
-        return None
+        return UnreadableSessionConfiguration()
 
 
 def _record_matches_process(record: SessionFile) -> bool:
@@ -1206,12 +1206,12 @@ def inventory(
             )
             continue
         attributed = _configuration_for_session(pid)
-        if attributed is None:
+        if isinstance(attributed, UnreadableSessionConfiguration):
             unattributed.append(
                 {"pid": pid, "name": name, "reason": "account unreadable"}
             )
             continue
-        if attributed.login.casefold() != wanted_login:
+        if attributed.account.login.casefold() != wanted_login:
             continue
 
         production = productions.get(session_id)
@@ -1233,6 +1233,7 @@ def inventory(
             "proc_start": _string(record.get("procStart")),
             "name": name,
             "cwd": cwd,
+            "config_dir": str(attributed.config_dir),
             "status": _string(record.get("status"), "unknown"),
             "model": _model(session_id),
             "checkout": _checkout(cwd),

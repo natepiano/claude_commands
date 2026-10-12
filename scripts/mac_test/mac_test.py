@@ -27,6 +27,10 @@ import sweep
 MESSAGE_TIMEOUT_S = 30.0
 
 
+class StateReadError(ValueError):
+    """A Mac coordination record cannot be read or decoded."""
+
+
 class RunRecord(TypedDict):
     """A process that currently owns Mac test capacity."""
 
@@ -236,6 +240,21 @@ Problem = NoProblem | ProblemLine
 NO_PROBLEM = NoProblem()
 
 
+class NoExpiredBlockLiftFailure:
+    """No expired block remains in place because its lift failed."""
+
+
+@dataclass(frozen=True)
+class ExpiredBlockLiftFailed:
+    """An expired block remains because its CI switch could not be restored."""
+
+    gh_error_line: str
+
+
+ExpiredBlockLiftFailure = NoExpiredBlockLiftFailure | ExpiredBlockLiftFailed
+NO_EXPIRED_BLOCK_LIFT_FAILURE = NoExpiredBlockLiftFailure()
+
+
 @dataclass(frozen=True)
 class MacTestConfig:
     """Mac block and CI settings."""
@@ -256,6 +275,7 @@ class SettleOutcome:
 
     run: RunState
     block: MacBlockState
+    expired_block_lift_failure: ExpiredBlockLiftFailure
     ci_problem: Problem
     waiting_problem: Problem
 
@@ -366,8 +386,10 @@ def read_json_object(path: Path) -> dict[str, object] | None:
         decoded = cast(object, json.loads(path.read_text(encoding="utf-8")))
     except FileNotFoundError:
         return None
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise StateReadError(f"{path}: {error}") from error
     if not isinstance(decoded, dict):
-        raise ValueError(f"{path} does not contain a JSON object")
+        raise StateReadError(f"{path} does not contain a JSON object")
     return cast(dict[str, object], decoded)
 
 
@@ -387,7 +409,8 @@ def read_run(path: Path) -> RunState:
         or not isinstance(worktree, str)
         or not isinstance(since, str)
     ):
-        raise ValueError(f"{path} has an invalid run record")
+        raise StateReadError(f"{path} has an invalid run record")
+    _ = aware_timestamp(since, path, "since")
     return {
         "pid": pid,
         "proc_start": proc_start,
@@ -399,20 +422,20 @@ def read_run(path: Path) -> RunState:
 
 def aware_timestamp(value: object, path: Path, field: str) -> datetime:
     if not isinstance(value, str):
-        raise ValueError(f"{path} has an invalid {field}")
+        raise StateReadError(f"{path} has an invalid {field}")
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError as error:
-        raise ValueError(f"{path} has an invalid {field}") from error
+        raise StateReadError(f"{path} has an invalid {field}") from error
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError(f"{path} has an invalid {field}")
+        raise StateReadError(f"{path} has an invalid {field}")
     return parsed
 
 
 def required_string(values: dict[str, object], key: str, path: Path) -> str:
     value = values.get(key)
     if not isinstance(value, str):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     return value
 
 
@@ -420,7 +443,7 @@ def decoded_delivery(session: object, holder: str, path: Path) -> MessageDeliver
     if session is None:
         return HolderQueue(holder)
     if not isinstance(session, str):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     return RecordedSession(session, holder)
 
 
@@ -428,7 +451,7 @@ def decoded_showrunner(showrunner: object, path: Path) -> Showrunner:
     if showrunner is None:
         return NO_SHOWRUNNER
     if not isinstance(showrunner, str):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     return NamedShowrunner(showrunner)
 
 
@@ -440,13 +463,13 @@ def decoded_ci(value: object, path: Path) -> CiSwitch:
         "still_on",
         "off_unconfirmed",
     ):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     return value
 
 
 def decode_waiting(value: object, path: Path) -> WaitingOn:
     if not isinstance(value, dict):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     item = cast(dict[str, object], value)
     kind = item.get("kind")
     if kind == "local_run" and set(item) == {"kind", "what"}:
@@ -457,12 +480,12 @@ def decode_waiting(value: object, path: Path) -> WaitingOn:
         return WAITING_ON_CI_JOB
     if kind == "ci_unknown" and set(item) == {"kind"}:
         return WAITING_ON_UNKNOWN_CI
-    raise ValueError(f"{path} has an invalid block record")
+    raise StateReadError(f"{path} has an invalid block record")
 
 
 def decode_free_message(value: object, path: Path) -> FreeMessage:
     if not isinstance(value, dict):
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     item = cast(dict[str, object], value)
     kind = item.get("kind")
     if kind == "not_needed" and set(item) == {"kind"}:
@@ -473,13 +496,13 @@ def decode_free_message(value: object, path: Path) -> FreeMessage:
         what = item.get("what")
         if isinstance(what, str):
             return FreeMessageOwed(what, aware_timestamp(item.get("ended"), path, "ended"))
-    raise ValueError(f"{path} has an invalid block record")
+    raise StateReadError(f"{path} has an invalid block record")
 
 
 def decode_legacy_block(values: dict[str, object], path: Path) -> MacBlockState:
     required = {"holder", "session", "for", "since", "state"}
     if set(values) != required:
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     holder = required_string(values, "holder", path)
     reason = required_string(values, "for", path)
     since = aware_timestamp(values.get("since"), path, "since")
@@ -495,7 +518,7 @@ def decode_legacy_block(values: dict[str, object], path: Path) -> MacBlockState:
             holder, reason, since, since + timedelta(hours=48), delivery,
             NO_SHOWRUNNER, "still_on", FREE_MESSAGE_NOT_NEEDED,
         )
-    raise ValueError(f"{path} has an invalid block record")
+    raise StateReadError(f"{path} has an invalid block record")
 
 
 def read_block(path: Path) -> MacBlockState:
@@ -511,7 +534,7 @@ def read_block(path: Path) -> MacBlockState:
     }
     expected_keys = common_keys | ({"waiting_on"} if state == "pending" else {"free_message"})
     if values.get("version") != 2 or set(values) != expected_keys:
-        raise ValueError(f"{path} has an invalid block record")
+        raise StateReadError(f"{path} has an invalid block record")
     holder = required_string(values, "holder", path)
     reason = required_string(values, "for", path)
     since = aware_timestamp(values.get("since"), path, "since")
@@ -529,7 +552,12 @@ def read_block(path: Path) -> MacBlockState:
             holder, reason, since, expires, delivery, showrunner, ci,
             decode_free_message(values.get("free_message"), path),
         )
-    raise ValueError(f"{path} has an invalid block record")
+    raise StateReadError(f"{path} has an invalid block record")
+
+
+def read_claim_block(paths: StatePaths) -> MacBlockState:
+    """Read the block that refuses new claims until its record is removed."""
+    return read_block(paths.block)
 
 
 def timestamp(value: datetime) -> str:
@@ -1045,7 +1073,11 @@ def expire_block(
                 text,
             )
             return SettleOutcome(
-                run, block, ProblemLine(restored.line), NO_PROBLEM
+                run,
+                block,
+                ExpiredBlockLiftFailed(restored.line),
+                NO_PROBLEM,
+                NO_PROBLEM,
             )
     with locked(paths.lock):
         paths.block.unlink(missing_ok=True)
@@ -1061,7 +1093,13 @@ def expire_block(
         1440,
         expiry_text(block, skipped),
     )
-    return SettleOutcome(run, NO_MAC_BLOCK, NO_PROBLEM, NO_PROBLEM)
+    return SettleOutcome(
+        run,
+        NO_MAC_BLOCK,
+        NO_EXPIRED_BLOCK_LIFT_FAILURE,
+        NO_PROBLEM,
+        NO_PROBLEM,
+    )
 
 
 def warning_text(block: PendingMacBlock | ActiveMacBlock) -> str:
@@ -1185,7 +1223,13 @@ def full_settle(
         run = live_run(paths)
         block = read_block(paths.block)
     if isinstance(block, NoMacBlock):
-        return SettleOutcome(run, block, NO_PROBLEM, NO_PROBLEM)
+        return SettleOutcome(
+            run,
+            block,
+            NO_EXPIRED_BLOCK_LIFT_FAILURE,
+            NO_PROBLEM,
+            NO_PROBLEM,
+        )
     now = utc_now()
     if now >= block.expires:
         outcome = expire_block(paths, config, run, block)
@@ -1269,7 +1313,13 @@ def full_settle(
         )
     if not watcher_holds_lock:
         start_watcher(paths)
-    return SettleOutcome(run, block, ci_problem, waiting_problem)
+    return SettleOutcome(
+        run,
+        block,
+        NO_EXPIRED_BLOCK_LIFT_FAILURE,
+        ci_problem,
+        waiting_problem,
+    )
 
 
 def block_duration(raw: str, config: MacTestConfig) -> BlockDuration:
@@ -1308,12 +1358,12 @@ def command_claim(args: CliArguments, paths: StatePaths) -> int:
         with locked(paths.lock):
             try:
                 run = live_run(paths)
-            except (OSError, ValueError):
+            except (OSError, StateReadError):
                 print(f"state unreadable: {paths.run}")
                 return 12
             try:
-                block = read_block(paths.block)
-            except (OSError, ValueError):
+                block = read_claim_block(paths)
+            except (OSError, StateReadError):
                 print(f"state unreadable: {paths.block}")
                 return 12
             if not isinstance(block, NoMacBlock):
@@ -1486,10 +1536,15 @@ def command_block(
             return 0
         print(block_state_line(outcome.block, outcome.waiting_problem))
         if ci_may_still_be_on(outcome.block.ci):
+            lift_failure = outcome.expired_block_lift_failure
             line = (
-                outcome.ci_problem.line
-                if isinstance(outcome.ci_problem, ProblemLine)
-                else "unknown error"
+                lift_failure.gh_error_line
+                if isinstance(lift_failure, ExpiredBlockLiftFailed)
+                else (
+                    outcome.ci_problem.line
+                    if isinstance(outcome.ci_problem, ProblemLine)
+                    else "unknown error"
+                )
             )
             print(
                 f"CI can still use the Mac: {line}. Run github-warmup, then block again."
@@ -1584,6 +1639,12 @@ def print_switch_without_block(config: MacTestConfig) -> None:
 def command_status(paths: StatePaths, config: MacTestConfig) -> int:
     with locked(paths.control_lock):
         outcome = full_settle(paths, config)
+        lift_failure = outcome.expired_block_lift_failure
+        switch_problem = (
+            ProblemLine(lift_failure.gh_error_line)
+            if isinstance(lift_failure, ExpiredBlockLiftFailed)
+            else outcome.ci_problem
+        )
         if isinstance(outcome.run, NoRun):
             print("free")
         else:
@@ -1601,7 +1662,7 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
                 + f"({pending_wait_text(block.waiting_on)}), "
                 + f"lifts {block_time(block.expires)}: {block.reason}"
             )
-            print_switch_with_block(block, outcome.ci_problem)
+            print_switch_with_block(block, switch_problem)
         else:
             print(
                 f"blocked by {block.holder} since {block_time(block.since)}, "
@@ -1611,7 +1672,13 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
                 print(
                     f'The "Mac is free" message has not reached {block.holder} yet.'
                 )
-            print_switch_with_block(block, outcome.ci_problem)
+            print_switch_with_block(block, switch_problem)
+        if isinstance(lift_failure, ExpiredBlockLiftFailed):
+            print(
+                "The block is past its time limit but could not lift: CI's Mac "
+                + "switch could not be turned back on "
+                + f"({lift_failure.gh_error_line}). Run github-warmup, then unblock."
+            )
     return 0
 
 

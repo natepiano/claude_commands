@@ -34,6 +34,7 @@ NEXTEST = ["cargo", "nextest", "run", "--workspace", "--retries", "2"]
 AMBIENT = (
     "BUILDLOG_CALLER",
     "BUILDLOG_CALL_ID",
+    "BUILDLOG_LOCAL_REASON",
     "LINT_OUTPUT_DIR",
     "VALIDATE_TARGET_DIR",
     "CLAUDECODE",
@@ -88,6 +89,14 @@ class RecordTests(unittest.TestCase):
             if name not in AMBIENT and not name.startswith("PLAN_DELEGATE_")
         }
         environment["BUILDLOG_DIR"] = str(self.root)
+        environment["BUILD_HOLD_DIR"] = str(self.base / "holders")
+        environment["BUILD_HOLD_RELEASE_DIR"] = str(self.base / "release")
+        environment["PLAN_DELEGATE_ACTIVE_DIR"] = str(self.base / "active")
+        environment["BUILDLOG_CALL_ID"] = environment["BUILDLOG_CALLER"] = ""
+        environment["BUILDLOG_HOLD_WAIT_FILE"] = environment["BUILDLOG_HOLD_ADMISSION_FILE"] = ""
+        environment["BUILDLOG_HOLD_STARTED_FILE"] = environment["BUILDLOG_HOLD_WAITER_FILE"] = ""
+        environment["BUILDLOG_HOLD_REGISTRATION_FILE"] = str(self.base / "registration")
+        environment["MAC_TEST_STATE_DIR"] = str(self.base / "mac-state")
         # No signing, hooks or identity from the user's own git config.
         environment["GIT_CONFIG_GLOBAL"] = os.devnull
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
@@ -598,13 +607,15 @@ class RecordTests(unittest.TestCase):
                 self.assertEqual(len(records), before + 1)
                 self.assertEqual(records[-1]["token_wait_s"], 0)
 
-    def test_call_records_mac_result(self) -> None:
+    def test_call_records_mac_result_and_local_reason(self) -> None:
+        local_reason = 'needs Linux path handling with a "quoted" mount'
         result = self.record(
             "call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana",
             extra={
                 "BUILDLOG_MAC": "passed",
                 "BUILDLOG_MAC_REASON": "",
                 "BUILDLOG_MAC_S": "12.5",
+                "BUILDLOG_LOCAL_REASON": local_reason,
             },
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -612,6 +623,14 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(call_record["mac"], "passed")
         self.assertEqual(call_record["mac_reason"], "")
         self.assertEqual(call_record["mac_s"], 12.5)
+        self.assertEqual(call_record["local_reason"], local_reason)
+
+    def test_call_local_reason_defaults_to_empty(self) -> None:
+        result = self.record(
+            "call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records()[-1]["local_reason"], "")
 
     def test_call_records_null_mac_seconds_when_value_is_unusable(self) -> None:
         for value in ("", "abc", "-1"):

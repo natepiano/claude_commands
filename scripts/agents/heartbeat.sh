@@ -8,7 +8,7 @@
 #              e.g. "running clippy for verification"
 #
 # Header usage: heartbeat.sh <file> header <role> <description>
-#   <role>         short role tag, e.g. "implementation (codex/gpt-5.6-sol:xhigh)"
+#   <role>         short role tag, e.g. "implementation (codex/gpt-6.1-sol:xhigh)"
 #   <description>  1-2 lines describing this run's responsibility (may contain \n)
 #
 # Beat line format:   <ISO-8601 local time+offset> [<source>] <message>

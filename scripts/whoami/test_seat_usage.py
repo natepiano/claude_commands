@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,8 @@ from io import StringIO
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import seat_usage
 
@@ -44,7 +47,27 @@ def edit(at: str) -> str:
 def inspection(at: str) -> str:
     return record("response_item", at, {
         "type": "custom_tool_call",
-        "input": '{"command":"rg -n apply_patch scripts"}',
+        "name": "exec",
+        "input": 'const r = await tools.exec_command({cmd: "rg -F \'tools.apply_patch(\' scripts"});',
+    })
+
+
+def exec_edit(at: str) -> str:
+    return record("response_item", at, {
+        "type": "custom_tool_call",
+        "name": "exec",
+        "input": (
+            'const patch = "*** Begin Patch\\n*** Update File: sample.py"; '
+            "const result = await tools.apply_patch(patch); text(result);"
+        ),
+    })
+
+
+def template_expression_edit(at: str) -> str:
+    return record("response_item", at, {
+        "type": "custom_tool_call",
+        "name": "exec",
+        "input": "const result = `${await tools.apply_patch(patch)}`;",
     })
 
 
@@ -128,17 +151,38 @@ class SeatUsageTests(unittest.TestCase):
         self.assertEqual(report.compactions_per_thread, seat_usage.KnownRate(0.5))
         self.assertEqual(report.usage_per_phase, seat_usage.KnownRate(105.0))
 
-    def test_text_mentioning_apply_patch_does_not_mark_the_first_edit(self) -> None:
+    def test_quoted_apply_patch_call_mention_is_not_an_edit(self) -> None:
         thread = seat_usage.parse_rollout((
             session("2026-01-01T00:00:00Z"),
             inspection("2026-01-01T00:01:00Z"),
             tokens("2026-01-01T00:02:00Z", 20, 0, 0),
-            edit("2026-01-01T00:03:00Z"),
+        ))
+        self.assertFalse(thread.ever_edited)
+        self.assertEqual([sample.before_first_edit for sample in thread.usage], [True])
+        self.assertEqual(thread.edits, ())
+
+    def test_real_exec_apply_patch_call_marks_the_edit(self) -> None:
+        thread = seat_usage.parse_rollout((
+            session("2026-01-01T00:00:00Z"),
+            inspection("2026-01-01T00:01:00Z"),
+            tokens("2026-01-01T00:02:00Z", 20, 0, 0),
+            exec_edit("2026-01-01T00:03:00Z"),
             tokens("2026-01-01T00:04:00Z", 10, 0, 0),
         ))
         self.assertTrue(thread.ever_edited)
         self.assertEqual([sample.before_first_edit for sample in thread.usage], [True, False])
         self.assertEqual(thread.edits, (datetime(2026, 1, 1, 0, 3, tzinfo=timezone.utc),))
+
+    def test_apply_patch_inside_template_expression_marks_the_edit(self) -> None:
+        thread = seat_usage.parse_rollout((
+            session("2026-01-01T00:00:00Z"),
+            template_expression_edit("2026-01-01T00:01:00Z"),
+        ))
+        self.assertTrue(thread.ever_edited)
+        self.assertEqual(
+            thread.edits,
+            (datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc),),
+        )
 
     def test_remote_stream_is_split_at_each_session_metadata_record(self) -> None:
         lines = [
@@ -160,7 +204,7 @@ class SeatUsageTests(unittest.TestCase):
             tokens("2026-01-02T01:00:00Z", 40, 20, 2),
         )) + "\n"
         fake = cast(subprocess.Popen[str], cast(object, FakeRemoteProcess(output, 0)))
-        with patch("seat_usage.subprocess.Popen", return_value=fake) as launch:
+        with patch.object(subprocess, "Popen", return_value=fake) as launch:
             result = seat_usage.mac_rollouts(datetime(2026, 1, 1, tzinfo=timezone.utc))
         self.assertIsInstance(result, seat_usage.MacIncluded)
         assert isinstance(result, seat_usage.MacIncluded)
@@ -169,7 +213,7 @@ class SeatUsageTests(unittest.TestCase):
 
     def test_mac_rollouts_reports_failed_fake_ssh_without_real_network(self) -> None:
         fake = cast(subprocess.Popen[str], cast(object, FakeRemoteProcess("", 255)))
-        with patch("seat_usage.subprocess.Popen", return_value=fake):
+        with patch.object(subprocess, "Popen", return_value=fake):
             result = seat_usage.mac_rollouts(datetime(2026, 1, 1, tzinfo=timezone.utc))
         self.assertEqual(result, seat_usage.MacUnreachable("ssh exit 255"))
 

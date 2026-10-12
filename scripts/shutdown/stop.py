@@ -30,6 +30,7 @@ from record import (
     ShutdownScope,
     ShutdownSessionEntry,
     StopTiming,
+    continuation,
     find_live,
     parse_records,
     stop_lock,
@@ -568,6 +569,40 @@ def _owner_identity_lost_issues(
     return issues
 
 
+def _retry_owner_cleanup(
+    login: str,
+    entry: ShutdownSessionEntry,
+    *,
+    is_alive: LivenessCheck,
+    codex_mesh: CommandRunner,
+    tmux: CommandRunner,
+    clock: Clock,
+) -> None:
+    """Retry only unconfirmed resources of an owner already safely stopped."""
+    pending = [
+        issue for issue in entry["stop_issues"]
+        if (
+            issue["kind"] == "codex server left running"
+            or issue["kind"] == "unit tmux session left running"
+        ) and issue["cause"] == "stop not confirmed"
+    ]
+    if not pending:
+        return
+    issues = [issue for issue in entry["stop_issues"] if issue not in pending]
+    session = entry["session"].copy()
+    session["run_dirs"] = [
+        issue["run_dir"] for issue in pending
+        if issue["kind"] == "codex server left running"
+    ]
+    session["codex_servers"] = []
+    issues.extend(_stop_codex_servers(
+        session, codex_mesh=codex_mesh, is_alive=is_alive, clock=clock
+    ))
+    if any(issue["kind"] == "unit tmux session left running" for issue in pending):
+        issues.extend(_stop_unit_tmux(session, tmux, clock))
+    _ = _replace_stop_issues(login, session["session_id"], issues)
+
+
 def _ready_to_stop(entry: ShutdownSessionEntry, current: Session) -> bool:
     expected = "passive seat ready" if current["kind"] == "seat" else "ready"
     return entry["progress"]["kind"] == expected and current["status"] == "idle"
@@ -937,6 +972,15 @@ def stop(
                 raise NoLiveRecord(f"no live shutdown for {login}")
             entry = _record_entry(current["record"], session_id)
             progress = entry["progress"]
+            if (
+                continuation(current["record"]) == "restart"
+                and progress["kind"] in {"stopped", "already gone"}
+                and entry["session"]["kind"] != "seat"
+            ):
+                _retry_owner_cleanup(
+                    login, entry, is_alive=is_alive, codex_mesh=codex_mesh,
+                    tmux=tmux, clock=clock,
+                )
             if progress["kind"] in {
                 "stopped",
                 "already gone",

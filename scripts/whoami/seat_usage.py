@@ -348,6 +348,59 @@ def token_usage(record: RolloutRecordJson) -> TokenUsage | None:
     return TokenUsage(input_tokens - cached_tokens, cached_tokens, output_tokens)
 
 
+def javascript_without_string_literals(source: str) -> str:
+    visible: list[str] = []
+    string_delimiter = ""
+    inside_template_text = False
+    template_expression_depths: list[int] = []
+    escaped = False
+    position = 0
+    while position < len(source):
+        character = source[position]
+        if string_delimiter:
+            visible.append(" ")
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == string_delimiter:
+                string_delimiter = ""
+        elif inside_template_text:
+            visible.append(" ")
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == "`":
+                inside_template_text = False
+            elif character == "$" and source[position:position + 2] == "${":
+                visible.append(" ")
+                template_expression_depths.append(0)
+                inside_template_text = False
+                position += 1
+        elif character in ("'", '"'):
+            string_delimiter = character
+            visible.append(" ")
+        elif character == "`":
+            inside_template_text = True
+            visible.append(" ")
+        elif character == "{" and template_expression_depths:
+            template_expression_depths[-1] += 1
+            visible.append(character)
+        elif character == "}" and template_expression_depths:
+            if template_expression_depths[-1] == 0:
+                _ = template_expression_depths.pop()
+                inside_template_text = True
+                visible.append(" ")
+            else:
+                template_expression_depths[-1] -= 1
+                visible.append(character)
+        else:
+            visible.append(character)
+        position += 1
+    return "".join(visible)
+
+
 def is_edit(record: RolloutRecordJson) -> bool:
     payload = payload_of(record)
     if record.get("type") != "response_item" or payload.get("type") != "custom_tool_call":
@@ -366,7 +419,10 @@ def is_edit(record: RolloutRecordJson) -> bool:
         if any(fields.get(key) == "apply_patch" for key in ("command", "name", "tool")):
             return True
     stripped = tool_input.lstrip()
-    return stripped.startswith("apply_patch ") or re.search(r"\b(?:tools\.)?apply_patch\s*\(", tool_input) is not None
+    executable_source = javascript_without_string_literals(tool_input)
+    return stripped.startswith("apply_patch ") or re.search(
+        r"\b(?:tools\.)?apply_patch\s*\(", executable_source,
+    ) is not None
 
 
 def is_compaction(record: RolloutRecordJson) -> bool:

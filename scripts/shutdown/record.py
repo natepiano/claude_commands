@@ -12,7 +12,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 from inventory import Session, parse_session
 from launch_permission import launch_barrier, shutdown_state_root
@@ -276,6 +276,9 @@ ShutdownState = Literal[
 ]
 
 
+ShutdownContinuation = Literal["stop", "restart"]
+
+
 class ShutdownRecord(TypedDict):
     login: str
     label: str
@@ -286,8 +289,14 @@ class ShutdownRecord(TypedDict):
     scope: ShutdownScope
     conductor: Conductor
     force: StopTiming
+    then: NotRequired[ShutdownContinuation]
     entries: list[ShutdownSessionEntry]
     stop_issues: list[OrchestrationStopIssue]
+
+
+def continuation(record: ShutdownRecord) -> ShutdownContinuation:
+    """Legacy records stop; an explicit restart survives conductor launches."""
+    return record.get("then", "stop")
 
 
 class LiveShutdownRecord(TypedDict):
@@ -608,6 +617,8 @@ def _orchestration_stop_issue(
 
 def _entry(value: object, place: str) -> ShutdownSessionEntry:
     values = _mapping(value, place)
+    # Earlier records duplicated this session field on the entry.
+    _ = values.pop("config_dir", None)
     try:
         values["session"] = parse_session(
             _required(values, "session", place), f"{place}.session"
@@ -661,6 +672,10 @@ def _record(value: object, place: str) -> ShutdownRecord:
     force = _string(_required(values, "force", place), f"{place}.force")
     if force not in {"wait for ready", "now"}:
         raise InvalidRecord(f"{place}.force is invalid")
+    if "then" in values:
+        next_action = _string(values["then"], f"{place}.then")
+        if next_action not in {"stop", "restart"}:
+            raise InvalidRecord(f"{place}.then is invalid")
     entry_values = _items(_required(values, "entries", place), f"{place}.entries")
     values["entries"] = [
         _entry(entry, f"{place}.entries[{index}]")
@@ -740,16 +755,21 @@ def _write_record(path: Path, record: ShutdownRecord) -> None:
         raise
 
 
-def find_live(login: str) -> LiveShutdownRecord | NoShutdown:
-    """Return the live shutdown for an account, if one exists."""
+def _existing_account_directory(login: str) -> Path | None:
     directory = _account_directory(login)
     directory_status = _lstat(directory)
     if directory_status is None:
-        return NoShutdown(kind="no shutdown")
+        return None
     if not stat.S_ISDIR(directory_status.st_mode):
         raise InvalidRecord(
             f"{directory} must be a directory; found {_entry_kind(directory_status.st_mode)}"
         )
+    return directory
+
+
+@contextmanager
+def _reading_lock(login: str, directory: Path) -> Generator[None, None, None]:
+    """Hold the account lock for a read; a lock that cannot be taken is an unreadable record."""
     account_lock = _account_lock(login, create_directory=False)
     try:
         _ = account_lock.__enter__()
@@ -759,21 +779,82 @@ def find_live(login: str) -> LiveShutdownRecord | NoShutdown:
             f"{lock_path} cannot be opened or locked: {error}"
         ) from error
     try:
-        path = directory / "record.json"
-        record_status = _lstat(path)
-        if record_status is None:
-            return NoShutdown(kind="no shutdown")
-        if not stat.S_ISREG(record_status.st_mode):
-            raise InvalidRecord(
-                f"{path} must be a regular file; found {_entry_kind(record_status.st_mode)}"
-            )
-        return LiveShutdownRecord(kind="live", record=_read_record(path))
+        yield
     finally:
         _ = account_lock.__exit__(None, None, None)
 
 
+def _slot_record(directory: Path) -> ShutdownRecord | None:
+    path = directory / "record.json"
+    record_status = _lstat(path)
+    if record_status is None:
+        return None
+    if not stat.S_ISREG(record_status.st_mode):
+        raise InvalidRecord(
+            f"{path} must be a regular file; found {_entry_kind(record_status.st_mode)}"
+        )
+    return _read_record(path)
+
+
+def _parked_records(directory: Path) -> list[ShutdownRecord]:
+    parked_directory = directory / "partial"
+    parked_status = _lstat(parked_directory)
+    if parked_status is None:
+        return []
+    if not stat.S_ISDIR(parked_status.st_mode):
+        raise InvalidRecord(
+            f"{parked_directory} must be a directory; found {_entry_kind(parked_status.st_mode)}"
+        )
+    records: list[ShutdownRecord] = []
+    for path in parked_directory.glob("*.json"):
+        path_status = _lstat(path)
+        if path_status is None:
+            continue
+        if not stat.S_ISREG(path_status.st_mode):
+            raise InvalidRecord(
+                f"{path} must be a regular file; found {_entry_kind(path_status.st_mode)}"
+            )
+        records.append(_read_record(path))
+    return sorted(records, key=lambda record: record["requested_at"])
+
+
+def find_live(login: str) -> LiveShutdownRecord | NoShutdown:
+    """Return the account's slot record, if one exists; parked records are not in the slot."""
+    directory = _existing_account_directory(login)
+    if directory is None:
+        return NoShutdown(kind="no shutdown")
+    with _reading_lock(login, directory):
+        found = _slot_record(directory)
+    if found is None:
+        return NoShutdown(kind="no shutdown")
+    return LiveShutdownRecord(kind="live", record=found)
+
+
+def _slot_and_parked(directory: Path) -> list[ShutdownRecord]:
+    slot = _slot_record(directory)
+    return [*([] if slot is None else [slot]), *_parked_records(directory)]
+
+
+def parked(login: str) -> list[ShutdownRecord]:
+    """Return the account's parked `restart partial` records, oldest first."""
+    directory = _existing_account_directory(login)
+    if directory is None:
+        return []
+    with _reading_lock(login, directory):
+        return _parked_records(directory)
+
+
+def account_records(login: str) -> list[ShutdownRecord]:
+    """Return the account's slot record, then its parked records oldest first."""
+    directory = _existing_account_directory(login)
+    if directory is None:
+        return []
+    with _reading_lock(login, directory):
+        return _slot_and_parked(directory)
+
+
 def create(record: ShutdownRecord) -> None:
-    """Create the account's only live record."""
+    """Create the account's slot record; parked records never block it."""
     checked = _record(record, "record")
     with launch_barrier():
         with _account_lock(checked["login"], create_directory=True) as directory:
@@ -823,17 +904,61 @@ def archive(login: str) -> None:
         os.replace(path, history / f"{record['requested_at']}.json")
 
 
+def park(login: str) -> ShutdownRecord:
+    """Move a `restart partial` slot record to `partial/<requested_at>.json`, freeing the slot."""
+    directory = _account_directory(login)
+    if not directory.is_dir():
+        raise NoLiveRecord(f"no live shutdown for {login}")
+    with _account_lock(login, create_directory=False):
+        found = _slot_record(directory)
+        if found is None:
+            raise NoLiveRecord(f"no live shutdown for {login}")
+        if found["state"] != "restart partial":
+            raise ValueError(
+                f"only a restart partial record can be parked; this one is {found['state']}"
+            )
+        parked_directory = directory / "partial"
+        parked_directory.mkdir(exist_ok=True)
+        target = parked_directory / f"{found['requested_at']}.json"
+        if _lstat(target) is not None:
+            raise ValueError(f"{target} is already parked")
+        os.replace(directory / "record.json", target)
+        return found
+
+
+def unpark(login: str, requested_at: str) -> None:
+    """Return one parked record to the empty slot."""
+    _ = _utc_time(requested_at, "requested_at")
+    directory = _account_directory(login)
+    if not directory.is_dir():
+        raise NoLiveRecord(f"no parked shutdown for {login}")
+    with _account_lock(login, create_directory=False):
+        occupant = _slot_record(directory)
+        if occupant is not None:
+            raise ShutdownInProgress(occupant)
+        source = directory / "partial" / f"{requested_at}.json"
+        source_status = _lstat(source)
+        if source_status is None:
+            raise NoLiveRecord(f"no parked shutdown of {login} from {requested_at}")
+        if not stat.S_ISREG(source_status.st_mode):
+            raise InvalidRecord(
+                f"{source} must be a regular file; found {_entry_kind(source_status.st_mode)}"
+            )
+        os.replace(source, directory / "record.json")
+
+
 def live_records() -> list[ShutdownRecord]:
-    """Return all live records on this machine, ordered by account login."""
+    """Return every account's records on this machine in login order.
+
+    Each account lists its slot record, then its parked ones oldest first.
+    """
     root = _state_root()
     if not root.is_dir():
         return []
     records: list[ShutdownRecord] = []
-    for directory in root.iterdir():
+    for directory in sorted(root.iterdir()):
         if not directory.is_dir():
             continue
-        path = directory / "record.json"
         with _account_lock(directory.name, create_directory=False):
-            if path.exists():
-                records.append(_read_record(path))
-    return sorted(records, key=lambda record: record["login"])
+            records.extend(_slot_and_parked(directory))
+    return records

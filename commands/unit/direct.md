@@ -37,6 +37,8 @@ State:
 - `REVIEW_PASS`: review dispatch count for the current phase; starts at 0.
 - `REVIEW_DISPATCH_HANDLE`: handle of an early-launched blind reviewer running
   alongside `DISPATCH_HANDLE`; empty when review runs synchronously.
+- `EARLY_REVIEW_SLOT`: slot running that early review; resets to empty with
+  each implementation or fix dispatch.
 - `EARLY_REVIEW`: `none` or `launched`; resets with every implementation or fix
   dispatch. Owned by <EarlyReviewArm/>.
 - `APPLICATION_SMOKE_RESULT`: starts as `not_run`.
@@ -89,15 +91,16 @@ A call site's arguments are what that file calls `$ARGUMENTS`.
 </TagReferenceContract>
 
 <LongLivedSeats>
-Codex implementation seats are run-scoped. Open `impl` and `test` once, then
-send each later phase, repair, and follow-up to an open seat with
-`implement.sh --to <full-seat-name>`. Keep a seat in the same role when the
-next assignment fits; otherwise move it under <RoleReassignment/>. A finished
-turn leaves its thread open.
+Codex seats are run-scoped in every role. Open `impl` and `test` once, then send
+later implementation, repair, and follow-up work with `implement.sh --to
+<full-seat-name>` and reviews with `review.sh --to <full-seat-name>`. Keep a
+seat in the same role when the next assignment fits; otherwise move it, even
+mid-phase, under <RoleReassignment/>. A finished turn leaves its thread open.
 
 Compaction can erase earlier prompt text. Every opening, later-phase, repair,
-and follow-up prompt repeats the Three Gods sentence and carries the Type Design
-Contract verbatim or by its allowed pointer under <WritePromptContract/>.
+review, and follow-up prompt repeats the Three Gods sentence and carries the
+Type Design Contract verbatim or by its allowed pointer under
+<WritePromptContract/>.
 
 Before follow-up work, the launcher attempts to compact a seat whose recorded
 context is over `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (default `100000` in
@@ -107,10 +110,15 @@ tokens, not correctness, because the seat compacts itself when its context
 fills. The launcher then sends `Continue where you stopped.` and posts one board
 line per overflow.
 
-Open a new implementation seat only when the Work Order needs more slots than
-are open or a seat has no reusable thread. A replacement under the same seat
-name starts fresh and receives an opening prompt. Reviews still open their own
-threads. Phase cleanup leaves Codex seats open; `end_session.sh` ends them.
+Open a new seat only when no open seat can take the work: the assignment needs
+more seats, every open seat is busy, or a reusable thread is gone. Name an extra
+slot for its role (`review`, `fix2`), never with a bare number, and keep it for
+reuse; an idle seat costs no context. A replacement under the same seat name
+starts fresh and receives an opening prompt. `review.sh --slot <role-name>`
+opens a new role-named seat; a call with neither `--to` nor `--slot` is only for
+a review outside a run.
+Phase cleanup leaves Codex seats open;
+`end_session.sh` ends them.
 </LongLivedSeats>
 
 <CoreContract>
@@ -375,16 +383,16 @@ not authorization; restate the pending question afterwards.
 
 <TypeDesignContract>
 Read `~/.claude/docs/type_design.md`. Apply it in the main review and put it
-under `## Type Design Contract` in every broad-review, implementation, and fix
-prompt. Copy it verbatim into broad-review and opening prompts; a follow-up may
-instead point to that file per <WritePromptContract/>. Closure reviews omit it
-to remain scoped to the repair.
+under `## Type Design Contract` in every review, implementation, and fix
+prompt. Copy it verbatim into opening prompts; any follow-up may instead point
+to that file per <WritePromptContract/>.
 </TypeDesignContract>
 
 <WritePromptContract>
 Read `~/.claude/docs/delegate/write_prompt_contract.md` in full before writing any
-implementation or fix prompt. It also defines <PhaseTeam/>, <CoordinationBoard/>,
-<PhaseMesh/>, <BuildTokenContract/>, <TeamFilePartition/>, and <RoleReassignment/>.
+implementation, fix, or review prompt. It also defines <PhaseTeam/>,
+<CoordinationBoard/>, <PhaseMesh/>, <BuildTokenContract/>,
+<TeamFilePartition/>, and <RoleReassignment/>.
 </WritePromptContract>
 
 <VerificationContract>
@@ -397,7 +405,7 @@ Rust delegates run only exact prompt lines using
 | package tests | `bash ~/.claude/scripts/delegate/verify.sh test <package>` |
 | one integration target alone | `bash ~/.claude/scripts/delegate/verify.sh test <package> <test>` |
 | only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/delegate/verify.sh test <package> --filter <name> [--filter <name> …]` |
-| a Mac failure that looks unrelated to the change, run on natedev | `bash ~/.claude/scripts/delegate/verify.sh test <package> --local` |
+| a test that must run on Linux, run on natedev | `bash ~/.claude/scripts/delegate/verify.sh test <package> --local "<why it must run on Linux>"` |
 | mend fix, format, scoped clippy, rustdoc | `bash ~/.claude/scripts/delegate/verify.sh lint <package>` |
 | checkpoint format | `bash ~/.claude/scripts/delegate/verify.sh fmt <package>` |
 | changed example | `bash ~/.claude/scripts/delegate/verify.sh example <package> <name>` |
@@ -884,15 +892,20 @@ At an eligible tick, in that same tick:
 3. Apply <ReviewDiffContract/> to the current partial tree. The delegate has
    named no created files yet, so that check is vacuous; the snapshot is
    expected to be incomplete.
-4. Write the applicable early-form prompt — the `adversary` lens of
+4. Select its seat under <TeamReview/> and save the slot as
+   `${EARLY_REVIEW_SLOT}`. Apply <RoleReassignment/> when the open seat's role
+   changes; when every open seat is busy, name a new `review` seat and keep it
+   after the turn. Write the applicable early-form prompt — the `adversary`
+   lens of
    <BroadReviewPrompt/> for pass 1, <ClosureReview/> for a fix — including the
    completion estimate, the partial diff, and the exact final-diff and
    ready-sentinel paths below. **Only the adversary arms early.** It is the lens
    that gains most from the extra time, and arming both against a partial
    tree would double the exposure to the void verdict below; `contract`
    launches at completion under <DualReview/> step 3.
-5. Launch `review.sh` exactly as <DualReview/> step 3 does — with `adversary`
-   as its lens for pass 1 — appending one extra final argument:
+5. Launch `review.sh` exactly as <DualReview/> step 3 does — with `--to` for an
+   open seat or `--slot "${EARLY_REVIEW_SLOT}"` for the new seat, and
+   `adversary` as its lens for pass 1 — appending one extra final argument:
    `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
    handle as `${REVIEW_DISPATCH_HANDLE}` and set `EARLY_REVIEW=launched`. Leave
    `${DISPATCH_HANDLE}` untouched.
@@ -920,8 +933,8 @@ always may — early launch is opportunistic, never required.
 | Event | Required action |
 | --- | --- |
 | Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${SESSION_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** |
-| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=test … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/> — the seat the `adversary` lens sits in; before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
-| Reviewer errors before delivery | Report it in one line, clear `${REVIEW_DISPATCH_HANDLE}`, set `EARLY_REVIEW=none`, and leave the numbered artifacts. The primary continues and is reviewed synchronously at completion under the next `${REVIEW_PASS}` index. |
+| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
+| Reviewer errors before delivery | Report it in one line, clear `${REVIEW_DISPATCH_HANDLE}` and `${EARLY_REVIEW_SLOT}`, set `EARLY_REVIEW=none`, and leave the numbered artifacts. The primary continues and is reviewed synchronously at completion under the next `${REVIEW_PASS}` index. |
 | A verdict arrives before delivery | **It is void.** The reviewer cannot have read a diff that does not exist yet, so discard its findings entirely rather than reading them as evidence: open nothing in the ledger, preempt nothing, route no blocker into a fix dispatch. Say in one line that it is discarded and why, then follow the reviewer-error row. A void verdict is often fluent and specific — a stale diff supports confident claims about missing work — so the check is the timing, never how convincing the text reads. |
 
 Every path that ends an early launch before its real pass starts also drops the
@@ -929,7 +942,8 @@ row it was given:
 
 `python3 ~/.claude/scripts/delegate/progress_history.py disarm-review --session-dir "${SESSION_DIR}" --reason "<canceled|reviewer error|void verdict>"`
 
-Run it alongside clearing `${REVIEW_DISPATCH_HANDLE}` and `EARLY_REVIEW`. The
+Run it alongside clearing `${REVIEW_DISPATCH_HANDLE}`, `${EARLY_REVIEW_SLOT}`,
+and `EARLY_REVIEW`. The
 row would retire itself at the next report anyway; this is how the reason
 reaches the record, and it is what lets that report state the reason rather
 than infer one.
@@ -1024,7 +1038,8 @@ only the launcher watches the worker exit, so only it can say a repair landed.
 Each further seat runs the same call with `PLAN_DELEGATE_RESOLVES_ROUND=0`, its
 own prompt and its slot; the round is done only once every seat has exited.
 
-Apply <DispatchContract/>; set `EARLY_REVIEW=none` at dispatch, and close the
+Apply <DispatchContract/>; set `EARLY_REVIEW=none` and clear
+`${EARLY_REVIEW_SLOT}` at dispatch, and close the
 turn with the progress header per <DelegationResultFormat/>. While a fix runs
 that will receive a delegate closure review, <EarlyReviewArm/> may arm that
 reviewer early.
@@ -1058,7 +1073,10 @@ id whose verdict reads unclear, a claim the seat says it could not verify and
 the main read cannot verify either, or a new defect the repair introduced.
 Uncertainty routes to the reviewer; a hunk fully read and fully understood
 does not. A closure review costs a stage of the phase, so it is spent on a
-question, never on a path.
+question, never on a path. Select its open seat under <TeamReview/>, post the
+<RoleReassignment/> handoff when its role changes, and launch it with
+`review.sh --to`; when every open seat is busy, open and retain a role-named
+review seat with `review.sh --slot review` instead.
 
 On completion, `implemented` continues as above; `error` applies
 <DelegateLaunchFailure/>, and then, if the error survives it,

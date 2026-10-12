@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import os
@@ -17,10 +18,12 @@ from pathlib import Path
 from typing import Literal, cast, final, override
 from unittest.mock import patch
 
+from test_support import ShutdownSendLeaf, ShutdownTestCase
 import inventory
 import record
 import remote as remote_transport
 import restart
+import add_unit
 import conversation_pause
 import settle
 import showrunner_footer
@@ -48,6 +51,14 @@ LOGIN = "owner@example.com"
 LABEL = "claude 2"
 STOPPED = "2026-10-09T21:49:10+00:00"
 RESTARTED = "2026-10-10T01:02:03+00:00"
+
+
+def named_prefix(config_dir: str) -> str:
+    """The assignments a session resumed on a named account's directory starts with."""
+    return (
+        f"CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} "
+        f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(Path.home() / '.claude'))} "
+    )
 
 
 def checkout() -> inventory.GitCheckout:
@@ -145,6 +156,7 @@ def unit(
     plan: inventory.UnitPlan | None = None,
     tmux_session: str | None = None,
     run_dirs: list[str] | None = None,
+    doc: str = "/tmp/demo production.md",
 ) -> inventory.UnitSession:
     return inventory.UnitSession(
         **common_session(session_id, run_dirs=run_dirs),
@@ -153,7 +165,7 @@ def unit(
             kind="unit",
             production="demo",
             unit=f"{session_id}-unit",
-            doc="/tmp/demo production.md",
+            doc=doc,
             tmux_session=tmux_session or f"tmux-{session_id}",
             plan=plan or inventory.PlanFromRunRecord(kind="plan", path=f"/tmp/{session_id} plan.md"),
         ),
@@ -267,13 +279,14 @@ class CommandRecorder:
 
 
 @final
-class RestartTests(unittest.TestCase):
+class RestartTests(ShutdownTestCase):
     root: Path = Path()
     state_root: Path = Path()
     account = Account("claude", LOGIN, LABEL)
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.state_root = self.root / "shutdown"
         environment_context: object = cast(
@@ -283,6 +296,7 @@ class RestartTests(unittest.TestCase):
                     os.environ,
                     {
                         **os.environ,
+                        "HOME": str(self.root),
                         "SHUTDOWN_STATE_DIR": str(self.state_root),
                         "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
                         "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
@@ -353,6 +367,7 @@ class RestartTests(unittest.TestCase):
     def test_restart_prompts_are_scheduled_before_showrunner_and_window_launches(
         self,
     ) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         restored_entries = [
             entry(showrunner("scheduled-showrunner")),
             entry(
@@ -459,6 +474,7 @@ class RestartTests(unittest.TestCase):
         )
 
     def test_unit_launch_leaves_prompt_recording_to_add_unit(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         restored = entry(unit("scheduled-unit"))
         saved = shutdown_record([restored])
         record.create(saved)
@@ -607,6 +623,131 @@ class RestartTests(unittest.TestCase):
         self.assertEqual(self.stored_record(), original)
         self.assertEqual(list(self.state_root.rglob("restart-note-*.txt")), [])
 
+    def test_unit_resumes_with_its_units_row_plan_when_its_run_record_names_another(self) -> None:
+        doc = self.root / "production.md"
+        _ = doc.write_text(
+            "\n".join([
+                "# Demo",
+                "",
+                "## Units",
+                "",
+                "| Unit | Plan | Worktree | Branch | Port | Owns |",
+                "| --- | --- | --- | --- | --- | --- |",
+                "| tables-unit | docs/as-built/tables.md | /w/tables | demo-tables | — | `x/` |",
+                "",
+            ]),
+            encoding="utf-8",
+        )
+        moved = entry(unit(
+            "tables",
+            doc=str(doc),
+            plan=inventory.PlanFromRunRecord(kind="plan", path="docs/plans/demo-tables-followups.md"),
+        ))
+        record.create(shutdown_record([moved]))
+
+        output = io.StringIO()
+        with (
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
+
+        argv = next(
+            shlex.split(line) for line in output.getvalue().splitlines() if "add_unit.py" in line
+        )
+        self.assertEqual(argv[argv.index("--plan") + 1], "docs/as-built/tables.md")
+
+    def test_dry_run_uses_recorded_dir_for_each_non_unit_host(self) -> None:
+        config_dir = str(self.root / "account with 'quotes' and $()")
+        restored_entries = [
+            entry(showrunner("named-showrunner")),
+            entry(top_level("named-tmux", host=tmux_host("named-tmux-host"))),
+            entry(top_level("named-terminal", host=inventory.TerminalHost(kind="terminal"))),
+            entry(top_level("named-window", host=inventory.WindowHost(
+                kind="ghostty", window_shell=10,
+                desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"),
+            ))),
+            entry(top_level("named-manual")),
+            entry(unit("named-unit")),
+        ]
+        for restored in restored_entries:
+            restored["session"]["config_dir"] = config_dir
+        saved = shutdown_record(restored_entries)
+        record.create(saved)
+        commands = CommandRecorder()
+        output = io.StringIO()
+        with (
+            patch.object(restart, "_run", commands),
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
+
+        resume_commands = [argv[-1] for argv in commands.calls if "-ic" in argv]
+        self.assertEqual(len(resume_commands), 4)
+        for command in resume_commands:
+            self.assertIn(
+                f"&& {named_prefix(config_dir)}ENABLE_TOOL_SEARCH=true command claude",
+                command,
+            )
+        self.assertIn(
+            f"{named_prefix(config_dir)}ENABLE_TOOL_SEARCH=true command claude",
+            output.getvalue().split("manual restart named-manual:", 1)[1],
+        )
+        unit_argv = next(
+            argv for argv in commands.calls
+            if any(part.endswith("add_unit.py") for part in argv)
+        )
+        self.assertNotIn(config_dir, unit_argv)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", shlex.join(unit_argv))
+        self.assertEqual(self.stored_record(), saved)
+
+    def test_replaced_session_snapshot_resumes_from_its_current_config_dir(self) -> None:
+        """F004: settling can replace the snapshot without retaining an old directory."""
+        old_dir = str(self.root / "previous account")
+        new_dir = str(self.root / "current account with 'quotes'")
+        restored = entry(top_level("moved-session"))
+        restored["session"]["config_dir"] = old_dir
+        record.create(shutdown_record([restored]))
+        replacement = top_level("moved-session")
+        replacement["config_dir"] = new_dir
+
+        def replace_session(current: ShutdownRecord) -> None:
+            current["entries"][0]["session"] = replacement
+
+        _ = record.update(LOGIN, replace_session)
+        output = io.StringIO()
+        with (
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
+
+        command = output.getvalue().split("manual restart moved-session:", 1)[1]
+        self.assertIn(
+            f"{named_prefix(new_dir)}ENABLE_TOOL_SEARCH=true command claude",
+            command,
+        )
+        self.assertNotIn(old_dir, command)
+
+    def test_default_and_legacy_resume_commands_are_byte_identical(self) -> None:
+        restored = entry(top_level("default-command"))
+        expected = (
+            "cd /tmp/default-command && ENABLE_TOOL_SEARCH=true command "
+            "claude --resume default-command -n default-command --remote-control "
+            "default-command --settings '{\"disableAgentView\": true}' prompt; exec zsh"
+        )
+        resume_command = cast(
+            Callable[[inventory.Session, str], str],
+            getattr(restart, "_resume_command"),
+        )
+        self.assertEqual(resume_command(restored["session"], "prompt"), expected)
+        restored["session"]["config_dir"] = str(Path.home() / ".claude")
+        self.assertEqual(resume_command(restored["session"], "prompt"), expected)
+
     def test_window_dry_run_reads_and_restores_the_starting_desktop(self) -> None:
         restored = entry(top_level(
             "window",
@@ -675,6 +816,8 @@ class RestartTests(unittest.TestCase):
             ),
             where=record.WhereSaid(kind="said", text=where, at=STOPPED),
         )
+        config_dir = str(self.root / "account with 'quotes' and $()")
+        restored["session"]["config_dir"] = config_dir
         saved = shutdown_record([restored])
         record.create(saved)
         output = io.StringIO()
@@ -691,6 +834,7 @@ class RestartTests(unittest.TestCase):
         ):
             self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
 
+        memory_base = str(Path.home() / ".claude")
         launch_line = next(line for line in output.getvalue().splitlines() if "ghostty" in line)
         outer = shlex.split(launch_line)
         resume_command = outer[outer.index("-ic") + 1]
@@ -704,6 +848,8 @@ class RestartTests(unittest.TestCase):
                 "import json, os, sys",
                 "from pathlib import Path",
                 "Path(os.environ['ARGV_LOG']).write_text(json.dumps(sys.argv[1:]))",
+                "Path(os.environ['CONFIG_LOG']).write_text(os.environ['CLAUDE_CONFIG_DIR'])",
+                "Path(os.environ['MEMORY_LOG']).write_text(os.environ['CLAUDE_CODE_REMOTE_MEMORY_DIR'])",
                 "",
             )),
             encoding="utf-8",
@@ -717,6 +863,9 @@ class RestartTests(unittest.TestCase):
         environment = {
             **os.environ,
             "ARGV_LOG": str(argv_log),
+            "CONFIG_LOG": str(self.root / "claude-config-dir"),
+            "MEMORY_LOG": str(self.root / "claude-memory-dir"),
+            "CLAUDE_CONFIG_DIR": "/another-account-in-the-shell",
             "HOME": str(self.root),
             "PATH": f"{binary}:/usr/bin:/bin",
             "ZDOTDIR": str(zdotdir),
@@ -731,6 +880,14 @@ class RestartTests(unittest.TestCase):
             timeout=60,
         )
         self.assertEqual(parsed.returncode, 0, (parsed.stdout, parsed.stderr))
+        self.assertEqual(
+            (self.root / "claude-config-dir").read_text(encoding="utf-8"),
+            config_dir,
+        )
+        self.assertEqual(
+            (self.root / "claude-memory-dir").read_text(encoding="utf-8"),
+            memory_base,
+        )
         actual = cast(
             list[str],
             cast(object, json.loads(argv_log.read_text(encoding="utf-8"))),
@@ -937,6 +1094,7 @@ class RestartTests(unittest.TestCase):
                 self.assertEqual(self.stored_record(), before)
 
     def test_every_stop_partial_progress_is_resumed_whether_live_or_stopped(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         kinds: tuple[
             Literal[
                 "waiting",
@@ -1095,6 +1253,7 @@ class RestartTests(unittest.TestCase):
         ])
 
     def test_tmux_respawns_a_reusable_live_or_dead_pane(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         cases = [
             ("live", "kept\t700\t0\n"),
             ("dead", "kept\t\t1\n"),
@@ -1162,6 +1321,7 @@ class RestartTests(unittest.TestCase):
                     self.assertFalse(any(argv[:1] == ["pgrep"] for argv in probes))
 
     def test_tmux_respawns_recorded_pane_when_session_name_has_outer_spaces(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         commands = CommandRecorder()
         restored = top_level(
             "spaced",
@@ -1200,6 +1360,7 @@ class RestartTests(unittest.TestCase):
         )
 
     def test_tmux_falls_back_when_a_recorded_pane_is_in_use_or_gone(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         recorded = inventory.TmuxPane(kind="pane", pane_id="%7", pane_pid=700)
         fallbacks: list[
             tuple[
@@ -1313,6 +1474,7 @@ class RestartTests(unittest.TestCase):
                     self.assertEqual(pane_probed, pane["kind"] == "pane")
 
     def test_an_already_live_session_gets_its_note_timer_and_footer_without_a_launch(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         timers = [
             TimerRestore(
                 instance="showrunner-demo",
@@ -1623,6 +1785,9 @@ class RestartTests(unittest.TestCase):
             patch.object(restart, "_retire"),
             patch.object(restart, "_live_session_ids", return_value=frozenset()),
             patch.object(
+                restart, "_session_liveness", return_value=restart.SessionNotLive()
+            ),
+            patch.object(
                 restart,
                 "_launch_session",
                 side_effect=subprocess.CalledProcessError(
@@ -1638,6 +1803,82 @@ class RestartTests(unittest.TestCase):
         if failed["kind"] != "restart failed":
             self.fail("expected restart failure")
         self.assertEqual(failed["reason"], "launcher refused")
+
+    def test_a_launch_that_fails_with_its_session_live_is_restarted_not_failed(
+        self,
+    ) -> None:
+        record.create(shutdown_record([
+            entry(top_level("launched", host=inventory.TerminalHost(kind="terminal")))
+        ]))
+        output = io.StringIO()
+
+        with (
+            patch.object(restart, "_retire"),
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(
+                restart, "_session_liveness", return_value=restart.SessionLive()
+            ),
+            patch.object(restart, "wait_for_session", return_value=True),
+            patch.object(
+                restart,
+                "_launch_session",
+                side_effect=subprocess.CalledProcessError(
+                    1,
+                    ["add_unit"],
+                    stderr="launched: /remote-control did not become active\npane",
+                ),
+            ) as launch,
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(restart.up(LOGIN), 0)
+            self.assertEqual(restart.up(LOGIN), 0)
+
+        launch.assert_called_once()
+        self.assertEqual(record.find_live(LOGIN)["kind"], "no shutdown")
+        self.assertIn(
+            "natedev: launched is live; its launch reported: "
+            + "launched: /remote-control did not become active",
+            output.getvalue(),
+        )
+        self.assertNotIn("restart failed", output.getvalue())
+
+    def test_a_launch_that_fails_with_liveness_unknown_is_left_unfinished(
+        self,
+    ) -> None:
+        record.create(shutdown_record([
+            entry(top_level("unknown", host=inventory.TerminalHost(kind="terminal")))
+        ]))
+        output = io.StringIO()
+
+        with (
+            patch.object(restart, "_retire"),
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(
+                restart,
+                "_session_liveness",
+                return_value=restart.SessionLivenessUnknown(
+                    "session registry unreadable: denied"
+                ),
+            ),
+            patch.object(
+                restart,
+                "_launch_session",
+                side_effect=subprocess.CalledProcessError(
+                    9, ["open"], stderr="launcher refused\ndetail"
+                ),
+            ),
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(restart.up(LOGIN), 1)
+
+        self.assertEqual(self.stored_record()["entries"][0]["progress"]["kind"], "stopped")
+        self.assertIn(
+            "natedev: unknown restart unfinished: launcher refused; "
+            + "session registry unreadable: denied",
+            output.getvalue(),
+        )
 
     def test_restart_note_recording_failure_prevents_the_launch(self) -> None:
         record.create(shutdown_record([
@@ -1732,7 +1973,207 @@ class RestartTests(unittest.TestCase):
         self.assertEqual(starts, ["timer", "timer"])
         self.assertEqual(record.find_live(LOGIN)["kind"], "no shutdown")
 
+    def park_record(self, entries: list[ShutdownSessionEntry], stopped_at: str) -> ShutdownRecord:
+        unfinished = shutdown_record(entries, state="restart partial", stopped_at=stopped_at)
+        record.create(unfinished)
+        _ = record.park(LOGIN)
+        return unfinished
+
+    def run_up(self, back: frozenset[str], live: frozenset[str] | None = None) -> tuple[int, list[str]]:
+        launches: list[str] = []
+
+        def wait(session_id: str, timeout: float) -> bool:
+            del timeout
+            return session_id in back
+
+        def launch(
+            current: ShutdownRecord,
+            current_entry: ShutdownSessionEntry,
+            note: str,
+            desktop_state: restart.DesktopLaunchState,
+            *,
+            dry_run: bool,
+        ) -> restart.SessionLaunched | restart.ManualRestartRequired:
+            del current, note, desktop_state, dry_run
+            launches.append(current_entry["session"]["session_id"])
+            return restart.SessionLaunched()
+
+        with (
+            patch.object(restart, "_retire"),
+            patch.object(restart, "_launch_session", launch),
+            patch.object(restart, "_live_session_ids", return_value=live or frozenset()),
+            patch.object(restart, "_send_restart_note", return_value=settle.MessageSent(kind="sent")),
+            patch.object(restart, "wait_for_session", wait),
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            redirect_stdout(io.StringIO()),
+        ):
+            return restart.up(LOGIN), launches
+
+    def test_up_finishes_the_slot_record_then_a_parked_one(self) -> None:
+        terminal = inventory.TerminalHost(kind="terminal")
+        _ = self.park_record([entry(top_level("older", host=terminal))], "2026-10-09T20:00:00+00:00")
+        record.create(shutdown_record([entry(top_level("newer", host=terminal))]))
+
+        status, launches = self.run_up(frozenset({"older", "newer"}))
+
+        self.assertEqual(status, 0)
+        self.assertEqual(launches, ["newer", "older"])
+        self.assertEqual(record.account_records(LOGIN), [])
+        self.assertEqual(len(list((self.state_root / LOGIN / "history").iterdir())), 2)
+
+    def test_a_parked_record_that_fails_again_stays_recorded(self) -> None:
+        terminal = inventory.TerminalHost(kind="terminal")
+        _ = self.park_record([entry(top_level("older", host=terminal))], "2026-10-09T20:00:00+00:00")
+        record.create(shutdown_record([entry(top_level("newer", host=terminal))]))
+
+        status, launches = self.run_up(frozenset({"newer"}))
+
+        self.assertEqual(status, 1)
+        self.assertEqual(launches, ["newer", "older"])
+        remaining = record.account_records(LOGIN)
+        self.assertEqual([item["state"] for item in remaining], ["restart partial"])
+        self.assertEqual(remaining[0]["entries"][0]["progress"]["kind"], "restart failed")
+
+    def test_an_active_slot_leaves_parked_records_parked(self) -> None:
+        terminal = inventory.TerminalHost(kind="terminal")
+        unfinished = self.park_record([entry(top_level("older", host=terminal))], "2026-10-09T20:00:00+00:00")
+        for state in ("settling", "stopping", "restarting"):
+            with self.subTest(state=state):
+                record.create(shutdown_record([entry(top_level("newer", host=terminal))], state=state))
+
+                _, launches = self.run_up(frozenset({"older", "newer"}))
+
+                self.assertEqual(launches, [])
+                self.assertEqual(record.parked(LOGIN), [unfinished])
+                (self.state_root / LOGIN / "record.json").unlink()
+
+    def test_a_failed_unit_resumed_by_hand_is_not_relaunched_slot_or_parked(self) -> None:
+        failed = record.SessionRestartFailed(kind="restart failed", at=STOPPED, reason="not live")
+        _ = self.park_record([entry(unit("older"), state=failed)], "2026-10-09T20:00:00+00:00")
+        record.create(shutdown_record([entry(unit("newer"), state=failed)], state="restart partial"))
+        commands = CommandRecorder()
+        output = io.StringIO()
+
+        with (
+            patch.object(restart, "_retire"),
+            patch.object(restart, "_run", commands),
+            patch.object(restart, "_live_session_ids", return_value=frozenset({"older", "newer"})),
+            patch.object(restart, "_send_restart_note", return_value=settle.MessageSent(kind="sent")),
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(restart.up(LOGIN), 0)
+
+        self.assertEqual(commands.calls, [])
+        self.assertEqual(
+            output.getvalue(),
+            "natedev: 1 restarted, 0 seats available on demand\n" * 2,
+        )
+        self.assertEqual(record.account_records(LOGIN), [])
+        archived = record.parse_records("[" + ",".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((self.state_root / LOGIN / "history").iterdir())
+        ) + "]")
+        self.assertEqual(
+            [(item["state"], item["entries"][0]["progress"]["kind"]) for item in archived],
+            [("up", "restarted"), ("up", "restarted")],
+        )
+
+    def test_restart_with_no_account_named_finds_a_parked_record(self) -> None:
+        _ = self.park_record(
+            [entry(top_level("older", host=inventory.TerminalHost(kind="terminal")))],
+            "2026-10-09T20:00:00+00:00",
+        )
+
+        def unreadable() -> Account:
+            raise UnreadableAccount("this process has no readable account")
+
+        def run_remote(
+            args: list[str],
+            stdin: str = "",
+            limit: remote_transport.RemoteCallLimit = remote_transport.STANDARD_TIME_LIMIT,
+        ) -> tuple[int, str]:
+            del stdin, limit
+            return (0, "[]") if args == ["records", "--json", "--here"] else (0, "")
+
+        with (
+            patch.object(restart, "own_claude_account", unreadable),
+            patch.object(restart, "run_remote", run_remote),
+            patch.object(restart, "_up", return_value=restart.MachineRestartResult("natedev", LABEL, "done")) as up,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(
+                restart.restart(restart.AccountNotNamed(), dry_run=False, alerts=restart.NeverAlert()),
+                0,
+            )
+
+        up.assert_called_once_with(LOGIN, False)
+
+    def add_unit_resolves(self, recorded_unit: str) -> str:
+        """The unit id add_unit's own rule gives the name restart passes it."""
+        checkout = self.root / "checkout"
+        checkout.mkdir(exist_ok=True)
+        doc = checkout / "demo-production.md"
+        _ = doc.write_text(
+            "\n".join([
+                "- **Merge branch:** demo",
+                f"- **Showrunner checkout:** {checkout}",
+                "- **Log:** demo-log.md",
+                "- **User zone:** America/Los_Angeles",
+                "",
+                "## Units",
+                "",
+                "| Unit | Plan | Worktree | Branch | Port | Owns |",
+                "| --- | --- | --- | --- | --- | --- |",
+                f"| {recorded_unit} | docs/plans/tables.md | /w/tables | demo-tables | — | `x/` |",
+                "",
+            ]),
+            encoding="utf-8",
+        )
+        restored = entry(unit("tables", doc=str(doc)))
+        host = restored["session"]["host"]
+        if host["kind"] != "unit":
+            self.fail("expected a unit host")
+        host["unit"] = recorded_unit
+        record.create(shutdown_record([restored]))
+        output = io.StringIO()
+        with (
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(settle, "record_time", return_value=RESTARTED),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
+        (self.state_root / LOGIN / "record.json").unlink()
+        argv = next(
+            shlex.split(line) for line in output.getvalue().splitlines() if "add_unit.py" in line
+        )
+
+        def value(flag: str) -> str:
+            return argv[argv.index(flag) + 1]
+
+        return add_unit.launch_request(argparse.Namespace(
+            production=value("--production"),
+            name=argv[argv.index("--production") + 2],
+            plan=value("--plan"),
+            brief=None,
+            standby=False,
+            port=None,
+            owns=None,
+            timeout=90.0,
+            resume=value("--resume"),
+            cwd=value("--cwd"),
+            restart_note=value("--restart-note"),
+            session_name=value("--session-name"),
+            tmux_session=value("--tmux-session"),
+        )).unit
+
+    def test_a_unit_restore_names_the_recorded_unit_by_add_units_own_rule(self) -> None:
+        for recorded_unit in ("tables-unit", "tables-unit-unit"):
+            with self.subTest(recorded_unit=recorded_unit):
+                self.assertEqual(self.add_unit_resolves(recorded_unit), recorded_unit)
+
     def test_manual_unit_holds_its_timer_and_seat_until_the_session_appears(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         timer = TimerRestore(
             instance="showrunner-demo",
             was_enabled=True,
@@ -1809,6 +2250,7 @@ class RestartTests(unittest.TestCase):
         self.assertEqual(shutdown.held_session_ids(), [])
 
     def test_output_and_alert_name_manual_failed_and_timer_work(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         timer = TimerRestore(
             instance="timer-one",
             was_enabled=True,
@@ -2075,6 +2517,7 @@ class RestartTests(unittest.TestCase):
         restore_timers.assert_not_called()
 
     def test_closed_session_with_pending_timers_is_fully_restarted(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         timers = [
             TimerRestore(
                 instance="pending-timer",
@@ -2243,6 +2686,7 @@ class RestartTests(unittest.TestCase):
         self.assertEqual(failed["reason"], "launcher refused")
 
     def test_unknown_host_is_manual_and_printed_again(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         record.create(shutdown_record([entry(top_level("mystery"))]))
         first = io.StringIO()
         second = io.StringIO()
@@ -2368,6 +2812,7 @@ class RestartTests(unittest.TestCase):
     def test_incomplete_restart_alert_emits_the_named_recovery_action(
         self,
     ) -> None:
+        self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
         sent: list[tuple[list[str], str]] = []
 
         def send(
@@ -2421,6 +2866,7 @@ class RestartTests(unittest.TestCase):
         self.assertIn(failure, body)
 
     def test_an_unreachable_other_machine_leaves_its_record_and_local_work_recovers(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
         local_entry = entry(
             top_level("local", host=inventory.TerminalHost(kind="terminal"))
         )

@@ -82,6 +82,9 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 The showrunner's session name is not in the doc: a name can change, so it is
 looked up when needed. `~/.claude/scripts/lib/py
 ~/.claude/scripts/production/showrunners.py name <slug>` prints it as it is now.
+A unit sends to the address `showrunners.py address <slug>` prints, not to the
+name: the address is the showrunner's session on this machine, and `SendMessage`
+refuses a name that another session of the same account also has.
 
 ## Units
 
