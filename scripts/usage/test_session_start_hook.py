@@ -16,7 +16,10 @@ from unittest.mock import patch
 from scripts.usage import agents_log
 
 
-HOOK = Path(__file__).resolve().parents[1] / "hooks/session-start-agents-log.py"
+REPOSITORY = Path(__file__).resolve().parents[2]
+HOOK = REPOSITORY / "scripts/hooks/session-start-agents-log.py"
+REGISTERED_COMMAND = ('"$HOME/.claude/scripts/lib/py" '
+                      '"$HOME/.claude/scripts/hooks/session-start-agents-log.py"')
 SESSION = "a1b2c3d4-1234-4567-89ab-123456789abc"
 SUBAGENT = "f00dbabe"
 AT = datetime(2026, 10, 11, 17, 30, tzinfo=timezone.utc)
@@ -44,6 +47,41 @@ class SessionStartHookTests(unittest.TestCase):
     def deliver(self, **payload: object) -> subprocess.CompletedProcess[str]:
         return self.run_hook(json.dumps(payload))
 
+    def registered_usage_commands(self) -> dict[str, list[str]]:
+        settings = cast(dict[str, object], json.loads(
+            (REPOSITORY / "settings.json").read_text(encoding="utf-8")))
+        hooks = cast(dict[str, list[dict[str, object]]], settings["hooks"])
+        commands: dict[str, list[str]] = {}
+        for event, entries in hooks.items():
+            for entry in entries:
+                for hook in cast(list[dict[str, object]], entry["hooks"]):
+                    command = hook.get("command")
+                    if not isinstance(command, str) or "scripts/hooks/session-start-agents-log.py" not in command:
+                        continue
+                    self.assertEqual(hook["type"], "command", event)
+                    self.assertNotIn("matcher", entry, event)
+                    commands.setdefault(event, []).append(command)
+        return commands
+
+    def run_registered_hook(self, event: str, payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
+        commands = self.registered_usage_commands().get(event, [])
+        self.assertEqual(len(commands), 1, f"Expected one usage hook for {event}")
+        home = self.root / "hook-home"
+        if not home.exists():
+            home.mkdir()
+            (home / ".claude").symlink_to(REPOSITORY, target_is_directory=True)
+        working_directory = self.root / "unrelated-working-directory"
+        working_directory.mkdir(exist_ok=True)
+        environment = os.environ.copy()
+        environment.update({
+            "HOME": str(home), "USAGE_STATE_DIR": str(self.state),
+            "XDG_CACHE_HOME": str(self.root / "cache"), "PYTHONDONTWRITEBYTECODE": "1",
+        })
+        return subprocess.run(
+            ["sh", "-c", commands[0]], input=json.dumps(payload), cwd=working_directory,
+            env=environment, capture_output=True, text=True, timeout=20, check=False,
+        )
+
     def records(self) -> list[dict[str, object]]:
         if not self.log_path.is_file():
             return []
@@ -55,6 +93,58 @@ class SessionStartHookTests(unittest.TestCase):
         self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(self.records(), [])
+
+    def test_usage_hook_is_registered_once_for_each_start_event_and_no_other_event(self) -> None:
+        self.assertEqual(self.registered_usage_commands(), {
+            "SessionStart": [REGISTERED_COMMAND],
+            "SubagentStart": [REGISTERED_COMMAND],
+        })
+
+    def test_registered_session_start_command_records_once_from_an_unrelated_directory(self) -> None:
+        payload: dict[str, object] = {
+            "hook_event_name": "SessionStart", "source": "startup", "session_id": SESSION,
+            "transcript_path": str(self.root / "parent.jsonl"), "cwd": str(self.root),
+        }
+
+        result = self.run_registered_hook("SessionStart", payload)
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        records = self.records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(set(records[0]), {"id", "role", "at"})
+        self.assertEqual((records[0]["id"], records[0]["role"]), (SESSION, "interactive"))
+        before = self.log_path.read_bytes()
+
+        repeated = self.run_registered_hook("SessionStart", payload)
+
+        self.assertEqual((repeated.returncode, repeated.stdout, repeated.stderr), (0, "", ""))
+        self.assertEqual(self.log_path.read_bytes(), before)
+        self.assertEqual(agents_log.assignments(self.log_path).problems, ())
+
+    def test_registered_subagent_start_command_records_once_from_an_unrelated_directory(self) -> None:
+        agent_id = "a4008deac73c98365"
+        payload: dict[str, object] = {
+            "hook_event_name": "SubagentStart", "session_id": SESSION,
+            "agent_id": agent_id, "agent_type": "Explore",
+            "transcript_path": str(self.root / "parent.jsonl"),
+        }
+
+        result = self.run_registered_hook("SubagentStart", payload)
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        records = self.records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(set(records[0]), {"id", "role", "at"})
+        self.assertEqual((records[0]["id"], records[0]["role"]), (agent_id, "subagent"))
+        before = self.log_path.read_bytes()
+
+        repeated = self.run_registered_hook("SubagentStart", payload)
+
+        self.assertEqual((repeated.returncode, repeated.stdout, repeated.stderr), (0, "", ""))
+        self.assertEqual(self.log_path.read_bytes(), before)
+        log = agents_log.assignments(self.log_path)
+        self.assertEqual(log.problems, ())
+        self.assertEqual(set(log.assignments), {agent_id})
 
     def test_session_payload_records_one_interactive_assignment(self) -> None:
         result = self.deliver(
