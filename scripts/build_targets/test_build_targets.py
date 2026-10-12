@@ -283,8 +283,8 @@ class WaitLocalTests(IsolatedTargetTest):
         })))
         _ = self.enterContext(mock.patch.object(build_hold, "process_start_time", return_value="test-start"))
         _ = self.enterContext(mock.patch.object(build_hold, "call_is_live", return_value=True))
-        _ = self.enterContext(mock.patch.object(build_hold, "socket_for", return_value="/test/socket"))
-        _ = self.enterContext(mock.patch.object(build_hold, "send_release", return_value=0))
+        _ = self.enterContext(mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")))
+        _ = self.enterContext(mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()))
         _ = self.enterContext(mock.patch.object(build_targets, "wait_clock", return_value=NOW))
 
     def begin_hold(self) -> None:
