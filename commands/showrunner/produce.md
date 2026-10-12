@@ -167,7 +167,9 @@ State:
   `SHOWRUNNER_STATE` to the complete new list, starting from `OUTSTANDING`'s
   current items; `[]` clears it.
   When the footer switch is off, the command says `footers off`; omit both the
-  footer and the Waiting on block. The command reads the switch, the notifier's
+  footer and the Waiting on block. It still stores `open_for_user`, so the
+  dailies count it, and with questions open the reply ends with the count line
+  alone (**Open questions** above). The command reads the switch, the notifier's
   next due time, and open-for-the-user items from `OUTSTANDING`. Keep each
   item complete enough to stand alone when the user asks for the list: what
   is asked, where, why and the choices. Remove
