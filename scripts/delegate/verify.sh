@@ -131,6 +131,7 @@ PY="${HOME}/.claude/scripts/lib/py"
 # invoke_clippy, and the sandbox-failure detection all come from here.
 # shellcheck source=/dev/null
 source "$HOME/.claude/scripts/lint/invoke.sh"
+BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
 
 # A failed step may be a process killed by earlyoom or the kernel. Keep the
 # journal query here so tests can put a journalctl stub first on PATH.
@@ -149,17 +150,32 @@ step_was_killed_for_memory() {
 }
 
 run() {
-    local attempt status started ended step_log
+    local attempt status started ended step_log monitor=0
     RUN_LAST_ATTEMPT_KILLED=0
     step_log="$(mktemp)"
     for attempt in 1 2; do
         started="$(date '+%Y-%m-%d %H:%M:%S %z')"
-        if run_once "$@" 2>&1 | tee "$step_log"; then
+        monitor=0
+        [[ $- != *m* ]] || monitor=1
+        set -m
+        (
+            set +m
+            if run_once "$@" 2>&1 | tee "$step_log"; then
+                exit 0
+            else
+                exit "${PIPESTATUS[0]}"
+            fi
+        ) &
+        RUN_STEP_PID=$!
+        if [[ "$monitor" == 0 ]]; then set +m; fi
+        if wait "$RUN_STEP_PID"; then
+            RUN_STEP_PID=""
             RUN_LAST_ATTEMPT_KILLED=0
             rm -f "$step_log"
             return 0
         else
-            status=${PIPESTATUS[0]}
+            status=$?
+            RUN_STEP_PID=""
         fi
         ended="$(date '+%Y-%m-%d %H:%M:%S %z')"
         RUN_LAST_ATTEMPT_KILLED=0
@@ -593,6 +609,35 @@ fi
 # the call record note_event writes.
 export BUILDLOG_CALLER=verify
 export BUILDLOG_CALL_ID="v$(date -u +%Y%m%dT%H%M%S)-$$-$RANDOM"
+export BUILDLOG_HOLD_PID=$$
+export BUILDLOG_HOLD_WAIT_S=0
+HOLD_WAIT_DIR=""
+HOLD_WAITER_PID=""
+RUN_STEP_PID=""
+
+collect_hold_wait() {
+    if [[ -n "${BUILDLOG_HOLD_WAIT_FILE:-}" && -f "$BUILDLOG_HOLD_WAIT_FILE" ]]; then
+        BUILDLOG_HOLD_WAIT_S="$(awk '{ total += $1 } END { printf "%.6f", total }' "$BUILDLOG_HOLD_WAIT_FILE")"
+        export BUILDLOG_HOLD_WAIT_S
+    fi
+}
+
+interrupt_hold_wait() {
+    if [[ -n "${BUILDLOG_HOLD_WAITER_FILE:-}" && -f "$BUILDLOG_HOLD_WAITER_FILE" ]]; then
+        python3 "$BUILD_TARGETS_SCRIPT" interrupt-local --call-id "$BUILDLOG_CALL_ID" >/dev/null 2>&1 || true
+    fi
+}
+
+finish_hold_wait() {
+    collect_hold_wait
+    if [[ -n "$HOLD_WAIT_DIR" ]]; then
+        if [[ -n "${BUILDLOG_HOLD_REGISTRATION_FILE:-}" && -f "$BUILDLOG_HOLD_REGISTRATION_FILE" ]]; then
+            python3 "$BUILD_TARGETS_SCRIPT" finish-local --call-id "$BUILDLOG_CALL_ID" >/dev/null 2>&1 || true
+        fi
+        rm -rf "$HOLD_WAIT_DIR"
+        HOLD_WAIT_DIR=""
+    fi
+}
 
 # Pass records (see the header): on for `test` and `lint` in a
 # delegate session. --no-cache turns off the lookup; its result is still
@@ -656,6 +701,7 @@ tree_key() {
 note_event() {
     [[ "${CALL_NOTED}" -eq 0 ]] || return 0
     CALL_NOTED=1
+    collect_hold_wait
     [[ -f "${BUILDLOG_RECORD:-}" ]] || return 0
     local outcome=$1 wait=$2 wall=$3 build=$4 saved=$5 status=$6 cached=0
     if [[ -n "${CACHE_DIR}" ]]; then
@@ -903,6 +949,35 @@ if [[ "$CMD" == test ]]; then
     fi
 fi
 
+HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.XXXXXX")"
+export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
+export BUILDLOG_HOLD_ADMISSION_FILE="$HOLD_WAIT_DIR/admission"
+export BUILDLOG_HOLD_STARTED_FILE="$HOLD_WAIT_DIR/started"
+export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
+export BUILDLOG_HOLD_REGISTRATION_FILE="$HOLD_WAIT_DIR/registration"
+trap 'hold_status=$?; interrupt_hold_wait; finish_hold_wait; exit "$hold_status"' EXIT
+hold_interrupted() {
+    local signal_name=$1 code=$2
+    trap - INT TERM HUP
+    if [[ -n "$HOLD_WAITER_PID" ]]; then
+        kill -s "$signal_name" "$HOLD_WAITER_PID" 2>/dev/null || true
+        wait "$HOLD_WAITER_PID" 2>/dev/null || true
+    fi
+    interrupt_hold_wait
+    note_event interrupted "$SECONDS" 0 "" 0 "$code"
+    exit "$code"
+}
+trap 'hold_interrupted INT 130' INT
+trap 'hold_interrupted TERM 143' TERM
+trap 'hold_interrupted HUP 129' HUP
+python3 "$BUILD_TARGETS_SCRIPT" wait-local --call-id "$BUILDLOG_CALL_ID" --pid $$ &
+HOLD_WAITER_PID=$!
+HOLD_WAIT_STATUS=0
+wait "$HOLD_WAITER_PID" || HOLD_WAIT_STATUS=$?
+HOLD_WAITER_PID=""
+if [[ "$HOLD_WAIT_STATUS" != 0 ]]; then exit "$HOLD_WAIT_STATUS"; fi
+trap - INT TERM HUP
+
 # Open a progress window for the duration of this run when a delegate session is
 # in scope. This is what the unit director's progress header reports against
 # while it runs verification itself: an activity, not a pass, so findings.py
@@ -1065,6 +1140,7 @@ fi
 # wait out the hold.
 verify_cleanup() {
     local status=$1 outcome=ran code="${EXIT_STATUS}"
+    if [[ "$status" != interrupted ]]; then interrupt_hold_wait; fi
     finish_run "${status}" || true
     # finish_run notes only a run with a record log; every other call is noted
     # here (note_event notes a call once). Its build time is unknown.
@@ -1073,6 +1149,7 @@ verify_cleanup() {
         interrupted) outcome=interrupted code="" ;;
     esac
     note_event "${outcome}" "${RUN_STARTED}" $(( SECONDS - RUN_STARTED )) "" 0 "${code}" || true
+    finish_hold_wait
     [[ -z "${MEM_KILL_FILE:-}" ]] || rm -f "$MEM_KILL_FILE"
     [[ -z "${MEM_KILL_FILE:-}" ]] || rm -f "${MEM_KILL_FILE}.stopped"
     if [[ "${ACTIVITY_ACTIVE}" -eq 1 ]]; then
@@ -1088,6 +1165,13 @@ trap 'EXIT_STATUS=$?; [[ ${EXIT_STATUS} -eq 0 ]] && verify_cleanup completed || 
 verify_interrupted() {
     trap - EXIT INT TERM HUP
     EXIT_STATUS=$((128 + $1))
+    interrupt_hold_wait
+    if [[ -n "$RUN_STEP_PID" ]]; then
+        kill -s "$1" -- "-$RUN_STEP_PID" 2>/dev/null || true
+        release_token || true
+        wait "$RUN_STEP_PID" 2>/dev/null || true
+        RUN_STEP_PID=""
+    fi
     verify_cleanup interrupted
     exit "$EXIT_STATUS"
 }

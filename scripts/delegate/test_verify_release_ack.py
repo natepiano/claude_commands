@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TypedDict, cast, override
 
 from scripts.delegate import test_verify_untested_examples
+from scripts.delegate.test_verify_hold_wait import read_cycle_file, release_registered_call
 
 
 INVOKE = Path(__file__).resolve().parent.parent / "lint" / "invoke.sh"
@@ -22,26 +23,6 @@ CYCLE_ID = "b" * 32
 class MemoryWaitObservation(TypedDict):
     state: str
     wait_started_at: str
-
-
-class WorkspaceTarget(TypedDict):
-    name: str
-    kind: list[str]
-    src_path: str
-    test: bool
-
-
-class WorkspacePackage(TypedDict):
-    id: str
-    name: str
-    manifest_path: str
-    features: dict[str, list[str]]
-    targets: list[WorkspaceTarget]
-
-
-class WorkspaceMetadata(TypedDict):
-    packages: list[WorkspacePackage]
-    workspace_members: list[str]
 
 
 class VerifyReleaseAckTests(unittest.TestCase):
@@ -93,6 +74,10 @@ PY
             "XDG_RUNTIME_DIR": str(self.root),
             "BUILD_HOLD_DIR": str(holders),
             "BUILD_HOLD_RELEASE_DIR": str(release),
+            "BUILDLOG_HOLD_REGISTRATION_FILE": str(self.root / "registration"),
+            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+            "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+            "BUILD_TARGETS_SCRIPT": str(INVOKE.parent.parent / "build_targets" / "build_targets.py"),
             "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
             "PLAN_DELEGATE_BOARD_DIR": "",
             "PLAN_DELEGATE_SESSION_DIR": "",
@@ -102,6 +87,7 @@ PY
             "BUILDLOG_MEM_POLL_S": "1",
             "BUILDLOG_OFF": "1",
             "BUILDLOG_SCOPE": "0",
+            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "CLAUDE_CODE_SESSION_ID": "unit-director",
             "LINT_CONFIG_READER": str(lint_reader),
             "CYCLE_FILE": str(self.cycle_file),
@@ -263,10 +249,6 @@ class VerifyRoutingTests(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.tearDown)
         root = self.fixture.root
-        scripts = Path(__file__).resolve().parent.parent
-        claude = root / ".claude"
-        claude.mkdir()
-        (claude / "scripts").symlink_to(scripts, target_is_directory=True)
         holders = root / "build-hold"
         release = root / "release"
         (release / CYCLE_ID).mkdir(parents=True)
@@ -283,6 +265,7 @@ class VerifyRoutingTests(unittest.TestCase):
             "CLAUDE_PYTHON": sys.executable,
             "BUILD_HOLD_DIR": str(holders),
             "BUILD_HOLD_RELEASE_DIR": str(release),
+            "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
             "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
             "PLAN_DELEGATE_BOARD_DIR": "",
             "PLAN_DELEGATE_TEAM_ROLE": "",
@@ -291,48 +274,13 @@ class VerifyRoutingTests(unittest.TestCase):
             "VERIFY_MAC_RUNNER": str(root / "no-mac-runner"),
             "CLAUDE_CODE_SESSION_ID": "unit-director",
         })
-        self.write_command_stand_ins()
-
-    def write_command_stand_ins(self) -> None:
-        root = self.fixture.root
-        metadata: WorkspaceMetadata = {
-            "packages": [{
-                "id": "sample-package", "name": "sample",
-                "manifest_path": str(root / "Cargo.toml"), "features": {},
-                "targets": [
-                    {"name": "sample", "kind": ["lib"],
-                     "src_path": str(root / "src" / "lib.rs"), "test": True},
-                    {"name": "demo", "kind": ["example"],
-                     "src_path": str(root / "examples" / "demo.rs"), "test": False},
-                ],
-            }],
-            "workspace_members": ["sample-package"],
-        }
-        metadata_file = root / "metadata.json"
-        _ = metadata_file.write_text(json.dumps(metadata) + "\n")
-        self.fixture.environment["PACKAGE_METADATA"] = str(metadata_file)
-        _ = self.fixture.environment.pop("REAL_CARGO", None)
-        cargo = root / "stubs" / "cargo"
-        _ = cargo.write_text(r'''#!/bin/sh
-if [ "$1" = metadata ]; then
-    printf 'metadata\n' >> "$METADATA_CALLS"
-    cat "$PACKAGE_METADATA"
-    exit 0
-fi
-printf '%s\n' "$*" >> "$CARGO_CALLS"
-case "$1 $2" in
-    "nextest --version"|"nextest run"|"+nightly fmt") exit 0 ;;
-    *) exit 97 ;;
-esac
-''')
-        for name, source in (
-            ("rustc", "#!/bin/sh\nprintf 'test compiler\\n'\n"),
-            ("ssh", "#!/bin/sh\nexit 99\n"),
-            ("rsync", "#!/bin/sh\nexit 99\n"),
-        ):
-            command = root / "stubs" / name
-            _ = command.write_text(source)
-            command.chmod(0o755)
+        toolchain = subprocess.run(
+            ["rustup", "which", "cargo"], capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.fixture.environment["REAL_CARGO"] = toolchain
+        self.fixture.environment["RUSTUP_HOME"] = os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup"))
+        self.fixture.environment["BUILD_TARGETS_POLL_S"] = "0.01"
+        self.fixture.environment["BUILD_TARGETS_NOW"] = ""
 
     def set_owner_marker(self) -> None:
         run = self.fixture.root / "delegate-run"
@@ -350,8 +298,7 @@ esac
             "holders": {"holder": {"since": now, "released_at": ""}},
             "recipients": {"unit-director": "unit"},
             "entries": [{
-                "session_id": "unit-director", "name": "unit", "state": "ReleasedAwaitingAdmission",
-                "released_at": now,
+                "session_id": "unit-director", "name": "unit", "state": "AwaitingRelease",
             }],
         }
         _ = self.cycle_file.write_text(json.dumps(cycle) + "\n")
@@ -369,13 +316,14 @@ esac
 
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("examples carry no tests", result.stderr)
-        self.assertEqual(self.state(), "ReleasedAwaitingAdmission")
+        self.assertEqual(self.state(), "AwaitingRelease")
         self.assertEqual(self.fixture.calls_made(), [])
 
     def test_recorded_pass_writes_no_second_admission_mark(self) -> None:
         _ = self.fixture.package()
         _ = self.fixture.example(source="fn main() {}\n")
-        first = self.fixture.verify("test", "sample")
+        with release_registered_call(self.cycle_file):
+            first = self.fixture.verify("test", "sample")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertEqual(self.state(), "MemoryGateReturned")
 
@@ -383,38 +331,54 @@ esac
         second = self.fixture.verify("test", "sample")
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertIn("PASS (recorded)", second.stdout)
-        self.assertEqual(self.state(), "ReleasedAwaitingAdmission")
+        self.assertEqual(self.state(), "AwaitingRelease")
 
     def test_seat_with_stale_shell_id_marks_marker_owner_through_verify(self) -> None:
         _ = self.fixture.package()
         _ = self.fixture.example(source="fn main() {}\n")
         self.set_owner_marker()
-
-        result = self.fixture.verify("test", "sample")
-
+        with release_registered_call(self.cycle_file):
+            result = self.fixture.verify("test", "sample")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(any(call.startswith("nextest run ") for call in self.fixture.calls_made()))
         self.assertEqual(self.state(), "MemoryGateReturned")
-        cycle = cast(dict[str, object], json.loads(self.cycle_file.read_text()))
-        entries = cast(list[dict[str, object]], cycle["entries"])
+        entries = read_cycle_file(self.cycle_file)["entries"]
         self.assertEqual(entries[0]["session_id"], "unit-director")
-        self.assertEqual(entries[0]["outcome"], "Granted")
+        self.assertEqual(entries[0].get("outcome"), "Granted")
 
-    def test_call_without_session_or_run_writes_no_admission_mark_through_verify(self) -> None:
+    def test_ownerless_call_registers_verification_key_and_runs_after_release(self) -> None:
         _ = self.fixture.package()
         _ = self.fixture.example(source="fn main() {}\n")
         self.fixture.environment.update({
-            "CLAUDE_CODE_SESSION_ID": "",
-            "PLAN_DELEGATE_BOARD_DIR": "",
+            "CLAUDE_CODE_SESSION_ID": "", "PLAN_DELEGATE_BOARD_DIR": "",
+            "PLAN_DELEGATE_SESSION_DIR": "",
+        })
+        cycle = read_cycle_file(self.cycle_file)
+        cycle["entries"] = []
+        cycle["recipients"] = {}
+        _ = self.cycle_file.write_text(json.dumps(cycle))
+        with release_registered_call(self.cycle_file):
+            result = self.fixture.verify("test", "sample")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any(call.startswith("nextest run ") for call in self.fixture.calls_made()))
+        entries = read_cycle_file(self.cycle_file)["entries"]
+        verification = [entry for entry in entries if entry["session_id"].startswith("verify:")]
+        self.assertEqual(len(verification), 1)
+        self.assertEqual(verification[0]["state"], "MemoryGateReturned")
+        self.assertEqual(verification[0].get("outcome"), "Granted")
+
+    def test_ownerless_example_refusal_performs_no_admission(self) -> None:
+        _ = self.fixture.package()
+        _ = self.fixture.example(source="#[test]\nfn check() {}\nfn main() {}\n")
+        self.fixture.environment.update({
+            "CLAUDE_CODE_SESSION_ID": "", "PLAN_DELEGATE_BOARD_DIR": "",
             "PLAN_DELEGATE_SESSION_DIR": "",
         })
         before = self.cycle_file.read_bytes()
-
         result = self.fixture.verify("test", "sample")
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertTrue(any(call.startswith("nextest run ") for call in self.fixture.calls_made()))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(self.cycle_file.read_bytes(), before)
+        self.assertEqual(self.fixture.calls_made(), [])
 
 
 if __name__ == "__main__":

@@ -294,7 +294,15 @@ class ShellTests(unittest.TestCase):
             _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
             config = root / "config.sh"
             _ = config.write_text('lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n')
-            environment = {**os.environ, "HOME": str(root), "BUILDLOG_MEMINFO": str(meminfo),
+            environment = {**os.environ,
+                           "BUILD_HOLD_DIR": str(root / "holders"),
+                           "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                           "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                           "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                           "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                           "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                           "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                           "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_MEMINFO": str(meminfo),
                            "BUILDLOG_OFF": "1", "BUILDLOG_SCOPE": "0",
                            "LINT_CONFIG_READER": str(config)}
             command = 'source "$1"; sweep_after_step() { :; }; run_once true'
@@ -313,7 +321,15 @@ class ShellTests(unittest.TestCase):
             result = subprocess.run(
                 ["bash", "-c", command, "test", str(MEMORY_GATE)],
                 capture_output=True, text=True, timeout=8, check=False,
-                env={**os.environ, "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
+                env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                      "BUILDLOG_MEMINFO": str(meminfo)},
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -340,7 +356,15 @@ class ShellTests(unittest.TestCase):
             command = 'source "$1"; buildlog_sample_anon "$2" "$3" & p=$!; sleep 1.2; kill "$p"; wait "$p" 2>/dev/null || true'
             result = subprocess.run(["bash", "-c", command, "test", str(INVOKE), str(sidecar), str(maximum)],
                                     capture_output=True, text=True, timeout=5, check=False,
-                                    env={**os.environ, "BUILDLOG_OFF": "1"})
+                                    env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "BUILDLOG_OFF": "1"})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(maximum.read_text().strip(), str(GIB))
             with patch.object(store, "host_name", return_value="test-host"):
@@ -356,7 +380,15 @@ class ShellTests(unittest.TestCase):
             command = 'source "$1"; buildlog_wait_for_memory; printf "%s\n" "$BUILDLOG_MEM_RESERVATION"'
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
                                     capture_output=True, text=True, timeout=5, check=False,
-                                    env={**os.environ, "BUILDLOG_DIR": str(root),
+                                    env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "BUILDLOG_DIR": str(root),
                                          "BUILDLOG_MEMINFO": str(meminfo), "BUILDLOG_MEM_POLL_S": "1",
                                          "BUILDLOG_MEM_WAIT_LIMIT_S": "1"})
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -378,7 +410,15 @@ class ShellTests(unittest.TestCase):
             )
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
                                     capture_output=True, text=True, timeout=8, check=False,
-                                    env={**os.environ, "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
+                                    env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo)})
             self.assertEqual(result.returncode, 0, result.stderr)
             lines = result.stderr.splitlines()
@@ -401,7 +441,15 @@ class ShellTests(unittest.TestCase):
             )
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
                                     capture_output=True, text=True, timeout=8, check=False,
-                                    env={**os.environ, "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
+                                    env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo), "BUILDLOG_MEM_WAIT_LIMIT_S": "0"})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertRegex(result.stdout, r"^TimedOut\|[^|\n]+\|exists\ngone\n$")
@@ -417,7 +465,15 @@ class ShellTests(unittest.TestCase):
                        'buildlog_wait_for_memory /bin/true; printf "%s\n" "$BUILDLOG_MEM_OUTCOME"; buildlog_release_memory 0')
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
                                     capture_output=True, text=True, timeout=8, check=False,
-                                    env={**os.environ, "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
+                                    env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo), "BUILDLOG_MEM_WAIT_LIMIT_S": "1"})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "Granted\n")
@@ -434,7 +490,15 @@ class ShellTests(unittest.TestCase):
             command = 'set -e; source "$1"; BUILDLOG_MEM_ADMIT_SCRIPT=$2; buildlog_wait_for_memory /bin/true; printf "%s\n" "$BUILDLOG_MEM_OUTCOME"'
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), str(broken)],
                                     capture_output=True, text=True, timeout=8, check=False,
-                                    env={**os.environ, "BUILDLOG_MEMINFO": str(meminfo)})
+                                    env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "BUILDLOG_MEMINFO": str(meminfo)})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "MeminfoUnavailable\n")
             self.assertIn("memory gate failed (RuntimeError: broken lookup); starting anyway", result.stderr)
@@ -451,7 +515,15 @@ class ShellTests(unittest.TestCase):
                     result = subprocess.run(
                         ["bash", "-c", command, "test", str(MEMORY_GATE)],
                         capture_output=True, text=True, timeout=8, check=False,
-                        env={**os.environ, "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
+                        env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                              "BUILDLOG_MEMINFO": str(meminfo)},
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -467,7 +539,15 @@ class ShellTests(unittest.TestCase):
             command = 'source "$1"; BUILDLOG_MEM_ADMIT_SCRIPT=$2; buildlog_wait_for_memory /bin/true; printf "%s|%s\n" "$BUILDLOG_MEM_OUTCOME" "$BUILDLOG_MEM_RESERVATION"'
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), str(wrapper)],
                                     capture_output=True, text=True, timeout=8, check=False,
-                                    env={**os.environ, "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
+                                    env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo)})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "Granted|\n")
