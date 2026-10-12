@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import json
 import os
 import re
@@ -26,10 +27,13 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.usage.agents_log import Assignment, Lens, Role, RoleLog, assignments, role_at, state_dir
-from scripts.whoami.seat_usage import (
-    MAC_HOST, KnownThreadOpening, ThreadRolloutBuilder, decode_rollout, is_compaction,
+from scripts.usage.rollouts import (
+    KnownThreadOpening, ThreadRolloutBuilder, decode_rollout, is_compaction,
     is_edit, parse_timestamp, token_usage,
 )
+
+
+MAC_HOST = "natemccoy@mac"
 
 
 @dataclass(frozen=True)
@@ -54,7 +58,7 @@ class CodexThread:
 Agent = ClaudeSession | ClaudeSubagent | CodexThread
 Family = Literal["claude", "codex"]
 LogFamily = Literal["claude", "codex", "history"]
-SourceFamily = Literal["claude", "codex", "history", "checkpoints", "readings", "account_roles"]
+SourceFamily = Literal["claude", "codex", "history", "checkpoints", "readings", "baseline_readings", "account_roles"]
 LOG_FAMILIES: tuple[LogFamily, ...] = ("claude", "codex", "history")
 STORE_VERSION = 7
 MAX_SQLITE_INTEGER = (1 << 63) - 1
@@ -962,7 +966,7 @@ def collect_local(db: sqlite3.Connection, args: CommandLine) -> None:
 REMOTE_BOOTSTRAP = """
 import json, sys, types
 request = json.load(sys.stdin)
-for name in ('scripts', 'scripts.usage', 'scripts.whoami'):
+for name in ('scripts', 'scripts.usage'):
     package = types.ModuleType(name)
     package.__path__ = []
     sys.modules[name] = package
@@ -1369,7 +1373,7 @@ def reader_payload(offsets: dict[str, int]) -> str:
     root = Path(__file__).resolve().parents[2]
     modules = {name: (root / relative).read_text(encoding="utf-8") for name, relative in (
         ("scripts.usage.agents_log", "scripts/usage/agents_log.py"),
-        ("scripts.whoami.seat_usage", "scripts/whoami/seat_usage.py"),
+        ("scripts.usage.rollouts", "scripts/usage/rollouts.py"),
         ("scripts.usage.collect", "scripts/usage/collect.py"),
     )}
     return json.dumps({"modules": modules, "cursors": offsets}, separators=(",", ":"))
@@ -1383,9 +1387,10 @@ def collect_mac(db: sqlite3.Connection) -> None:
                for row in cast(Iterable[sqlite3.Row], cursor_rows)}
     command = shlex.join(("python3", "-c", REMOTE_BOOTSTRAP)) + '; printf "\\nrc=%s\\n" "$?"'
     detail = ""
+    ssh_detail = ""
     try:
         payload = reader_payload(offsets)
-        with tempfile.TemporaryDirectory(prefix="usage-mac-") as directory, tempfile.TemporaryFile(mode="w+") as errors:
+        with tempfile.TemporaryDirectory(prefix="usage-mac-") as directory, tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as errors:
             process: subprocess.Popen[str] = subprocess.Popen(
                 ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
                  "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=1", MAC_HOST, command],
@@ -1409,10 +1414,12 @@ def collect_mac(db: sqlite3.Connection) -> None:
                 if process.poll() is None:
                     process.terminate()
                     _ = process.wait()
+                _ = errors.seek(0)
+                ssh_detail = next((line.strip() for line in errors if line.strip()), "")
     except (OSError, UnicodeError, RemoteReadFailed) as error:
         state = SourceState.PARTIAL if progress.completed_files else SourceState.UNREACHABLE
         progress.states = {family: state for family in LOG_FAMILIES}
-        detail = " (" + " ".join(str(error).splitlines()) + ")"
+        detail = " (" + (ssh_detail or " ".join(str(error).splitlines())) + ")"
         if isinstance(progress.role_snapshot, RoleSnapshotPending):
             with db:
                 # Keep the previous problem count until a new snapshot commits.
@@ -1443,11 +1450,12 @@ class CommandLine(argparse.Namespace):
     agents_log: Path
     no_mac: bool
     readings: Path
+    baseline_readings: Path
     account_roles: Path
     claude_repo: Path
     production_docs: Path
 
-    def __init__(self, readings: Path, account_roles: Path, claude_repo: Path, production_docs: Path) -> None:
+    def __init__(self, readings: Path, baseline_readings: Path, account_roles: Path, claude_repo: Path, production_docs: Path) -> None:
         super().__init__()
         self.db = store_path()
         self.machine = "natedev"
@@ -1456,6 +1464,7 @@ class CommandLine(argparse.Namespace):
         self.agents_log = state_dir() / "agents.jsonl"
         self.no_mac = False
         self.readings = readings
+        self.baseline_readings = baseline_readings
         self.account_roles = account_roles
         self.claude_repo = claude_repo
         self.production_docs = production_docs
@@ -1473,45 +1482,62 @@ def main(argv: Sequence[str] = ()) -> int:
     _ = parser.add_argument("--agents-log", type=Path)
     _ = parser.add_argument("--no-mac", action="store_true")
     _ = parser.add_argument("--readings", type=Path)
+    _ = parser.add_argument("--baseline-readings", type=Path)
     _ = parser.add_argument("--account-roles", type=Path)
     _ = parser.add_argument("--claude-repo", type=Path)
     _ = parser.add_argument("--production-docs", type=Path)
     defaults = outcomes.default_paths()
-    args = parser.parse_args(argv, namespace=CommandLine(defaults.readings, defaults.account_roles,
+    args = parser.parse_args(argv, namespace=CommandLine(defaults.readings, defaults.baseline_readings, defaults.account_roles,
                                                        defaults.claude_repo, defaults.production_docs))
     try:
         args.db.parent.mkdir(parents=True, exist_ok=True)
-        db = sqlite3.connect(args.db)
+        lock = Path(str(args.db) + ".lock").open("a")
         try:
-            db.row_factory = sqlite3.Row
-            _ = db.executescript(SCHEMA)
-            migrate_store(db)
-            collect_local(db, args)
-            if args.no_mac:
-                with db:
-                    for family in LOG_FAMILIES:
-                        save_turn_source(db, "mac", family, SourceState.SKIPPED)
-                for source in (*LOG_FAMILIES, "agents"):
-                    source_line("mac", source, 0, SourceState.SKIPPED)
-            else:
-                collect_mac(db)
-            reader = outcomes.IncrementalLogReader(complete_lines, json_fields, cursor_at,
-                                                  lambda ledger, machine, path, offset:
-                                                  save_cursor(ledger, machine, path, FileCursor(offset)))
-            for result in outcomes.collect(db, args.readings, args.account_roles,
-                                           args.claude_repo, args.production_docs, reader):
-                state = (SourceState.READY if isinstance(result.state, outcomes.CompleteSourceRead)
-                         else SourceState.MISSING if isinstance(result.state, outcomes.MissingSource)
-                         else SourceState.UNREADABLE if isinstance(result.state, outcomes.UnreadableSource)
-                         else SourceState.PARTIAL)
-                with db:
-                    save_turn_source(db, "natedev", result.family, state)
-                source_line("natedev", result.family, result.added, state)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close()
+            print("usage collect: another pass is running")
+            return 0
+        try:
+            return collect_pass(args)
         finally:
-            db.close()
+            lock.close()
     except (OSError, sqlite3.Error) as error:
         print("collect: database write failed: " + " ".join(str(error).splitlines()), file=sys.stderr)
         return 1
+
+
+def collect_pass(args: CommandLine) -> int:
+    from scripts.usage import outcomes
+    db = sqlite3.connect(args.db)
+    try:
+        db.row_factory = sqlite3.Row
+        _ = db.execute("PRAGMA journal_mode=WAL")
+        _ = db.executescript(SCHEMA)
+        migrate_store(db)
+        collect_local(db, args)
+        if args.no_mac:
+            with db:
+                for family in LOG_FAMILIES:
+                    save_turn_source(db, "mac", family, SourceState.SKIPPED)
+            for source in (*LOG_FAMILIES, "agents"):
+                source_line("mac", source, 0, SourceState.SKIPPED)
+        else:
+            collect_mac(db)
+        reader = outcomes.IncrementalLogReader(complete_lines, json_fields, cursor_at,
+                                              lambda ledger, machine, path, offset:
+                                              save_cursor(ledger, machine, path, FileCursor(offset)))
+        for result in outcomes.collect(db, args.readings, args.baseline_readings, args.account_roles,
+                                       args.claude_repo, args.production_docs, reader):
+            state = (SourceState.READY if isinstance(result.state, outcomes.CompleteSourceRead)
+                     else SourceState.MISSING if isinstance(result.state, outcomes.MissingSource)
+                     else SourceState.UNREADABLE if isinstance(result.state, outcomes.UnreadableSource)
+                     else SourceState.PARTIAL)
+            with db:
+                save_turn_source(db, "natedev", result.family, state)
+            source_line("natedev", result.family, result.added, state)
+    finally:
+        db.close()
     return 0
 
 
