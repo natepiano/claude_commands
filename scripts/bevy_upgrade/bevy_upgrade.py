@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 import add_unit
 import pins
 import showrunners
+import upstream
+import upgrade_check
 import upgrade_record
 import upgrade_report
 
@@ -23,6 +25,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = parser.add_argument("--production", type=Path)
     verbs = parser.add_subparsers(dest="verb")
     _ = verbs.add_parser("status")
+    _ = verbs.add_parser("check")
     start = verbs.add_parser("start")
     _ = start.add_argument("target")
     for verb in ("approve", "decline"):
@@ -49,9 +52,12 @@ def _production(args: argparse.Namespace) -> add_unit.Production:
 def _run(args: argparse.Namespace, production: add_unit.Production, now: datetime) -> int:
     verb = cast(str | None, args.verb) or "status"
     pins_error = ""
+    exit_code = 0
+    latest: pins.Pins | None = None  # None means no successful lockfile read in this run.
     with upgrade_record.locked(production.slug):
         if verb == "start":
-            current = upgrade_record.start(production, cast(str, args.target), pins.read_pins(production.checkout), now)
+            latest = pins.read_pins(production.checkout)
+            current = upgrade_record.start(production, cast(str, args.target), latest, now)
         else:
             current = upgrade_record.load(production.slug)
             if current is None:
@@ -71,13 +77,23 @@ def _run(args: argparse.Namespace, production: add_unit.Production, now: datetim
                 current = upgrade_record.forget_answer(current, cast(str, args.crate))
             elif verb == "note":
                 current = upgrade_record.set_note(current, cast(str, args.crate), cast(str, args.text))
-        if not pins_error or verb != "status":
+        if verb in ("start", "check"):
+            if pins_error:
+                exit_code = 1
+            elif latest is not None:
+                fixture = os.environ.get("BEVY_UPGRADE_FIXTURES")
+                fetch = upstream.fixture_fetch(Path(fixture)) if fixture is not None else upstream.http_fetch
+                result = upgrade_check.run_check(current, latest, fetch, lambda: datetime.now(timezone.utc))
+                current = result.record
+                if verb == "check" and result.asked > 0 and result.asked == result.failed:
+                    exit_code = 1
+        if not pins_error or verb not in ("status", "check"):
             upgrade_record.save(current)
     if pins_error:
         read_at = datetime.fromisoformat(current["pins_read"]).astimezone(production.zone)
         print(f"pins could not be re-read: {pins_error}; showing pins read {read_at:%H:%M %Z}")
     print(upgrade_report.table(current, production.zone, now))
-    return 0
+    return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
