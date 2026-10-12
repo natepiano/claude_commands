@@ -1,6 +1,7 @@
 """Account attribution and stale-data behavior of the vault writer."""
 
 import asyncio
+import base64
 import io
 import json
 import os
@@ -10,9 +11,9 @@ import tempfile
 import unittest
 import urllib.request
 from contextlib import redirect_stdout
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import cast, override
+from typing import Self, cast, override
 from unittest.mock import patch
 
 import agent_notes
@@ -20,9 +21,10 @@ import note_file
 import agent_accounts
 import codex_pacer
 import five_hour
+import quota_alert
 import usage_store
 import whoami
-from agent_accounts import (ClaudeDirectorySource, CodexRateLimits, Quota, Report,
+from agent_accounts import (ClaudeDirectorySource, CodexHomeSource, CodexRateLimits, Quota, Report,
                             codex_credits, reset_credits)
 from agent_notes import apply, local_reset
 from note_file import Note, read_note
@@ -47,6 +49,7 @@ class AgentNotesTests(unittest.TestCase):
         del home_context
         _ = os.environ.pop("CLAUDE_CONFIG_DIR", None)
         _ = os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        _ = os.environ.pop("CODEX_HOME", None)
         _ = self.enterContext(patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl", create=True))
 
@@ -78,6 +81,233 @@ class AgentNotesTests(unittest.TestCase):
         config = accounts.accounts_config_file()
         config.parent.mkdir(parents=True, exist_ok=True)
         _ = config.write_text(json.dumps(accounts.AccountsConfiguration(unit=label)))
+
+    def codex_login(self, home: Path, login: str) -> None:
+        home.mkdir(exist_ok=True)
+        claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
+        _ = (home / "auth.json").write_text(json.dumps({
+            "tokens": {"id_token": f"header.{claims}.signature"},
+        }))
+
+    def test_update_writes_each_codex_home_and_keeps_only_the_seats_note_active(self) -> None:
+        default = self.root / ".codex"
+        spare = self.root / ".codex2"
+        self.codex_login(default, "seats@example.com")
+        self.codex_login(spare, "spare@example.com")
+        _ = self.note("codex 1.md", "SEATS@example.com")
+        _ = self.note("codex 2.md", "spare@example.com")
+        _ = self.note("codex 3.md", "missing@example.com")
+        seats_report = Report("Codex", email="seats@example.com", source=CodexHomeSource(default),
+            quotas=[Quota("Weekly", 20, self.future)], credit_balance="7", limit_reset_count=1,
+            limit_reset_expirations=[self.future])
+        spare_report = Report("Codex", email="spare@example.com", source=CodexHomeSource(spare),
+            quotas=[Quota("Weekly", 95, self.future)], credit_balance="23", limit_reset_count=2,
+            limit_reset_expirations=[self.future])
+
+        for reports in ([seats_report, spare_report], [spare_report, seats_report]):
+            with (
+                self.subTest(order=[report.email for report in reports]),
+                patch.object(agent_notes, "live_reports", return_value=reports),
+                patch.object(five_hour, "watch", return_value=[]) as watch,
+            ):
+                _ = agent_notes.update()
+            notes = {note.path.stem: note for note in note_file.read_notes()}
+            self.assertEqual({label: note.get("state") for label, note in notes.items()}, {
+                "codex 1": "active", "codex 2": "inactive", "codex 3": "inactive",
+            })
+            self.assertEqual({label: note.get("weekly_remaining_usage") for label, note in notes.items()}, {
+                "codex 1": "80", "codex 2": "5", "codex 3": "null",
+            })
+            self.assertEqual(notes["codex 1"].get("credit_balance"), "7")
+            self.assertEqual(notes["codex 2"].get("credit_balance"), "23")
+            self.assertEqual(notes["codex 1"].get("limit_reset_count"), "1")
+            self.assertEqual(notes["codex 2"].get("limit_reset_count"), "2")
+            self.assertNotIn(notes["codex 1"].get("weekly_usage_checked_at"), (None, "null"))
+            self.assertNotIn(notes["codex 2"].get("weekly_usage_checked_at"), (None, "null"))
+            watch.assert_called_once_with([seats_report])
+        stored = usage_store.load()
+        seats_usage = stored[usage_store.key("Codex", "seats@example.com")]
+        spare_usage = stored[usage_store.key("Codex", "spare@example.com")]
+        if "weekly" not in seats_usage or "weekly" not in spare_usage:
+            self.fail("Both signed-in homes must save their weekly readings")
+        self.assertEqual(seats_usage["weekly"]["left"], 80)
+        self.assertEqual(spare_usage["weekly"]["left"], 5)
+        readings = [cast(agent_notes.StoredReading, json.loads(line))
+                    for line in (self.root / "readings.jsonl").read_text().splitlines()]
+        self.assertEqual({reading["account"] for reading in readings}, {"codex 1", "codex 2"})
+
+    def test_update_follows_the_codex_home_in_use_for_note_activity(self) -> None:
+        default = self.root / ".codex"
+        selected = self.root / ".codex2"
+        self.codex_login(default, "default@example.com")
+        self.codex_login(selected, "selected@example.com")
+        _ = self.note("codex 1.md", "default@example.com")
+        _ = self.note("codex 2.md", "selected@example.com")
+        default_report = Report("Codex", email="default@example.com", source=CodexHomeSource(default),
+            quotas=[Quota("Weekly", 10, self.future)])
+        selected_report = Report("Codex", email="selected@example.com", source=CodexHomeSource(selected),
+            quotas=[Quota("Weekly", 30, self.future)])
+        with (
+            patch.dict(os.environ, {"CODEX_HOME": str(selected)}),
+            patch.object(agent_notes, "live_reports", return_value=[selected_report, default_report]),
+            patch.object(five_hour, "watch", return_value=[]) as watch,
+        ):
+            _ = agent_notes.update()
+        notes = {note.path.stem: note for note in note_file.read_notes()}
+        self.assertEqual(notes["codex 1"].get("state"), "inactive")
+        self.assertEqual(notes["codex 2"].get("state"), "active")
+        self.assertEqual(notes["codex 1"].get("weekly_remaining_usage"), "90")
+        self.assertEqual(notes["codex 2"].get("weekly_remaining_usage"), "70")
+        watch.assert_called_once_with([selected_report])
+
+    def test_five_hour_watch_selects_codex_by_home_even_with_shared_or_absent_login(self) -> None:
+        default = self.root / ".codex"
+        spare = self.root / ".codex2"
+        self.codex_login(default, "shared@example.com")
+        self.codex_login(spare, "shared@example.com")
+        _ = self.note("codex 1.md", "shared@example.com")
+        seats_report = Report("Codex", email="shared@example.com", source=CodexHomeSource(default))
+        spare_report = Report("Codex", email="shared@example.com", source=CodexHomeSource(spare))
+        for current_login in ("shared@example.com", None):
+            seats_report.email = current_login
+            with (
+                self.subTest(current_login=current_login),
+                patch.object(agent_notes, "live_reports", return_value=[spare_report, seats_report]),
+                patch.object(five_hour, "watch", return_value=[]) as watch,
+            ):
+                _ = agent_notes.update()
+            watch.assert_called_once_with([seats_report])
+
+    def test_failed_selected_codex_read_preserves_activity_and_alert_acknowledgement(self) -> None:
+        default = self.root / ".codex"
+        selected = self.root / ".codex2"
+        self.codex_login(default, "spare@example.com")
+        self.codex_login(selected, "SEATS@example.com")
+        seats = self.note("codex 1.md", "seats@example.com")
+        _ = self.note("codex 2.md", "spare@example.com")
+        _ = apply([seats], Report("Codex", email="seats@example.com",
+            quotas=[Quota("Weekly", 100, self.future)]), self.now)
+        before = seats.path.read_text()
+        stamp = self.now.isoformat(timespec="seconds")
+        episode: quota_alert.Episode = {"since": stamp, "acknowledged": stamp, "last": {}}
+        state: quota_alert.State = {"episodes": {"codex 1": episode.copy()}}
+        seats_report = Report("Codex", problem="Account unavailable", source=CodexHomeSource(selected))
+        spare_report = Report("Codex", email="spare@example.com", source=CodexHomeSource(default),
+            quotas=[Quota("Weekly", 95, self.future)], credit_balance="23")
+        selection = agent_accounts.ClaudeAccountSelection(
+            agent_accounts.UnreadableClaudeAccount(), agent_accounts.UnreadableClaudeAccount(), False, (),
+        )
+
+        with (
+            patch.dict(os.environ, {"CODEX_HOME": str(selected)}),
+            patch.object(agent_notes, "live_reports", return_value=[spare_report, seats_report]),
+            patch.object(five_hour, "watch", return_value=[]) as watch,
+        ):
+            _ = agent_notes.update_for_selection(selection)
+
+        notes = {note.path.stem: note for note in note_file.read_notes()}
+        self.assertEqual(notes["codex 1"].get("state"), "active")
+        self.assertEqual(seats.path.read_text(), before)
+        self.assertEqual(notes["codex 1"].get("weekly_remaining_usage"), "0")
+        self.assertEqual(notes["codex 2"].get("state"), "inactive")
+        self.assertEqual(notes["codex 2"].get("weekly_remaining_usage"), "5")
+        self.assertEqual(notes["codex 2"].get("credit_balance"), "23")
+        self.assertEqual(quota_alert.close_recovered(state, list(notes.values()), 5, selection, self.now), [])
+        self.assertEqual(state["episodes"], {"codex 1": episode})
+        watch.assert_called_once_with([seats_report])
+
+    def test_unreadable_selected_codex_login_preserves_every_note_state(self) -> None:
+        default = self.root / ".codex"
+        selected = self.root / ".codex2"
+        self.codex_login(default, "spare@example.com")
+        selected.mkdir()
+        _ = (selected / "auth.json").write_text("not json")
+        seats = self.note("codex 1.md", "seats@example.com")
+        spare = self.note("codex 2.md", "spare@example.com")
+        _ = self.note("codex 3.md", "absent@example.com")
+        _ = apply([seats], Report("Codex", email="seats@example.com",
+            quotas=[Quota("Weekly", 100, self.future)]), self.now)
+        _ = apply([spare], Report("Codex", email="spare@example.com",
+            quotas=[Quota("Weekly", 90, self.future)]), self.now)
+        before = {note.path.stem: note.get("state") for note in note_file.read_notes()}
+        seats_report = Report("Codex", problem="Account unavailable", source=CodexHomeSource(selected))
+        spare_report = Report("Codex", email="spare@example.com", source=CodexHomeSource(default),
+            quotas=[Quota("Weekly", 95, self.future)])
+
+        for reports in ([spare_report, seats_report], [seats_report, spare_report]):
+            with (
+                self.subTest(order=[report.source for report in reports]),
+                patch.dict(os.environ, {"CODEX_HOME": str(selected)}),
+                patch.object(agent_notes, "live_reports", return_value=reports),
+                patch.object(five_hour, "watch", return_value=[]) as watch,
+            ):
+                _ = agent_notes.update()
+            notes = {note.path.stem: note for note in note_file.read_notes()}
+            self.assertEqual({label: note.get("state") for label, note in notes.items()}, before)
+            self.assertEqual(notes["codex 1"].get("weekly_remaining_usage"), "0")
+            self.assertEqual(notes["codex 2"].get("weekly_remaining_usage"), "5")
+            watch.assert_called_once_with([seats_report])
+
+    def test_update_names_the_logged_out_codex_spare_home(self) -> None:
+        default = self.root / ".codex"
+        spare = self.root / ".codex1"
+        self.codex_login(default, "seats@example.com")
+        spare.mkdir()
+        _ = self.note("codex 2.md", "seats@example.com")
+        reports = [
+            Report("Codex", email="seats@example.com", source=CodexHomeSource(default)),
+            Report("Codex", problem="Not logged in", source=CodexHomeSource(spare)),
+        ]
+        with (
+            patch.object(agent_notes, "live_reports", return_value=reports),
+            patch.object(five_hour, "watch", return_value=[]),
+        ):
+            messages = agent_notes.update()
+        self.assertIn("Codex (~/.codex1): Not logged in", messages)
+        self.assertNotIn("Codex: Not logged in", messages)
+
+    def test_update_with_one_logged_out_codex_home_keeps_the_original_message(self) -> None:
+        _ = self.note("codex 1.md", "seats@example.com")
+        report = Report("Codex", problem="Not logged in", source=CodexHomeSource(self.root / ".codex"))
+        with (
+            patch.object(agent_notes, "live_reports", return_value=[report]),
+            patch.object(five_hour, "watch", return_value=[]),
+        ):
+            messages = agent_notes.update()
+        self.assertEqual(messages[-1], "Codex: Not logged in")
+
+    def test_update_with_one_codex_home_keeps_note_states_and_messages(self) -> None:
+        home = self.root / ".codex"
+        self.codex_login(home, "seats@example.com")
+        current = self.note("codex 1.md", "seats@example.com")
+        spare = self.note("codex 2.md", "spare@example.com")
+        report = Report("Codex", email="seats@example.com", source=CodexHomeSource(home),
+            quotas=[Quota("Weekly", 20, self.future)], credit_balance="7")
+        checked_at = self.now
+
+        class FixedNoteCheckTime(datetime):
+            @classmethod
+            @override
+            def now(cls, tz: tzinfo | None = None) -> Self:
+                return cls.fromtimestamp(checked_at.timestamp(), tz)
+
+        with (
+            patch.object(agent_notes, "live_reports", return_value=[report]),
+            patch.object(agent_notes, "datetime", FixedNoteCheckTime),
+            patch.object(five_hour, "watch", return_value=[]) as watch,
+        ):
+            messages = agent_notes.update()
+        self.assertEqual(messages, [
+            "codex 1.md: state=active, credit_balance=7, weekly_remaining_usage=80, "
+            + f"resets={local_reset(self.future)}, weekly_usage_checked_at={self.now.isoformat(timespec='seconds')}",
+            "codex 2.md: state=inactive, weekly_remaining_usage=null, weekly_usage_checked_at=null",
+        ])
+        updated = {note.path.stem: note for note in note_file.read_notes()}
+        self.assertEqual(updated[current.path.stem].get("state"), "active")
+        self.assertEqual(updated[spare.path.stem].get("state"), "inactive")
+        self.assertEqual(updated[current.path.stem].get("weekly_remaining_usage"), "80")
+        self.assertTrue(all(note.path.read_text().endswith("---\nBody stays.\n") for note in (current, spare)))
+        watch.assert_called_once_with([report])
 
     def test_update_reads_two_active_accounts_and_an_inactive_spare(self) -> None:
         default = self.account_dir("default", "main@example.com", "main-fixture-token")

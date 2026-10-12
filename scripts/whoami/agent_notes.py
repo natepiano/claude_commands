@@ -31,7 +31,9 @@ import codex_pacer
 import five_hour
 import note_file
 from note_file import FIELD, Note
-from agent_accounts import ClaudeAccountSelection, ClaudeDirectorySource, EASTERN, Report, live_reports
+from agent_accounts import (ClaudeAccountSelection, ClaudeDirectorySource, CodexHomeSource, EASTERN, Report,
+                            codex_email_on_disk, codex_home, codex_home_display, codex_homes,
+                            codex_report_in_use, live_reports)
 from quota_alert import AgentNote, alert, blocked, current_session, refresh
 from run_out import READINGS_LOG
 import usage_store
@@ -53,12 +55,17 @@ class ObservedAccountActivity:
 
 @dataclass(frozen=True)
 class RoleAccountActivity:
-    """The Claude logins serving launch roles are active together."""
+    """The logins serving a tool's launch roles are active together."""
 
     logins: frozenset[str]
 
 
-AccountActivity = ObservedAccountActivity | RoleAccountActivity
+@dataclass(frozen=True)
+class UnknownAccountActivity:
+    """The role login cannot be read; preserve each note's current activity."""
+
+
+AccountActivity = ObservedAccountActivity | RoleAccountActivity | UnknownAccountActivity
 OBSERVED_ACCOUNT_ACTIVITY = ObservedAccountActivity()
 
 
@@ -188,7 +195,7 @@ def apply(
         matching = bool(account.email) and login == account.email.casefold()
         if isinstance(activity, RoleAccountActivity):
             updates["state"] = "active" if login in activity.logins else "inactive"
-        elif account.email:
+        elif isinstance(activity, ObservedAccountActivity) and account.email:
             updates["state"] = "active" if matching else "inactive"
         matched = matched or matching
         if matching:
@@ -233,7 +240,12 @@ def apply(
     if account.email and not matched:
         messages.append(f"{account.tool}: no note has login {account.email}")
     if account.problem or account.quota_problem:
-        messages.append(f"{account.tool}: {account.problem or account.quota_problem}")
+        tool = account.tool
+        if (tool.lower() == "codex" and len(codex_homes()) > 1
+                and (account.problem or account.email is None)
+                and isinstance(account.source, CodexHomeSource)):
+            tool += f" ({codex_home_display(account.source.home)})"
+        messages.append(f"{tool}: {account.problem or account.quota_problem}")
     return messages
 
 
@@ -264,21 +276,25 @@ def update_for_selection(selection: ClaudeAccountSelection) -> list[str]:
             if note.tool == "claude" and (login := note.get("login"))
             and selection.roles_for_login(login)
         ))
+    codex_activity: AccountActivity = ObservedAccountActivity()
+    if len(codex_homes()) > 1:
+        in_use_login = codex_email_on_disk(codex_home())
+        codex_activity = (RoleAccountActivity(frozenset({in_use_login.casefold()}))
+                          if in_use_login else UnknownAccountActivity())
     for account in reports:
         messages += apply(
             notes, account, checked_at,
-            activity if account.tool.lower() == "claude" else ObservedAccountActivity(),
+            activity if account.tool.lower() == "claude" else codex_activity,
         )
     try:
         # The existing 5-hour watcher has one episode per tool. Keep its default
-        # Claude input; named-account weekly episodes belong to quota_alert.
-        watch_reports = [report for report in reports if (
-            report.tool.lower() != "claude"
-            or not selection.multiple_accounts
-            or (report.source.directory == Path.home() / ".claude"
-                if isinstance(report.source, ClaudeDirectorySource)
-                else selection.is_default_login(report.email or ""))
-        )]
+        # Claude input and the Codex home in use; weekly episodes belong to quota_alert.
+        watch_reports = [report for report in reports
+                         if (report.tool.lower() != "codex" or codex_report_in_use(report))
+                         and (report.tool.lower() != "claude" or not selection.multiple_accounts
+                              or (report.source.directory == Path.home() / ".claude"
+                                  if isinstance(report.source, ClaudeDirectorySource)
+                                  else selection.is_default_login(report.email or "")))]
         messages += five_hour.watch(watch_reports)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         # The 5-hour watch must never cost the notes or the weekly alerts.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, inspect, and select isolated Claude account directories."""
+"""Build and inspect Claude and Codex account directories; select Claude roles."""
 
 from __future__ import annotations
 
@@ -57,6 +57,29 @@ SHARED = (
     "paste-cache",
     "uploads",
 )
+
+CODEX_SHARED = (
+    "config.toml",
+    "hooks.json",
+    "AGENTS.md",
+    "skills",
+    "rules",
+    "plugins",
+    "sessions",
+    "archived_sessions",
+    "session_index.jsonl",
+    "history.jsonl",
+    "models_cache.json",
+)
+CODEX_PRIVATE_NAMES = frozenset({
+    "auth.json", "app-server-control", "app-server-daemon", "installation_id",
+    "cache", "tmp", ".tmp", "version.json", "shell_snapshots", "packages",
+    ".sandbox_migration", ".sqlite-maintenance.lock", "thread-writer-locks",
+    "tui-luna-reserve", "tui-thread-reference-capabilities",
+    *(f"{database}.sqlite{suffix}"
+      for database in ("state_5", "thread_history_1", "goals_1", "logs_2", "queue_1", "memories_1")
+      for suffix in ("", "-wal", "-shm")),
+})
 
 ALWAYS_LINKED = frozenset({"projects", "sessions"})
 TOP_LEVEL_SEED_KEYS = (
@@ -240,27 +263,27 @@ ClaudeDirectoryIdentity = ClaudeDirectoryLogin | ClaudeDirectoryLoggedOut | Unre
 
 
 @dataclass(frozen=True)
-class ExpectedClaudeLogin:
+class ExpectedAccountLogin:
     """The login declared by the requested label's note."""
 
     login: str
 
 
 @dataclass(frozen=True)
-class MissingClaudeAccountNote:
-    """The label has no note yet; a logged-out directory may still log in."""
+class MissingAccountNote:
+    """The requested label has no account note."""
 
     problem: str
 
 
 @dataclass(frozen=True)
-class UnreadableClaudeAccountNote:
+class UnreadableAccountNote:
     """The existing label note cannot establish its expected login."""
 
     problem: str
 
 
-ClaudeAccountNote = ExpectedClaudeLogin | MissingClaudeAccountNote | UnreadableClaudeAccountNote
+AccountNote = ExpectedAccountLogin | MissingAccountNote | UnreadableAccountNote
 
 
 class QuotaReading(TypedDict):
@@ -326,13 +349,17 @@ class AccountStatus:
 
 @dataclass(frozen=True)
 class CodexStatus:
-    """One Codex row: the Codex home, or an account with a note that the home does not hold."""
+    """One Codex home or a noted account whose home is not set up."""
 
     folder: str
+    home: Path
+    is_set_up: bool
+    account_is_safe_to_inspect: bool
     label: str
     # The login the home is signed in with. Empty when it has none, and for an account no home holds.
     login: str
     role: str
+    problems: tuple[str, ...]
 
 
 class CommandLine(argparse.Namespace):
@@ -472,6 +499,13 @@ def account_dir(label: str) -> Path:
     return accounts_home() / f".claude{match.group(1)}"
 
 
+def codex_account_home(label: str) -> Path:
+    match = CODEX_LABEL_PATTERN.fullmatch(label)
+    if match is None:
+        raise AccountsError(f"accounts: {label} is not a codex N label")
+    return accounts_home() / f".codex{match.group(1)}"
+
+
 def _is_expected_link(path: Path, target: Path) -> bool:
     try:
         return path.is_symlink() and os.readlink(path) == str(target)
@@ -479,19 +513,19 @@ def _is_expected_link(path: Path, target: Path) -> bool:
         return False
 
 
-def _real_entry_problem(path: Path) -> str:
+def _real_entry_problem(path: Path, shared_home: str = "~/.claude") -> str:
     return (
-        f"accounts: {path} is a real file; move it aside or merge it into ~/.claude"
+        f"accounts: {path} is a real file; move it aside or merge it into {shared_home}"
     )
 
 
-def _repair_link(path: Path, target: Path) -> list[str]:
+def _repair_link(path: Path, target: Path, shared_home: str = "~/.claude") -> list[str]:
     if path.is_symlink():
         if _is_expected_link(path, target):
             return []
         path.unlink()
     elif path.exists():
-        return [_real_entry_problem(path)]
+        return [_real_entry_problem(path, shared_home)]
     path.symlink_to(target, target_is_directory=target.is_dir())
     return []
 
@@ -564,6 +598,8 @@ def _seed_config(destination: Path) -> list[str]:
 
 def setup(label: str) -> list[str]:
     """Build or repair one named account, returning every refusal or failure."""
+    if CODEX_LABEL_PATTERN.fullmatch(label):
+        return _setup_codex_home(label)
     destination = account_dir(label)
     problems: list[str] = []
     if destination.is_symlink():
@@ -608,12 +644,17 @@ def setup(label: str) -> list[str]:
 
 
 def _link_problems(destination: Path) -> list[str]:
+    return _shared_link_problems(destination, main_config_dir().absolute(), SHARED, ALWAYS_LINKED)
+
+
+def _shared_link_problems(
+    destination: Path, source_dir: Path, shared: tuple[str, ...], required: frozenset[str],
+) -> list[str]:
     problems: list[str] = []
-    source_dir = main_config_dir().absolute()
-    for name in SHARED:
+    for name in shared:
         target = source_dir / name
         path = destination / name
-        if name not in ALWAYS_LINKED and not os.path.lexists(target) and not os.path.lexists(path):
+        if name not in required and not os.path.lexists(target) and not os.path.lexists(path):
             continue
         if path.is_symlink():
             if not _is_expected_link(path, target):
@@ -627,7 +668,7 @@ def _link_problems(destination: Path) -> list[str]:
             elif not path.exists():
                 problems.append(f"accounts: {path} is broken")
         elif path.exists():
-            problems.append(_real_entry_problem(path))
+            problems.append(_real_entry_problem(path, f"~/{source_dir.name}"))
         else:
             problems.append(f"accounts: {path} is missing")
     return problems
@@ -661,20 +702,20 @@ def _account_notes_directory() -> Path:
     return Path(os.environ.get("AGENT_NOTES_DIR", str(accounts_home() / "rust" / "hanadocs" / "agents")))
 
 
-def _account_note(label: str) -> ClaudeAccountNote:
+def _account_note(label: str) -> AccountNote:
     path = _account_notes_directory() / f"{label}.md"
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return MissingClaudeAccountNote(f"accounts: {label} has no account note at {path}")
+        return MissingAccountNote(f"accounts: {label} has no account note at {path}")
     except (OSError, UnicodeError) as error:
-        return UnreadableClaudeAccountNote(f"accounts: could not read {path}: {error}")
+        return UnreadableAccountNote(f"accounts: could not read {path}: {error}")
     close = text.find("\n---", 3)
     if text.startswith("---\n") and close != -1:
-        login = note_file.Note(path, "claude", text, 4, close).get("login")
+        login = note_file.Note(path, label.partition(" ")[0], text, 4, close).get("login")
         if isinstance(login, str) and login.strip() and login not in {"null", "~"}:
-            return ExpectedClaudeLogin(login)
-    return UnreadableClaudeAccountNote(f"accounts: {path} has no readable login in its frontmatter")
+            return ExpectedAccountLogin(login)
+    return UnreadableAccountNote(f"accounts: {path} has no readable login in its frontmatter")
 
 
 def _private_identity_problems(destination: Path) -> list[str]:
@@ -701,7 +742,7 @@ def account_directory_readiness(label: str) -> AccountDirectoryReadiness:
     return _inspect_account_directory(selected, _account_note(label))
 
 
-def _inspect_account_directory(selected: NamedAccount, expected: ClaudeAccountNote) -> AccountDirectoryReadiness:
+def _inspect_account_directory(selected: NamedAccount, expected: AccountNote) -> AccountDirectoryReadiness:
     label = selected.label
     destination = selected.dir
     if destination.is_symlink():
@@ -722,20 +763,20 @@ def _inspect_account_directory(selected: NamedAccount, expected: ClaudeAccountNo
     problems = [*links, *private_problems]
     # Do not follow an unsafe identity link, even while collecting diagnostics.
     if (destination / ".claude.json").is_symlink():
-        if not isinstance(expected, ExpectedClaudeLogin):
+        if not isinstance(expected, ExpectedAccountLogin):
             problems.append(expected.problem)
         return AccountDirectoryBrokenLinks(tuple(problems))
     identity = _directory_identity(destination)
     if isinstance(identity, UnreadableClaudeDirectoryIdentity):
         problems.append(identity.problem)
-    if isinstance(expected, UnreadableClaudeAccountNote):
+    if isinstance(expected, UnreadableAccountNote):
         problems.append(expected.problem)
     if isinstance(identity, ClaudeDirectoryLoggedOut):
         problems.append(f"accounts: {destination} is not logged in")
-    if isinstance(expected, MissingClaudeAccountNote):
+    if isinstance(expected, MissingAccountNote):
         problems.append(expected.problem)
     wrong_login = False
-    if isinstance(identity, ClaudeDirectoryLogin) and isinstance(expected, ExpectedClaudeLogin):
+    if isinstance(identity, ClaudeDirectoryLogin) and isinstance(expected, ExpectedAccountLogin):
         wrong_login = identity.login.casefold() != expected.login.casefold()
         if wrong_login:
             problems.append(
@@ -745,9 +786,9 @@ def _inspect_account_directory(selected: NamedAccount, expected: ClaudeAccountNo
         return AccountDirectoryBrokenLinks(tuple(problems))
     if (
         isinstance(identity, UnreadableClaudeDirectoryIdentity)
-        or isinstance(expected, UnreadableClaudeAccountNote)
+        or isinstance(expected, UnreadableAccountNote)
         or private_problems
-        or isinstance(identity, ClaudeDirectoryLogin) and isinstance(expected, MissingClaudeAccountNote)
+        or isinstance(identity, ClaudeDirectoryLogin) and isinstance(expected, MissingAccountNote)
     ):
         return AccountDirectoryUnreadable(tuple(problems))
     if isinstance(identity, ClaudeDirectoryLoggedOut):
@@ -759,7 +800,99 @@ def _inspect_account_directory(selected: NamedAccount, expected: ClaudeAccountNo
 
 def check(label: str) -> list[str]:
     """Return every reason a named account is not fit to launch."""
+    if CODEX_LABEL_PATTERN.fullmatch(label):
+        return _check_codex_home(label)
     return list(account_directory_readiness(label).problems)
+
+
+def _setup_codex_home(label: str) -> list[str]:
+    destination = codex_account_home(label)
+    expected = _account_note(label)
+    if not isinstance(expected, ExpectedAccountLogin):
+        return [expected.problem]
+    for home in agent_accounts.codex_homes():
+        if home != destination and _codex_home_login(home).casefold() == expected.login.casefold():
+            return [
+                f"accounts: cannot set up {label}: {_codex_folder(home)} already holds its login; "
+                + "two homes on one login break token refresh"
+            ]
+    if destination.is_symlink():
+        return [f"accounts: {destination} is a link; an account home must be a real directory"]
+    if destination.exists() and not destination.is_dir():
+        return [f"accounts: {destination} is not a directory"]
+    try:
+        destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+        destination.chmod(0o700)
+    except OSError as error:
+        return [f"accounts: could not create {destination}: {error}"]
+    problems = _codex_private_link_problems(destination)
+    source = (accounts_home() / ".codex").absolute()
+    for name in CODEX_SHARED:
+        target = source / name
+        path = destination / name
+        try:
+            if target.exists():
+                problems.extend(_repair_link(path, target, "~/.codex"))
+            elif _is_expected_link(path, target):
+                path.unlink()
+            elif os.path.lexists(path):
+                problems.append(f"accounts: {path} has no shared entry in ~/.codex")
+        except OSError as error:
+            problems.append(f"accounts: could not link {path}: {error}")
+    return problems
+
+
+def _codex_private_link_problems(home: Path) -> list[str]:
+    return [
+        f"accounts: {home / name} is a link; sign-in and home state stay in each account home"
+        for name in sorted(CODEX_PRIVATE_NAMES) if (home / name).is_symlink()
+    ]
+
+
+def _codex_home_login(home: Path) -> str:
+    """Read a home identity without following a linked home or sign-in file."""
+    if home.is_symlink() or (home / "auth.json").is_symlink():
+        return ""
+    return agent_accounts.codex_email_on_disk(home) or ""
+
+
+def _codex_folder(home: Path) -> str:
+    return f"~/{home.relative_to(accounts_home())}" if home.is_relative_to(accounts_home()) else str(home)
+
+
+def _check_codex_home(label: str) -> list[str]:
+    destination = codex_account_home(label)
+    folder = _codex_folder(destination)
+    if destination.is_symlink():
+        return [f"accounts: {folder} is a link; an account home must be a real directory"]
+    if not destination.exists():
+        return [f"accounts: {folder} is missing"]
+    if not destination.is_dir():
+        return [f"accounts: {folder} is not a directory"]
+    problems = _shared_link_problems(
+        destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, frozenset(),
+    )
+    problems.extend(_codex_private_link_problems(destination))
+    try:
+        unknown = sorted(entry.name for entry in destination.iterdir()
+                         if entry.name not in CODEX_SHARED and entry.name not in CODEX_PRIVATE_NAMES)
+        if unknown:
+            problems.append(f"{folder}: unclassified: {', '.join(unknown)}")
+    except OSError as error:
+        problems.append(f"accounts: could not inspect {destination}: {error}")
+    expected = _account_note(label)
+    if not isinstance(expected, ExpectedAccountLogin):
+        problems.append(expected.problem)
+    login = _codex_home_login(destination)
+    if not login:
+        problems.append(f"accounts: {folder} is not logged in")
+    elif isinstance(expected, ExpectedAccountLogin) and login.casefold() != expected.login.casefold():
+        problems.append(f"accounts: {folder} is logged in as {login}, not {label}")
+    if login:
+        for home in agent_accounts.codex_homes():
+            if home != destination and _codex_home_login(home).casefold() == login.casefold():
+                problems.append(f"accounts: {folder} and {_codex_folder(home)} are logged in as {login}; two homes on one login break token refresh")
+    return problems
 
 
 def _drop_named_account(environment: dict[str, str]) -> None:
@@ -778,7 +911,7 @@ def exec_account(label: str, arguments: list[str]) -> None:
     if isinstance(selected, NamedAccount):
         default = _directory_identity(main_config_dir()) if label != "unit" else ClaudeDirectoryLoggedOut()
         expected = _account_note(selected.label)
-        default_login = isinstance(default, ClaudeDirectoryLogin) and isinstance(expected, ExpectedClaudeLogin) and expected.login.casefold() == default.login.casefold()
+        default_login = isinstance(default, ClaudeDirectoryLogin) and isinstance(expected, ExpectedAccountLogin) and expected.login.casefold() == default.login.casefold()
         if not default_login:
             readiness = _inspect_account_directory(selected, expected)
             if isinstance(readiness, AccountDirectoryNotSetUp):
@@ -1464,23 +1597,41 @@ def account_statuses() -> list[AccountStatus]:
 
 
 def codex_statuses() -> list[CodexStatus]:
-    """The Codex home, then every Codex account that has a note and that the home does not hold."""
-    home = agent_accounts.codex_home()
-    folder = f"~/{home.relative_to(Path.home())}" if home.is_relative_to(Path.home()) else str(home)
-    login = agent_accounts.codex_email_on_disk(home) or ""
-    label = account.label_for("Codex", login) if login else NO_VALUE
+    """Every listed home, then unheld noted accounts whose home is not listed."""
+    statuses: list[CodexStatus] = []
+    homes = agent_accounts.codex_homes()
+    for home in homes:
+        folder = _codex_folder(home)
+        safe = not home.is_symlink() and not (home / "auth.json").is_symlink()
+        login = _codex_home_login(home)
+        label = account.label_for("Codex", login) if login else NO_VALUE
+        match = re.fullmatch(r"\.codex([1-9][0-9]*)", home.name) if home.parent == accounts_home() else None
+        problems = check(f"codex {match.group(1)}") if match else []
+        statuses.append(CodexStatus(
+            folder, home, True, safe, NO_VALUE if label == login else label, login,
+            CODEX_ROLE if home == agent_accounts.codex_home() else "spare", tuple(problems),
+        ))
+    held_logins = {status.login.casefold() for status in statuses if status.login}
     noted = sorted(
         (path.stem for path in _account_notes_directory().glob("codex *.md") if CODEX_LABEL_PATTERN.fullmatch(path.stem)),
         key=lambda stem: int(stem.removeprefix("codex ")),
     )
-    return [
-        CodexStatus(folder, NO_VALUE if label == login else label, login, CODEX_ROLE),
-        *(CodexStatus(NO_VALUE, other, "", NO_VALUE) for other in noted if other != label),
-    ]
+    for label in noted:
+        home = codex_account_home(label)
+        expected = _account_note(label)
+        if home in homes or (
+            isinstance(expected, ExpectedAccountLogin) and expected.login.casefold() in held_logins
+        ):
+            continue
+        problems = tuple(check(label)) if os.path.lexists(home) else ()
+        statuses.append(CodexStatus(
+            f"~/{home.name}", home, False, not home.is_symlink(), label, "", NO_VALUE, problems,
+        ))
+    return statuses
 
 
-def _codex_live() -> agent_accounts.Report:
-    return asyncio.run(agent_accounts.codex_live())
+def _codex_live(home: Path) -> agent_accounts.Report:
+    return asyncio.run(agent_accounts.codex_live(home))
 
 
 def _stored_time(text: str) -> datetime | None:
@@ -1514,15 +1665,12 @@ def _stored_usage(
         status.config_dir for status in statuses
         if status.login and _is_stale(stored.get(usage_store.key("Claude", status.login)), now)
     ]
-    # One Codex home, so one live read covers the one login it holds.
-    codex_is_stale = any(
-        status.login and _is_stale(stored.get(usage_store.key("Codex", status.login)), now) for status in codex
-    )
-    if stale or codex_is_stale:
+    stale_codex = [status.home for status in codex
+                   if status.login and _is_stale(stored.get(usage_store.key("Codex", status.login)), now)]
+    if stale or stale_codex:
         with ThreadPoolExecutor() as pool:
             reads = [pool.submit(agent_accounts.claude_live, config_dir) for config_dir in stale]
-            if codex_is_stale:
-                reads.append(pool.submit(_codex_live))
+            reads.extend(pool.submit(_codex_live, home) for home in stale_codex)
             reports = [read.result() for read in reads]
         if usage_store.merge(stored, reports, now):
             try:
@@ -1622,6 +1770,10 @@ def _codex_row(
     status: CodexStatus, usage: usage_store.StoredUsage | None, now: datetime, zone: tzinfo | None,
 ) -> tuple[str, ...]:
     """One Codex row. `usage` is its login's stored reading, if it has one."""
+    if not status.is_set_up:
+        return (status.folder, status.label, "not set up", status.role, *NO_READING)
+    if not status.account_is_safe_to_inspect:
+        return (status.folder, status.label, "unavailable", status.role, *NO_READING)
     if not status.login:
         return (status.folder, status.label, "not logged in", status.role, *NO_READING)
     return (
@@ -1659,7 +1811,7 @@ def _status_notes(status: AccountStatus) -> list[str]:
 
 
 def status_report() -> str:
-    """One table row per Claude folder and Codex account, then one line for each thing wrong in a folder."""
+    """One table row per account folder, then one line for each thing wrong in a folder."""
     statuses = account_statuses()
     codex = codex_statuses()
     now = datetime.now(timezone.utc)
@@ -1669,7 +1821,8 @@ def status_report() -> str:
         *(_table_row(status, usage.get(usage_store.key("Claude", status.login)), now, zone) for status in statuses),
         *(_codex_row(status, usage.get(usage_store.key("Codex", status.login)), now, zone) for status in codex),
     ])
-    notes = [note for status in statuses for note in _status_notes(status)]
+    notes = [*(note for status in statuses for note in _status_notes(status)),
+             *(problem for status in codex for problem in status.problems)]
     return "\n".join([table, *([""] if notes else []), *notes])
 
 
@@ -1708,9 +1861,14 @@ def main(argv: list[str]) -> int:
             return 0
         if options.action == "setup":
             problems = setup(options.label)
-            destination = account_dir(options.label)
             for problem in problems:
                 print(problem, file=sys.stderr)
+            if CODEX_LABEL_PATTERN.fullmatch(options.label):
+                home = codex_account_home(options.label)
+                if not problems and home.is_dir() and not home.is_symlink():
+                    print(f"CODEX_HOME=~/{home.name} codex login")
+                return 1 if problems else 0
+            destination = account_dir(options.label)
             print(f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(destination))} claude")
             print("/login")
             return 1 if problems else 0

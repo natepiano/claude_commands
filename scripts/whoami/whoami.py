@@ -9,7 +9,8 @@ from datetime import datetime
 from pathlib import Path
 
 from account import label_for
-from agent_accounts import ClaudeAccountSelection, ClaudeRole, EASTERN, Quota, Report, live_reports
+from agent_accounts import (ClaudeAccountSelection, CodexHomeSource, EASTERN, Quota, Report,
+                            codex_home_display, codex_homes, codex_report_in_use, live_reports)
 import note_file
 
 
@@ -26,7 +27,14 @@ def quota_line(quota: Quota) -> str:
 
 
 def render(report: Report, selection: ClaudeAccountSelection) -> list[str]:
-    lines = [report.tool]
+    multiple_codex_homes = report.tool == "Codex" and len(codex_homes()) > 1
+    codex_seats = multiple_codex_homes and codex_report_in_use(report)
+    header = report.tool
+    if (multiple_codex_homes and (report.problem or report.email is None)
+            and isinstance(report.source, CodexHomeSource)):
+        role = ", seats" if codex_seats else ""
+        header += f" ({codex_home_display(report.source.home)}{role})"
+    lines = [header]
     if report.problem:
         return lines + [f"  {report.problem}"]
     email = report.email
@@ -34,9 +42,11 @@ def render(report: Report, selection: ClaudeAccountSelection) -> list[str]:
         lines.append("  Account: email unavailable")
     else:
         label = label_for(report.tool, email)
-        roles: tuple[ClaudeRole, ...] = ()
+        roles: tuple[str, ...] = ()
         if report.tool == "Claude" and selection.multiple_accounts:
             roles = selection.roles_for_login(email)
+        elif codex_seats:
+            roles = ("seats",)
         role = f" ({', '.join(roles)})" if roles else ""
         lines.append(f"  Account: {label}{role} — {email}" if label != email else f"  Account: {email}{role}")
     lines.append(f"  Plan: {report.plan or 'unavailable'}")

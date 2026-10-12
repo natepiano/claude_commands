@@ -1,6 +1,6 @@
 ---
-description: Show every Claude and Codex account in one table (label, login, role, quota left, Codex credits), or set up a Claude folder or swap the unit account.
-argument-hint: '[setup "claude N" | swap unit "claude N" | swap unit default]'
+description: Show Claude and Codex homes, roles, quotas and credits; set up a home or swap the unit account.
+argument-hint: '[setup "claude N" | setup "codex N" | check "codex N" | swap unit "claude N" | swap unit default]'
 ---
 
 # Accounts

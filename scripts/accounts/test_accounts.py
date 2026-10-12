@@ -64,6 +64,21 @@ EXPECTED_SHARED = (
 )
 
 
+EXPECTED_CODEX_SHARED = (
+    "config.toml",
+    "hooks.json",
+    "AGENTS.md",
+    "skills",
+    "rules",
+    "plugins",
+    "sessions",
+    "archived_sessions",
+    "session_index.jsonl",
+    "history.jsonl",
+    "models_cache.json",
+)
+
+
 @final
 class RoleWriteTime(datetime):
     """The fixed assignment time before this fixture's quota observations."""
@@ -185,10 +200,10 @@ class AccountsTests(unittest.TestCase):
         path = Path(os.environ["AGENT_NOTES_DIR"]) / f"{label}.md"
         _ = path.write_text(f"---\nlogin: {login}\n---\n", encoding="utf-8")
 
-    def codex_login(self, login: str) -> None:
+    def codex_login(self, login: str, home: Path | None = None) -> None:
         """Sign the Codex home in the way Codex stores it: the login is a claim of its id token."""
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
-        codex_home = self.home / ".codex"
+        codex_home = self.home / ".codex" if home is None else home
         codex_home.mkdir(exist_ok=True)
         _ = (codex_home / "auth.json").write_text(
             json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}), encoding="utf-8",
@@ -1711,7 +1726,7 @@ class AccountsTests(unittest.TestCase):
                     f"{100 - weekly_used:.0f}%", later.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
                     *credit_cells, read.astimezone(zone).strftime("%H:%M %Z"),
                 ))
-                self.assertEqual(rows[-1], ("—", "codex 1", "not logged in", "—", *("—",) * 7))
+                self.assertEqual(rows[-1], ("~/.codex1", "codex 1", "not set up", "—", *("—",) * 7))
         self.codex_reads.assert_not_awaited()
 
     def test_status_reads_codex_live_only_when_no_reading_is_recent_and_keeps_what_it_read(self) -> None:
@@ -1732,7 +1747,343 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual((first[6], first[8], first[9]), ("70%", "no", "5"))
         self.assertNotEqual(first[10], "—")
         self.assertEqual(second, first)
-        self.codex_reads.assert_awaited_once_with()
+        self.codex_reads.assert_awaited_once_with(self.home / ".codex")
+
+    def test_codex_setup_requires_its_note_before_creating_a_home(self) -> None:
+        result, stdout, stderr = self.run_cli("setup", "codex 1")
+        self.assertNotEqual(result, 0)
+        self.assertIn("codex 1", stderr)
+        self.assertIn("note", stderr.lower())
+        self.assertEqual(stdout, "")
+        self.assertFalse((self.home / ".codex1").exists())
+        self.codex_reads.assert_not_awaited()
+
+    def test_codex_setup_refuses_a_login_already_held_by_the_default_home(self) -> None:
+        self.write_note("codex 2", "seats@example.invalid")
+        self.codex_login("SEATS@example.invalid")
+        default = self.home / ".codex"
+        authentication = (default / "auth.json").read_bytes()
+        entries = set(self.home.iterdir())
+
+        problems = accounts.setup("codex 2")
+
+        self.assertEqual(len(problems), 1)
+        self.assertIn("codex 2", problems[0])
+        self.assertIn("~/.codex", problems[0])
+        self.assertIn("two homes on one login break token refresh", problems[0])
+        self.assertEqual(self.run_cli("setup", "codex 2"), (1, "", problems[0] + "\n"))
+        self.assertFalse((self.home / ".codex2").exists())
+        self.assertEqual(set(self.home.iterdir()), entries)
+        self.assertEqual((default / "auth.json").read_bytes(), authentication)
+        self.codex_reads.assert_not_awaited()
+
+    def test_codex_setup_duplicate_login_refusal_preserves_an_existing_home(self) -> None:
+        self.write_note("codex 2", "seats@example.invalid")
+        self.codex_login("seats@example.invalid")
+        default = self.home / ".codex"
+        _ = (default / "config.toml").write_text("shared config")
+        home = self.home / ".codex2"
+        home.mkdir(mode=0o755)
+        _ = (home / "config.toml").write_text("own config")
+        before = home.stat().st_mode
+
+        result, stdout, stderr = self.run_cli("setup", "codex 2")
+
+        self.assertEqual((result, stdout), (1, ""))
+        self.assertIn("~/.codex already holds", stderr)
+        self.assertEqual(home.stat().st_mode, before)
+        self.assertEqual({entry.name for entry in home.iterdir()}, {"config.toml"})
+        self.assertFalse((home / "config.toml").is_symlink())
+        self.assertEqual((home / "config.toml").read_text(), "own config")
+        self.assertEqual((default / "config.toml").read_text(), "shared config")
+
+    def test_codex_setup_refuses_a_login_held_by_a_numbered_or_custom_home(self) -> None:
+        self.write_note("codex 1", "spare@example.invalid")
+        for name in (".codex3", "custom-codex"):
+            with self.subTest(home=name):
+                other = self.home / name
+                self.codex_login("spare@example.invalid", other)
+                with patch.dict(os.environ, {"CODEX_HOME": str(other)}):
+                    result, stdout, stderr = self.run_cli("setup", "codex 1")
+                self.assertEqual((result, stdout), (1, ""))
+                self.assertIn(f"~/{name} already holds", stderr)
+                self.assertFalse((self.home / ".codex1").exists())
+                (other / "auth.json").unlink()
+                other.rmdir()
+
+    def test_codex_setup_links_existing_shared_entries_and_preserves_default_identity(self) -> None:
+        self.write_note("codex 1", "spare@example.invalid")
+        self.codex_login("seats@example.invalid")
+        default = self.home / ".codex"
+        directories = {"skills", "rules", "plugins", "sessions", "archived_sessions"}
+        for name in EXPECTED_CODEX_SHARED:
+            source = default / name
+            if name in directories:
+                source.mkdir()
+                _ = (source / "entry").write_text(name)
+            else:
+                _ = source.write_text(name)
+        for name in ("state_5.sqlite", "installation_id", "version.json"):
+            _ = (default / name).write_text("own state")
+        before = (default / "auth.json").read_bytes()
+
+        result, stdout, stderr = self.run_cli("setup", "codex 1")
+
+        self.assertEqual((result, stderr), (0, ""))
+        self.assertIn("CODEX_HOME=~/.codex1 codex login", stdout)
+        home = self.home / ".codex1"
+        self.assertTrue(home.is_dir())
+        self.assertFalse(home.is_symlink())
+        self.assertEqual(home.stat().st_mode & 0o777, 0o700)
+        self.assertEqual({entry.name for entry in home.iterdir()}, set(EXPECTED_CODEX_SHARED))
+        for name in EXPECTED_CODEX_SHARED:
+            self.assertTrue((home / name).is_symlink(), name)
+            self.assertEqual((home / name).resolve(), default / name)
+        self.assertEqual((default / "auth.json").read_bytes(), before)
+        self.codex_reads.assert_not_awaited()
+
+    def test_codex_setup_omits_missing_shared_targets_and_keeps_existing_links(self) -> None:
+        self.write_note("codex 2", "spare@example.invalid")
+        default = self.home / ".codex"
+        default.mkdir()
+        _ = (default / "config.toml").write_text("config")
+        self.assertEqual(self.run_cli("setup", "codex 2")[0], 0)
+        home = self.home / ".codex2"
+        linked = home / "config.toml"
+        before = linked.lstat()
+        self.codex_login("spare@example.invalid", home)
+        authentication = (home / "auth.json").read_bytes()
+
+        self.assertEqual(self.run_cli("setup", "codex 2")[0], 0)
+
+        self.assertEqual(linked.lstat().st_ino, before.st_ino)
+        self.assertEqual(linked.lstat().st_mtime_ns, before.st_mtime_ns)
+        self.assertEqual((home / "auth.json").read_bytes(), authentication)
+        self.assertEqual({entry.name for entry in home.iterdir()}, {"config.toml", "auth.json"})
+        self.assertEqual({entry.name for entry in default.iterdir()}, {"config.toml"})
+
+    def test_codex_setup_reports_real_entries_without_replacing_them(self) -> None:
+        self.write_note("codex 1", "spare@example.invalid")
+        default = self.home / ".codex"
+        default.mkdir()
+        _ = (default / "config.toml").write_text("shared")
+        (default / "skills").mkdir()
+        _ = (default / "hooks.json").write_text("shared hooks")
+        home = self.home / ".codex1"
+        home.mkdir(mode=0o700)
+        _ = (home / "config.toml").write_text("own config")
+        (home / "skills").mkdir()
+        _ = (home / "skills" / "own").write_text("own skills")
+
+        result, _, stderr = self.run_cli("setup", "codex 1")
+
+        self.assertNotEqual(result, 0)
+        self.assertIn("config.toml", stderr)
+        self.assertIn("skills", stderr)
+        self.assertEqual((home / "config.toml").read_text(), "own config")
+        self.assertFalse((home / "skills").is_symlink())
+        self.assertEqual((home / "skills" / "own").read_text(), "own skills")
+        self.assertEqual((home / "hooks.json").resolve(), default / "hooks.json")
+
+    def test_codex_check_accepts_own_state_files_and_matching_login(self) -> None:
+        self.write_note("codex 1", "SPARE@example.invalid")
+        self.codex_login("spare@example.invalid", self.home / ".codex1")
+        home = self.home / ".codex1"
+        for stem in ("state_5", "thread_history_1", "goals_1", "logs_2", "queue_1", "memories_1"):
+            for suffix in (".sqlite", ".sqlite-wal", ".sqlite-shm"):
+                _ = (home / f"{stem}{suffix}").write_text("own database")
+        for name in ("app-server-control", "app-server-daemon", "cache", "tmp", "shell_snapshots", "packages"):
+            (home / name).mkdir()
+        for name in ("installation_id", "version.json"):
+            _ = (home / name).write_text("own state")
+
+        self.assertEqual(self.run_cli("check", "codex 1"), (0, "", ""))
+        self.codex_reads.assert_not_awaited()
+
+    def test_codex_check_reports_links_unknown_entry_and_login_mismatch_together(self) -> None:
+        self.write_note("codex 1", "expected@example.invalid")
+        self.codex_login("other@example.invalid", self.home / ".codex1")
+        default = self.home / ".codex"
+        default.mkdir()
+        for name in ("config.toml", "hooks.json", "AGENTS.md"):
+            _ = (default / name).write_text("shared")
+        home = self.home / ".codex1"
+        _ = (home / "config.toml").symlink_to(self.root / "missing")
+        _ = (home / "hooks.json").write_text("replacement")
+        wrong = self.root / "other.md"
+        _ = wrong.write_text("other")
+        _ = (home / "AGENTS.md").symlink_to(wrong)
+        _ = (home / "unknown-entry").write_text("own")
+
+        result, stdout, stderr = self.run_cli("check", "codex 1")
+
+        self.assertNotEqual(result, 0)
+        self.assertEqual(stderr, "")
+        for detail in ("config.toml", "hooks.json", "AGENTS.md", "unknown-entry", "other@example.invalid", "codex 1"):
+            self.assertIn(detail, stdout)
+        self.assertEqual((home / "hooks.json").read_text(), "replacement")
+        self.codex_reads.assert_not_awaited()
+
+    def test_codex_check_reports_one_login_in_default_and_another_numbered_home(self) -> None:
+        self.write_note("codex 1", "same@example.invalid")
+        self.write_note("codex 2", "same@example.invalid")
+        for name in (".codex", ".codex1", ".codex2"):
+            self.codex_login("SAME@example.invalid", self.home / name)
+
+        result, stdout, stderr = self.run_cli("check", "codex 1")
+
+        self.assertNotEqual(result, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("~/.codex", stdout)
+        self.assertIn("~/.codex2", stdout)
+        self.assertIn("same@example.invalid", stdout.lower())
+
+    def test_codex_check_reports_missing_home_and_logged_out_home(self) -> None:
+        self.write_note("codex 1", "spare@example.invalid")
+        result, stdout, stderr = self.run_cli("check", "codex 1")
+        self.assertNotEqual(result, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("~/.codex1", stdout)
+        self.assertFalse((self.home / ".codex1").exists())
+        (self.home / ".codex1").mkdir(mode=0o700)
+
+        result, stdout, stderr = self.run_cli("check", "codex 1")
+
+        self.assertNotEqual(result, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("not logged in", stdout.lower())
+
+    def test_status_has_one_codex_row_per_home_then_only_unheld_missing_notes(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        for label, login in (("codex 1", "main-codex@example.invalid"), ("codex 2", "spare@example.invalid"),
+                             ("codex 3", "missing@example.invalid"), ("codex 4", "unheld@example.invalid")):
+            self.write_note(label, login)
+        self.codex_login("MAIN-CODEX@example.invalid")
+        self.codex_login("spare@example.invalid", self.home / ".codex2")
+        self.codex_login("unknown@example.invalid", self.home / ".codex4")
+        (self.home / ".codex10").mkdir()
+
+        rows = self.status_rows()[1:]
+
+        self.assertEqual([row[:4] for row in rows], [
+            ("~/.codex", "codex 1", "MAIN-CODEX@example.invalid", "seats"),
+            ("~/.codex2", "codex 2", "spare@example.invalid", "spare"),
+            ("~/.codex4", "—", "unknown@example.invalid", "spare"),
+            ("~/.codex10", "—", "not logged in", "spare"),
+            ("~/.codex3", "codex 3", "not set up", "—"),
+        ])
+
+    def test_status_reports_a_not_set_up_codex_account_when_its_home_is_a_file(self) -> None:
+        self.write_note("codex 1", "spare@example.invalid")
+        home = self.home / ".codex1"
+        _ = home.write_text("obstruction")
+
+        self.assertIn(("~/.codex1", "codex 1", "not set up", "—"),
+                      [row[:4] for row in self.status_rows()])
+        result, stdout, stderr = self.run_cli("status")
+        self.assertEqual((result, stderr), (0, ""))
+        problems = stdout.split("\n\n", 1)[1]
+        self.assertIn("~/.codex1 is not a directory", problems)
+        self.assertEqual(home.read_text(), "obstruction")
+        self.codex_reads.assert_not_awaited()
+
+    def test_status_reports_a_not_set_up_codex_account_when_its_home_is_a_dangling_link(self) -> None:
+        self.write_note("codex 1", "spare@example.invalid")
+        home = self.home / ".codex1"
+        target = self.root / "missing-home"
+        home.symlink_to(target)
+
+        self.assertIn(("~/.codex1", "codex 1", "not set up", "—"),
+                      [row[:4] for row in self.status_rows()])
+        result, stdout, stderr = self.run_cli("status")
+        self.assertEqual((result, stderr), (0, ""))
+        problems = stdout.split("\n\n", 1)[1]
+        self.assertIn("~/.codex1 is a link", problems)
+        self.assertEqual(os.readlink(home), str(target))
+        self.assertFalse(target.exists())
+        self.codex_reads.assert_not_awaited()
+
+    def test_status_assigns_seats_to_the_selected_codex_home(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.write_note("codex 1", "spare@example.invalid")
+        self.codex_login("default@example.invalid")
+        selected = self.home / ".codex1"
+        self.codex_login("spare@example.invalid", selected)
+        with patch.dict(os.environ, {"CODEX_HOME": str(selected)}):
+            rows = self.status_rows()[1:]
+        self.assertEqual([row[3] for row in rows], ["spare", "seats"])
+        self.assertEqual([row[0] for row in rows], ["~/.codex", "~/.codex1"])
+
+    def test_status_reads_each_stale_codex_home_and_saves_both_readings(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.write_note("codex 2", "spare@example.invalid")
+        default = self.home / ".codex"
+        spare = self.home / ".codex2"
+        self.codex_login("seats@example.invalid", default)
+        self.codex_login("spare@example.invalid", spare)
+        later = datetime.now(timezone.utc) + timedelta(days=3)
+        reports = {
+            default: agent_accounts.Report("Codex", email="seats@example.invalid",
+                quotas=[agent_accounts.Quota("Weekly", 20, later)], credit_balance="7"),
+            spare: agent_accounts.Report("Codex", email="spare@example.invalid",
+                quotas=[agent_accounts.Quota("Weekly", 95, later)], credit_balance="11"),
+        }
+        self.codex_reads.side_effect = reports.__getitem__
+
+        first = self.status_rows()[1:]
+        second = self.status_rows()[1:]
+
+        self.assertEqual([row[6] for row in first], ["80%", "5%"])
+        self.assertEqual([row[9] for row in first], ["7", "11"])
+        self.assertEqual(first, second)
+        self.assertCountEqual(self.codex_reads.await_args_list, [call(default), call(spare)])
+        stored = usage_store.load()
+        seats_usage = stored[usage_store.key("Codex", "seats@example.invalid")]
+        spare_usage = stored[usage_store.key("Codex", "spare@example.invalid")]
+        if "weekly" not in seats_usage or "weekly" not in spare_usage:
+            self.fail("Both signed-in homes must save their weekly readings")
+        self.assertEqual(seats_usage["weekly"]["left"], 80)
+        self.assertEqual(spare_usage["weekly"]["left"], 5)
+
+    def test_status_reads_only_the_codex_home_with_an_old_reading(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.write_note("codex 1", "spare@example.invalid")
+        default = self.home / ".codex"
+        spare = self.home / ".codex1"
+        self.codex_login("seats@example.invalid", default)
+        self.codex_login("spare@example.invalid", spare)
+        now = datetime.now(timezone.utc)
+        later = now + timedelta(days=3)
+        fresh = agent_accounts.Report("Codex", email="seats@example.invalid",
+            quotas=[agent_accounts.Quota("Weekly", 20, later)], credit_balance="7")
+        old = agent_accounts.Report("Codex", email="spare@example.invalid",
+            quotas=[agent_accounts.Quota("Weekly", 70, later)], credit_balance="11")
+        usage_store.save([old], now - timedelta(minutes=11))
+        usage_store.save([fresh], now - timedelta(minutes=1))
+        self.codex_reads.return_value = agent_accounts.Report("Codex", email="spare@example.invalid",
+            quotas=[agent_accounts.Quota("Weekly", 95, later)], credit_balance="13")
+
+        rows = self.status_rows()[1:]
+
+        self.codex_reads.assert_awaited_once_with(spare)
+        self.assertEqual([row[6] for row in rows], ["80%", "5%"])
+        self.assertEqual([row[9] for row in rows], ["7", "13"])
+
+    def test_status_prints_codex_check_problems_below_the_table(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.write_note("codex 1", "spare@example.invalid")
+        self.codex_login("spare@example.invalid", self.home / ".codex1")
+        self.assertNotIn("\n\n", self.run_cli("status")[1].rstrip())
+        _ = (self.home / ".codex1" / "unclassified-item").write_text("own")
+
+        result, stdout, stderr = self.run_cli("status")
+
+        self.assertEqual((result, stderr), (0, ""))
+        table, problems = stdout.split("\n\n", 1)
+        self.assertIn("~/.codex1", table)
+        self.assertNotIn("unclassified-item", table)
+        self.assertIn("~/.codex1", problems)
+        self.assertIn("unclassified-item", problems)
 
     def test_status_keeps_the_last_good_reading_when_the_service_refuses_a_read(self) -> None:
         self.write_main_config()
