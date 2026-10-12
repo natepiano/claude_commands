@@ -16,6 +16,8 @@ import tempfile
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import BinaryIO, Literal, cast
 
@@ -50,6 +52,16 @@ class CodexThread:
 
 Agent = ClaudeSession | ClaudeSubagent | CodexThread
 Family = Literal["claude", "codex"]
+MAX_SQLITE_INTEGER = (1 << 63) - 1
+
+
+class SourceState(Enum):
+    READY = "ready"
+    MISSING = "missing"
+    UNREADABLE = "unreadable"
+    PARTIAL = "partial"
+    SKIPPED = "skipped"
+    UNREACHABLE = "unreachable"
 
 
 @dataclass(frozen=True)
@@ -117,6 +129,12 @@ Attribution = RecordedAttribution | EstimatedAttribution | UnassignedAttribution
 
 
 @dataclass(frozen=True)
+class EstimatedDirectorAssignment:
+    agent: ClaudeSession | CodexThread
+    at: datetime
+
+
+@dataclass(frozen=True)
 class RawTokens:
     input: int
     cache_write_5m: int
@@ -148,6 +166,11 @@ class NoMeasurement:
 
 
 Measurement = Turn | Compaction | NoMeasurement
+
+
+@dataclass(frozen=True)
+class FileCursor:
+    offset: int
 
 
 @dataclass(frozen=True)
@@ -184,8 +207,11 @@ class CodexContext:
         usage = token_usage(record)
         if usage is None:
             return NoMeasurement()
+        # Validate the reported input total before its cached portion is removed.
+        _ = token_count(usage.uncached_input + usage.cached_input)
         return Turn(self.agent, str(offset), at, self.model, self.effort,
-                    RawTokens(usage.uncached_input, 0, 0, usage.cached_input, usage.output),
+                    RawTokens(token_count(usage.uncached_input), 0, 0,
+                              token_count(usage.cached_input), token_count(usage.output)),
                     not self.edit_seen)
 
 
@@ -210,7 +236,9 @@ def reported_model(value: object) -> Model:
 
 
 def token_count(value: object) -> int:
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+    if isinstance(value, int) and not isinstance(value, bool):
+        if not 0 <= value <= MAX_SQLITE_INTEGER:
+            raise ValueError("token count outside storage range")
         return value
     return 0
 
@@ -276,6 +304,11 @@ CREATE TABLE IF NOT EXISTS cursors (
 );
 CREATE TABLE IF NOT EXISTS role_log_sources (
     machine TEXT PRIMARY KEY, problems INTEGER NOT NULL, state TEXT NOT NULL, read_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS turn_sources (
+    machine TEXT NOT NULL, family TEXT NOT NULL, state TEXT NOT NULL,
+    read_at TEXT NOT NULL, last_complete_at TEXT,
+    PRIMARY KEY (machine, family)
 );
 """
 
@@ -418,20 +451,19 @@ def claude_identity(machine: str, path: Path) -> ClaudeSession | ClaudeSubagent:
     return ClaudeSession(machine, path.stem)
 
 
-def collect_file(db: sqlite3.Connection, machine: str, path: str, local_path: Path,
-                 family: Family, resolver: RoleResolver) -> int:
-    previous = cursor_at(db, machine, path)
-    size = local_path.stat().st_size
+def read_file(machine: str, path: Path, family: Family,
+              previous: int) -> Iterator[Turn | Compaction | FileCursor]:
+    """Replay context locally or on the Mac, yielding only new measurements."""
+    size = path.stat().st_size
     if previous == size:
-        return 0
+        return
     if previous > size:
         previous = 0
-    added = 0
     context = CodexContext(machine)
-    agent = claude_identity(machine, Path(path))
+    agent = claude_identity(machine, path)
     edit_seen = False
     completed = 0
-    with local_path.open("rb") as source:
+    with path.open("rb") as source:
         # Changed files replay their prefix to recover context and the first edit.
         # Unchanged files never enter this loop; cursors store only durable offsets.
         for offset, line in complete_lines(source):
@@ -445,12 +477,26 @@ def collect_file(db: sqlite3.Connection, machine: str, path: str, local_path: Pa
                     value = context.consume(line.decode("utf-8"), offset)
             except (ValueError, UnicodeError, RecursionError):
                 value = NoMeasurement()
-            if offset >= previous:
-                added += save_measurement(db, value, resolver)
+            if offset >= previous and not isinstance(value, NoMeasurement):
+                yield value
             completed = offset + len(line)
+    yield FileCursor(completed)
+
+
+def save_cursor(db: sqlite3.Connection, machine: str, path: str, cursor: FileCursor) -> None:
     _ = db.execute("INSERT INTO cursors VALUES (?, ?, ?) " +
                    "ON CONFLICT(machine, path) DO UPDATE SET offset = excluded.offset",
-                   (machine, path, completed))
+                   (machine, path, cursor.offset))
+
+
+def collect_file(db: sqlite3.Connection, machine: str, path: str, local_path: Path,
+                 family: Family, resolver: RoleResolver) -> int:
+    added = 0
+    for value in read_file(machine, local_path, family, cursor_at(db, machine, path)):
+        if isinstance(value, FileCursor):
+            save_cursor(db, machine, path, value)
+        else:
+            added += save_measurement(db, value, resolver)
     return added
 
 
@@ -500,35 +546,67 @@ def local_directors(machine: str) -> dict[Agent, tuple[Assignment, ...]]:
     return evidence
 
 
-def role_source(path: Path) -> tuple[RoleLog, str]:
+def role_source(path: Path) -> tuple[RoleLog, SourceState]:
     try:
         if not path.exists():
-            return assignments(path), "missing"
-        return assignments(path), "ready"
+            return assignments(path), SourceState.MISSING
+        return assignments(path), SourceState.READY
     except OSError:
-        return RoleLog({}, ()), "unreadable"
+        return RoleLog({}, ()), SourceState.UNREADABLE
 
 
-def save_role_source(db: sqlite3.Connection, machine: str, log: RoleLog, state: str) -> None:
+def save_role_source(db: sqlite3.Connection, machine: str, log: RoleLog, state: SourceState) -> None:
     _ = db.execute("INSERT INTO role_log_sources VALUES (?, ?, ?, ?) " +
                    "ON CONFLICT(machine) DO UPDATE SET problems = excluded.problems, " +
                    "state = excluded.state, read_at = excluded.read_at",
-                   (machine, len(log.problems), state, datetime.now(timezone.utc).isoformat()))
+                   (machine, len(log.problems), state.value, datetime.now(timezone.utc).isoformat()))
 
 
-def source_line(machine: str, source: str, added: int, state: str) -> None:
-    print(f"{machine} {source}: {added} turns added; {state}")
+def save_turn_source(db: sqlite3.Connection, machine: str, family: Family, state: SourceState) -> None:
+    at = datetime.now(timezone.utc).isoformat()
+    _ = db.execute("INSERT INTO turn_sources VALUES (?, ?, ?, ?, ?) " +
+                   "ON CONFLICT(machine, family) DO UPDATE SET state = excluded.state, " +
+                   "read_at = excluded.read_at, last_complete_at = CASE " +
+                   "WHEN excluded.state = 'ready' THEN excluded.last_complete_at " +
+                   "ELSE turn_sources.last_complete_at END",
+                   (machine, family, state.value, at, at if state is SourceState.READY else None))
 
 
-def source_paths(root: Path, family: Family) -> tuple[tuple[Path, ...], str]:
+def source_line(machine: str, source: str, added: int, state: SourceState, detail: str = "") -> None:
+    print(f"{machine} {source}: {added} turns added; {state.value}{detail}")
+
+
+def source_paths(root: Path, family: Family) -> tuple[tuple[Path, ...], SourceState]:
     try:
-        if not root.exists():
-            return (), "missing"
-        patterns = ("*/*.jsonl", "*/*/subagents/agent-*.jsonl") if family == "claude" else ("*/*/*/*.jsonl",)
-        paths = {path for pattern in patterns for path in root.glob(pattern)}
-        return tuple(sorted(paths, key=lambda path: (path.parent.name == "subagents", path))), "ready"
+        with os.scandir(root) as entries:
+            root_entries = tuple(entries)
+    except FileNotFoundError:
+        return (), SourceState.MISSING
     except OSError:
-        return (), "unreadable"
+        return (), SourceState.UNREADABLE
+    patterns = (("*", "*.jsonl"), ("*", "*", "subagents", "agent-*.jsonl")) if family == "claude" else (
+        ("*", "*", "*", "*.jsonl"),)
+    paths: set[Path] = set()
+    state = SourceState.READY
+
+    def find(entries: Iterable[os.DirEntry[str]], remaining: tuple[tuple[str, ...], ...]) -> None:
+        nonlocal state
+        for entry in entries:
+            matched = tuple(parts for parts in remaining if fnmatchcase(entry.name, parts[0]))
+            if any(len(parts) == 1 for parts in matched):
+                paths.add(Path(entry.path))
+            children = tuple(parts[1:] for parts in matched if len(parts) > 1)
+            if not children:
+                continue
+            try:
+                if entry.is_dir():
+                    with os.scandir(entry.path) as nested:
+                        find(tuple(nested), children)
+            except OSError:
+                state = SourceState.PARTIAL
+
+    find(root_entries, patterns)
+    return tuple(sorted(paths, key=lambda path: (path.parent.name == "subagents", path))), state
 
 
 def collect_local(db: sqlite3.Connection, args: CommandLine) -> None:
@@ -536,7 +614,7 @@ def collect_local(db: sqlite3.Connection, args: CommandLine) -> None:
     codex, codex_state = source_paths(args.codex_root, "codex")
     log, log_state = role_source(args.agents_log)
     resolver = RoleResolver(log, known_sessions(db, args.machine, claude), local_directors(args.machine))
-    results: list[tuple[str, int, str]] = []
+    results: list[tuple[Family, int, SourceState]] = []
     with db:
         for family, paths, state in (("claude", claude, claude_state), ("codex", codex, codex_state)):
             added = 0
@@ -544,69 +622,205 @@ def collect_local(db: sqlite3.Connection, args: CommandLine) -> None:
                 try:
                     added += collect_file(db, args.machine, str(path), path, cast(Family, family), resolver)
                 except OSError:
-                    state = "partial"
-            results.append((family, added, state))
-        if log_state != "unreadable":
+                    state = SourceState.PARTIAL
+            results.append((cast(Family, family), added, state))
+            save_turn_source(db, args.machine, cast(Family, family), state)
+        if log_state is not SourceState.UNREADABLE:
             reattribute(db, args.machine, resolver)
         save_role_source(db, args.machine, log, log_state)
     for family, added, state in results:
         source_line(args.machine, family, added, state)
-    source_line(args.machine, "agents", 0, f"{log_state}; {len(log.problems)} problems")
+    source_line(args.machine, "agents", 0, log_state, f"; {len(log.problems)} problems")
 
 
-# The remote reader only transports bytes. Parsing and all database writes stay here.
-# One source file is held at a time, including on the first import.
-REMOTE_READER = """
-import base64, json, sys
-from pathlib import Path
-offsets: dict[str, int] = json.load(sys.stdin)
-def emit(record):
-    print(json.dumps(record, separators=(',', ':')), flush=True)
-def paths(root, patterns):
-    try:
-        found = {p for pattern in patterns for p in root.glob(pattern)}
-        return sorted(found, key=lambda p: (p.parent.name == 'subagents', p)), 'ready' if root.exists() else 'missing'
-    except OSError:
-        return [], 'unreadable'
-def send(path, kind):
-    emit({'type': 'file', 'path': str(path), 'kind': kind})
-    try:
-        with path.open('rb') as source:
-            while True:
-                data = source.read(262144)
-                if not data:
-                    break
-                emit({'type': 'chunk', 'data': base64.b64encode(data).decode('ascii')})
-        state = 'ready'
-    except FileNotFoundError:
-        state = 'missing'
-    except OSError:
-        state = 'unreadable'
-    emit({'type': 'end', 'state': state})
-home = Path.home()
-claude, claude_state = paths(home / '.claude/projects', ('*/*.jsonl', '*/*/subagents/agent-*.jsonl'))
-codex, codex_state = paths(home / '.codex/sessions', ('*/*/*/*.jsonl',))
-emit({'type': 'manifest', 'claude': [str(p) for p in claude], 'claude_state': claude_state, 'codex_state': codex_state})
-send(home / '.local/state/usage-model/agents.jsonl', 'agents')
-history, _ = paths(home / '.local/state/plan-delegate/runs', ('*.jsonl',))
-for path in history:
-    send(path, 'history')
-for kind, sources in (('claude', claude), ('codex', codex)):
-    for path in sources:
-        try:
-            if path.stat().st_size != offsets.get(str(path), 0):
-                send(path, kind)
-        except OSError:
-            emit({'type': 'problem', 'kind': kind})
+# Only the bootstrap is a separate program; all reading uses this module.
+REMOTE_BOOTSTRAP = """
+import json, sys, types
+request = json.load(sys.stdin)
+for name in ('scripts', 'scripts.usage', 'scripts.whoami'):
+    package = types.ModuleType(name)
+    package.__path__ = []
+    sys.modules[name] = package
+for name, source in request['modules'].items():
+    module = types.ModuleType(name)
+    module.__file__ = '/' + name.replace('.', '/') + '.py'
+    module.__package__ = name.rpartition('.')[0]
+    sys.modules[name] = module
+    exec(compile(source, module.__file__, 'exec'), module.__dict__)
+sys.modules['scripts.usage.collect'].read_mac(request['cursors'])
 """
 
 
+def emit_remote(record: dict[str, object]) -> None:
+    print(json.dumps(record, separators=(",", ":")), flush=True)
+
+
+def send_role_log(path: Path) -> None:
+    emit_remote({"type": "file", "path": str(path), "kind": "agents"})
+    try:
+        with path.open("rb") as source:
+            while data := source.read(262144):
+                emit_remote({"type": "chunk", "data": base64.b64encode(data).decode("ascii")})
+        state = SourceState.READY
+    except FileNotFoundError:
+        state = SourceState.MISSING
+    except OSError:
+        state = SourceState.UNREADABLE
+    emit_remote({"type": "end", "state": state.value})
+
+
+def agent_record(agent: Agent) -> dict[str, object]:
+    identity: dict[str, object] = {"machine": agent.machine, "id": agent.agent_id}
+    if isinstance(agent, ClaudeSubagent):
+        identity.update(kind="subagent", parent_id=agent.parent_id)
+    else:
+        identity["kind"] = "session" if isinstance(agent, ClaudeSession) else "thread"
+    return identity
+
+
+def measurement_record(value: Turn | Compaction) -> dict[str, object]:
+    record: dict[str, object] = {
+        "type": "measurement", "kind": "compaction" if isinstance(value, Compaction) else "turn",
+        "agent": agent_record(value.agent), "at": value.at.isoformat(),
+    }
+    if isinstance(value, Turn):
+        tokens = value.tokens
+        record.update(key=value.key,
+                      model=value.model.value if isinstance(value.model, ReportedModel) else None,
+                      effort=value.effort.value if isinstance(value.effort, ReportedEffort) else None,
+                      tokens={"input": tokens.input, "cache_write_5m": tokens.cache_write_5m,
+                              "cache_write_1h": tokens.cache_write_1h, "cache_read": tokens.cache_read,
+                              "output": tokens.output}, before_first_edit=value.before_first_edit)
+    return record
+
+
+def read_mac(offsets: dict[str, int]) -> None:
+    """Run from the in-memory modules on the Mac; never open a database there."""
+    home = Path.home()
+    claude, claude_state = source_paths(home / ".claude/projects", "claude")
+    codex, codex_state = source_paths(home / ".codex/sessions", "codex")
+    emit_remote({"type": "manifest", "claude": [str(path) for path in claude],
+                 "claude_state": claude_state.value, "codex_state": codex_state.value})
+    send_role_log(state_dir() / "agents.jsonl")
+    for agent, history in local_directors("mac").items():
+        for assignment in history:
+            emit_remote({"type": "director", "agent": agent_record(agent),
+                         "at": assignment.at.isoformat(), "role": assignment.role,
+                         "approximate": assignment.approximate})
+    emit_remote({"type": "attribution_ready"})
+    for family, paths in (("claude", claude), ("codex", codex)):
+        for path in paths:
+            name = str(path)
+            try:
+                previous = offsets.get(name, 0)
+                if path.stat().st_size == previous:
+                    continue
+                emit_remote({"type": "file", "kind": family, "path": name})
+                for value in read_file("mac", path, cast(Family, family), previous):
+                    record: dict[str, object] = ({"type": "cursor", "offset": value.offset}
+                                                 if isinstance(value, FileCursor) else measurement_record(value))
+                    record.update(path=name, family=family)
+                    emit_remote(record)
+            except OSError:
+                emit_remote({"type": "problem", "family": family, "path": name})
+
+
 class RemoteReadFailed(Exception):
-    """The remote stream did not end with a successful command status."""
+    """The remote stream is incomplete or contains a record we cannot read."""
+
+
+class RemoteFileUnreadable(Exception):
+    """Discard this file's measurements, then continue reading other files."""
+
+
+def remote_string(record: dict[str, object], name: str) -> str:
+    value = record.get(name)
+    if not isinstance(value, str) or not value:
+        raise RemoteReadFailed(f"remote {name} missing or invalid")
+    return value
+
+
+def remote_integer(record: dict[str, object], name: str) -> int:
+    value = record.get(name)
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= MAX_SQLITE_INTEGER:
+        raise RemoteReadFailed(f"remote {name} missing or invalid")
+    return value
+
+
+def remote_object(record: dict[str, object], name: str) -> dict[str, object]:
+    value = record.get(name)
+    if not isinstance(value, dict):
+        raise RemoteReadFailed(f"remote {name} missing or invalid")
+    return cast(dict[str, object], value)
+
+
+def remote_state(record: dict[str, object], name: str) -> SourceState:
+    try:
+        return SourceState(remote_string(record, name))
+    except ValueError as error:
+        raise RemoteReadFailed(f"invalid remote {name}") from error
+
+
+def remote_agent(identity: dict[str, object], machine: str) -> Agent:
+    if remote_string(identity, "machine") != machine:
+        raise RemoteReadFailed("remote agent names another machine")
+    agent_id = remote_string(identity, "id")
+    kind = remote_string(identity, "kind")
+    if kind == "session":
+        return ClaudeSession(machine, agent_id)
+    if kind == "subagent":
+        return ClaudeSubagent(machine, remote_string(identity, "parent_id"), agent_id)
+    if kind == "thread":
+        return CodexThread(machine, agent_id)
+    raise RemoteReadFailed("invalid remote agent kind")
+
+
+def remote_director(record: dict[str, object], machine: str) -> EstimatedDirectorAssignment:
+    agent = remote_agent(remote_object(record, "agent"), machine)
+    if isinstance(agent, ClaudeSubagent):
+        raise RemoteReadFailed("invalid remote director identity")
+    at = parse_timestamp(remote_string(record, "at"))
+    if at is None:
+        raise RemoteReadFailed("invalid remote director time")
+    if remote_string(record, "role") != "director" or record.get("approximate") is not True:
+        raise RemoteReadFailed("remote assignment is not an estimated director")
+    return EstimatedDirectorAssignment(agent, at)
+
+
+def remote_measurement(record: dict[str, object], machine: str, family: Family) -> Turn | Compaction:
+    agent = remote_agent(remote_object(record, "agent"), machine)
+    if (family == "claude" and isinstance(agent, CodexThread)
+            or family == "codex" and not isinstance(agent, CodexThread)):
+        raise RemoteReadFailed("invalid remote agent kind")
+    at = parse_timestamp(remote_string(record, "at"))
+    if at is None:
+        raise RemoteReadFailed("invalid remote measurement time")
+    measurement_kind = remote_string(record, "kind")
+    if measurement_kind == "compaction":
+        return Compaction(agent, at)
+    if measurement_kind != "turn":
+        raise RemoteReadFailed("unknown remote measurement kind")
+    tokens = remote_object(record, "tokens")
+    # Explicit null denotes unreported; a missing field is a failed read.
+    if "model" not in record or "effort" not in record:
+        raise RemoteReadFailed("remote model or effort missing")
+    model: Model = (ModelNotReported() if record["model"] is None
+                    else ReportedModel(remote_string(record, "model")))
+    effort: Effort = (EffortNotReported() if record["effort"] is None
+                      else ReportedEffort(remote_string(record, "effort")))
+    before = record.get("before_first_edit")
+    if not isinstance(before, bool):
+        raise RemoteReadFailed("remote first edit flag missing or invalid")
+    return Turn(agent, remote_string(record, "key"), at, model, effort,
+                RawTokens(remote_integer(tokens, "input"), remote_integer(tokens, "cache_write_5m"),
+                          remote_integer(tokens, "cache_write_1h"), remote_integer(tokens, "cache_read"),
+                          remote_integer(tokens, "output")), before)
 
 
 def remote_records(lines: Iterable[str]) -> Iterator[dict[str, object]]:
     for line in lines:
+        if not line.endswith("\n"):
+            raise RemoteReadFailed("remote connection cut inside a record")
         if line.startswith("rc="):
             if line.strip() != "rc=0":
                 raise RemoteReadFailed(line.strip())
@@ -621,78 +835,164 @@ def remote_records(lines: Iterable[str]) -> Iterator[dict[str, object]]:
     raise RemoteReadFailed("remote command status missing")
 
 
-def receive_file(records: Iterator[dict[str, object]], path: Path) -> str:
+def receive_file(records: Iterator[dict[str, object]], path: Path) -> SourceState:
     with path.open("wb") as output:
         for record in records:
             if record.get("type") == "end":
-                state = record.get("state")
-                return state if isinstance(state, str) else "unreadable"
-            data = record.get("data")
-            if record.get("type") != "chunk" or not isinstance(data, str):
+                state = remote_state(record, "state")
+                if state not in (SourceState.READY, SourceState.MISSING, SourceState.UNREADABLE):
+                    raise RemoteReadFailed("invalid remote file state")
+                return state
+            if record.get("type") != "chunk":
                 raise RemoteReadFailed("incomplete remote file")
             try:
+                # An empty chunk is valid, though the reader never needs one.
+                data = record.get("data")
+                if not isinstance(data, str):
+                    raise RemoteReadFailed("remote file bytes missing")
                 _ = output.write(base64.b64decode(data, validate=True))
             except ValueError as error:
                 raise RemoteReadFailed("invalid remote file bytes") from error
     raise RemoteReadFailed("remote file status missing")
 
 
-def consume_remote(db: sqlite3.Connection, lines: Iterable[str], machine: str, scratch: Path) -> None:
+@dataclass(frozen=True)
+class RoleSnapshotPending:
+    pass
+
+
+@dataclass(frozen=True)
+class RoleSourceSnapshot:
+    log: RoleLog
+    state: SourceState
+
+
+@dataclass
+class MacReadProgress:
+    states: dict[Family, SourceState] = field(default_factory=lambda: {
+        "claude": SourceState.UNREACHABLE, "codex": SourceState.UNREACHABLE})
+    totals: dict[Family, int] = field(default_factory=lambda: {"claude": 0, "codex": 0})
+    completed_files: int = 0
+    role_snapshot: RoleSourceSnapshot | RoleSnapshotPending = field(default_factory=RoleSnapshotPending)
+
+
+def receive_measurements(db: sqlite3.Connection, records: Iterator[dict[str, object]],
+                         machine: str, path: str, family: Family, resolver: RoleResolver) -> int:
+    added = 0
+    # A merge into an earlier row also belongs to this file's transaction.
+    with db:
+        for record in records:
+            if remote_string(record, "path") != path or remote_string(record, "family") != family:
+                raise RemoteReadFailed("remote file changed before its cursor")
+            if record.get("type") == "cursor":
+                save_cursor(db, machine, path, FileCursor(remote_integer(record, "offset")))
+                return added
+            if record.get("type") == "problem":
+                raise RemoteFileUnreadable()
+            if record.get("type") != "measurement":
+                raise RemoteReadFailed("unexpected remote measurement record")
+            added += save_measurement(db, remote_measurement(record, machine, family), resolver)
+    raise RemoteReadFailed("remote file cursor missing")
+
+
+def consume_remote(db: sqlite3.Connection, lines: Iterable[str], machine: str, scratch: Path,
+                   progress: MacReadProgress) -> None:
     records = remote_records(lines)
     manifest = next(records)
     if manifest.get("type") != "manifest":
         raise RemoteReadFailed("remote inventory missing")
     raw_paths = manifest.get("claude")
-    paths = [Path(path) for path in cast(list[object], raw_paths) if isinstance(path, str)] if isinstance(raw_paths, list) else []
-    states = {family: str(manifest.get(f"{family}_state", "unreadable")) for family in ("claude", "codex")}
-    totals = {family: 0 for family in ("claude", "codex")}
-    log = RoleLog({}, ())
-    log_state = "unreadable"
+    if not isinstance(raw_paths, list):
+        raise RemoteReadFailed("remote session paths missing")
+    paths: list[Path] = []
+    for path in cast(list[object], raw_paths):
+        if not isinstance(path, str) or not path:
+            raise RemoteReadFailed("invalid remote session path")
+        paths.append(Path(path))
+    for family in ("claude", "codex"):
+        progress.states[family] = remote_state(manifest, f"{family}_state")
+    snapshot: RoleSourceSnapshot | RoleSnapshotPending = RoleSnapshotPending()
     directors: dict[Agent, tuple[Assignment, ...]] = {}
-    resolver = RoleResolver(log, known_sessions(db, machine, paths), directors)
+    resolver = RoleResolver(RoleLog({}, ()), known_sessions(db, machine, paths), directors)
+    attribution_ready = False
     received_path = scratch / "source"
     for record in records:
-        if record.get("type") == "success":
-            if log_state != "unreadable":
-                reattribute(db, machine, resolver)
-            save_role_source(db, machine, log, log_state)
-            for family in ("claude", "codex"):
-                source_line(machine, family, totals[family], states[family])
-            source_line(machine, "agents", 0, f"{log_state}; {len(log.problems)} problems")
+        record_type = record.get("type")
+        if record_type == "success":
+            if not attribution_ready:
+                raise RemoteReadFailed("remote attribution snapshot incomplete")
             return
-        kind = record.get("kind")
-        if record.get("type") == "problem":
-            if isinstance(kind, str) and kind in states:
-                states[kind] = "partial"
+        if record_type == "attribution_ready":
+            if attribution_ready or not isinstance(snapshot, RoleSourceSnapshot):
+                raise RemoteReadFailed("unexpected remote attribution marker")
+            resolver = RoleResolver(snapshot.log, known_sessions(db, machine, paths), directors)
+            with db:
+                if snapshot.state is not SourceState.UNREADABLE:
+                    reattribute(db, machine, resolver)
+                save_role_source(db, machine, snapshot.log, snapshot.state)
+            progress.role_snapshot = snapshot
+            attribution_ready = True
             continue
-        path = record.get("path")
-        if record.get("type") != "file" or not isinstance(path, str):
+        if record_type == "director":
+            if attribution_ready or isinstance(snapshot, RoleSnapshotPending):
+                raise RemoteReadFailed("unexpected remote director evidence")
+            evidence = remote_director(record, machine)
+            assignment = Assignment(evidence.at, "director", None, True)
+            history = directors.get(evidence.agent, ())
+            if assignment not in history:
+                directors[evidence.agent] = (*history, assignment)
+            continue
+        if record_type == "problem":
+            family_name = remote_string(record, "family")
+            if not attribution_ready or family_name not in ("claude", "codex"):
+                raise RemoteReadFailed("unexpected remote source problem")
+            progress.states[family_name] = SourceState.PARTIAL
+            continue
+        if record_type != "file":
             raise RemoteReadFailed("unexpected remote record")
-        file_state = receive_file(records, received_path)
+        kind = remote_string(record, "kind")
+        path = remote_string(record, "path")
         if kind == "agents":
-            log_state = file_state
-            log = assignments(received_path) if file_state == "ready" else RoleLog({}, ())
-            resolver = RoleResolver(log, known_sessions(db, machine, paths), directors)
-        elif kind == "history" and file_state == "ready":
-            with received_path.open("rb") as source:
-                director_evidence(source, machine, directors)
-        elif kind in ("claude", "codex"):
+            if attribution_ready or isinstance(snapshot, RoleSourceSnapshot):
+                raise RemoteReadFailed("unexpected remote attribution file")
+            file_state = receive_file(records, received_path)
+            log = assignments(received_path) if file_state is SourceState.READY else RoleLog({}, ())
+            snapshot = RoleSourceSnapshot(log, file_state)
+            received_path.unlink()
+        elif kind in ("claude", "codex") and attribution_ready:
             family = kind
-            if file_state == "ready":
-                totals[family] += collect_file(db, machine, path, received_path, family, resolver)
-            else:
-                states[family] = "partial"
-        received_path.unlink()
+            try:
+                added = receive_measurements(db, records, machine, path, family, resolver)
+            except RemoteFileUnreadable:
+                progress.states[family] = SourceState.PARTIAL
+                continue
+            progress.totals[family] += added
+            progress.completed_files += 1
+        else:
+            raise RemoteReadFailed("unexpected remote file kind or order")
     raise RemoteReadFailed("remote command status missing")
+
+
+def reader_payload(offsets: dict[str, int]) -> str:
+    root = Path(__file__).resolve().parents[2]
+    modules = {name: (root / relative).read_text(encoding="utf-8") for name, relative in (
+        ("scripts.usage.agents_log", "scripts/usage/agents_log.py"),
+        ("scripts.whoami.seat_usage", "scripts/whoami/seat_usage.py"),
+        ("scripts.usage.collect", "scripts/usage/collect.py"),
+    )}
+    return json.dumps({"modules": modules, "cursors": offsets}, separators=(",", ":"))
 
 
 def collect_mac(db: sqlite3.Connection) -> None:
     machine = "mac"
+    progress = MacReadProgress()
     cursor_rows = db.execute("SELECT path, offset FROM cursors WHERE machine = ?", (machine,))
     offsets = {cast(str, row[0]): cast(int, row[1])
                for row in cast(Iterable[sqlite3.Row], cursor_rows)}
-    command = shlex.join(("python3", "-c", REMOTE_READER)) + '; printf "\\nrc=%s\\n" "$?"'
+    command = shlex.join(("python3", "-c", REMOTE_BOOTSTRAP)) + '; printf "\\nrc=%s\\n" "$?"'
+    detail = ""
     try:
+        payload = reader_payload(offsets)
         with tempfile.TemporaryDirectory(prefix="usage-mac-") as directory, tempfile.TemporaryFile(mode="w+") as errors:
             process: subprocess.Popen[str] = subprocess.Popen(
                 ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
@@ -704,26 +1004,39 @@ def collect_mac(db: sqlite3.Connection) -> None:
                 if remote_input is None:
                     raise RemoteReadFailed("ssh produced no input stream")
                 with remote_input:
-                    _ = remote_input.write(json.dumps(offsets))
+                    _ = remote_input.write(payload)
                 output = process.stdout
                 if output is None:
                     raise RemoteReadFailed("ssh produced no stream")
-                with output, db:
-                    consume_remote(db, output, machine, Path(directory))
-                _ = process.wait()
+                with output:
+                    consume_remote(db, output, machine, Path(directory), progress)
+                status = process.wait()
+                if status != 0:
+                    raise RemoteReadFailed(f"ssh exited {status}")
             finally:
                 if process.poll() is None:
                     process.terminate()
                     _ = process.wait()
     except (OSError, UnicodeError, RemoteReadFailed) as error:
-        with db:
-            # An outage preserves the last diagnostic snapshot and attribution.
-            _ = db.execute("INSERT INTO role_log_sources VALUES (?, 0, 'unreachable', ?) " +
-                           "ON CONFLICT(machine) DO UPDATE SET state = excluded.state, read_at = excluded.read_at",
-                           (machine, datetime.now(timezone.utc).isoformat()))
-        reason = " ".join(str(error).splitlines())
-        for source in ("claude", "codex", "agents"):
-            source_line(machine, source, 0, f"unreachable ({reason})")
+        state = SourceState.PARTIAL if progress.completed_files else SourceState.UNREACHABLE
+        progress.states = {"claude": state, "codex": state}
+        detail = " (" + " ".join(str(error).splitlines()) + ")"
+        if isinstance(progress.role_snapshot, RoleSnapshotPending):
+            with db:
+                # Keep the previous problem count until a new snapshot commits.
+                _ = db.execute("INSERT INTO role_log_sources VALUES (?, 0, 'unreachable', ?) " +
+                               "ON CONFLICT(machine) DO UPDATE SET state = excluded.state, read_at = excluded.read_at",
+                               (machine, datetime.now(timezone.utc).isoformat()))
+    with db:
+        for family in ("claude", "codex"):
+            save_turn_source(db, machine, family, progress.states[family])
+    for family in ("claude", "codex"):
+        source_line(machine, family, progress.totals[family], progress.states[family], detail)
+    snapshot = progress.role_snapshot
+    if isinstance(snapshot, RoleSourceSnapshot):
+        source_line(machine, "agents", 0, snapshot.state, f"; {len(snapshot.log.problems)} problems")
+    else:
+        source_line(machine, "agents", 0, SourceState.UNREACHABLE, detail)
 
 
 class CommandLine(argparse.Namespace):
@@ -761,8 +1074,11 @@ def main(argv: Sequence[str] = ()) -> int:
             _ = db.executescript(SCHEMA)
             collect_local(db, args)
             if args.no_mac:
+                with db:
+                    for family in ("claude", "codex"):
+                        save_turn_source(db, "mac", family, SourceState.SKIPPED)
                 for source in ("claude", "codex", "agents"):
-                    source_line("mac", source, 0, "skipped")
+                    source_line("mac", source, 0, SourceState.SKIPPED)
             else:
                 collect_mac(db)
         finally:
