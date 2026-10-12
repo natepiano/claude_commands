@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import cast
+from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
@@ -21,12 +22,20 @@ import upgrade_report
 import upgrade_schedule
 
 
+class UpgradeUpdate(TypedDict):
+    """The watch's report sentence and whether a git pin awaits the user."""
+
+    update: str
+    needs_user: bool
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bevy_upgrade")
     _ = parser.add_argument("--production", type=Path)
     verbs = parser.add_subparsers(dest="verb")
     _ = verbs.add_parser("status")
-    _ = verbs.add_parser("line")
+    line = verbs.add_parser("line")
+    _ = line.add_argument("--json", action="store_true")
     _ = verbs.add_parser("stop")
     check = verbs.add_parser("check")
     _ = check.add_argument("--scheduled", action="store_true")
@@ -58,7 +67,7 @@ def _baseline(record: upgrade_record.Record) -> None:
                            for name, entry in record["dependencies"].items()}
 
 
-def _line(production: add_unit.Production, now: datetime) -> int:
+def _line(production: add_unit.Production, now: datetime, as_json: bool) -> int:
     current = upgrade_record.load(production.slug)
     if current is None or current["closed"] is not None:
         return 0
@@ -70,8 +79,12 @@ def _line(production: add_unit.Production, now: datetime) -> int:
     else:
         current = upgrade_record.apply_pins(current, latest, now)
     upgrade_schedule.ensure_job(current)
-    print(upgrade_report.line(current, production.zone, now,
-                              upgrade_schedule.next_check(production.slug), pins_error))
+    sentence = upgrade_report.line(current, production.zone, now,
+                                   upgrade_schedule.next_check(production.slug), pins_error)
+    if as_json:
+        print(json.dumps(UpgradeUpdate(update=sentence, needs_user=upgrade_report.waiting(current) > 0)))
+    else:
+        print(sentence)
     return 0
 
 
@@ -109,7 +122,7 @@ def _closed_sentence(record: upgrade_record.Record) -> str:
 def _run(args: argparse.Namespace, production: add_unit.Production, now: datetime) -> int:
     verb = cast(str | None, args.verb) or "status"
     if verb == "line":
-        return _line(production, now)
+        return _line(production, now, cast(bool, args.json))
     scheduled = verb == "check" and cast(bool, args.scheduled)
     pins_error = ""
     exit_code = 0

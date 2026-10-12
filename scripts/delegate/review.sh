@@ -244,9 +244,9 @@ board_post() {
   bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${TEAM_SLOT}" "$1" "$2" || true
 }
 
-# Preserve the old launcher's observable failure path: a solo review creates
-# its artifacts before agent resolution. A seated review claims first, so a
-# busy-seat refusal cannot overwrite another review's status or findings.
+# A solo review creates its artifacts before agent resolution. A seated review
+# claims first, so a busy-seat refusal cannot overwrite another review's status
+# or findings.
 if [[ -z "${REVIEW_SEAT}" && -z "${POOL_TYPE}" ]]; then
   initialize_review_artifacts
 fi
@@ -283,7 +283,7 @@ def post(message):
 with (root / "impl_seat_claim.lock").open("a+") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
     entry = read_roster().get(name, {})
-    context_tokens = entry.get("context_tokens", 0) if isinstance(entry, dict) else 0
+    context_tokens = entry.get("context_tokens") if isinstance(entry, dict) else None
     if isinstance(context_tokens, int) and context_tokens > compact_above:
         compact = subprocess.run(
             [sys.executable, mesh_script, "compact", "--session-dir", root_text,

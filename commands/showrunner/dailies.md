@@ -90,6 +90,8 @@ Read the current state, not memory, and check what you state the way
    its line as a topic until it prints `acknowledged`; exit 3 sets
    `needs_user` (`/showrunner:produce` → <MergeCheckpoint/> step 6).
    User, 2026-10-04.
+7. **Bevy upgrade.** The input builder adds the `Bevy upgrade` topic from the
+   record while a watch is open. Nothing else in the report states its status.
 
 ## Subjects
 
@@ -114,6 +116,8 @@ When it prints `phase tables: unavailable — <reason>`, continue. Only a unit
 whose records could not be read takes its ETA from the saved status capture
 and needs `started` in its judgment; a failed archive of retired notes changes
 nothing else.
+When it prints `bevy upgrade: unavailable — <reason>`, continue; the report
+carries the topic with that reason.
 
 ```sh
 python3 ~/.claude/scripts/production/dailies_input.py \

@@ -294,7 +294,7 @@ The store is at `PRAGMA user_version` 6 (`STORE_VERSION`) and holds what the wor
 
 **Ruled out:** `_resume_seat_thread`'s replacement write and `command_follow`'s write on the unguarded `_update_roster` (a restarted name's thread is overwritten); a `_roster_still_on_thread` read followed by a separate write (another writer fits between the two); an optional thread id for what a writer expects, and a bare optional for where the history begins; a size column in `list` for the compacted-seat size work (nothing reads one).
 
-### Phase 10 — A compacted seat shows its real size · status: todo
+### Phase 10 — A compacted seat shows its real size · status: done
 
 #### Work Order
 

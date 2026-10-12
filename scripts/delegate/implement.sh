@@ -288,7 +288,7 @@ with lock_file.open("a+") as lock:
         if family == "codex":
             if mesh != "1":
                 fail(f"{name} has mesh=none")
-            context_tokens = entry.get("context_tokens", 0)
+            context_tokens = entry.get("context_tokens")
             if isinstance(context_tokens, int) and context_tokens > compact_above:
                 compact = subprocess.run(
                     [sys.executable, mesh_script, "compact", "--session-dir", root_text,
