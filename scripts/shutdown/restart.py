@@ -25,6 +25,7 @@ from account import (  # noqa: E402
     Account,
     UnknownAccountName,
     UnreadableAccount,
+    named_account_prefix,
     named_claude_account,
     own_claude_account,
 )
@@ -365,7 +366,7 @@ def _resume_command(session: Session, prompt: str) -> str:
     default_dir = str(Path.home() / ".claude")
     config_dir = session.get("config_dir", default_dir)
     prefix = (
-        f"CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} "
+        named_account_prefix(Path(config_dir))
         if config_dir != default_dir
         else ""
     )

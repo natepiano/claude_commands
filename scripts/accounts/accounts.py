@@ -730,6 +730,11 @@ def check(label: str) -> list[str]:
     return list(account_directory_readiness(label).problems)
 
 
+def _drop_named_account(environment: dict[str, str]) -> None:
+    for name in account.NAMED_ACCOUNT_VARIABLES:
+        _ = environment.pop(name, None)
+
+
 def exec_account(label: str, arguments: list[str]) -> None:
     """Replace this process with Claude on the selected, safe directory."""
     if label == "unit":
@@ -750,11 +755,11 @@ def exec_account(label: str, arguments: list[str]) -> None:
                 )
             if not isinstance(readiness, (AccountDirectoryReady, AccountDirectoryLoggedOut)):
                 raise AccountsError(readiness.problems[0])
-            environment["CLAUDE_CONFIG_DIR"] = str(selected.dir)
+            environment.update(account.named_account_environment(selected.dir))
         else:
-            _ = environment.pop("CLAUDE_CONFIG_DIR", None)
+            _drop_named_account(environment)
     else:
-        _ = environment.pop("CLAUDE_CONFIG_DIR", None)
+        _drop_named_account(environment)
     try:
         os.execvpe("claude", ["claude", *arguments], environment)
     except OSError as error:
@@ -796,7 +801,7 @@ def account_prefix(selected: AccountSelection) -> str:
     """Return the shell assignment for an already selected account."""
     if isinstance(selected, DefaultAccount):
         return ""
-    return f"CLAUDE_CONFIG_DIR={shlex.quote(str(selected.dir))} "
+    return account.named_account_prefix(selected.dir)
 
 
 def launch_prefix(role: str) -> str:

@@ -194,6 +194,14 @@ class AddUnitTests(unittest.TestCase):
             )
         return directory
 
+    def named_prefix(self, directory: Path) -> str:
+        """The assignments a unit on a named account's directory starts with."""
+        memory_base = Path(self.env["HOME"]) / ".claude"
+        return (
+            f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} "
+            f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(memory_base))} "
+        )
+
     def write_agent_config(self, *, family: str = "claude", director: str = "opus:xhigh",
                            claude_set: bool = True) -> None:
         claude_section = f"[production.claude]\ndirector={director}\n\n" if claude_set else ""
@@ -972,9 +980,10 @@ class AddUnitTests(unittest.TestCase):
                     if cast(list[str], record["args"])[:1] == ["new-session"])
         command = cast(list[str], tmux["args"])[-1]
         prompt = (f"You are alpha-unit in production build-followups (doc {self.doc}), "
-                  "under the showrunner, whose session name `~/.claude/scripts/lib/py "
-                  "~/.claude/scripts/production/showrunners.py name build-followups` prints (look it up "
-                  f"before each message: the name can change), on standby. Work only in your worktree {worktree}, "
+                  "under the showrunner, whose `SendMessage` address `~/.claude/scripts/lib/py "
+                  "~/.claude/scripts/production/showrunners.py address build-followups` prints (look it up "
+                  "before each message: it changes when the showrunner restarts), on standby. "
+                  f"Work only in your worktree {worktree}, "
                   "branch build-followups-alpha. Do nothing until the showrunner sends you work.")
         self.assertIn(prompt, command)
         self.assert_director_flags("opus", "xhigh")
@@ -1062,7 +1071,7 @@ class AddUnitTests(unittest.TestCase):
 
         self.assertEqual(
             self.launch_command(),
-            f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} "
+            self.named_prefix(directory)
             + "ENABLE_TOOL_SEARCH=true command " + shlex.join([
                 "claude", "--model", "opus", "--effort", "xhigh",
                 "--remote-control", "alpha", "-n", "alpha",
@@ -1107,7 +1116,7 @@ class AddUnitTests(unittest.TestCase):
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
 
         self.assertTrue(self.launch_command().startswith(
-            f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} "
+            self.named_prefix(directory)
         ))
 
     def test_default_unit_guard_environment_is_unchanged(self) -> None:
@@ -1157,7 +1166,7 @@ class AddUnitTests(unittest.TestCase):
         selection.assert_called_once_with("unit")
         readiness.assert_called_once_with("claude 3")
         self.assertTrue(self.launch_command().startswith(
-            f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} "
+            self.named_prefix(directory)
         ))
         self.assertFalse((directory.parent / ".claude1").exists())
         with patch.dict(os.environ, self.env):
@@ -1177,7 +1186,7 @@ class AddUnitTests(unittest.TestCase):
         )
 
         self.assertTrue(self.launch_command().startswith(
-            f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} ENABLE_TOOL_SEARCH=true command claude "
+            self.named_prefix(directory) + "ENABLE_TOOL_SEARCH=true command claude "
         ))
         self.assertIn("--resume session-123", self.launch_command())
 
@@ -1198,7 +1207,7 @@ class AddUnitTests(unittest.TestCase):
         )
 
         self.assertTrue(self.launch_command().startswith(
-            f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} ENABLE_TOOL_SEARCH=true command claude "
+            self.named_prefix(directory) + "ENABLE_TOOL_SEARCH=true command claude "
         ))
         self.assertIn("--resume session-123", self.launch_command())
         self.assertNotIn(self.env["CLAUDE_CONFIG_DIR"], self.launch_command())

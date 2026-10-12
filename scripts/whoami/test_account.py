@@ -6,6 +6,7 @@ import base64
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -161,6 +162,24 @@ class AccountTests(unittest.TestCase):
             ),
         ):
             _ = account.own_claude_account()
+
+    def test_named_account_start_points_memory_at_the_default_directory(self) -> None:
+        home = self.root / "home with 'quotes'"
+        config_dir = home / ".claude3"
+        with patch.dict(os.environ, {"HOME": str(home)}):
+            environment = account.named_account_environment(config_dir)
+            prefix = account.named_account_prefix(config_dir)
+
+        self.assertEqual(environment, {
+            "CLAUDE_CONFIG_DIR": str(config_dir),
+            "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(home / ".claude"),
+        })
+        self.assertEqual(tuple(environment), account.NAMED_ACCOUNT_VARIABLES)
+        self.assertEqual(
+            prefix,
+            f"CLAUDE_CONFIG_DIR={shlex.quote(str(config_dir))} "
+            + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(home / '.claude'))} ",
+        )
 
     def test_process_config_dir_reads_set_variable_from_linux_process_environment(self) -> None:
         environ = b"USER=test\0CLAUDE_CONFIG_DIR=/tmp/claude-two\0PATH=/usr/bin\0"
