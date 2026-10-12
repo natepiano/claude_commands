@@ -220,6 +220,7 @@ class MeshCommandTests(unittest.TestCase):
     context_sizes: list[int]  # pyright: ignore[reportUninitializedInstanceVariable]
     compact_after_tokens: int  # pyright: ignore[reportUninitializedInstanceVariable]
     compact_uses_item: bool  # pyright: ignore[reportUninitializedInstanceVariable]
+    compact_never_finishes: bool  # pyright: ignore[reportUninitializedInstanceVariable]
     live_turn: str  # pyright: ignore[reportUninitializedInstanceVariable]
     announce_live_completion: bool  # pyright: ignore[reportUninitializedInstanceVariable]
     queued: list[dict[str, object]]  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -248,6 +249,7 @@ class MeshCommandTests(unittest.TestCase):
         self.context_sizes = []
         self.compact_after_tokens = 20000
         self.compact_uses_item = False
+        self.compact_never_finishes = False
         self.live_turn = ""
         self.announce_live_completion = False
         self.queued = []
@@ -482,6 +484,12 @@ class MeshCommandTests(unittest.TestCase):
             return frames
         if method == "thread/compact/start":
             compact_turn = "compact-turn"
+            if self.compact_never_finishes:
+                self.live_turn = compact_turn
+                return [
+                    _reply(request, {}),
+                    _notice("turn/started", {"threadId": params["threadId"], "turn": {"id": compact_turn}}),
+                ]
             completion = _notice(
                 "item/completed",
                 {
@@ -986,6 +994,68 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertEqual(codes, [0])
         self.assertIn("compacted seat:", output.getvalue())
+
+    def compact_with_short_waits(self) -> tuple[int, str]:
+        args = argparse.Namespace(session_dir=str(self.session_dir), to="seat")
+        with (
+            patch.object(codex_mesh, "CALL_TIMEOUT_SECS", 1),
+            patch.object(codex_mesh, "COMPACT_IDLE_WAIT_SECS", 0.3),
+            patch.object(codex_mesh, "COMPACT_IDLE_POLL_SECS", 0.05),
+            contextlib.redirect_stderr(io.StringIO()) as errors,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            code = codex_mesh.command_compact(args)
+        return code, errors.getvalue()
+
+    def test_a_compaction_that_times_out_is_interrupted_so_the_seat_can_follow(self) -> None:
+        self.context_sizes = [150000]
+        self.assertEqual(self.run_start()[0], 0)
+        self.compact_never_finishes = True
+
+        code, errors = self.compact_with_short_waits()
+
+        self.assertEqual(code, 1)
+        self.assertIn("no thread/compacted within 1s", errors)
+        self.assertIn("interrupted the compaction turn, the seat is idle and not compacted", errors)
+        self.assertEqual(len(self.methods("turn/interrupt")), 1)
+        self.assertEqual(self.live_turn, "")
+        self.assertEqual(self.seat_record()["context_tokens"], 150000)
+
+    def test_a_compaction_that_cannot_be_interrupted_exits_with_the_still_live_status(self) -> None:
+        self.context_sizes = [150000]
+        self.assertEqual(self.run_start()[0], 0)
+        self.compact_never_finishes = True
+        self.interrupt_error = "interrupt refused"
+
+        code, errors = self.compact_with_short_waits()
+
+        self.assertEqual(code, codex_mesh.COMPACT_TURN_STILL_LIVE)
+        self.assertIn("a turn is still live on the thread", errors)
+        self.assertEqual(self.live_turn, "compact-turn")
+
+    def test_compact_waits_for_a_live_turn_on_a_finished_seat_to_end(self) -> None:
+        self.context_sizes = [150000]
+        self.compact_after_tokens = 18000
+        self.assertEqual(self.run_start()[0], 0)
+        self.live_turn = "left-over-turn"
+        self.announce_live_completion = True
+
+        code, errors = self.compact_with_short_waits()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["context_tokens"], 18000)
+
+    def test_compact_refuses_a_finished_seat_whose_turn_stays_live(self) -> None:
+        self.context_sizes = [150000]
+        self.assertEqual(self.run_start()[0], 0)
+        self.live_turn = "left-over-turn"
+
+        code, errors = self.compact_with_short_waits()
+
+        self.assertEqual(code, codex_mesh.COMPACT_TURN_STILL_LIVE)
+        self.assertIn("thread has a live turn; compact refused", errors)
+        self.assertEqual(self.methods("thread/compact/start"), [])
+        self.assertEqual(self.methods("turn/interrupt"), [])
 
     def test_context_overflow_starts_one_continue_turn_and_posts_once(self) -> None:
         self.outcomes = ["overflow", "completed"]
