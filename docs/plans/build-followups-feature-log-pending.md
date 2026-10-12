@@ -100,7 +100,7 @@ The showrunner's assignment, 2026-10-12 10:20 PDT (a peer's coordination, not th
 - `amend` can still add an exact version of X to a note that already holds `X@Unreleased`; only the same-call mix and the stored-version case are refused.
 - `_section_bullets` keeps every heading's bullets; the compare loop picks the six and the empty heading.
 
-### Phase 2 — The five crates' pending changelog bullets are in the log  · status: todo
+### Phase 2 — The five crates' pending changelog bullets are in the log  · status: done
 
 #### Work Order
 
