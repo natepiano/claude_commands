@@ -97,6 +97,8 @@ Never `/logout` in a unit director's session: every unit on that account stops w
 
 The unit account runs the unit directors and the nightly review. A swap moves both: the next night's review starts on the new account.
 
+The review cannot edit any account folder: its settings deny edits under `~/.claude1`, `~/.claude2` and `~/.claude3` as well as `~/.claude`. A new account folder needs its own line in `scripts/nightly_review/settings.json`.
+
 Run the swap from a session on another account, normally plain `claude`, or from a terminal. This example moves units from claude 3 to claude 1:
 
 ```text
