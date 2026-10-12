@@ -95,6 +95,8 @@ Never `/logout` in a unit director's session: every unit on that account stops w
 
 ## Swapping the unit account
 
+The unit account runs the unit directors and the nightly review. A swap moves both: the next night's review starts on the new account.
+
 Run the swap from a session on another account, normally plain `claude`, or from a terminal. This example moves units from claude 3 to claude 1:
 
 ```text
