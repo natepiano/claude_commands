@@ -137,6 +137,176 @@ Usage errors, the stderr-only refusals above, an unreadable `--file` and an empt
 
 Delivery mechanics: a Claude recipient is reached through a headless `claude -p` relay (sonnet, auto mode, tools `SendMessage` plus `ListAgents` for a name, hooks, MCP and slash commands off, `CLAUDE_*` variables removed, named `--from`); delivery is read from the `SendMessage` tool result in the stream, which stays in `STATE/relay/<to>.jsonl`. `--timeout` defaults to 40 s for every transport. Where `~/.config/claude/oauth-token.gpg` exists (the Mac, whose keychain ssh cannot open) the relay decrypts it, and queues with `gpg-agent is cold on <machine>: run github-warmup there` when it cannot. Undelivered Claude messages go to `STATE/queue/`, latest per `--key`, under the recipient's session id; `pending` prints and clears them. `--key` with `--repeat-minutes` skips a repeat within the window; `ack` skips every later send with the key until `reopen`.
 
+### Postmaster mod (trial)
+
+Postmaster is a local Claude Code mod in `mods/postmaster/`, loaded directly with `--plugin-dir`; its intended main-checkout path is `~/.claude/mods/postmaster`. This section records the trial of the mod API on Claude Code 2.1.296, not completed measurements. The probe uses `STATE/postmaster/probe/`, where `STATE` is `$XDG_STATE_HOME/message` or, by default, `~/.local/state/message`. It reads and writes only under `STATE/postmaster/`, starts no process and makes no network call. The trial worktree is `/home/natepiano/worktrees/claude-build-followups-shutdown`, branch `build-followups-shutdown`.
+
+The unit director runs this procedure after both writers are idle. Seats run no live step. Every recipient below is a throwaway session created for this check; no probe message goes to an existing session.
+
+1. **Wait for both folder trusts.** The permanent session directory is `/home/natepiano/postmaster`, decided by the showrunner on 2026-10-12. The showrunner asks the user to create it, start `claude` there once with the `~/.claude` account, accept the folder-trust dialog and exit, then repeat with `CLAUDE_CONFIG_DIR=/home/natepiano/.claude3`. An unused directory presents the dialog with `No, exit` selected, and trust is stored per account. Start this procedure only after the showrunner reports both trusts done. Keep this directory empty; nobody types into a pane.
+
+2. **Start A, B and C.** Use one throwaway tmux session with three windows, each in `/home/natepiano/postmaster`, each with a shell as the pane process and `claude` as its child. Remove every environment variable whose name starts with `CLAUDE` before launching each child, including any restored by shell startup; only C then receives the account variable shown below. Use these launch commands:
+
+   ```sh
+   # A
+   claude -n pm-probe-a --plugin-dir /home/natepiano/worktrees/claude-build-followups-shutdown/mods/postmaster
+   # B
+   claude -n pm-probe-b
+   # C
+   CLAUDE_CONFIG_DIR=/home/natepiano/.claude3 claude -n pm-probe-c
+   ```
+
+   Retain the tmux session identifier and the child process identities for cleanup. Never use `--dangerously-skip-permissions`, edit a `settings.json`, read `.credentials.json` or `.claude.json`, or type into a pane. This is a folder-loaded mod, with no marketplace installation or `enabledPlugins` change.
+
+3. **Confirm identities from records.** Run `sessions.py id pm-probe-a`, `sessions.py id pm-probe-b` and `sessions.py id pm-probe-c` through the repository's `scripts/lib/py` interpreter, using C's `CLAUDE_CONFIG_DIR` when reading C's account. Read only the matching session registry records for socket paths, process identities and transcript locations; never identify a session from screen text. Read `STATE/postmaster/probe/started.json` for A's session id from `$.session.id` and the recorded absence of a call that gives the session's pid; obtain the pid from A's registry record for cleanup. Its `environment_read` records what `$.env.get` answered for `HOME` and `XDG_STATE_HOME`; `process_env_available` records whether `globalThis.process.env` exists in the worker. Confirm A, B and C are the processes just started. In the request objects below, replace `<A_ID>`, `<B_ID>` and `<C_ID>` with these ids, and `<A_SOCKET>`, `<B_SOCKET>` and `<C_SOCKET>` with their socket paths, without a `uds:` prefix. Select `<DEAD_ID>` as a session id that no running session has.
+
+4. **Write one request at a time from a shell.** Replace the placeholders before writing each JSON object below to `STATE/postmaster/probe/request.json`; publish it with one atomic rename of a sibling temporary file so the 0.5 s poll never reads a partial object. Wait for the line with the matching `id` and `step` in `STATE/postmaster/probe/report.jsonl` before writing the next request. Use new ids on a repeat. Each report line carries `run`, the hooks worker's start time in ms, fixed for that worker's life, along with `id`, `step`, `ok`, `detail`, `started_ms` and `ended_ms`; record a missing API as `ok: false` with its reason.
+
+   Each `session.start` appends a line with `id: "start"`, `step: "start"`, `ok: true` and `detail` containing `session_id` (the id or null) and `already_running` (a boolean). Record the initial `run`; a second `start` line with the same `run` means the event fired twice in one worker, and a new `run` means the worker was replaced. Record either observation in the worker-replacement table row and keep evidence from different workers separate.
+
+   An existing request file that does not parse or misses a field gets a `request-error` line with `ok: false`, `detail` giving the reason and `id` equal to the request's string id, or `request` when none exists. This is recorded once per distinct file text; an absent request file is idle and writes nothing. If no line with the request's id appears within 30 s, read the newest `request-error`, `start` and `tick` lines before writing anything else. A `request-error` with that id reports rejection, not completion of the requested step.
+
+   Read each run's traces, captures and logs, copy the answer and evidence line into the table, and delete that run's saved output before another run. Keep saved output below a few GB. Do not remove active probe files between requests in the same run.
+
+5. **Send by id to B, a different process.** Write:
+
+   ```json
+   {"id":"b-id-1","step":"send-by-id","to_session_id":"<B_ID>","to_socket":"<B_SOCKET>","text":"Postmaster trial b-id-1. Record receipt; no reply needed.","count":1}
+   ```
+
+   Read the `b-id-1` report line and B's transcript file to establish receipt. This tests `$.session.send({ to: { sessionId }, text })` across processes.
+
+6. **Send by socket address to B.** Write:
+
+   ```json
+   {"id":"b-address-1","step":"send-by-address","to_session_id":"<B_ID>","to_socket":"<B_SOCKET>","text":"Postmaster trial b-address-1. Record receipt; no reply needed.","count":1}
+   ```
+
+   Read the `b-address-1` report line and B's transcript. The probe uses `to: "uds:<B_SOCKET>"`; record whether that address form succeeds.
+
+7. **Repeat both address forms to C, the other account on natedev.** Write the first object, read its result and C's transcript, then write the second and read its result and C's transcript:
+
+   ```json
+   {"id":"c-id-1","step":"send-by-id","to_session_id":"<C_ID>","to_socket":"<C_SOCKET>","text":"Postmaster trial c-id-1. Record receipt; no reply needed.","count":1}
+   ```
+
+   ```json
+   {"id":"c-address-1","step":"send-by-address","to_session_id":"<C_ID>","to_socket":"<C_SOCKET>","text":"Postmaster trial c-address-1. Record receipt; no reply needed.","count":1}
+   ```
+
+   Read the `c-id-1` and `c-address-1` lines in `report.jsonl`. If C cannot be reached, later phases restrict mod delivery to recipients of the postmaster's own account.
+
+8. **Record the wrapper, reply route and consumption.** Read B's transcript for the exact wrapper received in steps 5 and 6, including its `from` name. Note A's transcript position, then arm consumption before asking B to reply. Write:
+
+   ```json
+   {"id":"consume-1","step":"consume","to_session_id":"","to_socket":"","text":"","count":0}
+   ```
+
+   Read the `consume-1` line in `report.jsonl` to confirm the probe is armed. Its `session.receive` handler consumes the next arriving message whose text contains `consume-1`, appends all event fields to `received.jsonl` with `consumed: true` and `consume_request_id: "consume-1"`, then returns `{ consumed: <reason string> }` without calling `next(e)`. Other arriving messages are passed on. Once armed, write:
+
+   ```json
+   {"id":"b-reply-1","step":"send-by-id","to_session_id":"<B_ID>","to_socket":"<B_SOCKET>","text":"Postmaster trial b-reply-1. Reply to the sender named by this message's wrapper with the text consume-1.","count":1}
+   ```
+
+   Read the `b-reply-1` line in `report.jsonl`, then wait at most five minutes for B's reply. Read B's transcript to record whether it replied, stopped at a permission prompt, or did nothing; record that outcome in the reply-route row, together with the destination if it replied. Read A's `received.jsonl` for every field of an arriving `session.receive` event and A's transcript for any new model turn. Record where the reply actually lands, even if it does not reach A. Nobody answers a permission prompt by typing into a pane.
+
+   Whatever B did, arm a second consumption request:
+
+   ```json
+   {"id":"consume-2","step":"consume","to_session_id":"","to_socket":"","text":"","count":0}
+   ```
+
+   Wait for the `consume-2` report line with `ok: true`, then note A's current transcript position. From its own session, the unit director uses its SendMessage tool to send `Postmaster trial consume-2.` to `uds:<A_SOCKET>`. Read A's `received.jsonl` for the matching event with `consumed: true` and `consume_request_id: "consume-2"`, and A's transcript to confirm no new model turn starts there. Criterion (d) passes when a message matching an armed id is consumed in A and starts no turn; it does not depend on B completing a reply. A is the throwaway session created for this check, so the director sends nothing to an existing session.
+
+9. **Send to a dead session.** Write:
+
+   ```json
+   {"id":"dead-1","step":"send-dead","to_session_id":"<DEAD_ID>","to_socket":"","text":"Postmaster trial dead-1.","count":1}
+   ```
+
+   Read the `dead-1` report line for whether the call throws or returns and the complete failure answer.
+
+10. **Send to A itself.** Write:
+
+    ```json
+    {"id":"self-1","step":"send-self","to_session_id":"<A_ID>","to_socket":"<A_SOCKET>","text":"Postmaster trial self-1. Record receipt; no reply needed.","count":1}
+    ```
+
+    Read the `self-1` report line, A's `received.jsonl` and A's transcript to record the self-send result.
+
+11. **Measure bursts of 20 and 60 sends to B.** Write the first object and read its result before writing the second:
+
+    ```json
+    {"id":"burst-20-1","step":"burst","to_session_id":"<B_ID>","to_socket":"<B_SOCKET>","text":"Postmaster trial burst-20-1. Record receipt; no reply needed.","count":20}
+    ```
+
+    ```json
+    {"id":"burst-60-1","step":"burst","to_session_id":"<B_ID>","to_socket":"<B_SOCKET>","text":"Postmaster trial burst-60-1. Record receipt; no reply needed.","count":60}
+    ```
+
+    Read the matching lines in `report.jsonl` for each send's timing and outcome, and B's transcript for received counts. Record any limit, delay or refusal at each burst size.
+
+12. **Exercise file calls and visibility.** Have another shell process observe `STATE/postmaster/probe/file-source.txt` before writing this request:
+
+    ```json
+    {"id":"files-1","step":"files","to_session_id":"","to_socket":"","text":"","count":0}
+    ```
+
+    Read the `files-1` report line for writing, listing, reading and testing the existence of a file through `$.fs`, then writing the same path again and reading the replacement value. Its detail includes `path` identifying `file-source.txt`, `final_content` and per-operation timestamps. From the observing process, check that the file and its replacement contents are visible as soon as each write returns; retain the write-return and external-observation evidence for criterion (b). Record that `$.fs` has no rename and no remove. The mod starts no process; the unit director runs the observing shell process outside the mod.
+
+13. **Observe ten idle minutes.** Write:
+
+    ```json
+    {"id":"timer-1","step":"timer","to_session_id":"","to_socket":"","text":"","count":0}
+    ```
+
+    Read the `timer-1` report line for the 0.5 s poll mechanism (`setInterval` in the module or an engine API) and the four baseline values: `poll_count`, `max_gap_ms`, `completed_count` and `max_completed_gap_ms`. Leave A idle for ten minutes, reading the `tick` lines appended every 60 s to `report.jsonl`. `poll_count` counts timer callbacks since the worker started; `completed_count` counts request-file checks that ran to their end since the worker started. `max_gap_ms` is the longest gap between timer callbacks inside the minute the tick closes. `max_completed_gap_ms` is the longest time between finished checks inside that minute, including the time still open when the tick is written. Both gap values start again at each tick.
+
+    Record the elapsed interval and ten consecutive ticks for the same `run`. The gate holds when every tick has `max_gap_ms` and `max_completed_gap_ms` at most 2000, and `poll_count` and `completed_count` both rise from tick to tick. Record a new `run` or a second `start` line if either occurs during the interval.
+
+14. **Record generated types, strict checking and the test kit.** Check whether `mods/postmaster/.claude-plugin/types/claude-code/index.d.ts` exists after A loads the mod. Read the generated declarations to identify the API actually available; keep generated types uncommitted. From the worktree, try this command and record the exact command that passes on natedev, together with its exit status and output:
+
+    ```sh
+    nix shell nixpkgs#typescript --command tsc --noEmit -p mods/postmaster
+    ```
+
+    Record the exit status and output, including the `hooks:` and `calls:` lines, from:
+
+    ```sh
+    claude plugin validate --strict mods/postmaster
+    claude plugin test mods/postmaster
+    ```
+
+    Record what a `tests/*.test.ts` file must import from `claude-code/testing`, including the exports for a fake clock, `$.session.send`, an arriving `session.receive` and file calls. A run with no test file does not establish those exports; keep unsupported points unverified. Hook exceptions or the 10 s hook limit must produce recorded failures; the probe must not throw out of a hook, and each handler must have a `.catch`.
+
+15. **Apply the four pass criteria.** Continue the trial only when all four have evidence: (a) a send by session id or `uds:` reaches B in another process; (b) the mod writes, lists, reads and tests the existence of files under its state directory, and another process sees a file as soon as the write returns; (c) ten consecutive minute ticks for the same `run` each show `max_gap_ms` and `max_completed_gap_ms` at most 2000, with `poll_count` and `completed_count` both rising from tick to tick; (d) an arriving message matching an armed consumption id is consumed in A and starts no turn there, including the director's `consume-2` check regardless of B's reply outcome. If any fails or cannot be verified, the unit director stops the run and reports to the showrunner. Record every other result for `/plan:phase_review`: address form, reach across accounts, sender name and wrapper, reply route and receive fields, worker replacement or repeated starts, burst limit, dead-session failure, self-send, identity reads, generated types, the TypeScript command, strict validation output and test-kit exports. The phase's acceptance gate also requires strict validation to exit 0, TypeScript checking to pass and the unchanged message suite to be green; this document-writing seat runs no suite.
+
+16. **Clean up the live check.** After reading the evidence and filling the table, exit A, B and C through the supported process/session controls, end only the throwaway tmux session and remove `STATE/postmaster/probe/`. End only processes this check started, confirmed from the retained identities; never type into a pane. Delete saved traces, captures and logs before another run. Keep `/home/natepiano/postmaster` empty and available as the permanent postmaster session directory.
+
+**Mod API on Claude Code 2.1.296, measured `<date>`**
+
+Replace `<date>` with the actual measurement date when the unit director fills the record. Each evidence cell must name the request id and the report, receive or transcript line, or the exact command output, supporting its answer.
+
+| Point | Answer | Evidence |
+|---|---|---|
+| Send by session id to another process | not yet measured | not yet measured |
+| Send by `uds:` address | not yet measured | not yet measured |
+| Reach of a session under the other account | not yet measured | not yet measured |
+| Sender name the recipient sees and the wrapper | not yet measured | not yet measured |
+| Where a reply lands and what `session.receive` carries | not yet measured | not yet measured |
+| Whether consuming the event starts no turn | not yet measured | not yet measured |
+| Burst limit at 20 and at 60 | not yet measured | not yet measured |
+| Send to a dead session | not yet measured | not yet measured |
+| Send to self | not yet measured | not yet measured |
+| Own session id from `$.session.id`; no call gives the session's pid | not yet measured | not yet measured |
+| File write/list/read/exists, overwrite and visibility in another process; no rename or remove | not yet measured | not yet measured |
+| Poll mechanism and ten idle minutes: `poll_count`, `max_gap_ms`, `completed_count`, `max_completed_gap_ms` | not yet measured | not yet measured |
+| Whether the hooks worker is replaced, or starts twice, during a session | not yet measured | not yet measured |
+| Whether the types file exists after a load | not yet measured | not yet measured |
+| The `tsc` command | not yet measured | not yet measured |
+| What `claude plugin validate --strict` prints | not yet measured | not yet measured |
+| What the test kit exports | not yet measured | not yet measured |
+
 ### `broadcast.py`: groups on both machines
 
 ```

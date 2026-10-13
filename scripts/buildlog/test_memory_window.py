@@ -51,6 +51,11 @@ def snapshot(at: str, high: int, peak: int, *, ci: Record | None = None) -> Reco
     }
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 class MemoryWindowTests(unittest.TestCase):
     base: Path = Path()
     root: Path = Path()

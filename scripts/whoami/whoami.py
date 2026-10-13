@@ -9,16 +9,18 @@ from datetime import datetime
 from pathlib import Path
 
 from account import label_for
-from agent_accounts import (ClaudeAccountSelection, CodexHomeSource, EASTERN, Quota, Report,
+from agent_accounts import (ClaudeAccountSelection, CodexHomeSource, Quota, Report,
                             codex_home_display, codex_homes, codex_report_in_use, live_reports,
                             seats_home as resolve_seats_home)
 import note_file
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
 
 def reset_time(value: datetime | None) -> str:
     if value is None:
         return "unavailable"
-    return value.astimezone().strftime("%a %Y-%m-%d %H:%M %Z")
+    return value.astimezone(user_zone()).strftime("%a %Y-%m-%d %H:%M %Z")
 
 
 def quota_line(quota: Quota) -> str:
@@ -58,7 +60,7 @@ def render(report: Report, selection: ClaudeAccountSelection, seats_home: Path) 
         count = report.limit_reset_count
         lines.append(f"  Limit resets available: {count if count is not None else 'unavailable'}")
         for expires in report.limit_reset_expirations:
-            lines.append(f"  Limit reset expires: {expires.astimezone(EASTERN).strftime('%a %Y-%m-%d %H:%M %Z')}")
+            lines.append(f"  Limit reset expires: {expires.astimezone(user_zone()).strftime('%a %Y-%m-%d %H:%M %Z')}")
         if count and len(report.limit_reset_expirations) < count:
             lines.append("  Some reset expiration dates are unavailable")
     elif report.tool == "Claude" and report.email:

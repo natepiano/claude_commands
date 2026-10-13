@@ -11,10 +11,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypedDict, cast
-from zoneinfo import ZoneInfo
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "production"):
+for dependency in ("whoami", "message", "production", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 from account import (
@@ -59,6 +58,7 @@ from remote import other_machine, run_remote
 import settle
 import stop as stop_work
 import restart as restart_work
+from user_zone import user_zone
 
 
 class CommandLine(argparse.Namespace):
@@ -226,14 +226,14 @@ def _local_time(value: str) -> str:
         parsed = datetime.fromisoformat(value)
     except ValueError:
         return value
-    return parsed.astimezone(ZoneInfo("America/Los_Angeles")).strftime(
+    return parsed.astimezone(user_zone()).strftime(
         "%Y-%m-%d %H:%M:%S %Z"
     )
 
 
 def _shutdown_hold_time(value: str) -> str:
     return datetime.fromisoformat(value).astimezone(
-        ZoneInfo("America/Los_Angeles")
+        user_zone()
     ).strftime("%Y-%m-%d %H:%M %Z")
 
 

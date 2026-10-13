@@ -81,6 +81,11 @@ elif name == "nix":
 '''
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 @final
 class AddUnitTests(ShutdownTestCase):
     def __init__(self, methodName: str = "runTest") -> None:

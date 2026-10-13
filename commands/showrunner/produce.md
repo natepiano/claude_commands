@@ -265,12 +265,12 @@ State:
   ```text
 
   ---
-  11:37 PDT update:
+  11:37 EDT update:
 
-  * build hold: <holder> holds builds since 11:34 PDT for the frame-time lane's breakdown of what each added tool costs; expected to release 11:40 PDT (in 3 minutes)
-  * Mac block: <holder> since 11:35 PDT, for the Mac-only test run - lifts Wed 12:35 PDT
+  * build hold: <holder> holds builds since 11:34 EDT for the frame-time lane's breakdown of what each added tool costs; expected to release 11:40 EDT (in 3 minutes)
+  * Mac block: <holder> since 11:35 EDT, for the Mac-only test run - lifts Wed 12:35 EDT
   * claude 1: …
-  * next dailies: 11:53 PDT - nothing needed
+  * next dailies: 11:53 EDT - nothing needed
 
 
   Waiting on:

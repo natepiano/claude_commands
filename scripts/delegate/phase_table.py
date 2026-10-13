@@ -24,6 +24,7 @@ if not __package__:
 sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 
 from scripts.delegate import progress_history
+from scripts.lib.user_zone import user_zone
 from scripts.production import showrunners, unit_lookup
 from scripts.production.add_unit import (
     Production,
@@ -1478,24 +1479,6 @@ def refresh(session_dir: Path) -> None:
     _remove_stale_notes(vault_root, target, ownership)
 
 
-def _local_zone() -> ZoneInfo:
-    configured = os.environ.get("TZ")
-    if configured:
-        try:
-            return ZoneInfo(configured)
-        except ZoneInfoNotFoundError:
-            pass
-    try:
-        localtime = Path("/etc/localtime").resolve()
-        marker = "/zoneinfo/"
-        if marker in str(localtime):
-            return ZoneInfo(str(localtime).split(marker, 1)[1])
-    except (OSError, ZoneInfoNotFoundError):
-        pass
-    local = datetime.now().astimezone().tzinfo
-    return local if isinstance(local, ZoneInfo) else ZoneInfo("UTC")
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Show or refresh a unit run's plan phases."
@@ -1546,7 +1529,7 @@ def main() -> int:
             output = show_production(production_doc.expanduser().resolve())
             print(output)
             return 0
-        zone = ZoneInfo(zone_name) if zone_name else _local_zone()
+        zone = ZoneInfo(zone_name) if zone_name else user_zone()
         output = show(session_dir.expanduser().resolve(), zone, json_value is True)
     except (NoState, NoPlan, Refusal, ZoneInfoNotFoundError) as error:
         print(str(error), file=sys.stderr)

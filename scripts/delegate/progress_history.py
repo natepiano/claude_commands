@@ -25,6 +25,10 @@ from pathlib import Path
 from typing import NamedTuple, NoReturn, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.user_zone import user_zone  # noqa: E402
+
 
 SCHEMA_VERSION = 1
 # The shared history spine, read by scripts/history/history.py. Kept separate
@@ -357,14 +361,14 @@ def _refuse_eta(message: str) -> NoReturn:
 
 
 def _process_timezone() -> tzinfo:
+    """The zone a caller names in `TZ`, else the user's zone setting."""
     configured = os.environ.get("TZ")
     if configured:
         try:
             return ZoneInfo(configured)
         except ZoneInfoNotFoundError:
             pass
-    detected = datetime.now().astimezone().tzinfo
-    return detected if detected is not None else UTC
+    return user_zone()
 
 
 def _local_eta_epoch(value: str, option: str) -> float:
@@ -2129,7 +2133,7 @@ def _clock_line(now: float, next_report_at: float | None) -> str:
     never when. This line is the one place a reader can tell whether the report
     they are looking at is current and how long until the next one lands.
     """
-    line = f"**now {datetime.fromtimestamp(now):%Y-%m-%d %H:%M:%S}"
+    line = f"**now {datetime.fromtimestamp(now, _process_timezone()):%Y-%m-%d %H:%M:%S}"
     if next_report_at is not None:
         line += f" - next report {_moment_stamp(next_report_at, now)}"
     return line + "**"
@@ -2137,8 +2141,8 @@ def _clock_line(now: float, next_report_at: float | None) -> str:
 
 def _moment_stamp(epoch: float, now: float) -> str:
     """A local clock time, dated only when it falls on a day other than `now`'s."""
-    moment = datetime.fromtimestamp(epoch)
-    if moment.date() == datetime.fromtimestamp(now).date():
+    moment = datetime.fromtimestamp(epoch, _process_timezone())
+    if moment.date() == datetime.fromtimestamp(now, _process_timezone()).date():
         return f"{moment:%H:%M:%S}"
     return f"{moment:%Y-%m-%d %H:%M:%S}"
 
@@ -2244,7 +2248,7 @@ def _agent_display(model: str, effort: str) -> str:
 
 
 def _clock_stamp(epoch: float) -> str:
-    return f"{datetime.fromtimestamp(epoch):%H:%M:%S}"
+    return f"{datetime.fromtimestamp(epoch, _process_timezone()):%H:%M:%S}"
 
 
 def _started_window(event: dict[str, object], event_type: str) -> StageWindow:
@@ -3538,8 +3542,8 @@ def _render_table(
 
 def _arrival_label(arrival_epoch: float, now: float) -> str:
     """A point in time named the way a person would say it aloud on `now`'s day."""
-    arrival = datetime.fromtimestamp(arrival_epoch)
-    days = (arrival.date() - datetime.fromtimestamp(now).date()).days
+    arrival = datetime.fromtimestamp(arrival_epoch, _process_timezone())
+    days = (arrival.date() - datetime.fromtimestamp(now, _process_timezone()).date()).days
     if days == 0:
         return f"today {arrival:%H:%M}"
     if days == 1:

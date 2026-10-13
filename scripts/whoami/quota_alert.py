@@ -68,9 +68,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
-from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts
 
 from agent_accounts import (ClaudeAccountSelection, ClaudeRole, CodexHomeSource, Report,
@@ -219,7 +219,6 @@ KILL_GRACE = 10
 # The whole switch took 2 s of wall time when measured idle and 8 s at load average 87; each entry
 # switched back, 0.4 s idle.
 EDIT_TIMEOUT = 30
-USER_ZONE = ZoneInfo("America/Los_Angeles")
 
 
 class Episode(TypedDict):
@@ -538,7 +537,7 @@ def close_recovered(state: State, notes: list[AgentNote], threshold: float,
 
 
 def local_time(stamp: str) -> str:
-    return datetime.fromisoformat(stamp).astimezone().strftime("%Y-%m-%d %H:%M")
+    return datetime.fromisoformat(stamp).astimezone(user_zone()).strftime("%Y-%m-%d %H:%M")
 
 
 def registry_assignments() -> dict[str, str]:
@@ -695,7 +694,7 @@ def credit_line(note: AgentNote) -> str:
 def user_time(stamp: str | None) -> str:
     """A machine-local note time rendered in the user's zone."""
     try:
-        return datetime.fromisoformat(stamp or "").astimezone(USER_ZONE).strftime("%a %m-%d %H:%M %Z")
+        return datetime.fromisoformat(stamp or "").astimezone(user_zone()).strftime("%a %m-%d %H:%M %Z")
     except ValueError:
         return "an unknown time"
 

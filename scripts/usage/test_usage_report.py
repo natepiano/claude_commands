@@ -9,12 +9,14 @@ import sqlite3
 import subprocess
 import sys
 import unittest
+from unittest import mock
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, cast, final, override
 from zoneinfo import ZoneInfo
 
+from scripts.usage import collect
 from scripts.usage.test_collect import FIXTURES as COLLECT_FIXTURES, MacStreamReport, REPOSITORY, SNAPSHOT_COMMIT_SCRIPT, SshBehavior
 from scripts.usage.test_outcomes import OutcomeFixture
 
@@ -24,6 +26,11 @@ REPORT = Path(__file__).with_name("usage_report.py")
 METRICS = ("weighted", "weighted_per_checkpoint", "before_first_edit_share", "cache_read_share",
            "output_share", "compactions_per_thread", "weighted_per_finding_closed",
            "weighted_per_review_round", "account_switches")
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class ReportFunctionCalls(TypedDict):
@@ -472,23 +479,26 @@ print(json.dumps(reports))
 
     def assert_version_refused_without_writing(self, version: int) -> None:
         with closing(sqlite3.connect(self.db_path)) as database, database:
-            if version == 6:
+            if version < collect.STORE_VERSION:
                 _ = database.execute("DROP TABLE folders")
             _ = database.execute(f"PRAGMA user_version = {version}")
         before = self.db_path.read_bytes()
         result = self.report("weighted")
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, "")
-        expected = (FIXTURES / "expected" / f"store-version-{version}.txt").read_text(encoding="utf-8")
+        reason = (f"store version {version} is older than report version {collect.STORE_VERSION}; run the collector once"
+                  if version < collect.STORE_VERSION else
+                  f"store version {version} is newer than report version {collect.STORE_VERSION}; this report is older than the store")
+        expected = f"usage_report: {reason}\n"
         self.assertEqual(result.stderr, expected)
         self.assertEqual(len(result.stderr.splitlines()), 1)
         self.assertEqual(self.db_path.read_bytes(), before)
 
     def test_older_store_names_its_version_and_requires_one_collection(self) -> None:
-        self.assert_version_refused_without_writing(6)
+        self.assert_version_refused_without_writing(collect.STORE_VERSION - 1)
 
     def test_newer_store_refuses_an_older_report_without_writing(self) -> None:
-        self.assert_version_refused_without_writing(8)
+        self.assert_version_refused_without_writing(collect.STORE_VERSION + 1)
 
     def test_large_stored_counts_report_raw_and_weighted_sums_without_overflow(self) -> None:
         for directory in (self.claude_root, self.codex_root, self.history):

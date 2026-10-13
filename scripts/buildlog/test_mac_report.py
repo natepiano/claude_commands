@@ -51,6 +51,7 @@ class MacReportTests(unittest.TestCase):
         previous = os.environ.get("TZ")
         os.environ["TZ"] = "America/Los_Angeles"
         time.tzset()
+        self.enterContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
         def restore_timezone() -> None:
             if previous is None:
@@ -500,7 +501,7 @@ class MacReportTests(unittest.TestCase):
         self.assertEqual(index.update(), 65_600)
         measured = time.perf_counter()
         result = subprocess.run(
-            [sys.executable, str(CLI), "mac-report"], env={**os.environ, "BUILDLOG_DIR": str(self.root), "TZ": "America/Los_Angeles"},
+            [sys.executable, str(CLI), "mac-report"], env={**os.environ, "BUILDLOG_DIR": str(self.root), "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"},
             capture_output=True, text=True, check=False, timeout=30,
         )
         elapsed = time.perf_counter() - measured

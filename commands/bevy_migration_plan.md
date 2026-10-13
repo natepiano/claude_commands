@@ -263,12 +263,12 @@ mkdir -p "${CODEBASE}/.claude/bevy_migration"
 ```
 
 **The script will:**
-- Run `cargo tree` to discover all bevy-dependent crates (direct and indirect)
+- Run `cargo tree` to discover direct Bevy-dependent crates, including crates that depend only on Bevy's own crates, such as `bevy_app` or `bevy_ecs`
 - Query crates.io for each dependency to find compatible versions
 - Classify each dependency as:
   - **🚫 BLOCKER**: No compatible version exists - cannot migrate
   - **🔄 UPDATE_REQUIRED**: Compatible version exists - must update Cargo.toml
-  - **⚠️ CHECK_NEEDED**: Compatibility unclear - needs manual testing
+  - **⚠️ CHECK_NEEDED**: Compatibility unclear or crates.io did not answer a lookup - needs manual verification
   - **✅ OK**: Already compatible
 - Output markdown section with dependency compatibility review
 - Includes clear explanations of each classification category

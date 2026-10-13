@@ -261,6 +261,7 @@ RosterRole = AssignedDelegateRole | RolelessThread
 class FollowableRecord(TypedDict):
     thread_id: str
     status: Literal["done", "failed"]
+    revision: NotRequired[int]
     role: NotRequired[SeatRole]
     context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
@@ -271,6 +272,7 @@ class FollowableRecord(TypedDict):
 class ActiveRecord(TypedDict):
     thread_id: str
     status: Literal["running"]
+    revision: NotRequired[int]
     turn_id: str
     launcher_pid: NotRequired[int]
     port: NotRequired[int]
@@ -282,6 +284,7 @@ class ActiveRecord(TypedDict):
 class StartingRecord(TypedDict):
     thread_id: str
     status: Literal["starting"]
+    revision: NotRequired[int]
     launcher_pid: NotRequired[int]
     port: NotRequired[int]
     role: NotRequired[SeatRole]
@@ -292,6 +295,7 @@ class StartingRecord(TypedDict):
 class WaitingCapacityRecord(TypedDict):
     thread_id: str
     status: Literal["waiting_capacity"]
+    revision: NotRequired[int]
     launcher_pid: int
     port: NotRequired[int]
     role: NotRequired[SeatRole]
@@ -302,6 +306,7 @@ class WaitingCapacityRecord(TypedDict):
 class ExhaustedRecord(TypedDict):
     thread_id: str
     status: Literal["capacity_exhausted"]
+    revision: NotRequired[int]
     role: NotRequired[SeatRole]
     context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
@@ -310,6 +315,7 @@ class ExhaustedRecord(TypedDict):
 class EndedRecord(TypedDict):
     thread_id: str
     status: Literal["ended"]
+    revision: NotRequired[int]
     role: NotRequired[SeatRole]
     context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
@@ -727,6 +733,22 @@ def _post_board_status(session_dir: str, name: str, message: str) -> None:
 
 
 @dataclass(frozen=True)
+class RosterRevision:
+    value: int
+
+
+def _roster_revision(value: object) -> RosterRevision:
+    revision = _as_dict(value).get("revision")
+    if isinstance(revision, int) and not isinstance(revision, bool) and revision >= 0:
+        return RosterRevision(revision)
+    return RosterRevision(0)
+
+
+def _advance_roster_revision(entry: dict[str, object]) -> None:
+    entry["revision"] = _roster_revision(entry).value + 1
+
+
+@dataclass(frozen=True)
 class RosterOnThread:
     thread_id: str
 
@@ -741,7 +763,13 @@ class RosterEndedOnThread:
     thread_id: str
 
 
-ExpectedRoster = RosterOnThread | RosterAbsent | RosterEndedOnThread
+@dataclass(frozen=True)
+class RosterUnchanged:
+    thread_id: str
+    revision: RosterRevision
+
+
+ExpectedRoster = RosterOnThread | RosterAbsent | RosterEndedOnThread | RosterUnchanged
 
 
 def _write_roster_record(handle: TextIO, roster: dict[str, object], name: str,
@@ -774,6 +802,7 @@ def _write_roster_record(handle: TextIO, roster: dict[str, object], name: str,
         stored["context_tokens"] = size.tokens
     elif isinstance(size, NotMeasuredSinceCompaction):
         stored["context_tokens"] = "not_measured_since_compaction"
+    stored["revision"] = _roster_revision(previous).value + 1
     roster[name] = stored
     _ = handle.seek(0)
     _ = handle.truncate()
@@ -809,6 +838,8 @@ def _update_roster_if_expected(session_dir: str, name: str, record: ThreadRecord
             matches = previous.get("thread_id") == expected.thread_id
             if isinstance(expected, RosterEndedOnThread):
                 matches = matches and previous.get("status") == "ended"
+            elif isinstance(expected, RosterUnchanged):
+                matches = matches and _roster_revision(previous) == expected.revision
         if not matches:
             return False
         _write_roster_record(handle, roster, name, record)
@@ -825,6 +856,7 @@ def _set_roster_role(session_dir: str, name: str, role: SeatRole) -> None:
         entry = _as_dict(roster.get(name))
         if entry:
             entry["role"] = role
+            _advance_roster_revision(entry)
             roster[name] = entry
             _ = handle.seek(0)
             _ = handle.truncate()
@@ -842,6 +874,7 @@ def _mark_roster_ended(session_dir: str, name: str) -> None:
         entry = _as_dict(roster.get(name))
         if entry:
             entry["status"] = "ended"
+            _advance_roster_revision(entry)
             roster[name] = entry
             _ = handle.seek(0)
             _ = handle.truncate()
@@ -860,6 +893,7 @@ def _mark_all_roster_ended(session_dir: str) -> None:
             entry = _as_dict(value)
             if entry:
                 entry["status"] = "ended"
+                _advance_roster_revision(entry)
                 roster[name] = entry
         _ = handle.seek(0)
         _ = handle.truncate()
@@ -932,6 +966,7 @@ def _claim_follow(
             "previous_status": previous_status,
             "role": role,
         })
+        _advance_roster_revision(claimed)
         roster[name] = claimed
         _ = handle.seek(0)
         _ = handle.truncate()
@@ -962,6 +997,7 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
         previous_status = entry.get("previous_status")
         previous_role = _roster_role(entry.get("previous_role"))
         restored = dict(entry)
+        _advance_roster_revision(restored)
         if isinstance(previous_role, AssignedDelegateRole):
             restored["role"] = previous_role.role
         else:
@@ -1132,6 +1168,7 @@ def _note_seat_port(session_dir: str, name: str, launcher_pid: int, port: int) -
         if entry.get("launcher_pid") != launcher_pid:
             return
         entry["port"] = port
+        _advance_roster_revision(entry)
         roster[name] = entry
         _ = handle.seek(0)
         _ = handle.truncate()
@@ -2087,6 +2124,13 @@ def command_compact(args: argparse.Namespace) -> int:
         )
         return 2
     before = _context_size_from_record(record)
+    revision = _roster_revision(record)
+    if isinstance(before, NotMeasuredSinceCompaction):
+        print(
+            f"codex_mesh: {name}: size not measured since its last compaction; compact refused",
+            file=sys.stderr,
+        )
+        return 2
     if not isinstance(before, KnownContextSize):
         print(
             f"codex_mesh: {name}: no recorded context size; compact refused",
@@ -2130,7 +2174,7 @@ def command_compact(args: argparse.Namespace) -> int:
             session_dir,
             name,
             compacted_record,
-            RosterOnThread(state.thread_id),
+            RosterUnchanged(state.thread_id, revision),
         )
         if isinstance(size, KnownContextSize):
             print(f"compacted {name}: {before.tokens} -> {size.tokens} tokens")
@@ -4089,6 +4133,7 @@ def _clear_reset_context(session_dir: str, name: str, thread_id: str, launcher_p
                 or entry.get("launcher_pid") != launcher_pid):
             return False
         entry["context_tokens"] = 0
+        _advance_roster_revision(entry)
         roster[name] = entry
         _ = handle.seek(0)
         _ = handle.truncate()

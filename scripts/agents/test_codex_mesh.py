@@ -908,7 +908,7 @@ class MeshCommandTests(unittest.TestCase):
         self.server.respond = reply
         code, output, errors = self.run_mesh(["steer", "--to", "seat", "--message", "invented correction"])
         self.assertEqual((code, output, errors), (0, "steered seat\n", ""))
-        self.assertEqual(self.seat_record(), {**original, "turn_id": "live-turn"})
+        self.assertEqual(self.seat_record(), {**original, "turn_id": "live-turn", "revision": 1})
 
     def test_steer_reply_after_replacement_preserves_its_context_and_identity(self) -> None:
         self.write_pool_roster({"seat": {"thread_id": THREAD_ID, "status": "running",
@@ -1202,7 +1202,9 @@ class MeshCommandTests(unittest.TestCase):
                 self.assertIn(f"{arguments[0]} refused", errors)
                 self.assertIn("old server still has a live turn", errors)
                 self.assertIn("seat seat", errors)
-                self.assertEqual(self.roster(), before)
+                expected = ({**before, "seat": {**_as_test_dict(before["seat"]), "revision": 2}}
+                            if arguments[0] == "reset" else before)
+                self.assertEqual(self.roster(), expected)
                 self.assertFalse(any(request.get("method") in ("thread/resume", "thread/fork", "thread/revert")
                                      for request in new.requests))
 
@@ -1302,7 +1304,9 @@ class MeshCommandTests(unittest.TestCase):
                 self.assertEqual((code, output), (2, ""))
                 self.assertIn("writer release not confirmed", errors)
                 self.assertIn(f"{arguments[0]} refused", errors)
-                self.assertEqual(self.roster(), before)
+                expected = ({**before, "seat": {**_as_test_dict(before["seat"]), "revision": 2}}
+                            if arguments[0] == "reset" else before)
+                self.assertEqual(self.roster(), expected)
                 self.assertEqual(self.methods("thread/resume"), [])
 
     def test_fork_supplies_and_copies_the_source_standing_instructions(self) -> None:
@@ -1548,7 +1552,7 @@ class MeshCommandTests(unittest.TestCase):
                 self.assertEqual(self.methods("thread/revert")[0]["params"], {
                     "threadId": THREAD_ID, "beforeTurnId": "first-turn",
                 })
-                self.assertEqual(self.seat_record(), {**original, "context_tokens": 0})
+                self.assertEqual(self.seat_record(), {**original, "context_tokens": 0, "revision": 3})
                 self.assertEqual(self.methods("turn/start"), [])
 
     def test_reset_of_a_thread_without_turns_clears_context_without_reverting(self) -> None:
@@ -1600,7 +1604,7 @@ class MeshCommandTests(unittest.TestCase):
                 self.assertTrue(self.methods("thread/read"))
                 self.assertEqual(self.methods("thread/turns/list"), [])
                 self.assertEqual(self.methods("thread/revert"), [])
-                self.assertEqual(self.roster(), entries)
+                self.assertEqual(self.roster(), {**entries, "seat": {**_as_test_dict(entries["seat"]), "revision": 2}})
 
     def test_reset_refuses_a_live_turn_without_erasing_its_context(self) -> None:
         self.live_turn = "live-review-turn"
@@ -1615,7 +1619,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(output, "")
         self.assertTrue(errors.startswith("codex_mesh: seat: "), errors)
         self.assertEqual(self.methods("thread/revert"), [])
-        self.assertEqual(self.roster(), entries)
+        self.assertEqual(self.roster(), {**entries, "seat": {**_as_test_dict(entries["seat"]), "revision": 2}})
 
     def test_reset_reports_request_failures_without_clearing_context_and_closes_clients(self) -> None:
         self.history_turns = [{"id": "first-turn", "status": "completed", "items": []}]
@@ -1627,7 +1631,7 @@ class MeshCommandTests(unittest.TestCase):
                 self.write_pool_roster(entries)
                 self.failing_method = method
                 self.assert_request_failure_closes_clients(["reset", "--to", "seat"], "seat")
-                self.assertEqual(self.roster(), entries)
+                self.assertEqual(self.roster(), {**entries, "seat": {**_as_test_dict(entries["seat"]), "revision": 2}})
 
     def test_follow_cli_sends_worktree_read_only_policy_and_images_after_text_in_order(self) -> None:
         self.write_pool_roster({"seat": {"thread_id": THREAD_ID, "status": "done", "role": "review"}})
@@ -2123,6 +2127,111 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(self.run_follow(), (0, ""))
         self.assertEqual(self.seat_record()["context_tokens"], 23456)
 
+    def compact_after_a_later_turn(self, after_tokens: int, *, finished: bool = False) -> None:
+        self.context_sizes = [150000]
+        self.compact_after_tokens = after_tokens
+        self.assertEqual(self.run_start(), (0, ""))
+        original = self.seat_record()
+        compact = cast(Callable[[codex_mesh.Client, str], codex_mesh.KnownContextSize],
+                       getattr(codex_mesh, "_compact_thread"))
+        update = cast(Callable[[str, str, codex_mesh.ThreadRecord, codex_mesh.ExpectedRoster], bool],
+                      getattr(codex_mesh, "_update_roster_if_expected"))
+        newer: list[dict[str, object]] = []
+
+        def finish_then_record_turn(client: codex_mesh.Client, thread_id: str) -> codex_mesh.KnownContextSize:
+            after = compact(client, thread_id)
+            if finished:
+                self.context_sizes = [150000]
+                self.assertEqual(self.run_follow(), (0, ""))
+                self.assertEqual(self.seat_record()["status"], original["status"])
+                self.assertEqual(self.seat_record()["context_tokens"], original["context_tokens"])
+                self.assertNotIn("turn_id", self.seat_record())
+            else:
+                self.assertTrue(update(str(self.session_dir), "seat", {
+                    "thread_id": thread_id, "status": "running", "turn_id": "later-turn",
+                    "context_tokens": 23456,
+                }, codex_mesh.RosterOnThread(thread_id)))
+            newer.append(self.seat_record())
+            return after
+
+        with patch.object(codex_mesh, "_compact_thread", finish_then_record_turn):
+            code, output, errors = self.run_mesh(["compact", "--to", "seat"])
+        line = (f"compacted seat: 150000 -> {after_tokens} tokens\n" if after_tokens > 0
+                else "compacted seat: 150000 tokens, size not measured until its next turn\n")
+        self.assertEqual((code, output, errors), (0, line, ""))
+        self.assertEqual(len(newer), 1)
+        self.assertEqual(self.seat_record(), newer[0])
+
+    def test_late_zero_compaction_keeps_the_newer_turns_complete_record(self) -> None:
+        self.compact_after_a_later_turn(0)
+
+    def test_late_measured_compaction_keeps_the_newer_turns_complete_record(self) -> None:
+        self.compact_after_a_later_turn(18000)
+
+    def test_late_compaction_keeps_a_finished_turn_with_the_same_status_and_size(self) -> None:
+        self.compact_after_a_later_turn(0, finished=True)
+
+    def test_compact_refuses_an_unmeasured_size_with_its_specific_reason(self) -> None:
+        record = {"thread_id": THREAD_ID, "status": "done",
+                  "context_tokens": "not_measured_since_compaction"}
+        self.write_pool_roster({"seat": record})
+        self.assertEqual(self.run_mesh(["compact", "--to", "seat"]), (
+            2, "", "codex_mesh: seat: size not measured since its last compaction; compact refused\n",
+        ))
+        self.assertEqual(self.seat_record(), record)
+        self.assertEqual(self.server.requests, [])
+
+    def test_compact_without_a_recorded_size_keeps_the_existing_refusal(self) -> None:
+        record = {"thread_id": THREAD_ID, "status": "done"}
+        self.write_pool_roster({"seat": record})
+        self.assertEqual(self.run_mesh(["compact", "--to", "seat"]), (
+            2, "", "codex_mesh: seat: no recorded context size; compact refused\n",
+        ))
+        self.assertEqual(self.seat_record(), record)
+        self.assertEqual(self.server.requests, [])
+
+    def test_each_roster_write_advances_revision_even_when_ended_fields_are_kept(self) -> None:
+        update = cast(Callable[[str, str, codex_mesh.ThreadRecord], None],
+                      getattr(codex_mesh, "_update_roster"))
+        guarded = cast(Callable[[str, str, codex_mesh.ThreadRecord, codex_mesh.ExpectedRoster], bool],
+                       getattr(codex_mesh, "_update_roster_if_expected"))
+        original = {"thread_id": THREAD_ID, "status": "done", "context_tokens": 150000}
+        self.write_pool_roster({"seat": original})
+        self.assertNotIn("revision", self.seat_record())
+        update(str(self.session_dir), "seat", {"thread_id": THREAD_ID, "status": "done"})
+        self.assertEqual(self.seat_record(), {**original, "revision": 1})
+        self.assertTrue(guarded(str(self.session_dir), "seat", {
+            "thread_id": THREAD_ID, "status": "failed",
+        }, codex_mesh.RosterOnThread(THREAD_ID)))
+        self.assertEqual(self.seat_record(), {**original, "status": "failed", "revision": 2})
+        update(str(self.session_dir), "seat", {"thread_id": THREAD_ID, "status": "ended"})
+        ended = self.seat_record()
+        self.assertEqual(ended, {**original, "status": "ended", "revision": 3})
+        self.assertTrue(guarded(str(self.session_dir), "seat", {
+            "thread_id": THREAD_ID, "status": "done",
+        }, codex_mesh.RosterOnThread(THREAD_ID)))
+        self.assertEqual(self.seat_record(), {**ended, "revision": 4})
+        before_refusal = self.seat_record()
+        self.assertFalse(guarded(str(self.session_dir), "seat", {
+            "thread_id": "different-thread", "status": "done",
+        }, codex_mesh.RosterOnThread("different-thread")))
+        self.assertEqual(self.seat_record(), before_refusal)
+        update(str(self.session_dir), "seat", {"thread_id": "different-thread", "status": "done"})
+        self.assertEqual(self.seat_record(), {
+            "thread_id": "different-thread", "status": "done", "context_tokens": 150000, "revision": 5,
+        })
+
+    def test_compaction_reads_a_legacy_entry_as_revision_zero(self) -> None:
+        self.write_pool_roster({"seat": {"thread_id": THREAD_ID, "status": "done",
+                                        "context_tokens": 150000}})
+        self.compact_after_tokens = 18000
+        self.assertEqual(self.run_mesh(["compact", "--to", "seat"]), (
+            0, "compacted seat: 150000 -> 18000 tokens\n", "",
+        ))
+        self.assertEqual(self.seat_record(), {
+            "thread_id": THREAD_ID, "status": "done", "context_tokens": 18000, "revision": 1,
+        })
+
     def test_follow_up_without_usage_keeps_the_unmeasured_compaction_size(self) -> None:
         original = self.compact_with_zero_usage()
         self.assertEqual(self.run_follow(), (0, ""))
@@ -2133,11 +2242,11 @@ class MeshCommandTests(unittest.TestCase):
         codex_mesh._update_roster(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
             "thread_id": THREAD_ID, "status": "failed",
         })
-        self.assertEqual(self.seat_record(), {**original, "status": "failed"})
+        self.assertEqual(self.seat_record(), {**original, "status": "failed", "revision": cast(int, original["revision"]) + 1})
         self.assertTrue(codex_mesh._update_roster_if_expected(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
             "thread_id": THREAD_ID, "status": "done",
         }, codex_mesh.RosterOnThread(THREAD_ID)))
-        self.assertEqual(self.seat_record(), original)
+        self.assertEqual(self.seat_record(), {**original, "revision": cast(int, original["revision"]) + 2})
         codex_mesh._update_roster(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
             "thread_id": THREAD_ID, "status": "ended",
         })
@@ -2145,7 +2254,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertTrue(codex_mesh._update_roster_if_expected(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
             "thread_id": THREAD_ID, "status": "done",
         }, codex_mesh.RosterOnThread(THREAD_ID)))
-        self.assertEqual(self.seat_record(), ended)
+        self.assertEqual(self.seat_record(), {**ended, "revision": cast(int, ended["revision"]) + 1})
         self.assertEqual(ended.get("context_tokens"), original.get("context_tokens"))
 
     def test_reset_replaces_unmeasured_compaction_state_with_measured_zero(self) -> None:
@@ -2171,11 +2280,11 @@ class MeshCommandTests(unittest.TestCase):
         codex_mesh._update_roster(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
             "thread_id": THREAD_ID, "status": "failed",
         })
-        self.assertEqual(self.seat_record(), {**original, "status": "failed"})
+        self.assertEqual(self.seat_record(), {**original, "status": "failed", "revision": cast(int, original["revision"]) + 1})
         self.assertTrue(codex_mesh._update_roster_if_expected(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
             "thread_id": THREAD_ID, "status": "done",
         }, codex_mesh.RosterOnThread(THREAD_ID)))
-        self.assertEqual(self.seat_record(), original)
+        self.assertEqual(self.seat_record(), {**original, "revision": cast(int, original["revision"]) + 2})
 
     def test_compact_waits_for_compaction_and_records_the_smaller_context(self) -> None:
         self.context_sizes = [150000]

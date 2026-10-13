@@ -22,8 +22,10 @@ from typing import Literal, TypeGuard, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import override_guard
 import sweep
+from user_zone import user_zone
 
 
 MESSAGE_TIMEOUT_S = 30.0
@@ -653,15 +655,15 @@ def utc_now() -> datetime:
 
 def local_time(instant: str, include_zone: bool = True) -> str:
     format_string = "%H:%M %Z" if include_zone else "%H:%M"
-    return datetime.fromisoformat(instant).astimezone().strftime(format_string)
+    return datetime.fromisoformat(instant).astimezone(user_zone()).strftime(format_string)
 
 
 def block_time(instant: datetime) -> str:
-    return instant.astimezone().strftime("%a %H:%M %Z")
+    return instant.astimezone(user_zone()).strftime("%a %H:%M %Z")
 
 
 def message_time(instant: datetime) -> str:
-    return instant.astimezone().strftime("%H:%M %Z")
+    return instant.astimezone(user_zone()).strftime("%H:%M %Z")
 
 
 def process_start_time(pid: int) -> str | None:
