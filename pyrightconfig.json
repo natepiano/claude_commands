@@ -37,7 +37,8 @@
         "scripts/hooks",
         "scripts/message",
         "scripts/notify",
-        "scripts/production"
+        "scripts/production",
+        "scripts/lib"
       ]
     },
     {

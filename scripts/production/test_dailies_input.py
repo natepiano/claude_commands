@@ -120,6 +120,11 @@ raise SystemExit(int(os.environ.get("DAILIES_BEVY_EXIT", "0")))
 '''
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 class DailiesInputTests(unittest.TestCase):
     root: Path = Path()
     home: Path = Path()

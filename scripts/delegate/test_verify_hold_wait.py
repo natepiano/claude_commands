@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 import unittest
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +57,19 @@ def grant_call(path: Path) -> None:
             cycle["release_started_at"] = now.isoformat()
             build_hold.save_cycle(cycle)
             _ = build_hold.advance_release(cycle, now, clock=lambda: now)
+
+
+def change_cycle(path: Path, change: Callable[[build_hold.HoldCycle], None]) -> None:
+    release = path.parent.parent
+    with mock.patch.dict(os.environ, {
+        "BUILD_HOLD_DIR": str(release.parent / "build-hold"),
+        "BUILD_HOLD_RELEASE_DIR": str(release),
+        "PLAN_DELEGATE_ACTIVE_DIR": str(release.parent / "active"),
+    }), build_hold.release_lock():
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        change(cycle)
+        build_hold.save_cycle(cycle)
 
 
 @contextmanager
@@ -225,13 +238,14 @@ class VerifyHoldWaitTests(unittest.TestCase):
                 )
                 self.addCleanup(self.stop_process, process)
                 _ = self.wait_for_call()
-                cycle = read_cycle_file(self.cycle_file)
-                cycle["entries"][0]["calls"].append({
-                    "call_id": "peer", "pid": os.getpid(),
-                    "proc_start": Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()[19],
-                    "started": False, "admitted_generation": 0,
-                })
-                _ = self.cycle_file.write_text(json.dumps(cycle))
+                def add_peer(cycle: build_hold.HoldCycle) -> None:
+                    cycle["entries"][0]["calls"].append({
+                        "call_id": "peer", "pid": os.getpid(),
+                        "proc_start": Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()[19],
+                        "started": False, "admitted_generation": 0,
+                    })
+
+                change_cycle(self.cycle_file, add_peer)
                 process.send_signal(signal_number)
                 code, output = self.finish(process)
                 self.assertEqual(code, expected, output)
@@ -283,7 +297,10 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
     cycle_id = "c" * 32
     (release / cycle_id).mkdir(parents=True, exist_ok=True)
     (release / "current").write_text(cycle_id)
-    (release / cycle_id / "cycle.json").write_text(json.dumps({"id": cycle_id, "opened_at": now, "release_started_at": "", "holders": {"hana": {"since": now, "released_at": ""}}, "recipients": {}, "entries": []}))
+    path = release / cycle_id / "cycle.json"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"id": cycle_id, "opened_at": now, "release_started_at": "", "holders": {"hana": {"since": now, "released_at": ""}}, "recipients": {}, "entries": []}))
+    os.replace(temporary, path)
 if arguments[:1] == ["metadata"]:''',
         )
         self.fixture.write_executable(cargo, source)
@@ -448,7 +465,9 @@ holders.mkdir()
 (holders / "hana").write_text(json.dumps({"holder": "hana", "since": now, "for": "memory admission", "release_eta": "unknown"}))
 path.parent.mkdir(parents=True)
 (path.parent.parent / "current").write_text(path.parent.name)
-path.write_text(json.dumps({"id": path.parent.name, "opened_at": now, "release_started_at": "", "holders": {"hana": {"since": now, "released_at": ""}}, "recipients": {}, "entries": []}))
+temporary = path.with_suffix(".tmp")
+temporary.write_text(json.dumps({"id": path.parent.name, "opened_at": now, "release_started_at": "", "holders": {"hana": {"since": now, "released_at": ""}}, "recipients": {}, "entries": []}))
+os.replace(temporary, path)
 PY_HOLD
         BUILDLOG_MEM_WAIT_S=2
     else
@@ -492,7 +511,9 @@ run_once cargo check
         (holders / "hana").write_text(json.dumps({"holder": "hana", "since": now, "for": "memory admission", "release_eta": "unknown"}))
         path.parent.mkdir(parents=True)
         (path.parent.parent / "current").write_text(path.parent.name)
-        path.write_text(json.dumps({"id": path.parent.name, "opened_at": now, "release_started_at": "", "holders": {"hana": {"since": now, "released_at": ""}}, "recipients": {}, "entries": []}))
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"id": path.parent.name, "opened_at": now, "release_started_at": "", "holders": {"hana": {"since": now, "released_at": ""}}, "recipients": {}, "entries": []}))
+        os.replace(temporary, path)
 os.execv(os.environ["TEST_REAL_PYTHON"],''',
         )
         _ = observer.write_text(source)

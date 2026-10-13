@@ -93,7 +93,15 @@ utc_offset() {
   print -r -- $seconds
 }
 
-local_time() { strftime "$1" "$2" }
+# Times shown are in the user's zone setting. It is read on first use, because most ticks show
+# none; when it cannot be read, the machine's zone stands in.
+shown_zone() {
+  (( ${+SHOWN_ZONE} )) || typeset -g SHOWN_ZONE="$("$PY" "${SCRIPT:h:h}/lib/user_zone.py" 2>/dev/null)"
+}
+local_time() {
+  shown_zone
+  if [[ -n $SHOWN_ZONE ]]; then TZ=$SHOWN_ZONE strftime "$1" "$2"; else strftime "$1" "$2"; fi
+}
 next_line() { print -r -- "next_due=${state[NEXT_DUE]} ($(local_time '%Y-%m-%d %H:%M %Z' ${state[NEXT_DUE]}))" }
 time_line() {
   if (( $2 == 0 )); then
@@ -357,6 +365,7 @@ cmd_status() {
 cmd_status_all() {
   local dir name mode
   typeset -A conf state
+  shown_zone
   for dir in "$STATE_DIR"/*(/N); do
     [[ -r $dir/conf && -r $dir/state ]] || continue
     name=${dir:t}

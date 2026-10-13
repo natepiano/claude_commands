@@ -276,9 +276,9 @@ def command_wait_local(call_id: str, *, pid: int = 0) -> int:
         print(wait_diagnostic(str(error)), file=sys.stderr, flush=True)
         return 12
     finally:
-        if cancelled and registered[0]:
+        if cancelled and key:
             try:
-                build_hold.remove_call(key, call_id, cycle_id=registered[0])
+                build_hold.remove_call(key, call_id)
             except (OSError, build_hold.ReleaseRecordReadError):
                 pass
         for signum, handler in previous_handlers.items():

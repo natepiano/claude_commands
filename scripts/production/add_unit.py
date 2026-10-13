@@ -22,6 +22,9 @@ sys.path.insert(0, str(SCRIPTS / "shutdown"))
 
 import unit_lookup
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from user_zone import user_zone  # noqa: E402
+
 if TYPE_CHECKING:
     from scripts.accounts.accounts import AccountSelection
 
@@ -201,7 +204,7 @@ def read_production(path: Path) -> Production:
         merge_branch = production_field(lines, "Merge branch")
         checkout = Path(production_field(lines, "Showrunner checkout")).expanduser().resolve()
         log = Path(production_field(lines, "Log"))
-        zone = ZoneInfo(production_field(lines, "User zone"))
+        zone = user_zone()
         slug = doc.name.removesuffix("-production.md")
         if slug == doc.name:
             raise Refusal("production doc name must end in -production.md")

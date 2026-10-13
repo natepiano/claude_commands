@@ -14,8 +14,8 @@ from itertools import groupby
 from pathlib import Path
 from statistics import fmean, median
 from typing import NoReturn, cast, override
-from zoneinfo import ZoneInfo
 
+from scripts.lib.user_zone import user_zone
 from scripts.usage import collect, usage_report, weights
 
 
@@ -327,7 +327,7 @@ def main(argv: Sequence[str] = ()) -> int:
     _ = parser.add_argument("--follow-up-prompt", type=float)
     try:
         args = parser.parse_args(argv, namespace=ReplayArguments())
-        zone = ZoneInfo("America/Los_Angeles")
+        zone = user_zone()
         window = usage_report.TimeWindow(usage_report.parse_bound(args.since, zone),
                                          usage_report.parse_bound(args.until, zone))
         if (isinstance(window.since, usage_report.TimeBound) and isinstance(window.until, usage_report.TimeBound)

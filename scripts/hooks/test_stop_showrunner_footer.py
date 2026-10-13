@@ -32,6 +32,11 @@ TWO_OPEN = "There are 2 open questions for you."
 QUOTA_LINE = "quota: codex at 12% for the week, resets Tue 14:00"
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 class FooterLibraryTests(unittest.TestCase):
     def test_reply_lines_keeps_waiting_block_after_footer(self) -> None:
         reply = "Done.\n\n---\n12:00 PDT update:\n\n* none active\n* no dailies scheduled" + WAITING_BLOCK
@@ -313,9 +318,10 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.assert_passes(self.run_hook())
 
     def test_hook_fails_open_for_unknown_zone_and_bad_outstanding_json(self) -> None:
-        _ = self.doc.write_text(self.doc.read_text().replace(ZONE, "Pacific/Nowhere"))
+        # The zone is the user's setting; a setting that names no zone stands the hook down.
+        self.environment["USER_ZONE"] = "Pacific/Nowhere"
         self.assert_passes(self.run_hook())
-        _ = self.doc.write_text(self.doc.read_text().replace("Pacific/Nowhere", ZONE))
+        self.environment["USER_ZONE"] = ZONE
         _ = self.outstanding.write_text("{bad")
         self.assert_passes(self.run_hook())
 
