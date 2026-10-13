@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -150,6 +152,11 @@ def run_compare(state_dir: Path) -> tuple[JsonRecord, str, str]:
     assert completed.returncode == 0, completed.stderr
     output = (state_dir / "compare.json").read_text(encoding="utf-8")
     return cast(JsonRecord, json.loads(output)), completed.stdout, output
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class ComparisonTests(unittest.TestCase):

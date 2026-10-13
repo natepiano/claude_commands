@@ -111,9 +111,12 @@ class RecordTests(unittest.TestCase):
             "slug": "demo", "production": str(self.production.doc), "checkout": str(self.production.checkout),
             "target": "0.20", "started": NOW.isoformat(), "closed": None,
             "bevy": ["0.19.1"], "pins_read": NOW.isoformat(),
+            "target_bevy": {"status": "unread"}, "target_error": "", "checked": None, "announced": None,
             "dependencies": {name: {
                 "pin": {"source": "registry", "version": "1.0.0"}, "bevy": "0.19.1", "via": [],
                 "patched_bevy": False, "answer": None, "note": "",
+                "crates_io": {"status": "unread"}, "error": "",
+                "branch": {"status": "unread"}, "items": [],
             } for name in ("alpha", "zeta")},
         })
 
@@ -239,6 +242,8 @@ class RecordTests(unittest.TestCase):
             "pin": {"source": "path", "version": "2.0.0", "path": "vendor/alpha"},
             "bevy": "0.19.2", "via": ["wrapper"], "patched_bevy": True,
             "answer": old_answer, "note": "CI needs a local feature",
+            "crates_io": {"status": "unread"}, "error": "",
+            "branch": {"status": "unread"}, "items": [],
         })
         self.assertIsNone(merged["dependencies"]["beta"]["answer"])
         self.assertEqual(merged["dependencies"]["beta"]["note"], "")
@@ -299,6 +304,240 @@ class RecordTests(unittest.TestCase):
         for version in ("0.2.0", "0.19.9", "0.200.0", "1.20.0"):
             with self.subTest(version=version):
                 self.assertFalse(upgrade_record.on_target(version, "0.20"))
+
+    def test_target_fit_accepts_simple_versions_only(self) -> None:
+        for requirement in ("0.20", "0.20.1", "^0.20", "~0.20.3", "=0.20.0", "0.20.0-rc.1"):
+            with self.subTest(requirement=requirement):
+                self.assertEqual(upgrade_record.target_fit(requirement, "0.20"), "on target")
+        for requirement in ("^0.19", "0.200.0", "1.20.0", "~0.21.0-rc.1"):
+            with self.subTest(requirement=requirement):
+                self.assertEqual(upgrade_record.target_fit(requirement, "0.20"), "off target")
+        for requirement in ("", "*", ">=0.20", "^0.20, <0.21", "0.20.*", "^^0.20", "0.20.0+local", " 0.20"):
+            with self.subTest(requirement=requirement):
+                self.assertEqual(upgrade_record.target_fit(requirement, "0.20"), "unreadable")
+
+    def test_load_migrates_phase_one_record_with_starting_values(self) -> None:
+        current = self.begin()
+        raw = cast(dict[str, object], json.loads(json.dumps(current)))
+        for key in ("target_bevy", "target_error", "checked"):
+            _ = raw.pop(key)
+        dependencies = cast(dict[str, dict[str, object]], raw["dependencies"])
+        for value in dependencies.values():
+            _ = value.pop("crates_io")
+            _ = value.pop("error")
+        with upgrade_record.locked("demo"):
+            _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+            loaded = upgrade_record.load("demo")
+        self.assertEqual(loaded, current)
+
+    def test_valid_added_fields_round_trip_for_every_target_variant(self) -> None:
+        current = self.begin()
+        targets: tuple[upgrade_record.TargetBevy, ...] = (
+            {"status": "unread"}, {"status": "unpublished"},
+            {"status": "pre-release", "since": "2026-10-01"},
+            {"status": "released", "version": "0.20.0", "date": "2026-10-12", "since": "2026-10-01"},
+        )
+        current["checked"] = NOW.isoformat()
+        current["target_error"] = "crates.io: old failure"
+        current["dependencies"]["alpha"]["crates_io"] = {
+            "status": "read", "checked": NOW.isoformat(), "releases": {"2.0.0": "^0.20", "1.0.0": ""},
+            "newest": "2.0.0", "ready": "2.0.0", "repository": "owner/adapter",
+        }
+        current["dependencies"]["alpha"]["error"] = "crates.io: HTTP 503"
+        for target in targets:
+            with self.subTest(target=target), upgrade_record.locked("demo"):
+                current["target_bevy"] = target
+                upgrade_record.save(current)
+                self.assertEqual(upgrade_record.load("demo"), current)
+
+    def test_load_validates_each_added_record_field_and_target_variant(self) -> None:
+        current = self.begin()
+        cases: tuple[tuple[str, object], ...] = (
+            ("checked", 1), ("checked", "not-a-time"), ("target_error", None),
+            ("target_bevy", None), ("target_bevy", {"status": "unknown"}),
+            ("target_bevy", {"status": "pre-release", "since": 1}),
+            ("target_bevy", {"status": "released", "version": "0.20.0", "date": "2026-10-12"}),
+            ("target_bevy", {"status": "released", "version": 1, "date": "2026-10-12", "since": "2026-10-01"}),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value), upgrade_record.locked("demo"):
+                raw = cast(dict[str, object], json.loads(json.dumps(current)))
+                raw[field] = value
+                _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+                with self.assertRaises(upgrade_record.RecordFailure):
+                    _ = upgrade_record.load("demo")
+
+    def test_load_validates_each_added_entry_field_and_read_fact(self) -> None:
+        current = self.begin()
+        good: dict[str, object] = {"status": "read", "checked": NOW.isoformat(), "releases": {"1.0.0": "^0.19"},
+                "newest": "1.0.0", "ready": "", "repository": "owner/adapter"}
+        cases: list[tuple[str, object]] = [("error", 1), ("crates_io", None),
+                                         ("crates_io", {"status": "unknown"})]
+        wrong_fields: tuple[tuple[str, object], ...] = (
+            ("checked", 1), ("checked", "bad-time"), ("newest", 1),
+            ("ready", None), ("repository", []), ("releases", []), ("releases", {"1.0.0": 1}),
+        )
+        for key, wrong in wrong_fields:
+            invalid = dict(good)
+            invalid[key] = wrong
+            cases.append(("crates_io", invalid))
+        incomplete = dict(good)
+        del incomplete["ready"]
+        cases.append(("crates_io", incomplete))
+        for field, value in cases:
+            with self.subTest(field=field, value=value), upgrade_record.locked("demo"):
+                raw = cast(dict[str, object], json.loads(json.dumps(current)))
+                dependencies = cast(dict[str, dict[str, object]], raw["dependencies"])
+                dependencies["alpha"][field] = value
+                _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+                with self.assertRaises(upgrade_record.RecordFailure):
+                    _ = upgrade_record.load("demo")
+
+    def test_apply_pins_retains_facts_errors_and_record_check_times(self) -> None:
+        current = self.begin()
+        facts: upgrade_record.CratesIoRead = {
+            "status": "read", "checked": NOW.isoformat(), "releases": {"1.0.0": "^0.19"},
+            "newest": "1.0.0", "ready": "", "repository": "owner/adapter",
+        }
+        current["dependencies"]["alpha"]["crates_io"] = facts
+        current["dependencies"]["alpha"]["error"] = "crates.io: offline"
+        current["target_bevy"] = {"status": "pre-release", "since": "2026-10-01"}
+        current["target_error"] = "crates.io: HTTP 503"
+        current["checked"] = NOW.isoformat()
+        merged = upgrade_record.apply_pins(current, pins.Pins(("0.19.1",), frozenset({"bevy_ecs"}),
+                                                             (dependent("alpha", "2.0.0"), dependent("beta"))), LATER)
+        self.assertEqual(merged["dependencies"]["alpha"]["crates_io"], facts)
+        self.assertEqual(merged["dependencies"]["alpha"]["error"], "crates.io: offline")
+        self.assertEqual(merged["dependencies"]["beta"]["crates_io"], {"status": "unread"})
+        self.assertEqual(merged["dependencies"]["beta"]["error"], "")
+        self.assertEqual(merged["target_bevy"], {"status": "pre-release", "since": "2026-10-01"})
+        self.assertEqual(merged["target_error"], "crates.io: HTTP 503")
+        self.assertEqual(merged["checked"], NOW.isoformat())
+
+    def test_load_adds_unread_branch_and_empty_items_to_previous_phase_record(self) -> None:
+        current = self.begin()
+        raw = cast(dict[str, object], json.loads(json.dumps(current)))
+        for value in cast(dict[str, dict[str, object]], raw["dependencies"]).values():
+            del value["branch"]
+            del value["items"]
+        with upgrade_record.locked("demo"):
+            _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+            self.assertEqual(upgrade_record.load("demo"), current)
+
+    def test_unlisted_crate_branch_and_items_round_trip_and_survive_pin_refresh(self) -> None:
+        current = self.begin()
+        value = current["dependencies"]["alpha"]
+        value["crates_io"] = {"status": "unlisted", "checked": NOW.isoformat(), "repository": "owner/adapter"}
+        value["branch"] = {"status": "read", "repository": "owner/adapter", "name": "main", "rev": "abcdef0123456789",
+                           "committed": "2026-10-12", "requirement": "^0.20"}
+        value["items"] = [
+            {"number": 7, "kind": "pr", "state": "merged", "title": "Port 0.20",
+             "updated": NOW.isoformat(), "head": "port @ abcdef0"},
+            {"number": 8, "kind": "issue", "state": "closed", "title": "Track 0.20",
+             "updated": NOW.isoformat(), "head": ""},
+        ]
+        with upgrade_record.locked("demo"):
+            upgrade_record.save(current)
+            self.assertEqual(upgrade_record.load("demo"), current)
+        branch, items, facts = value["branch"], value["items"], value["crates_io"]
+        merged = upgrade_record.apply_pins(current, self.current_pins, LATER)
+        self.assertEqual(merged["dependencies"]["alpha"]["branch"], branch)
+        self.assertEqual(merged["dependencies"]["alpha"]["items"], items)
+        self.assertEqual(merged["dependencies"]["alpha"]["crates_io"], facts)
+
+    def test_added_github_fields_reject_wrong_types_missing_members_and_invalid_tags(self) -> None:
+        current = self.begin()
+        branch: dict[str, object] = {"status": "read", "repository": "owner/adapter", "name": "main", "rev": "abcdef",
+                                    "committed": "2026-10-12", "requirement": "^0.20"}
+        item: dict[str, object] = {"number": 7, "kind": "pr", "state": "open", "title": "Port",
+                                  "updated": NOW.isoformat(), "head": "port @ abcdef0"}
+        unlisted: dict[str, object] = {"status": "unlisted", "checked": NOW.isoformat(), "repository": ""}
+        cases: list[tuple[str, object]] = [
+            ("branch", None), ("branch", {"status": "unknown"}), ("items", None), ("items", {}),
+            ("items", [1]), ("crates_io", {"status": "unlisted"}),
+        ]
+        for key in ("repository", "name", "rev", "committed", "requirement"):
+            for wrong in (None, 1):
+                invalid = dict(branch)
+                invalid[key] = wrong
+                cases.append(("branch", invalid))
+            incomplete = dict(branch)
+            del incomplete[key]
+            cases.append(("branch", incomplete))
+        wrong_items: tuple[tuple[str, object], ...] = (
+            ("number", "7"), ("number", True), ("kind", "discussion"),
+            ("state", "draft"), ("title", 1), ("updated", None), ("head", []),
+        )
+        for key, wrong in wrong_items:
+            invalid = dict(item)
+            invalid[key] = wrong
+            cases.append(("items", [invalid]))
+        for key in item:
+            invalid = dict(item)
+            del invalid[key]
+            cases.append(("items", [invalid]))
+        wrong_unlisted: tuple[tuple[str, object], ...] = (
+            ("checked", 1), ("checked", "bad-time"), ("repository", None),
+        )
+        for key, wrong in wrong_unlisted:
+            invalid = dict(unlisted)
+            invalid[key] = wrong
+            cases.append(("crates_io", invalid))
+        for field, invalid in cases:
+            with self.subTest(field=field, invalid=invalid), upgrade_record.locked("demo"):
+                raw = cast(dict[str, object], json.loads(json.dumps(current)))
+                values = cast(dict[str, dict[str, object]], raw["dependencies"])
+                values["alpha"][field] = invalid
+                _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+                with self.assertRaises(upgrade_record.RecordFailure):
+                    _ = upgrade_record.load("demo")
+
+    def test_read_branch_without_repository_is_refused(self) -> None:
+        current = self.begin()
+        raw = cast(dict[str, object], json.loads(json.dumps(current)))
+        values = cast(dict[str, dict[str, object]], raw["dependencies"])
+        values["alpha"]["branch"] = {"status": "read", "name": "main", "rev": "abcdef",
+                                     "committed": "2026-10-12", "requirement": "^0.20"}
+        with upgrade_record.locked("demo"):
+            _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaises(upgrade_record.RecordFailure):
+                _ = upgrade_record.load("demo")
+
+
+    def test_load_adds_unannounced_baseline_to_previous_phase_record(self) -> None:
+        current = self.begin()
+        raw = cast(dict[str, object], json.loads(json.dumps(current)))
+        del raw["announced"]
+        with upgrade_record.locked("demo"):
+            _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+            self.assertEqual(upgrade_record.load("demo"), current)
+
+    def test_announced_round_trips_and_pin_refresh_keeps_what_was_told(self) -> None:
+        current = self.begin()
+        current["announced"] = {"alpha": {"state": "port in PR", "repository": "owner/adapter",
+                                            "items": {"7": "open", "8": "closed"}}}
+        with upgrade_record.locked("demo"):
+            upgrade_record.save(current)
+            self.assertEqual(upgrade_record.load("demo"), current)
+        merged = upgrade_record.apply_pins(current, self.current_pins, LATER)
+        self.assertEqual(merged["announced"], current["announced"])
+
+    def test_announced_present_fields_are_validated(self) -> None:
+        current = self.begin()
+        cases: tuple[object, ...] = (
+            [], 1, {"alpha": None}, {"alpha": {"state": "done", "items": {}}},
+            {"alpha": {"state": 1, "repository": "", "items": {}}},
+            {"alpha": {"state": "done", "repository": None, "items": {}}},
+            {"alpha": {"state": "done", "repository": "", "items": []}},
+            {"alpha": {"state": "done", "repository": "", "items": {"7": 1}}},
+        )
+        for invalid in cases:
+            with self.subTest(value=invalid), upgrade_record.locked("demo"):
+                raw = cast(dict[str, object], json.loads(json.dumps(current)))
+                raw["announced"] = invalid
+                _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+                with self.assertRaises(upgrade_record.RecordFailure):
+                    _ = upgrade_record.load("demo")
 
 
 if __name__ == "__main__":

@@ -23,6 +23,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 from sessions import addressed, live_sessions  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import override_guard
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
@@ -488,6 +490,41 @@ def prune_calls(entry: ReleaseEntry) -> None:
         store_release_state(entry, AwaitingRelease() if entry["calls"] or entry["session_pending"] else NoPendingTurn())
 
 
+def open_turn(entry: ReleaseEntry, generation: int) -> bool:
+    return (not entry["session_id"].startswith("verify:") and not entry["active_call_id"]
+            and entry["delivery"]["generation"] == generation
+            and isinstance(read_release_state(entry), (ReleasedAwaitingAdmission, DeliveryQueued)))
+
+
+def turn_answer(cycle: HoldCycle, key: str, call_id: str) -> AwaitingTurn | AdmittedTurn:
+    generation = cycle.get("holder_generation", 1)
+    waiting = AwaitingTurn(cycle["id"], generation)
+    admitted = AdmittedTurn(cycle["id"], generation)
+    late = admitted if cycle["release_started_at"] else waiting
+    for entry in cycle["entries"]:
+        if entry["session_id"] != key:
+            continue
+        state = read_release_state(entry)
+        if call_id:
+            call = next((call for call in entry["calls"] if call["call_id"] == call_id), None)
+            if call is None or not call_is_live(call):
+                return waiting if open_turn(entry, generation) else late
+            if call["admitted_generation"] == generation:
+                return admitted
+            if entry["active_call_id"] != call_id:
+                return waiting
+            allowed = (DeliveryQueued, ReleasedAwaitingAdmission, WaitingForMemory, RecipientGone, DeliveryFailed)
+            return admitted if isinstance(state, allowed) else waiting
+        if entry["session_admitted_generation"] == generation:
+            return admitted
+        if entry["active_call_id"]:
+            return waiting
+        if isinstance(state, (DeliveryQueued, ReleasedAwaitingAdmission, WaitingForMemory)):
+            return admitted
+        return waiting if entry["session_pending"] else late
+    return late
+
+
 def read_admission(key: str, call_id: str = "") -> Admission:
     try:
         cycle = read_cycle()
@@ -497,28 +534,7 @@ def read_admission(key: str, call_id: str = "") -> Admission:
         signature = cycle.get("holder_signature", "")
         if signature and signature != holders_signature():
             return AwaitingTurn(cycle["id"], generation + 1)
-        waiting = AwaitingTurn(cycle["id"], generation)
-        for entry in cycle["entries"]:
-            if entry["session_id"] != key:
-                continue
-            state = read_release_state(entry)
-            if call_id:
-                call = next((call for call in entry["calls"] if call["call_id"] == call_id), None)
-                if call is None or not call_is_live(call):
-                    return waiting
-                if call["admitted_generation"] == generation:
-                    return AdmittedTurn(cycle["id"], generation)
-                if entry["active_call_id"] != call_id:
-                    return waiting
-                allowed = (DeliveryQueued, ReleasedAwaitingAdmission, WaitingForMemory, RecipientGone, DeliveryFailed)
-            else:
-                if entry["session_admitted_generation"] == generation:
-                    return AdmittedTurn(cycle["id"], generation)
-                if entry["active_call_id"]:
-                    return waiting
-                allowed = (DeliveryQueued, ReleasedAwaitingAdmission, WaitingForMemory)
-            return AdmittedTurn(cycle["id"], generation) if isinstance(state, allowed) else waiting
-        return waiting
+        return turn_answer(cycle, key, call_id)
     except ReleaseRecordReadError as error:
         return AdmissionReadError(f"release record could not be read: {error}")
     except (OSError, UnicodeError) as error:
@@ -870,6 +886,8 @@ def record_recipients(recipients: Sequence[tuple[str, str]]) -> None:
         cycle = read_cycle_for_change()
         if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
             return
+        if cycle["release_started_at"]:
+            return
         for name, session_id in recipients:
             if session_id:
                 cycle["recipients"][session_id] = name
@@ -894,6 +912,14 @@ def register_wait(session_id: str, name: str = "", *, call_id: str = "", pid: in
         update_holder_generation(cycle)
         generation = cycle.get("holder_generation", 1)
         existing = next((entry for entry in cycle["entries"] if entry["session_id"] == session_id), None)
+        if (cycle["release_started_at"]
+            and not (call_id and existing is not None
+                     and not any(call["call_id"] == call_id for call in existing["calls"])
+                     and open_turn(existing, generation))):
+            answer = turn_answer(cycle, session_id, call_id)
+            save_cycle(cycle)
+            action = "builds now" if isinstance(answer, AdmittedTurn) else "keeps its queued turn"
+            return f"release under way; {session_id} {action}"
         if existing is None:
             existing = new_entry(session_id, name or cycle["recipients"].get(session_id, session_id))
             existing["session_pending"] = not bool(call_id)
@@ -909,9 +935,7 @@ def register_wait(session_id: str, name: str = "", *, call_id: str = "", pid: in
                 pending_call: PendingCall = {"call_id": call_id, "pid": process, "proc_start": identity,
                                              "started": started, "admitted_generation": 0}
                 existing["calls"].append(pending_call)
-                if (not session_id.startswith("verify:") and not existing["active_call_id"]
-                    and existing["delivery"]["generation"] == generation
-                    and isinstance(read_release_state(existing), (ReleasedAwaitingAdmission, DeliveryQueued))):
+                if open_turn(existing, generation):
                     existing["active_call_id"] = call_id
                     existing["session_admitted_generation"] = generation
                     existing["session_pending"] = False
@@ -987,7 +1011,9 @@ def mark_gate(session_id: str, state: str, outcome: str = "", *, call_id: str = 
             if entry["active_call_id"] != call_id:
                 continue
             previous = read_release_state(entry)
-            if not isinstance(previous, (ReleasedAwaitingAdmission, DeliveryQueued, WaitingForMemory, RecipientGone, DeliveryFailed)):
+            allowed = ((ReleasedAwaitingAdmission, DeliveryQueued, WaitingForMemory, RecipientGone, DeliveryFailed)
+                       if call_id else (ReleasedAwaitingAdmission, DeliveryQueued, WaitingForMemory))
+            if not isinstance(previous, allowed):
                 continue
             instant = release_clock()
             if call_id:
@@ -1193,6 +1219,12 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
             continue
         if isinstance(state, WaitingForMemory):
             if (now - state.wait_started_at).total_seconds() < int(os.environ.get("BUILDLOG_MEM_WAIT_LIMIT_S", "900")) + RELEASE_SETTLE_S:
+                if not entry["active_call_id"] and isinstance(socket_for(entry["session_id"]), RecipientGone):
+                    entry["session_pending"] = False
+                    store_release_state(entry, RecipientGone())
+                    save_cycle(cycle)
+                    queue_told_sessions(cycle, now)
+                    continue
                 return False, entry_text(entry)
             entry["active_call_id"] = ""
             entry["session_pending"] = False
@@ -1390,6 +1422,7 @@ def wait_for_quiet(
 
 
 def main(arguments: list[str]) -> int:
+    override_guard.refuse_overrides(Path(__file__), "build_hold/build_hold.py")
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     hold = commands.add_parser("hold")

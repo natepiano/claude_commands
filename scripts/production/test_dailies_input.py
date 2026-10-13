@@ -11,11 +11,14 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast, override
+from unittest import mock
 from zoneinfo import ZoneInfo
 
-from dailies_input import (Activity, Block, ClaudeNotRunning, Decision, FormWaiting,
+from add_unit import read_production
+from dailies_render import LENGTHS
+from dailies_input import (Activity, BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,
                            Running, SessionGone, StillWaiting, TicksFailing, UnitRow,
-                           status_blocks)
+                           bevy_upgrade_watch, status_blocks)
 from unit_lookup import UnitState
 
 
@@ -104,6 +107,17 @@ if command == "prune":
     raise SystemExit(0)
 raise SystemExit(2)
 '''
+BEVY_UPGRADE_STUB = '''
+import json
+import os
+from pathlib import Path
+import sys
+
+Path(os.environ["DAILIES_BEVY_EVENTS"]).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+print(os.environ.get("DAILIES_BEVY_STDERR", ""), file=sys.stderr, flush=True)
+print(os.environ.get("DAILIES_BEVY_OUTPUT", ""))
+raise SystemExit(int(os.environ.get("DAILIES_BEVY_EXIT", "0")))
+'''
 
 
 class DailiesInputTests(unittest.TestCase):
@@ -123,6 +137,7 @@ class DailiesInputTests(unittest.TestCase):
     phase_table: Path = Path()
     phase_table_json: Path = Path()
     phase_table_events: Path = Path()
+    showrunner_state: Path = Path()
     env: dict[str, str] = {}
 
     @override
@@ -154,7 +169,14 @@ class DailiesInputTests(unittest.TestCase):
         _ = self.phase_table.write_text(PHASE_TABLE_STUB.replace("__PYTHON__", sys.executable), encoding="utf-8")
         self.phase_table.chmod(0o755)
         _ = self.phase_table_json.write_text("{}\n", encoding="utf-8")
+        self.showrunner_state = self.root / "showrunner-state"
+        upgrade = self.root / "bevy upgrade stub.py"
+        _ = upgrade.write_text(BEVY_UPGRADE_STUB, encoding="utf-8")
         self.env = {**os.environ, "HOME": str(self.home), "BUILD_HOLD_DIR": str(self.holders),
+                    "DAILIES_BEVY_UPGRADE": str(upgrade),
+                    "DAILIES_BEVY_EVENTS": str(self.root / "bevy-events.json"),
+                    "DAILIES_BEVY_OUTPUT": "", "DAILIES_BEVY_STDERR": "",
+                    "DAILIES_BEVY_EXIT": "0",
                     "MAC_TEST_STATE_DIR": str(self.root / "mac-test"),
                     "DAILIES_TEST_EVENTS": str(self.events), "DAILIES_TEST_FAIL": str(self.notifier_failure),
                     "DAILIES_PHASE_TABLE": str(self.phase_table),
@@ -163,6 +185,7 @@ class DailiesInputTests(unittest.TestCase):
                     "PHASE_TABLE_VAULT": str(self.root / "vault"),
                     "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
                     "NOTIFIER_STATE_DIR": str(self.root / "notifier-state"),
+                    "SHOWRUNNER_STATE_DIR": str(self.showrunner_state),
                     # Unit sessions are looked up in this stand-in; with no state file it has no sessions.
                     "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
                     "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
@@ -1134,13 +1157,36 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         units = cast(list[dict[str, object]], self.report()["units"])
         self.assertFalse(units[0].get("build_hold", False))
+        self.assertTrue(units[0]["holds_builds"])
         self.assertTrue(units[1]["build_hold"])
+        self.assertNotIn("holds_builds", units[1])
 
-    def test_holder_with_no_other_unit_is_refused(self) -> None:
+    def test_a_holder_with_no_other_unit_renders_with_no_marker(self) -> None:
         _ = (self.holders / ALPHA).write_text(json.dumps({"holder": ALPHA,
             "since": "2026-10-06T09:55:00-07:00", "for": "the panel timing check",
             "release_eta": "unknown"}) + "\n", encoding="utf-8")
-        _ = self.assert_refused_without_output(mention="build_hold")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        units = cast(list[dict[str, object]], self.report()["units"])
+        self.assertNotIn("build_hold", units[0])
+        self.assertTrue(units[0]["holds_builds"])
+
+    def test_a_supplied_holder_mark_is_refused(self) -> None:
+        self.judgment_file(alpha={"holds_builds": True})
+        _ = self.assert_refused_without_output(mention="holds_builds: supplied by holder files")
+
+    def test_a_hold_with_every_unit_left_out_still_renders(self) -> None:
+        # Seen 2026-10-12: the only unit's run had finished while another session held the builds.
+        self.finished_run(self.root / "alpha")
+        _ = self.judgment.write_text(json.dumps({"units": [], "topics": []}) + "\n", encoding="utf-8")
+        _ = (self.holders / "elsewhere").write_text(json.dumps({"holder": "elsewhere",
+            "since": "2026-10-06T09:55:00-07:00", "for": "a frame timing check",
+            "release_eta": "unknown"}) + "\n", encoding="utf-8")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.report()["units"], [])
+        self.assertIn(f"left out, run finished and nothing waiting on the user: {ALPHA}", result.stdout)
+        self.assertIn("build hold: ok — 1 active holders checked", result.stdout)
 
     def test_build_hold_marker_without_holder_file_is_refused(self) -> None:
         self.judgment_file(alpha={"build_hold": True})
@@ -1274,6 +1320,134 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(acknowledged.returncode, 0, acknowledged.stdout + acknowledged.stderr)
         topics = cast(list[dict[str, object]], self.report()["topics"])
         self.assertFalse(any(item["title"] == "Review watch" for item in topics))
+
+    def test_bevy_upgrade_topic_uses_record_line_and_waiting_answer_flag(self) -> None:
+        for needs_user in (True, False):
+            with self.subTest(needs_user=needs_user):
+                waiting = " (1 waiting for your answer)" if needs_user else ""
+                update = f"Bevy 0.20 upgrade: 1 of 2 done, 1 git ready{waiting}; checked 10:00 PDT"
+                self.env["DAILIES_BEVY_OUTPUT"] = json.dumps({"update": update, "needs_user": needs_user})
+                result = self.run_builder()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                topics = cast(list[dict[str, object]], self.report()["topics"])
+                self.assertEqual([item for item in topics if item["title"] == "Bevy upgrade"], [
+                    {"title": "Bevy upgrade", "update": update, "eta": "no ETA stated yet", "needs_user": needs_user}])
+                self.assertIn(f"bevy upgrade: ok — {update}\n", result.stdout)
+                self.assertLess(result.stdout.index("review watch: ok"), result.stdout.index("bevy upgrade: ok"))
+                self.assertLess(result.stdout.index("bevy upgrade: ok"), result.stdout.index("merge branch: ok"))
+                args = cast(list[str], json.loads((self.root / "bevy-events.json").read_text()))
+                self.assertEqual(args, ["--production", str(self.doc), "line", "--json"])
+
+    def test_bevy_upgrade_empty_output_adds_no_topic(self) -> None:
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("bevy upgrade: ok — no open watch\n", result.stdout)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        self.assertFalse(any(item["title"] == "Bevy upgrade" for item in topics))
+
+    def test_bevy_upgrade_long_sentence_is_bounded_and_report_is_written(self) -> None:
+        limit = min(limit for limit in LENGTHS.values() if limit is not None)
+        sentence = "Bevy 0.20 upgrade: " + "waiting " * limit
+        self.env["DAILIES_BEVY_OUTPUT"] = json.dumps({"update": sentence, "needs_user": True})
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        topic = next(item for item in topics if item["title"] == "Bevy upgrade")
+        update = cast(str, topic["update"])
+        self.assertLessEqual(len(update), limit)
+        self.assertEqual(update, sentence[:limit - 1] + "…")
+        self.assertIs(topic["needs_user"], True)
+        self.assertIn(f"bevy upgrade: ok — {update}\n", result.stdout)
+        self.assertIn("input: ok", result.stdout)
+
+    def test_bevy_upgrade_long_failure_reason_is_bounded_and_report_is_written(self) -> None:
+        limit = min(limit for limit in LENGTHS.values() if limit is not None)
+        reason = "record unreadable " * limit
+        self.env.update({"DAILIES_BEVY_EXIT": "2", "DAILIES_BEVY_STDERR": reason + "\nmore detail"})
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        topic = next(item for item in topics if item["title"] == "Bevy upgrade")
+        update = cast(str, topic["update"])
+        self.assertLessEqual(len(update), limit)
+        self.assertEqual(update, ("the record could not be read: " + reason)[:limit - 1] + "…")
+        self.assertIs(topic["needs_user"], False)
+        self.assertIn(f"bevy upgrade: unavailable — {update}\n", result.stdout)
+        self.assertIn("input: ok", result.stdout)
+
+    def test_bevy_upgrade_sentence_at_renderer_limit_is_unchanged(self) -> None:
+        limit = min(limit for limit in LENGTHS.values() if limit is not None)
+        sentence = "Bevy 0.20 upgrade: ".ljust(limit, "x")
+        self.env["DAILIES_BEVY_OUTPUT"] = json.dumps({"update": sentence, "needs_user": False})
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        topic = next(item for item in topics if item["title"] == "Bevy upgrade")
+        self.assertEqual(topic["update"], sentence)
+        self.assertIn(f"bevy upgrade: ok — {sentence}\n", result.stdout)
+        self.assertIn("input: ok", result.stdout)
+
+    def assert_bevy_unavailable(self, result: subprocess.CompletedProcess[str], reason: str) -> None:
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        update = f"the record could not be read: {reason}"
+        self.assertIn(f"bevy upgrade: unavailable — {update}\n", result.stdout)
+        self.assertNotIn("bevy upgrade: failed", result.stdout)
+        self.assertIn("input: ok", result.stdout)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        self.assertEqual([item for item in topics if item["title"] == "Bevy upgrade"], [
+            {"title": "Bevy upgrade", "update": update, "eta": "no ETA stated yet", "needs_user": False}])
+
+    def test_bevy_upgrade_nonzero_exit_keeps_report_with_first_stderr_line(self) -> None:
+        self.env.update({"DAILIES_BEVY_EXIT": "2", "DAILIES_BEVY_STDERR": "record is unreadable\nmore detail"})
+        self.assert_bevy_unavailable(self.run_builder(), "record is unreadable")
+        self.env["DAILIES_BEVY_STDERR"] = ""
+        self.assert_bevy_unavailable(self.run_builder(), "command exited 2")
+
+    def test_bevy_upgrade_wrong_json_shape_keeps_report_with_unavailable_topic(self) -> None:
+        cases: tuple[object, ...] = ([], None, {}, {"update": 1, "needs_user": False},
+                                   {"update": "Bevy upgrade", "needs_user": "false"},
+                                   {"update": "", "needs_user": False},
+                                   {"update": "Bevy upgrade\nextra line", "needs_user": False})
+        for value in cases:
+            with self.subTest(value=value):
+                self.env["DAILIES_BEVY_OUTPUT"] = json.dumps(value)
+                self.assert_bevy_unavailable(self.run_builder(),
+                                             "expected an object with update text and needs_user boolean")
+
+    def test_bevy_upgrade_invalid_json_prefers_first_stderr_line(self) -> None:
+        self.env.update({"DAILIES_BEVY_OUTPUT": "not JSON", "DAILIES_BEVY_STDERR": "bad record\nmore detail"})
+        self.assert_bevy_unavailable(self.run_builder(), "bad record")
+
+    def test_bevy_upgrade_invalid_json_without_stderr_keeps_report_with_parse_reason(self) -> None:
+        self.env["DAILIES_BEVY_OUTPUT"] = "not JSON"
+        self.assert_bevy_unavailable(self.run_builder(), "Expecting value: line 1 column 1 (char 0)")
+
+    def test_bevy_upgrade_missing_script_keeps_report_with_unavailable_topic(self) -> None:
+        script = Path(self.env["DAILIES_BEVY_UPGRADE"])
+        script.unlink()
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        topic = next(item for item in topics if item["title"] == "Bevy upgrade")
+        self.assertIn("can't open file", str(topic["update"]))
+        self.assertFalse(topic["needs_user"])
+        self.assertIn("bevy upgrade: unavailable", result.stdout)
+        self.assertIn("input: ok", result.stdout)
+
+    def test_bevy_upgrade_timeout_returns_unavailable_without_waiting(self) -> None:
+        cases: tuple[tuple[str | bytes | None, str], ...] = (
+            (None, "timed out after 30 seconds"),
+            ("record locked\nmore detail", "record locked"),
+            (b"record locked\nmore detail", "record locked"),
+        )
+        production = read_production(self.doc)
+        command = [sys.executable, self.env["DAILIES_BEVY_UPGRADE"], "--production", str(self.doc), "line", "--json"]
+        for stderr, reason in cases:
+            with self.subTest(stderr=stderr), mock.patch.dict(os.environ, self.env), mock.patch(
+                "dailies_input.subprocess.run", side_effect=subprocess.TimeoutExpired(command, 30, stderr=stderr),
+            ) as run:
+                self.assertEqual(bevy_upgrade_watch(production), BevyUpgradeUnavailable(reason))
+                run.assert_called_once_with(command, capture_output=True, text=True, timeout=30, check=False)
 
     def test_dailies_first_review_alert_marks_topic_and_merge_watch_repeats(self) -> None:
         events = self.watch_stubs()
@@ -1699,6 +1873,152 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(self.notifier_events(), [["restart", "showrunner-example"]])
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["why"],
                          "the unit found another panel repair")
+
+
+    def timer(self, slug: str) -> None:
+        """A production with a complete update timer, so the tree counts it."""
+        instance = self.root / "notifier-state" / f"showrunner-{slug}"
+        instance.mkdir(parents=True)
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
+
+    def attach(self, child: str, parent: str) -> None:
+        for slug in (child, parent):
+            if not (self.root / "notifier-state" / f"showrunner-{slug}").exists():
+                self.timer(slug)
+        edge = self.showrunner_state / child / "parent"
+        edge.parent.mkdir(parents=True, exist_ok=True)
+        _ = edge.write_text(parent + "\n", encoding="utf-8")
+
+    def saved_report(self, slug: str) -> Path:
+        return self.showrunner_state / slug / "dailies_last.json"
+
+    def write_saved_report(self, slug: str, **changed: object) -> None:
+        fields: dict[str, object] = {
+            "written": "2026-10-06T16:50", "zone": "America/Los_Angeles", "interval": 15, "units": 3, "held": 1,
+            "rows": [{"name": "fps", "started": "2026-10-06T15:10", "eta": "2026-10-06T19:20",
+                      "earliest": "2026-10-06T19:20", "latest": "2026-10-06T19:20"}, {"name": "docs"}],
+            **changed}
+        self.saved_report(slug).parent.mkdir(parents=True, exist_ok=True)
+        _ = self.saved_report(slug).write_text(json.dumps(fields), encoding="utf-8")
+
+    def write_open_for(self, slug: str, content: str) -> None:
+        path = self.showrunner_state / "outstanding" / f"{slug}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(content, encoding="utf-8")
+
+    def children(self) -> list[dict[str, object]]:
+        return cast(list[dict[str, object]], self.report()["children"])
+
+    def test_every_run_saves_what_the_showrunner_above_shows(self) -> None:
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"saved report: ok — wrote {self.saved_report('example')}", result.stdout)
+        saved = cast(dict[str, object], json.loads(self.saved_report("example").read_text(encoding="utf-8")))
+        self.assertEqual({key: saved[key] for key in ("written", "zone", "interval", "units", "held")},
+                         {"written": AT, "zone": "America/Los_Angeles", "interval": 15, "units": 1, "held": 0})
+        rows = cast(list[dict[str, object]], saved["rows"])
+        self.assertEqual([(row["name"], row["eta"]) for row in rows], [("alpha", "2026-10-06T23:40")])
+        # Alone, a production's input names nothing above or below it.
+        self.assertNotIn("children", self.report())
+        self.assertNotIn("reports_to", self.report())
+        self.assertEqual([path.name for path in self.saved_report("example").parent.iterdir()], ["dailies_last.json"])
+
+    def test_a_production_that_reports_on_demand_saves_no_interval(self) -> None:
+        doc = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(doc.replace("- **Updates:** every 15 minutes", "- **Updates:** on demand"),
+                                encoding="utf-8")
+        self.assertEqual(self.run_builder().returncode, 0)
+        saved = cast(dict[str, object], json.loads(self.saved_report("example").read_text(encoding="utf-8")))
+        self.assertIsNone(saved["interval"])
+
+    def test_a_production_below_is_read_into_the_input_with_what_waits_on_the_user(self) -> None:
+        self.attach("kid", "example")
+        self.attach("leaf", "kid")
+        self.write_saved_report("kid")
+        self.write_open_for("kid", json.dumps([{"since": "2026-10-06T09:00", "text": "pick a licence"},
+                                               {"since": "2026-10-06T09:00", "text": "later",
+                                                "after": "2026-10-07T09:00"}]))
+        self.write_open_for("leaf", json.dumps([{"since": "2026-10-06T10:00", "text": "name the release"}]))
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("children: ok — 1 below: kid", result.stdout)
+        kid = self.children()[0]
+        self.assertEqual({key: kid[key] for key in ("name", "open", "expand")},
+                         {"name": "kid", "open": 2, "expand": False})
+        self.assertEqual(cast(dict[str, object], kid["report"])["units"], 3)
+        self.assertNotIn("unreadable", kid)
+        # Its own saved report takes the lower production's counts in, and one row for it.
+        saved = cast(dict[str, object], json.loads(self.saved_report("example").read_text(encoding="utf-8")))
+        self.assertEqual((saved["units"], saved["held"]), (4, 1))
+        self.assertEqual([row["name"] for row in cast(list[dict[str, object]], saved["rows"])], ["alpha", "kid"])
+        rendered = self.run_renderer(AT)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        row = next(line for line in rendered.stdout.splitlines() if line.startswith("kid "))
+        self.assertTrue(row.endswith(" 19:20  3 units, 1 held, 2 open questions"), row)
+        self.assertNotIn("nothing needed", rendered.stdout)
+
+    def test_expand_names_a_production_directly_below_or_all(self) -> None:
+        self.attach("kid", "example")
+        self.attach("other", "example")
+        self.attach("leaf", "kid")
+        self.write_saved_report("kid")
+        self.assertEqual(self.run_builder("--expand", "kid").returncode, 0)
+        self.assertEqual([(child["name"], child["expand"]) for child in self.children()],
+                         [("kid", True), ("other", False)])
+        rendered = self.run_renderer(AT)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertEqual([line.split()[0] for line in rendered.stdout.splitlines() if line.startswith(("kid", "other"))],
+                         ["kid", "kid/fps", "kid/docs", "other"])
+        self.assertEqual(self.run_builder("--expand", "all").returncode, 0)
+        self.assertEqual([child["expand"] for child in self.children()], [True, True])
+        refused = self.run_builder("--expand", "leaf")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("expand: failed — leaf: not directly below example; choose from kid, other or all",
+                      refused.stdout)
+
+    def test_expand_is_refused_when_nothing_is_below(self) -> None:
+        refused = self.run_builder("--expand", "all")
+        self.assertEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        named = self.run_builder("--expand", "kid")
+        self.assertEqual(named.returncode, 2)
+        self.assertIn("expand: failed — kid: not directly below example; no production reports to it", named.stdout)
+
+    def test_a_lower_production_s_bad_files_cost_its_row_and_never_the_report(self) -> None:
+        self.attach("kid", "example")
+        self.attach("leaf", "kid")
+        self.write_saved_report("kid", written="yesterday")
+        self.write_open_for("leaf", "{not a list")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("children: unavailable — kid: ", result.stdout)
+        self.assertIn(".written: 'yesterday' is not YYYY-MM-DDTHH:MM", result.stdout)
+        kid = self.children()[0]
+        self.assertNotIn("report", kid)
+        self.assertEqual((kid["open"], kid["unreadable"]), (0, ["leaf"]))
+        rendered = self.run_renderer(AT)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertIn("kid      ?  no report yet", rendered.stdout)
+        self.assertIn("* leaf: needs-user list unreadable", rendered.stdout)
+        self.assertNotIn("nothing needed", rendered.stdout)
+
+    def test_a_showrunner_under_a_root_names_it_in_its_input(self) -> None:
+        self.attach("example", "middle")
+        self.attach("middle", "top")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.report()["reports_to"], "top")
+        rendered = self.run_renderer(AT)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertIn("* reports to top", rendered.stdout.splitlines())
+
+    def test_a_saved_report_that_cannot_be_written_never_fails_the_run(self) -> None:
+        self.showrunner_state.mkdir(parents=True)
+        _ = (self.showrunner_state / "example").write_text("a file where the folder goes\n", encoding="utf-8")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("saved report: unavailable — ", result.stdout)
+        self.assertTrue(self.output.exists())
 
 
 if __name__ == "__main__":

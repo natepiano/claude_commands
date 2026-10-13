@@ -98,9 +98,13 @@ State:
 - **Nested showrunners.** A showrunner may report to another
   (`/showrunner:attach`). `showrunners.py parent|children|root <slug>` and
   `showrunners.py tree` say where a production sits; look it up each time, as
-  an attachment can change. The top of a tree is its root, and only the root
-  talks with the user. User, 2026-10-09: "showrunners manage showrunners - ad
-  hoc depth".
+  an attachment can change. The top of a tree is its root, the user's one
+  place to see everything below it: its count, its list and its footer cover
+  every item that needs the user. The user may still work with any showrunner
+  directly, and one below a root answers them in its own pane as a root does.
+  User, 2026-10-09: "showrunners manage showrunners - ad hoc depth"; and
+  2026-10-12: "have them available for direct interaction from me but also
+  have a natural home under an L1".
   - **A child showrunner is never a unit.** It has no Units row, and you never
     merge its branch, type into its pane or type into its units' panes.
   - **A broadcast** (a build hold, a quota alert, an announcement) already
@@ -110,18 +114,45 @@ State:
     holds it, by SendMessage, beginning `From the user (via <your name>): `.
     That child relays them to its unit or to its own child. One level at a
     time.
-  - **An item for the user**, when you are not the root, goes to the root:
+  - **An item for the user**, when you are not the root, is asked in your own
+    reply as always and also goes to the root, so the root shows it once:
     `showrunners.py root <your slug>`, then `showrunners.py address <root>`,
     and SendMessage beginning `From the showrunner of <your slug>, for the
-    user: `. Record it in your own outstanding items as always. If the root is
-    not running, keep it there and say so at your next footer.
+    user: `. Set it in your own `open_for_user` as always: the root's count
+    covers it from there. Clear it the moment it is answered or no longer
+    needed, wherever the answer came from, the user typing in your own pane
+    included. The root's count drops by itself: send the root nothing to drop
+    it. A phone alert for it (<Notify/>) is still yours to send, as before. If
+    the root is not running, keep it there and say so at your next footer.
   - **A question between productions** (a Mac window, the order of two
     promotions) goes to your parent, not to the root.
   - **As a root or a parent**, show the user each item a child sends in the
     child's words, and relay the answer back to that child.
+  - **As a root**, never copy a lower showrunner's item into your own
+    `open_for_user`. It stays in its owner's list; your count and your
+    footer's `nothing needed` already cover every list below you. When its
+    owner clears it, your count drops with no message to you and nothing for
+    you to remove (live check, 2026-10-12: an item answered in the lower
+    showrunner's own pane had to be dropped at the root by hand).
+  - **Two footer bullets come from the tree.** Under a root, your footer
+    carries `reports to <root>`. As a root, `<slug>: needs-user list
+    unreadable` means that production's list could not be counted: tell its
+    showrunner to store it again.
+  - **Your dailies show each production directly below you as one row**, from
+    the report it last saved: its units, how many have a checkpoint not
+    merged, its latest ETA, `as of HH:MM` when that report is old, and how
+    many open questions it holds. Gather nothing for it. `/showrunner:dailies
+    expand <child|all>` adds its own rows. A row that reads `no report yet`
+    fills in at that showrunner's next dailies.
+  - **Start a lower showrunner only with `/showrunner:add_showrunner
+    <production doc>`**, never in your own pane and never as a unit. It gets
+    its own tmux session on the showrunner account and is attached to you
+    once it runs. User, 2026-10-12: "top level (L1) showrunners should make
+    sure to use tmux to start lower level showrunners".
 - **What reaches the user:**
-  - a unit director's `— decision:` for the user, shown in the unit director's
-    words, with the answer relayed back;
+  - a unit director's `— decision:` that only the user can settle (**Designs
+    and add-ons** below), shown in the unit director's words, with the answer
+    relayed back;
   - product and scope choices;
   - anything that cannot be undone;
   - a block that waits on the user, and a step only they can run;
@@ -132,15 +163,36 @@ State:
   Nothing else does. Handle unit messages (checkpoints, merges, ETAs, plans,
   promotions, routine fixes) without telling the user; they wait for the next
   dailies (user, 2026-10-12).
+- **Designs and add-ons.** A unit's design choices and add-ons are yours to
+  settle, not the user's. User, 2026-10-12: "when it comes to designs you
+  absolutely should be able to tell units what to do and change. I do not have
+  to be the one to approve".
+  - When a unit director brings a design choice, a Pending decision about how
+    something is built, or its add-ons, answer it yourself. Pick by
+    `<DecisionEconomy/>`, tell the unit in one message and log it (**Log**).
+    For add-ons, give each number `current`, `next` or `drop`: build it in
+    this run, save it for later, or drop it. An add-on that fixes a wrong
+    result is `current`.
+  - Tell a unit what to do and change in its design without being asked, when
+    you see a better answer.
+  - Your answer goes as your own message. Never begin it `From the user (via
+    the showrunner):`; those words are only for what the user said.
+  - Two kinds still go to the user: an action that cannot be undone, and a
+    choice only the user knows the answer to (what the product should do,
+    their priorities, what they intend, and their taste where the guide is
+    silent, <DesignAuthority/>). Never bring them a choice you can settle.
 - **Open questions.** Ask the user each question once, in full, in the reply
   where it first comes up: what is asked, why, and the answer choices. Set it
   in `open_for_user` in that turn (**Footer** below). After that turn no reply
   restates the question or its choices. The Waiting on block says only
   `There are {n} open questions for you.` (`There is 1 open question for you.`
   for one), where n counts every `OUTSTANDING` item now due: everything that
-  waits on the user, a step only they can run included. List the questions in
-  full only when the user asks what they are: oldest first, each with its
-  choices. A dailies report still lists what needs the user in full, because
+  waits on the user, a step only they can run included. A root's n also counts
+  every due item of every production below it (**Nested showrunners** above).
+  List the questions in full only when the user asks what they are: run
+  `python3 ~/.claude/scripts/production/update_registration.py open
+  --production PRODUCTION_DOC` and show its list, oldest first, each item led
+  by the production that owns it. A dailies report still lists what needs the user in full, because
   it is a report the user asked for. User, 2026-10-12, replacing the
   2026-10-06 rule that restated the user's items in every Waiting on block.
 - **Long commands** run in the background. The task notification is the wait;
@@ -213,12 +265,12 @@ State:
   ```text
 
   ---
-  11:37 PDT update:
+  11:37 EDT update:
 
-  * build hold: <holder> holds builds since 11:34 PDT for the frame-time lane's breakdown of what each added tool costs; expected to release 11:40 PDT (in 3 minutes)
-  * Mac block: <holder> since 11:35 PDT, for the Mac-only test run - lifts Wed 12:35 PDT
+  * build hold: <holder> holds builds since 11:34 EDT for the frame-time lane's breakdown of what each added tool costs; expected to release 11:40 EDT (in 3 minutes)
+  * Mac block: <holder> since 11:35 EDT, for the Mac-only test run - lifts Wed 12:35 EDT
   * claude 1: …
-  * next dailies: 11:53 PDT - nothing needed
+  * next dailies: 11:53 EDT - nothing needed
 
 
   Waiting on:
@@ -388,14 +440,15 @@ whatever arrived:
 | the user's words for a unit director | relay them (<Throughout/>) |
 | a unit waiting on another unit | <Dependencies/> |
 | a unit blocked on the showrunner | <ClearGate/>, <LandingCall/>, or answer it |
-| a unit director's decision for the user | show it to the user; relay the answer |
+| a unit director's design choice, Pending decision or add-ons | settle it and tell the unit (<Throughout/> → Designs and add-ons) |
+| a unit director's decision only the user can settle | show it to the user; relay the answer |
 | a quota alert | <QuotaAlert/> |
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
 | the user asks which phase or task each unit is on | `/showrunner:units` |
 | the user asks which proposals are open | `/showrunner:proposals` |
 | the user asks for the nightly improvement list | `/showrunner:nightly` |
 | the user asks to put a showrunner under another, or asks for the tree | `/showrunner:attach` |
-| the user asks what the open questions are | list every `OUTSTANDING` item now due in full, oldest first, each with its choices; name any deferred item and its time in one line (<Throughout/> → Open questions) |
+| the user asks what the open questions are | run `update_registration.py open --production PRODUCTION_DOC` and show its list: every item now due in full, oldest first, each led by its production; a deferred item with its time; a list it could not read (<Throughout/> → Open questions) |
 | a child showrunner's item for the user | show it in the child's words; relay the answer to that child (<Throughout/> → Nested showrunners) |
 | the user's words for a production below this one | relay them to the child that holds it (<Throughout/> → Nested showrunners) |
 
@@ -793,7 +846,9 @@ it needs. Every other wait is yours to clear, and fast.
    wait (Rules: parallel by default); else work inside its current phase: its
    fix built in a scratch copy, tests, docs or research.
 5. **Two things still go to the user:** a wait that clears only by changing what
-   ships, and approvals that belong in a unit director's own session.
+   ships, and an approval only the user can give in a unit director's own
+   session (a permission prompt, an action that cannot be undone). A unit's
+   design choices and add-ons are yours (<Throughout/> → Designs and add-ons).
 6. **A block on the user is still yours** (user, 2026-10-03, after trunk sat
    13 hours overnight on one refused command). The user may be asleep or away,
    and units must keep working without them. On the first tick that shows a

@@ -16,6 +16,7 @@ import argparse
 import base64
 import contextlib
 import dataclasses
+import fcntl
 import io
 import json
 import os
@@ -775,6 +776,204 @@ class MeshCommandTests(unittest.TestCase):
         self.assertTrue(opened, "the failed request must use a client")
         self.assertCountEqual(opened, closed)
 
+    def replacement_record(self) -> dict[str, object]:
+        return {"thread_id": "replacement-thread", "status": "running", "turn_id": "replacement-turn",
+                "context_tokens": 777, "role": "test", "launcher_pid": os.getpid(),
+                "port": self.server.port, "instructions_file": "replacement-instructions.txt"}
+
+    def replace_seat(self, name: str = "seat") -> dict[str, object]:
+        entries = self.roster()
+        previous = _as_test_dict(entries.get(name))
+        entries[name] = {**previous, "status": "ended"}
+        self.write_pool_roster(entries)
+        replacement = self.replacement_record()
+        entries[name] = replacement
+        self.write_pool_roster(entries)
+        return replacement
+
+    def test_old_launcher_normal_end_preserves_the_replacement_roster(self) -> None:
+        replacement = self.replacement_record()
+        def replace_at_end(_port: int, _thread_id: str, _log_path: Path) -> codex_mesh.RelaunchAllowed:
+            self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
+            self.assertEqual(self.replace_seat(), replacement)
+            return codex_mesh.RelaunchAllowed()
+        with patch.object(codex_mesh, "_end_unwatched_turn", side_effect=replace_at_end):
+            code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record(), replacement)
+
+    def test_old_launcher_exception_preserves_the_replacement_roster(self) -> None:
+        original = codex_mesh.Client.next_frame
+        replacement = self.replacement_record()
+        failed = [False]
+        def fail_after_replacement(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            if not failed[0]:
+                failed[0] = True
+                self.assertEqual(self.replace_seat(), replacement)
+                raise ConnectionError("invented stream failure")
+            return original(client, deadline)
+        with patch.object(codex_mesh.Client, "next_frame", fail_after_replacement):
+            code, errors = self.run_start()
+        self.assertEqual(code, 1)
+        self.assertIn("invented stream failure", errors)
+        self.assertEqual(self.seat_record(), replacement)
+
+    def test_old_thread_start_and_token_notices_preserve_every_replacement_field(self) -> None:
+        original = codex_mesh.Client.next_frame
+        replacement = self.replacement_record()
+        notices = [
+            codex_mesh.RpcMessage(method="turn/started", params={"threadId": THREAD_ID, "turn": {"id": "turn-1"}}),
+            codex_mesh.RpcMessage(method="thread/tokenUsage/updated", params={"threadId": THREAD_ID, "turnId": "turn-1",
+                                 "tokenUsage": {"last": {"inputTokens": 99999}, "total": {"inputTokens": 0}}}),
+        ]
+        observed: list[dict[str, object]] = []
+        def next_frame(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            if len(notices) == 2:
+                self.assertEqual(self.replace_seat(), replacement)
+            else:
+                observed.append(self.seat_record())
+            if notices:
+                return notices.pop(0)
+            return original(client, deadline)
+        with patch.object(codex_mesh.Client, "next_frame", next_frame):
+            code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertGreaterEqual(len(observed), 2)
+        for entry in observed:
+            self.assertEqual(entry, replacement)
+        self.assertEqual(self.seat_record(), replacement)
+
+    def test_compaction_reply_after_replacement_preserves_its_context_and_identity(self) -> None:
+        self.context_sizes = [150000]
+        self.assertEqual(self.run_start()[0], 0)
+        replacement = self.replacement_record()
+        respond = self.respond
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            frames = respond(request)
+            if request.get("method") == "thread/compact/start":
+                self.assertEqual(self.replace_seat(), replacement)
+            return frames
+        self.server.respond = reply
+        code, output, errors = self.run_mesh(["compact", "--to", "seat"])
+        self.assertEqual((code, output, errors), (0, "compacted seat: 150000 -> 20000 tokens\n", ""))
+        self.assertEqual(self.seat_record(), replacement)
+
+    def test_compaction_checks_ownership_after_acquiring_the_roster_lock(self) -> None:
+        self.context_sizes = [150000]
+        self.assertEqual(self.run_start()[0], 0)
+        replacement = self.replacement_record()
+        armed = [False]
+        writes = [0]
+        flock = fcntl.flock
+        respond = self.respond
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            frames = respond(request)
+            if request.get("method") == "thread/compact/start":
+                armed[0] = True
+            return frames
+        def acquire(descriptor: int, operation: int) -> None:
+            path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+            if armed[0] and operation == fcntl.LOCK_EX and path.name == codex_mesh.ROSTER_FILE:
+                armed[0] = False
+                with path.open("r+") as other:
+                    flock(other.fileno(), fcntl.LOCK_EX)
+                    entries = cast(dict[str, object], json.loads(other.read()))
+                    entries["seat"] = replacement
+                    _ = other.seek(0)
+                    _ = other.truncate()
+                    _ = other.write(json.dumps(entries))
+                    other.flush()
+                    flock(other.fileno(), fcntl.LOCK_UN)
+                writes[0] += 1
+            flock(descriptor, operation)
+        self.server.respond = reply
+        with patch.object(fcntl, "flock", acquire):
+            code, output, errors = self.run_mesh(["compact", "--to", "seat"])
+        self.assertEqual((code, output, errors), (0, "compacted seat: 150000 -> 20000 tokens\n", ""))
+        self.assertEqual(writes[0], 1)
+        self.assertEqual(self.seat_record(), replacement)
+
+    def test_steer_on_the_same_thread_keeps_fields_and_records_the_live_turn(self) -> None:
+        original = {**self.replacement_record(), "thread_id": THREAD_ID, "turn_id": "stale-turn"}
+        self.write_pool_roster({"seat": original})
+        calls = [0]
+        respond = self.respond
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/steer":
+                calls[0] += 1
+                if calls[0] == 1:
+                    return [{"id": request["id"], "error": {"message": "expected turn, but found `live-turn`"}}]
+                return [_reply(request, {})]
+            return respond(request)
+        self.server.respond = reply
+        code, output, errors = self.run_mesh(["steer", "--to", "seat", "--message", "invented correction"])
+        self.assertEqual((code, output, errors), (0, "steered seat\n", ""))
+        self.assertEqual(self.seat_record(), {**original, "turn_id": "live-turn", "revision": 1})
+
+    def test_steer_reply_after_replacement_preserves_its_context_and_identity(self) -> None:
+        self.write_pool_roster({"seat": {"thread_id": THREAD_ID, "status": "running",
+                                      "turn_id": "stale-turn", "context_tokens": 150000,
+                                      "port": self.server.port}})
+        replacement = self.replacement_record()
+        calls = [0]
+        respond = self.respond
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/steer":
+                calls[0] += 1
+                if calls[0] == 1:
+                    return [{"id": request["id"], "error": {"message": "expected turn, but found `live-turn`"}}]
+                self.assertEqual(self.replace_seat(), replacement)
+                return [_reply(request, {})]
+            return respond(request)
+        self.server.respond = reply
+        code, output, errors = self.run_mesh(["steer", "--to", "seat", "--message", "invented correction"])
+        self.assertEqual((code, output, errors), (0, "steered seat\n", ""))
+        self.assertEqual(calls[0], 2)
+        self.assertEqual(self.seat_record(), replacement)
+
+    def taken_fork(self, *, release_unknown: bool, initially_absent: bool = False) -> tuple[int, str, str]:
+        entries: dict[str, object] = {"template": {"thread_id": THREAD_ID, "status": "done"}}
+        if not initially_absent:
+            entries["reviewer"] = {"thread_id": "ended-thread", "status": "ended"}
+        self.write_pool_roster(entries)
+        self.server.requests.clear()
+        marker = self.session_dir / "reviewer.end"
+        pending = self.session_dir / "reviewer.pending.json"
+        _ = marker.write_text("replacement marker\n", encoding="utf-8")
+        _ = pending.write_text('{"messages": ["replacement message"]}\n', encoding="utf-8")
+        respond = self.respond
+        replacement = self.replacement_record()
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            frames = respond(request)
+            if request.get("method") == "thread/name/set":
+                self.assertEqual(self.replace_seat("reviewer"), replacement)
+            if request.get("method") == "thread/unsubscribe" and release_unknown:
+                return [{"id": request["id"], "error": {"message": "invented release refusal"}}]
+            return frames
+        self.server.respond = reply
+        result = self.run_mesh(["fork", "--from", "template", "--name", "reviewer"])
+        self.assertEqual(self.roster()["reviewer"], replacement)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "replacement marker\n")
+        self.assertEqual(pending.read_text(encoding="utf-8"), '{"messages": ["replacement message"]}\n')
+        self.assertEqual([_as_test_dict(request["params"]).get("threadId")
+                          for request in self.methods("thread/unsubscribe")], [self.fork_thread_id])
+        return result
+
+    def test_fork_taken_during_request_releases_only_its_new_thread_and_refuses(self) -> None:
+        for initially_absent in (False, True):
+            with self.subTest(initially_absent=initially_absent):
+                code, output, errors = self.taken_fork(release_unknown=False, initially_absent=initially_absent)
+                self.assertEqual((code, output, errors), (2, "",
+                                 "codex_mesh: reviewer: name was taken while the fork ran; fork refused\n"))
+
+    def test_fork_taken_during_request_reports_unconfirmed_release_without_touching_replacement(self) -> None:
+        code, output, errors = self.taken_fork(release_unknown=True)
+        self.assertEqual((code, output), (1, ""))
+        self.assertEqual(errors, f"codex_mesh: reviewer: name was taken while the fork ran; "
+                         + f"fork thread {self.fork_thread_id} not released: "
+                         + 'old thread release could not be confirmed: codex_mesh: thread/unsubscribe failed: '
+                         + '{"message": "invented release refusal"}\n')
+
     def test_prime_creates_and_names_a_read_only_review_template_without_a_turn(self) -> None:
         arguments = self.prime_cli("--model", "gpt-test", "--service-tier", "fast")
         instructions = (self.session_dir / "review-instructions.txt").read_text(encoding="utf-8")
@@ -795,6 +994,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(requests[1]["params"], {"threadId": THREAD_ID, "name": "template"})
         self.assert_review_record("template", THREAD_ID)
         self.assertEqual(self.roster()["other"], {"thread_id": "other-thread", "status": "done"})
+        self.assertEqual(_as_test_dict(self.roster()["template"]).get("context_tokens"), 0)
         self.assertEqual(self.methods("turn/start"), [])
 
     def test_prime_accepts_omitted_model_and_service_tier(self) -> None:
@@ -1002,7 +1202,9 @@ class MeshCommandTests(unittest.TestCase):
                 self.assertIn(f"{arguments[0]} refused", errors)
                 self.assertIn("old server still has a live turn", errors)
                 self.assertIn("seat seat", errors)
-                self.assertEqual(self.roster(), before)
+                expected = ({**before, "seat": {**_as_test_dict(before["seat"]), "revision": 2}}
+                            if arguments[0] == "reset" else before)
+                self.assertEqual(self.roster(), expected)
                 self.assertFalse(any(request.get("method") in ("thread/resume", "thread/fork", "thread/revert")
                                      for request in new.requests))
 
@@ -1102,7 +1304,9 @@ class MeshCommandTests(unittest.TestCase):
                 self.assertEqual((code, output), (2, ""))
                 self.assertIn("writer release not confirmed", errors)
                 self.assertIn(f"{arguments[0]} refused", errors)
-                self.assertEqual(self.roster(), before)
+                expected = ({**before, "seat": {**_as_test_dict(before["seat"]), "revision": 2}}
+                            if arguments[0] == "reset" else before)
+                self.assertEqual(self.roster(), expected)
                 self.assertEqual(self.methods("thread/resume"), [])
 
     def test_fork_supplies_and_copies_the_source_standing_instructions(self) -> None:
@@ -1348,7 +1552,7 @@ class MeshCommandTests(unittest.TestCase):
                 self.assertEqual(self.methods("thread/revert")[0]["params"], {
                     "threadId": THREAD_ID, "beforeTurnId": "first-turn",
                 })
-                self.assertEqual(self.seat_record(), {**original, "context_tokens": 0})
+                self.assertEqual(self.seat_record(), {**original, "context_tokens": 0, "revision": 3})
                 self.assertEqual(self.methods("turn/start"), [])
 
     def test_reset_of_a_thread_without_turns_clears_context_without_reverting(self) -> None:
@@ -1400,7 +1604,7 @@ class MeshCommandTests(unittest.TestCase):
                 self.assertTrue(self.methods("thread/read"))
                 self.assertEqual(self.methods("thread/turns/list"), [])
                 self.assertEqual(self.methods("thread/revert"), [])
-                self.assertEqual(self.roster(), entries)
+                self.assertEqual(self.roster(), {**entries, "seat": {**_as_test_dict(entries["seat"]), "revision": 2}})
 
     def test_reset_refuses_a_live_turn_without_erasing_its_context(self) -> None:
         self.live_turn = "live-review-turn"
@@ -1415,7 +1619,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(output, "")
         self.assertTrue(errors.startswith("codex_mesh: seat: "), errors)
         self.assertEqual(self.methods("thread/revert"), [])
-        self.assertEqual(self.roster(), entries)
+        self.assertEqual(self.roster(), {**entries, "seat": {**_as_test_dict(entries["seat"]), "revision": 2}})
 
     def test_reset_reports_request_failures_without_clearing_context_and_closes_clients(self) -> None:
         self.history_turns = [{"id": "first-turn", "status": "completed", "items": []}]
@@ -1427,7 +1631,7 @@ class MeshCommandTests(unittest.TestCase):
                 self.write_pool_roster(entries)
                 self.failing_method = method
                 self.assert_request_failure_closes_clients(["reset", "--to", "seat"], "seat")
-                self.assertEqual(self.roster(), entries)
+                self.assertEqual(self.roster(), {**entries, "seat": {**_as_test_dict(entries["seat"]), "revision": 2}})
 
     def test_follow_cli_sends_worktree_read_only_policy_and_images_after_text_in_order(self) -> None:
         self.write_pool_roster({"seat": {"thread_id": THREAD_ID, "status": "done", "role": "review"}})
@@ -1567,6 +1771,87 @@ class MeshCommandTests(unittest.TestCase):
         starts = self.methods("turn/start")
         follow_params = cast("dict[str, object]", starts[1]["params"])
         self.assertEqual(follow_params["model"], "gpt-test")
+
+    def follow_with_name_taken(self, take_at: str, *, release_unknown: bool = False) -> tuple[int, str]:
+        self.write_pool_roster({"seat": {"thread_id": "old-follow-thread", "status": "done",
+                                       "role": "impl", "context_tokens": 123, "port": self.server.port}})
+        replacement = self.replacement_record()
+        marker = self.session_dir / "seat.end"
+        pending = self.session_dir / "seat.pending.json"
+        marker_text = "new owner's end marker\n"
+        pending_text = json.dumps({"thread_id": replacement["thread_id"], "messages": ["new owner's message"]})
+        respond = self.respond
+        taken = [False]
+
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            method = request.get("method")
+            if method == take_at:
+                taken[0] = True
+                self.assertEqual(self.replace_seat(), replacement)
+                _ = marker.write_text(marker_text, encoding="utf-8")
+                _ = pending.write_text(pending_text, encoding="utf-8")
+            if method == "thread/resume":
+                return [{"id": request["id"], "error": {"message": "invented resume refusal"}}]
+            if method == "thread/unsubscribe" and release_unknown:
+                return [{"id": request["id"], "error": {"message": "invented release refusal"}}]
+            return respond(request)
+
+        self.server.respond = reply
+        result = self.run_follow()
+        self.assertTrue(taken[0])
+        self.assertEqual(self.seat_record(), replacement)
+        self.assertEqual(marker.read_text(encoding="utf-8"), marker_text)
+        self.assertEqual(pending.read_text(encoding="utf-8"), pending_text)
+        self.assertEqual([_as_test_dict(request["params"]).get("threadId")
+                          for request in self.methods("thread/unsubscribe")], [THREAD_ID])
+        self.assertEqual(self.methods("turn/start"), [])
+        self.assertNotIn(THREAD_ID, [record["id"] for record in self.usage_records()])
+        if take_at == "thread/resume":
+            self.assertEqual(self.methods("thread/name/set"), [])
+            board = self.session_dir / "board.log"
+            self.assertNotIn("seat continues as new thread", board.read_text() if board.exists() else "")
+        return result
+
+    def test_follow_name_taken_during_resume_releases_fallback_without_touching_new_owner(self) -> None:
+        code, errors = self.follow_with_name_taken("thread/resume")
+        self.assertEqual((code, errors), (1, "codex_mesh: seat: name was taken while the follow-up ran; "
+                                         + "follow-up did not start\n"))
+
+    def test_follow_name_taken_after_fallback_is_named_releases_it_without_starting_a_turn(self) -> None:
+        code, errors = self.follow_with_name_taken("thread/name/set")
+        self.assertEqual((code, errors), (1, "codex_mesh: seat: name was taken while the follow-up ran; "
+                                         + "follow-up did not start\n"))
+
+    def test_follow_name_taken_reports_unconfirmed_fallback_release_and_keeps_new_owner(self) -> None:
+        code, errors = self.follow_with_name_taken("thread/resume", release_unknown=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(errors, "codex_mesh: seat: name was taken while the follow-up ran; "
+                         + f"replacement thread {THREAD_ID} not released: "
+                         + "old thread release could not be confirmed: codex_mesh: thread/unsubscribe failed: "
+                         + '{"message": "invented release refusal"}\n')
+
+    def test_follow_refused_resume_without_replacement_owner_runs_on_the_fallback_thread(self) -> None:
+        self.write_pool_roster({"seat": {"thread_id": "old-follow-thread", "status": "done",
+                                       "role": "impl", "context_tokens": 123, "port": self.server.port}})
+        respond = self.respond
+
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/resume":
+                return [{"id": request["id"], "error": {"message": "invented resume refusal"}}]
+            return respond(request)
+
+        self.server.respond = reply
+        self.assertEqual(self.run_follow(), (0, ""))
+        self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertEqual(self.seat_record()["context_tokens"], 123)
+        self.assertEqual([_as_test_dict(request["params"]).get("threadId")
+                          for request in self.methods("thread/name/set")], [THREAD_ID])
+        self.assertEqual([_as_test_dict(request["params"]).get("threadId")
+                          for request in self.methods("turn/start")], [THREAD_ID])
+        self.assertEqual([record["id"] for record in self.usage_records()], ["old-follow-thread", THREAD_ID])
+        self.assertIn(f"seat continues as new thread {THREAD_ID}",
+                      (self.session_dir / "board.log").read_text(encoding="utf-8"))
 
     def test_start_records_the_assigned_role(self) -> None:
         code, errors = self.run_start()
@@ -1818,6 +2103,188 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("compact requires a finished seat", errors.getvalue())
         self.assertEqual(self.methods("thread/compact/start"), [])
+
+    def compact_with_zero_usage(self) -> dict[str, object]:
+        self.context_sizes = [150000]
+        self.compact_after_tokens = 0
+        self.assertEqual(self.run_start()[0], 0)
+        code, output, errors = self.run_mesh(["compact", "--to", "seat"])
+        self.assertEqual((code, output, errors), (
+            0, "compacted seat: 150000 tokens, size not measured until its next turn\n", "",
+        ))
+        record = self.seat_record()
+        self.assertEqual(record.get("context_tokens"), "not_measured_since_compaction")
+        return record
+
+    def test_zero_compaction_reports_an_unmeasured_size_and_list_keeps_three_fields(self) -> None:
+        _ = self.compact_with_zero_usage()
+        code, output, errors = self.run_mesh(["list"])
+        self.assertEqual((code, output, errors), (0, f"seat\tdone\t{THREAD_ID}\n", ""))
+
+    def test_next_turn_usage_replaces_the_unmeasured_compaction_size(self) -> None:
+        _ = self.compact_with_zero_usage()
+        self.context_sizes = [23456]
+        self.assertEqual(self.run_follow(), (0, ""))
+        self.assertEqual(self.seat_record()["context_tokens"], 23456)
+
+    def compact_after_a_later_turn(self, after_tokens: int, *, finished: bool = False) -> None:
+        self.context_sizes = [150000]
+        self.compact_after_tokens = after_tokens
+        self.assertEqual(self.run_start(), (0, ""))
+        original = self.seat_record()
+        compact = cast(Callable[[codex_mesh.Client, str], codex_mesh.KnownContextSize],
+                       getattr(codex_mesh, "_compact_thread"))
+        update = cast(Callable[[str, str, codex_mesh.ThreadRecord, codex_mesh.ExpectedRoster], bool],
+                      getattr(codex_mesh, "_update_roster_if_expected"))
+        newer: list[dict[str, object]] = []
+
+        def finish_then_record_turn(client: codex_mesh.Client, thread_id: str) -> codex_mesh.KnownContextSize:
+            after = compact(client, thread_id)
+            if finished:
+                self.context_sizes = [150000]
+                self.assertEqual(self.run_follow(), (0, ""))
+                self.assertEqual(self.seat_record()["status"], original["status"])
+                self.assertEqual(self.seat_record()["context_tokens"], original["context_tokens"])
+                self.assertNotIn("turn_id", self.seat_record())
+            else:
+                self.assertTrue(update(str(self.session_dir), "seat", {
+                    "thread_id": thread_id, "status": "running", "turn_id": "later-turn",
+                    "context_tokens": 23456,
+                }, codex_mesh.RosterOnThread(thread_id)))
+            newer.append(self.seat_record())
+            return after
+
+        with patch.object(codex_mesh, "_compact_thread", finish_then_record_turn):
+            code, output, errors = self.run_mesh(["compact", "--to", "seat"])
+        line = (f"compacted seat: 150000 -> {after_tokens} tokens\n" if after_tokens > 0
+                else "compacted seat: 150000 tokens, size not measured until its next turn\n")
+        self.assertEqual((code, output, errors), (0, line, ""))
+        self.assertEqual(len(newer), 1)
+        self.assertEqual(self.seat_record(), newer[0])
+
+    def test_late_zero_compaction_keeps_the_newer_turns_complete_record(self) -> None:
+        self.compact_after_a_later_turn(0)
+
+    def test_late_measured_compaction_keeps_the_newer_turns_complete_record(self) -> None:
+        self.compact_after_a_later_turn(18000)
+
+    def test_late_compaction_keeps_a_finished_turn_with_the_same_status_and_size(self) -> None:
+        self.compact_after_a_later_turn(0, finished=True)
+
+    def test_compact_refuses_an_unmeasured_size_with_its_specific_reason(self) -> None:
+        record = {"thread_id": THREAD_ID, "status": "done",
+                  "context_tokens": "not_measured_since_compaction"}
+        self.write_pool_roster({"seat": record})
+        self.assertEqual(self.run_mesh(["compact", "--to", "seat"]), (
+            2, "", "codex_mesh: seat: size not measured since its last compaction; compact refused\n",
+        ))
+        self.assertEqual(self.seat_record(), record)
+        self.assertEqual(self.server.requests, [])
+
+    def test_compact_without_a_recorded_size_keeps_the_existing_refusal(self) -> None:
+        record = {"thread_id": THREAD_ID, "status": "done"}
+        self.write_pool_roster({"seat": record})
+        self.assertEqual(self.run_mesh(["compact", "--to", "seat"]), (
+            2, "", "codex_mesh: seat: no recorded context size; compact refused\n",
+        ))
+        self.assertEqual(self.seat_record(), record)
+        self.assertEqual(self.server.requests, [])
+
+    def test_each_roster_write_advances_revision_even_when_ended_fields_are_kept(self) -> None:
+        update = cast(Callable[[str, str, codex_mesh.ThreadRecord], None],
+                      getattr(codex_mesh, "_update_roster"))
+        guarded = cast(Callable[[str, str, codex_mesh.ThreadRecord, codex_mesh.ExpectedRoster], bool],
+                       getattr(codex_mesh, "_update_roster_if_expected"))
+        original = {"thread_id": THREAD_ID, "status": "done", "context_tokens": 150000}
+        self.write_pool_roster({"seat": original})
+        self.assertNotIn("revision", self.seat_record())
+        update(str(self.session_dir), "seat", {"thread_id": THREAD_ID, "status": "done"})
+        self.assertEqual(self.seat_record(), {**original, "revision": 1})
+        self.assertTrue(guarded(str(self.session_dir), "seat", {
+            "thread_id": THREAD_ID, "status": "failed",
+        }, codex_mesh.RosterOnThread(THREAD_ID)))
+        self.assertEqual(self.seat_record(), {**original, "status": "failed", "revision": 2})
+        update(str(self.session_dir), "seat", {"thread_id": THREAD_ID, "status": "ended"})
+        ended = self.seat_record()
+        self.assertEqual(ended, {**original, "status": "ended", "revision": 3})
+        self.assertTrue(guarded(str(self.session_dir), "seat", {
+            "thread_id": THREAD_ID, "status": "done",
+        }, codex_mesh.RosterOnThread(THREAD_ID)))
+        self.assertEqual(self.seat_record(), {**ended, "revision": 4})
+        before_refusal = self.seat_record()
+        self.assertFalse(guarded(str(self.session_dir), "seat", {
+            "thread_id": "different-thread", "status": "done",
+        }, codex_mesh.RosterOnThread("different-thread")))
+        self.assertEqual(self.seat_record(), before_refusal)
+        update(str(self.session_dir), "seat", {"thread_id": "different-thread", "status": "done"})
+        self.assertEqual(self.seat_record(), {
+            "thread_id": "different-thread", "status": "done", "context_tokens": 150000, "revision": 5,
+        })
+
+    def test_compaction_reads_a_legacy_entry_as_revision_zero(self) -> None:
+        self.write_pool_roster({"seat": {"thread_id": THREAD_ID, "status": "done",
+                                        "context_tokens": 150000}})
+        self.compact_after_tokens = 18000
+        self.assertEqual(self.run_mesh(["compact", "--to", "seat"]), (
+            0, "compacted seat: 150000 -> 18000 tokens\n", "",
+        ))
+        self.assertEqual(self.seat_record(), {
+            "thread_id": THREAD_ID, "status": "done", "context_tokens": 18000, "revision": 1,
+        })
+
+    def test_follow_up_without_usage_keeps_the_unmeasured_compaction_size(self) -> None:
+        original = self.compact_with_zero_usage()
+        self.assertEqual(self.run_follow(), (0, ""))
+        self.assertEqual(self.seat_record().get("context_tokens"), original.get("context_tokens"))
+
+    def test_roster_writes_without_size_preserve_the_unmeasured_compaction_state(self) -> None:
+        original = self.compact_with_zero_usage()
+        codex_mesh._update_roster(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "failed",
+        })
+        self.assertEqual(self.seat_record(), {**original, "status": "failed", "revision": cast(int, original["revision"]) + 1})
+        self.assertTrue(codex_mesh._update_roster_if_expected(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "done",
+        }, codex_mesh.RosterOnThread(THREAD_ID)))
+        self.assertEqual(self.seat_record(), {**original, "revision": cast(int, original["revision"]) + 2})
+        codex_mesh._update_roster(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "ended",
+        })
+        ended = self.seat_record()
+        self.assertTrue(codex_mesh._update_roster_if_expected(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "done",
+        }, codex_mesh.RosterOnThread(THREAD_ID)))
+        self.assertEqual(self.seat_record(), {**ended, "revision": cast(int, ended["revision"]) + 1})
+        self.assertEqual(ended.get("context_tokens"), original.get("context_tokens"))
+
+    def test_reset_replaces_unmeasured_compaction_state_with_measured_zero(self) -> None:
+        _ = self.compact_with_zero_usage()
+        code, _output, errors = self.run_mesh(["reset", "--to", "seat"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["context_tokens"], 0)
+
+    def test_failed_compaction_keeps_the_complete_recorded_size(self) -> None:
+        self.context_sizes = [150000]
+        self.assertEqual(self.run_start()[0], 0)
+        original = self.seat_record()
+        self.failing_method = "thread/compact/start"
+        code, output, errors = self.run_mesh(["compact", "--to", "seat"])
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("scripted request failure", errors)
+        self.assertEqual(self.seat_record(), original)
+
+    def test_roster_writes_without_size_keep_a_measured_size(self) -> None:
+        self.context_sizes = [150000]
+        self.assertEqual(self.run_start()[0], 0)
+        original = self.seat_record()
+        codex_mesh._update_roster(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "failed",
+        })
+        self.assertEqual(self.seat_record(), {**original, "status": "failed", "revision": cast(int, original["revision"]) + 1})
+        self.assertTrue(codex_mesh._update_roster_if_expected(str(self.session_dir), "seat", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "done",
+        }, codex_mesh.RosterOnThread(THREAD_ID)))
+        self.assertEqual(self.seat_record(), {**original, "revision": cast(int, original["revision"]) + 2})
 
     def test_compact_waits_for_compaction_and_records_the_smaller_context(self) -> None:
         self.context_sizes = [150000]

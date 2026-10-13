@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
+from contextlib import closing
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -18,8 +19,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.usage import collect, weights
-from scripts.whoami import seat_usage
+from scripts.usage import collect, outcomes, weights
+from scripts.lib.user_zone import user_zone_name
+from scripts.usage.rollouts import parse_timestamp
 
 
 @dataclass(frozen=True)
@@ -44,32 +46,41 @@ RUN_DIMENSIONS = tuple(DIMENSIONS[name] for name in ("day", "machine", "unit"))
 
 
 @dataclass(frozen=True)
-class Outcome:
+class QueryOutcome:
     name: str
     query: str
     dimensions: tuple[Dimension, ...]
     aggregate: str = "count(*)"
-    over_turns: bool = False
+
+
+@dataclass(frozen=True)
+class TurnGroupOutcome:
+    name: str
+    dimensions: tuple[Dimension, ...]
+    aggregate: str
+
+
+Outcome = QueryOutcome | TurnGroupOutcome
 
 
 OUTCOMES = {
     outcome.name: outcome for outcome in (
-        Outcome("checkpoints", """
+        QueryOutcome("checkpoints", """
             SELECT c.at, coalesce(c.machine, 'natedev') AS machine,
                    CASE WHEN c.mapping = 'mapped' THEN r.worktree END AS folder
             FROM checkpoints c LEFT JOIN runs r ON r.machine = c.machine AND r.run_id = c.run_id
         """, RUN_DIMENSIONS),
-        Outcome("findings_closed", """
+        QueryOutcome("findings_closed", """
             SELECT f.state_at AS at, f.machine, r.worktree AS folder FROM findings f
             LEFT JOIN runs r ON r.machine = f.machine AND r.run_id = f.run_id
             WHERE f.state = 'accepted'
         """, RUN_DIMENSIONS),
-        Outcome("review_rounds", """
+        QueryOutcome("review_rounds", """
             SELECT p.started_at AS at, p.machine, r.worktree AS folder FROM passes p
             LEFT JOIN runs r ON r.machine = p.machine AND r.run_id = p.run_id
             WHERE p.kind = 'review'
         """, RUN_DIMENSIONS),
-        Outcome("compactions", """
+        QueryOutcome("compactions", """
             SELECT c.at, c.machine, f.folder, coalesce(t.role, 'unassigned') AS role,
                    t.lens, coalesce(t.lens_state, 'not_applicable') AS lens_state,
                    coalesce(t.model, 'unreported') AS model, t.effort
@@ -83,9 +94,9 @@ OUTCOMES = {
             LEFT JOIN folders f ON (f.machine, f.family, f.parent_id, f.agent_id)
                 = (c.machine, c.family, c.parent_id, c.agent_id)
         """, ALL_DIMENSIONS),
-        Outcome("threads", "SELECT * FROM turn_groups", ALL_DIMENSIONS,
-                "count(DISTINCT json_array(machine, family, parent_id, agent_id))", True),
-        Outcome("account_switches", """
+        TurnGroupOutcome("threads", ALL_DIMENSIONS,
+                         "count(DISTINCT json_array(machine, family, parent_id, agent_id))"),
+        QueryOutcome("account_switches", """
             SELECT at, machine FROM (
                 SELECT *, lag(label) OVER (PARTITION BY machine, role ORDER BY at, label) AS previous_label
                 FROM account_role_changes
@@ -265,8 +276,8 @@ def unit_worktrees(production_docs: Path) -> tuple[UnitWorktree, ...]:
             if all(set(cell) <= {"-", ":", " "} for cell in cells):
                 continue
             row = dict(zip(headings, cells, strict=False))
-            unit = seat_usage.cell_value(row.get("Unit", ""))
-            worktree = seat_usage.cell_value(row.get("Worktree", ""))
+            unit = outcomes.cell_value(row.get("Unit", ""))
+            worktree = outcomes.cell_value(row.get("Worktree", ""))
             if unit and worktree:
                 found.append(UnitWorktree(unit, Path(worktree).expanduser()))
     return tuple(sorted(found, key=lambda row: len(row.worktree.parts), reverse=True))
@@ -298,7 +309,7 @@ def side_dimensions(side: MetricSide) -> tuple[Dimension, ...]:
 
 
 def turn_side(side: MetricSide) -> bool:
-    return isinstance(side, (TurnAggregate, TurnSum)) or side.outcome.over_turns
+    return isinstance(side, (TurnAggregate, TurnSum)) or isinstance(side.outcome, TurnGroupOutcome)
 
 
 def turn_scope(metric: Metric) -> str:
@@ -324,7 +335,7 @@ def zone_offsets(db: sqlite3.Connection, request: ReportRequest) -> tuple[ZoneOf
                  f"SELECT max(at) AS at FROM turns WHERE {predicate}"]
     parameters = (*parameters, *parameters)
     for side in metric_sides(request.metric):
-        if not isinstance(side, OutcomeCount) or side.outcome.over_turns:
+        if not isinstance(side, OutcomeCount) or isinstance(side.outcome, TurnGroupOutcome):
             continue
         predicate, bounds = request.window.predicate("at")
         endpoints.append(f"SELECT min(at) AS at FROM ({side.outcome.query}) WHERE {predicate}")
@@ -390,7 +401,7 @@ def turn_relation(db: sqlite3.Connection, request: ReportRequest) -> tuple[str, 
     for name in ("role", "lens", "model"):
         if DIMENSIONS[name] not in dimensions:
             dimensions.append(DIMENSIONS[name])
-    if any(outcome.over_turns for outcome in outcomes.values()) and DIMENSIONS["unit"] not in dimensions:
+    if any(isinstance(outcome, TurnGroupOutcome) for outcome in outcomes.values()) and DIMENSIONS["unit"] not in dimensions:
         dimensions.append(DIMENSIONS["unit"])
     need_unit = DIMENSIONS["unit"] in dimensions or any(
         DIMENSIONS["unit"] in outcome.dimensions for outcome in outcomes.values())
@@ -437,7 +448,7 @@ def turn_relation(db: sqlite3.Connection, request: ReportRequest) -> tuple[str, 
                 + f"{weighted_sql('t')} AS weighted, {output_weighted} AS output_weighted "
                 + f"FROM turn_grain t{lookup_joins} LEFT JOIN weight_entries w ON w.weight_entry = t.weight_entry)")
     for outcome in outcomes.values():
-        if outcome.over_turns:
+        if isinstance(outcome, TurnGroupOutcome):
             continue
         predicate, bounds = request.window.predicate("t.at")
         day = ", " + day_sql("t", offsets) + " AS day" if need_day else ""
@@ -525,11 +536,11 @@ def side_query(request: ReportRequest, side: MetricSide, name: str) -> ReportQue
         query += f"FROM {relation} WHERE {side.where}{group_by}"
     else:
         outcome = side.outcome
-        fields = ["t." + dimension.name if outcome.over_turns else dimension.expression for dimension in carried]
+        fields = ["t." + dimension.name if isinstance(outcome, TurnGroupOutcome) else dimension.expression for dimension in carried]
         expressions = ", ".join(f"{field} AS {dimension.name}" for dimension, field in zip(carried, fields))
         outcome_group_by = " GROUP BY " + ", ".join(fields) if carried else ""
-        relation = "turn_groups" if outcome.over_turns else "outcome_" + outcome.name
-        joins = "" if outcome.over_turns else dimension_joins(carried)
+        relation = "turn_groups" if isinstance(outcome, TurnGroupOutcome) else "outcome_" + outcome.name
+        joins = "" if isinstance(outcome, TurnGroupOutcome) else dimension_joins(carried)
         query = (f"SELECT {expressions + ', ' if expressions else ''}{outcome.aggregate} AS amount, 0 AS turns "
                  f"FROM {relation} t{joins}{outcome_group_by}")
     return ReportQuery(name, (*[dimension.name for dimension in carried], "amount", "turns"), query, parameters)
@@ -566,9 +577,9 @@ def report_data(db: sqlite3.Connection, request: ReportRequest) -> dict[str, lis
     for side in metric_sides(request.metric):
         if isinstance(side, OutcomeCount) and DIMENSIONS["unit"] in side.outcome.dimensions:
             outcome = side.outcome
-            relation = "turn_groups" if outcome.over_turns else "outcome_" + outcome.name
-            joins = "" if outcome.over_turns else dimension_joins((DIMENSIONS["unit"],))
-            unit = "t.unit" if outcome.over_turns else DIMENSIONS["unit"].expression
+            relation = "turn_groups" if isinstance(outcome, TurnGroupOutcome) else "outcome_" + outcome.name
+            joins = "" if isinstance(outcome, TurnGroupOutcome) else dimension_joins((DIMENSIONS["unit"],))
+            unit = "t.unit" if isinstance(outcome, TurnGroupOutcome) else DIMENSIONS["unit"].expression
             queries.append(ReportQuery("unknown_" + side.outcome.name, ("outcomes",),
                 f"SELECT {outcome.aggregate} AS outcomes FROM {relation} t{joins} WHERE {unit} = 'unknown'"))
     prefix, parameters = turn_relation(db, request)
@@ -724,7 +735,7 @@ def coverage(request: ReportRequest, data: dict[str, list[dict[str, object]]]) -
 def source_time(value: object, zone: ZoneInfo) -> str:
     if not isinstance(value, str):
         return "never"
-    at = seat_usage.parse_timestamp(value)
+    at = parse_timestamp(value)
     return at.astimezone(zone).isoformat() if at is not None else "never"
 
 
@@ -829,11 +840,11 @@ class ReportArguments(argparse.Namespace):
         super().__init__()
         self.metric = ""
         self.db = collect.store_path()
-        self.production_docs = seat_usage.default_sources().production_docs
+        self.production_docs = outcomes.default_sources().production_docs
         self.by = DefaultGrouping()
         self.since = ""
         self.until = ""
-        self.zone = "America/Los_Angeles"
+        self.zone = user_zone_name()
         self.exact = False
 
 
@@ -857,12 +868,23 @@ def report_request(args: ReportArguments) -> ReportRequest:
     try:
         zone = ZoneInfo(zone_name)
     except (ZoneInfoNotFoundError, ValueError) as error:
-        raise ReportRefused(f"unknown zone {zone_name!r}; accepted: IANA zone names, such as America/Los_Angeles or UTC") from error
+        raise ReportRefused(f"unknown zone {zone_name!r}; accepted: IANA zone names, such as {user_zone_name()} or UTC") from error
     window = TimeWindow(parse_bound(args.since, zone), parse_bound(args.until, zone))
     if (isinstance(window.since, TimeBound) and isinstance(window.until, TimeBound)
             and window.since.at >= window.until.at):
         raise ReportRefused("invalid bounds; accepted: --since earlier than --until (inclusive start, exclusive end)")
     return ReportRequest(metric, dimensions, window, zone, args.exact)
+
+
+def open_read_store(path: Path, *, factory: type[sqlite3.Connection] = sqlite3.Connection) -> sqlite3.Connection:
+    db = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, factory=factory)
+    try:
+        db.row_factory = sqlite3.Row
+        _ = db.execute("BEGIN")
+    except BaseException:
+        db.close()
+        raise
+    return db
 
 
 def main(argv: Sequence[str] = ()) -> int:
@@ -881,15 +903,10 @@ def main(argv: Sequence[str] = ()) -> int:
             print("\n".join(f"{metric.name} — {metric.description}" for metric in METRICS.values()))
             return 0
         request = report_request(args)
-        path = args.db.absolute()
-        db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
-        try:
-            db.row_factory = sqlite3.Row
+        with closing(open_read_store(args.db)) as db:
             check_store_version(db)
             register_report_functions(db, unit_worktrees(args.production_docs))
             print(render_report(db, request), end="")
-        finally:
-            db.close()
     except ReportRefused as error:
         print("usage_report: " + " ".join(str(error).splitlines()), file=sys.stderr)
         return 2

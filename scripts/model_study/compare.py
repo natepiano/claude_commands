@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import statistics
+import sys
 import tempfile
 from collections import defaultdict
 from collections.abc import Callable, Sequence
@@ -12,15 +13,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypedDict, cast
-from zoneinfo import ZoneInfo
 
 from stats import PRICES, bootstrap_diff, bootstrap_net, label_difference, percentile, request_cost
 from turns import Compaction, Turn
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
 OPUS = "claude-opus-5-5"
 SONNET = "claude-sonnet-5-5"
 BASELINE_REQUESTS = 300
-PDT = ZoneInfo("America/Los_Angeles")
 CLASSES = ("continuation", "continuation/tool_use", "continuation/end_turn", "prompt")
 
 type ExtractedRow = dict[str, object]
@@ -288,7 +289,7 @@ def first_sonnet_time(turns: Sequence[Turn], name: str) -> datetime | None:
 
 
 def pdt_time(instant: datetime | None) -> str | None:
-    return instant.astimezone(PDT).strftime("%Y-%m-%d %H:%M PDT") if instant else None
+    return instant.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z") if instant else None
 
 
 def director_result(name: str, status: DirectorStatus, opus_all: list[Turn], sonnet: list[Turn], first_sonnet: datetime | None, dropped: dict[str, DropCounts], other: int) -> DirectorComparison:
@@ -350,7 +351,7 @@ def control_results_and_samples(directors: Sequence[DirectorComparison], arms: d
         return {"at_pdt": None, "directors": [], "pooled": {
             "before_n": 0, "after_n": 0, "before_median": None, "after_median": None, "change_seconds": None,
         }}, [], []
-    boundary = datetime.fromtimestamp(statistics.median(switched_times), tz=PDT)
+    boundary = datetime.fromtimestamp(statistics.median(switched_times), tz=user_zone())
     controls: list[ControlDirector] = []
     pooled_before: list[float] = []
     pooled_after: list[float] = []

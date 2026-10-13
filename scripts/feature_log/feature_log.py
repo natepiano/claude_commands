@@ -17,7 +17,9 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Literal, NamedTuple, NoReturn, TypedDict, cast
-from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
 
 class ProjectSpec(NamedTuple):
@@ -752,7 +754,14 @@ def _validate_release_values(project: str, crates: list[str], releases: list[str
         if not VERSION_RE.fullmatch(version):
             raise FeatureLogError(f"invalid release version {version}")
         validated.add(release)
-    return sorted(validated)
+    sorted_releases = sorted(validated)
+    for release in sorted_releases:
+        crate, _, version = release.partition("@")
+        if version != "Unreleased" and f"{crate}@Unreleased" in validated:
+            raise FeatureLogError(
+                f"release cannot hold both {crate}@Unreleased and {release}"
+            )
+    return sorted_releases
 
 
 def _canonical_link(project: str, value: str) -> str:
@@ -960,7 +969,7 @@ def _write_json(path: Path, value: object) -> None:
 
 
 def _event_time() -> str:
-    return datetime.now(ZoneInfo("America/Los_Angeles")).replace(microsecond=0).isoformat()
+    return datetime.now(user_zone()).replace(microsecond=0).isoformat()
 
 
 def _append_event(event: FeatureLogEvent) -> None:
@@ -1768,10 +1777,12 @@ def _run_amend(arguments: argparse.Namespace) -> int:
                 ]
                 changed.append("crate")
         validated_releases = _validate_release_values(project, updated["crate"], release_additions)
-        pending_crates: set[str] = set()
         for release in validated_releases:
             crate, _, version = release.partition("@")
             if version != "Unreleased":
+                pending_release = f"{crate}@Unreleased"
+                if pending_release in note["release"]:
+                    raise FeatureLogError(f"{title} already holds {pending_release}")
                 continue
             if note["state"] != "live":
                 raise FeatureLogError("a superseded note cannot be pending")
@@ -1779,13 +1790,6 @@ def _run_amend(arguments: argparse.Namespace) -> int:
                 existing_crate, _, existing_version = existing_release.partition("@")
                 if existing_crate == crate and existing_version != "Unreleased":
                     raise FeatureLogError(f"{title} already holds {existing_release}")
-            pending_crates.add(crate)
-        for release in validated_releases:
-            crate, _, version = release.partition("@")
-            if version != "Unreleased" and crate in pending_crates:
-                raise FeatureLogError(
-                    f"--release cannot add both {crate}@Unreleased and {release}"
-                )
         releases = sorted(set(updated["release"]) | set(validated_releases))
         if releases != updated["release"]:
             updated["release"] = releases
@@ -2144,7 +2148,7 @@ def _event_datetime(value: str) -> datetime:
         raise FeatureLogError(f"event time is invalid: {value}") from error
     if parsed.tzinfo is None:
         raise FeatureLogError(f"event time has no timezone: {value}")
-    return parsed.astimezone(ZoneInfo("America/Los_Angeles"))
+    return parsed.astimezone(user_zone())
 
 
 def _digest_time_label(value: str) -> str:
@@ -2181,9 +2185,7 @@ def _run_digest(arguments: argparse.Namespace) -> int:
     if since is not None:
         _validate_date(since, "since")
         events = _read_events()
-        boundary = datetime.fromisoformat(f"{since}T00:00:00").replace(
-            tzinfo=ZoneInfo("America/Los_Angeles")
-        )
+        boundary = datetime.fromisoformat(f"{since}T00:00:00").replace(tzinfo=user_zone())
         selected = [event for event in events if _event_datetime(event["at"]) >= boundary]
         return _print_digest(selected, boundary.strftime("%Y-%m-%d %H:%M %Z"))
 

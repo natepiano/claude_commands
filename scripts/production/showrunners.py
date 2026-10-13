@@ -305,14 +305,49 @@ def children_of(slug: str) -> list[str]:
     return sorted(child for child, parent in edges().items() if parent == slug)
 
 
+def _below(slug: str, tree: dict[str, str]) -> list[str]:
+    level = [slug]
+    found: list[str] = []
+    while level:
+        level = sorted(child for child, parent in tree.items() if parent in level)
+        found.extend(level)
+    return found
+
+
+def descendants_of(slug: str) -> list[str]:
+    """Every production below `slug`, at any depth, the nearest level first."""
+    return _below(slug, edges())
+
+
 def _root_in(slug: str, tree: dict[str, str]) -> str:
     while slug in tree:
         slug = tree[slug]
     return slug
 
 
+class Place(NamedTuple):
+    """Where a production sits in its tree, for what its showrunner shows the user."""
+    root: str  # the root it is under; empty when it is a root itself
+    below: list[str]  # for a root, every production below it; empty otherwise
+
+
+def place_of(slug: str) -> Place:
+    """`slug`'s place in its tree, from one reading of the edges."""
+    tree = edges()
+    return Place(_root_in(slug, tree), []) if slug in tree else Place("", _below(slug, tree))
+
+
+def user_facing(slug: str) -> list[str]:
+    """The productions whose items for the user `slug`'s showrunner counts and lists.
+
+    A root answers for itself and every production below it. Any other showrunner answers for its
+    own items alone.
+    """
+    return [slug, *place_of(slug).below]
+
+
 def root_of(slug: str) -> str:
-    """The top of the tree `slug` is in, the one showrunner that talks with the user. A root is its own."""
+    """The top of the tree `slug` is in, the showrunner that shows the user everything below it. A root is its own."""
     return _root_in(slug, edges())
 
 
@@ -478,7 +513,7 @@ def main(argv: list[str]) -> int:
             child = cast(str, args.child)
             parent = detach(child)
             print(f"{child} no longer reports to {parent}")
-            text = f"{child} no longer reports to {parent}. {child} is a root again and talks with the user itself."
+            text = f"{child} no longer reports to {parent}. {child} is a root again."
             for line in tell_others({child: text, parent: text}, f"showrunner-tree:{child}"):
                 print(line)
     except (OSError, ValueError, KeyError) as error:

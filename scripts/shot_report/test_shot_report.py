@@ -27,6 +27,11 @@ from scripts.shot_report.episodes import (
 from scripts.shot_report.transcripts import AvailableTimingSource, ExactAttemptCountFromOrderedCaptures
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 class EpisodeRecord(TypedDict):
     split: int
     agent: str

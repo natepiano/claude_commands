@@ -121,6 +121,10 @@
 # the same command unsandboxed; anything else is the underlying cargo status.
 
 set -euo pipefail
+BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
+[[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
+source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
+build_override_refusal "${BASH_SOURCE[0]}" delegate/verify.sh || exit 2
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this

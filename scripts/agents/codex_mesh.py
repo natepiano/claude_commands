@@ -73,7 +73,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Literal, NotRequired, TextIO, TypedDict, cast, final
+from typing import Literal, NoReturn, NotRequired, TextIO, TypedDict, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.usage import agents_log
@@ -261,8 +261,9 @@ RosterRole = AssignedDelegateRole | RolelessThread
 class FollowableRecord(TypedDict):
     thread_id: str
     status: Literal["done", "failed"]
+    revision: NotRequired[int]
     role: NotRequired[SeatRole]
-    context_tokens: NotRequired[int]
+    context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
 
 
@@ -271,47 +272,52 @@ class FollowableRecord(TypedDict):
 class ActiveRecord(TypedDict):
     thread_id: str
     status: Literal["running"]
+    revision: NotRequired[int]
     turn_id: str
     launcher_pid: NotRequired[int]
     port: NotRequired[int]
     role: NotRequired[SeatRole]
-    context_tokens: NotRequired[int]
+    context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
 
 
 class StartingRecord(TypedDict):
     thread_id: str
     status: Literal["starting"]
+    revision: NotRequired[int]
     launcher_pid: NotRequired[int]
     port: NotRequired[int]
     role: NotRequired[SeatRole]
-    context_tokens: NotRequired[int]
+    context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
 
 
 class WaitingCapacityRecord(TypedDict):
     thread_id: str
     status: Literal["waiting_capacity"]
+    revision: NotRequired[int]
     launcher_pid: int
     port: NotRequired[int]
     role: NotRequired[SeatRole]
-    context_tokens: NotRequired[int]
+    context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
 
 
 class ExhaustedRecord(TypedDict):
     thread_id: str
     status: Literal["capacity_exhausted"]
+    revision: NotRequired[int]
     role: NotRequired[SeatRole]
-    context_tokens: NotRequired[int]
+    context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
 
 
 class EndedRecord(TypedDict):
     thread_id: str
     status: Literal["ended"]
+    revision: NotRequired[int]
     role: NotRequired[SeatRole]
-    context_tokens: NotRequired[int]
+    context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
 
 
@@ -379,6 +385,14 @@ class ContextSizeUnavailable:
 
 
 ContextSize = KnownContextSize | ContextSizeUnavailable
+
+
+@dataclass(frozen=True)
+class NotMeasuredSinceCompaction:
+    """Compaction finished, but the next turn has not measured the seat's size."""
+
+
+RecordedContextSize = KnownContextSize | NotMeasuredSinceCompaction | ContextSizeUnavailable
 
 
 def _roster_thread(value: object) -> RosterThread:
@@ -492,8 +506,10 @@ def _as_float(value: object, fallback: float) -> float:
     return float(value) if isinstance(value, (int, float)) else fallback
 
 
-def _context_size_from_record(value: object) -> ContextSize:
+def _context_size_from_record(value: object) -> RecordedContextSize:
     tokens = _as_dict(value).get("context_tokens")
+    if tokens == "not_measured_since_compaction":
+        return NotMeasuredSinceCompaction()
     if isinstance(tokens, int) and tokens >= 0:
         return KnownContextSize(tokens)
     return ContextSizeUnavailable()
@@ -716,6 +732,84 @@ def _post_board_status(session_dir: str, name: str, message: str) -> None:
         )
 
 
+@dataclass(frozen=True)
+class RosterRevision:
+    value: int
+
+
+def _roster_revision(value: object) -> RosterRevision:
+    revision = _as_dict(value).get("revision")
+    if isinstance(revision, int) and not isinstance(revision, bool) and revision >= 0:
+        return RosterRevision(revision)
+    return RosterRevision(0)
+
+
+def _advance_roster_revision(entry: dict[str, object]) -> None:
+    entry["revision"] = _roster_revision(entry).value + 1
+
+
+@dataclass(frozen=True)
+class RosterOnThread:
+    thread_id: str
+
+
+@dataclass(frozen=True)
+class RosterAbsent:
+    pass
+
+
+@dataclass(frozen=True)
+class RosterEndedOnThread:
+    thread_id: str
+
+
+@dataclass(frozen=True)
+class RosterUnchanged:
+    thread_id: str
+    revision: RosterRevision
+
+
+ExpectedRoster = RosterOnThread | RosterAbsent | RosterEndedOnThread | RosterUnchanged
+
+
+def _write_roster_record(handle: TextIO, roster: dict[str, object], name: str,
+                        record: ThreadRecord) -> None:
+    previous = _as_dict(roster.get(name))
+    stored = dict(record)
+    size = _context_size_from_record(record if "context_tokens" in record else previous)
+    role = record.get("role", previous.get("role"))
+    if isinstance(role, str) and role in SEAT_ROLES:
+        stored["role"] = role
+    instructions_file = record.get("instructions_file")
+    if instructions_file is None and previous.get("thread_id") == record["thread_id"]:
+        instructions_file = previous.get("instructions_file")
+    if isinstance(instructions_file, str) and instructions_file:
+        stored["instructions_file"] = instructions_file
+    if record["status"] in ("starting", "running", WAITING_CAPACITY):
+        pid = record.get("launcher_pid", previous.get("launcher_pid"))
+        if isinstance(pid, int) and pid > 0:
+            stored["launcher_pid"] = pid
+        port = record.get("port", previous.get("port"))
+        if isinstance(port, int) and port > 0:
+            stored["port"] = port
+    if (
+        previous.get("status") == "ended"
+        and previous.get("thread_id") == record["thread_id"]
+        and record["status"] != "ended"
+    ):
+        stored = dict(previous)
+    if isinstance(size, KnownContextSize):
+        stored["context_tokens"] = size.tokens
+    elif isinstance(size, NotMeasuredSinceCompaction):
+        stored["context_tokens"] = "not_measured_since_compaction"
+    stored["revision"] = _roster_revision(previous).value + 1
+    roster[name] = stored
+    _ = handle.seek(0)
+    _ = handle.truncate()
+    _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
+    handle.flush()
+
+
 def _update_roster(session_dir: str, name: str, record: ThreadRecord) -> None:
     path = _session_path(session_dir, ROSTER_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -724,40 +818,32 @@ def _update_roster(session_dir: str, name: str, record: ThreadRecord) -> None:
         _ = handle.seek(0)
         text = handle.read()
         roster = _as_dict(_loads(text)) if text.strip() else {}
-        previous = _as_dict(roster.get(name))
-        stored = dict(record)
-        context_tokens = record.get("context_tokens", previous.get("context_tokens"))
-        if isinstance(context_tokens, int) and context_tokens >= 0:
-            stored["context_tokens"] = context_tokens
-        role = record.get("role", previous.get("role"))
-        if isinstance(role, str) and role in SEAT_ROLES:
-            stored["role"] = role
-        instructions_file = record.get("instructions_file")
-        if instructions_file is None and previous.get("thread_id") == record["thread_id"]:
-            instructions_file = previous.get("instructions_file")
-        if isinstance(instructions_file, str) and instructions_file:
-            stored["instructions_file"] = instructions_file
-        if record["status"] in ("starting", "running", WAITING_CAPACITY):
-            pid = record.get("launcher_pid", previous.get("launcher_pid"))
-            if isinstance(pid, int) and pid > 0:
-                stored["launcher_pid"] = pid
-            port = record.get("port", previous.get("port"))
-            if isinstance(port, int) and port > 0:
-                stored["port"] = port
-        if (
-            previous.get("status") == "ended"
-            and previous.get("thread_id") == record["thread_id"]
-            and record["status"] != "ended"
-        ):
-            stored = dict(previous)
-            if isinstance(context_tokens, int) and context_tokens >= 0:
-                stored["context_tokens"] = context_tokens
-        roster[name] = stored
+        _write_roster_record(handle, roster, name, record)
+
+
+def _update_roster_if_expected(session_dir: str, name: str, record: ThreadRecord,
+                              expected: ExpectedRoster) -> bool:
+    """Compare the name's owner and write while holding the same roster lock."""
+    path = _session_path(session_dir, ROSTER_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        _ = handle.truncate()
-        _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
-        handle.flush()
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        text = handle.read()
+        roster = _as_dict(_loads(text)) if text.strip() else {}
+        previous = _as_dict(roster.get(name))
+        if isinstance(expected, RosterAbsent):
+            matches = name not in roster
+        else:
+            matches = previous.get("thread_id") == expected.thread_id
+            if isinstance(expected, RosterEndedOnThread):
+                matches = matches and previous.get("status") == "ended"
+            elif isinstance(expected, RosterUnchanged):
+                matches = matches and _roster_revision(previous) == expected.revision
+        if not matches:
+            return False
+        _write_roster_record(handle, roster, name, record)
+        return True
 
 
 def _set_roster_role(session_dir: str, name: str, role: SeatRole) -> None:
@@ -770,6 +856,7 @@ def _set_roster_role(session_dir: str, name: str, role: SeatRole) -> None:
         entry = _as_dict(roster.get(name))
         if entry:
             entry["role"] = role
+            _advance_roster_revision(entry)
             roster[name] = entry
             _ = handle.seek(0)
             _ = handle.truncate()
@@ -787,6 +874,7 @@ def _mark_roster_ended(session_dir: str, name: str) -> None:
         entry = _as_dict(roster.get(name))
         if entry:
             entry["status"] = "ended"
+            _advance_roster_revision(entry)
             roster[name] = entry
             _ = handle.seek(0)
             _ = handle.truncate()
@@ -805,6 +893,7 @@ def _mark_all_roster_ended(session_dir: str) -> None:
             entry = _as_dict(value)
             if entry:
                 entry["status"] = "ended"
+                _advance_roster_revision(entry)
                 roster[name] = entry
         _ = handle.seek(0)
         _ = handle.truncate()
@@ -877,6 +966,7 @@ def _claim_follow(
             "previous_status": previous_status,
             "role": role,
         })
+        _advance_roster_revision(claimed)
         roster[name] = claimed
         _ = handle.seek(0)
         _ = handle.truncate()
@@ -907,6 +997,7 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
         previous_status = entry.get("previous_status")
         previous_role = _roster_role(entry.get("previous_role"))
         restored = dict(entry)
+        _advance_roster_revision(restored)
         if isinstance(previous_role, AssignedDelegateRole):
             restored["role"] = previous_role.role
         else:
@@ -1077,6 +1168,7 @@ def _note_seat_port(session_dir: str, name: str, launcher_pid: int, port: int) -
         if entry.get("launcher_pid") != launcher_pid:
             return
         entry["port"] = port
+        _advance_roster_revision(entry)
         roster[name] = entry
         _ = handle.seek(0)
         _ = handle.truncate()
@@ -1877,9 +1969,10 @@ def command_follow(args: argparse.Namespace) -> int:
         resumed = _resume_seat_thread(args, session_dir, name, thread_id, client, home)
         if resumed.thread_replaced:
             thread_id = resumed.thread_id
-            _update_roster(session_dir, name, {
+            if not _update_roster_if_expected(session_dir, name, {
                 "thread_id": thread_id, "status": "starting", "launcher_pid": owner_pid, "port": port,
-            })
+            }, RosterOnThread(thread_id)):
+                _refuse_taken_follow_up(client, thread_id, session_dir)
             _record_assignment(thread_id, role, _dispatch_lens(args))
         live = _read_live_turn(client, thread_id)
         if not isinstance(live, ThreadIdle):
@@ -2031,7 +2124,14 @@ def command_compact(args: argparse.Namespace) -> int:
         )
         return 2
     before = _context_size_from_record(record)
-    if isinstance(before, ContextSizeUnavailable):
+    revision = _roster_revision(record)
+    if isinstance(before, NotMeasuredSinceCompaction):
+        print(
+            f"codex_mesh: {name}: size not measured since its last compaction; compact refused",
+            file=sys.stderr,
+        )
+        return 2
+    if not isinstance(before, KnownContextSize):
         print(
             f"codex_mesh: {name}: no recorded context size; compact refused",
             file=sys.stderr,
@@ -2064,16 +2164,22 @@ def command_compact(args: argparse.Namespace) -> int:
             after = _compact_thread(client, state.thread_id)
         except CompactionTimedOut as timeout:
             return _abandon_compaction(client, name, state.thread_id, timeout)
-        _update_roster(
+        size: RecordedContextSize = after if after.tokens > 0 else NotMeasuredSinceCompaction()
+        compacted_record: FollowableRecord = {"thread_id": state.thread_id, "status": state.status}
+        if isinstance(size, KnownContextSize):
+            compacted_record["context_tokens"] = size.tokens
+        else:
+            compacted_record["context_tokens"] = "not_measured_since_compaction"
+        _ = _update_roster_if_expected(
             session_dir,
             name,
-            {
-                "thread_id": state.thread_id,
-                "status": state.status,
-                "context_tokens": after.tokens,
-            },
+            compacted_record,
+            RosterUnchanged(state.thread_id, revision),
         )
-        print(f"compacted {name}: {before.tokens} -> {after.tokens} tokens")
+        if isinstance(size, KnownContextSize):
+            print(f"compacted {name}: {before.tokens} -> {size.tokens} tokens")
+        else:
+            print(f"compacted {name}: {before.tokens} tokens, size not measured until its next turn")
         return 0
     except (ConnectionError, OSError, SystemExit) as exc:
         print(f"codex_mesh: {name}: {exc}", file=sys.stderr)
@@ -2278,9 +2384,17 @@ def _stream_turn(
         if not turn_id:
             raise SystemExit("codex_mesh: turn/start returned no turn id")
         followed_turn = turn_id if follow else ""
-        _update_roster(session_dir, name, {
-            "thread_id": thread_id, "turn_id": turn_id, "status": "running", "port": port
-        })
+        _ = _update_roster_if_expected(
+            session_dir,
+            name,
+            {
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "status": "running",
+                "port": port,
+            },
+            RosterOnThread(thread_id),
+        )
         with log_path.open("a", encoding="utf-8") as log:
             _ = log.write(f"[{_now_stamp()}] mesh: {name} thread {thread_id}\n")
             log.flush()
@@ -2346,11 +2460,16 @@ def _stream_turn(
                         turn_id = live
                         if follow:
                             followed_turn = live
-                        _update_roster(session_dir, name, {"thread_id": thread_id, "turn_id": live, "status": "running"})
+                        _ = _update_roster_if_expected(
+                            session_dir,
+                            name,
+                            {"thread_id": thread_id, "turn_id": live, "status": "running"},
+                            RosterOnThread(thread_id),
+                        )
                 elif method == "thread/tokenUsage/updated":
                     context_size = _context_size_from_usage(params)
                     if isinstance(context_size, KnownContextSize):
-                        _update_roster(
+                        _ = _update_roster_if_expected(
                             session_dir,
                             name,
                             {
@@ -2359,6 +2478,7 @@ def _stream_turn(
                                 "status": "running",
                                 "context_tokens": context_size.tokens,
                             },
+                            RosterOnThread(thread_id),
                         )
                 elif method == "item/completed":
                     item = _as_dict(params.get("item"))
@@ -2414,10 +2534,11 @@ def _stream_turn(
                         client, port, thread_id, turn_id = started.client, started.port, started.thread_id, started.turn_id
                         if follow:
                             followed_turn = turn_id
-                        _update_roster(
+                        _ = _update_roster_if_expected(
                             session_dir,
                             name,
                             {"thread_id": thread_id, "turn_id": turn_id, "status": "running"},
+                            RosterOnThread(thread_id),
                         )
                         waiting_for_progress_after_overflow = True
                         continue
@@ -2432,9 +2553,15 @@ def _stream_turn(
                                 thread_id, capacity_retries, int(CAPACITY_BUDGET_SECS / 60)
                             )
                             failure = run_outcome.message(name)
-                            _update_roster(session_dir, name, {
-                                "thread_id": thread_id, "status": CAPACITY_EXHAUSTED
-                            })
+                            _ = _update_roster_if_expected(
+                                session_dir,
+                                name,
+                                {
+                                    "thread_id": thread_id,
+                                    "status": CAPACITY_EXHAUSTED,
+                                },
+                                RosterOnThread(thread_id),
+                            )
                             break
                         # A queued peer message may already have opened a turn.
                         # Stream it, then return here with the task still owed.
@@ -2460,10 +2587,16 @@ def _stream_turn(
                                        CAPACITY_MAX_WAIT_SECS, remaining)
                             capacity_retries += 1
                             with _pending_file(session_dir, name):
-                                _update_roster(session_dir, name, {
-                                    "thread_id": thread_id,
-                                    "status": WAITING_CAPACITY, "launcher_pid": os.getpid(),
-                                })
+                                _ = _update_roster_if_expected(
+                                    session_dir,
+                                    name,
+                                    {
+                                        "thread_id": thread_id,
+                                        "status": WAITING_CAPACITY,
+                                        "launcher_pid": os.getpid(),
+                                    },
+                                    RosterOnThread(thread_id),
+                                )
                             live = _read_live_turn(client, thread_id)
                             if isinstance(live, ThreadStateUnknown):
                                 raise SystemExit(f"thread {thread_id}: thread/read failed: {live.reason}")
@@ -2492,14 +2625,27 @@ def _stream_turn(
                                     log.flush()
                                     return FailedWithThread(thread_id, f"capacity launcher {reason}", time.time() - opened)
                                 if turn_id:
-                                    _update_roster(session_dir, name, {
-                                        "thread_id": thread_id, "turn_id": turn_id, "status": "running"
-                                    })
+                                    _ = _update_roster_if_expected(
+                                        session_dir,
+                                        name,
+                                        {
+                                            "thread_id": thread_id,
+                                            "turn_id": turn_id,
+                                            "status": "running",
+                                        },
+                                        RosterOnThread(thread_id),
+                                    )
                                 else:
-                                    _update_roster(session_dir, name, {
-                                        "thread_id": thread_id, "status": "starting",
-                                        "launcher_pid": os.getpid(),
-                                    })
+                                    _ = _update_roster_if_expected(
+                                        session_dir,
+                                        name,
+                                        {
+                                            "thread_id": thread_id,
+                                            "status": "starting",
+                                            "launcher_pid": os.getpid(),
+                                        },
+                                        RosterOnThread(thread_id),
+                                    )
                             continue
                         with _pending_file(session_dir, name):
                             if end_marker.exists() or not _roster_still_on_thread(session_dir, name, thread_id):
@@ -2556,7 +2702,12 @@ def _stream_turn(
                                 if follow:
                                     followed_turn = turn_id
                         continue
-                    _update_roster(session_dir, name, {"thread_id": thread_id, "turn_id": turn_id, "status": "running"})
+                    _ = _update_roster_if_expected(
+                        session_dir,
+                        name,
+                        {"thread_id": thread_id, "turn_id": turn_id, "status": "running"},
+                        RosterOnThread(thread_id),
+                    )
                     if end_marker.exists():
                         break
             else:
@@ -2568,7 +2719,12 @@ def _stream_turn(
         if not resident or replies == 0:
             _finish_summary(summary_path, reply_path, name, replies + 1, final_answer or failure or f"The delegate {name} produced no summary.")
         if not isinstance(run_outcome, CapacityRetriesExhausted):
-            _update_roster(session_dir, name, {"thread_id": thread_id, "status": "failed" if failure else "done"})
+            _ = _update_roster_if_expected(
+                session_dir,
+                name,
+                {"thread_id": thread_id, "status": "failed" if failure else "done"},
+                RosterOnThread(thread_id),
+            )
         if isinstance(run_outcome, CapacityRetriesExhausted):
             return run_outcome
         return FailedWithThread(thread_id, failure, time.time() - opened, failure_serving,
@@ -2581,8 +2737,12 @@ def _stream_turn(
             thread_id = exc.cleanup.thread_id
         _ = _end_unwatched_turn(port, thread_id, log_path)
         failure = str(exc) or exc.__class__.__name__
-        if _roster_still_on_thread(session_dir, name, thread_id):
-            _update_roster(session_dir, name, {"thread_id": thread_id, "status": "failed"})
+        _ = _update_roster_if_expected(
+            session_dir,
+            name,
+            {"thread_id": thread_id, "status": "failed"},
+            RosterOnThread(thread_id),
+        )
         serving = exc.serving if isinstance(exc, (ServingRequestFailure, SeatMoveUncertain)) else client.serving
         reported = exc.reported if isinstance(exc, (ServingRequestFailure, SeatMoveUncertain)) else False
         return FailedWithThread(thread_id, failure, time.time() - opened, serving,
@@ -2701,6 +2861,14 @@ class _SeatThreadForHome:
     thread_replaced: bool
 
 
+def _refuse_taken_follow_up(client: Client, replacement: str, session_dir: str) -> NoReturn:
+    released = _release_seat_thread(client, replacement, session_dir)
+    if isinstance(released, SeatThreadStateUnknown):
+        raise SystemExit("name was taken while the follow-up ran; "
+                         + f"replacement thread {replacement} not released: {released.reason}")
+    raise SystemExit("name was taken while the follow-up ran; follow-up did not start")
+
+
 def _resume_seat_thread(
     args: argparse.Namespace, session_dir: str, name: str, thread_id: str, client: Client,
     seats_home: Path,
@@ -2724,7 +2892,8 @@ def _resume_seat_thread(
     record: StartingRecord = {"thread_id": replacement, "status": "starting", "port": client.port}
     if instructions_file:
         record["instructions_file"] = instructions_file
-    _update_roster(session_dir, name, record)
+    if not _update_roster_if_expected(session_dir, name, record, RosterOnThread(thread_id)):
+        _refuse_taken_follow_up(client, replacement, session_dir)
     _ = client.call("thread/name/set", {"threadId": replacement, "name": name})
     _post_board_status(
         session_dir, name,
@@ -3041,10 +3210,11 @@ def command_steer(args: argparse.Namespace) -> int:
             },
         )
         if not reply.get("error"):
-            _update_roster(
+            _ = _update_roster_if_expected(
                 session_dir,
                 target,
                 {"thread_id": record["thread_id"], "turn_id": live, "status": "running"},
+                RosterOnThread(record["thread_id"]),
             )
     _ = _require(reply, "turn/steer")
     client.close()
@@ -3900,6 +4070,8 @@ def command_fork(args: argparse.Namespace) -> int:
         if _as_str(existing.get("thread_id")) and existing.get("status") != "ended":
             print(f"codex_mesh: {name}: name already belongs to a thread; fork refused", file=sys.stderr)
             return 2
+        expected: ExpectedRoster = (RosterEndedOnThread(_as_str(existing.get("thread_id")))
+                                    if _as_str(existing.get("thread_id")) else RosterAbsent())
         source_name = _as_str(_attr(args, "from_name"))
         source_record = _lookup(session_dir, source_name)
         source = _roster_thread(source_record)
@@ -3927,7 +4099,14 @@ def command_fork(args: argparse.Namespace) -> int:
         instructions_file = _as_str(source_record.get("instructions_file"))
         if instructions_file:
             record["instructions_file"] = instructions_file
-        _update_roster(session_dir, name, record)
+        if not _update_roster_if_expected(session_dir, name, record, expected):
+            released = _release_seat_thread(client, thread_id, session_dir)
+            if isinstance(released, SeatThreadStateUnknown):
+                print(f"codex_mesh: {name}: name was taken while the fork ran; "
+                      + f"fork thread {thread_id} not released: {released.reason}", file=sys.stderr)
+                return 1
+            print(f"codex_mesh: {name}: name was taken while the fork ran; fork refused", file=sys.stderr)
+            return 2
         print(thread_id)
         return 0
     except (ConnectionError, OSError, SystemExit) as exc:
@@ -3954,6 +4133,7 @@ def _clear_reset_context(session_dir: str, name: str, thread_id: str, launcher_p
                 or entry.get("launcher_pid") != launcher_pid):
             return False
         entry["context_tokens"] = 0
+        _advance_roster_revision(entry)
         roster[name] = entry
         _ = handle.seek(0)
         _ = handle.truncate()

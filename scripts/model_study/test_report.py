@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import copy
 import io
 import json
@@ -177,6 +178,11 @@ def extract_fixture() -> ExtractReport:
     ]
     cast(dict[str, object], cast(object, sessions[0]))["prompt_text"] = SECRET
     return {"sessions": sessions}
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class ReportTests(unittest.TestCase):

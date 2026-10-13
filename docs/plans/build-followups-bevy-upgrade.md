@@ -18,23 +18,24 @@ okay - we should have some kind of note for tracking the upgrade so your report 
 - **Project started:** 2026-10-12T19:08:41.107+00:00
 - **Worktree:** `/home/natepiano/worktrees/claude-build-followups-bevy-upgrade`, branch `build-followups-bevy-upgrade`. Every edit and every command of every phase runs there (the user, 2026-10-12).
 - **Stack:** Python 3.11+ standard library only (`tomllib`, `json`, `urllib.request`, `fcntl`, `argparse`, `zoneinfo`, `shlex`, `subprocess`); the zsh notifier.
-- **Layout:** `scripts/bevy_upgrade/` (new) holds every module and its tests; `commands/showrunner/bevy_upgrade.md` (new) is the skill; `pyrightconfig.json` gains one entry. The dailies phase alone edits `scripts/production/dailies_input.py`, its test and `commands/showrunner/dailies.md`.
+- **Layout:** `scripts/bevy_upgrade/` (new) holds every module and its tests; `commands/showrunner/bevy_upgrade.md` (new) is the skill; `pyrightconfig.json` gains one entry. The dailies phase alone edits `scripts/production/dailies_input.py`, its test and `commands/showrunner/dailies.md`. The migration-check phase alone edits `scripts/bevy_migration_plan/bevy_migration_dependency_check.py` and adds its test.
 - **Key files:**
   - `scripts/production/showrunners.py` — `production_of(session_id) -> Path | None` (line 217), `current_address(slug) -> str` (line 243; empty while the showrunner is not running).
   - `scripts/production/add_unit.py` — `read_production(path) -> Production` (line 196) with fields `doc`, `slug`, `merge_branch`, `checkout`, `log`, `zone`; raises `Refusal`.
   - `scripts/message/notifier.sh` — `new <instance> --every <min> --run <cmd> [--timeout <s>]` (a `--run` job takes no `--to`, `--from`, `--check`, `--hold` or `--aligned`), `remove <instance>`, `status <instance>` (its second line is `next_due=<epoch> (<local time>)`; exit 1 for no such instance). State root: `NOTIFIER_STATE_DIR`, else `~/.local/state/notifier`.
   - `scripts/message/send.py` — `--to <address> --from <sender> --key <key> --summary <text> --text <text>`.
   - `scripts/production/proposals_table.py` and `commands/showrunner/proposals.md` — the pattern for a showrunner table script and its command file.
-  - `scripts/production/dailies_input.py` lines 852–861 — how the review watch becomes a dailies topic.
+  - `scripts/production/dailies_input.py` lines 900–910 — how the review watch becomes a dailies topic.
   - `scripts/bevy_migration_plan/bevy_migration_dependency_check.py` — the repo's reference for typed crates.io access without `Any`.
 - **Test lanes:** `scripts/bevy_upgrade/test_*.py`, beside the modules; `scripts/production/test_dailies_input.py` in the dailies phase.
 - **Build:** none.
 - **Test:** `python3 -m unittest discover -s scripts/bevy_upgrade -p 'test_*.py'`
 - **Lint:** `basedpyright scripts/bevy_upgrade` prints `0 errors, 0 warnings, 0 notes` (it exits 3 because `pyrightconfig.json` names a `.venv` no checkout has; read the counts).
 - **Invariants:**
-  - Tests never reach the network, the real state or a real session. All HTTP goes through one injected `Fetch`; every path comes from `BEVY_UPGRADE_STATE_DIR` when set; the notifier and `send.py` are replaced through `BEVY_UPGRADE_NOTIFIER` and `BEVY_UPGRADE_SEND`.
-  - A failed lookup never replaces a stored fact. It sets that dependency's `error` and leaves its `checked` time alone, so old data is never shown as current.
-  - The record stores what a script cannot look up again for free (user rule 2026-10-08): upstream facts with the time they were read, and the user's answers and notes. State words are derived when printed and never stored.
+  - Tests never reach the network, the real state or a real session. All HTTP goes through one injected `Fetch`, which the CLI takes from the file `BEVY_UPGRADE_FIXTURES` names when it is set; every path comes from `BEVY_UPGRADE_STATE_DIR` when set; the notifier and `send.py` are replaced through `BEVY_UPGRADE_NOTIFIER` and `BEVY_UPGRADE_SEND`.
+  - A failed lookup never replaces a stored fact. It sets that dependency's `error`, or the record's `target_error` for the target's own release, and leaves the `checked` time alone, so old data is never shown as current.
+  - The record stores what a script cannot look up again for free (user rule 2026-10-08): upstream facts with the time they were read, and the user's answers and notes. State words are derived when printed and never stored, with one exception: `announced` holds the state word the showrunner was last told for each crate. It records what was said, never what is true now.
+  - The CLI saves the record once per run, at the end of its locked block, after every change and check of that run. A refused verb saves nothing.
   - Only `approve`, `decline` and `forget` change a recorded answer. No default approves, and an answer covers one crate in one upgrade.
   - No project data in the code: no crate names, repositories or issue numbers. Everything comes from the checkout's `Cargo.lock`, crates.io and GitHub.
   - No Pushover and no `send.py --to user`.
@@ -45,410 +46,323 @@ okay - we should have some kind of note for tracking the upgrade so your report 
 
 ### Phase 1 — A showrunner starts a watch and reads pins and the user's answers from the record  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/showrunner:bevy_upgrade start 0.20` writes a record of every crate in the production's lockfile that depends on Bevy, and `approve`, `decline`, `forget` and `note` keep the user's answers in it, all printed as one table.
+`/showrunner:bevy_upgrade` keeps one record per production: every crate in the production checkout's lockfile that depends on Bevy, its pin, and the user's answer and note for it. Every verb ends by printing one table. The four modules use flat imports (`import pins`).
 
-**Spec:**
-Work only in the worktree and branch the Delegation Context names. All modules use flat imports (`import pins`), as `scripts/production/` does.
-
-`scripts/bevy_upgrade/pins.py` reads `<checkout>/Cargo.lock` and `<checkout>/Cargo.toml` with `tomllib`. No cargo command runs.
-
-```python
-class RegistryPin(TypedDict):
-    source: Literal["registry"]
-    version: str
-class GitPin(TypedDict):
-    source: Literal["git"]
-    version: str
-    url: str    # without query or fragment
-    ref: str    # the lock source's query: "branch=main", "rev=abc1234", "tag=v1", or ""
-    rev: str    # the full commit after "#"
-class PathPin(TypedDict):
-    source: Literal["path"]
-    version: str
-    path: str   # as the [patch] table writes it
-Pin = RegistryPin | GitPin | PathPin
-
-class Dependent(NamedTuple):
-    name: str
-    pin: Pin
-    bevy: str               # the Bevy version this crate resolves against in the lockfile
-    via: tuple[str, ...]    # empty when one of the project's own packages names it
-    patched_bevy: bool      # a Bevy crate replaced through [patch]
-
-class Pins(NamedTuple):
-    bevy: tuple[str, ...]              # every Bevy version in the lockfile, oldest first
-    bevy_names: frozenset[str]         # the names of the Bevy crates
-    dependents: tuple[Dependent, ...]  # sorted by name
-
-class PinsFailure(Exception): ...
-def read_pins(checkout: Path) -> Pins: ...
-```
-
-- The Bevy versions are the versions of the package `bevy_ecs`. With none, raise `PinsFailure("<lock path>: no bevy_ecs package, so this is not a Bevy project")`. A missing or unparseable file raises `PinsFailure("<path>: <reason>")`.
-- A **Bevy crate** is a package named `bevy` or `bevy_*` whose version is one of those versions, and that either comes from the crates.io registry (`source` starts with `registry+`) or is named by a `[patch.*]` table of the root manifest.
-- A **dependent** is any other package with a `source` (registry or git) whose `dependencies` list names a Bevy crate. A lock dependency string is `name`, `name version` or `name version (source)`; a bare name resolves to that name's only version. The dependent's `bevy` is the oldest Bevy version among the Bevy crates it lists. With two lock versions of one dependent, keep the one on the oldest Bevy.
-- A package with no `source` is the project's own (a workspace member or a path crate) and is never a row, unless a `[patch.*]` table names it.
-- A `[patch.*]` entry whose key is a Bevy crate is a row with `patched_bevy=True`, `bevy` equal to its own lock version, and a `PathPin` (or a `GitPin` when the patch is `git`). A `[patch.*]` entry whose key is a dependent gives that dependent its `PathPin` or `GitPin`.
-- `via` is empty when a package with no `source` lists the dependent. Otherwise it is the sorted names of the packages that list it.
-
-`scripts/bevy_upgrade/upgrade_record.py` owns the record file, `<state dir>/<slug>.json`, where the state dir is `BEVY_UPGRADE_STATE_DIR` when set, else `~/.local/state/bevy-upgrade`.
-
-```python
-class Answer(TypedDict):
-    answer: Literal["approved", "declined"]
-    at: str      # YYYY-MM-DD in the production's zone
-    words: str   # the user's words, verbatim
-class Entry(TypedDict):
-    pin: Pin
-    bevy: str
-    via: list[str]
-    patched_bevy: bool
-    answer: Answer | None
-    note: str
-class Record(TypedDict):
-    slug: str
-    production: str      # the production doc's path
-    checkout: str
-    target: str          # major.minor, e.g. "0.20"
-    started: str         # ISO-8601 UTC
-    closed: str | None
-    bevy: list[str]
-    pins_read: str       # ISO-8601 UTC
-    dependencies: dict[str, Entry]
-
-class RecordFailure(Exception): ...
-def state_dir() -> Path: ...
-def record_path(slug: str) -> Path: ...
-def locked(slug: str) -> ContextManager[None]: ...   # exclusive flock on <state dir>/<slug>.lock
-def load(slug: str) -> Record | None: ...            # None when no file; RecordFailure when unreadable
-def save(record: Record) -> None: ...                # temp file beside it, then replace
-def start(production: Production, target: str, pins: Pins, now: datetime) -> Record: ...
-def apply_pins(record: Record, pins: Pins, now: datetime) -> Record: ...
-def set_answer(record: Record, crate: str, answer: Literal["approved", "declined"], words: str, today: str) -> Record: ...
-def forget_answer(record: Record, crate: str) -> Record: ...
-def set_note(record: Record, crate: str, text: str) -> Record: ...
-def on_target(version: str, target: str) -> bool: ...   # same major.minor
-```
-
-- `start` refuses a target that does not match `^\d+\.\d+$` with `RecordFailure("target must be major.minor, such as 0.20")`. With an open record for the same target it returns that record after `apply_pins` (idempotent). With an open record for another target it refuses: `RecordFailure("a watch for <target> is open; stop it first")`. With a closed record it moves the old file to `<slug>.<old target>.closed.json` and begins a new one; answers and notes do not carry over.
-- `apply_pins` adds new dependents with `answer=None` and `note=""`, updates `pin`, `bevy`, `via` and `patched_bevy` of known ones and keeps their other fields, and removes entries the lockfile no longer has.
-- `set_answer`, `forget_answer` and `set_note` refuse an unknown crate with `RecordFailure("<crate> is not tracked; tracked: <names, comma separated>")`. `set_answer` refuses empty `words`. A second answer replaces the first.
-- Every read-modify-write of the file runs inside `locked(slug)`.
-
-`scripts/bevy_upgrade/upgrade_report.py`:
-
-```python
-State = Literal["git ready", "release ready", "re-vendor", "port in PR", "no port yet", "not checked", "done"]
-STATE_ORDER: tuple[State, ...]   # the order above
-def state(entry: Entry, target: str) -> State: ...
-def table(record: Record, zone: ZoneInfo, now: datetime) -> str: ...
-```
-
-- This phase derives three states: `done` when `on_target(entry["bevy"], target)`; else `re-vendor` when `patched_bevy`; else `not checked`.
-- `table` prints, in this order: the line `Bevy <target> upgrade for <slug>: <checkout>, on Bevy <versions joined by " and ">.`; the line `Upstream: not checked yet.`; a blank line; a Markdown table with the header `| Dependency | Our pin | crates.io | Git | State | Next |`; then, when any exist, `Answers on git pins:` with one `- <crate>: <answer> <at>: "<words>"` line each, and `Notes:` with one `- <crate>: <note>` line each.
-- Rows sort by `STATE_ORDER`, then name.
-- Cells. Dependency: `<name>`, `<name> (via <a>, <b>)`, or `<name> (patched Bevy crate)`. Our pin: `<version>` for a registry pin, `git <ref or first 7 of rev> @ <first 7 of rev>` for a git pin, `path <path>, <version>` for a path pin, each followed by ` on Bevy <bevy>` unless `patched_bevy`. crates.io and Git: `—` in this phase. Next: `—` for `done`, `re-vendor from Bevy <target>` for `re-vendor`, `run check` for `not checked`.
-
-`scripts/bevy_upgrade/bevy_upgrade.py` is the CLI:
-
-```
-bevy_upgrade.py [--production <doc>] [status]
-bevy_upgrade.py [--production <doc>] start <target>
-bevy_upgrade.py [--production <doc>] approve <crate> <words>
-bevy_upgrade.py [--production <doc>] decline <crate> <words>
-bevy_upgrade.py [--production <doc>] forget <crate>
-bevy_upgrade.py [--production <doc>] note <crate> [<text>]
-```
-
-- Without `--production` the doc is `showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))`. With none: exit 2 and `bevy_upgrade: this session runs no production; pass --production <doc>` on stderr. The doc is read with `add_unit.read_production`; its `checkout` is the tree whose lockfile is read and its `zone` is the zone of every printed time.
-- Every verb but `start` on a production with no record prints `no Bevy upgrade is tracked for <slug>; start one with /showrunner:bevy_upgrade start <version>` and exits 0.
-- Every verb re-reads the pins from the checkout and saves them before it prints, so `Our pin` is never older than the lockfile. When the read fails on a verb other than `start`, the table prints from the stored pins under the first line `pins could not be re-read: <reason>; showing pins read <HH:MM zone>`.
-- Every verb ends by printing `table`. `note` with no text clears the note. The `at` of an answer is today's date in the production's zone.
-- A refusal (`RecordFailure`, `PinsFailure` on `start`, `Refusal`) prints one `bevy_upgrade: <reason>` line on stderr and exits 2.
-
-`commands/showrunner/bevy_upgrade.md` follows `commands/showrunner/proposals.md`: frontmatter `description` and `argument-hint`, run in the showrunner session, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/bevy_upgrade/bevy_upgrade.py" <arguments>` and print its output exactly as it comes. It also states three rules. Any statement about the upgrade in a report or reply comes from this command's output in the same turn, never from the log or memory. `approve` and `decline` are run only on the user's own words about that crate, passed verbatim; an answer for one crate is never extended to another. `note` holds what a script cannot look up, such as why a pull request's CI fails.
-
-`pyrightconfig.json` gains one `executionEnvironments` entry: root `scripts/bevy_upgrade`, extraPaths `scripts/bevy_upgrade` and `scripts/production`.
+- **`pins.py`**: `read_pins(checkout: Path) -> Pins` reads `<checkout>/Cargo.lock` and `<checkout>/Cargo.toml` with `tomllib`; no cargo command runs. It raises `PinsFailure(Exception)` with `<path>: <reason>` for a missing or unparseable file, a dependency string that does not resolve to one package, or a lockfile with no `bevy_ecs` package.
+  - `Pin = RegistryPin | GitPin | PathPin`: `TypedDict`s tagged `source: Literal["registry"]`, `Literal["git"]` and `Literal["path"]`, each with `version: str`. `GitPin` adds `url: str` (no query or fragment), `ref: str` (the lock source's query, `branch=…`, `rev=…` or `tag=…`, or `""`) and `rev: str` (the full commit after `#`). `PathPin` adds `path: str`, as the `[patch]` table writes it.
+  - `Dependent(NamedTuple)`: `name: str`, `pin: Pin`, `bevy: str`, `via: tuple[str, ...]`, `patched_bevy: bool`. `Pins(NamedTuple)`: `bevy: tuple[str, ...]` (oldest first), `bevy_names: frozenset[str]`, `dependents: tuple[Dependent, ...]` (sorted by name).
+  - The Bevy versions are the versions of the package `bevy_ecs`. A Bevy crate is a package named `bevy` or `bevy_*` at one of those versions that has a `registry+` source or is replaced by a `[patch.*]` entry of the root manifest.
+  - A dependent is any other package with a `source` whose `dependencies` name a Bevy crate. Its `bevy` is the oldest Bevy version among the Bevy crates it lists; of two lock versions of one dependent, the one on the oldest Bevy is kept, chosen before any pin is built. Its `via` is empty when a package with no `source` lists it, otherwise the sorted names of the packages that list it.
+  - A `[patch.*]` entry belongs only to the lock package it replaced (`_is_patched`: a path patch and no `source`, or a git patch and a `git+` source). A patched Bevy crate is a row with `patched_bevy=True` and `bevy` equal to its own lock version. A `registry+` package always gets a `RegistryPin`. Every other package with no `source` is the project's own and is never a row.
+- **`upgrade_record.py`** owns `<state dir>/<slug>.json`: `state_dir() -> Path` is `BEVY_UPGRADE_STATE_DIR` when set, else `~/.local/state/bevy-upgrade`, and `record_path(slug: str) -> Path` is the file. Failures raise `RecordFailure(Exception)`.
+  - `Answer(TypedDict)`: `answer: Literal["approved", "declined"]`, `at: str` (`YYYY-MM-DD` in the production's zone), `words: str` (verbatim). `Entry(TypedDict)`: `pin: Pin`, `bevy: str`, `via: list[str]`, `patched_bevy: bool`, `answer: Answer | None`, `note: str`. `Record(TypedDict)`: `slug: str`, `production: str` (the doc's path), `checkout: str`, `target: str` (major.minor), `started: str` and `pins_read: str` (ISO-8601 UTC), `closed: str | None` (`None` while the watch is open), `bevy: list[str]`, `dependencies: dict[str, Entry]`.
+  - `locked(slug: str) -> Generator[None, None, None]`, a `@contextmanager`, holds an exclusive flock on `<state dir>/<slug>.lock` around every read-modify-write. Only directory creation, open and flock errors become `RecordFailure`; an error from the caller's body propagates unchanged.
+  - `load(slug: str) -> Record | None` returns `None` when no file exists and raises `RecordFailure` when the file is unreadable or `_validate` rejects any field. `save(record: Record) -> None` writes a temp file beside the record, then replaces it.
+  - `start(production: Production, target: str, pins: Pins, now: datetime) -> Record` refuses a target that is not `\d+\.\d+`. An open record for the same target comes back after `apply_pins`; one for another target refuses with `a watch for <target> is open; stop it first`; a closed record moves to `<slug>.<old target>.closed.json` and a new one begins without its answers and notes.
+  - `apply_pins(record: Record, pins: Pins, now: datetime) -> Record` adds new dependents with `answer=None` and `note=""`, updates `pin`, `bevy`, `via` and `patched_bevy` of known ones, keeps their other fields, and removes entries the lockfile no longer has.
+  - `set_answer(record: Record, crate: str, answer: Literal["approved", "declined"], words: str, today: str) -> Record`, `forget_answer(record: Record, crate: str) -> Record` and `set_note(record: Record, crate: str, text: str) -> Record` refuse an unknown crate and name the tracked ones. `set_answer` refuses empty or whitespace-only `words`; a second answer replaces the first.
+  - `on_target(version: str, target: str) -> bool` is true for the same major.minor.
+- **`upgrade_report.py`**: `State = Literal["git ready", "release ready", "re-vendor", "port in PR", "no port yet", "not checked", "done"]`, and `STATE_ORDER: tuple[State, ...]` is that order.
+  - `state(entry: Entry, target: str) -> State` is `done` when `on_target(entry["bevy"], target)`; else `re-vendor` when `patched_bevy`; else `not checked`.
+  - `table(record: Record, zone: ZoneInfo, now: datetime) -> str` prints, in order: `Bevy <target> upgrade for <slug>: <checkout>, on Bevy <versions joined by " and ">.`; `Upstream: not checked yet.`; a blank line; a Markdown table headed `| Dependency | Our pin | crates.io | Git | State | Next |`, rows sorted by `STATE_ORDER`, then name; then, when any exist, `Answers on git pins:` with one `- <crate>: <answer> <at>: "<words>"` line per recorded answer, whatever the pin source, and `Notes:` with one `- <crate>: <note>` line each.
+  - Cells. Dependency: `<name>`, `<name> (via <a>, <b>)` or `<name> (patched Bevy crate)`. Our pin: `<version>`, `git <ref or first 7 of rev> @ <first 7 of rev>` or `path <path>, <version>`, each followed by ` on Bevy <bevy>` unless `patched_bevy`. crates.io and Git: `—`. Next: `—` for `done`, `re-vendor from Bevy <target>` for `re-vendor`, `run check` for `not checked`.
+- **`bevy_upgrade.py`**: `bevy_upgrade.py [--production <doc>] <verb>`, with the verbs `status` (also the default), `start <target>`, `approve <crate> <words>`, `decline <crate> <words>`, `forget <crate>` and `note <crate> [<text>]`; `note` with no text clears the note.
+  - Without `--production` the doc is `showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))`; with none, it refuses with `this session runs no production; pass --production <doc>`. `add_unit.read_production` reads the doc: its `checkout` is the tree whose lockfile is read, and its `zone` is the zone of every printed time and of an answer's `at`.
+  - Every verb but `start` on a production with no record prints `no Bevy upgrade is tracked for <slug>; start one with /showrunner:bevy_upgrade start <version>` and exits 0.
+  - Every verb re-reads the pins from the checkout and applies them before it prints. When that read fails on a verb other than `start`, the table prints from the stored pins under the first line `pins could not be re-read: <reason>; showing pins read <HH:MM zone>`.
+  - A refusal (`RecordFailure`, `PinsFailure` on `start`, `add_unit.Refusal`) prints one `bevy_upgrade: <reason>` line on stderr and exits 2.
+- **`commands/showrunner/bevy_upgrade.md`** runs `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/bevy_upgrade/bevy_upgrade.py" $ARGUMENTS` in the showrunner session and prints the output exactly as it comes. It gives three rules: a statement about the upgrade comes from this command's output in the same turn, never from the log or memory; `approve` and `decline` run only on the user's own words about that crate, verbatim, and never extend to another crate; `note` holds what a script cannot look up.
 
 **Files:**
-- `scripts/bevy_upgrade/pins.py` — new: the lockfile and manifest reader.
-- `scripts/bevy_upgrade/upgrade_record.py` — new: the record's types, store, pins merge, answers and notes.
-- `scripts/bevy_upgrade/upgrade_report.py` — new: the derived state and the table.
-- `scripts/bevy_upgrade/bevy_upgrade.py` — new: the CLI.
-- `scripts/bevy_upgrade/test_pins.py` — new: tests of `read_pins`.
-- `scripts/bevy_upgrade/test_upgrade_record.py` — new: tests of the store, `start`, `apply_pins`, answers and notes.
-- `scripts/bevy_upgrade/test_upgrade_report.py` — new: tests of `state` and `table`.
-- `scripts/bevy_upgrade/test_cli.py` — new: the CLI run as a subprocess.
-- `commands/showrunner/bevy_upgrade.md` — new: the skill.
-- `pyrightconfig.json` — one execution environment for `scripts/bevy_upgrade`.
+- `scripts/bevy_upgrade/pins.py` — the lockfile and manifest reader.
+- `scripts/bevy_upgrade/upgrade_record.py` — the record's types, lock, validation, store, pins merge, answers and notes.
+- `scripts/bevy_upgrade/upgrade_report.py` — the derived state and the table.
+- `scripts/bevy_upgrade/bevy_upgrade.py` — the CLI.
+- `scripts/bevy_upgrade/test_pins.py`, `test_upgrade_record.py`, `test_upgrade_report.py`, `test_cli.py` — the tests; `test_cli.py` runs the CLI as a subprocess with `--production` and `BEVY_UPGRADE_STATE_DIR`.
+- `commands/showrunner/bevy_upgrade.md` — the skill.
+- `pyrightconfig.json` — one `executionEnvironments` entry: root `scripts/bevy_upgrade`, extraPaths `scripts/bevy_upgrade` and `scripts/production`.
 
-**Seats:** 1 writer + 1 tester — the four modules import each other, so one writer holds them; the tests are written from the Spec.
-- `impl` — `pins.py`, `upgrade_record.py`, `upgrade_report.py`, `bevy_upgrade.py`, `commands/showrunner/bevy_upgrade.md`; hub: `pyrightconfig.json` (owner followups-unit, run done; one entry).
-- `test` — `test_pins.py`, `test_upgrade_record.py`, `test_upgrade_report.py`, `test_cli.py`, from the Spec's signatures and rules. Lockfiles and manifests are written into temporary directories by the tests. The CLI tests pass `--production` with a production doc written to a temporary directory and set `BEVY_UPGRADE_STATE_DIR`.
+**Binds later work:**
+- One save point: the CLI saves once, at the end of its single `locked` block. `start` and every mutating verb save; `status` saves only when the pins re-read succeeded; a refused verb saves nothing. A new verb changes the record inside that block and adds no save of its own. `test_cli.py` counts saves by running the CLI in a subprocess with the real `save` wrapped.
+- `load` validates every field, so a field added to `Record`, `Entry` or a pin needs a starting value and a check in `_validate`.
+- No verb closes a watch: `closed` is never set, the archive branch of `start` runs only in tests, and the refusal text `stop it first` refers to a verb that does not exist.
+- `state` yields only `done`, `re-vendor` and `not checked`; the other four words of `State` are declared and never produced. A path-pinned dependent reads `not checked` with Next `run check`. The table's second line is the fixed `Upstream: not checked yet.`, and `table` does not read `zone` or `now`.
 
-**Constraints from prior phases:** none.
+**Gotchas:**
+- A module here needs a name no other directory under `scripts/` uses: `record.py` and `report.py` exist in `scripts/shutdown` and `scripts/buildlog`, and `add_unit.py` puts `scripts/shutdown` first on `sys.path`. `bevy_upgrade.py` imports the production helpers first, then `pins`, `upgrade_record` and `upgrade_report`; nothing else on that import path is named `pins`.
+- basedpyright exits 3 for the missing `.venv`; its counts line is the result.
 
-**Acceptance gate:** the Delegation Context **Test** and **Lint** commands pass. The tests cover: a registry, a git and a `[patch]` path pin; a patched Bevy crate; a dependent reached only through another (`via`); a lockfile with two Bevy versions; `start` idempotent, refused for a second target, and archiving a closed record; an answer replaced, forgotten, and refused for an unknown crate; the table's header, row order and the `Answers on git pins:` and `Notes:` lists. Run once by hand and paste the output in the handoff: `BEVY_UPGRADE_STATE_DIR=<scratch> python3 scripts/bevy_upgrade/bevy_upgrade.py --production /home/natepiano/rust/hana_catalyst/docs/hana/tool-based-ui-production.md start 0.20` lists ten rows, among them `bevy_render (patched Bevy crate)` and `bevy_egui (via bevy-inspector-egui)`.
+**Ruled out:** an opaque per-crate digest for change detection — the change lines need the previous state word.
 
-### Phase 2 — `check` records each dependency's crates.io releases and which one is on the target  · status: todo
+### Phase 2 — `check` records each dependency's crates.io releases and which one is on the target  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/showrunner:bevy_upgrade check` reads crates.io once per dependency that still needs it and records the newest release, the release built on the target, and whether the target Bevy is itself released.
-
-**Spec:**
-Work only in the worktree and branch the Delegation Context names.
-
-`scripts/bevy_upgrade/upstream.py` holds every lookup. Each takes the fetcher as its first argument.
-
-```python
-Fetch = Callable[[str], bytes]            # GET one URL; raises FetchFailure on any failure
-class FetchFailure(Exception): ...        # str() is "<host>: <reason>", e.g. "crates.io: HTTP 503"
-def http_fetch(url: str) -> bytes: ...    # urllib, User-Agent "bevy-upgrade (natepiano)", timeout 30 s
-
-class CrateInfo(NamedTuple):
-    versions: tuple[str, ...]    # not yanked, in the API's order (newest first)
-    repository: str | None       # "owner/name" when the crate's repository is on github.com
-def crate_info(fetch: Fetch, crate: str) -> CrateInfo: ...
-def release_requirement(fetch: Fetch, crate: str, version: str, bevy_names: frozenset[str]) -> str: ...
-
-class TargetRelease(NamedTuple):
-    version: str | None    # the newest release on the target that is not a pre-release
-    date: str | None       # its YYYY-MM-DD
-    since: str | None      # YYYY-MM-DD of the first version on the target, pre-releases included
-def target_release(fetch: Fetch, target: str) -> TargetRelease: ...
-```
-
-- `crate_info` reads `https://crates.io/api/v1/crates/<crate>`: `versions[].num` and `.yanked`, and `crate.repository`. A repository URL on github.com gives `owner/name` with any `.git` suffix and trailing path removed.
-- `release_requirement` reads `https://crates.io/api/v1/crates/<crate>/<version>/dependencies` and returns the `req` of the dependency named `bevy` when one of kind other than `dev` exists, else the `req` of the first such dependency, by sorted name, whose `crate_id` is in `bevy_names`, else `""`. A name outside `bevy_names` is never read as Bevy: `bevy_egui` is a third-party crate.
-- `target_release` reads `https://crates.io/api/v1/crates/bevy/versions` and looks at each `num` that starts with `<target>.`, with its `created_at`.
-
-`upgrade_record.py` grows:
-
-```python
-class Entry(TypedDict):          # added fields
-    releases: dict[str, str]     # version → its Bevy requirement; a release never changes, so each is read once
-    newest: str | None
-    ready: str | None            # the newest release whose requirement is on the target
-    repository: str | None
-    checked: str | None          # ISO-8601 UTC of the last complete read of this dependency
-    error: str                   # the last check's failure, or ""
-class Record(TypedDict):         # added fields
-    target_release: str | None
-    target_date: str | None
-    since: str | None
-    checked: str | None          # ISO-8601 UTC of the last check that finished
-def requirement_on_target(requirement: str, target: str) -> bool | None: ...
-```
-
-- `requirement_on_target` strips one leading `^`, `~` or `=`; a remainder matching `\d+\.\d+(\.\d+)?(-[\w.]+)?` is compared by major.minor. Anything else (a range, `*`, an empty string) is `None`.
-- `load` fills the added fields with their empty values when a record written by the first phase lacks them. `apply_pins` gives a new entry the empty values.
-
-`scripts/bevy_upgrade/check.py`:
-
-```python
-def run_check(record: Record, pins: Pins, fetch: Fetch, now: datetime) -> Record: ...
-```
-
-- While `record["target_release"]` is `None`, call `target_release` once per check and store `target_release`, `target_date` and `since`. Once the release is known this lookup never runs again.
-- Per entry, in name order. No request at all when the entry is `done`, is a patched Bevy crate, has a path pin, or already has `ready`. Otherwise call `crate_info`; walk its versions from the newest down to and including our pinned version (all of the newest six when the pin is not among them); call `release_requirement` only for versions missing from `releases`; set `newest`, `repository`, and `ready` to the newest walked version for which `requirement_on_target` is `True`.
-- A `FetchFailure` in one entry sets its `error` to the failure's text and leaves every other field of that entry as it was, `checked` included. The other entries still run. Success sets `error` to `""` and `checked` to `now`.
-- `record["checked"]` is set to `now` when the pass ends, whether or not entries failed.
-
-`upgrade_report.py`: `state` gains `release ready` (not `done`, `ready` set), ahead of `not checked`; an entry with `checked` set, no `ready` and no path pin reads `no port yet` in this phase. The crates.io cell reads `<newest> on Bevy <requirement>`, with ` → <ready> on Bevy <its requirement>` appended when `ready` differs from `newest`, `—` for a patched Bevy crate or a path pin, and `not checked` before the first read. An entry with `error` appends `; failed <HH:MM zone>: <error>` to that cell. Next: `bump to <ready>` for `release ready`, `wait` for `no port yet`. The second line of `table` becomes `Bevy <target>: released as <version> on <date>.` or `Bevy <target>: not released yet.`, followed by ` Upstream checked <HH:MM zone>.`; when `checked` is older than eight hours or any entry has `error`, that sentence reads ` Upstream last checked <YYYY-MM-DD HH:MM zone> (stale).` instead.
-
-`bevy_upgrade.py` gains `check`: re-read pins, `run_check` with `http_fetch`, save, print the table. `start` runs the same check after it writes the record. `check` exits 1 when every entry that made a request failed. The command file gains `check` and the stale rule: a report says `stale` when the table does.
+`/showrunner:bevy_upgrade check` runs one check over the record: for each dependency that still needs it, it reads crates.io for the crate's releases and each release's Bevy requirement, keeps them in the record, and marks the newest release on the target as `ready`. The same run looks up whether the target Bevy is itself released. `start` runs the same check after `upgrade_record.start` and before its one save. The table carries a second line (target release, lookup failure, time of the last upstream check), a crates.io cell per row, and the states `release ready`, `no port yet` and `not checked`. Every request goes through a `Fetch`, so a fixtures file or a test function stands in for the network.
 
 **Files:**
-- `scripts/bevy_upgrade/upstream.py` — new: the fetcher and the crates.io lookups.
-- `scripts/bevy_upgrade/check.py` — new: one check pass and its skip rules.
-- `scripts/bevy_upgrade/upgrade_record.py` — the upstream fields, their defaults and `requirement_on_target`.
-- `scripts/bevy_upgrade/upgrade_report.py` — `release ready`, the crates.io cell, the second line.
-- `scripts/bevy_upgrade/bevy_upgrade.py` — the `check` verb; `start` runs it.
-- `scripts/bevy_upgrade/test_upstream.py` — new: each lookup against canned response bodies.
-- `scripts/bevy_upgrade/test_check.py` — new: `run_check` with a fetcher that records every URL.
-- `scripts/bevy_upgrade/test_upgrade_record.py` — `requirement_on_target` and loading a first-phase record.
-- `scripts/bevy_upgrade/test_upgrade_report.py` — the new state, cells and stale line.
-- `commands/showrunner/bevy_upgrade.md` — the `check` verb and the stale rule.
+- `scripts/bevy_upgrade/upstream.py` — the two fetchers, the crates.io lookups (`crate_info`, `release_requirement`, `target_release`) and the types they return.
+- `scripts/bevy_upgrade/upgrade_check.py` — `run_check`, `CheckPass`, `Clock`, `CHECK_BUDGET`: one check, its skip rule and its time budget.
+- `scripts/bevy_upgrade/upgrade_record.py` — `CratesIoUnread | CratesIoRead`, `TargetUnread`, `TargetBevy`, the added `Entry` and `Record` fields with their starting values and validation, `target_fit`.
+- `scripts/bevy_upgrade/upgrade_report.py` — `state`, the crates.io cell (`_crates_io(entry, target)` takes the target), the Next cells, the table's second line.
+- `scripts/bevy_upgrade/bevy_upgrade.py` — the `check` verb, `start` running the same check, the fetcher choice, the one save, the exit codes.
+- `commands/showrunner/bevy_upgrade.md` — the `check` verb and the stale rule: a report says `stale` when the table does.
+- `scripts/bevy_upgrade/test_upstream.py`, `test_upgrade_check.py`, `test_upgrade_record.py`, `test_upgrade_report.py`, `test_cli.py` — the lookups against canned bodies, `run_check` with a URL-recording fetcher and a step clock, the added record fields, the table, the CLI with fixtures.
 
-**Seats:** 1 writer + 1 tester — `check.py` calls `upstream.py` and writes `upgrade_record.py` fields, so one writer holds the modules.
-- `impl` — `upstream.py`, `check.py`, `upgrade_record.py`, `upgrade_report.py`, `bevy_upgrade.py`, `commands/showrunner/bevy_upgrade.md`.
-- `test` — `test_upstream.py`, `test_check.py`, and the additions to `test_upgrade_record.py` and `test_upgrade_report.py`, from the Spec. The fetcher in every test is a function over a dict of URL to body that records each URL asked for; an unknown URL raises `FetchFailure`.
+**Binds later work:**
+- **Fetching.** `Fetch = Callable[[str], bytes]` GETs one URL and raises only `FetchFailure`, whose `str()` is `<host>: <reason>` (`crates.io: HTTP 503`). `http_fetch(url: str) -> bytes` (urllib, User-Agent `bevy-upgrade (natepiano)`, timeout 30 s) turns `HTTPError`, `http.client.HTTPException` (a truncated or malformed response), `OSError` and `ValueError` into `FetchFailure`; nothing else leaves it. `fixture_fetch(path: Path) -> Fetch` serves each URL from a JSON file of URL to body; a URL the file lacks raises `FetchFailure("<host>: no fixture")`. The CLI uses `fixture_fetch(Path(<value>))` when `BEVY_UPGRADE_FIXTURES` is set, else `http_fetch`. Any new upstream lookup takes a `Fetch` as its first argument and has this one failure type for every network or HTTP fault.
+- `crate_info(fetch: Fetch, crate: str) -> CrateInfo` reads `https://crates.io/api/v1/crates/<crate>`. `CrateInfo.versions: tuple[str, ...]` holds the versions not yanked, in the API's order (newest first). `CrateInfo.repository: str` is `owner/name` for a github.com URL, with any `.git` suffix and trailing path removed, and `""` for any other URL or none.
+- `release_requirement(fetch: Fetch, crate: str, version: str, bevy_names: frozenset[str]) -> str` reads `https://crates.io/api/v1/crates/<crate>/<version>/dependencies`. It returns the `req` of a non-dev dependency named `bevy` whether or not `bevy_names` holds it (a lockfile with only Bevy sub-crates has no `bevy` package); else the `req` of the first non-dev dependency, by sorted name, whose `crate_id` is in `bevy_names`; else `""`. A name outside `bevy_names` is never read as Bevy: `bevy_egui` is a third-party crate.
+- `target_release(fetch: Fetch, target: str) -> TargetUnpublished | TargetPrerelease | TargetReleased` reads `https://crates.io/api/v1/crates/bevy/versions` and looks at each `num` that starts with `<target>.`, with its `created_at`: no such version is `unpublished`, only pre-releases is `pre-release`, otherwise `released`.
+- `target_fit(requirement: str, target: str) -> TargetFit` in `upgrade_record.py`, with `TargetFit = Literal["on target", "off target", "unreadable"]`. It strips one leading `^`, `~` or `=`; a remainder matching `\d+\.\d+(\.\d+)?(-[\w.]+)?` is compared by major.minor; anything else (a range, `*`, an empty string) is `unreadable`.
+- **Entry fields.** `Entry.crates_io: CratesIoUnread | CratesIoRead`, tagged by `status` (`unread`, `read`) as `Pin` is tagged by `source`; no field is `bool | None`. `CratesIoRead` has `checked: str` (ISO-8601 UTC of the last complete check of this crate), `releases: dict[str, str]` (version → its Bevy requirement; a release never changes, so each is read once), `newest: str` (the newest version not yanked), `ready: str` (the newest release whose requirement is on the target; `""` while none is) and `repository: str` (as `CrateInfo.repository`). `Entry.error: str` is the last check's failure for this crate, or `""`. A report of what changed between checks and the production's dailies read these fields.
+- **Record fields.** `Record.target_bevy: TargetBevy` (`TargetUnread | TargetUnpublished | TargetPrerelease | TargetReleased`) is tagged by `status`: `unread`; `unpublished`; `pre-release` with `since`; `released` with `version`, `date` and `since`. `since` is the YYYY-MM-DD of the first version on the target, pre-releases included. `Record.target_error: str` is the last failure of the target lookup, or `""`. `Record.checked: str | None` is the ISO-8601 UTC time of the last check that reached every entry; `None` before the first.
+- `load` gives a record written before these fields existed their starting values (`crates_io` and `target_bevy` `{"status": "unread"}`, `error` and `target_error` `""`, `checked` `None`); a present field of the wrong type is a `RecordFailure`. `apply_pins` gives a new entry the starting values.
+- `run_check(record: Record, pins: Pins, fetch: Fetch, clock: Clock) -> CheckPass` in `upgrade_check.py`, with `Clock = Callable[[], datetime]` (the current UTC time) and `CheckPass(record: Record, asked: int, failed: int)`: `asked` counts the entries that made at least one request, `failed` those of them whose lookup failed. It never raises for a failed lookup or a spent budget, so the caller always saves what the check learned.
+  - Budget: `CHECK_BUDGET = timedelta(seconds=180)`. The run's `now` is `clock()` at its start, and the clock is read before every request. Once the budget is spent, no further request is made, the entry being read stays exactly as it was (its `error` too), and `run_check` returns. With one request's 30 s timeout, a run ends inside a scheduled job's 300 s limit.
+  - Target first: while `target_bevy["status"]` is not `released`, `target_release` runs once per check; its result is stored and `target_error` set to `""`. A `FetchFailure` there leaves `target_bevy` as it was and sets `target_error` to the failure's text; the entries still run. Once the status is `released`, the lookup never runs again.
+  - Entry order: entries never read first, then the oldest `crates_io["checked"]` first, then by name, so the next check continues one the budget cut short. Skip rule: no request at all for an entry that is `done`, is a patched Bevy crate, has a path pin, or already has `ready`.
+  - Any other entry: `crate_info`, then a walk from the newest version down to and including the pinned one (all of the newest six when the pin is not among them), calling `release_requirement` only for versions missing from `releases`. It stores `CratesIoRead` with `newest`, `repository`, the grown `releases`, `ready` (the newest walked version whose `target_fit` is `on target`, else `""`) and `checked` set to the run's `now`, and sets `error` to `""`.
+  - Per-entry failure rule: a `FetchFailure` sets that entry's `error` to the failure's text and leaves every other field of the entry as it was, `crates_io` included; the other entries still run. A crate whose every version is yanked fails the same way, with `crates.io: no version that is not yanked`. `record["checked"]` is set to the run's `now` when the check reached every entry, whether or not entries failed; a check the budget cut short leaves it as it was.
+- **CLI.** `check` works inside the one `upgrade_record.locked` block: the pins re-read, `run_check` with the chosen fetcher and `lambda: datetime.now(timezone.utc)`, the one save, the table. There is a single save per run, at the end of the block; a refused verb saves nothing. When the pins re-read fails, `check` makes no lookup (the Bevy crate names come from the lockfile), prints the `pins could not be re-read` line and the table from the stored record, saves nothing and exits 1. `check` exits 1 when `asked` is above zero and equals `failed`, else 0; the target lookup does not count. `start` exits 0 once the record is written, whatever its check found. A scheduled job that runs `check` reads this exit code and is what keeps `Record.checked` inside eight hours.
+- **States and Next.** `upgrade_report.state`, in order: `done`; `re-vendor` when `patched_bevy` or the pin is a path pin; `release ready` when `crates_io` is read and `ready` is not `""`; `not checked` when `crates_io` is `unread`; else `no port yet`. Next cells: `bump to <ready>` for `release ready`; `wait` for `no port yet`; `run check` for `not checked`; `re-vendor from Bevy <target>` for a patched Bevy crate; `port the copy at <path> to Bevy <target>` for a path-pinned dependent, which no check can move.
+- **crates.io cell.** `<newest> on Bevy <requirement>`, with ` → <ready> on Bevy <its requirement>` appended when `ready` is set and differs from `newest`; a requirement of `""` prints `requirement unknown` in place of `on Bevy <requirement>`. The cell is `—` for a patched Bevy crate, a path pin, or a `done` entry whose `crates_io` is `unread`, and `not checked` for any other `unread` entry; a `done` entry read before it reached the target keeps its release text. An entry with `error` appends `; last check failed: <error>`. Any new cell that depends on a lookup follows the same rule: `—` for a row no check will ever read (done, patched Bevy crate, path pin), never a `not checked` that cannot change.
+- **Second line of `table`**, three parts. The target: `Bevy <target>: released as <version> on <date>.` for `released`, `Bevy <target>: not released yet.` for `pre-release` and `unpublished`, `Bevy <target>: release not looked up yet.` for `unread`. Then ` Release lookup failed: <target_error>.` when `target_error` is not `""`. Then the check: ` Upstream: no complete check yet.` while `checked` is `None`; else ` Upstream checked <HH:MM zone>.`; or ` Upstream last checked <YYYY-MM-DD HH:MM zone> (stale).` when `checked` is older than eight hours, any entry has `error`, or `target_error` is not `""`.
 
-**Constraints from prior phases:** the first phase built `read_pins(checkout) -> Pins` with `bevy_names`, the `Record` and `Entry` types with `load`, `save`, `locked`, `apply_pins` and `on_target`, `upgrade_report.state` and `upgrade_report.table`, and the CLI's `--production` resolution and refusal form. The record file is `<state dir>/<slug>.json`. Tests set `BEVY_UPGRADE_STATE_DIR`.
+**Gotchas:**
+- `http.client.IncompleteRead` and `BadStatusLine` are `http.client.HTTPException`, which is neither `OSError` nor `ValueError`; a fetcher that catches only those two lets a truncated or malformed response escape as a traceback.
+- No check ever reads a `done` entry, so a "not read yet" text on a done row would never change; that is why such a row prints `—`.
+- `newest` is crates.io's first version not yanked, which is publication order. A yanked version of the target Bevy still reads as `released`.
+- There is no pause between crates.io requests; about 40 in a row were all answered.
+- A spent budget (`CheckBudgetSpent`, internal to `upgrade_check.py`) never leaves `run_check`; its only outward sign is that `Record.checked` does not advance.
+- Tests need no network and, for `run_check`, no file: the module tests use a fetcher over a dict of URL to body that records each URL asked for and raises `FetchFailure` for an unknown one, and `test_upgrade_check.py` uses a clock that advances by a set step on each call. `test_cli.py` writes a fixtures file and sets `BEVY_UPGRADE_FIXTURES` in `setUp`; its subprocess rejects real network access with `a test attempted network access`.
+- basedpyright exits 3 in this repo (no `.venv`); its result is the `0 errors, 0 warnings, 0 notes` line.
 
-**Acceptance gate:** the Delegation Context **Test** and **Lint** commands pass. `test_check.py` asserts the URLs requested: none for a `done` entry, a patched Bevy crate, or an entry with `ready`; no `dependencies` URL for a version already in `releases`; one `bevy` versions URL while the target is unreleased and none after. It asserts that a failing entry keeps its facts and `checked` while the others update. `test_upstream.py` covers a yanked version, a requirement taken from `bevy_app` when `bevy` is absent, a `bevy_egui` dependency ignored, and a repository URL ending `.git`. Run once by hand against the real network and paste the table in the handoff: `BEVY_UPGRADE_STATE_DIR=<scratch> python3 scripts/bevy_upgrade/bevy_upgrade.py --production /home/natepiano/rust/hana_catalyst/docs/hana/tool-based-ui-production.md start 0.20`.
+**Ruled out:** a pause between crates.io requests — not needed at this volume.
 
-### Phase 3 — For a dependency with no release on the target, `check` records its GitHub branch and port pull requests  · status: todo
+### Phase 3 — For a dependency with no release on the target, `check` records its GitHub branch and port pull requests  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** A dependency whose crates.io releases are all on the old Bevy shows whether its default branch is already on the target, at which commit, and which pull requests and issues track the port, with the user's answer deciding the next step.
-
-**Spec:**
-Work only in the worktree and branch the Delegation Context names. GitHub is read without a token, through `Fetch`: the `gh` token sits behind gpg-agent, which is cold after every reboot, and a check that fails then would leave the record stale. The unauthenticated limit is 60 API requests an hour, so the skip rules below are part of the behavior.
-
-`upstream.py` grows:
+After the crates.io step, `check` reads GitHub through `Fetch`, with no token, for an entry whose `crates_io` is read with `ready` `""`, or is unlisted, and whose `repository` is not `""`.
 
 ```python
-class BranchHead(NamedTuple):
-    rev: str
-    committed: str    # YYYY-MM-DD
-class Item(TypedDict):
-    number: int
-    kind: Literal["pr", "issue"]
-    state: Literal["open", "closed", "merged"]
-    title: str
-    updated: str      # the API's updated_at
-    head: str         # a PR's "<branch> @ <first 7 of rev>"; "" for an issue
+class NotFound(FetchFailure): ...
+class BranchHead(NamedTuple): rev: str; committed: str  # committed is YYYY-MM-DD
+class Item(TypedDict): number: int; kind: Literal["pr", "issue"]; state: Literal["open", "closed", "merged"]; title: str; updated: str; head: str
+def github_repository(url: str) -> str: ...
 def default_branch(fetch: Fetch, repository: str) -> str: ...
 def branch_head(fetch: Fetch, repository: str, branch: str) -> BranchHead: ...
 def manifest_requirement(fetch: Fetch, repository: str, rev: str, bevy_names: frozenset[str]) -> str: ...
 def port_items(fetch: Fetch, repository: str, target: str, since: str) -> list[Item]: ...
 def pull_state(fetch: Fetch, repository: str, number: int) -> tuple[Literal["open", "closed", "merged"], str]: ...
+class CratesIoUnlisted(TypedDict): status: Literal["unlisted"]; checked: str; repository: str
+class BranchUnread(TypedDict): status: Literal["unread"]
+class BranchRead(TypedDict): status: Literal["read"]; repository: str; name: str; rev: str; committed: str; requirement: str
+class Entry(TypedDict): crates_io: CratesIoUnread | CratesIoRead | CratesIoUnlisted; branch: BranchUnread | BranchRead; items: list[Item]  # added and widened fields only
 ```
 
-- `default_branch` reads `https://api.github.com/repos/<repository>` (`default_branch`). `branch_head` reads `https://api.github.com/repos/<repository>/commits/<branch>` (`sha`, `commit.committer.date`).
-- `manifest_requirement` reads `https://raw.githubusercontent.com/<repository>/<rev>/Cargo.toml` and parses it with `tomllib`. It looks at `[dependencies]` and `[workspace.dependencies]` keys that are in `bevy_names`. A string value is the requirement; a table gives its `version`; a table with `workspace = true` takes the requirement from `[workspace.dependencies]`; a table with only `path` or `git` is skipped. It returns the requirement of `bevy` when found, else the first by sorted key, else `""`.
-- `port_items` reads `https://api.github.com/repos/<repository>/issues?state=all&since=<since>T00:00:00Z&sort=updated&direction=desc&per_page=100` and keeps the items whose title contains `<target>` as a substring and whose `created_at` date is not before `since`. An item with a `pull_request` key is a `pr`. The filter runs here and not in GitHub's search, because the search does not match `0.20` inside `v0.20.0` (checked 2026-10-12 against Multirious/bevy_tween pull request 97, "Migrate to Bevy v0.20.0").
-- `pull_state` reads `https://api.github.com/repos/<repository>/pulls/<number>` and returns the state (`merged` when `merged` is true) and the head as `<head.ref> @ <first 7 of head.sha>`.
-
-`upgrade_record.py`: `Entry` gains `default_branch: str | None`, `branch_rev: str | None`, `branch_committed: str | None`, `branch_requirement: str | None` and `items: list[Item]`, with empty defaults filled by `load` and `apply_pins`.
-
-`check.py`: after the crates.io step, an entry that still has no `ready` and has a `repository` reads GitHub. An entry with `ready`, or with no `repository`, makes no GitHub request and its `items` are left as they are.
-
-- `default_branch` once: skipped when the entry already stores it.
-- `branch_head` every check. `manifest_requirement` only when the head's `rev` differs from the stored `branch_rev`.
-- `port_items` every check, with `record["since"]` (the record's `started` date when `since` is `None`). `pull_state` only for a `pr` whose `updated` differs from the stored item's, or that is new; an unchanged `pr` keeps its stored `state` and `head`.
-- A git pin's own requirement needs no request: `Entry.bevy` already comes from the lockfile.
-- The failure rule of the crates.io step covers these requests too: one `FetchFailure` leaves the whole entry as it was and sets `error`.
-
-`upgrade_report.py`: `state` is now, in order: `done`; `re-vendor`; `release ready`; `git ready` when `requirement_on_target(branch_requirement, target)` is `True`; `port in PR` when any item is a `pr` in state `open`; `not checked` when `checked` is `None`; else `no port yet`.
-
-- Git cell: `<default_branch> @ <first 7 of branch_rev> on Bevy <branch_requirement>` (`requirement unknown` when it is `""`), then each item as `; PR #<n> <state> (<head>)` or `; issue #<n> <state>`, newest number first. `—` when the entry made no GitHub read; `not on GitHub` when a check ran and `repository` is `None`.
-- Next for `git ready`: with an `approved` answer, `pin git rev <first 7 of branch_rev> (approved <at>)`; with a `declined` answer, `wait for a release (declined <at>)`; with no answer, `ask the user: git pin?`. Next for `port in PR`: `wait for PR #<n>`.
-
-The command file gains: when a row reads `ask the user: git pin?`, ask the user once, then record the answer with `approve` or `decline`; a pin to an unmerged pull request's branch needs the same answer.
+- **Lookups.** `http_fetch` raises `NotFound` for HTTP 404 and `fixture_fetch` for a fixture value of JSON `null`. Every lookup raises only `FetchFailure`, a manifest that is not valid TOML included, because `run_check` catches nothing else. `manifest_requirement` reads the root `Cargo.toml` at `rev`: the `[dependencies]` and `[workspace.dependencies]` keys that are `bevy` or in `bevy_names`, a `workspace = true` table resolved through `[workspace.dependencies]`; it returns the requirement of `bevy`, else the first by sorted key, else `""`, and `""` when the manifest answers `NotFound`. `port_items` keeps the issues and pull requests, open or closed, updated since `since` whose title contains `<target>` as a substring and whose `created_at` date is not before `since`; `updated` is the API's `updated_at`. It returns `head` `""` and never `merged`: `_github_facts` gives each `pr` its `state` and `head` (`<head.ref> @ <first 7 of head.sha>`) from `pull_state` or from the stored item.
+- **Check.** `run_check` stages `_crate_facts` and `_github_facts(fetch, entry, record, bevy_names)` on a copy of the entry and stores both or neither: one `FetchFailure`, a rate-limit answer included, leaves the entry as stored, sets `error` and counts in `failed`. When `crate_info` raises `NotFound`, `crates_io` becomes `unlisted` with this check's `checked` and, as `repository`, `github_repository(<pin url>)` for a git pin and `""` for any other pin; `error` is cleared, the entry does not count in `failed`, and it asks crates.io once on every check. An entry that is `done`, a patched Bevy crate, path-pinned or holding a `ready` release makes no request of any kind and keeps its stored `branch` and `items`.
+- **States and Next.** `upgrade_report.state` returns, in order: `done`; `re-vendor`; `release ready`; `git ready` when `branch` is read and `target_fit(<its requirement>, target)` is `on target`; `port in PR` when any item is a `pr` in state `open`; `not checked` when `crates_io` is `unread`; else `no port yet`. `STATE_ORDER` sorts rows `git ready`, `release ready`, `re-vendor`, `port in PR`, `no port yet`, `not checked`, `done`. Next for `git ready` is `ask the user: git pin?` with no answer, `pin git rev <first 7 of rev> (approved <at>)` with an `approved` one and `wait for a release (declined <at>)` with a `declined` one; for `port in PR` it is `wait for PR #<n>` with the largest open number.
+- **Cells.** The Git column sits between crates.io and State: `<name> @ <first 7 of rev> on Bevy <requirement>` from a read `branch`, with `requirement unknown` in place of `on Bevy <requirement>` for a requirement of `""`; `not on GitHub` when `crates_io` is read or unlisted with `repository` `""`; `—` otherwise. Each stored item follows as `; PR #<n> <state> (<head>)` or `; issue #<n> <state>`, largest number first. An unlisted entry's crates.io cell is `not on crates.io`; it carries no error, so it does not make the second line read `(stale)`.
 
 **Files:**
-- `scripts/bevy_upgrade/upstream.py` — the GitHub lookups.
-- `scripts/bevy_upgrade/check.py` — the GitHub step and its skip rules.
-- `scripts/bevy_upgrade/upgrade_record.py` — the branch and item fields and their defaults.
-- `scripts/bevy_upgrade/upgrade_report.py` — `git ready`, `port in PR`, the Git cell and the Next cell.
-- `scripts/bevy_upgrade/test_upstream.py` — the GitHub lookups against canned bodies.
-- `scripts/bevy_upgrade/test_check.py` — the GitHub step's requests and failures.
-- `scripts/bevy_upgrade/test_upgrade_report.py` — the new states and cells.
-- `commands/showrunner/bevy_upgrade.md` — the rule for asking the user once.
+- `scripts/bevy_upgrade/upstream.py` — `NotFound`, `BranchHead`, `Item` and the six functions above.
+- `scripts/bevy_upgrade/upgrade_check.py` — `_github_facts`, and the `unlisted` case in `_crate_facts`.
+- `scripts/bevy_upgrade/upgrade_record.py` — `CratesIoUnlisted`, `BranchUnread`, `BranchRead` and the `Entry` fields; `load` gives a missing `branch` `{"status": "unread"}` and missing `items` `[]` and validates present ones, and `apply_pins` starts a new entry with the same values.
+- `scripts/bevy_upgrade/upgrade_report.py` — `state`, `STATE_ORDER`, the Git column and the Next cells.
+- `scripts/bevy_upgrade/test_upstream.py`, `test_upgrade_check.py`, `test_upgrade_record.py`, `test_upgrade_report.py`, `test_cli.py` — their tests.
+- `commands/showrunner/bevy_upgrade.md` — on a row reading `ask the user: git pin?`, the showrunner asks once and records the answer with `approve` or `decline`; a pin to an unmerged pull request's branch needs the same answer.
 
-**Seats:** 1 writer + 1 tester — the same four modules as the crates.io phase, each extended.
-- `impl` — `upstream.py`, `check.py`, `upgrade_record.py`, `upgrade_report.py`, `commands/showrunner/bevy_upgrade.md`.
-- `test` — the additions to `test_upstream.py`, `test_check.py` and `test_upgrade_report.py`, from the Spec, with the recording fetcher the crates.io phase's tests use.
+**Binds later work:**
+- `Entry.crates_io` has three cases, `unread`, `read` and `unlisted`; only `read` has `ready`. Every fixture with a read branch needs `repository`, `name`, `rev`, `committed` and `requirement`, and a CLI test that runs `check` on an entry with no `ready` release needs GitHub answers in its fixture file: `write_fixtures` in `test_cli.py` holds them for `example/adapter`.
+- Requests for one repository: `default_branch` only when no `branch` is stored for it; `branch_head` and `port_items` on every check; `manifest_requirement` only when the head `rev` differs from the stored one, so a stored requirement, `""` included, is reused; `pull_state` only for a `pr` that is new or whose `updated` changed. `port_items` gets the `since` of `target_bevy` when its status is `pre-release` or `released`, else the date of the record's `started`.
+- Stored `branch` and `items` belong to `BranchRead.repository`: under another repository the check reads as if nothing were stored and the stored items are gone, so an item number names an item only with its repository. Within one repository a stored item that the issues answer lacks is kept as stored, with no request made for it.
+- The requirement comes from the root manifest only. A workspace whose Bevy requirement sits in a member crate's manifest (bevy-inspector-egui) reads `requirement unknown` and never `git ready`; once its port pull request merges, its row reads `no port yet` for a branch that is on the target.
+- GitHub allows 60 API requests an hour without a token, and `port_items` reads one page of 100 per check, newest update first. A repository's first read makes 4 requests plus one per pull request, a later check 2; one check of hana's ten dependencies makes 16 GitHub requests on a first read and 8 afterwards.
+- `ask the user: git pin?` is the one Next cell that asks the user for an answer.
 
-**Constraints from prior phases:** the crates.io phase built `Fetch`, `FetchFailure`, `http_fetch`, `crate_info` (which stores `repository` as `owner/name`), `run_check(record, pins, fetch, now)` with its per-entry failure rule, `requirement_on_target`, and `Record.since`. `upgrade_report.state` returns `no port yet` for a checked entry with no `ready`; this phase refines it. Tests use a fetcher over a dict of URL to body that records every URL asked for.
+**Gotchas:** `NotFound` is a `FetchFailure` and is an answer in three places only: `crate_info` (the entry becomes `unlisted`), the manifest (`""`), and `branch_head` under a stored name (`default_branch` is read again and `branch_head` asked once more; a stored `rev` equal to the new head still keeps its `requirement`). From any other request, a release's dependencies included, it fails the entry.
 
-**Acceptance gate:** the Delegation Context **Test** and **Lint** commands pass. `test_check.py` asserts: no GitHub URL for an entry with `ready` or with no `repository`; no repository URL once `default_branch` is stored; no manifest URL while the head `rev` is unchanged; no pull URL for a `pr` whose `updated` is unchanged; a failing GitHub request leaves the entry's crates.io facts and `checked` as they were. `test_upstream.py` covers a manifest that inherits `bevy` from `[workspace.dependencies]`, a title holding `v0.20.0`, an item created before `since`, and a merged pull request. `test_upgrade_report.py` covers the three Next cells of `git ready`. Run once by hand against the real network and paste the table in the handoff, with the command of the crates.io phase's gate.
+**Ruled out:** GitHub's search for the title filter: it does not match `0.20` inside `v0.20.0` (Multirious/bevy_tween pull request 97, "Migrate to Bevy v0.20.0", checked 2026-10-12). The `gh` token: it sits behind gpg-agent, cold after every reboot, and a check failing then would leave the record stale. Filling `branch` and `items` in `apply_pins` for a stored entry: `load` fills them, and every record reaches `apply_pins` through `load`.
 
-### Phase 4 — The check runs every four hours and tells the showrunner only what changed  · status: todo
+### Phase 4 — The check runs every four hours and tells the showrunner only what changed  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** Starting a watch schedules its check; a scheduled check is silent unless a dependency's state changed, and the watch closes itself when every dependency is on the target.
-
-**Spec:**
-Work only in the worktree and branch the Delegation Context names.
-
-`scripts/bevy_upgrade/schedule.py`:
+A watch keeps one notifier job, `bevy-upgrade-<slug>`, that runs `check --scheduled` every 240 minutes. A scheduled check tells the showrunner only what differs from what it was last told, and a check that finds every dependency on the target closes the watch.
 
 ```python
-def instance(slug: str) -> str: ...                           # "bevy-upgrade-<slug>"
+# upgrade_schedule.py
+def instance(slug: str) -> str: ...                    # "bevy-upgrade-<slug>"
 def ensure_job(record: Record) -> None: ...
 def remove_job(slug: str) -> None: ...
-def next_check(slug: str) -> datetime | None: ...             # from `notifier.sh status <instance>`
-def tell_showrunner(slug: str, summary: str, text: str) -> bool: ...
-```
-
-- The notifier is `BEVY_UPGRADE_NOTIFIER` when set, else `scripts/message/notifier.sh` beside this repo's `scripts/`; it runs as `zsh <notifier> …`. `send.py` is `BEVY_UPGRADE_SEND` when set, else `scripts/message/send.py`.
-- `ensure_job` runs `new <instance> --every 240 --timeout 300 --run "<py> <bevy_upgrade.py> --production <doc> check --scheduled"`, each word of the run command passed through `shlex.quote`, `<py>` being `scripts/lib/py`. `new` keeps an existing instance's clock, so calling it again is safe.
-- `tell_showrunner` sends to `showrunners.current_address(slug)` with `--from bevy-upgrade --key bevy-upgrade-<slug> --summary <summary> --text <text>`. It returns `False`, sending nothing, when the address is empty or `send.py` exits non-zero.
-
-`upgrade_record.py`: `Record` gains `announced: dict[str, str]`, each crate's digest as the showrunner last saw it, default `{}`.
-
-`upgrade_report.py`:
-
-```python
-def digest(entry: Entry, target: str) -> str: ...   # state, ready, and each item's number and state
+def next_check(slug: str) -> datetime | None: ...      # None when the notifier has no such job
+def tell_showrunner(slug: str, summary: str, text: str) -> bool: ...   # True only for exit 0 and a `SENT:` line
+def retire_message(slug: str) -> None: ...
+# upgrade_record.py
+class Announced(TypedDict): state: str; repository: str; items: dict[str, str]   # what the showrunner was last told about one crate
+class Record(TypedDict): announced: dict[str, Announced] | None   # added field; None until a table or a message reached the showrunner
+# upgrade_report.py
+def announcement(entry: Entry, target: str) -> Announced: ...
 def changes(record: Record) -> list[str]: ...
-def line(record: Record, zone: ZoneInfo, now: datetime, next_due: datetime | None) -> str: ...
+def line(record: Record, zone: ZoneInfo, now: datetime, next_due: datetime | None, pins_error: str) -> str: ...
 ```
 
-- `changes` compares each entry's `digest` with `record["announced"]` and returns one line per difference: `- <crate>: <old state> → <new state>` when the state word changed, with ` (<ready> on Bevy <requirement>)` after `release ready` and ` (<default_branch> @ <rev 7>)` after `git ready`; `- <crate>: PR #<n> <old> → <new>` or `- <crate>: new PR #<n> <state>: <title>` for an item; `- <crate>: new dependency` and `- <crate>: no longer a dependency` for entries that came or went. An empty `announced` (a watch that has never reported) gives no lines.
-- `line` is one sentence for a report: `Bevy <target> upgrade: <d> of <n> done`, then each other state with a non-zero count in `STATE_ORDER` as `, <count> <state>`, with ` (<k> waiting for your answer)` after `git ready` when k entries there have no answer, then `; checked <HH:MM zone>` and `, next check <HH:MM zone>` when `next_due` is known. When the table would say stale, it ends `; upstream last checked <YYYY-MM-DD HH:MM zone> (stale)` instead.
-
-`bevy_upgrade.py`:
-
-- `start` calls `ensure_job` after its first check. `status`, `check` and `line` call it too whenever the record is open, so a job that went missing comes back.
-- `status` and `check` print `Changed since the last report:` and the `changes` lines above the table when there are any, then store every entry's `digest` in `announced`. `line` prints only the sentence and never touches `announced`.
-- `check --scheduled` prints nothing. It re-reads pins, runs the check, and saves. With `changes`, it sends `tell_showrunner(slug, "Bevy <target> upgrade: <N> changes", <the change lines, then the line sentence, then "Full table: /showrunner:bevy_upgrade">)` and stores the digests in `announced` only when the send returned `True`, so a change found while the showrunner is away is sent by a later check.
-- When every entry is `done` after a pins read, any `check` closes the watch: it sets `closed`, removes the job, and (scheduled) sends `Bevy <target> upgrade: every dependency is on Bevy <target>. The watch is closed.` or (by hand) prints that sentence above the table.
-- `stop` sets `closed`, removes the job and prints the table. On a closed record `status` prints the table under `This watch closed <YYYY-MM-DD>.` and `check` refuses with `bevy_upgrade: the watch is closed; start a new one`.
-- `line` prints nothing and exits 0 when the production has no record or the record is closed.
-
-The command file gains `stop`, `line`, and: the scheduled check writes to this session only when something changed; show those lines to the user in the next reply.
+- **Job.** `ensure_job` runs `zsh <notifier> new <instance> --every 240 --timeout 300 --run "<scripts/lib/py> <bevy_upgrade.py> --production <doc> check --scheduled"`, each word of the run command through `shlex.quote`; `new` keeps an existing instance's clock. The notifier is `BEVY_UPGRADE_NOTIFIER`, else `scripts/message/notifier.sh`; the sender is `BEVY_UPGRADE_SEND`, else `scripts/message/send.py`. `start`, `status` and a hand `check` call `ensure_job` on an open record, and a closing run calls `remove_job`, both inside the record lock, directly after the one save.
+- **Messages.** `tell_showrunner` sends to `showrunners.current_address(slug)` with `--from bevy-upgrade --key bevy-upgrade-<slug> --summary <summary> --text <text>`. An empty address, `SKIPPED:`, `QUEUED:`, `REFUSED:` and `FAILED:` return `False` and print `bevy_upgrade: the showrunner was not told: <the outcome line, or "no showrunner session">` on stderr. `retire_message` runs `send.py retire --to <address> --from bevy-upgrade --key bevy-upgrade-<slug>`: silent on success, nothing run for an empty address, and `bevy_upgrade: could not retire the queued message: <outcome>` on stderr for a non-zero exit or an `OSError`, one from the address lookup included. A failed retire changes neither the exit code nor the table.
+- **Baseline.** Every verb that prints the table (`start`, `status`, a hand `check`, `approve`, `decline`, `forget`, `note`, `stop`) prints `Changed since the last report:` and the `changes` lines above the table when there are any, stores every entry's `announcement` in `announced` before the save, and calls `retire_message` after it, inside the lock, so a queued message never repeats what the table showed. `status` therefore always saves. A closed record prints no change lines.
+- **Change lines.** `changes` compares each entry's `announcement` with `announced`: `- <crate>: <old state> → <new state>`, with ` (<ready> on Bevy <requirement>)` after `release ready` and ` (<branch name> @ <rev 7>)` after `git ready`; `- <crate>: PR #<n> <old> → <new>` and `- <crate>: new PR #<n> <state>: <title>`, with `issue #<n>` for an item of kind `issue`; `- <crate>: new dependency` and `- <crate>: no longer a dependency`. `announced` of `None` gives no lines, and an announced item the entry no longer holds gives none. `announcement` takes `repository` from the entry's read branch; when it differs from the announced one, every item the entry holds is a new item and none is a transition.
+- **Scheduled check.** `check --scheduled` prints nothing on stdout, re-reads pins, runs the check and saves once. With `announced` of `None` it stores the baseline and sends nothing. With changes it sends the summary `Bevy <target> upgrade: 1 change` or `Bevy <target> upgrade: <N> changes` and, as text, the change lines, the `line` sentence and `Full table: /showrunner:bevy_upgrade`; it stores `announced` only when the send returned `True`, so a change found while the showrunner is away is sent by a later check. With a failed pins read it makes no lookup, sends nothing, saves nothing and never closes: one `bevy_upgrade: pins could not be re-read: <reason>` line on stderr, exit 1. It never calls `retire_message`.
+- **Closing.** When every entry is `done` after a pins re-read that succeeded in the same run, `check` closes the watch. By hand it sets `closed`, removes the job and prints `Bevy <target> upgrade: every dependency is on Bevy <target>. The watch is closed.` above the table. Scheduled, it sends the change lines, if any, then that sentence under the summary `Bevy <target> upgrade: done`, and only when that send returned `True` does it store `announced`, set `closed` and remove the job. `stop` sets `closed`, removes the job and prints the table. On a closed record `status` prints the table under `This watch closed <YYYY-MM-DD>.`, a hand `check` refuses with `bevy_upgrade: the watch is closed; start a new one` (exit 2), and `check --scheduled` removes the job and exits 0 with no message.
+- **`line`.** One sentence for a report: `Bevy <target> upgrade: <d> of <n> done`, then each other state with a non-zero count in `STATE_ORDER` as `, <count> <state>`, with ` (<k> waiting for your answer)` after `git ready` when k entries there have no answer, then `; checked <HH:MM zone>` and `, next check <HH:MM zone>` when `next_due` is not `None`. When the table would say stale it ends `; upstream last checked <YYYY-MM-DD HH:MM zone> (stale)` instead, and while `checked` is `None`, `; no complete upstream check yet`. With a failed pins read the sentence ends `; pins not re-read since <YYYY-MM-DD HH:MM zone>` and is all that stdout holds. The verb prints nothing and exits 0 for no record or a closed one.
 
 **Files:**
-- `scripts/bevy_upgrade/schedule.py` — new: the notifier job and the message to the showrunner.
-- `scripts/bevy_upgrade/upgrade_record.py` — the `announced` field.
-- `scripts/bevy_upgrade/upgrade_report.py` — `digest`, `changes` and `line`.
-- `scripts/bevy_upgrade/bevy_upgrade.py` — `stop`, `line`, `check --scheduled`, the job upkeep and the closing rule.
-- `scripts/bevy_upgrade/test_schedule.py` — new: the notifier and send commands, through stub scripts.
-- `scripts/bevy_upgrade/test_upgrade_report.py` — `digest`, `changes` and `line`.
-- `scripts/bevy_upgrade/test_cli.py` — `stop`, `line`, and `check --scheduled` with a fixture fetcher.
-- `commands/showrunner/bevy_upgrade.md` — `stop`, `line`, and what a scheduled message means.
+- `scripts/bevy_upgrade/upgrade_schedule.py` — the notifier job, the message to the showrunner and the retire call.
+- `scripts/bevy_upgrade/upgrade_record.py` — `Announced` and `Record.announced`; `load` gives a record without the field `None` and validates a present one.
+- `scripts/bevy_upgrade/upgrade_report.py` — `announcement`, `changes` and `line`.
+- `scripts/bevy_upgrade/bevy_upgrade.py` — `stop`, `line`, `check --scheduled`, the baseline, the job upkeep and the closing rule.
+- `scripts/bevy_upgrade/test_upgrade_schedule.py`, `test_upgrade_record.py`, `test_upgrade_report.py`, `test_cli.py`, `test_upgrade_check.py` — their tests.
+- `commands/showrunner/bevy_upgrade.md` — `stop`, `line`, and the scheduled message as the one exception to the same-turn rule: its lines are shown in the next reply as received, and anything beyond them needs `status` first.
 
-**Seats:** 1 writer + 1 tester — the CLI ties the schedule, the changes and the closing rule together.
-- `impl` — `schedule.py`, `upgrade_record.py`, `upgrade_report.py`, `bevy_upgrade.py`, `commands/showrunner/bevy_upgrade.md`.
-- `test` — `test_schedule.py` and the additions to `test_upgrade_report.py` and `test_cli.py`, from the Spec. The notifier and `send.py` stubs append their arguments to a file the test reads. For CLI tests of `check`, `bevy_upgrade.py` reads `BEVY_UPGRADE_FIXTURES`: when set, the fetcher serves each URL from that JSON file of URL to body and fails on any other URL.
+**Binds later work:**
+- `line` takes no lock, saves nothing and never changes `announced`, so a reader never waits behind a running check. For an open record it still makes two notifier calls, `ensure_job` and `next_check`, and no sender call.
+- `announced` is the one stored state word. It records what the showrunner was told, never what is true now.
+- In `test_cli.py` the notifier and sender stand-ins record every call with its arguments, whether the record lock was held and the saved `announced` and `closed`: `tool_calls(kind)`, `tool_args(kind)` (sends only for `send`), `retire_calls()`, `retire_arguments()`, `clear_calls()`.
+- A new required `Record` field also needs the record fixture in `test_upgrade_check.py`.
 
-**Constraints from prior phases:** `run_check(record, pins, fetch, now)` updates the record and never raises for a failed lookup. `upgrade_report.state` returns all seven states and `STATE_ORDER` orders them. `Entry.items` holds `number`, `kind`, `state`, `title`. `Entry.answer` is `None` or holds `answer`, `at`, `words`. The stale rule is the table's: `checked` older than eight hours, or any entry with `error`. Every CLI verb re-reads pins before it prints.
+**Gotchas:** The notifier takes its own lock only around its state edits and releases it before running a stored command, so a notifier call made under the record lock cannot deadlock with a firing job. `line` calls `ensure_job` outside the lock; a job it re-creates for a watch closed in that instant removes itself at its next run. A watch with zero dependencies closes at its first check. `next_check` raises `ValueError` for a `next_due=` line it cannot parse. A scheduled check for a production with no record exits 0 and leaves its job.
 
-**Acceptance gate:** the Delegation Context **Test** and **Lint** commands pass. The tests cover: the exact `new` command and its quoting for a doc path with a space; `next_check` read from a stub's `next_due=` line and `None` for exit 1; a scheduled check with no change sends nothing; with a change it sends once and a second run sends nothing; with an empty address `announced` stays and the next run sends; `status` clears pending changes; `line` leaves them; all entries `done` closes the watch and removes the job; `stop`; `check` refused on a closed record. `bash -n` is not needed (no shell file changes).
+**Ruled out:** Job upkeep after the lock is released: a `start` between a closing run's save and its job removal lost its new job. Retiring a queued message only when changes were pending: every saving hand verb retires, one rule with no state to read. `<N> changes` for a single line.
 
-### Phase 5 — The dailies carries the upgrade as a topic read from the record  · status: todo
+### Phase 5 — The dailies carries the upgrade as a topic read from the record  · status: done
+
+#### As-built
+
+While a watch is open, every dailies carries a `Bevy upgrade` topic whose text is the upgrade's `line` sentence, marked as needing the user while a git pin has no answer. The builder reads it from the upgrade command, never from the record file.
+
+```python
+# bevy_upgrade.py
+class UpgradeUpdate(TypedDict): update: str; needs_user: bool
+# upgrade_report.py
+def waiting(record: Record) -> int: ...   # entries whose state is `git ready` with no answer
+# dailies_input.py
+class OpenBevyUpgradeWatch(NamedTuple): update: str; needs_user: bool
+class NoOpenBevyUpgradeWatch(NamedTuple): ...
+class BevyUpgradeUnavailable(NamedTuple): reason: str
+BevyUpgradeWatch = OpenBevyUpgradeWatch | NoOpenBevyUpgradeWatch | BevyUpgradeUnavailable
+def bevy_upgrade_watch(production: Production) -> BevyUpgradeWatch: ...
+def bounded_bevy_update(text: str) -> str: ...
+```
+
+- **`line --json`.** Prints one object `{"update": <the line sentence>, "needs_user": <bool>}`, or nothing for no record or a closed one. `needs_user` is `waiting(record) > 0`, read from the record the sentence is built from; `line` uses the same count for `(<k> waiting for your answer)`.
+- **Lookup.** `bevy_upgrade_watch` runs `<sys.executable> <script> --production <doc> line --json` with a 30-second timeout. The script is `DAILIES_BEVY_UPGRADE`, else `scripts/bevy_upgrade/bevy_upgrade.py`. Empty or whitespace-only output is `NoOpenBevyUpgradeWatch`. An object with a non-blank single-line `update` string and a boolean `needs_user` is `OpenBevyUpgradeWatch`; extra keys are ignored. Everything else is `BevyUpgradeUnavailable`: a non-zero exit, a timeout, an `OSError`, invalid JSON, or an object of another form. Its reason is the first stderr line when there is one, else `command exited <code>`, `timed out after 30 seconds`, or the error text of the parser or the operating system.
+- **Topic.** `run()` adds the topic after the review watch topic, with the title `Bevy upgrade`, the ETA `no ETA stated yet` and the lookup's `needs_user`. For an unavailable lookup the text is `the record could not be read: <reason>` and `needs_user` is false. `bounded_bevy_update` cuts the text to the smallest finite value in `dailies_render.LENGTHS`, ending in `…`. With no open watch there is no topic.
+- **Step line.** `bevy upgrade: ok — <text>`, `bevy upgrade: ok — no open watch`, or `bevy upgrade: unavailable — <text>`. A failed lookup never fails the builder.
+
+**Files:**
+- `scripts/bevy_upgrade/bevy_upgrade.py` — `line --json` and `UpgradeUpdate`.
+- `scripts/bevy_upgrade/upgrade_report.py` — `waiting`.
+- `scripts/bevy_upgrade/test_cli.py`, `test_upgrade_report.py` — their tests.
+- `scripts/production/dailies_input.py` — the lookup, the cut and the topic (owner phase-tables-unit).
+- `scripts/production/test_dailies_input.py` — the topic's tests (owner phase-tables-unit).
+- `commands/showrunner/dailies.md` — Gather item 7 and the Output sentence for the `unavailable` line (owner phase-tables-unit).
+
+**Gotchas:** Every test in `test_dailies_input.py` runs behind a `DAILIES_BEVY_UPGRADE` stand-in set in the shared `setUp`, so none reaches the real upgrade command, which for an open watch calls the notifier. The timeout test replaces `subprocess.run` in-process and waits for nothing. A change that lengthens the `line` sentence shows in the dailies cut at the renderer's limit, 240 characters today.
+
+**Ruled out:** A second copy of the 240 limit in the builder. Shortening the `line` sentence itself.
+
+### Phase 6 — The migration plan's dependency check sees crates that depend only on Bevy's sub-crates  · status: done
+
+#### As-built
+
+`/bevy_migration_plan`'s dependency check lists and classifies a crate that depends on Bevy only through one of Bevy's own crates, such as `bevy_app` or `bevy_ecs`, as it does one that depends on `bevy`. A crates.io lookup that gets no answer keeps the crate in the report for manual verification.
+
+```python
+# bevy_migration_dependency_check.py — every class is a frozen dataclass
+class BevyRequirement: requirement: str
+class NoBevyDependency: ...
+class RequirementLookupFailed: reason: str
+RequirementLookup = BevyRequirement | NoBevyDependency | RequirementLookupFailed
+class DiscoveredDependency: name: str; version: str; lookup: BevyRequirement | RequirementLookupFailed
+class CompatibleVersion: version: str
+class NoCompatibleVersion: ...
+class CompatibilityUnknown: reason: str
+class BevyCheckoutRead: names: frozenset[str]
+class BevyCheckoutMissing: path: Path
+BevyCheckout = BevyCheckoutRead | BevyCheckoutMissing
+def get_bevy_internal_crates(bevy_version: str) -> BevyCheckout: ...
+def bevy_requirement_names(bevy_checkout: BevyCheckout) -> frozenset[str]: ...
+def get_bevy_dependency_requirement(crate_name: str, version: str, bevy_names: frozenset[str]) -> RequirementLookup: ...
+def get_all_direct_dependencies(codebase: Path, bevy_checkout: BevyCheckout) -> list[tuple[str, str]]: ...
+def get_bevy_dependencies(codebase: Path, bevy_checkout: BevyCheckout) -> list[DiscoveredDependency]: ...
+def find_bevy_compatible_version(crate_name: str, all_versions: list[str], target_bevy_version: str, bevy_checkout: BevyCheckout) -> CompatibleVersion | NoCompatibleVersion | CompatibilityUnknown: ...
+```
+
+- **Bevy's own crate names.** `get_bevy_internal_crates` runs once, in `main`, and its result is passed down. A read checkout holds every crate name under `~/rust/bevy-<version>/crates`, plus `bevy` and `bevy_internal`: a requirement may come from any of them, and `get_all_direct_dependencies` leaves them out of its list. A missing checkout allows only `bevy` and leaves nothing out.
+- **The requirement rule.** Among a release's dependencies whose kind is not `dev`: the `req` of the one named `bevy`, else of the first by sorted name whose `crate_id` is in `bevy_names`. A crates.io request that fails is `RequirementLookupFailed`, never `NoBevyDependency`, and `get_bevy_dependencies` leaves a crate out only for `NoBevyDependency`.
+- **Compatible version.** The newest of the 20 most recent versions whose requirement fits; `CompatibilityUnknown`, with the first failure's reason, when none fits and at least one lookup failed.
+- **Report.** A failed discovery lookup or `CompatibilityUnknown` gives a `CHECK_NEEDED` entry with the reason, under "Verification Needed", unless one of the crate's releases fits the target. Nothing else in the report changed.
+- **Missing checkout.** `Warning: <path> not found; crates that depend only on a Bevy sub-crate are not detected` is printed once on stderr and stands under the report's title, on an empty report too.
+
+**Files:**
+- `scripts/bevy_migration_plan/bevy_migration_dependency_check.py` — the dependency check behind `/bevy_migration_plan` (owned by no unit of this production).
+- `scripts/bevy_migration_plan/test_bevy_migration_dependency_check.py` — its tests, with canned crates.io bodies, a temporary home directory and no cargo.
+
+**Gotchas:** The script runs `cargo tree` on the codebase, so a live run counts as a build on that project. `/bevy_migration_plan` clones `~/rust/bevy-<version>` itself; a machine that has only `~/rust/bevy` reports the missing checkout. A direct dependency that is not on crates.io fails its lookup and is listed under "Verification Needed". The script reads the codebase's direct dependencies only.
+
+**Ruled out:** Sharing the requirement rule's code with `scripts/bevy_upgrade/upstream.release_requirement`: this script runs alone and prints its own warnings.
+
+### Phase 7 — The check reads a workspace member's Bevy requirement and asks again about a kept open pull request  · status: todo
 
 #### Work Order
 
-**Goal:** Every dailies of a production with an open watch shows one `Bevy upgrade` topic whose text is the record's line, and it needs the user only while a git pin waits for their answer.
+**Goal:** A dependency whose repository keeps the Bevy requirement in a workspace member's manifest reads `git ready` when its branch is on the target, and a stored open pull request is never left `open` after it merged.
 
 **Spec:**
-Work only in the worktree and branch the Delegation Context names. This phase edits three files owned by other units (the showrunner allowed it; name them in the checkpoint notice as `also touches`).
+Work only in the worktree and branch the Delegation Context names. The showrunner approved this phase on 2026-10-12.
 
-`bevy_upgrade.py`: `line --json` prints one JSON object, `{"update": "<the line sentence>", "needs_user": <true when an entry is git ready with no answer>}`, or nothing when there is no open record.
+`upstream.py`:
 
-`scripts/production/dailies_input.py`, directly after the review watch block (the `report("review watch", …)` call near line 861):
+```python
+def member_manifest_paths(fetch: Fetch, repository: str, rev: str) -> list[str]: ...
+def manifest_requirement(fetch: Fetch, repository: str, rev: str, crate: str, bevy_names: frozenset[str]) -> str: ...
+```
 
-- Run `"<python>" <script> --production <production doc> line --json`, where `<script>` is `DAILIES_BEVY_UPGRADE` when set, else `scripts/bevy_upgrade/bevy_upgrade.py` beside this repo's `scripts/production/`. Timeout 30 s.
-- Exit 0 with a JSON object: append `{"title": "Bevy upgrade", "update": <update>, "eta": "no ETA stated yet", "needs_user": <needs_user>}` to `topics_out`, then `report("bevy upgrade", "ok", <update>)`.
-- Exit 0 with no output: no topic; `report("bevy upgrade", "ok", "no open watch")`.
-- Any other outcome (non-zero exit, timeout, output that is not that object): append the topic with update `the record could not be read: <first stderr line or the reason>` and `needs_user` false, and `report("bevy upgrade", "failed", <the same text>)`. The dailies itself never fails because of this topic.
+- `member_manifest_paths` asks `https://api.github.com/repos/<repository>/git/trees/<rev>?recursive=1` once and returns, sorted, every `path` of `type` `blob` that ends with `/Cargo.toml`. A response that is not that object is a `FetchFailure`.
+- `manifest_requirement` reads the root manifest as today. Only when the root names no requirement and has a `[workspace]` table does it call `member_manifest_paths` and read member manifests until one's `[package] name` is `crate`: first the paths whose directory name is the crate's name, with `-` and `_` read as the same character, then the others in sorted order, at most 5 manifests. That member's `[dependencies]` are read by the root's rule, with the root's `[workspace.dependencies]` as the table an entry with `workspace = true` inherits from. The root's rule has already read that table, so a member is reached only when it names no Bevy version: an inherited entry then gives `""` for its name, and a version the member names itself is the answer. No such member within 5 reads gives `""`, and so does a tree with no member manifest. A manifest with no `[package]` table is not the crate's and is passed over. A member manifest that is not there (`NotFound`) is skipped and counts as one of the 5 reads. Every other failure is a `FetchFailure`, as it is for the root: a request that fails, text that is not valid TOML, a table of the wrong type. `run_check` then keeps the entry's stored facts and sets its error, so a member that could not be read is never recorded as `""`. `[workspace] members` and `exclude` are not read: the member is found by its `[package] name`, which crates.io keeps unique, so a glob that matches nothing changes nothing.
 
-`commands/showrunner/dailies.md`, in **Gather**, after the Review watch item: one item saying the input builder adds the `Bevy upgrade` topic from the record while a watch is open, and that nothing else in the report states the upgrade's status.
+`upgrade_check.py`:
+
+- `_github_facts(fetch, name, entry, record, bevy_names)` takes the crate's name and passes it on.
+- A stored requirement is reused only when the stored `rev` is the head's and the requirement is not `""`. A stored `""` is read again, so a record written before this phase gets its answer at the next check.
+- Each stored item the issues answer lacks is kept, as today. One that is a pull request with state `open` is asked again with `pull_state`, and its `state` and `head` are replaced; a kept issue and a kept closed or merged pull request cost no request.
+
+`commands/bevy_migration_plan.md` (an add-on the showrunner placed in this phase on 2026-10-12; the file belongs to no unit of this production, so the checkpoint notice names it as `also touches`):
+
+- Under `**The script will:**`, the first bullet says the script discovers Bevy-dependent crates "(direct and indirect)". `scripts/bevy_migration_plan/bevy_migration_dependency_check.py` reads the codebase's direct dependencies only. Rewrite that bullet to say so, and to say that a crate depending only on one of Bevy's own crates, such as `bevy_app` or `bevy_ecs`, is included.
+- Rewrite the `CHECK_NEEDED` bullet to give both reasons a crate lands there: its compatibility is unclear, or crates.io did not answer a lookup. Change nothing else in the file.
+
+Nothing in the record's types or the report changes: `""` still prints `requirement unknown`.
 
 **Files:**
-- `scripts/bevy_upgrade/bevy_upgrade.py` — `line --json`.
-- `scripts/bevy_upgrade/test_cli.py` — `line --json` with and without an unanswered git pin, and with no record.
-- `scripts/production/dailies_input.py` — the topic, after the review watch block.
-- `scripts/production/test_dailies_input.py` — the topic present, absent and failed, through a stub script.
-- `commands/showrunner/dailies.md` — the Gather item.
+- `scripts/bevy_upgrade/upstream.py` — `member_manifest_paths`, and the member read in `manifest_requirement`.
+- `scripts/bevy_upgrade/upgrade_check.py` — the crate name passed down, the `""` rule, the kept open pull request.
+- `scripts/bevy_upgrade/test_upstream.py` — the tree request and the member read.
+- `scripts/bevy_upgrade/test_upgrade_check.py` — the `""` rule and the kept open pull request.
+- `scripts/bevy_upgrade/test_cli.py` — only if a fixture needs an added answer; its root manifest names a requirement, so no tree request is expected.
+- `commands/bevy_migration_plan.md` — the two bullets under `**The script will:**`.
 
-**Seats:** 2 writers — the split is by directory, and each writer tests its own side.
-- `impl` — `scripts/bevy_upgrade/bevy_upgrade.py`, `scripts/bevy_upgrade/test_cli.py`.
-- `test` opens as impl — `scripts/production/dailies_input.py`, `scripts/production/test_dailies_input.py`, `commands/showrunner/dailies.md`. It codes against the JSON object above and a stub script set through `DAILIES_BEVY_UPGRADE`, the way `watch_stubs` in `test_dailies_input.py` replaces `review_regime.py`.
+**Seats:** 1 writer + 1 tester — two production modules and their test modules, the split phase 3 ran with.
+- `impl` — `upstream.py`, `upgrade_check.py`, `commands/bevy_migration_plan.md`.
+- `test` — `test_upstream.py`, `test_upgrade_check.py`, `test_cli.py`, from the Spec.
 
-**Constraints from prior phases:** `bevy_upgrade.py line` prints one sentence for an open record and nothing otherwise, and never changes `announced`. `upgrade_report.line(record, zone, now, next_due)` builds that sentence. A `git ready` entry's `answer` is `None` until the user approves or declines.
+**Constraints from prior phases:** `manifest_requirement(fetch, repository, rev, bevy_names)` reads only the root `Cargo.toml` (its `[workspace.dependencies]` and `[dependencies]`) from `https://raw.githubusercontent.com/<repository>/<rev>/Cargo.toml` and returns `""` when that manifest is not there (`NotFound`). `_github_facts` keeps the stored requirement when the stored `rev` equals the head's, and keeps a stored item whose number the one-page issues answer lacks. `pull_state(fetch, repository, number)` returns `(state, head)`. `fixture_fetch` answers `NotFound` for a `null` body and serves a string body raw. `run_check` stages an entry's facts and discards them all when a request fails or the 180 s budget is spent. GitHub allows 60 requests an hour without a token: a first read of one repository costs 4 requests plus one per pull request, and this phase adds at most 6 for a workspace repository.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/bevy_upgrade -p 'test_*.py'` and `python3 -m unittest discover -s scripts/production -p 'test_dailies_input.py'` pass. `basedpyright scripts/bevy_upgrade scripts/production/dailies_input.py scripts/production/test_dailies_input.py` prints `0 errors, 0 warnings, 0 notes`. The dailies tests cover the topic with `needs_user` true and false, no topic for empty output, and the failed form for a non-zero exit, with the report still built. Before the checkpoint notice, trial-merge the owner's tip per the production contract (item 9) and run the dailies tests.
+**Acceptance gate:** the Delegation Context **Test** and **Lint** commands pass. The tests cover: a workspace root and a member named like the crate giving the member's requirement in three requests (root, tree, member); a member whose Bevy entry is `workspace = true`, under a root whose `[workspace.dependencies]` entry names no version, giving `""`; a member with no Bevy entry giving `""`; a member manifest that is not valid TOML raising `FetchFailure`, and a member request that fails raising it too; a member manifest that is `NotFound` skipped and the next one read; a workspace root whose tree has no member manifest giving `""` in two requests; a crate name with `-` matched to a directory with `_`; no matching member giving `""` after 5 member reads; a root that names a requirement making no tree request; a stored `""` at an unchanged `rev` read again, and a stored requirement that is not `""` making no manifest request; a kept open pull request that merged reading `merged` after the check; a kept issue and a kept closed pull request making no request. `commands/bevy_migration_plan.md` says direct dependencies, names the sub-crate case and gives both `CHECK_NEEDED` reasons.
 
 ## Close-out for the showrunner
 

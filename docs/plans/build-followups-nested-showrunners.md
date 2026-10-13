@@ -18,7 +18,7 @@
 
 **What the user gets.**
 
-- One showrunner, the root, talks with the user. Its footer and its dailies show every production below it, and every item that needs the user appears there once.
+- The root is the user's one place to see everything: its footer and its dailies show every production below it, and every item that needs the user appears there once. The user may still work with any showrunner directly, and one below a root answers them in its own pane as a root does (user, 2026-10-12: "have them available for direct interaction from me but also have a natural home under an L1"). This replaced "only the root talks with the user", which Phase 1 built and the first live check showed to be wrong.
 - A showrunner starts a lower showrunner with one command. The lower showrunner runs in its own detached tmux session, as a unit does.
 - Every showrunner, at any depth, runs on the showrunner account. Unit directors stay on the unit account.
 - A unit whose work has grown into a production of its own is promoted with one command: it stops, and comes back as a showrunner on the showrunner account with its conversation kept.
@@ -113,7 +113,22 @@ On the showrunner's go, the phases run in order in this worktree. Each ends with
 
 **Acceptance gate:** the gate. Tests cover attach, each refusal, an edge to a production with no timer, the root walk at three levels and a cycle written by hand into the state dir. Live, with the showrunner's go: attach tool-based-ui under build-followups, read `showrunners.py tree`, and hana sends one test item to the root.
 
-### Phase 2 — The root's count covers every item that needs the user  · status: todo
+### Phase 2 — The root's count covers every item that needs the user  · status: done · live check waits on tool-based-ui being attached
+
+#### As-built
+
+- `scripts/production/showrunners.py`: `Place(root, below)` and `place_of(slug)`, one reading of the tree; `descendants_of(slug)`; `user_facing(slug)`, the productions whose items a showrunner counts and lists.
+- `scripts/production/dailies_render.py --footer`: `--below <list>` once per lower production and `--reports-to <root>`. `footer_main(..., below=, root=)` and `footer(..., unreadable=, root=)` default to nothing, so a root with nothing attached renders the same bytes.
+- `scripts/hooks/showrunner_footer.py`: `place_of`, `render_footer(..., place, ...)`, `open_questions(productions, below)`. `block_reason` reads each production's place once.
+- `scripts/production/update_registration.py`: `footer` passes the lower lists and the root; new verb `open --production <doc>` (`open_items`), which prints the list a showrunner shows when the user asks what the open questions are.
+- `pyrightconfig.json`: `scripts/hooks` can now see `scripts/production`.
+- Spec 2 was built as the bullet `reports to <root's production slug>`, not the root's session name: the slug is what `showrunners.py address` takes, and it still reads right while the root is restarting or down. A showrunner under a root keeps its own count of its own items.
+- Spec 4, and one thing the Work Order did not say: while a lower list cannot be read the root's footer never says `nothing needed`, because that list may hold an item. A due item in a lower list also drops `nothing needed` from the root's footer.
+- Not built here: the dailies report still reads only its own list. Phase 3 owns the report.
+
+**Binds later work:** Phase 3 reads the same lists for each child row's needs-user mark; `place_of(slug).below` is the list of productions to read, and `UNREADABLE_LIST` in `dailies_render.py` is the one wording for a list that cannot be read.
+
+**Gotchas:** `scripts/production` imports the hook module at import time, so the hook imports `showrunners` late, inside `place_of`. A test that calls `showrunner_footer.open_questions` in process passes `below` itself and so never reads the live tree. The hook reads needs-user lists under `$HOME`, and the tree under `SHOWRUNNER_STATE_DIR`, so a hook test sets both.
 
 #### Work Order
 
@@ -134,7 +149,7 @@ On the showrunner's go, the phases run in order in this worktree. Each ends with
 
 **Acceptance gate:** the gate. Tests use two-level and three-level trees, an unreadable file and a root with no children, whose footer and count must not change by a character. Live: with tool-based-ui attached, an item hana records raises natedev's count by one and appears in its list under `tool-based-ui`, and both drop when hana clears it.
 
-### Phase 3 — The parent's dailies show each child as one row  · status: todo
+### Phase 3 — The parent's dailies show each child as one row  · status: done · live check waits on promotion and on tool-based-ui's next dailies
 
 #### Work Order
 
@@ -153,7 +168,23 @@ On the showrunner's go, the phases run in order in this worktree. Each ends with
 
 **Acceptance gate:** the gate. Tests cover a current child, a stale child, a child with no file, `expand` and a three-level tree. A production with no children renders exactly as before. Live: natedev's dailies show tool-based-ui as one row.
 
-### Phase 4 — A showrunner starts a lower showrunner in tmux, on the showrunner account  · status: todo · live check gated by G1
+#### As-built
+
+- `scripts/production/dailies_render.py`: `Child`, `ChildReport`, `NoChildReport`; `Report.children` and `Report.reports_to`, from the input keys `children` and `reports_to`; `Row.note`; `child_row`, `unit_rows`, `last_report`, `parse_child_report`, `due`, `zone_named`. The label column is as wide as the longest row name, so a report with no child keeps its nine columns.
+- `scripts/production/dailies_input.py`: `--expand <child|all>`, `child_fields`, `save_last_report`, `last_report_path`. It reads the tree through `showrunners.py` and the lists through `update_registration.outstanding_file`.
+- `commands/showrunner/dailies.md`: usage, the builder flag, the two input keys, and what the renderer writes for a production below.
+- Spec 1: the file also carries `zone` and `interval`, which the parent needs to move times into its own zone and to tell an old report from a current one. "Held" counts units whose checkpoint is not merged, the meaning `held` already has in a report.
+- Spec 2: the row sits in the chart, after the unit rows. A child that reports on demand always shows `as of HH:MM`, since nothing refreshes its file on a schedule. A child with no file reads `?  no report yet`: the `?` is the chart's mark for no ETA.
+- Spec 2, the needs-user mark: `<n> open questions`, the count of due items in the child's list and the lists below it. The items are printed nowhere in the report.
+- Spec 4: `expand` is taken with any length, not only `simple`. An expanded child shows its units and one row for each production below it.
+- What Phase 2 left: the full report's footer now covers the lists below (`nothing needed`, the unreadable bullet) and names the root.
+- Not built: a build-hold mark on a child's row. A hold is machine-wide and already in the parent's footer, and a mark from an old file could outlive the hold.
+
+**Binds later work:** `dailies_last.json` is what a parent knows of a child between messages; Phase 5's stop and Phase 6's failure paths can read `written` and `interval` from it to tell a child that has gone quiet.
+
+**Gotchas:** the file is local, like the tree, so both showrunners must be on one machine. A child's row reads `no report yet` until that child's builder has run once with this code.
+
+### Phase 4 — A showrunner starts a lower showrunner in tmux, on the showrunner account  · status: done · live check is the showrunner's to run after promotion
 
 #### Work Order
 
@@ -175,6 +206,22 @@ On the showrunner's go, the phases run in order in this worktree. Each ends with
 **Files:** `scripts/production/add_showrunner.py`, `test_add_showrunner.py`; `commands/showrunner/add_showrunner.md`; `commands/showrunner/produce.md`.
 
 **Acceptance gate:** the gate. Tests run against `fake_tmux.py`: the tmux command carries no unit mark and no account prefix, the environment holds no `CLAUDE_*`, each refusal starts nothing, and attach follows the timer. Live under G1: natedev starts the scratch production's showrunner; `showrunners.py tree` shows it under build-followups; `/showrunner:accounts` shows it on the showrunner account; the scratch production is wrapped afterwards.
+
+#### As-built
+
+Built as specified; the code-level account is `docs/as-built/showrunner-automation.md` → Nested showrunners → "A parent starts a child showrunner in tmux (phase 4)". Calls made while building:
+
+- **A running showrunner is an update timer whose session is live**, not a timer alone. A timer outlives a session that ended, and that ended session is what `--resume` restarts; counting the timer would have refused every resume. The wait after the launch is for the same thing.
+- **A resumed child that already reports to the caller is left as it is.** Its parent file is still stored from before, so the command prints `<child> already reports to <caller>` and sends nothing. A child that reports to another showrunner gets `attach`'s own refusal and exit 1, with its session left running.
+- **Two refusals beyond the five in the spec:** the caller runs no production, and the session records cannot be read (the command cannot tell whether the child runs).
+- **The ancestor check reads the tree downward** from the child: `caller in descendants_of(child)`.
+- **The wait is 180 s**, changed with `ADD_SHOWRUNNER_WAIT_S`. On a timeout the command names the two commands to finish by hand.
+- **Tests use their own recording stand-ins**, not `fake_tmux.py`, which answers neither `has-session` nor `new-session`. Nothing real starts and nothing real is sent.
+- **G1** was settled by the showrunner as its own call (a scratch showrunner started and wrapped can be undone); it runs the live check after promotion.
+
+**Binds later work:** Phase 5's stop finds a lower showrunner's tmux session by its slug, the name this launcher gives it. The session has no unit mark, so `unit_lookup` never lists it.
+
+**Gotchas:** the tmux session's name is the production's slug, so a unit whose session has that same name blocks the start (`a tmux session named <slug> is already live`). The launcher needs the parent's own `CLAUDE_CODE_SESSION_ID` to know which production it runs: run from a plain shell it refuses with "this session runs no production".
 
 ### Phase 5 — Promote a unit to a showrunner  · status: todo · live check gated by G2
 

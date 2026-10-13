@@ -5,21 +5,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import tempfile
 from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast
-from zoneinfo import ZoneInfo
 
 from compare import compare, load_turns, markdown as compare_markdown
 from phases import markdown as phases_markdown, phases
 import report as study_report
 import results as study_results
-from turns import Compaction, Dropped, Turn, load_roster, read_session, recompute_switch_turns, session_ids
+from turns import RECORDED_ZONE, Compaction, Dropped, Turn, load_roster, read_session, recompute_switch_turns, session_ids
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
-PDT = ZoneInfo("America/Los_Angeles")
 DEFAULT_STATE = Path.home() / ".local/state/model-study"
 DEFAULT_ROSTER = Path(__file__).with_name("roster.json")
 
@@ -50,10 +51,10 @@ def json_lines(rows: Sequence[Turn] | Sequence[Compaction]) -> str:
     return "".join(json.dumps(row.to_json(), separators=(",", ":")) + "\n" for row in rows)
 
 
-def pdt(instant: str | None) -> str | None:
+def user_time(instant: str | None) -> str | None:
     if instant is None:
         return None
-    return datetime.fromisoformat(instant).astimezone(PDT).strftime("%Y-%m-%d %H:%M PDT")
+    return datetime.fromisoformat(instant).astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z")
 
 
 def drop_sum(values: list[Dropped]) -> dict[str, int]:
@@ -86,7 +87,7 @@ def extract(roster: Path, projects_dir: Path, registry_dir: Path, state_dir: Pat
                 duration_ms=cast(int | None, row["duration_ms"]), model=cast(str, row["model"]),
             ))
     if verbose:
-        print("name | requests | model / effort | first Sonnet PDT | switched by PDT | difference min | drops")
+        print("name | requests | model / effort | first Sonnet | switched by | difference min | drops")
     for entry in load_roster(roster):
         prior_ids = [session_id for session_id, state in old_states.items() if state["director"] == entry.name]
         if migrating:
@@ -144,11 +145,11 @@ def extract(roster: Path, projects_dir: Path, registry_dir: Path, state_dir: Pat
         models = dict(Counter(turn.model for turn in turns))
         efforts = dict(Counter(turn.effort for turn in turns))
         first_sonnet = min((turn.started for turn in turns if "sonnet" in turn.model.lower()), default=None)
-        first_pdt = pdt(first_sonnet)
-        switch = entry.switched_by_pdt
+        first_shown = user_time(first_sonnet)
+        switched_at = (datetime.fromisoformat(entry.switched_by_pdt).replace(tzinfo=RECORDED_ZONE)
+                       if entry.switched_by_pdt is not None else None)
         difference: float | None = None
-        if switch is not None and first_sonnet is not None:
-            switched_at = datetime.fromisoformat(switch).replace(tzinfo=PDT)
+        if switched_at is not None and first_sonnet is not None:
             difference = round((datetime.fromisoformat(first_sonnet) - switched_at).total_seconds() / 60, 1)
         dropped = {field: sum(states[session_id]["dropped"].get(field, 0) for session_id in ids)
                    for field in Dropped().to_json()}
@@ -164,7 +165,7 @@ def extract(roster: Path, projects_dir: Path, registry_dir: Path, state_dir: Pat
             "by_model": models,
             "by_effort": efforts,
             "first_sonnet": first_sonnet,
-            "first_sonnet_pdt": first_pdt,
+            "first_sonnet_pdt": first_shown,
             "dropped": dropped,
         }
         summaries.append(summary)
@@ -173,9 +174,9 @@ def extract(roster: Path, projects_dir: Path, registry_dir: Path, state_dir: Pat
         drop_text = ", ".join(f"{key}:{value}" for key, value in dropped.items())
         if verbose:
             carried_note = f" | carried {len(carried)}" if carried else ""
-            print(f"{entry.name} | {len(turns)} | {breakdown}; {effort_breakdown} | {first_pdt or '-'} | {switch or '-'} | {difference if difference is not None else '-'} | {drop_text}{carried_note}")
+            print(f"{entry.name} | {len(turns)} | {breakdown}; {effort_breakdown} | {first_shown or '-'} | {user_time(switched_at.isoformat()) if switched_at else '-'} | {difference if difference is not None else '-'} | {drop_text}{carried_note}")
     moment = now or datetime.now(timezone.utc)
-    moment = moment.replace(tzinfo=PDT) if moment.tzinfo is None else moment
+    moment = moment.replace(tzinfo=user_zone()) if moment.tzinfo is None else moment
     result: dict[str, object] = {
         "extracted": moment.astimezone(timezone.utc).isoformat(),
         "sessions": summaries,
@@ -273,7 +274,7 @@ def main() -> None:
         assert isinstance(state_dir, Path)
         now = args["now"]
         assert now is None or isinstance(now, datetime)
-        moment = now or datetime.now(PDT)
+        moment = now or datetime.now(user_zone())
         if args["no_extract"] is True:
             extracted = cast(study_report.ExtractReport, json.loads((state_dir / "extract.json").read_text()))
         else:

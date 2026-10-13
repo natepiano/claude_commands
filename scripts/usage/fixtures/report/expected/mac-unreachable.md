@@ -32,6 +32,7 @@ Not read in full:
 | mac | codex | unreachable | {{mac.codex.complete}} |  |
 | mac | history | unreachable | {{mac.history.complete}} |  |
 | mac | role log | unreachable | {{mac.roles.read}} |  |
+| natedev | baseline_readings | missing | never |  |
 
 | machine | family | state | last read | details |
 | --- | --- | --- | --- | --- |

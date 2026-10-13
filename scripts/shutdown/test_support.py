@@ -13,6 +13,7 @@ import remote
 import restart
 import settle
 import shutdown
+import sessions
 from record import SessionShutdown
 
 
@@ -46,6 +47,12 @@ _REAL_LEAF_BINDINGS: dict[ShutdownSendLeaf, tuple[tuple[ModuleType, str, object]
     ),
     ShutdownSendLeaf.RUN_NOTIFIER: ((settle, "run_notifier", settle.run_notifier),),
 }
+
+
+def registry_confirmation(ids: frozenset[str]) -> restart.RegistryConfirmation:
+    return restart.RegistryConfirmation(tuple(sessions.SessionRecord(pid=index + 1,
+        sessionId=identity, name=identity, messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+        for index, identity in enumerate(sorted(ids))))
 
 
 class ShutdownTestCase(unittest.TestCase):

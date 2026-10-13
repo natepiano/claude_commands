@@ -8,19 +8,30 @@ import json
 import os
 import re
 import stat
+import sys
 import tempfile
+import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
-from zoneinfo import ZoneInfo
 
 from inventory import Session, parse_session
 from launch_permission import launch_barrier, shutdown_state_root
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
+
 CLAIM_STALE_SECONDS = 120
+CONDUCTOR_LOCK_RETRY_DELAYS = (0.05,) * 5
+
+
+class NoRemoteControl(TypedDict):
+    session_id: str
+    name: str
+    alerts: Literal["user", "none"]
 
 
 class ReadinessClear(TypedDict):
@@ -1313,10 +1324,40 @@ def migrate(login: str) -> list[str]:
         for (source, saved), target in zip(sources, targets):
             os.replace(source, target)
             when = datetime.fromisoformat(saved["requested_at"]).astimezone(
-                ZoneInfo("America/Los_Angeles")
+                user_zone()
             ).strftime("%Y-%m-%d %H:%M %Z")
             lines.append(f"shutdown: converted the {saved['state']} record of {saved['label']} from {when}")
         return lines
+
+
+@dataclass(frozen=True)
+class ShutdownFound:
+    record: SessionShutdown
+
+
+@dataclass(frozen=True)
+class NoShutdown:
+    """This session has no shutdown request."""
+
+
+@dataclass(frozen=True)
+class AccountHeld:
+    hold: AccountHold
+
+
+@dataclass(frozen=True)
+class AccountOpen:
+    """No account-wide launch hold is present."""
+
+
+def lookup_session(login: str, session_id: str) -> ShutdownFound | NoShutdown:
+    saved = find_session(login, session_id)
+    return NoShutdown() if saved is None else ShutdownFound(saved)
+
+
+def lookup_account_hold(login: str) -> AccountHeld | AccountOpen:
+    held = account_hold(login)
+    return AccountOpen() if held is None else AccountHeld(held)
 
 
 @dataclass(frozen=True)
@@ -1332,11 +1373,26 @@ class SessionRetained:
 def withdraw_session(
     login: str, session_id: str, restore_and_notify: Callable[[SessionShutdown], None]
 ) -> SessionWithdrawn | SessionRetained:
-    """Restore and notify under the lock, then archive.
+    """Restore and notify under the lock before another request can send."""
+    return _withdraw_session(login, session_id, lambda saved: False, restore_and_notify)
 
-    A later request must not send its instruction before this withdrawal's
-    queue retirement and cancellation notice finish.
+
+def withdraw_failed_stop(
+    login: str, session_id: str, identity_check: Callable[[SessionShutdown], bool],
+    restore_and_notify: Callable[[SessionShutdown], None],
+) -> SessionWithdrawn | SessionRetained:
+    """Withdraw a failed stop only when its original session is still live.
+
+    The identity check, resource restore, notification and archive share the
+    account lock, so a competing stop claim cannot advance between them.
     """
+    return _withdraw_session(login, session_id, identity_check, restore_and_notify)
+
+
+def _withdraw_session(
+    login: str, session_id: str, identity_check: Callable[[SessionShutdown], bool],
+    restore_and_notify: Callable[[SessionShutdown], None],
+) -> SessionWithdrawn | SessionRetained:
     with _session_store_lock(login, write=True) as directory:
         path = directory / "sessions" / _session_filename(session_id)
         if not _regular_record(path):
@@ -1345,7 +1401,10 @@ def withdraw_session(
         _check_account(login, saved["login"], path)
         if saved["session"]["session_id"] != session_id:
             raise InvalidRecord(f"{path} is used by a different session id")
-        if saved["progress"]["kind"] not in {"waiting", "ready"}:
+        progress = saved["progress"]["kind"]
+        if progress not in {"waiting", "ready"} and not (
+            progress == "stop failed" and identity_check(saved)
+        ):
             return SessionRetained(saved)
         history = directory / "history"
         _ = _record_directory(history, create=True)
@@ -1355,6 +1414,58 @@ def withdraw_session(
         restore_and_notify(saved)
         os.replace(path, target)
         return SessionWithdrawn(saved)
+
+
+@dataclass(frozen=True)
+class ConductorRunning:
+    """A process currently owns the machine's conductor lock."""
+
+
+@dataclass(frozen=True)
+class ConductorNotRunning:
+    """The lock is absent or available."""
+
+
+@dataclass(frozen=True)
+class ConductorUnavailable:
+    reason: str
+
+
+def clear_finished_account_hold(login: str, *, request_ids: tuple[str, ...] = ()) -> None:
+    """Clear the current hold only after its last session record leaves."""
+    if _existing_account_directory(login) is None:
+        return
+    with _session_store_lock(login, write=True) as directory:
+        path = directory / "hold.json"
+        if not _regular_record(path):
+            return
+        held = _account_hold(_read_json(path), str(path))
+        _check_account(login, held["login"], path)
+        if request_ids and held["request_id"] not in request_ids:
+            return
+        if not any(saved["request_id"] == held["request_id"]
+                   for saved in _session_records_in_directory(directory, login)):
+            path.unlink()
+
+
+def conductor_status(login: str) -> ConductorRunning | ConductorNotRunning | ConductorUnavailable:
+    """Observe ownership without creating a file or waiting for its owner."""
+    try:
+        directory = _existing_account_directory(login)
+        if directory is None:
+            return ConductorNotRunning()
+        path = directory / "conduct.lock"
+        if not _regular_record(path):
+            return ConductorNotRunning()
+        with path.open("r", encoding="utf-8") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return ConductorRunning()
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        return ConductorNotRunning()
+    except (InvalidRecord, OSError, ValueError) as error:
+        return ConductorUnavailable(str(error))
 
 
 @dataclass(frozen=True)
@@ -1369,17 +1480,21 @@ class ConductorAlreadyRunning:
 
 @contextmanager
 def conductor_lock(login: str) -> Generator[ConductorAcquired | ConductorAlreadyRunning, None, None]:
-    """Try to own one machine's conductor without waiting for another process."""
+    """Allow brief ownership probes to finish before refusing a duplicate."""
     directory = _account_directory(login)
     _ = _record_directory(directory, create=True)
     path = directory / "conduct.lock"
     _ = _regular_record(path)
     with path.open("a+", encoding="utf-8") as lock:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield ConductorAlreadyRunning()
-            return
+        for delay in (*CONDUCTOR_LOCK_RETRY_DELAYS, 0.0):
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not delay:
+                    yield ConductorAlreadyRunning()
+                    return
+                time.sleep(delay)
         try:
             yield ConductorAcquired()
         finally:
