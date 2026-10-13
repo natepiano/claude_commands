@@ -1173,7 +1173,7 @@ class RestartTests(ShutdownTestCase):
         _, phone, _ = restart.restart_push("claude 2", ["Owner: running, no Remote Control"],
             failed=False, phone_access=True)
         self.assertIn("cannot reach them from your phone", phone)
-        self.assertIn("Owner", phone)
+        self.assertIn("Affected sessions: Owner.", phone)
         self.assertIn("/remote-control", phone)
 
     def test_restart_cli_builds_a_never_alert_policy(self) -> None:

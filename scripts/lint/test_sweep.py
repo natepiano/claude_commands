@@ -18,11 +18,16 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 import sweep
+if TYPE_CHECKING:
+    from ..notify import review
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
+    import review
 
 GIB = 1 << 30
 SIZE = 64 * 1024
@@ -627,6 +632,16 @@ raise SystemExit(int(os.environ[variable]))
               mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "3", "SWEEP_USER_EXIT": "3"}),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
             self.assertFalse(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE))
+
+    def test_phone_alert_wait_covers_configured_review_while_session_wait_stays_short(self) -> None:
+        config = Path(self.enterContext(tempfile.TemporaryDirectory())) / "notify.conf"
+        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
+        with (mock.patch.object(review, "NOTIFY_CONFIG", config),
+              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
+              redirect_stdout(io.StringIO())):
+            self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE))
+        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [40, 130])
+        self.assertEqual(run.call_count, 2)
 
     def test_phone_disk_alert_keeps_action_and_build_shortfall_without_directory_dump(self) -> None:
         """F011: the disk action states how much to free and the body explains why."""

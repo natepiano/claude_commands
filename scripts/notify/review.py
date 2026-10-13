@@ -13,10 +13,12 @@ import shlex
 import subprocess
 import sys
 import time
+import threading
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast
 
@@ -31,11 +33,59 @@ STATE_DIR = Path.home() / ".local/state/notify"
 GUIDE = Path.home() / "rust/nate_style/message"
 LOADER = Path.home() / ".claude/scripts/ux_style/load-ux-style.sh"
 PROMPT_FILE = Path(__file__).with_name("reviewer_prompt.md")
-TIMEOUT_S = 20
+NOTIFY_CONFIG = ROOT / "config/notify.conf"
 HOLD_SECONDS = 300
-# A claim gets 120 s, beyond a revision's 20 s review plus 15 s post budget.
+# Minimum age; the configured review and post budgets may require more time.
 CLAIM_STALE_SECONDS = 120
+DELIVERED_KEEP_SECONDS = 3600
 EXPIRY_KEYS_FILE = Path.home() / ".config/pushover/env"
+
+
+def review_timeout_seconds() -> float:
+    """Read the reviewer limit once; configuration faults use the 60 s default."""
+    try:
+        contents = NOTIFY_CONFIG.read_text(encoding="utf-8")
+        for line in contents.splitlines():
+            key, separator, value = line.partition("#")[0].partition("=")
+            if separator and key.strip() == "REVIEW_TIMEOUT_SECONDS":
+                seconds = float(value.strip())
+                if not math.isfinite(seconds) or seconds <= 0:
+                    raise ValueError("REVIEW_TIMEOUT_SECONDS must be positive and finite")
+                return seconds
+        raise ValueError("missing REVIEW_TIMEOUT_SECONDS")
+    except (OSError, ValueError) as error:
+        print(f"review: {NOTIFY_CONFIG}: {error}; using REVIEW_TIMEOUT_SECONDS=60", file=sys.stderr)
+        return 60.0
+
+
+@dataclass(frozen=True)
+class DeliveryWaits:
+    revision: float
+    user_send: float
+    claim_stale: float
+    posting: float
+
+
+def delivery_waits() -> DeliveryWaits:
+    revision = review_timeout_seconds() + push_channel().TIMEOUT_S
+    return DeliveryWaits(revision, revision + 10, max(CLAIM_STALE_SECONDS, revision + 10),
+                         min(110, revision + 5))
+
+
+def revision_seconds() -> float:
+    return delivery_waits().revision
+
+
+def user_send_seconds() -> float:
+    return delivery_waits().user_send
+
+
+def claim_stale_seconds() -> float:
+    return delivery_waits().claim_stale
+
+
+def posting_wait_seconds() -> float:
+    return delivery_waits().posting
 
 
 @dataclass(frozen=True)
@@ -65,10 +115,17 @@ class Approved:
 
 
 @dataclass(frozen=True)
+class RuleFailure:
+    rule: str
+    quote: str
+
+
+@dataclass(frozen=True)
 class Rewritten:
     version: Draft
     failed_rules: list[str]
     metadata: ReviewMetadata = ReviewMetadata()
+    failures: tuple[RuleFailure, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -77,12 +134,14 @@ class Questions:
     questions: list[str]
     failed_rules: list[str]
     metadata: ReviewMetadata = ReviewMetadata()
+    failures: tuple[RuleFailure, ...] = ()
 
 
 @dataclass(frozen=True)
 class Unreviewed:
     why: str
     metadata: ReviewMetadata = ReviewMetadata()
+    failures: tuple[RuleFailure, ...] = ()
 
 
 ReviewOutcome = Approved | Rewritten | Questions | Unreviewed
@@ -131,6 +190,31 @@ class UnreadableHold:
 HoldLookup = NoHold | LiveHold | UnreadableHold
 
 
+class ReleaseOutcome(Enum):
+    DELIVERED = "delivered"
+    RELEASED = "released"
+    POSTING = "posting"
+    NONE = "none"
+
+
+@dataclass(frozen=True)
+class ClaimSent:
+    pass
+
+
+@dataclass(frozen=True)
+class ClaimCancelled:
+    pass
+
+
+@dataclass(frozen=True)
+class ClaimFailed:
+    code: int
+
+
+ClaimDelivery = ClaimSent | ClaimCancelled | ClaimFailed
+
+
 class MessageRecord(TypedDict):
     title: str
     action: str | None
@@ -152,10 +236,15 @@ class HeldRecord(TypedDict):
     questions: list[str]
 
 
+class RuleFailureRecord(TypedDict):
+    rule: str
+    quote: str
+
+
 class VerdictRecord(MessageRecord):
     verdict: Literal["send", "rewrite", "ask"]
     questions: list[str]
-    failed_rules: list[str]
+    failed_rules: list[RuleFailureRecord]
 
 
 class ReviewRecord(TypedDict):
@@ -173,16 +262,20 @@ class ReviewRecord(TypedDict):
     replay: NotRequired[bool]
     dry: NotRequired[bool]
     detail: NotRequired[str]
+    failures: NotRequired[list[RuleFailureRecord]]
 
 
-class StringSchema(TypedDict):
+class ItemSchema(TypedDict, total=False):
     type: str
+    properties: dict[str, dict[str, str]]
+    required: list[str]
+    additionalProperties: bool
 
 
 class PropertySchema(TypedDict, total=False):
     type: str | list[str]
     enum: list[str]
-    items: StringSchema
+    items: ItemSchema
     maxItems: int
 
 
@@ -200,7 +293,9 @@ SCHEMA: VerdictSchema = {
         "title": {"type": "string"}, "action": {"type": ["string", "null"]},
         "body": {"type": "string"},
         "questions": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
-        "failed_rules": {"type": "array", "items": {"type": "string"}},
+        "failed_rules": {"type": "array", "items": {"type": "object",
+            "properties": {"rule": {"type": "string"}, "quote": {"type": "string"}},
+            "required": ["rule", "quote"], "additionalProperties": False}},
     },
     "required": ["verdict", "title", "action", "body", "questions", "failed_rules"],
     "additionalProperties": False,
@@ -284,8 +379,38 @@ def _draft(value: object) -> Draft:
                  _action(record), _text(record, "body"), answerable)
 
 
+def length_failures(draft: Draft) -> list[str]:
+    failures: list[str] = []
+    if len(draft.title) >= 45:
+        failures.append("push-title-under-45")
+    if len(first_line(draft.action) + "\n" + draft.body) >= 500:
+        failures.append("push-body-under-500")
+    return failures
+
+
+def supported_failures(value: object, draft: Draft) -> list[RuleFailure]:
+    if not isinstance(value, list):
+        raise ValueError("failed_rules")
+    original = [draft.title, first_line(draft.action) + "\n" + draft.body]
+    if isinstance(draft.action, ActionRequired):
+        original.append(draft.action.text)
+    failures: list[RuleFailure] = []
+    for item in cast(list[object], value):
+        record = _object(item)
+        rule, quote = _text(record, "rule"), _text(record, "quote")
+        if rule in ("push-title-under-45", "push-body-under-500"):
+            continue  # Length rules are decided by the code count.
+        if rule and quote and any(quote in text for text in original) and all(item.rule != rule for item in failures):
+            failures.append(RuleFailure(rule, quote))
+    for rule in length_failures(draft):
+        quote = draft.title if rule == "push-title-under-45" else first_line(draft.action) + "\n" + draft.body
+        failures.append(RuleFailure(rule, quote))
+    return failures
+
+
 def validate(value: object, draft: Draft, revision: bool,
              metadata: ReviewMetadata = DEFAULT_METADATA) -> ReviewOutcome:
+    failures: list[RuleFailure] = []
     try:
         record = _object(value)
         verdict = _text(record, "verdict")
@@ -306,7 +431,8 @@ def validate(value: object, draft: Draft, revision: bool,
         if len(first_line(action) + "\n" + body) > 1024:
             raise ValueError("message exceeds 1024")
         questions = _strings(record.get("questions"), "questions")
-        failed = _strings(record.get("failed_rules"), "failed_rules")
+        failures = supported_failures(record.get("failed_rules"), draft)
+        failed = [failure.rule for failure in failures]
         if len(questions) > 3:
             raise ValueError("questions exceeds 3")
         if verdict != "ask" and questions:
@@ -315,14 +441,21 @@ def validate(value: object, draft: Draft, revision: bool,
         if verdict == "send":
             if message_record(version) != message_record(draft):
                 raise ValueError("send changed draft")
+            if not failed:
+                return Approved(draft, metadata)
+            return Unreviewed("send failed rules: " + ", ".join(failed), metadata, tuple(failures))
+        if not failed:
             return Approved(draft, metadata)
+        proposed_lengths = length_failures(version)
+        if proposed_lengths:
+            raise ValueError("proposed text fails: " + ", ".join(proposed_lengths))
         if verdict == "ask" and not revision:
             if not questions or any(not question.strip() for question in questions):
                 raise ValueError("ask needs questions")
-            return Questions(version, questions, failed, metadata)
-        return Rewritten(version, failed, metadata)
+            return Questions(version, questions, failed, metadata, tuple(failures))
+        return Rewritten(version, failed, metadata, tuple(failures))
     except ValueError as error:
-        return Unreviewed(str(error), metadata)
+        return Unreviewed(str(error), metadata, tuple(failures))
 
 
 def reviewer_environment() -> tuple[dict[str, str], str]:
@@ -359,14 +492,16 @@ def reviewer_assignment(runner: ProcessRunner, environment: dict[str, str],
 def _review(draft: Draft, revision: bool, runner: ProcessRunner) -> ReviewOutcome:
     started = time.monotonic()
     account, model = "default", "opus"
+    timeout = 60.0
 
     def details() -> ReviewMetadata:
         return ReviewMetadata(time.monotonic() - started, account, model)
 
     def remaining() -> float:
-        return max(0.001, TIMEOUT_S - (time.monotonic() - started))
+        return max(0.001, timeout - (time.monotonic() - started))
 
     try:
+        timeout = review_timeout_seconds()
         if not GUIDE.is_dir():
             return Unreviewed("no guide", details())
         environment, account = reviewer_environment()
@@ -379,12 +514,13 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner) -> ReviewOutcom
         action_line = first_line(draft.action) if isinstance(draft.action, ActionRequired) else "no action"
         draft_prompt = (f"Title: {draft.title}\n{action_line}\n"
                         f"Body (text after the action line; never repeat it): {draft.body}\n"
-                        f"Priority: {draft.priority}\nRevision: {str(revision).lower()}")
+                        f"Priority: {draft.priority}\nRevision: {str(revision).lower()}\n"
+                        f"Code-counted length failures: {', '.join(length_failures(draft)) or 'none'}")
         command = ["claude", "-p", "--model", model, "--effort", effort,
                    "--system-prompt", guide.stdout + "\n" + prompt,
                    "--json-schema", json.dumps(SCHEMA), "--output-format", "json",
                    "--tools", "", "--no-session-persistence", "--setting-sources", "", draft_prompt]
-        if time.monotonic() - started >= TIMEOUT_S:
+        if time.monotonic() - started >= timeout:
             return Unreviewed("timeout", details())
         result = runner(command, timeout=remaining(), env=environment)
         if result.returncode != 0:
@@ -427,6 +563,7 @@ def log_review(draft: Draft, outcome: ReviewOutcome, sent: Delivery = NOT_SENT, 
     verdict, failed, questions = "send", [], []
     if isinstance(outcome, Unreviewed):
         verdict = "review: off" if detail == "review: off" else "unreviewed: " + outcome.why
+        failed = [failure.rule for failure in outcome.failures]
     elif isinstance(outcome, Rewritten):
         verdict, failed = "rewrite", outcome.failed_rules
     elif isinstance(outcome, Questions):
@@ -439,6 +576,8 @@ def log_review(draft: Draft, outcome: ReviewOutcome, sent: Delivery = NOT_SENT, 
         "sent": message_record(sent.draft) if isinstance(sent, Sent) else None,
         "seconds": metadata.seconds, "account": metadata.account, "model": metadata.model,
     }
+    if isinstance(outcome, (Rewritten, Questions, Unreviewed)) and outcome.failures:
+        entry["failures"] = [{"rule": failure.rule, "quote": failure.quote} for failure in outcome.failures]
     if replay:
         entry["replay"] = True
     if dry:
@@ -448,15 +587,58 @@ def log_review(draft: Draft, outcome: ReviewOutcome, sent: Delivery = NOT_SENT, 
     _append(entry)
 
 
+_STATE_MUTEX = threading.RLock()
+_LOCK_DEPTH = threading.local()
+
+
 @contextmanager
-def locked() -> Generator[None]:
-    state_path().mkdir(parents=True, exist_ok=True)
-    with (state_path() / "review.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+def locked(*, timeout: float = math.inf, clock: Callable[[], float] = time.monotonic,
+           sleep: Callable[[float], None] = time.sleep) -> Generator[None]:
+    deadline = clock() + timeout
+
+    def wait() -> None:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise TimeoutError("review lock deadline expired")
+        sleep(min(0.05, remaining))
+
+    if math.isinf(timeout):
+        _ = _STATE_MUTEX.acquire()
+    else:
+        while True:
+            if clock() >= deadline:
+                raise TimeoutError("review lock deadline expired")
+            if _STATE_MUTEX.acquire(blocking=False):
+                break
+            wait()
+    try:
+        depth = cast(int, getattr(_LOCK_DEPTH, "value", 0))
+        _LOCK_DEPTH.value = depth + 1
         try:
-            yield
+            if depth:
+                yield
+            else:
+                state_path().mkdir(parents=True, exist_ok=True)
+                with (state_path() / "review.lock").open("a") as lock:
+                    if math.isinf(timeout):
+                        fcntl.flock(lock, fcntl.LOCK_EX)
+                    else:
+                        while True:
+                            if clock() >= deadline:
+                                raise TimeoutError("review lock deadline expired")
+                            try:
+                                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                break
+                            except BlockingIOError:
+                                wait()
+                    try:
+                        yield
+                    finally:
+                        fcntl.flock(lock, fcntl.LOCK_UN)
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            _LOCK_DEPTH.value = depth
+    finally:
+        _STATE_MUTEX.release()
 
 
 def held_path(source: str) -> Path:
@@ -481,10 +663,13 @@ def _read_hold(path: Path) -> HoldLookup:
             raise ValueError("stored priority mismatch")
         if path.stem != held_path(held.source).stem:
             raise ValueError("hold filename mismatch")
-        checked = validate(VerdictRecord(**message_record(held.best_version), verdict="ask",
-                                        questions=held.questions, failed_rules=[]), held.draft, False)
-        if isinstance(checked, Unreviewed):
-            raise ValueError(checked.why)
+        if (isinstance(held.draft.action, ActionRequired)
+                != isinstance(held.best_version.action, ActionRequired)):
+            raise ValueError("hold action form changed")
+        if len(held.best_version.title) > 250 or len(first_line(held.best_version.action) + "\n" + held.best_version.body) > 1024:
+            raise ValueError("hold transport limits")
+        if not 1 <= len(held.questions) <= 3 or any(not question.strip() for question in held.questions):
+            raise ValueError("hold questions")
         return LiveHold(held)
     except FileNotFoundError:
         return NoHold()
@@ -539,7 +724,7 @@ def _claim(path: Path) -> bool:
     sending = path.with_suffix(".sending")
     now = time.time()
     if sending.exists():
-        if now - sending.stat().st_mtime < CLAIM_STALE_SECONDS:
+        if now - sending.stat().st_mtime < claim_stale_seconds():
             return False
         os.utime(sending, (now, now))
         return True
@@ -569,15 +754,65 @@ def hold_identity(held: Held) -> str:
     return hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
 
 
-def release_if_matches(source: str, identity: str) -> bool:
-    """Remove only the restored hold named by a failed revision's fallback."""
-    with locked():
+def delivered_path(identity: str) -> Path:
+    if len(identity) != 64 or any(character not in "0123456789abcdef" for character in identity):
+        raise ValueError("invalid hold identity")
+    return state_path() / "held/delivered" / identity
+
+
+def release_if_matches(source: str, identity: str, *, timeout: float = math.inf,
+                       clock: Callable[[], float] = time.monotonic,
+                       sleep: Callable[[float], None] = time.sleep) -> ReleaseOutcome:
+    """Resolve every state of the exact hold a failed revision replaced."""
+    with locked(timeout=timeout, clock=clock, sleep=sleep):
+        delivered = delivered_path(identity)
+        if delivered.exists() and time.time() - delivered.stat().st_mtime < DELIVERED_KEEP_SECONDS:
+            return ReleaseOutcome.DELIVERED
         path = held_path(source)
-        found = _read_hold(path)
-        if isinstance(found, LiveHold) and hold_identity(found.hold) == identity:
-            path.unlink()
-            return True
-        return False
+        sending = path.with_suffix(".sending")
+        for candidate in (sending, path):
+            found = _read_hold(candidate)
+            if not isinstance(found, LiveHold) or hold_identity(found.hold) != identity:
+                continue
+            if candidate == sending and time.time() - sending.stat().st_mtime < claim_stale_seconds():
+                return ReleaseOutcome.POSTING
+            _ = path.with_suffix(".cancel").write_text(identity, encoding="utf-8")
+            candidate.unlink()
+            return ReleaseOutcome.RELEASED
+        return ReleaseOutcome.NONE
+
+
+def post_claim(held: Held, send: Callable[[], int]) -> ClaimDelivery:
+    """Check cancellation and complete delivery in one state-lock transaction."""
+    identity = hold_identity(held)
+    with locked():
+        path = held_path(held.source)
+        sending = path.with_suffix(".sending")
+        found = _read_hold(sending)
+        cancel = path.with_suffix(".cancel")
+        cancelled = cancel.exists() and cancel.read_text(encoding="utf-8") == identity
+        if not isinstance(found, LiveHold) or hold_identity(found.hold) != identity:
+            return ClaimCancelled()
+        delivered = delivered_path(identity)
+        already_sent = delivered.exists() and time.time() - delivered.stat().st_mtime < DELIVERED_KEEP_SECONDS
+        if cancelled or already_sent:
+            sending.unlink()
+            return ClaimCancelled()
+        try:
+            code = send()
+        except Exception:
+            _ = sending.replace(path)
+            raise
+        if code:
+            _ = sending.replace(path)
+            return ClaimFailed(code)
+        delivered = delivered_path(identity)
+        delivered.parent.mkdir(parents=True, exist_ok=True)
+        delivered.touch()
+        stamp = time.time()
+        os.utime(delivered, (stamp, stamp))
+        sending.unlink()
+        return ClaimSent()
 
 
 def restore(source: str) -> None:
@@ -590,6 +825,7 @@ def restore(source: str) -> None:
 
 class PushChannel(Protocol):
     LOG_FILE: Path
+    TIMEOUT_S: int
 
     def http_post(self, url: str, data: bytes) -> tuple[int, bytes]: ...
 
@@ -610,6 +846,9 @@ def due(*, post: Callable[[str, bytes], tuple[int, bytes]] = expiry_post,
     channel = push_channel()
     directory = state_path() / "held"
     with locked():
+        for delivered in (directory / "delivered").glob("*"):
+            if time.time() - delivered.stat().st_mtime >= DELIVERED_KEEP_SECONDS:
+                delivered.unlink()
         paths = sorted({path.with_suffix(".json") for pattern in ("*.json", "*.sending")
                         for path in directory.glob(pattern)})
     failed = False
@@ -617,7 +856,7 @@ def due(*, post: Callable[[str, bytes], tuple[int, bytes]] = expiry_post,
         with locked():
             sending = path.with_suffix(".sending")
             recovering = sending.exists()
-            if recovering and time.time() - sending.stat().st_mtime < CLAIM_STALE_SECONDS:
+            if recovering and time.time() - sending.stat().st_mtime < claim_stale_seconds():
                 continue
             found = _read_hold(sending if recovering else path)
             if not isinstance(found, LiveHold):
@@ -628,19 +867,15 @@ def due(*, post: Callable[[str, bytes], tuple[int, bytes]] = expiry_post,
             if not _claim(path):
                 continue
         try:
-            code = channel.deliver(held.best_version, keys_file, post,
-                                    detail="sent after hold expired")
+            delivery = post_claim(held, lambda: channel.deliver(held.best_version, keys_file, post,
+                                                               detail="sent after hold expired"))
         except Exception as error:
-            code = 1
-            why = f"{type(error).__name__}: {error}"
-        else:
-            why = f"pushover exit {code}"
-        if code == 0:
-            release(held.source)
-        else:
-            restore(held.source)
             failed = True
-            log_review(held.draft, Unreviewed(f"expired send failed: {why}"))
+            log_review(held.draft, Unreviewed(f"expired send failed: {type(error).__name__}: {error}"))
+        else:
+            if isinstance(delivery, ClaimFailed):
+                failed = True
+                log_review(held.draft, Unreviewed(f"expired send failed: pushover exit {delivery.code}"))
     return int(failed)
 
 
@@ -659,6 +894,7 @@ def print_review(draft: Draft, outcome: ReviewOutcome, stamp: str = "") -> None:
     failed: list[str] = []
     if isinstance(outcome, Unreviewed):
         verdict = "unreviewed: " + outcome.why
+        failed = [failure.rule for failure in outcome.failures]
     elif isinstance(outcome, Rewritten):
         verdict, failed = "rewrite", outcome.failed_rules
     elif isinstance(outcome, Questions):
@@ -668,6 +904,9 @@ def print_review(draft: Draft, outcome: ReviewOutcome, stamp: str = "") -> None:
     print(version.title)
     print(first_line(version.action))
     print(version.body)
+    if isinstance(outcome, (Rewritten, Questions, Unreviewed)):
+        for failure in outcome.failures:
+            print("failure: " + json.dumps({"rule": failure.rule, "quote": failure.quote}))
     if isinstance(outcome, Questions):
         for index, question in enumerate(outcome.questions, 1):
             print(f"{index}. {question}")
@@ -740,7 +979,7 @@ def main(argv: list[str]) -> int:
     arguments = parser.parse_args(argv)
     command = cast(str, arguments.command)
     if command == "release":
-        _ = release_if_matches(cast(str, arguments.source), cast(str, arguments.identity))
+        print(release_if_matches(cast(str, arguments.source), cast(str, arguments.identity)).value)
         return 0
     if command == "due":
         return due()

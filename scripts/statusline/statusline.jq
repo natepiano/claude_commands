@@ -6,8 +6,9 @@
 # was the second largest source of short-lived processes on this machine, behind
 # only cargo-tile. This is sh plus jq: two.
 #
-# Called as:  jq -r --arg pwd "$PWD" --arg account "$account" -f statusline.jq
-# Input:      the status line JSON on stdin.
+# Called as:  jq -r --arg pwd "$PWD" --arg account "$account" --slurpfile labels <by-label.json> -f statusline.jq
+# Input:      the status line JSON on stdin; --slurpfile labels is optional, and
+#             /dev/null stands in when the file is missing.
 # Output:     Line 1: "<machine> | <account> | <dirname> | <tokens with thousands separators> | <model [effort]>"
 #             Line 2, when present: "5-hour <N>% left until <HH:MM zone> | weekly <M>% left until <Day HH:MM zone>",
 #             each " until ..." only when its window carries a reset time.
@@ -53,6 +54,21 @@ def user_time($fmt):
   | ($t + (if $dst then -4 else -5 end) * 3600 | gmtime | strftime($fmt))
     + (if $dst then " EDT" else " EST" end);
 
+# The window as agent_notes last read it for this session's account label
+# (~/.local/state/agent-notes/by-label.json), which is the number the quota
+# alerts use. The response's own figure is a different counter and lags it.
+# That reading stands only while it is under 10 minutes old and its window has
+# not reset; otherwise the response's figure does, so the line never goes blank.
+def window($name; $live):
+  (($ARGS.named.labels // [])[0] // {} | .[$ARGS.named.account // ""] // {} | .[$name] // null) as $stored
+  | if ($stored | type) == "object"
+       and ($stored.at | type) == "number" and (now - $stored.at) <= 600
+       and (($stored.resets_at | type) != "number" or $stored.resets_at > now)
+       and ($stored.left | type) == "number"
+    then {used_percentage: (100 - $stored.left), resets_at: $stored.resets_at}
+    else $live
+    end;
+
 # "<label> <N>% left", then " until <reset time>" when the window carries one.
 def usage($label; $window; $fmt):
   remaining($window) as $left
@@ -70,13 +86,14 @@ def usage($label; $window; $fmt):
    + (if (.effort.level // "") == "" then "" else " " + .effort.level end)) as $m
 | ([
      machine,
-     (if $account == "" then empty else $account end),
+     # A label is a note name; an address never reaches the line.
+     (if $account == "" or ($account | contains("@")) then empty else $account end),
      $base,
      ((.context_window.total_input_tokens // 0) | commas),
      $m
    ] | join(" | ")) as $first_line
 | ([
-     usage("5-hour"; .rate_limits.five_hour?; "%H:%M"),
-     usage("weekly"; .rate_limits.seven_day?; "%a %H:%M")
+     usage("5-hour"; window("five_hour"; .rate_limits.five_hour?); "%H:%M"),
+     usage("weekly"; window("weekly"; .rate_limits.seven_day?); "%a %H:%M")
    ] | join(" | ")) as $second_line
 | $first_line + (if $second_line == "" then "" else "\n" + $second_line end)

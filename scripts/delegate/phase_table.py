@@ -509,7 +509,9 @@ def _gap_samples(runs: list[list[dict[str, object]]]) -> list[int]:
         pending_finishes: list[float] = []
         for event in events:
             at = _epoch(event.get("timestamp_epoch"))
-            if at is None:
+            # A phase recorded after the fact is written out of time order, so
+            # the gap before it measures nothing.
+            if at is None or event.get("backfilled") is True:
                 continue
             event_type = _text(event.get("event_type"))
             if (

@@ -284,7 +284,10 @@ def update_alert_pass(selection: ClaudeAccountsInUse, seats_home: Path) -> Updat
     if not notes:
         messages.append(f"no agent notes in {note_file.AGENTS_DIR}")
     try:
-        usage_store.save(reports, checked_at)
+        # Each Claude note's stem is the label a session's account-label names.
+        logins = {note.path.stem: login for note in notes
+                  if note.tool == "claude" and (login := note.get("login"))}
+        usage_store.save(reports, checked_at, logins)
     except (OSError, ValueError) as error:
         # The saved readings must never cost the notes or the alerts.
         messages.append(f"usage store: {error}")

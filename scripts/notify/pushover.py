@@ -275,19 +275,20 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
         record["held_source"] = source
         record["held_identity"] = review.hold_identity(found.hold)
     print("pushover: reviewed JSON: " + json.dumps(record), flush=True)
-    try:
+    if claimed:
+        if not isinstance(found, review.LiveHold):
+            completion: review.ClaimDelivery = review.ClaimCancelled()
+        else:
+            completion = review.post_claim(found.hold, lambda: deliver(version, keys_file, post, detail=detail))
+        if isinstance(completion, review.ClaimCancelled):
+            review.log_review(draft, outcome, detail="claim cancelled before posting")
+            print("pushover: replaced: a newer version replaced this push; nothing was sent")
+            return 5
+        code = completion.code if isinstance(completion, review.ClaimFailed) else 0
+    else:
         code = deliver(version, keys_file, post, detail=detail)
-    except OSError:
-        if claimed:
-            review.restore(source)
-        raise
     delivery = review.Sent(version) if code == 0 else review.NotSent()
     review.log_review(draft, outcome, delivery, detail=detail)
-    if claimed:
-        if code == 0:
-            review.release(source)
-        else:
-            review.restore(source)
     if code == 0 and isinstance(outcome, (review.Rewritten, review.Questions)):
         print("pushover: sent as rewritten:")
         print(version.title)

@@ -1818,7 +1818,7 @@ def restart_push(label: str, lines: list[str], *, failed: bool, phone_access: bo
     else:
         title = "Restarted sessions lack phone access"
         names = ", ".join(line.partition(":")[0] for line in diagnostics)
-        body = f"Sessions on Claude account {account} restarted. Remote Control is off in these sessions, so you cannot reach them from your phone: {names}.\n\n"
+        body = f"Sessions on Claude account {account} restarted. Remote Control is off, so you cannot reach them from your phone. Affected sessions: {names}.\n\n"
     if phone_access:
         body += "The status command shows each session's machine. On that machine, run /remote-control in its terminal to turn phone access back on."
     return title, body, ActionRequired(f"In a Claude session on natedev, run /shutdown status {account}.")

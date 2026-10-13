@@ -20,6 +20,7 @@ import unittest
 import build_targets
 import build_hold
 import offload
+import mac_test
 import targets
 from test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
 
@@ -62,6 +63,28 @@ class StatusTests(IsolatedTargetTest):
             build_targets.format_state("mac", targets.Running("nextest hana", since)),
             "mac: running nextest hana since 13:20 PDT",
         )
+
+    def test_mac_running_status_adds_idle_since_from_claim(self) -> None:
+        self.write_claim()
+        path = self.mac_state / "run.json"
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        record["idle_since"] = "2026-10-11T20:20:00+00:00"
+        _ = path.write_text(json.dumps(record))
+        config = self.write_config(
+            "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            + "kind.natedev=local\nplatform.natedev=linux\n",
+        )
+        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+             mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+            code, output, errors = self.capture_status()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(output, "mac: running nextest hana since 13:05 PDT, idle since 13:20\nnatedev: free\n")
+
+    def test_mac_running_status_without_idle_time_keeps_existing_line(self) -> None:
+        self.write_claim()
+        with mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+            state = targets.target_state(targets.SshTarget("mac", "macos", self.settings))
+            self.assertEqual(build_targets.format_state("mac", state), "mac: running nextest hana since 13:05 PDT")
 
     def test_expiring_hold_line(self) -> None:
         self.assertEqual(

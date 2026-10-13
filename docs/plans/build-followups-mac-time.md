@@ -118,47 +118,51 @@ Source: steps recorded on the Mac; failed follows the build log's failure rule, 
 
 **Gotchas:** the log carries two Mac host names (`Mac` and `Nates-MacBook-Pro-2023`), so Mac selection is `host <> 'natedev'`, never one Mac name. The `scripts/buildlog/buildlog` wrapper runs the installed copy; worktree code is checked with `~/.claude/scripts/lib/py scripts/buildlog/cli.py` and `BUILDLOG_DIR` on a scratch copy of the log.
 
-### Phase 2 — A Mac claim with no Mac process for 15 minutes is released, and its holder is told  · status: todo
+### Phase 2 — A Mac claim with no Mac process for 15 minutes is released, and its holder is told  · status: done
+
+#### As-built
+
+- `config/mac_test.conf` holds `claim_idle_minutes=15` and `claim_poll_seconds=60`, read into `MacTestConfig`.
+- `mac_test.py claim` records `holder_session` (`CLAUDE_CODE_SESSION_ID`, or a Codex seat's `build_hold.owning_session()`) and, on exit 0 or takeover exit 13, `start_claim_watcher` starts the `systemd-run --user` unit `mac-test-claim-watch-<pid>`, which runs `watch-claim` under `claim_watch.lock` and exits once no claim remains.
+- `claim_watch_pass` reads the claim under `state.lock`, runs `check_mac_activity(config, host) -> MacActive | MacIdle | ActivityCheckFailed` with no lock held, then acts only on the same claim (`pid`, `proc_start`, `since`): activity clears `idle_since`, the first idle pass writes it, and an `idle_since` at least `claim_idle_minutes` old deletes `run.json`, starts the block watcher when a block is present, and sends the holder one message (key `mac-claim-idle-<pid>-<since>`). A failed check changes nothing; a process-bound claim whose process is gone is left to the existing liveness rules. The claim-again command in the message carries `--remote '<host>'` for a remote claim.
+- `offload.py` `mirror_selector_script()` is the one mirror selector text, shared by the leftover check and the activity check (`pgrep -u "$(id -u)"`, never a signal).
+- `mac_test.py status` and `build_targets.py status` append `, idle since <HH:MM>` to a running claim's line. `commands/build/mac.md` says an idle claim is released after 15 minutes and the holder is told.
+
+**Files:**
+- `config/mac_test.conf` — the two claim watcher keys
+- `scripts/mac_test/mac_test.py` — `watch-claim`, `start_claim_watcher`, `claim_watch_pass`, `check_mac_activity`, `holder_session`, `idle_since`
+- `scripts/mac_test/offload.py` — `mirror_selector_script`
+- `scripts/build_targets/build_targets.py` — the `idle since` clause
+- `scripts/mac_test/test_mac_test.py`, `scripts/mac_test/test_offload.py`, `scripts/build_targets/test_build_targets.py`, `scripts/build_targets/test_targets.py` — pass outcomes, message, holder session, remote activity text under `sh` and `zsh -f`, status clause, watcher stand-in
+- `commands/build/mac.md` — the release sentence
+
+**Binds later work:** `mirror_selector_script` is shared by the leftover check and the activity check and stays unchanged; the claim serializes all use of the Mac mirror.
+
+**Gotchas:** the ssh activity check has a fixed 10 s total limit beside the configurable connect timeout. `start_hold_recorder` starts a detached buildlog recorder that outlives the command, so `test_mac_test.py` teardown waits on it through a pipe fd before removing its temp folder. The live check runs the worktree's `mac_test.py` through `~/.claude/scripts/lib/py` with scratch `MAC_TEST_STATE_DIR` and `MAC_TEST_CONFIG`; the installed copy refuses those overrides.
+
+**Ruled out:** releasing on the leftover check's answer, which kills what it finds; counting the user's own shells under the clones as activity; messaging the showrunner as well as the holder.
+
+### Phase 3 — Each test run sent to the Mac deletes its build output when it finishes  · status: todo
 
 #### Work Order
 
-**Goal:** A Mac claim whose host has had no Mac process for `claim_idle_minutes` (15) minutes is released by a claim watcher, and the holder's session gets one message saying so and how to claim again.
+**Goal:** after each offloaded test run, the Mac mirror's target dir for that repository is deleted, so offloaded runs stop filling the Mac's disk. Nothing else on the Mac is touched, `/tmp` included. Source: the user, 2026-10-13 ("it needs to be cleaned up as we go", "we should only be cleaning up nextest target dirs as we go along - you should leave the rest of /tmp alone of course"); the showrunner chose this form over a size-capped trim (simple ranks above fast).
 
 **Spec:**
-- `config/mac_test.conf` gains `claim_idle_minutes=15` and `claim_poll_seconds=60`, each with a comment, read into `MacTestConfig`.
-- `mac_test.py`:
-  - `ClaimOwnerRecord` gains optional `holder_session` and `idle_since`, and `read_run` decodes both.
-  - `command_claim` records `holder_session` and starts the claim watcher after exit 0 and after exit 13.
-  - A new `watch-claim` subcommand runs the pass loop under `claim_watch.lock`.
-  - `start_claim_watcher(paths)` follows `start_watcher`, with unit `mac-test-claim-watch-<pid>`.
-  - `check_mac_activity(config, host) -> MacActive(count) | MacIdle | ActivityCheckFailed(reason)` makes the one ssh call, using a remote text that prints `active=<n>` then `rc=0`. Its mirror selectors share `offload.py`'s text and do not copy it: factor the selector function out of `leftover_check_script` so both texts use it.
-  - `command_status` adds the `idle since` clause.
-- `build_targets.py`: the Mac's running line gets the same clause.
+- `offload.py` `remote_test_command`: after `echo mac_exit=$?`, the remote text deletes `"$HOME"/.local/state/mac-test/mirror/<repo>/target` (built from `remote_mirror`, quoted) whatever the run's exit code, then prints `mac_cleanup=<rc>` on its own line. Only that path is ever deleted. When the run's nextest words name another target dir (`--target-dir`), the text skips the delete and prints `mac_cleanup=skipped`; the offload prints one line, `Mac build output kept: the run used another target dir`.
+- `scripts/lint/invoke.sh`: an offloaded run starts no detached sweep after its step, because its target is deleted right after. `remote_test_command` sets the switch that turns the sweep off (name it in the summary); runs on natedev keep their sweep unchanged.
+- The parser that reads `mac_exit=` (`offload.py:553`, today only as the last line) also reads `mac_cleanup=`, as a named outcome type (`CleanupDone`, `CleanupFailed(rc)`, `CleanupSkipped`, `CleanupUnconfirmed`), never a bare optional. The test result always comes from `mac_exit=`. A failed delete prints `Mac build output not removed: <rc>`; an ssh drop between the two markers prints `Mac build output cleanup unconfirmed`. Neither changes the run's result.
 - Tests:
-  - `test_mac_test.py`:
-    - the four pass outcomes;
-    - a pass that finds a different claim, or no claim, changes nothing;
-    - the release message's target, key and text, and no message without `holder_session`;
-    - the holder session from `CLAUDE_CODE_SESSION_ID` and from a seat's owning session;
-    - a takeover keeps `holder_session`;
-    - an old record without the new fields still reads;
-    - `claim` starts the claim watcher on exits 0 and 13 and on no other exit;
-    - `release --pid` after a watcher release exits 0.
-  - `test_offload.py`: the remote activity text runs under `sh` and `zsh -f` with stand-in `pgrep`, `lsof` and `ps`, and prints `active=0` and a counted case. The leftover text's existing cases still pass.
-  - `test_build_targets.py`: the `idle since` clause.
-- `commands/build/mac.md`: after the claim instruction, one sentence saying a claim with nothing running on the Mac for 15 minutes is released and the holder is told, so claim right before the remote work and claim again after a release.
-- Constraints from prior phases: a wrapper under `scripts/<tool>/` execs the installed `~/.claude/scripts` copy, so the live check runs this worktree's file directly (`~/.claude/scripts/lib/py <worktree>/scripts/mac_test/mac_test.py`), with `MAC_TEST_STATE_DIR` and `MAC_TEST_CONFIG` pointing at scratch copies; `override_guard` refuses those overrides on the installed copy. `start_claim_watcher` runs `Path(__file__)` and forwards the `MAC_TEST_*` environment, as `start_watcher` does, so the watcher it starts is the same file with the same scratch state.
+  - `test_offload.py`: run the remote text under `sh` and `zsh -f` with a stand-in `lint`. The target is gone after a passing run and after a failing run. A sibling path in the mirror and a file in a stand-in `/tmp` survive. A `--target-dir` run deletes nothing. Parser fixtures cover both markers, a failed delete, a skip, and a disconnect between the markers.
+  - `test_invoke_scope.py`: with the switch set, no sweep starts; without it, the sweep still starts.
+- Constraints from prior phases: `mirror_selector_script` is shared by the leftover check and the claim watcher's activity check; leave it unchanged. Mac runs are serialized by the claim, so nothing else uses the mirror's target during the delete. message-clarity changes `scripts/lint/sweep.py` and `test_sweep.py` on its branch: phase 3 edits `invoke.sh` only, and the unit merges build-followups before its checkpoint if that work lands first.
 
 **Files:**
-- `config/mac_test.conf`
-- `scripts/mac_test/mac_test.py`
 - `scripts/mac_test/offload.py`
-- `scripts/mac_test/test_mac_test.py`
 - `scripts/mac_test/test_offload.py`
-- `scripts/build_targets/build_targets.py`
-- `scripts/build_targets/test_build_targets.py`
-- `commands/build/mac.md`
+- `scripts/lint/invoke.sh`
+- `scripts/lint/test_invoke_scope.py`
 
 **Seats:** 1 writer + 1 tester.
 
-**Acceptance gate:** both lanes pass. A live check on natedev against the real Mac, with no Mac work running, shows the release and the message. In it, a scratch session claims with `--remote mac` and a short-lived `claim_idle_minutes` set in a scratch config copy. The check never touches `~/.local/state/mac-test` while a real claim is present.
+**Acceptance gate:** the mac_test and lint lanes pass. A live check runs only while no real Mac claim is held. While holding the claim, confirm the Mac's hana mirror has no `target`, then run one hana nextest offload from natedev; afterwards no `target` remains. The phase report gives that cold run's Mac wall time beside the last warm hana Mac runs and natedev's time for the same tests, all from buildlog. If the cold Mac run is slower than natedev, tell the showrunner before the checkpoint notice.

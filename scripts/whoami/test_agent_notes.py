@@ -6,6 +6,7 @@ import io
 import json
 import os
 import subprocess
+import time
 import sys
 import tempfile
 import unittest
@@ -472,6 +473,13 @@ class AgentNotesTests(unittest.TestCase):
             {login: usage.get("weekly", {}).get("left") for login, usage in usage_store.load().items()},
             {"main@example.com": 80.0, "unit@example.com": 4.0},
         )
+        by_label = (self.root / ".local/state/agent-notes/by-label.json").read_text(encoding="utf-8")
+        self.assertEqual(
+            {label: usage["weekly"]["left"]
+             for label, usage in cast(dict[str, dict[str, dict[str, float]]], json.loads(by_label)).items()},
+            {"claude 2": 80.0, "claude 3": 4.0},
+        )
+        self.assertNotIn("@", by_label)
 
     def test_update_keeps_its_live_login_snapshot_when_sessions_change_mid_read(self) -> None:
         _ = self.account_dir("default", "main@example.com", "main-token")
@@ -655,6 +663,21 @@ class AgentNotesTests(unittest.TestCase):
         request = cast(urllib.request.Request, usage.call_args.args[0])
         self.assertEqual(request.get_header("Authorization"), "Bearer fixture-inherited")
         self.assertEqual(report.source, ClaudeDirectorySource(self.root / ".claude"))
+
+    def test_an_expired_stored_token_is_not_sent(self) -> None:
+        named = self.root / ".claude3"
+        named.mkdir()
+        _ = (named / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "fixture-stale", "expiresAt": int((time.time() - 60) * 1000)}}))
+        with (
+            patch.object(agent_accounts, "executable", return_value="fixture-claude"),
+            patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, '{"loggedIn": true, "email": "unit@example.com", "authMethod": "claude.ai"}', "")),
+            patch.object(urllib.request, "urlopen", side_effect=AssertionError("a stale token was sent")),
+        ):
+            report = agent_accounts.claude_live(named)
+        self.assertEqual(report.quota_problem,
+                         "Weekly quota: not read (stale token; a Claude session on this account refreshes it)")
 
     def test_named_credentials_never_fall_back_to_the_default_keychain(self) -> None:
         named = self.root / ".claude3"
