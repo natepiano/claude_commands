@@ -417,7 +417,8 @@ for s in sorted(m["spans"], key=lambda s: s["start"], reverse=True):
     body = pathlib.Path(s["file"]).read_text().splitlines(keepends=True)
     assert body and body[0].rstrip("\n") == original.rstrip("\n"), \
         f"span {s['id']} replacement does not open with the original heading"
-    lines[start - 1 : end] = ["".join(body).rstrip("\n") + "\n\n"]
+    tail = "\n" if end >= len(lines) else "\n\n"
+    lines[start - 1 : end] = ["".join(body).rstrip("\n") + tail]
 
 plan.write_text("".join(lines))
 print(f"spliced {len(m['spans'])} phases")
