@@ -8,6 +8,7 @@ import math
 import os
 import re
 import shlex
+import socket
 import sqlite3
 import statistics
 import subprocess
@@ -83,6 +84,16 @@ class ReviewRecord:
 
     def contains(self, at: float) -> bool:
         return self.started_at <= at <= self.finished_at
+
+
+@dataclass(frozen=True)
+class PlanKnown:
+    path: str
+
+
+@dataclass(frozen=True)
+class PlanUnavailable:
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -350,13 +361,39 @@ def read_events(path: Path) -> list[dict[str, object]]:
     return events
 
 
+def normalize_plan(path: str, working_dir: str = "") -> str:
+    normalized = Path(os.path.normpath(path))
+    if normalized.is_absolute() and working_dir and Path(working_dir).is_absolute():
+        try:
+            normalized = normalized.relative_to(os.path.normpath(working_dir))
+        except ValueError:
+            pass
+    return os.path.normpath(str(normalized))
+
+
+def review_plan(record: ReviewRecord, sources: ReportSources) -> PlanKnown | PlanUnavailable:
+    events = sources.histories.get((record.machine, record.history_file))
+    if events is None:
+        return PlanUnavailable("history file unavailable")
+    for event in events:
+        if event.get("event_type") != "run_started":
+            continue
+        path = event.get("plan_doc")
+        if not isinstance(path, str) or not path:
+            return PlanUnavailable("run_started has no plan_doc")
+        working_dir = event.get("working_dir")
+        return PlanKnown(normalize_plan(path, working_dir if isinstance(working_dir, str) else ""))
+    return PlanUnavailable("no run_started event")
+
+
 def local_sources(root: Path, quality: bool) -> ReportSources:
     # Earlier records still own requests in overlapping windows at the cutoff.
     sources = ReportSources(records=read_records(root))
     if quality:
         for path in {record.history_file for record in sources.records if record.history_file}:
             try:
-                sources.histories[("local", path)] = read_events(Path(path))
+                if Path(path).is_file():
+                    sources.histories[("local", path)] = read_events(Path(path))
             except (OSError, ValueError) as exc:
                 sources.warnings.append(f"history unavailable: {path}: {exc}")
         try:
@@ -458,6 +495,7 @@ def quality_lines(records: Sequence[ReviewRecord], sources: ReportSources) -> li
     mixed = {key for key, group in phases.items() if len({record.arm for record in group}) > 1}
     lines = ["Code review quality by arm", "| Arm | Phases | Raised | Confirmed | Precision | Escapes per phase |",
              "| --- | ---: | ---: | ---: | ---: | ---: |"]
+    warnings: list[str] = []
     for arm in ("pool", "own"):
         groups = [group for key, group in phases.items() if key not in mixed and group[0].arm == arm]
         raised = confirmed = escapes = 0
@@ -474,14 +512,31 @@ def quality_lines(records: Sequence[ReviewRecord], sources: ReportSources) -> li
                 elif event.get("caught_by") == "main":
                     escapes += 1
             # Merge holds describe the whole phase, not a particular lens.
-            escapes += sum(int(value) for row in sources.holds.get(record.machine, [])
-                           if row.get("unit") == record.unit and str(row.get("phase")) == record.phase
-                           and isinstance(value := row.get("holds"), int))
+            plan = review_plan(record, sources)
+            unmatched = False
+            for row in sources.holds.get(record.machine, []):
+                if row.get("unit") != record.unit or str(row.get("phase")) != record.phase:
+                    continue
+                value = row.get("holds")
+                if not isinstance(value, int):
+                    continue
+                held_plan = row.get("plan")
+                if isinstance(held_plan, str):
+                    if isinstance(plan, PlanUnavailable):
+                        unmatched = True
+                        continue
+                    if normalize_plan(held_plan) != plan.path:
+                        continue
+                escapes += value
+            if unmatched and isinstance(plan, PlanUnavailable):
+                warnings.append(f"source warning: merge holds unmatched: {record.unit} phase {record.phase}: "
+                                + f"review plan unavailable ({plan.reason})")
         precision = f"{confirmed / raised * 100:.1f}%" if raised else "-"
         escape_rate = f"{escapes / len(groups):.1f}" if groups else "-"
         lines.append(f"| {arm} | {len(groups)} | {raised} | {confirmed} | {precision} | {escape_rate} |")
     lines.extend((f"mixed phases: {len(mixed)} (excluded from comparison)",
                   "ui checks: compared by --shadow, not in this table"))
+    lines.extend(warnings)
     return lines
 
 
@@ -594,7 +649,8 @@ def render_shadow(root: Path) -> str:
             check = f"ux_{match[1]}_{match[2]}"
             checks.setdefault((path.parent, check), {})[match[3]] = path
     lines = ["UI shadow checks (all local pairs; --since and --quality do not filter them)",
-             "Comparison: rule and shot file name, by count; Defect and Fix wording is not compared."]
+             "Comparison: rule and shot file name, by count; Defect and Fix wording is not compared.",
+             f"Machine: {socket.gethostname().split('.')[0]} (pairs saved on another machine are not counted)"]
     complete = incomplete = missed_total = 0
     for (directory, check), pair in checks.items():
         lines.extend(("", f"check: {directory.name}/{check}"))

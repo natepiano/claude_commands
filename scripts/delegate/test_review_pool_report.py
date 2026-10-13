@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import unittest
 from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
 from typing import Literal, TypedDict, cast, override
 from unittest.mock import patch
@@ -63,6 +65,14 @@ def usage(seconds: float, uncached: int, cached: int = 0, output: int = 0) -> di
     }
 
 
+class MacReportProcess:
+    def __init__(self, output: str) -> None:
+        self.stdout: StringIO = StringIO(output)
+
+    def wait(self) -> int:
+        return 0
+
+
 class ReviewPoolReportTests(unittest.TestCase):
     # unittest initializes these fixtures through setUp before each test.
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -92,11 +102,11 @@ class ReviewPoolReportTests(unittest.TestCase):
                start: int = 10, finish: float = 20.5, ordinal: int = 1,
                status: Literal["reviewed", "void", "canceled", "error"] = "reviewed",
                phase_instance: str = "phase-instance", unit: str = "unit", phase: str = "4",
-               raised: int = 0) -> Path:
+               raised: int = 0, history_path: str = "") -> Path:
         record: ReviewTurnJson = {
             "arm": arm, "pool": "production" if arm == "pool" else "",
             "reviewer": "code1", "thread_id": thread, "unit": unit, "phase": phase,
-            "phase_instance_id": phase_instance, "history_file": str(self.history_file),
+            "phase_instance_id": phase_instance, "history_file": history_path or str(self.history_file),
             "kind": kind, "lens": "ux" if kind == "ux" else "contract" if kind == "broad" else "",
             "pass_number": 1 if kind != "closure" else 2,
             "started_at": int(EPOCH) + start, "finished_at": EPOCH + finish,
@@ -138,13 +148,18 @@ class ReviewPoolReportTests(unittest.TestCase):
         _ = self.history_file.write_text("\n".join(json.dumps(event) for event in events) + "\n",
                                          encoding="utf-8")
 
-    def holds(self, unit: str, phase: str, count: int) -> None:
+    def holds(self, unit: str, phase: str, count: int, **fields: object) -> None:
         ledger = self.home / ".claude" / "data" / "review_regime.jsonl"
         ledger.parent.mkdir(parents=True, exist_ok=True)
-        row = {"unit": unit, "phase": phase, "regime": "after", "started": timestamp(0),
-               "merged": timestamp(30), "holds": count, "merge_defects": 0}
+        row: dict[str, object] = {"unit": unit, "phase": phase, "regime": "after", "started": timestamp(0),
+                                  "merged": timestamp(30), "holds": count, "merge_defects": 0}
+        row.update(fields)
         with ledger.open("a", encoding="utf-8") as stream:
             _ = stream.write(json.dumps(row) + "\n")
+
+    def run_started(self, plan: str, *, working_dir: str = "") -> dict[str, object]:
+        return {"event_type": "run_started", "plan_doc": plan,
+                "working_dir": working_dir or str(self.home)}
 
     def populate_usage_store(self, directory: Path) -> None:
         """Collect fixture logs into the store the report reads without log access."""
@@ -471,6 +486,177 @@ class ReviewPoolReportTests(unittest.TestCase):
         self.holds("another-unit", "4", 100)
         self.holds("held-unit", "different-phase", 100)
         self.quality_row(self.report("--quality"), "pool", 2, 6, 2, 100 / 3, 2)
+
+    def test_review_plan_returns_known_normalized_path_from_run_started(self) -> None:
+        path = self.record("review")
+        record = review_pool_report.read_record(path.read_text(encoding="utf-8"), "local", str(path))
+        sources = review_pool_report.ReportSources(
+            histories={("local", str(self.history_file)): [self.finding(), self.run_started(
+                str(self.home / "docs/plans/../plans/alpha.md"))]})
+        result = review_pool_report.review_plan(record, sources)
+        self.assertIsInstance(result, review_pool_report.PlanKnown)
+        if isinstance(result, review_pool_report.PlanKnown):
+            self.assertEqual(result.path, "docs/plans/alpha.md")
+
+    def test_review_plan_returns_unavailable_with_reason_for_missing_run_metadata(self) -> None:
+        path = self.record("review")
+        record = review_pool_report.read_record(path.read_text(encoding="utf-8"), "local", str(path))
+        histories: list[dict[tuple[str, str], list[dict[str, object]]]] = [
+            {},
+            {("local", str(self.history_file)): [self.finding()]},
+            {("local", str(self.history_file)): [{"event_type": "run_started"}]},
+            {("local", str(self.history_file)): [{"event_type": "run_started", "plan_doc": None}]},
+        ]
+        for index, history in enumerate(histories):
+            with self.subTest(case=index):
+                sources = review_pool_report.ReportSources(histories=history)
+                result = review_pool_report.review_plan(record, sources)
+                self.assertIsInstance(result, review_pool_report.PlanUnavailable)
+                if isinstance(result, review_pool_report.PlanUnavailable):
+                    self.assertTrue(result.reason.strip())
+
+    def test_quality_matches_each_plan_hold_to_its_own_unit_phase_review(self) -> None:
+        second_history = self.history_file.with_name("second-run.jsonl")
+        _ = self.record("alpha-review", raised=2, phase="1")
+        _ = self.record("beta-review", arm="own", thread="thread-own", raised=2, phase="1",
+                        history_path=str(second_history))
+        self.events(self.run_started("docs/plans/alpha.md"), self.finding())
+        _ = second_history.write_text(
+            "\n".join(json.dumps(event) for event in
+                      (self.run_started("docs/plans/beta.md"), self.finding())) + "\n",
+            encoding="utf-8")
+        self.holds("unit", "1", 2, plan="docs/plans/alpha.md")
+        self.holds("unit", "1", 5, plan="docs/plans/beta.md")
+        self.holds("other-unit", "1", 100, plan="docs/plans/alpha.md")
+        self.holds("unit", "2", 100, plan="docs/plans/beta.md")
+        text = self.report("--quality")
+        self.quality_row(text, "pool", 1, 2, 1, 50, 2)
+        self.quality_row(text, "own", 1, 2, 1, 50, 5)
+        self.assertNotIn("merge holds unmatched:", text)
+
+    def test_quality_keeps_unit_phase_matching_for_rows_without_a_string_plan(self) -> None:
+        _ = self.record("review", raised=2)
+        self.events(self.run_started("docs/plans/alpha.md"), self.finding())
+        self.holds("unit", "4", 2)
+        for plan in (None, 17, False, ["docs/plans/alpha.md"], {"path": "docs/plans/alpha.md"}):
+            self.holds("unit", "4", 1, plan=plan)
+        self.holds("other-unit", "4", 100)
+        self.holds("unit", "5", 100)
+        text = self.report("--quality")
+        self.quality_row(text, "pool", 1, 2, 1, 50, 7)
+        self.assertNotIn("merge holds unmatched:", text)
+
+    def test_quality_normalizes_relative_and_working_directory_plan_paths(self) -> None:
+        spellings = ("docs/plans/alpha.md", "./docs/plans/alpha.md",
+                     str(self.home / "docs/plans/alpha.md"),
+                     str(self.home / "docs/plans/../plans/alpha.md"))
+        for index, plan in enumerate(spellings):
+            history = self.history_file.with_name(f"run-{index}.jsonl")
+            unit = f"unit-{index}"
+            instance = f"phase-{index}"
+            _ = self.record(unit, unit=unit, raised=2, phase_instance=instance, history_path=str(history))
+            _ = history.write_text(
+                "\n".join(json.dumps(event) for event in
+                          (self.run_started(plan), self.finding(phase_instance=instance))) + "\n",
+                encoding="utf-8")
+            self.holds(unit, "4", 2, plan="docs/plans/alpha.md")
+            self.holds(unit, "4", 3, plan="./docs/plans/alpha.md")
+            self.holds(unit, "4", 4, plan="docs/plans/../plans/alpha.md")
+            # The ledger has no working directory for making absolute paths relative.
+            self.holds(unit, "4", 100, plan=str(self.home / "docs/plans/alpha.md"))
+        text = self.report("--quality")
+        self.quality_row(text, "pool", 4, 8, 4, 50, 9)
+        self.assertNotIn("merge holds unmatched:", text)
+
+    def test_quality_keeps_absolute_plan_outside_working_directory_absolute(self) -> None:
+        plan = str(self.home / "other-worktree/docs/plans/alpha.md")
+        _ = self.record("review", raised=2)
+        self.events(self.run_started(plan, working_dir=str(self.home / "worktree")), self.finding())
+        self.holds("unit", "4", 3, plan=plan)
+        self.holds("unit", "4", 100, plan="docs/plans/alpha.md")
+        text = self.report("--quality")
+        self.quality_row(text, "pool", 1, 2, 1, 50, 3)
+
+    def test_quality_warns_once_per_phase_when_review_plan_is_unavailable(self) -> None:
+        _ = self.record("broad", raised=2)
+        _ = self.record("closure", kind="closure", raised=2)
+        _ = self.record("second-phase", phase="5", phase_instance="second-phase", raised=2)
+        self.holds("unit", "4", 100, plan="docs/plans/alpha.md")
+        self.holds("unit", "4", 200, plan="docs/plans/beta.md")
+        self.holds("unit", "5", 100, plan="docs/plans/alpha.md")
+        self.holds("other-unit", "4", 100, plan="docs/plans/alpha.md")
+        self.holds("unit", "6", 100, plan="docs/plans/alpha.md")
+        self.holds("unit", "4", 2)
+        cases: list[tuple[str, list[dict[str, object]]]] = [
+            ("missing history", []),
+            ("no run_started", [self.finding(), self.finding(caught_by="main")]),
+            ("no plan_doc", [{"event_type": "run_started", "working_dir": str(self.home)},
+                             self.finding(), self.finding(caught_by="main")]),
+        ]
+        for name, events in cases:
+            with self.subTest(history=name):
+                if name == "missing history":
+                    self.history_file.unlink(missing_ok=True)
+                else:
+                    self.events(*events)
+                text = self.report("--quality")
+                cells = self.table_row(text, "Arm Phases", "pool")
+                self.assertEqual(cells[:2], ["2", "6"], text)
+                self.assertEqual(float(cells[4]), 1 if name == "missing history" else 1.5, text)
+                warnings = [line for line in text.splitlines()
+                            if line.startswith("source warning: merge holds unmatched:")]
+                self.assertEqual(len(warnings), 2, text)
+                for phase in ("4", "5"):
+                    prefix = f"source warning: merge holds unmatched: unit phase {phase}: "
+                    matches = [line for line in warnings if line.startswith(prefix)]
+                    self.assertEqual(len(matches), 1, text)
+                    self.assertRegex(matches[0][len(prefix):], r"^review plan unavailable \(.+\)$")
+
+    def test_quality_needs_no_plan_warning_without_matching_plan_rows(self) -> None:
+        _ = self.record("review", raised=2)
+        self.events(self.finding())
+        self.holds("unit", "4", 2)
+        self.holds("other-unit", "4", 100, plan="docs/plans/alpha.md")
+        self.holds("unit", "5", 100, plan="docs/plans/alpha.md")
+        text = self.report("--quality")
+        self.quality_row(text, "pool", 1, 2, 1, 50, 2)
+        self.assertNotIn("merge holds unmatched:", text)
+
+    def test_mac_sources_match_plan_holds_using_remote_history_events(self) -> None:
+        remote_history = "/Users/test/history/run.jsonl"
+        record = self.record("mac-review", raised=2, history_path=remote_history)
+        events = [self.run_started("/Users/test/worktree/docs/plans/alpha.md",
+                                   working_dir="/Users/test/worktree"), self.finding()]
+        rows: list[dict[str, object]] = [
+            {"unit": "unit", "phase": "4", "plan": "./docs/plans/alpha.md", "holds": 3},
+            {"unit": "unit", "phase": "4", "plan": "docs/plans/beta.md", "holds": 100},
+            {"unit": "unit", "phase": "4", "holds": 2},
+        ]
+        envelopes = [
+            {"kind": "record", "path": "/Users/test/history/review_turns/run/review.json",
+             "text": record.read_text(encoding="utf-8")},
+            {"kind": "history", "path": remote_history,
+             "text": "\n".join(json.dumps(event) for event in events)},
+            {"kind": "holds", "path": "/Users/test/.claude/data/review_regime.jsonl",
+             "text": "\n".join(json.dumps(row) for row in rows)},
+        ]
+        process = MacReportProcess("\n".join(json.dumps(envelope) for envelope in envelopes))
+        with patch.object(subprocess, "Popen", return_value=process) as launch:
+            sources = review_pool_report.mac_sources("", quality=True)
+        launch.assert_called_once()
+        self.assertEqual(len(sources.records), 1)
+        self.assertEqual(sources.records[0].machine, "mac")
+        costs = {item.key: review_pool_report.IncompleteCost("fixture") for item in sources.records}
+        text = review_pool_report.render_report(sources.records, costs, True, sources=sources)
+        self.quality_row(text, "pool", 1, 2, 1, 50, 5)
+        self.assertNotIn("merge holds unmatched:", text)
+        sources.histories[("mac", remote_history)] = [self.finding()]
+        text = review_pool_report.render_report(sources.records, costs, True, sources=sources)
+        self.quality_row(text, "pool", 1, 2, 1, 50, 2)
+        warnings = [line for line in text.splitlines()
+                    if line.startswith("source warning: merge holds unmatched: unit phase 4:")]
+        self.assertEqual(len(warnings), 1, text)
+        self.assertRegex(warnings[0], r": review plan unavailable \(.+\)$")
 
     def test_mixed_phase_is_named_and_excluded_from_quality_comparison(self) -> None:
         _ = self.record("pool-mixed", phase_instance="mixed", raised=100)
@@ -805,6 +991,27 @@ class ReviewPoolReportTests(unittest.TestCase):
         self.assertNotIn(common, missing_rows)
         self.assertNotIn(extra, missing_rows)
         self.assertIn("complete shadow checks: 2; incomplete: 0; pool missed rows: 2", text)
+
+    def test_shadow_names_short_local_machine_immediately_after_comparison(self) -> None:
+        lines = self.shadow().splitlines()
+        comparison = next(index for index, line in enumerate(lines) if line.startswith("Comparison:"))
+        expected = (f"Machine: {socket.gethostname().split('.')[0]} "
+                    "(pairs saved on another machine are not counted)")
+        self.assertEqual(lines[comparison + 1], expected)
+        self.assertEqual(sum(line.startswith("Machine:") for line in lines), 1)
+
+    def test_shadow_shortens_a_qualified_host_name(self) -> None:
+        with patch.object(socket, "gethostname", return_value="fixture.example.test"):
+            text = review_pool_report.render_shadow(self.history)
+        self.assertIn("Machine: fixture (pairs saved on another machine are not counted)", text)
+
+    def test_other_reports_keep_local_name_and_omit_machine_line(self) -> None:
+        record = self.record("review")
+        for options in ((), ("--quality",)):
+            with self.subTest(options=options):
+                text = self.report(*options)
+                self.assertNotIn("Machine:", text)
+                self.assertIn(f"local:{record}", text)
 
     def test_shadow_names_unpaired_helper_and_pool_files(self) -> None:
         helper = self.verdict("6_1", "helper")
