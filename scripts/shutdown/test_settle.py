@@ -1502,10 +1502,68 @@ class SettleTests(ShutdownTestCase):
         with patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert:
             settle._send_holdout_alert([(saved, "showing a form")])  # pyright: ignore[reportPrivateUsage]
         body = cast(str, alert.call_args.args[1])
+        action = cast(ActionRequired, alert.call_args.args[2])
+        expected = (
+            'Shutdown of Claude account "claude 2" is waiting for sessions to stop. '
+            "Its session named Owner on natedev is showing a form, so it has not stopped."
+            " Read any open form in that session's terminal before choosing.\n\n"
+            'Cancel (recommended): /shutdown cancel "claude 2" --only Owner. This keeps it running so you can check its work.\n\n'
+            'Stop now: /shutdown now "claude 2" --only Owner. This stops it without waiting.'
+        )
+        self.assertEqual(body, expected)
+        self.assertEqual(action.text, "In the natedev Claude session, choose cancel or stop now.")
+        posted = "Action: " + action.text + "\n" + body
+        self.assertIn('Shutdown of Claude account "claude 2" is waiting for sessions to stop.', posted[:150])
+        self.assertLess(len(posted), 500)
+        self.assertLess(len(cast(str, alert.call_args.args[0])), 45)
         self.assertIn("session named Owner on natedev", body)
-        self.assertIn("Read any open form in that session's terminal before stopping it.", body)
+        self.assertIn("Read any open form in that session's terminal before choosing.", body)
         self.assertIn("keeps it running so you can check its work", body)
         self.assertIn("stops it without waiting", body)
+
+    def test_grouped_holdout_notice_keeps_whole_sentences_and_counts_omitted_sessions(self) -> None:
+        for names, included in ((("abcdefgh", "ijklmnop", "qrstuvwx"), 1),
+                                (("CoordinatorSessionOne", "CoordinatorSessionTwo", "CoordinatorSessionThree"), 0),
+                                (("A" * 80, "B" * 80, "C" * 80), 0)):
+            with self.subTest(names=names):
+                due = [(session_shutdown(top_level(str(index), name)), "showing a form")
+                       for index, name in enumerate(names)]
+                with patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert:
+                    settle._send_holdout_alert(due)  # pyright: ignore[reportPrivateUsage]
+                body = cast(str, alert.call_args.args[1])
+                action = cast(ActionRequired, alert.call_args.args[2])
+                opening = 'Shutdown of Claude account "claude 2" is waiting for sessions to stop. '
+                sentences = [f"Its session named {name} on natedev is showing a form, so it has not stopped."
+                             for name in names[:included]]
+                expected = opening + " ".join([*sentences, f"{3 - included} more sessions are waiting."])
+                if len(names[0]) == 80:
+                    expected = opening + "3 sessions are waiting. One is showing a form, so it has not stopped."
+                self.assertEqual(body.split("\n\n")[0], expected)
+                posted = "Action: " + action.text + "\n" + body
+                self.assertIn(opening.strip(), posted[:150])
+                self.assertLess(len(posted), 500)
+                self.assertLess(len(cast(str, alert.call_args.args[0])), 45)
+
+    def test_holdout_notice_with_names_that_do_not_fit_offers_account_commands(self) -> None:
+        due = [(session_shutdown(top_level(str(index), name * 80)), "showing a form")
+               for index, name in enumerate(("A", "B", "C"))]
+        with patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert:
+            settle._send_holdout_alert(due)  # pyright: ignore[reportPrivateUsage]
+        body = cast(str, alert.call_args.args[1])
+        action = cast(ActionRequired, alert.call_args.args[2])
+        expected = (
+            'Shutdown of Claude account "claude 2" is waiting for sessions to stop. '
+            '3 sessions are waiting. One is showing a form, so it has not stopped.\n\n'
+            'Cancel (recommended): /shutdown cancel "claude 2". This keeps every waiting session running so you can check their work.\n\n'
+            'Stop now: /shutdown now "claude 2". This stops every waiting session without waiting for its work to finish.'
+        )
+        self.assertEqual(body, expected)
+        self.assertEqual(action.text, "In the natedev Claude session, choose cancel or stop now.")
+        posted = "Action: " + action.text + "\n" + body
+        self.assertEqual(len(posted), 438)
+        self.assertIn('Shutdown of Claude account "claude 2" is waiting for sessions to stop.', posted[:150])
+        self.assertLess(len(posted), 500)
+        self.assertLess(len(cast(str, alert.call_args.args[0])), 45)
 
     def test_report_stop_treats_owner_resource_issues_as_a_partial_stop(self) -> None:
         for kind in ("stopped", "already gone", "process identity lost"):

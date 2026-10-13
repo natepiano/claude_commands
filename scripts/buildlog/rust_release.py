@@ -424,10 +424,12 @@ def release_push_text(version: str, pin: str, trial: TrialOutcome) -> str:
         errors = f"{trial['errors']} error" + ("" if trial["errors"] == 1 else "s")
         result = (f"Hana's code check found {errors} and {trial['warnings']} new warnings on {version}. "
                   + f"The tool that repairs Rust build errors {'compiled' if trial['mend_builds'] else 'failed to compile'} with {version}.")
-        recommendation = (f"Upgrade (recommended): Hana moves to {version}. Both code checks passed."
+        if not trial["errors"] and trial["mend_builds"]:
+            result = f"Hana's compiler check passed on {version}: no errors, {trial['warnings']} new warnings."
+        recommendation = (f"Upgrade (recommended because the check passed): Hana builds with {version} from now on."
                           if not trial["errors"] and trial["mend_builds"] else
                           f"Wait (recommended): Hana stays on {pin}, so the failed check does not affect its builds.")
-    other = (f"Wait: Hana stays on {pin}." if recommendation.startswith("Upgrade") else
+    other = (f"Wait: keep building Hana with {pin}." if recommendation.startswith("Upgrade") else
              f"Upgrade: Hana moves to {version} now. Its builds may fail.")
     return f"{intro}{result}\n\n{recommendation}\n\n{other}"
 

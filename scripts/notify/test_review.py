@@ -44,6 +44,19 @@ class ReviewerEnvelope(TypedDict):
     is_error: bool
 
 
+class TranscriptMessage(TypedDict):
+    id: str
+    role: str
+    stop_reason: str
+    content: list[dict[str, str]]
+
+
+class TranscriptEntry(TypedDict):
+    type: str
+    timestamp: str
+    message: TranscriptMessage
+
+
 @dataclass(frozen=True)
 class ProcessCall:
     argv: list[str]
@@ -181,6 +194,196 @@ class LocalReviewTests(unittest.TestCase):
     def entries(self) -> list[dict[str, object]]:
         path = self.root / "state/review.jsonl"
         return [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
+
+    def transcript(self, name: str, replies: list[tuple[str, str, str]]) -> Path:
+        path = self.root / name
+        records = [TranscriptEntry(type="assistant", timestamp=stamp,
+                   message=TranscriptMessage(id=f"message-{index}", role="assistant", stop_reason=stop,
+                       content=[{"type": "text", "text": text}]))
+                   for index, (stamp, text, stop) in enumerate(replies)]
+        _ = path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+        return path
+
+    def test_sample_uses_reply_rules_date_and_previous_reply_without_phone_limits(self) -> None:
+        old = "The prior decision is still open."
+        body = "The build completed. " * 80
+        path = self.transcript("session.jsonl", [
+            ("2026-10-11T10:00:00Z", old, "end_turn"),
+            ("2026-10-13T10:00:00Z", "I will run a tool.", "tool_use"),
+            ("2026-10-13T11:00:00Z", body.strip(), "end_turn")])
+        draft = review.Draft("review.sample", "0", "", NoActionRequired(), body.strip(), False)
+        runner = FakeReviewer(verdict(draft))
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(review.sample([path], since=datetime.fromisoformat("2026-10-12T00:00:00+00:00"), runner=runner), 0)
+        guide = runner.calls[0].argv
+        self.assertEqual(guide[guide.index("--tags") + 1], "reply,all")
+        prompt = runner.calls[-1].argv[-1]
+        self.assertIn("Reply date: 2026-10-13T11:00:00+00:00", prompt)
+        self.assertIn("Previous reply:\n" + old, prompt)
+        self.assertNotIn("I will run a tool.", prompt)
+        self.assertIn("passed: 1; failed: 0; unreviewed: 0", output.getvalue())
+        entry = self.entries()[0]
+        self.assertIs(entry["sample"], True)
+        self.assertEqual(entry["kind"], "reply")
+        self.assertEqual(entry["previous_reply"], old)
+        self.assertEqual(entry["transcript"], str(path))
+        self.assertIsNone(entry["sent"])
+        self.assertFalse((self.root / "state/held").exists())
+        self.assertFalse(pushover.LOG_FILE.exists())
+
+    def test_sample_limit_selects_recent_non_question_replies_across_transcripts(self) -> None:
+        paths = [self.transcript("one.jsonl", [
+            ("2026-10-13T10:00:00Z", "The first build completed.", "end_turn"),
+            ("2026-10-13T12:00:00Z", "Would you retry the build?", "end_turn")]),
+            self.transcript("two.jsonl", [("2026-10-13T11:00:00Z", "The second build completed.", "end_turn")])]
+        draft = review.Draft("review.sample", "0", "", NoActionRequired(), "The second build completed.", False)
+        runner = FakeReviewer(verdict(draft))
+        with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.sample(paths, 1, since=datetime.fromisoformat("2026-10-12T00:00:00+00:00"), runner=runner), 0)
+        self.assertIn("sample: 1 replies", output.getvalue())
+        self.assertIn("replies with unregistered questions: 1", output.getvalue())
+        self.assertEqual(len(self.entries()), 1)
+        self.assertEqual(self.entries()[0]["transcript"], str(paths[1]))
+
+    def test_sample_reports_unreviewed_apart_from_valid_rule_failures(self) -> None:
+        path = self.transcript("session.jsonl", [
+            ("2026-10-13T10:00:00Z", "The first build completed.", "end_turn"),
+            ("2026-10-13T11:00:00Z", "The second build completed.", "end_turn")])
+        def runner(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+            body = "The second build completed." if "second build" in argv[-1] else "The first build completed."
+            draft = review.Draft("review.sample", "0", "", NoActionRequired(), body, False)
+            fake = FakeReviewer(verdict(draft, "rewrite", body="The build passed.",
+                failed_rules=[{"rule": "reader-starts-cold", "quote": body}]),
+                failure="timeout" if "second build" in argv[-1] else "none")
+            return fake(argv, timeout=timeout, env=env)
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(review.sample([path], since=datetime.fromisoformat("2026-10-12T00:00:00+00:00"), runner=runner), 0)
+        self.assertIn("passed: 0; failed: 1; unreviewed: 1", output.getvalue())
+        self.assertIn("sample failed rules: reader-starts-cold=1", output.getvalue())
+
+    def test_sample_registered_questions_and_quoted_examples_are_not_unregistered(self) -> None:
+        path = self.transcript("session.jsonl", [
+            ("2026-10-13T10:00:00Z", "Would you retry the build?", "end_turn"),
+            ("2026-10-13T11:00:00Z", "> Example: retry?\n```\nquery?\n```\nThe build passed.", "end_turn")])
+        registration = self.root / "showrunner/outstanding/build.json"
+        registration.parent.mkdir(parents=True)
+        _ = registration.write_text(json.dumps([{"text": "Would you retry the build?", "since": "2026-10-13T10:00"}]))
+        body = "> Example: retry?\n```\nquery?\n```\nThe build passed."
+        runner = FakeReviewer(verdict(review.Draft("review.sample", "0", "", NoActionRequired(), body, False)))
+        with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(registration.parents[1])}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.sample([path], since=datetime.fromisoformat("2026-10-12T00:00:00+00:00"), runner=runner), 0)
+        self.assertIn("replies with unregistered questions: 0", output.getvalue())
+
+    def test_sample_cli_accepts_paths_limit_and_zoned_since(self) -> None:
+        with mock.patch.object(review, "sample", return_value=0) as sample:
+            self.assertEqual(review.main(["sample", "one.jsonl", "two.jsonl", "--limit", "2",
+                                          "--since", "2026-10-12T00:00:00Z"]), 0)
+        self.assertEqual(sample.call_args.args, ([Path("one.jsonl"), Path("two.jsonl")], 2))
+        self.assertEqual(sample.call_args.kwargs["since"], datetime.fromisoformat("2026-10-12T00:00:00+00:00"))
+
+    def test_request_sentences_and_recommended_choices_are_asks(self) -> None:
+        requests = ["Reply upgrade or wait.", "Choose upgrade or wait.", "Pick a version.",
+                    "Confirm the version.", "Decide whether to upgrade.", "Approve the upgrade.",
+                    "Tell me which version.", "Let me know which version.", "Say upgrade or wait.",
+                    "Please choose a version."]
+        for request in requests:
+            with self.subTest(request=request):
+                self.assertEqual(review.reply_questions("The check passed. " + request), review.ReplyAsks((request,), False))
+        self.assertEqual(review.reply_questions("Upgrade (recommended): use the new compiler."),
+                         review.ReplyAsks((), True))
+        self.assertEqual(review.reply_questions("- Choose a version.\n2. Confirm the version."),
+                         review.ReplyAsks(("Choose a version.", "Confirm the version."), False))
+        self.assertEqual(review.reply_questions(
+            "> Reply upgrade or wait.\n```\nChoose a version.\n```\n~~~\nApprove it.\n~~~\n"
+            + "The example is `Tell me which version.` and ``Choose a version.``."), review.ReplyAsks((), False))
+
+    def test_sample_matches_registered_asks_without_matching_their_choice_lines(self) -> None:
+        question = "Would you retry the build?"
+        registered_text = "Retry the build"
+        choices = "Yes (recommended): retry the build.\nNo: keep the current build."
+        registration = self.root / "showrunner/outstanding/build.json"
+        registration.parent.mkdir(parents=True)
+        _ = registration.write_text(json.dumps([{"text": question}, {"text": registered_text}]))
+        cases = [(question + "\n" + choices, 0),
+                 ("Would you change the compiler?\n" + choices, 1),
+                 (registered_text + ".\n" + choices, 0),
+                 (choices, 1)]
+        runner = mock.Mock(side_effect=AssertionError("choice reply reached the reviewer"))
+        for index, (body, expected) in enumerate(cases):
+            with self.subTest(body=body):
+                path = self.transcript(f"choices-{index}.jsonl", [("2026-10-13T10:00:00Z", body, "end_turn")])
+                with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(registration.parents[1])}),
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(review.sample([path], since=datetime.fromisoformat("2026-10-12T00:00:00+00:00"),
+                                                   runner=runner), 0)
+                self.assertIn("sample: 0 replies", output.getvalue())
+                self.assertIn(f"replies with unregistered questions: {expected}", output.getvalue())
+        runner.assert_not_called()
+
+    def test_sample_excludes_imperative_requests_from_replies_that_ask_nothing(self) -> None:
+        path = self.transcript("requests.jsonl", [
+            ("2026-10-13T10:00:00Z", "Reply upgrade or wait.", "end_turn"),
+            ("2026-10-13T11:00:00Z", "The check passed. Choose upgrade or wait.", "end_turn"),
+            ("2026-10-13T12:00:00Z", "Upgrade (recommended): use the new compiler.", "end_turn")])
+        runner = mock.Mock(side_effect=AssertionError("asking reply reached the reviewer"))
+        with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.sample([path], since=datetime.fromisoformat("2026-10-12T00:00:00+00:00"),
+                                           runner=runner), 0)
+        runner.assert_not_called()
+        self.assertIn("sample: 0 replies", output.getvalue())
+        self.assertIn("replies with unregistered questions: 3", output.getvalue())
+
+    def test_sample_matches_each_question_sentence_on_the_same_line(self) -> None:
+        first, second = "Would you retry the build?", "Which version should it use?"
+        self.assertEqual(review.reply_questions(first + " " + second), review.ReplyAsks((first, second), False))
+        path = self.transcript("questions.jsonl", [("2026-10-13T10:00:00Z", first + " " + second, "end_turn")])
+        registration = self.root / "showrunner/outstanding/build.json"
+        registration.parent.mkdir(parents=True)
+        _ = registration.write_text(json.dumps([{"text": first, "since": "2026-10-13T10:00"}]))
+        with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(registration.parents[1])}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.sample([path], 0, since=datetime.fromisoformat("2026-10-12T00:00:00+00:00")), 0)
+        self.assertIn("replies with unregistered questions: 1", output.getvalue())
+
+    def test_sample_counts_a_reply_with_two_unregistered_questions_once(self) -> None:
+        path = self.transcript("questions.jsonl", [("2026-10-13T10:00:00Z",
+            "Would you retry the build?\nWhich version should it use?", "end_turn")])
+        with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.sample([path], 0, since=datetime.fromisoformat("2026-10-12T00:00:00+00:00")), 0)
+        self.assertIn("replies with unregistered questions: 1", output.getvalue())
+
+    def test_sample_remembers_a_registered_question_after_it_closes(self) -> None:
+        question = "Would you retry the build?"
+        path = self.transcript("closed.jsonl", [("2026-10-13T10:00:00Z", question, "end_turn")])
+        registration = self.root / "showrunner/outstanding/build.json"
+        registration.parent.mkdir(parents=True)
+        _ = registration.write_text("[]\n")
+        _ = registration.with_suffix(".history.jsonl").write_text(json.dumps(review.QuestionRegistration(
+            time="2026-10-13T10:00:00+00:00", text=question)) + "\n")
+        with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(registration.parents[1])}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.sample([path], 0, since=datetime.fromisoformat("2026-10-12T00:00:00+00:00")), 0)
+        self.assertIn("replies with unregistered questions: 0", output.getvalue())
+
+    def test_registration_history_outside_the_sample_window_does_not_match(self) -> None:
+        question = "Would you retry the build?"
+        path = self.transcript("questions.jsonl", [("2026-10-13T10:00:00Z", question, "end_turn")])
+        directory = self.root / "showrunner/outstanding"
+        directory.mkdir(parents=True)
+        _ = (directory / "build.json").write_text(json.dumps([{"text": "Choose a compiler.", "since": "2026-10-01T10:00"}]))
+        records = [review.QuestionRegistration(time="2026-10-11T10:00:00+00:00", text=question),
+                   review.QuestionRegistration(time="2026-10-12T00:00:00+00:00", text="Approve the release.")]
+        _ = (directory / "build.history.jsonl").write_text("\n".join(json.dumps(item) for item in records) + "\n{bad\n")
+        cutoff = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
+        with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(directory.parent)}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.registered_questions(cutoff), ["Choose a compiler.", "Approve the release."])
+            self.assertEqual(review.sample([path], 0, since=cutoff), 0)
+        self.assertIn("replies with unregistered questions: 1", output.getvalue())
 
     def test_send_keeps_the_whole_draft(self) -> None:
         result = self.reviewed(verdict(self.draft))

@@ -215,8 +215,8 @@ def ci_collect(production: Production, state_dir: Path, no_ci: bool) -> None:
 
 def review_watch_push(table: str) -> tuple[str, str, str]:
     title = "Reviewer removal lacks comparison data"
-    result = "The report has no comparable defect counts."
-    recommendation = "Acknowledge (recommended after reading): stop this report reminder."
+    result = "The report has no comparable defect counts, so the removal's effect is unknown."
+    recommendation = "Acknowledge (recommended; work continues either way): rerun with ack instead of report to stop these report notices."
     for line in table.splitlines():
         cells = [cell.strip() for cell in line.strip("|").split("|")]
         if len(cells) == 4 and cells[0] == "merge design-check defects per phase (mean)":
@@ -225,14 +225,14 @@ def review_watch_push(table: str) -> tuple[str, str, str]:
             if cells[2] == cells[3] and cells[2] != "—":
                 title = "Reviewer removal left defects unchanged"
                 result = f"Defects found at merge stayed at {cells[3]} per phase before and after."
-                recommendation = "Acknowledge (recommended, since defects did not rise): stop the reminder."
+                recommendation = "Acknowledge (recommended; defects did not rise): rerun with ack instead of report to stop these report notices."
             break
-    body = ("An extra code reviewer was removed. " + result + " Work continues either way.\n\n"
-            + "Read the report:\n"
+    body = ("An extra code reviewer was removed from merge review. " + result + "\n\n"
+            + "In a terminal on natedev, read:\n"
             + "python3 ~/.claude/scripts/production/review_regime.py report\n"
-            + recommendation + " Run it with ack in place of report.\n\n"
+            + recommendation + "\n\n"
             + "Discuss: raise concerns in the natedev Claude session.")
-    return title, "In a natedev terminal, read the report, then acknowledge it or discuss concerns in the natedev Claude session.", body
+    return title, "On natedev, read the report. Choose acknowledge or discuss.", body
 
 
 def review_watch(production: Production, state_dir: Path) -> WatchFirstAlert | WatchRepeat | WatchBelowThreshold:
