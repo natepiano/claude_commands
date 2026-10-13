@@ -271,7 +271,7 @@ The user, 2026-10-12: "Let's trial post master to see if it works". Scope is sec
 
 **Ruled out:** an `if-shell -F` guard around the launch that repeats the server check (nested tmux quoting of the resume command).
 
-### Phase 10 — The live start-up and its results  · status: todo
+### Phase 10 — The live start-up and its results  · status: done
 
 #### Work Order
 
