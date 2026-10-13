@@ -664,6 +664,10 @@ def prompt_for(request: UnitLaunch) -> str:
                 f"{showrunner}, on standby. Work only in your worktree "
                 f"{request.worktree}, branch {request.branch}. Do nothing until the showrunner sends you work.")
     plan = request.plan_path.as_posix()
+    review_unit = request.identity.unit == "review-unit" and any(
+        line.startswith("- **Review pool:** ")
+        for line in production.doc.read_text(encoding="utf-8").splitlines()
+    )
     if isinstance(request.session, ResumedSession):
         plan = str(request.worktree / request.plan_path)
         identity = (f"You are now {request.identity.unit} in production {production.slug} (doc {doc}), under "
@@ -672,8 +676,12 @@ def prompt_for(request: UnitLaunch) -> str:
         if isinstance(request.launch_kind, UnitRestoreLaunch):
             note = request.launch_kind.note.read_text(encoding="utf-8").rstrip("\n")
             return f"{identity} {note}"
+        if review_unit:
+            return f"{identity} Run /review:direct {doc}."
         return f"{identity} Run /unit:direct {plan}."
     if isinstance(request.plan, PlanGiven):
+        if review_unit:
+            return f"/review:direct {doc}"
         return f"/unit:direct {plan}"
     return (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under "
             f"{showrunner}. Work only in your worktree {request.worktree}, "

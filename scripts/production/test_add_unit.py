@@ -1115,6 +1115,37 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
         self.assertIn("alpha-unit started: tmux attach -t alpha", result.stdout)
 
+    def test_review_unit_uses_an_ordinary_row_and_worktree_with_review_direct_opening(self) -> None:
+        _ = self.doc.write_text(self.doc.read_text().replace("## Units", "- **Review pool:** code\n\n## Units"))
+        _ = self.successful("review", "--plan", "docs/plans/given.md")
+        worktree = self.root / "project-review"
+        self.assertTrue(worktree.is_dir())
+        self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD", cwd=worktree),
+                         "build-followups-review")
+        row = next(line for line in self.doc.read_text().splitlines() if line.startswith("| review-unit |"))
+        self.assertEqual([cell.strip() for cell in row.strip("|").split("|")],
+                         ["review-unit", "docs/plans/given.md", str(worktree),
+                          "build-followups-review", "—", "—"])
+        self.assertTrue(row.endswith("| — | — |"), row)
+        self.assertEqual(self.marks("review"),
+                         {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "review-unit"})
+        self.assertIn(shlex.quote(f"/review:direct {self.doc}"), self.launch_command())
+        self.assertNotIn("/unit:direct", self.launch_command())
+
+    def test_promoted_review_unit_uses_review_direct_with_its_identity(self) -> None:
+        _ = self.doc.write_text(self.doc.read_text().replace("## Units", "- **Review pool:** code\n\n## Units"))
+        _ = self.successful("review-unit", "--plan", "docs/plans/given.md",
+                            "--resume", "session-123", "--cwd", str(self.checkout))
+        command = self.launch_command()
+        self.assertIn("You are now review-unit in production build-followups", command)
+        self.assertIn(f"Run /review:direct {self.doc}.", command)
+        self.assertNotIn("Run /unit:direct", command)
+
+    def test_review_named_unit_without_a_pool_keeps_unit_direct_opening(self) -> None:
+        _ = self.successful("review", "--plan", "docs/plans/given.md")
+        self.assertIn(shlex.quote("/unit:direct docs/plans/given.md"), self.launch_command())
+        self.assertNotIn("/review:direct", self.launch_command())
+
     def test_named_unit_account_is_quoted_inside_tmux_command(self) -> None:
         home = self.root / "home with 'quotes' $()"
         _ = Path(self.env["HOME"]).rename(home)

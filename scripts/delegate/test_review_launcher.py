@@ -154,17 +154,20 @@ import sys
 
 parser = argparse.ArgumentParser()
 sub = parser.add_subparsers(dest="verb", required=True)
-for verb in ("allocate", "release"):
+for verb in ("allocate", "release", "unit-memory"):
     command = sub.add_parser(verb)
     command.add_argument("--production", required=True)
-    command.add_argument("--pid", type=int, required=True)
+    if verb != "unit-memory":
+        command.add_argument("--pid", type=int, required=True)
     if verb == "allocate":
         for flag in ("--type", "--unit", "--phase", "--pass"):
             command.add_argument(flag, required=True)
         command.add_argument("--lens", default="")
-    else:
+    elif verb == "release":
         command.add_argument("--reviewer", required=True)
         command.add_argument("--thread-id", default="")
+    else:
+        command.add_argument("--unit", required=True)
 args = parser.parse_args()
 with Path(os.environ["STUB_POOL_CALLS"]).open("a") as calls:
     calls.write(json.dumps(vars(args)) + "\n")
@@ -175,7 +178,12 @@ if args.verb == "allocate":
         print("review_pool: retired code0: reset failed", file=sys.stderr)
     print(json.dumps({"reviewer": "code1", "thread_id": "thread-pool",
                       "mesh_dir": os.environ["STUB_POOL_MESH_DIR"],
-                      "lease_ordinal": 4, "prime_hash": "contract-hash"}))
+                      "lease_ordinal": int(os.environ.get("STUB_LEASE_ORDINAL", "4")),
+                      "prime_hash": "contract-hash"}))
+elif args.verb == "unit-memory":
+    if os.environ.get("STUB_UNIT_MEMORY_FAILURE"):
+        sys.exit("review_pool: unable to read unit memory")
+    sys.stdout.write(os.environ.get("STUB_UNIT_MEMORY", ""))
 '''
 
 class OpenPass(TypedDict):
@@ -518,6 +526,74 @@ while True:
         self.assertEqual(record["phase_instance_id"], cast("dict[str, object]", state["phase"])["instance_id"])
         self.assertEqual(record["history_file"], state["history_file"])
         self.assertLessEqual(cast(float, record["started_at"]), cast(float, record["finished_at"]))
+
+    def test_first_pool_lease_prepends_unit_memory_and_preserves_the_source_prompt(self) -> None:
+        session = self.start_implementation("pool-memory")
+        self.finish_implementation(session)
+        environment = self.pool_fixture()
+        environment["STUB_LEASE_ORDINAL"] = "1"
+        memory = "## Unit memory\nSource: finding 3, 2026-10-12. Preserve café."
+        environment["STUB_UNIT_MEMORY"] = memory
+        command = self.pool_command(session)
+        prompt = Path(command[8])
+        original = prompt.read_text()
+        result = subprocess.run(command, env=environment, capture_output=True,
+                                text=True, check=False, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        delivered = (Path(environment["STUB_POOL_MESH_DIR"]) / "follow_message.txt").read_text()
+        self.assertEqual(delivered, memory + "\n\n" + original)
+        self.assertEqual(prompt.read_text(), original)
+        calls = self.call_records("pool-calls.jsonl")
+        self.assertEqual([call["verb"] for call in calls], ["allocate", "unit-memory", "release"])
+        self.assertEqual(calls[1]["production"], "production")
+        self.assertEqual(calls[1]["unit"], "unit")
+        self.assertEqual(list(session.glob("review_message_*")), [])
+
+    def test_first_pool_lease_without_unit_memory_delivers_the_original_prompt(self) -> None:
+        session = self.start_implementation("pool-no-memory")
+        self.finish_implementation(session)
+        environment = self.pool_fixture()
+        environment["STUB_LEASE_ORDINAL"] = "1"
+        command = self.pool_command(session)
+        original = Path(command[8]).read_text()
+        result = subprocess.run(command, env=environment, capture_output=True,
+                                text=True, check=False, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((Path(environment["STUB_POOL_MESH_DIR"]) / "follow_message.txt").read_text(), original)
+        self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")],
+                         ["allocate", "unit-memory", "release"])
+        self.assertEqual(list(session.glob("review_message_*")), [])
+
+    def test_later_pool_lease_review_does_not_read_or_prepend_unit_memory(self) -> None:
+        session = self.start_implementation("pool-later-memory")
+        self.finish_implementation(session)
+        environment = self.pool_fixture()
+        environment["STUB_UNIT_MEMORY"] = "Unit memory must only be sent at lease start."
+        command = self.pool_command(session)
+        original = Path(command[8]).read_text()
+        result = subprocess.run(command, env=environment, capture_output=True,
+                                text=True, check=False, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((Path(environment["STUB_POOL_MESH_DIR"]) / "follow_message.txt").read_text(), original)
+        self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")], ["allocate", "release"])
+
+    def test_unit_memory_read_failure_releases_the_pool_reviewer_without_opening_a_pass(self) -> None:
+        session = self.start_implementation("pool-memory-error")
+        self.finish_implementation(session)
+        environment = self.pool_fixture()
+        environment["STUB_LEASE_ORDINAL"] = "1"
+        environment["STUB_UNIT_MEMORY_FAILURE"] = "1"
+        result = subprocess.run(self.pool_command(session), env=environment, capture_output=True,
+                                text=True, check=False, timeout=120)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")],
+                         ["allocate", "unit-memory", "release"])
+        self.assertFalse(any(event.get("pass_kind") == "review" for event in self.pass_events(session.name)))
+        self.assertEqual(self.turn_records(session)[0]["status"], "error")
+        self.assertEqual((session / "review_status_contract").read_text().strip(), "error")
+        self.assertIn("review_pool: unable to read unit memory", (session / "review_agent_1_contract.log").read_text())
+        self.assertFalse((self.root / "mesh-calls.jsonl").exists())
+        self.assertEqual(list(session.glob("review_message_*")), [])
 
     def test_pool_compaction_with_live_turn_refuses_and_releases_without_follow(self) -> None:
         session = self.start_implementation("pool-live")

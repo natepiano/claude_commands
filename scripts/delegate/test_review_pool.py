@@ -350,6 +350,47 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual(self.events("end"), [])
         self.assertEqual(old_file.read_bytes(), old_content)
 
+    def test_unit_memory_prints_only_the_named_unit_file_without_added_newline(self) -> None:
+        memory = self.pool / "memory"
+        memory.mkdir(parents=True)
+        content = "## Unit memory\n2026-10-12 — Source: finding 2. Preserve café."
+        _ = (memory / "unit.md").write_text(content, encoding="utf-8")
+        _ = (memory / "other.md").write_text("Another unit.", encoding="utf-8")
+        _ = (memory / "repository.md").write_text("Repository memory.", encoding="utf-8")
+        result = self.run_pool("unit-memory", "--unit", "unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, content)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse((self.pool / "pool.json").exists())
+        self.assertEqual(self.events(), [])
+
+    def test_unit_memory_is_empty_when_the_file_is_absent(self) -> None:
+        result = self.run_pool("unit-memory", "--unit", "unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(self.pool.exists())
+
+    def test_unit_memory_refuses_a_unit_outside_the_memory_directory(self) -> None:
+        result = self.run_pool("unit-memory", "--unit", "../other")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unit must name one memory file", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_closure_keeps_leased_memory_hash_after_repository_memory_changes(self) -> None:
+        old_hash = self.prime()
+        broad = self.allocate()
+        self.release(str(broad["reviewer"]))
+        _ = self.instructions.write_text("Standing contract with new repository memory.\n", encoding="utf-8")
+        new_hash = self.prime()
+        self.assertNotEqual(new_hash, old_hash)
+        closure = self.allocate(review_pass="2", lens="")
+        self.assertEqual(closure["reviewer"], broad["reviewer"])
+        self.assertEqual(closure["prime_hash"], old_hash)
+        self.assertEqual(closure["lease_ordinal"], 2)
+        self.assertEqual(len(self.events("fork")), 1)
+        self.assertTrue((self.pool / "prime" / f"{old_hash}.md").exists())
+
     def test_prime_failure_does_not_publish_a_template(self) -> None:
         self.control({"prime": {"exit": 1}})
         result = self.run_pool("prime", "--type", "code", "--instructions-file", str(self.instructions))

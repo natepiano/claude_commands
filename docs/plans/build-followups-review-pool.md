@@ -174,7 +174,7 @@
 - Moving `review.sh`'s start time after its compaction: the launcher belongs to the model-study unit, and the report counts those records itself.
 - Reading rollout files through `scripts/usage/rollouts.py`: the store already holds every request with its model, time and compactions for both machines.
 
-### Phase 5 — The review unit director and review memory  · status: todo
+### Phase 5 — The review unit director and review memory  · status: done
 
 #### Work Order
 
