@@ -11,7 +11,7 @@ import tempfile
 import time
 import unittest
 import urllib.parse
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -36,7 +36,7 @@ class VerdictJSON(TypedDict):
     action: str | None
     body: str
     questions: list[str]
-    failed_rules: list[str]
+    failed_rules: list[review.RuleFailureRecord]
 
 
 class ReviewerEnvelope(TypedDict):
@@ -89,7 +89,8 @@ def verdict(draft: review.Draft, decision: str = "send", /, **changes: object) -
     value: VerdictJSON = {
         "verdict": decision, "title": draft.title,
         "action": draft.action.text if isinstance(draft.action, ActionRequired) else None,
-        "body": draft.body, "questions": [], "failed_rules": [],
+        "body": draft.body, "questions": [], "failed_rules": ([] if decision == "send" else
+            [{"rule": "reader-starts-cold", "quote": draft.body[:10]}]),
     }
     return cast(VerdictJSON, cast(object, dict(value) | changes))
 
@@ -116,6 +117,63 @@ class LocalReviewTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(review, "schedule"))
         _ = self.enterContext(mock.patch.object(pushover, "http_post", side_effect=AssertionError("real post")))
         _ = self.enterContext(mock.patch.object(pushover, "LOG_FILE", self.root / "pushes.jsonl"))
+        config = self.root / "notify.conf"
+        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=60\n")
+        _ = self.enterContext(mock.patch.object(review, "NOTIFY_CONFIG", config))
+
+    def test_review_config_accepts_positive_finite_seconds_and_logs_fallbacks(self) -> None:
+        for contents, expected in (("# local limit\nREVIEW_TIMEOUT_SECONDS=90 # seconds\n", 90),
+                                   ("REVIEW_TIMEOUT_SECONDS=0.5\n", 0.5)):
+            _ = review.NOTIFY_CONFIG.write_text(contents)
+            with redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(review.review_timeout_seconds(), expected)
+            self.assertEqual(errors.getvalue(), "")
+        for contents, reason in (("OTHER=90\n", "missing REVIEW_TIMEOUT_SECONDS"),
+                                 ("REVIEW_TIMEOUT_SECONDS=oops", "could not convert"),
+                                 ("REVIEW_TIMEOUT_SECONDS=0", "positive and finite"),
+                                 ("REVIEW_TIMEOUT_SECONDS=-1", "positive and finite"),
+                                 ("REVIEW_TIMEOUT_SECONDS=nan", "positive and finite"),
+                                 ("REVIEW_TIMEOUT_SECONDS=inf", "positive and finite")):
+            _ = review.NOTIFY_CONFIG.write_text(contents)
+            with redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(review.review_timeout_seconds(), 60)
+            self.assertIn(reason, errors.getvalue())
+            self.assertIn("using REVIEW_TIMEOUT_SECONDS=60", errors.getvalue())
+        review.NOTIFY_CONFIG.unlink()
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(review.review_timeout_seconds(), 60)
+        self.assertIn("No such file", errors.getvalue())
+
+    def test_all_delivery_waits_derive_from_the_configured_review_and_post_limits(self) -> None:
+        _ = review.NOTIFY_CONFIG.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
+        self.assertEqual(review.revision_seconds(), 105)
+        self.assertEqual(review.user_send_seconds(), 115)
+        self.assertEqual(review.claim_stale_seconds(), 120)
+        self.assertEqual(review.posting_wait_seconds(), 110)
+        with mock.patch.object(pushover, "TIMEOUT_S", 30):
+            self.assertEqual(review.revision_seconds(), 120)
+            self.assertEqual(review.user_send_seconds(), 130)
+            self.assertEqual(review.claim_stale_seconds(), 130)
+            self.assertEqual(review.posting_wait_seconds(), 110)
+        _ = review.NOTIFY_CONFIG.write_text("REVIEW_TIMEOUT_SECONDS=60\n")
+        self.assertEqual(review.user_send_seconds(), 85)
+        self.assertEqual(review.posting_wait_seconds(), 80)
+
+    def test_stale_claim_recovery_respects_a_longer_configured_revision_budget(self) -> None:
+        _ = review.NOTIFY_CONFIG.write_text("REVIEW_TIMEOUT_SECONDS=150\n")
+        held = self.held()
+        review.hold(held)
+        with mock.patch.object(time, "time", return_value=1301):
+            self.assertTrue(review.claim(held.source))
+        with mock.patch.object(time, "time", return_value=1301 + 174):
+            self.assertFalse(review.claim(held.source))
+            self.assertEqual(review.release_if_matches(held.source, review.hold_identity(held)),
+                             review.ReleaseOutcome.POSTING)
+            self.assertEqual(review.due(post=mock.Mock(side_effect=AssertionError("early post")),
+                                        keys_file=self.root / "unused"), 0)
+        with mock.patch.object(time, "time", return_value=1301 + 175):
+            self.assertEqual(review.release_if_matches(held.source, review.hold_identity(held)),
+                             review.ReleaseOutcome.RELEASED)
 
     def reviewed(self, value: VerdictJSON, *, revision: bool = False) -> review.ReviewOutcome:
         return review.review(self.draft, revision, runner=FakeReviewer(value))
@@ -132,7 +190,7 @@ class LocalReviewTests(unittest.TestCase):
 
     def test_rewrite_keeps_source_priority_and_action_form(self) -> None:
         result = self.reviewed(verdict(self.draft, "rewrite", title="Build stopped", body="Choose whether to retry.",
-                                       failed_rules=["short-plain-sentences"]))
+                                       failed_rules=[{"rule": "short-plain-sentences", "quote": self.draft.body}]))
         self.assertIsInstance(result, review.Rewritten)
         assert isinstance(result, review.Rewritten)
         self.assertEqual((result.version.source, result.version.priority, result.version.action),
@@ -207,12 +265,93 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual(result.version.body, "")
 
     def test_ask_has_questions_but_a_revision_cannot_ask_again(self) -> None:
-        value = verdict(self.draft, "ask", questions=["Which build stopped?"], failed_rules=["reader-starts-cold"])
+        value = verdict(self.draft, "ask", questions=["Which build stopped?"], failed_rules=[{"rule": "reader-starts-cold", "quote": self.draft.body}])
         first = self.reviewed(value)
         self.assertIsInstance(first, review.Questions)
         assert isinstance(first, review.Questions)
         self.assertEqual(first.questions, ["Which build stopped?"])
         self.assertIsInstance(self.reviewed(value, revision=True), review.Rewritten)
+
+    def test_false_length_failures_return_the_original_unchanged(self) -> None:
+        for rule in ("push-body-under-500", "push-title-under-45"):
+            result = self.reviewed(verdict(self.draft, "ask", title="Different title",
+                questions=[], failed_rules=[{"rule": rule, "quote": self.draft.body}]))
+            self.assertIsInstance(result, review.Approved)
+            assert isinstance(result, review.Approved)
+            self.assertEqual(result.draft, self.draft)
+
+    def test_unsupported_quotes_are_dropped_while_supported_failures_stay(self) -> None:
+        result = self.reviewed(verdict(self.draft, "rewrite", body="Choose whether to retry.", failed_rules=[
+            {"rule": "reader-starts-cold", "quote": "Words absent from this draft"},
+            {"rule": "short-plain-sentences", "quote": "The build stopped."},
+            {"rule": "push-body-under-500", "quote": self.draft.body}]))
+        self.assertIsInstance(result, review.Rewritten)
+        assert isinstance(result, review.Rewritten)
+        self.assertEqual(result.failed_rules, ["short-plain-sentences"])
+        self.assertEqual(result.failures, (review.RuleFailure("short-plain-sentences", "The build stopped."),))
+        with redirect_stdout(io.StringIO()) as output:
+            review.print_review(self.draft, result)
+        self.assertIn('failure: {"rule": "short-plain-sentences", "quote": "The build stopped."}', output.getvalue())
+        self.assertIsInstance(self.reviewed(verdict(self.draft, "rewrite", failed_rules=[
+            {"rule": "reader-starts-cold", "quote": "Not in the original"}])), review.Approved)
+
+    def test_oversized_rewrite_keeps_supported_original_quotes_in_check_output(self) -> None:
+        result = self.reviewed(verdict(self.draft, "rewrite", body="B" * 500, failed_rules=[
+            {"rule": "reader-starts-cold", "quote": "The build stopped."},
+            {"rule": "short-plain-sentences", "quote": "Words absent from the original"}]))
+        self.assertIsInstance(result, review.Unreviewed)
+        assert isinstance(result, review.Unreviewed)
+        self.assertEqual(result.failures, (review.RuleFailure("reader-starts-cold", "The build stopped."),))
+        with redirect_stdout(io.StringIO()) as output:
+            review.print_review(self.draft, result)
+        self.assertIn("unreviewed: proposed text fails: push-body-under-500; failed rules: reader-starts-cold", output.getvalue())
+        self.assertIn('failure: {"rule": "reader-starts-cold", "quote": "The build stopped."}', output.getvalue())
+        review.log_review(self.draft, result, dry=True)
+        entry = self.entries()[0]
+        self.assertEqual(entry["failed_rules"], ["reader-starts-cold"])
+        self.assertEqual(entry["failures"], [{"rule": "reader-starts-cold", "quote": "The build stopped."}])
+
+    def test_length_counts_check_original_and_proposed_text_at_the_boundaries(self) -> None:
+        for field, boundary, rule in (("title", 45, "push-title-under-45"),
+                                     ("body", 500 - len(first_line(self.draft.action) + "\n"),
+                                      "push-body-under-500")):
+            for size in (boundary - 1, boundary):
+                draft = replace(self.draft, **{field: "X" * size})
+                result = REAL_REVIEW(draft, False, runner=FakeReviewer(verdict(draft, "rewrite",
+                    title="Build stopped", body="Choose retry.", failed_rules=[])))
+                if size < boundary:
+                    self.assertIsInstance(result, review.Approved)
+                else:
+                    self.assertIsInstance(result, review.Rewritten)
+                    assert isinstance(result, review.Rewritten)
+                    self.assertEqual(result.failed_rules, [rule])
+            proposed = self.reviewed(verdict(self.draft, "rewrite", **{field: "X" * boundary}))
+            self.assertIsInstance(proposed, review.Unreviewed)
+
+    def test_message_length_counts_action_and_no_action_headers_and_separator(self) -> None:
+        for action in (self.draft.action, NoActionRequired()):
+            for length in (499, 500):
+                with self.subTest(action=action, length=length):
+                    draft = replace(self.draft, action=action, priority="0",
+                        body="B" * (length - len(first_line(action) + "\n")))
+                    result = REAL_REVIEW(draft, False, runner=FakeReviewer(verdict(draft, "rewrite",
+                        body="The build stopped.", failed_rules=[])))
+                    if length == 499:
+                        self.assertIsInstance(result, review.Approved)
+                        assert isinstance(result, review.Approved)
+                        self.assertEqual(result.draft, draft)
+                    else:
+                        self.assertIsInstance(result, review.Rewritten)
+                        assert isinstance(result, review.Rewritten)
+                        self.assertEqual(result.failed_rules, ["push-body-under-500"])
+                        self.assertEqual(result.failures[0].quote, first_line(action) + "\n" + draft.body)
+                    proposed = REAL_REVIEW(replace(self.draft, action=action, priority="0"), False,
+                        runner=FakeReviewer(verdict(replace(self.draft, action=action, priority="0"), "rewrite",
+                            body=draft.body)))
+                    if length == 499:
+                        self.assertIsInstance(proposed, review.Rewritten)
+                    else:
+                        self.assertIsInstance(proposed, review.Unreviewed)
 
     def test_action_cannot_be_removed_emptied_or_added(self) -> None:
         for action in (None, "", "   ", "none"):
@@ -225,10 +364,10 @@ class LocalReviewTests(unittest.TestCase):
     def test_wire_limits_include_the_action_line(self) -> None:
         available = 1024 - len("Action: " + cast(ActionRequired, self.draft.action).text + "\n")
         maximum = verdict(self.draft, "rewrite", title="T" * 250, body="B" * available)
-        self.assertIsInstance(self.reviewed(maximum), review.Rewritten)
+        self.assertIsInstance(self.reviewed(maximum), review.Unreviewed)
         repeated = verdict(self.draft, "rewrite", action=first_line(self.draft.action),
                            body=first_line(self.draft.action) + "\n\n" + "B" * available)
-        self.assertIsInstance(self.reviewed(repeated), review.Rewritten)
+        self.assertIsInstance(self.reviewed(repeated), review.Unreviewed)
         for changes in ({"title": "T" * 251}, {"body": "B" * (available + 1)}):
             self.assertIsInstance(self.reviewed(verdict(self.draft, "rewrite", **changes)), review.Unreviewed)
 
@@ -236,7 +375,8 @@ class LocalReviewTests(unittest.TestCase):
         invalid: list[dict[str, object]] = [
             {"verdict": "drop"}, {"title": 3}, {"body": None}, {"failed_rules": [3]},
             {"verdict": "ask", "questions": ["a", "b", "c", "d"]},
-            {"verdict": "ask", "questions": []}, {"verdict": "ask", "questions": [""]},
+            {"verdict": "ask", "questions": [], "failed_rules": [{"rule": "reader-starts-cold", "quote": self.draft.body}]},
+            {"verdict": "ask", "questions": [""], "failed_rules": [{"rule": "reader-starts-cold", "quote": self.draft.body}]},
             {"questions": ["Unexpected question"]}, {"title": "Changed while claiming send"},
         ]
         for changes in invalid:
@@ -321,7 +461,7 @@ class LocalReviewTests(unittest.TestCase):
         schema = cast(dict[str, object], json.loads(command[command.index("--json-schema") + 1]))
         self.assertEqual(set(cast(list[str], schema["required"])),
                          {"verdict", "title", "action", "body", "questions", "failed_rules"})
-        self.assertTrue(all(0 < call.timeout <= 20 for call in runner.calls))
+        self.assertTrue(all(0 < call.timeout <= 60 for call in runner.calls))
 
     def test_unresolved_registry_uses_opus_medium(self) -> None:
         runner = FakeReviewer(verdict(self.draft), assignment_ok=False)
@@ -330,14 +470,14 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual(command[command.index("--model") + 1], "opus")
         self.assertEqual(command[command.index("--effort") + 1], "medium")
 
-    def test_setup_and_reviewer_share_one_twenty_second_budget(self) -> None:
+    def test_setup_and_reviewer_share_one_configured_budget_read_once(self) -> None:
         runner = FakeReviewer(verdict(self.draft))
         elapsed = [0.0]
 
         def process(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-            self.assertLessEqual(timeout, 20 - elapsed[0])
+            self.assertLessEqual(timeout, 90 - elapsed[0])
             if argv[0] == "zsh":
-                elapsed[0] += 18
+                elapsed[0] += 88
             elif argv[0] == "bash":
                 elapsed[0] += 1
             else:
@@ -346,12 +486,14 @@ class LocalReviewTests(unittest.TestCase):
                 raise subprocess.TimeoutExpired(argv, timeout)
             return runner(argv, timeout=timeout, env=env)
 
-        with mock.patch.object(time, "monotonic", side_effect=lambda: elapsed[0]):
+        with (mock.patch.object(time, "monotonic", side_effect=lambda: elapsed[0]),
+              mock.patch.object(review, "review_timeout_seconds", return_value=90) as config):
             result = review.review(self.draft, False, runner=process)
+        config.assert_called_once()
         self.assertIsInstance(result, review.Unreviewed)
         assert isinstance(result, review.Unreviewed)
         self.assertEqual(result.why, "timeout")
-        self.assertEqual(elapsed[0], 20)
+        self.assertEqual(elapsed[0], 90)
 
     def test_default_account_cannot_use_the_callers_login(self) -> None:
         runner = FakeReviewer(verdict(self.draft))
@@ -378,7 +520,7 @@ class LocalReviewTests(unittest.TestCase):
 
     def test_log_retains_draft_sent_version_and_review_metadata(self) -> None:
         result = self.reviewed(verdict(self.draft, "rewrite", body="Choose whether to retry.",
-                                       failed_rules=["short-plain-sentences"]))
+                                       failed_rules=[{"rule": "short-plain-sentences", "quote": self.draft.body}]))
         assert isinstance(result, review.Rewritten)
         review.log_review(self.draft, result, review.Sent(result.version))
         entry = self.entries()[0]
@@ -572,6 +714,103 @@ class LocalReviewTests(unittest.TestCase):
         directory = self.root / "state/held"
         self.assertEqual(len(list(directory.glob("*.sending"))), 1)
         self.assertEqual(len(list(directory.glob("*.json"))), 1)
+
+    def test_release_reports_delivered_released_posting_and_none(self) -> None:
+        held = self.held()
+        identity = review.hold_identity(held)
+        self.assertEqual(review.release_if_matches(held.source, identity), review.ReleaseOutcome.NONE)
+        review.hold(held)
+        self.assertEqual(review.release_if_matches(held.source, identity), review.ReleaseOutcome.RELEASED)
+        self.assertEqual(review.held_path(held.source).with_suffix(".cancel").read_text(), identity)
+        review.hold(held)
+        # A cancellation for this exact record stops even a later attempt to claim it.
+        self.assertTrue(review.claim(held.source))
+        self.assertIsInstance(review.post_claim(held, lambda: self.fail("cancelled post")), review.ClaimCancelled)
+        review.held_path(held.source).with_suffix(".cancel").unlink()
+        review.hold(held)
+        with mock.patch.object(time, "time", return_value=1301):
+            self.assertTrue(review.claim(held.source))
+            self.assertEqual(review.release_if_matches(held.source, identity), review.ReleaseOutcome.POSTING)
+            self.assertIsInstance(review.post_claim(held, lambda: 0), review.ClaimSent)
+            self.assertEqual(review.release_if_matches(held.source, identity), review.ReleaseOutcome.DELIVERED)
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(review.main(["release", "--identity", identity, "--", held.source]), 0)
+            self.assertEqual(output.getvalue(), "delivered\n")
+
+    def test_release_stops_at_its_deadline_when_the_thread_mutex_is_busy(self) -> None:
+        held = self.held()
+        elapsed = [0.0]
+        def sleep(seconds: float) -> None:
+            elapsed[0] += seconds
+        acquire = mock.Mock(return_value=False)
+        release = mock.Mock()
+        mutex = mock.Mock(acquire=acquire, release=release)
+        with mock.patch.object(review, "_STATE_MUTEX", mutex), self.assertRaises(TimeoutError):
+            _ = review.release_if_matches(held.source, review.hold_identity(held), timeout=0.2,
+                                          clock=lambda: elapsed[0], sleep=sleep)
+        self.assertAlmostEqual(elapsed[0], 0.2)
+        release.assert_not_called()
+        acquire.assert_called_with(blocking=False)
+
+    def test_stale_claim_is_cancelled_and_a_resuming_worker_does_not_post(self) -> None:
+        held = self.held()
+        review.hold(held)
+        real_post_claim = review.post_claim
+        posted: list[str] = []
+
+        def resume_after_fallback(held: review.Held, send: object) -> review.ClaimDelivery:
+            del send
+            with mock.patch.object(time, "time", return_value=1301 + review.CLAIM_STALE_SECONDS):
+                self.assertEqual(review.release_if_matches(held.source, review.hold_identity(held)),
+                                 review.ReleaseOutcome.RELEASED)
+            return real_post_claim(held, lambda: posted.append(held.source) or 0)
+
+        with (mock.patch.object(time, "time", return_value=1301),
+              mock.patch.object(review, "post_claim", side_effect=resume_after_fallback)):
+            self.assertEqual(review.due(post=mock.Mock(), keys_file=self.root / "unused"), 0)
+        self.assertEqual(posted, [])
+        self.assertIsInstance(review.held_for(held.source), review.NoHold)
+
+    def test_release_preserves_a_newer_hold_and_claim_with_another_identity(self) -> None:
+        original = self.held()
+        replacement = replace(original, created=2000, questions=["Which terminal?"])
+        review.hold(replacement)
+        for claimed in (False, True):
+            if claimed:
+                self.assertTrue(review.claim(replacement.source))
+            self.assertEqual(review.release_if_matches(original.source, review.hold_identity(original)),
+                             review.ReleaseOutcome.NONE)
+            found = review.held_for(replacement.source)
+            assert isinstance(found, review.LiveHold)
+            self.assertEqual(found.hold, replacement)
+
+    def test_recovery_drops_a_claim_with_a_completed_delivery_record(self) -> None:
+        held = self.held()
+        review.hold(held)
+        with mock.patch.object(time, "time", return_value=1301):
+            self.assertTrue(review.claim(held.source))
+            delivered = review.delivered_path(review.hold_identity(held))
+            delivered.parent.mkdir(parents=True)
+            delivered.touch()
+            os.utime(delivered, (1301, 1301))
+        with (mock.patch.object(time, "time", return_value=1301 + review.CLAIM_STALE_SECONDS),
+              mock.patch.object(pushover, "deliver", side_effect=AssertionError("duplicate post"))):
+            self.assertEqual(review.due(post=mock.Mock(), keys_file=self.root / "unused"), 0)
+        self.assertIsInstance(review.held_for(held.source), review.NoHold)
+
+    def test_delivered_records_expire_after_one_hour(self) -> None:
+        held = self.held()
+        review.hold(held)
+        with mock.patch.object(time, "time", return_value=1301):
+            self.assertTrue(review.claim(held.source))
+            self.assertIsInstance(review.post_claim(held, lambda: 0), review.ClaimSent)
+        path = review.delivered_path(review.hold_identity(held))
+        with mock.patch.object(time, "time", return_value=1301 + review.DELIVERED_KEEP_SECONDS - 1):
+            self.assertEqual(review.due(post=mock.Mock(), keys_file=self.root / "unused"), 0)
+            self.assertTrue(path.exists())
+        with mock.patch.object(time, "time", return_value=1301 + review.DELIVERED_KEEP_SECONDS):
+            self.assertEqual(review.due(post=mock.Mock(), keys_file=self.root / "unused"), 0)
+            self.assertFalse(path.exists())
 
     def test_switch_status_does_not_change_the_switch(self) -> None:
         with redirect_stdout(io.StringIO()) as output:

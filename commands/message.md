@@ -29,6 +29,7 @@ Message the user with `send.py --to user --summary "<title>" --text "<message>" 
 - `SENT: <how>` (exit 0) means delivered; `SKIPPED: <why>` (exit 0) means acknowledged or inside the repeat window. `QUEUED: <why>` (exit 1) keeps a Claude message for later delivery; it has not arrived.
 - `SENT: to the user, rewritten:` (exit 0) shows exactly what the user received on the following lines.
 - `HELD: <questions>` (exit 4): send a revision with the answers within 5 minutes; its `--summary` may change. A revision is never held again. Without a revision, the reviewer's version goes out at 5 minutes.
+- `REPLACED: <why>` (exit 0): a newer version replaced this push, and that version carries the message; nothing was sent. No PushNotification fallback.
 - `REFUSED: <why>` (exit 2): fix the action flags as the line says and send again. No PushNotification fallback.
 - `send.py: <name> cannot take messages (<reason>); contact its unit director <director> or wait` (exit 2): a seat between turns is resumed only by its unit director; contact that director or wait. With no director running, the reason says so and has no contact tail.
 - `send.py: <name> cannot take messages (no messaging socket); wait for it to open its messaging socket, then read the roster again and send again` (exit 2): that Claude session has not opened its messaging socket yet; follow the line.

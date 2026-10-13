@@ -15,7 +15,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -33,6 +33,10 @@ import sessions
 import stop as stop_work
 from user_action import ActionRequired
 from user_zone import user_zone
+if TYPE_CHECKING:
+    from ..notify import review
+else:
+    import review
 
 SHUTDOWN = Path(__file__).resolve().parent / "shutdown.py"
 NOTIFIER = SCRIPTS / "message" / "notifier.sh"
@@ -197,14 +201,23 @@ def run_notifier(verb: str, instance: str) -> None:
 def _deliver_message(
     command: list[str], recipient: str, text: str
 ) -> MessageDelivery:
-    result = subprocess.run(
-        command,
-        input=text,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )
+    timeout = 60.0
+    if recipient == "user":
+        timeout = review.user_send_seconds() + 15
+        if "--machine" in command:
+            # send.py gives SSH its user wait plus 10 s termination and 30 s transport time.
+            timeout += 40
+    try:
+        result = subprocess.run(
+            command,
+            input=text,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"send to {recipient} timed out after {timeout:g} seconds") from error
     if result.returncode == 0:
         return {"kind": "sent"}
     if result.returncode == 1:
@@ -255,7 +268,10 @@ def alert_user(summary: str, text: str, action: ActionRequired, *, machine: str 
                "--summary", summary, "--need", "decision", "--action", action.text]
     if machine:
         command.extend(("--machine", machine))
-    _ = _deliver_message(command, "user", text)
+    try:
+        _ = _deliver_message(command, "user", text)
+    except RuntimeError as error:
+        print(f"shutdown: user alert failed: {error}", file=sys.stderr)
 
 
 def alert_details(lines: list[str]) -> str:
@@ -1150,11 +1166,13 @@ def _send_holdout_alert(due: list[tuple[SessionShutdown, str]]) -> None:
     waiting = " ".join(f"Its session named {saved['session']['name']} on {saved['machine']} is {reason}." for saved, reason in due)
     account = json.dumps(first["label"])
     names = ",".join(saved["session"]["name"] for saved, _ in due)
-    form_instruction = " Read any open form in their terminals before stopping them." if len(due) == 1 else ""
+    subject = "it" if len(due) == 1 else "them"
+    possessive = "its" if len(due) == 1 else "their"
+    form_instruction = " Read any open form in that session's terminal before stopping it." if len(due) == 1 else ""
     phone_text = (f"Shutdown of Claude account {account} is waiting. " + waiting[:120]
                   + form_instruction + "\n\n"
-                  + f"Cancel (recommended): /shutdown cancel {account} --only {names} keeps them running so you can check their work.\n\n"
-                  + f"Stop now: /shutdown now {account} --only {names} stops them without waiting.")
+                  + f"Cancel (recommended): /shutdown cancel {account} --only {names} keeps {subject} running so you can check {possessive} work.\n\n"
+                  + f"Stop now: /shutdown now {account} --only {names} stops {subject} without waiting.")
     title = "Shutdown waits on a session showing a form" if any("form" in reason for _, reason in due) else "Shutdown waits on running Claude sessions"
     try:
         alert_user(title, phone_text,

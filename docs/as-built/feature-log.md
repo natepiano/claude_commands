@@ -21,7 +21,7 @@ The feature log is the current account of what six projects do: hana, natedev, c
 | `/etc/nixos/README.md` | Per-change loop step 6: the natedev close-out. Outside this repository. |
 | `pyrightconfig.json` | An `executionEnvironments` entry for `scripts/feature_log`. |
 | `/home/natepiano/rust/hanadocs/feature-log/<project>/` | The notes. |
-| `/home/natepiano/rust/hanadocs/home/feature-log.base`, `feature-log - <project>.base` | The seven Bases. |
+| `/home/natepiano/rust/hanadocs/home-base/feature-log.base`, `feature-log - <project>.base` | The seven Bases. |
 | `~/.local/state/claude/feature-log/` | State: lock, events, proposals, digest cursor, ledgers, saved release contents. |
 | `/home/natepiano/rust/hanadocs/proposals/feature-log.md` | The design this implements. Read-only for agents. |
 
