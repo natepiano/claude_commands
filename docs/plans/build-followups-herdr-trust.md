@@ -22,6 +22,7 @@ Design calls and evidence: `docs/plans/build-followups-herdr-adoption.md` (Calls
 ## Delegation Context
 
 - **Project:** `~/.claude` config repo. Worktree and branch are set by the showrunner at launch; name both in every dispatch.
+- **Project started:** 2026-10-13T22:59:12.058+00:00
 - **Stack:** Python 3 standard library, checked by basedpyright; zsh scripts; Markdown commands and docs; herdr 0.9.0 (`herdr --help`, `herdr --skill`); tmux; systemd user units.
 - **Layout:** `scripts/herdr/` (new library `herdr.py`, CLI `herdr_sessions.py`, test double `fake_herdr.py`) · `scripts/production/` (unit lookup, launchers, relays, status) · `scripts/message/roster.py` · `scripts/shutdown/` (inventory, stop, record, restart, settle) · `scripts/nightly_review/nightly_review.py` · `commands/showrunner/`, `commands/shutdown.md`, `commands/producer/to_production.md` · `docs/production_format.md` · `docs/as-built/`.
 - **Key files:**
@@ -65,7 +66,7 @@ Design calls and evidence: `docs/plans/build-followups-herdr-adoption.md` (Calls
 
 ## Phases
 
-### Phase 1 — Trust checked before every launch  · status: todo
+### Phase 1 — Trust checked before every launch  · status: done
 
 **User sees:** before — a new unit can open on Claude's folder-trust prompt and sit there until someone notices; after — a launch in an untrusted folder stops at once with one line naming the folder, the account and the command to run, and a trusted folder launches as before.
 
