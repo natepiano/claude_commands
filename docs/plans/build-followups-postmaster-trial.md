@@ -255,33 +255,21 @@ The user, 2026-10-12: "Let's trial post master to see if it works". Scope is sec
 
 ### Phase 9 — Restart tells a replaced tmux server apart by its pid as well as its start time  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** restart never uses a recorded tmux pane id or session id on a tmux server other than the one that issued it, even one started in the same second.
+- `inventory.py`: `TmuxServer{"kind": "server", "pid": int, "started_at": int}` comes from `#{pid}` and `#{start_time}` in `_tmux_session`'s one `display -p -t <pane>`; a missing or non-integer pid or start time records `not recorded`. `_parse_tmux_server` requires both, so a stored `server` with `started_at` and no `pid` parses as `not recorded` and restarts by name or creation.
+- `restart.py`: `_tmux_server_matches(server, started_at_text, pid_text)` requires both values to equal the recorded ones. The pane probe in `_tmux_pane_state` reads `#{session_id}\t#{pane_pid}\t#{pane_dead}\t#{start_time}\t#{pid}`; the session-id probe in `_tmux_launch` reads `#{start_time}\t#{pid}`. No probe is added. A replacement server started in the same second with a different pid gets neither the pane route nor either id route.
+- `docs/as-built/shutdown-and-restart.md`: the `TmuxHost` line names `TmuxServer{pid, started_at}`; the restart paragraph uses ids only while the recorded pid and start time both match the running server; an invariant records the window between probe and launch; the live check's Clean up ends only the throwaway sessions and their tmux session and keeps `/home/natepiano/postmaster`.
 
-**Spec:**
-
-Worktree `/home/natepiano/worktrees/claude-build-followups-shutdown`, branch `build-followups-shutdown`. A defect in Phase 8's committed repair, found by its architect review: `TmuxServer{started_at}` holds `#{start_time}` in whole seconds, and a scratch check produced two servers with different pids, the same `start_time`, and the same `$0`/`%0`. Both id routes then accept the replacement.
-
-- `inventory.py`: `TmuxServer` becomes `{"kind": "server", "pid": int, "started_at": int}`, read from `#{pid}` (the server's pid) beside `#{start_time}` in `_tmux_session`'s one `display` call. A missing or non-integer pid or start time records `not recorded`. `_parse_tmux_server` requires both; a record written by Phase 8 (`server` without `pid`) parses as `not recorded`, so it restarts by name.
-- `restart.py`: `_tmux_server_matches` compares both values. The pane probe in `_tmux_pane_state` and the session-id probe in `_tmux_launch` each add `#{pid}` to the format they already send; no probe is added.
-- `docs/as-built/shutdown-and-restart.md`: the `TmuxHost` line names `TmuxServer{pid, started_at}`; the restart paragraph says ids are used only while the recorded server pid and start time both match the running server. The live check's Clean up step (line 226) reads: end only the throwaway sessions and their tmux session; preserve `/home/natepiano/postmaster`.
-- Tests: a replacement server with the same start time and a different pid gets neither the pane route nor either id route, for a free pane, an occupied pane and a closed pane; a Phase 8 record (`server` with `started_at` only) restarts by name; the inventory records the pid and records `not recorded` when the pid field is missing or not an integer. The existing route tests answer `#{pid}` with the recorded value.
-
-**Files:** - `scripts/shutdown/inventory.py` — `TmuxServer`, `_parse_tmux_server`, `_tmux_session`.
+**Files:**
+- `scripts/shutdown/inventory.py` — `TmuxServer`, `_parse_tmux_server`, `_tmux_session`.
 - `scripts/shutdown/restart.py` — `_tmux_server_matches`, `_tmux_pane_state`, `_tmux_launch`.
-- `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_inventory.py` — the cases above; `test_settle.py` and `test_stop.py` only if a fixture builds a `TmuxServer`.
-- `docs/as-built/shutdown-and-restart.md` — the server identity and the Clean up line.
+- `scripts/shutdown/test_restart.py`, `test_inventory.py` — the same-second replacement for a free, occupied and closed pane; a start-only record restarting by name or creation; a missing or non-integer pid recorded as `not recorded` with the ids kept.
+- `docs/as-built/shutdown-and-restart.md` — the server identity, the restart routes, the invariant, the Clean up step.
 
-**Seats:** 1 writer + 1 tester — the same partition as Phase 8.
-- `impl` — `scripts/shutdown/inventory.py`, `scripts/shutdown/restart.py`, `docs/as-built/shutdown-and-restart.md`; hub: `scripts/shutdown/inventory.py`.
-- `test` — `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_inventory.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_stop.py`.
+**Gotchas:** the probe and the launch are separate tmux calls, so a server replaced in the milliseconds between them is not detected. The window is accepted: closing it would need an `if-shell -F` guard that nests the resume command inside tmux quoting.
 
-**Constraints from prior phases:** Phase 8 added `TmuxHost.session_ref: TmuxSessionId{session_id} | TmuxSessionIdNotRecorded` and `TmuxHost.server: TmuxServer{started_at} | TmuxServerNotRecorded`; restart's pane probe reads `#{session_id}\t#{pane_pid}\t#{pane_dead}\t#{start_time}`, the session-id route probes `display -p -t $N '#{start_time}'`, and a `not recorded` server skips both id routes. Tests build probe answers through `pane_display` in `test_restart.py`, which substitutes by field name; no test pins a format's field order. Tests never start a real tmux server, never message a session, and never run the shutdown scripts against real state. Python: basedpyright 0 errors and 0 warnings on the six files; `basedpyright` exits 3 only for the absent `.venv`.
-
-**Acceptance gate:** the shutdown suite green; basedpyright clean on the six Python files; a test shows a same-second replacement server with a different pid taking the name route; a Phase 8 record restarts by name.
-
-**Verification:** `cd scripts/shutdown && HOME=<scratch> python3 -m unittest test_restart test_inventory test_record test_settle test_stop test_shutdown_cli test_shutdown_status test_remote test_send_guard` · `basedpyright scripts/shutdown/inventory.py scripts/shutdown/restart.py scripts/shutdown/test_restart.py scripts/shutdown/test_inventory.py scripts/shutdown/test_settle.py scripts/shutdown/test_stop.py`.
+**Ruled out:** an `if-shell -F` guard around the launch that repeats the server check (nested tmux quoting of the resume command).
 
 ### Phase 10 — The live start-up and its results  · status: todo
 
