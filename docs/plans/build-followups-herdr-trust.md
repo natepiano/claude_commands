@@ -68,44 +68,23 @@ Design calls and evidence: `docs/plans/build-followups-herdr-adoption.md` (Calls
 
 ### Phase 1 — Trust checked before every launch  · status: done
 
-**User sees:** before — a new unit can open on Claude's folder-trust prompt and sit there until someone notices; after — a launch in an untrusted folder stops at once with one line naming the folder, the account and the command to run, and a trusted folder launches as before.
+#### As-built
 
-#### Work Order
-
-**Goal:** `add_unit.py`, `add_showrunner.py`, `promote_showrunner.py` and `nightly_review.py` refuse an untrusted start folder through one shared check, with the rule for which keys count measured first.
-
-**Spec:**
-
-1. **Measure first (read-only).** New `scripts/herdr/trust_survey.py`: for each account file (`~/.claude.json` and `<dir>/.claude.json` for every `~/.claude[0-9]` dir) and each project key it holds, print `<account>\t<key>\t<accepted>\t<kind>`, where kind is `main checkout`, `worktree of <main>`, `plain folder` or `ancestor of <n> repos`. Then for every directory under `~/worktrees` print whether its own key, its `--show-toplevel` key or its main checkout's key is accepted on each account. It writes nothing and prints no other field of the file. Run it once and put the counts in the phase report.
-2. **The rule.** From the survey: a folder is trusted on an account when `projects[k].hasTrustDialogAccepted is True` for k in {the folder, its `--show-toplevel`, its main checkout (parent of `--git-common-dir`)}, the rule `add_showrunner._project_keys` uses today. An ancestor folder never counts (G1 live check 2026-10-13; herdr trial). If the survey finds a worktree that ran unprompted with none of those keys accepted, stop and report to the showrunner before step 3: the rule is then wrong.
-3. `herdr.py` gains `claude_trust(folder, claude_json) -> Trusted | Untrusted(folder, account_file, keys_tried)` with that rule, and `trust_command(folder, account: AccountSelection) -> str`, the one line the user runs: `cd <folder> && <account prefix>claude`, then accept the prompt and type `/exit`. An unreadable file refuses with its path and the error's class name only.
-4. Callers, each reading the account file of the account that will run the session (`<CLAUDE_CONFIG_DIR>/.claude.json` for a named account, `~/.claude.json` for the default):
-   - `add_unit.py` `preflight`: refuse (exit 2) with `<unit>: Claude is not trusted in <folder> on <account label>. Run: <trust_command>`; the folder is the session cwd (`request.session_cwd`), checked after the worktree path is known and before anything is written or launched. A new worktree is checked by its main checkout's key, since the worktree folder does not exist yet.
-   - `add_showrunner.py`: `trusted` and `_project_keys` are removed; `checked` calls `claude_trust` with the default account file (`ADD_SHOWRUNNER_CLAUDE_JSON` still overrides it for tests) and prints the same refusal line.
-   - `promote_showrunner.py`: no change in code (it goes through `add_showrunner.checked`); its test gains an untrusted-worktree case if none exists.
-   - `nightly_review.py`: refuse a launch in an untrusted folder with the same line, on the account it launches with.
-5. Codex trust is not checked: no launcher starts interactive Codex (Call 1).
-6. Correct `docs/plans/build-followups-two-accounts.md:151` to the measured rule (owner two-accounts-unit; the showrunner clears the edit).
+- `herdr.py` holds the one Claude trust check: `claude_trust(folder, claude_json) -> Trusted | Untrusted | UnreadableTrustFile`. A folder is trusted when `projects[k].hasTrustDialogAccepted is True` for k in {the folder, its `--show-toplevel`, its main checkout (`repository_trust_key`, parent of `--git-common-dir`)}. `Untrusted` carries `keys_tried`; `UnreadableTrustFile` prints `cannot read <file> to check Claude trust (<ErrorClass>)`.
+- `trust_command(folder, account: ClaudeLaunchAccount) -> str` is the line the user runs before accepting the prompt and typing `/exit`: `cd <folder> && <account prefix> claude`, where the default account's prefix is `env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR`.
+- `add_unit.py` `preflight`, `add_showrunner.checked` (and through it `promote_showrunner.py`) and `nightly_review.py` refuse before any write or launch with `<unit | child slug | session>: Claude is not trusted in <folder> on <account label>. Run: <trust_command>`, or `<prefix>: <UnreadableTrustFile text>`. Launchers pick their account by room, and each check reads that account's file: `~/.claude.json` for the default, `<dir>/.claude.json` for a named account (`ADD_SHOWRUNNER_CLAUDE_JSON` overrides it in tests).
+- A unit worktree not yet created is checked by its main checkout's key, and its trust command runs in the main checkout.
+- `trust_survey.py` (read-only) prints, per account file, `<account> <key> <accepted> <kind>` (main checkout, worktree of <main>, plain folder, ancestor of <n> repos), then per `~/worktrees` folder whether its own, toplevel or main key is accepted. On 2026-10-13, 22 of 23 worktrees per account were covered by the main-checkout key and none by their own or toplevel key.
 
 **Files:**
-- `scripts/herdr/trust_survey.py` — new read-only survey.
-- `scripts/herdr/herdr.py` — `claude_trust`, `trust_command`.
-- `scripts/herdr/test_herdr.py` — trust rule cases.
-- `scripts/production/add_unit.py` — trust refusal in `preflight`.
-- `scripts/production/test_add_unit.py` — refusal before any write.
-- `scripts/production/add_showrunner.py` — shared check.
-- `scripts/production/test_add_showrunner.py` — refusal text.
-- `scripts/production/test_promote_showrunner.py` — untrusted worktree.
-- `scripts/nightly_review/nightly_review.py` — trust refusal.
-- `scripts/nightly_review/test_nightly_review.py` — refusal case.
-- `pyrightconfig.json` — `scripts/herdr` in the `scripts/nightly_review` environment.
-- `docs/plans/build-followups-two-accounts.md` — line 151.
-- `commands/showrunner/add_unit.md` — the refusal and what the user runs.
+- `scripts/herdr/herdr.py` — `claude_trust`, its three outcome types, `trust_command`, `repository_trust_key`.
+- `scripts/herdr/trust_survey.py` — the read-only trust survey.
+- `scripts/production/add_unit.py`, `scripts/production/add_showrunner.py`, `scripts/nightly_review/nightly_review.py` — trust refusal before launch.
+- `pyrightconfig.json` — `.` and `scripts/herdr` in the herdr and nightly_review environments, for `scripts.accounts` imports.
+- `commands/showrunner/add_unit.md` — the refusal and the command the user runs.
 
-**Seats:** 2 writers (no test lane; `test` opens as impl); split library against callers.
-- `impl` — `trust_survey.py`, `herdr.py`, `test_herdr.py`, the two-accounts line; hub: `scripts/herdr/herdr.py`.
-- `test` (opens as impl) — `add_unit.py`, `add_showrunner.py`, `nightly_review.py`, `pyrightconfig.json`, `add_unit.md` and their tests.
+**Binds later work:** the herdr panes unit and herdr adoption's launch work call `claude_trust` and `trust_command` from `herdr.py`, not a check of their own.
 
-**Constraints from prior phases:** `herdr.py` already holds `repository_trust_key` and `trusted_by_claude` (exact main-checkout key only); this phase replaces `trusted_by_claude` with `claude_trust`. `pyrightconfig.json` already lists `scripts/herdr` for production, message and shutdown.
+**Gotchas:** Trust counts only on an exact key (the folder, its `--show-toplevel`, or its main checkout), never an ancestor. The survey prints only the key, accepted and kind fields of `.claude.json`, and an unreadable file reports only its path and the error's class name. Absent keys alone do not show a folder launched without a prompt; that needs runtime evidence such as a Claude project dir. When `nightly_review.py` picks the default account but inherits `CLAUDE_CONFIG_DIR`, it checks trust on the inherited dir.
 
-**Acceptance gate:** `python3 -m unittest discover` for `scripts/herdr`, `scripts/production` and `scripts/nightly_review` green; `basedpyright scripts/herdr scripts/production scripts/nightly_review` prints `0 errors, 0 warnings`. Tests cover each of the three keys accepted, an ancestor-only entry refused, an unreadable file refused without its contents, and `add_unit.py` refusing before it writes a stub, a row or a worktree. The survey ran and its counts are in the phase report.
+**Ruled out:** ancestor keys as trust (refused in the 2026-10-13 live check); `trusted_by_claude` and `add_showrunner._project_keys`, replaced by `claude_trust`; a Codex trust check, since no launcher starts interactive Codex.
