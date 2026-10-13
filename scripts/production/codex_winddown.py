@@ -246,11 +246,13 @@ def announce_quiet(running: int) -> None:
         (STATE / QUIET).touch(exist_ok=False)
     except FileExistsError:
         return
-    text = f"No Codex agent is running on {socket.gethostname()}. Reset when ready, then /codex_winddown clear."
+    machine = socket.gethostname()
+    text = (f"All Codex agents on {machine} have stopped, so a reset now will not interrupt their work. "
+            "New Codex work stays paused until you run the clear command.")
     _ = broadcast.send(
         "user", "codex-winddown", text,
-        "--summary", "Codex wind-down", "--need", "decision",
-        "--action", "Reset Codex, then run /codex_winddown clear.",
+        "--summary", "Codex is ready for your reset", "--need", "decision",
+        "--action", f"Reset Codex, then run /codex_winddown clear in a Claude session on {machine}.",
     )
 
 

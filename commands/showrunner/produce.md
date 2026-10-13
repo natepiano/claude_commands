@@ -945,8 +945,7 @@ message is the one action or fact, under 500 characters, per the message guide. 
 what the user does with `--action`, or says nothing is needed with
 `--no-action`. Emergency (`--need blocked`) is only for an action the user must
 take now. Exit 0 means sent. On `FAILED` (exit 3), fall back to PushNotification
-with the same `Action: <what the user does>` or `No action needed.` first line,
-and say so in the log. Never
+with the `fallback text:` that `send.py` printed, and say so in the log. Never
 read or print `~/.config/pushover/env`. Every attempt is logged in
 `~/.local/state/message/log.jsonl`.
 

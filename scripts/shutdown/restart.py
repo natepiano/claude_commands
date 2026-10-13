@@ -1739,6 +1739,30 @@ def _restart_alerts_enabled(login: str, only: Iterable[str] = (), *, peer: PeerR
     return (not records and not ids) or any(saved["alerts"] == "user" for saved in _eligible_records(records))
 
 
+def restart_push(label: str, lines: list[str], *, failed: bool, phone_access: bool) -> tuple[str, str, ActionRequired]:
+    account = json.dumps(label)
+    diagnostics = sorted(lines, key=lambda line: not any(word in line.lower() for word in ("failed", "not reached", "no remote control")))
+    details = "\n".join(diagnostics)
+    details = details if len(details) <= 130 else details[:127].rsplit(" ", 1)[0] + "…"
+    if failed:
+        title = "Some Claude sessions did not restart"
+        body = f"Sessions on Claude account {account} did not restart. Failure details: {details}\n\n"
+        body += f"The status command shows what failed. Fix the cause. Then run /shutdown restart {account} in the same Claude session on natedev to try again."
+        failures = [match for line in diagnostics if (match := re.match(r"[^:]+: ([^:]+) restart failed: (.*)", line)) is not None]
+        if failures:
+            name, reason = failures[0].groups()
+            reason = reason if len(reason) <= 130 else reason[:127].rsplit(" ", 1)[0] + "…"
+            title = f"Session {name} did not restart" if len(name) <= 15 else title
+            body = f"Session {name} on Claude account {account} did not restart: {reason}.\n\n" + body.split("\n\n", 1)[1]
+    else:
+        title = "Restarted sessions lack phone access"
+        names = ", ".join(line.partition(":")[0] for line in diagnostics)
+        body = f"Sessions on Claude account {account} restarted. Remote Control is off in these sessions, so you cannot reach them from your phone: {names}.\n\n"
+    if phone_access:
+        body += "The status command shows each session's machine. On that machine, run /remote-control in its terminal to turn phone access back on."
+    return title, body, ActionRequired(f"In a Claude session on natedev, run /shutdown status {account}.")
+
+
 def restart(
     account: AccountNamed | AccountNotNamed,
     *,
@@ -1822,16 +1846,8 @@ def restart(
                 if incomplete:
                     lines.append(incomplete)
             lines.extend(f"{item['name']}: running, no Remote Control" for item in missing)
-            actions: list[str] = []
-            if failure_alert:
-                lines.append("Fix what is named above, then run /shutdown restart again; it brings back only what is left.")
-                actions.append("Fix what is named, then run /shutdown restart again.")
-            if missing:
-                instruction = "Turn on Remote Control in each named session at its terminal: /remote-control"
-                lines.append(instruction)
-                actions.append(instruction)
             try:
-                settle.alert_user(f"{selected.label} is not fully back", "\n".join(lines), ActionRequired(" ".join(actions)))
+                settle.alert_user(*restart_push(selected.label, lines, failed=failure_alert, phone_access=bool(missing)))
             except (OSError, RuntimeError, ValueError):
                 pass
     return 0 if local.exit_status == 0 and peer["outcome"] != "partial" and not peer["refused"] else 1

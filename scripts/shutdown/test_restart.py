@@ -917,9 +917,27 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(len(sent), 1)
         args, body = sent[0]
         action_index = args.index('--action')
-        self.assertEqual(args[action_index + 1], 'Fix what is named, then run /shutdown restart again.')
-        self.assertIn(f'{LABEL} is not fully back', args)
+        self.assertEqual(args[action_index + 1], f'In a Claude session on natedev, run /shutdown status {json.dumps(LABEL)}.')
+        self.assertIn('Some Claude sessions did not restart', args)
         self.assertIn(failure, body)
+        self.assertLess(len('Action: ' + args[action_index + 1] + '\n' + body), 500)
+
+    def test_restart_push_names_failed_sessions_and_phone_access_effect(self) -> None:
+        """F014: recovery explains the named session's failure or missing phone access."""
+        result = restart.MachineRestartResult("natedev", "claude 2", "partial", failed=1,
+            failed_sessions=(restart.FailedSessionRestart("Beta", "window failed to open"),))
+        title, body, action = restart.restart_push("claude 2", restart._result_lines(result),  # pyright: ignore[reportPrivateUsage]
+            failed=True, phone_access=False)
+        self.assertIn("Beta", title)
+        self.assertIn('Session Beta on Claude account "claude 2"', body)
+        self.assertIn("window failed to open", body)
+        self.assertIn('/shutdown restart "claude 2"', body)
+        self.assertIn("Claude session on natedev", action.text)
+        _, phone, _ = restart.restart_push("claude 2", ["Owner: running, no Remote Control"],
+            failed=False, phone_access=True)
+        self.assertIn("cannot reach them from your phone", phone)
+        self.assertIn("Owner", phone)
+        self.assertIn("/remote-control", phone)
 
     def test_restart_cli_builds_a_never_alert_policy(self) -> None:
         received: list[tuple[restart.AccountNamed | restart.AccountNotNamed, bool, restart.AlertWhenNotBack | restart.NeverAlert]] = []
@@ -1868,7 +1886,8 @@ class RestartTests(ShutdownTestCase):
                     self.assertEqual(alert.call_count, int(policy == "user" and isinstance(command_alerts, restart.AlertWhenNotBack)))
                     if alert.called:
                         self.assertIn("Owner", cast(str, cast(object, alert.call_args.args[1])))
-                        self.assertIn("/remote-control", cast(ActionRequired, cast(object, alert.call_args.args[2])).text)
+                        self.assertIn("/remote-control", cast(str, cast(object, alert.call_args.args[1])))
+                        self.assertIn("Claude session on natedev", cast(ActionRequired, cast(object, alert.call_args.args[2])).text)
                         self.assertNotIn("run /shutdown restart again", cast(str, cast(object, alert.call_args.args[1])))
 
     def test_remote_control_active_restart_sends_no_alert(self) -> None:
@@ -1891,7 +1910,8 @@ class RestartTests(ShutdownTestCase):
                 self.assertEqual(alert.call_count, int(policy == "user"))
                 if alert.called:
                     self.assertIn("Remote", cast(str, cast(object, alert.call_args.args[1])))
-                    self.assertIn("/remote-control", cast(ActionRequired, cast(object, alert.call_args.args[2])).text)
+                    self.assertIn("/remote-control", cast(str, cast(object, alert.call_args.args[1])))
+                    self.assertIn("Claude session on natedev", cast(ActionRequired, cast(object, alert.call_args.args[2])).text)
 
     def test_peer_no_shutdown_refusal_keeps_line_without_alert(self) -> None:
         refusal = restart.RestartNoShutdown(kind="no shutdown", session_id="peer", name="Remote")
