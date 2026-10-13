@@ -349,7 +349,7 @@ The store is at `PRAGMA user_version` 6 (`STORE_VERSION`) and holds what the wor
 
 **Ruled out:** comparing status, turn id and size in place of a revision (a turn's ending write removes its turn id, so a newer turn that ends with the same status and size would pass).
 
-### Phase 12 — A Codex request is keyed by its session file too · status: todo
+### Phase 12 — A Codex request is keyed by its session file too · status: done
 
 #### Work Order
 
