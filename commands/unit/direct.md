@@ -550,8 +550,9 @@ The key sets the Codex poll timeout and a Claude unit's notifier interval.
 For Codex, a missing or non-positive integer is an error; tell the user to set
 it. <PrepareSession/> creates Claude's `delegate-<run id>` instance, where
 the run id is the basename of `${SESSION_DIR}`; `end_session.sh` removes it.
-With `PLAN_DELEGATE_PROGRESS_UPDATES=on-demand` it creates none: reports run
-only when asked, until `/unit:report on` starts the schedule. The key does not
+With `PLAN_DELEGATE_PROGRESS_UPDATES=on-demand`, the default, it creates none:
+reports run only when asked, until `/unit:report on` starts the schedule. A
+resumed run that already has an instance keeps it, on or off. The key does not
 change the Codex poll interval. The agent arms nothing. When `prepare_session.sh` prints `notifier instance not
 created`, say so in one line: this run gets no ticks until
 `zsh ~/.claude/scripts/delegate/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID"`
