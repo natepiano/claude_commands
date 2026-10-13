@@ -107,8 +107,8 @@ merged phase, join by `finding_id` and `phase_instance_id`, and read each
 finding's last verdict. A finding with no verdict at merge remains open;
 process it with the closed findings and the line's design-check verdict.
 Do not use `findings.py status`: the unit may already be in another phase.
-Only a history file that cannot be read keeps the merge pending for memory;
-report that failure to the showrunner.
+A `session dir unavailable` line or a history file that cannot be read keeps
+the merge pending for memory; report the cause to the showrunner.
 Use earlier merged phases' history to check recurrence, taking their unit,
 phase and session dir from the merge lines in `LOG`.
 
