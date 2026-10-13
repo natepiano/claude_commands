@@ -144,25 +144,19 @@ Source: steps recorded on the Mac; failed follows the build log's failure rule, 
 
 ### Phase 3 — Each test run sent to the Mac deletes its build output when it finishes  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** after each offloaded test run, the Mac mirror's target dir for that repository is deleted, so offloaded runs stop filling the Mac's disk. Nothing else on the Mac is touched, `/tmp` included. Source: the user, 2026-10-13 ("it needs to be cleaned up as we go", "we should only be cleaning up nextest target dirs as we go along - you should leave the rest of /tmp alone of course"); the showrunner chose this form over a size-capped trim (simple ranks above fast).
-
-**Spec:**
-- `offload.py` `remote_test_command`: after `echo mac_exit=$?`, the remote text deletes `"$HOME"/.local/state/mac-test/mirror/<repo>/target` (built from `remote_mirror`, quoted) whatever the run's exit code, then prints `mac_cleanup=<rc>` on its own line. Only that path is ever deleted. When the run's nextest words name another target dir (`--target-dir`), the text skips the delete and prints `mac_cleanup=skipped`; the offload prints one line, `Mac build output kept: the run used another target dir`.
-- `scripts/lint/invoke.sh`: an offloaded run starts no detached sweep after its step, because its target is deleted right after. `remote_test_command` sets the switch that turns the sweep off (name it in the summary); runs on natedev keep their sweep unchanged.
-- The parser that reads `mac_exit=` (`offload.py:553`, today only as the last line) also reads `mac_cleanup=`, as a named outcome type (`CleanupDone`, `CleanupFailed(rc)`, `CleanupSkipped`, `CleanupUnconfirmed`), never a bare optional. The test result always comes from `mac_exit=`. A failed delete prints `Mac build output not removed: <rc>`; an ssh drop between the two markers prints `Mac build output cleanup unconfirmed`. Neither changes the run's result.
-- Tests:
-  - `test_offload.py`: run the remote text under `sh` and `zsh -f` with a stand-in `lint`. The target is gone after a passing run and after a failing run. A sibling path in the mirror and a file in a stand-in `/tmp` survive. A `--target-dir` run deletes nothing. Parser fixtures cover both markers, a failed delete, a skip, and a disconnect between the markers.
-  - `test_invoke_scope.py`: with the switch set, no sweep starts; without it, the sweep still starts.
-- Constraints from prior phases: `mirror_selector_script` is shared by the leftover check and the claim watcher's activity check; leave it unchanged. Mac runs are serialized by the claim, so nothing else uses the mirror's target during the delete. message-clarity changes `scripts/lint/sweep.py` and `test_sweep.py` on its branch: phase 3 edits `invoke.sh` only, and the unit merges build-followups before its checkpoint if that work lands first.
+- `offload.py` `remote_test_command` sets `LINT_SKIP_SWEEP=1` on the remote lint and, after `echo mac_exit=$?`, runs a cleanup step whatever the exit code. When the run's words name `--target-dir`, it prints `mac_cleanup=skipped`. Otherwise it reads the Mac's free space with `df -g "$HOME"`: below the existing `free_floor_gib` (`config/mac_test.conf`, 100) it removes `"$HOME"/.local/state/mac-test/mirror/<repo>/target` and prints `mac_cleanup=0` or the `rm` status; at or above the floor, or when `df` is unreadable, it keeps the output for reuse and prints `mac_cleanup=kept`. Only that path is ever removed.
+- `stream_mac_run` holds a `mac_exit=` line as the result only when every later line is a `mac_cleanup=` marker; any other later line prints the held line and leaves the result `MISSING_MAC_STATUS`. `ReportedMacStatus(status, cleanup)` carries `CleanupOutcome` = `CleanupDone | CleanupFailed(rc) | CleanupSkipped | CleanupKept | CleanupUnconfirmed`. The test result always comes from `mac_exit=`.
+- `report_cleanup` prints `Mac build output not removed: <rc>`, `Mac build output kept: the run used another target dir`, or `Mac build output cleanup unconfirmed`, and nothing for done or kept. On an unconfirmed cleanup `claimed_run` runs `check_leftovers` and releases the claim only on `LeftoversEnded`.
+- `scripts/lint/invoke.sh` `sweep_after_step` returns at once when `LINT_SKIP_SWEEP=1`; runs on natedev keep their sweep.
 
 **Files:**
-- `scripts/mac_test/offload.py`
-- `scripts/mac_test/test_offload.py`
-- `scripts/lint/invoke.sh`
-- `scripts/lint/test_invoke_scope.py`
+- `scripts/mac_test/offload.py` — floor-gated cleanup text, cleanup outcome types, marker parsing, cleanup report, leftover check before release
+- `scripts/lint/invoke.sh` — the `LINT_SKIP_SWEEP` switch
+- `scripts/mac_test/test_offload.py` — remote text under `sh` and `zsh -f` (below floor, at or above, unreadable `df`, `--target-dir` skip, survivors), parser fixtures, unconfirmed-cleanup release
+- `scripts/lint/test_invoke_scope.py` — sweep with and without the switch
 
-**Seats:** 1 writer + 1 tester.
+**Gotchas:** offloaded Mac nextest rows in buildlog have an empty `repo`, so filter them with `coalesce(repo,'')=''` and `host<>'natedev'`. A cold Mac hana build takes about 1760 s against a 141 s warm median, which is why output is kept above the floor.
 
-**Acceptance gate:** the mac_test and lint lanes pass. A live check runs only while no real Mac claim is held. While holding the claim, confirm the Mac's hana mirror has no `target`, then run one hana nextest offload from natedev; afterwards no `target` remains. The phase report gives that cold run's Mac wall time beside the last warm hana Mac runs and natedev's time for the same tests, all from buildlog. If the cold Mac run is slower than natedev, tell the showrunner before the checkpoint notice.
+**Ruled out:** deleting the target after every run (cold rebuilds cost far more than natedev's run); a size-capped trim; touching anything else on the Mac, `/tmp` included.
