@@ -37,8 +37,11 @@ UNIT_LOGIN = "unit@example.com"
 
 
 def setUpModule() -> None:
-    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    """The times these tests expect are Pacific; neither the user's zone setting nor a showrunner
+    registered on the machine running them may change them."""
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+    no_showrunners = unittest.enterModuleContext(tempfile.TemporaryDirectory())
+    _ = unittest.enterModuleContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", Path(no_showrunners)))
 
 
 class FakeNote:

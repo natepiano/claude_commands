@@ -15,7 +15,8 @@ Run these steps in order for each completed loop or verbose phase:
 
 1. **Code commit.** Run <CheckpointCommit/> for the phase's code, tests, and
    plan doc with `status: done` and its Work Order still in place. Its
-   reservation release, <PushCheckpoint/>, and `review-trial` line happen here.
+   reservation release, <PushCheckpoint/>, `review-trial` line and
+   `phase_table.py parallel` line happen here.
 2. **Code ready notice.** Send <ProductionUnit/> item 3's checkpoint notice.
    Its hash is mergeable now; `Phase <next> ETA` counts from this commit.
    Outside a production, report
