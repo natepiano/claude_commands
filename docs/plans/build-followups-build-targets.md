@@ -189,7 +189,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 **Binds later work:** The driver releases only sessions that have an entry in the release record, so a session that was told of the hold and never registered is not released yet; the release fix (a release reaches every session the hold told) closes that in `advance_release`, with its tests in `test_build_hold.py`. No command registers a call without blocking (`wait-local` blocks, `check-admission` never registers), which test routing to the first free target depends on. `BUILDLOG_HOLD_WAIT_S` is exported per call as decimal seconds; the build log's recorder does not read it yet and no report shows it (the build report's hold-wait column adds both). The automatic wait, the launch refusal (launch again after the release) and the exit 12 recovery (fix or remove the file the diagnostic names) are not documented in any command file yet; the `/build_hold` target and docs work owns them and the only change to the notice text.
 
 **Gotchas:**
-- Each compiling step of a local `verify.sh` call starts Python twice (`wait-local`, then `check-admission`), about 70 ms each, whether or not a hold exists.
+- Each compiling step of a local `verify.sh` call starts Python twice (`wait-local`, then `check-admission`), about 70 ms each, while a holder file exists; with the holder directory empty, `build_hold_nothing_held` answers in the shell and neither starts.
 - The holder file stays in place through the whole release, so natedev reads `Held` until the last turn ends; never watch the holder file to learn that a call may run.
 - A release driver keeps the code it started with; an older driver sets a newer record aside and releases every session at once. Change `build_hold.py` on the live machine only while natedev is free and no release runs.
 - Every fixture that can reach the wait needs temporary `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR` and `PLAN_DELEGATE_ACTIVE_DIR` and a cleared `BUILDLOG_CALL_ID` and `BUILDLOG_CALLER`; a fixture that reaches the installed scripts through the real HOME rewrites the live release record.
@@ -629,7 +629,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **Ruled out:** catching every exception from `read_targets` — other errors would then read as config problems.
 
-### Phase 17 — A build step on a free natedev starts at once, and the Mac run builds what a build typed in the clone would reuse  · status: todo
+### Phase 17 — A build step on a free natedev starts at once, and the Mac run builds what a build typed in the clone would reuse  · status: done
 
 #### Work Order
 

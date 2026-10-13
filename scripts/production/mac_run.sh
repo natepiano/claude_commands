@@ -99,7 +99,7 @@ head=$(ssh $host "git -C $clone rev-parse HEAD")
 print "HEAD=$head"
 [[ $head == $sha ]] || { print "wrong tree: wanted $sha"; exit 5 }
 
-on_mac "cd $clone && ~/.cargo/bin/cargo build -q -p hana" || { print "build failed"; exit 6 }
+on_mac "cd $clone && MACOSX_DEPLOYMENT_TARGET=14.0 ~/.cargo/bin/cargo build -q -p hana" || { print "build failed"; exit 6 }
 
 # perl's alarm stops hana after the hold; 142 (SIGALRM) means it stayed up.
 # Run outside cargo, so Bevy needs the asset root that `cargo run` would give it.
@@ -134,7 +134,7 @@ for entry in $examples; do
   args="-p $parts[1] --example $parts[2]"
   (( $#parts == 3 )) && args="$args --features $parts[3]"
   example_log=/tmp/mac_run_$parts[2].log
-  if ! on_mac "cd $clone && ~/.cargo/bin/cargo build -q $args" > /dev/null 2>&1; then
+  if ! on_mac "cd $clone && MACOSX_DEPLOYMENT_TARGET=14.0 ~/.cargo/bin/cargo build -q $args" > /dev/null 2>&1; then
     print "example $parts[2]: build failed"
     failed=1
     continue

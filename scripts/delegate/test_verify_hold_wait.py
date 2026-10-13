@@ -38,6 +38,10 @@ class StepObservation(TypedDict):
     arguments: list[str]
 
 
+class CallWithHoldWait(test_verify_mac_offload.CallRecord):
+    hold_wait_s: float
+
+
 def read_cycle_file(path: Path) -> build_hold.HoldCycle:
     return cast(build_hold.HoldCycle, json.loads(path.read_text()))
 
@@ -179,6 +183,76 @@ class VerifyHoldWaitTests(unittest.TestCase):
         self.assertNotIn("natedev is held", result.stdout + result.stderr)
         self.assertEqual(len(self.fixture.local_runs()), 1)
         self.assertFalse(self.cycle_file.exists())
+
+    def count_python_starts(self) -> Path:
+        starts = self.fixture.root / "python-starts"
+        self.fixture.environment.update({"TEST_PYTHON_STARTS": str(starts), "TEST_REAL_PYTHON": sys.executable})
+        self.fixture.write_executable(self.fixture.bin_directory / "python3", '''import json, os, sys
+from pathlib import Path
+with Path(os.environ["TEST_PYTHON_STARTS"]).open("a") as output:
+    output.write(json.dumps(sys.argv[1:]) + chr(10))
+os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.argv[1:]])
+''')
+        return starts
+
+    def hold_commands(self, starts: Path) -> list[list[str]]:
+        commands: list[list[str]] = []
+        for line in starts.read_text().splitlines() if starts.exists() else []:
+            arguments = cast(list[str], json.loads(line))
+            if (len(arguments) < 2 or Path(arguments[0]).name not in {"build_targets.py", "build_hold.py"}
+                    or arguments[1] == "eligible"):
+                continue
+            arguments[0] = Path(arguments[0]).name
+            for option, replacement in (("--call-id", "c1"), ("--pid", "<pid>"), ("--cycle-id", CYCLE_ID)):
+                if option in arguments:
+                    arguments[arguments.index(option) + 1] = replacement
+            commands.append(arguments)
+        return commands
+
+    def recorded_hold_wait(self) -> float:
+        row = cast(CallWithHoldWait, self.fixture.call_records()[-1])
+        return row["hold_wait_s"]
+
+    def test_call_with_an_empty_holder_directory_starts_no_hold_check(self) -> None:
+        Path(self.fixture.environment["BUILD_HOLD_DIR"]).mkdir()
+        starts = self.count_python_starts()
+        for arguments in (("check", "sample"), ("test", "sample", "--local", "local admission test", "--filter", "smoke")):
+            with self.subTest(arguments=arguments):
+                starts.unlink(missing_ok=True)
+                result = self.fixture.verify(*arguments)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.hold_commands(starts), [])
+                self.assertEqual(self.recorded_hold_wait(), 0)
+
+    def test_held_call_starts_the_same_hold_checks_as_before(self) -> None:
+        self.hold()
+        starts = self.count_python_starts()
+        observation = self.observe_waits()
+        process = self.start("test", "sample", "--local", "local admission test", "--filter", "smoke")
+        _ = self.wait_for_call()
+        self.assertEqual(self.fixture.local_runs(), [])
+        grant_call(self.cycle_file)
+        code, output = self.finish(process)
+        self.assertEqual(code, 0, output)
+        self.assertIn("held by hana for render checks; waiting", output)
+        self.assertEqual(output.count("natedev is held by"), 1)
+        self.assertEqual(len(self.fixture.local_runs()), 1)
+        observed = cast(WaitObservation, json.loads(observation.read_text()))
+        self.assertGreater(float(observed["total"]), 0)
+        self.assertAlmostEqual(float(observed["total"]), sum(float(value) for value in observed["waits"]), places=5)
+        self.assertAlmostEqual(self.recorded_hold_wait(), float(observed["total"]), places=5)
+        # Ordered commands recorded from the unchanged scripts at 8b3178f8.
+        expected = [
+            ["build_targets.py", "check-admission", "--call-id", "c1"],
+            ["build_targets.py", "wait-local", "--call-id", "c1", "--pid", "<pid>"],
+            ["build_targets.py", "wait-local", "--call-id", "c1", "--pid", "<pid>"],
+            ["build_targets.py", "wait-local", "--call-id", "c1", "--pid", "<pid>"],
+            ["build_targets.py", "check-admission", "--call-id", "c1"],
+            ["build_hold.py", "mark", "--state", "MemoryGateReturned", "--outcome", "Granted",
+             "--call-id", "c1", "--cycle-id", "cccccccccccccccccccccccccccccccc", "--generation", "1"],
+            ["build_targets.py", "finish-local", "--call-id", "c1"],
+        ]
+        self.assertEqual(self.hold_commands(starts), expected)
 
     def test_held_call_registers_before_compiling_then_runs_on_release(self) -> None:
         self.hold()
