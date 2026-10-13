@@ -58,7 +58,7 @@ In `invoke.sh`, `run_once` checks natedev holds before memory admission, runs th
 
 ### BRP launches
 
-`scripts/hooks/pre-tool-use-brp-launch-gate.sh` is a `PreToolUse` hook on `mcp__brp__brp_launch` (`settings.json`, timeout 960 s). It sets `CLAUDE_CODE_SESSION_ID` from the hook input, clears the call id and asks `build_targets.py check-local` first. A hold or unreadable hold state prints a deny answer with its reason and exits 0 without memory admission; the session launches again after release. Admission runs the memory gate and marks `MemoryGateReturned`. A launch's build runs in the session's own scope, not `builds.slice`. A launch arriving after release began, with no queued turn, is admitted without a second release message.
+`scripts/hooks/pre-tool-use-brp-launch-gate.sh` is a `PreToolUse` hook on `mcp__brp__brp_launch` (`settings.json`, timeout 960 s). It sets `CLAUDE_CODE_SESSION_ID` from the hook input, clears the call id and asks `build_targets.py check-local` first. A launch from the session whose hold file is the only hold in force is admitted. A hold or unreadable hold state prints a deny answer with its reason and exits 0 without memory admission; the session launches again after release. Admission runs the memory gate and marks `MemoryGateReturned`. A launch's build runs in the session's own scope, not `builds.slice`. A launch arriving after release began, with no queued turn, is admitted without a second release message.
 
 ### Memory kills in `verify.sh`
 

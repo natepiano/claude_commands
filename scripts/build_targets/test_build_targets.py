@@ -584,6 +584,65 @@ class WaitLocalTests(IsolatedTargetTest):
         assert cycle is not None
         self.assertFalse(any(entry["state"] == "MemoryGateReturned" for entry in cycle["entries"]))
 
+    def check_launch(self, session_id: str) -> tuple[int, str, str]:
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(self.root), "CLAUDE_CODE_SESSION_ID": session_id}), \
+             redirect_stdout(output), redirect_stderr(errors):
+            code = build_targets.command_check_local()
+        return code, output.getvalue(), errors.getvalue()
+
+    def test_holder_session_launch_is_admitted_without_changing_hold_or_release(self) -> None:
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), NOW)
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        cycle_file = self.root / "release" / cycle["id"] / "cycle.json"
+        current = self.root / "release" / "current"
+        holder_file = build_hold.holder_path(self.holders, "holder-session")
+        before = (cycle_file.read_bytes(), current.read_bytes(), holder_file.read_bytes())
+        with mock.patch.object(build_hold, "register_wait", wraps=build_hold.register_wait) as register, \
+             mock.patch.object(build_hold, "read_admission", wraps=build_hold.read_admission) as admission:
+            self.assertEqual(self.check_launch("holder-session"), (0, "", ""))
+        register.assert_not_called()
+        admission.assert_not_called()
+        self.assertEqual((cycle_file.read_bytes(), current.read_bytes(), holder_file.read_bytes()), before)
+        self.assertEqual([path.name for path in self.holders.iterdir()], ["holder-session"])
+
+    def test_another_session_launch_is_refused_by_the_session_hold(self) -> None:
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), NOW)
+        self.assertEqual(self.check_launch("other-session"), (
+            10, "natedev is held by hana for render checks; launch after the release.\n", "",
+        ))
+
+    def test_holder_session_launch_is_refused_when_another_hold_is_in_force(self) -> None:
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), NOW)
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("other-session", "research"),
+                                  "timing", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1))
+        self.assertEqual(self.check_launch("holder-session"), (
+            10, "natedev is held by hana for render checks; launch after the release.\n", "",
+        ))
+
+    def test_holder_session_launch_is_refused_when_the_release_record_names_an_unusable_holder(self) -> None:
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), NOW)
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        cycle["holders"]["."] = {"since": NOW.isoformat(), "released_at": ""}
+        build_hold.save_cycle(cycle)
+        self.assertEqual(self.check_launch("holder-session"), (
+            10, "natedev is held by hana for render checks; launch after the release.\n", "",
+        ))
+
+    def test_hold_under_a_name_refuses_every_launching_session(self) -> None:
+        self.begin_hold()
+        for session_id in ("holder-session", "other-session", ""):
+            with self.subTest(session_id=session_id):
+                self.assertEqual(self.check_launch(session_id), (
+                    10, "natedev is held by hana for render checks; launch after the release.\n", "",
+                ))
+
     def test_register_local_is_nonblocking_repeatable_and_uses_given_pid(self) -> None:
         self.begin_hold()
         with mock.patch.object(build_targets, "wait_sleep", side_effect=AssertionError("Registration must return")):
