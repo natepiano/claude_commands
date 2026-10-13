@@ -211,7 +211,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    ```
    From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
    review trial: ux <N> findings, code <N> findings, review-seat minutes <M>, ux check minutes <U>, ux repair minutes <R>
-   design check: <pass | N defects, each moved to <phase>> — fresh helper on exactly these shots, built from <hash>
+   design check: <pass | N defects, each moved to <phase>> — fresh check on exactly these shots, built from <hash>
    ```
 
    A phase checkpoint's notice carries the second line:
@@ -243,9 +243,10 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    round.
 
    Such a notice carries the third line: the verdict of the design check
-   (`/unit:direct` → <UXReview/>) that a fresh helper gave on exactly the
-   shots this notice sends, taken from a build of `<hash>`. A verdict on other
-   shots, or on a build from before a later change to what users see, is
+   (`/unit:direct` → <UXReview/>) given on exactly the shots this notice sends
+   by a fresh check (the Claude helper, or the pooled UI reviewer once the
+   production has adopted it), taken from a build of `<hash>`. A verdict on
+   other shots, or on a build from before a later change to what users see, is
    stale: re-shoot and re-judge before sending. Send the notice on a `pass`,
    or with each defect moved to a follow-up phase under item 7, named on the
    line. User rule 2026-10-01 (nightly review): 2 of about 25 notices carried

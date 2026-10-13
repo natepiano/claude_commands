@@ -814,6 +814,36 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual(self.event_mesh_dir(self.events("stop")[0]), Path(str(original["mesh_dir"])))
         self.assert_fork_names_are_unique_per_generation()
 
+    def test_stop_clears_ui_adoption_and_prime_keeps_the_new_pool_in_shadow(self) -> None:
+        _ = self.prime("ui")
+        adoption = self.pool / "ui_adopted"
+        adoption.touch()
+        result = self.run_pool("stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(adoption.exists())
+        self.assertIn("review_pool: ui adoption cleared", result.stderr)
+        _ = self.prime("ui")
+        self.assertFalse(adoption.exists())
+        self.assertTrue(json_object(self.state()["templates"])["ui"])
+
+    def test_failed_stop_still_clears_ui_adoption(self) -> None:
+        self.seed({})
+        adoption = self.pool / "ui_adopted"
+        adoption.touch()
+        self.control({"stop": {"exit": 1}})
+        result = self.run_pool("stop")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(adoption.exists())
+        self.assertIn("review_pool: ui adoption cleared", result.stderr)
+        self.assertTrue(self.state().get("stopping", False))
+
+    def test_stop_without_ui_adoption_does_not_report_an_adoption_change(self) -> None:
+        self.seed({})
+        result = self.run_pool("stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("ui adoption cleared", result.stderr)
+        self.assertFalse((self.pool / "ui_adopted").exists())
+
     def test_stop_during_fork_drops_late_thread_instead_of_repopulating_pool(self) -> None:
         self.seed({})
         gate = self.hold("fork:code1")
