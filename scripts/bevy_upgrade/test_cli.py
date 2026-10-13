@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, final
@@ -27,6 +28,11 @@ SCRIPT = Path(__file__).with_name("bevy_upgrade.py")
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 REVISION = "1234567890abcdef1234567890abcdef12345678"
 ZONE = ZoneInfo("Pacific/Kiritimati")
+
+
+def setUpModule() -> None:
+    """The dates these tests expect are in `ZONE`; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "Pacific/Kiritimati"}))
 
 
 @final

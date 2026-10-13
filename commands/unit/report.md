@@ -79,7 +79,7 @@ Everything below is the contract.
    The `progress` call also rewrites this unit's phase note; write nothing in
    that note by hand. When the user asks for the phase table, paste the output
    of `python3 ~/.claude/scripts/delegate/phase_table.py show --session-dir
-   "${SESSION_DIR}" --zone <User zone>`.
+   "${SESSION_DIR}"`. Its times are in the user's zone setting.
 
    **Between windows the tables still print.** With the phase active and no
    pass or activity open — reviews closed, repair writers not started — the

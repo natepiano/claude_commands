@@ -13,7 +13,7 @@ holds the local time, source, priority, posted title and message, and outcome.
 
 Messages without --action or --no-action are refused before sending. Exit 0
 sent, 1 Pushover refused it or could not be reached, 2 refused before sending,
-usage, or keys missing.
+usage, or keys missing; 4 held for review. --answerable permits one revision.
 """
 
 from __future__ import annotations
@@ -22,14 +22,16 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
+import review
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at)
 
@@ -43,7 +45,7 @@ TITLE_MAX = 250
 MESSAGE_MAX = 1024
 ACTION_TEXT_MAX = MESSAGE_MAX - len("Action: ") - 1
 TIMEOUT_S = 15
-USAGE = "usage: pushover.py [--priority 0|1|2] [--source NAME] (--action TEXT | --no-action) TITLE MESSAGE"
+USAGE = "usage: pushover.py [--priority 0|1|2] [--source NAME] [--answerable] (--action TEXT | --no-action) TITLE MESSAGE"
 
 
 class Keys(TypedDict):
@@ -56,6 +58,20 @@ class Reply(TypedDict, total=False):
     request: str
     receipt: str
     errors: list[str]
+
+
+class ReviewedPushRecord(review.MessageRecord):
+    held_source: NotRequired[str]
+    held_identity: NotRequired[str]
+
+
+class PushLogRecord(TypedDict):
+    time: str
+    source: str
+    priority: str
+    title: str
+    message: str
+    outcome: str
 
 
 Post = Callable[[str, bytes], tuple[int, bytes]]
@@ -111,7 +127,7 @@ def parent_source() -> str:
 
 
 def log(source: str, priority: str, title: str, message: str, outcome: str) -> None:
-    entry = {"time": datetime.now().astimezone().replace(microsecond=0).isoformat(),
+    entry: PushLogRecord = {"time": datetime.now().astimezone().replace(microsecond=0).isoformat(),
              "source": source, "priority": priority, "title": title, "message": message, "outcome": outcome}
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -126,6 +142,7 @@ class Arguments(TypedDict):
     source: str | None
     action: str | None
     no_action: bool
+    answerable: bool
     title: str
     message: str
 
@@ -136,9 +153,14 @@ def parse(argv: list[str]) -> Arguments | None:
     source: str | None = None
     action: str | None = None
     no_action = False
+    answerable = False
     index = 0
     while index < len(argv) and argv[index].startswith("--"):
         option = argv[index]
+        if option == "--answerable":
+            answerable = True
+            index += 1
+            continue
         if option == "--no-action":
             no_action = True
             index += 1
@@ -165,15 +187,19 @@ def parse(argv: list[str]) -> Arguments | None:
         "source": source,
         "action": action,
         "no_action": no_action,
+        "answerable": answerable,
         "title": positionals[0],
         "message": positionals[1],
     }
 
 
+def trimmed_body(action: UserAction, message: str) -> str:
+    body_limit = max(MESSAGE_MAX - len(first_line(action)) - 1, 0)
+    return message[:body_limit]
+
+
 def posted_message(action: UserAction, message: str) -> str:
-    line = first_line(action)
-    body_limit = max(MESSAGE_MAX - len(line) - 1, 0)
-    return f"{line}\n{message[:body_limit]}"
+    return f"{first_line(action)}\n{trimmed_body(action, message)}"
 
 
 def refuse(source: str, priority: str, title: str, message: str, reason: str) -> int:
@@ -205,17 +231,87 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
             return refuse(source, priority, title, message, reason)
         case ActionAllowed():
             pass
-    message = posted_message(action, arguments["message"])
+    draft = review.Draft(source, priority, title, action,
+                         trimmed_body(action, arguments["message"]),
+                         arguments["answerable"])
+    claimed = False
+    try:
+        found = review.held_for(source)
+        if isinstance(found, review.LiveHold):
+            claimed = review.claim(source)
+            if not claimed:
+                print("pushover: held for review: this source's push is being sent", file=sys.stderr)
+                return 4
+            found = review.held_for(source)
+    except OSError as error:
+        found = review.UnreadableHold(review.held_path(source), str(error))
+    detail = ""
+    if review.switched_off():
+        outcome: review.ReviewOutcome = review.Unreviewed("review off")
+        version = draft
+        detail = "review: off"
+    else:
+        outcome = review.review(draft, revision=claimed)
+        version = review.best_version(draft, outcome)
+        if isinstance(outcome, review.Unreviewed):
+            detail = "unreviewed: " + outcome.why
+        elif isinstance(outcome, review.Questions):
+            if draft.answerable:
+                try:
+                    review.hold(review.Held(source, time.time(), draft, version, outcome.questions))
+                except (OSError, subprocess.SubprocessError) as error:
+                    detail = f"hold failed: {error}"
+                else:
+                    review.log_review(draft, outcome)
+                    print("pushover: held for review: answer these in a revised push within 5 minutes; " +
+                          "otherwise the reviewer's version is sent:", file=sys.stderr)
+                    for index, question in enumerate(outcome.questions, 1):
+                        print(f"{index}. {question}", file=sys.stderr)
+                    return 4
+            else:
+                detail = "rewritten, script text failed: " + ", ".join(outcome.failed_rules)
+    record: ReviewedPushRecord = {**review.message_record(version)}
+    if claimed and isinstance(found, review.LiveHold):
+        record["held_source"] = source
+        record["held_identity"] = review.hold_identity(found.hold)
+    print("pushover: reviewed JSON: " + json.dumps(record), flush=True)
+    try:
+        code = deliver(version, keys_file, post, detail=detail)
+    except OSError:
+        if claimed:
+            review.restore(source)
+        raise
+    delivery = review.Sent(version) if code == 0 else review.NotSent()
+    review.log_review(draft, outcome, delivery, detail=detail)
+    if claimed:
+        if code == 0:
+            review.release(source)
+        else:
+            review.restore(source)
+    if code == 0 and isinstance(outcome, (review.Rewritten, review.Questions)):
+        print("pushover: sent as rewritten:")
+        print(version.title)
+        print(first_line(version.action))
+        print(version.body)
+    return code
+
+
+def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
+            post: Post = http_post, *, detail: str = "") -> int:
+    """Post an already reviewed version, including expiry sends; do not review again."""
+    source, priority, title = draft.source, draft.priority, draft.title
+    message = posted_message(draft.action, draft.body)
+    suffix = f", {detail}" if detail else ""
     keys = read_keys(keys_file)
     if keys is None:
-        log(source, priority, title, message, "keys missing")
+        log(source, priority, title, message, "keys missing" + suffix)
         print(f"pushover: PUSHOVER_USER and PUSHOVER_TOKEN must both be set in {keys_file}", file=sys.stderr)
         return 2
     data = urllib.parse.urlencode(fields(keys, title, message, priority)).encode()
     try:
         status, raw = post(API_URL, data)
     except (urllib.error.URLError, TimeoutError) as error:
-        log(source, priority, title, message, f"unreachable: {error}")
+        log(source, priority, title, message, f"unreachable: {error}" + suffix)
         print(f"pushover: could not reach Pushover: {error}", file=sys.stderr)
         return 1
     try:
@@ -226,11 +322,11 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     if status == 200 and reply.get("status") == 1:
         receipt = reply.get("receipt")
         outcome = f"sent, receipt {receipt}" if receipt else "sent"
-        log(source, priority, title, message, outcome)
+        log(source, priority, title, message, outcome + suffix)
         print(f"pushover: {outcome}")
         return 0
     errors = "; ".join(reply.get("errors", [])) or f"HTTP {status}"
-    log(source, priority, title, message, f"refused: {errors}")
+    log(source, priority, title, message, f"refused: {errors}" + suffix)
     print(f"pushover: refused: {errors}", file=sys.stderr)
     return 1
 

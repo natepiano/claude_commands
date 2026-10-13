@@ -2,6 +2,7 @@
 """Conduct each account session through its own safe stop and optional restore."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -28,6 +29,7 @@ import record as store
 from record import NoRemoteControl, SessionShutdown, SessionStopIssue, TimerRestore, ShowrunnerFooter, NoFooter, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
 import showrunner_footer
+import sessions
 import stop as stop_work
 from user_action import ActionRequired
 from user_zone import user_zone
@@ -39,6 +41,47 @@ SETTLE_INTERVAL_SECONDS = 15
 SETTLE_RETRY_SECONDS = 300
 NOT_ANSWERING_AFTER = timedelta(minutes=5)
 REPEAT_HOLDOUT_ALERT = timedelta(minutes=60)
+USAGE_LIMIT_PATTERNS = (
+    "hit your session limit",
+    "hit your usage limit",
+    "hit your weekly limit",
+    "usage limit reached",
+    "wait for limit to reset",
+)
+
+
+@dataclass(frozen=True)
+class ScreenText:
+    text: str
+
+
+@dataclass(frozen=True)
+class ScreenUnreadable:
+    reason: Literal["no tmux host", "no pane id", "capture failed"]
+
+
+@dataclass(frozen=True)
+class EnterUsageLimitHold:
+    """The owner cannot answer the settle request while its limit is shown."""
+
+
+@dataclass(frozen=True)
+class LeaveUsageLimitHold:
+    """The owner must answer the settle request after its limit stops showing."""
+
+
+@dataclass(frozen=True)
+class NoUsageLimitChange:
+    """This observation does not change the owner's shutdown progress."""
+
+
+@dataclass(frozen=True)
+class UsageLimitChangeRefused:
+    """The current request no longer permits the observed transition."""
+
+
+class _UsageLimitChangeRejected(Exception):
+    """Abort a store update before it writes a changed request."""
 
 class MessageSent(TypedDict):
     kind: Literal["sent"]
@@ -214,6 +257,11 @@ def alert_user(summary: str, text: str, action: ActionRequired, *, machine: str 
         command.extend(("--machine", machine))
     _ = _deliver_message(command, "user", text)
 
+
+def alert_details(lines: list[str]) -> str:
+    details = "\n".join(lines)
+    return details if len(details) <= 180 else details[:177] + "..."
+
 def _notifier_enabled(instance: str) -> bool:
     root = Path(
         os.environ.get(
@@ -332,23 +380,88 @@ def blocker(session: Session) -> ReadinessCheck:
         return {"kind": "blocked", "reason": "finish the merge in progress first"}
     return {"kind": "clear"}
 
-def _showing_form(session: Session) -> bool:
+def _screen(session: Session) -> ScreenText | ScreenUnreadable:
     host = session["host"]
     if host["kind"] != "tmux" and host["kind"] != "unit":
-        return False
+        return ScreenUnreadable("no tmux host")
+    entry = sessions.read_session(sessions.sessions_dir() / f"{session['pid']}.json")
+    if isinstance(entry, sessions.UnreadableSessionRecord) or entry["sessionId"] != session["session_id"]:
+        return ScreenUnreadable("no pane id")
+    pane_id = entry["tmux"].rsplit(".", 1)[-1]
+    if re.fullmatch(r"%[0-9]+", pane_id) is None or "." not in entry["tmux"]:
+        return ScreenUnreadable("no pane id")
     tmux = os.environ.get("SHUTDOWN_TMUX", "tmux")
     try:
         result = subprocess.run(
-            (tmux, "capture-pane", "-pt", host["tmux_session"]),
+            [tmux, "capture-pane", "-p", "-t", pane_id],
             capture_output=True,
             text=True,
             check=False,
             timeout=5,
         )
     except (OSError, subprocess.TimeoutExpired):
+        return ScreenUnreadable("capture failed")
+    if result.returncode != 0:
+        return ScreenUnreadable("capture failed")
+    return ScreenText(result.stdout)
+
+
+def _showing_form(session: Session) -> bool:
+    screen = _screen(session)
+    if isinstance(screen, ScreenUnreadable):
         return False
-    pane = result.stdout.casefold()
-    return result.returncode == 0 and ("form" in pane or "esc to cancel" in pane)
+    pane = screen.text.casefold()
+    return "form" in pane or "esc to cancel" in pane
+
+
+def _held_by_usage_limit(screen: ScreenText | ScreenUnreadable) -> bool:
+    if isinstance(screen, ScreenUnreadable):
+        return False
+    lines = [line for line in screen.text.splitlines() if line.strip()][-15:]
+    return any(pattern in line.casefold() for line in lines for pattern in USAGE_LIMIT_PATTERNS)
+
+
+def _usage_limit_shown(session: Session) -> bool:
+    return session["status"] != "busy" and _held_by_usage_limit(_screen(session))
+
+
+def _usage_limit_change(
+    saved: SessionShutdown, owner: stop_work.FreshSession,
+) -> EnterUsageLimitHold | LeaveUsageLimitHold | NoUsageLimitChange:
+    if owner["kind"] != "matching session" or saved["force"] != "wait for ready":
+        return NoUsageLimitChange()
+    progress = saved["progress"]["kind"]
+    if progress in {"waiting", "ready"}:
+        if _usage_limit_shown(owner["session"]):
+            return EnterUsageLimitHold()
+    elif progress == "held by usage limit" and not _usage_limit_shown(owner["session"]):
+        return LeaveUsageLimitHold()
+    return NoUsageLimitChange()
+
+
+def _apply_usage_limit_change(
+    saved: SessionShutdown,
+    change: EnterUsageLimitHold | LeaveUsageLimitHold | NoUsageLimitChange,
+) -> SessionShutdown | UsageLimitChangeRefused:
+    if isinstance(change, NoUsageLimitChange):
+        return saved
+
+    def apply(current: SessionShutdown) -> None:
+        if current["request_id"] != saved["request_id"] or current["force"] != "wait for ready":
+            raise _UsageLimitChangeRejected
+        progress = current["progress"]["kind"]
+        if isinstance(change, EnterUsageLimitHold) and progress in {"waiting", "ready"}:
+            current["progress"] = {"kind": "held by usage limit", "at": record_time()}
+        elif isinstance(change, LeaveUsageLimitHold) and progress == "held by usage limit":
+            current["progress"] = {"kind": "waiting"}
+            current["settle_message"] = {"kind": "not sent"}
+        else:
+            raise _UsageLimitChangeRejected
+
+    try:
+        return store.update_session(saved["login"], saved["session"]["session_id"], apply)
+    except (store.NoLiveRecord, _UsageLimitChangeRejected):
+        return UsageLimitChangeRefused()
 
 def shutdown_command(*arguments: str) -> str:
     """A runnable terminal command with shell-quoted arguments."""
@@ -423,9 +536,9 @@ def status_record_lines(record: SessionShutdown, owner: stop_work.FreshSession |
                         *, local_observation: bool = True) -> list[str]:
     """Render progress, observed readiness details and issues for one owner."""
     progress = _progress_text(record)
-    if record["progress"]["kind"] in {"waiting", "ready"} and not isinstance(owner, _StatusUnobserved) and owner["kind"] == "matching session":
+    if record["progress"]["kind"] in {"waiting", "ready", "held by usage limit"} and not isinstance(owner, _StatusUnobserved) and owner["kind"] == "matching session":
         try:
-            detail = ", ".join(_hold_details(owner, local_observation=local_observation))
+            detail = ", ".join(_hold_details(owner, record["progress"]["kind"], local_observation=local_observation))
         except Exception:
             detail = record["progress"]["kind"]
         if detail and detail != record["progress"]["kind"]:
@@ -515,7 +628,7 @@ def _is_requester(saved: SessionShutdown) -> bool:
     return origin["kind"] == "session" and origin["session_id"] == saved["session"]["session_id"]
 
 
-def _hold_details(owner: stop_work.FreshSession, *, local_observation: bool = True) -> list[str]:
+def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observation: bool = True) -> list[str]:
     """Return observed hold conditions without delivery state."""
     if owner["kind"] == "session account unreadable":
         return ["account unreadable"]
@@ -527,7 +640,7 @@ def _hold_details(owner: stop_work.FreshSession, *, local_observation: bool = Tr
         details.append(session["status"])
     if session["status"] != "busy" and any(server["busy_seats"] for server in session["codex_servers"]):
         details.append("busy")
-    if local_observation and _showing_form(session):
+    if local_observation and progress != "held by usage limit" and _showing_form(session):
         details.append("showing a form")
     checkout = session["checkout"]
     if checkout["kind"] == "git" and checkout["upstream"]["kind"] == "tracking":
@@ -547,7 +660,7 @@ def _hold_details(owner: stop_work.FreshSession, *, local_observation: bool = Tr
 
 def hold_reason(saved: SessionShutdown, owner: stop_work.FreshSession, *, local_observation: bool = True) -> str:
     """Describe the condition preventing this owner from advancing."""
-    details = _hold_details(owner, local_observation=local_observation)
+    details = _hold_details(owner, saved["progress"]["kind"], local_observation=local_observation)
     message = saved["settle_message"]
     if owner["kind"] == "matching session" and message["kind"] == "queued":
         details.append(f"message queued: {message['reason']}")
@@ -570,17 +683,17 @@ def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
         return Hold("requester goes last")
     if _stop_retry_pending(saved):
         return StopSession()
-    if owner["kind"] == "session account unreadable" and progress in {"waiting", "ready"}:
+    if owner["kind"] == "session account unreadable" and progress in {"waiting", "ready", "held by usage limit"}:
         return Hold("account unreadable")
-    if progress in {"waiting", "ready"}:
+    if progress in {"waiting", "ready", "held by usage limit"}:
         if owner["kind"] in {"session absent", "session identity lost"}:
             return StopSession()
         if owner["kind"] == "matching session":
             if saved["force"] == "now":
                 return StopSession()
-            if progress == "ready" and owner["session"]["status"] == "idle" and all(
+            if progress in {"ready", "held by usage limit"} and owner["session"]["status"] == "idle" and all(
                 seat["status"] == "idle" for seat in owner["seats"]
-            ) and blocker(owner["session"])["kind"] == "clear" and not _showing_form(owner["session"]):
+            ) and blocker(owner["session"])["kind"] == "clear" and (progress == "held by usage limit" or not _showing_form(owner["session"])):
                 return StopSession()
         if progress == "waiting" and not _is_requester(saved):
             message = saved["settle_message"]
@@ -622,7 +735,7 @@ def ready(where: str) -> int:
     """Record this owner's next step without replacing its process identity."""
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     for saved in store.all_session_records():
-        if saved["session"]["session_id"] != session_id or saved["progress"]["kind"] not in {"waiting", "ready"}:
+        if saved["session"]["session_id"] != session_id or saved["progress"]["kind"] not in {"waiting", "ready", "held by usage limit"}:
             continue
         owner = stop_work.fresh_session(saved["session"], run_inventory(saved["login"]))
         if owner["kind"] != "matching session":
@@ -635,7 +748,7 @@ def ready(where: str) -> int:
         accepted = False
         def mark(current: SessionShutdown) -> None:
             nonlocal accepted
-            if current["progress"]["kind"] in {"waiting", "ready"}:
+            if current["progress"]["kind"] in {"waiting", "ready", "held by usage limit"}:
                 current["where"] = {"kind": "said", "text": where, "at": record_time()}
                 current["progress"] = {"kind": "ready", "at": record_time()}
                 accepted = True
@@ -761,12 +874,12 @@ def now(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
     for saved in records:
         if ids and saved["session"]["session_id"] not in ids:
             continue
-        if not ids and saved["progress"]["kind"] not in {"waiting", "ready"} and not store.stop_incomplete(saved):
+        if not ids and saved["progress"]["kind"] not in {"waiting", "ready", "held by usage limit"} and not store.stop_incomplete(saved):
             continue
         forced = False
         def force(current: SessionShutdown) -> None:
             nonlocal forced
-            if current["progress"]["kind"] in {"waiting", "ready"} or store.stop_incomplete(current):
+            if current["progress"]["kind"] in {"waiting", "ready", "held by usage limit"} or store.stop_incomplete(current):
                 current["force"] = "now"
                 forced = True
         try:
@@ -905,12 +1018,34 @@ def report_stop(records: list[SessionShutdown]) -> None:
                      + shutdown_command("restart", first["label"]))
     text = "\n".join(lines)
     origins = {saved["requested_by"]["session_id"] for saved in records if saved["requested_by"]["kind"] == "session"}
+    account = json.dumps(first["label"])
+    def failure_details(items: list[SessionShutdown], verb: str) -> str:
+        details: list[str] = []
+        for saved in items:
+            progress = saved["progress"]
+            if progress["kind"] == "stop failed" or progress["kind"] == "restart failed":
+                reason = progress["reason"]
+            elif progress["kind"] == "manual restart":
+                reason = "manual restart needed: " + progress["command"]
+            elif progress["kind"] == "timers pending":
+                reason = "session restarted; some scheduled jobs have not resumed"
+            else:
+                reason = progress["kind"]
+            details.append(f"The session named {saved['session']['name']} on {saved['machine']} {verb}: {reason}.")
+            details.extend(stop_issue_text(issue) for issue in saved["stop_issues"])
+        return alert_details(details)
     try:
         if any(saved["hold"] == "account" and saved["alerts"] == "user" for saved in failed):
-            alert_user(summary, text, ActionRequired("Run /shutdown now to retry the failed stop."),
+            alert_user("Claude account shutdown is incomplete",
+                       f"The shutdown you requested on Claude account {account} did not finish. " + failure_details(failed, "could not stop")
+                       + "\n\nThe status command lists what failed. The now command tries to stop them again.",
+                       ActionRequired(f"In a Claude session on natedev, read /shutdown status {account}, then retry with /shutdown now {account}."),
                        machine="natedev" if local_machine().casefold() == "mac" else "")
         elif any(saved["alerts"] == "user" for saved in restore_failed):
-            alert_user(summary, text, ActionRequired("Run /shutdown restart to finish restoring these sessions."),
+            alert_user(f"{first['label'] if len(first['label']) <= 16 else 'Claude'} sessions did not come back",
+                       f"Sessions on Claude account {account} did not return after shutdown. " + failure_details(restore_failed, "could not return")
+                       + "\n\nThe status command lists what failed. The restart command tries to bring the sessions back.",
+                       ActionRequired(f"In a Claude session on natedev, read /shutdown status {account}, then /shutdown restart {account} to retry."),
                        machine="natedev" if local_machine().casefold() == "mac" else "")
     finally:
         for origin in sorted(origins):
@@ -963,9 +1098,13 @@ def _remote_control_alert(records: list[SessionShutdown], missing: tuple[NoRemot
     due = [item for item in missing if item["alerts"] == "user"]
     if not due:
         return
-    instruction = "Turn on Remote Control in each named session at its terminal: /remote-control"
-    text = "\n".join([*(f"{item['name']}: running, no Remote Control" for item in due), instruction])
-    alert_user(f"{records[0]['label']} is not fully back", text, ActionRequired(instruction),
+    names = ", ".join(item["name"] for item in due)
+    machine = records[0]["machine"]
+    instruction = f"In the {names} session's terminal on {machine}, run /remote-control." if len(due) == 1 else f"In each listed session's terminal on {machine}, run /remote-control."
+    text = (f"The Claude sessions on {machine} were restarted and are running again. "
+            f"Remote control is still off in {names}, so you cannot reach {'it' if len(due) == 1 else 'them'} from your phone until you turn it back on.")
+    title = f"{names} session unreachable from your phone" if len(due) == 1 and len(names) <= 5 else "Claude sessions unreachable from your phone"
+    alert_user(title, text, ActionRequired(instruction),
         machine="natedev" if local_machine().casefold() == "mac" else "")
 
 
@@ -995,16 +1134,24 @@ def _send_holdout_alert(due: list[tuple[SessionShutdown, str]]) -> None:
     first = due[0][0]
     summaries = [f"{saved['session']['name']} is not answering the shutdown of {saved['label']}" for saved, _ in due]
     lines: list[str] = []
-    actions: list[str] = []
     for saved, reason in due:
         name = saved["session"]["name"]
         action = f"/shutdown cancel --only {name} (take it out; it carries on), /shutdown now --only {name} (stop it anyway)"
-        actions.append(action)
         lines.append(f"{saved['machine']} {name}: {reason}; {action}")
     text = "\n".join(lines)
     summary = "; ".join(summaries)
+    waiting = " ".join(f"Its session named {saved['session']['name']} on {saved['machine']} is {reason}." for saved, reason in due)
+    account = json.dumps(first["label"])
+    names = ",".join(saved["session"]["name"] for saved, _ in due)
+    form_instruction = " Read any open form in their terminals before stopping them." if len(due) == 1 else ""
+    phone_text = (f"Shutdown of Claude account {account} is waiting. " + waiting[:120]
+                  + form_instruction + "\n\n"
+                  + f"Cancel (recommended): /shutdown cancel {account} --only {names} keeps them running so you can check their work.\n\n"
+                  + f"Stop now: /shutdown now {account} --only {names} stops them without waiting.")
+    title = "Shutdown waits on a session showing a form" if any("form" in reason for _, reason in due) else "Shutdown waits on running Claude sessions"
     try:
-        alert_user(summary, text, ActionRequired("; ".join(actions)),
+        alert_user(title, phone_text,
+            ActionRequired("In the natedev Claude session, choose cancel or stop now using the commands below."),
             machine="natedev" if local_machine().casefold() == "mac" else "")
     finally:
         origins = {saved["requested_by"]["session_id"] for saved, _ in due if saved["requested_by"]["kind"] == "session"}
@@ -1165,6 +1312,12 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                         if session_id in pending or session_id in confirming_ids or session_id not in observed_ids:
                             continue
                         owner = stop_work.fresh_session(saved["session"], report)
+                        change = _usage_limit_change(saved, owner)
+                        if not isinstance(change, NoUsageLimitChange):
+                            updated = _apply_usage_limit_change(saved, change)
+                            if isinstance(updated, UsageLimitChangeRefused):
+                                continue
+                            saved = updated
                         step = next_step(saved, owner, records, now_utc())
                         if (due and saved["progress"]["kind"] in {"waiting", "ready"}
                             and (saved["progress"]["kind"] == "waiting" or isinstance(step, Hold))

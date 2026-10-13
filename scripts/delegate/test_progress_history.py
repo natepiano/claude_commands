@@ -135,6 +135,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = zone
+        environment["USER_ZONE"] = zone
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         # Popped rather than left alone: the suite copies the ambient
@@ -165,6 +166,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = zone
+        environment["USER_ZONE"] = zone
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         # Popped rather than left alone: the suite copies the ambient
@@ -198,6 +200,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
         stdout = io.StringIO()
@@ -792,6 +795,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["NOTIFIER_STATE_DIR"] = str(state_dir)
         environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         _ = subprocess.run(
             [
                 "zsh",
@@ -837,6 +841,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["NOTIFIER_STATE_DIR"] = str(state_dir)
         environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         _ = subprocess.run(
             [
                 "zsh",
@@ -905,6 +910,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["NOTIFIER_STATE_DIR"] = str(state_dir)
         environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         _ = subprocess.run(
             [
                 "zsh",
@@ -1374,6 +1380,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["NOTIFIER_STATE_DIR"] = str(state_dir)
         environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         _ = subprocess.run(
             [
                 "zsh",
@@ -1809,6 +1816,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         _ = environment.pop("PLAN_DELEGATE_PASS_OWNER", None)
         if self.team_slot:
@@ -2879,6 +2887,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         result = subprocess.run(
             ["python3", str(FINDINGS), *arguments, "--session-dir", str(session_dir)],

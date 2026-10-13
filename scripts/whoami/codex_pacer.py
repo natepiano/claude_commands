@@ -48,6 +48,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
+from note_file import reset_time
+
 STATE_DIR = Path(os.environ.get("CODEX_PACER_STATE_DIR", Path.home() / ".local" / "state" / "codex-pacer"))
 SESSIONS = Path.home() / ".codex" / "sessions"
 AGENTS_CONF = Path.home() / ".claude" / "config" / "agents.conf"
@@ -365,12 +367,9 @@ def accounts(notes: Sequence[AgentNote], now: datetime) -> list[Account]:
 
 
 def parse_local(value: str | None) -> datetime | None:
-    if not value or value == "null":
-        return None
-    try:
-        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S")
-    except ValueError:
-        return None
+    """A note's reset as this machine's wall time, whichever zone wrote it."""
+    reset = reset_time(value)
+    return None if reset is None else reset.astimezone().replace(tzinfo=None)
 
 
 def parse_float(value: str | None) -> float | None:

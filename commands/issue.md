@@ -9,7 +9,7 @@ The hanadocs vault lives at an absolute path on disk so this command works from 
 - Vault root: `~/rust/hanadocs`
 - Template: `~/rust/hanadocs/.claude/templates/issue.yaml`
 - Issues directory: `~/rust/hanadocs/issues/`
-- Project base files: `~/rust/hanadocs/issues - <short>.base`
+- Project base files: `~/rust/hanadocs/home/issues - <short>.base`
 
 ## Arguments
 
@@ -17,7 +17,7 @@ $ARGUMENTS contains: `<project-shorthand> <issue title on first line>\n<optional
 
 ## Project mapping
 
-Look up the project shorthand from the base files in the vault root (`~/rust/hanadocs/issues - <short>.base`). The mapping is:
+Look up the project shorthand from the base files in the vault's home/ folder (`~/rust/hanadocs/home/issues - <short>.base`). The mapping is:
 
 | Shorthand | Project link | Base file |
 |-----------|-------------|-----------|

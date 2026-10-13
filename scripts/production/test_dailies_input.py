@@ -103,8 +103,6 @@ if command == failure:
 if command == "show":
     print(Path(os.environ["DAILIES_PHASE_TABLE_JSON"]).read_text(encoding="utf-8"))
     raise SystemExit(0)
-if command == "prune":
-    raise SystemExit(0)
 raise SystemExit(2)
 '''
 BEVY_UPGRADE_STUB = '''
@@ -118,6 +116,11 @@ print(os.environ.get("DAILIES_BEVY_STDERR", ""), file=sys.stderr, flush=True)
 print(os.environ.get("DAILIES_BEVY_OUTPUT", ""))
 raise SystemExit(int(os.environ.get("DAILIES_BEVY_EXIT", "0")))
 '''
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class DailiesInputTests(unittest.TestCase):
@@ -487,8 +490,8 @@ class DailiesInputTests(unittest.TestCase):
             "first": "2026-10-06T17:30", "why": "checks and build remain",
             "fixes": 0, "stated": "2026-10-06T16:45",
         })
+        # Pruning is the snapshot timer's (prune_phase_notes.py): a dailies only reads.
         self.assertEqual(self.phase_table_calls(), [
-            ["prune", "--production-doc", str(self.doc)],
             ["show", "--production-doc", str(self.doc), "--json"],
         ])
 
@@ -922,14 +925,13 @@ class DailiesInputTests(unittest.TestCase):
             self.judgment.read_text(encoding="utf-8")))
         del judgment["units"][0]["started"]
         _ = self.judgment.write_text(json.dumps(judgment) + "\n", encoding="utf-8")
-        self.env["DAILIES_PHASE_TABLE_FAIL"] = "prune"
-        pruned = self.run_builder()
-        self.assertEqual(pruned.returncode, 0, pruned.stdout + pruned.stderr)
-        self.assertIn("phase tables: unavailable — prune could not read records", pruned.stdout)
+        _ = self.env.pop("DAILIES_PHASE_TABLE_FAIL")
+        recorded = self.run_builder()
+        self.assertEqual(recorded.returncode, 0, recorded.stdout + recorded.stderr)
+        self.assertNotIn("phase tables: unavailable", recorded.stdout)
         self.assertEqual(self.unit()["started"], "2026-10-06T08:30")
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "17:40")
 
-        _ = self.env.pop("DAILIES_PHASE_TABLE_FAIL")
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 23:40")
         self.judgment_file()
         _ = self.phase_table_json.write_text("not json\n", encoding="utf-8")
@@ -938,7 +940,7 @@ class DailiesInputTests(unittest.TestCase):
         self.assertIn("phase tables: unavailable —", unparsable.stdout)
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
 
-    def test_retiring_the_last_unit_runs_prune_before_no_live_units(self) -> None:
+    def test_a_dailies_leaves_a_retired_units_note_for_the_timer_to_prune(self) -> None:
         note = self.root / "vault/old-showrunner/alpha-unit.md"
         note.parent.mkdir(parents=True)
         _ = note.write_text(
@@ -950,8 +952,7 @@ class DailiesInputTests(unittest.TestCase):
                                 encoding="utf-8")
         _ = self.env.pop("DAILIES_PHASE_TABLE")
         _ = self.assert_refused_without_output(mention="no live units: every Units row is retired")
-        self.assertFalse(note.exists())
-        self.assertFalse(note.parent.exists())
+        self.assertTrue(note.exists())
 
     def test_record_backed_input_renders_at_every_length_without_screen_eta(self) -> None:
         self.open_phase_record()
@@ -1464,9 +1465,13 @@ class DailiesInputTests(unittest.TestCase):
         calls = self.watch_events(events)
         self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
         self.assertEqual([row for row in calls if row[0] == "send.py"], [[
-            "send.py", "--to", "user", "--need", "decision", "--action",
-            "Acknowledge the review watch in this session.", "--summary", "Hana: review watch", "--text",
-            "12 of 12 phases: report ready, waiting for your acknowledgment; the table is in this session",
+            "send.py", "--to", "user", "--from", "ci_points", "--need", "decision", "--action",
+            "In a natedev terminal, read the report, then acknowledge it or discuss concerns in the natedev Claude session.",
+            "--summary", "Reviewer removal lacks comparison data", "--text",
+            "An extra code reviewer was removed. The report has no comparable defect counts. Work continues either way.\n\n"
+            + "Read the report:\npython3 ~/.claude/scripts/production/review_regime.py report\n"
+            + "Acknowledge (recommended after reading): stop this report reminder. Run it with ack in place of report.\n\n"
+            + "Discuss: raise concerns in the natedev Claude session.",
         ]])
         self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
 
@@ -1483,9 +1488,13 @@ class DailiesInputTests(unittest.TestCase):
         calls = self.watch_events(events)
         self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
         self.assertEqual([row for row in calls if row[0] == "send.py"], [[
-            "send.py", "--to", "user", "--need", "decision", "--action",
-            "Acknowledge the review watch in this session.", "--summary", "Hana: review watch", "--text",
-            "12 of 12 phases: report ready, waiting for your acknowledgment; the table is in this session",
+            "send.py", "--to", "user", "--from", "ci_points", "--need", "decision", "--action",
+            "In a natedev terminal, read the report, then acknowledge it or discuss concerns in the natedev Claude session.",
+            "--summary", "Reviewer removal lacks comparison data", "--text",
+            "An extra code reviewer was removed. The report has no comparable defect counts. Work continues either way.\n\n"
+            + "Read the report:\npython3 ~/.claude/scripts/production/review_regime.py report\n"
+            + "Acknowledge (recommended after reading): stop this report reminder. Run it with ack in place of report.\n\n"
+            + "Discuss: raise concerns in the natedev Claude session.",
         ]])
         self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
 

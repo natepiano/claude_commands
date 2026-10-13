@@ -12,6 +12,8 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request
 
+import crates_io_pacer
+
 Fetch = Callable[[str], bytes]
 LookupResult = TypeVar("LookupResult")
 
@@ -96,6 +98,8 @@ def http_fetch(url: str) -> bytes:
     host = urlsplit(url).hostname or url
     try:
         request = Request(url, headers={"User-Agent": "bevy-upgrade (natepiano)"})
+        if host == "crates.io":
+            crates_io_pacer.CRATES_IO_PACER.wait()
         with cast(HTTPResponse, urllib.request.urlopen(request, timeout=30)) as response:
             return response.read()
     except HTTPError as error:
@@ -260,24 +264,66 @@ def _manifest_version(value: object) -> str:
     return _text(version)
 
 
-def manifest_requirement(fetch: Fetch, repository: str, rev: str, bevy_names: frozenset[str]) -> str:
-    url = f"https://raw.githubusercontent.com/{repository}/{quote(rev, safe='')}/Cargo.toml"
+def member_manifest_paths(fetch: Fetch, repository: str, rev: str) -> list[str]:
+    def read(data: dict[str, object]) -> list[str]:
+        paths: list[str] = []
+        for raw in _array(data["tree"]):
+            item = _object(raw)
+            path, kind = _text(item["path"]), _text(item["type"])
+            if kind == "blob" and path.endswith("/Cargo.toml"):
+                paths.append(path)
+        return sorted(paths)
+
+    url = f"https://api.github.com/repos/{repository}/git/trees/{quote(rev, safe='')}?recursive=1"
+    return _lookup(fetch, url, read)
+
+
+def _read_manifest(fetch: Fetch, repository: str, rev: str, path: str) -> dict[str, object]:
+    url = f"https://raw.githubusercontent.com/{repository}/{quote(rev, safe='')}/{quote(path, safe='/')}"
     try:
-        document = cast(dict[str, object], tomllib.loads(fetch(url).decode("utf-8")))
+        return cast(dict[str, object], tomllib.loads(fetch(url).decode("utf-8")))
+    except (ValueError, KeyError, TypeError) as error:
+        raise FetchFailure(f"raw.githubusercontent.com: invalid response: {error}") from error
+
+
+def _manifest_requirement(dependencies: dict[str, object], workspace: dict[str, object],
+                          bevy_names: frozenset[str]) -> str:
+    requirements: dict[str, str] = {}
+    for name in sorted(set(workspace) | set(dependencies)):
+        if name != "bevy" and name not in bevy_names:
+            continue
+        value = dependencies.get(name, workspace.get(name))
+        if not isinstance(value, str) and _object(value).get("workspace") is True:
+            value = workspace.get(name, {})
+        requirement = _manifest_version(value)
+        if requirement:
+            requirements[name] = requirement
+    return requirements.get("bevy", "") or (requirements[sorted(requirements)[0]] if requirements else "")
+
+
+def manifest_requirement(fetch: Fetch, repository: str, rev: str, crate: str,
+                         bevy_names: frozenset[str]) -> str:
+    try:
+        document = _read_manifest(fetch, repository, rev, "Cargo.toml")
+    except NotFound:
+        return ""
+    try:
         workspace = _object(_object(document.get("workspace", {})).get("dependencies", {}))
         dependencies = _object(document.get("dependencies", {}))
-        requirements: dict[str, str] = {}
-        for name in sorted(set(workspace) | set(dependencies)):
-            if name != "bevy" and name not in bevy_names:
+        requirement = _manifest_requirement(dependencies, workspace, bevy_names)
+        if requirement or "workspace" not in document:
+            return requirement
+        paths = member_manifest_paths(fetch, repository, rev)
+        paths.sort(key=lambda path: (Path(path).parent.name.replace("-", "_") != crate.replace("-", "_"), path))
+        for path in paths[:5]:
+            try:
+                member = _read_manifest(fetch, repository, rev, path)
+            except NotFound:
                 continue
-            value = dependencies.get(name, workspace.get(name))
-            if not isinstance(value, str) and _object(value).get("workspace") is True:
-                value = workspace.get(name, {})
-            requirement = _manifest_version(value)
-            if requirement:
-                requirements[name] = requirement
-        return requirements.get("bevy", "") or (requirements[sorted(requirements)[0]] if requirements else "")
-    except NotFound:
+            package = _object(member.get("package", {}))
+            dependencies = _object(member.get("dependencies", {}))
+            if _text(package.get("name", "")) == crate:
+                return _manifest_requirement(dependencies, workspace, bevy_names)
         return ""
     except (ValueError, KeyError, TypeError) as error:
         raise FetchFailure(f"raw.githubusercontent.com: invalid response: {error}") from error

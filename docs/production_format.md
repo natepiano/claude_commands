@@ -44,6 +44,8 @@ must not drift from it:
   work, and end at `end_session.sh`. Reviews run on the unit's seats, or on the
   production's review pool when its doc names one.
 - **Review pool** — a production's reusable reviewers, allocated by a script.
+- **Review unit** — the production's `/review:direct` run. It primes the pools
+  and curates review memory; it dispatches no review and owns no source files.
 - **Reviewer** — a read-only Codex thread in that pool, named `code1`, `ui2`, etc.
 - **Template** — a thread holding a type's standing prompt, forked into reviewers
   and never leased.
@@ -86,10 +88,11 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
 - **Showrunner checkout:** <path, on the merge branch>
 - **Log:** <repo-relative path> — git-excluded; one line per event
-- **User zone:** <IANA zone> — every time the showrunner reports is in this zone plus UTC
-- **Updates:** every <N> minutes (default 15), or `on demand`; each update reports every
-  unit in full; the update timer reads N from this line, `on demand` runs no timer and a
-  dailies runs only when the user asks, and `/showrunner:report_interval` changes it
+- **Updates:** `on demand` (the default, also when the line is missing), or every <N>
+  minutes when the user asks for a schedule; each update reports every unit in full; the
+  update timer reads N from this line, `on demand` runs no timer and a dailies runs only
+  when the user asks, and `/showrunner:report_interval` changes it (user, 2026-10-13: no
+  timer and no footer unless asked)
 - **Merge tests:** <packages tested on every merge besides the changed ones, e.g. the
   app crate>; omit if none
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
@@ -113,6 +116,10 @@ refuses a name that another session of the same account also has.
 | Unit | Plan | Worktree | Branch | Port | Owns |
 | --- | --- | --- | --- | --- | --- |
 | <name>-unit | <plan path> | <path> | <branch> | <app port or —> | <dirs/files> |
+
+With a **Review pool** line, include `review-unit` as an ordinary row with
+its own worktree, branch and plan path, Port `—` and Owns `—`. Its plan holds
+one standing phase that stays `todo`; `/review:direct` writes it when absent.
 
 The Unit value names the unit everywhere: in the log, the dailies, the waits and every
 tool's arguments. A unit's session name is written nowhere, because the user may rename
@@ -205,7 +212,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    ```
    From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
    review trial: ux <N> findings, code <N> findings, review-seat minutes <M>, ux check minutes <U>, ux repair minutes <R>
-   design check: <pass | N defects, each moved to <phase>> — fresh helper on exactly these shots, built from <hash>
+   design check: <pass | N defects, each moved to <phase>> — fresh check on exactly these shots, built from <hash>
    ```
 
    A phase checkpoint's notice carries the second line:
@@ -237,9 +244,10 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    round.
 
    Such a notice carries the third line: the verdict of the design check
-   (`/unit:direct` → <UXReview/>) that a fresh helper gave on exactly the
-   shots this notice sends, taken from a build of `<hash>`. A verdict on other
-   shots, or on a build from before a later change to what users see, is
+   (`/unit:direct` → <UXReview/>) given on exactly the shots this notice sends
+   by a fresh check (the Claude helper, or the pooled UI reviewer once the
+   production has adopted it), taken from a build of `<hash>`. A verdict on
+   other shots, or on a build from before a later change to what users see, is
    stale: re-shoot and re-judge before sending. Send the notice on a `pass`,
    or with each defect moved to a follow-up phase under item 7, named on the
    line. User rule 2026-10-01 (nightly review): 2 of about 25 notices carried
@@ -333,9 +341,10 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     on the user never mentions the showrunner, so the showrunner's status script
     can tell the two apart.
 11. **Updates.** Each progress update is the full `/unit:report`, as outside a
-    production (user, 2026-10-06). Run its recorder calls under `TZ=<zone>`, the
-    production doc's **User zone**, so every time in it is in that zone (user,
-    2026-10-04). When the showrunner asks for `/unit:eta`, run it at once.
+    production (user, 2026-10-06). Every time in it is in the user's zone
+    (user, 2026-10-04): the recorder reads the zone setting itself, so pass
+    no `TZ=`. An older production doc may carry a **User zone** line; nothing
+    reads it. When the showrunner asks for `/unit:eta`, run it at once.
 12. **Visual choices go to the showrunner.** Wording, spacing, layout, and
     which of two working options looks better are the showrunner's calls, made
     from the **UX guide**. Ask the showrunner, never the user. The showrunner

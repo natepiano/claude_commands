@@ -16,6 +16,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import cast
 
 import ci
+import holds
 import disk
 import memory
 import sync
@@ -39,6 +40,11 @@ from mac_outcome import (
     offload_seconds,
     usable_share,
 )
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
 KIND_ORDER = ["fmt", "check", "clippy", "mend", "doc", "nextest", "sweep"]
 CALLER_LABELS = {
@@ -401,7 +407,7 @@ def wait_row(row: WaitingRow) -> list[str]:
     longest = measurements.longest
     if isinstance(longest, NoWait):
         return [label, "none", "0", waited, f"0.0 {'job' if unit == 'jobs' else 'seat'}-hours", ""]
-    when = call_time(longest.started_at).astimezone().strftime("%H:%M %Z")
+    when = memory.local_time(call_time(longest.started_at))
     totals: dict[str, float] = {}
     for duration, owner, _, _ in positive:
         totals[owner] = totals.get(owner, 0.0) + duration
@@ -1166,10 +1172,10 @@ def ci_freshness(day: str) -> str:
     if not polled:
         return "; CI never polled"
     newest = max(polled, key=lambda state: datetime.fromisoformat(state.polled_at.replace("Z", "+00:00")))
-    now = datetime.now().astimezone()
-    day_end = datetime.combine(date.fromisoformat(day) + timedelta(days=1), datetime.min.time()).astimezone()
+    now = datetime.now(user_zone())
+    day_end = datetime.combine(date.fromisoformat(day) + timedelta(days=1), datetime.min.time(), user_zone())
     horizon = min(now, day_end)
-    at = datetime.fromisoformat(newest.polled_at.replace("Z", "+00:00")).astimezone()
+    at = datetime.fromisoformat(newest.polled_at.replace("Z", "+00:00")).astimezone(user_zone())
     if day_end < now and at >= day_end:
         return ""
     stale = at < horizon - timedelta(seconds=CI_STALE_AFTER_S)
@@ -1442,7 +1448,7 @@ def lead_block(connection: sqlite3.Connection, day: str, calls: Sequence[Reporte
     """The day's routing, waits, failures and saved work, before the tables."""
     start, end = day_range(day)
     share = usable_share(connection, start, end)
-    lines: list[str] = []
+    lines = holds.now_lines(holds.read_current_holds())
     if share.candidates:
         lines.append(f"Mac when usable: {share.finished} of {share.candidates} candidates finished there ({share.finished / share.candidates:.0%}).")
     measured_rows = [(row.measurements.longest.seconds, row.name) for row in waits.rows
@@ -1469,9 +1475,10 @@ def lead_block(connection: sqlite3.Connection, day: str, calls: Sequence[Reporte
     candidates = [call for call in calls if call.on_report_day and call.candidate]
     if candidates:
         latest = candidates[-1]
-        if isinstance(latest.offload, OffloadDeclined) and latest.offload.reason in ('blocked', 'backoff', 'unreachable'):
-            state = 'blocked' if latest.offload.reason == 'blocked' else 'unreachable'
-            lines.append(f"Mac {state} as of {latest.started_at.astimezone().strftime('%H:%M')}")
+        if isinstance(latest.offload, OffloadDeclined) and latest.offload.reason in ('backoff', 'unreachable'):
+            instant = latest.started_at.astimezone(user_zone())
+            shown = instant.strftime('%H:%M' if day == datetime.now(user_zone()).date().isoformat() else '%Y-%m-%d %H:%M %Z')
+            lines.append(f"Mac unreachable as of {shown}")
     return [*lines, ""] if lines else []
 
 

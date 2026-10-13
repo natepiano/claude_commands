@@ -23,22 +23,23 @@ from typing import Literal, TextIO, cast, final
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "buildlog"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 import override_guard
 import sweep
+import treekey
 
 
 # Version the mirrored repository's development shell exports on the Mac.
 MACOSX_DEPLOYMENT_TARGET = "14.0"
 
 
-MacDeclineReason = Literal[
+NonBusyMacDeclineReason = Literal[
     "off",
     "repo",
     "linux_only",
     "backoff",
     "blocked",
-    "busy",
     "state",
     "unreachable",
     "mac_busy",
@@ -46,6 +47,7 @@ MacDeclineReason = Literal[
     "disk",
     "copy",
 ]
+MacDeclineReason = NonBusyMacDeclineReason | Literal["busy"]
 MacPower = Literal["ac", "battery"]
 
 
@@ -62,6 +64,36 @@ class UnknownRepository:
 
 RepositoryIdentity = KnownRepository | UnknownRepository
 UNKNOWN_REPOSITORY = UnknownRepository()
+
+
+@dataclass(frozen=True)
+class KnownTreeKey:
+    value: str
+
+
+@dataclass(frozen=True)
+class UnavailableTreeKey:
+    pass
+
+
+TreeKey = KnownTreeKey | UnavailableTreeKey
+UNAVAILABLE_TREE_KEY = UnavailableTreeKey()
+
+
+@dataclass(frozen=True)
+class CopiedTree:
+    tree_key: TreeKey
+
+
+@dataclass(frozen=True)
+class TreeCopyFailed:
+    pass
+
+
+def read_tree_key(directory: Path) -> TreeKey:
+    if key := treekey.tree_key(str(directory)):
+        return KnownTreeKey(key)
+    return UNAVAILABLE_TREE_KEY
 
 
 @dataclass(frozen=True)
@@ -97,12 +129,51 @@ class LostMacRun:
 class DeclinedMacRun:
     """An attempt declined before a Mac test command began."""
 
-    reason: MacDeclineReason
+    reason: NonBusyMacDeclineReason
     seconds: float
 
 
+@dataclass(frozen=True)
+class KnownMacJob:
+    what: str
+
+
+@dataclass(frozen=True)
+class LostRunLeftovers:
+    pass
+
+
+@dataclass(frozen=True)
+class UnreadableMacHolder:
+    pass
+
+
+MacHolder = KnownMacJob | LostRunLeftovers | UnreadableMacHolder
+
+
+@dataclass(frozen=True)
+class BusyMacDecline:
+    holder: MacHolder
+    seconds: float
+
+    @property
+    def reason(self) -> Literal["busy"]:
+        return "busy"
+
+
+def claim_holder(stdout: str) -> MacHolder:
+    match = re.fullmatch(r"busy: (.+) since (?:[01][0-9]|2[0-3]):[0-5][0-9]\n?", stdout)
+    return KnownMacJob(match.group(1)) if match is not None else UnreadableMacHolder()
+
+
+def holder_value(holder: MacHolder) -> str:
+    if isinstance(holder, KnownMacJob):
+        return holder.what
+    return "leftovers" if isinstance(holder, LostRunLeftovers) else "unreadable"
+
+
 MacOffloadResult = (
-    PassedOnMac | FailedOnMac | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun
+    PassedOnMac | FailedOnMac | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun | BusyMacDecline
 )
 
 
@@ -553,7 +624,7 @@ def elapsed_seconds(started: float) -> float:
     return max(0.0, time.monotonic() - started)
 
 
-def declined(reason: MacDeclineReason, started: float) -> DeclinedMacRun:
+def declined(reason: NonBusyMacDeclineReason, started: float) -> DeclinedMacRun:
     return DeclinedMacRun(reason, elapsed_seconds(started))
 
 
@@ -597,8 +668,9 @@ def write_result(
         if not decline_already_shown(result.reason, last_decline):
             print(f"mac_test: not running on the Mac ({reason})")
     if isinstance(destination, ResultFile):
+        holder_line = f"holder={holder_value(result.holder)}\n" if isinstance(result, BusyMacDecline) else ""
         _ = destination.path.write_text(
-            f"mac={mac}\nreason={reason}\nseconds={result.seconds:.6f}\n",
+            f"mac={mac}\nreason={reason}\nseconds={result.seconds:.6f}\n" + holder_line,
             encoding="utf-8",
         )
     return status
@@ -852,6 +924,21 @@ def copy_tree(
         return False
 
 
+def copy_tree_with_key(
+    controller: ProcessController,
+    config: OffloadConfig,
+    request: OffloadRequest,
+    repository: KnownRepository,
+) -> CopiedTree | TreeCopyFailed:
+    before = read_tree_key(request.repo_root)
+    if not copy_tree(controller, config, request, repository):
+        return TreeCopyFailed()
+    after = read_tree_key(request.repo_root)
+    if isinstance(before, KnownTreeKey) and isinstance(after, KnownTreeKey) and before == after:
+        return CopiedTree(before)
+    return CopiedTree(UNAVAILABLE_TREE_KEY)
+
+
 def nextest_words_with_skip(
     words: tuple[str, ...], skip_expression: str
 ) -> tuple[str, ...]:
@@ -874,6 +961,7 @@ def remote_test_command(
     config: OffloadConfig,
     request: OffloadRequest,
     repository: KnownRepository,
+    sent_tree_key: TreeKey = UNAVAILABLE_TREE_KEY,
 ) -> str:
     budget = config.values.get(
         f"mac_budget_gib.{repository.name}", config.default_target_budget_gib
@@ -883,11 +971,16 @@ def remote_test_command(
         config.values.get(f"mac_skip.{repository.name}", ""),
     )
     invocation = shlex.join(["nextest", *words])
+    sent_tree = (
+        f"BUILDLOG_SENT_TREE_KEY={shlex.quote(sent_tree_key.value)} "
+        if isinstance(sent_tree_key, KnownTreeKey) else ""
+    )
     return (
         f"cd {shlex.quote(remote_mirror(repository))} && "
         'PATH="$HOME/.cargo/bin:$PATH" '
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_CALL_ID={shlex.quote(request.call_id)} "
+        f"{sent_tree}"
         "BUILDLOG_SYNC=1 "
         f"LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "
         f"MACOSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET} "
@@ -1018,7 +1111,8 @@ def claimed_run(
             return declined("disk", started)
 
         copy_started = time.monotonic()
-        if not copy_tree(controller, config, request, repository):
+        copied = copy_tree_with_key(controller, config, request, repository)
+        if isinstance(copied, TreeCopyFailed):
             return declined("copy", started)
         copy_seconds = elapsed_seconds(copy_started)
         print(
@@ -1030,7 +1124,7 @@ def claimed_run(
         remote_status = controller.stream_mac_run(
             [
                 *ssh_prefix(config),
-                remote_test_command(config, request, repository),
+                remote_test_command(config, request, repository, copied.tree_key),
             ]
         )
         seconds = elapsed_seconds(started)
@@ -1085,17 +1179,19 @@ def run_offload(
             write_backoff(time.time() + config.unreachable_backoff_s)
             return declined("unreachable", started)
         if isinstance(checked, LeftoversRemain):
-            return declined("busy", started)
+            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
         release_claim(controller)
         claim = claim_for_run(controller, config, request)
         if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
-            return declined("busy", started)
+            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     if isinstance(claim, MacClaimNotConfirmed):
         if not decline_already_shown(claim.reason, request.last_decline):
             if claim.stdout:
                 print(claim.stdout, end="" if claim.stdout.endswith("\n") else "\n", file=sys.stderr, flush=True)
             if claim.stderr:
                 print(claim.stderr, end="" if claim.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
+        if claim.reason == "busy":
+            return BusyMacDecline(claim_holder(claim.stdout), elapsed_seconds(started))
         return declined(claim.reason, started)
     return claimed_run(controller, config, request, repository, started)
 

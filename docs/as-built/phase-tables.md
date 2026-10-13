@@ -12,7 +12,8 @@ A phase table shows one unit's current phase with its ETA, and every plan phase 
 | --- | --- |
 | `scripts/delegate/phase_table.py` | Builds a `PhaseRecord` from run events, renders it as Markdown or JSON, and writes, moves and archives the notes. It writes no event. |
 | `scripts/delegate/progress_history.py` | The recorder: the `eta` command, the `eta_stated` event, the note hook, and the public readers the table uses. |
-| `scripts/production/dailies_input.py` | Calls `prune` and `show --production-doc` once per build and fills each unit's start and ETA from its record. |
+| `scripts/production/dailies_input.py` | Calls `show --production-doc` once per build and fills each unit's start and ETA from its record. |
+| `scripts/production/prune_phase_notes.py` | Runs `prune` in-process for every update timer's production; the agent-sessions snapshot timer runs it every 2 minutes. |
 | `commands/unit/report.md`, `commands/unit/eta.md`, `commands/unit/eta_breakdown.md` | Where a unit reports progress and records a stated ETA. |
 | `commands/showrunner/dailies.md` | The `eta` row of the judgment contract and the meaning of `phase tables: unavailable`. |
 
@@ -25,7 +26,7 @@ phase_table.py archive --production-doc <doc>
 progress_history.py eta --session-dir <dir> --time <YYYY-MM-DDTHH:MM> [--earliest <YYYY-MM-DDTHH:MM> --latest <YYYY-MM-DDTHH:MM>] --basis <text>
 ```
 
-`show` takes exactly one of `--session-dir` and `--production-doc`. With `--session-dir` it prints Markdown, or JSON under `--json`, in `--zone`; the default zone is `TZ`, then the machine's. With `--production-doc` it always prints JSON in the production doc's **User zone**. `NoState`, `NoPlan`, a `Refusal` or an unknown zone prints one line on stderr and exits 1.
+`show` takes exactly one of `--session-dir` and `--production-doc`. With `--session-dir` it prints Markdown, or JSON under `--json`, in `--zone`; the default zone is the user's zone setting (`scripts/lib/user_zone.py`). With `--production-doc` it always prints JSON in the user's zone setting. `NoState`, `NoPlan`, a `Refusal` or an unknown zone prints one line on stderr and exits 1.
 
 ### The record
 
@@ -116,10 +117,10 @@ phases[]     {phase, title, status: "done" | "running" | "todo", start, finish, 
 
 ### Recorder side
 
-- **`eta`.** Reads its times in the process `TZ`, requires an active phase, appends one `eta_stated` event through `_append_event`, runs the hook, and prints `ETA recorded: <HH:MM zone>`. Beside the fields every event carries, the event holds `eta_at`, `basis` (stripped) and, with a range, `eta_earliest_at` and `eta_latest_at`, all times as epochs. It exits 2 with one stderr line for a malformed time, a time in the past, a time inside the hour the local clock skips, `--earliest` after `--time`, `--latest` before it, one range end alone, a blank `--basis`, or no active phase.
+- **`eta`.** Reads its times in the process `TZ`, or in the user's zone setting when `TZ` is unset, requires an active phase, appends one `eta_stated` event through `_append_event`, runs the hook, and prints `ETA recorded: <HH:MM zone>`. Beside the fields every event carries, the event holds `eta_at`, `basis` (stripped) and, with a range, `eta_earliest_at` and `eta_latest_at`, all times as epochs. It exits 2 with one stderr line for a malformed time, a time in the past, a time inside the hour the local clock skips, `--earliest` after `--time`, `--latest` before it, one range end alone, a blank `--basis`, or no active phase.
 - **Hook.** `_refresh_phase_table(session_dir)` is the last act of `_start_phase`, `_progress`, `_finish_phase` and `_finish_run`, and follows the append in `_eta`. It returns at once unless the state's plan file contains `> **Production:`. Otherwise it runs `phase_table.py refresh` beside it under `sys.executable`, with a 10 s timeout and stdout discarded. A non-zero exit, a timeout or an `OSError` prints one stderr line, `phase table not written: <reason>`.
 - **Public readers.** `plan_phases`, `plan_runs`, `eta_band_seconds(percent, elapsed, spread) -> EtaBand | EtaProjectionUnavailable` (`EtaBand`: `remaining`, `earliest`, `latest`, in seconds), `percent_spread`, `now_epoch` and `resolve_plan_path`.
-- **Command files.** `commands/unit/report.md` step 5 says the `progress` call rewrites the note and that a requested table is `phase_table.py show --session-dir "${SESSION_DIR}" --zone <User zone>`. `commands/unit/eta.md` records the ETA, range and basis before the answer is sent, as `TZ=<User zone> python3 ~/.claude/scripts/delegate/progress_history.py eta …`. `commands/unit/eta_breakdown.md` runs the same command, with the bullets' last end time and no range, when the breakdown moves the ETA.
+- **Command files.** `commands/unit/report.md` step 5 says the `progress` call rewrites the note and that a requested table is `phase_table.py show --session-dir "${SESSION_DIR}"`. `commands/unit/eta.md` records the ETA, range and basis before the answer is sent, as `python3 ~/.claude/scripts/delegate/progress_history.py eta …`. `commands/unit/eta_breakdown.md` runs the same command, with the bullets' last end time and no range, when the breakdown moves the ETA.
 
 ### Dailies side
 
@@ -127,7 +128,6 @@ phases[]     {phase, title, status: "done" | "running" | "todo", start, finish, 
 
 ```python
 phase_tables(production_doc: Path, zone: ZoneInfo) -> PhaseTablesAvailable | PhaseTablesUnavailable
-prune_phase_tables(production_doc: Path) -> PhaseTablesPruned | PhaseTablesUnavailable
 unit_phase_state(value: object, where: str, zone: ZoneInfo) -> NumberedOpenPlanPhase | NoNumberedOpenPlanPhase
 
 NumberedOpenPlanPhase(number: int, started: datetime,
@@ -141,13 +141,13 @@ record_eta_stated(target: datetime, source: datetime, rendered_time: str) -> dat
 record_eta_range(target, earliest, latest, source, rendered_time, now) -> RendererSafeRecordEtaRange | RecordEtaRangeOmitted
 ```
 
-- **Order.** `run` calls `prune_phase_tables` between `read_production` and `units_from_doc`, its one write before its checks, then `phase_tables` once. Record times are converted to `Production.zone`.
+- **Order.** `run` calls `phase_tables` once, after `units_from_doc`. It writes nothing to the vault. Record times are converted to `Production.zone`.
 - **Which units.** A unit is record-backed when its open phase id is all digits, that phase has a `running` row in `phases`, and its number equals the one in the judgment's phase text (`judgment_phase_number`, `^Phase (\d+) of \d+: `). The record fills an absent `started`, and the ETA unless the judgment's `eta` holds `time` or `none`. Every other unit keeps the status-capture path (`eta_state`, `eta_value`).
 - **State.** `record_eta_state` returns `EtaFresh | EtaStale | EtaPassed | EtaNone` in this order: no ETA and no first target is `EtaNone`; no ETA with a first target is `EtaPassed`; held, unchanged and not already requested is `EtaFresh`; a target at or before the build time is `EtaPassed`; a source time (`stated_at` or `as_of`) over one hour old is `EtaStale`; else `EtaFresh`. It keeps the `eta_seen.json` record under `<unit>|<phase text>` with `text` as the target in `YYYY-MM-DDTHH:MM`. A record whose `text` has another form came from a screen capture and is adopted with its `first_seen` and `requested`.
 - **Value.** `record_eta_value` writes `time` as `record_clock` gives it (`HH:MM`, with `+N` when the target falls N days after the build's date), `stated`, the range, `percent` (the reported percent or `null`), `first` and `fixes` when the record holds a first stated target, and `why`: a stated ETA's `basis` with whitespace collapsed, or `it is now projected from <N>% done`. The judgment's own `eta` fields overwrite these, and a stale ETA gets `detail: set HH:MM` when the judgment gave none.
 - **Renderer fit.** `record_eta_stated` returns the anchor the renderer reads a bare clock against: the source minute, or the target's own minute when `parse_time(rendered_time, source)` would land elsewhere. `record_eta_range` writes `earliest` and `latest` only when the renderer's `parse_range_end` reads both back as the record's minutes; else `RecordEtaRangeOmitted` and neither end is written.
 - **Repair rounds.** The builder's `FirstStatedEtaTarget(time, repair_rounds)` mirrors the record's. `unit_phase_state` reads `repair_rounds_since_first_stated_eta` only when the first target is not `null`, and requires an `int` (not a `bool`) of 0 or more; anything else raises `ValueError("<where>.current.repair_rounds_since_first_stated_eta: expected a whole number from 0")`. `EtaPassed`, `EtaNone` and an unavailable ETA carry no `fixes`.
-- **Failure.** A failed or unparsable `show`, a record that fails decoding, or a failed `prune` prints `phase tables: unavailable — <reason>` and the build continues from the status capture.
+- **Failure.** A failed or unparsable `show`, or a record that fails decoding, prints `phase tables: unavailable — <reason>` and the build continues from the status capture.
 
 ### Roots and overrides
 
@@ -155,7 +155,7 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - `PLAN_DELEGATE_HISTORY_DIR`: the recorder's history root (`_history_root`), default `~/.local/state/plan-delegate`; run files sit in its `runs/`. `PLAN_DELEGATE_NOW_EPOCH` replaces the clock (`now_epoch`).
 - `NOTIFIER_STATE_DIR`, `NOTIFIER_SESSIONS_DIR`: where `scripts/production/showrunners.py` finds a showrunner, defaults `~/.local/state/notifier` and `~/.claude/sessions`.
 - `DAILIES_PHASE_TABLE`: the table script the dailies builder calls (`phase_table_path`), default `scripts/delegate/phase_table.py`.
-- `TZ`: the zone of `eta`'s typed times, and `show`'s default zone.
+- `TZ`: the zone of `eta`'s typed times; unset, the user's zone setting. `show` no longer reads it.
 
 ## Invariants
 
@@ -169,7 +169,7 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - A note is moved, replaced or removed only when its frontmatter carries `phase_table: true`, a `production` and a `unit`. A hand-written file is never changed.
 - `_json_record` is the only JSON form, and nothing stores it. The first stated target has one place in it: `current.first_stated_eta_target`.
 - A state is a named type, never an optional field or a placeholder `datetime`.
-- Every time in a note and in the production JSON is in the production doc's **User zone**.
+- Every time in a note and in the production JSON is in the user's zone setting.
 - In the dailies a judgment value always wins, and a judgment `time` or `none` decides the ETA entirely.
 - A phase-table failure in the dailies reads `unavailable`, never `failed`: `dailies.md` stops the report on a `<step>: failed` line.
 - The dailies builder fits the renderer. `scripts/production/dailies_render.py` is not changed to suit a record.
@@ -185,7 +185,7 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - A unit that stated an ETA, ran past it and reported no percent has `current.eta` `null` with a first target present. The dailies read that as `EtaPassed`, which asks for a new ETA once; with no first target it is `EtaNone`.
 - A stated ETA with no progress report has `current.percent` `null` and stays record-backed. `basis` is never blank and may hold `|` or line breaks. A predicted row's JSON `status` is `todo`; only the Markdown says `predicted`.
 - `show --production-doc` reads neither `--zone` nor `--json`. It turns only an unreadable plan into `unavailable`; an unreadable production doc fails the whole call.
-- The machine's zone is Eastern and the User zone is Pacific: an `eta` call with no `TZ` reads a typed time three hours off. `eta.md` and `eta_breakdown.md` call the recorder installed under `~/.claude`, so a recorder change reaches them only once it is on main.
+- An `eta` call with no `TZ` reads a typed time in the user's zone setting, never the machine's zone (2026-10-12). `eta.md` and `eta_breakdown.md` call the recorder installed under `~/.claude`, so a recorder change reaches them only once it is on main.
 - `scripts/production/showrunners.py` reads its two directories once, at import. A test that runs `refresh` in a subprocess sets them in the child's environment; a test that calls `phase_table.main()` in process patches the module constants. `scripts/production/fake_showrunner.py` (`write_timer`, `write_session`) supplies the running showrunner a note needs.
 - `add_unit.py` imports its siblings by bare name, so `phase_table.py` puts `scripts/production` on `sys.path` before its `scripts.production` imports. The form type-checks with no ignore and runs from any working directory.
 - A vault on a file system without hard links refuses a note's first write with one line. A showrunner name of `.` or `..`, or one holding `/` or NUL, is refused.
@@ -194,7 +194,8 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - `refresh` deletes, not archives, the older copy of a moved unit's note; the newer note carries the same phases.
 - Repair-round starts go through `_moment` to datetimes, the representation of `stated_at`. A raw float epoch compared against the microsecond-rounded `stated_at` would count an equal-moment round as later.
 - The renderer reads a bare range end on the ETA's own day and moves it at most one day. An end more than a day from its ETA cannot be written, so both ends are left out.
-- `phase tables: unavailable` after a failed prune does not mean the records went unread. A live builder run archives retired notes in the real vault unless `PHASE_TABLE_VAULT` points elsewhere.
+- **Pruning (2026-10-13; user: "Yes do the part C").** `prune_phase_notes.py` reads each `showrunner-*` folder under `NOTIFIER_STATE_DIR` and takes the production doc from its `conf` `CHECK` (`showrunners.checked_doc`); no session record is read, so a stopped showrunner's production is pruned too. It calls `phase_table.prune(doc)` for each, in one process, and uses the standard library alone because the timer runs it with nix's `python3`. A timer with no readable doc, or a prune that raises `Refusal`, `OSError` or `UnicodeError`, prints `phase notes not pruned for <slug>: <reason>` to stderr and the next production still runs; the exit is 1 when any failed. Success prints nothing. `/etc/nixos/modules/linux/agent-sessions-snapshot.py` runs it as its own process after `refresh_agent_notes`, so a failure never costs the session record. The Mac has no snapshot timer, so nothing prunes there (accepted 2026-10-13: no Mac production needed it). Before this, a dailies pruned, so a production that built none kept its retired units' notes.
+- A live run of `prune_phase_notes.py` archives retired notes in the real vault unless `PHASE_TABLE_VAULT` points elsewhere.
 - The recorder's test suite takes two to four minutes (195 s measured); the table suite about six seconds.
 
 ## Why

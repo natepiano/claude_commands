@@ -292,6 +292,7 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # location, so the copy needs the interpreter shim beside it too.
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", lib / "py")
+        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
         home_lib = self.root / ".claude" / "scripts" / "lib"
         home_lib.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", home_lib / "py")
@@ -330,6 +331,7 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         # path would need a live app-server, which is a different test's subject.
         environment["PLAN_DELEGATE_CODEX_MESH"] = "0"
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         _ = environment.pop("CODEX_THREAD_ID", None)
         _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
         return environment

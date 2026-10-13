@@ -6,12 +6,15 @@ import argparse
 import json
 import math
 import os
+import re
 import shlex
+import socket
 import sqlite3
 import statistics
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass, field
@@ -84,6 +87,16 @@ class ReviewRecord:
 
 
 @dataclass(frozen=True)
+class PlanKnown:
+    path: str
+
+
+@dataclass(frozen=True)
+class PlanUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
 class ReviewRequest:
     at: datetime
     model: str
@@ -118,6 +131,61 @@ class IncompleteCost:
 ReviewCost = CompleteCost | IncompleteCost
 
 
+@dataclass(frozen=True)
+class AvailableUsageStore:
+    """The shared store was read completely."""
+
+
+@dataclass(frozen=True)
+class UnavailableUsageStore:
+    """Review costs cannot be read from the shared store."""
+
+
+UsageStore = AvailableUsageStore | UnavailableUsageStore
+AVAILABLE_USAGE_STORE = AvailableUsageStore()
+
+
+@dataclass(frozen=True)
+class UXDefect:
+    shot: str
+    rule: str
+    defect: str
+    fix: str
+
+    @property
+    def pairs(self) -> tuple[tuple[str, str], ...]:
+        rule = self.rule.replace("`", "").strip().lower().removesuffix(".md")
+        return tuple((rule, Path(shot.replace("`", "").strip()).name) for shot in self.shot.split(","))
+
+    def table_row(self) -> str:
+        return f"| {self.shot} | {self.rule} | {self.defect} | {self.fix} |"
+
+
+@dataclass(frozen=True)
+class PassUXVerdict:
+    @property
+    def rows(self) -> tuple[UXDefect, ...]:
+        return ()
+
+
+@dataclass(frozen=True)
+class DefectsUXVerdict:
+    first: UXDefect
+    remaining: tuple[UXDefect, ...]
+
+    @property
+    def rows(self) -> tuple[UXDefect, ...]:
+        return (self.first, *self.remaining)
+
+
+@dataclass(frozen=True)
+class UnusableUXVerdict:
+    reason: str
+
+
+UXVerdict = PassUXVerdict | DefectsUXVerdict | UnusableUXVerdict
+
+
 @dataclass
 class ReportSources:
     records: list[ReviewRecord] = field(default_factory=list)
@@ -125,6 +193,7 @@ class ReportSources:
     histories: dict[HistoryKey, list[dict[str, object]]] = field(default_factory=dict)
     holds: dict[str, list[dict[str, object]]] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    usage_store: UsageStore = field(default_factory=AvailableUsageStore)
 
 
 def json_object(text: str) -> dict[str, object]:
@@ -223,11 +292,14 @@ def stored_usage(sources: ReportSources, include_mac: bool) -> None:
                         sources.warnings.append(f"Mac usage source {row['state']}; last complete read {row['last_complete_at']}")
     except (OSError, ValueError, sqlite3.Error) as exc:
         sources.warnings.append(f"usage store unavailable: {exc}")
+        sources.usage_store = UnavailableUsageStore()
         return
     sources.threads = list(threads.values())
+    sources.usage_store = AvailableUsageStore()
 
 
-def attribute_costs(records: Sequence[ReviewRecord], threads: Sequence[CodexThreadUsage]) -> dict[RecordKey, ReviewCost]:
+def attribute_costs(records: Sequence[ReviewRecord], threads: Sequence[CodexThreadUsage],
+                    usage_store: UsageStore = AVAILABLE_USAGE_STORE) -> dict[RecordKey, ReviewCost]:
     owners: dict[tuple[str, str], list[ReviewRecord]] = {}
     for record in sorted(records, key=lambda item: (item.started_at, item.path)):
         owners.setdefault((record.machine, record.thread_id), []).append(record)
@@ -249,6 +321,9 @@ def attribute_costs(records: Sequence[ReviewRecord], threads: Sequence[CodexThre
                     compactions.setdefault(record.key, []).append(at.timestamp())
     costs: dict[RecordKey, ReviewCost] = {}
     for record in records:
+        if isinstance(usage_store, UnavailableUsageStore):
+            costs[record.key] = IncompleteCost("usage store unavailable")
+            continue
         owned = requests[record.key]
         markers = compactions.get(record.key, [])
         if (record.machine, record.thread_id) not in found:
@@ -286,13 +361,39 @@ def read_events(path: Path) -> list[dict[str, object]]:
     return events
 
 
+def normalize_plan(path: str, working_dir: str = "") -> str:
+    normalized = Path(os.path.normpath(path))
+    if normalized.is_absolute() and working_dir and Path(working_dir).is_absolute():
+        try:
+            normalized = normalized.relative_to(os.path.normpath(working_dir))
+        except ValueError:
+            pass
+    return os.path.normpath(str(normalized))
+
+
+def review_plan(record: ReviewRecord, sources: ReportSources) -> PlanKnown | PlanUnavailable:
+    events = sources.histories.get((record.machine, record.history_file))
+    if events is None:
+        return PlanUnavailable("history file unavailable")
+    for event in events:
+        if event.get("event_type") != "run_started":
+            continue
+        path = event.get("plan_doc")
+        if not isinstance(path, str) or not path:
+            return PlanUnavailable("run_started has no plan_doc")
+        working_dir = event.get("working_dir")
+        return PlanKnown(normalize_plan(path, working_dir if isinstance(working_dir, str) else ""))
+    return PlanUnavailable("no run_started event")
+
+
 def local_sources(root: Path, quality: bool) -> ReportSources:
     # Earlier records still own requests in overlapping windows at the cutoff.
     sources = ReportSources(records=read_records(root))
     if quality:
         for path in {record.history_file for record in sources.records if record.history_file}:
             try:
-                sources.histories[("local", path)] = read_events(Path(path))
+                if Path(path).is_file():
+                    sources.histories[("local", path)] = read_events(Path(path))
             except (OSError, ValueError) as exc:
                 sources.warnings.append(f"history unavailable: {path}: {exc}")
         try:
@@ -387,40 +488,55 @@ def cost_cells(records: Sequence[ReviewRecord], costs: Mapping[RecordKey, Review
 
 def quality_lines(records: Sequence[ReviewRecord], sources: ReportSources) -> list[str]:
     phases: dict[PhaseKey, list[ReviewRecord]] = {}
-    selected_phases = {record.phase_key for record in records}
+    selected_phases = {record.phase_key for record in records if record.kind != "ux"}
     for record in sources.records:
-        if record.phase_key in selected_phases:
+        if record.kind != "ux" and record.phase_key in selected_phases:
             phases.setdefault(record.phase_key, []).append(record)
     mixed = {key for key, group in phases.items() if len({record.arm for record in group}) > 1}
-    lines = ["Quality by arm and kind", "| Arm | Kind | Phases | Raised | Confirmed | Precision | Escapes per phase |",
-             "| --- | --- | ---: | ---: | ---: | ---: | ---: |"]
+    lines = ["Code review quality by arm", "| Arm | Phases | Raised | Confirmed | Precision | Escapes per phase |",
+             "| --- | ---: | ---: | ---: | ---: | ---: |"]
+    warnings: list[str] = []
     for arm in ("pool", "own"):
-        for kind in ("code", "ux"):
-            groups = [group for key, group in phases.items() if key not in mixed and group[0].arm == arm
-                      and any((record.kind == "ux") == (kind == "ux") for record in group)]
-            raised = confirmed = escapes = 0
-            for group in groups:
-                record = group[0]
-                raised += sum(item.raised for item in group if item.outcome == "reviewed"
-                              and (item.kind == "ux") == (kind == "ux"))
-                events = sources.histories.get((record.machine, record.history_file), [])
-                for event in events:
-                    if (event.get("event_type") != "finding_opened" or
-                            event.get("phase_instance_id") != record.phase_instance_id or
-                            (event.get("lens") == "ux") != (kind == "ux")):
+        groups = [group for key, group in phases.items() if key not in mixed and group[0].arm == arm]
+        raised = confirmed = escapes = 0
+        for group in groups:
+            record = group[0]
+            raised += sum(item.raised for item in group if item.outcome == "reviewed")
+            events = sources.histories.get((record.machine, record.history_file), [])
+            for event in events:
+                if (event.get("event_type") != "finding_opened" or
+                        event.get("phase_instance_id") != record.phase_instance_id or event.get("lens") == "ux"):
+                    continue
+                if event.get("caught_by") in ("delegate", "both"):
+                    confirmed += 1
+                elif event.get("caught_by") == "main":
+                    escapes += 1
+            # Merge holds describe the whole phase, not a particular lens.
+            plan = review_plan(record, sources)
+            unmatched = False
+            for row in sources.holds.get(record.machine, []):
+                if row.get("unit") != record.unit or str(row.get("phase")) != record.phase:
+                    continue
+                value = row.get("holds")
+                if not isinstance(value, int):
+                    continue
+                held_plan = row.get("plan")
+                if isinstance(held_plan, str):
+                    if isinstance(plan, PlanUnavailable):
+                        unmatched = True
                         continue
-                    if event.get("caught_by") in ("delegate", "both"):
-                        confirmed += 1
-                    elif event.get("caught_by") == "main":
-                        escapes += 1
-                # Merge holds describe the whole phase, not a particular lens.
-                escapes += sum(int(value) for row in sources.holds.get(record.machine, [])
-                               if row.get("unit") == record.unit and str(row.get("phase")) == record.phase
-                               and isinstance(value := row.get("holds"), int))
-            precision = f"{confirmed / raised * 100:.1f}%" if raised else "-"
-            escape_rate = f"{escapes / len(groups):.1f}" if groups else "-"
-            lines.append(f"| {arm} | {kind} | {len(groups)} | {raised} | {confirmed} | {precision} | {escape_rate} |")
-    lines.append(f"mixed phases: {len(mixed)} (excluded from comparison)")
+                    if normalize_plan(held_plan) != plan.path:
+                        continue
+                escapes += value
+            if unmatched and isinstance(plan, PlanUnavailable):
+                warnings.append(f"source warning: merge holds unmatched: {record.unit} phase {record.phase}: "
+                                + f"review plan unavailable ({plan.reason})")
+        precision = f"{confirmed / raised * 100:.1f}%" if raised else "-"
+        escape_rate = f"{escapes / len(groups):.1f}" if groups else "-"
+        lines.append(f"| {arm} | {len(groups)} | {raised} | {confirmed} | {precision} | {escape_rate} |")
+    lines.extend((f"mixed phases: {len(mixed)} (excluded from comparison)",
+                  "ui checks: compared by --shadow, not in this table"))
+    lines.extend(warnings)
     return lines
 
 
@@ -474,17 +590,122 @@ def render_report(records: Sequence[ReviewRecord], costs: Mapping[RecordKey, Rev
     return "\n".join(lines)
 
 
+def ux_table_cells(line: str) -> list[str]:
+    cells = [" ".join(cell.split()) for cell in re.split(r"(?<!\\)\|", line.strip())[1:]]
+    if cells and not cells[-1]:
+        _ = cells.pop()
+    return cells
+
+
+def read_ux_verdict(path: Path) -> UXVerdict:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        return UnusableUXVerdict(str(exc))
+    verdicts: list[str] = []
+    for line in lines:
+        text = line.replace("*", "").strip()
+        match = re.fullmatch(r"Verdict:\s*(pass|defects)", text, re.IGNORECASE)
+        if match:
+            verdicts.append(match[1].lower())
+    if not verdicts:
+        return UnusableUXVerdict("missing verdict line")
+    if len(verdicts) != 1:
+        return UnusableUXVerdict("multiple verdict lines")
+    headers = [index for index, line in enumerate(lines)
+               if line.strip().startswith("|") and ux_table_cells(line) == ["Shot", "Rule", "Defect", "Fix"]]
+    if not headers:
+        return UnusableUXVerdict("missing defect table")
+    if len(headers) != 1:
+        return UnusableUXVerdict("multiple defect tables")
+    start = headers[0] + 1
+    if start >= len(lines):
+        return UnusableUXVerdict("missing defect table separator")
+    separator = ux_table_cells(lines[start])
+    if len(separator) != 4 or not all(re.fullmatch(r":?-+:?", cell.replace(" ", "")) for cell in separator):
+        return UnusableUXVerdict("invalid defect table separator")
+    defects: list[UXDefect] = []
+    for line in lines[start + 1:]:
+        if not line.strip().startswith("|"):
+            break
+        cells = ux_table_cells(line)
+        if len(cells) != 4 or not all(cells):
+            return UnusableUXVerdict("invalid defect table row")
+        if all(re.fullmatch(r":?-+:?", cell.replace(" ", "")) for cell in cells):
+            continue
+        defects.append(UXDefect(*cells))
+    if verdicts[0] == "pass":
+        return UnusableUXVerdict("pass verdict has defect rows") if defects else PassUXVerdict()
+    if not defects:
+        return UnusableUXVerdict("defects verdict has no defect rows")
+    return DefectsUXVerdict(defects[0], tuple(defects[1:]))
+
+
+def render_shadow(root: Path) -> str:
+    checks: dict[tuple[Path, str], dict[str, Path]] = {}
+    for path in sorted(root.glob("review_turns/*/ux_*.txt")):
+        match = re.fullmatch(r"ux_(.+)_([1-9][0-9]*)_(helper|pool)\.txt", path.name)
+        if match:
+            check = f"ux_{match[1]}_{match[2]}"
+            checks.setdefault((path.parent, check), {})[match[3]] = path
+    lines = ["UI shadow checks (all local pairs; --since and --quality do not filter them)",
+             "Comparison: rule and shot file name, by count; Defect and Fix wording is not compared.",
+             f"Machine: {socket.gethostname().split('.')[0]} (pairs saved on another machine are not counted)"]
+    complete = incomplete = missed_total = 0
+    for (directory, check), pair in checks.items():
+        lines.extend(("", f"check: {directory.name}/{check}"))
+        if len(pair) != 2:
+            incomplete += 1
+            for arm in ("helper", "pool"):
+                if arm not in pair:
+                    lines.append(f"unpaired file: {next(iter(pair.values()))}; missing {directory / f'{check}_{arm}.txt'}")
+            continue
+        helper = read_ux_verdict(pair["helper"])
+        pool = read_ux_verdict(pair["pool"])
+        for arm, verdict in (("helper", helper), ("pool", pool)):
+            if isinstance(verdict, UnusableUXVerdict):
+                lines.append(f"verdict unavailable: {pair[arm]}: {verdict.reason}")
+        if isinstance(helper, UnusableUXVerdict) or isinstance(pool, UnusableUXVerdict):
+            incomplete += 1
+            continue
+        available = Counter(pair for row in pool.rows for pair in row.pairs)
+        missed: list[UXDefect] = []
+        for row in helper.rows:
+            needed = Counter(row.pairs)
+            if all(available[pair] >= count for pair, count in needed.items()):
+                available.subtract(needed)
+            else:
+                missed.append(row)
+        complete += 1
+        missed_total += len(missed)
+        for label, rows in (("helper", helper.rows), ("pool", pool.rows), ("pool missed", missed)):
+            lines.extend((f"{label} defects: {len(rows)}", "| Shot | Rule | Defect | Fix |",
+                          "| --- | --- | --- | --- |"))
+            lines.extend(row.table_row() for row in rows)
+    lines.extend(("", f"complete shadow checks: {complete}; incomplete: {incomplete}; pool missed rows: {missed_total}",
+                  "Adoption is the user's decision after ten checks; this report creates no marker."))
+    return "\n".join(lines)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("--since", required=True)
+    _ = parser.add_argument("--since")
     _ = parser.add_argument("--root")
     _ = parser.add_argument("--no-mac", action="store_true")
     _ = parser.add_argument("--quality", action="store_true")
+    _ = parser.add_argument("--shadow", action="store_true", help="compare local UI verdict pairs without the usage store")
     args = parser.parse_args()
+    shadow = cast(bool, args.shadow)
+    since_text = cast(str | None, args.since)
+    if not shadow and not since_text:
+        parser.error("--since is required unless --shadow is used")
     try:
-        since = parse_boundary(cast(str, args.since))
         configured_root = cast(str | None, args.root)
         root = Path(configured_root or os.environ.get("PLAN_DELEGATE_HISTORY_DIR", "~/.local/state/plan-delegate")).expanduser()
+        if shadow:
+            print(render_shadow(root))
+            return 0
+        since = parse_boundary(cast(str, since_text))
         quality = cast(bool, args.quality)
         sources = local_sources(root, quality)
         include_mac = not cast(bool, args.no_mac)
@@ -495,7 +716,7 @@ def main() -> int:
             sources.holds.update(mac.holds)
             sources.warnings.extend(mac.warnings)
         stored_usage(sources, include_mac)
-        costs = attribute_costs(sources.records, sources.threads)
+        costs = attribute_costs(sources.records, sources.threads, sources.usage_store)
         selected = [record for record in sources.records if record.started_at >= since.timestamp()]
         print(render_report(selected, costs, quality, sources=sources))
     except (OSError, ValueError) as exc:

@@ -210,6 +210,23 @@ class CollectorFixture(unittest.TestCase):
             return self.claude_root / "project" / f"{SESSION}.jsonl"
         return self.codex_root / "2026/10/10/rollout-example.jsonl"
 
+    def write_codex_session(self, path: Path, thread: str = THREAD) -> tuple[int, int]:
+        records = (
+            {"timestamp": "2026-10-10T21:34:57Z", "type": "session_meta",
+             "payload": {"id": thread, "cwd": "/invented/π"}},
+            {"timestamp": "2026-10-10T21:34:58Z", "type": "turn_context",
+             "payload": {"model": "gpt-5.6-sol", "effort": "medium"}},
+            {"timestamp": "2026-10-10T21:34:59Z", "type": "event_msg",
+             "payload": {"type": "token_count", "info": {"last_token_usage": {
+                 "input_tokens": 30, "cached_input_tokens": 10, "output_tokens": 2}}}},
+            {"timestamp": "2026-10-10T21:35:01Z", "type": "response_item",
+             "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": "invented edit"}},
+        )
+        lines = [(json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8") for record in records]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_bytes(b"".join(lines))
+        return sum(map(len, lines[:2])), sum(map(len, lines[:3]))
+
     def cursor(self, path: Path) -> int:
         matches = [row for row in self.rows("SELECT path, offset FROM cursors WHERE machine = 'natedev'")
                    if cast(str, row["path"]).endswith(path.name)]
@@ -266,6 +283,125 @@ class CollectorFixture(unittest.TestCase):
 
 
 class CollectTests(CollectorFixture):
+    def two_codex_sessions(self) -> tuple[Path, Path, int, int]:
+        shutil.rmtree(self.codex_root)
+        first = self.codex_root / "2026/10/10/rollout-first.jsonl"
+        second = self.codex_root / "2026/10/11/rollout-second.jsonl"
+        turn_offset, edit_offset = self.write_codex_session(first)
+        self.assertEqual(self.write_codex_session(second), (turn_offset, edit_offset))
+        return first, second, turn_offset, edit_offset
+
+    def test_two_session_files_keep_requests_at_the_same_byte_offset(self) -> None:
+        first, second, offset, _ = self.two_codex_sessions()
+        output = self.collect()
+        turns = self.turns("codex", THREAD)
+        self.assertEqual(len(turns), 2)
+        self.assertCountEqual(self.values(turns, "turn_key"),
+                              [(f"{first.name}:{offset}",), (f"{second.name}:{offset}",)])
+        self.assertEqual(self.values(turns, "input", "cache_read", "output"), [(20, 10, 2), (20, 10, 2)])
+        self.assert_source_additions(output, "codex", 2)
+
+    def test_two_session_files_keep_edits_at_the_same_byte_offset(self) -> None:
+        first, second, _, offset = self.two_codex_sessions()
+        _ = self.collect()
+        edits = self.rows("SELECT * FROM edits WHERE family = 'codex' AND agent_id = ?", (THREAD,))
+        self.assertEqual(len(edits), 2)
+        self.assertCountEqual(self.values(edits, "edit_key"),
+                              [(f"{first.name}:{offset}",), (f"{second.name}:{offset}",)])
+
+    def test_repeated_cursor_reads_replayed_files_and_relocation_keep_each_event_once(self) -> None:
+        shutil.rmtree(self.codex_root)
+        path = self.codex_root / "2026/10/10/rollout-movable.jsonl"
+        turn_offset, edit_offset = self.write_codex_session(path)
+        _ = self.collect()
+        turns = self.all_values(self.turns("codex", THREAD))
+        edits = self.all_values(self.rows("SELECT * FROM edits WHERE family = 'codex'"))
+        self.assertEqual(self.values(self.turns("codex", THREAD), "turn_key"), [(f"{path.name}:{turn_offset}",)])
+        self.assertEqual(self.values(self.rows("SELECT * FROM edits WHERE family = 'codex'"), "edit_key"),
+                         [(f"{path.name}:{edit_offset}",)])
+        for step in ("cursor", "replay", "relocate"):
+            with self.subTest(step=step):
+                if step == "replay":
+                    with closing(sqlite3.connect(self.db_path)) as database, database:
+                        _ = database.execute("DELETE FROM cursors WHERE path = ?", (str(path),))
+                elif step == "relocate":
+                    destination = self.codex_root / "2026/10/12" / path.name
+                    destination.parent.mkdir(parents=True)
+                    path = path.rename(destination)
+                output = self.collect()
+                self.assert_source_additions(output, "codex", 0)
+                self.assertEqual(self.all_values(self.turns("codex", THREAD)), turns)
+                self.assertEqual(self.all_values(self.rows("SELECT * FROM edits WHERE family = 'codex'")), edits)
+                self.assertEqual(self.values(self.rows("SELECT sum(input), sum(cache_read), sum(output) "
+                                                      + "FROM turns WHERE family = 'codex'"), "sum(input)",
+                                             "sum(cache_read)", "sum(output)"), [(20, 10, 2)])
+                self.assertEqual(self.rows("SELECT offset FROM cursors WHERE path = ?", (str(path),))[0][0],
+                                 path.stat().st_size)
+
+    def test_offset_key_store_versions_are_refused_without_changing_rows_or_cursors(self) -> None:
+        _ = self.collect()
+        with closing(sqlite3.connect(self.db_path)) as database, database:
+            _ = database.execute("UPDATE turns SET turn_key = substr(turn_key, instr(turn_key, ':') + 1) "
+                                 + "WHERE family = 'codex'")
+            _ = database.execute("UPDATE edits SET edit_key = substr(edit_key, instr(edit_key, ':') + 1) "
+                                 + "WHERE family = 'codex'")
+        self.assertTrue(all(cast(str, row["turn_key"]).isdigit() for row in self.turns("codex", THREAD)))
+        legacy_edits = self.rows("SELECT edit_key FROM edits WHERE family = 'codex'")
+        self.assertTrue(legacy_edits)
+        self.assertTrue(all(cast(str, row["edit_key"]).isdigit() for row in legacy_edits))
+        for version in (7, 1):
+            with self.subTest(version=version):
+                with closing(sqlite3.connect(self.db_path)) as database, database:
+                    _ = database.execute(f"PRAGMA user_version = {version}")
+                before = {cast(str, row["name"]): self.all_values(self.rows(
+                    'SELECT * FROM "' + cast(str, row["name"]) + '"'))
+                    for row in self.rows("SELECT name FROM sqlite_master WHERE type = 'table'")}
+                result = self.cli(db=self.db_path)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, f"collect: store version {version} predates file-named Codex keys; "
+                                 + f"delete {self.db_path} and run the collector again to rebuild it\n")
+                self.assertEqual(self.rows("PRAGMA user_version")[0][0], version)
+                for table, rows in before.items():
+                    self.assertEqual(self.all_values(self.rows('SELECT * FROM "' + table + '"')), rows, table)
+
+    def test_legacy_store_refusal_preserves_bytes_journal_and_schema(self) -> None:
+        _ = self.collect()
+        with closing(sqlite3.connect(self.db_path)) as database:
+            _ = database.execute("DROP TABLE folders")
+            _ = database.execute("PRAGMA user_version = 6")
+            self.assertEqual(database.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+        schema_query = "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        schema = self.all_values(self.rows(schema_query))
+        tables = [cast(str, row["name"]) for row in self.rows(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
+        self.assertNotIn("folders", tables)
+        rows = {table: self.all_values(self.rows('SELECT * FROM "' + table + '"')) for table in tables}
+        before = self.db_path.read_bytes()
+
+        result = self.cli(db=self.db_path)
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (
+            1, "", "collect: store version 6 predates file-named Codex keys; "
+            + f"delete {self.db_path} and run the collector again to rebuild it\n",
+        ))
+        self.assertTrue(self.db_path.read_bytes() == before, "Refusal changed the store file's bytes")
+        self.assertEqual(self.rows("PRAGMA journal_mode")[0][0], "delete")
+        self.assertEqual(self.rows("PRAGMA user_version")[0][0], 6)
+        self.assertEqual(self.all_values(self.rows(schema_query)), schema)
+        for table, before_rows in rows.items():
+            self.assertEqual(self.all_values(self.rows('SELECT * FROM "' + table + '"')), before_rows, table)
+
+    def test_new_store_is_stamped_with_the_file_named_key_version(self) -> None:
+        _ = self.collect()
+        self.assertEqual(self.rows("PRAGMA user_version")[0][0], 8)
+
+    def test_claude_request_keys_keep_the_message_and_request_identity(self) -> None:
+        _ = self.collect()
+        self.assertEqual([json.loads(cast(str, row["turn_key"])) for row in self.turns("claude", SESSION)],
+                         [["message-one", "request-one"], ["message-two", "request-two"],
+                          ["message-three", "request-two"], ["message-one", "request-four"]])
+
     def test_held_pass_lock_exits_without_opening_or_changing_the_store(self) -> None:
         _ = self.collect()
         before = self.db_path.read_bytes()
@@ -495,7 +631,7 @@ with open(sys.argv[1], 'a') as lock:
             ("unknown-future-model", None, 5, 0, 0, 2, 1),
         ])
 
-    def test_codex_turn_keys_are_byte_offsets(self) -> None:
+    def test_codex_turn_keys_use_the_file_name_and_byte_offset(self) -> None:
         _ = self.collect()
         expected_offsets: list[int] = []
         offset = 0
@@ -506,8 +642,8 @@ with open(sys.argv[1], 'a') as lock:
             if record["type"] == "event_msg" and payload.get("type") == "token_count" and "last_token_usage" in info:
                 expected_offsets.append(offset)
             offset += len(line)
-        actual_offsets = [int(cast(str, row["turn_key"])) for row in self.turns("codex", THREAD)]
-        self.assertEqual(actual_offsets, expected_offsets)
+        self.assertEqual(self.values(self.turns("codex", THREAD), "turn_key"),
+                         [(f"{self.source_path('codex').name}:{offset}",) for offset in expected_offsets])
 
     def test_edit_boundaries_and_compactions_are_per_agent(self) -> None:
         _ = self.collect()
@@ -1009,6 +1145,39 @@ class MacCollectTests(CollectorFixture):
         report = cast(MacStreamReport, json.loads(report_path.read_text(encoding="utf-8")))
         report_path.unlink()
         return MacRun(output, report)
+
+    def test_remote_session_files_keep_matching_request_and_edit_offsets_as_text_keys(self) -> None:
+        sessions = self.mac_home / ".codex/sessions"
+        shutil.rmtree(sessions)
+        first = sessions / "2026/10/10/rollout-first.jsonl"
+        second = sessions / "2026/10/11/rollout-second.jsonl"
+        turn_offset, edit_offset = self.write_codex_session(first, MAC_THREAD)
+        self.assertEqual(self.write_codex_session(second, MAC_THREAD), (turn_offset, edit_offset))
+        run = self.mac_collect()
+        turns = self.rows("SELECT * FROM turns WHERE machine = 'mac' AND family = 'codex'")
+        edits = self.rows("SELECT * FROM edits WHERE machine = 'mac' AND family = 'codex'")
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(len(edits), 2)
+        self.assertCountEqual(self.values(turns, "turn_key"),
+                              [(f"{first.name}:{turn_offset}",), (f"{second.name}:{turn_offset}",)])
+        self.assertCountEqual(self.values(edits, "edit_key"),
+                              [(f"{first.name}:{edit_offset}",), (f"{second.name}:{edit_offset}",)])
+        self.assertEqual(self.values(turns, "input", "cache_read", "output"), [(20, 10, 2), (20, 10, 2)])
+        self.assertEqual(run.stream["edit_records"], 4, "Two Codex edits and the fixture's two Claude edits")
+        before_turns, before_edits = self.all_values(turns), self.all_values(edits)
+        repeated = self.mac_collect()
+        self.assertEqual(repeated.stream["measurement_records"], 0)
+        with closing(sqlite3.connect(self.db_path)) as database, database:
+            _ = database.execute("DELETE FROM cursors WHERE machine = 'mac' AND path = ?", (str(first),))
+        moved = sessions / "2026/10/12" / second.name
+        moved.parent.mkdir(parents=True)
+        _ = second.rename(moved)
+        replayed = self.mac_collect()
+        self.assert_source_additions(replayed.output, "codex", 0, "mac")
+        self.assertEqual(self.all_values(self.rows("SELECT * FROM turns WHERE machine = 'mac' AND family = 'codex'")),
+                         before_turns)
+        self.assertEqual(self.all_values(self.rows("SELECT * FROM edits WHERE machine = 'mac' AND family = 'codex'")),
+                         before_edits)
 
     def test_running_pass_keeps_its_lock_through_the_mac_read_until_exit(self) -> None:
         report = self.root / "ssh-report.json"

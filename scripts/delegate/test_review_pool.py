@@ -350,6 +350,47 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual(self.events("end"), [])
         self.assertEqual(old_file.read_bytes(), old_content)
 
+    def test_unit_memory_prints_only_the_named_unit_file_without_added_newline(self) -> None:
+        memory = self.pool / "memory"
+        memory.mkdir(parents=True)
+        content = "## Unit memory\n2026-10-12 — Source: finding 2. Preserve café."
+        _ = (memory / "unit.md").write_text(content, encoding="utf-8")
+        _ = (memory / "other.md").write_text("Another unit.", encoding="utf-8")
+        _ = (memory / "repository.md").write_text("Repository memory.", encoding="utf-8")
+        result = self.run_pool("unit-memory", "--unit", "unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, content)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse((self.pool / "pool.json").exists())
+        self.assertEqual(self.events(), [])
+
+    def test_unit_memory_is_empty_when_the_file_is_absent(self) -> None:
+        result = self.run_pool("unit-memory", "--unit", "unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(self.pool.exists())
+
+    def test_unit_memory_refuses_a_unit_outside_the_memory_directory(self) -> None:
+        result = self.run_pool("unit-memory", "--unit", "../other")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unit must name one memory file", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_closure_keeps_leased_memory_hash_after_repository_memory_changes(self) -> None:
+        old_hash = self.prime()
+        broad = self.allocate()
+        self.release(str(broad["reviewer"]))
+        _ = self.instructions.write_text("Standing contract with new repository memory.\n", encoding="utf-8")
+        new_hash = self.prime()
+        self.assertNotEqual(new_hash, old_hash)
+        closure = self.allocate(review_pass="2", lens="")
+        self.assertEqual(closure["reviewer"], broad["reviewer"])
+        self.assertEqual(closure["prime_hash"], old_hash)
+        self.assertEqual(closure["lease_ordinal"], 2)
+        self.assertEqual(len(self.events("fork")), 1)
+        self.assertTrue((self.pool / "prime" / f"{old_hash}.md").exists())
+
     def test_prime_failure_does_not_publish_a_template(self) -> None:
         self.control({"prime": {"exit": 1}})
         result = self.run_pool("prime", "--type", "code", "--instructions-file", str(self.instructions))
@@ -773,6 +814,36 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual(self.event_mesh_dir(self.events("stop")[0]), Path(str(original["mesh_dir"])))
         self.assert_fork_names_are_unique_per_generation()
 
+    def test_stop_clears_ui_adoption_and_prime_keeps_the_new_pool_in_shadow(self) -> None:
+        _ = self.prime("ui")
+        adoption = self.pool / "ui_adopted"
+        adoption.touch()
+        result = self.run_pool("stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(adoption.exists())
+        self.assertIn("review_pool: ui adoption cleared", result.stderr)
+        _ = self.prime("ui")
+        self.assertFalse(adoption.exists())
+        self.assertTrue(json_object(self.state()["templates"])["ui"])
+
+    def test_failed_stop_still_clears_ui_adoption(self) -> None:
+        self.seed({})
+        adoption = self.pool / "ui_adopted"
+        adoption.touch()
+        self.control({"stop": {"exit": 1}})
+        result = self.run_pool("stop")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(adoption.exists())
+        self.assertIn("review_pool: ui adoption cleared", result.stderr)
+        self.assertTrue(self.state().get("stopping", False))
+
+    def test_stop_without_ui_adoption_does_not_report_an_adoption_change(self) -> None:
+        self.seed({})
+        result = self.run_pool("stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("ui adoption cleared", result.stderr)
+        self.assertFalse((self.pool / "ui_adopted").exists())
+
     def test_stop_during_fork_drops_late_thread_instead_of_repopulating_pool(self) -> None:
         self.seed({})
         gate = self.hold("fork:code1")
@@ -944,6 +1015,18 @@ class ReviewPoolTests(unittest.TestCase):
         self.seed({"code1": {**self.idle("unit"), "last_allocated": time.time() - 2 * 3600}})
         _ = self.succeed("health", "--stale-hours", "1")
         self.assertIsNone(self.reviewer("code1")["lease"])
+
+
+class UIStandingPromptTests(unittest.TestCase):
+    def test_ui_standing_prompt_defines_report_and_measurement_without_rule_reads(self) -> None:
+        prompt = (SCRIPT.parents[2] / "config" / "review_pool" / "ui.md").read_text(encoding="utf-8")
+        self.assertRegex(prompt, r"Verdict:\s*pass\b")
+        self.assertRegex(prompt, r"Verdict:\s*(?:pass\s*\|\s*)?defects\b")
+        self.assertIn("| Shot | Rule | Defect | Fix |", prompt)
+        self.assertIn("measure_text.py", prompt)
+        instructions = " ".join(prompt.split())
+        self.assertNotIn("Follow `~/.claude/commands/ux_eval.md`", instructions)
+        self.assertNotIn("Read a rule's full text", instructions)
 
 
 if __name__ == "__main__":

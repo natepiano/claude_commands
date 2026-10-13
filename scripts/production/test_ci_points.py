@@ -13,6 +13,8 @@ import unittest
 from pathlib import Path
 from typing import cast, final, override
 
+import ci_points
+
 
 SCRIPT = Path(__file__).with_name("ci_points.py")
 LIFECYCLE = SCRIPT.with_name("production_lifecycle.py")
@@ -73,6 +75,20 @@ exit 0
 
 @final
 class CiPointsTests(unittest.TestCase):
+    def test_review_push_compares_merge_defects_and_explains_acknowledgment(self) -> None:
+        """F012: the review decision includes its result and acknowledgment's effect."""
+        title, action, body = ci_points.review_watch_push(
+            "| merge design-check defects per phase (mean) | 0.5 | 0.4 | 0.4 |")
+        self.assertIn("defects unchanged", title)
+        self.assertIn("0.4 per phase before and after", body)
+        self.assertIn("Work continues either way", body)
+        self.assertIn("stop the reminder", body)
+        self.assertIn("Discuss:", body)
+        self.assertIn("natedev terminal", action)
+        self.assertLess(len("Action: " + action + "\n" + body), 500)
+        _, _, missing = ci_points.review_watch_push("| phases merged | 12 |")
+        self.assertIn("no comparable defect counts", missing)
+
     root: Path = Path()
     home: Path = Path()
     origin: Path = Path()
@@ -418,9 +434,13 @@ class CiPointsTests(unittest.TestCase):
         self.assert_step(second, "watch", True)
         self.assertNotIn("| phases merged | 12 |", second.stdout)
         self.assertEqual(self.calls("send.py"), [[
-            "--to", "user", "--need", "decision", "--action",
-            "Acknowledge the review watch in this session.", "--summary", "Hana: review watch", "--text",
-            "12 of 12 phases: report ready, waiting for your acknowledgment; the table is in this session",
+            "--to", "user", "--from", "ci_points", "--need", "decision", "--action",
+            "In a natedev terminal, read the report, then acknowledge it or discuss concerns in the natedev Claude session.",
+            "--summary", "Reviewer removal lacks comparison data", "--text",
+            "An extra code reviewer was removed. The report has no comparable defect counts. Work continues either way.\n\n"
+            + "Read the report:\npython3 ~/.claude/scripts/production/review_regime.py report\n"
+            + "Acknowledge (recommended after reading): stop this report reminder. Run it with ack in place of report.\n\n"
+            + "Discuss: raise concerns in the natedev Claude session.",
         ]])
         self.assertEqual(len(self.calls("review_regime.py")), 3)
         self.assertEqual(self.log.read_text().count("review watch"), 1)

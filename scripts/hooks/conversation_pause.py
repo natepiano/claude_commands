@@ -370,10 +370,14 @@ def prompt_source(
     return PromptSource.TYPED
 
 
-def pauses(source: PromptSource, showrunner_session: bool) -> bool:
-    if source is PromptSource.TYPED:
-        return True
-    return source is PromptSource.PEER and not showrunner_session
+def pauses(source: PromptSource) -> bool:
+    """Only the user's own input pauses: a peer message, a tick or a relay never does.
+
+    Until 2026-10-13 a peer message paused a unit director too, so a review unit's hourly health
+    tick, relayed by another session, paused its timer and asked the user to return six times
+    while the user never typed in that pane.
+    """
+    return source is PromptSource.TYPED
 
 
 def is_showrunner_session(session_id: str) -> bool:
@@ -622,7 +626,8 @@ def _pause_locked(session_id: str, now: int) -> PauseResult:
             record = replace(record, instances=(*record.instances, report.name))
             write_record(record)
         try:
-            _ = run_notifier("stop", report.name)
+            # `pause` marks the timer, so an explicit stop during the pause keeps it stopped.
+            _ = run_notifier("pause", report.name)
         except (OSError, RuntimeError, subprocess.TimeoutExpired):
             record = replace(record, instances=tuple(
                 name for name in record.instances if name != report.name
@@ -640,7 +645,7 @@ def _pause_locked(session_id: str, now: int) -> PauseResult:
             record = replace(record, footers=(*record.footers, slug))
             write_record(record)
         try:
-            showrunner_footer.set_footer_state(slug, showrunner_footer.FooterState.OFF)
+            showrunner_footer.pause_footer(slug)
         except OSError:
             record = replace(record, footers=tuple(
                 name for name in record.footers if name != slug
@@ -677,18 +682,22 @@ def _resume_items(record: PauseRecord) -> tuple[str, ...]:
         if not (notifier_root() / name).is_dir():
             continue
         try:
-            _ = run_notifier("resume", name)
+            # `unpause` restarts only a timer the pause stopped and nobody stopped or started since.
+            came_back = bool(run_notifier("unpause", name).strip())
         except (OSError, RuntimeError, subprocess.TimeoutExpired):
             failed_instances.append(name)
         else:
-            resumed_instances.append(name)
+            if came_back:
+                resumed_instances.append(name)
     for slug in record.footers:
         try:
-            showrunner_footer.set_footer_state(slug, showrunner_footer.FooterState.ON)
+            # Only a footer the pause turned off comes back; one switched off since stays off.
+            came_back = showrunner_footer.unpause_footer(slug)
         except OSError:
             failed_footers.append(slug)
         else:
-            resumed_footers.append(slug)
+            if came_back:
+                resumed_footers.append(slug)
     if failed_instances or failed_footers:
         write_record(replace(
             record,
@@ -715,12 +724,24 @@ def resume(session_id: str) -> tuple[str, ...]:
 
 
 def release(session_id: str) -> RecordLookup:
-    """Remove and return a pause record without resuming what it paused."""
+    """Remove and return a pause record without resuming what it paused.
+
+    The record returned names only what is still the pause's: a timer or footer stopped or started
+    by hand since the pause is left out, so whoever restores the rest leaves it as it was left.
+    """
+    import showrunner_footer
+
     with record_lock():
         current = _record(session_id)
-        if isinstance(current, PauseRecord):
-            record_path(session_id).unlink(missing_ok=True)
-        return current
+        if not isinstance(current, PauseRecord):
+            return current
+        record_path(session_id).unlink(missing_ok=True)
+        root = notifier_root()
+        return replace(
+            current,
+            instances=tuple(name for name in current.instances if _timer_paused(root / name)),
+            footers=tuple(slug for slug in current.footers if showrunner_footer.footer_paused(slug)),
+        )
 
 
 def mark_reply_ended(session_id: str, now: int) -> None:
@@ -918,22 +939,34 @@ def _review_slugs(record: PauseRecord) -> frozenset[str]:
     return frozenset(slugs)
 
 
+def _timer_paused(instance: Path) -> bool:
+    """Whether the timer is stopped by a pause and nobody has stopped or started it since."""
+    try:
+        return _key_values(instance / "state").get("PAUSED") == "1"
+    except (OSError, UnicodeError):
+        return False
+
+
 def _prune_unscheduled(record: PauseRecord) -> PauseRecord | None:
     """Drop what no schedule runs any more; None when nothing paused is left to return.
 
     A production switched to on demand loses its `showrunner-<slug>` instance while a pause
-    still names it, and its footer has no schedule to name. Asking to return such updates would
-    ask about nothing.
+    still names it, and its footer has no schedule to name. A timer or footer someone stopped,
+    started or switched by hand since the pause has lost the pause's mark and is no longer the
+    pause's to return. Asking to return such updates would ask about nothing.
     """
     import showrunner_footer
 
     root = notifier_root()
-    instances = tuple(name for name in record.instances if (root / name).is_dir())
-    footers = tuple(slug for slug in record.footers if (root / f"showrunner-{slug}").is_dir())
+    instances = tuple(name for name in record.instances if _timer_paused(root / name))
+    footers = tuple(
+        slug for slug in record.footers
+        if (root / f"showrunner-{slug}").is_dir() and showrunner_footer.footer_paused(slug)
+    )
     for slug in record.footers:
         if slug not in footers:
             with contextlib.suppress(OSError):
-                showrunner_footer.set_footer_state(slug, showrunner_footer.FooterState.ON)
+                _ = showrunner_footer.unpause_footer(slug)
     if not instances and not footers:
         return None
     if (instances, footers) == (record.instances, record.footers):

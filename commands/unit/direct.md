@@ -550,8 +550,9 @@ The key sets the Codex poll timeout and a Claude unit's notifier interval.
 For Codex, a missing or non-positive integer is an error; tell the user to set
 it. <PrepareSession/> creates Claude's `delegate-<run id>` instance, where
 the run id is the basename of `${SESSION_DIR}`; `end_session.sh` removes it.
-With `PLAN_DELEGATE_PROGRESS_UPDATES=on-demand` it creates none: reports run
-only when asked, until `/unit:report on` starts the schedule. The key does not
+With `PLAN_DELEGATE_PROGRESS_UPDATES=on-demand`, the default, it creates none:
+reports run only when asked, until `/unit:report on` starts the schedule. A
+resumed run that already has an instance keeps it, on or off. The key does not
 change the Codex poll interval. The agent arms nothing. When `prepare_session.sh` prints `notifier instance not
 created`, say so in one line: this run gets no ticks until
 `zsh ~/.claude/scripts/delegate/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID"`
@@ -1191,8 +1192,8 @@ instructions name; with none, skip and say so in one line.
 2. Open an activity; the
    label is exact, because `review-trial` counts it:
    `progress_history.py start-activity --session-dir "${SESSION_DIR}" --label "UX review" --activity "<what the shots show>"`
-3. Spawn a fresh Claude Agent helper in the background with the showrunner's
-   design-check prompt, so the shots never enter your context:
+3. Run one design check, so the shots never enter your context. Use this
+   prompt for the Claude helper:
 
    > Read `~/.claude/commands/ux_eval.md` and follow it for these shots:
    > <paths>. Guide: <path>. Scale: <shot pixels per logical pixel>. Context:
@@ -1202,7 +1203,51 @@ instructions name; with none, skip and say so in one line.
    > production rules: <the production doc's rules that concern looks>. You
    > only review: edit nothing. Return only the verdict and the table.
 
-   Read its verdict once, then stop it with TaskStop. Save each canonical
+   For the pool, use this separate prompt:
+
+   > Judge these shots by your standing instructions, which hold the rules
+   > and the report format: <paths>. Scale: <shot pixels per logical pixel>.
+   > Context: <unit> phase <N> — <what changed, every state the shots must
+   > show, and each shot's window size in logical pixels>. Production rules:
+   > <the production doc's rules that concern looks>. You only review: edit
+   > nothing. Return only the verdict and the table.
+
+   Without `ui` in the production's `**Review pool:**` line, spawn a fresh
+   Claude Agent helper in the background; read its verdict once and stop it
+   with TaskStop. With `ui` listed, use this procedure on every check:
+
+   - Let `<slug>` be the production doc's filename without `-production.md`.
+     Use the pool regardless of the phase's code-review arm. Count design
+     checks within the phase from `k=1`, including repairs and notice checks;
+     resume from the largest saved `ux_<phase>_<k>_*` name plus one.
+   - Write one full shot path per line to
+     `${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt`, using the next unused UX
+     pass index in this session. Write the helper prompt to
+     `${SESSION_DIR}/ux_prompt_${PASS_INDEX}_helper.md` and the pool prompt to
+     `${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md`, then launch
+     `review.sh --pool ui --lease <slug>/<unit>/<phase> "${SESSION_DIR}" <worktree> "${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md" review "UI design check" "judging the shots" "${PASS_INDEX}" ux`
+     in the background. The launcher resets the reviewer before each turn
+     and sends the unit's memory and every listed image.
+   - Test `~/.local/state/review-pool/<slug>/ui_adopted`. While it is absent,
+     also start the fresh Claude helper with the prompt from its helper file
+     and those shots;
+     use only its verdict, defects and canonical candidates. Wait for both
+     results; stop the helper with TaskStop. When the marker exists, run no
+     helper and use only the pool's result.
+   - Save the full helper verdict, when run, and the successful pool verdict
+     from `${SESSION_DIR}/review_findings_${PASS_INDEX}_ux.txt` beside the turn
+     records in `${PLAN_DELEGATE_HISTORY_DIR:-$HOME/.local/state/plan-delegate}/review_turns/<session dir name>/`,
+     as `ux_<phase>_<k>_helper.txt` and `ux_<phase>_<k>_pool.txt`. Preserve each
+     pair. A failed shadow pool check leaves its pool file missing and gets
+     an error note; the helper's verdict still governs. An adopted pool
+     failure holds the design check until a successful retry.
+
+   Never create `ui_adopted` in this workflow. After ten shadow checks, the
+   user decides from `review_pool_report.py --shadow --root <history root>`
+   whether to create it by hand. Missing markers, new productions and pools
+   after `review_pool.py stop` use shadow.
+
+   Save each canonical
    candidate it lists, without viewing it, into a slot still empty:
    `mkdir -p <guide>/examples/<stem> && magick <shot> -crop <crop> +repage <guide>/examples/<stem>/<slot>.png`.
    Saving it approves it for use now. Add one line to
@@ -1217,13 +1262,15 @@ instructions name; with none, skip and say so in one line.
    repair round under <FixDispatch/>, except that `converged` continues to
    <PhaseEnd/> in loop or verbose, or <RunPhaseReview/> in `single`.
 5. Re-entered after a `ux` repair that changed the screen, this step replaces
-   1–4: re-shoot and re-judge only the rows raised — a fresh helper, under its
-   own `UX review` activity, given just those rows and their shots — and record
+   1–4: re-shoot and re-judge only the rows raised, under its own `UX review`
+   activity, given just those rows and their shots. Run step 3's design-check
+   procedure, including the pool, verdict selection and a new pair index;
+   then close the activity and record
    each with `findings.py verdict`. A `still_open` row returns to step 4's
    gate. Then continue to <PhaseEnd/> in loop or verbose, or
    <RunPhaseReview/> in `single`.
 6. **The notice's verdict.** In a production unit, the checkpoint notice's
-   `design check:` line (<ProductionUnit/> item 3) is one fresh helper's
+   `design check:` line (<ProductionUnit/> item 3) uses step 3's selected
    verdict on exactly the shots the notice sends, from a build of the
    checkpoint's code. Step 5's partial re-judge does not count, nor does a
    verdict from before any later change to what users see (a repair, a merge

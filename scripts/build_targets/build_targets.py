@@ -39,6 +39,7 @@ from targets import (
 import offload
 import build_hold
 import override_guard
+from user_zone import user_zone
 
 
 
@@ -69,7 +70,7 @@ class CliArguments(argparse.Namespace):
 
 
 def local_time(instant: datetime) -> str:
-    return instant.astimezone().strftime("%H:%M %Z")
+    return instant.astimezone(user_zone()).strftime("%H:%M %Z")
 
 
 def display_field(value: str) -> str:
@@ -275,9 +276,9 @@ def command_wait_local(call_id: str, *, pid: int = 0) -> int:
         print(wait_diagnostic(str(error)), file=sys.stderr, flush=True)
         return 12
     finally:
-        if cancelled and registered[0]:
+        if cancelled and key:
             try:
-                build_hold.remove_call(key, call_id, cycle_id=registered[0])
+                build_hold.remove_call(key, call_id)
             except (OSError, build_hold.ReleaseRecordReadError):
                 pass
         for signum, handler in previous_handlers.items():
@@ -339,6 +340,15 @@ def command_check_admission(call_id: str) -> int:
         return 12
 
 
+def holds_only_own(owner: build_hold.OwningSession, directory: Path) -> bool:
+    try:
+        holds = build_hold.natedev_holds(directory)
+        key = build_hold.holder_path(directory, owner.session_id).name
+    except ValueError:
+        return False
+    return bool(holds.in_force) and all(holder.key == key for holder in holds.in_force)
+
+
 def command_check_local() -> int:
     try:
         state = target_state(local_target())
@@ -348,6 +358,8 @@ def command_check_local() -> int:
         if not isinstance(state, Held):
             return 0
         owner = build_hold.owning_session()
+        if isinstance(owner, build_hold.OwningSession) and holds_only_own(owner, build_hold.holder_directory()):
+            return 0
         key = owner.session_id if isinstance(owner, build_hold.OwningSession) else ""
         admission = build_hold.read_admission(key)
         if isinstance(admission, build_hold.AdmissionReadError):

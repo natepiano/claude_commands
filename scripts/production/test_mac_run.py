@@ -51,12 +51,22 @@ if command == "systemd-run":
 if command == "scp":
     raise SystemExit(0)
 if command == "git":
+    if "merge-base" in arguments and "--is-ancestor" in arguments:
+        descendant = os.environ.get("MAC_RUN_CLONE_DESCENDANT", "")
+        raise SystemExit(
+            0 if descendant and arguments[-2:] == [os.environ["MAC_RUN_SHA"], descendant]
+            else 1
+        )
     if "rev-parse" in arguments and "--verify" in arguments:
         status = int(os.environ.get("MAC_RUN_GIT_RESOLVE_STATUS", "0"))
         if status == 0:
             print(os.environ["MAC_RUN_SHA"])
         raise SystemExit(status)
     if "bundle" in arguments and "create" in arguments:
+        descendant = os.environ.get("MAC_RUN_CLONE_DESCENDANT", "")
+        if descendant and f"^{descendant}" in arguments:
+            print("fatal: Refusing to create empty bundle.", file=sys.stderr)
+            raise SystemExit(128)
         bundle = Path(arguments[arguments.index("-q") + 1])
         bundle.write_text("bundle\n", encoding="utf-8")
     raise SystemExit(0)
@@ -67,6 +77,9 @@ if arguments[-1:] == ["true"] and "-o" in arguments:
     raise SystemExit(0 if os.environ.get("MAC_RUN_REACHABLE", "1") == "1" else 255)
 
 remote = arguments[-1]
+clone_head = state / "clone-head"
+if "checkout -q --detach" in remote:
+    clone_head.write_text(os.environ["MAC_RUN_SHA"], encoding="utf-8")
 if "rm -f /tmp/mac_run.bundle" in remote and "pkill -f" in remote:
     (state / "cleanup-called").write_text("called\n", encoding="utf-8")
     raise SystemExit(int(os.environ.get("MAC_RUN_CLEANUP_STATUS", "0")))
@@ -87,7 +100,10 @@ if "; echo mac_exit=$?" in remote:
     print(f"mac_exit={status}")
     raise SystemExit(0)
 if "git -C rust/hana_catalyst_mac rev-parse HEAD" in remote:
-    print(os.environ["MAC_RUN_SHA"])
+    print(
+        clone_head.read_text(encoding="utf-8") if clone_head.exists()
+        else os.environ.get("MAC_RUN_CLONE_DESCENDANT", os.environ["MAC_RUN_SHA"])
+    )
     raise SystemExit(0)
 if "cat /tmp/mac_run_hana.status" in remote:
     print("142")
@@ -262,6 +278,24 @@ class MacRunTests(unittest.TestCase):
         self.assert_no_build_started()
         self.assert_claim_released()
 
+    def test_both_builds_set_the_development_deployment_target(self) -> None:
+        self.environment.update({
+            "BUILD_HOLD_DIR": str(self.root / "holders"),
+            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+            "BUILDLOG_DIR": str(self.root / "buildlog"),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+        })
+        result = self.mac_run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        builds = [event["args"][-1] for event in self.events()
+                  if event["command"] == "ssh" and "cargo build" in event["args"][-1]]
+        self.assertGreaterEqual(len(builds), 2)
+        self.assertTrue(any("cargo build -q -p hana" in command for command in builds))
+        self.assertTrue(any("--example" in command for command in builds))
+        for command in builds:
+            self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0 ~/.cargo/bin/cargo build", command)
+
     def test_busy_mac_exits_nine_without_starting_build(self) -> None:
         claimed = self.state_command(
             "claim",
@@ -317,6 +351,40 @@ class MacRunTests(unittest.TestCase):
         self.assertGreater(len(remote_events), 1)
         self.assertFalse(remote_events[0]["claimed"])
         self.assertTrue(all(event["claimed"] for event in remote_events[1:]))
+
+    def test_ancestor_of_the_clone_head_checks_out_without_a_bundle(self) -> None:
+        result = self.mac_run(extra={
+            "MAC_RUN_CLONE_DESCENDANT": "abcdef1234567890abcdef1234567890abcdef12",
+        })
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = self.events()
+        self.assertFalse(any(
+            event["command"] == "git" and "bundle" in event["args"]
+            and "create" in event["args"] for event in events
+        ), events)
+        self.assertFalse(any(event["command"] == "scp" for event in events), events)
+        remote_commands = [
+            event["args"][-1] for event in events if event["command"] == "ssh"
+        ]
+        self.assertFalse(any("fetch" in command for command in remote_commands), events)
+        self.assertEqual(sum(
+            f"checkout -q --detach {SHA}" in command for command in remote_commands
+        ), 1, events)
+        self.assertTrue(any(
+            "cargo build -q -p hana" in command for command in remote_commands
+        ), events)
+        self.assertTrue(any(
+            "cargo build" in command and "--example" in command
+            for command in remote_commands
+        ), events)
+        self.assertFalse(any(
+            event["command"] == "git" and "update-ref" in event["args"]
+            for event in events
+        ), events)
+        self.assertEqual(list(self.temp_directory.iterdir()), [])
+        self.assertIn(f"HEAD={SHA}", result.stdout)
+        self.assert_claim_released()
 
     def test_bundle_uses_fixture_temp_directory(self) -> None:
         result = self.mac_run()

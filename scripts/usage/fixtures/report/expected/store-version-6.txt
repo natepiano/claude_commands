@@ -1,1 +1,0 @@
-usage_report: store version 6 is older than report version 7; run the collector once

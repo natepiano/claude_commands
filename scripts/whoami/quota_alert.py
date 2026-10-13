@@ -73,6 +73,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts
 
+from note_file import reset_time
 from agent_accounts import (ClaudeAccountSelection, ClaudeRole, CodexHomeSource, Report,
                             codex_can_work, CodexWorkAvailable, codex_email_on_disk,
                             codex_homes, codex_live, seats_home)
@@ -216,6 +217,7 @@ OWNER = "natedev"
 # send.py stops a relay at --timeout and kills it KILL_GRACE seconds later.
 RELAY_TIMEOUT = 40
 KILL_GRACE = 10
+USER_SEND_TIMEOUT = 60
 # The whole switch took 2 s of wall time when measured idle and 8 s at load average 87; each entry
 # switched back, 0.4 s idle.
 EDIT_TIMEOUT = 30
@@ -445,11 +447,9 @@ def state_file() -> Generator[State]:
 
 
 def ahead(resets: str | None) -> bool:
-    """Whether a note's local-time reset is still to come."""
-    try:
-        return resets is not None and datetime.fromisoformat(resets) > datetime.now()
-    except ValueError:
-        return False
+    """Whether a note's reset is still to come."""
+    reset = reset_time(resets)
+    return reset is not None and reset > datetime.now(timezone.utc)
 
 
 def remaining(note: AgentNote) -> float | None:
@@ -501,20 +501,16 @@ def recovered(name: str, notes: list[AgentNote], threshold: float,
                 value, reset = report.weekly_remaining, report.weekly_reset
                 if value is not None and reset is not None and reset > now and value > threshold:
                     return True
-        try:
-            return datetime.fromisoformat(note.get("resets") or "").astimezone() <= now
-        except ValueError:
-            return False
+        reset = reset_time(note.get("resets"))
+        return reset is not None and reset <= now
     if selection.multiple_accounts and name.startswith("claude "):
         if note is None:
             return False
         value = remaining(note)
         if value is not None and math.isfinite(value) and value > threshold:
             return True
-        try:
-            return datetime.fromisoformat(note.get("resets") or "").astimezone() <= now
-        except ValueError:
-            return False
+        reset = reset_time(note.get("resets"))
+        return reset is not None and reset <= now
     if note is None or note.get("state") == "inactive":
         return True
     value = remaining(note)
@@ -537,7 +533,7 @@ def close_recovered(state: State, notes: list[AgentNote], threshold: float,
 
 
 def local_time(stamp: str) -> str:
-    return datetime.fromisoformat(stamp).astimezone().strftime("%Y-%m-%d %H:%M")
+    return datetime.fromisoformat(stamp).astimezone(user_zone()).strftime("%Y-%m-%d %H:%M")
 
 
 def registry_assignments() -> dict[str, str]:
@@ -694,7 +690,7 @@ def credit_line(note: AgentNote) -> str:
 def user_time(stamp: str | None) -> str:
     """A machine-local note time rendered in the user's zone."""
     try:
-        return datetime.fromisoformat(stamp or "").astimezone(user_zone()).strftime("%a %m-%d %H:%M %Z")
+        return datetime.fromisoformat(stamp or "").astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z")
     except ValueError:
         return "an unknown time"
 
@@ -703,30 +699,52 @@ def run_out_push(note: AgentNote, selection: ClaudeAccountSelection) -> UserPush
     """The one direct user message sent when this account's episode opens."""
     name = note.path.stem
     roles = claude_roles(note, selection)
-    display_name = f"{name} ({', '.join(roles)})" if roles else name
-    summary = f"{name} weekly limit"
-    first = f"{display_name} has {percent(note)} of its weekly usage left; it refills {user_time(note.get('resets'))}."
+    purposes = ", ".join("production coordination" if role == "showrunners" else "delegated work" for role in roles)
+    display_name = f"{name}, used for {purposes}," if roles else name
+    summary = "Claude work needs more usage" if note.tool == "claude" else "Codex weekly usage is low"
+    first = f"The {display_name} account has {percent(note)} weekly usage left. It refills {user_time(note.get('resets'))}."
     if note.tool == "codex":
         return UserPush(name, summary, f"{first} Codex keeps working on its credits. {credit_line(note)}", None)
     count = note.get("limit_reset_count")
     resets = f" ({count} available)" if count is not None and count != "null" else ""
-    return UserPush(name, summary, first,
-                    Ask("decision", f"Log in to another Claude account, or redeem a limit reset{resets}."))
+    reset_choice = (f"Reset: redeem one of the {count} limit resets to refill this account now."
+                    if count is not None and count.isdecimal() and int(count) > 0 else
+                    "Reset, if available: redeem a limit reset to refill this account now.")
+    text = (first + " Its work may stop until then.\n\n"
+            + "Sign in (recommended): switch to an account with usage left so work continues.\n\n"
+            + reset_choice)
+    return UserPush(name, summary, text,
+                    Ask("decision", f"In a Claude session on natedev, sign in to another account or redeem a limit reset{resets}."))
+
+
+def short_reason(reason: str) -> str:
+    """Keep complete words in a phone explanation of at most 60 characters."""
+    if len(reason) <= 60:
+        return reason
+    complete: list[str] = []
+    for word in reason.split():
+        if len(" ".join([*complete, word])) > 59:
+            break
+        complete.append(word)
+    return " ".join(complete) + "…"
 
 
 def refusal_push(note: AgentNote, switch: CodexQuotaFallback, failed: str | None, already: bool) -> UserPush:
     """The one direct user message sent when Codex refuses this episode."""
     if not isinstance(switch, NoCodexQuotaFallback):
         verb = "had already moved" if already else "moved"
-        outcome = f"The automatic switch {verb} {', '.join(switch.moved)} to Claude"
+        outcome = f"The automatic switch {verb} work from Codex to Claude"
     elif failed:
         reason = re.sub(r"/\S+", "the account registry", failed)
-        outcome = f"The automatic switch to Claude failed: {reason}"
+        outcome = f"The automatic switch to Claude failed: {short_reason(reason)}"
     else:
         outcome = "Nothing was on Codex, so the automatic switch moved nothing"
     name = note.path.stem
-    return UserPush(name, "Codex refused work", f"Codex refused work on {name}. {credit_line(note)} {outcome}.",
-                    Ask("decision", f"Add credits to {name} or redeem a limit reset to bring Codex back."))
+    text = (f"Codex refused work on the {name} account. {credit_line(note)} {outcome}.\n\n"
+            "Reset (recommended, if available): refill usage without buying credits.\n\n"
+            "Add credits: pay for more Codex usage.")
+    return UserPush(name, "Codex work needs usage or credits", text,
+                    Ask("decision", f"In a Claude session on natedev, redeem a limit reset or add credits to {name} to restore Codex work."))
 
 
 def instruction(tool: str, switch: CodexQuotaFallback, failed: str | None) -> str:
@@ -831,9 +849,10 @@ def tell_user(summary: str, text: str, ask: Ask | None) -> str | None:
     """Deliver text directly to the user, as a note when `ask` is None; None when it arrived, otherwise why not."""
     asked = ["--no-action"] if ask is None else ["--need", ask.need, "--action", ask.action]
     command = [sys.executable, str(SEND), "--to", "user", "--from", "quota_alert", "--summary", summary, *asked,
-               "--timeout", str(RELAY_TIMEOUT - KILL_GRACE)]
+               "--timeout", str(USER_SEND_TIMEOUT)]
     try:
-        done = subprocess.run(command, input=text, capture_output=True, text=True, timeout=RELAY_TIMEOUT + 5,
+        done = subprocess.run(command, input=text, capture_output=True, text=True,
+                              timeout=USER_SEND_TIMEOUT + KILL_GRACE + 5,
                               check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
         return str(error)
@@ -900,8 +919,11 @@ def alert(notes: list[AgentNote], now: datetime | None = None, *,
             episode = episodes[name]
             if episode.get("push") == "due":
                 push = run_out_push(note, selection)
-                swap_line = codex_swap_line(codex_readings, now) if note.tool == "codex" else ""
-                pushes.append(UserPush(push.name, push.summary, push.text + ("\n" + swap_line if swap_line else ""), push.ask))
+                if note.tool == "codex":
+                    log.append(f"quota status {name}: {push.text}")
+                    episode["push"] = stamp
+                else:
+                    pushes.append(push)
             if "acknowledged" in episode:
                 continue
             switch = state["fallback"] if note.tool == "codex" else NoCodexQuotaFallback()
@@ -1042,11 +1064,12 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
             push = refusal_push(note, fallback, failed, already)
         else:
             text = f"Codex refused work on {name}, {account_status}. Nothing switched to Claude."
-            push = UserPush(name, f"{name} refused work", text, None)
+            if "push" not in notice:
+                log.append(f"quota status {name}: {text}")
+                notice["push"] = stamp
+            return log
         swap_line = codex_swap_line(readings, now)
         if swap_line:
-            if not owns_role:
-                text += "\n" + swap_line
             push = UserPush(push.name, push.summary, push.text + "\n" + swap_line, push.ask)
         new_failure = owns_role and not already and failed is not None and failed not in notice.get("failure_pushes", [])
         if not moved and not new_failure and ("push" in notice or episode is not None and "refusal_push" in episode):

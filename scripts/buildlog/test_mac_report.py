@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 import tempfile
@@ -11,7 +12,7 @@ import unittest
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, TypedDict, Unpack, override
+from typing import Literal, TypedDict, Unpack, cast, override
 from unittest.mock import patch
 
 import index
@@ -19,7 +20,9 @@ import launches
 import mac_report
 import mac_outcome
 import store
+from test_holds import hold_event, timed_hold_events, write_mac_block
 from test_index import Record, call, encode, point_root_at, step
+from user_zone import user_zone
 
 CLI = Path(__file__).with_name("cli.py")
 NOW = datetime(2026, 10, 12, 15, 9, tzinfo=UTC)
@@ -36,6 +39,7 @@ class MacCallFields(TypedDict, total=False):
     sha: str
     target: str
     hold_wait_s: float
+    mac_holder: str
 
 
 class MacReportTests(unittest.TestCase):
@@ -51,6 +55,7 @@ class MacReportTests(unittest.TestCase):
         previous = os.environ.get("TZ")
         os.environ["TZ"] = "America/Los_Angeles"
         time.tzset()
+        self.enterContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
         def restore_timezone() -> None:
             if previous is None:
@@ -190,6 +195,62 @@ class MacReportTests(unittest.TestCase):
         )
         self.assertIn("Mac failures with a natedev pass of the same tree: 1 recorded", self.report())
 
+    def record_sent_mac_step(self, call_id: str, sent_key: str) -> None:
+        mirror = self.root.parent / "mac-mirror"
+        mirror.mkdir()
+        self.assertFalse((mirror / ".git").exists())
+        environment = {
+            name: value for name, value in os.environ.items()
+            if not name.startswith("BUILDLOG_") and name != "MANIFEST_PATH"
+        }
+        environment.update({
+            "BUILDLOG_DIR": str(self.root), "BUILDLOG_CALLER": "verify-mac",
+            "BUILDLOG_CALL_ID": call_id, "BUILDLOG_SENT_TREE_KEY": sent_key,
+        })
+        started = datetime(2026, 10, 12, 14, tzinfo=UTC).timestamp()
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("record.py")), "step", "1",
+             str(started), str(started + 1), "0", "", "", "cargo", "nextest", "run"],
+            cwd=mirror, env=environment, capture_output=True, text=True, check=False, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [
+            cast(Record, json.loads(line))
+            for path in self.root.glob("*/*.jsonl")
+            for line in path.read_text().splitlines()
+        ]
+        mac_steps = [row for row in rows if row.get("kind") == "step" and row.get("caller") == "verify-mac"]
+        self.assertEqual(len(mac_steps), 1)
+        self.assertEqual((mac_steps[0]["call_id"], mac_steps[0]["tree_key"]), (call_id, sent_key))
+
+    def test_sent_key_on_recorded_mac_step_counts_a_natedev_pass_of_the_same_selection(self) -> None:
+        sent_key = "a" * 64
+        self.write(
+            self.mac_call("sent-mac-failure", "failed", command="test hana --filter one"),
+            self.mac_call("same-selection-pass", "declined", "local_flag", local_reason="retry",
+                          command="test hana --filter one"),
+            step("same-selection-step", started_at=START, call_id="same-selection-pass",
+                 step="nextest", status=0, tree_key=sent_key),
+        )
+        self.record_sent_mac_step("sent-mac-failure", sent_key)
+        output = self.report()
+        self.assertIn("Mac failures with a natedev pass of the same tree: 1 recorded.", output)
+        self.assertNotIn("without a tree key", output)
+
+    def test_sent_key_on_recorded_mac_step_does_not_count_a_different_natedev_command(self) -> None:
+        sent_key = "a" * 64
+        self.write(
+            self.mac_call("sent-mac-failure", "failed", command="test hana --filter one"),
+            self.mac_call("different-selection-pass", "declined", "local_flag", local_reason="retry",
+                          command="test hana --filter two"),
+            step("different-selection-step", started_at=START, call_id="different-selection-pass",
+                 step="nextest", status=0, tree_key=sent_key),
+        )
+        self.record_sent_mac_step("sent-mac-failure", sent_key)
+        output = self.report()
+        self.assertIn("Mac failures with a natedev pass of the same tree: 0 recorded.", output)
+        self.assertNotIn("without a tree key", output)
+
     def test_mac_failures_require_the_same_test_selection_as_the_natedev_pass(self) -> None:
         self.write(
             self.mac_call("whole-package", "failed", command="test hana"),
@@ -260,7 +321,7 @@ class MacReportTests(unittest.TestCase):
             statements: list[str] = []
             connection.set_trace_callback(statements.append)
             _ = mac_report.mac_report(connection, NOW)
-        self.assertEqual(len(statements), 2)
+        self.assertLessEqual(len(statements), 4)
         self.assertEqual(sum("JOIN steps" in sql or "FROM steps" in sql for sql in statements), 1)
 
     def test_step_read_uses_both_time_bounds_and_the_steps_started_index(self) -> None:
@@ -433,7 +494,11 @@ class MacReportTests(unittest.TestCase):
         self.assertIn("Candidates: 0.", output)
         self.assertIn("Usable share: 0 of 0 finished on the Mac (no usable candidates)", output)
         self.assertIn("at least 0:00 (lower bound, from declines)", output)
-        self.assertTrue(output.endswith(mac_report.NOT_RECORDED_YET))
+        self.assertTrue(output.endswith("natedev holds: no event recorded yet"))
+        self.assertIn("mac holds: no event recorded yet", output)
+        self.assertNotIn("Not recorded yet:", output)
+        self.assertIn("## Hold intervals\n\nnone\n", output)
+        self.assertIn("| Blocked | natedev held |", output)
 
     def test_mac_report_cli_accepts_custom_hours_without_collecting_launches(self) -> None:
         import cli
@@ -475,6 +540,54 @@ class MacReportTests(unittest.TestCase):
                         print(line)
                 self.assertIn("where the call was when it ended: mac, natedev, or empty", result.stdout)
 
+    def test_busy_causes_split_by_the_recorded_holder_and_null_holder_is_named(self) -> None:
+        self.write(self.mac_call("known", "declined", "busy", mac_holder="hana nextest"),
+                   self.mac_call("lost-run", "declined", "busy", mac_holder="leftovers"),
+                   self.mac_call("unreadable", "declined", "busy", mac_holder="unreadable"),
+                   self.mac_call("old", "declined", "busy"))
+        output = self.report()
+        self.assertIn("Largest causes of a usable Mac going unused: busy: 4.", output)
+        for name in ("hana nextest", "lost-run leftovers", "holder unreadable", "holder not recorded"):
+            self.assertIn(f"- {name}: 1", output)
+        self.assertIn("Usable share: 0 of 4", output)
+
+    def test_a_known_job_named_holder_not_recorded_is_counted_separately_from_a_missing_holder(self) -> None:
+        self.write(self.mac_call("known", "declined", "busy", mac_holder="holder not recorded"),
+                   self.mac_call("old", "declined", "busy"))
+        summary = self.summary()
+        self.assertEqual(len(summary.busy_holders), 2)
+        self.assertEqual(sorted(summary.busy_holders.values()), [1, 1])
+
+    def test_mac_block_intervals_replace_decline_bounds_and_natedev_holds_use_the_union(self) -> None:
+        self.write(hold_event("began", "mac-block", "2026-10-12T07:00:00Z", "mac"),
+                   hold_event("ended", "mac-block", "2026-10-12T09:00:00Z", "mac"),
+                   hold_event("began", "a", "2026-10-12T07:00:00Z"),
+                   hold_event("ended", "a", "2026-10-12T09:00:00Z"),
+                   hold_event("began", "b", "2026-10-12T08:00:00Z"),
+                   hold_event("ended", "b", "2026-10-12T10:00:00Z"))
+        output = self.report()
+        day_line = next(line for line in output.splitlines() if line.startswith("| 2026-10-12 |"))
+        self.assertIn("| 2:00 | 3:00 | at least 0:00", day_line)
+        self.assertIn("mac holds recorded since 2026-10-12 00:00 PDT: 1 intervals", output)
+        self.assertIn("natedev holds recorded since 2026-10-12 00:00 PDT: 2 intervals", output)
+        previous = next(line for line in output.splitlines() if line.startswith("| 2026-10-11 |"))
+        self.assertIn("| not recorded |", previous)
+
+    def test_beginnings_before_the_first_window_are_read_and_missing_events_mark_totals(self) -> None:
+        since = datetime(2026, 10, 8, 7, tzinfo=UTC)
+        write_mac_block(since)
+        self.write(hold_event("began", since.isoformat(), since.isoformat(), "mac", store.host_name()),
+                   hold_event("began", "missing-end", "2026-10-11T08:00:00Z", "mac"),
+                   hold_event("ended", "missing-begin", "2026-10-12T08:00:00Z"))
+        output = self.report()
+        day_line = next(line for line in output.splitlines() if line.startswith("| 2026-10-12 |"))
+        self.assertIn("| at least 8:09 | at least 0:00 |", day_line)
+        self.assertIn("to open", output)
+        self.assertIn("to end not recorded", output)
+        self.assertIn("began not recorded to", output)
+        self.assertIn("Now: Mac blocked by hana for render since 2026-10-08 00:00 PDT", output)
+        self.assertNotIn("Not recorded yet:", output)
+
     def test_mac_report_cli_runs_under_two_seconds_at_the_log_size(self) -> None:
         now = datetime.now(UTC)
         began = (now - timedelta(hours=20)).replace(minute=0, second=0, microsecond=0)
@@ -497,10 +610,13 @@ class MacReportTests(unittest.TestCase):
                     caller="verify-mac" if 100 <= number < 200 else "verify",
                     tree_key=f"tree-{number % 100}", status=1 if 100 <= number < 200 else 0,
                 )))
-        self.assertEqual(index.update(), 65_600)
+            hold_rows = timed_hold_events(began, now)
+            for hold_row in hold_rows:
+                _ = handle.write(encode(hold_row))
+        self.assertEqual(index.update(), 65_600 + len(hold_rows))
         measured = time.perf_counter()
         result = subprocess.run(
-            [sys.executable, str(CLI), "mac-report"], env={**os.environ, "BUILDLOG_DIR": str(self.root), "TZ": "America/Los_Angeles"},
+            [sys.executable, str(CLI), "mac-report"], env={**os.environ, "BUILDLOG_DIR": str(self.root), "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"},
             capture_output=True, text=True, check=False, timeout=30,
         )
         elapsed = time.perf_counter() - measured
@@ -509,9 +625,19 @@ class MacReportTests(unittest.TestCase):
         self.assertIn("Usable share:", result.stdout)
         self.assertIn("Set aside as not usable: blocked, backoff, unreachable, battery, disk, off", result.stdout)
         self.assertIn("Counted against the share: busy, mac_busy, lost, runner, state, copy.", result.stdout)
-        self.assertIn("at least 0:03 (lower bound, from declines)", result.stdout)
+        self.assertIn("mac holds recorded since", result.stdout)
         self.assertIn("Mac failures with a natedev pass of the same tree: 100 recorded.", result.stdout)
-        self.assertIn(mac_report.NOT_RECORDED_YET, result.stdout)
+        self.assertIn("natedev holds recorded since", result.stdout)
+        self.assertNotIn("Not recorded yet:", result.stdout)
+        self.assertIn("to open", result.stdout)
+        self.assertIn("to end not recorded", result.stdout)
+        day = began.astimezone(user_zone()).date().isoformat()
+        day_line = next(line for line in result.stdout.splitlines() if line.startswith(f"| {day} |"))
+        cells = [cell.strip() for cell in day_line.split("|")[1:-1]]
+        for cell in cells[9:11]:
+            duration = cell.removeprefix("at least ")
+            hours, minutes = duration.split(":")
+            self.assertGreater(int(hours) * 60 + int(minutes), 0, day_line)
         self.assertLessEqual(elapsed, 2.0, result.stdout)
 
 

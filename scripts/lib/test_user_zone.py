@@ -24,6 +24,20 @@ NAMES_A_ZONE = {
     "prioritize/renumber.py": "one fixed zone, so a date is the same on both machines",
     "whoami/agent_accounts.py": "the offset a stored reset time is written with",
 }
+# A time put in the machine's zone: `astimezone()` with no zone.
+MACHINE_ZONE = re.compile(r"\.astimezone\(\)")
+# The scripts that may use the machine's zone, each because the time there is stored or compared, never shown.
+USES_THE_MACHINE_ZONE = {
+    "agents/codex_mesh.py": "log stamps written with their offset",
+    "hooks/banned_words_lib.py": "a log stamp written with its offset",
+    "notify/pushover.py": "a log stamp written with its offset",
+    "notify/review.py": "a log stamp written with its offset",
+    "production/dailies_render.py": "reads reset times stored with no offset, in the machine's zone",
+    "production/review_regime.py": "a stamp written with its offset",
+    "whoami/agent_notes.py": "reset times written with their offset, and the note's date as the vault's linter writes it",
+    "whoami/codex_pacer.py": "Codex names its session folders by the machine's date",
+    "whoami/note_file.py": "reads a reset time stored before the offset was, in the machine's zone",
+}
 SKIPPED_DIRS = {"__pycache__", "fixtures", "tests", "testdata", "node_modules"}
 
 
@@ -82,6 +96,18 @@ class UserZoneTests(unittest.TestCase):
                 found.add(relative.as_posix())
         self.assertEqual(found, set(NAMES_A_ZONE), "a script names a zone itself; read it from user_zone.py, "
                          + "or add the script to NAMES_A_ZONE with the reason its zone is a fact")
+
+    def test_no_script_shows_a_time_in_the_machines_zone(self) -> None:
+        scripts = SCRIPT.parents[1]
+        found: set[str] = set()
+        for path in scripts.rglob("*.py"):
+            relative = path.relative_to(scripts)
+            if path.name.startswith("test_") or SKIPPED_DIRS.intersection(relative.parts) or not path.is_file():
+                continue
+            if MACHINE_ZONE.search(path.read_text(encoding="utf-8", errors="replace")):
+                found.add(relative.as_posix())
+        self.assertEqual(found, set(USES_THE_MACHINE_ZONE), "a script puts a time in the machine's zone; pass "
+                         + "user_zone() to astimezone(), or add the script to USES_THE_MACHINE_ZONE with the reason")
 
     def test_the_shipped_setting_is_a_real_zone(self) -> None:
         env = {key: value for key, value in os.environ.items() if key not in ("USER_ZONE", "USER_ZONE_CONF")}

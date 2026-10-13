@@ -34,6 +34,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
 import phase_table
 import progress_history
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from user_zone import user_zone
+
 BACKLOG_DIR = Path(os.environ.get("PLAN_BACKLOG_DIR") or Path.home() / ".local/state/plan-backlog")
 # A run keeps its pending add-ons here, in a directory named by its run id.
 SESSION_ROOT = Path("/tmp/claude/delegate")
@@ -196,7 +199,7 @@ def doc_rows(worktrees: list[Worktree]) -> list[Row]:
 
 def file_date(path: Path) -> str:
     try:
-        return f"{datetime.fromtimestamp(path.stat().st_mtime):%Y-%m-%d}"
+        return f"{datetime.fromtimestamp(path.stat().st_mtime, user_zone()):%Y-%m-%d}"
     except OSError:
         return NONE
 

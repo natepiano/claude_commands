@@ -243,11 +243,11 @@ neither the command's output nor its exit status. Plans without a
 `> **Production:` line skip the subprocess. [Phase tables](phase-tables.md)
 covers the note, the table built from these events and the hook's limits.
 
-`eta` reads its times in the process `TZ`, requires an active phase, appends
+`eta` reads its times in the user's zone setting (`scripts/lib/user_zone.py`), requires an active phase, appends
 one `eta_stated` event, and prints `ETA recorded: <HH:MM zone>`. It exits 2 on
 a malformed or past time, a time the local clock skips, a range that does not
 enclose the target, one range end alone, a blank basis, or no active phase.
-`/unit:eta` and `/unit:eta_breakdown` run it under `TZ=<User zone>`.
+`/unit:eta` and `/unit:eta_breakdown` pass no `TZ=`; the process `TZ` is not read.
 
 `implement.sh` and `review.sh` own pass lifecycle: they set
 `PLAN_DELEGATE_PASS_OWNER=launcher` on their own `start-pass` / `finish-pass`
@@ -256,7 +256,10 @@ rejects an unowned call, because a hand-written pass forges one that never ran
 and `findings.py gate` counts passes to decide whether a phase is converging.
 The single exception is a launcher the unit director killed, whose pass stays
 open: `finish-pass --status canceled --orphaned-launcher` closes it, and only
-that status, and only while a pass is open.
+that status, and only while a pass is open. A review with lens `ux` records
+no pass: the unit director's `UX review` activity carries that time. A pooled
+review records its pass under the slot `pool_<reviewer>`
+(`docs/as-built/review-pool.md`).
 
 `progress` writes the event and prints two tables under a line naming the
 worktree, and the branch when it differs. The line carries no position: how

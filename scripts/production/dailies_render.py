@@ -126,7 +126,7 @@ CHART_CONF = Path.home() / ".local/state/showrunner/dailies.conf"
 AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
 CHART_KEY = "chart"
 NOW_MARK = "▼ "
-# A unit under a /build_hold carries this marker on its timeline row; no
+# A unit under a /build:hold carries this marker on its timeline row; no
 # marker means not held (user, 2026-10-03: "Without that marker I will assume
 # it is not held"). The hold's start, purpose and release are stated once, in
 # the line after the timeline (user, 2026-10-04: "you do not need to repeat
@@ -875,7 +875,7 @@ def read_dailies_hold() -> HoldState:
             try:
                 check_plumbing(holder.purpose, f"build hold {holder.name!r} purpose")
             except InputError as error:
-                raise InputError(f"{error}; have {holder.name} run /build_hold hold again with other words") from None
+                raise InputError(f"{error}; have {holder.name} run /build:hold hold again with other words") from None
     return hold
 
 
@@ -891,7 +891,7 @@ def read_mac_block() -> MacBlockFooterState:
             check_plumbing(block.reason, f"Mac block {block.holder!r} reason")
         except InputError as error:
             raise InputError(
-                f"{error}; have {block.holder} run /mac_test block again with other words"
+                f"{error}; have {block.holder} run /build:mac block again with other words"
             ) from None
     return block
 

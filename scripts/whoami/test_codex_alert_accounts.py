@@ -308,14 +308,15 @@ class CodexAccountAlertTests(unittest.TestCase):
             codex_readings=self.readings(a, self.report(a), self.report(b, 80)))
         self.assertTrue(any(text.startswith("Quota alert:") for text in self.sent))
 
-    def test_outgoing_refusal_user_push_has_the_session_swap_line(self) -> None:
+    def test_outgoing_refusal_records_a_note_without_user_or_session_delivery(self) -> None:
+        """F008: an outgoing account's refusal is recorded in the quota log only."""
         a, b, c = self.account(1), self.account(2), self.account(3)
         readings = self.readings(b, self.report(a, 0), self.report(b, 0), self.report(c, 80))
         with patch.object(quota_alert, "tell_user", wraps=self.push) as push:
-            _ = quota_alert.blocked([self.note(1, "inactive", 0)], a, self.now, codex_readings=readings)
-        advice = 'swap seats "codex 3"'
-        self.assertIn(advice, cast(str, push.call_args.args[1]))
-        self.assertTrue(any(advice in text for text in self.sent))
+            lines = quota_alert.blocked([self.note(1, "inactive", 0)], a, self.now, codex_readings=readings)
+        push.assert_not_called()
+        self.assertEqual(self.sent, [])
+        self.assertIn("quota status codex 1: Codex refused work on codex 1, the outgoing account. Nothing switched to Claude.", lines)
 
     def test_failed_restoration_is_attempted_and_reported_once(self) -> None:
         a = self.account(1)

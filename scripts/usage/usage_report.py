@@ -51,6 +51,7 @@ class QueryOutcome:
     query: str
     dimensions: tuple[Dimension, ...]
     aggregate: str = "count(*)"
+    exact_where: str = "1"
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,25 @@ OUTCOMES = {
             LEFT JOIN folders f ON (f.machine, f.family, f.parent_id, f.agent_id)
                 = (c.machine, c.family, c.parent_id, c.agent_id)
         """, ALL_DIMENSIONS),
+        QueryOutcome("compaction_reread", """
+            SELECT t.at, t.machine, f.folder, t.role, t.lens, t.lens_state, t.attribution,
+                   t.model, t.effort,
+                   CASE WHEN w.weight_entry IS NOT NULL THEN
+                       t.input + t.cache_write_5m * w.write_5m + t.cache_write_1h * w.write_1h
+                   END AS reread_weighted
+            FROM (SELECT DISTINCT (
+                SELECT p.rowid FROM turns p WHERE
+                    (p.machine, p.family, p.parent_id, p.agent_id)
+                    = (c.machine, c.family, c.parent_id, c.agent_id)
+                    AND p.at > c.at AND p.input + p.cache_read > 0
+                ORDER BY p.at, p.turn_key LIMIT 1) AS request_rowid
+                FROM compactions c) r JOIN turns t ON t.rowid = r.request_rowid
+            LEFT JOIN folders f ON (f.machine, f.family, f.parent_id, f.agent_id)
+                = (t.machine, t.family, t.parent_id, t.agent_id)
+            LEFT JOIN (
+        """ + weights.sql_weights("t.model", "t.at").entries + ") w ON w.weight_entry = "
+            + weights.sql_weights("t.model", "t.at").active_entry,
+            ALL_DIMENSIONS, "coalesce(sum(t.reread_weighted), 0)", "t.attribution = 'recorded'"),
         TurnGroupOutcome("threads", ALL_DIMENSIONS,
                          "count(DISTINCT json_array(machine, family, parent_id, agent_id))"),
         QueryOutcome("account_switches", """
@@ -195,6 +215,8 @@ METRICS = {
                WEIGHTED, ReportFormat.SHARE),
         Metric("compactions_per_thread", "Compactions per thread", OutcomeCount(OUTCOMES["compactions"]),
                OutcomeCount(OUTCOMES["threads"]), ReportFormat.RATE),
+        Metric("compaction_reread_share", "Share of weighted tokens spent on the first request after a compaction",
+               OutcomeCount(OUTCOMES["compaction_reread"]), WEIGHTED, ReportFormat.SHARE),
         Metric("weighted_per_finding_closed", "Weighted tokens per accepted finding", WEIGHTED,
                OutcomeCount(OUTCOMES["findings_closed"]), ReportFormat.RATE),
         Metric("weighted_per_review_round", "Weighted tokens per review pass", WEIGHTED,
@@ -452,7 +474,8 @@ def turn_relation(db: sqlite3.Connection, request: ReportRequest) -> tuple[str, 
             continue
         predicate, bounds = request.window.predicate("t.at")
         day = ", " + day_sql("t", offsets) + " AS day" if need_day else ""
-        ctes.append(f"outcome_{outcome.name} AS MATERIALIZED (SELECT t.*{day} FROM ({outcome.query}) t WHERE {predicate})")
+        exact = " AND " + outcome.exact_where if request.exact else ""
+        ctes.append(f"outcome_{outcome.name} AS MATERIALIZED (SELECT t.*{day} FROM ({outcome.query}) t WHERE {predicate}{exact})")
         parameters = (*parameters, *bounds)
     if general:
         # An arbitrary aggregate always receives individual turns and every relation column.
@@ -580,8 +603,9 @@ def report_data(db: sqlite3.Connection, request: ReportRequest) -> dict[str, lis
             relation = "turn_groups" if isinstance(outcome, TurnGroupOutcome) else "outcome_" + outcome.name
             joins = "" if isinstance(outcome, TurnGroupOutcome) else dimension_joins((DIMENSIONS["unit"],))
             unit = "t.unit" if isinstance(outcome, TurnGroupOutcome) else DIMENSIONS["unit"].expression
+            row_count = outcome.aggregate if isinstance(outcome, TurnGroupOutcome) else "count(*)"
             queries.append(ReportQuery("unknown_" + side.outcome.name, ("outcomes",),
-                f"SELECT {outcome.aggregate} AS outcomes FROM {relation} t{joins} WHERE {unit} = 'unknown'"))
+                f"SELECT {row_count} AS outcomes FROM {relation} t{joins} WHERE {unit} = 'unknown'"))
     prefix, parameters = turn_relation(db, request)
     # One grouped token relation serves additive metrics and their coverage figures.
     columns = tuple(dict.fromkeys(column for query in queries for column in query.columns))

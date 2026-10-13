@@ -19,11 +19,14 @@ import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime, tzinfo
+from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
 from typing import NamedTuple, NoReturn, TypedDict, cast
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 
 SCHEMA_VERSION = 1
@@ -356,17 +359,6 @@ def _refuse_eta(message: str) -> NoReturn:
     raise SystemExit(2)
 
 
-def _process_timezone() -> tzinfo:
-    configured = os.environ.get("TZ")
-    if configured:
-        try:
-            return ZoneInfo(configured)
-        except ZoneInfoNotFoundError:
-            pass
-    detected = datetime.now().astimezone().tzinfo
-    return detected if detected is not None else UTC
-
-
 def _local_eta_epoch(value: str, option: str) -> float:
     layout = "%Y-%m-%dT%H:%M"
     try:
@@ -375,7 +367,7 @@ def _local_eta_epoch(value: str, option: str) -> float:
         _refuse_eta(f"{option} must use YYYY-MM-DDTHH:MM")
     if parsed.strftime(layout) != value:
         _refuse_eta(f"{option} must use YYYY-MM-DDTHH:MM")
-    zone = _process_timezone()
+    zone = user_zone()
     epoch = parsed.replace(tzinfo=zone).timestamp()
     if datetime.fromtimestamp(epoch, zone).strftime(layout) != value:
         _refuse_eta(f"{option} is a time the local clock skips")
@@ -2129,7 +2121,7 @@ def _clock_line(now: float, next_report_at: float | None) -> str:
     never when. This line is the one place a reader can tell whether the report
     they are looking at is current and how long until the next one lands.
     """
-    line = f"**now {datetime.fromtimestamp(now):%Y-%m-%d %H:%M:%S}"
+    line = f"**now {datetime.fromtimestamp(now, user_zone()):%Y-%m-%d %H:%M:%S}"
     if next_report_at is not None:
         line += f" - next report {_moment_stamp(next_report_at, now)}"
     return line + "**"
@@ -2137,8 +2129,8 @@ def _clock_line(now: float, next_report_at: float | None) -> str:
 
 def _moment_stamp(epoch: float, now: float) -> str:
     """A local clock time, dated only when it falls on a day other than `now`'s."""
-    moment = datetime.fromtimestamp(epoch)
-    if moment.date() == datetime.fromtimestamp(now).date():
+    moment = datetime.fromtimestamp(epoch, user_zone())
+    if moment.date() == datetime.fromtimestamp(now, user_zone()).date():
         return f"{moment:%H:%M:%S}"
     return f"{moment:%Y-%m-%d %H:%M:%S}"
 
@@ -2244,7 +2236,7 @@ def _agent_display(model: str, effort: str) -> str:
 
 
 def _clock_stamp(epoch: float) -> str:
-    return f"{datetime.fromtimestamp(epoch):%H:%M:%S}"
+    return f"{datetime.fromtimestamp(epoch, user_zone()):%H:%M:%S}"
 
 
 def _started_window(event: dict[str, object], event_type: str) -> StageWindow:
@@ -3538,8 +3530,8 @@ def _render_table(
 
 def _arrival_label(arrival_epoch: float, now: float) -> str:
     """A point in time named the way a person would say it aloud on `now`'s day."""
-    arrival = datetime.fromtimestamp(arrival_epoch)
-    days = (arrival.date() - datetime.fromtimestamp(now).date()).days
+    arrival = datetime.fromtimestamp(arrival_epoch, user_zone())
+    days = (arrival.date() - datetime.fromtimestamp(now, user_zone()).date()).days
     if days == 0:
         return f"today {arrival:%H:%M}"
     if days == 1:
@@ -4341,7 +4333,7 @@ def _eta(args: argparse.Namespace) -> None:
 
     _append_event(state, event)
     _refresh_phase_table(session_dir)
-    local_eta = datetime.fromtimestamp(eta_at, _process_timezone())
+    local_eta = datetime.fromtimestamp(eta_at, user_zone())
     print(f"ETA recorded: {local_eta:%H:%M %Z}")
 
 
