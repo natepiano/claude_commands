@@ -162,6 +162,7 @@ class RustReleaseTests(unittest.TestCase):
               mock.patch.dict(os.environ, {"RELEASE_SEND_EXIT": "0"})):
             self.assertTrue(rust_release.send_release_text("Rust 1.100.0 out", "trial passed"))
             self.assertEqual(run.call_args.args[0], command)
+            self.assertEqual(run.call_args.kwargs["timeout"], 60)
         with (mock.patch.object(rust_release, "__file__", str(fake_module)),
               mock.patch.dict(os.environ, {"RELEASE_SEND_EXIT": "3"})):
             self.assertFalse(rust_release.send_release_text("Rust 1.100.0 out", "trial passed"))

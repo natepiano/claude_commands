@@ -72,7 +72,7 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 
 **Gotchas:** a push's `Action:` / `No action needed.` line always comes first, and every order rule applies after it. `ask-once-then-count` limits only the end-of-reply reminder, never an answer the user asked for.
 
-### Phase 2 — The push reviewer  · status: todo
+### Phase 2 — The push reviewer  · status: done
 
 #### Work Order
 
