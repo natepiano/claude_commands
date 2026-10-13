@@ -13,5 +13,6 @@ and report its output. Use `status` when no argument was given; it changes nothi
 With any argument other than `on` or `off`, say `Use /showrunner:footer on or /showrunner:footer off.` and stop.
 
 `off` pauses reply footers and the Waiting on block for every production
-targeting this session; `on` resumes both. The switch persists across
+targeting this session; `on` resumes both. A new production starts with them
+off, and `on` turns them on (user, 2026-10-13). The switch persists across
 compaction and session resume.

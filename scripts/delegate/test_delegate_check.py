@@ -16,6 +16,7 @@ REPO = Path(__file__).resolve().parents[2]
 PY = REPO / "scripts" / "lib" / "py"
 CHECK = REPO / "scripts" / "hooks" / "delegate_run.py"
 UNIT_NOTIFIER = REPO / "scripts" / "delegate" / "unit_notifier.sh"
+SCHEDULED = "PLAN_DELEGATE_PROGRESS_UPDATES=scheduled\n"
 NOTIFIER = REPO / "scripts" / "message" / "notifier.sh"
 
 
@@ -38,6 +39,8 @@ class DelegateCheckTests(unittest.TestCase):
         self.active_dir.mkdir()
         self.state_dir = self.root / "notifier"
         self.config_file = self.root / "delegate.conf"
+        # A schedule is asked for here; the shipped default, on demand, has its own tests.
+        _ = self.config_file.write_text(SCHEDULED, encoding="utf-8")
 
     @override
     def tearDown(self) -> None:
@@ -107,7 +110,7 @@ class DelegateCheckTests(unittest.TestCase):
     def test_unit_notifier_creates_held_instance_with_rounded_interval(self) -> None:
         self.write_marker()
         _ = self.config_file.write_text(
-            "PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=901 # a trailing comment\n",
+            "PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=901 # a trailing comment\n" + SCHEDULED,
             encoding="utf-8",
         )
         result = self.run_unit_notifier()
@@ -200,10 +203,32 @@ class DelegateCheckTests(unittest.TestCase):
         ])
         self.assertFalse((self.state_dir / f"delegate-{self.session_dir.name}").exists())
 
-    def test_unit_notifier_on_demand_stops_the_schedule_a_resumed_run_holds(self) -> None:
+    def test_unit_notifier_with_no_updates_line_makes_no_schedule(self) -> None:
+        self.write_marker()
+        _ = self.config_file.write_text("PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=900\n", encoding="utf-8")
+        result = self.run_unit_notifier()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("progress updates on demand:", result.stdout)
+        self.assertFalse((self.state_dir / f"delegate-{self.session_dir.name}").exists())
+
+    def test_unit_notifier_on_demand_keeps_the_schedule_a_resumed_run_holds(self) -> None:
         self.write_marker()
         created = self.run_unit_notifier()
         self.assertEqual(created.returncode, 0, created.stderr)
+        instance = self.state_dir / f"delegate-{self.session_dir.name}"
+        before = (instance / "state").read_text(encoding="utf-8")
+        self.on_demand()
+        resumed = self.run_unit_notifier()
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        # Retargeted, with its clock and its on/off state as they were.
+        self.assertEqual((instance / "state").read_text(encoding="utf-8"), before)
+        self.assertIn("ENABLED=1", before.splitlines())
+        self.assertIn(f"TARGET=session:{self.session_id}", (instance / "conf").read_text(encoding="utf-8").splitlines())
+
+    def test_unit_notifier_on_demand_keeps_a_stopped_schedule_stopped(self) -> None:
+        self.write_marker()
+        self.assertEqual(self.run_unit_notifier().returncode, 0)
+        self.assertEqual(self.run_unit_notifier("off").returncode, 0)
         self.on_demand()
         resumed = self.run_unit_notifier()
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
@@ -238,7 +263,7 @@ class DelegateCheckTests(unittest.TestCase):
         )
 
     def test_unit_notifier_all_retimes_every_run_and_keeps_a_stopped_one_stopped(self) -> None:
-        _ = self.config_file.write_text("PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=900\n", encoding="utf-8")
+        _ = self.config_file.write_text("PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=900\n" + SCHEDULED, encoding="utf-8")
         running = self.start_run("running")
         stopped = self.start_run("stopped")
         self.assertEqual(self.run_unit_notifier_as("stopped", "off").returncode, 0)

@@ -1,6 +1,6 @@
 # Quiet defaults: no timer or footer unless asked, and phase-note pruning on the snapshot timer
 
-> **Status: IMPLEMENTATION PLAN — two phases, neither built.**
+> **Status: IMPLEMENTATION PLAN — Phase 1 built; Phase 2 not built.**
 
 > **As-built disposition: amend** — `docs/as-built/showrunner-automation.md`, `docs/as-built/session-notifier.md`, `docs/as-built/phase-tables.md`
 
@@ -22,7 +22,7 @@
 - **The snapshot timer.** `/etc/nixos/modules/linux/agent-sessions.nix` runs `agent-sessions-snapshot.py` every 2 minutes on natedev. Its first step, `refresh_agent_notes`, runs `~/.claude/scripts/whoami/agent_notes.py` as its own process, so a failure there can never cost the session record.
 - **Live now (read 08:50 EDT).** All four registered productions read `on demand` and have their footers off, so (b) changes nothing that runs today.
 
-## Phase 1: quiet by default (b)
+## Phase 1: quiet by default (b) — done
 
 **Productions.**
 

@@ -119,10 +119,11 @@ makes the notifier use 900 seconds; Codex requires a positive integer. It is
 `unit_notifier.sh --all` retimes every unit run's instance to the new value,
 or to `--all <minutes>`, and leaves each one on or off.
 
-`PLAN_DELEGATE_PROGRESS_UPDATES=on-demand` gives a new Claude unit run no
-notifier instance, so `/unit:report` runs only when someone asks for it;
-`/unit:report on` makes the instance then. `scheduled`, or no line, makes it
-at every run's start. It is `scheduled` (user, 2026-10-10).
+`PLAN_DELEGATE_PROGRESS_UPDATES=on-demand`, or no line, gives a new Claude
+unit run no notifier instance, so `/unit:report` runs only when someone asks
+for it; `/unit:report on` makes the instance then. `scheduled` makes it at
+every run's start. A resumed run that already has an instance keeps it, on or
+off. It is `on-demand` (user, 2026-10-13: no timer unless asked).
 
 `scripts/delegate/findings.py` reads the file at startup, so an edit applies to
 the next `findings.py gate` with nothing to restart. The file is authoritative:
