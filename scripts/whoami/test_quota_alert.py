@@ -19,6 +19,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 import quota_alert
+import review
 from scripts.whoami import agent_accounts
 from agent_accounts import ClaudeAccountSelection, CodexHomeSource, Quota, Report
 import agent_notes
@@ -105,7 +106,7 @@ class QuotaAlertTests(unittest.TestCase):
         self.failing: set[str] = set()
         self.sent: list[tuple[str, str]] = []
         self.push_errors: list[str | None] = []
-        self.pushed: list[tuple[str, str, quota_alert.Ask | None]] = []
+        self.pushed: list[tuple[str, str, quota_alert.Ask]] = []
 
     @override
     def setUp(self) -> None:
@@ -151,7 +152,7 @@ class QuotaAlertTests(unittest.TestCase):
         self.sent.append((recipient, text))
         return "not reachable" if recipient in self.failing else None
 
-    def tell_user(self, summary: str, text: str, ask: quota_alert.Ask | None) -> str | None:
+    def tell_user(self, summary: str, text: str, ask: quota_alert.Ask) -> str | None:
         """Record direct delivery so no test can reach send.py's real user channel."""
         self.assertNotIn("/", text)
         self.assertNotIn("@", text)
@@ -599,12 +600,25 @@ class QuotaAlertTests(unittest.TestCase):
         _ = self.alert(notes, self.now)
         _ = self.block(notes, self.now)
         for summary, text, ask in self.pushed:
-            if ask is None:
-                continue
             self.assertLess(len(summary), 45)
             self.assertLess(len("Action: " + ask.action + "\n" + text), 500)
             self.assertIn("Claude session on natedev", ask.action)
             self.assertLessEqual(text.count("recommended"), 1)
+
+    def test_quota_delivery_roles_separate_log_notes_from_actionable_pushes(self) -> None:
+        claude = self.note("claude 2.md", "active", "0", limit_reset_count="3")
+        codex = self.note("codex 1.md", "active", "0", credit_balance="10")
+        selection = accounts.claude_account_selection()
+        status = quota_alert.run_out_push(codex, selection)
+        self.assertIsInstance(status, quota_alert.QuotaStatusNote)
+        self.assertNotIsInstance(status, quota_alert.UserPush)
+        assert isinstance(status, quota_alert.QuotaStatusNote)
+        self.assertIn("Codex keeps working on its credits", status.text)
+        push = quota_alert.run_out_push(claude, selection)
+        self.assertIsInstance(push, quota_alert.UserPush)
+        assert isinstance(push, quota_alert.UserPush)
+        self.assertIsInstance(push.ask, quota_alert.Ask)
+        self.assertIn("sign in", push.ask.action)
 
     def test_quota_choices_explain_what_restores_work_and_what_costs_money(self) -> None:
         """F016: usage choices say how work resumes and when credits must be bought."""
@@ -634,13 +648,16 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertEqual(self.user_sends(lambda: quota_alert.tell_user("title", "text", ask)),
                          {"title": ("blocked", ActionRequired(ask.action))})
 
-    def test_user_send_allows_review_and_post_without_shortening_agent_relays(self) -> None:
+    def test_user_send_uses_configured_review_limit_without_shortening_agent_relays(self) -> None:
+        config = self.root / "notify.conf"
+        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
         done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user", "")
-        with mock.patch.object(subprocess, "run", return_value=done) as run:
-            self.assertIsNone(REAL_TELL_USER("title", "body", None))
+        with (mock.patch.object(review, "NOTIFY_CONFIG", config),
+              mock.patch.object(subprocess, "run", return_value=done) as run):
+            self.assertIsNone(REAL_TELL_USER("title", "body", quota_alert.Ask("decision", "Choose an account.")))
             command = cast(list[str], run.call_args.args[0])
-            self.assertEqual(command[command.index("--timeout") + 1], "60")
-            self.assertEqual(run.call_args.kwargs["timeout"], 75)
+            self.assertEqual(float(command[command.index("--timeout") + 1]), 115)
+            self.assertEqual(run.call_args.kwargs["timeout"], 130)
             self.assertEqual(run.call_args.kwargs["input"], "body")
         self.assertEqual(quota_alert.RELAY_TIMEOUT, 40)
 

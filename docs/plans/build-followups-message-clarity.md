@@ -40,7 +40,7 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 - **Lint:** `basedpyright <changed .py files>` — pass is its `0 errors, 0 warnings` line (it exits 3 on the missing `.venv`).
 - **Invariants:**
   - **No test or live check reaches the phone** (user rule, memory `phone-push-must-be-actionable`; showrunner 2026-10-13). Tests fake the reviewer process and `post`; a live check uses `review.py replay` or `--dry-run`, which never posts.
-  - **A push is never lost.** Reviewer missing, slow (over 30 s), failing, out of quota, or returning unreadable JSON → the push goes out as written and the log marks it `unreviewed: <why>` (approved design).
+  - **A push is never lost.** Reviewer missing, slower than its configured limit (`REVIEW_TIMEOUT_SECONDS`, default 60 s), failing, out of quota, or returning unreadable JSON → the push goes out as written and the log marks it `unreviewed: <why>` (approved design).
   - **The reviewer never adds a fact.** It may cut, reorder and reword; whatever is missing it asks for (approved design).
   - **No skip option.** `pushover.py` has no flag that bypasses review; only the user's switch (`review_off`) turns it off (approved design).
   - **The reviewer keeps the action form and priority.** An `--action` push stays an action push (non-empty action text); a `--no-action` push stays one; priority never changes.
@@ -117,7 +117,7 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 
 **Ruled out:** Denying the fallback outright while a claim is live — the user could get no push at all.
 
-### Phase 4 — A fallback push never lets a claimed hold post too, and the reviewer passes its own rewrite  · status: todo
+### Phase 4 — A fallback push never lets a claimed hold post too, and the reviewer passes its own rewrite  · status: done
 
 #### Work Order
 
@@ -127,12 +127,13 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 - Follow-up from Phase 3 (landing rule, round 3): two fixes left one case open. The gate releases the restored hold through `review.release_if_matches`, which reads only `held/<id>.json`. If `review.py due` has claimed that hold (renamed to `<id>.sending`) and the worker exits before posting, the release finds nothing, the fallback is allowed, and stale-claim recovery posts the held version once more after `CLAIM_STALE_SECONDS`. A live claim posts it at once. Either way the user gets two pushes.
 - Release protocol (showrunner's call 2026-10-13, after Phase 3's phase review; losing a push is worse than a rare second copy): `review.py` keeps a delivered record keyed by the hold's identity (`held/delivered/<identity>`, kept 1 hour). `release_if_matches(source, identity)` answers, under the review lock: `delivered` (the record exists), `released` (a matching `.json`, or matching claim older than `CLAIM_STALE_SECONDS`, is deleted and a cancel mark `held/<id>.cancel` holding the identity is written), `posting` (a matching younger claim), or `none` (no hold, or one with another identity, left alone).
 - `due()` and a revision's post re-check, under the lock immediately before posting, that their claim still exists and carries no cancel mark for its identity; a cancelled claim is dropped unposted. A successful post writes the delivered record before releasing the lock.
-- The gate: `delivered` denies the fallback (`The held version of this push was already sent.`); `released` and `none` allow it; `posting` waits up to 20 s, re-asking each second, then follows the delivered or released answer, and allows on timeout. The marker is consumed in every case. Any gate error allows the fallback (a push is never lost), so a rare duplicate remains possible; this plan accepts it.
+- The gate: `delivered` denies the fallback (`The held version of this push was already sent.`); `released` and `none` allow it; `posting` waits (review plus post plus 5 s, capped at 110 s; the time-limit bullet below), re-asking each second, then follows the delivered or released answer, and allows on timeout. The marker is consumed in every case. Any gate error allows the fallback (a push is never lost), so a rare duplicate remains possible; this plan accepts it.
 - `review.py release --identity I -- SOURCE` prints the answer word on one line; the gate's remote path reads it from the ssh output.
 - Tests (deterministic, fakes only): expiry delivers then the fallback arrives (local and remote) → denied; posting then worker fails → allowed after release; a suspended worker resuming after release → drops its claim unposted (interleaving test); a newer hold with another identity is kept.
 - Reviewer stability (measured 2026-10-13 after Phase 3's repair round 3): re-checking the reviewer's own rewrite gave `send` for 2 of 4 texts; one flipped to `ask`, and one kept failing `push-body-under-500` on a body of about 330 characters. Length limits are counted by `review.validate` in code, never judged by the model; the reviewer prompt (`scripts/notify/reviewer_prompt.md`) says a text that meets every rule is returned unchanged with `send`, and a rule failure must quote the failing words. Test: a fake reviewer that flags `push-body-under-500` on a short body is overruled by the code count.
 - Review findings folded after Phase 3 (unit director's calls): length rules are counted in code against both the original and the proposed text (title under 45 characters, action plus body under 500), apart from the 250/1024 transport limits; a false length failure is removed and the other failures kept. A rule failure carries quoted words (`{rule, quote}` in the reviewer schema, `review.py` 196); a quote not found in the text is rejected. The prompt rule that passing text returns unchanged already exists (`reviewer_prompt.md` 3): this phase enforces it. `quota_alert.UserPush.ask: Ask | None` becomes two delivery roles (a phone push with its ask, a log-only note). The checkpoint notice hands the showrunner a fake-payload check that the installed settings hook denies a push with no marker.
 - Live gate: the 15 Phase 3 script texts (`round3_samples.txt` shape, rendered from the code) each get at most three live checks; a quoted failure is fixed in the script and that script re-checked; a text still not `send` after three is listed in the notice. Deterministic tests, not the live gate, prove the code rules.
+- The reviewer's time limit (the user, 2026-10-13: "20 seconds is too short a time for a reviewer - it needs to be configurable and longer"): `review.py`'s fixed `TIMEOUT_S = 20` becomes `REVIEW_TIMEOUT_SECONDS` in a new committed `config/notify.conf` (one `KEY=VALUE` line with a comment; never `config/agents.conf`, which is pinned), default 60 (live reviews measured 10–13 s; 60 is over four times the slowest). `review.py` reads it once per call, and a missing file, missing key or bad value falls back to 60 and logs why; every other wait derives from it in one place in `review.py`, never a second constant: a revision's budget is review plus the 15 s post; `send.py`'s user-delivery wait, and the 60 s user-send waits in `quota_alert.py` and `rust_release.py`, become review plus post plus a 10 s margin (85 s at the default); `CLAIM_STALE_SECONDS` stays above review plus post (at least 120); the gate's `posting` wait becomes review plus post plus 5 s, capped at 110 s so the hook ends inside its settings timeout of 120 s (the showrunner adds `"timeout": 120` to the PushNotification entry; Claude Code's default is 60 s). Tests: the config parse and its fallback, and each derived wait at a non-default value.
 
 **Files:**
 - `scripts/notify/review.py` — `release_if_matches` outcomes and the `release` command's output
@@ -154,10 +155,15 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 - `scripts/shutdown/settle.py` — its push text, only where a quoted rule fails
 - `scripts/shutdown/test_settle.py` — its push text, only where a quoted rule fails
 - `scripts/production/test_dailies_input.py` — its ci_points send assertions
+- `scripts/notify/pushover.py` — a claimed revision posts through `review.post_claim`
+- `scripts/notify/test_pushover.py` — that path and a revision cancellation interleaving test
+- `config/notify.conf` — new: `REVIEW_TIMEOUT_SECONDS=60`
+- `scripts/message/send.py` — its user-delivery wait derives from the reviewer limit
+- `scripts/message/test_send.py` — that wait
 
 **Seats:** 2 writers
-- `impl` — `review.py`, `reviewer_prompt.md`, the push gate and their tests; hub: `scripts/notify/review.py`
-- `test` — `quota_alert.py`, the script texts and their tests
+- `impl` — `review.py`, `reviewer_prompt.md`, the push gate, `pushover.py`'s revision post, `config/notify.conf`, `send.py`'s wait and their tests; hub: `scripts/notify/review.py`
+- `test` — `quota_alert.py` (delivery roles and its send wait), `rust_release.py`'s send wait, the script texts and their tests
 
 **Constraints from prior phases:** Phase 3 built the gate: the marker `failed/<session_id>.json` holds `fallback`, the restored hold's `source`, its identity (`review.hold_identity`) and the delivery machine; the gate allows when the push's `message` matches `fallback`, consumes the marker, then releases locally or over `ssh -o BatchMode=yes <machine> … review.py release --identity <id> -- <source>`; any gate error allows. Fix 1 released by source and deleted newer holds; fix 2 added the identity check but reads only `.json`. A claim is a stamped rename to `<id>.sending`; `due` takes over a claim older than 120 s.
 

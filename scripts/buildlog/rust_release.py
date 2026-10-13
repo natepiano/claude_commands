@@ -17,11 +17,16 @@ import urllib.request
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, BinaryIO, Literal, TypedDict, cast
 
 import store
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 import override_guard
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
+if TYPE_CHECKING:
+    from ..notify import review
+else:
+    import review
 
 CHANNEL_URL = "https://static.rust-lang.org/dist/channel-rust-stable.toml"
 HANA = Path.home() / "rust/hana"
@@ -163,7 +168,7 @@ def send_release_text(title: str, message: str) -> bool:
         ["python3", str(sender), "--to", "user", "--from", "rust_release", "--need", "decision",
          "--action", "In the natedev Claude session, reply upgrade or wait.",
          "--summary", title, "--text", message],
-        capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, timeout=review.user_send_seconds(), stdin=subprocess.DEVNULL,
     )
     return result.returncode == 0
 
@@ -413,13 +418,13 @@ def release_push_text(version: str, pin: str, trial: TrialOutcome) -> str:
         recommendation = f"Wait (recommended): Hana stays on {pin} until tested, so it avoids an untested compiler."
     elif trial["status"] == "failed":
         step = "Rust's code checker" if trial["step"] == "clippy" else trial["step"]
-        result = f"A test of Hana on {version} failed. {step}: {trial['reason'][:100]}."
+        result = f"Hana's test on {version} failed. Check: {step}. Cause: {trial['reason'][:100]}."
         recommendation = f"Wait (recommended): Hana stays on {pin}, so its builds do not move to a version that failed testing."
     else:
         errors = f"{trial['errors']} error" + ("" if trial["errors"] == 1 else "s")
-        result = (f"Compiler compatibility checks: Hana's code check found {errors} and {trial['warnings']} new warnings on {version}. "
-                  + f"A tool for repairing Rust builds {'compiled' if trial['mend_builds'] else 'failed to compile'} with {version}.")
-        recommendation = (f"Upgrade (recommended): Hana moves to {version}. Both checks passed, so nothing blocks the move."
+        result = (f"Hana's code check found {errors} and {trial['warnings']} new warnings on {version}. "
+                  + f"The tool that repairs Rust build errors {'compiled' if trial['mend_builds'] else 'failed to compile'} with {version}.")
+        recommendation = (f"Upgrade (recommended): Hana moves to {version}. Both code checks passed."
                           if not trial["errors"] and trial["mend_builds"] else
                           f"Wait (recommended): Hana stays on {pin}, so the failed check does not affect its builds.")
     other = (f"Wait: Hana stays on {pin}." if recommendation.startswith("Upgrade") else

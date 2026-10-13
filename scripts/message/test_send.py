@@ -21,6 +21,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import send
+import review
 import postmaster
 from test_postmaster import FakeClock
 import codex_daemon
@@ -1076,6 +1077,21 @@ class SendTests(ShutdownTestCase):
         self.assertEqual(send.pending("user"), "")
         self.assertEqual([entry["to"] for entry in self.log()], ["user", "user"])
 
+    def test_user_delivery_wait_uses_the_review_limit_locally_and_across_machines(self) -> None:
+        arguments = ["--to", "user", "--from", "script", "--summary", "Build choice",
+                     "--action", "Choose retry.", "--text", "The build stopped."]
+        with mock.patch.object(review, "review_timeout_seconds", return_value=90):
+            for extra, expected in (([], 115), (["--timeout", "5"], 115),
+                                    (["--timeout", "150"], 150), (["--machine", "natedev"], 155)):
+                with self.subTest(extra=extra), mock.patch.object(send, "run", return_value=(0, "SENT: to the user\n", "")) as run:
+                    self.assertEqual(send.send(local_options([*arguments, *extra])).outcome, "sent")
+                self.assertEqual(run.call_args.args[2], expected)
+                if "--machine" in extra:
+                    self.assertIn("--timeout 115", cast(list[str], run.call_args.args[0])[-1])
+            with mock.patch.object(send, "relay", return_value=send.Result("sent", "fake")) as relay:
+                _ = self.send("--text", "body")
+            self.assertEqual(relay.call_args.args[1], 40)
+
     def test_a_remote_send_to_the_user_carries_its_need(self) -> None:
         commands: list[list[str]] = []
 
@@ -1126,6 +1142,21 @@ class SendTests(ShutdownTestCase):
 
     def failure_marker(self) -> Path:
         return self.root / "notify/failed/writer-id.json"
+
+    def test_cancelled_user_revision_reports_replaced_locally_and_remotely_without_a_fallback(self) -> None:
+        self.writer_session()
+        reason = "a newer version replaced this push; nothing was sent"
+        for extra, code, reply, detail in (([], 5, "pushover: replaced: " + reason + "\n", reason),
+                                          (["--machine", "natedev"], 0, "REPLACED: " + reason + "\n",
+                                           "on natedev: " + reason)):
+            with (self.subTest(extra=extra), mock.patch.object(send, "run", return_value=(code, reply, "")),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(send.main([*([] if extra else ["--here"]), *self.user_arguments(*extra)]), 0)
+            self.assertEqual(output.getvalue(), "REPLACED: " + detail + "\n")
+            self.assertEqual(errors.getvalue(), "")
+            self.assertFalse(self.failure_marker().exists())
+            self.assertEqual(self.log()[-1]["outcome"], "replaced")
+        self.assertEqual(send.pending("user"), "")
 
     def test_only_a_named_session_without_from_is_answerable(self) -> None:
         self.writer_session()

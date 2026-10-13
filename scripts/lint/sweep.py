@@ -141,10 +141,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Literal, TypeGuard, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
+if TYPE_CHECKING:
+    from ..notify import review
 
 GIB = 1 << 30
 MIB = 1 << 20
@@ -1099,6 +1101,10 @@ def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
 
 def send_floor_alert(message: str, channels: FloorAlertChannels) -> bool:
     scripts = Path(__file__).resolve().parents[1]
+    if not TYPE_CHECKING:
+        # Imported here, so modules that only read sweep's config never load the reviewer.
+        sys.path.insert(0, str(scripts / "notify"))
+        import review
     commands = [
         ("message", [sys.executable, str(scripts / "message/send.py"), "--to", "natedev", "--from", "disk_floor", "--timeout", "30"]),
     ]
@@ -1113,7 +1119,8 @@ def send_floor_alert(message: str, channels: FloorAlertChannels) -> bool:
     delivered = False
     for channel, command in commands:
         try:
-            result = subprocess.run(command, input=message if channel == "message" else None, text=True, capture_output=True, timeout=40)
+            timeout = review.user_send_seconds() + 15 if channel == "phone" else 40
+            result = subprocess.run(command, input=message if channel == "message" else None, text=True, capture_output=True, timeout=timeout)
             if result.returncode == 0 or (channel == "message" and result.returncode == 1):
                 delivered = True
                 state = "queued" if result.returncode == 1 else "delivered"

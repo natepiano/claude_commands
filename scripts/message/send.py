@@ -51,6 +51,7 @@ message text as one JSON line in STATE/log.jsonl:
                  session answers to it, which the outcome says
   FAILED: why    not delivered and not kept: a Codex recipient,   exit 3
                  the user, or ssh to HOST
+  REPLACED: why  a newer version replaced this push; not sent     exit 0
   REFUSED: why   rejected before delivery; not kept              exit 2
   HELD: questions  revise within 5 minutes, or the best version sends  exit 4
 Usage errors, an unreadable --file and an empty message exit 2. STATE is $XDG_STATE_HOME/message, or ~/.local/state/message.
@@ -82,6 +83,7 @@ import sessions  # noqa: E402
 import postmaster  # noqa: E402
 import codex_daemon  # noqa: E402
 import roster  # noqa: E402
+import review  # noqa: E402
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
                          UserAction, NoActionRequired, first_line, parse_user_action)  # noqa: E402
 
@@ -99,10 +101,10 @@ PERMISSION_MODE = "auto"
 TIMEOUT = 40
 KILL_GRACE = 10
 
-Outcome = Literal["sent", "skipped", "queued", "failed", "refused", "held"]
+Outcome = Literal["sent", "skipped", "queued", "failed", "refused", "held", "replaced"]
 Need = Literal["note", "decision", "blocked"]
 CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "1", "blocked": "2"}
-EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2, "held": 4}
+EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2, "held": 4, "replaced": 0}
 
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str,
@@ -916,6 +918,8 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
     command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], "--source", message.sender,
                *(["--answerable"] if answerable else []), *action_arguments(action), message.summary, message.text]
     code, out, err = run(command, "", timeout)
+    if code == 5:
+        return Result("replaced", "a newer version replaced this push; nothing was sent")
     if code == 4:
         return Result("held", err.removesuffix("\n") or out.removesuffix("\n"))
     if code == 0:
@@ -950,7 +954,7 @@ def remote(message: Message, host: str, options: Options) -> Result:
     code, out, err = run(command, message.text, options.timeout + KILL_GRACE + 30)
     lines = out.removesuffix("\n").split("\n")
     headers = [(index, line.partition(": ")) for index, line in enumerate(lines)
-               if line.partition(": ")[0] in ("SENT", "HELD", "SKIPPED", "QUEUED", "FAILED", "REFUSED")]
+               if line.partition(": ")[0] in ("SENT", "HELD", "SKIPPED", "QUEUED", "FAILED", "REFUSED", "REPLACED")]
     if not headers:
         why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
         return Result("failed", f"ssh {host}: {why}")
@@ -1146,6 +1150,8 @@ def delivered_text(message: Message, entry_id: str) -> str:
 
 
 def send(options: Options) -> Result:
+    if options.to == USER:
+        options = options._replace(timeout=max(options.timeout, review.user_send_seconds()))
     text = body_text(options).rstrip("\n")
     if not text.strip():
         usage_error("the message is empty")
