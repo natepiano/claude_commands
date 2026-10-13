@@ -721,7 +721,7 @@ class MergeCheckpointTests(unittest.TestCase):
         merged_at = review[0][review[0].index("--merged") + 1]
         self.assertRegex(merged_at, r"^\d{4}-\d\d-\d\dT")
         self.assertEqual(review[0], [
-            "add", "--unit", "alpha-unit", "--phase", "2", "--regime", "trial",
+            "add", "--unit", "alpha-unit", "--plan", "docs/plans/alpha.md", "--phase", "2", "--regime", "trial",
             "--started", STARTED, "--merged", merged_at, "--holds", "2",
             "--merge-defects", "1", "--ux-findings", "2", "--code-findings", "3",
             "--review-minutes", "14", "--ux-check-minutes", "4",
