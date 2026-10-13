@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from user_zone import user_zone_name  # noqa: E402
+
 if TYPE_CHECKING:
     from showrunners import Place
 
@@ -26,7 +29,6 @@ REASON_HEAD = ("Showrunner footer missing or out of date. End this reply with th
                "then two empty lines, `Waiting on:`, an empty line, and one `* ` bullet per item. A question for the user "
                "is never restated there; while any is open, the first bullet is its count, as below:")
 STATUS = re.compile(r"Status: PRODUCTION — ([a-z]*)")
-ZONE_MARKER = "- **User zone:**"
 TIME_LINE = re.compile(r"^(\d{2}):(\d{2}) (\S+) update:$")
 RENDER_TIMEOUT_SECONDS = 10
 TIME = r"(?:[01]\d|2[0-3]):[0-5]\d(?:\+1)?"
@@ -152,14 +154,8 @@ def read_production(instance_dir: Path) -> Production | None:
         status = next((match.group(1) for line in lines if (match := STATUS.search(line))), None)
         if status != "running":
             return None
-        zone_line = next((line for line in lines if line.startswith(ZONE_MARKER)), None)
-        if zone_line is None:
-            return None
-        zone_words = zone_line[len(ZONE_MARKER):].strip().split()
-        if not zone_words:
-            return None
-        zone = zone_words[0].strip("`")
-        _ = ZoneInfo(zone)
+        # The user's zone setting; the doc's own User zone line is no longer read.
+        zone = user_zone_name()
         try:
             state = key_values(instance_dir / "state")
         except OSError:

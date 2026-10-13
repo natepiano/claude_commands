@@ -25,7 +25,7 @@ phase_table.py archive --production-doc <doc>
 progress_history.py eta --session-dir <dir> --time <YYYY-MM-DDTHH:MM> [--earliest <YYYY-MM-DDTHH:MM> --latest <YYYY-MM-DDTHH:MM>] --basis <text>
 ```
 
-`show` takes exactly one of `--session-dir` and `--production-doc`. With `--session-dir` it prints Markdown, or JSON under `--json`, in `--zone`; the default zone is the user's zone setting (`scripts/lib/user_zone.py`). With `--production-doc` it always prints JSON in the production doc's **User zone**. `NoState`, `NoPlan`, a `Refusal` or an unknown zone prints one line on stderr and exits 1.
+`show` takes exactly one of `--session-dir` and `--production-doc`. With `--session-dir` it prints Markdown, or JSON under `--json`, in `--zone`; the default zone is the user's zone setting (`scripts/lib/user_zone.py`). With `--production-doc` it always prints JSON in the user's zone setting. `NoState`, `NoPlan`, a `Refusal` or an unknown zone prints one line on stderr and exits 1.
 
 ### The record
 
@@ -119,7 +119,7 @@ phases[]     {phase, title, status: "done" | "running" | "todo", start, finish, 
 - **`eta`.** Reads its times in the process `TZ`, or in the user's zone setting when `TZ` is unset, requires an active phase, appends one `eta_stated` event through `_append_event`, runs the hook, and prints `ETA recorded: <HH:MM zone>`. Beside the fields every event carries, the event holds `eta_at`, `basis` (stripped) and, with a range, `eta_earliest_at` and `eta_latest_at`, all times as epochs. It exits 2 with one stderr line for a malformed time, a time in the past, a time inside the hour the local clock skips, `--earliest` after `--time`, `--latest` before it, one range end alone, a blank `--basis`, or no active phase.
 - **Hook.** `_refresh_phase_table(session_dir)` is the last act of `_start_phase`, `_progress`, `_finish_phase` and `_finish_run`, and follows the append in `_eta`. It returns at once unless the state's plan file contains `> **Production:`. Otherwise it runs `phase_table.py refresh` beside it under `sys.executable`, with a 10 s timeout and stdout discarded. A non-zero exit, a timeout or an `OSError` prints one stderr line, `phase table not written: <reason>`.
 - **Public readers.** `plan_phases`, `plan_runs`, `eta_band_seconds(percent, elapsed, spread) -> EtaBand | EtaProjectionUnavailable` (`EtaBand`: `remaining`, `earliest`, `latest`, in seconds), `percent_spread`, `now_epoch` and `resolve_plan_path`.
-- **Command files.** `commands/unit/report.md` step 5 says the `progress` call rewrites the note and that a requested table is `phase_table.py show --session-dir "${SESSION_DIR}" --zone <User zone>`. `commands/unit/eta.md` records the ETA, range and basis before the answer is sent, as `TZ=<User zone> python3 ~/.claude/scripts/delegate/progress_history.py eta …`. `commands/unit/eta_breakdown.md` runs the same command, with the bullets' last end time and no range, when the breakdown moves the ETA.
+- **Command files.** `commands/unit/report.md` step 5 says the `progress` call rewrites the note and that a requested table is `phase_table.py show --session-dir "${SESSION_DIR}"`. `commands/unit/eta.md` records the ETA, range and basis before the answer is sent, as `python3 ~/.claude/scripts/delegate/progress_history.py eta …`. `commands/unit/eta_breakdown.md` runs the same command, with the bullets' last end time and no range, when the breakdown moves the ETA.
 
 ### Dailies side
 
@@ -169,7 +169,7 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - A note is moved, replaced or removed only when its frontmatter carries `phase_table: true`, a `production` and a `unit`. A hand-written file is never changed.
 - `_json_record` is the only JSON form, and nothing stores it. The first stated target has one place in it: `current.first_stated_eta_target`.
 - A state is a named type, never an optional field or a placeholder `datetime`.
-- Every time in a note and in the production JSON is in the production doc's **User zone**.
+- Every time in a note and in the production JSON is in the user's zone setting.
 - In the dailies a judgment value always wins, and a judgment `time` or `none` decides the ETA entirely.
 - A phase-table failure in the dailies reads `unavailable`, never `failed`: `dailies.md` stops the report on a `<step>: failed` line.
 - The dailies builder fits the renderer. `scripts/production/dailies_render.py` is not changed to suit a record.

@@ -117,7 +117,7 @@ The user, 2026-10-12: "Let's trial post master to see if it works". Scope is sec
 
 **Ruled out:** `$.clock.every` for the poll — not measured live; `setInterval` was.
 
-### Phase 3 — The mod delivers outbox entries and writes a result for each  · status: todo
+### Phase 3 — The mod delivers outbox entries and writes a result for each  · status: done
 
 #### Work Order
 
