@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import re
+import select
 import signal
 import subprocess
 import tempfile
@@ -192,6 +193,53 @@ class BuildScopeTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(list(root.glob("*.peak.cgroup")), [])
+
+
+class SweepStartupTests(unittest.TestCase):
+    def sweep_events(self, switch: str) -> str:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reader, writer = os.pipe()
+            process = subprocess.Popen(
+                ["bash", "-c", 'source "$1"; invoke_sweep() { printf "started\\n" >&"$SWEEP_TEST_FD"; }; sweep_after_step test-step',
+                 "sweep-test", str(INVOKE)],
+                cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                pass_fds=(writer,),
+                env={**os.environ, "HOME": directory, "TMPDIR": directory,
+                     "XDG_RUNTIME_DIR": str(root / "runtime"), "LINT_INVOKE_SOURCED": "",
+                     "LINT_CONFIG_READER": str(root / "missing-config"), "LINT_SKIP_SWEEP": switch,
+                     "SWEEP_TEST_FD": str(writer)},
+            )
+            os.close(writer)
+            try:
+                output, errors = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, output + errors)
+                events = b""
+                deadline = time.monotonic() + 10
+                while True:
+                    ready, _, _ = select.select([reader], [], [], max(0, deadline - time.monotonic()))
+                    self.assertTrue(ready, "sweep stand-in still holds its pipe")
+                    chunk = os.read(reader, 4096)
+                    if not chunk:
+                        break
+                    events += chunk
+                if switch == "1":
+                    self.assertFalse((root / "runtime" / "lint-sweep").exists())
+                return events.decode()
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    _ = process.communicate(timeout=5)
+                os.close(reader)
+
+    def test_offload_switch_starts_no_detached_sweep(self) -> None:
+        self.assertEqual(self.sweep_events("1"), "")
+
+    def test_without_offload_switch_the_detached_sweep_still_starts(self) -> None:
+        self.assertEqual(self.sweep_events(""), "started\n")
+
+    def test_switch_set_to_zero_keeps_detached_sweep_enabled(self) -> None:
+        self.assertEqual(self.sweep_events("0"), "started\n")
 
 
 class BuildAdmissionTests(unittest.TestCase):

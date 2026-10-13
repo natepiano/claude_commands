@@ -24,7 +24,7 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 
 ### Report layout
 
-`report(connection, day)` emits, in order:
+`report(connection, day)` emits, in order. Every step-based number counts natedev's steps only (`host = 'natedev'`, `mac_outcome.natedev_step_predicate`); the Mac's steps appear only in `### Mac`.
 
 1. `## Builds, <Weekday YYYY-MM-DD>`
 2. `### Waiting` (build-folder turns behind another seat and behind its own call, memory admission, CI queue; see `docs/as-built/build-memory-admission.md`)
@@ -33,6 +33,7 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 5. `### Memory pressure`, always present: memory waits, the sccache, unsliced-step and memory-kill lines, the stall table and the sample line (`docs/as-built/buildlog-memory-stalls.md`, `docs/as-built/build-memory-admission.md`)
 6. `### Agent calls (verify.sh)`
 7. `### Test builds (temporary)`, only on a day with a measured `verify.sh test` call
+   - `Tests by target`, on a day with test calls, then `### Mac`: the Mac's steps by caller and kind, or `No steps recorded on the Mac.` (`docs/as-built/mac-test-offload.md`, "Build log and report")
 8. `### cargo-port calls (port-lint)`
 9. `### CI`
 10. `### Tests per edit` (`docs/as-built/buildlog-tests-per-edit-rust-release.md`)
@@ -134,7 +135,7 @@ def measure(folders: list[tuple[str, str]], usage: Callable[[], FilesystemUsage]
 Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-linked file once.
 ```
 
-`other` is used minus the sum of the rows, clamped at zero. The free label is plain `free` when the floor is None. The time goes through `sync_time`, which adds the date when it is not today.
+`other` is used minus the sum of the rows, clamped at zero. The free label is `free` alone when the floor is None. The time goes through `sync_time`, which adds the date when it is not today.
 
 ### Test log isolation
 
