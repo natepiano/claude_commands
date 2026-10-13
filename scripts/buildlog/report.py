@@ -17,6 +17,7 @@ from typing import cast
 
 import ci
 import holds
+import index
 import disk
 import memory
 import sync
@@ -26,6 +27,7 @@ from mac_outcome import (
     CacheReuse,
     DurationNotRecorded,
     LocalRunRequested,
+    MAC_STEP_CALLER,
     MacRunCompleted,
     MacRunLost,
     MacRunMatchedNoTest,
@@ -745,13 +747,15 @@ def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int
     waits = fetch(
         connection,
         "SELECT count(*), sum(mem_wait_s), max(mem_wait_s) FROM steps"
-        + " WHERE date(started_at, 'localtime') = ? AND mem_wait_s > 0",
+        + " WHERE date(started_at, 'localtime') = ? AND mem_wait_s > 0"
+        + f" AND {natedev_step_predicate()}",
         day,
     )[0]
     longest = fetch(
         connection,
         f"SELECT {SCRATCH} AS is_scratch, caller, host FROM steps"
         + " WHERE date(started_at, 'localtime') = ? AND mem_wait_s > 0"
+        + f" AND {natedev_step_predicate()}"
         + " ORDER BY mem_wait_s DESC LIMIT 1",
         day,
     )
@@ -759,8 +763,10 @@ def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int
         connection,
         f"SELECT {SCRATCH} AS is_scratch, s.step, s.caller, s.host, s.mem_stall_some_s,"
         + " (SELECT count(*) FROM steps other WHERE other.host = s.host"
-        + " AND other.started_at <= s.started_at AND s.started_at < other.ended_at)"
+        + " AND other.started_at <= s.started_at AND s.started_at < other.ended_at"
+        + f" AND {natedev_step_predicate('other')})"
         + " FROM steps s WHERE date(s.started_at, 'localtime') = ? AND s.mem_stall_some_s > 0"
+        + f" AND {natedev_step_predicate('s')}"
         + " ORDER BY s.mem_stall_some_s DESC LIMIT 5",
         day,
     )
@@ -771,7 +777,8 @@ def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int
         + " FROM samples WHERE date(at, 'localtime') = ? ORDER BY host, at",
         day,
     )
-    instruments = memory.instrument_lines(connection, "date({column}, 'localtime') = ?", (day,))
+    instrument_predicate = "date({column}, 'localtime') = ? AND " + natedev_step_predicate().removeprefix("steps.")
+    instruments = memory.instrument_lines(connection, instrument_predicate, (day,))
     section = ["### Memory pressure", "", "Source: 60 s machine samples and step cgroup stall counters.", ""]
     if longest:
         is_scratch, caller, host = longest[0]
@@ -991,6 +998,44 @@ def matched_local_failures(
 
 def median_duration(values: Sequence[float]) -> float:
     return nearest_rank(values, 50) if values else 0.0
+
+
+def mac_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    """Steps recorded on Mac hosts, including calls started there directly."""
+    start, end = day_range(day)
+    rows = fetch(
+        connection,
+        f"SELECT caller, step, count(*), sum({index.COUNTED_FAILURE}),"
+        + " avg(duration_s), min(duration_s), max(duration_s), group_concat(duration_s),"
+        + " avg(finished_s), sum(tests_run), sum(tests_failed), sum(duration_s)"
+        + " FROM steps WHERE started_at >= ? AND started_at < ? AND host <> 'natedev'"
+        + " GROUP BY caller, step ORDER BY count(*) DESC, caller, step",
+        start, end,
+    )
+    if not rows:
+        return ["### Mac", "", "No steps recorded on the Mac.", ""]
+    body = [
+        [
+            "verify.sh offload" if row[0] == MAC_STEP_CALLER else caller_label(row[0], "", 1),
+            str(row[1]),
+            *common(row[2:8]),
+            seconds(row[8]) or "—",
+            count(row[9]) or "—",
+            count(row[10]) or "—",
+        ]
+        for row in rows
+    ]
+    mac_table = table(["Caller", "Kind", *COMMON_HEAD, "Build", "Tests", "Tests failed"], body)
+    mac_table[1] = "|---|---|--:|--:|--:|--:|--:|--:|--:|--:|"
+    runs = sum(cast(int, row[2]) for row in rows)
+    failed = sum(cast(int, row[3] or 0) for row in rows)
+    duration = sum(cast(float, row[11] or 0) for row in rows)
+    return [
+        "### Mac", "", *mac_table,
+        f"Mac total: {runs} steps, {seconds(duration)}; {failed} failed.",
+        "Source: steps recorded on the Mac; failed follows the build log's failure rule, so a Mac nextest that matched no tests is not a failure.",
+        "",
+    ]
 
 
 def mac_tests_section(connection: sqlite3.Connection, day: str) -> list[str]:
@@ -1509,6 +1554,7 @@ def report(connection: sqlite3.Connection, day: str) -> str:
         calls
         + test_builds_section(connection, day)
         + tests_by_target_lines(test_calls)
+        + mac_section(connection, day)
         + port_lint
         + ci
         + tests_per_edit_section(connection, day)
