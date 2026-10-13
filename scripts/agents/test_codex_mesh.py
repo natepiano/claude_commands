@@ -3908,6 +3908,357 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(self.seat_record()["thread_id"], THREAD_ID)
         self.assertEqual(agent_accounts.seats_home(), target)
 
+    def prepare_post_turn_home_change(
+        self, messages: tuple[str, ...], *, late: bool = False,
+    ) -> tuple[StubAppServer, Callable[[], None], Callable[[], None]]:
+        """Keep the old writer loaded while selecting a different fake server."""
+        target, new = self.prepare_seats_move()
+        selected_home = [target.parent / ".codex"]
+        loaded = [True]
+        changed = [False]
+        _ = self.patches.enter_context(patch.object(codex_mesh, "seats_home", side_effect=lambda: selected_home[0]))
+        _ = self.patches.enter_context(patch.object(agent_accounts, "seats_home", side_effect=lambda: selected_home[0]))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "_stop_unused", return_value=False))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "_stop_unused_with_lock_held", return_value=False))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", 0.03))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "UNSEEN_END_CHECK_SECS", 0.02))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "RESIDENT_POLL_SECS", 0.02))
+        respond = self.server.respond
+
+        def old(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/loaded/list":
+                return [_reply(request, {"data": [THREAD_ID] if loaded[0] else [], "nextCursor": None})]
+            if request.get("method") == "thread/unsubscribe":
+                return [_reply(request, {})]
+            frames = respond(request)
+            if request.get("method") == "turn/start" and frames is not None:
+                frames.insert(-1, _notice("item/completed", {
+                    "threadId": THREAD_ID,
+                    "item": {"type": "agentMessage", "text": "phase 13 turn answer"},
+                }))
+            return frames
+
+        self.server.respond = old
+
+        def change_home_and_park() -> None:
+            if changed[0]:
+                return
+            changed[0] = True
+            selected_home[0] = target
+            for message in messages:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(codex_mesh.command_send(argparse.Namespace(
+                        session_dir=str(self.session_dir), to="seat", message=message, message_file="",
+                    )), 0)
+
+        read = codex_mesh.Client.next_frame
+
+        def frame(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            notice = read(client, deadline)
+            if not late and notice is not None and notice.get("method") in ("turn/completed", "turn/failed", "item/completed"):
+                if notice.get("method") != "item/completed" or _as_test_dict(_as_test_dict(notice.get("params")).get("item")).get("type") == "agentMessage":
+                    change_home_and_park()
+            return notice
+
+        _ = self.patches.enter_context(patch.object(codex_mesh.Client, "next_frame", frame))
+
+        def release_old_writer() -> None:
+            loaded[0] = False
+
+        return new, change_home_and_park, release_old_writer
+
+    def assert_post_turn_messages_held(
+        self, new: StubAppServer, messages: tuple[str, ...], board: MagicMock,
+    ) -> None:
+        pending = cast(codex_mesh.SeatPendingMessages, json.loads(
+            (self.session_dir / "seat.pending.json").read_text(encoding="utf-8")))
+        self.assertEqual(pending["thread_id"], THREAD_ID)
+        self.assertEqual(pending["messages"], list(messages))
+        self.assertIs(pending["accepting_messages"], False)
+        count = "1 message" if len(messages) == 1 else f"{len(messages)} messages"
+        board.assert_called_once()
+        board_message = cast(str, board.call_args.args[2])
+        prefix = f"launcher: {count} held for the next launch: "
+        self.assertTrue(board_message.startswith(prefix), board_message)
+        reason = board_message[len(prefix):]
+        self.assertIn("old server has not released the thread", reason)
+        log = (self.session_dir / "seat.log").read_text(encoding="utf-8")
+        self.assertEqual(log.count(f"mesh: seat cannot move: {reason}; {count} held for the next launch"), 1)
+        self.assertFalse(any(request.get("method") in ("thread/resume", "thread/start", "turn/start") for request in new.requests))
+        self.assertEqual(len(self.methods("thread/unsubscribe")), 1, "a held launch must not attempt a second move")
+
+    def test_completed_follow_holds_one_message_and_finishes_done_after_home_change(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        self.server.requests.clear()
+        new, _change, _release = self.prepare_post_turn_home_change(("parked peer message",))
+        with patch.object(codex_mesh, "_post_board_status") as board, patch.object(codex_mesh, "_more_work_coming") as more:
+            code, errors = self.run_follow()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertEqual((self.session_dir / "summary.txt").read_text().strip(), "phase 13 turn answer")
+        self.assert_post_turn_messages_held(new, ("parked peer message",), board)
+        more.assert_not_called()
+
+    def test_hold_closes_inbox_and_keeps_matching_messages_under_one_lock(self) -> None:
+        pending = self.session_dir / "seat.pending.json"
+        for stored_thread, messages, kept in (
+            (THREAD_ID, ["first message", "second message"], 2),
+            (THREAD_ID, [], 0),
+            ("previous-thread", ["old thread message"], 0),
+        ):
+            with self.subTest(thread=stored_thread, messages=messages):
+                _ = pending.write_text(json.dumps({
+                    "thread_id": stored_thread, "messages": messages, "accepting_messages": True,
+                }))
+                with patch.object(codex_mesh, "_pending_file", wraps=codex_mesh._pending_file) as lock, patch.object(codex_mesh, "_write_pending", wraps=codex_mesh._write_pending) as write:  # pyright: ignore[reportPrivateUsage]
+                    count = codex_mesh._close_messages_and_keep_pending(str(self.session_dir), "seat", THREAD_ID)  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(count, kept)
+                lock.assert_called_once_with(str(self.session_dir), "seat")
+                write.assert_called_once()
+                self.assertEqual(cast(dict[str, object], json.loads(pending.read_text())), {
+                    "thread_id": THREAD_ID, "messages": messages if kept else [], "accepting_messages": False,
+                })
+
+    def test_completed_start_holds_two_messages_with_plural_wording_and_finishes_done(self) -> None:
+        messages = ("first peer message", "second peer message")
+        new, _change, _release = self.prepare_post_turn_home_change(messages)
+        with patch.object(codex_mesh, "_post_board_status") as board, patch.object(codex_mesh, "_more_work_coming") as more:
+            code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertEqual((self.session_dir / "summary.txt").read_text().strip(), "phase 13 turn answer")
+        self.assert_post_turn_messages_held(new, messages, board)
+        more.assert_not_called()
+
+    def test_message_arriving_at_inbox_close_is_held_after_unconfirmed_move(self) -> None:
+        new, change, _release = self.prepare_post_turn_home_change(("late peer message",), late=True)
+
+        def last_check(_client: codex_mesh.Client, _thread: str, _deadline: float) -> bool:
+            change()
+            return False
+
+        with patch.object(codex_mesh, "_post_board_status") as board, patch.object(codex_mesh, "_more_work_coming", side_effect=last_check) as more:
+            code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assert_post_turn_messages_held(new, ("late peer message",), board)
+        more.assert_called_once()
+
+    def test_ended_unseen_answer_holds_parked_message_and_finishes_done(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        self.server.requests.clear()
+        self.outcomes = ["answered_without_completion"]
+        new, _change, _release = self.prepare_post_turn_home_change(("unseen peer message",))
+        with patch.object(codex_mesh, "_post_board_status") as board, patch.object(codex_mesh, "_more_work_coming") as more:
+            code, errors = self.run_follow()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertEqual((self.session_dir / "summary.txt").read_text().strip(), "late answer")
+        self.assert_post_turn_messages_held(new, ("unseen peer message",), board)
+        more.assert_not_called()
+
+    def test_ended_unseen_without_answer_keeps_its_failure_while_holding_message(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        self.server.requests.clear()
+        self.outcomes = ["earlier_only"]
+        new, change, _release = self.prepare_post_turn_home_change(("unanswered peer message",), late=True)
+        respond = self.server.respond
+
+        def no_answer(request: dict[str, object]) -> list[dict[str, object]] | None:
+            frames = respond(request)
+            if request.get("method") == "turn/start" and frames is not None:
+                return [frame for frame in frames if _as_test_dict(_as_test_dict(frame.get("params")).get("item")).get("type") != "agentMessage"]
+            return frames
+
+        self.server.respond = no_answer
+        ended = codex_mesh._ended_unseen  # pyright: ignore[reportPrivateUsage]
+
+        def check(client: codex_mesh.Client, thread: str) -> bool:
+            change()
+            return ended(client, thread)
+
+        with patch.object(codex_mesh, "_post_board_status") as board, patch.object(codex_mesh, "_ended_unseen", side_effect=check):
+            code, errors = self.run_follow()
+        self.assertEqual(code, 1)
+        self.assertIn("the thread went idle with no completion notice and no answer", errors)
+        self.assertNotIn("state unknown", errors)
+        self.assertEqual(self.seat_record()["status"], "failed")
+        self.assert_post_turn_messages_held(new, ("unanswered peer message",), board)
+
+    def test_failed_follow_holds_messages_and_exits_with_its_own_failure_detail(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        self.server.requests.clear()
+        self.outcomes = ["failed"]
+        new, _change, _release = self.prepare_post_turn_home_change(("failure peer message",))
+        with patch.object(codex_mesh, "_post_board_status") as board:
+            code, errors = self.run_follow()
+        self.assertEqual(code, 1)
+        self.assertIn("ordinary failure", errors)
+        self.assertNotIn("state unknown", errors)
+        self.assertEqual(self.seat_record()["status"], "failed")
+        self.assert_post_turn_messages_held(new, ("failure peer message",), board)
+
+    def test_follow_after_hold_submits_prompt_then_held_messages_once_and_empties_inbox(self) -> None:
+        messages = ("first held message", "second held message")
+        new, _change, release = self.prepare_post_turn_home_change(messages)
+        with patch.object(codex_mesh, "_post_board_status"):
+            self.assertEqual(self.run_start(), (0, ""))
+        release()
+        code, errors = self.run_follow("next launch prompt")
+        self.assertEqual((code, errors), (0, ""))
+        starts = [request for request in new.requests if request.get("method") == "turn/start"]
+        self.assertEqual(len(starts), 1)
+        inputs = cast(list[dict[str, object]], _as_test_dict(starts[0].get("params"))["input"])
+        self.assertEqual([item["text"] for item in inputs], ["next launch prompt", *messages])
+        pending = cast(codex_mesh.SeatPendingMessages, json.loads((self.session_dir / "seat.pending.json").read_text()))
+        self.assertEqual(pending["messages"], [])
+        self.assertIs(pending["accepting_messages"], False)
+        self.assertEqual(self.seat_record()["status"], "done")
+
+    def assert_accepted_target_turn_write_failure(self, write_site: str) -> None:
+        message = "peer message accepted by target"
+        new, _change, release = self.prepare_post_turn_home_change((message,))
+        release()
+        self.assertNotEqual(self.server.port, new.port)
+        failed = [False]
+        closed_ports: list[int] = []
+        write_pending = codex_mesh._write_pending  # pyright: ignore[reportPrivateUsage]
+        update_roster = codex_mesh._update_roster  # pyright: ignore[reportPrivateUsage]
+        close = codex_mesh.Client.close
+        detail = f"local {write_site} write failed after target accepted turn"
+
+        def target_accepted() -> bool:
+            return any(request.get("method") == "turn/start" for request in new.requests)
+
+        def pending(handle: TextIO, thread: str, messages: list[str], *, accepting_messages: bool = True) -> None:
+            if write_site == "pending" and target_accepted() and not failed[0]:
+                self.assertEqual(messages, [])
+                failed[0] = True
+                raise OSError(detail)
+            write_pending(handle, thread, messages, accepting_messages=accepting_messages)
+
+        def roster(session: str, name: str, fields: codex_mesh.ThreadRecord) -> None:
+            if (write_site == "roster" and target_accepted() and not failed[0]
+                    and fields.get("status") == "running" and fields.get("port") == new.port):
+                failed[0] = True
+                raise OSError(detail)
+            update_roster(session, name, fields)
+
+        def closed(client: codex_mesh.Client) -> None:
+            closed_ports.append(client.port)
+            close(client)
+
+        with (
+            patch.object(codex_mesh, "_write_pending", side_effect=pending),
+            patch.object(codex_mesh, "_update_roster", side_effect=roster),
+            patch.object(codex_mesh.Client, "close", closed),
+            patch.object(codex_mesh, "_close_messages_and_keep_pending") as hold,
+            patch.object(codex_mesh, "_post_board_status") as board,
+            patch.object(codex_mesh, "_end_unwatched_turn", return_value=codex_mesh.RelaunchAllowed()) as cleanup,
+        ):
+            code, errors = self.run_start()
+        self.assertTrue(failed[0], "the injected failure must follow target turn acceptance")
+        self.assertEqual(code, 1)
+        self.assertIn(f"state unknown ({detail})", errors)
+        self.assertEqual(self.seat_record()["status"], "failed")
+        cleanup.assert_called_once_with(new.port, THREAD_ID, self.session_dir / "seat.log")
+        self.assertIn(new.port, closed_ports, "the failed move must close its target client")
+        hold.assert_not_called()
+        board.assert_not_called()
+        self.assertNotIn("held for the next launch", (self.session_dir / "seat.log").read_text())
+        self.assertEqual(len(self.methods("turn/start")), 1)
+        starts = [request for request in new.requests if request.get("method") == "turn/start"]
+        self.assertEqual(len(starts), 1)
+        inputs = cast(list[dict[str, object]], _as_test_dict(starts[0].get("params"))["input"])
+        self.assertEqual([item["text"] for item in inputs], [message])
+        if write_site == "roster":
+            stored = cast(codex_mesh.SeatPendingMessages, json.loads((self.session_dir / "seat.pending.json").read_text()))
+            self.assertEqual(stored["messages"], [])
+            client = codex_mesh.Client(new.port, "seat")
+            try:
+                with patch.object(codex_mesh, "_update_roster", side_effect=OSError("idle roster write failed")):
+                    result = codex_mesh._move_resident(self.start_args(), str(self.session_dir), "seat", THREAD_ID, client)  # pyright: ignore[reportPrivateUsage]
+            finally:
+                client.close()
+            self.assertIsInstance(result, codex_mesh.SeatThreadStateUnknown)
+            assert isinstance(result, codex_mesh.SeatThreadStateUnknown)
+            self.assertIsInstance(result.cleanup, codex_mesh.NoSeatTurnToCleanUp)
+            self.assertEqual(result.reason, "idle roster write failed")
+            self.assertEqual(len([request for request in new.requests if request.get("method") == "turn/start"]), 1)
+
+    def test_accepted_target_turn_pending_write_failure_fails_and_cleans_distinct_target(self) -> None:
+        self.assert_accepted_target_turn_write_failure("pending")
+
+    def test_accepted_target_turn_roster_write_failure_fails_and_cleans_distinct_target(self) -> None:
+        self.assert_accepted_target_turn_write_failure("roster")
+
+    def test_completed_turn_with_seat_ended_before_move_leaves_pending_untouched_and_reports_no_hold(self) -> None:
+        new, _change, _release = self.prepare_post_turn_home_change(("message for ended seat",))
+        read = codex_mesh.Client.next_frame
+        pending_path = self.session_dir / "seat.pending.json"
+        saved_pending = [""]
+        writes_after_end: list[str] = []
+        write_pending = codex_mesh._write_pending  # pyright: ignore[reportPrivateUsage]
+
+        def frame(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            notice = read(client, deadline)
+            if notice is not None and notice.get("method") == "turn/completed":
+                saved_pending[0] = pending_path.read_text()
+                _ = (self.session_dir / "seat.end").write_text("end")
+            return notice
+
+        def pending(handle: TextIO, thread: str, messages: list[str], *, accepting_messages: bool = True) -> None:
+            if (self.session_dir / "seat.end").exists():
+                writes_after_end.append(thread)
+            write_pending(handle, thread, messages, accepting_messages=accepting_messages)
+
+        with (
+            patch.object(codex_mesh.Client, "next_frame", frame),
+            patch.object(codex_mesh, "_write_pending", side_effect=pending),
+            patch.object(codex_mesh, "_post_board_status") as board,
+        ):
+            code, errors = self.run_start()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.seat_record()["status"], "done")
+        self.assertEqual((self.session_dir / "summary.txt").read_text().strip(), "phase 13 turn answer")
+        self.assertTrue(saved_pending[0], "the seat must end after its message is parked")
+        self.assertEqual(writes_after_end, [])
+        self.assertEqual(pending_path.read_text(), saved_pending[0])
+        board.assert_not_called()
+        self.assertNotIn("held for the next launch", (self.session_dir / "seat.log").read_text())
+        self.assertFalse(any(request.get("method") in ("thread/resume", "thread/start", "turn/start") for request in new.requests))
+
+    def test_resident_delivered_reply_waits_for_old_writer_and_moves_on_later_tick(self) -> None:
+        new, _change, release = self.prepare_post_turn_home_change(())
+        args = self.start_args()
+        args.resident = True
+        delivered = codex_mesh._deliver_reply  # pyright: ignore[reportPrivateUsage]
+        move = codex_mesh._move_resident  # pyright: ignore[reportPrivateUsage]
+        attempts = [0]
+
+        def retry(args: argparse.Namespace, session: str, name: str, thread: str, client: codex_mesh.Client, *, message: str = "") -> codex_mesh.SeatMoveResult:
+            if self.turn_starts:
+                attempts[0] += 1
+            if attempts[0] == 3:
+                release()
+            result = move(args, session, name, thread, client, message=message)
+            if isinstance(result, codex_mesh.MovedSeat) and result.port == new.port:
+                _ = (self.session_dir / "seat.end").write_text("end")
+            return result
+
+        with patch.object(codex_mesh, "_move_resident", side_effect=retry), patch.object(codex_mesh, "_deliver_reply", wraps=delivered) as replies, contextlib.redirect_stdout(io.StringIO()):
+            outcome = codex_mesh._run_delegate(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(outcome, codex_mesh.RunCompleted)
+        replies.assert_called_once()
+        self.assertEqual(attempts[0], 3)
+        log = (self.session_dir / "seat.log").read_text()
+        self.assertEqual(log.count("; waiting"), 2)
+        self.assertIn("old server has not released the thread", log)
+        self.assertEqual(len([request for request in new.requests if request.get("method") == "thread/resume"]), 1)
+        self.assertFalse(any(request.get("method") in ("thread/start", "turn/start") for request in new.requests))
+        self.assertEqual(self.turn_starts, 1)
+        self.assertEqual(self.seat_record()["status"], "done")
+
     def test_move_failure_after_thread_replacement_retains_target_cleanup(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         _target, new = self.prepare_seats_move()

@@ -1,6 +1,6 @@
 # Two accounts: showrunners on one Claude account, unit directors on another
 
-> **Status: IMPLEMENTATION PLAN — phases 1–6 are done; the cutover (Phase 7) moved all ten build-followups unit directors to claude 3 on 2026-10-11, with the spare dir and the cross-machine message check still open; Phase 8 (move any one session) waits on the user's go; Phases 10–12 add the Codex accounts: a home per account, one account for all seats with a swap, and alerts per account.** Phases 1–5 built everything and initiated nothing: no account dir, no login, no role. Phase 6 proved `~/.claude3` live. The design: each account the user has gets its own config dir, `~/.claude1`, `~/.claude2` and `~/.claude3`. Each holds only that account's login, and everything else is a symlink into `~/.claude`. Unit directors launch with `CLAUDE_CONFIG_DIR` set to the unit account's dir. Showrunners and every other session stay on `~/.claude`'s own login, as today. When the unit account runs low, one command swaps every unit onto a spare account through `/shutdown`'s safe stop and resume. Any one session, a showrunner included, moves to any account the same way with `/showrunner:accounts move` (Phase 8). Phased, delegate-ready once approved.
+> **Status: IMPLEMENTATION PLAN — phases 1–6 are done; the cutover (Phase 7) moved all ten build-followups unit directors to claude 3 on 2026-10-11, with the spare dir and the cross-machine message check still open; Phase 8 (move any one session) waits on the user's go; Phases 10–12 add the Codex accounts: a home per account, one account for all seats with a swap, and alerts per account; Phase 13 repairs a seat launch that finished its turn while the seats account changed.** Phases 1–5 built everything and initiated nothing: no account dir, no login, no role. Phase 6 proved `~/.claude3` live. The design: each account the user has gets its own config dir, `~/.claude1`, `~/.claude2` and `~/.claude3`. Each holds only that account's login, and everything else is a symlink into `~/.claude`. Unit directors launch with `CLAUDE_CONFIG_DIR` set to the unit account's dir. Showrunners and every other session stay on `~/.claude`'s own login, as today. When the unit account runs low, one command swaps every unit onto a spare account through `/shutdown`'s safe stop and resume. Any one session, a showrunner included, moves to any account the same way with `/showrunner:accounts move` (Phase 8). Phased, delegate-ready once approved.
 
 > **As-built disposition: create**
 
@@ -586,3 +586,48 @@ Recommend whether any change is needed. The nightly review already moved to the 
 - Retrying a failed restore from `switch_back`.
 - Moving seats to another Codex account automatically when Codex refuses work, because every swap stays the user's call.
 - The Mac.
+
+### Phase 13 — A launch that finished its turn ends as done across a seats change  · status: done
+
+#### Work Order
+
+**Goal:** a seat launch whose own turn completed ends as done when the seats account changed during that turn, and its parked messages wait for the seat's next launch.
+
+**Spec:**
+Found live 2026-10-12 20:26 EDT, when the seats role moved from the default home to `~/.codex1` while two seats of one run were mid-turn. Each seat finished its turn and wrote its summary. Its launcher then had a parked peer message to deliver, saw the role change, started a server on the selected home, and waited `THREAD_RELEASE_TIMEOUT_SECS` (20 s) for the old server to unload the conversation. The old server kept it loaded (it was started before the launcher passed `thread_unload_delay_secs=0`), so the move answered `SeatThreadStateUnknown`, `_stream_turn` raised `SeatMoveUncertain`, the roster read `failed` and the launcher exited 1 with `state unknown (… old server has not released the thread …); no turn resubmitted`. No new turn had been submitted and no message was lost.
+
+All sites are in `_stream_turn` in `scripts/agents/codex_mesh.py`; find them by name, because line numbers move with every merge.
+
+1. The rule. After the launch's own turn has ended, a move that answers `SeatThreadStateUnknown` whose `cleanup` is `NoSeatTurnToCleanUp` never fails the launch. A `SeatThreadStateUnknown` whose `cleanup` is `SeatTurnCleanup` still raises `SeatMoveUncertain`, as now, because a turn may have started on the target server. The resident idle tick already draws this line (`cannot move: <reason>; waiting`); the three sites below follow it. `_move_idle_seat` keeps that meaning true: once the target server has accepted a turn, every later failure in the move answers with `SeatTurnCleanup` for the target port, the local writes after the submission included.
+2. The sites: the two `_move_resident` calls after a `turn/completed` (the `if resident or held_messages` branch and the `if not resident` branch after `_close_messages_if_empty`), and the `_move_resident` call in the ended-unseen branch (`_ended_unseen`). Unchanged: `_start_seats_turn`, the capacity resume and the overflow continuation, where the launch's turn has not ended and an unconfirmed move is a real failure.
+3. A launch that is not resident, at any of the three sites:
+   - It closes the seat's inbox and keeps what is parked, in one `_pending_file` lock: `_write_pending(handle, thread_id, <the parked messages>, accepting_messages=False)`. Add one helper for it beside `_close_messages_if_empty`, returning the number kept.
+   - With one or more kept, it posts one board line through `_post_board_status`: `launcher: 1 message held for the next launch: <reason>` or `launcher: <N> messages held for the next launch: <reason>`, and writes one seat-log line `mesh: <name> cannot move: <reason>; 1 message held for the next launch` in the same singular and plural wording. With none kept it posts and logs nothing.
+   - It stops watching and finishes as the ended turn deserves: no `_more_work_coming` wait and no second move. `failure` keeps the value the turn itself gave it (empty for a completed turn; the followed turn's own detail for a failed one; the existing ended-unseen wording when that branch has no answer). The code after the loop is unchanged, so the summary is written, the roster reads `done` or `failed` by that `failure` alone, and `start` and `follow` exit 0 for a completed turn.
+   - Nothing is sent to the target server after the unknown answer: no `thread/resume`, `thread/start` or `turn/start`.
+   - When the seat's end marker exists, it holds nothing: no pending write, no board line and no log line, as `_stream_turn`'s `finally` clause already leaves an ended seat's pending file alone. The launch still finishes as the ended turn deserves.
+4. A resident launch at the two `turn/completed` sites writes the idle tick's log line (`mesh: <name> cannot move: <reason>; waiting`) and keeps serving; its idle ticks try the move again. It never reaches the ended-unseen site.
+5. The next `follow` to the seat is unchanged and must keep working after a hold: it reopens the inbox, releases the old writer, resumes on the selected home and starts one turn whose inputs are its own prompt followed by the held messages in order.
+
+Tests, each named for the behavior it pins, built on the test file's existing fake server and helpers:
+- a `follow` whose turn completed, with one parked message and an old server that never unloads the conversation after the seats home changed: exit 0, roster `done`, the summary holds the turn's answer, the pending file keeps the message with `accepting_messages` false, one board line with `1 message held for the next launch`, no `thread/resume`, `thread/start` or `turn/start` on the target server, and no `state unknown` on stderr;
+- the same for `start`, and with two parked messages the plural wording;
+- the ended-unseen branch with a parked message holds it and finishes;
+- a followed turn that failed still exits 1 with its own detail while its parked messages are held;
+- an unconfirmed move that may have started a turn (`SeatTurnCleanup`) still fails the launch and cleans up on the target port, in a move between two different ports so the assertion tells the target port from the launch's own;
+- a move whose target accepted the turn and whose next local write then failed fails the launch, cleans up on the target port and holds nothing;
+- a launch whose seat was ended before the move holds nothing (no board line, pending file untouched) and finishes as its turn deserves;
+- a resident launch whose reply was delivered keeps serving after an unconfirmed move, and moves at a later tick once the old server has let go;
+- after a hold, the next `follow` starts one turn with its prompt first and the held messages after it, and leaves the pending file empty.
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — the three sites in `_stream_turn`, the one inbox helper, and `_move_idle_seat`'s answer for a failure after the target accepted a turn.
+- `scripts/agents/test_codex_mesh.py` — the tests above.
+
+**Seats:** 1 writer + 1 tester; one source file and one test file, so nothing else splits.
+- `impl` — `scripts/agents/codex_mesh.py`
+- `test` — `scripts/agents/test_codex_mesh.py`, written from this Spec alone
+
+**Constraints from prior phases:** Both files belong to model-study-unit as well (its usage-ledger phases changed the roster records and compaction); change only what this Spec names. `send` parks every message for the seat's launcher, and with no live launcher it exits 2 with `launcher is closing; message not delivered; relaunch the seat`. A `start` that replaces a seat's thread drops messages held for the old thread; a `follow` keeps them. `_release_seat_thread` answers released when the old server is gone, when `thread/unsubscribe` answers `notLoaded`, or when the conversation leaves the loaded list within `THREAD_RELEASE_TIMEOUT_SECS`. Port numbers are reused across a run's retired servers, so a server is identified by its record, never by its port. No seat runs `set-role`, `swap seats`, `codex login` or an app-server against a real Codex home; tests use the fake server only.
+
+**Acceptance gate:** the agents suite passes under a temp HOME with the account variables unset (`H=$(mktemp -d) && env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CODE_REMOTE_MEMORY_DIR -u CODEX_HOME HOME="$H" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/agents -p 'test_*.py'`) and `basedpyright scripts/agents` reports 0 errors, 0 warnings, 0 notes. Each new test fails on the tree before this phase. Not proven by this gate and left for the user's live swap check: a real launch in flight across a real role change.
