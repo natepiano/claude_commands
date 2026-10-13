@@ -29,6 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from user_zone import user_zone
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import override_guard
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
+from target_config import ConfigError, read_targets
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
@@ -134,7 +136,7 @@ class DamagedRecordSetAside:
 
 
 def release_record_error_line(error: ReleaseRecordReadError) -> str:
-    return f"release record could not be read: {error}; /build_hold release sets it aside and ends the hold"
+    return f"release record could not be read: {error}; /build:hold release sets it aside and ends the hold"
 
 
 @dataclass(frozen=True)
@@ -349,6 +351,77 @@ ReleaseRequest = NoReleaseEta | ClockReleaseEta
 class HolderIdentity:
     key: str
     name: str
+
+
+@dataclass(frozen=True)
+class NatedevHoldTarget:
+    pass
+
+
+@dataclass(frozen=True)
+class MacHoldTarget:
+    pass
+
+
+@dataclass(frozen=True)
+class UnknownHoldTarget:
+    name: str
+    configured: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UncheckedHoldTarget:
+    name: str
+    reason: str
+
+
+HoldTarget = NatedevHoldTarget | MacHoldTarget | UnknownHoldTarget | UncheckedHoldTarget
+
+
+def parse_hold_target(name: str) -> HoldTarget:
+    if name == "natedev":
+        return NatedevHoldTarget()
+    if name == "mac":
+        return MacHoldTarget()
+    try:
+        configured = read_targets()
+    except (ConfigError, UnicodeError) as error:
+        return UncheckedHoldTarget(name, str(error))
+    return UnknownHoldTarget(name, tuple(target.name for target in configured))
+
+
+@dataclass(frozen=True)
+class MacHoldResult:
+    status: int
+    stdout: str
+    stderr: str
+
+
+def run_mac_hold(arguments: Sequence[str]) -> MacHoldResult:
+    script = Path(__file__).resolve().parent.parent / "mac_test" / "mac_test.py"
+    result = subprocess.run([sys.executable, str(script), *arguments], capture_output=True, text=True)
+    return MacHoldResult(result.returncode, result.stdout, result.stderr)
+
+
+def release_mac_hold(identity: HolderIdentity, given: str) -> MacHoldResult:
+    result = run_mac_hold(["unblock", "--holder", identity.name])
+    prefix = "blocked by "
+    line = result.stdout.rstrip("\n")
+    if result.status != 1 or not line.startswith(prefix):
+        return result
+    holder = line[len(prefix):]
+    no_former_names: list[str] = []
+    former = next((record["formerNames"] for record in live_sessions()
+                   if record["sessionId"] == identity.key), no_former_names)
+    if holder != identity.name and holder in (identity.name, given, *former):
+        return run_mac_hold(["unblock", "--holder", holder])
+    return result
+
+
+def print_mac_hold_result(result: MacHoldResult) -> int:
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    return result.status
 
 
 @dataclass(frozen=True)
@@ -742,7 +815,9 @@ def write_hold(directory: Path, identity: HolderIdentity, purpose: str, request:
     temporary = directory.parent / f"{directory.name}.{path.name}.tmp"
     _ = temporary.write_text(json.dumps(record, ensure_ascii=False) + "\n")
     os.replace(temporary, path)
-    return f"/build_hold from {identity.name}: stop any cargo or verify.sh you are running and start none until I release. No release after 2 h: ask me. For: {purpose.strip()}"
+    return (f"natedev is held for {purpose.strip()}. verify.sh waits by itself; an app launch is refused until the release, "
+            "so launch again after it. Tests that can run on the Mac keep running there. "
+            "Stop only cargo you started outside verify.sh. No release after 2 h: ask me.")
 
 
 @dataclass(frozen=True)
@@ -984,7 +1059,7 @@ def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request:
             cycle["holders"][identity.key] = {"since": now.isoformat(), "released_at": ""}
             update_holder_generation(cycle)
             save_cycle(cycle)
-        return notice + " Run python3 ~/.claude/scripts/build_hold/build_hold.py wait now in this session."
+        return notice
 
 
 def record_recipients(recipients: Sequence[tuple[str, str]]) -> None:
@@ -1203,7 +1278,7 @@ def socket_for(session_id: str) -> RecipientLive | RecipientGone | RecipientLook
 
 def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
     script = Path(__file__).resolve().parent.parent / "message" / "send.py"
-    notice = ("/build_hold: your hold has been released. Start your next build or BRP launch now; its memory gate records admission. "
+    notice = ("/build:hold: your hold has been released. Start your next build or BRP launch now; its memory gate records admission. "
               "With nothing to build, run python3 ~/.claude/scripts/build_hold/build_hold.py nothing-to-build now, so the next session is released. "
               f"Session {entry['session_id']}.")
     try:
@@ -1589,11 +1664,13 @@ def main(arguments: list[str]) -> int:
     _ = hold.add_argument("--for", dest="purpose", required=True)
     _ = hold.add_argument("--release-eta")
     _ = hold.add_argument("--zone")
+    _ = hold.add_argument("--target", type=parse_hold_target, default="natedev")
     quiet = commands.add_parser("quiet")
     _ = quiet.add_argument("--max-wait", type=float, default=600)
     release = commands.add_parser("release")
     _ = release.add_argument("--holder")
     _ = release.add_argument("--resume", action="store_true")
+    _ = release.add_argument("--target", type=parse_hold_target, default="natedev")
     _ = commands.add_parser("wait")
     _ = commands.add_parser("nothing-to-build")
     mark = commands.add_parser("mark")
@@ -1610,6 +1687,31 @@ def main(arguments: list[str]) -> int:
     options = parser.parse_args(arguments)
     try:
         action = cast(str, options.action)
+        if action in {"hold", "release"}:
+            target = cast(HoldTarget, options.target)
+            if isinstance(target, UnknownHoldTarget):
+                print(f"unknown target {target.name}; configured targets: {', '.join(target.configured)}")
+                return 2
+            if isinstance(target, UncheckedHoldTarget):
+                print(f"unknown target {target.name}; the target config cannot be read: {target.reason}")
+                return 2
+            if isinstance(target, MacHoldTarget):
+                refused: list[str] = []
+                if action == "hold":
+                    if cast(object, options.release_eta) is not None:
+                        refused.append("--release-eta")
+                    if cast(object, options.zone) is not None:
+                        refused.append("--zone")
+                elif cast(bool, options.resume):
+                    refused.append("--resume")
+                if refused:
+                    print(f"{refused[0]} is not supported with --target mac")
+                    return 2
+                identity = holder_of(cast(str | None, options.holder))
+                if action == "hold":
+                    return print_mac_hold_result(run_mac_hold(
+                        ["block", "--holder", identity.name, "--for", cast(str, options.purpose)]))
+                return print_mac_hold_result(release_mac_hold(identity, cast(str | None, options.holder) or identity.name))
         if action == "hold":
             request = release_request(cast(str | None, options.release_eta), cast(str | None, options.zone))
             identity = holder_of(cast(str | None, options.holder))

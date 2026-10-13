@@ -53,7 +53,7 @@ the SKIPPED line), or run it as the `/lint_config` CLI.
 
 ## mac_test.conf
 
-Controls Mac test offload and the `/mac_test` block command. It names the CI
+Controls Mac test offload and the `/build:mac` block command. It names the CI
 repository, workflow, job and repository variable; bounds each `gh` call;
 sets the default and maximum block lifetime; and sets the expiry-warning
 window. Offload settings name the SSH host and connection and probe time
