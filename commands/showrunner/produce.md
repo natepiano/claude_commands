@@ -1143,6 +1143,11 @@ that condition.
 - **Parallel by default.** Plan for parallelism; the user never has to find it.
   Every phase that can run safely runs now. At each ETA, notice or new item, ask
   which waiting work could start, and start it unasked:
+  - When a plan is approved, and when a unit starts one, map which phases
+    depend on which and start every independent phase now: beside the current
+    phase in the same unit, or as its own unit (`/showrunner:add_unit`) when
+    its files can be fenced. Packaging is yours, never the user's. User,
+    2026-10-13.
   - A unit's later phase runs beside its current one, with its own seats, berth
     reservation and checkpoint. A checkpoint commits only its own phase's paths.
     Where files overlap, it claims after the earlier phase and builds on its tree.
