@@ -242,7 +242,7 @@ class WidthTrialTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            env={**os.environ, "BUILDLOG_DIR": str(self.root), "TZ": "America/Los_Angeles"},
+            env={**os.environ, "BUILDLOG_DIR": str(self.root), "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"},
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout

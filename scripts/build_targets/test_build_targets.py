@@ -31,7 +31,7 @@ REAL_CALL_IS_LIVE = build_hold.call_is_live
 @contextmanager
 def pacific_zone() -> Generator[None, None, None]:
     try:
-        with mock.patch.dict(os.environ, {"TZ": "America/Los_Angeles"}):
+        with mock.patch.dict(os.environ, {"TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"}):
             time.tzset()
             yield
     finally:

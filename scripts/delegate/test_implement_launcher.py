@@ -292,6 +292,7 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # location, so the copy needs the interpreter shim beside it too.
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", lib / "py")
+        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
         home_lib = self.root / ".claude" / "scripts" / "lib"
         home_lib.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", home_lib / "py")

@@ -537,7 +537,7 @@ def close_recovered(state: State, notes: list[AgentNote], threshold: float,
 
 
 def local_time(stamp: str) -> str:
-    return datetime.fromisoformat(stamp).astimezone().strftime("%Y-%m-%d %H:%M")
+    return datetime.fromisoformat(stamp).astimezone(user_zone()).strftime("%Y-%m-%d %H:%M")
 
 
 def registry_assignments() -> dict[str, str]:

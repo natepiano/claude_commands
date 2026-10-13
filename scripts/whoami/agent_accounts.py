@@ -45,6 +45,9 @@ if __name__ == "agent_accounts":
 elif __name__ == "scripts.whoami.agent_accounts":
     _ = sys.modules.setdefault("agent_accounts", sys.modules[__name__])
 
+from scripts.lib.user_zone import user_zone as setting_zone  # noqa: E402
+
+
 @dataclass(frozen=True)
 class KnownCodexAccount:
     home: Path
@@ -145,15 +148,15 @@ FIVE_HOUR_MINUTES = 5 * 60
 EASTERN = ZoneInfo("America/New_York")
 
 
-def user_zone() -> tzinfo | None:
-    """Use a running production's zone, or None for the machine's local zone."""
+def user_zone() -> tzinfo:
+    """Use a running production's zone, or the user's zone setting when none runs."""
     try:
         from scripts.production import showrunners
 
         zone = next((runner["zone"] for runner in showrunners.registered_showrunners()), "")
     except (ImportError, OSError):
         zone = ""
-    return ZoneInfo(zone) if zone else None
+    return ZoneInfo(zone) if zone else setting_zone()
 
 
 @dataclass(frozen=True)

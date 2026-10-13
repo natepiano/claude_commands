@@ -64,6 +64,11 @@ def section_seconds(connection: sqlite3.Connection, day: str) -> dict[str, float
     return elapsed
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 class ReportSpeedTests(unittest.TestCase):
     def test_report_command_from_a_temporary_log_shows_lead_and_targets(self) -> None:
         with tempfile.TemporaryDirectory(prefix="buildlog-report-output-") as temporary:
@@ -85,7 +90,7 @@ class ReportSpeedTests(unittest.TestCase):
                 result = subprocess.run(
                     [sys.executable, "scripts/buildlog/cli.py", "report"],
                     cwd=Path(__file__).resolve().parents[2],
-                    env={**os.environ, "TZ": "America/Los_Angeles",
+                    env={**os.environ, "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles",
                          "BUILDLOG_TRANSCRIPTS": str(Path(temporary) / "transcripts")},
                     capture_output=True, text=True, check=False,
                 )
@@ -101,7 +106,7 @@ class ReportSpeedTests(unittest.TestCase):
             root = Path(temporary) / "buildlog"
             transcripts = Path(temporary) / "transcripts"
             environment = {**os.environ, "BUILDLOG_DIR": str(root),
-                           "BUILDLOG_TRANSCRIPTS": str(transcripts), "TZ": "America/Los_Angeles"}
+                           "BUILDLOG_TRANSCRIPTS": str(transcripts), "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"}
             with mock.patch.dict(os.environ, environment):
                 time.tzset()
                 day = datetime.now().date().isoformat()
@@ -381,7 +386,7 @@ class ReportTests(unittest.TestCase):
 
     def test_day_ranges_match_sqlite_on_each_side_of_local_midnight(self) -> None:
         self.addCleanup(time.tzset)
-        with mock.patch.dict(os.environ, {"TZ": "America/Los_Angeles"}):
+        with mock.patch.dict(os.environ, {"TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"}):
             time.tzset()
             before = "2026-10-03T06:59:59.999Z"
             after = "2026-10-03T07:00:00.000Z"
@@ -1889,7 +1894,7 @@ class ReportTests(unittest.TestCase):
 
     def test_memory_pressure_counts_counter_rise_across_midnight_when_samples_are_close(self) -> None:
         self.addCleanup(time.tzset)
-        with mock.patch.dict(os.environ, {"TZ": "UTC"}):
+        with mock.patch.dict(os.environ, {"TZ": "UTC", "USER_ZONE": "UTC"}):
             time.tzset()
             self.write(
                 self.root / "natedev" / "samples-2026-10.jsonl",
@@ -2208,7 +2213,7 @@ class ReportTests(unittest.TestCase):
 
     def test_sync_time_names_its_zone_and_an_earlier_day(self) -> None:
         self.addCleanup(time.tzset)
-        with mock.patch.dict(os.environ, {"TZ": "America/New_York"}):
+        with mock.patch.dict(os.environ, {"TZ": "America/New_York", "USER_ZONE": "America/New_York"}):
             time.tzset()
             now = datetime.fromisoformat("2026-10-03T15:00:00-04:00")
             self.assertEqual(sync.sync_time("2026-10-03T16:14:00+00:00", now), "12:14 EDT")
