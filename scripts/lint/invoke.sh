@@ -112,6 +112,7 @@ buildlog_step_compiles() {
     for arg in "$@"; do
         [[ "$arg" == */sweep.py ]] && return 1
     done
+    [[ "${1:-}" == taplo ]] && return 1
     [[ "${1:-}" == cargo ]] || return 0
     shift
     if [[ "${1:-}" == +* ]]; then

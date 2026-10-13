@@ -172,7 +172,7 @@ Build holds inside W stay in the readout (they reach both arms): hana's on 2026-
 - Keeping 16 threads: no memory-wait gain (W ratio 1.05, interval 0.53–2.27) to pay for 13% slower whole-hana runs.
 - Reading the verdict from main's changed script: the frozen script is the pre-registered instrument.
 
-### Phase 4 — The local lint covers what CI's Clippy job covers  · status: todo
+### Phase 4 — The local lint covers what CI's Clippy job covers  · status: done
 
 #### Work Order
 
@@ -181,6 +181,7 @@ Build holds inside W stay in the readout (they reach both arms): hana's on 2026-
 **Spec:**
 - In the `lint` arm of `scripts/delegate/verify.sh`, the clippy stage becomes `invoke_clippy --workspace --all-targets --all-features`. It takes no `FEATURE_FLAGS`: `--all-features` covers a trailing `--features`, which still reaches mend and rustdoc.
 - This is CI's command. Job `clippy` in `~/rust/hana/.github/workflows/ci.yml` runs `cargo clippy --workspace --all-targets --all-features -- -D warnings`, the other repos' workflows hold the same line, and `scripts/release/pre_release_checks.sh` already runs it at the push gate, so the dev loop and the push gate share one all-features set of check artifacts. CI's second pass, for the Windows target, stays CI's alone.
+- The `lint` arm also runs `taplo fmt --check` from the workspace root, the check form of the step `scripts/validate_and_push/validate_ci.sh` runs (`run_autofix_step "taplo" taplo fmt`), so taplo loads the same workspace `taplo.toml`; an unformatted `.toml` fails lint and the output names the file. Source: the showrunner, 2026-10-12 (reported by the cargo-liner showrunner): a unit's `.toml` edits pass lint and are reformatted into a separate fix commit at merge, as 933ab2ce did to cargo-tile's theme files. Tests pin it like the clippy stage: a stand-in `taplo` records its argv and working directory, and a failing stand-in fails `lint`.
 - `check`, `test`, `example`, `final`, mend, fmt and rustdoc keep their scope. The `example` verb stays: one example, while iterating.
 - Comments and usage in `verify.sh` say what is true after the change: the header (the dev-loop target pinning, `Nothing below final uses --all-targets`, `with default features`), the `lint` and `--features` usage lines, the comment in `compose_nextest_args` on what the lint half compiles under clippy, and the `example` arm's `lint never sees an example`.
 - Tests run the real `verify.sh` with a stand-in `cargo` that answers `cargo metadata` from synthetic JSON and records each call's argv (the pattern in `scripts/delegate/test_verify_mac_offload.py`; `test_verify_release_ack.py` stubs the lint-config reader and silences skip notices, so it does not fit), and the real lint-config reader over a temporary `lint.conf`: `lint <pkg>` gives clippy exactly `--workspace --all-targets --all-features -- -D warnings`; `lint <pkg> --features a` gives clippy the same argv and gives mend and rustdoc the qualified `--features`; `example` argv is unchanged; with clippy off in `lint.conf` the skip line names the new command.

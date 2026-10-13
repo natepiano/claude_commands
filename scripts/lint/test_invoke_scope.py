@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Behavior of the shell command run inside each build step's systemd scope."""
+"""Build-step admission and behavior inside each step's systemd scope."""
 
 from __future__ import annotations
 
@@ -192,6 +192,81 @@ class BuildScopeTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(list(root.glob("*.peak.cgroup")), [])
+
+
+class BuildAdmissionTests(unittest.TestCase):
+    def run_invoke(
+        self, root: Path, shell: str, arguments: list[str]
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "-c", 'set -euo pipefail; source "$1"; shift; ' + shell,
+             "admission-test", str(INVOKE), *arguments],
+            capture_output=True, text=True, check=False,
+            env={**os.environ,
+                 "HOME": str(root), "TMPDIR": str(root),
+                 "BUILDLOG_DIR": str(root / "buildlog"),
+                 "BUILD_HOLD_DIR": str(root / "holders"),
+                 "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                 "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                 "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                 "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                 "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                 "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                 "MAC_TEST_STATE_DIR": str(root / "mac-state"),
+                 "LINT_CONFIG_READER": str(root / "missing-config")},
+        )
+
+    def test_taplo_does_not_compile_and_existing_command_classification_is_preserved(self) -> None:
+        cases = [
+            (["taplo", "fmt", "--check"], 1),
+            (["cargo", "clippy", "--workspace", "--all-targets", "--all-features"], 0),
+            (["env", "RUSTC_WRAPPER=", "cargo", "mend", "--workspace"], 0),
+            (["cargo", "+nightly", "fmt", "--all", "--check"], 1),
+            (["python3", "/tmp/sweep.py", "--check"], 1),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            for arguments, expected_status in cases:
+                with self.subTest(arguments=arguments):
+                    result = self.run_invoke(Path(directory), 'buildlog_step_compiles "$@"', arguments)
+                    self.assertEqual(result.returncode, expected_status, result.stdout + result.stderr)
+
+    def test_taplo_skips_build_hold_and_memory_admission_but_records_its_status(self) -> None:
+        shell = r'''
+events="$TMPDIR/events"
+build_hold_wait_local() { echo hold >> "$events"; }
+buildlog_wait_for_memory() {
+    echo memory >> "$events"
+    BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=Granted
+}
+build_hold_step_started() { :; }
+build_hold_check_admission() { return 0; }
+build_hold_mark() { :; }
+buildlog_begin() {
+    printf 'begin %s\n' "$*" >> "$events"
+    BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_MEM_RESERVATION=""
+    BUILDLOG_MEM_WAIT_S=0
+}
+buildlog_end() {
+    local recorded_status=$1
+    shift 3
+    printf 'end %s %s\n' "$recorded_status" "$*" >> "$events"
+}
+buildlog_release_memory() { :; }
+sweep_after_step() { :; }
+step_status=$1
+taplo() { printf 'checked Cargo.toml\n'; return "$step_status"; }
+run_once taplo fmt --check
+'''
+        for status in (0, 1):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                result = self.run_invoke(root, shell, [str(status)])
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertIn("checked Cargo.toml", result.stdout)
+                self.assertEqual(
+                    (root / "events").read_text().splitlines(),
+                    ["begin taplo fmt --check", f"end {status} taplo fmt --check"],
+                )
 
 
 if __name__ == "__main__":
