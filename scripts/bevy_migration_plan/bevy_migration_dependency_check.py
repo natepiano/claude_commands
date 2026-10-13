@@ -15,8 +15,6 @@ import json
 import re
 import subprocess
 import sys
-import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from http.client import HTTPException, HTTPResponse
 from pathlib import Path
@@ -25,36 +23,9 @@ from urllib import parse, request
 from urllib.error import HTTPError, URLError
 
 
-CRATES_IO_MIN_INTERVAL_SECONDS: float = 1.0
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bevy_upgrade"))
 
-
-class RequestPacer:
-    """Space request starts by at least the configured interval."""
-
-    def __init__(
-        self,
-        min_interval: float,
-        clock: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> None:
-        self._min_interval: float = min_interval
-        self._clock: Callable[[], float] = clock
-        self._sleep: Callable[[float], None] = sleep
-        self._has_started: bool = False
-        self._last_start: float = 0.0
-
-    def wait(self) -> None:
-        request_start = self._clock()
-        if self._has_started:
-            remaining = self._last_start + self._min_interval - request_start
-            if remaining > 0:
-                self._sleep(remaining)
-                request_start = self._clock()
-        self._last_start = request_start
-        self._has_started = True
-
-
-CRATES_IO_PACER = RequestPacer(CRATES_IO_MIN_INTERVAL_SECONDS)
+import crates_io_pacer
 
 
 class CrateVersion(TypedDict):
@@ -335,7 +306,7 @@ def query_crates_io(crate_name: str) -> QueryResult | None:
         req = request.Request(url)
         req.add_header('User-Agent', 'bevy-dependency-checker/1.0')
 
-        CRATES_IO_PACER.wait()
+        crates_io_pacer.CRATES_IO_PACER.wait()
         with request.urlopen(req, timeout=10) as response:  # pyright: ignore[reportAny]
             data: CratesIOResponse = json.loads(response.read().decode('utf-8'))  # pyright: ignore[reportAny]
 
@@ -375,7 +346,7 @@ def get_bevy_dependency_requirement(
         req = request.Request(url)
         req.add_header('User-Agent', 'bevy-dependency-checker/1.0')
 
-        CRATES_IO_PACER.wait()
+        crates_io_pacer.CRATES_IO_PACER.wait()
         with cast(HTTPResponse, request.urlopen(req, timeout=10)) as response:
             raw = cast(object, json.loads(response.read().decode('utf-8')))
             if not isinstance(raw, dict):

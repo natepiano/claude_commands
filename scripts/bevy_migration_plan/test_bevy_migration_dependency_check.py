@@ -14,7 +14,9 @@ from unittest import mock
 from urllib import parse, request
 from urllib.error import URLError
 
-from scripts.bevy_migration_plan import bevy_migration_dependency_check as checker
+import bevy_migration_dependency_check as checker
+
+import crates_io_pacer
 
 if TYPE_CHECKING:
     from typing import override
@@ -63,8 +65,8 @@ class MigrationDependencyTests(unittest.TestCase):
         self.bodies = {}
         self.urls = []
         self.clock = StandInClock()
-        pacer_patch = mock.patch.object(checker, "CRATES_IO_PACER", checker.RequestPacer(
-            checker.CRATES_IO_MIN_INTERVAL_SECONDS, clock=self.clock.read, sleep=self.clock.sleep))
+        pacer_patch = mock.patch.object(crates_io_pacer, "CRATES_IO_PACER", crates_io_pacer.RequestPacer(
+            crates_io_pacer.CRATES_IO_MIN_INTERVAL_SECONDS, clock=self.clock.read, sleep=self.clock.sleep))
         home_patch = mock.patch.object(Path, "home", return_value=self.root)
         network_patch = mock.patch.object(request, "urlopen", side_effect=self.urlopen)
         cargo_patch = mock.patch.object(subprocess, "run", side_effect=AssertionError("unexpected cargo command"))
@@ -171,47 +173,10 @@ class MigrationDependencyTests(unittest.TestCase):
             "shared-adapter", "1.0.0", checker.BevyRequirement("^0.20"))])
         self.assertEqual(self.urls, ["https://crates.io/api/v1/crates/shared-adapter/1.0.0/dependencies"])
 
-    def test_request_pacer_first_request_does_not_sleep(self) -> None:
-        pacer = checker.RequestPacer(1.0, clock=self.clock.read, sleep=self.clock.sleep)
-        pacer.wait()
-        self.assertEqual(self.clock.sleeps, [])
-
-    def test_request_pacer_sleeps_only_remaining_interval(self) -> None:
-        pacer = checker.RequestPacer(1.0, clock=self.clock.read, sleep=self.clock.sleep)
-        pacer.wait()
-        self.clock.now = 0.25
-        pacer.wait()
-        self.assertEqual(self.clock.sleeps, [0.75])
-        self.assertEqual(self.clock.now, 1.0)
-
-    def test_request_pacer_does_not_sleep_after_interval_and_records_new_start(self) -> None:
-        pacer = checker.RequestPacer(1.0, clock=self.clock.read, sleep=self.clock.sleep)
-        pacer.wait()
-        self.clock.now = 1.25
-        pacer.wait()
-        self.assertEqual(self.clock.sleeps, [])
-        self.clock.now = 1.5
-        pacer.wait()
-        self.assertEqual(self.clock.sleeps, [0.75])
-
-    def test_request_pacer_back_to_back_requests_sleep_one_second_each(self) -> None:
-        pacer = checker.RequestPacer(1.0, clock=self.clock.read, sleep=self.clock.sleep)
-        for _ in range(3):
-            pacer.wait()
-        self.assertEqual(self.clock.sleeps, [1.0, 1.0])
-
-    def test_request_pacer_measures_from_actual_start_after_a_sleep_that_runs_long(self) -> None:
-        requested: list[float] = []
-
-        def oversleep(seconds: float) -> None:
-            requested.append(seconds)
-            self.clock.now += seconds + 0.5
-
-        pacer = checker.RequestPacer(1.0, clock=self.clock.read, sleep=oversleep)
-        for _ in range(3):
-            pacer.wait()
-        self.assertEqual(requested, [1.0, 1.0])
-        self.assertEqual(self.clock.now, 3.0)
+    def test_pacing_definitions_live_only_in_shared_module(self) -> None:
+        for name in ("RequestPacer", "CRATES_IO_PACER", "CRATES_IO_MIN_INTERVAL_SECONDS"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, vars(checker))
 
     def test_each_crates_io_query_is_paced_immediately_before_request(self) -> None:
         self.crate("paced-adapter", ["1.0.0"])
@@ -226,7 +191,7 @@ class MigrationDependencyTests(unittest.TestCase):
             events.append("request")
             return self.urlopen(value, timeout)
 
-        with mock.patch.object(checker.CRATES_IO_PACER, "wait", side_effect=wait), \
+        with mock.patch.object(crates_io_pacer.CRATES_IO_PACER, "wait", side_effect=wait), \
                 mock.patch.object(request, "urlopen", side_effect=urlopen):
             for _ in range(2):
                 self.assertEqual(checker.query_crates_io("paced-adapter"), expected)
@@ -243,7 +208,7 @@ class MigrationDependencyTests(unittest.TestCase):
             events.append("request")
             return self.urlopen(value, timeout)
 
-        with mock.patch.object(checker.CRATES_IO_PACER, "wait", side_effect=wait), \
+        with mock.patch.object(crates_io_pacer.CRATES_IO_PACER, "wait", side_effect=wait), \
                 mock.patch.object(request, "urlopen", side_effect=urlopen):
             for _ in range(2):
                 self.assertEqual(checker.get_bevy_dependency_requirement("paced-adapter", "1.0.0", NAMES),
