@@ -9,7 +9,8 @@
 # Called as:  jq -r --arg pwd "$PWD" --arg account "$account" -f statusline.jq
 # Input:      the status line JSON on stdin.
 # Output:     Line 1: "<machine> | <account> | <dirname> | <tokens with thousands separators> | <model [effort]>"
-#             Line 2, when present: "5-hour <N>% left | weekly <M>% left"
+#             Line 2, when present: "5-hour <N>% left until <HH:MM zone> | weekly <M>% left until <Day HH:MM zone>",
+#             each " until ..." only when its window carries a reset time.
 
 # Thousands separators, matching `printf "%'d"` under en_US: walk the digits
 # from the right and insert a comma (codepoint 44) before every third one. The
@@ -32,6 +33,33 @@ def remaining($window):
     else empty
     end;
 
+# 00:00 UTC on the $n-th Sunday of $month (0-based) in $year, as epoch seconds.
+def nth_sunday($year; $month; $n):
+  ([$year, $month, 1, 0, 0, 0, 0, 0] | mktime) as $first
+  | $first + ((7 - ($first | gmtime | .[6])) % 7 + 7 * ($n - 1)) * 86400;
+
+# Epoch seconds as wall-clock time in the user's zone, formatted by strftime
+# $fmt and followed by the zone's abbreviation. The zone is America/New_York,
+# from config/user_zone.conf, written out here: jq cannot read that file without
+# a change to the settings.json command line, and strflocaltime would use the
+# machine's zone, which is Pacific on the Mac. EDT runs from 02:00 EST on the
+# second Sunday in March (07:00 UTC) to 02:00 EDT on the first Sunday in
+# November (06:00 UTC).
+def user_time($fmt):
+  . as $t
+  | ($t | gmtime | .[0]) as $year
+  | ($t >= nth_sunday($year; 2; 2) + 7 * 3600
+     and $t < nth_sunday($year; 10; 1) + 6 * 3600) as $dst
+  | ($t + (if $dst then -4 else -5 end) * 3600 | gmtime | strftime($fmt))
+    + (if $dst then " EDT" else " EST" end);
+
+# "<label> <N>% left", then " until <reset time>" when the window carries one.
+def usage($label; $window; $fmt):
+  remaining($window) as $left
+  | ($window.resets_at? // null) as $reset
+  | "\($label) \($left)% left"
+    + (if ($reset | type) == "number" then " until " + ($reset | user_time($fmt)) else "" end);
+
 ($ARGS.named.account // "") as $account
 | ((.workspace.current_dir // .cwd // "") | if . == "" then $pwd else . end) as $d
 # Trailing slashes stripped first, so "/etc/nixos/" gives "nixos" and not "".
@@ -48,7 +76,7 @@ def remaining($window):
      $m
    ] | join(" | ")) as $first_line
 | ([
-     (remaining(.rate_limits.five_hour?) | "5-hour \(.)% left"),
-     (remaining(.rate_limits.seven_day?) | "weekly \(.)% left")
+     usage("5-hour"; .rate_limits.five_hour?; "%H:%M"),
+     usage("weekly"; .rate_limits.seven_day?; "%a %H:%M")
    ] | join(" | ")) as $second_line
 | $first_line + (if $second_line == "" then "" else "\n" + $second_line end)
