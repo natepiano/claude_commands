@@ -3,20 +3,27 @@ from __future__ import annotations
 
 import json
 import subprocess
+import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import final, override
 from zoneinfo import ZoneInfo
 
 PROGRAM = Path(__file__).with_name("statusline.jq")
 USER_ZONE = ZoneInfo("America/New_York")
 
 
-def status_lines(*inputs: object) -> list[str]:
-    """Run statusline.jq once over every input and return its output lines."""
+def status_lines(*inputs: object, labels: Path | None = None, account: str = "claude 1") -> list[str]:
+    """Run statusline.jq once over every input and return its output lines.
+
+    `labels` is the by-label readings file, passed as the settings command passes it.
+    """
     stdin = "\n".join(json.dumps(each) for each in inputs)
+    stored = [] if labels is None else ["--slurpfile", "labels", str(labels)]
     result = subprocess.run(
-        ["jq", "-r", "--arg", "pwd", "/tmp", "--arg", "account", "claude 1", "-f", str(PROGRAM)],
+        ["jq", "-r", "--arg", "pwd", "/tmp", "--arg", "account", account, *stored, "-f", str(PROGRAM)],
         input=stdin, capture_output=True, text=True, check=True,
     )
     return result.stdout.splitlines()
@@ -62,6 +69,66 @@ class UsageLineTests(unittest.TestCase):
             for t in epochs
         ]
         self.assertEqual(lines, expected)
+
+
+
+@final
+class StoredReadingTests(unittest.TestCase):
+    """The weekly and 5-hour figures agent_notes stored for the session's label."""
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.directory = Path()
+        self.now = 0
+        self.reset = 0
+        self.live: dict[str, object] = {}
+
+    @override
+    def setUp(self) -> None:
+        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.now = int(time.time())
+        self.reset = self.now + 3 * 86400
+        self.live = limits({"used_percentage": 10, "resets_at": self.now + 3600},
+                           {"used_percentage": 97, "resets_at": self.now + 86400})
+
+    def labels(self, readings: dict[str, object]) -> Path:
+        path = self.directory / "by-label.json"
+        _ = path.write_text(json.dumps(readings), encoding="utf-8")
+        return path
+
+    def weekly(self, left: float, at: int, resets_at: int | None) -> dict[str, object]:
+        return {"weekly": {"left": left, "resets_at": resets_at, "at": at}}
+
+    def test_a_fresh_reading_for_the_label_replaces_the_response_figure(self) -> None:
+        path = self.labels({"claude 1": self.weekly(2.0, self.now - 120, self.reset)})
+        self.assertEqual(
+            status_lines(self.live, labels=path)[1].split(" | ")[1],
+            f"weekly 2% left until {user_time(self.reset, '%a %H:%M %Z')}",
+        )
+
+    def test_a_reading_older_than_ten_minutes_gives_the_response_figure(self) -> None:
+        path = self.labels({"claude 1": self.weekly(2.0, self.now - 601, self.reset)})
+        self.assertTrue(status_lines(self.live, labels=path)[1].endswith("| weekly 3% left until "
+                        + user_time(self.now + 86400, "%a %H:%M %Z")))
+
+    def test_a_reading_whose_window_has_reset_gives_the_response_figure(self) -> None:
+        path = self.labels({"claude 1": self.weekly(2.0, self.now - 60, self.now - 1)})
+        self.assertIn("weekly 3% left", status_lines(self.live, labels=path)[1])
+
+    def test_another_label_s_reading_is_not_used(self) -> None:
+        path = self.labels({"claude 2": self.weekly(50.0, self.now - 60, self.reset)})
+        self.assertIn("weekly 3% left", status_lines(self.live, labels=path)[1])
+
+    def test_a_missing_file_given_as_dev_null_gives_the_response_figure(self) -> None:
+        self.assertIn("weekly 3% left", status_lines(self.live, labels=Path("/dev/null"))[1])
+
+    def test_a_none_open_five_hour_reading_shows_all_left_with_no_reset(self) -> None:
+        path = self.labels({"claude 1": {"five_hour": {"left": 100.0, "resets_at": None, "at": self.now - 60}}})
+        self.assertTrue(status_lines(self.live, labels=path)[1].startswith("5-hour 100% left | weekly"))
+
+    def test_an_address_as_the_account_never_reaches_the_line(self) -> None:
+        line = status_lines(self.live, account="someone@example.invalid")[0]
+        self.assertNotIn("@", line)
 
 
 if __name__ == "__main__":

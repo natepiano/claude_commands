@@ -816,6 +816,18 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertNotIn("claude 1", text)
         self.assertNotIn("@", text)
 
+    def test_a_run_killed_while_sending_does_not_send_again_on_the_next_run(self) -> None:
+        note = self.note("claude 2.md", "active", "1")
+
+        def killed(recipient: str, text: str, key: str | None) -> str | None:
+            _ = (recipient, text, key)
+            raise KeyboardInterrupt  # stands in for the snapshot timer's kill mid-delivery
+
+        with mock.patch.object(quota_alert, "relay", killed), self.assertRaises(KeyboardInterrupt):
+            _ = self.alert([note], self.now)
+        _ = self.alert([note], self.now + timedelta(minutes=2))
+        self.assertEqual(self.sent, [])
+
     def test_a_claude_alert_never_states_a_recorded_reset_count(self) -> None:
         note = self.note("claude 2.md", "active", "1", limit_reset_count="1")
         text = self.message(note, [note], quota_alert.load_config())
