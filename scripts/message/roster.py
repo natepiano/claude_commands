@@ -608,6 +608,14 @@ def _production_rows(doc: Path, slug: str) -> list[dict[str, str]]:
     return add_unit.live_unit_table(lines, slug)
 
 
+def _every_marked_unit() -> unit_lookup.MarkedProductions | OSError:
+    """Every production's marked units, or why tmux could not say which sessions exist."""
+    try:
+        return unit_lookup.every_marked_unit()
+    except OSError as error:
+        return error
+
+
 def _production_places(
     records: list[SessionRecord], details: Mapping[str, _ClaudeDetails],
     registered: list[showrunners.Showrunner],
@@ -616,6 +624,9 @@ def _production_places(
 ) -> dict[str, _ProductionPlace]:
     addresses = {runner["slug"]: f"session:{session_id}" for session_id, runner in runner_ids.items()}
     places: dict[str, _ProductionPlace] = {}
+    has_tmux = shutil.which(os.environ.get("UNIT_LOOKUP_TMUX") or "tmux") is not None
+    # One read of every production's marks serves every showrunner below.
+    every = _every_marked_unit() if has_tmux and registered else OSError("no tmux binary")
     for runner in registered:
         doc = Path(runner["doc"])
         runner_address = addresses.get(runner["slug"], "")
@@ -624,11 +635,10 @@ def _production_places(
             if runner["session"] and runner_address
             else ProductionWithoutRunningShowrunner(runner["slug"])
         )
-        has_tmux = shutil.which(os.environ.get("UNIT_LOOKUP_TMUX") or "tmux") is not None
         try:
-            if not has_tmux:
-                raise OSError("no tmux binary")
-            units = live_units.production_units(doc)
+            if isinstance(every, OSError):
+                raise every
+            units = live_units.units_in(doc, every)
         except (OSError, ValueError) as error:
             if has_tmux:
                 _problem(problems, f"tmux for {runner['slug']} was not read", error)
