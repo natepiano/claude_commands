@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import resource
 import subprocess
 import sqlite3
 import sys
@@ -25,9 +26,12 @@ import index
 import launches
 import mac_outcome
 import report
+import holds
+from user_zone import user_zone
 import rust_release
 import sync
-from test_index import STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
+from test_holds import timed_hold_events, write_holder, write_mac_block
+from test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
 
 
 def section_seconds(connection: sqlite3.Connection, day: str) -> dict[str, float]:
@@ -66,10 +70,17 @@ def section_seconds(connection: sqlite3.Connection, day: str) -> dict[str, float
 
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+    unittest.addModuleCleanup(time.tzset)
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"}))
+    time.tzset()
 
 
 class ReportSpeedTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {name: str(temporary / name) for name in COORDINATION_VARIABLES})))
+
     def test_report_command_from_a_temporary_log_shows_lead_and_targets(self) -> None:
         with tempfile.TemporaryDirectory(prefix="buildlog-report-output-") as temporary:
             root = Path(temporary) / "buildlog"
@@ -138,7 +149,11 @@ class ReportSpeedTests(unittest.TestCase):
                             crates_compiled=1, mem_wait_s=0, tests_flaky=0,
                             mem_stall_some_s=0.2 if number % 100 == 0 else 0,
                         )))
-                self.assertEqual(index.update(), 29_138 + 36_462)
+                    hold_rows = timed_hold_events(midnight, datetime.now(UTC))
+                    for hold_row in hold_rows:
+                        _ = output.write(encode(hold_row))
+                self.assertEqual(index.update(), 29_138 + 36_462 + len(hold_rows))
+                usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
                 began = time.perf_counter()
                 result = subprocess.run(
                     [sys.executable, "scripts/buildlog/cli.py", "report"],
@@ -146,9 +161,14 @@ class ReportSpeedTests(unittest.TestCase):
                     capture_output=True, text=True, check=False,
                 )
                 elapsed = time.perf_counter() - began
+                usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+                cpu_seconds = usage_after.ru_utime + usage_after.ru_stime - usage_before.ru_utime - usage_before.ru_stime
+                print(f"report CPU: {cpu_seconds:.3f} s", flush=True)
                 print(f"report: {elapsed:.3f} s (29,138 calls, 36,462 steps)", flush=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("### Tests by target", result.stdout)
+                self.assertIn("Now: Mac blocked by", result.stdout)
+                self.assertIn("Now: natedev held by", result.stdout)
                 for name, job in (("launches.collect", launches.collect), ("index.update", index.update)):
                     began = time.perf_counter()
                     _ = job()
@@ -156,7 +176,7 @@ class ReportSpeedTests(unittest.TestCase):
                 with closing(index.read_only()) as connection:
                     for name, duration in section_seconds(connection, day).items():
                         print(f"report section {name}: {duration:.3f} s", flush=True)
-                self.assertLessEqual(elapsed, 2.0, result.stderr)
+                self.assertLessEqual(cpu_seconds, 2.0, result.stderr)
         time.tzset()
 
 
@@ -408,6 +428,7 @@ class ReportTests(unittest.TestCase):
         time.tzset()
 
     def test_lead_block_has_all_five_facts_before_waiting(self) -> None:
+        write_mac_block(datetime(2026, 10, 12, 15, tzinfo=UTC), "mac-holder", "preview")
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("passed", mac="passed", mac_reason="", mac_s=10, hold_wait_s=600),
@@ -418,11 +439,39 @@ class ReportTests(unittest.TestCase):
         lines = self.render().splitlines()
         lead = [line for line in lines[2:lines.index("### Waiting")] if line]
         self.assertEqual(lead, [
+            "Now: Mac blocked by mac-holder for preview since 2026-10-12 08:00 PDT",
             "Mac when usable: 1 of 1 candidates finished there (100%).",
             "Longest wait: 10.0 min for Held target.",
             "Failed steps: 1; flaky tests: 2.", "Pass records saved: 2.0 min.",
-            f"Mac blocked as of {local_clock('2026-10-02T12:10:00Z').split()[0]}",
         ])
+
+    def test_earlier_day_names_the_hold_in_force_now_and_that_days_unreachable_call(self) -> None:
+        now = datetime(2026, 10, 12, 15, tzinfo=UTC)
+        write_holder("session", now, "renderer", "screenshot")
+        write_mac_block(now, "mac-holder", "preview")
+        self.write(self.root / "natedev" / "2026-10.jsonl",
+                   call("old-unreachable", mac="declined", mac_reason="unreachable", mac_s=1))
+        output = self.render("2026-10-02")
+        self.assertIn("Now: natedev held by renderer for screenshot since 2026-10-12 08:00 PDT", output)
+        self.assertIn("Now: Mac blocked by mac-holder for preview since 2026-10-12 08:00 PDT", output)
+        self.assertIn("Mac unreachable as of 2026-10-02 05:00 PDT", output)
+        self.assertLess(output.index("Now: Mac"), output.index("### Waiting"))
+
+    def test_a_historical_blocked_call_does_not_claim_a_current_block(self) -> None:
+        self.write(self.root / "natedev" / "2026-10.jsonl",
+                   call("old-block", mac="declined", mac_reason="blocked", mac_s=1))
+        output = self.render()
+        self.assertNotIn("Mac blocked as of", output)
+        self.assertNotIn("Now: Mac blocked", output)
+
+    def test_todays_unreachable_call_keeps_the_short_time(self) -> None:
+        now = datetime.now(UTC)
+        stamp = now.isoformat()
+        self.write(self.root / "natedev" / "2026-10.jsonl",
+                   call("today-unreachable", started_at=stamp, ended_at=stamp,
+                        mac="declined", mac_reason="unreachable", mac_s=1))
+        output = self.render(now.astimezone(user_zone()).date().isoformat())
+        self.assertIn(f"Mac unreachable as of {now.astimezone(user_zone()):%H:%M}", output.splitlines())
 
     def test_lead_block_uses_latest_candidate_and_groups_backoff_with_unreachable(self) -> None:
         for reason in ("backoff", "unreachable"):
@@ -433,7 +482,7 @@ class ReportTests(unittest.TestCase):
                     call("local", started_at="2026-10-02T12:10:00Z", mac="declined", mac_reason="local_flag"),
                     call("linux", started_at="2026-10-02T12:20:00Z", mac="declined", mac_reason="linux_only"),
                 )
-                self.assertIn(f"Mac unreachable as of {local_clock(STAMP).split()[0]}", self.render())
+                self.assertIn("Mac unreachable as of " + holds.shown_time(datetime.fromisoformat(STAMP)), self.render())
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("blocked", mac="declined", mac_reason="blocked", mac_s=1),

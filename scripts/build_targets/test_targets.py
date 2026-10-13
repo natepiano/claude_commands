@@ -15,6 +15,7 @@ from typing import Literal, TypedDict, cast, override
 from unittest import mock
 
 import targets
+import build_hold
 import mac_test
 import offload
 
@@ -77,6 +78,7 @@ class IsolatedTargetTest(unittest.TestCase):
         _ = self.settings.write_text("host=test-mac\n", encoding="utf-8")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILD_HOLD_DIR": str(self.holders),
+            "BUILDLOG_DIR": str(self.root / "buildlog"),
             "MAC_TEST_STATE_DIR": str(self.mac_state),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "",
@@ -84,6 +86,7 @@ class IsolatedTargetTest(unittest.TestCase):
             "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         })))
+        _ = self.enterContext(mock.patch.object(build_hold, "record_hold_event"))
         _ = os.environ.pop("BUILD_TARGETS_CONFIG", None)
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         _ = self.enterContext(mock.patch(

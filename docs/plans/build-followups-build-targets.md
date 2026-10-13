@@ -522,7 +522,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **Ruled out:** identifying the hold by `cycle["holders"][name]["since"]` (two names map to one file, which let a resumed release run under a new hold); a flag, field or state in the record (comparing `since` suffices); a retry in the live reader of `cycle.json` (it would hide real damage); a second temp location for a holder directory on another file system (none exists on natedev or in a test).
 
-### Phase 13 — The Mac report shows who held the Mac and when it was blocked or held  · status: todo
+### Phase 13 — The Mac report shows who held the Mac and when it was blocked or held  · status: done
 
 #### Work Order
 

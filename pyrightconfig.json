@@ -90,7 +90,9 @@
         "scripts/buildlog",
         "scripts/build_hold",
         "scripts/lint",
-        "scripts/lib"
+        "scripts/lib",
+        "scripts/build_targets",
+        "scripts/mac_test"
       ]
     },
     {
@@ -147,7 +149,8 @@
       "extraPaths": [
         "scripts/build_hold",
         "scripts/message",
-        "scripts/notify"
+        "scripts/notify",
+        "scripts/lib"
       ]
     },
     {

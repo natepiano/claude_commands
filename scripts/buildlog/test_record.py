@@ -22,6 +22,7 @@ from typing import cast, override
 
 import record as recorder
 import sample
+import store
 from test_index import point_root_at
 
 SCRIPT = Path(__file__).with_name("record.py")
@@ -36,6 +37,7 @@ AMBIENT = (
     "BUILDLOG_CALLER",
     "BUILDLOG_CALL_ID",
     "BUILDLOG_LOCAL_REASON",
+    "BUILDLOG_MAC_HOLDER",
     "BUILDLOG_TARGET",
     "BUILDLOG_HOLD_WAIT_S",
     "LINT_OUTPUT_DIR",
@@ -72,7 +74,9 @@ def ledger_line(**fields: object) -> str:
 
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+    unittest.addModuleCleanup(time.tzset)
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"}))
+    time.tzset()
 
 
 class RecordTests(unittest.TestCase):
@@ -105,6 +109,7 @@ class RecordTests(unittest.TestCase):
         environment["BUILDLOG_HOLD_STARTED_FILE"] = environment["BUILDLOG_HOLD_WAITER_FILE"] = ""
         environment["BUILDLOG_HOLD_REGISTRATION_FILE"] = str(self.base / "registration")
         environment["MAC_TEST_STATE_DIR"] = str(self.base / "mac-state")
+        environment["NOTIFIER_SESSIONS_DIR"] = str(self.base / "sessions")
         # No signing, hooks or identity from the user's own git config.
         environment["GIT_CONFIG_GLOBAL"] = os.devnull
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
@@ -614,6 +619,52 @@ class RecordTests(unittest.TestCase):
                 records = self.records()
                 self.assertEqual(len(records), before + 1)
                 self.assertEqual(records[-1]["token_wait_s"], 0)
+
+    def test_busy_call_stores_the_claim_what_as_mac_holder(self) -> None:
+        result = self.record(
+            "call", "ran", "0", "1", "0", "1", "1", "0", "1", "test", "hana",
+            extra={"BUILDLOG_MAC": "declined", "BUILDLOG_MAC_REASON": "busy",
+                   "BUILDLOG_MAC_S": "1", "BUILDLOG_MAC_HOLDER": "hana nextest"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records()[-1]["mac_holder"], "hana nextest")
+
+    def test_hold_event_keeps_the_key_and_the_locked_utc_time(self) -> None:
+        result = self.record("hold-event", "began", "mac", "block-key", "hana", "render",
+                             "2026-10-12T12:00:00.123456+00:00", "2026-10-12T14:00:00+00:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.records()[-1]
+        self.assertEqual(row, {
+            "kind": "hold_event", "v": recorder.RECORD_VERSION,
+            "at": "2026-10-12T12:00:00.123456Z", "host": socket.gethostname().split(".")[0],
+            "target": "mac", "event": "began", "hold_key": "block-key", "holder": "hana",
+            "reason": "render", "until": "2026-10-12T14:00:00+00:00",
+        })
+        result = self.record("hold-event", "ended", "mac", "block-key", "hana", "render",
+                             "2026-10-12T14:00:00+00:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records()[-1]["until"], "")
+
+    def test_hold_event_write_failure_returns_zero_and_adds_no_event(self) -> None:
+        with mock.patch.object(store, "append_line", side_effect=OSError("write failed")):
+            self.assertEqual(recorder.main(["hold-event", "began", "natedev", "key", "hana", "render",
+                                            "2026-10-12T12:00:00+00:00"]), 0)
+        self.assertEqual(self.records(), [])
+        self.assertIn("write failed", (self.root / "errors.log").read_text())
+
+    def test_hold_event_refuses_invalid_or_naive_planned_ends_without_failing_its_caller(self) -> None:
+        for until in ("later", "2026-10-12T14:00:00"):
+            with self.subTest(until=until):
+                result = self.record("hold-event", "began", "mac", "block-key", "hana", "render",
+                                     "2026-10-12T12:00:00Z", until)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.records(), [])
+
+    def test_hold_event_accepts_an_empty_planned_end(self) -> None:
+        result = self.record("hold-event", "began", "mac", "block-key", "hana", "render",
+                             "2026-10-12T12:00:00Z", "")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records()[-1]["until"], "")
 
     def test_call_records_mac_result_and_local_reason(self) -> None:
         local_reason = 'needs Linux path handling with a "quoted" mount'

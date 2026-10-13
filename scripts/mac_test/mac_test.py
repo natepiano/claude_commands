@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Generator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import fcntl
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 from typing import Literal, TypeGuard, TypedDict, cast
 
 
@@ -383,7 +385,7 @@ def read_config() -> MacTestConfig:
 @contextmanager
 def locked(path: Path) -> Generator[None, None, None]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as lock_file:
+    with record_after_unlock(), path.open("a+", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             yield
@@ -650,7 +652,53 @@ def write_block(path: Path, block: PendingMacBlock | ActiveMacBlock) -> None:
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc).replace(microsecond=0)
+    return datetime.now(timezone.utc)
+
+
+@dataclass(frozen=True)
+class MacBlockEvent:
+    kind: Literal["began", "ended"]
+    block: PendingMacBlock | ActiveMacBlock
+    at: datetime
+
+
+pending_hold_events: ContextVar[tuple[MacBlockEvent, ...]] = ContextVar("pending_hold_events", default=())
+coordination_depth: ContextVar[int] = ContextVar("coordination_depth", default=0)
+
+
+@contextmanager
+def record_after_unlock() -> Generator[None, None, None]:
+    depth = coordination_depth.get()
+    token = coordination_depth.set(depth + 1)
+    try:
+        yield
+    finally:
+        coordination_depth.reset(token)
+        if depth == 0:
+            events = pending_hold_events.get()
+            _ = pending_hold_events.set(())
+            for event in events:
+                start_hold_recorder(event)
+
+
+def start_hold_recorder(event: MacBlockEvent) -> None:
+    command = [sys.executable, str(Path(__file__).resolve().parent.parent / "buildlog" / "record.py"),
+               "hold-event", event.kind, "mac", timestamp(event.block.since), event.block.holder, event.block.reason,
+               timestamp(event.at.astimezone(timezone.utc)), timestamp(event.block.expires)]
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except OSError:
+        return
+    threading.Thread(target=process.wait, name="hold-event-recorder", daemon=True).start()
+
+
+def record_hold_event(event: Literal["began", "ended"], block: PendingMacBlock | ActiveMacBlock, at: datetime) -> None:
+    record = MacBlockEvent(event, block, at)
+    if coordination_depth.get():
+        _ = pending_hold_events.set((*pending_hold_events.get(), record))
+    else:
+        start_hold_recorder(record)
 
 
 def local_time(instant: str, include_zone: bool = True) -> str:
@@ -994,7 +1042,7 @@ def skipped_ci_runs(config: MacTestConfig, since: datetime) -> str:
         "--workflow",
         config.ci_workflow,
         "--created",
-        f">={timestamp(since)}",
+        f">={timestamp(since.replace(microsecond=0))}",
         "--limit",
         "200",
         "--json",
@@ -1116,7 +1164,13 @@ def expire_block(
                 NO_PROBLEM,
             )
     with locked(paths.lock):
-        paths.block.unlink(missing_ok=True)
+        at = utc_now()
+        try:
+            paths.block.unlink()
+        except FileNotFoundError:
+            pass
+        else:
+            record_hold_event("ended", block, at)
     skipped = (
         skipped_ci_runs(config, block.since)
         if block.ci != "not_configured"
@@ -1582,6 +1636,8 @@ def command_block(
                 )
                 new_block = False
             write_block(paths.block, block)
+            if new_block:
+                record_hold_event("began", block, now)
         outcome = full_settle(
             paths,
             config,
@@ -1636,7 +1692,13 @@ def command_unblock(
                 )
                 return 2
         with locked(paths.lock):
-            paths.block.unlink(missing_ok=True)
+            at = utc_now()
+            try:
+                paths.block.unlink()
+            except FileNotFoundError:
+                pass
+            else:
+                record_hold_event("ended", block, at)
         if ci_needs_restore(block.ci):
             print("Mac unblocked; CI may use the Mac again.")
         elif block.ci == "off_before":

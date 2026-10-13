@@ -29,7 +29,6 @@ MACHINE_ZONE = re.compile(r"\.astimezone\(\)")
 # The scripts that may use the machine's zone, each because the time there is stored or compared, never shown.
 USES_THE_MACHINE_ZONE = {
     "agents/codex_mesh.py": "log stamps written with their offset",
-    "build_hold/build_hold.py": "its displays move in the build hold's own phase",
     "hooks/banned_words_lib.py": "a log stamp written with its offset",
     "notify/pushover.py": "a log stamp written with its offset",
     "production/dailies_render.py": "reads reset times stored with no offset, in the machine's zone",
