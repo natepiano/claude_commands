@@ -266,6 +266,18 @@ class AccountsTests(unittest.TestCase):
         self.assertFalse(accounts.accounts_config_file().exists())
         self.assertFalse(accounts.roles_history_file().exists())
 
+    def test_exec_default_removes_inherited_config_directory_and_oauth_token(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        with (
+            patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "inherited", "CLAUDE_CODE_OAUTH_TOKEN": "fixture-token"}),
+            patch.object(os, "execvpe") as launch,
+        ):
+            expected = dict(os.environ)
+            del expected["CLAUDE_CONFIG_DIR"]
+            del expected["CLAUDE_CODE_OAUTH_TOKEN"]
+            self.assertEqual(self.run_cli("exec", "default", "--resume", "same-id"), (0, "", ""))
+        launch.assert_called_once_with("claude", ["claude", "--resume", "same-id"], expected)
+
     def test_exec_missing_directory_prints_setup_refusal_without_launching(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
         with patch.object(os, "execvpe") as launch:
@@ -640,7 +652,7 @@ class AccountsTests(unittest.TestCase):
             if argv[2] == "status":
                 self.assertEqual(argv[4:], ("--json",))
                 return subprocess.CompletedProcess(argv, 0, json.dumps(inventory), "")
-            self.assertEqual(argv[2:], ("down", argv[3], "--restart"))
+            self.assertEqual(argv[2:], ("down", argv[3], "--restart", "--to", label))
             current = accounts.role_account("unit")
             if label == "default":
                 self.assertIsInstance(current, accounts.DefaultAccount)
@@ -667,7 +679,7 @@ class AccountsTests(unittest.TestCase):
 
         self.assertEqual(result, (0, "shutdown started\nunits come back on claude 1 when claude 3 is down\n", ""))
         self.assertEqual([argv[2:] for argv in commands], [
-            ("status", "claude 3", "--json"), ("down", "claude 3", "--restart"),
+            ("status", "claude 3", "--json"), ("down", "claude 3", "--restart", "--to", "claude 1"),
         ])
         self.assertEqual(accounts.role_account("unit"), accounts.NamedAccount("claude 1", self.home / ".claude1"))
         audit = cast(dict[str, object], json.loads(accounts.roles_history_file().read_text()))
@@ -713,7 +725,7 @@ class AccountsTests(unittest.TestCase):
 
         self.assertEqual(result[0], 0, result)
         self.assertEqual([argv[2:] for argv in commands], [
-            ("status", "claude 2", "--json"), ("down", "claude 2", "--restart"),
+            ("status", "claude 2", "--json"), ("down", "claude 2", "--restart", "--to", "claude 1"),
         ])
         self.assertIn("when claude 2 is down", result[1])
 
@@ -735,7 +747,7 @@ class AccountsTests(unittest.TestCase):
         result, commands = self.swap_cli([found], "default")
 
         self.assertEqual(result, (0, "shutdown started\nunits come back on claude 2 when claude 3 is down\n", ""))
-        self.assertEqual(commands[-1][2:], ("down", "claude 3", "--restart"))
+        self.assertEqual(commands[-1][2:], ("down", "claude 3", "--restart", "--to", "default"))
         self.assertIsInstance(accounts.role_account("unit"), accounts.DefaultAccount)
         audit = cast(dict[str, object], json.loads(accounts.roles_history_file().read_text()))
         self.assertEqual((audit["label"], audit["account_label"]), ("default", "claude 2"))
@@ -749,7 +761,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual((result[0], result[2]), (0, ""))
         role_argv, down_argv = [shlex.split(line) for line in result[1].splitlines()]
         self.assertEqual(role_argv[2:], ["set-role", "unit", "claude 1"])
-        self.assertEqual(down_argv[2:], ["down", "claude 3", "--restart"])
+        self.assertEqual(down_argv[2:], ["down", "claude 3", "--restart", "--to", "claude 1"])
         self.assertEqual([argv[2] for argv in commands], ["status"])
         self.assertEqual(self.role_files(), before)
 

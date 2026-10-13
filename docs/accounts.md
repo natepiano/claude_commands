@@ -53,7 +53,7 @@ These aliases come from natedev's shell configuration after a rebuild; the Mac h
 
 Arguments after the label pass through to `claude`.
 
-Units started by showrunners pick their account themselves. A named alias whose login matches the default runs on `~/.claude`, with `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_REMOTE_MEMORY_DIR` removed. Today that is `claude2`; other named aliases use their own `~/.claudeN` directory. Plain `claude` is unchanged.
+New units pick the unit role; resumed units keep their recorded account unless given `--account`. Each unit launch saves its config directory and model on its tmux session for later resumes. If neither tmux nor shutdown has a recorded account, resume refuses and asks for `--account`. A named alias whose login matches the default runs on `~/.claude`, with `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_REMOTE_MEMORY_DIR` removed. Today that is `claude2`; other named aliases use their own `~/.claudeN` directory. `exec default` starts plain `claude`, removing those variables and any inherited OAuth token.
 
 A missing directory refuses without starting Claude, for example:
 
@@ -109,6 +109,42 @@ env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=~/.claude3 claude
 
 Never `/logout` in a unit director's session: every unit on that account stops working. After any login, run `/showrunner:accounts`; every directory must match its label.
 
+## Move a session
+
+Move a showrunner, unit director or top-level session from the machine where it runs:
+
+```text
+/showrunner:accounts move <session-id-or-exact-name> "claude 3"
+/showrunner:accounts move <session-id-or-exact-name> default
+```
+
+In a terminal, use `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <session-id-or-exact-name> 'claude 3'`. A session can move itself. The request names its requester and stops through the normal shutdown readiness checks. It keeps its conversation, name, model and Remote Control name. SendMessage and `send.py` still reach it; Remote Control registers on the target account and leaves the old account's phone app.
+
+Before changing anything, move refuses when:
+
+- No live session has that id or exact name here; move a session on the other machine from there.
+- Two live sessions share the name; their ids are listed so you can select one.
+- The session is a seat: `seats move with their unit director`.
+- The target fails `check`; its first problem is printed.
+- Its login is already the target: `<name> is already on <label>`.
+- A target label names the default login, or its directory holds that login: `<label> is the default account; use default`.
+- That session has an open shutdown: `<name> already has a shutdown in progress`. An unrelated session's shutdown does not refuse.
+- The current account or shutdown state cannot be read safely.
+
+Move runs `shutdown.py down '<current note label>' --here --only <id> --restart --to '<target>'`. A tmux session respawns its pane; a unit resumes through `add_unit.py --resume --account '<target>'`; Ghostty, Zed and Terminal reopen a window. Use `--why "<text>"` to explain the move; the default is `<old label> is out of usage`. Every resume says it was an account move, not a stop, and continues where it stopped; a unit director continues its `/unit:direct` run. An unknown host prints exactly one resume command with `run this once <name> has exited` before starting shutdown. Run it after exit; restart reports the same command as `manual restart <name>: <line>`.
+
+The target is checked again at launch. A moved launch uses `accounts.py exec '<target>'`, which drops inherited OAuth tokens. Moving changes no login or credentials and leaves other sessions in place. The unit role selects only new launches.
+
+To move every showrunner off an expired account together:
+
+```text
+/showrunner:accounts move showrunners --from "claude 2" --to "claude 3"
+```
+
+The terminal command is `accounts.py move showrunners --from 'claude 2' --to 'claude 3' [--dry-run]`, through the same script path above. `--dry-run` prints each selected name and id, one `down` command and each resume command, without changing anything. No match refuses with `no showrunner on <label> on this machine`. An unfit target, a default-login alias or the same source login refuses the whole move. A showrunner already in shutdown prints `<name> already has a shutdown in progress` and is skipped; the others still move in one selected shutdown.
+
+Each returns to its own conversation, cwd, name, model and production resume prompt. Tmux respawns its existing pane and keeps the attached desktop window. For a direct Ghostty showrunner, shutdown closes its window as usual and restart opens a replacement on the recorded desktop. The batch command also accepts `--why "<text>"`; each resume carries the same account-move explanation.
+
 ## Swapping the unit account
 
 The unit account runs the unit directors and the nightly review. A swap moves both: the next night's review starts on the new account.
@@ -144,9 +180,12 @@ accounts: <label> is the default account; use default
 accounts: <note label> is already the unit account
 accounts: cannot swap <old>: <machine> <kind> <name> would not move
 accounts: cannot swap <old>: <machine> unattributed session <name> (pid <pid>)
+accounts: <name> already has a shutdown in progress
 ```
 
 An unfit target reports its first `/showrunner:accounts` problem. Fix account readiness there; for a logged-out account, use its alias and `/login` as that account. Close ordinary sessions on the outgoing unit account before retrying a session refusal. Only units and their director-owned seats on natedev move; any session on the Mac refuses. Swap needs the Mac reachable even if its inventory is empty. A Mac outage refuses with the role unchanged. Swap takes no `--here`.
+
+Swap selects the unit role, then runs `down '<old>' --restart --to '<new>'`; `--dry-run` prints both commands. A unit already in shutdown refuses before changing the role because a repeated request cannot attach a target to its existing record.
 
 `unit account unchanged: still claude 3` means shutdown refused and the old role is back. Fix the printed refusal, then run the same swap again.
 

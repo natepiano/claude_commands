@@ -529,6 +529,117 @@ class SettleTests(ShutdownTestCase):
         self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC + timedelta(seconds=299)), settle.Hold)
         self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC + timedelta(seconds=300)), settle.SendSettleMessage)
 
+    def test_moved_ghostty_showrunner_records_its_existing_desktop_without_old_window_tracking(self) -> None:
+        owner = showrunner("hana-id", "hana")
+        owner["host"] = inventory.WindowHost(kind="ghostty", window_shell=123,
+            desktop=inventory.NamedDesktop(kind="named", name="Production"))
+        with (
+            patch.object(settle, "run_inventory", return_value=machine_inventory([owner])),
+            patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")) as windows_probe,
+            patch.object(sys, "platform", "linux"),
+            redirect_stdout(io.StringIO()),
+        ):
+            saved = settle.begin(LOGIN, only=["hana-id"], request_id="move", target="claude 3", then="restart")
+        self.assertNotIn("old_window", saved[0])
+        self.assertNotIn("old_window", record.session_records(LOGIN)[0])
+        self.assertEqual(saved[0]["session"]["host"], owner["host"])
+        windows_probe.assert_not_called()
+
+    def test_down_to_stores_target_on_each_new_session_record(self) -> None:
+        owners: list[inventory.Session] = [top_level("first", "First"), top_level("second", "Second")]
+        with (
+            patch.object(settle, "_warm", return_value=True),
+            patch.object(settle, "inventory", return_value=machine_inventory(owners)),
+            patch.object(settle, "run_inventory", return_value=machine_inventory(owners)),
+            patch.object(settle, "_launch_conductor"),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(settle.down(Account("claude", LOGIN, LABEL), True,
+                ["first", "second"], then="restart", target="claude 3"), 0)
+        saved = record.session_records(LOGIN)
+        self.assertEqual(len(saved), 2)
+        self.assertTrue(all(item.get("target") == "claude 3" for item in saved))
+
+    def test_down_to_persists_source_label_and_explicit_reason_beside_each_new_target(self) -> None:
+        with (
+            patch.object(settle, "run_inventory", return_value=machine_inventory([top_level("owner", "Owner")])),
+            redirect_stdout(io.StringIO()),
+        ):
+            saved = settle.begin(LOGIN, only=["owner"], request_id="move", then="restart",
+                target="claude 3", why="weekly limit reached")
+        self.assertEqual(saved[0].get("source_label"), LABEL)
+        self.assertEqual(saved[0].get("why"), "weekly limit reached")
+        self.assertEqual(record.session_records(LOGIN)[0].get("source_label"), LABEL)
+        self.assertEqual(record.session_records(LOGIN)[0].get("why"), "weekly limit reached")
+
+    def test_down_to_defaults_its_saved_reason_to_source_label_out_of_usage(self) -> None:
+        with (
+            patch.object(settle, "run_inventory", return_value=machine_inventory([top_level("owner", "Owner")])),
+            redirect_stdout(io.StringIO()),
+        ):
+            saved = settle.begin(LOGIN, only=["owner"], request_id="move", then="restart", target="default")
+        self.assertEqual(saved[0].get("why"), f"{LABEL} is out of usage")
+        self.assertEqual(saved[0].get("source_label"), LABEL)
+
+    def test_down_without_to_records_no_move_target(self) -> None:
+        with patch.object(settle, "run_inventory", return_value=machine_inventory([top_level("owner", "Owner")])):
+            added = settle.begin(LOGIN, only=["owner"], request_id="ordinary", then="restart")
+        self.assertEqual(len(added), 1)
+        self.assertNotIn("target", added[0])
+        self.assertNotIn("target", record.session_records(LOGIN)[0])
+
+    def test_down_to_never_changes_an_existing_record_or_its_request_fields(self) -> None:
+        original = session_shutdown(top_level("owner", "Owner"), requester="requester",
+            request_id="first-request", then="stop")
+        original["alerts"] = "none"
+        self.save(original)
+        before = {str(path): path.read_bytes() for path in (self.root / "state").rglob("*.json")}
+        with (
+            patch.object(settle, "_warm", return_value=True),
+            patch.object(settle, "inventory", return_value=machine_inventory([original["session"]])),
+            patch.object(settle, "run_inventory", return_value=machine_inventory([original["session"]])),
+            patch.object(settle, "_launch_conductor"),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(settle.down(Account("claude", LOGIN, LABEL), True, ["owner"],
+                then="restart", target="claude 3", why="different reason", requested_by="another", request_id="second-request"), 0)
+        self.assertEqual(record.find_session(LOGIN, "owner"), original)
+        self.assertEqual({str(path): path.read_bytes() for path in (self.root / "state").rglob("*.json")}, before)
+
+    def test_down_to_forwards_the_target_to_peer_for_remote_selected_sessions(self) -> None:
+        with (
+            patch.object(settle, "_warm", return_value=True),
+            patch.object(settle, "inventory", return_value=machine_inventory([])),
+            patch.object(settle, "run_inventory", return_value=machine_inventory([])),
+            patch.object(settle, "_launch_conductor"),
+            patch.object(settle, "run_remote", return_value=(0, "")) as peer,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(settle.down(Account("claude", LOGIN, LABEL), False, ["remote"],
+                then="restart", target="default", why="weekly limit reached", requested_by="requester", request_id="move-request"), 0)
+        arguments = cast(list[str], peer.call_args.args[0])
+        self.assertEqual(arguments[:3], ["down", LOGIN, "--here"])
+        self.assertEqual(arguments[arguments.index("--to") + 1], "default")
+        self.assertEqual(arguments[arguments.index("--why") + 1], "weekly limit reached")
+        self.assertEqual(arguments[arguments.index("--only") + 1], "remote")
+        self.assertEqual(arguments[arguments.index("--requested-by") + 1], "requester")
+        self.assertIn("--restart", arguments)
+
+    def test_self_move_records_the_session_as_its_requester(self) -> None:
+        owner = top_level("self-id", "Self")
+        with (
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "self-id"}),
+            patch.object(settle, "_warm", return_value=True),
+            patch.object(settle, "inventory", return_value=machine_inventory([owner])),
+            patch.object(settle, "run_inventory", return_value=machine_inventory([owner])),
+            patch.object(settle, "_launch_conductor"),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(settle.down(Account("claude", LOGIN, LABEL), True, ["self-id"],
+                then="restart", target="claude 3"), 0)
+        self.assertEqual(record.session_records(LOGIN)[0]["requested_by"],
+            record.FromSession(kind="session", session_id="self-id"))
+
     def test_begin_attaches_owned_seats_and_second_request_adds_only_new_owner(self) -> None:
         first, second = top_level("first", "First"), top_level("second", "Second")
         worker = seat("worker", "Worker", owner="first")

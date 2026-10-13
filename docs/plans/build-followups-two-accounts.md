@@ -420,7 +420,7 @@ Asked for by the user through the showrunner. Text above this section that names
 - **Never reply to a message's `from` socket.** A showrunner's messages arrive through `send.py`'s relay process, which ends at once, so that socket is gone by the time a reply is written.
 - **Rollout:** units started before this keep the old prompt and need the row's ref until they restart. The showrunner's own sends to units by name can hit the same refusal; `sessions.py address <unit session name>` serves it, and whether it adopts that is its call.
 
-### Phase 8 — Move one session to any account  · status: todo · waits on the user's go
+### Phase 8 — Move one session to any account  · status: done
 
 #### Work Order
 
@@ -446,7 +446,15 @@ Asked for by the user through the showrunner. Text above this section that names
    - unknown: move prints the one resume line before the stop starts, with `run this once <name> has exited`, and restart reports the same line as `manual restart <name>: <line>`.
 5. A session may move itself. Its own request is recorded as the requester, as for any shutdown it asks for.
 6. `swap unit` keeps its refusals and becomes `set-role unit` plus `down '<old>' --restart --to '<new>'`, because a unit resume no longer reads the role. It also refuses a unit that already has a shutdown record, because that record would be given no target. `swap seats` is unchanged.
+4a. **Moved, not stopped** (showrunner, 2026-10-13, from hana's report: a unit that was `/exit`-ed read it as the user stopping its run and stayed stopped). `move` and `move showrunners` take `--why '<text>'` (default `<old label> is out of usage`); the record stores the source label and the why beside the target. Every moved session resumes with a note saying it was moved from `<old>` to `<new>` because `<why>`, that this was an account move and not a stop, and to continue where it stopped: a unit director continues its `/unit:direct` run, a showrunner resumes through `/showrunner:produce <doc> resume` with the same note. A unit keeps its recorded model.
 7. A moved session keeps its name, so `send.py` and same-machine SendMessage reach it on either account. Its Remote Control registers on the target account, and the old account's phone app no longer lists it.
+8. **Move every showrunner off an account at once** (the user, 2026-10-13: "a cli that will shut down all showrunners running on an expired claude and restart them on an unexpired claude (provided by the user) AND restart them in their same desktop window as they are currently located"). `accounts.py move showrunners --from '<label>' --to '<claude N | default>' [--dry-run]`, also `/showrunner:accounts move showrunners …`.
+   - It selects every live showrunner session on this machine (the sessions `scripts/shutdown/inventory.py` already classes as `showrunner`, from `showrunners.registered_showrunners()`) whose process runs on `--from`'s login. None found refuses with `no showrunner on <label> on this machine`.
+   - The target refusals of Spec 2 (fails `check`, the default login's label, already the `--from` login) refuse the whole command before anything changes. A showrunner with a shutdown record already open is skipped with Spec 2's line and the others still move.
+   - It runs one `shutdown.py down '<from>' --here --only <every selected id> --restart --to '<to>'`. Each resumes as Spec 4 says: by session id, from its original cwd, with its own name, `--remote-control <name>`, the model, and `/showrunner:produce <doc> resume`.
+   - **Same window, same desktop.** A showrunner hosted in tmux (a Ghostty window running `tmux attach -t <s>`) respawns in its own pane, so its window never changes. A showrunner running directly in a Ghostty window (natedev, hana and bevy_brp do today; KWin on Wayland) has its window closed when it stops, as shutdown already does, and reopens in a new Ghostty window on the desktop it was on, as restart already does. Nothing can type into another window's shell on Wayland, so a new window on the same desktop is how it looks the same. (Review, 2026-10-13: tracking the old window by its title failed on live titles, which carry a status glyph, `✳ natedev`.)
+   - `--dry-run` prints the selected showrunners, the `down` line and each resume line, and changes nothing.
+   - `docs/accounts.md` gains the command under "Move a session"; the unit director sends the vault page text to its owner after merge, so no seat edits anything under `~/rust/`.
 
 **Files:**
 
@@ -455,7 +463,7 @@ Asked for by the user through the showrunner. Text above this section that names
 - `scripts/production/add_unit.py` — `--account` on `--resume`, and a resume keeps the account it ran on; its tests.
 - `docs/accounts.md` — "Move a session", with every refusal; `commands/showrunner/accounts.md` — the argument hint; `docs/as-built/shutdown-and-restart.md`.
 
-**Acceptance gate:** the accounts, shutdown, production and whoami suites and the scoped lint pass. Live on natedev with a scratch probe in tmux: move it claude 2 → claude 3 → `default`. After each move it answers a question about its earlier turns, its status line and `account.py --pid` show the target, and `send.py` reaches it and its reply comes back. A second probe with no known host gets exactly one printed resume line, and running that line resumes it on the target. `swap unit … --dry-run` prints `down … --to`. `~/.claude/.credentials.json` is unchanged and no other session moved.
+**Acceptance gate:** the accounts, shutdown, production and whoami suites and the scoped lint pass. Live on natedev with a scratch probe in tmux: move it claude 2 → claude 3 → `default`. After each move it answers a question about its earlier turns, its status line and `account.py --pid` show the target, and `send.py` reaches it and its reply comes back. A second probe with no known host gets exactly one printed resume line, and running that line resumes it on the target. `swap unit … --dry-run` prints `down … --to`. `move showrunners --from 'claude 2' --to 'claude 3' --dry-run` lists the showrunners and their resume lines; live, with the user, the showrunners move and each comes back in its own window on its own desktop with no old window left. `~/.claude/.credentials.json` is unchanged and no other session moved.
 
 ### Phase 9 — One-week readout  · status: todo · gated by G3
 
