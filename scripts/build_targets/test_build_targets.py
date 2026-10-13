@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import signal
 import sys
 import subprocess
 import time
@@ -386,10 +387,68 @@ class WaitLocalTests(IsolatedTargetTest):
         self.assertEqual((code, output, errors), (0, "", ""))
         self.assertFalse((self.root / "release").exists())
 
+    def test_signal_right_after_registration_removes_the_call(self) -> None:
+        self.begin_hold()
+        register = build_targets.register_local_call
+        handlers = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+
+        def cancel(key: str, call_id: str, pid: int) -> build_hold.Admission:
+            answer = register(key, call_id, pid)
+            signal.raise_signal(signal.SIGTERM)
+            return answer
+
+        with mock.patch.object(build_targets, "register_local_call", side_effect=cancel):
+            with self.assertRaises(SystemExit) as stopped:
+                _ = build_targets.command_wait_local("cancelled-call", pid=os.getpid())
+        self.assertEqual(stopped.exception.code, 143)
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        self.assertEqual([call for entry in cycle["entries"] for call in entry.get("calls", [])], [])
+        for signum, handler in handlers.items():
+            self.assertEqual(signal.getsignal(signum), handler)
+
     def test_unheld_call_skips_owner_and_admission_lookup(self) -> None:
         with mock.patch.object(build_hold, "owning_session", side_effect=AssertionError("Owner lookup not needed")):
             with mock.patch.object(build_hold, "read_admission", side_effect=AssertionError("Admission lookup not needed")):
                 self.assertEqual(self.wait(), (0, "", ""))
+
+    def test_signal_after_registration_in_a_new_cycle_removes_only_the_cancelled_call(self) -> None:
+        self.begin_hold()
+        register = build_targets.register_local_call
+        registrations: list[str] = []
+        cycles: list[str] = []
+        handlers = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+
+        def change_cycle(_seconds: float) -> None:
+            self.assertEqual(len(registrations), 1)
+            cycle = build_hold.open_cycle(NOW + timedelta(seconds=1))
+            cycles.append(cycle["id"])
+            _ = build_hold.register_wait("peer", call_id="peer-call", pid=os.getpid())
+
+        def cancel_second_registration(key: str, call_id: str, pid: int) -> build_hold.Admission:
+            answer = register(key, call_id, pid)
+            assert isinstance(answer, build_hold.AwaitingTurn)
+            registrations.append(answer.cycle_id)
+            if len(registrations) == 2:
+                signal.raise_signal(signal.SIGTERM)
+            return answer
+
+        with mock.patch.object(build_targets, "register_local_call", side_effect=cancel_second_registration), \
+             mock.patch.object(build_targets, "wait_sleep", side_effect=change_cycle), \
+             redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as stopped:
+                _ = build_targets.command_wait_local("cancelled-call", pid=os.getpid())
+        self.assertEqual(stopped.exception.code, 143)
+        self.assertEqual(len(registrations), 2)
+        self.assertNotEqual(registrations[0], registrations[1])
+        self.assertEqual(registrations[1], cycles[0])
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        self.assertEqual(cycle["id"], cycles[0])
+        self.assertEqual([call["call_id"] for entry in cycle["entries"] for call in entry.get("calls", [])], ["peer-call"])
+        self.assertFalse(any(entry["active_call_id"] == "cancelled-call" for entry in cycle["entries"]))
+        for signum, handler in handlers.items():
+            self.assertEqual(signal.getsignal(signum), handler)
 
     def test_finish_without_registration_skips_release_state_and_call_removal(self) -> None:
         self.begin_hold()
