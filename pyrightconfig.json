@@ -158,6 +158,13 @@
       ]
     },
     {
+      "root": "scripts/bevy_migration_plan",
+      "extraPaths": [
+        "scripts/bevy_migration_plan",
+        "scripts/bevy_upgrade"
+      ]
+    },
+    {
       "root": "."
     }
   ]

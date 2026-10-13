@@ -14,6 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request
 
+import crates_io_pacer
 import upstream
 
 if TYPE_CHECKING:
@@ -23,6 +24,20 @@ else:
         return method
 
 API = "https://crates.io/api/v1/crates"
+
+
+@final
+class StandInClock:
+    def __init__(self) -> None:
+        self.now: float = 0.0
+        self.sleeps: list[float] = []
+
+    def read(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
 
 
 @final
@@ -46,12 +61,20 @@ class CannedFetch:
 @final
 class UpstreamTests(unittest.TestCase):
     root: Path = Path()
+    clock: StandInClock = StandInClock()
 
     @override
     def setUp(self) -> None:
         folder = tempfile.TemporaryDirectory(prefix="bevy-upstream-")
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
+        self.clock = StandInClock()
+        pacer_patch = mock.patch.object(crates_io_pacer, "CRATES_IO_PACER", crates_io_pacer.RequestPacer(
+            crates_io_pacer.CRATES_IO_MIN_INTERVAL_SECONDS, clock=self.clock.read, sleep=self.clock.sleep))
+        network_patch = mock.patch("urllib.request.urlopen", side_effect=AssertionError("unexpected network request"))
+        for patch in (pacer_patch, network_patch):
+            _ = patch.start()
+            self.addCleanup(patch.stop)
 
     def test_crate_info_filters_yanked_and_preserves_api_order(self) -> None:
         url = f"{API}/adapter"
@@ -176,6 +199,48 @@ class UpstreamTests(unittest.TestCase):
         self.assertEqual(requests[0][0].full_url, f"{API}/adapter")
         self.assertEqual(requests[0][0].get_header("User-agent"), "bevy-upgrade (natepiano)")
         self.assertEqual(requests[0][1], 30)
+
+    def test_crates_io_http_fetch_waits_once_before_opening_request(self) -> None:
+        events: list[str] = []
+
+        def wait() -> None:
+            events.append("wait")
+
+        def urlopen(request: Request, *, timeout: int) -> io.BytesIO:
+            self.assertEqual(request.full_url, f"{API}/paced-adapter")
+            self.assertEqual(timeout, 30)
+            events.append("request")
+            return io.BytesIO(b"canned response")
+
+        with mock.patch.object(crates_io_pacer.CRATES_IO_PACER, "wait", side_effect=wait), \
+                mock.patch("urllib.request.urlopen", side_effect=urlopen):
+            self.assertEqual(upstream.http_fetch(f"{API}/paced-adapter"), b"canned response")
+        self.assertEqual(events, ["wait", "request"])
+
+    def test_github_http_fetch_does_not_wait_for_crates_io_pacer(self) -> None:
+        for url in ("https://api.github.com/repos/owner/project",
+                    "https://raw.githubusercontent.com/owner/project/main/Cargo.toml"):
+            with self.subTest(url=url), \
+                    mock.patch.object(crates_io_pacer.CRATES_IO_PACER, "wait") as wait, \
+                    mock.patch("urllib.request.urlopen", return_value=io.BytesIO(b"canned response")) as urlopen:
+                self.assertEqual(upstream.http_fetch(url), b"canned response")
+                wait.assert_not_called()
+                self.assertEqual(urlopen.call_count, 1)
+
+    def test_consecutive_crates_io_http_fetch_calls_sleep_one_second_once(self) -> None:
+        with mock.patch("urllib.request.urlopen", side_effect=[io.BytesIO(b"first"), io.BytesIO(b"second")]):
+            self.assertEqual(upstream.http_fetch(f"{API}/first-adapter"), b"first")
+            self.assertEqual(upstream.http_fetch(f"{API}/second-adapter"), b"second")
+        self.assertEqual(self.clock.sleeps, [1.0])
+        self.assertEqual(self.clock.now, 1.0)
+
+    def test_fixture_fetch_does_not_use_the_shared_pacer(self) -> None:
+        url = f"{API}/fixture-adapter"
+        path = self.root / "fixtures.json"
+        _ = path.write_text(json.dumps({url: "canned response"}), encoding="utf-8")
+        with mock.patch.object(crates_io_pacer.CRATES_IO_PACER, "wait") as wait:
+            self.assertEqual(upstream.fixture_fetch(path)(url), b"canned response")
+            wait.assert_not_called()
 
     def test_truncated_response_read_is_a_host_qualified_fetch_failure(self) -> None:
         response = io.BytesIO(b"")
