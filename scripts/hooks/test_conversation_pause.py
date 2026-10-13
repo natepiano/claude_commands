@@ -556,17 +556,9 @@ print("SENT: delivered")
 
     def test_pause_policy_for_each_source_and_session_kind(self) -> None:
         source = conversation_pause.PromptSource
-        self.assertTrue(conversation_pause.pauses(source.PEER, False))
-        self.assertFalse(conversation_pause.pauses(source.PEER, True))
-        self.assertTrue(conversation_pause.pauses(source.TYPED, False))
-        self.assertTrue(conversation_pause.pauses(source.TYPED, True))
-        for showrunner_session in (False, True):
-            self.assertFalse(
-                conversation_pause.pauses(source.SCHEDULED, showrunner_session)
-            )
-            self.assertFalse(
-                conversation_pause.pauses(source.NOTICE, showrunner_session)
-            )
+        self.assertTrue(conversation_pause.pauses(source.TYPED))
+        for other in (source.PEER, source.SCHEDULED, source.NOTICE):
+            self.assertFalse(conversation_pause.pauses(other))
 
     def test_typed_prompts_record_alert_stamp_with_and_without_reports(self) -> None:
         stamp = self.escalate_root / "typed"
@@ -810,6 +802,21 @@ print("SENT: delivered")
         self.assertEqual(self.calls(self.notifier_log), [["unpause", "delegate-beta"]])
         self.assertTrue((failed / "state").read_text().startswith("ENABLED=1\n"))
         self.assertTrue((stopped / "state").read_text().startswith("ENABLED=1\n"))
+
+    def test_peer_message_does_not_pause_a_unit_director(self) -> None:
+        instance = self.create_instance("delegate-abc")
+        result = self.run_prompt(cross_session("natedev", "continue"))
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
+
+    def test_the_sessions_own_tick_does_not_pause_it(self) -> None:
+        # A review unit's hourly health tick, from its own notifier instance.
+        instance = self.create_instance("review-health", sender="review-health")
+        result = self.run_prompt(cross_session("review-health", "/review:health"))
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
 
     def test_peer_prompt_does_not_pause_a_showrunner_session(self) -> None:
         instance = self.create_instance("showrunner-demo")
@@ -1896,30 +1903,23 @@ print("SENT: delivered")
                         (instance / "state").read_text().startswith("ENABLED=0\n")
                     )
 
-    def test_asked_other_and_peer_yes_restart_replying(self) -> None:
+    def test_asked_other_restarts_replying_and_a_peer_yes_changes_nothing(self) -> None:
         instance = self.create_instance("delegate-abc", enabled=False, paused=True)
-        for prompt in ("later", cross_session("natedev", "yes")):
-            with self.subTest(prompt=prompt):
-                _ = self.write_record(
-                    asked_read(100, 1),
-                    instances=("delegate-abc",),
-                )
-                self.set_enabled(instance, False, paused=True)
-                result = self.run_prompt(prompt, now=200)
-                if prompt == "later":
-                    reply = self.parsed_reply(result)
-                    self.assertNotIn("systemMessage", reply)
-                    output = cast(dict[str, object], reply["hookSpecificOutput"])
-                    self.assertEqual(output["additionalContext"], OTHER_ANSWER_CONTEXT)
-                else:
-                    self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
-                self.assertEqual(
-                    self.record()["phase"],
-                    {"kind": "replying", "user_wrote_at": 200},
-                )
-                self.assertTrue(
-                    (instance / "state").read_text().startswith("ENABLED=0\n")
-                )
+        _ = self.write_record(asked_read(100, 1), instances=("delegate-abc",))
+        reply = self.parsed_reply(self.run_prompt("later", now=200))
+        self.assertNotIn("systemMessage", reply)
+        output = cast(dict[str, object], reply["hookSpecificOutput"])
+        self.assertEqual(output["additionalContext"], OTHER_ANSWER_CONTEXT)
+        self.assertEqual(self.record()["phase"], {"kind": "replying", "user_wrote_at": 200})
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+
+        # A peer is never the user: its "yes" neither answers the question nor restarts the wait.
+        _ = self.write_record(asked_read(100, 1), instances=("delegate-abc",))
+        asked = self.record()["phase"]
+        result = self.run_prompt(cross_session("natedev", "yes"), now=200)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual(self.record()["phase"], asked)
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_returned_yes_deletes_record_without_pausing_again(self) -> None:
         instance = self.create_instance("delegate-abc")
