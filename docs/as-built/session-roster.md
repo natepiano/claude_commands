@@ -386,6 +386,7 @@ Senders:
 - No launcher writes `lens` into the mesh roster; the lens lives in review artifact names and the progress and findings records.
 - No running registered showrunner is a correct, common state.
 - The Mac has no tmux; with no `tmux` binary the tmux problem line is left out and the Units-table worktree match decides directors.
+- Sessions in herdr panes are outside the roster's sources. With tmux readable, a unit director in a herdr pane has no tmux mark and lists as freestanding, and an interactive Codex worker in a pane is not listed. herdr's `agent list` gives each pane's agent, status and pane id (`docs/as-built/herdr-trial.md`, finding 1).
 - A worker under a heartbeat-only run is `NoDirector`, so refusal wording handles a missing unit director.
 
 **Sending**
