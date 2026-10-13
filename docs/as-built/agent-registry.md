@@ -121,7 +121,8 @@ reach: a delegate launched that way takes one prompt and is unreachable until it
 exits. `codex_mesh.py` is the alternative launch path that gives a codex delegate
 an address, so peers and the unit director can message and interrupt it mid-run
 the way they already can a claude delegate. It launches `/unit:direct`'s codex
-seats and `/ask_a_friend`'s codex friend (`start --resident`). For delegates it
+seats, `/ask_a_friend`'s codex friend (`start --resident`) and each
+production's pooled reviewers (`review-pool.md`). For delegates it
 is selected per `[delegate.options] codex_mesh` in the registry (`1` as shipped,
 so the mesh is the normal codex launch path), overridable for one run with
 `PLAN_DELEGATE_CODEX_MESH`; `implement.sh` reads it and branches, and `0`, or a
@@ -137,6 +138,9 @@ codex_mesh.py start  --session-dir --name [--role] --cwd --prompt-file \
                      --service-tier --sandbox --timeout --resident]
 codex_mesh.py follow --session-dir --to <name> --role ...     # one more turn on a finished seat
 codex_mesh.py compact --session-dir --to <name>
+codex_mesh.py prime  --session-dir --name --instructions-file --cwd [--model --service-tier]
+codex_mesh.py fork   --session-dir --from <name> --name <new name>
+codex_mesh.py reset  --session-dir --to <name>              # back to the thread's first turn
 codex_mesh.py send   --session-dir --to <name> (--message <text> | --message-file <path>)
 codex_mesh.py steer  --session-dir --to <name> (--message <text> | --message-file <path>)
 codex_mesh.py end    --session-dir --to <name>
@@ -147,6 +151,9 @@ codex_mesh.py sweep  [--root <dir>] [--stop]
 
 `follow`, `compact`, `can-follow`, `release-follow`, the roster's `role` and
 `context_tokens`, and overflow press-on are described in `long-lived-seats.md`.
+`prime`, `fork` and `reset`, and `follow`'s `--cwd`, `--read-only` and
+`--image`, serve the review pool's reviewers and are described in
+`review-pool.md`.
 
 `serve` spawns `codex app-server --listen ws://127.0.0.1:<free port>` detached
 (`start_new_session=True`) and records `{port, pid}` in
@@ -292,7 +299,7 @@ A thin dispatcher over the resolver:
 | `config/README.md` | The `## agents.conf` section: three-layer schema, `/agent` as the editor, sync behavior. |
 | `scripts/agents/agents_config.sh` | Resolver + editors + freshness-gated sync trigger. |
 | `scripts/agents/agent_exec.sh` | Family dispatch launcher, dry-run hook. |
-| `scripts/agents/codex_mesh.py` | Addressable codex launcher: the default for codex `/unit:direct` seats and the path for `/ask_a_friend`'s codex friend (`start --resident`). One app-server per session, one thread per delegate, `send`/`steer`/`end`/`list`/`stop`, `follow`/`can-follow`/`release-follow` (a new turn on a finished seat's thread, for `implement.sh --to` and `review.sh --to`), `compact`, `sweep`, and a capacity backoff that resumes the same thread. |
+| `scripts/agents/codex_mesh.py` | Addressable codex launcher: the default for codex `/unit:direct` seats the path for `/ask_a_friend`'s codex friend (`start --resident`), and the launcher of each production's pooled reviewers (`prime`/`fork`/`reset`, `docs/as-built/review-pool.md`). One app-server per session, one thread per delegate, `send`/`steer`/`end`/`list`/`stop`, `follow`/`can-follow`/`release-follow` (a new turn on a finished seat's thread, for `implement.sh --to` and `review.sh --to`), `compact`, `sweep`, and a capacity backoff that resumes the same thread. |
 | `scripts/agents/agent_admin.sh` | `/agent` backend. |
 | `scripts/agents/sync_codex_catalog.sh` + `.plist` | `[codex.agents]` materialization, staleness warnings. |
 | `scripts/agents/heartbeat.sh`, `heartbeat_watch.sh` | Liveness log helpers used by the delegate wrappers (role header block, 60 s beats with an activity digest decoded from the agent log). |
@@ -328,8 +335,9 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - Any awk that writes a user-supplied value into the conf passes it through `ENVIRON`, not `awk -v`. Row rewrites preserve trailing inline comments and spacing byte-exactly; conf writes go through a tmp file + `mv` (mode preserved), never in place.
 - `agent_exec` owns all redirection: wrappers must not redirect its stdout/stderr to a file, or dry-run output never reaches them. It exports nothing — provenance comes from the wrapper's own `agents_resolve`.
 - Callers pass **absolute** prompt/output/log paths to `agent_exec`.
-- `codex_mesh.py` is a launcher for `/unit:direct` and `/ask_a_friend`, not a
-  second dispatcher. It resolves nothing: `implement.sh` and `launch_friend.sh`
+- `codex_mesh.py` is a launcher for `/unit:direct`, `/ask_a_friend` and the
+  review pool (`review_pool.py`), not a second dispatcher. It resolves
+  nothing: `implement.sh` and `launch_friend.sh`
   resolve family, agent and effort through `agents_resolve`, exactly as for
   `agent_exec`, and pass them in as `--model` / `--effort`, so the mesh path
   changes only whether the delegate has an address, never which agent runs or at
