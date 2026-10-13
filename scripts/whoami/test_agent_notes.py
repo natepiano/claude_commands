@@ -465,6 +465,13 @@ class AgentNotesTests(unittest.TestCase):
             {login: usage.get("weekly", {}).get("left") for login, usage in usage_store.load().items()},
             {"main@example.com": 80.0, "unit@example.com": 4.0},
         )
+        by_label = (self.root / ".local/state/agent-notes/by-label.json").read_text(encoding="utf-8")
+        self.assertEqual(
+            {label: usage["weekly"]["left"]
+             for label, usage in cast(dict[str, dict[str, dict[str, float]]], json.loads(by_label)).items()},
+            {"claude 2": 80.0, "claude 3": 4.0},
+        )
+        self.assertNotIn("@", by_label)
 
     def test_role_swap_during_update_keeps_one_unit_login_active(self) -> None:
         """Every note uses the same role selection for the entire update."""

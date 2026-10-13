@@ -77,6 +77,8 @@ class CommandLine(argparse.Namespace):
     no_alert: bool = False
     restart_of: str | None = None
     restart: bool = False
+    target: str = ""
+    why: str = ""
     then: ShutdownContinuation = "stop"
 
 
@@ -518,6 +520,8 @@ def main(arguments: list[str] | None = None) -> int:
     _ = down.add_argument("--here", action="store_true")
     _ = down.add_argument("--only", metavar="NAME[,NAME...]", help="session ids or exact names, separated by commas")
     _ = down.add_argument("--restart", action="store_true")
+    _ = down.add_argument("--to", dest="target", default="", help="resume on default or claude N")
+    _ = down.add_argument("--why", default="", help="reason for the account move")
     _ = down.add_argument("--requested-by", help=argparse.SUPPRESS)
     _ = down.add_argument("--request-id", default="", help=argparse.SUPPRESS)
     _ = down.add_argument("--no-alert", action="store_true", help=argparse.SUPPRESS)
@@ -693,6 +697,7 @@ def main(arguments: list[str] | None = None) -> int:
                 then="restart" if options.restart else "stop",
                 alerts="none" if options.no_alert else "user",
                 requested_by=options.requested_by, request_id=options.request_id,
+                target=options.target, why=options.why,
             )
         if options.command == "now":
             return settle.now(selected, options.here, ids)

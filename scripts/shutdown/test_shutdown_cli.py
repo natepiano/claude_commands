@@ -282,6 +282,30 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertNotIn("Traceback", output.getvalue())
         self.assertEqual(self.store_contents(), before)
 
+    def test_down_to_passes_target_through_the_cli_to_settle(self) -> None:
+        selected = Account("claude", LOGIN, LABEL)
+        with (
+            patch.object(shutdown, "named_claude_account", return_value=selected),
+            patch.object(settle, "down", return_value=0) as down,
+            patch.object(shutdown, "resolve_sessions", return_value=["move-id"]),
+        ):
+            self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "move-id",
+                "--restart", "--to", "claude 3"]), 0)
+        down.assert_called_once_with(selected, True, ("move-id",), then="restart", alerts="user",
+            requested_by=None, request_id="", target="claude 3", why="")
+
+    def test_down_to_passes_custom_move_reason_through_the_cli_to_settle(self) -> None:
+        selected = Account("claude", LOGIN, LABEL)
+        with (
+            patch.object(shutdown, "named_claude_account", return_value=selected),
+            patch.object(settle, "down", return_value=0) as down,
+            patch.object(shutdown, "resolve_sessions", return_value=["move-id"]),
+        ):
+            self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "move-id",
+                "--restart", "--to", "claude 3", "--why", "weekly limit reached"]), 0)
+        down.assert_called_once_with(selected, True, ("move-id",), then="restart", alerts="user",
+            requested_by=None, request_id="", target="claude 3", why="weekly limit reached")
+
     def test_down_restart_passes_the_selected_scope_and_intent(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
         with (
@@ -293,7 +317,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 "down", LABEL, "--restart", "--only", "unit-a,unit-b,unit-a", "--here",
             ]), 0)
         down.assert_called_once_with(
-            selected, True, ("unit-a", "unit-b"), then="restart", alerts="user", requested_by=None, request_id=""
+            selected, True, ("unit-a", "unit-b"), then="restart", alerts="user", requested_by=None, request_id="", target="", why=""
         )
 
 
@@ -331,7 +355,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             patch.object(settle, "down", return_value=0) as down,
         ):
             self.assertEqual(shutdown.main(["down", LABEL]), 0)
-        down.assert_called_once_with(selected, False, (), then="stop", alerts="user", requested_by=None, request_id="")
+        down.assert_called_once_with(selected, False, (), then="stop", alerts="user", requested_by=None, request_id="", target="", why="")
 
 
 
@@ -754,7 +778,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         selected = Account("claude", LOGIN, LABEL)
         with patch.object(shutdown, "named_claude_account", return_value=selected), patch.object(settle, "down", return_value=0) as down:
             self.assertEqual(shutdown.main(["down", LOGIN, "--here", "--restart", "--no-alert", "--requested-by", "requester", "--request-id", "same-request"]), 0)
-        down.assert_called_once_with(selected, True, (), then="restart", alerts="none", requested_by="requester", request_id="same-request")
+        down.assert_called_once_with(selected, True, (), then="restart", alerts="none", requested_by="requester", request_id="same-request", target="", why="")
 
     def test_stopping_session_restore_is_held_by_name(self) -> None:
         self.assertTrue(record.create_session(session_shutdown(record.SessionStopping(kind="stopping", at=OCTOBER))))

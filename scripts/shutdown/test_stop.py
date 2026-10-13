@@ -727,6 +727,25 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(finished["progress"]["kind"], "stopped")
 
 
+    def test_moved_ghostty_showrunner_closes_its_recorded_shell_when_stopped(self) -> None:
+        owner = showrunner("hana-id", 101)
+        owner["host"] = inventory.WindowHost(kind="ghostty", window_shell=901,
+            desktop=inventory.NamedDesktop(kind="named", name="Production"))
+        saved = entry(owner)
+        saved["target"] = "claude 3"
+        self.create([saved])
+        signals: list[tuple[int, int]] = []
+        with patch.object(stop, "_ghostty_still_owns_shell", return_value=True):
+            finished = stop.stop_session(
+                saved, kill=lambda pid, sent: signals.append((pid, sent)), is_alive=lambda pid: pid == 901,
+                session_record_exists=lambda _pid: False,
+                fresh_inventory=lambda _login, _only: machine_inventory([saved["session"]]),
+                clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0, tmux=lambda _args: 1,
+                sleep=lambda _seconds: None,
+            )
+        self.assertEqual(signals, [(101, signal.SIGTERM), (901, signal.SIGHUP)])
+        self.assertEqual(finished["progress"]["kind"], "stopped")
+
     def test_stop_snapshot_cannot_claim_a_new_request_for_the_same_session(self) -> None:
         old = entry(top_level("owner", 101))
         self.create([old])

@@ -881,16 +881,19 @@ def deliver(jobs: list[Job]) -> list[str | None]:
 
 
 def deliver_and_record(jobs: list[Job], stamp: str) -> list[str]:
-    """Deliver every job, stamp each alert's attempt on its episode, and return one log line per job."""
-    errors = deliver(jobs)
-    log: list[str] = []
+    """Stamp each alert's attempt on its episode, then deliver every job; one log line per job.
+
+    The stamp comes first: the snapshot timer kills a run that outlasts its budget, and a kill
+    after the sends but before a later stamp sent every alert again on the next run. A kill now
+    costs at most one repeat.
+    """
     with state_file() as state:
-        for job, error in zip(jobs, errors):
+        for job in jobs:
             if job.kind == "alert" and job.name in state["episodes"]:
                 state["episodes"][job.name]["last"][job.recipient] = stamp
-            outcome = "sent" if error is None else f"not delivered: {error}"
-            log.append(f"quota {job.kind} {job.name} -> {job.recipient}: {outcome}")
-    return log
+    errors = deliver(jobs)
+    return [f"quota {job.kind} {job.name} -> {job.recipient}: "
+            + ("sent" if error is None else f"not delivered: {error}") for job, error in zip(jobs, errors)]
 
 
 def alert(notes: list[AgentNote], now: datetime | None = None, *,
