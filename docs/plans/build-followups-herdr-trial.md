@@ -132,36 +132,27 @@ Showrunner's brief and approval, 2026-10-13 10:3x–10:4x EDT (not the user's wo
 
 ### Phase 4 — Run the fake production and log what breaks  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** Each fake unit finishes its one phase and the fake showrunner merges all three to `herdr-fake` and pushes to the bare origin; every failure along the way is in `issues.jsonl`.
-
-**Spec:**
-- Watch, never poll: run `herdr agent wait <pane> --until blocked` per director and for the showrunner in the background and act on each return; read a blocked pane and log it. Observe the already-running production in workspace w9; do not relaunch it. Keep blocked-state waits for the directors and showrunner, and a separate showrunner completion wait using the default settled states. Gate repeated completion waits on observed working activity to avoid repeatedly returning idle. All waits share the deadline 2026-10-13 14:53 EDT, measured from the 13:23 launch; completion triggers the bare-origin merge check. Never answer a trust or permission prompt: bring it to the showrunner, which asks the user.
-- Relay nothing from the real showrunner to the fake one. Answer a fake session's question only when the brief or this plan answers it; otherwise log it and answer "skip it for the trial".
-- Places expected to fail, to watch and log (research §2, §3, §6): the fake showrunner's unit lookup, roster and dailies (tmux); `SendMessage` addresses between fake sessions; `add_unit.py` if the showrunner calls it; notifier timers it registers (record their names for Phase 5); `/unit:direct` steps that start `implement.sh` or `review.sh` seats instead of the pane workers; the fake showrunner reaching `promote-main` (must not run; record the refusal or the stop).
-- Codex workers in panes against the default (threads on one shared `codex app-server` per delegate session): log per worker its startup to idle, RSS from `herdr pane process-info`, whether herdr labels it `codex` and reads its state right, whether the director can interrupt or message it mid-run, and quota drawn. A worker whose account hits its limit is logged and relaunched on its `[delegate.claude]` row.
-- Stop condition: the merge to `herdr-fake` is pushed, or 90 minutes pass, or a blocker no rule here answers. Each background `agent wait` carries `--timeout` = the time left to the 90-minute deadline, so the deadline returns every wait. When the fake showrunner's wait returns `done` or `idle`, check `git --git-dir <root>/origin.git log herdr-fake` for the three unit merges. At the stop, end the director's own outstanding background waits (by task, never by pattern) and leave every fake session, the herdr session and its window running: the user said 2026-10-13, "don't close it when you're finished - i may want to try some things".
+- The fake production in workspace `herdr-fake` runs to completion with no relay from the real showrunner: each unit's phase 1, shrink and as-built commits are merged into `herdr-fake` and pushed to the bare `origin.git`; promote refuses on `Promote: none`. Every failure is a line in `<root>/issues.jsonl` (19 entries).
+- `trial.py work` reads `herdr agent get <pane>` (`WorkerReadiness`: `agent_status`, `interactive_ready`) before its one prompt. A worker not `interactive_ready` or not `idle`/`done` is refused through `worker_blocked`: exit 2, one `issues.jsonl` line, no text or keys sent.
+- After the prompt, `work` waits `--until working` under `HERDR_TRIAL_TURN_START_TIMEOUT` (default 60000 ms). A started turn or an existing report returns 0; otherwise it removes the work record, logs an issue and exits 1. `work_record(label)` is the one path helper for `<root>/work/<label>.json`; `timeout_milliseconds(variable, default)` parses both timeout variables.
+- Codex workers in panes, measured: each runs `codex -m gpt-6.1-sol -c model_reasoning_effort=high -s danger-full-access -a never`, labelled `codex` by herdr, 46–83 MB RSS plus a 0.3–5 MB `codex-code-mode` child; no new `~/.codex1` app-server daemon starts with them. herdr reads `idle`, `working` and `done` correctly for Claude and Codex; `agent send-keys <name> esc` interrupts a Codex turn cleanly. No worker hit a quota limit.
+- The fake sessions, the herdr session and its client window stay running after the phase, for the user to experiment with.
 
 **Files:**
-- `scripts/herdr/trial.py` — only fixes the run needs; each one logged as an issue against the trial itself
-- `scripts/herdr/test_trial.py` — a regression test per fix; a `blocked` pane at shutdown gets no text or keys
+- `scripts/herdr/trial.py` — `work` readiness check and turn-start confirmation, `work_record`, `timeout_milliseconds`
+- `scripts/herdr/fake_herdr.py` — responses accept `write_files` (path-to-text report fixtures)
+- `scripts/herdr/test_trial.py` — 80 tests; adds the not-ready refusal, the turn-start failure and the report-already-written cases
 
-**Seats:** 1 writer + 1 tester — the unit director runs the trial; the seats take only the fixes it needs.
-- `impl` — `scripts/herdr/trial.py`
-- `test` — `scripts/herdr/test_trial.py`, `scripts/herdr/fake_herdr.py`
+**Binds later work:** The findings as-built ranks the entries in `<root>/issues.jsonl`. The fake production registered exactly one notifier instance, `showrunner-herdr-fake`, and the state folder `~/.local/state/showrunner/herdr-fake/`; teardown removes those by exact name and waits for the user.
 
-**Constraints from prior phases:**
-- On quota exhaustion, log the worker and replace only that worker with Claude on claude 1, resolving its role's `[delegate.claude]` row explicitly. Preserve its label, cwd and assignment; start without opening text, then prompt through the agent surface. Do not rerun launch (it refuses an existing herdr-fake workspace) or automatically resend an uncertain in-flight Work Order. Add a regression proving unrelated panes remain running and a startup dialog receives no input.
-- Run from the complete worktree `/home/natepiano/worktrees/claude-build-followups-herdr-trial`, branch `build-followups-herdr-trial`; trial.py imports scaffold_files and scripts.accounts, so copying only the launcher is insufficient.
-- The scratch production (phase 2, `trial.py scaffold`) lives under `<root>` = `/home/natepiano/rust/herdr-trial-scratch`: `repo/` on branch `herdr-fake` (the fake showrunner's folder; doc `repo/docs/plans/herdr-fake-production.md`), the bare origin `origin.git`, and `worktrees/{slug,clamp,count}-unit` on branches `herdr-fake-{slug,clamp,count}`, each holding its unit plan `docs/plans/herdr-fake-<slug>.md`. `trial.py work <unit> impl|review <file>` writes `<root>/work/<unit>-<role>.json` (one file per worker, temp file + `os.replace`) and prompts once; `trial.py wait <unit> impl|review` waits under one deadline (`HERDR_TRIAL_WAIT_TIMEOUT`, default 1800000 ms), waiting for `working` when the worker settles with no report, prints the report path, exits 1 at the deadline without a report and 2 on `blocked`/`agent_blocked` with an `issues.jsonl` line; it never resubmits. Scratch git runs with `GIT_*` cleared and `core.hooksPath=/dev/null`; `production_check.sh` runs under `zsh`, never `bash`.
-- `trial.py` (phase 1) drives session `herdr-trial` as `<herdr store path> --session herdr-trial <group> ...` (`Herdr.argv`). Subcommands: `up`, `server start|stop`, `client open|close`, `open <label> [--cwd DIR] [--command CMD]` (prints the pane id), `close <label>`, `pane-id`, `read` (visible text), `type` (text then Enter), `agents` (`label<TAB>kind<TAB>state`), `issue`, `trust-check`. Exit 0 ok, 1 refusal, 2 usage. Every external program comes through `HERDR_BIN`, `HERDR_TRIAL_SYSTEMD_RUN`, `HERDR_TRIAL_SYSTEMCTL`; the scratch root is `HERDR_TRIAL_ROOT`; tests drive `fake_herdr.py` (argv log in `FAKE_HERDR_LOG`, canned replies in `FAKE_HERDR_RESPONSES`).
-- herdr 0.9.0 facts, measured live: `workspace create --label` labels the workspace, not its root pane, so `open` renames the pane (`pane rename <id> <label>`); closing a workspace's last pane removes the workspace; `pane read` prints plain text, `status server` prints plain text; the other control commands print JSON (`.result...`), errors as JSON on stderr; the binary's own reference (`herdr --skill`) is the authority for argv, and each prompt names its saved copy; `status server` exits 0 even when stopped (look for the line `status: running`).
-- The server (`herdr-trial-server`) and the client (`herdr-trial-client`) run as systemd user units recorded in `<root>/started.json`; both stay up across phases. The client is ghostty titled `herdr-trial` (`client open|up [--desktop N]` waits for the window and moves it); Konsole showed no window.
-- Claude and Codex both key folder trust on a repository's main worktree root, exactly (`repo/` for every scratch worktree), never an ancestor; the user granted both for `repo/`, and Codex hooks trust ("Trust all") on `~/.codex1`. `launch` sends each opening prompt by `agent prompt` once the agent is ready (herdr refuses multi-line start arguments).
-- A Claude pane started in herdr turns on Remote Control by itself (claude 1 settings), so each Claude session registers a claude.ai session; `--remote-control <name>` only names it.
-- Interactive Codex on `~/.codex1` starts a managed `codex app-server` daemon under `systemd --user` that outlives its pane; typed `/quit` did not exit Codex, `pane close` did.
-
+**Gotchas:**
+- herdr does not classify the Codex folder-trust screen as blocked; only `agent get`'s `interactive_ready` shows it.
+- herdr Claude panes are ordinary local sessions, so the real postmaster's alerts reach the fake showrunner.
+- `showrunners.py` finds the fake showrunner only after its state registers; `roster.py` files herdr directors as freestanding and lists no Codex pane workers; `production_lifecycle.py load` and `waiting.py quota` look units up through tmux and miss herdr panes.
+- `merge_checkpoint.py` has no as-built mode and fails at its promote step under `Promote: none` after pushing, so the merge record is written by hand.
+- A Codex worker can show `Working` with a frozen timer for minutes on a one-line task; `trial.py wait` times out as designed and `esc` recovers it.
 
 ### Phase 5 — Remove everything and write the findings  · status: todo
 
@@ -178,7 +169,7 @@ Showrunner's brief and approval, 2026-10-13 10:3x–10:4x EDT (not the user's wo
 
 **Files:**
 - `scripts/herdr/trial.py` — `teardown`, `leftovers`
-- `scripts/herdr/test_trial.py` — recorded units stopped before the scratch tree is deleted; an unrelated `~/.config/herdr/sessions/<other>/` survives teardown; a daemon in `codex_daemons_before` is never stopped; `leftovers` names each surviving resource
+- `scripts/herdr/test_trial.py` — recorded units stopped before the scratch tree is deleted; teardown closes blocked and not-interactively-ready panes without sending text, prompts or keys; an unrelated `~/.config/herdr/sessions/<other>/` survives teardown; a daemon in `codex_daemons_before` is never stopped; `leftovers` names each surviving resource
 - `docs/as-built/herdr-trial.md` — new
 
 **Seats:** 1 writer + 1 tester — the unit director writes the as-built.
@@ -186,6 +177,7 @@ Showrunner's brief and approval, 2026-10-13 10:3x–10:4x EDT (not the user's wo
 - `test` — `scripts/herdr/test_trial.py`, `scripts/herdr/fake_herdr.py`, from the Spec alone
 
 **Constraints from prior phases:**
+- Measured at the end of phase 4 (14:15 EDT): the fake production registered one notifier instance, `~/.local/state/notifier/showrunner-herdr-fake/`, and the state folder `~/.local/state/showrunner/herdr-fake/`; the fake directors created no `delegate-<run id>` instances (progress updates on demand). Its only systemd units are `herdr-trial-server` and `herdr-trial-client`. No new `~/.codex1` app-server daemon started with the panes. `trial.py work` now refuses a worker that is not ready and confirms its turn started (`HERDR_TRIAL_TURN_START_TIMEOUT`).
 - Goal: after the user finishes, remove trial-owned runtime resources and scratch files; report retained shared resources and user-granted configuration changes.
 - Read and report the retained repo-key trust entries in the Claude and Codex configs and the user-granted Codex hooks trust. Never remove these grants automatically. Document their disposition in the as-built; fixture tests verify reporting without changing either config.
 - Before deleting scratch, persist a cleanup manifest outside it containing the original daemon baseline, accumulated started identities, recorded unit and notifier names, and exact state paths. Teardown retries and standalone leftovers read this manifest after scratch removal. Assign the manifest one owner and specify its path in the dispatch. Test leftovers in a separate invocation after scratch deletion with a surviving shared daemon.
