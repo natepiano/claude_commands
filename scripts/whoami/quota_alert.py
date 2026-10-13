@@ -73,6 +73,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
+import review
+
 from note_file import reset_time
 from agent_accounts import (ClaudeAccountSelection, ClaudeRole, CodexHomeSource, Report,
                             codex_can_work, CodexWorkAvailable, codex_email_on_disk,
@@ -217,7 +220,6 @@ OWNER = "natedev"
 # send.py stops a relay at --timeout and kills it KILL_GRACE seconds later.
 RELAY_TIMEOUT = 40
 KILL_GRACE = 10
-USER_SEND_TIMEOUT = 60
 # The whole switch took 2 s of wall time when measured idle and 8 s at load average 87; each entry
 # switched back, 0.4 s idle.
 EDIT_TIMEOUT = 30
@@ -376,11 +378,20 @@ class Ask(NamedTuple):
 
 
 class UserPush(NamedTuple):
+    """An actionable quota notice delivered to the user's phone."""
     name: str
     summary: str
     text: str
-    # None for a note, which asks nothing of the user.
-    ask: Ask | None
+    ask: Ask
+
+
+class QuotaStatusNote(NamedTuple):
+    """Quota information recorded in the log without a phone delivery."""
+    name: str
+    text: str
+
+
+QuotaNotice = UserPush | QuotaStatusNote
 
 
 def load_config() -> Config:
@@ -695,8 +706,8 @@ def user_time(stamp: str | None) -> str:
         return "an unknown time"
 
 
-def run_out_push(note: AgentNote, selection: ClaudeAccountSelection) -> UserPush:
-    """The one direct user message sent when this account's episode opens."""
+def run_out_push(note: AgentNote, selection: ClaudeAccountSelection) -> QuotaNotice:
+    """The actionable push or log note when this account's episode opens."""
     name = note.path.stem
     roles = claude_roles(note, selection)
     purposes = ", ".join("production coordination" if role == "showrunners" else "delegated work" for role in roles)
@@ -704,7 +715,7 @@ def run_out_push(note: AgentNote, selection: ClaudeAccountSelection) -> UserPush
     summary = "Claude work needs more usage" if note.tool == "claude" else "Codex weekly usage is low"
     first = f"The {display_name} account has {percent(note)} weekly usage left. It refills {user_time(note.get('resets'))}."
     if note.tool == "codex":
-        return UserPush(name, summary, f"{first} Codex keeps working on its credits. {credit_line(note)}", None)
+        return QuotaStatusNote(name, f"{first} Codex keeps working on its credits. {credit_line(note)}")
     count = note.get("limit_reset_count")
     resets = f" ({count} available)" if count is not None and count != "null" else ""
     reset_choice = (f"Reset: redeem one of the {count} limit resets to refill this account now."
@@ -845,14 +856,15 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
     return " ".join((done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split())
 
 
-def tell_user(summary: str, text: str, ask: Ask | None) -> str | None:
-    """Deliver text directly to the user, as a note when `ask` is None; None when it arrived, otherwise why not."""
-    asked = ["--no-action"] if ask is None else ["--need", ask.need, "--action", ask.action]
+def tell_user(summary: str, text: str, ask: Ask) -> str | None:
+    """Deliver actionable text; return None when it arrived, otherwise why not."""
+    user_send_timeout = review.user_send_seconds()
+    asked = ["--need", ask.need, "--action", ask.action]
     command = [sys.executable, str(SEND), "--to", "user", "--from", "quota_alert", "--summary", summary, *asked,
-               "--timeout", str(USER_SEND_TIMEOUT)]
+               "--timeout", str(user_send_timeout)]
     try:
         done = subprocess.run(command, input=text, capture_output=True, text=True,
-                              timeout=USER_SEND_TIMEOUT + KILL_GRACE + 5,
+                              timeout=user_send_timeout + KILL_GRACE + 5,
                               check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
         return str(error)
@@ -919,7 +931,7 @@ def alert(notes: list[AgentNote], now: datetime | None = None, *,
             episode = episodes[name]
             if episode.get("push") == "due":
                 push = run_out_push(note, selection)
-                if note.tool == "codex":
+                if isinstance(push, QuotaStatusNote):
                     log.append(f"quota status {name}: {push.text}")
                     episode["push"] = stamp
                 else:
@@ -1064,8 +1076,9 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
             push = refusal_push(note, fallback, failed, already)
         else:
             text = f"Codex refused work on {name}, {account_status}. Nothing switched to Claude."
+            status = QuotaStatusNote(name, text)
             if "push" not in notice:
-                log.append(f"quota status {name}: {text}")
+                log.append(f"quota status {status.name}: {status.text}")
                 notice["push"] = stamp
             return log
         swap_line = codex_swap_line(readings, now)

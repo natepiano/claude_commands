@@ -16,7 +16,7 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Generator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import TYPE_CHECKING, TypedDict, cast, final, override
 from unittest.mock import call, patch
 
 from test_support import registry_confirmation, ShutdownSendLeaf, ShutdownTestCase
@@ -26,6 +26,10 @@ import sessions
 from user_action import ActionRequired
 import restart as restart_work
 import settle
+if TYPE_CHECKING:
+    from ..notify import review
+else:
+    import review
 import stop as stop_work
 from account import Account
 
@@ -1381,6 +1385,16 @@ class SettleTests(ShutdownTestCase):
                 self.assertIn("natedev", action.text)
                 self.assertLess(len(title), 45)
 
+    def test_single_holdout_names_the_terminal_where_its_form_can_be_read(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"))
+        with patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert:
+            settle._send_holdout_alert([(saved, "showing a form")])  # pyright: ignore[reportPrivateUsage]
+        body = cast(str, alert.call_args.args[1])
+        self.assertIn("session named Owner on natedev", body)
+        self.assertIn("Read any open form in that session's terminal before stopping it.", body)
+        self.assertIn("keeps it running so you can check its work", body)
+        self.assertIn("stops it without waiting", body)
+
     def test_report_stop_treats_owner_resource_issues_as_a_partial_stop(self) -> None:
         for kind in ("stopped", "already gone", "process identity lost"):
             for alerts in ("user", "none"):
@@ -1608,6 +1622,7 @@ class SettleTests(ShutdownTestCase):
         self.assertIn("choose cancel or stop now", action.text)
         self.assertIn("natedev", action.text)
         self.assertIn("recommended", text)
+        self.assertIn("--only form,requester", text)
         self.assertLess(len("Action: " + action.text + "\n" + text), 500)
         sender.assert_called_once()
         self.assertIn("/shutdown cancel --only form", cast(str, sender.call_args.args[2]))
@@ -1685,6 +1700,28 @@ class SettleTests(ShutdownTestCase):
                     self.assertIn("/remote-control", cast(ActionRequired, cast(object, alert.call_args.args[2])).text)
                 record.archive_session(LOGIN, other["session"]["session_id"])
 
+    def test_user_alert_wait_covers_configured_review_and_remote_transport(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
+        config = self.root / "notify.conf"
+        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
+        with patch.object(review, "NOTIFY_CONFIG", config):
+            for machine, expected in (("", 130), ("natedev", 170)):
+                with (self.subTest(machine=machine),
+                      patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as sender):
+                    settle.alert_user("UPS power warning", "Battery low", ActionRequired("Check power"), machine=machine)
+                self.assertEqual(sender.call_args.kwargs["timeout"], expected)
+            with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as sender:
+                self.assertEqual(settle.send_message("session:owner", "Shutdown", "Stop work"), {"kind": "sent"})
+            self.assertEqual(sender.call_args.kwargs["timeout"], 60)
+
+    def test_user_alert_timeout_reports_failed_delivery_without_interrupting_shutdown(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
+        with (patch.object(review, "user_send_seconds", return_value=115),
+              patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("fake send", 130)),
+              redirect_stderr(io.StringIO()) as errors):
+            settle.alert_user("UPS power warning", "Battery low", ActionRequired("Check power"))
+        self.assertIn("shutdown: user alert failed: send to user timed out after 130 seconds", errors.getvalue())
+
     def test_ups_alert_ignores_account_hold_and_every_session_progress(self) -> None:
         progresses: list[record.SessionProgress] = [{"kind": "waiting"}, {"kind": "ready", "at": NOW}, {"kind": "stopping", "at": NOW}, {"kind": "stopped", "at": NOW}, {"kind": "already gone", "at": NOW}, {"kind": "process identity lost", "at": NOW}, {"kind": "stop failed", "at": NOW, "reason": "failed"}, {"kind": "restarting", "at": NOW, "prior": {"kind": "stopped", "at": NOW}}, {"kind": "restarted", "at": NOW}, {"kind": "restart failed", "at": NOW, "reason": "failed"}, {"kind": "manual restart", "command": "resume"}, {"kind": "timers pending", "at": NOW, "timers": []}]
         held = record.AccountHold(login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW, request_id="held", requested_by={"kind": "terminal"}, then="stop")
@@ -1693,10 +1730,10 @@ class SettleTests(ShutdownTestCase):
         for index, progress in enumerate(progresses):
             saved = session_shutdown(top_level(str(index), str(index)), progress=progress)
             self.save(saved)
-            with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as sender, patch.object(record, "session_records", side_effect=AssertionError("alert consulted shutdown state")):
+            with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as sender, patch.object(record, "session_records", side_effect=AssertionError("alert consulted shutdown state")), patch.object(review, "user_send_seconds", return_value=85):
                 settle.alert_user("UPS power warning", "Battery low", ActionRequired("Check power"))
             self.assertEqual(sender.call_args.kwargs["input"], "Battery low")
-            self.assertEqual(sender.call_args.kwargs["timeout"], 60)
+            self.assertEqual(sender.call_args.kwargs["timeout"], 100)
             self.assertIn("--to", cast(list[str], cast(object, sender.call_args.args[0])))
 
     def test_remote_control_paused_alert_send_does_not_delay_later_ready_session(self) -> None:
