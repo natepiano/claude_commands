@@ -589,45 +589,20 @@ Recommend whether any change is needed. The nightly review already moved to the 
 
 ### Phase 13 — A launch that finished its turn ends as done across a seats change  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a seat launch whose own turn completed ends as done when the seats account changed during that turn, and its parked messages wait for the seat's next launch.
+After a seat launch's own turn has ended, a move to the selected seats home that answers `SeatThreadStateUnknown` with `NoSeatTurnToCleanUp` never fails the launch. This holds at three sites in `_stream_turn` in `scripts/agents/codex_mesh.py`: the two `_move_resident` calls after a `turn/completed` and the one in the ended-unseen branch.
 
-**Spec:**
-Found live 2026-10-12 20:26 EDT, when the seats role moved from the default home to `~/.codex1` while two seats of one run were mid-turn. Each seat finished its turn and wrote its summary. Its launcher then had a parked peer message to deliver, saw the role change, started a server on the selected home, and waited `THREAD_RELEASE_TIMEOUT_SECS` (20 s) for the old server to unload the conversation. The old server kept it loaded (it was started before the launcher passed `thread_unload_delay_secs=0`), so the move answered `SeatThreadStateUnknown`, `_stream_turn` raised `SeatMoveUncertain`, the roster read `failed` and the launcher exited 1 with `state unknown (… old server has not released the thread …); no turn resubmitted`. No new turn had been submitted and no message was lost.
-
-All sites are in `_stream_turn` in `scripts/agents/codex_mesh.py`; find them by name, because line numbers move with every merge.
-
-1. The rule. After the launch's own turn has ended, a move that answers `SeatThreadStateUnknown` whose `cleanup` is `NoSeatTurnToCleanUp` never fails the launch. A `SeatThreadStateUnknown` whose `cleanup` is `SeatTurnCleanup` still raises `SeatMoveUncertain`, as now, because a turn may have started on the target server. The resident idle tick already draws this line (`cannot move: <reason>; waiting`); the three sites below follow it. `_move_idle_seat` keeps that meaning true: once the target server has accepted a turn, every later failure in the move answers with `SeatTurnCleanup` for the target port, the local writes after the submission included.
-2. The sites: the two `_move_resident` calls after a `turn/completed` (the `if resident or held_messages` branch and the `if not resident` branch after `_close_messages_if_empty`), and the `_move_resident` call in the ended-unseen branch (`_ended_unseen`). Unchanged: `_start_seats_turn`, the capacity resume and the overflow continuation, where the launch's turn has not ended and an unconfirmed move is a real failure.
-3. A launch that is not resident, at any of the three sites:
-   - It closes the seat's inbox and keeps what is parked, in one `_pending_file` lock: `_write_pending(handle, thread_id, <the parked messages>, accepting_messages=False)`. Add one helper for it beside `_close_messages_if_empty`, returning the number kept.
-   - With one or more kept, it posts one board line through `_post_board_status`: `launcher: 1 message held for the next launch: <reason>` or `launcher: <N> messages held for the next launch: <reason>`, and writes one seat-log line `mesh: <name> cannot move: <reason>; 1 message held for the next launch` in the same singular and plural wording. With none kept it posts and logs nothing.
-   - It stops watching and finishes as the ended turn deserves: no `_more_work_coming` wait and no second move. `failure` keeps the value the turn itself gave it (empty for a completed turn; the followed turn's own detail for a failed one; the existing ended-unseen wording when that branch has no answer). The code after the loop is unchanged, so the summary is written, the roster reads `done` or `failed` by that `failure` alone, and `start` and `follow` exit 0 for a completed turn.
-   - Nothing is sent to the target server after the unknown answer: no `thread/resume`, `thread/start` or `turn/start`.
-   - When the seat's end marker exists, it holds nothing: no pending write, no board line and no log line, as `_stream_turn`'s `finally` clause already leaves an ended seat's pending file alone. The launch still finishes as the ended turn deserves.
-4. A resident launch at the two `turn/completed` sites writes the idle tick's log line (`mesh: <name> cannot move: <reason>; waiting`) and keeps serving; its idle ticks try the move again. It never reaches the ended-unseen site.
-5. The next `follow` to the seat is unchanged and must keep working after a hold: it reopens the inbox, releases the old writer, resumes on the selected home and starts one turn whose inputs are its own prompt followed by the held messages in order.
-
-Tests, each named for the behavior it pins, built on the test file's existing fake server and helpers:
-- a `follow` whose turn completed, with one parked message and an old server that never unloads the conversation after the seats home changed: exit 0, roster `done`, the summary holds the turn's answer, the pending file keeps the message with `accepting_messages` false, one board line with `1 message held for the next launch`, no `thread/resume`, `thread/start` or `turn/start` on the target server, and no `state unknown` on stderr;
-- the same for `start`, and with two parked messages the plural wording;
-- the ended-unseen branch with a parked message holds it and finishes;
-- a followed turn that failed still exits 1 with its own detail while its parked messages are held;
-- an unconfirmed move that may have started a turn (`SeatTurnCleanup`) still fails the launch and cleans up on the target port, in a move between two different ports so the assertion tells the target port from the launch's own;
-- a move whose target accepted the turn and whose next local write then failed fails the launch, cleans up on the target port and holds nothing;
-- a launch whose seat was ended before the move holds nothing (no board line, pending file untouched) and finishes as its turn deserves;
-- a resident launch whose reply was delivered keeps serving after an unconfirmed move, and moves at a later tick once the old server has let go;
-- after a hold, the next `follow` starts one turn with its prompt first and the held messages after it, and leaves the pending file empty.
+- A launch that is not resident closes the seat's inbox and keeps what is parked, in one `_pending_file` lock (`_close_messages_and_keep_pending(session_dir, name, thread_id) -> int`). With one or more kept it posts `launcher: 1 message held for the next launch: <reason>` (or `<N> messages`) and writes the seat-log line `mesh: <name> cannot move: <reason>; 1 message held for the next launch`. It then finishes as the ended turn deserves: the roster reads `done` or `failed` by the turn's own result, and nothing is sent to the target server.
+- A resident launch logs `mesh: <name> cannot move: <reason>; waiting` and keeps serving; its idle ticks try the move again.
+- A `SeatThreadStateUnknown` with `SeatTurnCleanup` still raises `SeatMoveUncertain` and cleans up on the target port. `_move_idle_seat` answers `SeatTurnCleanup(port, thread_id)` for every failure after the target accepted a turn, the pending clear, the final roster write and the lock release included; with no turn submitted a failure still means no cleanup.
+- With the seat's end marker present the hold writes, posts and logs nothing.
+- The next `follow` reopens the inbox, resumes on the selected home and starts one turn: its own prompt, then the held messages in order.
 
 **Files:**
-- `scripts/agents/codex_mesh.py` — the three sites in `_stream_turn`, the one inbox helper, and `_move_idle_seat`'s answer for a failure after the target accepted a turn.
-- `scripts/agents/test_codex_mesh.py` — the tests above.
+- `scripts/agents/codex_mesh.py` — the three sites, `_close_messages_and_keep_pending`, and `_move_idle_seat`'s one handler around the move.
+- `scripts/agents/test_codex_mesh.py` — twelve tests of the hold, the cleanup routing between two ports, the ended seat and the resident retry.
 
-**Seats:** 1 writer + 1 tester; one source file and one test file, so nothing else splits.
-- `impl` — `scripts/agents/codex_mesh.py`
-- `test` — `scripts/agents/test_codex_mesh.py`, written from this Spec alone
+**Gotchas:** Held messages stay with the thread: a `start` that replaces the thread drops them, a `follow` keeps them. `basedpyright` exits 3 in every checkout because its config names a `.venv` no checkout has; the pass is its last line. Both files are model-study-unit's as well. A real launch in flight across a real role change is not proven by tests; it is the live swap check with the user.
 
-**Constraints from prior phases:** Both files belong to model-study-unit as well (its usage-ledger phases changed the roster records and compaction); change only what this Spec names. `send` parks every message for the seat's launcher, and with no live launcher it exits 2 with `launcher is closing; message not delivered; relaunch the seat`. A `start` that replaces a seat's thread drops messages held for the old thread; a `follow` keeps them. `_release_seat_thread` answers released when the old server is gone, when `thread/unsubscribe` answers `notLoaded`, or when the conversation leaves the loaded list within `THREAD_RELEASE_TIMEOUT_SECS`. Port numbers are reused across a run's retired servers, so a server is identified by its record, never by its port. No seat runs `set-role`, `swap seats`, `codex login` or an app-server against a real Codex home; tests use the fake server only.
-
-**Acceptance gate:** the agents suite passes under a temp HOME with the account variables unset (`H=$(mktemp -d) && env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CODE_REMOTE_MEMORY_DIR -u CODEX_HOME HOME="$H" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/agents -p 'test_*.py'`) and `basedpyright scripts/agents` reports 0 errors, 0 warnings, 0 notes. Each new test fails on the tree before this phase. Not proven by this gate and left for the user's live swap check: a real launch in flight across a real role change.
+**Ruled out:** failing the launch whenever a move cannot be confirmed (the turn's own result is already known).
