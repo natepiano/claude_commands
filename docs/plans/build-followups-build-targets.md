@@ -481,7 +481,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **Ruled out:** a copied list of who was waiting (the record at that instant is the list); a second test of `release_started_at` in `mark_gate` (one tuple chosen by `call_id`); a late second call stored as pending until its session's turn (a stored pending call is what adds turns); a `confirm_delivery` that ignores a late mark (the final line would name a session that is building); a refusal text or a second message for a launch after a cut turn (no later turn exists); a process recorded for a mark with no call id (the record's format would change); a migration for a cycle open at install (it behaves as before until its release begins).
 
-### Phase 12 — A release that is still running stops when a new hold is placed  · status: todo
+### Phase 12 — A release that is still running stops when a new hold is placed  · status: done
 
 #### Work Order
 
