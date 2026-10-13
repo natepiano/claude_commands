@@ -129,7 +129,7 @@ def checked(name: str, child_doc: Path) -> Promotion:
     child = read_production(child_doc)
     _committed(child.doc)
     # The unit's own tmux session may carry the child's name; the stop ends it before the restart.
-    _ = add_showrunner.checked(child, parent.slug, ending=marked.label)
+    _ = add_showrunner.checked(child, parent.slug, ending=marked.label, start_in=worktree)
     return Promotion(unit, parent, child, marked, claude, worktree, cell_value(cells.get("Plan", "")))
 
 
