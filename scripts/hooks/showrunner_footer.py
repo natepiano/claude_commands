@@ -48,6 +48,11 @@ ASK_ONCE = ("A question for the user is asked once, in full, when it first comes
             + "block never restates it or its choices; list the questions in full only when the user asks what they are. ")
 
 
+# The switch file's content when a conversation pause turned the footer off. A switch turned off
+# on purpose is empty, so the pause's resume leaves it off.
+PAUSE_MARK = "paused by a conversation pause\n"
+
+
 class FooterState(Enum):
     ON = "on"
     OFF = "off"
@@ -118,12 +123,36 @@ def footer_state(slug: str) -> FooterState:
 
 
 def set_footer_state(slug: str, state: FooterState) -> None:
+    """Switch the footer on purpose; `off` writes the switch empty, which clears any pause mark."""
     path = switch_path(slug)
     if state is FooterState.OFF:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch(exist_ok=True)
+        _ = path.write_text("", encoding="utf-8")
     else:
         path.unlink(missing_ok=True)
+
+
+def pause_footer(slug: str) -> None:
+    """Turn the footer off for a conversation pause, with the mark `unpause_footer` looks for."""
+    path = switch_path(slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_text(PAUSE_MARK, encoding="utf-8")
+
+
+def footer_paused(slug: str) -> bool:
+    """Whether the footer is off because a conversation pause turned it off, and only that."""
+    try:
+        return switch_path(slug).read_text(encoding="utf-8") == PAUSE_MARK
+    except FileNotFoundError:
+        return False
+
+
+def unpause_footer(slug: str) -> bool:
+    """Turn the footer back on if the pause's mark is still there; whether it came back."""
+    if not footer_paused(slug):
+        return False
+    switch_path(slug).unlink(missing_ok=True)
+    return True
 
 
 def targeted_instances(session_id: str) -> list[Path]:
