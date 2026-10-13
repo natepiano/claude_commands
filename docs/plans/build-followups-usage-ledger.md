@@ -472,7 +472,7 @@ The store is at `PRAGMA user_version` 6 (`STORE_VERSION`) and holds what the wor
 
 **Ruled out:** a higher limit (every higher limit used more weighted tokens and more requests over 272,000).
 
-### Phase 15 — The compaction replay's refusals are tested · status: todo
+### Phase 15 — The compaction replay's refusals are tested · status: done
 
 #### Work Order
 
