@@ -154,7 +154,9 @@ On `pool` the unit sends that phase's code reviews with `--pool code --lease <sl
 
 ### Prompts
 
-A reviewer's standing instructions come from its template and reach every turn of its thread. `config/review_pool/code.md` holds the role line, the Three Gods sentence, `type_design.md` verbatim and the Rust style guide's rule headings with each rule's file path. `config/review_pool/ui.md` holds the role line, the Three Gods sentence, the UX checklist with each rule file's name, and the report format of `commands/ux_eval.md`. Neither file holds review memory.
+A reviewer's standing instructions come from its template and reach every turn of its thread. `config/review_pool/code.md` holds the role line, the Three Gods sentence, `type_design.md` verbatim and the Rust style guide's rule headings with each rule's file path. `config/review_pool/ui.md` holds the UI reviewer's whole procedure: the role line, the Three Gods sentence, the UX checklist with each rule file's name, the judging steps (shrink each shot, check that the shots cover every state the context names, propose canonical candidates only for empty slots, measure contrast and text size with `measure_text.py`, normalise sizes to a 1440×900 window, confirm each defect against the rule's included text) and the report format (`Verdict: pass | defects`, the `| Shot | Rule | Defect | Fix |` table, canonical candidates). It tells the reviewer not to load command or rule files; the rule texts come with the standing prompt (Review unit director and review memory). Neither file holds review memory.
+
+On every design check the unit director writes two prompts (<UXReview/> step 3): `${SESSION_DIR}/ux_prompt_<pass>_helper.md`, the Claude helper's prompt that points at `commands/ux_eval.md`, and `ux_prompt_<pass>_pool.md`, which opens "Judge these shots by your standing instructions, which hold the rules and the report format:" and carries the shots, scale, context and production rules. The pool is launched with the pool file, so a pooled UI turn reads no rule or command file; it may still read `measure_text.py`'s source for its flags.
 
 On the pool arm a code review prompt opens with the pooled-reviewer line (unit, phase, and `git -C <worktree> rev-parse HEAD` as the first command, reporting an error when it is not the expected head), and its Three Gods and Type Design Contract sections each hold `As in your standing instructions.` <TeamReview/>'s seat choice and role reassignment do not apply.
 
@@ -165,10 +167,19 @@ On the pool arm a code review prompt opens with the pooled-reviewer line (unit, 
 At start and on resume the director:
 
 - records one standing phase (`progress_history.py start-run`, then `start-phase --phase-id 1`) in `<history root>/review_units/review-<slug>`; both calls reuse an existing run;
-- builds each type's standing prompt, `config/review_pool/<type>.md` plus that type's section of `memory/repository.md`, into `<pool dir>/standing/<type>.md`, and runs `review_pool.py prime` on it;
+- builds each type's standing prompt into `<pool dir>/standing/<type>.md` and runs `review_pool.py prime` on it (below);
 - registers an hourly health message to itself (`notifier.sh new review-health-<slug> --every 60`).
 
-On each showrunner line `review merge: unit <unit>; phase <phase>; session dir <path>; design check: <verdict>` it reads `<history root>/runs/<session dir name>.jsonl` (local, else the Mac's over ssh at `collect.MAC_HOST`), joins the merged phase's `finding_opened` and `finding_verdict` events by `finding_id` and `phase_instance_id`, and records in memory a defect class seen in two or more findings, a ruling by a unit director or the showrunner, and a defect that got past review. A finding with no verdict is open and is processed with the rest; only an unreadable history file keeps a merge pending.
+`standing/code.md` is `config/review_pool/code.md` plus the `code` section of `memory/repository.md`. `standing/ui.md` is, in order:
+
+1. `config/review_pool/ui.md`;
+2. `## Rules`, then `UX guide: <absolute guide path>`, then each `.md` in the guide root with a non-empty frontmatter `test:`, in file-name order, as `### <file name>` and its text; the selection is `scripts/ux_style/load-ux-style.sh`'s, so README and notes are left out;
+3. when present, `docs/design-decisions.md` of the repository that holds the production doc, under `## Design decisions`: the file the helper's `ux_eval.md` reads from a unit's worktree;
+4. the `ui` section of `memory/repository.md`.
+
+A production doc with no **UX guide** primes no `ui`, and the director tells the showrunner `UI pool not primed: production has no UX guide`. An unreadable guide or rule fails the prime; an incomplete UI prompt is never primed. The prompt is rebuilt at start and on resume, so a changed rule's text changes the prompt hash.
+
+On each showrunner line `review merge: unit <unit>; phase <phase>; session dir <path>; design check: <verdict>` (the showrunner takes the session directory's name from `unit_run.py`, `docs/as-built/showrunner-automation.md`) it reads `<history root>/runs/<session dir name>.jsonl` (local, else the Mac's over ssh at `collect.MAC_HOST`), joins the merged phase's `finding_opened` and `finding_verdict` events by `finding_id` and `phase_instance_id`, and records in memory a defect class seen in two or more findings, a ruling by a unit director or the showrunner, and a defect that got past review. A finding with no verdict is open and is processed with the rest; only a `session dir unavailable` line or an unreadable history file keeps a merge pending, and the director reports the cause to the showrunner.
 
 Memory lives under `<pool dir>/memory/`: `repository.md` with `code` and `ui` sections, and `<unit>.md`. Each entry carries a date and its sources. After a repository section changes, the director primes that type again, which makes a new template. A turn record's `prime_hash` names the memory a reviewer received; no separate version count exists. Unit memory reaches a reviewer through the launcher, not through the standing prompt.
 
@@ -202,20 +213,31 @@ Only a `reviewed` record is a completed review: reviews, medians, means and `rai
 
 A `cost incomplete` reason is the first that applies: `usage store unavailable` (the store is absent or unreadable), `missing rollout` (the store was read and holds no such thread), `no request in its window`, `a compaction after its first request`; a request whose model has no weights gives `unweighted model <model>`.
 
-**Quality.** `--quality` adds `Code review quality by arm`: `| Arm | Phases | Raised | Confirmed | Precision | Escapes per phase |`. It covers code reviews only: records of kind `ux` and findings with lens `ux` are left out, because shadow turns double the raised count for one check and skew the arm comparison. Records are joined by phase instance (machine, `history_file`, `phase_instance_id`); a record with no `phase_instance_id` is a phase of its own. A phase's arm is the arm of its code-review records of every status; a phase with records of both arms is mixed and left out of both rows. Raised sums `raised` over `reviewed` records. Confirmed counts `finding_opened` events in the phase's `history_file` with `caught_by` `delegate` or `both`. Escapes count `caught_by` `main` events plus merge holds from the `review_regime.py` ledger rows that match the unit and phase (not the phase instance). The table closes with `mixed phases: N (excluded from comparison)` and `ui checks: compared by --shadow, not in this table`.
+**Quality.** `--quality` adds `Code review quality by arm`: `| Arm | Phases | Raised | Confirmed | Precision | Escapes per phase |`. It covers code reviews only: records of kind `ux` and findings with lens `ux` are left out, because shadow turns double the raised count for one check and skew the arm comparison. Records are joined by phase instance (machine, `history_file`, `phase_instance_id`); a record with no `phase_instance_id` is a phase of its own. A phase's arm is the arm of its code-review records of every status; a phase with records of both arms is mixed and left out of both rows. Raised sums `raised` over `reviewed` records. Confirmed counts `finding_opened` events in the phase's `history_file` with `caught_by` `delegate` or `both`. Escapes count `caught_by` `main` events plus the `holds` of matching `review_regime.py` ledger rows, from the same machine as the phase.
 
-**Source warnings:** `usage store unavailable: <reason>`; `Mac usage source <state>; last complete read <time>` (the store's `turn_sources` row for the Mac is not `ready`); `merge holds unavailable: <reason>` (quality continues without holds); `history unavailable: <path>: <reason>`; `Mac unavailable: <reason>`; `Mac file unavailable: <path>: <reason>`; `invalid Mac file: <reason>`.
+Merge holds are matched by plan as well as unit and phase, because a unit that runs a second plan starts again at phase 1. `quality_lines` reads the ledger's raw JSON rows through `read_events`, not `review_regime.read_rows()`, so it sees each row's `plan`. Neither the turn record nor `ReviewRecord` carries a plan: `review_plan(record, sources) -> PlanKnown(path) | PlanUnavailable(reason)` takes `plan_doc` and `working_dir` from the first `run_started` event of the record's `history_file`. `normalize_plan(path, working_dir="")` makes an absolute path under `working_dir` relative to it, then applies `os.path.normpath`; a ledger plan is normalized with no `working_dir`, so `docs/plans/alpha.md`, `./docs/plans/alpha.md` and `<working_dir>/docs/plans/alpha.md` are one plan. A row matches by:
+
+- no string `plan`: unit and phase;
+- a `plan` and `PlanKnown`: unit, phase and normalized plan;
+- a `plan` and `PlanUnavailable`: none; the row's holds are left out and the phase prints one `source warning: merge holds unmatched: <unit> phase <phase>: review plan unavailable (<reason>)`. The reasons are `history file unavailable`, `no run_started event` and `run_started has no plan_doc`.
+
+Mac rows and histories from `mac_sources` take the same path. The table closes with `mixed phases: N (excluded from comparison)`, `ui checks: compared by --shadow, not in this table`, then the `merge holds unmatched` warnings.
+
+**Source warnings:** `usage store unavailable: <reason>`; `Mac usage source <state>; last complete read <time>` (the store's `turn_sources` row for the Mac is not `ready`); `merge holds unavailable: <reason>` (quality continues without holds); `merge holds unmatched: <unit> phase <phase>: review plan unavailable (<reason>)` (printed with the quality table, see Quality); `history unavailable: <path>: <reason>`; `Mac unavailable: <reason>`; `Mac file unavailable: <path>: <reason>`; `invalid Mac file: <reason>`.
 
 **Final line.** `pool reviews: N of 20 for the first reading` until 20, then `pool is at X% of own-seat tokens per review`, a ratio of mean complete costs. N and the comparison count `reviewed` records of kinds `broad` and `closure` only. At 20 with no complete costs on one arm: `pool tokens per review: no comparison yet (complete costs needed for both arms)`.
 
 ### UI pool and adoption
 
-With `ui` on the production's `**Review pool:**` line, every design check in <UXReview/> (steps 3, 5 and 6, rechecks and notice checks included) also runs the pooled UI reviewer on the same prompt and shots, after the unit director writes the shot paths to `${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt`:
+With `ui` on the production's `**Review pool:**` line, every design check in <UXReview/> (steps 3, 5 and 6, rechecks and notice checks included) also runs the pooled UI reviewer on the same shots with its own prompt file (Prompts), after the unit director writes the shot paths to `${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt`:
 
 ```
 review.sh --pool ui --lease <slug>/<unit>/<phase> "${SESSION_DIR}" <worktree> \
-  <prompt-file> review "UI design check" "judging the shots" "${PASS_INDEX}" ux
+  "${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md" review "UI design check" \
+  "judging the shots" "${PASS_INDEX}" ux
 ```
+
+While the pool is in shadow the Claude helper's prompt and verdict path stay as they are: the helper is the baseline the pool is compared with.
 
 Both verdicts are saved as a pair in `<history root>/review_turns/<session dir name>/`, as `ux_<phase>_<k>_helper.txt` and `ux_<phase>_<k>_pool.txt`; `k` counts the phase's design checks from 1. While `~/.local/state/review-pool/<slug>/ui_adopted` is absent the pool is in shadow: the Claude helper's verdict is the one used, and a failed pool check only leaves its file missing. Once the marker exists, no helper runs, the pool's verdict is used, and a failed pool check holds the design check until a retry succeeds. No code creates the marker: leaving shadow is the user's decision, made by hand after reading the shadow report from ten checks. `review_pool.py stop` removes it, so a pool primed after a stop starts in shadow.
 
@@ -223,6 +245,7 @@ Both verdicts are saved as a pair in `<history root>/review_turns/<session dir n
 
 - `UI shadow checks (all local pairs; --since and --quality do not filter them)`
 - `Comparison: rule and shot file name, by count; Defect and Fix wording is not compared.`
+- `Machine: <short host name> (pairs saved on another machine are not counted)`, the name being `socket.gethostname().split(".")[0]`; the rest of the report calls this machine `local`. This line keeps its text and its place after `Comparison:`.
 - per check, `check: <session dir name>/ux_<phase>_<k>`, then `helper defects: N`, `pool defects: N` and `pool missed defects: N`, each followed by its rows as a `| Shot | Rule | Defect | Fix |` table;
 - `unpaired file: <path>; missing <path>` for a check with one file of its pair, and `verdict unavailable: <path>: <reason>` for an unusable file; neither counts as a complete check;
 - `complete shadow checks: <N>; incomplete: <K>; pool missed rows: <M>`
@@ -252,7 +275,8 @@ A rule stated with its mechanism above is not repeated here.
 **Numbers**
 
 - The prompt cache is per thread. First request after a reset: 212 uncached / 23,552 cached / 9 output = 1,435 weighted tokens. First after a new fork: 12,372 / 11,392 / 8 = 12,982. A reset took 0.199 s, a fork 0.189 s. This is one measured pair (2026-10-12, Codex CLI 0.162.1, `gpt-6.1-sol` weights uncached 1, cached 0.05, output 5; the run is recorded in `docs/as-built/review-pool-probes.md`), not a standing guarantee of cache behavior.
-- `config/review_pool/code.md` stays under 7 KB and `ui.md` under 6 KB.
+- `config/review_pool/code.md` stays under 7 KB. `ui.md` holds the whole judging procedure and measures 8,376 bytes; `standing/ui.md` adds every rule's full text.
+- A pooled UI turn with the rules in its standing prompt (2026-10-13: scratch pool, hana guide, 30 rules, one stored shot) read neither `ux_eval.md` nor a rule file, `--shadow` gave `pool missed defects: 0`, and it cost 79,903 weighted tokens in 6 requests against 102,264 in 8 for a turn that read them.
 - Repository memory: at most 4,000 tokens for `code` and 3,000 for `ui`, counted as UTF-8 bytes divided by four, rounded up; the least-cited entry is pruned at the cap.
 
 **Mesh**
@@ -274,13 +298,13 @@ A rule stated with its mechanism above is not repeated here.
 
 - `review.sh` reads its start time before it compacts a large thread, so most own-arm windows open with a compaction; the first request after it re-reads the kept context (about 86,000 uncached tokens), which leans the comparison toward the pool. A compaction keeps 55,000 to 108,000 tokens, so such a thread is compacted again at nearly every follow-up. The start time stays where it is because that part of the launcher belongs to the model-study unit; the report's `began with a compaction` line counts these records.
 - `started_at` is whole seconds, so two windows on one thread can overlap inside one second; the overlap goes to the earlier record.
-- `commands/review/direct.md` says the launcher sends the unit file only at lease ordinal 1. That is the `code` rule; a `ui` turn gets it every time.
-- The shared design-check prompt tells the reviewer to read `commands/ux_eval.md` and names the rule files by path, so a pooled UI reviewer reads them again on each turn although its standing instructions hold them.
+- A pooled UI turn may read `measure_text.py`'s source for its flags; that is a script, not a rule.
 
 **Report**
 
 - The hourly `usage-collect` job on natedev builds the store for both machines; the Mac has no store of its own. The report runs on natedev, and its tables carry costs only once the store exists. An empty cost cell means unavailable, never zero.
 - The collector keys a Codex request by `<session file name>:<byte offset>` (`collect.codex_key`), so the new rollout file a `--fresh` reset or a revert starts keeps every request of its own. Two files of one thread with the same last path component would still share keys (`docs/as-built/usage-ledger.md`).
+- `read_events` returns `[]` for a missing file, so `local_sources` stores a history only when `is_file()` holds: an absent entry in `sources.histories` is what tells a missing history (`history file unavailable`) apart from an empty one (`no run_started event`). Symlinks in plan paths are not resolved.
 - A live check of the UI pool belongs in a scratch `REVIEW_POOL_STATE` and a scratch `PLAN_DELEGATE_HISTORY_DIR`; the real pool state and history then hold no trial record of it.
 
 **Review director**
@@ -288,7 +312,7 @@ A rule stated with its mechanism above is not repeated here.
 - The director's session directory lives under the history root, never under `/tmp`: no `prepare_session.sh`, no run-active marker, no report timer.
 - `start-run` returns early when the session's state file exists, so a resume from another session is safe. With no `--main-*` flags the recorder detects the director's model and effort itself, so the director does not read them from its transcript.
 - A production doc that was never committed has no start date; the director reports that and runs no report.
-- The showrunner finds a unit's session directory by reading run records (the newest `runs/<run id>.jsonl` whose `run_started` event's `working_dir` is the unit's Worktree cell); no script prints it.
+- `--shadow` reads only this machine's verdict pairs. Reading a second machine's pairs waits until a unit on the Mac runs design checks.
 - No live pool, live director session or Mac history has exercised `/review:direct`; the tests cover the scripts and the recorder calls.
 
 ## Why
@@ -305,12 +329,14 @@ A reason given beside its mechanism above is not repeated here.
 - **Cost comes from the usage store.** It already holds every request with its model, time and compactions for both machines, so reading rollout files through `scripts/usage/rollouts.py` was ruled out.
 - **The production's start date comes from Git.** A date typed onto the production log's title line was ruled out: existing productions have none.
 - **The director reads run history, not `findings.py status`.** By merge time the unit has usually moved on, and that command shows only the active phase.
+- **The pooled UI reviewer's standing prompt holds the rule texts.** A `ui` turn starts from a reset thread, so a prompt that names `commands/ux_eval.md` and the rule files has them read again on every turn; with the texts standing, the turn reads none and cost about 22% fewer weighted tokens (Numbers).
+- **Design decisions come from the production's repository, never from the guide.** It is the file the helper's `ux_eval.md` reads; taking it from the guide would make the helper and the pool judge against different exceptions.
 
 ## Tests
 
-- `scripts/delegate/test_review_pool.py` (60 tests) runs the pool CLI as subprocesses against a stub mesh named by `REVIEW_POOL_MESH`: primes and old-hash retirement, the arm split, allocation, name issue, `--fresh`, `release --thread-id`, `end-lease`, `health`, dead reservations, `stop` and its recovery, a stop that lands during a prime, fork or reset, `unit-memory` and the adoption marker.
+- `scripts/delegate/test_review_pool.py` (61 tests) runs the pool CLI as subprocesses against a stub mesh named by `REVIEW_POOL_MESH`: primes and old-hash retirement, the arm split, allocation, name issue, `--fresh`, `release --thread-id`, `end-lease`, `health`, dead reservations, `stop` and its recovery, a stop that lands during a prime, fork or reset, `unit-memory` and the adoption marker. `UIStandingPromptTests` pins `ui.md`'s verdict line, its table header and `measure_text.py`, and the absence of the old instructions to follow `ux_eval.md` and read a rule's full text.
 - `scripts/delegate/test_review_launcher.py` (55 tests) covers `review.sh`: the pool path, unit memory, the slot file, turn records of both arms and all four statuses, signals, a replaced thread, the tree check, the argument refusals, shots for `ui`, the `ux` row count, no pass for lens `ux`, and the seated and fresh paths.
-- `scripts/delegate/test_review_pool_report.py` (68 tests) runs the report as subprocesses. `populate_usage_store` collects fixture rollouts into a fixture store, and `USAGE_STATE_DIR` points the script at it. It covers request attribution, every incomplete reason, compaction counts, outcome lines, the quality table with merge holds and mixed phases, the final line on both sides of 20, an absent and an unreadable store, the Mac source warning, and `--shadow`. These tests call the collector's `SCHEMA`, `migrate_store`, `read_file`, `save_measurement` and `RoleResolver`; a rename in `scripts/usage/collect.py` breaks them. The fixtures prefix the collector's request key with the file path.
+- `scripts/delegate/test_review_pool_report.py` (80 tests) runs the report as subprocesses. `populate_usage_store` collects fixture rollouts into a fixture store, and `USAGE_STATE_DIR` points the script at it. It covers request attribution, every incomplete reason, compaction counts, outcome lines, the quality table with merge holds and mixed phases, each merge-hold match case and the `merge holds unmatched` warning, plan normalization, Mac rows and histories, the final line on both sides of 20, an absent and an unreadable store, the Mac source warning, and `--shadow` with its `Machine:` line. These tests call the collector's `SCHEMA`, `migrate_store`, `read_file`, `save_measurement` and `RoleResolver`; a rename in `scripts/usage/collect.py` breaks them. The fixtures prefix the collector's request key with the file path.
 - `scripts/agents/test_codex_mesh.py`, with a fake app-server, covers `prime`, `fork` and `reset`, the three `follow` flags, and standing instructions restored on resume, fork, compact, reset and a replaced thread.
 - `scripts/production/test_add_unit.py` covers the review unit's opening message: `/review:direct` with a pool line, `/unit:direct` without one.
 - `scripts/production/test_review_unit_phase.py` (3 tests): the standing phase reads as `1 of 1`, running; a resume adds no run and no phase; shutdown finishes the run while the plan heading stays `todo`.
