@@ -236,7 +236,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertIn("moved from claude 1 to claude 3 because weekly limit reached", arguments[-1])
         self.assertIn("account move, not a stop", arguments[-1])
 
-    def test_swap_unit_refuses_an_existing_shutdown_before_role_or_history_changes(self) -> None:
+    def test_retired_unit_swap_refuses_before_role_history_shutdown_or_process_changes(self) -> None:
         configuration = accounts.accounts_config_file()
         configuration.parent.mkdir(parents=True, exist_ok=True)
         _ = configuration.write_text(json.dumps(accounts.AccountsConfiguration(unit="claude 1")), encoding="utf-8")
@@ -244,19 +244,22 @@ class AccountMoveTests(ShutdownTestCase):
         saved["login"] = "current@example.invalid"
         saved["label"] = "claude 1"
         self.assertTrue(record.create_session(saved))
-        report = accounts.SwapInventory(machine="natedev", login="current@example.invalid", label="claude 1",
-            sessions=[accounts.SwapUnitSession(kind="unit", session_id="move-id", name="kept name")], unattributed=[])
         before = self.disk_state()
         output, error = io.StringIO(), io.StringIO()
         with (
-            patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps([report]), "")) as process,
+            patch.object(subprocess, "run") as process,
+            patch.object(os, "execvpe") as launch,
+            patch.object(settle, "begin") as begin,
             redirect_stdout(output), redirect_stderr(error),
         ):
-            self.assertEqual(accounts.main(["swap", "unit", "claude 3", "--dry-run"]), 1)
+            self.assertEqual(accounts.main(["swap", "unit", "claude 3"]), 1)
         self.assertEqual(output.getvalue(), "")
-        self.assertEqual(error.getvalue(), "accounts: kept name already has a shutdown in progress\n")
-        self.assertEqual(process.call_count, 1)
-        self.assertEqual(process.call_args.args[0][2], "status")
+        self.assertEqual(error.getvalue(),
+            "the unit role is gone: new sessions pick the account with room "
+            + "(accounts.py pick claude); move one session with accounts.py move\n")
+        process.assert_not_called()
+        launch.assert_not_called()
+        begin.assert_not_called()
         self.assertEqual(self.disk_state(), before)
 
     def showrunner_inventory(self) -> inventory.Inventory:

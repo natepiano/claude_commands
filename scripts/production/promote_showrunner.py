@@ -5,7 +5,7 @@ Usage: promote_showrunner.py <unit> --production <child production doc> --model 
 
 The parent showrunner runs it, once the unit has written the child's production doc and committed it.
 The unit gets `/exit`; once its Claude is gone its tmux session is ended, and add_showrunner.py resumes
-the same conversation as the child's showrunner: in tmux, with no unit mark, on the showrunner account,
+the same conversation as the child's showrunner: in tmux, with no unit mark, on its retained account,
 attached to this showrunner's production. The unit's Units row is then retired and committed in this
 showrunner's checkout. --check runs every refusal and stops nothing.
 
@@ -129,7 +129,8 @@ def checked(name: str, child_doc: Path) -> Promotion:
     child = read_production(child_doc)
     _committed(child.doc)
     # The unit's own tmux session may carry the child's name; the stop ends it before the restart.
-    _ = add_showrunner.checked(child, parent.slug, ending=marked.label, start_in=worktree)
+    directory = recorded_account_directory(marked)
+    _ = add_showrunner.checked(child, parent.slug, ending=marked.label, start_in=worktree, config_dir=directory)
     return Promotion(unit, parent, child, marked, claude, worktree, cell_value(cells.get("Plan", "")))
 
 
@@ -161,13 +162,17 @@ def stop(promotion: Promotion) -> bool:
     return True
 
 
-def account_line() -> str:
-    """Whether the promotion moves the session's account: showrunners run on the default account."""
-    from scripts.accounts import accounts
+def recorded_account_directory(marked: unit_lookup.MarkedUnit) -> Path:
+    held = _tmux("show-options", "-v", "-t", f"={marked.label}", "@claude_config_dir")
+    if held.returncode != 0 or not held.stdout.strip():
+        raise Refusal("no account recorded for this unit; resume with --account before promoting")
+    directory = Path(held.stdout.strip()).expanduser()
+    if not directory.is_dir():
+        raise Refusal(f"recorded resume account directory {directory} is missing")
+    return directory
 
-    unit_account = accounts.role_account("unit")
-    if isinstance(unit_account, accounts.NamedAccount):
-        return f"moved from {unit_account.label} to the showrunner account"
+
+def account_line() -> str:
     return "same account, no move"
 
 
@@ -194,11 +199,11 @@ def retire(promotion: Promotion) -> None:
                  + f"promoted to showrunner of {promotion.child.slug}")
 
 
-def restore_line(promotion: Promotion) -> str:
+def restore_line(promotion: Promotion, retained: Path) -> str:
     """The command that resumes the stopped session as the unit it was."""
     return "~/.claude/scripts/lib/py ~/.claude/scripts/production/add_unit.py " + shlex.join([
         "--production", str(promotion.parent.doc), promotion.unit.removesuffix("-unit"), "--plan", promotion.plan,
-        "--resume", promotion.claude.session_id, "--cwd", str(promotion.worktree)])
+        "--resume", promotion.claude.session_id, "--cwd", str(promotion.worktree), "--config-dir", str(retained)])
 
 
 def main(argv: list[str]) -> int:
@@ -211,6 +216,7 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     try:
         promotion = checked(cast(str, args.unit), cast(Path, args.production))
+        retained = recorded_account_directory(promotion.marked)
         moved = account_line()
     except Refusal as refusal:
         print(f"promote_showrunner: {refusal}", file=sys.stderr)
@@ -231,10 +237,10 @@ def main(argv: list[str]) -> int:
         return 1
     started = add_showrunner.main(["--production", str(promotion.child.doc), "--model", cast(str, args.model),
                                    "--effort", cast(str, args.effort), "--resume", promotion.claude.session_id,
-                                   "--cwd", str(promotion.worktree)])
+                                   "--cwd", str(promotion.worktree), "--config-dir", str(retained)])
     if started == 2:
         print(f"{unit} is stopped and did not start as a showrunner; its Units row is unchanged. "
-              + f"Bring it back as the unit it was with: {restore_line(promotion)}")
+              + f"Bring it back as the unit it was with: {restore_line(promotion, retained)}")
         return 1
     try:
         retire(promotion)

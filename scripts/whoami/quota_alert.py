@@ -77,7 +77,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 import review
 
 from note_file import reset_time
-from agent_accounts import (ClaudeAccountSelection, ClaudeRole, CodexHomeSource, Report,
+from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, Report,
                             codex_can_work, CodexWorkAvailable, codex_email_on_disk,
                             codex_homes, codex_live, seats_home)
 
@@ -181,7 +181,7 @@ class ReadCurrentClaudeSelection:
 READ_CURRENT_CLAUDE_SELECTION = ReadCurrentClaudeSelection()
 
 
-def _selection(value: ClaudeAccountSelection | ReadCurrentClaudeSelection) -> ClaudeAccountSelection:
+def _selection(value: ClaudeAccountsInUse | ReadCurrentClaudeSelection) -> ClaudeAccountsInUse:
     if isinstance(value, ReadCurrentClaudeSelection):
         # Resolve only standalone calls; injected selections are already fixed.
         from scripts.accounts import accounts
@@ -489,7 +489,7 @@ def usable(notes: list[AgentNote], threshold: float) -> list[AgentNote]:
 
 
 def recovered(name: str, notes: list[AgentNote], threshold: float,
-              selection: ClaudeAccountSelection, now: datetime,
+              selection: ClaudeAccountsInUse, now: datetime,
               codex_readings: CodexAlertPassReadings,
               episode: Episode) -> bool:
     """Known to be out of the low state. An unknown reading is not a recovery."""
@@ -529,7 +529,7 @@ def recovered(name: str, notes: list[AgentNote], threshold: float,
 
 
 def close_recovered(state: State, notes: list[AgentNote], threshold: float,
-                    selection: ClaudeAccountSelection, now: datetime,
+                    selection: ClaudeAccountsInUse, now: datetime,
                     codex_readings: CodexAlertPassReadings) -> list[str]:
     """Remove the episodes whose account recovered and return their names."""
     episodes = state["episodes"]
@@ -643,7 +643,7 @@ def switch_back(state: State, now: datetime, readings: CodexAlertPassReadings) -
     return back
 
 
-def account_line(note: AgentNote, threshold: float, selection: ClaudeAccountSelection) -> str:
+def account_line(note: AgentNote, threshold: float, selection: ClaudeAccountsInUse) -> str:
     roles = claude_roles(note, selection)
     if note.tool == "claude" and selection.multiple_accounts:
         return (f"{note.path.stem} ({', '.join(roles) or 'spare'}) at {percent(note)} of its weekly "
@@ -652,38 +652,26 @@ def account_line(note: AgentNote, threshold: float, selection: ClaudeAccountSele
             + f"usage left (threshold {threshold:g}%); it resets {note.get('resets')}.")
 
 
-def claude_roles(note: AgentNote, selection: ClaudeAccountSelection) -> tuple[ClaudeRole, ...]:
-    """Current roles, with legacy accounts retaining their original alert text."""
-    if note.tool != "claude" or not selection.multiple_accounts:
-        return ()
-    return selection.roles_for_login(note.get("login") or "")
+def claude_roles(note: AgentNote, selection: ClaudeAccountsInUse) -> tuple[str, ...]:
+    """Describe account use without assigning a role to its login."""
+    return ("in use",) if note.tool == "claude" and selection.is_in_use(note.get("login") or "") else ()
 
 
-def unit_swap_line(note: AgentNote, notes: list[AgentNote], selection: ClaudeAccountSelection) -> str:
-    """Suggest the fit spare with most measured quota; never perform a swap."""
-    current = remaining(note)
-    choices: list[tuple[float, str]] = []
-    for named in selection.named_accounts:
-        login = named.identity.login
-        if selection.roles_for_login(login):
-            continue
-        for spare in notes:
-            if (
-                spare.tool != "claude"
-                or (spare.get("login") or "").casefold() != login.casefold()
-                or not ahead(spare.get("resets"))
-            ):
-                continue
-            value = remaining(spare)
-            if (
-                value is not None and current is not None
-                and math.isfinite(value) and 0 <= value <= 100 and value > current
-            ):
-                choices.append((value, named.label))
-    if not choices:
-        return "no spare account has more left"
-    _, label = max(choices, key=lambda choice: (choice[0], choice[1]))
-    return f"swap: /showrunner:accounts swap unit {json.dumps(label)}"
+def unit_swap_line(note: AgentNote, _notes: list[AgentNote], selection: ClaudeAccountsInUse) -> str:
+    """Explain where sessions on this login can move after a refusal."""
+    from scripts.accounts import accounts
+
+    login = (note.get("login") or "").casefold()
+    excluded = {named.label for named in selection.named_accounts if named.identity.login.casefold() == login}
+    if selection.is_default_login(login):
+        excluded.add("default")
+    selected = accounts.pick("claude", datetime.now(timezone.utc), exclude=frozenset(excluded), keep=accounts.NoKeep())
+    label = note.path.stem
+    if isinstance(selected, accounts.PickedAccount):
+        return f"{label} is low; sessions on it move to {selected.label} when refused"
+    reset = selected.earliest_reset
+    time = reset.at.astimezone(user_zone()).strftime("%a %Y-%m-%d %H:%M %Z") if isinstance(reset, accounts.EarliestReset) else "an unknown reset"
+    return f"{label} is low; no other account has room until {time}"
 
 
 def credit_line(note: AgentNote) -> str:
@@ -706,12 +694,11 @@ def user_time(stamp: str | None) -> str:
         return "an unknown time"
 
 
-def run_out_push(note: AgentNote, selection: ClaudeAccountSelection) -> QuotaNotice:
+def run_out_push(note: AgentNote, selection: ClaudeAccountsInUse) -> QuotaNotice:
     """The actionable push or log note when this account's episode opens."""
     name = note.path.stem
     roles = claude_roles(note, selection)
-    purposes = ", ".join("production coordination" if role == "showrunners" else "delegated work" for role in roles)
-    display_name = f"{name}, used for {purposes}," if roles else name
+    display_name = f"{name}, used by live sessions," if roles else name
     summary = "Claude work needs more usage" if note.tool == "claude" else "Codex weekly usage is low"
     first = f"The {display_name} account has {percent(note)} weekly usage left. It refills {user_time(note.get('resets'))}."
     if note.tool == "codex":
@@ -770,7 +757,7 @@ def instruction(tool: str, switch: CodexQuotaFallback, failed: str | None) -> st
 
 def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: CodexQuotaFallback = NO_CODEX_QUOTA_FALLBACK,
             failed: str | None = None, *,
-            selection: ClaudeAccountSelection | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
+            selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
             codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS,
             now: datetime | None = None) -> str:
     selection = _selection(selection)
@@ -779,7 +766,7 @@ def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: Cod
     threshold = f"{config['threshold_percent']:g}%"
     lines = [f"Quota alert: {account_line(note, config['threshold_percent'], selection)}"]
     roles = claude_roles(note, selection)
-    if "unit directors" in roles:
+    if note.tool == "claude":
         lines.append(unit_swap_line(note, notes, selection))
     if note.tool == "codex":
         lines.append(credit_line(note))
@@ -820,7 +807,7 @@ def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: Cod
 
 def restored_message(accounts: list[AgentNote], reason: str, threshold: float,
                      back: CodexFallbackRestoration = NO_CODEX_FALLBACK_RESTORATION, *,
-                     selection: ClaudeAccountSelection | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION) -> str:
+                     selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION) -> str:
     selection = _selection(selection)
     tools = " and ".join(sorted({note.tool.capitalize() for note in accounts}))
     names = ", ".join(note.path.stem for note in accounts)
@@ -897,7 +884,7 @@ def deliver_and_record(jobs: list[Job], stamp: str) -> list[str]:
 
 
 def alert(notes: list[AgentNote], now: datetime | None = None, *,
-          selection: ClaudeAccountSelection | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
+          selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
           codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS) -> list[str]:
     """Send what is due, record it, and return one log line per attempt."""
     selection = _selection(selection)
@@ -916,8 +903,7 @@ def alert(notes: list[AgentNote], now: datetime | None = None, *,
         back = switch_back(state, now, codex_readings)
         for note in [*low([note for note in notes if note.tool != "codex"], threshold),
                      *_low_codex_notes(notes, threshold, codex_readings, now)]:
-            if (note.tool == "claude" and selection.multiple_accounts
-                    and not selection.roles_for_login(note.get("login") or "")):
+            if note.tool == "claude" and not selection.is_in_use(note.get("login") or ""):
                 continue
             name = note.path.stem
             if name not in episodes:
@@ -1005,7 +991,7 @@ def _low_codex_notes(notes: list[AgentNote], threshold: float,
 
 def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCodexAccount,
             now: datetime | None = None, *,
-            selection: ClaudeAccountSelection | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
+            selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
             codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS) -> list[str]:
     """Only a selected account's low weekly quota or open episode permits fallback."""
     selection = _selection(selection)
@@ -1101,7 +1087,7 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
 
 
 def refresh(notes: list[AgentNote], here: str | None, now: datetime | None = None, *,
-            selection: ClaudeAccountSelection | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
+            selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
             codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS) -> list[str]:
     """After the user reports a reset: close what recovered, alert what is still low, tell the others.
 

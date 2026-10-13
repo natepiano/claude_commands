@@ -874,7 +874,7 @@ def _new_window_argv(tmux: str, target: str, cwd: str, command: str) -> list[str
     ]
 
 
-def _tmux_launch(command: str, session: Session, *, dry_run: bool) -> None:
+def _tmux_launch(command: str, session: Session, *, dry_run: bool) -> str:
     host = session["host"]
     if host["kind"] != "tmux":
         raise ValueError("tmux launch needs a tmux host")
@@ -887,7 +887,7 @@ def _tmux_launch(command: str, session: Session, *, dry_run: bool) -> None:
             _respawn_pane_argv(tmux, pane, session, command),
             dry_run=dry_run,
         )
-        return
+        return pane["pane_id"]
 
     if isinstance(pane_state, OccupiedTmuxPane) and pane_state.session_ref["kind"] == "session id":
         _ = _run(
@@ -896,7 +896,7 @@ def _tmux_launch(command: str, session: Session, *, dry_run: bool) -> None:
             ),
             dry_run=dry_run,
         )
-        return
+        return pane_state.session_ref["session_id"]
     session_ref = host["session_ref"]
     if server["kind"] == "server" and session_ref["kind"] == "session id":
         session_probe = _probe(
@@ -913,7 +913,7 @@ def _tmux_launch(command: str, session: Session, *, dry_run: bool) -> None:
                 _new_window_argv(tmux, f"{session_ref['session_id']}:", session["cwd"], command),
                 dry_run=dry_run,
             )
-            return
+            return session_ref["session_id"]
     probe_argv = [tmux, "has-session", "-t", f"={host['tmux_session']}"]
     probe = _probe(probe_argv, dry_run=dry_run)
     if probe.returncode == 0:
@@ -921,7 +921,7 @@ def _tmux_launch(command: str, session: Session, *, dry_run: bool) -> None:
             _new_window_argv(tmux, f"={host['tmux_session']}:", session["cwd"], command),
             dry_run=dry_run,
         )
-        return
+        return f"={host['tmux_session']}"
     try:
         _ = _run(
             [
@@ -945,6 +945,8 @@ def _tmux_launch(command: str, session: Session, *, dry_run: bool) -> None:
             _new_window_argv(tmux, f"={host['tmux_session']}:", session["cwd"], command),
             dry_run=False,
         )
+
+    return f"={host['tmux_session']}"
 
 
 def _herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool) -> None:
@@ -1051,7 +1053,14 @@ def _launch_session(
             )
             desktop_state.started_windows += 1
         case "tmux":
-            _tmux_launch(command, session, dry_run=dry_run)
+            retained_session = _tmux_launch(command, session, dry_run=dry_run)
+            if "target" in record:
+                from scripts.accounts import accounts
+
+                directory = (accounts.main_config_dir() if record["target"] == "default"
+                             else accounts.account_dir(record["target"]))
+                _ = _run([os.environ.get("SHUTDOWN_TMUX", "tmux"), "set-option", "-t",
+                          retained_session, "@claude_config_dir", str(directory)], dry_run=dry_run)
         case "unit":
             raise ValueError("non-unit session has a unit host")
     return SessionLaunched()

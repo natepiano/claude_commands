@@ -216,6 +216,8 @@ class PhaseTablesUnavailable(NamedTuple):
 
 class PhaseTablesAvailable(NamedTuple):
     units: dict[str, UnitPhaseState]
+    # Waiting phases whose dependencies are all done, by unit.
+    could_start: dict[str, tuple[str, ...]]
 
 
 PhaseTablesState = PhaseTablesUnavailable | PhaseTablesAvailable
@@ -563,12 +565,22 @@ def phase_tables(production_doc: Path, zone: ZoneInfo) -> PhaseTablesState:
     try:
         raw = cast(object, json.loads(result.stdout))
         fields = as_map(raw, "phase tables")
-        return PhaseTablesAvailable({
-            unit: unit_phase_state(value, f"phase tables.{unit}", zone)
-            for unit, value in fields.items()
-        })
+        return PhaseTablesAvailable(
+            {unit: unit_phase_state(value, f"phase tables.{unit}", zone) for unit, value in fields.items()},
+            {unit: could_start(value, f"phase tables.{unit}") for unit, value in fields.items()},
+        )
     except (InputError, ValueError, json.JSONDecodeError) as error:
         return PhaseTablesUnavailable(str(error))
+
+
+def could_start(value: object, where: str) -> tuple[str, ...]:
+    parallel = as_map(value, where).get("parallel")
+    if parallel is None:
+        return ()
+    phases = as_list(as_map(parallel, f"{where}.parallel").get("could_start"), f"{where}.parallel.could_start")
+    if not all(isinstance(phase, str) for phase in phases):
+        raise ValueError(f"{where}.parallel.could_start: expected phase ids")
+    return tuple(cast(list[str], phases))
 
 
 def judgment_phase_number(text: str) -> JudgmentPlanPhase:
@@ -826,6 +838,10 @@ def run(args: argparse.Namespace) -> int:
         units = tuple(unit for unit in units if unit.name not in finished)
         blocks = tuple(block for block in blocks if block.session not in finished)
         report("status", "ok", f"left out, run finished and nothing waiting on the user: {', '.join(finished)}")
+    if isinstance(table_state, PhaseTablesAvailable):
+        for unit in units:
+            for phase in table_state.could_start.get(unit.name, ()):
+                print(f"parallel check: {unit.name}: Phase {phase} could start")
     for block in blocks:
         first: list[str] = []
         if isinstance(block.state, SessionGone):

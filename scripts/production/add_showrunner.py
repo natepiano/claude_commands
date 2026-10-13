@@ -2,14 +2,13 @@
 """Start a lower production's showrunner in a detached tmux session, attached to this showrunner's production.
 
 Usage: add_showrunner.py --production <child production doc> --model <id> --effort <level>
-                         [--resume <session id> --cwd <dir>] [--check]
+                         [--resume <session id> --cwd <dir> [--account <label> | --config-dir <dir>]] [--check]
 
 The parent showrunner runs it. The session is named for the child's slug and starts in the child's
 checkout with `/showrunner:produce <doc>`, or `/showrunner:produce <doc> resume` with --resume. It
-carries no unit mark and no account prefix, and its environment holds no CLAUDE_* variable, so at
-any depth it takes the showrunner account's login. Once the child's showrunner runs, with an update
+carries no unit mark. New sessions pick an account with room; resumes keep their recorded account. Once the child's showrunner runs, with an update
 timer addressed to a live session, the child is attached to the caller's production. --check runs
-every refusal and starts nothing. The session must start in a folder the showrunner account's login
+every refusal and starts nothing. The session must start in a folder the selected account's login
 already trusts, since a showrunner never answers Claude's folder-trust prompt.
 
 Exit 0 when the child is attached, or --check found nothing in the way; 1 when the session started
@@ -26,11 +25,22 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 import showrunners
 import unit_lookup
-from add_unit import Production, Refusal, launch_environment, read_production, tmux_live
+from add_unit import Production, Refusal, RetainedClaudeAccount, launch_environment, read_production, tmux_live
+
+if TYPE_CHECKING:
+    from scripts.accounts.accounts import ClaudeLaunchAccount
+    ShowrunnerLaunchAccount = ClaudeLaunchAccount | RetainedClaudeAccount
+
+class DefaultClaudeConfiguration(NamedTuple):
+    """Trust comes from the default login's configuration."""
+
+
+_DEFAULT_CONFIGURATION = DefaultClaudeConfiguration()
+
 
 WAIT_S = float(os.environ.get("ADD_SHOWRUNNER_WAIT_S") or 180)
 POLL_S = 2.0
@@ -45,9 +55,9 @@ def running(slug: str) -> bool:
     return bool(showrunners.current_address(slug))
 
 
-def claude_json() -> Path:
-    """The showrunner account's global config: no CLAUDE_CONFIG_DIR, so the login's `~/.claude.json`."""
-    return Path(os.environ.get("ADD_SHOWRUNNER_CLAUDE_JSON") or Path.home() / ".claude.json")
+def claude_json(config_dir: Path | DefaultClaudeConfiguration = _DEFAULT_CONFIGURATION) -> Path:
+    """The configuration of the account this launch will use."""
+    return Path(os.environ.get("ADD_SHOWRUNNER_CLAUDE_JSON") or (config_dir / ".claude.json" if isinstance(config_dir, Path) and config_dir != Path.home() / ".claude" else Path.home() / ".claude.json"))
 
 
 def _project_keys(folder: Path) -> set[str]:
@@ -63,14 +73,14 @@ def _project_keys(folder: Path) -> set[str]:
     return keys
 
 
-def trusted(folder: Path) -> bool:
+def trusted(folder: Path, config_dir: Path | DefaultClaudeConfiguration = _DEFAULT_CONFIGURATION) -> bool:
     """Whether Claude's folder-trust prompt was accepted for `folder` on the showrunner account.
 
     Only `projects[<path>].hasTrustDialogAccepted` is read: the file also holds account details, and
     no message ever carries any of it. A trusted parent folder does not cover a repository below it
     (G1 live check, 2026-10-13: the child sat on the prompt). Raises Refusal when the file cannot be read.
     """
-    path = claude_json()
+    path = claude_json(config_dir)
     try:
         config = cast(object, json.loads(path.read_text(encoding="utf-8")))
     except (OSError, UnicodeError, ValueError) as error:
@@ -86,7 +96,7 @@ def trusted(folder: Path) -> bool:
     return False
 
 
-def checked(child: Production, caller: str, ending: str = "", start_in: Path | None = None) -> str:
+def checked(child: Production, caller: str, ending: str = "", start_in: Path | None = None, *, config_dir: Path | DefaultClaudeConfiguration = _DEFAULT_CONFIGURATION) -> str:
     """The tmux to start `child`'s showrunner with. Raises Refusal naming what is in the way.
 
     `ending` names a tmux session the caller ends before the start, so it is not in the way.
@@ -111,24 +121,70 @@ def checked(child: Production, caller: str, ending: str = "", start_in: Path | N
     if child.slug != ending and tmux_live(tmux, child.slug):
         raise Refusal(f"a tmux session named {child.slug} is already live")
     folder = start_in or child.checkout
-    if not trusted(folder):
+    if not trusted(folder, config_dir):
         raise Refusal(f"Claude is not trusted in {folder} on the showrunner account. The user trusts it first, "
                       + "by running `claude` there once and accepting: a showrunner never answers a trust prompt")
     return tmux
 
 
-def launch(child: Production, tmux: str, model: str, effort: str, resume: str | None, cwd: Path) -> None:
-    """Start the session. No mark and no account prefix: it is a showrunner, on the showrunner account."""
+def account_directory(selected: ShowrunnerLaunchAccount) -> Path:
+    from scripts.accounts import accounts
+    return accounts.main_config_dir() if isinstance(selected, accounts.DefaultAccount) else selected.dir
+
+
+def account_for_launch(child: Production, resume: str | None, target: str = "", config_dir: str = "") -> ShowrunnerLaunchAccount:
+    """Pick new work; a resume retains the account saved on its tmux session."""
+    from scripts.accounts import accounts
+
+    if not resume:
+        if target or config_dir:
+            raise Refusal("--account and --config-dir require --resume")
+        try:
+            return accounts.role_account("unit")
+        except accounts.AccountsError as error:
+            raise Refusal(str(error)) from error
+    if target:
+        if config_dir:
+            raise Refusal("give only one of --account and --config-dir")
+        problems = accounts.check(target)
+        if problems:
+            raise Refusal(problems[0])
+        return accounts.DefaultAccount() if target == "default" else accounts.NamedAccount(target, accounts.account_dir(target))
+    if config_dir:
+        directory = Path(os.path.abspath(Path(config_dir).expanduser()))
+    else:
+        directory = recorded_account_directory(child)
+    if not directory.is_dir():
+        raise Refusal(f"recorded resume account directory {directory} is missing; use --account or --config-dir")
+    return accounts.DefaultAccount() if directory == accounts.main_config_dir() else RetainedClaudeAccount(directory)
+
+
+def recorded_account_directory(child: Production) -> Path:
+    found = subprocess.run([unit_lookup.tmux_binary(), "show-options", "-v", "-t", f"={child.slug}", "@claude_config_dir"],
+                           capture_output=True, text=True, check=False)
+    if found.returncode != 0 or not found.stdout.strip():
+        raise Refusal("no account recorded for this showrunner; resume with --account <claude N|default>")
+    return Path(found.stdout.strip()).expanduser()
+
+
+def launch(child: Production, tmux: str, model: str, effort: str, resume: str | None, cwd: Path, selected: ShowrunnerLaunchAccount) -> None:
+    """Launch and retain its account and model on the tmux session."""
+    from scripts.accounts import accounts
+    from scripts.whoami import account
     prompt = f"/showrunner:produce {child.doc}" + (" resume" if resume else "")
     argv = ["claude", "--model", model, "--effort", effort]
     if resume:
         argv.extend(["--resume", resume])
     argv.extend(["--remote-control", child.slug, "-n", child.slug, "--settings", '{"disableAgentView": true}', prompt])
-    command = "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
+    prefix = account.named_account_prefix(selected.dir) if isinstance(selected, RetainedClaudeAccount) else accounts.account_prefix(selected)
+    command = "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; " + prefix + "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
     scope = f"--unit={re.sub(r'[^A-Za-z0-9_.-]', '-', child.slug)}-{int(time.time())}"
     _ = subprocess.run(["systemd-run", "--user", "--scope", scope, tmux, "new-session", "-d", "-s", child.slug,
                         "-c", str(cwd), "zsh", "-ic", command],
                        env=launch_environment(), text=True, capture_output=True, check=True)
+    for option, value in (("@claude_config_dir", str(account_directory(selected))), ("@claude_model", model)):
+        _ = subprocess.run([tmux, "set-option", "-t", f"={child.slug}", option, value],
+                           env=launch_environment(), text=True, capture_output=True, check=True)
 
 
 def showrunner_appeared(slug: str) -> bool:
@@ -159,6 +215,8 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--model", required=True, help="pass your own model id")
     _ = parser.add_argument("--effort", required=True, help="pass your own effort level")
     _ = parser.add_argument("--resume", help="the session id to resume; needs --cwd")
+    _ = parser.add_argument("--account", default="", help="with --resume: retained or selected account")
+    _ = parser.add_argument("--config-dir", default="", help="with --resume: retained config directory")
     _ = parser.add_argument("--cwd", type=Path, help="with --resume: the directory that session ran in")
     _ = parser.add_argument("--check", action="store_true", help="run every refusal and start nothing")
     args = parser.parse_args(argv)
@@ -169,8 +227,13 @@ def main(argv: list[str]) -> int:
     caller = showrunners.own_slug()
     try:
         child = read_production(cast(Path, args.production))
-        tmux = checked(child, caller, start_in=cwd)
-    except Refusal as refusal:
+        selected = account_for_launch(child, resume, cast(str, args.account), cast(str, args.config_dir))
+        tmux = checked(child, caller, start_in=cwd, config_dir=account_directory(selected))
+        if resume:
+            from scripts.message import sessions
+            if any(item["sessionId"] == resume for item in sessions.live_sessions()):
+                raise Refusal(f"session {resume} is still live")
+    except (Refusal, OSError) as refusal:
         print(f"add_showrunner: {refusal}", file=sys.stderr)
         return 2
     where = cwd or child.checkout
@@ -178,7 +241,7 @@ def main(argv: list[str]) -> int:
         print(f"check: ok — would start {child.slug} in {where} and attach it to {caller}")
         return 0
     try:
-        launch(child, tmux, cast(str, args.model), cast(str, args.effort), resume, where)
+        launch(child, tmux, cast(str, args.model), cast(str, args.effort), resume, where, selected)
     except (OSError, subprocess.CalledProcessError) as error:
         said = cast(object, error.stderr) if isinstance(error, subprocess.CalledProcessError) else None
         detail = said.strip() if isinstance(said, str) and said.strip() else str(error)
