@@ -810,5 +810,38 @@ class AgentNotesTests(unittest.TestCase):
         self.assertEqual(sum("log" in message.lower() or "readings" in message.lower() for message in messages), 1)
 
 
+class ResetTimeTests(unittest.TestCase):
+    """Notes travel between machines in the vault, so a reset time carries its offset."""
+
+    def test_a_reset_is_written_with_its_offset(self) -> None:
+        at = datetime(2026, 10, 13, 7, 0, 20, tzinfo=timezone.utc)
+        written = datetime.fromisoformat(local_reset(at))
+        self.assertIsNotNone(written.tzinfo)
+        self.assertEqual(written, at.replace(second=0))
+
+    def test_a_reset_written_in_another_zone_is_read_by_its_offset(self) -> None:
+        self.assertEqual(note_file.reset_time("2026-10-13T03:00:00-07:00"),
+                         datetime(2026, 10, 13, 10, tzinfo=timezone.utc))
+        self.assertTrue(agent_notes.still_ahead("2099-01-01T00:00:00-07:00"))
+        self.assertFalse(agent_notes.still_ahead("2000-01-01T00:00:00-07:00"))
+        self.assertTrue(quota_alert.ahead("2099-01-01T00:00:00+09:00"))
+        self.assertFalse(quota_alert.ahead("2000-01-01T00:00:00+09:00"))
+        self.assertEqual(codex_pacer.parse_local("2026-10-13T03:00:00-07:00"),
+                         datetime(2026, 10, 13, 10, tzinfo=timezone.utc).astimezone().replace(tzinfo=None))
+
+    def test_a_reset_written_before_the_offset_is_read_in_the_machines_zone(self) -> None:
+        self.assertEqual(note_file.reset_time("2026-10-13T03:00:00"), datetime(2026, 10, 13, 3).astimezone())
+        self.assertTrue(agent_notes.still_ahead("2099-01-01T00:00:00"))
+        self.assertFalse(quota_alert.ahead("2000-01-01T00:00:00"))
+        self.assertEqual(codex_pacer.parse_local("2026-10-13T03:00:00"), datetime(2026, 10, 13, 3))
+
+    def test_an_absent_or_unreadable_reset_is_none(self) -> None:
+        for value in (None, "", "null", "soon"):
+            with self.subTest(value=value):
+                self.assertIsNone(note_file.reset_time(value))
+                self.assertFalse(agent_notes.still_ahead(value))
+                self.assertFalse(quota_alert.ahead(value))
+
+
 if __name__ == "__main__":
     _ = unittest.main()
