@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("dailies_render.py")
@@ -202,8 +204,17 @@ class DailiesHoldTests(unittest.TestCase):
         self.assertEqual(lines[-1], "* next dailies: 11:30 PDT - nothing needed")
 
     def test_mac_block_reason_with_plumbing_is_refused_with_recovery(self) -> None:
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.scratch), "BUILDLOG_DIR": str(self.scratch / "buildlog"),
+            "BUILD_HOLD_DIR": str(self.folder),
+            "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
+            "MAC_TEST_STATE_DIR": str(self.mac_state),
+            "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.scratch / "active"),
+            "TZ": ZONE, "USER_ZONE": ZONE,
+        }))
         _ = self.write_mac_block(reason="the tester handoff")
-        suffix = "; have alice run /mac_test block again with other words"
+        suffix = "; have alice run /build:mac block again with other words"
         self.assert_refused(self.report(False), "tester", suffix)
         self.assert_refused(self.footer(), "tester", suffix)
 
@@ -299,6 +310,15 @@ class DailiesHoldTests(unittest.TestCase):
         self.assertEqual([line for line in lines if line.startswith("  * ")], [])
 
     def test_footer_and_report_keep_hold_lines_when_release_record_is_damaged(self) -> None:
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.scratch), "BUILDLOG_DIR": str(self.scratch / "buildlog"),
+            "BUILD_HOLD_DIR": str(self.folder),
+            "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
+            "MAC_TEST_STATE_DIR": str(self.mac_state),
+            "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.scratch / "active"),
+            "TZ": ZONE, "USER_ZONE": ZONE,
+        }))
         _ = self.write_holder("seat", "2026-10-04T10:56:00-07:00", "the focused test")
         self.write_cycle([("first", "ReleasedAwaitingAdmission")])
         path = self.scratch / "release" / CYCLE_ID / "cycle.json"
@@ -311,13 +331,22 @@ class DailiesHoldTests(unittest.TestCase):
         footer = self.assert_ok(self.footer())
         for lines in (report, footer):
             hold_index = next(index for index, line in enumerate(lines) if line.startswith("* build hold:"))
-            error_line = "release record could not be read: invalid released_at for first; /build_hold release sets it aside and ends the hold"
+            error_line = "release record could not be read: invalid released_at for first; /build:hold release sets it aside and ends the hold"
             self.assertIn("  * " + error_line, lines)
             self.assertLess(hold_index, next(index for index, line in enumerate(lines) if error_line in line))
         self.assertLess(next(index for index, line in enumerate(report) if error_line in line), report.index("* none active"))
         self.assertEqual(path.read_bytes(), before)
 
     def test_footer_reports_damaged_current_without_changing_it(self) -> None:
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.scratch), "BUILDLOG_DIR": str(self.scratch / "buildlog"),
+            "BUILD_HOLD_DIR": str(self.folder),
+            "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
+            "MAC_TEST_STATE_DIR": str(self.mac_state),
+            "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.scratch / "active"),
+            "TZ": ZONE, "USER_ZONE": ZONE,
+        }))
         _ = self.write_holder("seat", "2026-10-04T10:56:00-07:00", "the focused test")
         self.write_cycle([("first", "AwaitingRelease")])
         path = self.scratch / "release" / "current"
@@ -325,7 +354,7 @@ class DailiesHoldTests(unittest.TestCase):
         _ = path.write_bytes(content)
         lines = self.assert_ok(self.footer())
         self.assertIn(
-            "  * release record could not be read: invalid current hold cycle; /build_hold release sets it aside and ends the hold",
+            "  * release record could not be read: invalid current hold cycle; /build:hold release sets it aside and ends the hold",
             lines,
         )
         self.assertEqual(path.read_bytes(), content)
@@ -375,12 +404,32 @@ class DailiesHoldTests(unittest.TestCase):
         )
 
     def test_report_footer_and_marker_agree_after_partial_release(self) -> None:
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.scratch), "BUILDLOG_DIR": str(self.scratch / "buildlog"),
+            "BUILD_HOLD_DIR": str(self.folder),
+            "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
+            "MAC_TEST_STATE_DIR": str(self.mac_state),
+            "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.scratch / "active"),
+            "TZ": ZONE, "USER_ZONE": ZONE,
+        }))
         _ = self.write_holder("first", "2026-10-04T10:50:00-07:00", "the first test")
         _ = self.write_holder("second", "2026-10-04T10:56:00-07:00", "the second test")
         units = [unit(True), {**unit(True), "unit": "frame-time", "label": "frame"}]
-        release = self.run_script(HOLD_SCRIPT, "release", "--holder", "first")
+        # The child joins its recorder before the temporary log is removed.
+        child = (
+            "import sys, threading; sys.path.insert(0, sys.argv.pop(1)); import build_hold; "
+            "status = build_hold.main(sys.argv[1:]); "
+            "[thread.join(timeout=5) for thread in threading.enumerate() if thread.name == 'hold-event-recorder']; "
+            "assert not any(thread.name == 'hold-event-recorder' for thread in threading.enumerate()); "
+            "sys.exit(status)"
+        )
+        release = subprocess.run(
+            [sys.executable, "-c", child, str(HOLD_SCRIPT.parent), "release", "--holder", "first"],
+            capture_output=True, text=True, check=False, env=dict(os.environ))
         self.assertEqual(release.returncode, 0, release.stderr)
         self.assertIn("still held by second", release.stdout)
+        self.assertEqual(len(list((self.scratch / "buildlog").rglob("*.jsonl"))), 1)
         report = self.assert_ok(self.report(True, extra={"units": units}))
         footer = self.assert_ok(self.footer())
         hold_lines = [line for line in report if line.startswith("* build hold:")]

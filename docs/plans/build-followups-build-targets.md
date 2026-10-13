@@ -583,7 +583,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **Ruled out:** a key read only before `rsync` (it need not describe the files sent); filling a key after `tree_facts` answered `tree_changed=True`; a schema, table or view change (`steps.tree_key` exists; `SCHEMA_VERSION` stays 14).
 
-### Phase 15 — The build commands are one group: `/build:hold`, `/build:mac`, `/build:targets`  · status: todo
+### Phase 15 — The build commands are one group: `/build:hold`, `/build:mac`, `/build:targets`  · status: done
 
 #### Work Order
 

@@ -192,12 +192,21 @@ class ReportFooterTests(unittest.TestCase):
         self.assertTrue(any("expected to release 02:30 EST (in 180 minutes)" in line for line in tail))
 
     def test_plumbing_in_holder_purpose_is_refused_in_report_and_footer(self) -> None:
-        record = holder(purpose="the writer's timings")
-        for result in (render(report(True), holders=[record]), footer(holders=[record])):
-            with self.subTest(result=result):
-                self.refused(result, "frame-time")
-                self.assertIn("'writer'", result.error)
-                self.assertIn("/build_hold hold again with other words", result.error)
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.dict(os.environ, {
+            "HOME": scratch, "BUILDLOG_DIR": str(Path(scratch) / "buildlog"),
+            "BUILD_HOLD_DIR": str(Path(scratch) / "holders"),
+            "BUILD_HOLD_RELEASE_DIR": str(Path(scratch) / "release"),
+            "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-state"),
+            "NOTIFIER_SESSIONS_DIR": str(Path(scratch) / "sessions"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(Path(scratch) / "active"),
+            "TZ": ZONE, "USER_ZONE": ZONE,
+        }):
+            record = holder(purpose="the writer's timings")
+            for result in (render(report(True), holders=[record]), footer(holders=[record])):
+                with self.subTest(result=result):
+                    self.refused(result, "frame-time")
+                    self.assertIn("'writer'", result.error)
+                    self.assertIn("have frame-time run /build:hold hold again with other words", result.error)
 
     def test_multiple_holders_share_footer(self) -> None:
         records = [holder(), holder("2026-10-04T10:54:00-07:00", "other", "2026-10-04T10:57:00-07:00")]

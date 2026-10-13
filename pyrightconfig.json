@@ -149,6 +149,8 @@
       "root": "scripts/build_hold",
       "extraPaths": [
         "scripts/build_hold",
+        "scripts/build_targets",
+        "scripts/lint",
         "scripts/message",
         "scripts/notify",
         "scripts/lib"
