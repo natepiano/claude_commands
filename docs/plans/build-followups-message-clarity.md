@@ -17,7 +17,7 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 ## Delegation Context
 
 - **Project:** `~/.claude` config repo, plus the style repo `~/rust/nate_style`. Worktree `/home/natepiano/worktrees/claude-build-followups-message-clarity`, branch `build-followups-message-clarity` (unit `message-clarity-unit`); name both in every dispatch. Guide files go in the nate_style worktree `/home/natepiano/worktrees/nate_style-message-clarity`, branch `message-clarity` (the showrunner merges it to nate_style main with the phase; showrunner's call 2026-10-13).
-- **Project started:** <!-- written by progress_history.py start-run -->
+- **Project started:** 2026-10-13T11:38:57.992+00:00
 - **Stack:** Python 3 standard library, checked by basedpyright; zsh; Markdown commands and rule files; `claude -p` for the reviewer.
 - **Layout:** `scripts/notify/` (owned: `pushover.py`, `user_action.py`, new `review.py`, `reviewer_prompt.md`, tests) · `scripts/message/send.py` and `commands/message.md` (owner shutdown-unit; also touches) · `commands/alert_user.md`, `commands/showrunner/produce.md` `<Notify>` (hub, owner stalls-unit; also touches) · `docs/user_facing_explanation.md` · new `commands/message_style.md`, `commands/message_review.md` · new `scripts/hooks/pre-tool-use-push-gate.py` · `scripts/production/update_registration.py`, `scripts/hooks/showrunner_footer.py` (Phase 4) · `scripts/nightly_review/nightly_review.py`, `commands/nightly_review.md` (Phase 5) · `~/rust/nate_style/message/` (new). State: `~/.local/state/notify/` (`pushover.jsonl` today; new `review.jsonl`, `held/`, `failed/`, `review_off`).
 - **Key files:**
@@ -50,7 +50,7 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 
 ## Phases
 
-### Phase 1 — The message guide and /message_style  · status: todo
+### Phase 1 — The message guide and /message_style  · status: done
 
 #### Work Order
 
@@ -79,9 +79,13 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 - Memories stay as they are: they are the sources each rule quotes (unit director's call; a memory edit is not this unit's scope).
 
 **Files:**
-- `~/rust/nate_style/message/*.md` (new, 13 rules + README), `~/rust/nate_style/README.md` — in the nate_style worktree
-- `commands/message_style.md` (new)
-- `commands/alert_user.md`, `commands/message.md`, `commands/showrunner/produce.md` (`<Notify>` only), `docs/user_facing_explanation.md` — one line each, plus the produce.md summary/limit edits
+- `/home/natepiano/worktrees/nate_style-message-clarity/message/` — new: the 13 rule files and README
+- `/home/natepiano/worktrees/nate_style-message-clarity/README.md` — a `message/` line under Structure
+- `commands/message_style.md` — new
+- `commands/alert_user.md` — one loader line
+- `commands/message.md` — one loader line
+- `commands/showrunner/produce.md` — `<Notify>` only: loader line, summary and limit edits
+- `docs/user_facing_explanation.md` — one line pointing to the guide
 
 **Seats:** 2 writers (no test lane; `test` opens as impl)
 - `impl` — the 13 rule files and both READMEs in the nate_style worktree
@@ -123,10 +127,15 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 - Proposed lines for the showrunner (not committed): `config/agents.conf` `[assignments]` gains `message_review=claude`, and a new section `[message_review.claude]` with `reviewer=opus:medium` (unit director's call: medium keeps a review near 10 s; `/agent` can raise it).
 
 **Files:**
-- `scripts/notify/review.py`, `scripts/notify/reviewer_prompt.md`, `scripts/notify/test_review.py` (new)
-- `scripts/notify/pushover.py`, `scripts/notify/test_pushover.py`
-- `scripts/message/send.py`, `scripts/message/test_send.py`
-- `commands/message.md` (outcomes), `commands/message_review.md` (new)
+- `scripts/notify/review.py` — new
+- `scripts/notify/reviewer_prompt.md` — new
+- `scripts/notify/test_review.py` — new
+- `scripts/notify/pushover.py` — the review step, `--answerable`, exit 4
+- `scripts/notify/test_pushover.py` — review outcomes
+- `scripts/message/send.py` — `HELD`, rewritten `SENT`, `--answerable`
+- `scripts/message/test_send.py` — those outcomes
+- `commands/message.md` — outcomes
+- `commands/message_review.md` — new
 
 **Seats:** 2 writers (no test lane; `test` opens as impl)
 - `impl` — `scripts/notify/review.py`, `reviewer_prompt.md`, `pushover.py`, `commands/message_review.md`; hub: `scripts/notify/pushover.py` (the exit-4 and stdout contract `send.py` parses)
@@ -151,10 +160,34 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 - Unit director's note in the phase notice: each script file's owner unit, so the showrunner can tell them.
 
 **Files:**
-- `scripts/message/send.py`, `test_send.py`; `scripts/notify/pushover.py`, `test_pushover.py`
-- `scripts/hooks/pre-tool-use-push-gate.py`, `scripts/hooks/test_push_gate.py` (new)
-- `commands/alert_user.md`, `commands/showrunner/produce.md` (`<Notify>` fallback line)
-- the ten script files above and their `test_*.py` where text is asserted
+- `scripts/message/send.py` — failure marker and `fallback text:`
+- `scripts/message/test_send.py` — those
+- `scripts/notify/pushover.py` — prints the reviewed text on failure
+- `scripts/notify/test_pushover.py` — that
+- `scripts/hooks/pre-tool-use-push-gate.py` — new
+- `scripts/hooks/test_push_gate.py` — new
+- `commands/alert_user.md` — fallback line
+- `commands/showrunner/produce.md` — `<Notify>` fallback line
+- `scripts/buildlog/rust_release.py` — push text, `--from`
+- `scripts/lint/sweep.py` — push text
+- `scripts/production/ci_points.py` — push text, `--from`
+- `scripts/production/codex_winddown.py` — push text
+- `scripts/shutdown/record.py` — push text
+- `scripts/shutdown/restart.py` — push text
+- `scripts/shutdown/settle.py` — push text
+- `scripts/shutdown/shutdown.py` — push text
+- `scripts/whoami/quota_alert.py` — push text
+- `scripts/message/escalate.py` — the text it composes
+- `scripts/buildlog/test_rust_release.py` — where the old text is asserted
+- `scripts/lint/test_sweep.py` — where the old text is asserted
+- `scripts/production/test_ci_points.py` — where the old text is asserted
+- `scripts/production/test_codex_winddown.py` — where the old text is asserted
+- `scripts/shutdown/test_record.py` — where the old text is asserted
+- `scripts/shutdown/test_restart.py` — where the old text is asserted
+- `scripts/shutdown/test_settle.py` — where the old text is asserted
+- `scripts/shutdown/test_shutdown_cli.py` — where the old text is asserted
+- `scripts/whoami/test_quota_alert.py` — where the old text is asserted
+- `scripts/message/test_escalate.py` — where the old text is asserted
 
 **Seats:** 2 writers (no test lane; `test` opens as impl)
 - `impl` — `send.py`, `pushover.py`, the push gate hook and their tests, the two command edits; hub: `scripts/message/send.py`
@@ -177,10 +210,13 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 - `commands/showrunner/produce.md`: one sentence where `open_for_user` is described (line ~41) — a new question goes in `question`; the reply carries the `reviewed question` text.
 
 **Files:**
-- `scripts/production/update_registration.py` and its test
-- `scripts/hooks/showrunner_footer.py`, its test
-- `scripts/notify/review.py` (question mode: no title, guide tags), `test_review.py`
-- `commands/showrunner/produce.md` (one sentence)
+- `scripts/production/update_registration.py` — `question` field and its review
+- `scripts/production/test_update_registration.py` — those cases
+- `scripts/hooks/showrunner_footer.py` — reviewed-text and choice-line checks
+- `scripts/hooks/test_stop_showrunner_footer.py` — those cases
+- `scripts/notify/review.py` — question mode
+- `scripts/notify/test_review.py` — question mode
+- `commands/showrunner/produce.md` — one sentence near `open_for_user`
 
 **Seats:** 2 writers (no test lane; `test` opens as impl)
 - `impl` — `update_registration.py`, `review.py` and their tests; hub: `scripts/notify/review.py`
@@ -201,9 +237,11 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 - `review.py` gains `review.py sample <transcript-paths...> --limit N` for that dry review (posts nothing, holds nothing, logs `"sample": true`).
 
 **Files:**
-- `scripts/nightly_review/nightly_review.py`, `test_nightly_review.py`
-- `commands/nightly_review.md`
-- `scripts/notify/review.py`, `test_review.py`
+- `scripts/nightly_review/nightly_review.py` — `messages` mode
+- `scripts/nightly_review/test_nightly_review.py` — that mode
+- `commands/nightly_review.md` — `<Scope mode="messages">`
+- `scripts/notify/review.py` — `sample`
+- `scripts/notify/test_review.py` — `sample`
 
 **Seats:** 2 writers (no test lane; `test` opens as impl)
 - `impl` — `review.py sample` and its tests; hub: `scripts/notify/review.py`
