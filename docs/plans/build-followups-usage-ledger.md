@@ -432,33 +432,70 @@ The store is at `PRAGMA user_version` 6 (`STORE_VERSION`) and holds what the wor
 
 **Ruled out:** a third printed left-out reason for a thread with a compaction and no request (one more printed line for a case with no cost effect); raising the limit (every higher limit used more weighted tokens and more requests over 272,000).
 
-### Phase 14 — Weights for gpt-6-sol and gpt-6-astra · status: todo
+### Phase 14 — Weights for gpt-6-sol and gpt-6-astra · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** Turns of `gpt-6-sol` and `gpt-6-astra` count in every weighted figure, so the role report and the seat readout's week before go-live cover all of natedev's Codex turns.
+- `MODEL_WEIGHTS` in `scripts/usage/weights.py` has an entry for `gpt-6-sol` and one for `gpt-6-astra`, each `ModelWeights(<model>, datetime.min.replace(tzinfo=timezone.utc), 0.1, 1.25, 1.25, 5)`: cached input 0.1, both cache writes 1.25, output 5, uncached input 1, from the start of time. `weights_at` and `sql_weights` match a model to its entry by equal name, and to the `claude-*` entry by the prefix `claude-`; of the matching entries, the one with the latest `effective_from` at or before the turn's time is used. Turns of both models count in every weighted figure, and the replay covers their threads.
+- The comment above the two entries reads `Above 272K input tokens, these weights omit 2x input and cache costs and 1.5x output costs.` The weights leave out the premium on a request over 272K input tokens.
+- The fixtures' example of a model with no entry is the invented name `invented-unweighted-model`, the same in both source fixtures and in all 39 expected files that print it. No fixture names `gpt-6-sol` or `gpt-6-astra`.
+- Read 2026-10-12 over a scratch store of natedev's logs (store version 8). The role report (`usage_report.py --db <store> --by role,model weighted`) lists neither model as unweighted; the only model in its `Unweighted:` table is `<synthetic>`, 458 turns. The seat readout (`seat_usage.py --db <store> --before 2026-10-03 2026-10-10 --after 2026-10-10 2026-10-13`) prints `Unweighted: none`. The replay (`python3 -m scripts.usage.compaction_replay --db <store>`) covered 664 threads, 2,001 compactions and 355,236 requests; fit `kept = 83,899.84 - 0.170678 × before`; median first request 27,080 tokens.
 
-**Spec:**
-- `scripts/usage/weights.py` gains two entries in `MODEL_WEIGHTS`, `gpt-6-sol` and `gpt-6-astra`, each from the start of time (`datetime.min` in UTC, as `gpt-5.6-sol`'s entry is): cached input 0.1, both cache-write weights 1.25, output 5, with uncached input as 1.
-- Where the numbers come from: prices the showrunner relayed 2026-10-12 from OpenAI's model and pricing pages, per 1M tokens, uncached input / cached input / output, cache write in brackets: `gpt-6-sol` 2.00 / 0.20 / 10.00 [2.50]; `gpt-6-astra` 10.00 / 1.00 / 50.00 [12.50]. Relative to each model's own uncached input both are 1 / 0.1 / 5 and 1.25. A weight compares token kinds within one model, as for every other entry.
-- One comment line beside the entries says what the weights leave out: a request over 272K input tokens costs 2 times for input and cache and 1.5 times for output.
-- The fixtures use these two models as their example of a model with no entry (`scripts/usage/fixtures/day1_seats/unweighted.jsonl`, `scripts/usage/fixtures/report/home/.codex/sessions/2026/10/10/rollout-unweighted.jsonl`, and the expected files that print them). That example moves to an invented model name with no entry, the same name in every fixture. Each expected file changes only in that name, and every test of the unweighted paths (the `Unweighted:` line, the verdict's note, the report's unweighted models) stays as strict as it is.
-- Nothing else changes: no store change and no report or readout code change. `sql_weights` and `weights_at` pick the new entries up as they do the others.
-- Done when the tests below pass and the live check in the Acceptance gate agrees.
+| rule | simulated compactions | weighted tokens | change against `limit 100,000` | requests over 272,000 |
+| --- | --- | --- | --- | --- |
+| `limit 100,000` | 1,928 | 5,777,829,425 | the base | 1,953 |
+| `limit 150,000` | 1,707 | 5,798,934,432 | +0.4% | 3,234 |
+| `limit 200,000` | 1,523 | 5,887,358,506 | +1.9% | 8,555 |
+| `limit 250,000` | 683 | 8,066,593,866 | +39.6% | 111,029 |
+| `never` | 0 | 23,242,221,181 | +302.3% | 210,404 |
+
+- The new-seat estimate row equals `limit 100,000`, with 0 new seats. Stored weighted tokens of the same threads: 5,551,641,863. Left out: 1,764 threads with no compaction and 0 with a request with no weight entry; 2,023 rows of size 0 skipped. Requests with simulated cache read held at 0: 56, 62, 48 and 158 for the four limits. No rule is at least 5% under `limit 100,000`, so `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` stays 100000 and no phase changes the limit.
 
 **Files:**
 - `scripts/usage/weights.py` — the two entries and the comment.
-- `scripts/usage/test_usage_report.py` — tests of the new entries.
-- `scripts/usage/fixtures/day1_seats/` and `scripts/usage/fixtures/report/` — the unweighted example's model name.
+- `scripts/usage/test_usage_report.py` — 44 tests, three of them new: `ModelWeightTests` holds `test_sol_and_astra_weights_cover_all_dates_and_token_kinds` and `test_sql_weights_agree_with_python_for_both_models_from_the_start_of_time`; `UsageReportTests` holds `test_new_model_turns_are_weighted_and_the_invented_model_stays_unweighted`.
+- `scripts/usage/fixtures/day1_seats/` — `unweighted.jsonl` and seven expected files name the invented model.
+- `scripts/usage/fixtures/report/` — `home/.codex/sessions/2026/10/10/rollout-unweighted.jsonl` and 32 files in `expected/` name the invented model.
+
+**State and consequence:** none new. `UnweightedModel` and the `Unweighted:` outputs are unchanged and stay covered by the invented model: in the report by `test_new_model_turns_are_weighted_and_the_invented_model_stays_unweighted` and the expected files, in the seat readout by the `day1_seats` expected files that `scripts/whoami/test_seat_usage.py` compares in full.
+
+**Deviations:** each expected file changes only in the example's name, except `scripts/usage/fixtures/report/expected/day-model.md`. That table is sorted by model name, so the renamed row also moves from above the `gpt-6.1-sol` row to below it. The Work Order was amended to allow it.
+
+**Binds later work:**
+- A new Codex model needs its own entry in `MODEL_WEIGHTS` before its turns count. Until then the report and the seat readout print it as unweighted, and the replay leaves out every thread that has a request of that model.
+- The replay's table here is the one to compare a later limit proposal against. It covers the 328 threads that the table in "What seat compactions cost, and a limit chosen by replay" left out.
+
+**Gotchas:**
+- `seat_usage.py` refuses `--before START END` without `--after START END`: `--before and --after must be given together`.
+- A weighted figure for a request over 272K input tokens is under its cost: the two entries leave out 2 times for input and cache and 1.5 times for output.
+- `scripts/whoami/test_quota_alert.py` and `commands/agent.md` name `gpt-6-sol` for other reasons and need no change.
+
+**Ruled out:** a higher limit (every higher limit used more weighted tokens and more requests over 272,000).
+
+### Phase 15 — The compaction replay's refusals are tested · status: todo
+
+#### Work Order
+
+**Goal:** A change that turns one of the replay's refusals into a table, a traceback or a different exit status fails a test.
+
+**Spec:**
+- `python3 -m scripts.usage.compaction_replay` refuses in two ways. Refused arguments exit 2: `--since` not earlier than `--until`, and a `--follow-up-prompt` that is negative, `nan` or `inf`. A store it cannot use exits 1: a store stamped with an older version, a file that is not a SQLite store, and a store path that does not exist. Each refusal prints one line on stderr that begins `compaction_replay: `, prints nothing on stdout, and leaves the store file's bytes unchanged.
+- `scripts/usage/test_compaction_replay.py` gains one test per refusal named above. Each test builds its store in a temporary directory, runs the replay as the existing tests do, and pins the exit status, that stderr is that one line with its text, and that stdout is empty. The store tests also pin that the store file's bytes are the same after the run and that a path that did not exist still does not exist.
+- The existing `replay` helper requires exit 0 and an empty stderr. A refused run gets its own helper or a parameter; no existing test is weakened.
+- `scripts/usage/compaction_replay.py` changes only where a refusal does not behave as this Spec says. A refusal that already behaves so is left as it is.
+- Done when the tests below pass.
+
+**Files:**
+- `scripts/usage/test_compaction_replay.py` — the refusal tests.
+- `scripts/usage/compaction_replay.py` — only where a refusal is wrong.
 
 **Seats:** `1 writer + 1 tester`.
-- `impl` — `scripts/usage/weights.py`.
-- `test` — `scripts/usage/test_usage_report.py`, `scripts/usage/fixtures/day1_seats/`, `scripts/usage/fixtures/report/`, from this Spec alone. The tests pin:
-  - `weights_at` gives each of the two models its entry at any time, and a turn of each gets the weighted figure the weights give (input 1, cached input 0.1, output 5);
-  - `sql_weights` gives the same figures as `weights_at` for both models;
-  - a turn of the invented model is still left out of the weighted figure and still counted as unweighted, in the report and in the seat readout;
-  - every expected file differs from its earlier text only in the unweighted example's name.
+- `impl` — `scripts/usage/compaction_replay.py`. It reads each refusal path against this Spec first, edits only what is wrong, and tells `test` by message what it found.
+- `test` — `scripts/usage/test_compaction_replay.py`, from this Spec alone. The tests pin:
+  - exit 2, one stderr line and an empty stdout for `--since` equal to `--until`, for `--since` after `--until`, and for a `--follow-up-prompt` of `-1`, `nan` and `inf`;
+  - exit 1, one stderr line and an empty stdout for a store with an older version stamp, for a file that is not a SQLite store, and for a path that does not exist;
+  - the store file's bytes unchanged after each store refusal, and no file created at a path that did not exist.
 
-**Constraints from prior phases:** Work only in the worktree `/home/natepiano/worktrees/claude-build-followups-model-study`, branch `build-followups-model-study`. `scripts/usage/weights.py` holds `ModelWeights(model, effective_from, cached, cache_write_5m, cache_write_1h, output)` and the tuple `MODEL_WEIGHTS`: `gpt-5.6-sol` from the start of time (0.1, 0, 0, 8), `gpt-6.1-sol` from 2026-10-10T21:35Z (0.05, 0, 0, 5) and `claude-*` (0.1, 1.25, 2, 5). `weights.sql_weights(model, at)` gives the entries as SQL and `weights_at(model, at)` raises `UnweightedModel` for a model with no entry. Anything per turn is SQL: one grouped scan of natedev's 1.2 million turns takes 2.3 to 2.8 s. Turns of a model with no entry are left out of the weighted figure and counted on the readout's `Unweighted:` line and in its verdict note. Measured on natedev 2026-10-12: 273,189 `gpt-6-sol` turns and 34,226 `gpt-6-astra` turns have no entry, and in the week before long-lived seats went live (2026-10-03 to 2026-10-10) they are 131,665 of natedev's 275,432 Codex turns. `scripts/whoami/test_seat_usage.py` and `scripts/usage/test_usage_report.py` read the fixtures named above; `scripts/whoami/` is not a package, so its test imports by full path. Tests never write to the real `~/.local/state/usage-model/`. The report has the metric `compaction_reread_share`, whose expected file `scripts/usage/fixtures/report/expected/compaction_reread_share.md` prints `gpt-6-sol` as an unweighted model like the other expected files, so the name change reaches it too. `scripts/usage/compaction_replay.py` and `scripts/usage/test_compaction_replay.py` name neither model: the replay leaves out a thread that has a request with no weight entry and prints the count as `request with no weight entry=<n>`, and its tests build their own stores. Measured 2026-10-12 over a scratch store of natedev's logs, before these two entries: the replay covered 336 Codex threads and left 328 out for that reason, and no rule came in under `limit 100,000`.
+**Constraints from prior phases:** Work only in the worktree `/home/natepiano/worktrees/claude-build-followups-model-study`, branch `build-followups-model-study`. The replay's `main` catches `usage_report.ReportRefused` (exit 2) and `OSError`, `sqlite3.Error` and `usage_report.StoreVersionMismatch` (exit 1), and prints `compaction_replay: ` followed by the error's text on one line. It opens the store with `usage_report.open_read_store` and checks it with `usage_report.check_store_version`; the store version is 8. `scripts/usage/test_compaction_replay.py` has 9 tests on stores each test builds, and its `replay` helper asserts exit 0 and an empty stderr. Tests never write to the real `~/.local/state/usage-model/`: they use a temporary directory with `--db` and `USAGE_STATE_DIR`. No seat runs the replay against the real store.
 
-**Acceptance gate:** `python3 -m unittest scripts.whoami.test_seat_usage scripts.usage.test_rollouts scripts.usage.test_collect scripts.usage.test_usage_report scripts.usage.test_compaction_replay scripts.usage.test_outcomes scripts.usage.test_agents_log` green; `python3 -m unittest discover -s scripts/whoami -p 'test_*.py'` green from the repo root; basedpyright 0/0/0 on `scripts/usage scripts/whoami/seat_usage.py scripts/whoami/test_seat_usage.py`. Live, by the unit director, on a scratch store of natedev's real logs: the role report lists neither model as unweighted, and the seat readout's `Before` row for 2026-10-03 to 2026-10-10 counts no `gpt-6-sol` or `gpt-6-astra` turn on its `Unweighted:` line. The unit director also runs `python3 -m scripts.usage.compaction_replay` over that store, now that the threads of both models are covered, and the as-built records its table; a rule that then comes in at least 5% under `limit 100,000` with no more requests over 272,000 becomes a follow-up phase, and this phase changes no limit.
+**Acceptance gate:** `python3 -m unittest scripts.usage.test_compaction_replay scripts.usage.test_usage_report` green; basedpyright 0 errors, 0 warnings, 0 notes on `scripts/usage`.

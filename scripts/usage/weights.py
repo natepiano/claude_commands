@@ -21,6 +21,9 @@ class ModelWeights:
 MODEL_WEIGHTS = (
     ModelWeights("gpt-5.6-sol", datetime.min.replace(tzinfo=timezone.utc), 0.1, 0, 0, 8),
     ModelWeights("gpt-6.1-sol", datetime(2026, 10, 10, 21, 35, tzinfo=timezone.utc), 0.05, 0, 0, 5),
+    # Above 272K input tokens, these weights omit 2x input and cache costs and 1.5x output costs.
+    ModelWeights("gpt-6-sol", datetime.min.replace(tzinfo=timezone.utc), 0.1, 1.25, 1.25, 5),
+    ModelWeights("gpt-6-astra", datetime.min.replace(tzinfo=timezone.utc), 0.1, 1.25, 1.25, 5),
     # This entry covers the specified weights shared by every Claude model.
     ModelWeights("claude-*", datetime.min.replace(tzinfo=timezone.utc), 0.1, 1.25, 2, 5),
 )

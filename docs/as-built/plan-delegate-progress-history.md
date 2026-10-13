@@ -256,7 +256,10 @@ rejects an unowned call, because a hand-written pass forges one that never ran
 and `findings.py gate` counts passes to decide whether a phase is converging.
 The single exception is a launcher the unit director killed, whose pass stays
 open: `finish-pass --status canceled --orphaned-launcher` closes it, and only
-that status, and only while a pass is open.
+that status, and only while a pass is open. A review with lens `ux` records
+no pass: the unit director's `UX review` activity carries that time. A pooled
+review records its pass under the slot `pool_<reviewer>`
+(`docs/as-built/review-pool.md`).
 
 `progress` writes the event and prints two tables under a line naming the
 worktree, and the branch when it differs. The line carries no position: how

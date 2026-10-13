@@ -141,6 +141,8 @@ Delivery mechanics: a Claude recipient is reached through a headless `claude -p`
 
 Postmaster is a local Claude Code mod in `mods/postmaster/`, loaded directly with `--plugin-dir`; its intended main-checkout path is `~/.claude/mods/postmaster`. This section records how the probe exercises the mod API on Claude Code 2.1.296 and the measured answers. The probe uses `STATE/postmaster/probe/`, where `STATE` is `$XDG_STATE_HOME/message` or, by default, `~/.local/state/message`. It reads and writes only under `STATE/postmaster/`, starts no process and makes no network call. The trial worktree is `/home/natepiano/worktrees/claude-build-followups-shutdown`, branch `build-followups-shutdown`.
 
+The probe was removed from the tree after the measurement; commit `cd85b091` holds it, and this procedure stays as the record of how the table was measured.
+
 The unit director runs this procedure in isolated sessions. Every recipient below is a throwaway session created for this check; no probe message goes to an existing session.
 
 1. **Wait for all three folder trusts.** The permanent session directory is `/home/natepiano/postmaster`, decided by the showrunner on 2026-10-12. The showrunner asks the user to create it, start `command claude` there once with the `~/.claude` account, accept the folder-trust dialog and exit, then repeat with `CLAUDE_CONFIG_DIR=/home/natepiano/.claude3` and `CLAUDE_CONFIG_DIR=/home/natepiano/.claude1`. An unused directory presents the dialog with `No, exit` selected, and trust is stored per account. Start this procedure only after the showrunner reports all three trusts done. Keep this directory empty; nobody types into a pane.
