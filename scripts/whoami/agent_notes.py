@@ -198,6 +198,11 @@ def apply(
         elif isinstance(activity, ObservedAccountActivity) and account.email:
             updates["state"] = "active" if matching else "inactive"
         matched = matched or matching
+        if note.tool == "claude":
+            # Nothing reads a Claude limit-reset count live, so a recorded one only goes stale.
+            for key in ("limit_reset_count", "limit_reset"):
+                if note.get(key) not in (None, "null"):
+                    updates[key] = "null"
         if matching:
             if account.tool.lower() == "codex" and account.limit_reset_count is not None:
                 updates["limit_reset_count"] = str(account.limit_reset_count)

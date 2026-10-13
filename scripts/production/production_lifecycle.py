@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 import showrunners
+import tidy_wrapped
 import unit_lookup
 from add_unit import Production, Refusal, cell_value, read_production, unit_table
 from merge_checkpoint import (CodeCheckpoint, MacCheckout, MergeEntry, NoMerge, NoPromotion,
@@ -356,6 +357,18 @@ def release_edges(slug: str) -> None:
     report("tree", "ok", "; ".join(part for part in (above, below, *told) if part))
 
 
+def tidy_state(slug: str) -> None:
+    """Delete the production's own footer, pause, open-question and state files; a failure keeps them for the sweep."""
+    try:
+        removed = tidy_wrapped.tidy(slug)
+    except (tidy_wrapped.TidyRefused, OSError) as error:
+        report("tidy", "kept", f"{error}; tidy_wrapped.py removes them once the doc says wrapped")
+        return
+    names = ", ".join(str(path.relative_to(tidy_wrapped.STATE_DIR)) + ("/" if path.parent == tidy_wrapped.STATE_DIR else "")
+                      for path in removed)
+    report("tidy", "ok", f"removed {names}" if removed else "no state files")
+
+
 def wrap(production: Production, lines: list[str], no_ci: bool,
          ci_green: CommitVerdict | VerdictMissing,
          smoke_passed: CommitVerdict | VerdictMissing, done: tuple[str, ...]) -> None:
@@ -423,6 +436,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         _ = command("notifier", production.checkout, str(notifier), "remove", f"showrunner-{production.slug}")
         report("notifier", "ok", "update timer removed")
         release_edges(production.slug)
+        tidy_state(production.slug)
         archived = command(
             "phase-notes",
             production.checkout,
