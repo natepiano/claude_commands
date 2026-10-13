@@ -533,7 +533,7 @@ class QuotaAlertTests(unittest.TestCase):
         with quota_alert.state_file() as state:
             self.assertNotIn("push", state["episodes"]["claude 2"])
 
-    def test_claude_push_names_refill_and_reset_count_at_decision_priority(self) -> None:
+    def test_claude_push_names_refill_and_offers_no_redeem_at_decision_priority(self) -> None:
         # Ahead of the real clock, which decides whether a reset is still to come.
         refill = (datetime.now().astimezone() + timedelta(days=2)).replace(second=0, microsecond=0)
         resets = refill.strftime("%Y-%m-%d %H:%M")
@@ -543,7 +543,7 @@ class QuotaAlertTests(unittest.TestCase):
             "claude 2 weekly limit",
             "claude 2 has 0% of its weekly usage left; it refills "
             + f"{refill.astimezone(ZoneInfo('America/Los_Angeles')):%a %m-%d %H:%M %Z}.",
-            quota_alert.Ask("decision", "Log in to another Claude account, or redeem a limit reset (3 available)."),
+            quota_alert.Ask("decision", "Log in to another Claude account."),
         )])
 
     def test_codex_push_names_credits_at_note_priority(self) -> None:
@@ -560,7 +560,7 @@ class QuotaAlertTests(unittest.TestCase):
         sends |= self.user_sends(lambda: self.block([codex], self.now))
         self.assertEqual(sends, {
             "claude 2 weekly limit": (
-                "decision", ActionRequired("Log in to another Claude account, or redeem a limit reset (3 available).")),
+                "decision", ActionRequired("Log in to another Claude account.")),
             "codex 1 weekly limit": ("note", NoActionRequired()),
             "Codex refused work": ("decision", ActionRequired(REFUSAL_ACTION)),
         })
@@ -749,6 +749,17 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertIn("every 30 minutes until the user acknowledges it by typing /quota_ack", text)
         self.assertNotIn("claude 1", text)
         self.assertNotIn("@", text)
+
+    def test_a_claude_alert_never_states_a_recorded_reset_count(self) -> None:
+        note = self.note("claude 2.md", "active", "1", limit_reset_count="1")
+        text = self.message(note, [note], quota_alert.load_config())
+        self.assertNotIn("Limit resets available", text)
+        self.assertNotIn("redeem", text)
+
+    def test_a_codex_alert_states_the_reset_count_its_refresh_read(self) -> None:
+        note = self.note("codex 1.md", "active", "1", limit_reset_count="2")
+        text = self.message(note, [note], quota_alert.load_config())
+        self.assertIn("Limit resets available on codex 1: 2,", text)
 
     def assignments(self) -> dict[str, str]:
         return quota_alert.registry_assignments()

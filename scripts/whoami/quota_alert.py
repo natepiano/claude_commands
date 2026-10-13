@@ -704,10 +704,8 @@ def run_out_push(note: AgentNote, selection: ClaudeAccountSelection) -> UserPush
     first = f"{display_name} has {percent(note)} of its weekly usage left; it refills {user_time(note.get('resets'))}."
     if note.tool == "codex":
         return UserPush(name, summary, f"{first} Codex keeps working on its credits. {credit_line(note)}", None)
-    count = note.get("limit_reset_count")
-    resets = f" ({count} available)" if count is not None and count != "null" else ""
-    return UserPush(name, summary, first,
-                    Ask("decision", f"Log in to another Claude account, or redeem a limit reset{resets}."))
+    # Nothing reads a Claude limit-reset count live, so the ask offers no redeem it cannot back.
+    return UserPush(name, summary, first, Ask("decision", "Log in to another Claude account."))
 
 
 def refusal_push(note: AgentNote, switch: CodexQuotaFallback, failed: str | None, already: bool) -> UserPush:
@@ -760,9 +758,10 @@ def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: Cod
         swap_line = codex_swap_line(readings, now or datetime.now(timezone.utc))
         if swap_line:
             lines.append(swap_line)
-    count = note.get("limit_reset_count")
-    if count and count != "null":
-        lines.append(f"Limit resets available on {name}: {count}, earliest expiring {note.get('limit_reset')}.")
+        # Only a Codex count is read live; a Claude note's count is never stated.
+        count = note.get("limit_reset_count")
+        if count and count != "null":
+            lines.append(f"Limit resets available on {name}: {count}, earliest expiring {note.get('limit_reset')}.")
     for other in notes:
         if other.tool == note.tool and other.path != note.path:
             lines.append(f"{other.path.stem}: {other.get('state')}, {percent(other)} weekly usage left, "
