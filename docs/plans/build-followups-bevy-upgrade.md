@@ -275,7 +275,7 @@ def bounded_bevy_update(text: str) -> str: ...
 
 **Ruled out:** A second copy of the 240 limit in the builder. Shortening the `line` sentence itself.
 
-### Phase 6 — The migration plan's dependency check sees crates that depend only on Bevy's sub-crates  · status: todo
+### Phase 6 — The migration plan's dependency check sees crates that depend only on Bevy's sub-crates  · status: done
 
 #### Work Order
 
