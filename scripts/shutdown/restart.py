@@ -222,7 +222,7 @@ class RestartNotStopped(TypedDict):
     kind: Literal["not stopped"]
     session_id: str
     name: str
-    progress: Literal["waiting", "ready", "stopping"]
+    progress: Literal["waiting", "ready", "held by usage limit", "stopping"]
 
 
 class RestartNoShutdown(TypedDict):
@@ -1408,9 +1408,9 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
         print(refusal_line(refusal))
     at = datetime.fromisoformat(settle.record_time())
     for saved in records:
-        if ids and saved["progress"]["kind"] in {"waiting", "ready", "stopping"}:
+        if ids and saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "stopping"}:
             refusal = RestartNotStopped(kind="not stopped", session_id=saved["session"]["session_id"],
-                name=saved["session"]["name"], progress=cast(Literal["waiting", "ready", "stopping"], saved["progress"]["kind"]))
+                name=saved["session"]["name"], progress=cast(Literal["waiting", "ready", "held by usage limit", "stopping"], saved["progress"]["kind"]))
             refused.append(refusal)
             print(refusal_line(refusal))
         elif ids and saved["progress"]["kind"] == "restarting" and (
@@ -1541,9 +1541,9 @@ def parse_peer_result(text: str) -> PeerRestartResult:
                 missing.append(NoRemoteControl(session_id=identity, name=name, alerts=cast(Literal["user", "none"], item["alerts"])))
             elif item.get("kind") == "no shutdown":
                 refusals.append(RestartNoShutdown(kind="no shutdown", session_id=identity, name=name))
-            elif item.get("kind") == "not stopped" and item.get("progress") in ("waiting", "ready", "stopping"):
+            elif item.get("kind") == "not stopped" and item.get("progress") in ("waiting", "ready", "held by usage limit", "stopping"):
                 refusals.append(RestartNotStopped(kind="not stopped", session_id=identity, name=name,
-                    progress=cast(Literal["waiting", "ready", "stopping"], item["progress"])))
+                    progress=cast(Literal["waiting", "ready", "held by usage limit", "stopping"], item["progress"])))
             else:
                 raise ValueError("invalid peer restart refusal")
     return PeerRestartResult(machine=cast(str, fields["machine"]), label=cast(str, fields["label"]),

@@ -861,7 +861,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertEqual(record.session_records(LOGIN), before)
 
     def test_only_restart_refuses_waiting_ready_and_stopping_with_exact_line(self) -> None:
-        cases: list[record.SessionProgress] = [{"kind": "waiting"}, {"kind": "ready", "at": OCTOBER}, {"kind": "stopping", "at": OCTOBER}]
+        cases: list[record.SessionProgress] = [{"kind": "waiting"}, {"kind": "ready", "at": OCTOBER}, {"kind": "stopping", "at": OCTOBER}, record.SessionHeldByUsageLimit(kind="held by usage limit", at=OCTOBER)]
         for progress in cases:
             with self.subTest(progress=progress["kind"]):
                 state = self.root / "state"
@@ -1060,6 +1060,32 @@ class OnlySessionCliTests(ShutdownTestCase):
     def test_selected_cancel_names_the_waiting_session_taken_out(self) -> None:
         _ = self.save_three({"kind": "waiting"})
         self.assertEqual(self.action("cancel", "beta-id"), (0, "Beta: taken out\n", ""))
+
+    def test_selected_now_forces_usage_limit_held_session_and_names_it(self) -> None:
+        before = self.save_three(record.SessionHeldByUsageLimit(kind="held by usage limit", at=OCTOBER))
+        with patch.object(settle, "_launch_conductor") as conductor:
+            self.assertEqual(self.action("now", "beta-id"), (0, "Beta: stopping now\n", ""))
+        conductor.assert_called_once_with(LOGIN, LABEL)
+        latest = record.find_session(LOGIN, "beta-id")
+        assert latest is not None
+        self.assertEqual(latest["force"], "now")
+        self.assertEqual(record.find_session(LOGIN, "alpha-id"), before[0])
+        self.assertEqual(record.find_session(LOGIN, "gamma-id"), before[2])
+
+    def test_selected_cancel_takes_usage_limit_held_session_out_and_names_it(self) -> None:
+        before = self.save_three(record.SessionHeldByUsageLimit(kind="held by usage limit", at=OCTOBER))
+        self.assertEqual(self.action("cancel", "beta-id"), (0, "Beta: taken out\n", ""))
+        self.assertIsNone(record.find_session(LOGIN, "beta-id"))
+        self.assertEqual(record.find_session(LOGIN, "alpha-id"), before[0])
+        self.assertEqual(record.find_session(LOGIN, "gamma-id"), before[2])
+
+    def test_status_actions_include_usage_limit_held_session(self) -> None:
+        _ = self.save_three(record.SessionHeldByUsageLimit(kind="held by usage limit", at=OCTOBER))
+        output = io.StringIO()
+        with patch.object(settle, "_showing_form", return_value=True), patch.object(settle, "merge_in_progress", return_value=False), redirect_stdout(output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        self.assertIn("  take out: /shutdown cancel --only <name> · Alpha, Beta, Gamma\n", output.getvalue())
+        self.assertIn("  stop now: /shutdown now --only <name> · Alpha, Beta, Gamma\n", output.getvalue())
 
     def test_selected_restart_fresh_claim_names_existing_worker_without_launch_or_alert(self) -> None:
         _ = self.save_three({"kind": "stopped", "at": OCTOBER})

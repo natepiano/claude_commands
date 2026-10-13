@@ -532,6 +532,27 @@ else:
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
         self.assertIn("  missing: waiting\n", output.getvalue())
 
+    def test_status_usage_limit_held_owner_shows_busy_seat_without_form_and_offers_actions(self) -> None:
+        saved = session_shutdown(name="Held")
+        saved["progress"] = record_store.SessionHeldByUsageLimit(kind="held by usage limit", at=saved["requested_at"])
+        saved["session"]["status"] = "idle"
+        self.assertTrue(record_store.create_session(saved))
+        worker = inventory.parse_session({**saved["session"], "kind": "seat", "session_id": "worker",
+            "name": "worker", "status": "busy", "host": {"kind": "unknown"},
+            "owner": {"kind": "director", "session_id": saved["session"]["session_id"]}}, "worker")
+        report = empty_inventory()
+        report["sessions"] = [saved["session"], worker]
+        output = io.StringIO()
+        with patch.object(shutdown, "inventory", return_value=report), patch.object(settle, "_showing_form", return_value=True) as form, patch.object(settle, "merge_in_progress", return_value=False), redirect_stdout(output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        self.assertIn("  Held: held by usage limit — Codex seat worker is still running\n", output.getvalue())
+        self.assertNotIn("showing a form", output.getvalue())
+        form.assert_not_called()
+        self.assertIn("  no conductor running; /shutdown --only <name> resumes one, /shutdown cancel --only <name> takes it out\n", output.getvalue())
+        self.assertIn("  take out: /shutdown cancel --only <name> · Held\n", output.getvalue())
+        self.assertIn("  stop now: /shutdown now --only <name> · Held\n", output.getvalue())
+        self.assertNotIn("  bring back:", output.getvalue())
+
     def test_status_reports_owned_busy_seats_and_a_queued_message_once(self) -> None:
         saved = session_shutdown(name="owner")
         saved["settle_message"] = {"kind": "queued", "at": saved["requested_at"], "reason": "delivery pending"}

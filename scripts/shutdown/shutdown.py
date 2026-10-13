@@ -435,7 +435,7 @@ def _status_actions(records: list[SessionShutdown], ownership: ConductorRunning 
     take_out: list[str] = []
     stop_now: list[str] = []
     bring_back: list[str] = []
-    waiting = any(saved["progress"]["kind"] in {"waiting", "ready"} for saved in records)
+    waiting = any(saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit"} for saved in records)
     if waiting:
         if isinstance(ownership, ConductorNotRunning):
             lines.append("  no conductor running; /shutdown --only <name> resumes one, /shutdown cancel --only <name> takes it out")
@@ -444,7 +444,7 @@ def _status_actions(records: list[SessionShutdown], ownership: ConductorRunning 
     for saved in records:
         name = saved["session"]["name"]
         progress = saved["progress"]["kind"]
-        if progress in {"waiting", "ready"}:
+        if progress in {"waiting", "ready", "held by usage limit"}:
             take_out.append(name)
             stop_now.append(name)
         elif progress == "stop failed":
@@ -715,7 +715,7 @@ def main(arguments: list[str] | None = None) -> int:
                            else _remote_shutdown_records(selected.login))
                 record_lines = _shutdown_record_lines(outcome, observations, local_observation=index == 0)
                 if outcome["kind"] == "records":
-                    waiting = any(saved["progress"]["kind"] in {"waiting", "ready"} for saved in outcome["records"])
+                    waiting = any(saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit"} for saved in outcome["records"])
                     ownership = (conductor_status(selected.login) if index == 0 else _remote_conductor_status(selected.login)) if waiting else ConductorNotRunning()
                     record_lines.extend(_status_actions(outcome["records"], ownership))
                 if record_lines:
