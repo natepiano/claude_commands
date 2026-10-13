@@ -26,6 +26,7 @@ class CommandResponse(TypedDict):
     stdout: str
     code: int
     stderr: NotRequired[str]
+    write_files: NotRequired[dict[str, str]]
 
 
 class PaneDetails(TypedDict):
@@ -81,6 +82,23 @@ class AgentDetails(TypedDict):
     pane_id: str
     agent: str
     agent_status: str
+    interactive_ready: NotRequired[bool]
+
+
+class WorkerReadinessDetails(TypedDict):
+    pane_id: str
+    agent: str
+    agent_status: str
+    interactive_ready: bool
+
+
+class WorkerReadinessResult(TypedDict):
+    agent: WorkerReadinessDetails
+
+
+class WorkerReadinessResponse(TypedDict):
+    ok: bool
+    result: WorkerReadinessResult
 
 
 class AgentListResult(TypedDict):
@@ -321,6 +339,45 @@ class TrialTests(unittest.TestCase):
         self.configure(herdr_args("agent", "wait", pane_id, "--timeout", str(timeout)),
                        json.dumps(response))
 
+    def worker_state(self, pane_id: str, state: str = "idle", ready: bool = True) -> None:
+        response: WorkerReadinessResponse = {"ok": True, "result": {"agent": {
+            "pane_id": pane_id, "agent": "codex", "agent_status": state,
+            "interactive_ready": ready,
+        }}}
+        self.configure(herdr_args("agent", "get", pane_id), json.dumps(response))
+
+    def working_response(self, pane_id: str, timeout: int = 60000) -> None:
+        response: SettledAgentResponse = {"ok": True, "result": {"agent": {
+            "pane_id": pane_id, "agent": "codex", "agent_status": "working",
+        }}}
+        self.configure(herdr_args("agent", "wait", pane_id, "--until", "working",
+                                  "--timeout", str(timeout)), json.dumps(response))
+
+    def work_fixture(self) -> tuple[str, Path, Path]:
+        pane = "w38:p71"
+        work_order = self.root / "turn-order.md"
+        _ = work_order.write_text("tiny Work Order\n")
+        self.pane_list([{"pane_id": pane, "label": "slug-unit-impl"}])
+        return pane, work_order, Path(str(work_order) + ".done")
+
+    def turn_start_timeout_response(self, pane: str, milliseconds: int) -> list[str]:
+        response: AgentErrorResponse = {"ok": False, "error": {
+            "code": "timeout", "message": "agent wait timed out before working",
+        }}
+        arguments = herdr_args("agent", "wait", pane, "--until", "working",
+                               "--timeout", str(milliseconds))
+        self.configure(arguments, code=1, stderr=json.dumps(response))
+        return arguments
+
+    def single_issue(self, label: str) -> IssueRecord:
+        lines = (self.scratch / "issues.jsonl").read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        issue = cast(IssueRecord, json.loads(lines[0]))
+        self.assertEqual(set(issue), {"time", "session", "expected", "happened"})
+        self.assertEqual(issue["session"], label)
+        self.assertEqual(datetime.fromisoformat(issue["time"]).utcoffset(), timedelta(0))
+        return issue
+
     def assert_blocked_issue(self, result: InvocationResult, label: str) -> None:
         self.assertEqual(result.code, 2, result.stderr)
         self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
@@ -370,6 +427,13 @@ class TrialTests(unittest.TestCase):
     def pane_list(self, panes: list[PaneDetails]) -> None:
         response: PaneListResponse = {"ok": True, "result": {"panes": panes}}
         self.configure(herdr_args("pane", "list"), json.dumps(response))
+        for pane in panes:
+            if pane["label"] in {
+                "slug-unit-impl", "slug-unit-review", "clamp-unit-impl",
+                "clamp-unit-review", "count-unit-impl", "count-unit-review",
+            }:
+                self.worker_state(pane["pane_id"])
+                self.working_response(pane["pane_id"])
 
     def launch_fixture(self, impl_family: str = "codex", review_family: str = "codex") -> None:
         self.assert_success(self.invoke("scaffold"))
@@ -938,6 +1002,122 @@ class TrialTests(unittest.TestCase):
         self.assert_success(result)
         self.assertEqual(result.stdout, "herdr-fake\n")
 
+    def test_work_refuses_a_worker_not_interactively_ready_without_submitting_or_recording(self) -> None:
+        pane, work_order, report = self.work_fixture()
+        self.worker_state(pane, state="idle", ready=False)
+        _ = report.write_text("preserve the previous report\n")
+        result = self.invoke("work", "slug-unit", "impl", str(work_order))
+        self.assertEqual(result.code, 2, result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertFalse((self.scratch / "work" / "slug-unit-impl.json").exists())
+        self.assertEqual(report.read_text(), "preserve the previous report\n")
+        issue = self.single_issue("slug-unit-impl")
+        self.assertEqual(issue["expected"], "worker is ready for its Work Order")
+        self.assertIn("idle", issue["happened"])
+        self.assertIn("false", issue["happened"].casefold())
+        self.assertEqual(self.calls(), [
+            herdr_args("pane", "list"), herdr_args("agent", "get", pane),
+        ])
+
+    def test_work_refuses_a_blocked_worker_even_when_interactive_readiness_is_true(self) -> None:
+        pane, work_order, _ = self.work_fixture()
+        self.worker_state(pane, state="blocked", ready=True)
+        result = self.invoke("work", "slug-unit", "impl", str(work_order))
+        self.assertEqual(result.code, 2, result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertFalse((self.scratch / "work" / "slug-unit-impl.json").exists())
+        issue = self.single_issue("slug-unit-impl")
+        self.assertEqual(issue["expected"], "worker is ready for its Work Order")
+        self.assertIn("blocked", issue["happened"])
+        self.assertIn("true", issue["happened"].casefold())
+        self.assertEqual(self.calls(), [
+            herdr_args("pane", "list"), herdr_args("agent", "get", pane),
+        ])
+
+    def test_work_removes_assignment_and_logs_when_one_prompt_never_starts_a_turn(self) -> None:
+        pane, work_order, report = self.work_fixture()
+        milliseconds = 23
+        wait = self.turn_start_timeout_response(pane, milliseconds)
+        prompt = herdr_args("agent", "prompt", pane,
+                           f"Read and carry out {work_order}. When done, write your report to {report}.")
+        with patch.dict(os.environ, {"HERDR_TRIAL_TURN_START_TIMEOUT": str(milliseconds)}):
+            result = self.invoke("work", "slug-unit", "impl", str(work_order))
+        self.assert_refusal(result, "slug-unit-impl")
+        self.assertFalse(report.exists())
+        self.assertFalse((self.scratch / "work" / "slug-unit-impl.json").exists())
+        issue = self.single_issue("slug-unit-impl")
+        self.assertEqual(issue["expected"], "worker starts a turn on its Work Order")
+        self.assertEqual(issue["happened"], "prompt submitted, no turn started within 23 ms")
+        self.assertEqual(self.calls(), [
+            herdr_args("pane", "list"), herdr_args("agent", "get", pane), prompt, wait,
+        ])
+
+    def test_work_accepts_a_fast_report_when_working_was_missed_by_the_start_wait(self) -> None:
+        pane, work_order, report = self.work_fixture()
+        milliseconds = 31
+        wait = self.turn_start_timeout_response(pane, milliseconds)
+        prompt = herdr_args("agent", "prompt", pane,
+                           f"Read and carry out {work_order}. When done, write your report to {report}.")
+        # The recorder creates the report only after work removed any stale report.
+        response = cast(CommandResponse, self.responses[" ".join(wait)])
+        response["write_files"] = {str(report): "fast turn finished\n"}
+        with patch.dict(os.environ, {"HERDR_TRIAL_TURN_START_TIMEOUT": str(milliseconds)}):
+            result = self.invoke("work", "slug-unit", "impl", str(work_order))
+        self.assert_success(result)
+        self.assertTrue(report.is_file(), "working timeout must accept the newly written report")
+        self.assertEqual(report.read_text(), "fast turn finished\n")
+        self.assertEqual(self.assigned_files(), {"slug-unit-impl": str(work_order)})
+        self.assertFalse((self.scratch / "issues.jsonl").exists())
+        self.assertEqual(self.calls(), [
+            herdr_args("pane", "list"), herdr_args("agent", "get", pane), prompt, wait,
+        ])
+
+    def test_work_keeps_assignment_after_a_ready_worker_starts_working_with_one_prompt(self) -> None:
+        pane, work_order, _ = self.work_fixture()
+        for state in ("idle", "done"):
+            with self.subTest(state=state):
+                self.log.unlink(missing_ok=True)
+                self.worker_state(pane, state=state)
+                result = self.invoke("work", "slug-unit", "impl", str(work_order))
+                self.assert_success(result)
+                self.assertEqual(self.assigned_files(), {"slug-unit-impl": str(work_order)})
+                self.assertFalse((self.scratch / "issues.jsonl").exists())
+                calls = self.calls()
+                self.assertEqual(calls[:2], [
+                    herdr_args("pane", "list"), herdr_args("agent", "get", pane),
+                ])
+                self.assertEqual(sum(call[2:4] == ["agent", "prompt"] for call in calls), 1)
+                self.assertEqual(calls[-1], herdr_args("agent", "wait", pane, "--until", "working",
+                                                     "--timeout", "60000"))
+                self.assertEqual(len(calls), 4)
+
+    def test_work_rejects_an_invalid_turn_start_deadline_before_submitting_input(self) -> None:
+        _, work_order, _ = self.work_fixture()
+        for value in ("-1", "1.5", "not-a-number"):
+            with self.subTest(value=value):
+                self.log.unlink(missing_ok=True)
+                with patch.dict(os.environ, {"HERDR_TRIAL_TURN_START_TIMEOUT": value}):
+                    result = self.invoke("work", "slug-unit", "impl", str(work_order))
+                self.assertEqual(result.code, 2, result.stderr)
+                self.assertEqual(len(result.stderr.splitlines()), 1)
+                self.assertIn("HERDR_TRIAL_TURN_START_TIMEOUT", result.stderr)
+                self.assertFalse((self.scratch / "work" / "slug-unit-impl.json").exists())
+                self.assertFalse(any(call[2:4] == ["agent", "prompt"] for call in self.calls()))
+
+    def test_work_logs_a_blocked_turn_start_without_sending_additional_input(self) -> None:
+        pane, work_order, _ = self.work_fixture()
+        response: SettledAgentResponse = {"ok": True, "result": {"agent": {
+            "pane_id": pane, "agent": "codex", "agent_status": "blocked",
+        }}}
+        wait = herdr_args("agent", "wait", pane, "--until", "working", "--timeout", "60000")
+        self.configure(wait, json.dumps(response))
+        result = self.invoke("work", "slug-unit", "impl", str(work_order))
+        self.assert_blocked_issue(result, "slug-unit-impl")
+        calls = self.calls()
+        self.assertEqual(sum(call[2:4] == ["agent", "prompt"] for call in calls), 1)
+        self.assertEqual(calls[-1], wait)
+        self.assertFalse(any(call[3] in {"send-text", "send-keys", "run"} for call in calls))
+
     def test_concurrent_worker_dispatches_preserve_both_assignments_for_separate_waits(self) -> None:
         units = {"slug-unit": "w38:p71", "clamp-unit": "w38:p81"}
         self.pane_list([{"pane_id": pane, "label": f"{unit}-impl"}
@@ -1003,7 +1183,10 @@ class TrialTests(unittest.TestCase):
         self.assertEqual(self.assigned_files(), {
             "count-unit-review": str(other_file), label: str(work_order),
         })
-        self.assertEqual(self.calls(), [herdr_args("pane", "list"), expected])
+        self.assertEqual(self.calls(), [
+            herdr_args("pane", "list"), herdr_args("agent", "get", "w38:p71"), expected,
+            herdr_args("agent", "wait", "w38:p71", "--until", "working", "--timeout", "60000"),
+        ])
 
     def test_work_and_wait_use_role_labels_and_refuse_invalid_roles_without_input(self) -> None:
         for action in ("work", "wait"):
@@ -1114,6 +1297,7 @@ class TrialTests(unittest.TestCase):
         self.pane_list([{"pane_id": "w38:p71", "label": "slug-unit-impl"}])
         self.assert_success(self.invoke("work", "slug-unit", "impl", str(work_order)))
         _ = Path(str(work_order) + ".done").write_text("long work finished\n")
+        dispatch_call_count = len(self.calls())
         original_run = subprocess.run
         deadlines: list[float] = []
 
@@ -1138,7 +1322,7 @@ class TrialTests(unittest.TestCase):
         self.assertGreater(deadlines[0], 1800)
         self.assertGreater(deadlines[1], 25)
         self.assertEqual(sum(call[2:4] == ["agent", "prompt"] for call in self.calls()), 1)
-        self.assertFalse(any("--until" in call for call in self.calls()))
+        self.assertFalse(any("--until" in call for call in self.calls()[dispatch_call_count:]))
 
     def test_work_agent_blocked_refusal_logs_one_issue_without_raw_input(self) -> None:
         label = "slug-unit-review"
@@ -1153,7 +1337,9 @@ class TrialTests(unittest.TestCase):
         arguments = herdr_args("agent", "prompt", "w38:p72", prompt)
         self.configure(arguments, code=1, stderr=json.dumps(response))
         self.assert_blocked_issue(self.invoke("work", "slug-unit", "review", str(work_order)), label)
-        self.assertEqual(self.calls(), [herdr_args("pane", "list"), arguments])
+        self.assertEqual(self.calls(), [
+            herdr_args("pane", "list"), herdr_args("agent", "get", "w38:p72"), arguments,
+        ])
 
     def test_wait_settled_blocked_logs_issue_even_when_a_report_exists(self) -> None:
         label = "count-unit-review"

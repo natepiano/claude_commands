@@ -130,7 +130,7 @@ Showrunner's brief and approval, 2026-10-13 10:3x–10:4x EDT (not the user's wo
 
 **Ruled out:** Konsole as the client (no window appeared); opening prompts as `agent start` arguments (herdr refuses multi-line text); trust from an ancestor folder (both agents still prompt).
 
-### Phase 4 — Run the fake production and log what breaks  · status: todo
+### Phase 4 — Run the fake production and log what breaks  · status: done
 
 #### Work Order
 
