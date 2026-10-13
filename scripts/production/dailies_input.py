@@ -221,13 +221,6 @@ class PhaseTablesAvailable(NamedTuple):
 PhaseTablesState = PhaseTablesUnavailable | PhaseTablesAvailable
 
 
-class PhaseTablesPruned(NamedTuple):
-    pass
-
-
-PrunePhaseTablesState = PhaseTablesPruned | PhaseTablesUnavailable
-
-
 class JudgmentNumberedPlanPhase(NamedTuple):
     number: int
 
@@ -578,13 +571,6 @@ def phase_tables(production_doc: Path, zone: ZoneInfo) -> PhaseTablesState:
         return PhaseTablesUnavailable(str(error))
 
 
-def prune_phase_tables(production_doc: Path) -> PrunePhaseTablesState:
-    result = command(phase_table_path(), "prune", "--production-doc", str(production_doc))
-    if result.returncode:
-        return PhaseTablesUnavailable(result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}")
-    return PhaseTablesPruned()
-
-
 def judgment_phase_number(text: str) -> JudgmentPlanPhase:
     matched = re.match(r"^Phase (\d+) of \d+: ", text)
     if matched is None:
@@ -821,9 +807,6 @@ def run(args: argparse.Namespace) -> int:
     render_state = cast(Path, args.render_state)
     expand = cast(list[str], args.expand)
     production = read_production(production_path)
-    prune_failure = prune_phase_tables(production.doc)
-    if isinstance(prune_failure, PhaseTablesUnavailable):
-        report("phase tables", "unavailable", prune_failure.reason)
     now, _ = local_now(str(production.zone), "--zone", at)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     units = units_from_doc(lines, production.slug)

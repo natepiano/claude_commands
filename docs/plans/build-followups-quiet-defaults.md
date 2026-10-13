@@ -1,6 +1,6 @@
 # Quiet defaults: no timer or footer unless asked, and phase-note pruning on the snapshot timer
 
-> **Status: IMPLEMENTATION PLAN — Phase 1 built; Phase 2 not built.**
+> **Status: IMPLEMENTATION PLAN — both phases built; the nix change waits on the showrunner and the user's rebuild.**
 
 > **As-built disposition: amend** — `docs/as-built/showrunner-automation.md`, `docs/as-built/session-notifier.md`, `docs/as-built/phase-tables.md`
 
@@ -48,9 +48,9 @@
 - `unit_notifier.sh`: with no config line it creates no instance; with an instance already running and on-demand set, it leaves that instance running.
 - Existing expectations in `test_update_registration.py`, `test_delegate_check.py` and the unit notifier tests that assume `scheduled` get updated.
 
-## Phase 2: pruning on the snapshot timer (c)
+## Phase 2: pruning on the snapshot timer (c) — done
 
-- **New, `scripts/production/prune_phase_notes.py`.** For every registered showrunner (`showrunners.registered_showrunners()`, running or not), it runs `phase_table.prune(<its doc>)` in-process. It is one process every 2 minutes, not one per production. A production whose doc cannot be read or whose prune refuses gets one stderr line, and the others still run. It prints a line only when it archived a note, and exits 1 when any production failed. It uses only the standard library, because the timer runs it with nix's `python3`.
+- **New, `scripts/production/prune_phase_notes.py`.** For every update timer's production (each `showrunner-*` instance's checked doc, running or not; no session record is read), it runs `phase_table.prune(<its doc>)` in-process. It is one process every 2 minutes, not one per production. A production whose doc cannot be read or whose prune refuses gets one stderr line, and the others still run. It prints nothing on success and exits 1 when any production failed; `phase_table.prune` returns nothing, so there is no archived count to print. It uses only the standard library, because the timer runs it with nix's `python3`.
 - **`dailies_input.py`.** It loses `prune_phase_tables`, `PhaseTablesPruned` and `PrunePhaseTablesState`, and its tests lose their prune expectations. A dailies then makes no write before its checks.
 - **The nix change.** It is the showrunner's to apply in `/etc/nixos`, and a rebuild is the user's. The change goes in `modules/linux/agent-sessions-snapshot.py`, the script the timer runs, not the `.nix` module, which needs no change. The exact lines go in the phase notice: a `prune_phase_notes()` beside `refresh_agent_notes()`, built the same way (its own process, a 60-second timeout, failures to stderr), called second in `main()`.
 - **Order.** `dailies_input.py` stops pruning only once the timer prunes. The phase merges first, with the nix change applied and rebuilt after it, so for that gap nothing prunes. That costs only stale notes sitting in the vault, no lost data, and the next timer run after the rebuild catches up.
