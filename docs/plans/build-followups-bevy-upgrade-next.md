@@ -88,83 +88,38 @@ CRATES_IO_PACER = RequestPacer(CRATES_IO_MIN_INTERVAL_SECONDS)
 
 ### Phase 2 — The upgrade watch sends crates.io at most one request a second, through the same pacer as the migration check  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** The scheduled upgrade watch starts its crates.io requests at least one second apart, as the migration check does, and both scripts take that pacing from one module.
-
-**Spec:**
-Work only in the worktree and branch the Delegation Context names. The showrunner asked for this phase on 2026-10-12, in the words the Source section quotes.
-
-`scripts/bevy_upgrade/crates_io_pacer.py` (new):
-
-- It holds the three definitions that sit at the top of the migration check today, moved as they are, docstring included:
-
-```python
-CRATES_IO_MIN_INTERVAL_SECONDS: float = 1.0
-
-class RequestPacer:
-    def __init__(
-        self,
-        min_interval: float,
-        clock: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> None: ...
-    def wait(self) -> None: ...
-
-CRATES_IO_PACER = RequestPacer(CRATES_IO_MIN_INTERVAL_SECONDS)
-```
-
-- `RequestPacer.wait` keeps its behaviour to the letter: it returns at once on its first call; a later call sleeps for what is left of `min_interval` since the previous request started, then records the clock reading taken after the sleep.
-- The module starts with `from __future__ import annotations` and a one-line docstring, like its neighbours, and says in a comment or the docstring where the one-a-second figure comes from: crates.io's published limit for a crawler.
-
-`scripts/bevy_migration_plan/bevy_migration_dependency_check.py`:
-
-- It no longer defines `CRATES_IO_MIN_INTERVAL_SECONDS`, `RequestPacer` or `CRATES_IO_PACER`, and it does not re-export them. Drop the imports that only they used.
-- After its standard-library imports it puts the watch's directory on the path and imports the module, in the idiom `scripts/bevy_upgrade/bevy_upgrade.py` uses for `scripts/production`:
-
-```python
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bevy_upgrade"))
-
-import crates_io_pacer
-```
-
-- `query_crates_io` and `get_bevy_dependency_requirement` call `crates_io_pacer.CRATES_IO_PACER.wait()` immediately before `request.urlopen`, reading the attribute at call time, so a test can replace it.
-
-`scripts/bevy_upgrade/upstream.py`:
-
-- It imports `crates_io_pacer`, a sibling module.
-- `http_fetch` calls `crates_io_pacer.CRATES_IO_PACER.wait()` immediately before `urllib.request.urlopen` when the address's host is `crates.io`, and only then. `urlsplit(url).hostname` already gives the host. A request to `api.github.com` or `raw.githubusercontent.com` is never paced: GitHub has its own limit and the watch already keeps to it.
-- Nothing else in the watch changes. `fixture_fetch` never reaches `http_fetch`, so a run from a fixtures file does not wait.
-
-`pyrightconfig.json`:
-
-- Add one `executionEnvironments` entry, before the closing `{"root": "."}` entry: root `scripts/bevy_migration_plan`, `extraPaths` `scripts/bevy_migration_plan` and `scripts/bevy_upgrade`. The `scripts/bevy_upgrade` entry already lists its own directory, where the new module lives.
+- `scripts/bevy_upgrade/crates_io_pacer.py` is the one home of the pacing. It holds `CRATES_IO_MIN_INTERVAL_SECONDS`, `RequestPacer` and the shared `CRATES_IO_PACER`, with the signatures and the `wait` behaviour they had in the migration check. Its docstring gives the source of the figure: crates.io's published crawler limit of one request a second.
+- `bevy_migration_dependency_check.py` defines none of the three names and does not re-export them. After its standard-library imports it runs `sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bevy_upgrade"))` and `import crates_io_pacer`. `query_crates_io` and `get_bevy_dependency_requirement` call `crates_io_pacer.CRATES_IO_PACER.wait()` immediately before `request.urlopen`.
+- The watch paces its crates.io requests. `http_fetch` in `scripts/bevy_upgrade/upstream.py` calls `crates_io_pacer.CRATES_IO_PACER.wait()` immediately before `urllib.request.urlopen` when `urlsplit(url).hostname` is `crates.io`, and for no other host: a request to `api.github.com` or `raw.githubusercontent.com` never waits. `fixture_fetch` never reaches `http_fetch`, so a run from a fixtures file does not wait.
+- Both scripts read `crates_io_pacer.CRATES_IO_PACER` at call time, so a test replaces the pacer once, with `mock.patch.object(crates_io_pacer, "CRATES_IO_PACER", ...)`, never on the check or on `upstream`.
+- `run_check` in `scripts/bevy_upgrade/upgrade_check.py` is unchanged. It reads the clock before each fetch and the sleep happens inside the fetch, so a sleep counts against `CHECK_BUDGET`. The scheduled job's 300 second limit holds the 180 second budget, one sleep of at most a second and one request's 30 second timeout.
+- `pyrightconfig.json` has an `executionEnvironments` entry with root `scripts/bevy_migration_plan` and `extraPaths` `scripts/bevy_migration_plan` and `scripts/bevy_upgrade`, before the closing `{"root": "."}` entry.
+- `commands/bevy_migration_plan.md` says how a migration check's requests add up: one for each direct dependency, then up to 21 more for each one that depends on Bevy.
+- Measured on 2026-10-12 at 22:01 EDT through the real `http_fetch`: three crates.io lookups in a row answered at 0.22, 1.18 and 2.17 seconds, and a GitHub lookup after them took 0.27 seconds with no wait.
 
 **Files:**
-- `scripts/bevy_upgrade/crates_io_pacer.py` — new: the interval, `RequestPacer` and the shared `CRATES_IO_PACER`.
-- `scripts/bevy_upgrade/upstream.py` — `http_fetch` paces a crates.io request.
-- `scripts/bevy_migration_plan/bevy_migration_dependency_check.py` — imports the pacer module; its own copy is gone.
-- `pyrightconfig.json` — the execution environment that lets the check's directory resolve the import.
-- `scripts/bevy_upgrade/test_crates_io_pacer.py` — new: the five `RequestPacer` tests, moved from the check's test module with a stand-in clock.
-- `scripts/bevy_upgrade/test_upstream.py` — `setUp` installs a stand-in pacer; the tests that the watch goes through it.
-- `scripts/bevy_migration_plan/test_bevy_migration_dependency_check.py` — replaces the pacer at its new home; the five `RequestPacer` tests leave.
+- `scripts/bevy_upgrade/crates_io_pacer.py` — the interval, `RequestPacer` and the shared `CRATES_IO_PACER`.
+- `scripts/bevy_upgrade/upstream.py` — `http_fetch` waits for the pacer before a crates.io request.
+- `scripts/bevy_migration_plan/bevy_migration_dependency_check.py` — imports the pacer module from the watch's directory; its two crates.io functions call it.
+- `pyrightconfig.json` — the execution environment that lets the check's directory resolve `crates_io_pacer`.
+- `scripts/bevy_upgrade/test_crates_io_pacer.py` — the five `RequestPacer` tests on their own stand-in clock: no sleep on the first call, the remaining 0.75 seconds after 0.25, no sleep after the interval, two one-second sleeps for three calls in a row, and a sleep that runs long.
+- `scripts/bevy_upgrade/test_upstream.py` — `UpstreamTests.setUp` installs a pacer on a stand-in clock and a `urllib.request.urlopen` stand-in that fails any test reaching the network. Four tests cover one wait before a crates.io request, no wait for either GitHub host, one one-second sleep between two crates.io requests, and no pacing through `fixture_fetch`.
+- `scripts/bevy_migration_plan/test_bevy_migration_dependency_check.py` — `setUp` replaces the pacer at `crates_io_pacer.CRATES_IO_PACER`; one test checks that the three pacing names are absent from the check.
+- `commands/bevy_migration_plan.md` — the time note beside the command that runs the check.
 
-**Seats:** 1 writer + 1 tester — one moved class, two callers, and their test modules.
-- `impl` — `scripts/bevy_upgrade/crates_io_pacer.py`, `scripts/bevy_upgrade/upstream.py`, `scripts/bevy_migration_plan/bevy_migration_dependency_check.py`, `pyrightconfig.json`.
-- `test` — `scripts/bevy_upgrade/test_crates_io_pacer.py`, `scripts/bevy_upgrade/test_upstream.py`, `scripts/bevy_migration_plan/test_bevy_migration_dependency_check.py`, from the Spec.
+**Gotchas:**
+- An `executionEnvironments` entry rooted at a script directory makes basedpyright resolve that directory's imports from the directory itself. The check's test module therefore has `import bevy_migration_dependency_check as checker`; the `scripts.bevy_migration_plan` package path is an unresolved import under the entry. The module imports only under `python3 -m unittest discover -s scripts/bevy_migration_plan -p 'test_*.py'`, which puts its directory on `sys.path`; named by package path from the repository root it raises `ModuleNotFoundError`.
+- Importing the check puts `scripts/bevy_upgrade` first on `sys.path`, so a module there is found before a same-named module later on that process's path. A module added to `scripts/bevy_upgrade` under a name that process imports later is loaded in place of the intended one.
+- The limit holds per process: `CRATES_IO_PACER` is one object in each Python process. The watch and a migration check running at the same moment each keep to one request a second and do not see each other.
+- A check that makes N crates.io requests takes at least N − 1 seconds and holds the record lock that long, about 40 seconds for hana_catalyst's first read. A verb that takes the lock waits behind it; `line` takes no lock. About 180 crates.io requests is the most one check makes before `CHECK_BUDGET` cuts it short. The next check continues from there, and the only outward sign is that `Record.checked` does not advance.
+- `test_cli.py` names a fixtures file for every CLI run, so no CLI test reaches `http_fetch` or waits on the real pacer.
+- The stand-in clock class has one copy in each of the three test modules that pace, because a test module here imports no other test module. A change to it is made in all three.
 
-**Constraints from prior phases:**
-- The watch's check has a time budget: `run_check` in `scripts/bevy_upgrade/upgrade_check.py` reads the clock before each fetch and stops asking once `CHECK_BUDGET` (180 seconds) is spent. A pacer sleep happens inside the fetch, so it counts against that budget and no budget code changes. The scheduled job's limit is 300 seconds: the budget, one request's 30 second timeout and one pacer sleep fit inside it.
-- The watch sends about 40 crates.io requests for hana_catalyst, so pacing adds about 40 seconds to a check that nothing waits on.
-- The pacer records the clock reading after its sleep, never the planned wake time; the test whose stand-in sleep runs long guards that and moves with the others.
-- `commands/bevy_migration_plan.md` has an uncommitted edit by the unit director. Leave it as it is; it is committed with this phase.
-- The check's test module replaces the pacer in `setUp` with `mock.patch.object(checker, "CRATES_IO_PACER", ...)` and two of its tests patch `checker.CRATES_IO_PACER`'s `wait`. After this phase the object to patch is `crates_io_pacer.CRATES_IO_PACER`.
-
-**Acceptance gate:** both Delegation Context **Test** commands and the **Lint** command pass. The tests cover:
-- The five `RequestPacer` tests pass in `scripts/bevy_upgrade/test_crates_io_pacer.py` against `crates_io_pacer.RequestPacer`, with their assertions unchanged: first call does not sleep; a call 0.25 seconds after the previous start sleeps 0.75 seconds; a call after more than the interval does not sleep; three calls with no time passing sleep twice, one second each; a sleep that runs long does not shorten the next gap.
-- `http_fetch` on a crates.io address calls the shared pacer's `wait` once, before `urllib.request.urlopen`. The test records the order of the two calls.
-- `http_fetch` on an `api.github.com` address and on a `raw.githubusercontent.com` address does not call the pacer.
-- Two crates.io `http_fetch` calls in a row, under a pacer on a stand-in clock, sleep once for one second.
-- `UpstreamTests.setUp` installs a pacer with a stand-in clock and sleep, so its existing `http_fetch` tests never wait on the real clock.
-- The check's tests pass with the pacer replaced at `crates_io_pacer.CRATES_IO_PACER`: `query_crates_io` and `get_bevy_dependency_requirement` each still call it once per request, before the request.
-- No name `RequestPacer`, `CRATES_IO_PACER` or `CRATES_IO_MIN_INTERVAL_SECONDS` is defined in `bevy_migration_dependency_check.py`.
+**Ruled out:**
+- A second copy of the pacer in the watch, or a re-export from the check: both scripts import one module.
+- Pacing GitHub hosts: GitHub has its own limit and the watch already keeps to it.
+- Changing `run_check` or `CHECK_BUDGET`: the sleep falls inside the fetch the budget already brackets.
+- A test in the check's suite that reaches the shared pacer through a private module import to assert identity: basedpyright warns, and the two caller-order tests already prove the check uses the replaced pacer.
+- Keeping the `scripts.bevy_migration_plan` package-path import in the check's tests: it does not resolve under the new execution environment.
