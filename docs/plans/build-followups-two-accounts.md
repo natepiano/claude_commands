@@ -604,7 +604,7 @@ After a seat launch's own turn has ended, a move to the selected seats home that
 
 **Ruled out:** failing the launch whenever a move cannot be confirmed (the turn's own result is already known).
 
-### Phase 14 — An account picked by room, not by role  · status: todo
+### Phase 14 — An account picked by room, not by role  · status: done
 
 #### Work Order
 

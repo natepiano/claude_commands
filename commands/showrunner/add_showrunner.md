@@ -1,6 +1,6 @@
 ---
-description: Start a lower production's showrunner in its own tmux session, on the showrunner account, already reporting to this one.
-argument-hint: "<production doc> [resume <session id> <dir>] [check]"
+description: Start a lower production's showrunner in its own tmux session, on a picked account, already reporting to this one.
+argument-hint: "<production doc> [resume <session id> <dir> [account <label>|config-dir <dir>]] [check]"
 ---
 
 # Add showrunner
@@ -19,7 +19,7 @@ still be grouped in the same accounts".
 Run, with the sandbox off:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/add_showrunner.py" --production <PRODUCTION_DOC> --model <your model id> --effort <your effort level> [--resume <session id> --cwd <dir>] [--check]
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/add_showrunner.py" --production <PRODUCTION_DOC> --model <your model id> --effort <your effort level> [--resume <session id> --cwd <dir> [--account <label>|--config-dir <dir>]] [--check]
 ```
 
 Pass your own model id and effort level, so the lower showrunner runs as you
@@ -34,9 +34,11 @@ What it does:
   showrunner checkout, with `/showrunner:produce <doc>`. With `resume` it
   resumes that session in `<dir>`, the directory it ran in, with
   `/showrunner:produce <doc> resume`.
-- The session is on the showrunner account at any depth: it takes the main
-  login, whatever account your units use. It carries no unit mark, so it is
-  never relayed to as one of your units.
+- New sessions pick an account with room whose weekly reset comes soonest.
+  Resumes retain the tmux session’s recorded account; use `--account <label>`
+  or `--config-dir <dir>` with `--resume` to supply or override it. With no
+  recorded account, resume refuses and names `--account`. It carries no unit
+  mark, so it is never relayed to as one of your units.
 - It waits up to three minutes for the new showrunner to register its update
   timer, then attaches it to your production and tells it so. Session records
   that cannot be read for a moment are read again until the three minutes
@@ -54,12 +56,12 @@ It refuses, and starts nothing, when:
   others;
 - this session runs no production;
 - there is no tmux, or the session records cannot be read;
-- Claude is not trusted, on the showrunner account, in the folder the session
+- Claude is not trusted, on the selected account, in the folder the session
   starts in: the doc's checkout, or the folder `resume` names. A trusted
   parent folder does not count; the folder, its repository, or the main
   checkout of a worktree must be trusted. The user trusts it first, by
-  running `claude` there once and accepting. A showrunner never answers a
-  trust prompt (live check, 2026-10-13: a child sat on it for the whole wait).
+  running Claude on that account there once and accepting. A showrunner never
+  answers a trust prompt (live check, 2026-10-13: a child sat on it for the whole wait).
 
 If the session starts and no showrunner appears in time, the command says so,
 exits 1 and leaves the session running. Look at it with `tmux attach -t

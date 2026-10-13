@@ -42,10 +42,11 @@ PHASE = "Phase 2 of 3: panel labels stay clear"
 # Quota notices read no live account dirs: each test names the Claude accounts in use.
 MAIN_CLAUDE = agent_accounts.KnownClaudeAccount("main@example.invalid", "claude 2")
 UNIT_CLAUDE = agent_accounts.KnownClaudeAccount("unit@example.invalid", "claude 3")
-ONE_CLAUDE_ACCOUNT = agent_accounts.ClaudeAccountSelection(MAIN_CLAUDE, MAIN_CLAUDE, False, ())
-TWO_CLAUDE_ACCOUNTS = agent_accounts.ClaudeAccountSelection(
-    MAIN_CLAUDE, UNIT_CLAUDE, True,
-    (agent_accounts.CheckedNamedClaudeAccount("claude 3", Path("/unread/.claude3"), UNIT_CLAUDE),))
+ONE_CLAUDE_ACCOUNT = agent_accounts.ClaudeAccountsInUse(MAIN_CLAUDE, False, (), frozenset())
+TWO_CLAUDE_ACCOUNTS = agent_accounts.ClaudeAccountsInUse(
+    MAIN_CLAUDE, True,
+    (agent_accounts.CheckedNamedClaudeAccount("claude 3", Path("/unread/.claude3"), UNIT_CLAUDE),),
+    frozenset((UNIT_CLAUDE.login,)))
 PHASE_IDENTITY = "Phase 2 of 3"
 BERTH_STUB = '''#!__PYTHON__
 import os
@@ -435,7 +436,7 @@ class WaitingTests(unittest.TestCase):
         })
 
     def quota_message(self, note: QuotaNote,
-                      selection: agent_accounts.ClaudeAccountSelection = ONE_CLAUDE_ACCOUNT) -> str:
+                      selection: agent_accounts.ClaudeAccountsInUse = ONE_CLAUDE_ACCOUNT) -> str:
         config: quota_alert.Config = {
             "threshold_percent": 5.0,
             "repeat_minutes": 30.0,
@@ -964,7 +965,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.add_gamma()
         note = self.quota_note("claude 3", "claude", login=UNIT_CLAUDE.login)
         notice = self.quota_message(note, TWO_CLAUDE_ACCOUNTS)
-        self.assertTrue(notice.startswith("Quota alert: claude 3 (unit directors) at 4%"), notice)
+        self.assertTrue(notice.startswith("Quota alert: claude 3 (in use) at 4%"), notice)
         production = add_unit.read_production(self.doc)
         with mock.patch.dict(os.environ, self.env):
             units = waiting.units_from_doc(production)

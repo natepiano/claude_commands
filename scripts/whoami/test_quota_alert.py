@@ -20,9 +20,10 @@ from zoneinfo import ZoneInfo
 
 import quota_alert
 from scripts.whoami import agent_accounts
-from agent_accounts import ClaudeAccountSelection, CodexHomeSource, Quota, Report
+from agent_accounts import ClaudeAccountsInUse, CodexHomeSource, Quota, Report
 import agent_notes
 import note_file
+import account
 from agent_notes import local_reset
 from note_file import read_note
 from scripts.accounts import accounts
@@ -116,6 +117,8 @@ class QuotaAlertTests(unittest.TestCase):
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
         })))
         del environment_context
+        (self.root / ".claude").mkdir()
+        _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "someone@example.com"}}))
         _ = self.enterContext(mock.patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(mock.patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl"))
         config = self.root / "showrunners.json"
@@ -221,14 +224,14 @@ class QuotaAlertTests(unittest.TestCase):
             (quota_alert.CodexHomeReading(home, live, now),))
 
     def alert(self, notes: Notes, now: datetime | None = None, *,
-              selection: ClaudeAccountSelection | quota_alert.ReadCurrentClaudeSelection =
+              selection: ClaudeAccountsInUse | quota_alert.ReadCurrentClaudeSelection =
               quota_alert.READ_CURRENT_CLAUDE_SELECTION) -> list[str]:
         checked = now or self.now
         return quota_alert.alert(notes, checked, selection=selection,
                                   codex_readings=self.alert_readings(notes, checked))
 
     def block(self, notes: Notes, now: datetime | None = None, *,
-              selection: ClaudeAccountSelection | quota_alert.ReadCurrentClaudeSelection =
+              selection: ClaudeAccountsInUse | quota_alert.ReadCurrentClaudeSelection =
               quota_alert.READ_CURRENT_CLAUDE_SELECTION) -> list[str]:
         checked = now or self.now
         readings = self.alert_readings(notes, checked)
@@ -242,63 +245,119 @@ class QuotaAlertTests(unittest.TestCase):
     def message(self, note: quota_alert.AgentNote, notes: Notes, config: quota_alert.Config) -> str:
         return quota_alert.message(note, notes, config, codex_readings=self.alert_readings(notes, self.now))
 
+    def set_claude_activity(self, label: str) -> None:
+        from scripts.message import sessions
+        identity = accounts.account_identity(accounts.account_dir(label))
+        assert isinstance(identity, agent_accounts.KnownClaudeAccount)
+        _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[sessions.SessionRecord(
+            pid=43210, sessionId="activity-fixture", name="live unit", messagingSocketPath="/fixture.sock",
+            updatedAt=1, tmux="", formerNames=[])]))
+        _ = self.enterContext(mock.patch.object(account, "account_of",
+            return_value=account.Account("claude", identity.login, identity.label)))
+
+    def stored_room(self, login: str, left: float, days: float) -> None:
+        import usage_store
+        saved = usage_store.load()
+        saved[usage_store.key("Claude", login)] = usage_store.StoredUsage(weekly=usage_store.StoredWindow(
+            left=left, at=datetime.now(timezone.utc).isoformat(),
+            resets=(datetime.now(timezone.utc) + timedelta(days=days)).isoformat()))
+        file = usage_store.store_file()
+        file.parent.mkdir(parents=True, exist_ok=True)
+        _ = file.write_text(json.dumps(saved))
+
     def configure_claude_roles(self) -> None:
-        _ = (self.root / ".claude").mkdir()
+        _ = (self.root / ".claude").mkdir(exist_ok=True)
         _ = (self.root / ".claude.json").write_text(
             json.dumps({"oauthAccount": {"emailAddress": "showrunner@example.invalid"}}), encoding="utf-8",
         )
         for label, login in (("claude 1", "spare@example.invalid"), ("claude 3", "unit@example.invalid")):
             self.assertEqual(accounts.setup(label), [])
+            _ = (self.root / f"{label}.md").write_text(f"---\nlogin: {login}\n---\n")
             _ = (accounts.account_dir(label) / ".claude.json").write_text(
                 json.dumps({"oauthAccount": {"emailAddress": login}}), encoding="utf-8",
             )
-        accounts.set_role("unit", "claude 3")
+        self.set_claude_activity("claude 3")
 
-    def test_unit_alert_names_role_and_suggests_the_fit_spare_with_most_remaining(self) -> None:
+    def test_low_account_advice_uses_soonest_reset_and_moves_only_when_refused(self) -> None:
         self.configure_claude_roles()
-        # A second spare tests selection by quota rather than account number.
-        self.assertEqual(accounts.setup("claude 4"), [])
-        _ = (accounts.account_dir("claude 4") / ".claude.json").write_text(
-            json.dumps({"oauthAccount": {"emailAddress": "other-spare@example.invalid"}}), encoding="utf-8",
-        )
-        notes: Notes = [
-            self.note("claude 3.md", "active", "1", login="unit@example.invalid"),
-            self.note("claude 2.md", "active", "99", login="showrunner@example.invalid"),
-            self.note("claude 1.md", "inactive", "40", login="spare@example.invalid"),
-            self.note("claude 4.md", "inactive", "70", login="other-spare@example.invalid"),
-        ]
-        config = quota_alert.load_config()
-        config["threshold_percent"] = 4
-        text = self.message(notes[0], notes, config)
-        self.assertTrue(text.startswith("Quota alert: claude 3 (unit directors) at 1%"))
-        self.assertIn('swap: /showrunner:accounts swap unit "claude 4"', text)
-        self.assertIn("Sessions on claude 3 start no new Claude work", text)
-        self.assertIn("Showrunners relay this notice to their units on that account.", text)
-        self.assertNotIn("@", text)
+        self.stored_room("unit@example.invalid", 1, 7)
+        self.stored_room("spare@example.invalid", 1, 2)
+        self.stored_room("showrunner@example.invalid", 80, 5)
+        note = self.note("claude 3.md", "active", "1", login="unit@example.invalid")
+        with (mock.patch.object(accounts, "move") as move,
+              mock.patch.object(accounts, "move_showrunners") as move_showrunners):
+            text = self.message(note, [note], quota_alert.load_config())
+        move.assert_not_called()
+        move_showrunners.assert_not_called()
+        self.assertIn("claude 3 is low; sessions on it move to claude 1 when refused", text)
+        self.assertNotIn("swap unit", text)
 
-    def test_unit_alert_rejects_expired_unknown_lower_and_unfit_spares(self) -> None:
+    def test_low_account_advice_names_no_room_and_earliest_reset(self) -> None:
         self.configure_claude_roles()
-        unit = self.note("claude 3.md", "active", "1", login="unit@example.invalid")
-        for left, resets in (("null", self.resets), ("nan", self.resets),
-                             ("inf", self.resets), ("101", self.resets), ("1", self.resets),
-                             ("0", self.resets), ("90", local_reset(self.now - timedelta(hours=1)))):
-            with self.subTest(left=left, resets=resets):
-                spare = self.note("claude 1.md", "inactive", left, resets, login="spare@example.invalid")
-                text = self.message(unit, [unit, spare], quota_alert.load_config())
-                self.assertIn("no spare account has more left", text)
-        spare = self.note("claude 1.md", "inactive", "90", login="spare@example.invalid")
-        (accounts.account_dir("claude 1") / "projects").unlink()
-        self.assertIn("no spare account has more left", self.message(
-            unit, [unit, spare], quota_alert.load_config(),
-        ))
+        self.stored_room("unit@example.invalid", 1, 7)
+        self.stored_room("spare@example.invalid", 0, 2)
+        self.stored_room("showrunner@example.invalid", 0, 5)
+        note = self.note("claude 3.md", "active", "1", login="unit@example.invalid")
+        text = self.message(note, [note], quota_alert.load_config())
+        self.assertIn("no other account has room until", text)
+        self.assertNotIn("swap unit", text)
 
-    def test_showrunner_alert_names_its_role_without_suggesting_a_unit_swap(self) -> None:
+    def test_sessions_on_multiple_accounts_each_get_their_accounts_alerts(self) -> None:
+        from scripts.message import sessions
         self.configure_claude_roles()
-        note = self.note("claude 2.md", "active", "0", login="showrunner@example.invalid")
-        _ = self.alert([note], self.now)
-        self.assertTrue(self.sent[0][1].startswith("Quota alert: claude 2 (showrunners) at 0%"))
-        self.assertNotIn("swap:", self.sent[0][1])
-        self.assertIn("claude 2, used for production coordination,", self.pushed[0][1])
+        owners = [sessions.SessionRecord(pid=pid, sessionId=str(pid), name=str(pid),
+                  messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[])
+                  for pid in (10001, 10003)]
+        identities = {10001: account.Account("claude", "spare@example.invalid", "claude 1"),
+                      10003: account.Account("claude", "unit@example.invalid", "claude 3")}
+        notes: Notes = [self.note("claude 1.md", "active", "0", login="spare@example.invalid"),
+                        self.note("claude 2.md", "active", "0", login="showrunner@example.invalid"),
+                        self.note("claude 3.md", "active", "0", login="unit@example.invalid")]
+        def observed_account(pid: int) -> account.Account | None:
+            return identities.get(pid)
+        with (mock.patch.object(sessions, "live_sessions", return_value=owners),
+              mock.patch.object(account, "account_of", side_effect=observed_account)):
+            _ = self.alert(notes, self.now)
+        for label in ("claude 1", "claude 2", "claude 3"):
+            self.assertTrue(any(text.startswith(f"Quota alert: {label}") for _, text in self.sent))
+        with quota_alert.state_file() as state:
+            self.assertEqual(set(state["episodes"]), {"claude 1", "claude 2", "claude 3"})
+
+    def test_live_unfit_and_external_accounts_receive_alerts_from_collected_readings(self) -> None:
+        from scripts.message import sessions
+        import five_hour
+        self.configure_claude_roles()
+        unfit = accounts.account_dir("claude 3")
+        (unfit / "projects").unlink()
+        external = self.root / "retained account"
+        external.mkdir()
+        owners = [sessions.SessionRecord(pid=pid, sessionId=str(pid), name=str(pid),
+            messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[]) for pid in (10001, 10003)]
+        directories = {10001: external, 10003: unfit}
+        logins = {self.root / ".claude": "showrunner@example.invalid", unfit: "unit@example.invalid",
+                  external: "external@example.invalid", accounts.account_dir("claude 1"): "spare@example.invalid"}
+        _ = self.note("claude 4.md", "inactive", "90", login="external@example.invalid")
+        _ = self.note("claude 3.md", "inactive", "90", login="unit@example.invalid")
+        _ = self.note("claude 2.md", "active", "90", login="showrunner@example.invalid")
+        def process_directory(pid: int) -> Path | None:
+            return directories.get(pid)
+        def process_account(pid: int) -> account.Account | None:
+            directory = directories.get(pid)
+            return account.Account("claude", logins[directory], "fixture") if directory is not None else None
+        def live(directory: Path) -> Report:
+            return Report("Claude", email=logins[directory], quotas=[Quota("Weekly", 100,
+                datetime.now(timezone.utc) + timedelta(days=2))], source=agent_accounts.ClaudeDirectorySource(directory))
+        with (mock.patch.object(sessions, "live_sessions", return_value=owners),
+              mock.patch.object(account, "account_of", side_effect=process_account),
+              mock.patch.object(account, "process_config_dir", side_effect=process_directory)):
+            selection = accounts.claude_account_selection()
+        with (mock.patch.object(agent_accounts, "claude_live", side_effect=live),
+              mock.patch.object(agent_accounts, "codex_homes", return_value=[]),
+              mock.patch.object(five_hour, "watch", return_value=[])):
+            _ = agent_notes.update_alert_pass(selection, self.root / ".codex")
+        _ = self.alert(list(note_file.read_notes()), datetime.now(timezone.utc), selection=selection)
+        for label in ("claude 3", "claude 4"):
+            self.assertTrue(any(text.startswith("Quota alert: " + label) for _, text in self.sent), self.sent)
 
     def test_acknowledging_one_claude_account_keeps_the_other_account_alerting(self) -> None:
         self.configure_claude_roles()
@@ -311,12 +370,12 @@ class QuotaAlertTests(unittest.TestCase):
         self.sent.clear()
         _ = self.alert(notes, self.now + timedelta(minutes=30))
         self.assertEqual(len(self.sent), 2)
-        self.assertTrue(all(text.startswith("Quota alert: claude 2 (showrunners)") for _, text in self.sent))
+        self.assertTrue(all(text.startswith("Quota alert: claude 2") for _, text in self.sent))
         with quota_alert.state_file() as state:
             self.assertIn("acknowledged", state["episodes"]["claude 3"])
             self.assertNotIn("acknowledged", state["episodes"]["claude 2"])
 
-    def test_acknowledgement_survives_spare_and_unit_role_changes_until_quota_recovers(self) -> None:
+    def test_acknowledgement_survives_sessions_moving_until_the_accounts_quota_recovers(self) -> None:
         """A role change does not close or rearm the same account's episode."""
         self.configure_claude_roles()
         unit = self.note("claude 3.md", "active", "0", login="unit@example.invalid")
@@ -327,7 +386,7 @@ class QuotaAlertTests(unittest.TestCase):
         self.sent.clear()
         self.pushed.clear()
 
-        accounts.set_role("unit", "claude 1")
+        self.set_claude_activity("claude 1")
         spare = self.note("claude 1.md", "active", "90", login="spare@example.invalid")
         for left in ("0", "null"):
             unit = self.note("claude 3.md", "inactive", left, login="unit@example.invalid")
@@ -335,7 +394,7 @@ class QuotaAlertTests(unittest.TestCase):
             with quota_alert.state_file() as state:
                 self.assertEqual(state["episodes"]["claude 3"].get("acknowledged"), self.now.isoformat(timespec="seconds"))
         _ = self.alert([spare, main], self.now + timedelta(minutes=3))
-        accounts.set_role("unit", "claude 3")
+        self.set_claude_activity("claude 3")
         unit = self.note("claude 3.md", "active", "0", login="unit@example.invalid")
         spare = self.note("claude 1.md", "inactive", "90", login="spare@example.invalid")
         _ = self.alert([unit, spare, main], self.now + timedelta(hours=1))
@@ -343,7 +402,7 @@ class QuotaAlertTests(unittest.TestCase):
         with quota_alert.state_file() as state:
             self.assertIn("acknowledged", state["episodes"]["claude 3"])
 
-        accounts.set_role("unit", "claude 1")
+        self.set_claude_activity("claude 1")
         unit = self.note("claude 3.md", "inactive", "80", login="unit@example.invalid")
         _ = self.alert([unit, spare, main], self.now + timedelta(hours=2))
         self.assertTrue(all(text.startswith("Quota restored: work on claude 3 can resume;") for _, text in self.sent))
@@ -351,7 +410,7 @@ class QuotaAlertTests(unittest.TestCase):
         with quota_alert.state_file() as state:
             self.assertNotIn("claude 3", state["episodes"])
         self.sent.clear()
-        accounts.set_role("unit", "claude 3")
+        self.set_claude_activity("claude 3")
         unit = self.note("claude 3.md", "active", "0", login="unit@example.invalid")
         _ = self.alert([unit, spare, main], self.now + timedelta(hours=3))
         self.assertEqual((len(self.sent), len(self.pushed)), (2, 1))
@@ -362,7 +421,7 @@ class QuotaAlertTests(unittest.TestCase):
         unit = self.note("claude 3.md", "active", "0", login="unit@example.invalid")
         _ = self.alert([unit], self.now)
         _ = quota_alert.acknowledge("claude 3", now=self.now)
-        accounts.set_role("unit", "claude 1")
+        self.set_claude_activity("claude 1")
         unit = self.note("claude 3.md", "inactive", "null",
                          local_reset(self.now - timedelta(minutes=1)), login="unit@example.invalid")
         self.sent.clear()
@@ -372,7 +431,7 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 2)
         self.assertTrue(all(text.startswith("Quota restored: work on claude 3 can resume;") for _, text in self.sent))
 
-    def test_one_alert_run_keeps_its_roles_when_a_swap_happens_during_rendering(self) -> None:
+    def test_one_alert_run_keeps_its_activity_snapshot_when_sessions_move_during_rendering(self) -> None:
         """Every message and spare comparison uses one role value."""
         self.configure_claude_roles()
         notes: Notes = [
@@ -382,9 +441,9 @@ class QuotaAlertTests(unittest.TestCase):
         ]
         resolve_roles = accounts.claude_account_selection
 
-        def swap_after_resolving() -> ClaudeAccountSelection:
+        def swap_after_resolving() -> ClaudeAccountsInUse:
             roles = resolve_roles()
-            accounts.set_role("unit", "claude 1")
+            self.set_claude_activity("claude 1")
             return roles
 
         with mock.patch.object(accounts, "claude_account_selection", side_effect=swap_after_resolving) as resolve:
@@ -392,8 +451,8 @@ class QuotaAlertTests(unittest.TestCase):
         resolve.assert_called_once_with()
         first_lines = [text.splitlines()[0] for _, text in self.sent]
         self.assertEqual(len(first_lines), 4)
-        self.assertEqual(sum(line.startswith("Quota alert: claude 2 (showrunners)") for line in first_lines), 2)
-        self.assertEqual(sum(line.startswith("Quota alert: claude 3 (unit directors)") for line in first_lines), 2)
+        self.assertEqual(sum(line.startswith("Quota alert: claude 2") for line in first_lines), 2)
+        self.assertEqual(sum(line.startswith("Quota alert: claude 3") for line in first_lines), 2)
         with quota_alert.state_file() as state:
             self.assertEqual(set(state["episodes"]), {"claude 2", "claude 3"})
 
@@ -402,10 +461,10 @@ class QuotaAlertTests(unittest.TestCase):
         self.configure_claude_roles()
         unit = self.note("claude 3.md", "active", "0", login="unit@example.invalid")
         roles = accounts.claude_account_selection()
-        accounts.set_role("unit", "claude 1")
+        self.set_claude_activity("claude 1")
         with mock.patch.object(accounts, "claude_account_selection", side_effect=AssertionError("roles resolved twice")):
             _ = self.alert([unit], self.now, selection=roles)
-        self.assertTrue(self.sent[0][1].startswith("Quota alert: claude 3 (unit directors)"))
+        self.assertTrue(self.sent[0][1].startswith("Quota alert: claude 3"))
 
     def test_refusal_uses_supplied_selection_without_resolving_again(self) -> None:
         """Refusal notices accept the same run's frozen role value."""
@@ -444,14 +503,15 @@ class QuotaAlertTests(unittest.TestCase):
         _ = self.alert([unit, main], self.now + timedelta(minutes=2))
         self.assertEqual(self.sent, [])
 
-    def test_unconfigured_claude_alert_retains_the_original_message(self) -> None:
+    def test_default_only_claude_alert_names_sessions_and_future_move_advice(self) -> None:
         note = self.note("claude 2.md", "active", "0")
         text = self.message(note, [note], quota_alert.load_config())
         self.assertEqual(text.splitlines()[0],
                          f"Quota alert: claude 2, the active Claude account, has 0% of its weekly "
                          + f"usage left (threshold 1%); it resets {self.resets}.")
         self.assertNotIn("swap:", text)
-        self.assertIn("if you delegate Claude work, start no new Claude work", text)
+        self.assertIn("Sessions on claude 2 start no new Claude work", text)
+        self.assertIn("claude 2 is low; no other account has room", text)
 
     def test_quota_config_uses_shared_showrunner_settings(self) -> None:
         self.assertEqual(quota_alert.Config.__module__, "scripts.production.showrunners")

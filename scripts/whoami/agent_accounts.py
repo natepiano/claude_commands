@@ -117,30 +117,21 @@ class CheckedNamedClaudeAccount:
 
 
 @dataclass(frozen=True)
-class ClaudeAccountSelection:
-    """One run's role identities and fit named directories, fixed across role changes."""
+class ClaudeAccountsInUse:
+    """One run's readable accounts and local sessions' logins."""
 
     default_account: KnownClaudeAccount | UnreadableClaudeAccount
-    unit_account: KnownClaudeAccount | UnreadableClaudeAccount
     multiple_accounts: bool
     named_accounts: tuple[CheckedNamedClaudeAccount, ...]
+    live_logins: frozenset[str]
+    live_directories: tuple[Path, ...] = ()
 
     def is_default_login(self, login: str) -> bool:
-        return (
-            isinstance(self.default_account, KnownClaudeAccount)
-            and login.casefold() == self.default_account.login.casefold()
-        )
+        return (isinstance(self.default_account, KnownClaudeAccount)
+                and login.casefold() == self.default_account.login.casefold())
 
-    def roles_for_login(self, login: str) -> tuple[ClaudeRole, ...]:
-        roles: list[ClaudeRole] = []
-        if self.is_default_login(login):
-            roles.append("showrunners")
-        if (
-            isinstance(self.unit_account, KnownClaudeAccount)
-            and login.casefold() == self.unit_account.login.casefold()
-        ):
-            roles.append("unit directors")
-        return tuple(roles)
+    def is_in_use(self, login: str) -> bool:
+        return self.is_default_login(login) or login.casefold() in self.live_logins
 
 
 WEEK_MINUTES = 7 * 24 * 60
@@ -899,14 +890,13 @@ def reset_credits(report: Report, summary: object) -> None:
     report.limit_reset_expirations.sort()
 
 
-async def live_reports(selection: ClaudeAccountSelection, seats_home: Path) -> list[Report]:
+async def live_reports(selection: ClaudeAccountsInUse, seats_home: Path) -> list[Report]:
     """Live Claude directories and every Codex home, fetched concurrently."""
     homes = codex_homes(seats_home)
-    if not selection.multiple_accounts:
-        return list(await asyncio.gather(
-            asyncio.to_thread(claude_live), *(codex_live(home) for home in homes),
-        ))
-    directories = [Path.home() / ".claude", *(named.directory for named in selection.named_accounts)]
+    directories = list(dict.fromkeys([
+        Path.home() / ".claude", *(named.directory for named in selection.named_accounts),
+        *selection.live_directories,
+    ]))
     return list(await asyncio.gather(
         *(asyncio.to_thread(claude_live, directory) for directory in directories),
         *(codex_live(home) for home in homes),

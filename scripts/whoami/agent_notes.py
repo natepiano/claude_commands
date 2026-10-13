@@ -33,7 +33,7 @@ import note_file
 from note_file import FIELD, Note, reset_time
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
-from agent_accounts import (ClaudeAccountSelection, ClaudeDirectorySource, CodexHomeSource, EASTERN, Report,
+from agent_accounts import (ClaudeAccountsInUse, ClaudeDirectorySource, CodexHomeSource, EASTERN, Report,
                             codex_home_display, codex_homes,
                             codex_report_in_use, live_reports, seats_home as resolve_seats_home)
 from quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
@@ -262,7 +262,7 @@ def update() -> list[str]:
     return update_for_selection(accounts.claude_account_selection(), seats_home)
 
 
-def update_for_selection(selection: ClaudeAccountSelection, seats_home: Path) -> list[str]:
+def update_for_selection(selection: ClaudeAccountsInUse, seats_home: Path) -> list[str]:
     """Update notes and watch using one live pass."""
     return list(update_alert_pass(selection, seats_home).messages)
 
@@ -273,7 +273,7 @@ class UpdatedAgentNotes:
     codex_readings: CodexAlertPassReadings
 
 
-def update_alert_pass(selection: ClaudeAccountSelection, seats_home: Path) -> UpdatedAgentNotes:
+def update_alert_pass(selection: ClaudeAccountsInUse, seats_home: Path) -> UpdatedAgentNotes:
     """Build the alert readings before writing any note."""
     notes = note_file.read_notes()
     multiple_codex_homes = len(codex_homes(seats_home)) > 1
@@ -288,13 +288,10 @@ def update_alert_pass(selection: ClaudeAccountSelection, seats_home: Path) -> Up
     except (OSError, ValueError) as error:
         # The saved readings must never cost the notes or the alerts.
         messages.append(f"usage store: {error}")
-    activity: AccountActivity = ObservedAccountActivity()
-    if selection.multiple_accounts:
-        activity = RoleAccountActivity(frozenset(
-            login.casefold() for note in notes
-            if note.tool == "claude" and (login := note.get("login"))
-            and selection.roles_for_login(login)
-        ))
+    activity: AccountActivity = RoleAccountActivity(frozenset(
+        login.casefold() for note in notes
+        if note.tool == "claude" and (login := note.get("login")) and selection.is_in_use(login)
+    ))
     selected_account = codex_readings.selected_account
     in_use_login = selected_account.login if isinstance(selected_account, KnownCodexAccount) else None
     codex_activity: AccountActivity = (RoleAccountActivity(frozenset({in_use_login.casefold()}))
