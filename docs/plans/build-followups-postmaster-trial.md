@@ -85,7 +85,7 @@ The user, 2026-10-12: "Let's trial post master to see if it works". Scope is sec
 
 **Ruled out:** a rename deciding who delivers (no rename in `$.fs`; a claim file decides instead); reaching `node:fs` through a dynamic import (refused by the validator); building later work ahead of the live facts (a failed pass criterion stops the trial).
 
-### Phase 2 — The live check of the mod API  · status: todo
+### Phase 2 — The live check of the mod API  · status: done
 
 #### Work Order
 
