@@ -654,30 +654,16 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 ### Phase 18 — The Mac run starts when the Mac's clone already holds the asked-for commit  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `mac_run.sh <repo> <sha>` succeeds when `<sha>` is an ancestor of the Mac clone's HEAD: it sends no bundle and fetches nothing, checks out `<sha>` in the clone, and builds and runs as for any other sha. Every other path keeps today's commands and exit codes.
-
-**Spec:**
-- Work only in worktree `/home/natepiano/worktrees/claude-build-followups-build-report`, branch `build-followups-build-report`. Line numbers are those of commit `7ad6dfd5`.
-- **The defect.** `scripts/production/mac_run.sh` 81-97 ships commits as a bundle: `base` is the clone's HEAD (82); when `base` is a commit in `<repo>` and differs from `sha`, it runs `git bundle create -q $bundle $ref "^$base"` (86-87). When `sha` is already reachable from `base`, git answers `fatal: Refusing to create empty bundle.`, `bundle_exit` is nonzero, and the script exits 4 (93), which its header (11) gives as a reachability failure. Measured 2026-10-13 06:00 EDT: sha `ce51498c` (hana `origin/main`) with the clone at `46b8c87e`.
-- **The fix.** After `base` is read and before `bundle=$(mktemp …)`, when `git -C $repo merge-base --is-ancestor $sha $base` succeeds (which also covers `sha == base`), skip the bundle, the `scp` and the fetch, and run on the Mac `git -C $clone checkout -q --detach $sha`. The `HEAD=` line, the wrong-tree check (99-100) and everything after run unchanged. When `base` is not a commit in `<repo>`, `merge-base` fails and the bundle path runs as today. No `mktemp` file and no `refs/mac-run/tip` ref is left behind on the new path.
-- **New case, `scripts/production/test_mac_run.py`**, class `MacRunTests`: `test_ancestor_of_the_clone_head_checks_out_without_a_bundle`. The fixture's Mac clone HEAD is a descendant of the sha passed; the run exits 0, the recorded events hold no `bundle create`, no `scp` and no `fetch`, one ssh event carries `checkout -q --detach <sha>`, and hana and the example builds start. Read `setUp` (136-174), `mac_run` (190), `events` (216) and `test_success_releases_claim` (327) for how the fixture fakes ssh, scp and the clone's HEAD; extend the stand-ins as the case needs without changing what existing cases see.
-- **Docs.** The header comment above the bundle step (80) gains: "When the clone already holds the commit, nothing is sent and the clone checks it out." Find the as-built doc that describes `mac_run.sh` (`grep -rln mac_run.sh docs/as-built`) and add the same fact beside its description of the bundle.
+- `mac_run.sh` asks `git merge-base --is-ancestor <sha> <clone head>` right after reading the clone's head. When the clone already holds the commit (the sha equal to the head included), one ssh call runs `git -C <clone> checkout -q --detach <sha>`: no bundle, no `scp`, no fetch, and no temporary file or `refs/mac-run/tip` ref. Before, git refused to make an empty bundle and the run exited 4. A clone head natedev lacks, or any other answer, keeps the bundle path unchanged. The `HEAD=` line and the wrong-tree check follow either path.
+- Live check 2026-10-13: on `ce51498c`, an ancestor of the clone head, the ship step reached `HEAD=ce51498c` with nothing sent (hana at that commit then exits 1 on the Mac, a sampler limit fixed on `origin/init/catalyst`); on `46b8c87e`, equal to the clone head, the run exited 0.
 
 **Files:**
-- `scripts/production/mac_run.sh` — the ancestor check and the direct checkout.
-- `scripts/production/test_mac_run.py` — the new case and any stand-in extension it needs.
+- `scripts/production/mac_run.sh` — the ancestor check and the direct checkout in the ship step.
+- `scripts/production/test_mac_run.py` — `test_ancestor_of_the_clone_head_checks_out_without_a_bundle`; the command stand-in answers `merge-base` and refuses an empty bundle when `MAC_RUN_CLONE_DESCENDANT` is set.
+- `docs/as-built/mac-test-offload.md` — one sentence in the `mac_run.sh` section.
 
-**Seats:** 1 writer + 1 tester.
-- writer (impl): `scripts/production/mac_run.sh`, the as-built doc.
-- tester (test): `scripts/production/test_mac_run.py`.
-
-**Acceptance gate:**
-- `cd /home/natepiano/worktrees/claude-build-followups-build-report && python3 -m unittest scripts/production/test_mac_run.py` passes, the new case included, and it fails with the fix reverted.
-- `basedpyright scripts/production` reports 0 errors, 0 warnings.
-- The director's live check, never a seat's: one `mac_run.sh ~/rust/hana <an ancestor of the Mac clone's HEAD> 60` exits 0.
-
-**Constraints from prior phases:**
-- `mac_run.sh` is zsh; both builds carry `MACOSX_DEPLOYMENT_TARGET=14.0 ~/.cargo/bin/cargo build`, and `test_both_builds_set_the_development_deployment_target` checks it.
-- Saved run output stays small and is deleted once read; a disk-floor sweeper keeps 300 GiB free.
+**Gotchas:**
+- The test stand-in answers "not an ancestor" when the sha equals the clone head, where git answers "is an ancestor"; the older bundle-path cases depend on that.
+- Live checks of `mac_run.sh` use a commit on `origin/init/catalyst` until it merges into hana's `main`.
