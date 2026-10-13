@@ -10,7 +10,7 @@ Bounds: unbounded <= at < unbounded; zone: America/Los_Angeles
 | review | gpt-6.1-sol | 305 | 4 | 305 |
 | subagent | claude-haiku-4-5 | 20 | 1 | 20 |
 | unassigned | claude-opus-4-6 | 50 | 1 | 50 |
-| unassigned | gpt-6-sol | unweighted | 1 | unweighted |
+| unassigned | invented-unweighted-model | unweighted | 1 | unweighted |
 
 Coverage
 
@@ -24,7 +24,7 @@ Unweighted:
 
 | model | turns |
 | --- | --- |
-| gpt-6-sol | 1 |
+| invented-unweighted-model | 1 |
 
 Review turns with unrecorded lens: 1.
 
