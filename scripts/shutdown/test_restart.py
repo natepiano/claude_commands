@@ -73,7 +73,7 @@ def recorded_tmux_host(
     return inventory.TmuxHost(
         kind="tmux",
         tmux_session=tmux_session,
-        server=inventory.TmuxServer(kind="server", started_at=1700000000),
+        server=inventory.TmuxServer(kind="server", pid=34500, started_at=1700000000),
         session_ref=inventory.TmuxSessionIdNotRecorded(kind="not recorded"),
         pane=inventory.TmuxPane(
             kind="pane", pane_id=pane_id, pane_pid=pane_pid
@@ -82,9 +82,9 @@ def recorded_tmux_host(
 
 
 
-def pane_display(format_text: str, name: str, session_id: str, pid: str, dead: str, started_at: str = "1700000000") -> str:
+def pane_display(format_text: str, name: str, session_id: str, pid: str, dead: str, started_at: str = "1700000000", server_pid: str = "34500") -> str:
     values = {"#{session_name}": name, "#{session_id}": session_id,
-              "#{pane_pid}": pid, "#{pane_dead}": dead, "#{start_time}": started_at}
+              "#{pane_pid}": pid, "#{pane_dead}": dead, "#{start_time}": started_at, "#{pid}": server_pid}
     for field, value in values.items():
         format_text = format_text.replace(field, value)
     return format_text + "\n"
@@ -681,7 +681,7 @@ class RestartTests(ShutdownTestCase):
                 with self.subTest(label=label, session_survives=session_survives), patch.dict(os.environ, {'SHUTDOWN_STATE_DIR': str(self.root / (label + str(session_survives)))}):
                     commands = CommandRecorder()
                     probes: list[list[str]] = []
-                    restored = top_level('fallback', cwd='/tmp/fallback', host=inventory.TmuxHost(kind='tmux', tmux_session='kept', server=inventory.TmuxServer(kind='server', started_at=1700000000), session_ref=inventory.TmuxSessionIdNotRecorded(kind='not recorded'), pane=pane))
+                    restored = top_level('fallback', cwd='/tmp/fallback', host=inventory.TmuxHost(kind='tmux', tmux_session='kept', server=inventory.TmuxServer(kind='server', pid=34500, started_at=1700000000), session_ref=inventory.TmuxSessionIdNotRecorded(kind='not recorded'), pane=pane))
                     self.create(records_for_test([entry(restored)], machine='Mac'))
 
                     def probe(argv: list[str], *, capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
@@ -759,6 +759,7 @@ class RestartTests(ShutdownTestCase):
                     if argv[1:2] == ["display"]:
                         self.assertEqual(argv[:5], ["/test/tmux", "display", "-p", "-t", "$4"])
                         self.assertIn("#{start_time}", argv[-1])
+                        self.assertIn("#{pid}", argv[-1])
                         return subprocess.CompletedProcess(argv, 0 if "$4" in available else 1,
                             pane_display(argv[-1], "", "$4", "", ""), "")
                     if argv[:1] == ["pgrep"]:
@@ -803,10 +804,40 @@ class RestartTests(ShutdownTestCase):
                     self.assertEqual(commands.calls, [prefix + ["-c", owner["cwd"], "zsh", "-ic", "resume owner"]])
                     self.assertEqual([argv[4] for argv in probes if argv[1:2] == ["display"]], ["%8", "$4"])
 
-    def test_unrecorded_server_uses_name_or_creation_without_id_routes(self) -> None:
-        for wire_without_server in (False, True):
+    def test_same_second_replacement_server_uses_name_or_creation_for_every_pane_state(self) -> None:
+        for pane_state in ("free", "occupied", "closed"):
             for name_exists in (True, False):
-                with self.subTest(wire_without_server=wire_without_server, name_exists=name_exists):
+                with self.subTest(pane_state=pane_state, name_exists=name_exists):
+                    host = recorded_tmux_host("old name", "%8", 700)
+                    host["session_ref"] = inventory.TmuxSessionId(kind="session id", session_id="$4")
+                    owner = top_level("owner", host=host)
+                    commands = CommandRecorder()
+                    probes: list[list[str]] = []
+                    def probe(argv: list[str], *, dry_run: bool) -> subprocess.CompletedProcess[str]:
+                        self.assertFalse(dry_run)
+                        probes.append(argv)
+                        if argv[1:2] == ["display"]:
+                            self.assertIn(argv[4], ("%8", "$4"))
+                            self.assertIn("#{pid}", argv[-1])
+                            self.assertIn("#{start_time}", argv[-1])
+                            pane_pid = "701" if pane_state == "occupied" else "700"
+                            return subprocess.CompletedProcess(argv,
+                                0 if argv[4] == "$4" or pane_state != "closed" else 1,
+                                pane_display(argv[-1], "unrelated", "$9", pane_pid, "0",
+                                    server_pid="34501"), "")
+                        self.assertEqual(argv, ["/test/tmux", "has-session", "-t", "=old name"])
+                        return subprocess.CompletedProcess(argv, 0 if name_exists else 1, "", "")
+                    with patch.dict(os.environ, {"SHUTDOWN_TMUX": "/test/tmux"}), patch.object(restart, "_probe", probe), patch.object(restart, "_run", commands):
+                        restart._tmux_launch("resume owner", owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                    prefix = (["/test/tmux", "new-window", "-t", "=old name:"] if name_exists
+                              else ["/test/tmux", "new-session", "-d", "-s", "old name"])
+                    self.assertEqual(commands.calls, [prefix + ["-c", owner["cwd"], "zsh", "-ic", "resume owner"]])
+                    self.assertEqual([argv[4] for argv in probes if argv[1:2] == ["display"]], ["%8", "$4"])
+
+    def test_unrecorded_server_uses_name_or_creation_without_id_routes(self) -> None:
+        for server_wire in ("not recorded", "missing", "start only"):
+            for name_exists in (True, False):
+                with self.subTest(server_wire=server_wire, name_exists=name_exists):
                     host = recorded_tmux_host("old name", "%8", 700)
                     host["session_ref"] = inventory.TmuxSessionId(kind="session id", session_id="$4")
                     host["server"] = inventory.TmuxServerNotRecorded(kind="not recorded")
@@ -814,8 +845,10 @@ class RestartTests(ShutdownTestCase):
                     value = cast(dict[str, object], cast(object, json.loads(json.dumps(saved))))
                     owner_wire = cast(dict[str, object], value["session"])
                     host_wire = cast(dict[str, object], owner_wire["host"])
-                    if wire_without_server:
+                    if server_wire == "missing":
                         del host_wire["server"]
+                    elif server_wire == "start only":
+                        host_wire["server"] = {"kind": "server", "started_at": 1700000000}
                     parsed = record.parse_session_records(json.dumps([value]))[0]["session"]
                     self.assertEqual(parsed["host"].get("server"), {"kind": "not recorded"})
                     probes: list[list[str]] = []
@@ -834,8 +867,7 @@ class RestartTests(ShutdownTestCase):
                     prefix = (["/test/tmux", "new-window", "-t", "=old name:"] if name_exists
                               else ["/test/tmux", "new-session", "-d", "-s", "old name"])
                     self.assertEqual(commands.calls, [prefix + ["-c", parsed["cwd"], "zsh", "-ic", "resume legacy"]])
-                    self.assertFalse(any("$4" in argv for argv in probes))
-                    self.assertEqual(probes[-1], ["/test/tmux", "has-session", "-t", "=old name"])
+                    self.assertEqual(probes, [["/test/tmux", "has-session", "-t", "=old name"]])
 
     def test_legacy_record_without_session_reference_restarts_by_name_or_creates_session(self) -> None:
         for survives in (True, False):

@@ -68,6 +68,7 @@ class TmuxSessionIdNotRecorded(TypedDict):
 
 class TmuxServer(TypedDict):
     kind: Literal["server"]
+    pid: int
     started_at: int
 
 
@@ -396,8 +397,11 @@ def _parse_tmux_server(
     data = _wire_object(value, place)
     kind = _wire_kind(data, place)
     if kind == "server":
+        if "pid" not in data:
+            return {"kind": "not recorded"}
         return {
             "kind": "server",
+            "pid": _wire_integer(data["pid"], f"{place}.pid"),
             "started_at": _wire_integer(
                 _wire_required(data, "started_at", place), f"{place}.started_at"
             ),
@@ -950,7 +954,7 @@ def _tmux_session(pane: str) -> tuple[
                 "-p",
                 "-t",
                 pane,
-                "#{session_name}\t#{session_id}\t#{pane_pid}\t#{start_time}",
+                "#{session_name}\t#{session_id}\t#{pane_pid}\t#{start_time}\t#{pid}",
             ),
             capture_output=True,
             text=True,
@@ -971,9 +975,9 @@ def _tmux_session(pane: str) -> tuple[
     if re.fullmatch(r"\$[0-9]+", fields[1]) is not None:
         session_ref = {"kind": "session id", "session_id": fields[1]}
     server: TmuxServer | TmuxServerNotRecorded = no_server
-    if len(fields) == 4:
+    if len(fields) == 5:
         try:
-            server = {"kind": "server", "started_at": int(fields[3])}
+            server = {"kind": "server", "pid": int(fields[4]), "started_at": int(fields[3])}
         except ValueError:
             pass
     try:
