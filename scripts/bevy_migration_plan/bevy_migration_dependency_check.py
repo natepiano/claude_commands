@@ -19,8 +19,13 @@ from dataclasses import dataclass
 from http.client import HTTPException, HTTPResponse
 from pathlib import Path
 from typing import TypedDict, cast
-from urllib import request
+from urllib import parse, request
 from urllib.error import HTTPError, URLError
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bevy_upgrade"))
+
+import crates_io_pacer
 
 
 class CrateVersion(TypedDict):
@@ -178,12 +183,17 @@ def run_cargo_tree(codebase: Path) -> str | None:
     """
     Run `cargo tree` for direct dependencies and return its stdout.
 
+    Cargo abbreviates already printed packages as `name vX (*)` without children,
+    hiding a member's dependencies when an earlier member depends on it; --no-dedupe
+    prints every package in full each time. --workspace includes every member even
+    when the root manifest is also a package, which cargo otherwise lists alone.
+
     Tries `--all-features` first so optional / feature-gated dependencies are
     included; without it, deps behind a non-default feature are invisible to
     the tree. Falls back to the default feature set if `--all-features` fails
     (e.g. mutually exclusive features). Returns None on error.
     """
-    base_cmd = ['cargo', 'tree', '--depth=1', '--format', '{p}']
+    base_cmd = ['cargo', 'tree', '--workspace', '--no-dedupe', '--depth=1', '--format', '{p}']
 
     for extra_args in (['--all-features'], []):
         try:
@@ -218,8 +228,10 @@ def get_all_direct_dependencies(
     """
     Run cargo tree to find all DIRECT dependencies (from Cargo.toml).
     Returns list of (crate_name, version) tuples, excluding bevy internal crates and workspace members.
-    Uses --depth=1 to only get direct dependencies, not transitive ones, and
-    --all-features so optional dependencies are not missed.
+    Uses --depth=1 for direct dependencies, --workspace for every member,
+    --no-dedupe for their complete trees, and --all-features for optional dependencies.
+    --no-dedupe repeats a shared crate under every member that uses it; the set
+    returns each (crate_name, version) once, so discovery looks it up once.
     """
     # Get the definitive list of bevy internal crates
     internal_crates: frozenset[str] = bevy_checkout.names if isinstance(bevy_checkout, BevyCheckoutRead) else frozenset()
@@ -243,7 +255,7 @@ def get_all_direct_dependencies(
 
     for line in stdout.splitlines():
         # Extract crate name and version, handling tree characters (├──, │, etc.)
-        match = re.search(r'([a-zA-Z0-9_-]+)\s+v([0-9.]+)', line)
+        match = re.search(r'([a-zA-Z0-9_-]+)\s+v(\d\S*)', line)
         if match:
             crate_name = match.group(1)
             version = match.group(2)
@@ -294,6 +306,7 @@ def query_crates_io(crate_name: str) -> QueryResult | None:
         req = request.Request(url)
         req.add_header('User-Agent', 'bevy-dependency-checker/1.0')
 
+        crates_io_pacer.CRATES_IO_PACER.wait()
         with request.urlopen(req, timeout=10) as response:  # pyright: ignore[reportAny]
             data: CratesIOResponse = json.loads(response.read().decode('utf-8'))  # pyright: ignore[reportAny]
 
@@ -327,12 +340,13 @@ def get_bevy_dependency_requirement(
     Query crates.io API for a specific version's bevy dependency requirement.
     Distinguishes a Bevy requirement, no Bevy dependency, and an unread release.
     """
-    url = f"https://crates.io/api/v1/crates/{crate_name}/{version}/dependencies"
+    url = f"https://crates.io/api/v1/crates/{crate_name}/{parse.quote(version, safe='')}/dependencies"
 
     try:
         req = request.Request(url)
         req.add_header('User-Agent', 'bevy-dependency-checker/1.0')
 
+        crates_io_pacer.CRATES_IO_PACER.wait()
         with cast(HTTPResponse, request.urlopen(req, timeout=10)) as response:
             raw = cast(object, json.loads(response.read().decode('utf-8')))
             if not isinstance(raw, dict):

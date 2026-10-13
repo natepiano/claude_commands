@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Find a production's units by the marks on their tmux sessions.
+"""Find units by the marks on their tmux sessions: one production's, or every production's at once.
 
 A unit's tmux session carries two marks in its environment: the production slug and the unit id.
 Nothing else records which session is which unit. A unit's current name, pane and socket are read
 here, from tmux and the live session records, each time they are needed, so a rename or a relaunch
 leaves nothing to bring in step. Its run state is stored nowhere either: it is read from the
-records /unit:direct keeps of its runs.
+records /unit:direct keeps of its runs. `every_marked_unit` is the one enumeration of units on this
+machine; a caller that wants every unit director, whatever its production, reads it once.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterable
 from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, cast
@@ -56,11 +58,19 @@ Claude = LiveClaude | ClaudeNotRunning | ClaudeUnknown
 
 class MarkedUnit(NamedTuple):
     unit: str
-    # The first pane of the marked tmux session, as tmux addresses it ("%41").
+    # The pane its live Claude runs in, else the first pane of the marked tmux session, as tmux
+    # addresses it ("%41").
     pane: str
     # The tmux session's label now. It is a display name: nothing finds a pane by it.
     label: str
     claude: Claude
+
+
+class MarkedProductions(NamedTuple):
+    # Each production's marked units, by production slug and then unit id.
+    units: dict[str, dict[str, MarkedUnit]]
+    # Why a production's units were left out, by production slug: two sessions carry one unit's mark.
+    faults: dict[str, str]
 
 
 def runs_dir() -> Path:
@@ -178,25 +188,50 @@ def _claudes() -> tuple[dict[str, LiveClaude], str]:
     return {pane: claude for pane, (_, claude) in newest.items()}, unread
 
 
+def _marked_sessions() -> Iterable[tuple[str, MarkedUnit]]:
+    """Each tmux session that carries both marks, with its production slug.
+
+    Raises OSError when tmux cannot say which sessions exist.
+    """
+    claudes, unread = _claudes()
+    for session, (label, panes) in tmux_sessions().items():
+        marks = _marks(session)
+        slug, unit = marks.get(PRODUCTION_MARK, ""), marks.get(UNIT_MARK, "")
+        if not slug or not unit:
+            continue
+        live = [pane for pane in panes if pane in claudes]
+        claude: Claude = (claudes[live[0]] if live else ClaudeUnknown(unread) if unread else ClaudeNotRunning())
+        yield slug, MarkedUnit(unit, live[0] if live else panes[0], label, claude)
+
+
+def every_marked_unit() -> MarkedProductions:
+    """Every unit on this machine that has a tmux session, whatever its production.
+
+    One read of tmux and the session records serves every production. Raises OSError when tmux
+    cannot say which sessions exist. Two sessions carrying one unit's mark is a fault of whoever
+    marked them: that production's units are left out, with why, since no caller may pick one.
+    """
+    units: dict[str, dict[str, MarkedUnit]] = {}
+    faults: dict[str, str] = {}
+    for slug, marked in _marked_sessions():
+        production = units.setdefault(slug, {})
+        if marked.unit in production:
+            _ = faults.setdefault(slug, f"tmux sessions {production[marked.unit].label} and {marked.label}"
+                                  + f" both carry the mark of {marked.unit}")
+        production[marked.unit] = marked
+    return MarkedProductions({slug: found for slug, found in units.items() if slug not in faults}, faults)
+
+
 def marked_units(slug: str) -> dict[str, MarkedUnit]:
     """Every unit of the production that has a tmux session, by unit id.
 
-    Raises OSError when tmux cannot say which sessions exist. Two sessions carrying one unit's mark
-    is a fault of whoever marked them, and is raised too: no caller may pick one.
+    Raises OSError when tmux cannot say which sessions exist, and when two sessions carry one of
+    the production's unit marks.
     """
-    claudes, unread = _claudes()
-    units: dict[str, MarkedUnit] = {}
-    for session, (label, panes) in tmux_sessions().items():
-        marks = _marks(session)
-        unit = marks.get(UNIT_MARK, "")
-        if marks.get(PRODUCTION_MARK) != slug or not unit:
-            continue
-        if unit in units:
-            raise OSError(f"tmux sessions {units[unit].label} and {label} both carry the mark of {unit}")
-        live = [claudes[pane] for pane in panes if pane in claudes]
-        claude: Claude = (live[0] if live else ClaudeUnknown(unread) if unread else ClaudeNotRunning())
-        units[unit] = MarkedUnit(unit, panes[0], label, claude)
-    return units
+    found = every_marked_unit()
+    if slug in found.faults:
+        raise OSError(found.faults[slug])
+    return found.units.get(slug, {})
 
 
 def mark(target: str, slug: str, unit: str) -> None:

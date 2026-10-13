@@ -11,10 +11,12 @@ import unittest
 from pathlib import Path
 from typing import TYPE_CHECKING, final
 from unittest import mock
-from urllib import request
+from urllib import parse, request
 from urllib.error import URLError
 
-from scripts.bevy_migration_plan import bevy_migration_dependency_check as checker
+import bevy_migration_dependency_check as checker
+
+import crates_io_pacer
 
 if TYPE_CHECKING:
     from typing import override
@@ -32,11 +34,26 @@ def dependency(name: str, requirement: str, kind: str = "normal") -> dict[str, s
 
 
 @final
+class StandInClock:
+    def __init__(self) -> None:
+        self.now: float = 0.0
+        self.sleeps: list[float] = []
+
+    def read(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@final
 class MigrationDependencyTests(unittest.TestCase):
     root: Path = Path()
     codebase: Path = Path()
     bodies: dict[str, object] = {}
     urls: list[str] = []
+    clock: StandInClock = StandInClock()
 
     @override
     def setUp(self) -> None:
@@ -47,10 +64,13 @@ class MigrationDependencyTests(unittest.TestCase):
         self.codebase.mkdir()
         self.bodies = {}
         self.urls = []
+        self.clock = StandInClock()
+        pacer_patch = mock.patch.object(crates_io_pacer, "CRATES_IO_PACER", crates_io_pacer.RequestPacer(
+            crates_io_pacer.CRATES_IO_MIN_INTERVAL_SECONDS, clock=self.clock.read, sleep=self.clock.sleep))
         home_patch = mock.patch.object(Path, "home", return_value=self.root)
         network_patch = mock.patch.object(request, "urlopen", side_effect=self.urlopen)
         cargo_patch = mock.patch.object(subprocess, "run", side_effect=AssertionError("unexpected cargo command"))
-        for patch in (home_patch, network_patch, cargo_patch):
+        for patch in (home_patch, network_patch, cargo_patch, pacer_patch):
             _ = patch.start()
             self.addCleanup(patch.stop)
 
@@ -66,11 +86,13 @@ class MigrationDependencyTests(unittest.TestCase):
         return io.BytesIO(json.dumps(body).encode("utf-8"))
 
     def release(self, crate: str, version: str, dependencies: list[dict[str, str]]) -> None:
-        self.bodies[f"https://crates.io/api/v1/crates/{crate}/{version}/dependencies"] = {
+        encoded_version = parse.quote(version, safe="")
+        self.bodies[f"https://crates.io/api/v1/crates/{crate}/{encoded_version}/dependencies"] = {
             "dependencies": dependencies}
 
     def failed_release(self, crate: str, version: str, reason: str = "offline") -> None:
-        self.bodies[f"https://crates.io/api/v1/crates/{crate}/{version}/dependencies"] = URLError(reason)
+        encoded_version = parse.quote(version, safe="")
+        self.bodies[f"https://crates.io/api/v1/crates/{crate}/{encoded_version}/dependencies"] = URLError(reason)
 
     def crate(self, name: str, versions: list[str]) -> None:
         self.bodies[f"https://crates.io/api/v1/crates/{name}"] = {
@@ -98,6 +120,133 @@ class MigrationDependencyTests(unittest.TestCase):
             except SystemExit as error:
                 self.assertEqual(error.code, 0)
         return output.read_text(encoding="utf-8"), stdout.getvalue(), stderr.getvalue()
+
+    def test_cargo_tree_all_features_covers_every_workspace_member_without_deduplication(self) -> None:
+        command = ["cargo", "tree", "--workspace", "--no-dedupe", "--depth=1", "--format", "{p}",
+                   "--all-features"]
+        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                command, 0, stdout="alpha v0.1.0")) as run:
+            self.assertEqual(checker.run_cargo_tree(self.codebase), "alpha v0.1.0")
+        run.assert_called_once_with(command, cwd=self.codebase, capture_output=True, text=True, check=True)
+
+    def test_cargo_tree_fallback_keeps_workspace_and_no_dedupe_flags(self) -> None:
+        command = ["cargo", "tree", "--workspace", "--no-dedupe", "--depth=1", "--format", "{p}"]
+        with mock.patch.object(subprocess, "run", side_effect=[
+                subprocess.CalledProcessError(1, command + ["--all-features"], stderr="conflicting features"),
+                subprocess.CompletedProcess(command, 0, stdout="alpha v0.1.0")]) as run:
+            self.assertEqual(checker.run_cargo_tree(self.codebase), "alpha v0.1.0")
+        self.assertEqual(run.call_args_list, [
+            mock.call(command + ["--all-features"], cwd=self.codebase, capture_output=True, text=True, check=True),
+            mock.call(command, cwd=self.codebase, capture_output=True, text=True, check=True)])
+
+    def test_direct_dependencies_keep_whole_versions_and_exclude_workspace_members(self) -> None:
+        tree = "\n".join([
+            "alpha v0.1.0 (/home/u/project/crates/alpha)",
+            "├── beta v1.1.6+spec-1.1.0",
+            "├── gamma v0.20.0-rc.1",
+            "├── delta v2.0.1 (proc-macro)",
+            "├── epsilon v0.5.0-dev (/home/u/project/crates/epsilon)",
+            "├── zeta v0.3.0 (/home/u/project/crates/zeta)",
+            "[dev-dependencies]",
+            "└── beta v1.1.6+spec-1.1.0",
+            "zeta v0.3.0 (/home/u/project/crates/zeta)"])
+        with mock.patch.object(checker, "run_cargo_tree", return_value=tree), \
+                mock.patch.object(checker, "get_workspace_members", return_value={"alpha", "zeta"}):
+            result = checker.get_all_direct_dependencies(self.codebase, self.checkout())
+        self.assertEqual(result, [("beta", "1.1.6+spec-1.1.0"), ("delta", "2.0.1"),
+                                  ("epsilon", "0.5.0-dev"), ("gamma", "0.20.0-rc.1")])
+
+    def test_dependency_declared_only_by_second_member_is_returned(self) -> None:
+        tree = "alpha v0.1.0\n└── zeta v0.2.0\nzeta v0.2.0\n└── later-adapter v1.0.0"
+        with mock.patch.object(checker, "run_cargo_tree", return_value=tree), \
+                mock.patch.object(checker, "get_workspace_members", return_value={"alpha", "zeta"}):
+            self.assertEqual(checker.get_all_direct_dependencies(self.codebase, self.checkout()),
+                             [("later-adapter", "1.0.0")])
+
+    def test_shared_dependency_is_looked_up_once_across_workspace_members(self) -> None:
+        tree = "alpha v0.1.0\n└── shared-adapter v1.0.0\nzeta v0.2.0\n└── shared-adapter v1.0.0"
+        self.release("shared-adapter", "1.0.0", [dependency("bevy_ecs", "^0.20")])
+        with mock.patch.object(checker, "run_cargo_tree", return_value=tree), \
+                mock.patch.object(checker, "get_workspace_members", return_value={"alpha", "zeta"}):
+            result = checker.get_bevy_dependencies(self.codebase, self.checkout())
+        self.assertEqual(result, [checker.DiscoveredDependency(
+            "shared-adapter", "1.0.0", checker.BevyRequirement("^0.20"))])
+        self.assertEqual(self.urls, ["https://crates.io/api/v1/crates/shared-adapter/1.0.0/dependencies"])
+
+    def test_pacing_definitions_live_only_in_shared_module(self) -> None:
+        for name in ("RequestPacer", "CRATES_IO_PACER", "CRATES_IO_MIN_INTERVAL_SECONDS"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, vars(checker))
+
+    def test_each_crates_io_query_is_paced_immediately_before_request(self) -> None:
+        self.crate("paced-adapter", ["1.0.0"])
+        events: list[str] = []
+        expected: checker.QueryResult = {
+            "latest_version": "1.0.0", "all_versions": ["1.0.0"], "updated_at": "2026-10-12"}
+
+        def wait() -> None:
+            events.append("wait")
+
+        def urlopen(value: request.Request, timeout: int = 10) -> io.BytesIO:
+            events.append("request")
+            return self.urlopen(value, timeout)
+
+        with mock.patch.object(crates_io_pacer.CRATES_IO_PACER, "wait", side_effect=wait), \
+                mock.patch.object(request, "urlopen", side_effect=urlopen):
+            for _ in range(2):
+                self.assertEqual(checker.query_crates_io("paced-adapter"), expected)
+        self.assertEqual(events, ["wait", "request", "wait", "request"])
+
+    def test_each_bevy_requirement_lookup_is_paced_immediately_before_request(self) -> None:
+        self.release("paced-adapter", "1.0.0", [dependency("bevy", "^0.20")])
+        events: list[str] = []
+
+        def wait() -> None:
+            events.append("wait")
+
+        def urlopen(value: request.Request, timeout: int = 10) -> io.BytesIO:
+            events.append("request")
+            return self.urlopen(value, timeout)
+
+        with mock.patch.object(crates_io_pacer.CRATES_IO_PACER, "wait", side_effect=wait), \
+                mock.patch.object(request, "urlopen", side_effect=urlopen):
+            for _ in range(2):
+                self.assertEqual(checker.get_bevy_dependency_requirement("paced-adapter", "1.0.0", NAMES),
+                                 checker.BevyRequirement("^0.20"))
+        self.assertEqual(events, ["wait", "request", "wait", "request"])
+
+    def test_build_suffix_is_encoded_in_dependency_lookup_address(self) -> None:
+        self.release("build-adapter", "1.1.6+spec-1.1.0", [])
+        self.assertEqual(checker.get_bevy_dependency_requirement("build-adapter", "1.1.6+spec-1.1.0", NAMES),
+                         checker.NoBevyDependency())
+        self.assertEqual(self.urls, [
+            "https://crates.io/api/v1/crates/build-adapter/1.1.6%2Bspec-1.1.0/dependencies"])
+
+    def test_main_build_suffix_without_bevy_dependency_has_no_report_row(self) -> None:
+        _ = self.checkout()
+        self.release("format-helper", "1.1.6+spec-1.1.0", [])
+        report, _, _ = self.run_main("project v0.1.0\n└── format-helper v1.1.6+spec-1.1.0")
+        self.assertIn("No bevy-related dependencies found", report)
+        self.assertNotIn("format-helper", report)
+        self.assertEqual(self.urls, [
+            "https://crates.io/api/v1/crates/format-helper/1.1.6%2Bspec-1.1.0/dependencies"])
+
+    def test_main_matching_build_suffix_is_classified_ok_and_printed_whole(self) -> None:
+        _ = self.checkout()
+        version = "1.2.3+scene.4"
+        self.release("scene-adapter", version, [dependency("bevy_app", "^0.20")])
+        self.crate("scene-adapter", [version])
+        with mock.patch.object(checker, "classify_dependency", wraps=checker.classify_dependency) as classify:
+            report, _, _ = self.run_main(f"project v0.1.0\n└── scene-adapter v{version}")
+        classify.assert_called_once_with(version, version, version, TARGET)
+        self.assertIn("### ✅ Compatible Dependencies", report)
+        self.assertIn(f'`scene-adapter = "{version}"` - Compatible with Bevy {TARGET}', report)
+        self.assertIn("- ✅ Compatible: 1", report)
+        self.assertNotIn("### 🔄 Updates Required", report)
+        self.assertEqual(self.urls, [
+            "https://crates.io/api/v1/crates/scene-adapter/1.2.3%2Bscene.4/dependencies",
+            "https://crates.io/api/v1/crates/scene-adapter",
+            "https://crates.io/api/v1/crates/scene-adapter/1.2.3%2Bscene.4/dependencies"])
 
     def test_bevy_requirement_takes_precedence_over_subcrates(self) -> None:
         self.release("adapter", "1.0.0", [dependency("bevy_app", "^0.19"), dependency("bevy", "^0.20")])
