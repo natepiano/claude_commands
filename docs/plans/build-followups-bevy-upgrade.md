@@ -318,51 +318,42 @@ def find_bevy_compatible_version(crate_name: str, all_versions: list[str], targe
 
 ### Phase 7 — The check reads a workspace member's Bevy requirement and asks again about a kept open pull request  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** A dependency whose repository keeps the Bevy requirement in a workspace member's manifest reads `git ready` when its branch is on the target, and a stored open pull request is never left `open` after it merged.
-
-**Spec:**
-Work only in the worktree and branch the Delegation Context names. The showrunner approved this phase on 2026-10-12.
-
-`upstream.py`:
+When a repository's root manifest names no Bevy requirement and has a `[workspace]` table, the check finds the crate's own manifest among the workspace members and reads the requirement there, so such a dependency reads `git ready` once its branch is on the target. A pull request stored as `open` is asked for its state again whenever GitHub's answer no longer lists it.
 
 ```python
+# scripts/bevy_upgrade/upstream.py
 def member_manifest_paths(fetch: Fetch, repository: str, rev: str) -> list[str]: ...
 def manifest_requirement(fetch: Fetch, repository: str, rev: str, crate: str, bevy_names: frozenset[str]) -> str: ...
+
+# scripts/bevy_upgrade/upgrade_check.py
+def _github_facts(fetch: upstream.Fetch, name: str, entry: Entry, record: Record, bevy_names: frozenset[str]) -> None: ...
 ```
 
-- `member_manifest_paths` asks `https://api.github.com/repos/<repository>/git/trees/<rev>?recursive=1` once and returns, sorted, every `path` of `type` `blob` that ends with `/Cargo.toml`. A response that is not that object is a `FetchFailure`.
-- `manifest_requirement` reads the root manifest as today. Only when the root names no requirement and has a `[workspace]` table does it call `member_manifest_paths` and read member manifests until one's `[package] name` is `crate`: first the paths whose directory name is the crate's name, with `-` and `_` read as the same character, then the others in sorted order, at most 5 manifests. That member's `[dependencies]` are read by the root's rule, with the root's `[workspace.dependencies]` as the table an entry with `workspace = true` inherits from. The root's rule has already read that table, so a member is reached only when it names no Bevy version: an inherited entry then gives `""` for its name, and a version the member names itself is the answer. No such member within 5 reads gives `""`, and so does a tree with no member manifest. A manifest with no `[package]` table is not the crate's and is passed over. A member manifest that is not there (`NotFound`) is skipped and counts as one of the 5 reads. Every other failure is a `FetchFailure`, as it is for the root: a request that fails, text that is not valid TOML, a table of the wrong type. `run_check` then keeps the entry's stored facts and sets its error, so a member that could not be read is never recorded as `""`. `[workspace] members` and `exclude` are not read: the member is found by its `[package] name`, which crates.io keeps unique, so a glob that matches nothing changes nothing.
-
-`upgrade_check.py`:
-
-- `_github_facts(fetch, name, entry, record, bevy_names)` takes the crate's name and passes it on.
-- A stored requirement is reused only when the stored `rev` is the head's and the requirement is not `""`. A stored `""` is read again, so a record written before this phase gets its answer at the next check.
-- Each stored item the issues answer lacks is kept, as today. One that is a pull request with state `open` is asked again with `pull_state`, and its `state` and `head` are replaced; a kept issue and a kept closed or merged pull request cost no request.
-
-`commands/bevy_migration_plan.md` (an add-on the showrunner placed in this phase on 2026-10-12; the file belongs to no unit of this production, so the checkpoint notice names it as `also touches`):
-
-- Under `**The script will:**`, the first bullet says the script discovers Bevy-dependent crates "(direct and indirect)". `scripts/bevy_migration_plan/bevy_migration_dependency_check.py` reads the codebase's direct dependencies only. Rewrite that bullet to say so, and to say that a crate depending only on one of Bevy's own crates, such as `bevy_app` or `bevy_ecs`, is included.
-- Rewrite the `CHECK_NEEDED` bullet to give both reasons a crate lands there: its compatibility is unclear, or crates.io did not answer a lookup. Change nothing else in the file.
-
-Nothing in the record's types or the report changes: `""` still prints `requirement unknown`.
+- **Tree lookup.** `member_manifest_paths` asks `https://api.github.com/repos/<repository>/git/trees/<rev>?recursive=1` once and returns the sorted paths of `blob` entries ending `/Cargo.toml`; any other answer is a `FetchFailure`.
+- **Member search.** `manifest_requirement` reads the root as before. Members are read only when the root gives no requirement and has `[workspace]`: the directory named like the crate first (`-` and `_` equal), then sorted order, at most five reads, until one's `[package] name` equals the crate. That member's `[dependencies]` is read by the root's rule with the root's `[workspace.dependencies]` as the inherited table. A matching member ends the search even when its requirement is empty.
+- **Reuse.** `_github_facts` reuses a stored requirement only when the stored `rev` is the branch head's and the requirement is not empty.
+- **Kept items.** A kept pull request in state `open` is asked again with `pull_state`, which updates its state and head. Kept issues and kept closed or merged pull requests cost no request.
+- **`/bevy_migration_plan` doc.** The two bullets under "The script will" say the dependency check reads direct dependencies, including crates that depend only on Bevy's own crates, and that `CHECK_NEEDED` means compatibility is unclear or crates.io did not answer a lookup.
 
 **Files:**
-- `scripts/bevy_upgrade/upstream.py` — `member_manifest_paths`, and the member read in `manifest_requirement`.
-- `scripts/bevy_upgrade/upgrade_check.py` — the crate name passed down, the `""` rule, the kept open pull request.
-- `scripts/bevy_upgrade/test_upstream.py` — the tree request and the member read.
-- `scripts/bevy_upgrade/test_upgrade_check.py` — the `""` rule and the kept open pull request.
-- `scripts/bevy_upgrade/test_cli.py` — only if a fixture needs an added answer; its root manifest names a requirement, so no tree request is expected.
-- `commands/bevy_migration_plan.md` — the two bullets under `**The script will:**`.
+- `scripts/bevy_upgrade/upstream.py` — the tree lookup, the shared manifest reader and requirement rule, the member search
+- `scripts/bevy_upgrade/upgrade_check.py` — passes the crate name, the reuse rule, the refresh of kept open pull requests
+- `scripts/bevy_upgrade/test_upstream.py`, `scripts/bevy_upgrade/test_upgrade_check.py` — tests for the tree lookup, the member search, reuse, kept items and rollback
+- `commands/bevy_migration_plan.md` — the two corrected bullets
 
-**Seats:** 1 writer + 1 tester — two production modules and their test modules, the split phase 3 ran with.
-- `impl` — `upstream.py`, `upgrade_check.py`, `commands/bevy_migration_plan.md`.
-- `test` — `test_upstream.py`, `test_upgrade_check.py`, `test_cli.py`, from the Spec.
+**Gotchas:**
+- A member entry with `workspace = true` under a root entry that has no version gives an empty requirement.
+- A member that answers `NotFound` is skipped and counts as one of the five reads. Every other member failure is a `FetchFailure`, so the entry keeps its stored facts; this includes a wrongly typed table in a member that is not the crate's.
+- `[workspace] members` and `exclude` are not read; the tree decides which manifests exist.
+- GitHub marks a very large tree `truncated` and the lookup does not read that field, so such a repository can give an empty requirement.
+- An entry whose requirement stays empty is read again on every check: up to seven requests (root, tree, five members).
+- Kept items are copied before the refresh, so a later failed request cannot change the stored entry.
 
-**Constraints from prior phases:** `manifest_requirement(fetch, repository, rev, bevy_names)` reads only the root `Cargo.toml` (its `[workspace.dependencies]` and `[dependencies]`) from `https://raw.githubusercontent.com/<repository>/<rev>/Cargo.toml` and returns `""` when that manifest is not there (`NotFound`). `_github_facts` keeps the stored requirement when the stored `rev` equals the head's, and keeps a stored item whose number the one-page issues answer lacks. `pull_state(fetch, repository, number)` returns `(state, head)`. `fixture_fetch` answers `NotFound` for a `null` body and serves a string body raw. `run_check` stages an entry's facts and discards them all when a request fails or the 180 s budget is spent. GitHub allows 60 requests an hour without a token: a first read of one repository costs 4 requests plus one per pull request, and this phase adds at most 6 for a workspace repository.
-
-**Acceptance gate:** the Delegation Context **Test** and **Lint** commands pass. The tests cover: a workspace root and a member named like the crate giving the member's requirement in three requests (root, tree, member); a member whose Bevy entry is `workspace = true`, under a root whose `[workspace.dependencies]` entry names no version, giving `""`; a member with no Bevy entry giving `""`; a member manifest that is not valid TOML raising `FetchFailure`, and a member request that fails raising it too; a member manifest that is `NotFound` skipped and the next one read; a workspace root whose tree has no member manifest giving `""` in two requests; a crate name with `-` matched to a directory with `_`; no matching member giving `""` after 5 member reads; a root that names a requirement making no tree request; a stored `""` at an unchanged `rev` read again, and a stored requirement that is not `""` making no manifest request; a kept open pull request that merged reading `merged` after the check; a kept issue and a kept closed pull request making no request. `commands/bevy_migration_plan.md` says direct dependencies, names the sub-crate case and gives both `CHECK_NEEDED` reasons.
+**Ruled out:**
+- Reading `[workspace] members` globs to find the member: the tree lookup needs no glob rules.
+- Following a truncated tree with further requests: the search is bounded and answers unknown.
 
 ## Close-out for the showrunner
 
