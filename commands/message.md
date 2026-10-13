@@ -20,6 +20,8 @@ description: Rules every message between Claude sessions or Codex seats follows 
 - Send anything the roster lists with `send.py --to <address> --from "<your session name>" --text "<message>"`: `session:<id>` (Claude), `seat:<run id>/<seat name>` (Codex worker), `codex:<thread id>` (Codex daemon session), or a unique name. Resolution tries this machine first, then the other; `--machine HOST` selects that host. A `uds:<path>` always refers to this machine's socket.
 - For many at once, run `~/.claude/scripts/lib/py ~/.claude/scripts/production/broadcast.py --from "<your session name>" --all "<message>"`. Groups are `--showrunners`, `--units` (unit directors), `--agents` (workers and freestanding Claude/Codex sessions), `--workers`, `--top-level` (Claude sessions except workers and unit directors under a showrunner), and `--all` (every role). Put `--of <unit, director name, or session: address>` before `--workers` for one unit. Each recipient gets the last selecting flag's text once. The sender is excluded by `CODEX_THREAD_ID`, else `CLAUDE_CODE_SESSION_ID`.
 
+Load `/message_style` before the first message to the user in a session.
+
 Message the user with `send.py --to user --summary "<title>" --text "<message>" --action "<what the user does>"`, or `--no-action` when nothing is needed. Action flags go only with `--to user`. `--need decision` and `--need blocked` require `--action`; emergency (`--need blocked`) is only for an action the user must take now because work cannot continue.
 
 ### Outcomes and recovery

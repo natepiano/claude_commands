@@ -39,6 +39,7 @@
 | two-accounts-unit | docs/plans/build-followups-two-accounts.md | /home/natepiano/worktrees/claude-build-followups-two-accounts | build-followups-two-accounts | — | docs/plans/build-followups-two-accounts.md |
 | review-pool-unit | (retired 2026-10-13: promoted to showrunner of nested-g2) `docs/as-built/review-pool.md` (runs done) | /home/natepiano/worktrees/claude-build-followups-review-pool | build-followups-review-pool | — | scripts/delegate/review_pool.py, commands/review/ |
 | bevy-upgrade-unit | docs/as-built/bevy-upgrade.md | /home/natepiano/worktrees/claude-build-followups-bevy-upgrade | build-followups-bevy-upgrade | — | scripts/bevy_upgrade/, commands/showrunner/bevy_upgrade.md |
+| message-clarity-unit | docs/plans/build-followups-message-clarity.md | /home/natepiano/worktrees/claude-build-followups-message-clarity | build-followups-message-clarity | — | scripts/notify/ |
 
 ## Hub files
 
