@@ -118,7 +118,7 @@ Source: steps recorded on the Mac; failed follows the build log's failure rule, 
 
 **Gotchas:** the log carries two Mac host names (`Mac` and `Nates-MacBook-Pro-2023`), so Mac selection is `host <> 'natedev'`, never one Mac name. The `scripts/buildlog/buildlog` wrapper runs the installed copy; worktree code is checked with `~/.claude/scripts/lib/py scripts/buildlog/cli.py` and `BUILDLOG_DIR` on a scratch copy of the log.
 
-### Phase 2 — A Mac claim with no Mac process for 15 minutes is released, and its holder is told  · status: todo
+### Phase 2 — A Mac claim with no Mac process for 15 minutes is released, and its holder is told  · status: done
 
 #### Work Order
 
@@ -162,3 +162,23 @@ Source: steps recorded on the Mac; failed follows the build log's failure rule, 
 **Seats:** 1 writer + 1 tester.
 
 **Acceptance gate:** both lanes pass. A live check on natedev against the real Mac, with no Mac work running, shows the release and the message. In it, a scratch session claims with `--remote mac` and a short-lived `claim_idle_minutes` set in a scratch config copy. The check never touches `~/.local/state/mac-test` while a real claim is present.
+
+### Phase 3 — Each test run sent to the Mac deletes its build output when it finishes  · status: todo
+
+#### Work Order
+
+**Goal:** after each offloaded test run, the Mac mirror's target dir for that repository is deleted, so offloaded runs stop filling the Mac's disk. Nothing else on the Mac is touched, `/tmp` included. Source: the user, 2026-10-13 ("it needs to be cleaned up as we go", "we should only be cleaning up nextest target dirs as we go along - you should leave the rest of /tmp alone of course"); the showrunner chose this form over a size-capped trim (simple ranks above fast).
+
+**Spec:**
+- `offload.py` `remote_test_command`: after `echo mac_exit=$?`, the remote text deletes `"$HOME"/.local/state/mac-test/mirror/<repo>/target` (the path built from `remote_mirror`, quoted) whatever the run's exit code was, and prints `mac_cleanup=<rc>` on its own line. Before writing it, confirm that neither the mirror's `.cargo/config.toml` nor the remote command sets a different target dir. If one does, delete that dir instead and record it in the summary.
+- A failed delete never changes the run's result. The offload reports it as one line, `Mac build output not removed: <rc>`, and continues.
+- The parser that reads `mac_exit=` also reads `mac_cleanup=`, as a named outcome type, not a bare optional.
+- Tests (`test_offload.py`): run the remote text under `sh` and `zsh -f` with a stand-in `lint`. The target dir is gone after a passing run and after a failing run. A sibling path in the mirror and a file in a stand-in `/tmp` survive. `mac_exit` is unchanged. A failed delete yields the report line and the run's own result.
+
+**Files:**
+- `scripts/mac_test/offload.py`
+- `scripts/mac_test/test_offload.py`
+
+**Seats:** 1 writer + 1 tester.
+
+**Acceptance gate:** the mac_test lane passes. A live check runs only while no real Mac claim is held: one hana nextest offload from natedev leaves no `target` under the Mac's hana mirror afterwards. The phase report gives that run's Mac wall time, built from nothing, beside the last warm hana Mac runs and natedev's time for the same tests, all from buildlog. If the cold Mac run is slower than natedev, tell the showrunner before the checkpoint notice.
