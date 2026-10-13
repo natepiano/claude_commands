@@ -33,6 +33,7 @@ Evidence: `docs/as-built/herdr-trial.md` (findings 1–8, gotchas, reusable and 
 ## Delegation Context
 
 - **Project:** `~/.claude` config repo. Worktree `/home/natepiano/worktrees/claude-build-followups-herdr-trial`, branch `build-followups-herdr-trial` (unit `herdr-trial-unit` unless the showrunner assigns another); name both in every dispatch.
+- **Project started:** 2026-10-13T19:45:42.848+00:00
 - **Stack:** Python 3 standard library, checked by basedpyright; zsh scripts; Markdown commands and docs; herdr 0.9.0 (`herdr --help`, `herdr --skill`); tmux; systemd user units.
 - **Layout:** `scripts/herdr/` (new library `herdr.py`, CLI `herdr_sessions.py`, test double `fake_herdr.py`) · `scripts/production/` (unit lookup, launchers, relays, status) · `scripts/message/roster.py` · `scripts/shutdown/` (inventory, stop, record, restart, settle) · `scripts/nightly_review/nightly_review.py` · `commands/showrunner/`, `commands/shutdown.md`, `commands/producer/to_production.md` · `docs/production_format.md` · `docs/as-built/`.
 - **Key files:**
@@ -76,7 +77,7 @@ Evidence: `docs/as-built/herdr-trial.md` (findings 1–8, gotchas, reusable and 
 
 ## Phases
 
-### Phase 1 — The herdr library and session commands  · status: todo
+### Phase 1 — The herdr library and session commands  · status: done
 
 **User sees:** before — herdr exists only as the torn-down trial's driver; after — still nothing in daily work changes; `herdr_sessions.py list` prints the herdr sessions on the machine (none yet).
 
