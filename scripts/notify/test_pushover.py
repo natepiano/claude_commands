@@ -346,7 +346,7 @@ class PushoverTests(unittest.TestCase):
         review.hold(review.Held(draft.source, 1000, draft, draft, ["Which build stopped?"]))
         body = "The nightly build stopped. Choose whether to retry."
         runner = FakeReviewer(verdict(draft, "ask", body=body, questions=["Another question?"],
-                                      failed_rules=["reader-starts-cold"]))
+                                      failed_rules=[{"rule": "reader-starts-cold", "quote": draft.body}]))
 
         def read(draft: review.Draft, revision: bool) -> review.ReviewOutcome:
             self.assertTrue(revision)
@@ -364,6 +364,40 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(form["message"], [first_line(draft.action) + "\n" + body])
         self.assertEqual(self.reviews()[0]["verdict"], "rewrite")
         self.assertIsInstance(review.held_for(draft.source), review.NoHold)
+
+    def test_cancelled_revision_drops_its_claim_without_posting_or_reporting_a_rewrite(self) -> None:
+        draft = self.draft(answerable=True)
+        held = review.Held(draft.source, 1000, draft, draft, ["Which build stopped?"])
+        review.hold(held)
+
+        def read(revised: review.Draft, revision: bool) -> review.ReviewOutcome:
+            self.assertTrue(revision)
+            # The reviewer resumes after the gate has cancelled its stale claim.
+            sending = review.held_path(held.source).with_suffix(".sending")
+            stamp = time.time() - review.claim_stale_seconds()
+            os.utime(sending, (stamp, stamp))
+            self.assertEqual(review.release_if_matches(held.source, review.hold_identity(held)),
+                             review.ReleaseOutcome.RELEASED)
+            return review.Rewritten(replace(revised, body="Choose whether to retry the nightly build."),
+                                    ["reader-starts-cold"])
+
+        with (mock.patch.object(review, "review", side_effect=read),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(self.run_send(self.arguments(answerable=True)), (5, {}))
+        self.assertIn("pushover: replaced: a newer version replaced this push; nothing was sent", output.getvalue())
+        self.assertNotIn("pushover: sent", output.getvalue())
+        self.assertNotIn("sent as rewritten:", output.getvalue())
+        self.assertIsNone(self.reviews()[0]["sent"])
+        self.assertEqual(self.reviews()[0]["detail"], "claim cancelled before posting")
+        self.assertIsInstance(review.held_for(held.source), review.NoHold)
+
+    def test_successful_revision_records_delivery_before_a_fallback_can_release_it(self) -> None:
+        draft = self.draft(answerable=True)
+        held = review.Held(draft.source, 1000, draft, draft, ["Which build stopped?"])
+        review.hold(held)
+        self.assertEqual(self.run_send(self.arguments(answerable=True))[0], 0)
+        self.assertEqual(review.release_if_matches(held.source, review.hold_identity(held)),
+                         review.ReleaseOutcome.DELIVERED)
 
     def test_failed_revision_restores_the_previous_hold(self) -> None:
         draft = self.draft(answerable=True)
@@ -445,14 +479,14 @@ class PushoverTests(unittest.TestCase):
             self.assertIn("unreviewed: " + why, str(self.log_lines()[-1]["outcome"]))
             self.assertEqual(self.reviews()[-1]["verdict"], "unreviewed: " + why)
 
-    def test_reviewer_timeout_plus_post_fits_the_senders_forty_seconds(self) -> None:
+    def test_configured_reviewer_timeout_still_posts_inside_the_derived_sender_wait(self) -> None:
         draft = self.draft()
         runner = FakeReviewer(verdict(draft))
         elapsed = [0.0]
 
         def process(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
             if argv[0] == "claude":
-                self.assertLessEqual(timeout, 20)
+                self.assertLessEqual(timeout, 90)
                 elapsed[0] += timeout
                 raise subprocess.TimeoutExpired(argv, timeout)
             return runner(argv, timeout=timeout, env=env)
@@ -470,11 +504,12 @@ class PushoverTests(unittest.TestCase):
         with (mock.patch.object(review, "GUIDE", self.keys.parent),
               mock.patch.object(review, "reviewer_environment", return_value=({}, "default")),
               mock.patch.object(time, "monotonic", side_effect=lambda: elapsed[0]),
-              mock.patch.object(review, "review", side_effect=read)):
+              mock.patch.object(review, "review", side_effect=read),
+              mock.patch.object(review, "review_timeout_seconds", return_value=90)):
             self.assertEqual(pushover.send(self.arguments(), self.keys, post), 0)
+            self.assertLess(elapsed[0], review.user_send_seconds())
         self.assertEqual(len(posted), 1)
-        self.assertEqual(elapsed[0], 35)
-        self.assertLess(elapsed[0], 40)
+        self.assertEqual(elapsed[0], 105)
         self.assertEqual(urllib.parse.parse_qs(posted[0].decode())["message"],
                          [first_line(draft.action) + "\n" + draft.body])
         self.assertIn("unreviewed: timeout", str(self.log_lines()[0]["outcome"]))

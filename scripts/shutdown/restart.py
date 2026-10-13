@@ -444,6 +444,9 @@ def restart_note(
     record: SessionShutdown, restarted_at: str
 ) -> str:
     """Build the exact first prompt given to a resumed session."""
+    if "target" in record:
+        return account_move_note(record["session"], record["target"],
+                                 record.get("source_label", record["label"]), record.get("why", ""))
     opening = (
         f"Restarted after /shutdown of {record['label']} "
         f"(stopped {_user_time(record['requested_at'])}, "
@@ -466,7 +469,7 @@ def restart_note(
     )
 
 
-def _resume_command(session: Session, prompt: str) -> str:
+def _resume_command(session: Session, prompt: str, target: str = "") -> str:
     default_dir = str(Path.home() / ".claude")
     config_dir = session.get("config_dir", default_dir)
     prefix = (
@@ -483,6 +486,9 @@ def _resume_command(session: Session, prompt: str) -> str:
         "--remote-control",
         session["name"],
     ]
+    if target:
+        prefix = ""
+        argv = [sys.executable, str(SCRIPTS / "accounts" / "accounts.py"), "exec", target, *argv[1:]]
     model = session["model"]
     if model["kind"] == "model":
         argv.extend(("--model", model["name"]))
@@ -491,6 +497,29 @@ def _resume_command(session: Session, prompt: str) -> str:
         f"cd {shlex.quote(session['cwd'])} && {prefix}ENABLE_TOOL_SEARCH=true command "
         f"{shlex.join(argv)}; exec zsh"
     )
+
+
+def account_move_note(session: Session, target: str, source_label: str, why: str = "") -> str:
+    """One stable explanation for every moved conversation and host."""
+    reason = why or f"{source_label} is out of usage"
+    continuation = (" Continue your /unit:direct run." if session["kind"] == "unit" else "")
+    return (f"You were moved from {source_label} to {target} because {reason}. "
+            + "This was an account move, not a stop. Continue where you stopped."
+            + continuation + " First run `~/.claude/scripts/lib/py "
+            + "~/.claude/scripts/message/send.py pending` for messages kept while you "
+            + "were down; if you were waiting on the user, keep waiting.")
+
+
+def resume_command(session: Session, target: str, source_label: str = "", why: str = "") -> str:
+    """The stable manual move command printed before shutdown and at restart."""
+    if not source_label:
+        directory = Path(session.get("config_dir", str(Path.home() / ".claude")))
+        from account import claude_account
+        identity = claude_account(directory)
+        source_label = identity.label if identity is not None else str(directory)
+    note = account_move_note(session, target, source_label, why)
+    prompt = f"{_showrunner_prompt(session)} {note}" if session["kind"] == "showrunner" else note
+    return _resume_command(session, prompt, target)
 
 
 def _showrunner_prompt(session: Session) -> str:
@@ -570,7 +599,7 @@ def _unit_argv(
     else:
         raise ValueError("unit launch has no run record")
     note_path = _note_path(record, session["session_id"])
-    return [
+    argv = [
         *_add_unit_command(),
         "--production",
         host["doc"],
@@ -589,6 +618,14 @@ def _unit_argv(
         "--restart-note",
         str(note_path),
     ]
+    model = session["model"]
+    if model["kind"] == "model":
+        argv.extend(("--model", model["name"]))
+    if "target" in record:
+        argv.extend(("--account", record["target"]))
+    else:
+        argv.extend(("--config-dir", session.get("config_dir", str(Path.home() / ".claude"))))
+    return argv
 
 
 def _desktop_numbers() -> dict[str, int]:
@@ -900,8 +937,13 @@ def _launch_session(
         return SessionLaunched()
 
     prompt = _showrunner_prompt(session) if session["kind"] == "showrunner" else note
-    command = _resume_command(session, prompt)
+    if session["kind"] == "showrunner" and "target" in record:
+        prompt += " " + note
+    command = (_resume_command(session, prompt, record["target"]) if "target" in record
+               else _resume_command(session, prompt))
     if host["kind"] == "unknown":
+        if "target" in record:
+            command = resume_command(session, record["target"], record.get("source_label", record["label"]), record.get("why", ""))
         return ManualRestartRequired(command)
     _record_scheduled_restart_prompt(
         session["session_id"], prompt, dry_run=dry_run
@@ -1223,8 +1265,7 @@ def launch_entry(
             return EntrySettled()
         launch = SessionLaunched()
     if isinstance(launch, ManualRestartRequired):
-        if dry_run:
-            print(f"manual restart {session['name']}: {launch.command}")
+        print(f"manual restart {session['name']}: {launch.command}")
         if not dry_run:
             _ = _set_entry_progress(record, SessionNeedsManualRestart(
                 kind="manual restart", command=launch.command,
@@ -1319,8 +1360,11 @@ def _result_lines(result: MachineRestartResult) -> list[str]:
     return lines
 
 
-def _print_result(result: MachineRestartResult) -> None:
-    for line in _result_lines(result):
+def _print_result(result: MachineRestartResult, *,
+                  already_reported: tuple[ManualSessionRestart, ...] = ()) -> None:
+    displayed = replace(result, manual_sessions=tuple(item for item in result.manual_sessions
+                                                     if item not in already_reported))
+    for line in _result_lines(displayed):
         print(line)
 
 
@@ -1507,6 +1551,8 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
                 if record["progress"]["kind"] != "restarted":
                     _ = relaunch_session(record, dry_run=True, desktop_state=state)
             return MachineRestartResult(machine, label, "done", refused=refused, local_session_ids=frozenset(local_ids))
+        previous_manual_ids = {record["session"]["session_id"] for record in eligible
+                               if _prior_progress(record)["kind"] == "manual restart"}
         ordered = sorted(eligible, key=_entry_order)
         others = [record for record in ordered if ids or not _entry_order(record)[0]]
         requesters = [record for record in ordered if not ids and _entry_order(record)[0]]
@@ -1550,7 +1596,13 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
                 clear_finished_account_hold(login, request_ids=finished_requests)
         result = replace(_machine_result(attempted, machine, label), elapsed_seconds=time.monotonic() - started_at)
         result = replace(result, refused=refused, no_remote_control=missing_control, local_session_ids=frozenset(local_ids))
-        _print_result(result)
+        reported = tuple(ManualSessionRestart(record["session"]["name"], record["progress"]["command"])
+                             for record in attempted if record["progress"]["kind"] == "manual restart"
+                             and record["session"]["session_id"] not in previous_manual_ids)
+        if reported:
+            _print_result(result, already_reported=reported)
+        else:
+            _print_result(result)
         return result
     finally:
         state.restore(dry_run=dry_run)
@@ -1757,7 +1809,7 @@ def restart_push(label: str, lines: list[str], *, failed: bool, phone_access: bo
     else:
         title = "Restarted sessions lack phone access"
         names = ", ".join(line.partition(":")[0] for line in diagnostics)
-        body = f"Sessions on Claude account {account} restarted. Remote Control is off in these sessions, so you cannot reach them from your phone: {names}.\n\n"
+        body = f"Sessions on Claude account {account} restarted. Remote Control is off, so you cannot reach them from your phone. Affected sessions: {names}.\n\n"
     if phone_access:
         body += "The status command shows each session's machine. On that machine, run /remote-control in its terminal to turn phone access back on."
     return title, body, ActionRequired(f"In a Claude session on natedev, run /shutdown status {account}.")

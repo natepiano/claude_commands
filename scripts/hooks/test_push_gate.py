@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import fcntl
 import io
 import json
 import os
@@ -13,6 +14,7 @@ import shlex
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from collections.abc import Callable
 from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast, override
 from unittest import mock
 
@@ -29,8 +31,9 @@ spec = importlib.util.spec_from_file_location("push_gate", Path(__file__).with_n
 assert spec is not None and spec.loader is not None
 class PushGate(Protocol):
     DENIAL: str
+    ALREADY_SENT: str
 
-    def main(self) -> None: ...
+    def main(self, *, clock: Callable[[], float], sleep: Callable[[float], None]) -> None: ...
 
 
 module = importlib.util.module_from_spec(spec)
@@ -96,7 +99,10 @@ class PushGateTests(unittest.TestCase):
         payload: HookPayload = {"session_id": session, "tool_name": "PushNotification",
                                "tool_input": {"message": message, "status": "proactive"}}
         with mock.patch("sys.stdin", io.StringIO(raw or json.dumps(payload))), redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
-            push_gate.main()
+            elapsed = [0.0]
+            def sleep(seconds: float) -> None:
+                elapsed[0] += seconds
+            push_gate.main(clock=lambda: elapsed[0], sleep=sleep)
         return out.getvalue(), err.getvalue()
 
     def assert_denied(self, output: str) -> None:
@@ -172,13 +178,13 @@ class PushGateTests(unittest.TestCase):
         path = self.marker()
         marker = cast(Marker, json.loads(path.read_text()))
         marker["held_source"], marker["held_machine"] = "writer source", "natedev"
-        marker["held_identity"] = "original-hold-hash"
+        marker["held_identity"] = "a" * 64
         _ = path.write_text(json.dumps(marker))
-        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "none\n", "")) as run:
             self.assertEqual(self.call(), ("", ""))
         command = cast(list[str], run.call_args.args[0])
         self.assertEqual(command[-2], "natedev")
-        self.assertIn("review.py release --identity original-hold-hash -- 'writer source'", command[-1])
+        self.assertIn("review.py release --identity " + "a" * 64 + " -- 'writer source'", command[-1])
         self.assertFalse(path.exists())
 
     def test_hold_release_error_still_allows_and_reports_the_error(self) -> None:
@@ -186,7 +192,7 @@ class PushGateTests(unittest.TestCase):
         path = self.marker()
         marker = cast(Marker, json.loads(path.read_text()))
         marker["held_source"] = "writer source"
-        marker["held_identity"] = "original-hold-hash"
+        marker["held_identity"] = "a" * 64
         _ = path.write_text(json.dumps(marker))
         with mock.patch.object(review, "release_if_matches", side_effect=OSError("cannot release")):
             output, errors = self.call()
@@ -198,8 +204,9 @@ class PushGateTests(unittest.TestCase):
         del capture_output, text, check, timeout
         # Replace SSH with the real remote CLI parser, using only temporary state.
         self.assertEqual(argv[0], "ssh")
-        self.assertEqual(review.main(shlex.split(argv[-1])[2:]), 0)
-        return subprocess.CompletedProcess(argv, 0, "", "")
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(review.main(shlex.split(argv[-1])[2:]), 0)
+        return subprocess.CompletedProcess(argv, 0, output.getvalue(), "")
 
     def test_old_revision_fallback_preserves_a_replacement_hold_locally_and_remotely(self) -> None:
         """F004: cleanup identifies the restored hold, not just its source."""
@@ -209,12 +216,13 @@ class PushGateTests(unittest.TestCase):
         _ = keys.write_text("PUSHOVER_USER=test-user\nPUSHOVER_TOKEN=test-token\n")
         arguments = ["--source", draft.source, "--priority", "1", "--answerable",
                      "--action", "Choose retry.", draft.title, draft.body]
-        for machine in ("", "natedev"):
+        for index, machine in enumerate(("", "natedev")):
             with (self.subTest(machine=machine), mock.patch.object(review, "schedule"),
                   mock.patch.object(review, "review", return_value=review.Approved(draft)),
                   mock.patch.object(pushover, "LOG_FILE", self.root / "push.jsonl"),
                   redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO())):
-                review.hold(review.Held(draft.source, 1000, draft, draft, ["Which build?"]))
+                review.release(draft.source)  # Keep local and remote cases independent if an assertion fails.
+                review.hold(review.Held(draft.source, 1000 + index, draft, draft, ["Which build?"]))
                 self.assertEqual(pushover.send(arguments, keys, lambda _u, _d: (500, b'{"status":0}')), 1)
                 record = cast(dict[str, object], json.loads(output.getvalue().splitlines()[0].removeprefix("pushover: reviewed JSON: ")))
                 path = self.marker()
@@ -227,7 +235,10 @@ class PushGateTests(unittest.TestCase):
                 replacement = review.Held(draft.source, 2000, draft, draft, ["Which terminal?"])
                 review.hold(replacement)
                 with mock.patch.object(subprocess, "run", side_effect=self.remote_release) as run:
-                    self.assertEqual(self.call(), ("", ""))
+                    result, errors = self.call()
+                    response = cast(Response, json.loads(result))
+                    self.assertEqual(response["hookSpecificOutput"]["permissionDecisionReason"], push_gate.ALREADY_SENT)
+                    self.assertEqual(errors, "")
                 self.assertEqual(run.call_count, int(bool(machine)))
                 self.assertFalse(path.exists())
                 found = review.held_for(draft.source)
@@ -253,6 +264,101 @@ class PushGateTests(unittest.TestCase):
             self.assertEqual(self.call(), ("", ""))
         self.assertIn(" -- --writer", cast(list[str], run.call_args.args[0])[-1])
         self.assertIsInstance(review.held_for(draft.source), review.NoHold)
+        self.assertFalse(path.exists())
+
+    def hold_marker(self, held: review.Held, machine: str = "") -> Path:
+        path = self.marker()
+        marker = cast(Marker, json.loads(path.read_text()))
+        marker["held_source"] = held.source
+        marker["held_identity"] = review.hold_identity(held)
+        marker["held_machine"] = machine
+        _ = path.write_text(json.dumps(marker))
+        return path
+
+    def test_expiry_delivery_denies_later_fallback_locally_and_remotely(self) -> None:
+        for machine in ("", "natedev"):
+            draft = review.Draft("writer " + machine, "1", "Build choice", ActionRequired("Choose retry."),
+                                 "The build stopped.", True)
+            held = review.Held(draft.source, 1000, draft, draft, ["Which build?"])
+            with mock.patch.object(review, "schedule"):
+                review.hold(held)
+            with mock.patch.object(pushover, "deliver", return_value=0):
+                self.assertEqual(review.due(post=mock.Mock(), keys_file=self.root / "unused"), 0)
+            path = self.hold_marker(held, machine)
+            with mock.patch.object(subprocess, "run", side_effect=self.remote_release):
+                output, errors = self.call()
+            response = cast(Response, json.loads(output))
+            self.assertEqual(response["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertEqual(response["hookSpecificOutput"]["permissionDecisionReason"], push_gate.ALREADY_SENT)
+            self.assertEqual(errors, "")
+            self.assertFalse(path.exists())
+
+    def test_posting_worker_failure_allows_after_the_restored_hold_is_released(self) -> None:
+        draft = review.Draft("writer", "1", "Build choice", ActionRequired("Choose retry."), "Stopped.", True)
+        held = review.Held(draft.source, 1000, draft, draft, ["Which build?"])
+        with mock.patch.object(review, "schedule"):
+            review.hold(held)
+        self.assertTrue(review.claim(held.source))
+        path = self.hold_marker(held)
+        real_release = review.release_if_matches
+        calls: list[review.ReleaseOutcome] = []
+        def release(source: str, identity: str, *, timeout: float,
+                    clock: Callable[[], float], sleep: Callable[[float], None]) -> review.ReleaseOutcome:
+            if calls:
+                self.assertIsInstance(review.post_claim(held, lambda: 1), review.ClaimFailed)
+            outcome = real_release(source, identity, timeout=timeout, clock=clock, sleep=sleep)
+            calls.append(outcome)
+            return outcome
+        with mock.patch.object(review, "release_if_matches", side_effect=release):
+            self.assertEqual(self.call(), ("", ""))
+        self.assertEqual(calls, [review.ReleaseOutcome.POSTING, review.ReleaseOutcome.RELEASED])
+        self.assertFalse(path.exists())
+        self.assertIsInstance(review.held_for(held.source), review.NoHold)
+
+    def test_posting_timeout_and_unreadable_remote_answer_allow_and_consume_marker(self) -> None:
+        draft = review.Draft("writer", "1", "Build choice", ActionRequired("Choose retry."), "Stopped.", True)
+        held = review.Held(draft.source, 1000, draft, draft, ["Which build?"])
+        path = self.hold_marker(held)
+        with (mock.patch.object(review, "release_if_matches", return_value=review.ReleaseOutcome.POSTING) as release,
+              mock.patch.object(review, "review_timeout_seconds", return_value=90)):
+            self.assertEqual(self.call(), ("", ""))
+        self.assertEqual(release.call_count, 110)
+        self.assertFalse(path.exists())
+        path = self.hold_marker(held, "natedev")
+        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "unreadable\n", "")):
+            output, errors = self.call()
+        self.assertEqual(output, "")
+        self.assertIn("push gate:", errors)
+        self.assertFalse(path.exists())
+
+    def test_busy_local_review_lock_consumes_marker_and_allows_at_the_overall_deadline(self) -> None:
+        draft = review.Draft("writer", "1", "Build choice", ActionRequired("Choose retry."), "Stopped.", True)
+        held = review.Held(draft.source, 1000, draft, draft, ["Which build?"])
+        with mock.patch.object(review, "schedule"):
+            review.hold(held)
+        self.assertTrue(review.claim(held.source))
+        path = self.hold_marker(held)
+        elapsed = [0.0]
+        def sleep(seconds: float) -> None:
+            elapsed[0] += seconds
+        def flock(file: object, operation: int) -> None:
+            if Path(cast(str, getattr(file, "name", ""))).name != "review.lock":
+                return
+            self.assertFalse(path.exists())
+            if operation == fcntl.LOCK_EX:
+                self.fail("local release tried an unbounded lock acquisition")
+            if operation & fcntl.LOCK_NB and elapsed[0] >= 109:
+                raise BlockingIOError("worker still posting")
+        payload: HookPayload = {"session_id": "writer", "tool_name": "PushNotification",
+            "tool_input": {"message": "Build choice — Action: Choose retry.", "status": "proactive"}}
+        with (mock.patch.object(review, "review_timeout_seconds", return_value=90),
+              mock.patch.object(fcntl, "flock", side_effect=flock),
+              mock.patch("sys.stdin", io.StringIO(json.dumps(payload))),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            push_gate.main(clock=lambda: elapsed[0], sleep=sleep)
+        self.assertAlmostEqual(elapsed[0], 110)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("review lock deadline expired", errors.getvalue())
         self.assertFalse(path.exists())
 
     def test_hook_errors_allow_and_report_the_error(self) -> None:

@@ -3,7 +3,7 @@
 
 FAKE_HERDR_RESPONSES maps space-joined argv (excluding the executable) to
 {stdout, code} entries, optionally with stderr and write_files (path-to-text
-report fixtures). The "default" entry is used for unmatched argv. A list of entries replays successive responses, keeping
+report fixtures), require_paths and remove_paths (fixture lifecycle checks). The "default" entry is used for unmatched argv. A list of entries replays successive responses, keeping
 the final response for subsequent calls.
 """
 
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
@@ -21,6 +22,8 @@ class CommandResponse(TypedDict):
     code: int
     stderr: NotRequired[str]
     write_files: NotRequired[dict[str, str]]
+    require_paths: NotRequired[list[str]]
+    remove_paths: NotRequired[list[str]]
 
 
 def main(argv: list[str]) -> int:
@@ -38,6 +41,16 @@ def main(argv: list[str]) -> int:
     if isinstance(response, list):
         seen = sum(cast(list[str], json.loads(line)) == argv for line in previous)
         response = response[min(seen, len(response) - 1)]
+    for required in response.get("require_paths", []):
+        if not Path(required).exists():
+            _ = sys.stderr.write(f"fixture required path missing: {required}\n")
+            return 98
+    for removed in response.get("remove_paths", []):
+        path = Path(removed)
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
     for file, text in response.get("write_files", {}).items():
         _ = Path(file).write_text(text)
     _ = sys.stdout.write(response["stdout"])

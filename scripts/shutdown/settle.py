@@ -15,7 +15,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -33,6 +33,10 @@ import sessions
 import stop as stop_work
 from user_action import ActionRequired
 from user_zone import user_zone
+if TYPE_CHECKING:
+    from ..notify import review
+else:
+    import review
 
 SHUTDOWN = Path(__file__).resolve().parent / "shutdown.py"
 NOTIFIER = SCRIPTS / "message" / "notifier.sh"
@@ -197,14 +201,23 @@ def run_notifier(verb: str, instance: str) -> None:
 def _deliver_message(
     command: list[str], recipient: str, text: str
 ) -> MessageDelivery:
-    result = subprocess.run(
-        command,
-        input=text,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )
+    timeout = 60.0
+    if recipient == "user":
+        timeout = review.user_send_seconds() + 15
+        if "--machine" in command:
+            # send.py gives SSH its user wait plus 10 s termination and 30 s transport time.
+            timeout += 40
+    try:
+        result = subprocess.run(
+            command,
+            input=text,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"send to {recipient} timed out after {timeout:g} seconds") from error
     if result.returncode == 0:
         return {"kind": "sent"}
     if result.returncode == 1:
@@ -255,7 +268,10 @@ def alert_user(summary: str, text: str, action: ActionRequired, *, machine: str 
                "--summary", summary, "--need", "decision", "--action", action.text]
     if machine:
         command.extend(("--machine", machine))
-    _ = _deliver_message(command, "user", text)
+    try:
+        _ = _deliver_message(command, "user", text)
+    except RuntimeError as error:
+        print(f"shutdown: user alert failed: {error}", file=sys.stderr)
 
 
 def alert_details(lines: list[str]) -> str:
@@ -570,6 +586,7 @@ def begin(
     login: str, requested_by: str | None = None, only: Iterable[str] = (), *,
     then: ShutdownContinuation = "stop", alerts: Literal["user", "none"] = "user",
     request_id: str,
+    target: str = "", why: str = "",
 ) -> list[SessionShutdown]:
     """Add independent owners, leaving every existing request intact."""
     for line in store.migrate(login):
@@ -596,6 +613,10 @@ def begin(
             settle_message={"kind": "not sent"}, where={"kind": "not said"},
             progress={"kind": "waiting"}, stop_issues=[],
         )
+        if target:
+            saved["target"] = target
+            saved["source_label"] = report["label"]
+            saved["why"] = why or f"{report['label']} is out of usage"
         if not store.create_session(saved):
             print(f"{session['name']}: already in progress")
             continue
@@ -928,7 +949,7 @@ def _launch_conductor(login: str, label: str) -> None:
 
 def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
          then: ShutdownContinuation = "stop", alerts: Literal["user", "none"] = "user",
-         requested_by: str | None = None, request_id: str = "") -> int:
+         requested_by: str | None = None, request_id: str = "", target: str = "", why: str = "") -> int:
     """Start local work immediately and ask the peer to conduct its own owners."""
     if not _warm():
         print(f"GitHub keys are cold: run `github-warmup` in a terminal on {_machine()}, then `/shutdown` again", file=sys.stderr)
@@ -938,7 +959,7 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
     identity = request_id or str(uuid4())
     local_ids: set[str] = ({saved["session"]["session_id"] for saved in store.session_records(account.login)}
                  | {session["session_id"] for session in inventory(account.login, frozenset(ids))["sessions"]}) if ids else set()
-    _ = begin(account.login, origin, ids, then=then, alerts=alerts, request_id=identity)
+    _ = begin(account.login, origin, ids, then=then, alerts=alerts, request_id=identity, target=target, why=why)
     _launch_conductor(account.login, account.label)
     peer_ids = [session_id for session_id in ids if session_id not in local_ids]
     if not here and (not ids or peer_ids):
@@ -949,6 +970,8 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
             arguments.extend(("--only", ",".join(peer_ids)))
         if then == "restart":
             arguments.append("--restart")
+        if target:
+            arguments.extend(("--to", target, "--why", why or f"{account.label} is out of usage"))
         if alerts == "none":
             arguments.append("--no-alert")
         status, output = run_remote(arguments)
@@ -1143,11 +1166,13 @@ def _send_holdout_alert(due: list[tuple[SessionShutdown, str]]) -> None:
     waiting = " ".join(f"Its session named {saved['session']['name']} on {saved['machine']} is {reason}." for saved, reason in due)
     account = json.dumps(first["label"])
     names = ",".join(saved["session"]["name"] for saved, _ in due)
-    form_instruction = " Read any open form in their terminals before stopping them." if len(due) == 1 else ""
+    subject = "it" if len(due) == 1 else "them"
+    possessive = "its" if len(due) == 1 else "their"
+    form_instruction = " Read any open form in that session's terminal before stopping it." if len(due) == 1 else ""
     phone_text = (f"Shutdown of Claude account {account} is waiting. " + waiting[:120]
                   + form_instruction + "\n\n"
-                  + f"Cancel (recommended): /shutdown cancel {account} --only {names} keeps them running so you can check their work.\n\n"
-                  + f"Stop now: /shutdown now {account} --only {names} stops them without waiting.")
+                  + f"Cancel (recommended): /shutdown cancel {account} --only {names} keeps {subject} running so you can check {possessive} work.\n\n"
+                  + f"Stop now: /shutdown now {account} --only {names} stops {subject} without waiting.")
     title = "Shutdown waits on a session showing a form" if any("form" in reason for _, reason in due) else "Shutdown waits on running Claude sessions"
     try:
         alert_user(title, phone_text,

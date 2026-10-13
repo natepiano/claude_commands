@@ -1,6 +1,6 @@
 # Two accounts: showrunners on one Claude account, unit directors on another
 
-> **Status: IMPLEMENTATION PLAN — phases 1–6 are done; the cutover (Phase 7) moved all ten build-followups unit directors to claude 3 on 2026-10-11, with the spare dir and the cross-machine message check still open; Phase 8 (move any one session) waits on the user's go; Phases 10–12 add the Codex accounts: a home per account, one account for all seats with a swap, and alerts per account; Phase 13 repairs a seat launch that finished its turn while the seats account changed.** Phases 1–5 built everything and initiated nothing: no account dir, no login, no role. Phase 6 proved `~/.claude3` live. The design: each account the user has gets its own config dir, `~/.claude1`, `~/.claude2` and `~/.claude3`. Each holds only that account's login, and everything else is a symlink into `~/.claude`. Unit directors launch with `CLAUDE_CONFIG_DIR` set to the unit account's dir. Showrunners and every other session stay on `~/.claude`'s own login, as today. When the unit account runs low, one command swaps every unit onto a spare account through `/shutdown`'s safe stop and resume. Any one session, a showrunner included, moves to any account the same way with `/showrunner:accounts move` (Phase 8). Phased, delegate-ready once approved.
+> **Status: IMPLEMENTATION PLAN — phases 1–6 are done; the cutover (Phase 7) moved all ten build-followups unit directors to claude 3 on 2026-10-11, with the spare dir and the cross-machine message check still open; Phase 8 moves any one session, or every showrunner off an account, by hand; Phases 14–17 drop the unit role so every new session picks the account with room, and move Codex seats and Claude sessions by themselves when their account refuses them; Phase 9 reads out a week of moves; Phases 10–12 add the Codex accounts: a home per account, one account for all seats with a swap, and alerts per account; Phase 13 repairs a seat launch that finished its turn while the seats account changed.** Phases 1–5 built everything and initiated nothing: no account dir, no login, no role. Phase 6 proved `~/.claude3` live. The design: each account the user has gets its own config dir, `~/.claude1`, `~/.claude2` and `~/.claude3`. Each holds only that account's login, and everything else is a symlink into `~/.claude`. Unit directors launch with `CLAUDE_CONFIG_DIR` set to the unit account's dir. Showrunners and every other session stay on `~/.claude`'s own login, as today. When the unit account runs low, one command swaps every unit onto a spare account through `/shutdown`'s safe stop and resume. Any one session, a showrunner included, moves to any account the same way with `/showrunner:accounts move` (Phase 8). Phased, delegate-ready once approved.
 
 > **As-built disposition: create**
 
@@ -97,8 +97,8 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 5. **Move any one session (Phase 8), when the user says go.**
    - `/showrunner:accounts move <session> "claude N"` moves one showrunner, unit director or top-level session to any account. It stops safely, as `/shutdown` does it, and resumes the same conversation on the target in its own tmux pane or window.
    - Undo: move it back.
-6. **During the week.** When claude 3 runs low, the alert names `/showrunner:accounts swap unit "claude 1"`. Nothing switches by itself.
-7. **Day 7 (Phase 9).** A readout gives points per account per day, the times of any swaps, and whether the showrunner account lasted the week.
+6. **Accounts by room (Phases 14–17).** No role ties a kind of session to an account. A new session launches on the account with room that resets soonest (`accounts.py pick`). When an account refuses a session or the Codex seats, they move to the picked account by themselves and continue; a 5-hour refusal whose reset is under 20 minutes away waits instead. Phase 17 proves it live with the user.
+7. **A week later (Phase 9).** A readout gives the moves, their causes, any time with no account having room, and points per account per day.
 
 ## Delegation Context
 
@@ -179,7 +179,8 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 | G0 | Phase 1 | the user | cleared 2026-10-10 for the code phases 1–5: "prepare everything but don't initiate" |
 | G1 | Phase 6 | the user | the user explicitly authorizes the first live proof. Phase 6 then creates `~/.claude3`, and the user completes its login (step 2) before any probe starts |
 | G2 | Phase 7 | the user | the user authorizes cutover at a chosen time and confirms the unit account. Phase 7 then sets up and logs in the remaining dirs, and every check passes before step 4 writes the role |
-| G3 | Phase 9 | the clock | 7 days after cutover |
+| G3 | Phase 9 | the clock | 7 days after Phase 17's live proof |
+| G4 | Phase 17 | the user | the user is present for the live moves |
 
 ## Phases
 
@@ -420,65 +421,61 @@ Asked for by the user through the showrunner. Text above this section that names
 - **Never reply to a message's `from` socket.** A showrunner's messages arrive through `send.py`'s relay process, which ends at once, so that socket is gone by the time a reply is written.
 - **Rollout:** units started before this keep the old prompt and need the row's ref until they restart. The showrunner's own sends to units by name can hit the same refusal; `sessions.py address <unit session name>` serves it, and whether it adopts that is its call.
 
-### Phase 8 — Move one session to any account  · status: todo · waits on the user's go
+### Phase 8 — Move one session to any account  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** one command moves any one session (showrunner, unit director or top-level) to any account and keeps its conversation. The unit role only picks the account for new unit launches. User, 2026-10-11: "we can run out of account usage on a showrunner too so we need the ability to move arbitrary sessions to arbitrary accounts."
-
-**Constraints from prior phases:** for Claude sessions the unit role selects new unit launches, and Codex seats follow the `seats` role by themselves; showrunners and top-level sessions run on `~/.claude`'s login, and swap moves only units. `shutdown.py down <account> --only <ids or exact names> --restart` already stops sessions safely (each records where it was, then exits) and resumes them in their recorded host: tmux respawns the pane, a ghostty or zed session comes back in a Ghostty window, a unit relaunches through `add_unit.py --resume`, and an unknown host prints `manual restart <name>: <command>`. Shutdown keeps one `SessionShutdown` record per top-level session, with its seats inside it, and no account-level record; `relaunch_session(record, …)` relaunches one record. The CLI has no `begin` verb: `down` calls `settle.begin(login, requested_by, only, *, then, alerts, request_id)`. Without `--here` it sends the peer `down <login> --here --request-id <id> [--requested-by <id>] [--only <ids>] [--restart] [--no-alert]` for the ids this machine does not hold; with `--here` it makes no peer call. A second request never conflicts with an open one: a session with no record is added (`<name>: added`), and a session that has one prints `<name>: already in progress` and keeps its `then`, `hold`, `alerts`, `request_id` and `requested_by`, so a repeated `down` changes nothing on it. Each machine conducts its own records, and a session relaunches once its own record has stopped. A failed stop is retried with `shutdown.py now <account> [--here] [--only <name>]`. A refused conversion of an old record prints one `shutdown: <error>` line and exits 3 in `down`, `cancel`, `now`, `conduct` and `ready`. Restart resumes a non-unit session on the config dir its process ran with (`Session.config_dir`), and `add_unit.py --resume` takes the unit role. Inventory classes a session as a unit from the unit marks on its tmux pane, read for each registered showrunner's production; a session without them is top-level and moves through its tmux pane either way. Same-machine messaging works across accounts, and Remote Control is per account (Phase 6 (c), (g)). The hand move the showrunner ran for mul_add was `/exit`, then `accounts.py exec 'claude 3' --resume <id>` in its tmux. Phase 7 moves units with the role and `down --restart`; once a unit resume keeps the account it ran on (spec 4), a later move of every unit goes through swap's `--to`. Codex account identity (`KnownCodexAccount`, `UnknownCodexAccount`, `codex_account`, `codex_home_role_label`) lives in `scripts/whoami/agent_accounts.py`; the names `agent_accounts` and `scripts.whoami.agent_accounts` are one module object, so import it by either name and never load it by path. After a change of the seats account, the next updater run or the relay's own check at delivery retires that account's 5-hour holds and queued relays (`escalate.reconcile_codex_holds`, `escalate.due`); `swap seats` calls neither and needs nothing from this phase. New code never names a time zone: it calls `user_zone()` from `scripts.lib.user_zone`, which arrives with the user-zone change (build-followups-enh-showrunner 43a14830) when the merge branch is merged here, and a test in `scripts/lib` fails on a zone name written into a script.
-
-**Spec:**
-
-1. `accounts.py move <session id | name> <claude N | default>`, also `/showrunner:accounts move`. It finds the live session in this machine's session registry by id, or by the name it runs under, and reads its current account from its process's config dir. A name two live sessions share refuses and lists their ids.
-2. Before any change it refuses and names the cause:
-   - no live session by that id or name on this machine (a session on the other machine moves from there);
-   - a seat (`seats move with their unit director`);
-   - a target that fails `check` (its first problem);
-   - a target that is already the session's login (`<name> is already on <label>`);
-   - the default login's note label, or a dir logged in to that login (`<label> is the default account; use default`), as set-role and swap refuse it;
-   - a shutdown record already open for the session (`<name> already has a shutdown in progress`): a repeated `down` leaves an existing record as it was, so the target would not be stored. A shutdown of other sessions on the same account does not refuse.
-3. Otherwise it runs `shutdown.py down '<current account note label>' --here --only <id> --restart --to '<target>'`. `--to` stores the target on each `SessionShutdown` record the request adds (`settle.down` passes it to `settle.begin`); a record made without it has none, and an existing record is never given one. Without `--here`, `down` forwards `--to` in the `down <login> --here …` it sends the peer. The session stops as any shutdown stops it.
-4. Restart relaunches a session record that has a target (`relaunch_session`) through `accounts.py exec '<target>'`, with restart's usual resume arguments: `--resume <id> -n <name> --remote-control <name>`, the model, and the restart note (or `/showrunner:produce <doc> resume` for a showrunner). So an inherited `CLAUDE_CODE_OAUTH_TOKEN` is dropped and the target is checked again at launch. `exec` accepts `default`: plain `claude` with `CLAUDE_CONFIG_DIR` removed. A record with no target resumes on the account it ran on, as today. By host:
-   - tmux: respawns its own pane, as restart does now.
-   - unit: `add_unit.py --resume … --account '<target>'`. A unit resume without `--account` keeps the account it ran on; `add_unit.py` reads the unit role only for a new unit.
-   - ghostty, zed or Terminal: reopens its window, as restart does now.
-   - unknown: move prints the one resume line before the stop starts, with `run this once <name> has exited`, and restart reports the same line as `manual restart <name>: <line>`.
-5. A session may move itself. Its own request is recorded as the requester, as for any shutdown it asks for.
-6. `swap unit` keeps its refusals and becomes `set-role unit` plus `down '<old>' --restart --to '<new>'`, because a unit resume no longer reads the role. It also refuses a unit that already has a shutdown record, because that record would be given no target. `swap seats` is unchanged.
-7. A moved session keeps its name, so `send.py` and same-machine SendMessage reach it on either account. Its Remote Control registers on the target account, and the old account's phone app no longer lists it.
+- `accounts.py move <session id | name> <claude N | default> [--why '<text>']` (also `/showrunner:accounts move`) finds the live session in this machine's registry, reads its account from its process's config dir, and returns `MoveStarted | MoveStartFailed | MoveRefused`. Before any change it refuses: no live session here, a name two sessions share (lists ids), a seat, a target that fails `check`, the session's own login, the default login's label or dir (`use default`), or an open shutdown record. Otherwise it runs `shutdown.py down '<current label>' --here --only <id> --restart --to '<target>' --why '<why>'` (default why `<old label> is out of usage`); a session may move itself.
+- `accounts.py move showrunners --from '<label>' --to '<claude N | default>' [--why] [--dry-run]` returns `ShowrunnersMoveStarted | ShowrunnersMoveStartFailed | ShowrunnersMoveDryRun | MoveRefused`. It selects every live inventory `showrunner` on `--from`'s login, refuses the whole command on a bad target or none found, skips one with an open record, and runs one `down` over every selected id. `--dry-run` prints the selection, the `down` line and each resume line.
+- `down --to/--why` stores `target`, `source_label` and `why` on each new `SessionShutdown`; an existing record never gains them; the peer `down` carries both. A record with no target resumes on the account it ran on.
+- Restart relaunches a targeted record through `accounts.py exec '<target>'` with the usual resume arguments plus one moved-not-stopped note from `restart.account_move_note` (moved from, to, because; an account move, not a stop; continue). A unit continues `/unit:direct`; a showrunner gets `/showrunner:produce <doc> resume` with the note. tmux respawns its pane; a unit resumes through `add_unit.py --resume --account '<target>'`; a Ghostty session is closed at stop and reopened on its recorded desktop (kdotool `set_desktop`), so one window per session on its desktop; an unknown host prints the resume line once before the stop, and restart reports `manual restart <name>: <line>`. A moved session keeps its name, so `send.py` reaches it; its Remote Control registers on the target account.
+- `exec default` drops `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_OAUTH_TOKEN`. `swap unit` is `set-role unit` plus `down '<old>' --restart --to '<new>'` and refuses a unit with an open record; `swap seats` is unchanged.
+- `add_unit.py` stores `@claude_config_dir` and `@claude_model` on each unit's tmux session and reads the unit role only for a new unit. An untargeted `--resume` uses the shutdown record's target, then those options, else refuses naming `--account`; a recorded dir outside the account farm is kept (`RetainedUnitAccount`), a missing one is refused; the recorded model goes through `--model`. `produce.md`'s manual unit resume runs `add_unit.py --resume`.
 
 **Files:**
+- `scripts/accounts/accounts.py` — `move`, `move_showrunners`, `_move_target`, `exec default`, swap through `down --to`; `test_accounts.py`.
+- `scripts/shutdown/shutdown.py`, `settle.py`, `record.py`, `restart.py`, `stop.py` — `--to`/`--why`, the record fields, resume through `exec`, the moved note; `test_account_move.py` and the inventory, restart, settle, shutdown_cli and stop tests.
+- `scripts/production/add_unit.py`, `test_add_unit.py` — `--account`, the tmux options, the untargeted-resume refusal.
+- `commands/showrunner/produce.md` — unit resume through `add_unit.py --resume`.
+- `docs/accounts.md` ("Move a session"), `commands/showrunner/accounts.md`, `docs/as-built/shutdown-and-restart.md`; `pyrightconfig.json` — shutdown extraPaths include the repo root.
 
-- `scripts/accounts/accounts.py` — `move`, `exec default`, swap's `--to`; `scripts/accounts/test_accounts.py`.
-- `scripts/shutdown/shutdown.py`, `settle.py`, `record.py`, `restart.py` — `--to` on `down` (the parser, `settle.down`, `settle.begin` and the `down` sent to the peer), the target field on `SessionShutdown`, resume through `exec` in every host; their tests.
-- `scripts/production/add_unit.py` — `--account` on `--resume`, and a resume keeps the account it ran on; its tests.
-- `docs/accounts.md` — "Move a session", with every refusal; `commands/showrunner/accounts.md` — the argument hint; `docs/as-built/shutdown-and-restart.md`.
+**Binds later work:** "Claude sessions move on a refusal", "An account picked by room, not by role" and "Readout of the moves" call `accounts.move()` / `down --to`. Removing the unit role takes `swap unit` with it, but `exec unit` stays because nixos `shell.nix` aliases `claude-unit` to `accounts.py exec unit`. The readout counts `SessionShutdown` records with a `target` as moves.
 
-**Acceptance gate:** the accounts, shutdown, production and whoami suites and the scoped lint pass. Live on natedev with a scratch probe in tmux: move it claude 2 → claude 3 → `default`. After each move it answers a question about its earlier turns, its status line and `account.py --pid` show the target, and `send.py` reaches it and its reply comes back. A second probe with no known host gets exactly one printed resume line, and running that line resumes it on the target. `swap unit … --dry-run` prints `down … --to`. `~/.claude/.credentials.json` is unchanged and no other session moved.
+**Gotchas:**
+- Live Ghostty titles carry a status glyph (`✳ natedev`) and the shell retitles the window after exit.
+- A session that already has a shutdown record is refused: a repeated `down` keeps the record as it was, so no target would be stored.
+- A refused tmux/unit session already enters "held by usage limit" in shutdown (settle.py `USAGE_LIMIT_PATTERNS`) and stops once idle; Ghostty/zed sessions have no screen read.
+- Transcripts record a Claude refusal for every host as an `assistant` entry with `error: "rate_limit"`, `isApiErrorMessage: true`, `apiErrorStatus: 429`, model `<synthetic>`, text "You've hit your session limit · resets …" (`session` = 5-hour, `weekly` = weekly).
+- The 2-minute timer (`agent-sessions-snapshot`, nixos) runs `~/.claude/scripts/whoami/agent_notes.py` with no arguments, so a watcher hooked there needs no nixos change.
 
-### Phase 9 — One-week readout  · status: todo · gated by G3
+**Ruled out:** tracking and closing the old Ghostty window by title — titles change.
+
+**Live check outstanding (with the user):** a scratch tmux probe moved claude 2 → claude 3 → `default` keeps its earlier turns, shows the target in its status line and `account.py --pid`, and answers through `send.py`; an unknown-host probe resumes from its one printed line; `move showrunners --from 'claude 2' --to 'claude 3'` brings each showrunner back in its own window on its own desktop with no old window left; `~/.claude/.credentials.json` is unchanged.
+
+### Phase 9 — Readout of the moves  · status: todo · gated by G3
 
 #### Work Order
 
-**Goal:** answer the user's question with a week of data: did the showrunner account last the week, and how many unit swaps did it take?
+**Goal:** answer the user's question with a week of data: how often sessions and seats moved between accounts, why, and whether any time passed with no account having room.
 
-**Constraints from prior phases:** role history is `~/.local/state/accounts/roles.jsonl`. Records from Phase 4 on carry `at`, `role`, `label` (the dir selected, or `default`) and `account_label` (the note label at write time); use `account_label` for them. Older records keep `burn`'s current-dir resolution and can refuse an unreadable historical identity. A role row is an assignment, not a completed move: a refused `down` writes a compensating row. `agent_notes.py` keeps readings for eight days, so the readout runs at T0 + 7 d. Role history holds both unit and seats assignments; this Claude readout counts only unit assignments and independently confirmed Claude moves. `accounts.py burn` reads a `--since` or `--until` time that carries no zone in a default zone (America/Los_Angeles on this branch, the user's zone once the user-zone change (build-followups-enh-showrunner 43a14830) is merged here), so give both with an explicit UTC offset. Shutdown keeps one record per session in `~/.local/state/shutdown/<login>/sessions/`, moved to `history/` there once the session is confirmed restarted; there is no account-level record of a request, and the records of one request share a `request_id`.
+**Constraints from prior phases:** from "An account picked by room" on, no role ties a session to an account: a new Claude session launches on `accounts.py pick claude`, Codex seats move on a refusal ("Codex seats move on a refusal") and Claude sessions move on a refusal ("Claude sessions move on a refusal"). Every automatic transition is one line of `~/.local/state/accounts/moves.jsonl`, keyed by a stable `move_id`: `requested`, `confirmed`, `failed`, `waited`, `wait ended`, `no room`, `room again`, each with the reset it used. A Claude move is also a `SessionShutdown` record with `target`, `source_label` and `why` in `~/.local/state/shutdown/<login>/sessions/`, moved to `history/` there once the session is confirmed restarted; a record still in `sessions/` or ending `restart failed` is not a completed move. Role history `~/.local/state/accounts/roles.jsonl` still records each seats-home write (`role: seats`). `agent_notes.py` keeps readings (`~/.local/state/agent-notes/readings.jsonl`) for eight days, so the readout runs at T0 + 7 d, T0 being the live proof. `accounts.py burn` reads a `--since` or `--until` time with no zone in the user's zone, so give both with an explicit UTC offset.
 
-**Spec:** run `accounts.py burn --since <T0> --until <T0 + 7 d>`, and read the role history, `~/.local/state/agent-notes/readings.jsonl`, and the shutdown records or recorded outcomes that tell completed moves from refused or rolled-back ones. Report role-write times as assignment times and confirm each move separately; mark an unconfirmed outcome rather than counting it as a swap. Name the intervals where old units were still finishing after a new role was written. Compare the default account's observed remaining values with the `threshold_percent` recorded at T0; state gaps and observed-day coverage, and flag any change of the default login instead of inferring its past role from today's login. Report to the showrunner:
+**Spec:** for the window T0 to T0 + 7 d, read `moves.jsonl`, the shutdown records and history, `roles.jsonl` and `readings.jsonl`, and run `accounts.py burn --since <T0> --until <T0 + 7 d>`. Report to the showrunner:
 
-- points per account per day
-- the role split
-- each confirmed Claude unit-account swap's time
-- whether the default account went below `threshold_percent`
+- moves per tool (Claude session, Codex seats) and per cause (weekly refusal, 5-hour refusal, by hand with `move`), each confirmed against its record; an unconfirmed or failed restart is marked, never counted as a move;
+- the waits for a 5-hour reset under 20 minutes away, and how long each lasted (`waited` to `wait ended`; an unclosed one is an unknown interval, not a duration);
+- every interval with no account having room (`no room` to `room again`), with the earliest reset each named, and unknown intervals marked;
+- points per account per day, and observed-day coverage with gaps.
 
-Recommend whether any change is needed. The nightly review already moved to the unit role on 2026-10-11, so include what it spent there.
+Recommend whether more accounts are needed.
 
 **Files:**
 
 - `docs/plans/build-followups-two-accounts.md` — the readout.
 
-**Acceptance gate:** the readout cites its window, account identities, observed days, assignment and move evidence, and the observed quota minimum. It tells rolled-back or unconfirmed attempts from completed swaps, reports coverage gaps, and is in this plan and sent to the showrunner. The evidence includes a history that holds both unit and seats assignments.
+**Seats:** nothing splits: the unit director writes the readout from the records; no seat opens.
+
+**Acceptance gate:** the readout cites its window, account identities, observed days, and the move, wait and no-room evidence. It tells unconfirmed or failed moves from completed ones, reports coverage gaps, and is in this plan and sent to the showrunner.
 
 ### Phase 10 — A home per Codex account  · status: done
 
@@ -606,3 +603,134 @@ After a seat launch's own turn has ended, a move to the selected seats home that
 **Gotchas:** Held messages stay with the thread: a `start` that replaces the thread drops them, a `follow` keeps them. `basedpyright` exits 3 in every checkout because its config names a `.venv` no checkout has; the pass is its last line. Both files are model-study-unit's as well. A real launch in flight across a real role change is not proven by tests; it is the live swap check with the user.
 
 **Ruled out:** failing the launch whenever a move cannot be confirmed (the turn's own result is already known).
+
+### Phase 14 — An account picked by room, not by role  · status: todo
+
+#### Work Order
+
+**Goal:** every new Claude session (unit director, showrunner, nightly review) launches on the account with room that resets soonest, and no role ties a kind of session to an account. The user, 2026-10-13: "we should not be hard coding roles to accounts - if we run out of capacity in an account we have to switch to an account with capacity. showrunners or units (claude accounts) and workers (codex accounts) can all switch when they run out."
+
+**Spec:**
+
+1. `accounts.pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[str] = frozenset(), keep: KeepAccount | NoKeep) -> PickedAccount | NoAccountWithRoom` in `scripts/accounts/accounts.py`, and the verb `accounts.py pick claude|codex [--exclude '<label>']... [--keep '<label>'] [--explain]`.
+   - **Candidates.** Claude: `default` (`~/.claude`) and every named account that passes `check` (`checked_named_accounts()`). Codex: every home in `agent_accounts.codex_homes(agent_accounts.seats_home())` that passes `check`. One candidate per login: when two dirs hold one login, `default` wins, then the lowest number. A label in `exclude` is not a candidate.
+   - **Reading.** Each candidate's numbers come from the usage store (`usage_store.load()`, keyed by `usage_store.key("Claude" | "Codex", login)`: the key adds the `codex:` namespace only for `"Codex"`). One adapter in `accounts.py`, `stored_reading(tool, login, now) -> FreshReading | StaleReading | NoReading`, converts a `StoredUsage` into the picker's own types, so no bare optional from `Report`/`Quota`/`StoredUsage` enters `pick`'s API; a window with no reset is `NoResetKnown()`. A `StaleReading` (weekly reading more than 10 minutes old) or `NoReading` skips the candidate with the reason `no reading in the last 10 minutes`.
+   - **Refusals win over readings.** `scripts/accounts/refusals.py` (new) keeps the accounts that refused work, keyed by tool and login: `AccountRefusal{tool, login, window: KnownWindow | UnknownWindow, reset: KnownReset | NoResetKnown, at}` in `~/.local/state/accounts/refusals.json`, written under a lock. A refusal is resolved when its known reset has passed, or a reading taken after the refusal shows that window's reset moved later; an unknown window or reset resolves only on a reading taken after the refusal that shows both windows above 0. An unresolved refusal is not a candidate (`refused at <time>`), whatever the saved percentages say, because the usage store keeps the last good reading after a failed read. "Codex seats move on a refusal" and "Claude sessions move on a refusal" write it; this phase writes the store, its reader and `pick`'s use of it.
+   - **Room.** A Claude account has room when its weekly window and its 5-hour window both have more than 0% left; an account with no 5-hour window counts the weekly window only. A Codex account has room by `agent_accounts.codex_can_work`'s rule applied to the stored reading, credits included; share one function for that rule rather than copying it. There is no minimum: 1% left is room.
+   - **Order.** `keep` (the account a session is already on) wins while it has room. Otherwise the soonest weekly reset wins, ties go to the most weekly left, then label order. So claude 3 at 3% resetting Thursday is used before claude 1 at 90% resetting Sunday.
+   - `PickedAccount` holds the label (`default`, `claude N` or `codex N`), its dir or home, its weekly left and its weekly reset. `NoAccountWithRoom` holds the earliest reset among the candidates (`EarliestReset(at)` or `NoResetKnown()`), and one reason per candidate.
+   - The verb prints the label and exits 0, or prints `no <tool> account has room; the earliest reset is <time in the user's zone>` and exits 1. `--explain` adds one line per candidate: label, weekly left, weekly reset, 5-hour left, and `picked`, `has room` or its reason.
+2. **The unit role is gone.** `role_account("unit")`, `role unit`, `env unit` and `exec unit` resolve through `pick("claude", now)` and store nothing; `role unit` prints the picked label. A `unit` key left in `config/accounts.json` is ignored. `set-role unit` and `swap unit` refuse with `the unit role is gone: new sessions pick the account with room (accounts.py pick claude); move one session with accounts.py move`. `exec unit` stays because `/etc/nixos/modules/linux/shell.nix:55` aliases `claude-unit` to it. The `seats` role, `set-role seats` and `swap seats` are unchanged: the seats role names the home the seats run on now.
+3. **Launches pick.** A new unit (`add_unit.py`, the `role_account("unit")` call in its launch-account choice) launches on the picked account and records it in `@claude_config_dir` as now. `add_showrunner.py` launches a new showrunner through `accounts.account_prefix(<picked>)` instead of no prefix, and records `@claude_config_dir` and `@claude_model` on its tmux session as `add_unit.py` does. `nightly_review.py`'s `tonight()` uses the picked account (its `role_account("unit")` call), and its `MIN_REMAINING = 10` gate is replaced by `pick`'s room decision, so a picked account at 1% launches. A pick that finds no account with room refuses the launch with the `no claude account has room` line.
+   - **Resumes keep their account.** `add_showrunner.py`'s resume takes `--account '<label | default>'`; without it, it uses its tmux session's `@claude_config_dir`, else refuses in one line naming `--account`, never picking. `promote_showrunner.py` reads the unit's `@claude_config_dir` before it deletes the unit's tmux session and passes it as `--account`. A unit resume is unchanged (Phase 8).
+4. **Notes and alerts follow sessions, not the role.** `ClaudeAccountSelection` (in `agent_accounts.py`) loses `unit_account` and `roles_for_login`; it becomes `ClaudeAccountsInUse`: the default account, the checked named accounts, and the logins live sessions on this machine run on (`sessions.live_sessions()` and `account.account_of(pid)`), built once per run by `accounts.claude_account_selection()`. A Claude note is `active` when it is the default login or a live session runs on its login. `whoami.py`'s account filter and `quota_alert.py`'s choice of which account's notices to send read that set, so sessions on several logins all stay visible and all get their account's alerts. `quota_alert.unit_swap_line` becomes a move line: `<label> is low; sessions on it move to <picked label> when refused` (or `…; no other account has room until <earliest reset>`), with no swap command.
+5. The status table drops the `unit` mark and marks the account `pick claude` would choose now with `next`. `docs/accounts.md` and `commands/showrunner/accounts.md` describe `pick`, drop `swap unit` and `set-role unit`, and say that `claude-unit` starts a session on the picked account.
+
+**Files:**
+
+- `scripts/accounts/accounts.py` — `pick`, its types and verb; `role_account`, `set_role`, `swap`, the status table and `claude_account_selection`; `scripts/accounts/test_accounts.py`.
+- `scripts/accounts/refusals.py`, `scripts/accounts/test_refusals.py` — new: the refusal store and its resolution rule.
+- `scripts/production/add_unit.py`, `scripts/production/add_showrunner.py`, `scripts/production/promote_showrunner.py` — launch on the picked account, showrunner resume keeps its account; `scripts/production/test_add_unit.py`, `scripts/production/test_add_showrunner.py`, `scripts/production/test_promote_showrunner.py`.
+- `scripts/nightly_review/nightly_review.py` — the picked account, no 10% gate; `scripts/nightly_review/test_nightly_review.py`.
+- `scripts/whoami/agent_accounts.py` — `ClaudeAccountsInUse`; `scripts/whoami/whoami.py` — the account filter; `scripts/whoami/quota_alert.py` — `unit_swap_line`, alert recipients; `scripts/whoami/agent_notes.py` — the active set; `scripts/whoami/test_agent_notes.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_codex_alert_accounts.py`.
+- `docs/accounts.md`, `commands/showrunner/accounts.md`, `docs/quota_alerts.md` — `pick`, no unit role, `claude-unit` on the picked account.
+
+**Seats:** 1 writer + 1 tester.
+- `impl` — every production file and doc above; hub: `scripts/accounts/accounts.py` (pick and its types).
+- `test` — the test files above, from the Spec: candidates and refusals per reason, the order rule (soonest reset, ties, keep), no minimum, an unresolved refusal beating a positive saved reading and each resolution path, `NoAccountWithRoom` with and without a reset, the refusing `set-role unit`/`swap unit`, each launch site on the picked account, a nightly launch below 10%, a showrunner resume and a promotion keeping their account, sessions on several logins all visible and alerted. Phase 8 regressions stay: the unit tmux options and the one-line `--account` refusal.
+
+**Constraints from prior phases:** Phase 8 shipped `accounts.move(session, target, *, why)` and `accounts.move_showrunners(source, target, *, dry_run, why)`; both resume through `shutdown.py down '<from>' --here --only <ids> --restart --to '<to>'` with a moved-not-stopped note, and a unit resume keeps the account it ran on (a shutdown record's target, else its recorded `session.config_dir`, else the unit's tmux options `@claude_config_dir`/`@claude_model`, else a refusal naming `--account`). `swap unit` is today `set-role unit` plus `down '<old>' --restart --to '<new>'`; this phase retires it. `scripts/notify/review.py` belongs to message-clarity-unit, whose Phase 4 rewrites it: leave the file alone; its `role_account("unit")` call keeps working because the role word now picks. `config/agents.conf` is never committed from this unit. The usage store is `~/.local/state/agent-notes/usage.json` (`usage_store.StoredUsage`: `five_hour`, `weekly` as `StoredWindow{left, resets, at}`, Codex `credits`), written every 2 minutes on natedev by the `agent-sessions-snapshot` timer running `agent_notes.py`. The Mac has no such timer (it lives in the nixos repo), so pick there finds no fresh reading: a known gap, out of scope. New code never names a time zone: `user_zone()` from `scripts.lib.user_zone`.
+
+**Acceptance gate:** the accounts, production, nightly_review and whoami suites and the scoped lint pass. `/whoami` and the status table show every account a live session runs on. `accounts.py pick claude --explain` on natedev lists every account with its numbers and picks the soonest weekly reset with room; `role unit` prints the same label; `set-role unit` refuses with its line.
+
+### Phase 15 — Codex seats move on a refusal  · status: todo
+
+#### Work Order
+
+**Goal:** when a seat is refused by its Codex account, the seats move to the picked Codex account by themselves; the Claude fallback runs only when no Codex account has room.
+
+**Spec:**
+
+1. **Trigger: a refusal only.** A seat's refusal already reaches `quota_alert.blocked(notes, refusing_account, …)` (`codex_mesh._quota_refused` → `_report_quota_refusal` → `agent_notes.py blocked`). A low reading never moves seats.
+2. **Which window.** The refusal handoff carries `KnownWindow(weekly | five_hour)` or `UnknownWindow()`: known from the refusal text when it names one, else from a reading taken after the refusal in which exactly one window is at 0, else unknown. The reset is that window's stored reset (`KnownReset` or `NoResetKnown`). Record the refusal in `refusals.py`. The seats wait only for a known 5-hour window whose known reset is in the future and less than 20 minutes away: no move, one alert `seats wait for <label>'s 5-hour reset at <time>`, a `waited` entry, and a `wait ended` entry when the reset passes. One wait per reset. An unknown window or reset moves.
+3. **Move.** Otherwise `accounts.pick("codex", now, exclude={<refusing label>})`. A picked account: write the seats role to it through the path `swap seats` uses, so seats move at their next idle turn (`codex_mesh._move_idle_seat`, `retire_seats_servers`) as a swap moves them; one alert `seats moved from <old> to <new>: <old> refused (<window> limit until <reset>)`. No account with room: the Claude fallback (`switch_to_claude`) runs as today, its alert names the earliest reset, and a `room again` entry follows when an account has room. `switch_back` also requires the account's refusal to be resolved, not only allowance.
+   - **The refused turn continues.** `codex_mesh.py` marks a seat whose turn a quota refusal ended as owing a continuation. After it moves to the new home, or after a wait ends, it starts one turn `Continue where you stopped.` even with no queued messages, then any held messages in order.
+4. **The moves log.** `~/.local/state/accounts/moves.jsonl`, one entry per transition, a TypedDict per kind sharing `at`, `tool` (`claude` | `codex`), `subject` (`seats` or the session id and name) and a stable `move_id` (the shutdown `request_id` for Claude, a new id per seats transition for Codex): `requested{from, to, why, window, reset}`, `confirmed{home or config_dir}`, `failed{reason}`, `waited{window, reset}`, `wait ended`, `no room{earliest_reset}`, `room again{label}`. A role write is `requested`, never proof: Codex `confirmed` is written by `codex_mesh.py` when a seat resumes on the new home (one per seat). Writers append under a lock; readers skip a malformed line. The writer and reader live in `scripts/accounts/moves.py`, which "Claude sessions move on a refusal" reuses.
+5. `codex_swap_line` stops suggesting a swap: it says `seats move to <picked> when refused`, or that no other Codex account has room until the earliest reset.
+
+**Files:**
+
+- `scripts/whoami/quota_alert.py` — `blocked`, `codex_swap_line`, `switch_back`; `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_codex_alert_accounts.py`.
+- `scripts/agents/codex_mesh.py` — the owed continuation, the window in the refusal handoff, `confirmed` entries; `scripts/agents/test_codex_mesh.py`.
+- `scripts/accounts/moves.py`, `scripts/accounts/test_moves.py` — new: `MoveEntry`, `append_move`, `read_moves`, and their tests.
+- `docs/quota_alerts.md`, `docs/accounts.md` — seats move on a refusal.
+
+**Seats:** 1 writer + 1 tester.
+- `impl` — `quota_alert.py`, `codex_mesh.py`, `moves.py`, the docs; hub: `scripts/accounts/moves.py`.
+- `test` — the tests above, from the Spec: weekly refusal moves; a stale 1% weekly reading with an unknown window moves; 5-hour refusal with a reset 19 minutes away waits once, then `wait ended`; exactly 20 minutes and a past reset move; no room runs the Claude fallback and `switch_back` waits for the refusal to resolve; a low reading moves nothing; a refused seat with no queued messages continues on the new home; each log entry kind.
+
+**Constraints from prior phases:** "An account picked by room" ships `accounts.pick` (soonest weekly reset with room wins, ties to most left, no minimum, credits count as room for Codex). Phase 11 made `seats` the one Codex role: `swap seats '<label>'` writes it, and every seat moves to the selected home at its next idle turn; Phase 13 holds a launch's messages when a move cannot be confirmed. Phase 12 alerts per Codex account. `quota_alert.blocked` today records the refusal and may switch to the Claude fallback (`switch_to_claude`, back with `switch_back` when the Codex account has room). `config/agents.conf` stays uncommitted: the fallback flips through the live mechanism only. `codex_mesh.py` is also model-study-unit's: name it in the checkpoint notice's also-touches line. New code calls `user_zone()` for times. "An account picked by room" ships `scripts/accounts/refusals.py` (`AccountRefusal`, `KnownWindow`, `UnknownWindow`, `KnownReset`, `NoResetKnown`).
+
+**Acceptance gate:** the whoami, accounts and agents suites and the scoped lint pass. A forced refusal in a test moves the seats role to the picked account and writes one `moved` entry; the 20-minute wait and the no-room fallback each have a test.
+
+### Phase 16 — Claude sessions move on a refusal  · status: todo
+
+#### Work Order
+
+**Goal:** a Claude session that its account refuses (showrunner, unit director or top-level, on any host) is found and its move started within one 2-minute tick; it stops once safe (idle, seats idle, no merge, nothing ahead), resumes on the picked account and continues its work.
+
+**Spec:**
+
+1. **Detection, every host.** A session is refused when the last entry of its transcript (`~/.claude/projects/<project>/<session id>.jsonl`, located as `inventory._model` locates it) is an `assistant` entry with `isApiErrorMessage: true` and `error: "rate_limit"`. Its text names the window: `You've hit your session limit · resets 11:30pm (America/New_York)` is the 5-hour window, `weekly limit` the weekly one; other text uses the account's reading (weekly at 0 means weekly). The reset time comes from the account's stored reading, never from the text.
+2. **The watcher.** `scripts/accounts/refusal_watch.py`, run at the end of `agent_notes.py`'s argument-free run (the `agent-sessions-snapshot` timer, every 2 minutes on natedev); a failure prints one stderr line and never fails the notes update. Each run reads the live top-level sessions on this machine (`shutdown/inventory.py`; seats excluded, and a session with an open shutdown record skipped) and finds the refused ones.
+3. **Decide.** Record the refusal in `refusals.py`. Window and reset are typed as in "Codex seats move on a refusal". Only a known 5-hour window whose known reset is in the future and less than 20 minutes away waits: one `waited` entry per session per reset, and `wait ended` when it passes. Otherwise `accounts.pick("claude", now, exclude={<its account>})`. Sessions refused on the same account move together: one `shutdown.py down '<from>' --here --only <ids> --restart --to '<to>' --why '<from> refused: <window> limit until <reset>'`, through a `move_sessions(ids, target, *, why)` that `move_showrunners` also uses. Each gets a `requested` entry keyed by its shutdown `request_id`; `restart.py` writes `confirmed` when the record reaches `restarted`, and `failed` at `restart failed` or `manual restart`. No account with room: one alert naming the earliest reset, a `no room` entry, `room again` when an account has room, and no second alert for that account until a reading changes.
+   - **The real model.** `inventory._model` skips an assistant entry whose model is `<synthetic>`, so a refused session resumes on the model of its last real reply.
+4. **A refused session stops without answering.** A refused session cannot answer the settle message, so shutdown's usage-limit hold (`settle._usage_limit_shown`, today a screen read of tmux and unit panes only) also enters `held by usage limit` when the transcript shows the refusal of item 1, or an assumed refusal of item 6, for every host. The hold's stop rule is unchanged: owner idle, every seat idle, no merge in progress, nothing ahead of upstream. A move blocked there stays visible: `/shutdown status` shows each moved record's target and why on its progress line.
+5. The moved session resumes with Phase 8's moved-not-stopped note (from, to, why): a unit director continues its `/unit:direct` run, a showrunner `/showrunner:produce <doc> resume`.
+6. `refusal_watch.py --dry-run` prints each refused session and what it would do, and changes nothing. `refusal_watch.py --assume-refused '<session id | name>' weekly|five-hour` writes `~/.local/state/accounts/assumed_refusals/<session id>.json` and runs once; the watcher and the shutdown hold both read that file as a refusal of that one session only, and it is deleted when the session's record restarts or is cancelled. It is for the live proof.
+7. `/showrunner:accounts status` lists each live session's account, and the last 10 entries of `moves.jsonl` in the user's zone.
+
+**Files:**
+
+- `scripts/accounts/refusal_watch.py`, `scripts/accounts/test_refusal_watch.py` — new: the watcher and its tests.
+- `scripts/accounts/accounts.py` — `move_sessions`, the status lines; `scripts/accounts/test_accounts.py`.
+- `scripts/whoami/agent_notes.py` — calls the watcher; its test.
+- `scripts/shutdown/settle.py` — the transcript and assumed refusal in the usage-limit hold, target and why on the status line; `scripts/shutdown/test_settle.py`.
+- `scripts/shutdown/inventory.py` — `_model` skips `<synthetic>`; `scripts/shutdown/test_inventory.py`.
+- `scripts/shutdown/restart.py` — `confirmed` and `failed` entries; `scripts/shutdown/test_restart.py`.
+- `docs/accounts.md`, `docs/as-built/shutdown-and-restart.md`, `commands/showrunner/accounts.md` — sessions move on a refusal; the hold reads the transcript.
+
+**Seats:** 1 writer + 1 tester.
+- `impl` — every production file and doc above; hub: `scripts/accounts/accounts.py` (`move_sessions`).
+- `test` — the tests above, from the Spec: detection on a fixture transcript per window and per host, the 20-minute wait and its end, grouping by account into one `down`, no room with one alert and `room again`, the Ghostty hold entered from the transcript and from an assumed refusal, a move blocked by a busy seat staying visible with its target and why, a real reply followed by a refusal resuming on the real model, `confirmed`/`failed` entries, `--dry-run` changing nothing.
+
+**Constraints from prior phases:** Phase 8: `accounts.move()` and `move_showrunners()` resume through `down … --restart --to` with a `--why` stored on each `SessionShutdown` record (`target`, `source_label`, `why`) and a moved-not-stopped note; a Ghostty session's window closes at stop and reopens on its recorded desktop. "An account picked by room" ships `pick`; "Codex seats move on a refusal" ships `scripts/accounts/moves.py` (`MoveEntry`, `append_move`, `read_moves`). Shutdown's usage-limit hold matches `USAGE_LIMIT_PATTERNS` in `settle.py` on a tmux or unit pane's last 15 non-empty lines; Ghostty, zed and terminal sessions have no screen read. The timer script is `/etc/nixos/modules/linux/agent-sessions-snapshot.py` and runs `~/.claude/scripts/whoami/agent_notes.py` with no arguments, so no nixos change is needed. The Mac has no timer: a known gap, out of scope. New code calls `user_zone()` for times.
+
+Phase 8's moved-not-stopped note and per-host restart already work; keep their tests green. "Codex seats move on a refusal" ships the moves log's entry kinds and the typed refusal handoff.
+
+**Acceptance gate:** the accounts, shutdown and whoami suites and the scoped lint pass. `refusal_watch.py --dry-run` on natedev reports no refused session, or each one with its decision.
+
+### Phase 17 — Live proof of the moves  · status: todo · gated by G4
+
+#### Work Order
+
+**Goal:** show the user, on natedev, a Claude session and the Codex seats each moved by a refusal and working on the target.
+
+**Spec:**
+
+1. `accounts.py pick claude --explain` and `pick codex --explain` agree with `/showrunner:accounts status`.
+2. A scratch probe in tmux on a Claude account: `refusal_watch.py --assume-refused <probe> weekly` moves it to the picked account through the real stop path (the shutdown hold reads the assumed refusal). It resumes with the moved note, answers a question about its earlier turns, and `account.py --pid` shows the target. Run once more with `five-hour` against an account whose 5-hour reset is under 20 minutes away (or a reading forced in a temp copy of the store) and it waits.
+3. A scratch probe in a Ghostty window: the same move, with the window back on its desktop.
+4. Codex, with the user present: `agent_notes.py blocked <seats home> <login> '<seats label>'` (its form today: `HOME LOGIN LABEL` or `HOME REASON`) for the seats account moves the seats role to the picked Codex account, and a running seat finishes its turn and resumes on the new home.
+5. `moves.jsonl` holds one entry per decision above, and `/showrunner:accounts status` lists them.
+6. The first real refusal after this phase is reported to the showrunner with its entry.
+
+**Files:**
+
+- `docs/plans/build-followups-two-accounts.md` — the results.
+
+**Seats:** nothing splits: the unit director runs the proof with the user; a defect found gets a repair seat under the usual rules.
+
+**Constraints from prior phases:** the three phases before this ship `pick`, the Codex move on a refusal, and the Claude watcher with `--dry-run` and `--assume-refused`. No `set-role`, `swap`, `move` or `shutdown down` runs against the real home without the user present. Never print a credentials file.
+
+**Acceptance gate:** each item above observed live and written into this plan; `~/.claude/.credentials.json` unchanged; no Claude session other than the probes moved, except by a real refusal; the seats moved once in item 4, with the user present, and every running seat continued.

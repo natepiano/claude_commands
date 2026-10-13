@@ -50,7 +50,7 @@ if name == "tmux":
 
     def named(target):
         for index, session in enumerate(live, 1):
-            if target in (f"${index}", f"%{index}", f"={session}"):
+            if target in (session, f"${index}", f"%{index}", f"={session}"):
                 return session
         return None
 
@@ -69,6 +69,20 @@ if name == "tmux":
             print(f"{key}={value}")
     if args[:1] == ["capture-pane"]:
         print("/remote-control is active" if (state / "ready").exists() else "Waiting for remote control")
+    if args[:1] == ["show-options"]:
+        options = state / f"options-{named(target)}.json"
+        value = (json.loads(options.read_text()) if options.exists() else {}).get(args[-1], "")
+        print(value)
+    if args[:1] == ["set-option"]:
+        options = state / f"options-{named(target)}.json"
+        values = json.loads(options.read_text()) if options.exists() else {}
+        values[args[-2]] = args[-1]
+        options.write_text(json.dumps(values))
+    if args[:1] == ["kill-session"]:
+        session = named(target)
+        for prefix in ("live-", "env-", "options-"):
+            suffix = "" if prefix == "live-" else ".json"
+            (state / f"{prefix}{session}{suffix}").unlink(missing_ok=True)
     if args[:1] == ["new-session"]:
         session = args[args.index("-s") + 1]
         (state / f"live-{session}").touch()
@@ -200,6 +214,17 @@ class AddUnitTests(ShutdownTestCase):
                 f"---\nlogin: {login}\nstate: active\n---\n", encoding="utf-8"
             )
         return directory
+
+    def persist_unit_account(self, directory: Path, *, session: str = "recorded-tmux", model: str = "opus") -> None:
+        _ = (self.state / f"live-{session}").touch()
+        _ = (self.state / f"env-{session}.json").write_text(json.dumps({
+            unit_lookup.PRODUCTION_MARK: "build-followups", unit_lookup.UNIT_MARK: "alpha-unit"}), encoding="utf-8")
+        _ = (self.state / f"options-{session}.json").write_text(json.dumps({
+            "@claude_config_dir": str(directory), "@claude_model": model}), encoding="utf-8")
+        (Path(self.env["HOME"]) / ".claude/sessions").mkdir(exist_ok=True)
+
+    def recorded_unit_options(self, session: str) -> dict[str, str]:
+        return cast(dict[str, str], json.loads((self.state / f"options-{session}.json").read_text(encoding="utf-8")))
 
     def named_prefix(self, directory: Path) -> str:
         """The assignments a unit on a named account's directory starts with."""
@@ -395,7 +420,9 @@ class AddUnitTests(ShutdownTestCase):
         self.assertFalse(self.config.exists())
         self.assertFalse(self.log.exists())
         self.assertFalse((self.root / "project-alpha").exists())
-        self.assertEqual(self.events("tmux"), [])
+        for event in self.events("tmux"):
+            arguments = cast(list[str], event["args"])
+            self.assertIn(arguments[0], {"list-panes", "show-environment", "show-options", "has-session"})
         self.assertEqual(self.events("systemd-run"), [])
 
     def marks(self, session: str) -> dict[str, str]:
@@ -410,7 +437,7 @@ class AddUnitTests(ShutdownTestCase):
         _ = note.write_text("Resume this unit.", encoding="utf-8")
         return self.cli(name, "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(cwd),
                         "--restart-note", str(note), "--session-name", "recorded-name",
-                        "--tmux-session", "recorded-tmux")
+                        "--tmux-session", "recorded-tmux", "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
 
     def repository_state(self) -> tuple[str, str, str]:
         """The production doc, every branch with its commit, and every worktree with its branch."""
@@ -439,7 +466,8 @@ class AddUnitTests(ShutdownTestCase):
             plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
             port=add_unit.OmittedCell(),
             owns=add_unit.OmittedCell(),
-            session=add_unit.ResumedSession("session-123", self.root / "prior-session"),
+            session=(add_unit.ResumedSession("session-123", self.root / "prior-session")
+                     if isinstance(launch_kind, add_unit.UnitRestoreLaunch) else add_unit.NewSession()),
             launch_kind=launch_kind,
             timeout=1.0,
         )
@@ -456,6 +484,8 @@ class AddUnitTests(ShutdownTestCase):
             _ = launch_kind.note.write_text("Resume this unit.", encoding="utf-8")
 
         def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            if "show-options" in command:
+                return subprocess.CompletedProcess(command, 0, "", "")
             if "launch-blocked" in command:
                 live = (
                     Path(self.env["SHUTDOWN_STATE_DIR"])
@@ -481,8 +511,11 @@ class AddUnitTests(ShutdownTestCase):
             _tmux: str,
             _director: add_unit.DirectorAgent,
             prompt: str,
-            _selected: accounts.AccountSelection,
+            _selected: add_unit.UnitLaunchAccount,
+            *, target: str = "", model: str = "",
         ) -> None:
+            self.assertEqual(target, "")
+            self.assertEqual(model, "")
             if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
                 recorded = self.recorded_prompts(launch_kind.session_id)
                 self.assertEqual(recorded[-1], prompt)
@@ -516,7 +549,10 @@ class AddUnitTests(ShutdownTestCase):
             patch.dict(os.environ, self.env),
             redirect_stderr(error),
         ):
-            result = add_unit.main(["--production", "unused", "alpha", "--plan", "unused"])
+            arguments = ["--production", "unused", "alpha", "--plan", "unused"]
+            if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
+                arguments.extend(("--config-dir", str(Path(self.env["HOME"]) / ".claude")))
+            result = add_unit.main(arguments)
         if result == 0:
             if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
                 wait.assert_not_called()
@@ -668,7 +704,7 @@ class AddUnitTests(ShutdownTestCase):
             "--resume", "session-123", "--cwd", str(prior),
             "--restart-note", str(note),
             "--session-name", "recorded-name", "--tmux-session", "recorded-tmux",
-        )
+         "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
 
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(
@@ -692,7 +728,8 @@ class AddUnitTests(ShutdownTestCase):
         recorded = self.commit_row_off_the_naming_pattern()
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
-        promote = ("--resume", "session-123", "--cwd", str(recorded))
+        promote = ("--resume", "session-123", "--cwd", str(recorded),
+                   "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
         for launch, flags in (("new work", ()), ("promote", promote)):
             with self.subTest(launch=launch):
                 result = self.cli("trunk", "--plan", "docs/plans/given.md", *flags)
@@ -752,7 +789,7 @@ class AddUnitTests(ShutdownTestCase):
             "recorded-name",
             "--tmux-session",
             "recorded-tmux",
-        )
+         "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
 
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertIn("/shutdown restart first", result.stderr)
@@ -782,7 +819,7 @@ class AddUnitTests(ShutdownTestCase):
             "recorded-name",
             "--tmux-session",
             "recorded-tmux",
-        )
+         "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
 
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertIn("/shutdown restart first", result.stderr)
@@ -908,8 +945,11 @@ class AddUnitTests(ShutdownTestCase):
             _tmux: str,
             _director: add_unit.DirectorAgent,
             _prompt: str,
-            _selected: accounts.AccountSelection,
+            _selected: add_unit.UnitLaunchAccount,
+            *, target: str = "", model: str = "",
         ) -> None:
+            self.assertEqual(target, "")
+            self.assertEqual(model, "")
             self.assertIsNotNone(creator)
             if creator is None:
                 self.fail("shutdown creator did not start")
@@ -951,7 +991,8 @@ class AddUnitTests(ShutdownTestCase):
             redirect_stderr(error),
         ):
             result = add_unit.main(
-                ["--production", "unused", "alpha", "--plan", "unused"]
+                ["--production", "unused", "alpha", "--plan", "unused",
+                 "--config-dir", str(Path(self.env["HOME"]) / ".claude")]
             )
             finish_shutdown()
 
@@ -1140,7 +1181,7 @@ class AddUnitTests(ShutdownTestCase):
     def test_promoted_review_unit_uses_review_direct_with_its_identity(self) -> None:
         _ = self.doc.write_text(self.doc.read_text().replace("## Units", "- **Review pool:** code\n\n## Units"))
         _ = self.successful("review-unit", "--plan", "docs/plans/given.md",
-                            "--resume", "session-123", "--cwd", str(self.checkout))
+                            "--resume", "session-123", "--cwd", str(self.checkout), "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
         command = self.launch_command()
         self.assertIn("You are now review-unit in production build-followups", command)
         self.assertIn(f"Run /review:direct {self.doc}.", command)
@@ -1266,8 +1307,39 @@ class AddUnitTests(ShutdownTestCase):
                 accounts.NamedAccount("claude 1", directory.parent / ".claude1"),
             )
 
-    def test_named_unit_resume_uses_the_unit_account(self) -> None:
+    def test_new_unit_launch_records_default_account_for_a_later_resume(self) -> None:
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(self.recorded_unit_options("alpha")["@claude_config_dir"], str(Path(self.env["HOME"]) / ".claude"))
+
+    def test_new_unit_launch_records_named_account_for_a_later_resume(self) -> None:
         directory = self.prepare_unit_account("claude 3")
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(self.recorded_unit_options("alpha")["@claude_config_dir"], str(directory))
+
+    def test_explicit_unit_account_move_records_target_account_for_a_later_resume(self) -> None:
+        directory = self.prepare_unit_account("claude 3")
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md",
+            "--resume", "session-123", "--cwd", str(prior), "--account", "claude 3")
+        self.assertEqual(self.recorded_unit_options("alpha")["@claude_config_dir"], str(directory))
+
+    def test_manual_unit_resume_keeps_its_recorded_model_despite_changed_director_configuration(self) -> None:
+        self.write_agent_config(director="sonnet:high")
+        directory = self.prepare_unit_account("claude 3")
+        self.persist_unit_account(directory, session="alpha", model="opus")
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md",
+            "--resume", "session-123", "--cwd", str(prior))
+        arguments = shlex.split(self.launch_command().removesuffix("; exec zsh"))
+        self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
+        self.assertEqual(self.recorded_unit_options("alpha")["@claude_model"], "opus")
+
+    def test_unit_resume_without_account_keeps_default_despite_named_unit_role(self) -> None:
+        directory = self.prepare_unit_account("claude 3")
+        self.env["CLAUDE_CONFIG_DIR"] = str(directory)
+        self.persist_unit_account(Path(self.env["HOME"]) / ".claude", session="alpha")
         prior = self.root / "prior-session"
         prior.mkdir()
 
@@ -1276,15 +1348,16 @@ class AddUnitTests(ShutdownTestCase):
             "--resume", "session-123", "--cwd", str(prior),
         )
 
-        self.assertTrue(self.launch_command().startswith(
-            self.named_prefix(directory) + "ENABLE_TOOL_SEARCH=true command claude "
-        ))
+        self.assertTrue(self.launch_command().startswith("ENABLE_TOOL_SEARCH=true command claude "))
+        self.assertNotIn(str(directory), self.launch_command())
         self.assertIn("--resume session-123", self.launch_command())
 
-    def test_unit_restore_uses_the_current_unit_account(self) -> None:
+    def test_unit_resume_without_account_keeps_its_own_named_account(self) -> None:
         self.commit_prepared_row(self.unit_row())
-        self.env["CLAUDE_CONFIG_DIR"] = str(self.select_unit_account("claude 1"))
-        directory = self.prepare_unit_account("claude 3")
+        directory = self.prepare_unit_account("claude 1")
+        other_directory = self.prepare_unit_account("claude 3")
+        self.env["CLAUDE_CONFIG_DIR"] = str(other_directory)
+        self.persist_unit_account(directory)
         prior = self.root / "prior-session"
         prior.mkdir()
         note = self.root / "restart-note.txt"
@@ -1301,7 +1374,75 @@ class AddUnitTests(ShutdownTestCase):
             self.named_prefix(directory) + "ENABLE_TOOL_SEARCH=true command claude "
         ))
         self.assertIn("--resume session-123", self.launch_command())
-        self.assertNotIn(self.env["CLAUDE_CONFIG_DIR"], self.launch_command())
+        self.assertNotIn(str(other_directory), self.launch_command())
+
+    def test_unit_resume_without_recorded_account_refuses_instead_of_using_callers_account(self) -> None:
+        self.env["CLAUDE_CONFIG_DIR"] = str(self.prepare_unit_account("claude 3"))
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        before = self.repository_state()
+        result = self.cli("alpha", "--plan", "docs/plans/given.md",
+            "--resume", "unrecorded-session", "--cwd", str(prior))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn("--account", result.stderr)
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.events("systemd-run"), [])
+
+    def test_unit_resume_accepts_its_recorded_directory_outside_the_account_farm(self) -> None:
+        directory = self.root / "external account with spaces"
+        directory.mkdir()
+        _ = (directory / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "external@example.invalid"}}), encoding="utf-8")
+        _ = self.prepare_unit_account("claude 3")
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md",
+            "--resume", "session-123", "--cwd", str(prior), "--config-dir", str(directory))
+        self.assertTrue(self.launch_command().startswith(self.named_prefix(directory)))
+        self.assertIn("--resume session-123", self.launch_command())
+
+    def test_unit_resume_refuses_a_missing_recorded_directory_and_names_it(self) -> None:
+        directory = self.root / "gone-account"
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        before = self.repository_state()
+        result = self.cli("alpha", "--plan", "docs/plans/given.md",
+            "--resume", "session-123", "--cwd", str(prior), "--config-dir", str(directory))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn(str(directory), result.stderr)
+        self.assertIn("is missing", result.stderr)
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.events("systemd-run"), [])
+
+    def test_resumed_unit_uses_its_recorded_model_despite_a_different_director_configuration(self) -> None:
+        self.write_agent_config(director="sonnet:high")
+        directory = self.prepare_unit_account("claude 3")
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md",
+            "--resume", "session-123", "--cwd", str(prior), "--account", "claude 3", "--model", "opus")
+        arguments = shlex.split(self.launch_command().removesuffix("; exec zsh"))
+        self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
+        self.assertNotIn(str(directory), self.launch_command())
+
+    def test_unit_resume_explicit_account_overrides_its_old_account_and_role(self) -> None:
+        old_directory = self.prepare_unit_account("claude 1")
+        self.env["CLAUDE_CONFIG_DIR"] = str(old_directory)
+        target = self.prepare_unit_account("claude 3")
+        _ = self.select_unit_account("claude 1")
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md",
+            "--resume", "session-123", "--cwd", str(prior), "--account", "claude 3")
+        command = self.launch_command()
+        arguments = shlex.split(command.removesuffix("; exec zsh"))
+        script = next(argument for argument in arguments if argument.endswith("/accounts.py"))
+        self.assertEqual(arguments[arguments.index(script) + 1:arguments.index(script) + 3], ["exec", "claude 3"])
+        self.assertNotIn(str(target), command)
+        self.assertNotIn(str(old_directory), command)
+        self.assertIn("--resume session-123", command)
 
     def test_unready_unit_account_is_refused_before_launch_permission(self) -> None:
         directory = self.select_unit_account("claude 3")
@@ -1474,7 +1615,7 @@ class AddUnitTests(ShutdownTestCase):
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
         result = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
-                          "--cwd", str(self.root / "prior-session"), "--check")
+                          "--cwd", str(self.root / "prior-session"), "--check", "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
@@ -1484,7 +1625,7 @@ class AddUnitTests(ShutdownTestCase):
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
         result = self.cli("new director", "--plan", "docs/plans/given.md", "--resume", "session-123",
-                          "--cwd", str(self.root / "prior-session"), "--check")
+                          "--cwd", str(self.root / "prior-session"), "--check", "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(len(result.stderr.strip().splitlines()), 1)
         self.assertIn("name must contain only letters", result.stderr)
@@ -1623,7 +1764,7 @@ class AddUnitTests(ShutdownTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
-                            "--cwd", str(prior))
+                            "--cwd", str(prior), "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
         tmux = next(record for record in self.events("tmux")
                     if cast(list[str], record["args"])[:1] == ["new-session"])
         args = cast(list[str], tmux["args"])
@@ -1742,7 +1883,7 @@ class AddUnitTests(ShutdownTestCase):
             "--restart-note", str(note),
             "--session-name", recorded_session,
             "--tmux-session", recorded_tmux,
-        )
+         "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
 
         tmux = self.new_sessions()[0]
         self.assertEqual(tmux[tmux.index("-s") + 1], recorded_tmux)
@@ -1795,7 +1936,7 @@ class AddUnitTests(ShutdownTestCase):
             "--restart-note", str(note),
             "--session-name", "recorded-name",
             "--tmux-session", "recorded-tmux",
-        )
+         "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
 
         self.assertEqual(result.returncode, 1, (result.stdout, result.stderr))
         self.assertEqual(len(result.stderr.splitlines()), 1)
@@ -1927,36 +2068,17 @@ class UnitLaunchProtocolTests(ShutdownTestCase):
             "</LaunchUnits>", 1
         )[0]
 
-    def test_manual_unit_resume_requires_successful_account_resolution(self) -> None:
-        """F002: failed account resolution must stop the manual resume protocol."""
+    def test_manual_unit_resume_uses_add_unit_without_selecting_the_current_unit_role(self) -> None:
         instructions = self.resume_instructions()
-        resolver = "`~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py env unit`"
-        refusal = "If it exits nonzero, do not resume and tell the user its line."
+        self.assertIn("add_unit.py", instructions)
+        self.assertIn("--resume <session-id>", instructions)
+        self.assertNotIn("env unit", instructions)
+        self.assertNotIn("claude --resume", instructions)
 
-        self.assertLess(instructions.index(resolver), instructions.index(refusal))
-        self.assertLess(instructions.index(refusal), instructions.index("claude --resume"))
-        self.assertNotIn("eval", instructions)
-
-    def test_manual_unit_resume_uses_the_resolved_account_for_guard_and_launch(self) -> None:
-        """F002: the same resolved assignment precedes the guard and Claude resume."""
+    def test_manual_unit_resume_requires_explicit_account_when_prior_account_is_unknown(self) -> None:
         instructions = self.resume_instructions()
-
-        self.assertIn(
-            "Its output (empty for the default account) is `<account>`; "
-            + "put it verbatim before both commands below.",
-            instructions,
-        )
-        self.assertIn(
-            "`<account>$HOME/.claude/scripts/lib/py "
-            + "$HOME/.claude/scripts/shutdown/shutdown.py "
-            + "launch-blocked --restart-of <session-id>`",
-            instructions,
-        )
-        self.assertIn(
-            "`<account>claude --resume <session-id> <flags> "
-            + "--remote-control <session> -n <session>`",
-            instructions,
-        )
+        self.assertIn("--account", instructions)
+        self.assertIn("recorded", instructions.casefold())
 
     def test_production_import_paths_resolve_the_accounts_package(self) -> None:
         """F005: production's configured import search can find scripts.accounts."""

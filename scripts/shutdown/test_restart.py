@@ -290,6 +290,222 @@ class RestartTests(ShutdownTestCase):
     def all_sessions_live(ids: frozenset[str], _timeout: float) -> restart.RegistryConfirmation:
         return registry_confirmation(ids)
 
+    def moved_restart(self, session: inventory.Session) -> tuple[list[list[str]], str]:
+        saved = entry(session)
+        saved["target"] = "claude 3"
+        commands = CommandRecorder()
+        output = io.StringIO()
+
+        def probe(arguments: list[str], *, dry_run: bool) -> subprocess.CompletedProcess[str]:
+            del dry_run
+            if arguments[:2] == ["tmux", "display"]:
+                return subprocess.CompletedProcess(arguments, 0, "$8\t420\t0\t1700000000\t34500\n", "")
+            return subprocess.CompletedProcess(arguments, 1, "", "")
+
+        with (
+            patch.object(restart, "_run", commands),
+            patch.object(restart, "_retire"),
+            patch.object(restart, "_probe", side_effect=probe),
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(restart, "_desktop_numbers", return_value={}),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(restart.relaunch_session(saved, dry_run=True,
+                desktop_state=self.desktop_state), saved)
+        return commands.calls, output.getvalue()
+
+    def assert_move_resume(self, command: str, session: inventory.Session) -> None:
+        arguments = shlex.split(command.removesuffix("; exec zsh"))
+        script = next(argument for argument in arguments if argument.endswith("/accounts.py"))
+        start = arguments.index(script)
+        self.assertEqual(arguments[start + 1:start + 3], ["exec", "claude 3"])
+        self.assertEqual(arguments[arguments.index("--resume") + 1], session["session_id"])
+        self.assertEqual(arguments[arguments.index("-n") + 1], session["name"])
+        self.assertEqual(arguments[arguments.index("--remote-control") + 1], session["name"])
+        model = session["model"]
+        if model["kind"] == "model":
+            self.assertEqual(arguments[arguments.index("--model") + 1], model["name"])
+        self.assertIn("pending` for messages kept while you", arguments[-1])
+        self.assertNotIn("CLAUDE_CONFIG_DIR=", command)
+
+    def test_move_target_respawns_its_tmux_pane_through_accounts_exec(self) -> None:
+        owner = top_level("move-id", name="kept name", model=inventory.ModelName(kind="model", name="opus"),
+            host=recorded_tmux_host("kept tmux", "%move", 420))
+        commands, _ = self.moved_restart(owner)
+        launch = next(argv for argv in commands if argv[:2] == ["tmux", "respawn-pane"])
+        self.assertEqual(launch[launch.index("-t") + 1], "%move")
+        self.assert_move_resume(launch[-1], owner)
+
+    def test_move_target_relaunches_unit_with_explicit_account(self) -> None:
+        owner = unit("move-unit")
+        commands, _ = self.moved_restart(owner)
+        launch = next(argv for argv in commands if any(part.endswith("/add_unit.py") for part in argv))
+        self.assertEqual(launch[launch.index("--account") + 1], "claude 3")
+        self.assertEqual(launch[launch.index("--resume") + 1], "move-unit")
+        self.assertEqual(launch[launch.index("--session-name") + 1], "move-unit")
+
+    def test_moved_unit_passes_its_recorded_model_to_add_unit_resume(self) -> None:
+        owner = unit("model-unit")
+        owner["model"] = inventory.ModelName(kind="model", name="opus")
+        commands, _ = self.moved_restart(owner)
+        launch = next(argv for argv in commands if any(part.endswith("/add_unit.py") for part in argv))
+        self.assertEqual(launch[launch.index("--model") + 1], "opus")
+
+    def test_move_target_reopens_ghostty_through_accounts_exec(self) -> None:
+        owner = top_level("move-ghostty", host=inventory.WindowHost(kind="ghostty", window_shell=10,
+            desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot")))
+        commands, _ = self.moved_restart(owner)
+        launch = next(argv for argv in commands if "ghostty" in argv)
+        self.assert_move_resume(launch[-1], owner)
+
+    def test_move_target_reopens_zed_session_through_accounts_exec(self) -> None:
+        owner = top_level("move-zed", host=inventory.WindowHost(kind="zed", window_shell=10,
+            desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot")))
+        commands, _ = self.moved_restart(owner)
+        launch = next(argv for argv in commands if "ghostty" in argv)
+        self.assert_move_resume(launch[-1], owner)
+
+    def test_move_target_reopens_terminal_through_accounts_exec(self) -> None:
+        owner = top_level("move-terminal", host=inventory.TerminalHost(kind="terminal"))
+        commands, _ = self.moved_restart(owner)
+        launch = next(argv for argv in commands if argv[:1] == ["open"])
+        self.assert_move_resume(launch[-1], owner)
+
+    def test_move_target_unknown_host_prints_one_manual_restart_line(self) -> None:
+        owner = top_level("move-manual", name="kept name")
+        _, output = self.moved_restart(owner)
+        lines = output.splitlines()
+        self.assertEqual(len(lines), 1)
+        prefix = "manual restart kept name: "
+        self.assertTrue(lines[0].startswith(prefix), output)
+        self.assert_move_resume(lines[0].removeprefix(prefix), owner)
+
+    def test_move_target_showrunner_resumes_its_production_conversation(self) -> None:
+        owner = showrunner("move-showrunner")
+        commands, _ = self.moved_restart(owner)
+        launch = next(argv for argv in commands if "-ic" in argv)
+        arguments = shlex.split(launch[-1].removesuffix("; exec zsh"))
+        self.assertIn("accounts.py", " ".join(arguments))
+        self.assertEqual(arguments[arguments.index("exec") + 1], "claude 3")
+        self.assertEqual(arguments[arguments.index("--resume") + 1], "move-showrunner")
+        self.assertTrue(arguments[-1].startswith("/showrunner:produce /tmp/demo production.md resume "))
+        self.assertIn("moved from claude 2 to claude 3", arguments[-1])
+
+    def test_moved_showrunners_each_keep_cwd_name_model_and_their_own_production_resume(self) -> None:
+        for identity, name, model, doc in (
+            ("hana-id", "hana", "opus", "/tmp/hana production.md"),
+            ("brp-id", "bevy_brp", "sonnet", "/tmp/brp production.md"),
+        ):
+            with self.subTest(showrunner=name):
+                owner = showrunner(identity, host=inventory.WindowHost(kind="ghostty", window_shell=10,
+                    desktop=inventory.NamedDesktop(kind="named", name="Production")))
+                owner["name"] = name
+                owner["model"] = inventory.ModelName(kind="model", name=model)
+                owner["doc"] = doc
+                owner["cwd"] = f"/tmp/{name} workspace"
+                commands, _ = self.moved_restart(owner)
+                command = next(argv[-1] for argv in commands if "ghostty" in argv)
+                arguments = shlex.split(command.removesuffix("; exec zsh"))
+                self.assertEqual(arguments[:3], ["cd", owner["cwd"], "&&"])
+                self.assertEqual(arguments[arguments.index("--resume") + 1], identity)
+                self.assertEqual(arguments[arguments.index("-n") + 1], name)
+                self.assertEqual(arguments[arguments.index("--remote-control") + 1], name)
+                self.assertEqual(arguments[arguments.index("--model") + 1], model)
+                self.assertTrue(arguments[-1].startswith(f"/showrunner:produce {doc} resume "))
+                self.assertIn("moved from claude 2 to claude 3", arguments[-1])
+
+    def test_moved_ghostty_showrunner_reopens_on_its_recorded_desktop_without_window_title_tracking(self) -> None:
+        owner = showrunner("hana-id", host=inventory.WindowHost(kind="ghostty", window_shell=123,
+            desktop=inventory.NamedDesktop(kind="named", name="Production")))
+        saved = entry(owner)
+        saved["target"] = "claude 3"
+        commands = CommandRecorder()
+        with (
+            patch.object(restart, "_run", commands),
+            patch.object(restart, "_retire"),
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(restart, "_desktop_numbers", return_value={"Production": 4}),
+            redirect_stdout(io.StringIO()),
+        ):
+            _ = restart.relaunch_session(saved, dry_run=True, desktop_state=self.desktop_state)
+        launch_index = next(index for index, arguments in enumerate(commands.calls) if "ghostty" in arguments)
+        self.assertEqual(commands.calls[launch_index - 1], ["kdotool", "set_desktop", "4"])
+        self.assertFalse(any("windowclose" in arguments or "getwindowname" in arguments for arguments in commands.calls))
+
+    def test_live_unknown_host_move_reports_its_manual_resume_line_once(self) -> None:
+        saved = entry(top_level("manual-move", name="kept name"))
+        saved["target"] = "claude 3"
+        self.create([saved])
+        output = io.StringIO()
+        command = restart.resume_command(saved["session"], "claude 3", LABEL)
+        with (
+            patch.object(restart, "_retire"),
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            redirect_stdout(output),
+        ):
+            current = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
+            _ = restart.relaunch_session(current, dry_run=False, desktop_state=self.desktop_state)
+        self.assertEqual(output.getvalue().splitlines(), [f"manual restart kept name: {command}"])
+        self.assertEqual(record.session_records(LOGIN)[0]["progress"]["kind"], "manual restart")
+
+    def test_live_restart_verb_reports_an_unknown_host_move_command_exactly_once(self) -> None:
+        saved = entry(top_level("manual-move", name="kept name"))
+        saved["target"] = "claude 3"
+        self.create([saved])
+        output = io.StringIO()
+        with (
+            patch.object(restart, "_retire"),
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(settle, "unrecorded_local_sessions", return_value={}),
+            redirect_stdout(output),
+        ):
+            result = restart.up_result(LOGIN, False, ["manual-move"])
+        lines = [line for line in result["lines"] if "manual restart kept name:" in line]
+        self.assertEqual(len(lines), 1, "\n".join(result["lines"]))
+        self.assertIn(restart.resume_command(saved["session"], "claude 3", LABEL), lines[0])
+
+    def test_move_restart_note_names_source_target_reason_and_continuation_for_every_session_kind(self) -> None:
+        for owner in (top_level("top"), unit("unit"), showrunner("runner")):
+            with self.subTest(kind=owner["kind"]):
+                saved = entry(owner)
+                saved["target"] = "claude 3"
+                note = restart.restart_note(saved, RESTARTED)
+                self.assertIn("moved from claude 2 to claude 3", note.casefold())
+                self.assertIn("claude 2 is out of usage", note)
+                self.assertIn("account move", note.casefold())
+                self.assertIn("not a stop", note.casefold())
+                self.assertIn("continue", note.casefold())
+                if owner["kind"] == "unit":
+                    self.assertIn("/unit:direct", note)
+
+    def test_move_restart_notes_use_the_same_explicit_source_target_and_reason_for_all_hosts(self) -> None:
+        owners = (
+            top_level("tmux-note", host=tmux_host("tmux-note")),
+            top_level("ghostty-note", host=inventory.WindowHost(kind="ghostty", window_shell=10,
+                desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"))),
+            top_level("zed-note", host=inventory.WindowHost(kind="zed", window_shell=10,
+                desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"))),
+            top_level("terminal-note", host=inventory.TerminalHost(kind="terminal")),
+            top_level("unknown-note"), unit("unit-note"), showrunner("runner-note"),
+        )
+        for owner in owners:
+            with self.subTest(host=owner["host"]["kind"], kind=owner["kind"]):
+                saved = entry(owner)
+                saved["target"] = "default"
+                saved["source_label"] = "claude 3"
+                saved["why"] = "weekly limit reached"
+                note = restart.restart_note(saved, RESTARTED)
+                self.assertIn("moved from claude 3 to default because weekly limit reached", note)
+                self.assertIn("account move, not a stop", note)
+                self.assertIn("Continue where you stopped", note)
+                command = restart.resume_command(owner, "default", "claude 3", "weekly limit reached")
+                arguments = shlex.split(command.removesuffix("; exec zsh"))
+                self.assertIn(note, arguments[-1])
+                if owner["kind"] == "showrunner":
+                    self.assertTrue(arguments[-1].startswith(f"/showrunner:produce {owner['doc']} resume "))
+                if owner["kind"] == "unit":
+                    self.assertIn("/unit:direct", note)
+
     def test_notes_use_the_stop_dates_zone_and_explain_a_missing_where(self) -> None:
         october = entry(top_level('october'), where=record.WhereSaid(kind='said', text="quoted 'work' and $()", at=STOPPED))
         october_note = restart.restart_note(records_for_test([october])[0], RESTARTED)
@@ -433,7 +649,7 @@ class RestartTests(ShutdownTestCase):
         argv = next((shlex.split(line) for line in output.getvalue().splitlines() if 'add_unit.py' in line))
         self.assertEqual(argv[argv.index('--plan') + 1], 'docs/as-built/tables.md')
 
-    def test_dry_run_uses_recorded_dir_for_each_non_unit_host(self) -> None:
+    def test_dry_run_without_target_keeps_recorded_dir_for_every_host(self) -> None:
         config_dir = str(self.root / "account with 'quotes' and $()")
         restored_entries = [entry(showrunner('named-showrunner')), entry(top_level('named-tmux', host=tmux_host('named-tmux-host'))), entry(top_level('named-terminal', host=inventory.TerminalHost(kind='terminal'))), entry(top_level('named-window', host=inventory.WindowHost(kind='ghostty', window_shell=10, desktop=inventory.DesktopNotInSnapshot(kind='not in snapshot')))), entry(top_level('named-manual')), entry(unit('named-unit'))]
         for restored in restored_entries:
@@ -450,7 +666,7 @@ class RestartTests(ShutdownTestCase):
             self.assertIn(f'&& {named_prefix(config_dir)}ENABLE_TOOL_SEARCH=true command claude', command)
         self.assertIn(f'{named_prefix(config_dir)}ENABLE_TOOL_SEARCH=true command claude', output.getvalue().split('manual restart named-manual:', 1)[1])
         unit_argv = next((argv for argv in commands.calls if any((part.endswith('add_unit.py') for part in argv))))
-        self.assertNotIn(config_dir, unit_argv)
+        self.assertEqual(unit_argv[unit_argv.index("--config-dir") + 1], config_dir)
         self.assertNotIn('CLAUDE_CONFIG_DIR', shlex.join(unit_argv))
         self.assertCountEqual(record.session_records(LOGIN), saved)
 
@@ -936,7 +1152,7 @@ class RestartTests(ShutdownTestCase):
         _, phone, _ = restart.restart_push("claude 2", ["Owner: running, no Remote Control"],
             failed=False, phone_access=True)
         self.assertIn("cannot reach them from your phone", phone)
-        self.assertIn("Owner", phone)
+        self.assertIn("Affected sessions: Owner.", phone)
         self.assertIn("/remote-control", phone)
 
     def test_restart_cli_builds_a_never_alert_policy(self) -> None:

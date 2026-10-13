@@ -13,10 +13,14 @@ import unittest
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import final, override
+from typing import TYPE_CHECKING, final, override
 from unittest import mock
 
 import rust_release
+if TYPE_CHECKING:
+    from ..notify import review
+else:
+    import review
 from test_index import point_root_at
 
 
@@ -165,7 +169,7 @@ class RustReleaseTests(unittest.TestCase):
             "warning_crates": 1, "errors": 0, "error_crates": 0, "mend_builds": True,
             "target_gib": 1, "mend_target_gib": 1}
         text = rust_release.release_push_text("1.100.0", "1.99.0", trial)
-        self.assertIn("Compiler compatibility checks", text)
+        self.assertIn("Both code checks passed", text)
         self.assertIn("compiled with 1.100.0", text)
         self.assertIn("Hana moves to 1.100.0", text)
         self.assertIn("Hana stays on 1.99.0", text)
@@ -188,14 +192,25 @@ class RustReleaseTests(unittest.TestCase):
         ]
         real_run = subprocess.run
         with (mock.patch.object(rust_release, "__file__", str(fake_module)),
+              mock.patch.object(review, "user_send_seconds", return_value=85),
               mock.patch.object(subprocess, "run", wraps=real_run) as run,
               mock.patch.dict(os.environ, {"RELEASE_SEND_EXIT": "0"})):
             self.assertTrue(rust_release.send_release_text("Rust 1.100.0 out", "trial passed"))
             self.assertEqual(run.call_args.args[0], command)
-            self.assertEqual(run.call_args.kwargs["timeout"], 60)
+            self.assertEqual(run.call_args.kwargs["timeout"], 85)
         with (mock.patch.object(rust_release, "__file__", str(fake_module)),
+              mock.patch.object(review, "user_send_seconds", return_value=85),
               mock.patch.dict(os.environ, {"RELEASE_SEND_EXIT": "3"})):
             self.assertFalse(rust_release.send_release_text("Rust 1.100.0 out", "trial passed"))
+
+    def test_release_send_wait_includes_the_configured_review_limit(self) -> None:
+        config = self.scratch / "notify.conf"
+        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
+        done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user", "")
+        with (mock.patch.object(review, "NOTIFY_CONFIG", config),
+              mock.patch.object(subprocess, "run", return_value=done) as run):
+            self.assertTrue(rust_release.send_release_text("Rust 1.100.0 out", "trial passed"))
+            self.assertEqual(run.call_args.kwargs["timeout"], 115)
 
     def test_newer_stable_is_fetched_once_per_local_day(self) -> None:
         fetches: list[str] = []
@@ -330,7 +345,7 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual(str(clone / "mend-target"), mend[2]["CARGO_TARGET_DIR"])
         self.assertEqual(1, len(texts))
         self.assertIn("1 error and 2 new warnings", texts[0][1])
-        self.assertIn("A tool for repairing Rust builds compiled with 1.100.0", texts[0][1])
+        self.assertIn("The tool that repairs Rust build errors compiled with 1.100.0", texts[0][1])
 
     def test_stale_trial_clone_is_removed_before_commands_and_after_success(self) -> None:
         clone = self.scratch / "rust-release-trial-1.100.0"
@@ -360,7 +375,7 @@ class RustReleaseTests(unittest.TestCase):
         assert trial["status"] == "finished"
         self.assertFalse(trial["mend_builds"])
         self.assertFalse(clone.exists())
-        self.assertIn("A tool for repairing Rust builds failed to compile with 1.100.0", texts[0][1])
+        self.assertIn("The tool that repairs Rust build errors failed to compile with 1.100.0", texts[0][1])
 
     def test_failed_clippy_step_records_first_error_and_is_not_retried(self) -> None:
         clone = self.scratch / "rust-release-trial-1.100.0"
@@ -454,7 +469,7 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual((1, 1), (trial["errors"], trial["error_crates"]))
         self.assertEqual("cargo", runner.calls[-1][0][0])
         self.assertIn("1 error", texts[0][1])
-        self.assertIn("A tool for repairing Rust builds compiled with 1.100.0", texts[0][1])
+        self.assertIn("The tool that repairs Rust build errors compiled with 1.100.0", texts[0][1])
         self.assertIn("1 error in 1 crate, cargo-mend builds", rust_release.report_line()[0])
 
         rust_release.state_path().unlink()
