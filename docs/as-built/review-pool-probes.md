@@ -22,13 +22,15 @@ mesh prime --session-dir "$D" --name template \
   --instructions-file "$D/instructions.txt" --cwd "$D/cwd-a" --model gpt-6.1-sol
 ```
 
-Tokens came from each thread's rollout, using the fields read by
-`scripts/whoami/seat_usage.py`: uncached input = input minus cached input.
+Tokens came from each thread's rollout, using the fields
+`scripts/usage/rollouts.py` (`token_usage`) reads: uncached input = input minus
+cached input.
 Single-request measurements use `last_token_usage`; turns with tool calls use
 `total_token_usage` from a fork with no inherited turns. After revert, the repair
 probe used the active rollout path returned by `thread/read`, since revert
 created another rollout for the same thread id. The cost comparison uses
-the repository weights: uncached input 1, cached input 0.1, output 8.
+the repository's `gpt-6.1-sol` weights (`scripts/usage/weights.py`, in force
+from 2026-10-10T21:35Z): uncached input 1, cached input 0.05, output 5.
 
 ## 1. First request after reset versus fork
 
@@ -44,9 +46,9 @@ follow lease-fork --read-only            # same prompt
 
 | Request | Uncached input | Cached input | Output | Weighted cost | Follow seconds |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Warmup | 12,372 | 11,392 | 8 | 13,575.2 | 8.136 |
-| First after reset | 212 | 23,552 | 9 | 2,639.2 | 6.935 |
-| First after fork | 12,372 | 11,392 | 8 | 13,575.2 | 8.259 |
+| Warmup | 12,372 | 11,392 | 8 | 12,981.6 | 8.136 |
+| First after reset | 212 | 23,552 | 9 | 1,434.6 | 6.935 |
+| First after fork | 12,372 | 11,392 | 8 | 12,981.6 | 8.259 |
 
 Prime took 2.007 s; the warmup fork took 0.670 s. Reset itself took 0.199 s;
 the comparison fork took 0.189 s. **Reset was cheaper for lease end with the
@@ -55,9 +57,9 @@ all used `--read-only`; compare reset and fork within this run, rather than
 treating the earlier and repaired requests as identical. One sample does not
 establish future cache behavior.
 
-Before the repair — warmup: uncached 11,115, cached 11,392, output 6, weighted 12,302.2, follow 6.740 s, reply `ready.`.
-Before the repair — first after reset: uncached 235, cached 22,272, output 6, weighted 2,510.2, follow 7.877 s, reply `ready.`.
-Before the repair — first after fork: uncached 15,339, cached 7,168, output 6, weighted 16,103.8, follow 6.524 s, reply `ready.`.
+Before the repair — warmup: uncached 11,115, cached 11,392, output 6, weighted 11,714.6, follow 6.740 s, reply `ready.`.
+Before the repair — first after reset: uncached 235, cached 22,272, output 6, weighted 1,378.6, follow 7.877 s, reply `ready.`.
+Before the repair — first after fork: uncached 15,339, cached 7,168, output 6, weighted 15,727.4, follow 6.524 s, reply `ready.`.
 Before the repair — reset took 0.206 s and fork 0.181 s; neither measured reply obeyed the closing rule or retained it in its rollout.
 
 ## 2. Developer instructions through the thread lifecycle
@@ -111,8 +113,10 @@ Supplying the file text as `developerInstructions` on resume and fork restored
 the standing contract. Direct same-name follow after `stop` remains refused;
 the restart rows measure disk resume of the same conversation through aliases.
 
-Compact succeeded in 12.307 s, produced one compaction record, and printed
-`23764 -> 0 tokens`. Its last input/cached/output counters were zero with
+Compact succeeded in 12.307 s and produced one compaction record. The
+compaction turn reported 0 input tokens, so `compact` stores the size as
+`not_measured_since_compaction` and prints `compacted <name>: 23764 tokens,
+size not measured until its next turn`. Its last input/cached/output counters were zero with
 `total_tokens=19622`; those counters cannot establish compaction billing cost.
 The final reset took 0.195 s. After the following restart, `thread/turns/list`
 returned zero turns, and the next request's 23,764 input tokens equalled the
@@ -199,4 +203,4 @@ PID 1193625/port 59611. Each stopped PID no longer existed. The repair session
 and its five rollouts, including the two created by revert, were deleted;
 logs and replies were read and deleted before subsequent turns.
 
-**Reset gives the cheaper first request with instructions retained: 2,639.2 versus 13,575.2 weighted tokens in this measured pair.**
+**Reset gives the cheaper first request with instructions retained: 1,434.6 versus 12,981.6 weighted tokens in this measured pair.**

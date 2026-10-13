@@ -149,8 +149,9 @@ codex_mesh.py stop   --session-dir
 codex_mesh.py sweep  [--root <dir>] [--stop]
 ```
 
-`follow`, `compact`, `can-follow`, `release-follow`, the roster's `role` and
-`context_tokens`, and overflow press-on are described in `long-lived-seats.md`.
+`follow`, `compact`, `can-follow`, `release-follow`, the roster's `role`,
+`revision` and `context_tokens`, and overflow press-on are described in
+`long-lived-seats.md`; the role log and guarded roster writes in `usage-ledger.md`.
 `prime`, `fork` and `reset`, and `follow`'s `--cwd`, `--read-only` and
 `--image`, serve the review pool's reviewers and are described in
 `review-pool.md`.
@@ -168,10 +169,10 @@ so no `--ws-auth` token.
 
 `start` connects, calls `thread/start` then `turn/start`, writes the delegate's
 entry into `<session_dir>/mesh_roster.json`
-(`{name: {thread_id, turn_id, status, launcher_pid?, port?, role?, context_tokens?}}`, `launcher_pid` on a
+(`{name: {thread_id, turn_id, status, revision?, launcher_pid?, port?, role?, context_tokens?}}`, `launcher_pid` on a
 `waiting_capacity` entry and on a follow-up's `starting` and `running` entries,
 which also carry `previous_status` and `previous_role`; every read-modify-write under `fcntl.LOCK_EX`, because
-the delegates register concurrently), and **blocks until its last turn ends**,
+the delegates register concurrently, and each write raises `revision` by one), and **blocks until its last turn ends**,
 translating the notification stream into the log file (`agent:`, `exec:`,
 `edit:`, `thinking`) that `heartbeat_watch.sh` narrates. On a `turn/completed`
 with nothing queued it writes the final message to the summary file — or, given
