@@ -25,4 +25,6 @@ Start the job on natedev. `verify.sh test` and `mac_run.sh` claim for themselves
 
 Before the first remote command, run `python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what '<job>' --wait <seconds>`. Continue only after exit 0: 10 means blocked, 11 means busy, and 12 means state unreadable; use the recovery above. When done, run `python3 ~/.claude/scripts/mac_test/mac_test.py release --pid $$`.
 
+A claim with nothing running on the Mac for 15 minutes is released and its holder is told, so claim right before remote work and claim again after a release.
+
 Without `--remote`, the lock is tied to that process; its death frees it. A remote job uses `claim ... --remote <host>` and keeps its claim after the process dies. Exit 13 means takeover of a kept claim and prints `leftovers: <host>`: check those leftovers before starting work. A job started on the Mac cannot take the natedev lock.

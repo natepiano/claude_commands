@@ -12,7 +12,6 @@ from account import label_for
 from agent_accounts import (ClaudeAccountSelection, CodexHomeSource, Quota, Report,
                             codex_home_display, codex_homes, codex_report_in_use, live_reports,
                             seats_home as resolve_seats_home)
-import note_file
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 
@@ -63,17 +62,6 @@ def render(report: Report, selection: ClaudeAccountSelection, seats_home: Path) 
             lines.append(f"  Limit reset expires: {expires.astimezone(user_zone()).strftime('%a %Y-%m-%d %H:%M %Z')}")
         if count and len(report.limit_reset_expirations) < count:
             lines.append("  Some reset expiration dates are unavailable")
-    elif report.tool == "Claude" and report.email:
-        for path in sorted(note_file.AGENTS_DIR.glob("claude *.md")):
-            note = note_file.read_note(path)
-            if note and (note.get("login") or "").lower() == report.email.lower():
-                expires = note.get("limit_reset")
-                count = note.get("limit_reset_count")
-                if count and count != "null":
-                    lines.append(f"  Limit resets available: {count} (manually recorded)")
-                if expires and expires != "null":
-                    lines.append(f"  Limit reset expires: {expires} (manually recorded date; time unavailable)")
-                break
     return lines
 
 
