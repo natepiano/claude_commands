@@ -43,85 +43,37 @@ On the plan, the showrunner approved it with one change:
 
 ### Phase 1 — The check lists every workspace member's direct dependencies and looks each one up by its whole version  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** Run on a workspace, the check asks about the direct dependencies of every member, once per crate and version and never faster than one crates.io request a second, and a dependency whose version carries a pre-release or build suffix is looked up, compared and printed under that whole version.
-
-**Spec:**
-Work only in the worktree and branch the Delegation Context names. The showrunner approved this phase on 2026-10-12.
-
-`run_cargo_tree`:
-
-- The base command becomes `['cargo', 'tree', '--workspace', '--no-dedupe', '--depth=1', '--format', '{p}']`. The `--all-features` first attempt and the fallback to the default features stay as they are, and both carry the two new flags.
-- Why, for the docstring, in one or two sentences: cargo prints a package it has already printed as `name vX (*)` with no children. In a workspace, a member that an earlier member depends on is printed that way when its own turn comes, so its direct dependencies never appear. `--no-dedupe` prints every package in full each time. `--workspace` covers a workspace whose root manifest is also a package: without it cargo lists only that root package.
-
-`get_all_direct_dependencies`:
-
-- The line pattern becomes `r'([a-zA-Z0-9_-]+)\s+v(\d\S*)'`: the version is the whole token after `v`, up to the next whitespace. The lines it reads look like these:
-
-```
-alpha v0.1.0 (/home/u/project/crates/alpha)
-├── beta v1.1.6+spec-1.1.0
-├── gamma v0.20.0-rc.1
-├── delta v2.0.1 (proc-macro)
-├── epsilon v0.5.0-dev (/home/u/project/crates/epsilon)
-[dev-dependencies]
-└── beta v1.1.6+spec-1.1.0
-```
-
-- From those lines the versions are `0.1.0`, `1.1.6+spec-1.1.0`, `0.20.0-rc.1`, `2.0.1` and `0.5.0-dev`. The exclusions (Bevy's own crates, workspace members, the utility list) and the sorted, de-duplicated result stay as they are. Update the docstring's sentence on `--depth=1` to name the two new flags.
-
-`get_bevy_dependency_requirement`:
-
-- The version is percent-encoded in the address: `urllib.parse.quote(version, safe='')`, so `1.1.6+spec-1.1.0` is requested as `.../crates/<name>/1.1.6%2Bspec-1.1.0/dependencies`. The crate name is unchanged. Every caller goes through this function, so the versions `find_bevy_compatible_version` takes from crates.io are encoded the same way.
-
-One lookup per crate:
-
-- `get_all_direct_dependencies` already collects `(name, version)` pairs in a set, so a crate that several members list at one version is returned once and `get_bevy_dependencies` asks about it once. Keep that, and say so in the docstring: `--no-dedupe` repeats a shared crate under every member that uses it.
-
-Paced requests (crates.io's published limit for a crawler is one request a second):
+- `run_cargo_tree` runs `cargo tree --workspace --no-dedupe --depth=1 --format {p}`, with `--all-features` first and the default features when that fails; both attempts carry the two flags. Cargo prints a package it has already printed as `name vX (*)` with no children, so without `--no-dedupe` a member that an earlier member depends on hides its own direct dependencies. `--workspace` covers a root manifest that is also a package, which cargo otherwise lists alone.
+- `get_all_direct_dependencies` reads each line with `r'([a-zA-Z0-9_-]+)\s+v(\d\S*)'`: the version is the whole token after `v`, so `1.1.6+spec-1.1.0`, `0.20.0-rc.1` and `0.5.0-dev` are kept whole and a trailing ` (proc-macro)` or path is left out. Its set of `(name, version)` pairs returns a crate that several members list at one version once, so that crate is looked up once.
+- `get_bevy_dependency_requirement` percent-encodes the version in the address with `parse.quote(version, safe='')`: `1.1.6+spec-1.1.0` is requested as `.../crates/<name>/1.1.6%2Bspec-1.1.0/dependencies`. The crate name is not encoded. The whole version reaches `classify_dependency`'s equality comparison and the report row, so a crate already on the compatible version, suffix included, is `OK`.
+- crates.io requests start at least one second apart:
 
 ```python
 CRATES_IO_MIN_INTERVAL_SECONDS: float = 1.0
-
-class RequestPacer:
-    def __init__(
-        self,
-        min_interval: float,
-        clock: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> None: ...
-    def wait(self) -> None: ...
-
+RequestPacer(min_interval: float, clock: Callable[[], float] = time.monotonic,
+             sleep: Callable[[float], None] = time.sleep)
+RequestPacer.wait() -> None
 CRATES_IO_PACER = RequestPacer(CRATES_IO_MIN_INTERVAL_SECONDS)
 ```
 
-- `wait` returns at once on its first call. On a later call it reads the clock, and when less than `min_interval` has passed since the moment the previous call let its request start, it sleeps for the remainder. It then records the moment this request starts: the clock reading, taken again after the sleep when it slept, so a sleep that runs long never shortens the next gap.
-- `query_crates_io` and `get_bevy_dependency_requirement` each call `CRATES_IO_PACER.wait()` immediately before `request.urlopen`. They are the only two functions that reach crates.io. They read the module attribute at call time, so a test can replace it.
-- `Callable` comes from `collections.abc`.
-
-Nothing else changes. `classify_dependency` already compares the current version with the compatible one by equality, and crates.io's own version strings carry the suffix, so the comparison becomes right once the current version keeps its suffix. The report prints the version it is given. `commands/bevy_migration_plan.md` stays as it is: its bullet says the script reads direct dependencies, which stays true. The paced run takes longer than before, about one second for each request: the unit director measures it in the Smoke run and reports the time.
+- `wait` returns at once on its first call. A later call sleeps for what is left of `min_interval` since the previous request started, then records the clock reading taken after the sleep. `query_crates_io` and `get_bevy_dependency_requirement`, the only two functions that reach crates.io, call `CRATES_IO_PACER.wait()` immediately before `request.urlopen` and read the module attribute at call time, so a test can replace it.
+- `commands/bevy_migration_plan.md` tells the runner to run the check in the background and wait, and how many requests a run sends.
+- Measured on 2026-10-12 against hana_catalyst for Bevy 0.20.0: exit 0, 129 seconds, 45 crates asked about, every request answered. `bevy_tween` 0.13.0 and `bevy_lookup_curve` 0.12.0 are listed, both as blockers; `moonshine-save` is still listed; `toml` is not.
 
 **Files:**
-- `scripts/bevy_migration_plan/bevy_migration_dependency_check.py` — the cargo command, the line pattern, the encoded version in the lookup address, the pacer and its two calls, the two docstrings.
-- `scripts/bevy_migration_plan/test_bevy_migration_dependency_check.py` — the tests the Acceptance gate lists.
+- `scripts/bevy_migration_plan/bevy_migration_dependency_check.py` — the check: the cargo command, the version pattern, the encoded lookup address, `RequestPacer` and its two calls.
+- `scripts/bevy_migration_plan/test_bevy_migration_dependency_check.py` — its tests; `setUp` installs a `RequestPacer` on a stand-in clock and sleep, so no test waits on the real clock.
+- `commands/bevy_migration_plan.md` — the command that runs the check; carries the time allowance.
 
-**Seats:** 1 writer + 1 tester — one module and its test module.
-- `impl` — `scripts/bevy_migration_plan/bevy_migration_dependency_check.py`.
-- `test` — `scripts/bevy_migration_plan/test_bevy_migration_dependency_check.py`, from the Spec.
+**Gotchas:**
+- The pacer records the clock reading after its sleep, never the planned wake time. With the planned time, a sleep that runs 0.6 seconds long gives request starts at 0.0, 1.6 and 2.0 seconds. A stand-in sleep that advances the clock by the amount asked for cannot show this; the regression test's stand-in runs long.
+- Run time follows the request count, not the dependency count: one request per direct dependency, then for each one that depends on Bevy one for its crates.io entry and up to 20 for its recent releases. A blocker spends all 20.
+- `--no-dedupe` repeats a shared crate under every member that uses it; only the set in `get_all_direct_dependencies` keeps that to one lookup.
+- crates.io answers 404 for `/api/v1/crates/toml/1.1.6/dependencies` and 200 for `/api/v1/crates/toml/1.1.6%2Bspec-1.1.0/dependencies` (measured 2026-10-12): a version cut off at its suffix reads as a failed lookup and a `CHECK_NEEDED` row.
+- `scripts/bevy_upgrade/upstream.py` `release_requirement` encodes the version the same way, so the two copies of the lookup address agree. That module does not pace its requests.
 
-**Constraints from prior phases:**
-- `get_bevy_dependency_requirement(crate_name, version, bevy_names)` returns `BevyRequirement`, `NoBevyDependency` or `RequirementLookupFailed`. `get_bevy_dependencies` keeps a crate on the first and the third and drops it on the second; a kept `RequirementLookupFailed` becomes a `CHECK_NEEDED` row.
-- Measured on 2026-10-12: crates.io answers 404 for `/api/v1/crates/toml/1.1.6/dependencies` and 200 for `/api/v1/crates/toml/1.1.6%2Bspec-1.1.0/dependencies`. In hana_catalyst, `cargo tree --depth=1 --format '{p}' --all-features` prints 27 member roots, most of them as `name (*)` with no children, and never prints two direct dependencies that only later members declare; with `--workspace --no-dedupe` added it prints both.
-- Existing tests that need a tree replace `checker.run_cargo_tree` with a canned string (`mock.patch.object(checker, "run_cargo_tree", return_value=tree)`).
-
-**Acceptance gate:** the Delegation Context **Test** and **Lint** commands pass. The tests cover:
-- `run_cargo_tree` passes `--workspace` and `--no-dedupe` to cargo, in the `--all-features` attempt and in the fallback after that attempt fails. This test replaces the `subprocess.run` stand-in for itself and reads the argument lists it was called with.
-- `get_all_direct_dependencies`, given the tree lines the Spec shows, returns each dependency with its whole version: the build suffix, the pre-release suffix, and a version that ends before ` (proc-macro)` or a path. A member named as a dependency of another member is still left out.
-- A dependency that only the second member of a tree lists is returned.
-- A crate two members list at the same version is looked up once: with a tree that names it under both, crates.io is asked for that crate's dependencies one time.
-- `RequestPacer` with a stand-in clock and sleep: the first `wait` does not sleep; a `wait` 0.25 seconds after the previous start sleeps 0.75 seconds; a `wait` after more than the interval does not sleep; three calls with no time passing sleep twice, one second each.
-- `query_crates_io` and `get_bevy_dependency_requirement` each call the pacer once per request, before the request.
-- `setUp` installs a pacer with a stand-in clock and sleep, so no test waits on the real clock.
-- `get_bevy_dependency_requirement`, given a version with a build suffix, requests the address with `+` encoded as `%2B`.
-- End to end with canned answers: a direct dependency whose version has a build suffix and which has no Bevy dependency gets no row in the report, and one that depends on a Bevy crate and already sits on the compatible version, suffix included, is classified `OK`.
+**Ruled out:**
+- Recording the pacer's planned wake time: a long sleep then shortens the next gap.
+- Leaving `commands/bevy_migration_plan.md` without a time allowance: the paced run is longer than a default 120 second command limit.
