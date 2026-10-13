@@ -32,13 +32,12 @@ import sweep
 MACOSX_DEPLOYMENT_TARGET = "14.0"
 
 
-MacDeclineReason = Literal[
+NonBusyMacDeclineReason = Literal[
     "off",
     "repo",
     "linux_only",
     "backoff",
     "blocked",
-    "busy",
     "state",
     "unreachable",
     "mac_busy",
@@ -46,6 +45,7 @@ MacDeclineReason = Literal[
     "disk",
     "copy",
 ]
+MacDeclineReason = NonBusyMacDeclineReason | Literal["busy"]
 MacPower = Literal["ac", "battery"]
 
 
@@ -97,12 +97,51 @@ class LostMacRun:
 class DeclinedMacRun:
     """An attempt declined before a Mac test command began."""
 
-    reason: MacDeclineReason
+    reason: NonBusyMacDeclineReason
     seconds: float
 
 
+@dataclass(frozen=True)
+class KnownMacJob:
+    what: str
+
+
+@dataclass(frozen=True)
+class LostRunLeftovers:
+    pass
+
+
+@dataclass(frozen=True)
+class UnreadableMacHolder:
+    pass
+
+
+MacHolder = KnownMacJob | LostRunLeftovers | UnreadableMacHolder
+
+
+@dataclass(frozen=True)
+class BusyMacDecline:
+    holder: MacHolder
+    seconds: float
+
+    @property
+    def reason(self) -> Literal["busy"]:
+        return "busy"
+
+
+def claim_holder(stdout: str) -> MacHolder:
+    match = re.fullmatch(r"busy: (.+) since (?:[01][0-9]|2[0-3]):[0-5][0-9]\n?", stdout)
+    return KnownMacJob(match.group(1)) if match is not None else UnreadableMacHolder()
+
+
+def holder_value(holder: MacHolder) -> str:
+    if isinstance(holder, KnownMacJob):
+        return holder.what
+    return "leftovers" if isinstance(holder, LostRunLeftovers) else "unreadable"
+
+
 MacOffloadResult = (
-    PassedOnMac | FailedOnMac | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun
+    PassedOnMac | FailedOnMac | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun | BusyMacDecline
 )
 
 
@@ -553,7 +592,7 @@ def elapsed_seconds(started: float) -> float:
     return max(0.0, time.monotonic() - started)
 
 
-def declined(reason: MacDeclineReason, started: float) -> DeclinedMacRun:
+def declined(reason: NonBusyMacDeclineReason, started: float) -> DeclinedMacRun:
     return DeclinedMacRun(reason, elapsed_seconds(started))
 
 
@@ -597,8 +636,9 @@ def write_result(
         if not decline_already_shown(result.reason, last_decline):
             print(f"mac_test: not running on the Mac ({reason})")
     if isinstance(destination, ResultFile):
+        holder_line = f"holder={holder_value(result.holder)}\n" if isinstance(result, BusyMacDecline) else ""
         _ = destination.path.write_text(
-            f"mac={mac}\nreason={reason}\nseconds={result.seconds:.6f}\n",
+            f"mac={mac}\nreason={reason}\nseconds={result.seconds:.6f}\n" + holder_line,
             encoding="utf-8",
         )
     return status
@@ -1085,17 +1125,19 @@ def run_offload(
             write_backoff(time.time() + config.unreachable_backoff_s)
             return declined("unreachable", started)
         if isinstance(checked, LeftoversRemain):
-            return declined("busy", started)
+            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
         release_claim(controller)
         claim = claim_for_run(controller, config, request)
         if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
-            return declined("busy", started)
+            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     if isinstance(claim, MacClaimNotConfirmed):
         if not decline_already_shown(claim.reason, request.last_decline):
             if claim.stdout:
                 print(claim.stdout, end="" if claim.stdout.endswith("\n") else "\n", file=sys.stderr, flush=True)
             if claim.stderr:
                 print(claim.stderr, end="" if claim.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
+        if claim.reason == "busy":
+            return BusyMacDecline(claim_holder(claim.stdout), elapsed_seconds(started))
         return declined(claim.reason, started)
     return claimed_run(controller, config, request, repository, started)
 

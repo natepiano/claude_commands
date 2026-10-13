@@ -673,6 +673,7 @@ LOOKUP_STATUS=0
 EXIT_STATUS=0
 FILTER_RUN=0
 BUILDLOG_MAC=""
+BUILDLOG_MAC_HOLDER=""
 BUILDLOG_MAC_REASON=""
 BUILDLOG_MAC_S=""
 export BUILDLOG_TARGET=""
@@ -732,7 +733,7 @@ note_event() {
     if [[ -n "${MEM_KILL_FILE:-}" && -f "${MEM_KILL_FILE}.stopped" ]]; then
         mem_kill_stopped=1
     fi
-    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="${TOKEN_WAIT_S:-0}" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
+    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="${TOKEN_WAIT_S:-0}" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_HOLDER="$BUILDLOG_MAC_HOLDER" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
         "$build" "$saved" "${SECONDS}" "$CMD" ${ARGS[@]+"${ARGS[@]}"} \
         </dev/null >/dev/null 2>&1 || true
 }
@@ -764,7 +765,7 @@ try_mac_test() {
     trap 'forward_mac_runner_signal TERM 143' TERM
     trap 'forward_mac_runner_signal HUP 129' HUP
     local runner_status result_text="" result_word="" result_reason=""
-    local result_seconds="" mac_words=0 line
+    local result_seconds="" result_holder="" mac_words=0 line
     local runner_args=(run --repo-root "$(git rev-parse --show-toplevel)"
         --package "$PKG" --call-id "$BUILDLOG_CALL_ID" --settings "$1")
     if [[ $# -gt 1 ]]; then
@@ -801,6 +802,7 @@ try_mac_test() {
                     ;;
                 reason=*) result_reason="${line#reason=}" ;;
                 seconds=*) result_seconds="${line#seconds=}" ;;
+                holder=*) result_holder="${line#holder=}" ;;
             esac
         done <<< "$result_text"
     fi
@@ -818,6 +820,7 @@ try_mac_test() {
         BUILDLOG_MAC=declined
         BUILDLOG_MAC_REASON=runner
         BUILDLOG_MAC_S=""
+        BUILDLOG_MAC_HOLDER=""
         export BUILDLOG_TARGET=""
         return
     fi
@@ -825,6 +828,10 @@ try_mac_test() {
     BUILDLOG_MAC="$result_word"
     BUILDLOG_MAC_REASON="$result_reason"
     BUILDLOG_MAC_S="$result_seconds"
+    BUILDLOG_MAC_HOLDER=""
+    if [[ "$result_word" == declined && "$result_reason" == busy ]]; then
+        BUILDLOG_MAC_HOLDER="$result_holder"
+    fi
     case "$result_word" in
         declined|lost)
             export BUILDLOG_TARGET=""
