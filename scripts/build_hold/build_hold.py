@@ -645,6 +645,18 @@ def has_holder_file(directory: Path) -> bool:
         return False
 
 
+def live_holds(cycle: HoldCycle, directory: Path) -> tuple[Holder, ...]:
+    holders = read_holders(directory)
+    if isinstance(holders, NoHolders):
+        return ()
+    return tuple(holder for holder in holders.holders if not any(
+        holder_path(directory, key).name == holder.key
+        and aware_instant(instants["since"]) == holder.since
+        and instants["released_at"]
+        for key, instants in cycle["holders"].items()
+    ))
+
+
 def release_eta_text(release: ReleaseEta) -> str:
     if isinstance(release, UnknownReleaseEta):
         return "unknown"
@@ -653,6 +665,11 @@ def release_eta_text(release: ReleaseEta) -> str:
 
 def holder_text(holder: Holder) -> str:
     return f"{holder.name} (for {holder.purpose}, release eta {release_eta_text(holder.release)})"
+
+
+def resume_refusal(holders: tuple[Holder, ...]) -> str:
+    return ("a hold is in force (" + "; ".join(holder_text(holder) for holder in holders)
+            + "); --resume only continues a release already begun. Release that hold without --resume.")
 
 
 def release_request(release_time: str | None, zone_name: str | None) -> ReleaseRequest:
@@ -686,7 +703,10 @@ def write_hold(directory: Path, name: str, purpose: str, request: ReleaseRequest
         release_eta = release.isoformat()
     directory.mkdir(parents=True, exist_ok=True)
     record = {"holder": label or name, "since": now.isoformat(), "for": purpose.strip(), "release_eta": release_eta}
-    _ = holder_path(directory, name).write_text(json.dumps(record, ensure_ascii=False) + "\n")
+    path = holder_path(directory, name)
+    temporary = directory.parent / f"{directory.name}.{path.name}.tmp"
+    _ = temporary.write_text(json.dumps(record, ensure_ascii=False) + "\n")
+    os.replace(temporary, path)
     return f"/build_hold from {label or name}: stop any cargo or verify.sh you are running and start none until I release. No release after 2 h: ask me. For: {purpose.strip()}"
 
 
@@ -750,6 +770,7 @@ def read_cycle() -> HoldCycle | None:
             fields = cast(dict[str, object], instants)
             if not isinstance(fields.get("since"), str) or not isinstance(fields.get("released_at"), str):
                 raise ValueError(f"invalid holder {name}: expected since and released_at strings")
+            _ = aware_instant(cast(str, fields["since"]))
         recipients = cycle.get("recipients")
         if not isinstance(recipients, dict):
             raise ValueError("invalid recipients: expected object")
@@ -856,7 +877,9 @@ def save_cycle(cycle: HoldCycle) -> None:
 def open_cycle(now: datetime) -> HoldCycle:
     cycle: HoldCycle = {"id": uuid.uuid4().hex, "opened_at": now.isoformat(), "holders": {}, "recipients": {}, "entries": [], "release_started_at": "", "holder_generation": 1, "holder_signature": ""}
     save_cycle(cycle)
-    _ = (release_directory() / "current").write_text(cycle["id"] + "\n")
+    temporary = release_directory() / "current.tmp"
+    _ = temporary.write_text(cycle["id"] + "\n")
+    os.replace(temporary, release_directory() / "current")
     return cycle
 
 
@@ -1335,27 +1358,70 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
     return True, "; ".join(entry_text(entry) for entry in entries) or "NoRegistration timeout; no recipients registered"
 
 
-def release_cycle(directory: Path, name: str) -> str:
+@dataclass(frozen=True)
+class FirstRelease:
+    pass
+
+
+@dataclass(frozen=True)
+class ResumedRelease:
+    pass
+
+
+FIRST_RELEASE = FirstRelease()
+
+
+def release_cycle(directory: Path, name: str, start: FirstRelease | ResumedRelease = FIRST_RELEASE) -> str:
+    release_since: FirstRelease | datetime = FIRST_RELEASE
     while True:
         with release_lock():
+            path = holder_path(directory, name)
+            if not isinstance(release_since, FirstRelease):
+                if not path.is_file():
+                    remaining = read_holders(directory)
+                    if isinstance(remaining, ActiveHolders):
+                        return ("release ended: another release command finished it; still held by "
+                                + "; ".join(holder_text(other) for other in remaining.holders))
+                    return "release ended: another release command finished it; builds may resume."
+                holder = read_holder(path)
+                if holder.since != release_since:
+                    return (f"release stopped: {holder.name} placed a new hold at {holder.since.astimezone():%H:%M %Z}; "
+                            + "that hold's release serves the sessions still waiting.")
+            if not path.is_file() and isinstance(start, FirstRelease):
+                raise ValueError(f"{name} held nothing")
             cycle = read_cycle_for_change()
+            if (isinstance(release_since, FirstRelease) and isinstance(start, ResumedRelease)
+                and not isinstance(cycle, (NoCycle, DamagedRecordSetAside))):
+                holds = live_holds(cycle, directory)
+                if holds:
+                    raise ValueError(resume_refusal(holds))
+            if not path.is_file():
+                raise ValueError(f"{name} held nothing")
+            holder = read_holder(path)
             if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
                 result = release_hold(directory, name)
                 if result == "released, builds may resume.":
                     return result + " No hold cycle: broadcast this release to every session."
                 return result
-            path = holder_path(directory, name)
-            if not path.is_file():
-                raise ValueError(f"{name} held nothing")
             now = datetime.now().astimezone()
             update_holder_generation(cycle)
             holders = read_holders(directory)
-            if cycle["holders"].get(name, {}).get("released_at", "") == "":
-                cycle["holders"].setdefault(name, {"since": now.isoformat(), "released_at": ""})["released_at"] = now.isoformat()
-                save_cycle(cycle)
+            if isinstance(start, FirstRelease):
+                if (name not in cycle["holders"]
+                    or aware_instant(cycle["holders"][name]["since"]) != holder.since):
+                    cycle["holders"][name] = {"since": holder.since.isoformat(), "released_at": ""}
+                if not cycle["holders"][name]["released_at"]:
+                    for key, instants in cycle["holders"].items():
+                        if (holder_path(directory, key).name == holder.key
+                            and aware_instant(instants["since"]) == holder.since
+                            and not instants["released_at"]):
+                            instants["released_at"] = now.isoformat()
+                    save_cycle(cycle)
+            if isinstance(release_since, FirstRelease):
+                release_since = holder.since
             if isinstance(holders, ActiveHolders) and len(holders.holders) > 1:
                 path.unlink()
-                return "released; still held by " + "; ".join(holder_text(holder) for holder in holders.holders if holder.key != name)
+                return "released; still held by " + "; ".join(holder_text(other) for other in holders.holders if other.key != holder.key)
             if not cycle["release_started_at"]:
                 cycle["release_started_at"] = now.isoformat()
                 save_cycle(cycle)
@@ -1469,7 +1535,13 @@ def main(arguments: list[str]) -> int:
                 with release_lock():
                     cycle = read_cycle_for_change()
                     if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
-                        name = next((holder for holder, instants in cycle["holders"].items() if instants["released_at"] and holder_path(holder_directory(), holder).is_file()), None)
+                        name = next((key for key, instants in cycle["holders"].items()
+                                     if instants["released_at"] and holder_path(holder_directory(), key).is_file()
+                                     and aware_instant(instants["since"]) == read_holder(holder_path(holder_directory(), key)).since), None)
+                        if name is None:
+                            holds = live_holds(cycle, holder_directory())
+                            if holds:
+                                raise ValueError(resume_refusal(holds))
                     elif isinstance(cycle, DamagedRecordSetAside):
                         state = read_holders(holder_directory())
                         if isinstance(state, ActiveHolders) and len(state.holders) == 1:
@@ -1478,7 +1550,7 @@ def main(arguments: list[str]) -> int:
                 raise ValueError("release needs --holder, or --resume for an active release")
             if name is None:
                 name = held_key(holder_directory(), given)
-            print(release_cycle(holder_directory(), name))
+            print(release_cycle(holder_directory(), name, ResumedRelease() if resume_requested else FirstRelease()))
         elif action == "wait":
             print(register_wait(os.environ.get("CLAUDE_CODE_SESSION_ID", "")))
         elif action == "nothing-to-build":

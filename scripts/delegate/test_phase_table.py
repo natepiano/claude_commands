@@ -29,6 +29,11 @@ def plan_text(*lines: str) -> str:
     return "\n".join((*lines, ""))
 
 
+def setUpModule() -> None:
+    """The times these tests expect are UTC; the user's zone setting must not change them."""
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "UTC"}))
+
+
 class PhaseTableTests(unittest.TestCase):
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -2012,6 +2017,8 @@ class PhaseTableTests(unittest.TestCase):
     def test_production_json_resolves_each_plan_from_its_unit_worktree(
         self,
     ) -> None:
+        # The offset this test expects is Pacific.
+        self.enterContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
         worktree = self.make_live_worktree("unit-worktree")
         plan = worktree / "docs" / "unit-plan.md"
         plan.parent.mkdir()
