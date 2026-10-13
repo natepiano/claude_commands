@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -90,6 +91,25 @@ class AgentListResponse(TypedDict):
     result: AgentListResult
 
 
+class SettledAgentResult(TypedDict):
+    agent: AgentDetails
+
+
+class SettledAgentResponse(TypedDict):
+    ok: bool
+    result: SettledAgentResult
+
+
+class AgentErrorDetail(TypedDict):
+    code: str
+    message: str
+
+
+class AgentErrorResponse(TypedDict):
+    ok: bool
+    error: AgentErrorDetail
+
+
 class StartedUnits(TypedDict):
     systemd_units: list[str]
 
@@ -109,6 +129,20 @@ class ClaudeTrustConfiguration(TypedDict):
     projects: dict[str, ClaudeProjectTrust]
 
 
+class RecordedWorkOrder(TypedDict):
+    file: str
+
+
+WorkerAssignments = TypedDict("WorkerAssignments", {
+    "slug-unit-impl": str,
+    "slug-unit-review": str,
+    "clamp-unit-impl": str,
+    "clamp-unit-review": str,
+    "count-unit-impl": str,
+    "count-unit-review": str,
+}, total=False)
+
+
 @dataclass(frozen=True)
 class InvocationResult:
     code: int
@@ -119,6 +153,16 @@ class InvocationResult:
 def herdr_args(*arguments: str) -> list[str]:
     """Use targeting confirmed by the impl slot against herdr 0.9.0."""
     return ["--session", "herdr-trial", *arguments]
+
+
+def installed_git() -> str:
+    executable = shutil.which("git")
+    if executable is None:
+        raise RuntimeError("scaffold fixture tests require Git")
+    return executable
+
+
+GIT_BINARY = installed_git()
 
 
 class TrialTests(unittest.TestCase):
@@ -153,12 +197,20 @@ class TrialTests(unittest.TestCase):
             "HERDR_BIN": str(self.fake),
             "HERDR_TRIAL_SYSTEMD_RUN": str(self.fake),
             "HERDR_TRIAL_SYSTEMCTL": str(self.fake),
+            "HERDR_TRIAL_GIT": GIT_BINARY,
             "HERDR_TRIAL_ROOT": str(self.scratch),
             "HERDR_TRIAL_START_TIMEOUT": "0.5",
             "FAKE_HERDR_LOG": str(self.log),
             "FAKE_HERDR_RESPONSES": str(self.response_file),
             "CLAUDE_CONFIG_DIR": str(self.claude),
             "CODEX_HOME": str(self.codex),
+            "HOME": str(self.root),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_AUTHOR_NAME": "Trial fixture",
+            "GIT_AUTHOR_EMAIL": "trial@example.invalid",
+            "GIT_COMMITTER_NAME": "Trial fixture",
+            "GIT_COMMITTER_EMAIL": "trial@example.invalid",
             # An omitted tool override must fail instead of reaching a real tool.
             "PATH": str(self.root / "no-external-programs"),
         }, clear=True)))
@@ -176,6 +228,65 @@ class TrialTests(unittest.TestCase):
         with redirect_stdout(stdout), redirect_stderr(stderr):
             code = trial.main(list(arguments))
         return InvocationResult(code, stdout.getvalue(), stderr.getvalue())
+
+    def invoke_cli(self, *arguments: str) -> InvocationResult:
+        _ = self.response_file.write_text(json.dumps(self.responses))
+        result = subprocess.run([
+            sys.executable, str(Path(__file__).with_name("trial.py").resolve()), *arguments,
+        ], cwd=self.project, capture_output=True, text=True, check=False, timeout=10)
+        return InvocationResult(result.returncode, result.stdout, result.stderr)
+
+    def fixture_git(self, directory: Path, *arguments: str) -> str:
+        result = subprocess.run([GIT_BINARY, "-C", str(directory), *arguments],
+                                capture_output=True, text=True, check=False, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def production_parser(self, document: Path, expression: str) -> InvocationResult:
+        program = (
+            "import sys\nfrom pathlib import Path\n" +
+            "sys.path.insert(0, '/home/natepiano/.claude/scripts/production')\n" +
+            "from add_unit import cell_value\n" +
+            "from merge_checkpoint import optional_field, FieldPresent\n" +
+            "from production_lifecycle import production_name\n" +
+            "lines = Path(sys.argv[1]).read_text().splitlines()\n" + expression
+        )
+        result = subprocess.run([sys.executable, "-B", "-c", program, str(document)],
+                                capture_output=True, text=True, check=False, timeout=10)
+        return InvocationResult(result.returncode, result.stdout, result.stderr)
+
+    def assignment(self, label: str, work_order: Path) -> None:
+        directory = self.scratch / "work"
+        directory.mkdir(parents=True, exist_ok=True)
+        order: RecordedWorkOrder = {"file": str(work_order)}
+        _ = (directory / f"{label}.json").write_text(json.dumps(order))
+
+    def assigned_files(self) -> WorkerAssignments:
+        files: dict[str, str] = {}
+        for path in (self.scratch / "work").glob("*.json"):
+            order = cast(RecordedWorkOrder, json.loads(path.read_text()))
+            files[path.stem] = order["file"]
+        return cast(WorkerAssignments, cast(object, files))
+
+    def settled_response(self, pane_id: str, state: str, timeout: int = 1800000) -> None:
+        response: SettledAgentResponse = {"ok": True, "result": {"agent": {
+            "pane_id": pane_id, "agent": "codex", "agent_status": state,
+        }}}
+        self.configure(herdr_args("agent", "wait", pane_id, "--timeout", str(timeout)),
+                       json.dumps(response))
+
+    def assert_blocked_issue(self, result: InvocationResult, label: str) -> None:
+        self.assertEqual(result.code, 2, result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn("blocked", result.stderr.casefold())
+        lines = (self.scratch / "issues.jsonl").read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        issue = cast(IssueRecord, json.loads(lines[0]))
+        self.assertEqual(set(issue), {"time", "session", "expected", "happened"})
+        self.assertEqual(issue["session"], label)
+        self.assertTrue(issue["expected"])
+        self.assertIn("blocked", issue["happened"].casefold())
+        self.assertEqual(datetime.fromisoformat(issue["time"]).utcoffset(), timedelta(0))
 
     def calls(self) -> list[list[str]]:
         if not self.log.exists():
@@ -213,6 +324,366 @@ class TrialTests(unittest.TestCase):
     def pane_list(self, panes: list[PaneDetails]) -> None:
         response: PaneListResponse = {"ok": True, "result": {"panes": panes}}
         self.configure(herdr_args("pane", "list"), json.dumps(response))
+
+    def test_scaffold_builds_bare_origin_committed_branches_and_three_worktrees(self) -> None:
+        self.scratch.mkdir()
+        started = self.scratch / "started.json"
+        issues = self.scratch / "issues.jsonl"
+        _ = started.write_text('{"systemd_units": ["herdr-trial-server"]}\n')
+        _ = issues.write_text('existing phase one evidence\n')
+        before = (started.read_bytes(), issues.read_bytes())
+        self.assert_success(self.invoke("scaffold"))
+        repo = self.scratch / "repo"
+        origin = self.scratch / "origin.git"
+        self.assertEqual(self.fixture_git(origin, "rev-parse", "--is-bare-repository"), "true")
+        initial = self.fixture_git(repo, "rev-parse", "main")
+        for reference in ("origin/main", "herdr-fake", "origin/herdr-fake"):
+            self.assertEqual(self.fixture_git(repo, "rev-parse", reference), initial)
+        self.assertEqual(self.fixture_git(repo, "status", "--porcelain"), "")
+        self.assertTrue((repo / "README.md").is_file())
+        self.assertTrue((repo / "textkit" / "__init__.py").is_file())
+        self.assertTrue((repo / "textkit" / "test_textkit.py").is_file())
+        for name in ("slug", "clamp", "count"):
+            checkout = self.scratch / "worktrees" / f"{name}-unit"
+            self.assertEqual(self.fixture_git(checkout, "branch", "--show-current"),
+                             f"herdr-fake-{name}")
+            self.assertEqual(self.fixture_git(checkout, "rev-parse", "HEAD"), initial)
+            self.assertEqual(self.fixture_git(checkout, "status", "--porcelain"), "")
+            self.assertTrue((checkout / "textkit" / "__init__.py").is_file())
+        with patch.object(subprocess, "run", side_effect=AssertionError("second scaffold starts nothing")):
+            self.assert_refusal(self.invoke("scaffold"), str(repo))
+        self.assertEqual(self.fixture_git(repo, "rev-parse", "main"), initial)
+        baseline = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "textkit"],
+                                  cwd=repo, capture_output=True, text=True, check=False, timeout=10)
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        self.assertIn("Ran 1 test", baseline.stderr)
+        self.assertEqual((started.read_bytes(), issues.read_bytes()), before)
+        self.assertEqual(self.calls(), [])
+
+    def test_scaffold_writes_production_rules_and_delegate_ready_unit_plans(self) -> None:
+        self.assert_success(self.invoke("scaffold"))
+        repo = self.scratch / "repo"
+        plans = repo / "docs" / "plans"
+        production = (plans / "herdr-fake-production.md").read_text()
+        for text in (
+            "> **Status: PRODUCTION — running.**", "## Production Context", "## Units",
+            "**Repository:**", str(repo), "**Merge branch:**", "herdr-fake",
+            "**Showrunner checkout:**", "**Showrunner session:**", "natedev",
+            "**Log:**", "docs/plans/herdr-fake-log.md", "**User zone:**", "America/New_York",
+            "**Updates:**", "on demand", "**Merge tests:**", "python3 -m unittest discover -s textkit",
+            "**Push:**", "git", "**Promote:**", "none", "herdr session herdr-trial",
+            "/home/natepiano/worktrees/claude-build-followups-herdr-trial/scripts/herdr/trial.py",
+            "tmux", "add_unit.py", "trial.py issue", "never promote or wrap",
+            "never answer a trust or permission prompt",
+        ):
+            self.assertIn(text, production)
+        functions = {"slug": "slugify", "clamp": "clamp", "count": "word_count"}
+        for name, function in functions.items():
+            unit = f"{name}-unit"
+            filename = f"herdr-fake-{name}.md"
+            self.assertIn(filename, production)
+            self.assertIn(unit, production)
+            self.assertIn(str(self.scratch / "worktrees" / unit), production)
+            self.assertIn(f"herdr-fake-{name}", production)
+            plan = (plans / filename).read_text()
+            for text in ("Delegation Context", "Phase 1", "Work Order", function,
+                         "textkit/__init__.py", "test", f"{unit}-impl", f"{unit}-review",
+                         f"trial.py work {unit}", f"trial.py wait {unit}"):
+                self.assertIn(text, plan)
+            self.assertNotIn("Phase 2", plan)
+            self.assertIn(filename, self.fixture_git(repo, "ls-tree", "-r", "--name-only", "HEAD"))
+        self.trust_configs({str(self.root): True}, {str(self.root): "trusted"})
+        for checkout in (repo, *(self.scratch / "worktrees" / f"{name}-unit"
+                                  for name in functions)):
+            self.assert_success(self.invoke("trust-check", str(checkout)))
+
+    def test_scaffold_refuses_existing_repo_before_running_git_or_replacing_files(self) -> None:
+        repo = self.scratch / "repo"
+        repo.mkdir(parents=True)
+        marker = repo / "keep.txt"
+        _ = marker.write_text("do not replace\n")
+        with patch.object(subprocess, "run", side_effect=AssertionError("refusal must start nothing")):
+            self.assert_refusal(self.invoke("scaffold"), str(repo))
+        self.assertEqual(marker.read_text(), "do not replace\n")
+        self.assertFalse((self.scratch / "origin.git").exists())
+        self.assertEqual(self.calls(), [])
+
+    def test_rendered_production_push_parses_as_git_with_the_real_merge_parser(self) -> None:
+        self.assert_success(self.invoke("scaffold"))
+        document = self.scratch / "repo" / "docs" / "plans" / "herdr-fake-production.md"
+        result = self.production_parser(document,
+                                        "field = optional_field(lines, 'Push')\n" +
+                                        "assert isinstance(field, FieldPresent)\n" +
+                                        "print(cell_value(field.text))\n")
+        self.assert_success(result)
+        self.assertEqual(result.stdout, "git\n")
+
+    def test_rendered_production_name_is_accepted_by_the_real_lifecycle_parser(self) -> None:
+        self.assert_success(self.invoke("scaffold"))
+        document = self.scratch / "repo" / "docs" / "plans" / "herdr-fake-production.md"
+        result = self.production_parser(document, "print(production_name(lines))\n")
+        self.assert_success(result)
+        self.assertEqual(result.stdout, "herdr-fake\n")
+
+    def test_concurrent_worker_dispatches_preserve_both_assignments_for_separate_waits(self) -> None:
+        units = {"slug-unit": "w38:p71", "clamp-unit": "w38:p81"}
+        self.pane_list([{"pane_id": pane, "label": f"{unit}-impl"}
+                        for unit, pane in units.items()])
+        orders: dict[str, Path] = {}
+        for unit in units:
+            order = self.root / f"{unit}.md"
+            _ = order.write_text("tiny simultaneous work order\n")
+            orders[unit] = order
+        _ = self.response_file.write_text(json.dumps(self.responses))
+        launcher = [sys.executable, "-B", str(Path(__file__).with_name("trial.py").resolve()), "work"]
+        with subprocess.Popen([*launcher, "slug-unit", "impl", str(orders["slug-unit"])],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as first:
+            with subprocess.Popen([*launcher, "clamp-unit", "impl", str(orders["clamp-unit"])],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as second:
+                try:
+                    first_stdout, first_stderr = first.communicate(timeout=10)
+                    second_stdout, second_stderr = second.communicate(timeout=10)
+                    self.assert_success(InvocationResult(first.returncode, first_stdout, first_stderr))
+                    self.assert_success(InvocationResult(second.returncode, second_stdout, second_stderr))
+                finally:
+                    for process in (first, second):
+                        if process.poll() is None:
+                            process.kill()
+        for unit, pane in units.items():
+            with self.subTest(unit=unit):
+                self.assertTrue((self.scratch / "work" / f"{unit}-impl.json").is_file())
+                report = Path(str(orders[unit]) + ".done")
+                _ = report.write_text(f"{unit} completed\n")
+                self.settled_response(pane, "done")
+                result = self.invoke("wait", unit, "impl")
+                self.assert_success(result)
+                self.assertEqual(result.stdout, str(report) + "\n")
+        self.assertFalse((self.scratch / "work.json").exists())
+        prompts = [call for call in self.calls() if call[2:4] == ["agent", "prompt"]]
+        self.assertEqual({call[4] for call in prompts}, set(units.values()))
+        self.assertEqual(len(prompts), 2)
+
+    def test_work_records_file_removes_stale_report_and_submits_literal_prompt_once(self) -> None:
+        label = "slug-unit-impl"
+        work_order = self.root / "work order ' café.md"
+        report = Path(str(work_order) + ".done")
+        _ = work_order.write_text("tiny work order\n")
+        _ = report.write_text("stale report\n")
+        other_file = self.root / "other.md"
+        self.assignment("count-unit-review", other_file)
+        self.pane_list([{"pane_id": "w38:p71", "label": label}])
+        prompt = f"Read and carry out {work_order}. When done, write your report to {report}."
+        expected = herdr_args("agent", "prompt", "w38:p71", prompt)
+        original_run = subprocess.run
+
+        def check_dispatch_order(argv: list[str], *, capture_output: bool, text: bool,
+                                 check: bool, timeout: float) -> subprocess.CompletedProcess[str]:
+            if argv == [str(self.fake), *expected]:
+                self.assertFalse(report.exists())
+                self.assertEqual(self.assigned_files().get(label), str(work_order))
+            return original_run(argv, capture_output=capture_output, text=text,
+                                check=check, timeout=timeout)
+
+        with patch.object(subprocess, "run", side_effect=check_dispatch_order):
+            self.assert_success(self.invoke("work", "slug-unit", "impl", str(work_order)))
+        self.assertFalse(report.exists())
+        self.assertEqual(self.assigned_files(), {
+            "count-unit-review": str(other_file), label: str(work_order),
+        })
+        self.assertEqual(self.calls(), [herdr_args("pane", "list"), expected])
+
+    def test_work_and_wait_use_role_labels_and_refuse_invalid_roles_without_input(self) -> None:
+        for action in ("work", "wait"):
+            arguments = [action, "slug-unit", "director"]
+            if action == "work":
+                arguments.append(str(self.root / "order.md"))
+            with self.subTest(action=action):
+                result = self.invoke(*arguments)
+                self.assertEqual(result.code, 2, result.stderr)
+                self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(self.scratch.exists())
+
+    def test_wait_in_separate_process_uses_recorded_assignment_and_prints_settled_report_path(self) -> None:
+        label = "clamp-unit-review"
+        work_order = self.root / "review.md"
+        report = Path(str(work_order) + ".done")
+        _ = work_order.write_text("review the tiny change\n")
+        self.pane_list([{"pane_id": "w38:p82", "label": label}])
+        self.assert_success(self.invoke("work", "clamp-unit", "review", str(work_order)))
+        _ = report.write_text("Review complete: the change passes.\n")
+        for state in ("idle", "done"):
+            with self.subTest(state=state):
+                self.settled_response("w38:p82", state)
+                result = self.invoke_cli("wait", "clamp-unit", "review")
+                self.assert_success(result)
+                self.assertEqual(result.stdout, str(report) + "\n")
+        prompt_calls = [call for call in self.calls() if call[2:4] == ["agent", "prompt"]]
+        self.assertEqual(len(prompt_calls), 1)
+        self.assertEqual(self.calls()[-2:], [
+            herdr_args("pane", "list"),
+            herdr_args("agent", "wait", "w38:p82", "--timeout", "1800000"),
+        ])
+
+    def test_wait_without_assignment_refuses_before_contacting_herdr(self) -> None:
+        for has_map in (False, True):
+            with self.subTest(has_map=has_map):
+                if has_map:
+                    self.assignment("count-unit-impl", self.root / "other.md")
+                self.assert_refusal(self.invoke("wait", "slug-unit", "impl"), "slug-unit-impl")
+                self.assertEqual(self.calls(), [])
+
+    def test_relative_work_file_remains_resolvable_when_wait_runs_from_another_directory(self) -> None:
+        work_order = self.project / "relative.md"
+        report = Path(str(work_order) + ".done")
+        _ = work_order.write_text("work from the worker checkout\n")
+        self.pane_list([{"pane_id": "w38:p93", "label": "count-unit-impl"}])
+        self.assert_success(self.invoke_cli("work", "count-unit", "impl", "relative.md"))
+        self.assertEqual(self.assigned_files().get("count-unit-impl"), str(work_order))
+        _ = report.write_text("finished\n")
+        self.settled_response("w38:p93", "done")
+        result = self.invoke("wait", "count-unit", "impl")
+        self.assert_success(result)
+        self.assertEqual(result.stdout, str(report) + "\n")
+        self.assertEqual(sum(call[2:4] == ["agent", "prompt"] for call in self.calls()), 1)
+
+    def test_wait_keeps_waiting_after_initial_idle_until_report_or_deadline_without_resubmitting(self) -> None:
+        work_order = self.root / "order.md"
+        report = Path(str(work_order) + ".done")
+        _ = work_order.write_text("work that has not started its turn yet\n")
+        self.pane_list([{"pane_id": "w38:p93", "label": "count-unit-impl"}])
+        self.assert_success(self.invoke("work", "count-unit", "impl", str(work_order)))
+        states = iter(("idle", "working", "done"))
+        waits: list[list[str]] = []
+        original_run = subprocess.run
+
+        def finish_after_start(argv: list[str], *, capture_output: bool, text: bool,
+                               check: bool, timeout: float) -> subprocess.CompletedProcess[str]:
+            if argv[3:5] == ["agent", "wait"]:
+                state = next(states)
+                waits.append(argv[1:])
+                self.assertEqual("--until" in argv, state == "working")
+                if state == "working":
+                    self.assertEqual(argv[argv.index("--until") + 1], "working")
+                self.assertFalse(report.exists())
+                response: SettledAgentResponse = {"ok": True, "result": {"agent": {
+                    "pane_id": "w38:p93", "agent": "codex", "agent_status": state,
+                }}}
+                self.configure(argv[1:], json.dumps(response))
+                _ = self.response_file.write_text(json.dumps(self.responses))
+                result = original_run(argv, capture_output=capture_output, text=text,
+                                      check=check, timeout=timeout)
+                if state == "done":
+                    _ = report.write_text("report arrives after the turn starts\n")
+                return result
+            return original_run(argv, capture_output=capture_output, text=text,
+                                check=check, timeout=timeout)
+
+        with patch.object(subprocess, "run", side_effect=finish_after_start):
+            result = self.invoke("wait", "count-unit", "impl")
+        self.assert_success(result)
+        self.assertEqual(result.stdout, str(report) + "\n")
+        self.assertEqual(len(waits), 3)
+        remaining = [int(call[call.index("--timeout") + 1]) for call in waits]
+        self.assertTrue(all(0 < milliseconds <= 1800000 for milliseconds in remaining))
+        self.assertEqual(remaining, sorted(remaining, reverse=True))
+        report.unlink()
+        self.settled_response("w38:p93", "idle", timeout=0)
+        with patch.dict(os.environ, {"HERDR_TRIAL_WAIT_TIMEOUT": "0"}):
+            expired = self.invoke("wait", "count-unit", "impl")
+        self.assert_refusal(expired)
+        self.assertRegex(expired.stderr.casefold(), "deadline|timed out|timeout|report missing")
+        self.assertEqual(sum(call[2:4] == ["agent", "prompt"] for call in self.calls()), 1)
+
+    def test_wait_deadline_exceeds_ten_seconds_and_prompt_is_not_resubmitted(self) -> None:
+        work_order = self.root / "long-order.md"
+        _ = work_order.write_text("takes longer than ten seconds\n")
+        self.pane_list([{"pane_id": "w38:p71", "label": "slug-unit-impl"}])
+        self.assert_success(self.invoke("work", "slug-unit", "impl", str(work_order)))
+        _ = Path(str(work_order) + ".done").write_text("long work finished\n")
+        original_run = subprocess.run
+        deadlines: list[float] = []
+
+        def emulate_long_wait(argv: list[str], *, capture_output: bool, text: bool,
+                              check: bool, timeout: float) -> subprocess.CompletedProcess[str]:
+            if argv[3:5] == ["agent", "wait"]:
+                milliseconds = int(argv[-1])
+                deadlines.append(timeout)
+                # Model the long wait at its process boundary without sleeping.
+                if timeout <= milliseconds / 1000:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+            return original_run(argv, capture_output=capture_output, text=text,
+                                check=check, timeout=timeout)
+
+        for milliseconds in (1800000, 25000):
+            with self.subTest(milliseconds=milliseconds):
+                self.settled_response("w38:p71", "done", milliseconds)
+                with patch.dict(os.environ, {"HERDR_TRIAL_WAIT_TIMEOUT": str(milliseconds)}):
+                    with patch.object(subprocess, "run", side_effect=emulate_long_wait):
+                        self.assert_success(self.invoke("wait", "slug-unit", "impl"))
+        self.assertEqual(len(deadlines), 2)
+        self.assertGreater(deadlines[0], 1800)
+        self.assertGreater(deadlines[1], 25)
+        self.assertEqual(sum(call[2:4] == ["agent", "prompt"] for call in self.calls()), 1)
+        self.assertFalse(any("--until" in call for call in self.calls()))
+
+    def test_work_agent_blocked_refusal_logs_one_issue_without_raw_input(self) -> None:
+        label = "slug-unit-review"
+        work_order = self.root / "review.md"
+        _ = work_order.write_text("review\n")
+        self.pane_list([{"pane_id": "w38:p72", "label": label}])
+        response: AgentErrorResponse = {"ok": False, "error": {
+            "code": "agent_blocked", "message": "agent is blocked by a permission dialog",
+        }}
+        prompt = (f"Read and carry out {work_order}. When done, write your report to "
+                  f"{work_order}.done.")
+        arguments = herdr_args("agent", "prompt", "w38:p72", prompt)
+        self.configure(arguments, code=1, stderr=json.dumps(response))
+        self.assert_blocked_issue(self.invoke("work", "slug-unit", "review", str(work_order)), label)
+        self.assertEqual(self.calls(), [herdr_args("pane", "list"), arguments])
+
+    def test_wait_settled_blocked_logs_issue_even_when_a_report_exists(self) -> None:
+        label = "count-unit-review"
+        work_order = self.root / "review.md"
+        self.assignment(label, work_order)
+        _ = Path(str(work_order) + ".done").write_text("do not accept while blocked\n")
+        self.pane_list([{"pane_id": "w38:p94", "label": label}])
+        self.settled_response("w38:p94", "blocked")
+        result = self.invoke("wait", "count-unit", "review")
+        self.assert_blocked_issue(result, label)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.calls(), [
+            herdr_args("pane", "list"),
+            herdr_args("agent", "wait", "w38:p94", "--timeout", "1800000"),
+        ])
+
+    def test_wait_agent_blocked_error_logs_one_issue_and_never_submits_input(self) -> None:
+        label = "clamp-unit-impl"
+        self.assignment(label, self.root / "order.md")
+        self.pane_list([{"pane_id": "w38:p81", "label": label}])
+        response: AgentErrorResponse = {"ok": False, "error": {
+            "code": "agent_blocked", "message": "blocked while waiting",
+        }}
+        arguments = herdr_args("agent", "wait", "w38:p81", "--timeout", "1800000")
+        self.configure(arguments, code=1, stderr=json.dumps(response))
+        self.assert_blocked_issue(self.invoke("wait", "clamp-unit", "impl"), label)
+        self.assertEqual(self.calls(), [herdr_args("pane", "list"), arguments])
+
+    def test_wait_timeout_refuses_without_resending_the_prompt(self) -> None:
+        label = "clamp-unit-review"
+        work_order = self.root / "review.md"
+        self.assignment(label, work_order)
+        self.pane_list([{"pane_id": "w38:p82", "label": label}])
+        response: AgentErrorResponse = {"ok": False, "error": {
+            "code": "timeout", "message": "agent wait timed out",
+        }}
+        arguments = herdr_args("agent", "wait", "w38:p82", "--timeout", "1800000")
+        self.configure(arguments, code=1, stderr=json.dumps(response))
+        result = self.invoke("wait", "clamp-unit", "review")
+        self.assert_refusal(result)
+        self.assertIn("timed out", result.stderr)
+        self.assertEqual(self.assigned_files(), {label: str(work_order)})
+        self.assertEqual(self.calls(), [herdr_args("pane", "list"), arguments])
 
     def test_pane_id_finds_exact_label_and_uses_opaque_id(self) -> None:
         self.pane_list([

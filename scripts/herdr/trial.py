@@ -9,12 +9,17 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NoReturn, NotRequired, TypedDict, cast, override
+from typing import Literal, NoReturn, NotRequired, TypedDict, cast, override
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.herdr import scaffold_files
 
 HERDR_BINARY = "/nix/store/pyqm5522kvk30b9vgb1ab976pjnjwn51-herdr-0.9.0/bin/herdr"
 SESSION = "herdr-trial"
@@ -46,8 +51,16 @@ class CreatedWorkspace(TypedDict):
     root_pane: PaneIdentity
 
 
+class AgentLifecycle(TypedDict):
+    agent_status: str
+
+
+class AgentWaitResult(TypedDict):
+    agent: AgentLifecycle
+
+
 class HerdrReply(TypedDict):
-    result: PaneListResult | AgentListResult | CreatedWorkspace
+    result: PaneListResult | AgentListResult | CreatedWorkspace | AgentWaitResult
 
 
 class HerdrError(TypedDict):
@@ -68,6 +81,16 @@ class TrialIssue(TypedDict):
     session: str
     expected: str
     happened: str
+
+
+type WorkerLabel = Literal[
+    "slug-unit-impl", "slug-unit-review", "clamp-unit-impl", "clamp-unit-review",
+    "count-unit-impl", "count-unit-review",
+]
+
+
+class WorkerWorkOrder(TypedDict):
+    file: str
 
 
 @dataclass(frozen=True)
@@ -96,6 +119,42 @@ class CommandToRun:
     text: str
 
 
+@dataclass(frozen=True)
+class AssignedWork:
+    file: Path
+
+    @property
+    def report(self) -> Path:
+        return Path(f"{self.file}.done")
+
+
+@dataclass(frozen=True)
+class NoAssignedWork:
+    label: str
+
+
+@dataclass(frozen=True)
+class ObservedAgentState:
+    status: str
+
+
+@dataclass(frozen=True)
+class WaitTimedOut:
+    """The CLI or its subprocess exhausted the remaining wait."""
+
+
+@dataclass(frozen=True)
+class WorkDeadline:
+    expires_at: float
+
+    def remaining_milliseconds(self) -> int:
+        return max(0, math.ceil((self.expires_at - time.monotonic()) * 1000))
+
+
+class BlockedWorker(Exception):
+    """The worker needs the user; no prompt response is sent."""
+
+
 class TrialFailure(Exception):
     """A named refusal or external command failure."""
 
@@ -120,6 +179,9 @@ class TrialArguments(argparse.Namespace):
     happened: str = ""
     directory: str = ""
     start_command: ShellOnly | CommandToRun = ShellOnly()
+    unit: str = ""
+    role: str = ""
+    file: str = ""
 
 
 def json_object(value: object, context: str) -> dict[str, object]:
@@ -353,6 +415,165 @@ def write_issue(session: str, expected: str, happened: str) -> None:
         _ = output.write(json.dumps(issue) + "\n")
 
 
+def git_command(*arguments: str) -> None:
+    # Keep inherited git overrides and user hooks out of the scratch repository.
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+    result = subprocess.run([
+        os.environ.get("HERDR_TRIAL_GIT", "git"), "-c", "core.hooksPath=/dev/null",
+        "-c", "init.templateDir=", *arguments,
+    ], capture_output=True, text=True, check=False, timeout=30.0, env=environment)
+    require_success(result, "scaffold git")
+
+
+def scaffold() -> None:
+    root = scratch_root().resolve()
+    repo = root / "repo"
+    if repo.exists() or repo.is_symlink():
+        raise TrialFailure(f"scaffold refuses existing repository {repo}")
+    for path in (root / "origin.git", *(root / "worktrees" / unit.name for unit in scaffold_files.UNITS)):
+        if path.exists() or path.is_symlink():
+            raise TrialFailure(f"scaffold refuses existing path {path}")
+    root.mkdir(parents=True, exist_ok=True)
+    git_command("init", "--bare", "--initial-branch=main", str(root / "origin.git"))
+    git_command("clone", str(root / "origin.git"), str(repo))
+    for name, text in scaffold_files.file_texts(root).items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(text)
+    git_command("-C", str(repo), "add", ".")
+    git_command("-C", str(repo), "-c", "user.name=Herdr Trial", "-c", "user.email=herdr-trial@localhost",
+                "-c", "commit.gpgSign=false", "commit", "-m", "Seed the herdr fake production")
+    git_command("-C", str(repo), "push", "-u", "origin", "main")
+    git_command("-C", str(repo), "switch", "-c", "herdr-fake")
+    git_command("-C", str(repo), "push", "-u", "origin", "herdr-fake")
+    for unit in scaffold_files.UNITS:
+        git_command("-C", str(repo), "worktree", "add", "-b", f"herdr-fake-{unit.slug}",
+                    str(root / "worktrees" / unit.name), "herdr-fake")
+
+
+def worker_label(unit: str, role: str) -> WorkerLabel:
+    if unit not in tuple(item.name for item in scaffold_files.UNITS) or role not in ("impl", "review"):
+        raise UsageFailure(f"invalid worker {unit}-{role}")
+    return cast(WorkerLabel, f"{unit}-{role}")
+
+
+def assigned_work(label: WorkerLabel) -> AssignedWork | NoAssignedWork:
+    path = scratch_root() / "work" / f"{label}.json"
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return NoAssignedWork(label)
+    order = decode_object(text, str(path))
+    return AssignedWork(Path(json_text(order.get("file"), f"{path} work order file")))
+
+
+def record_work(label: WorkerLabel, assignment: AssignedWork) -> None:
+    directory = scratch_root() / "work"
+    directory.mkdir(parents=True, exist_ok=True)
+    order: WorkerWorkOrder = {"file": str(assignment.file)}
+    with tempfile.NamedTemporaryFile(mode="w", dir=directory, prefix=f".{label}-", delete=False) as output:
+        temporary_path = Path(output.name)
+        try:
+            _ = output.write(json.dumps(order) + "\n")
+            output.close()
+            os.replace(temporary_path, directory / f"{label}.json")
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+
+def check_worker_result(result: subprocess.CompletedProcess[str], label: str, operation: str) -> None:
+    if result.returncode != 0:
+        try:
+            error = json_object(decode_object(result.stderr, "herdr refusal").get("error"), "herdr error")
+        except TrialFailure:
+            error = {}
+        if error.get("code") == "agent_blocked":
+            worker_blocked(label, operation, json_text(error.get("message"), "herdr blocked message"))
+    require_success(result, f"{operation} {label}")
+
+
+def worker_blocked(label: str, expected: str, happened: str) -> NoReturn:
+    write_issue(label, expected, happened)
+    raise BlockedWorker(f"{label}: {happened}")
+
+
+def work(herdr: Herdr, unit: str, role: str, file: str) -> None:
+    label = worker_label(unit, role)
+    assignment = AssignedWork(Path(file).expanduser().resolve())
+    if not assignment.file.is_file():
+        raise TrialFailure(f"work order missing: {assignment.file}")
+    pane = herdr.pane_id(label)
+    assignment.report.unlink(missing_ok=True)
+    record_work(label, assignment)
+    prompt = f"Read and carry out {assignment.file}. When done, write your report to {assignment.report}."
+    result = run_program(herdr.argv("agent", "prompt", pane, prompt))
+    check_worker_result(result, label, "carry out the assigned work")
+
+
+def wait_timeout() -> int:
+    try:
+        milliseconds = int(os.environ.get("HERDR_TRIAL_WAIT_TIMEOUT", "1800000"))
+    except ValueError as error:
+        raise UsageFailure("HERDR_TRIAL_WAIT_TIMEOUT must be a nonnegative integer in milliseconds") from error
+    if milliseconds < 0:
+        raise UsageFailure("HERDR_TRIAL_WAIT_TIMEOUT must be a nonnegative integer in milliseconds")
+    return milliseconds
+
+
+def wait_for_agent(herdr: Herdr, label: WorkerLabel, pane: str, milliseconds: int,
+                   *state_arguments: str) -> ObservedAgentState | WaitTimedOut:
+    try:
+        result = run_program(herdr.argv("agent", "wait", pane, *state_arguments,
+                                       "--timeout", str(milliseconds)), timeout=milliseconds / 1000 + 10)
+    except subprocess.TimeoutExpired:
+        return WaitTimedOut()
+    if result.returncode != 0:
+        try:
+            error = json_object(decode_object(result.stderr, "herdr refusal").get("error"), "herdr error")
+        except TrialFailure:
+            error = {}
+        if error.get("code") == "timeout":
+            return WaitTimedOut()
+    check_worker_result(result, label, "wait for assigned work to finish")
+    response = decode_object(result.stdout, "herdr agent wait")
+    payload = json_object(response.get("result"), "herdr agent wait result")
+    agent = json_object(payload.get("agent"), "herdr agent state")
+    status = json_text(agent.get("agent_status"), "herdr agent lifecycle status")
+    if status == "blocked":
+        worker_blocked(label, "assigned work completes", "worker blocked at a trust, permission or question prompt")
+    return ObservedAgentState(status)
+
+
+def wait(herdr: Herdr, unit: str, role: str) -> Path:
+    label = worker_label(unit, role)
+    assignment = assigned_work(label)
+    if isinstance(assignment, NoAssignedWork):
+        raise TrialFailure(f"no assigned work for {label}")
+    milliseconds = wait_timeout()
+    pane = herdr.pane_id(label)
+    deadline = WorkDeadline(time.monotonic() + milliseconds / 1000)
+    while True:
+        remaining = deadline.remaining_milliseconds()
+        if remaining == 0 and not assignment.report.is_file():
+            raise TrialFailure(f"{label}: timed out waiting for report: {assignment.report}")
+        outcome = wait_for_agent(herdr, label, pane, remaining)
+        if isinstance(outcome, ObservedAgentState) and outcome.status not in ("idle", "done"):
+            raise TrialFailure(f"{label}: agent wait returned unsettled state {outcome.status!r}")
+        if assignment.report.is_file():
+            return assignment.report
+        if isinstance(outcome, WaitTimedOut) or deadline.remaining_milliseconds() == 0:
+            raise TrialFailure(f"{label}: timed out waiting for report: {assignment.report}")
+        # A just-submitted prompt may still look idle. Observe activity before
+        # asking for settlement again, without sending the prompt a second time.
+        outcome = wait_for_agent(herdr, label, pane, deadline.remaining_milliseconds(), "--until", "working")
+        if isinstance(outcome, WaitTimedOut):
+            # A fast turn can finish and write its report between state observations.
+            if assignment.report.is_file():
+                return assignment.report
+            raise TrialFailure(f"{label}: timed out waiting for report: {assignment.report}")
+
+
 def trusted_by_claude(directory: Path, config: Path) -> bool:
     data = decode_object(config.read_text(), str(config))
     projects = json_object(data.get("projects", {}), f"{config} projects")
@@ -411,6 +632,13 @@ def parser() -> TrialParser:
             _ = pane_parser.add_argument("--command", dest="start_command", type=CommandToRun,
                                          default=ShellOnly())
     _ = commands.add_parser("agents")
+    _ = commands.add_parser("scaffold")
+    for command in ("work", "wait"):
+        worker_parser = commands.add_parser(command)
+        _ = worker_parser.add_argument("unit", choices=tuple(unit.name for unit in scaffold_files.UNITS))
+        _ = worker_parser.add_argument("role", choices=("impl", "review"))
+        if command == "work":
+            _ = worker_parser.add_argument("file")
     issue_parser = commands.add_parser("issue")
     for field in ("session", "expected", "happened"):
         _ = issue_parser.add_argument(field)
@@ -456,10 +684,16 @@ def main(argv: list[str]) -> int:
                 print(f"{label}\t{agent.get('agent') or 'unknown'}\t{agent['agent_status']}")
         elif args.command == "issue":
             write_issue(args.session, args.expected, args.happened)
+        elif args.command == "scaffold":
+            scaffold()
+        elif args.command == "work":
+            work(herdr, args.unit, args.role, args.file)
+        elif args.command == "wait":
+            print(wait(herdr, args.unit, args.role))
         elif args.command == "trust-check":
             trust_check(args.directory)
         return 0
-    except UsageFailure as error:
+    except (UsageFailure, BlockedWorker) as error:
         print(f"trial: {' '.join(str(error).splitlines())}", file=sys.stderr)
         return 2
     except (TrialFailure, OSError, subprocess.SubprocessError) as error:

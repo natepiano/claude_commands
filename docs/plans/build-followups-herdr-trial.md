@@ -81,7 +81,7 @@ Showrunner's brief and approval, 2026-10-13 10:3x–10:4x EDT (not the user's wo
 - Interactive Codex on `~/.codex1` starts a managed `codex app-server` daemon under systemd `--user` that outlives its pane.
 - Trust comes from folder choice: Claude on claude 1 and Codex on `~/.codex1` show no trust prompt in a trusted folder.
 
-### Phase 2 — The scratch production  · status: todo
+### Phase 2 — The scratch production  · status: done
 
 #### Work Order
 
