@@ -1114,7 +1114,8 @@ that condition.
    a dirty worktree, an unmerged branch, or a lower showrunner that still runs
    and reports to this one (**Nested showrunners** above). It promotes main, retires the unit
    worktrees and branches, removes the update instance, removes the
-   production's links in the showrunner tree, archives the production's
+   production's links in the showrunner tree, deletes its own footer, pause,
+   open-question and state files, archives the production's
    phase notes in the vault, wraps and pushes the doc, and prints the final report.
    Leave tmux sessions for the user to close.
 </Wrap>
