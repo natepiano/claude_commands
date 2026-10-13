@@ -80,7 +80,7 @@ The four items of `docs/plans/build-followups-review-pool-next.md`, each placed 
 
 **Ruled out:** reading the Units table through `units_table.py` — it has no Units-table reader; skipping a newest run with undecodable later bytes — that names an older run's session directory.
 
-### Phase 3 — A pooled design check reads no file on its turn  · status: todo
+### Phase 3 — A pooled design check reads no file on its turn  · status: done
 
 #### Work Order
 
@@ -91,7 +91,7 @@ The four items of `docs/plans/build-followups-review-pool-next.md`, each placed 
 Today every UI turn starts from a reset thread whose standing instructions hold the checklist, yet three things make the reviewer read files again on each turn: the shared prompt opens with "Read `~/.claude/commands/ux_eval.md` and follow it"; `config/review_pool/ui.md` says "Follow `~/.claude/commands/ux_eval.md`" and "Read a rule's full text before reporting its defect"; and the rule text itself is only in the guide's files. Each read is one more request that re-sends the whole thread.
 
 - **The standing prompt holds everything.** `config/review_pool/ui.md` keeps the role line, the Three Gods sentence and the checklist, and gains the report format and the judging steps of `commands/ux_eval.md` written out in full (the `Verdict:` line, the `| Shot | Rule | Defect | Fix |` table, the `Canonical candidates` section, how to measure size and contrast with `~/.claude/scripts/ux_style/measure_text.py`). It no longer tells the reviewer to follow `ux_eval.md` or to read a rule's text. Its line about rule paths becomes: the full text of each rule follows under `## Rules`.
-- **The review director adds the rules' text.** In `commands/review/direct.md`, building `<pool dir>/standing/ui.md` becomes: `config/review_pool/ui.md`, then `## Rules` with each rule file of the production doc's **UX guide** in name order as `### <file name>` and its text, then the guide's `docs/design-decisions.md` when present, then the `ui` section of `memory/repository.md`. With no UX guide in the production doc, the `ui` type is not primed and the director says so in one line. The director rebuilds and primes at start and on resume as today; a changed rule file changes the hash, which makes a new template.
+- **The review director adds the rules' text.** In `commands/review/direct.md`, building `<pool dir>/standing/ui.md` becomes: `config/review_pool/ui.md`, then `## Rules` with each rule file of the production doc's **UX guide** in name order as `### <file name>` and its text, then `docs/design-decisions.md` of the repository that holds the production doc when present (the file the helper reads from a unit's worktree), then the `ui` section of `memory/repository.md`. With no UX guide in the production doc, the `ui` type is not primed and the director says so in one line. The director rebuilds and primes at start and on resume as today; a changed rule file changes the hash, which makes a new template.
 - **The pooled prompt.** In `commands/unit/direct.md` <UXReview/> step 3, the unit director writes two prompt files. The Claude helper's is unchanged. The pool's is:
 
   > Judge these shots by your standing instructions, which hold the rules and the report format: <paths>. Scale: <shot pixels per logical pixel>. Context: <unit> phase <N> — <what changed, every state the shots must show, and each shot's window size in logical pixels>. Production rules: <the production doc's rules that concern looks>. You only review: edit nothing. Return only the verdict and the table.
