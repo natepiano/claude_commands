@@ -1,10 +1,12 @@
 import { describe, expect, test } from "claude-code/testing";
-import { isOutboxEntry as isEntry, isOutboxResult as isResult, isHeartbeat, isEntryId, isOutboxClaim } from "../hooks/protocol";
+import { isOutboxEntry as isEntry, isOutboxResult as isResult, isHeartbeat, isEntryId, isOutboxClaim, isDeliveryRouteFile, isReplyLog, PATHS } from "../hooks/protocol";
 
 const entry = {
   id: "0123456789abcdef0123456789abcdef",
   session_id: "recipient",
-  socket: "/test-sockets/recipient.sock",
+  socket: "uds:/test-sockets/recipient.sock",
+  sender: "Original sender",
+  reply_to_session_id: "original-session",
   text: "Message text\n\nwith another line.",
   sha256: "a".repeat(64),
   deadline_ms: 10000,
@@ -20,6 +22,57 @@ const result = {
 const heartbeat = { session_id: "postmaster-session", at_ms: 9000, version: "0.1.0" };
 
 describe("postmaster protocol validators", () => {
+  test("entry requires a sender name and permits an unresolved reply destination on the wire", () => {
+    expect(isEntry({ ...entry, sender: "" })).toBe(false);
+    const missing: Record<string, unknown> = { ...entry };
+    delete missing.reply_to_session_id;
+    expect(isEntry(missing)).toBe(false);
+    expect(isEntry({ ...entry, reply_to_session_id: "" })).toBe(true);
+    expect(PATHS.delivered).toBe("delivered");
+    expect(PATHS.replies).toBe("replies");
+  });
+
+  test("route files accept open and withdrawn routes with unresolved wire destinations", () => {
+    const route = { route: "open", socket: "uds:/test-sockets/recipient.sock", sender: "Original sender",
+      reply_to_session_id: "original-session", session_id: "recipient", at_ms: 1000 };
+    expect(isDeliveryRouteFile(route)).toBe(true);
+    expect(isDeliveryRouteFile({ ...route, route: "withdrawn" })).toBe(true);
+    expect(isDeliveryRouteFile({ ...route, reply_to_session_id: "" })).toBe(true);
+    for (const [field, value] of Object.entries(route)) {
+      const missing: Record<string, unknown> = { ...route };
+      delete missing[field];
+      expect(isDeliveryRouteFile(missing)).toBe(false);
+      expect(isDeliveryRouteFile({ ...route, [field]: typeof value === "number" ? "1000" : 17 })).toBe(false);
+    }
+    for (const routeState of ["", "delivered", "OPEN"]) expect(isDeliveryRouteFile({ ...route, route: routeState })).toBe(false);
+    for (const at_ms of [-1, 0.5, NaN, Infinity]) expect(isDeliveryRouteFile({ ...route, at_ms })).toBe(false);
+    for (const value of [null, undefined, [], "route"]) expect(isDeliveryRouteFile(value)).toBe(false);
+  });
+
+  test("reply logs require the replying identity original sender body and confirmed destinations", () => {
+    const log = { at_ms: 1000, socket: "uds:/test-sockets/recipient.sock", name: "Recipient",
+      session_id: "recipient", senders: ["Original sender"], body: "answer", forwarded: ["original-session"] };
+    expect(isReplyLog(log)).toBe(true);
+    expect(isReplyLog({ ...log, forwarded: [] })).toBe(true);
+    for (const field of Object.keys(log)) {
+      const missing: Record<string, unknown> = { ...log };
+      delete missing[field];
+      expect(isReplyLog(missing)).toBe(false);
+    }
+    for (const forwarded of ["original-session", [17], [""], null]) expect(isReplyLog({ ...log, forwarded })).toBe(false);
+  });
+
+  test("reply logs require a nonempty list of nonempty sender names", () => {
+    const log = { at_ms: 1000, socket: "uds:/test-sockets/recipient.sock", name: "Recipient",
+      session_id: "recipient", senders: ["Alice", "Bob"], body: "answer", forwarded: [] };
+    expect(isReplyLog(log)).toBe(true);
+    for (const senders of [[], [""], ["Alice", ""], [17], "Alice", null]) {
+      expect(isReplyLog({ ...log, senders })).toBe(false);
+    }
+    const { senders: _senders, ...rest } = log;
+    expect(isReplyLog({ ...rest, sender: "Alice, Bob" })).toBe(false);
+  });
+
   test("entry accepts the specified fields and preserves message text", () => {
     const value: unknown = JSON.parse(JSON.stringify(entry));
     expect(isEntry(value)).toBe(true);

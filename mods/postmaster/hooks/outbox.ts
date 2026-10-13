@@ -1,8 +1,9 @@
 import { BATCH, PATHS, POLL_MS, VERSION, isEntryId, isOutboxClaim, isOutboxEntry } from "./protocol";
-import type { Heartbeat, Outbox, OutboxClaim, OutboxEntry, OutboxResult, PostmasterCalls } from "./protocol";
+import type { Heartbeat, Outbox, OutboxClaim, OutboxEntry, OutboxResult, PostmasterCalls, Replies, RouteToken } from "./protocol";
 
 type EntryRead = { status: "valid"; entry: OutboxEntry } | { status: "unreadable" };
 type PendingResult = { path: string; result: OutboxResult };
+type RouteWithdrawal = { kind: "awaiting durable write"; token: RouteToken } | { kind: "durable" };
 
 let errorCount = 0;
 
@@ -11,7 +12,7 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function stateDirectory(calls: PostmasterCalls): Promise<string> {
+export async function stateDirectory(calls: PostmasterCalls): Promise<string> {
   const xdg = await calls.env.get("XDG_STATE_HOME");
   const root = typeof xdg === "string" && xdg !== "" ? xdg : `${await calls.env.get("HOME")}/.local/state`;
   if (!root.startsWith("/")) throw new Error("No absolute home or XDG_STATE_HOME is available");
@@ -35,12 +36,13 @@ async function textHash(text: string): Promise<string> {
   return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
-export async function startOutbox(calls: PostmasterCalls): Promise<Outbox> {
+export async function startOutbox(calls: PostmasterCalls, replies: Replies): Promise<Outbox> {
   const directory = await stateDirectory(calls);
   const session_id = await calls.session.id();
   if (session_id === "") throw new Error("No session id is available");
   const run = `${calls.now()}-${crypto.randomUUID()}`;
   const pending = new Map<string, PendingResult>();
+  const pendingWithdrawals = new Map<string, RouteToken>();
   let polling = false;
   let cancelled = false;
 
@@ -63,6 +65,21 @@ export async function startOutbox(calls: PostmasterCalls): Promise<Outbox> {
       } catch (error) { await writeError(calls, directory, error); }
     }
   };
+  const withdraw = async (token: RouteToken): Promise<RouteWithdrawal> => {
+    try {
+      await replies.notDelivered(token);
+      return { kind: "durable" };
+    } catch (error) {
+      await writeError(calls, directory, error);
+      return { kind: "awaiting durable write", token };
+    }
+  };
+  const flushWithdrawals = async (): Promise<void> => {
+    for (const [key, token] of pendingWithdrawals) {
+      const withdrawal = await withdraw(token);
+      if (withdrawal.kind === "durable") pendingWithdrawals.delete(key);
+    }
+  };
   const result = async (id: string, claimed_ms: number, sha256: string, outcome: OutboxResult["outcome"], detail: string): Promise<void> => {
     pending.set(id, { path: path(PATHS.results, id), result: { id, outcome, detail, sha256, claimed_ms, finished_ms: calls.now() } });
     await flush();
@@ -82,8 +99,13 @@ export async function startOutbox(calls: PostmasterCalls): Promise<Outbox> {
       if (read.status === "unreadable") return await result(id, claimed_ms, sha256, "failed", "unreadable entry");
       const entry = read.entry;
       if (entry.deadline_ms < calls.now()) return await result(id, claimed_ms, sha256, "expired", "entry deadline passed");
+      const token = await replies.sending(entry, calls.now());
       sendAttempted = true;
       const answer = await calls.session.send({ to: { sessionId: entry.session_id }, text: entry.text });
+      if (!answer.isDelivered) {
+        const withdrawal = await withdraw(token);
+        if (withdrawal.kind === "awaiting durable write") pendingWithdrawals.set(token.key, withdrawal.token);
+      }
       await result(id, claimed_ms, sha256, answer.isDelivered ? "delivered" : "failed", answer.isDelivered ? "" : answer.reason);
     } catch (error) {
       await writeError(calls, directory, error);
@@ -115,6 +137,7 @@ export async function startOutbox(calls: PostmasterCalls): Promise<Outbox> {
     polling = true;
     try {
       await heartbeat();
+      await flushWithdrawals();
       await flush();
       for (const id of await listIds(PATHS.claimed)) {
         await oldClaim(id).catch(error => writeError(calls, directory, error));
