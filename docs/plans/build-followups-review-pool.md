@@ -212,7 +212,7 @@
 - The director reading its own model and effort out of its transcript: the recorder detects them.
 - `findings.py status` for a merged phase: the unit has usually moved on, and it shows only the active phase.
 
-### Phase 6 — The UI pool, in shadow first  · status: todo
+### Phase 6 — The UI pool, in shadow first  · status: done
 
 #### Work Order
 

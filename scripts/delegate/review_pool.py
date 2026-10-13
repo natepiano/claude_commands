@@ -579,6 +579,10 @@ def command_status(args: PoolArguments) -> int:
 def command_stop(args: PoolArguments) -> int:
     production = _production(str(args.production))
     with production.locked() as pool:
+        adoption = production.directory / "ui_adopted"
+        if adoption.exists():
+            adoption.unlink()
+            print("review_pool: ui adoption cleared", file=sys.stderr)
         # Retry an interrupted stop against the same ended generation.
         if not pool.stopping:
             pool.generation += 1
