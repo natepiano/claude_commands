@@ -25,7 +25,7 @@ export type OutboxResult = {
   claimed_ms: number;
   finished_ms: number;
 };
-export type Heartbeat = { session_id: string; at_ms: number; version: string };
+export type Heartbeat = { session_id: string; at_ms: number; version: string; run: string };
 export type PostmasterCalls = {
   env: Pick<EngineInterface["env"], "get">;
   fs: Pick<EngineInterface["fs"], "write" | "exists" | "list"> & {
@@ -97,7 +97,8 @@ export function isOutboxResult(value: unknown): value is OutboxResult {
 }
 export function isHeartbeat(value: unknown): value is Heartbeat {
   return record(value) && typeof value.session_id === "string" && value.session_id !== ""
-    && timestamp(value.at_ms) && typeof value.version === "string" && value.version !== "";
+    && timestamp(value.at_ms) && typeof value.version === "string" && value.version !== ""
+    && typeof value.run === "string" && value.run !== "";
 }
 export function isDeliveryRouteFile(value: unknown): value is DeliveryRouteFile {
   return record(value) && (value.route === "open" || value.route === "withdrawn")

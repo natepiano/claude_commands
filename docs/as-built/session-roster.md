@@ -15,7 +15,7 @@ this machine's records ──► roster._local_roster ──┐
 other machine: ssh roster.py --here --snapshot ──►├─► Roster(entries, problems)
                 (AllMachines only)                │
                                                   ├─► roster.py           text | --json
-                                                  ├─► send.py             one recipient ──► relay | codex_mesh send
+                                                  ├─► send.py             one recipient ──► postmaster | relay | codex_mesh send
                                                   │                                         | codex queue | pushover.py
                                                   │                                         | ssh send.py --here
                                                   ├─► broadcast.py        groups ──► send.py --to <address> --here per row
@@ -105,9 +105,9 @@ Routes (`resolve_recipient(to, scope) -> DeliveryRoute`):
 | `--to` | Route |
 |---|---|
 | `user` | `pushover.py` here; under `--machine`, `send.py --here --to user ...` there |
-| `uds:<path>` | Claude relay on this machine, even with `--machine` |
+| `uds:<path>` | Claude delivery on this machine, even with `--machine`; postmaster first when registered and available, else relay |
 | any form, `--machine HOST` | `ssh HOST send.py --here ...` with no local roster read |
-| `session:<id>` | Claude relay; resolved to the live session's `uds:` socket first; no live session → `QUEUED` |
+| `session:<id>` | Claude delivery; resolved to the live session's `uds:` socket first; postmaster first when available, else relay; no live session → `QUEUED` |
 | `seat:<run>/<seat>` | that row's `codex_mesh.py send --session-dir <run dir> --to <seat>` |
 | `codex:<thread>` | `codex_daemon.queue(thread_id, text, timeout)`: `codex queue --thread <id> --message <text>` |
 | bare name | roster rows with that `name`; one `Messageable` sends by its address |
@@ -127,7 +127,7 @@ Outcomes print as one line and log with the full text to `$XDG_STATE_HOME/messag
 
 | Line | Exit | Meaning |
 |---|---|---|
-| `SENT: <how>` | 0 | delivered |
+| `SENT: <how>` | 0 | delivered; the outbox path reports `postmaster; verbatim` or `postmaster; NOT VERBATIM`, then `session:<id>` |
 | `SKIPPED: <why>` | 0 | key acknowledged, or inside its repeat window |
 | `QUEUED: <why>` | 1 | a Claude recipient not reached; kept under its session id |
 | `REFUSED: <why>` | 2 | `pushover.py` refused before sending; nothing kept |
@@ -135,167 +135,88 @@ Outcomes print as one line and log with the full text to `$XDG_STATE_HOME/messag
 
 Usage errors, the stderr-only refusals above, an unreadable `--file` and an empty message also exit 2.
 
-Delivery mechanics: a Claude recipient is reached through a headless `claude -p` relay (sonnet, auto mode, tools `SendMessage` plus `ListAgents` for a name, hooks, MCP and slash commands off, `CLAUDE_*` variables removed, named `--from`); delivery is read from the `SendMessage` tool result in the stream, which stays in `STATE/relay/<to>.jsonl`. `--timeout` defaults to 40 s for every transport. Where `~/.config/claude/oauth-token.gpg` exists (the Mac, whose keychain ssh cannot open) the relay decrypts it, and queues with `gpg-agent is cold on <machine>: run github-warmup there` when it cannot. Undelivered Claude messages go to `STATE/queue/`, latest per `--key`, under the recipient's session id; `pending` prints and clears them. `--key` with `--repeat-minutes` skips a repeat within the window; `ack` skips every later send with the key until `reopen`.
+Delivery mechanics: for a Claude recipient found in the live registry, `send.py` first tries the local postmaster. It waits up to 3 s for a result, withdrawing the entry before checking for a claim; an existing claim allows another 2 s for a result. A confirmed `delivered` result reports `SENT: postmaster; …`. Each miss requires the relay: `absent` (no heartbeat), `stale` (unreadable, older than 2 s or no live postmaster identity), `self` (recipient is the postmaster), `unclaimed` (withdrawn without a delivery), `outbox-error` (entry write failed), `failed`, `expired`, `claimed-no-result` (delivery unknown), and `relay-only-sender` (`shutdown`). A recipient not in the live registry uses the relay directly and logs `unresolved`. With no fresh heartbeat, the relay outcome, queue and text stay as before. After an attempt, the relay receives `max(1.0, options.timeout - attempt.seconds)`; a recipient not in the registry gets the original timeout.
+
+The fallback is a headless `command claude -p` relay (sonnet, auto mode, tools `SendMessage` plus `ListAgents` for a name, hooks, MCP and slash commands off, `CLAUDE_*` variables removed, named `--from`); delivery is read from the `SendMessage` tool result in the stream, which stays in `STATE/relay/<to>.jsonl`. `--timeout` defaults to 40 s for every transport. Where `~/.config/claude/oauth-token.gpg` exists (the Mac, whose keychain ssh cannot open) the relay decrypts it, and queues with `gpg-agent is cold on <machine>: run github-warmup there` when it cannot. Undelivered Claude messages go to `STATE/queue/`, latest per `--key`, under the recipient's session id; `pending` prints and clears them. `--key` with `--repeat-minutes` skips a repeat within the window; `ack` skips every later send with the key until `reopen`.
 
 ### Postmaster mod (trial)
 
-Postmaster is a local Claude Code mod in `mods/postmaster/`, loaded directly with `--plugin-dir`; its intended main-checkout path is `~/.claude/mods/postmaster`. This section records how the probe exercises the mod API on Claude Code 2.1.296 and the measured answers. The probe uses `STATE/postmaster/probe/`, where `STATE` is `$XDG_STATE_HOME/message` or, by default, `~/.local/state/message`. It reads and writes only under `STATE/postmaster/`, starts no process and makes no network call. The trial worktree is `/home/natepiano/worktrees/claude-build-followups-shutdown`, branch `build-followups-shutdown`.
+Postmaster is a local Claude Code mod in `mods/postmaster/`, loaded directly with `--plugin-dir`; the trial start procedure loads `/home/natepiano/.claude/mods/postmaster` from main. It uses a Claude session named `postmaster` in `/home/natepiano/postmaster`. It reads and writes only under `STATE/postmaster/`, starts no process and makes no network call. `STATE` is `$XDG_STATE_HOME/message`, defaulting to `~/.local/state/message`. The trial worktree is `/home/natepiano/worktrees/claude-build-followups-shutdown`, branch `build-followups-shutdown`.
 
-The probe was removed from the tree after the measurement; commit `cd85b091` holds it, and this procedure stays as the record of how the table was measured.
+**Files and formats**
 
-The unit director runs this procedure in isolated sessions. Every recipient below is a throwaway session created for this check; no probe message goes to an existing session.
+Each record is one JSON file. The engine refuses reads and writes over 4 MiB, so the mod never rewrites a growing log. Timestamps ending in `_ms` are non-negative safe integer milliseconds; entry ids are 32 hex characters and hashes are 64 lowercase hex characters.
 
-1. **Wait for all three folder trusts.** The permanent session directory is `/home/natepiano/postmaster`, decided by the showrunner on 2026-10-12. The showrunner asks the user to create it, start `command claude` there once with the `~/.claude` account, accept the folder-trust dialog and exit, then repeat with `CLAUDE_CONFIG_DIR=/home/natepiano/.claude3` and `CLAUDE_CONFIG_DIR=/home/natepiano/.claude1`. An unused directory presents the dialog with `No, exit` selected, and trust is stored per account. Start this procedure only after the showrunner reports all three trusts done. Keep this directory empty; nobody types into a pane.
+| Path under `STATE/postmaster/` | JSON fields and meaning |
+|---|---|
+| `outbox/<id>.json` | `{id, session_id, socket, text, sha256, deadline_ms, sender, reply_to_session_id}`; recipient id and `uds:` socket come from its live registry record; `sender` is non-empty |
+| `claimed/<id>.json` | `{id, claimed_ms, run}`; `run` identifies the hooks worker as `<at_ms>-<uuid>` |
+| `results/<id>.json` | `{id, outcome, detail, sha256, claimed_ms, finished_ms}`; outcome is `delivered`, `failed`, `expired`, `withdrawn` or `abandoned`; hash is computed from the text passed to the send |
+| `heartbeat.json` | `{session_id, at_ms, version, run}`; written each poll and before each send; version is `0.1.0`; non-empty `run` is the worker's `<at_ms>-<uuid>`, also carried by its claims |
+| `delivered/<at_ms>-<n>.json` | `{route, socket, sender, reply_to_session_id, session_id, at_ms}`; `route` is `open` or `withdrawn`; names one delivery route |
+| `replies/<at_ms>-<n>.json` | `{at_ms, socket, name, session_id, senders, body, forwarded}`; replying identity, distinct original sender names in first-route order, body and confirmed forward destination ids |
+| `errors/<at_ms>-<n>.json` | `{at_ms, error}`; file/start/poll errors, including failed durable route withdrawal |
 
-2. **Start A, B, C and D.** Use one throwaway tmux session with four windows, each in `/home/natepiano/postmaster`, each with a shell as the pane process and `claude` as its child. Remove every environment variable whose name starts with `CLAUDE` before launching each child, including any restored by shell startup; C and D then receive their account variable shown below. Use `command claude` for every launch and plugin command: the interactive shell's `claude` alias adds `--remote-control` and `--settings`, and plugin testing refuses options before `plugin`. Use these launch commands:
+The client resolves the original sender by its current name: exactly one live session gives `ReplyToSession(session_id)`, otherwise `ReplyUnroutable()`. Only the wire entry uses `reply_to_session_id: ""` for that state. The mod converts it into `ReplyDestination` (`session` or `unroutable`) when registering or restoring a route; it reads no session registry. The recipient gets `Message from <sender> via postmaster: <summary> [<first eight id characters>]`, a blank line and the original text. Distinct tags prevent the recipient's repeat-text filter from dropping equal messages. The mod adds neither entry routing field to the text itself.
 
-   ```sh
-   # A
-   command claude -n pm-probe-a --plugin-dir /home/natepiano/worktrees/claude-build-followups-shutdown/mods/postmaster
-   # B
-   command claude -n pm-probe-b
-   # C
-   CLAUDE_CONFIG_DIR=/home/natepiano/.claude3 command claude -n pm-probe-c
-   # D
-   CLAUDE_CONFIG_DIR=/home/natepiano/.claude1 command claude -n pm-probe-d
-   ```
+**Worker, claim and fallback**
 
-   Retain the tmux session identifier and the child process identities for cleanup. Never use `--dangerously-skip-permissions`, edit a `settings.json`, read `.credentials.json` or `.claude.json`, or type into a pane. This is a folder-loaded mod, with no marketplace installation or `enabledPlugins` change.
+Either `session.start` or `session.receive` starts one shared worker promise, restoring replies before starting the outbox; concurrent hooks await the same start. A failed start writes an error and permits the next hook to retry. The 0.5 s poll never overlaps itself, handles at most 20 new entries oldest-first, retries unwritten results and route withdrawals, and marks a claim from an earlier worker without a result `abandoned` without sending again.
 
-3. **Confirm identities from records.** Run `sessions.py id pm-probe-a`, `sessions.py id pm-probe-b`, `sessions.py id pm-probe-c` and `sessions.py id pm-probe-d` through the repository's `scripts/lib/py` interpreter. `sessions.py` reads `NOTIFIER_SESSIONS_DIR`, defaulting to `~/.claude/sessions`; it never reads `CLAUDE_CONFIG_DIR`. On natedev, `~/.claude3/sessions` and `~/.claude1/sessions` link to `~/.claude/sessions`, so the same registry lookup finds all four sessions across the three accounts. Read only the matching session registry records for socket paths and process identities; locate each transcript under that session's account project directory; never identify a session from screen text. Read `STATE/postmaster/probe/started.json` for A's session id from `$.session.id` and the recorded absence of a call that gives the session's pid; obtain the pid from A's registry record for cleanup. Its `environment_read` records what `$.env.get` answered for `HOME` and `XDG_STATE_HOME`; `process_env_available` records whether `globalThis.process.env` exists in the worker. Confirm A, B, C and D are the processes just started. In the request objects below, replace `<A_ID>`, `<B_ID>`, `<C_ID>` and `<D_ID>` with these ids, and `<A_SOCKET>`, `<B_SOCKET>`, `<C_SOCKET>` and `<D_SOCKET>` with their socket paths, without a `uds:` prefix. Select `<DEAD_ID>` as a session id that no running session has.
+The mod writes a claim, then checks the entry still exists before sending. The client publishes a sibling temporary file by atomic rename, polls every 50 ms, and at its deadline takes the entry out before checking the claim. When no claim exists the mod cannot send it; when the mod sees the entry gone it writes `withdrawn`, which sends the client to the relay. These two orders give one delivery through the mod or the relay when a result arrives. A send throw or a claim with no result after the grace period becomes `claimed-no-result`: the client relays, accepting a possible second copy to avoid a lost message. An explicit refused send becomes `failed`; its route is removed from memory, its file becomes `withdrawn`, and a failed file write is retried on later polls.
 
-4. **Write one request at a time from a shell.** Replace the placeholders before writing each JSON object below to `STATE/postmaster/probe/request.json`; publish it with one atomic rename of a sibling temporary file so the 0.5 s poll never reads a partial object. Wait for the line with the matching `id` and `step` in `STATE/postmaster/probe/report.jsonl` before writing the next request. Use new ids on a repeat. Each report line carries `run`, the hooks worker's start time in ms, fixed for that worker's life, along with `id`, `step`, `ok`, `detail`, `started_ms` and `ended_ms`; record a missing API as `ok: false` with its reason.
+A delivered result's hash sets `verbatim`; a mismatched hash is still reported as sent with `NOT VERBATIM`. Unreadable result files remain pending, and an unreadable heartbeat is read up to three times 20 ms apart. A heartbeat without a non-empty string `run` is unreadable and counts as `stale`. Every return after publishing attempts entry cleanup before claim/result cleanup. If entry removal fails, the client keeps the claim and result to prevent another mod send. Each attempt that reaches the write step also removes old outbox entries before their claims/results (10 minutes), and old route files (30 minutes). `postmaster.py status` performs that cleanup and removes errors older than seven days; its first line reads `postmaster: running, heartbeat <age> s old, worker <run>; errors: <count>; replies: <count>`, with age to one decimal, or `postmaster: not running; errors: <count>; replies: <count>`. It also prints today's route counts in `user_zone()`, exiting 0 for a fresh live heartbeat and 1 otherwise.
 
-   Each `session.start` appends a line with `id: "start"`, `step: "start"`, `ok: true` and `detail` containing `session_id` (the id or null) and `already_running` (a boolean). Record the initial `run`; a second `start` line with the same `run` means the event fired twice in one worker, and a new `run` means the worker was replaced. Record either observation in the worker-replacement table row and keep evidence from different workers separate.
+`RELAY_ONLY_SENDERS = frozenset({"shutdown"})` bypasses all postmaster file access. Shutdown instructions depend on the wrapper's sender name, which a mod delivery changes to `postmaster`; these messages keep the relay during the trial. The mod delivery share below excludes them.
 
-   An existing request file that does not parse or misses a field gets a `request-error` line with `ok: false`, `detail` giving the reason and `id` equal to the request's string id, or `request` when none exists. This is recorded once per distinct file text; an absent request file is idle and writes nothing. If no line with the request's id appears within 30 s, read the newest `request-error`, `start` and `tick` lines before writing anything else. A `request-error` with that id reports rejection, not completion of the requested step.
+**Replies**
 
-   Read each run's traces, captures and logs, copy the answer and evidence line into the table, and delete that run's saved output before another run. Keep saved output below a few GB. Do not remove active probe files between requests in the same run.
+Only a `peer` event with a complete cross-session wrapper and a `from` socket having a route inside the 30-minute window is a reply. The handler reads the first line's `from` and `from-name` and the body between the opening and closing lines. It forwards to each distinct session destination registered for that socket, logs one reply file, and returns `{consumed: "postmaster reply"}`, starting no turn in the postmaster session. Script senders with no destination still have their replies consumed and logged. Unknown sockets, other origins, ordinary prompts, relay messages and broadcasts pass to `next(e)` unchanged; a failed handler also passes the event on.
 
-5. **Send by id to B, a different process.** Write:
+A forward begins `Message from <name> (their answer to <sender>, passed on by postmaster) [<at_ms>-<n>]:`, then a blank line and the body. Several sender names produce `their answer to one of <a>, <b>` and each distinct session destination gets it. Each forward has a new tag. The Claude receiving rule answers the real sender named on the first line, never the wrapper's `postmaster` name. Routes are registered before the outbox send returns, so a quick reply is recognized; refusing a later delivery removes only that delivery's route. A throwing send keeps its route because delivery is unknown. A replaced worker restores valid `open` route files inside the window; malformed, invalid and withdrawn files are skipped.
 
-   ```json
-   {"id":"b-id-1","step":"send-by-id","to_session_id":"<B_ID>","to_socket":"<B_SOCKET>","text":"Postmaster trial b-id-1. Record receipt; no reply needed.","count":1}
-   ```
+**Start, check and stop procedure**
 
-   Read the `b-id-1` report line and B's transcript file to establish receipt. This tests `$.session.send({ to: { sessionId }, text })` across processes.
+The unit director runs this on natedev as Phase 9's work once Phase 7's checkpoint is on main, since the session loads `~/.claude/mods/postmaster`. No seat runs it. All message recipients are throwaway sessions created for the check. The permanent directory is outside the repo and must already be trusted by each account used. Every launch removes all environment variables whose names begin `CLAUDE`, including variables restored by shell startup, and uses a shell whose child is `command claude`. Retain each new session's registry identity and pid; end only those processes. No pane input, settings edit or marketplace installation is part of the procedure.
 
-6. **Send by socket address to B.** Write:
+1. Check `~/.claude/scripts/lib/py ~/.claude/scripts/message/postmaster.py status`: expect `not running`, exit 1.
+2. Start a new tmux session named `postmaster` in `/home/natepiano/postmaster`, running `command claude -n postmaster --plugin-dir /home/natepiano/.claude/mods/postmaster` with the environment removal above. Confirm with `~/.claude/scripts/lib/py ~/.claude/scripts/message/sessions.py id postmaster`. Within 10 s, `postmaster.py status` must exit 0.
+3. Start `command claude -n pm-check` in the second window of a separate throwaway tmux session in the same directory. Confirm its identity from the registry and locate its transcript in its account project directory.
+4. Send three identical messages: `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --here --to pm-check --from pm-trial --summary "Postmaster trial" --text "Postmaster trial: record receipt; no reply needed."`. Each must return under 1.5 s with `SENT: postmaster; verbatim; …`, exit 0. The transcript must show three arrivals with `pm-trial` and distinct tags; `STATE/relay/` must gain no file; the three log rows must say `via: postmaster`; status must show `errors: 0`.
+5. Stop the postmaster's Claude child with `SIGTERM` to its confirmed pid, then end the `postmaster` tmux session this procedure created with `tmux kill-session -t =postmaster`, so step 6 can create it again. Send one more message to `pm-check`: expect `SENT: mode auto; verbatim; …`, one transcript arrival, and `via: relay` with reason `stale` or `absent`. The ordinary stop procedure ends both the Claude child and its tmux session; until it is started again by hand, Claude sends use the relay.
+6. Start postmaster again as in step 2 and start `command claude -n pm-origin` in a third throwaway window. Send `pm-check` a message `--from pm-origin` asking it to answer the session named `postmaster`. Start a third throwaway recipient, `command claude -n pm-check2`, in a fourth window, and send it one `--from pm-trial` (no live session) asking the same. A reply is forwarded to every session routed through its socket within 30 minutes, so `pm-trial`'s message goes to a socket that holds no other route. Wait at most five minutes per answer. A reply to `pm-origin`'s message must list `pm-origin` in `senders` and its id in `forwarded`, appear once in `pm-origin`'s transcript, and start no postmaster turn. `pm-check2`'s reply to `pm-trial`'s message must list `pm-trial` in `senders`, have `forwarded: []`, and start no postmaster turn. Record any missing answer; without an answer, reply consumption remains supported by the hermetic tests and the measured consumption evidence below. Status must still show `errors: 0`; a non-zero count fails the step, and every error file's text goes into the results.
+7. While postmaster is idle, record the `worker` printed by `postmaster.py status`, then change only the mtime with `touch /home/natepiano/.claude/mods/postmaster/hooks/register.ts`. Read status 5 s later. A fresh heartbeat with a new worker means reload ran `session.start`; record that receive-first is not reachable in this live check. A fresh heartbeat with the same worker means the touch replaced nothing; record it and fail the step. A fresh heartbeat with the worker alternating between reads means the old worker outlived the reload; record it and fail the step. A stale heartbeat means the new worker awaits a hook: ask `pm-check` through the relay to answer `postmaster`, letting its answer start `session.receive`. Within 10 s of the first hook status must exit 0 naming a worker other than the one recorded before the touch; 30 s later heartbeat age must remain below 2 s, so the poll timer outlives the handler that started it. Another send to `pm-check` must report `SENT: postmaster; …`, and errors must remain zero. Record which hook started this worker separately from initial startup.
+8. Leave postmaster running as the trial start. End `pm-check`, `pm-origin`, `pm-check2` and their tmux session. Read the clock and record the start time using `scripts/lib/user_zone.py`'s `user_zone()`; the checkpoint notice names that time as the beginning of step 2's two-day window. Delete saved check traces after recording their results and before another run.
 
-   ```json
-   {"id":"b-address-1","step":"send-by-address","to_session_id":"<B_ID>","to_socket":"<B_SOCKET>","text":"Postmaster trial b-address-1. Record receipt; no reply needed.","count":1}
-   ```
+Results: pending Phase 9's unit-director run after Phase 7's checkpoint is on main; record all eight steps, send timings/tags/transcript arrivals, relay and log checks, routed and script-only replies or absent answers, every error file's text, the worker before and after reload, which hook started the new worker and its sustained timer, and trial start time in the user's zone. Whether `/shutdown restart` restores postmaster with its `--plugin-dir` flag remains unverified.
 
-   Read the `b-address-1` report line and B's transcript. The probe uses `to: "uds:<B_SOCKET>"`; record whether that address form succeeds.
+**Log checks for step 2**
 
-7. **Repeat both address forms to C and D, the two other accounts on natedev.** Write the first object, read its result and C's transcript, then write the second and read its result and C's transcript:
+`STATE/log.jsonl` retains `time`, `outcome`, `detail`, `from` and `to`; a local Claude branch adds `via` (`postmaster`, `relay` or `queue`), `postmaster` (`delivered`, a miss reason or `unresolved`) and `seconds` (monotonic elapsed branch time rounded to three decimals). A `session:` address with no live registry record is queued without any send and logged as `via: queue`, `postmaster: unresolved`. `via: relay` always means a relay ran. Other transports and skipped messages have none of these fields. The `seconds` value includes any relay fallback. Replies are recorded separately under `replies/`.
 
-   ```json
-   {"id":"c-id-1","step":"send-by-id","to_session_id":"<C_ID>","to_socket":"<C_SOCKET>","text":"Postmaster trial c-id-1. Record receipt; no reply needed.","count":1}
-   ```
+From the repo root, define `pm_rows` once; it selects today's local Claude rows using the user's zone, without computing the trial's results here:
 
-   ```json
-   {"id":"c-address-1","step":"send-by-address","to_session_id":"<C_ID>","to_socket":"<C_SOCKET>","text":"Postmaster trial c-address-1. Record receipt; no reply needed.","count":1}
-   ```
+```sh
+pm_rows() { python3 -c 'import datetime,json,os,sys; from pathlib import Path; sys.path.insert(0,"scripts/lib"); from user_zone import user_zone; z=user_zone(); today=datetime.datetime.now(z).date(); p=Path(os.environ.get("XDG_STATE_HOME",str(Path.home()/".local/state")))/"message/log.jsonl"; rows=(json.loads(s) for s in p.read_text().splitlines() if s.strip()) if p.exists() else []; [print(json.dumps(r)) for r in rows if "via" in r and datetime.datetime.fromisoformat(r["time"]).astimezone(z).date()==today]'; }
+```
 
-   Read the `c-id-1` and `c-address-1` lines in `report.jsonl`. Repeat for D, reading each result and D's transcript before the next request:
+Each following line reads those rows without changing state. The delivery-share denominator includes `queue` rows as messages not delivered by the mod; the relay count includes only `via: relay`. Compare the daily relay count to the baseline of about 600 and the elapsed-time median to the relay baseline of 4.5 s; use the trial start timestamp to select the two-day interval for the final comparison.
 
-   ```json
-   {"id":"d-id-1","step":"send-by-id","to_session_id":"<D_ID>","to_socket":"<D_SOCKET>","text":"Postmaster trial d-id-1. Record receipt; no reply needed.","count":1}
-   ```
+| Number | One-line command |
+|---|---|
+| Mod delivery share, excluding `shutdown` | `pm_rows \| python3 -c 'import json,sys; r=[json.loads(s) for s in sys.stdin]; r=[x for x in r if x["postmaster"]!="relay-only-sender"]; print(sum(x["via"]=="postmaster" for x in r)/len(r) if r else 0)'` |
+| Relays today | `pm_rows \| python3 -c 'import json,sys; print(sum(json.loads(s)["via"]=="relay" for s in sys.stdin))'` |
+| Delivery time, median seconds by route | `pm_rows \| python3 -c 'import json,statistics,sys; r=[json.loads(s) for s in sys.stdin]; [print(v,statistics.median(x["seconds"] for x in r if x["via"]==v and x["outcome"]=="sent")) for v in ("postmaster","relay") if any(x["via"]==v and x["outcome"]=="sent" for x in r)]'` |
+| Queued and failed counts | `pm_rows \| python3 -c 'import collections,json,sys; c=collections.Counter(json.loads(s)["outcome"] for s in sys.stdin if s.strip()); print("queued",c["queued"],"failed",c["failed"])'` |
+| `claimed-no-result` count | `pm_rows \| python3 -c 'import json,sys; print(sum(json.loads(s)["postmaster"]=="claimed-no-result" for s in sys.stdin))'` |
+| Replies consumed | `python3 -c 'import os; from pathlib import Path; p=Path(os.environ.get("XDG_STATE_HOME",str(Path.home()/".local/state")))/"message/postmaster/replies"; print(sum(f.is_file() for f in p.glob("*.json")))'` |
+| Replies passed on, and confirmed forwards | `python3 -c 'import json,os; from pathlib import Path; p=Path(os.environ.get("XDG_STATE_HOME",str(Path.home()/".local/state")))/"message/postmaster/replies"; r=[json.loads(f.read_text()) for f in p.glob("*.json")]; print(sum(bool(x["forwarded"]) for x in r),sum(len(x["forwarded"]) for x in r))'` |
 
-   ```json
-   {"id":"d-address-1","step":"send-by-address","to_session_id":"<D_ID>","to_socket":"<D_SOCKET>","text":"Postmaster trial d-address-1. Record receipt; no reply needed.","count":1}
-   ```
+Reply counts cover retained files, not just today; use `at_ms` and the trial start to select the same measurement interval as the log. A reply can have several confirmed forwards.
 
-   Read the `d-id-1` and `d-address-1` report lines. Record reach separately for `~/.claude3` and `~/.claude1`; both other accounts are within this check.
+**API measurement record**
 
-8. **Record the wrapper, reply route and consumption.** Read B's transcript for the exact wrapper received in steps 5 and 6, including its `from` name. A has no transcript file until it has had a turn. Record the file as absent, or note its current last line if present, then arm consumption before asking B to reply. Write:
-
-   ```json
-   {"id":"consume-1","step":"consume","to_session_id":"","to_socket":"","text":"","count":0}
-   ```
-
-   Read the `consume-1` line in `report.jsonl` to confirm the probe is armed. Its `session.receive` handler consumes the next arriving message whose text contains `consume-1`, appends all event fields to `received.jsonl` with `consumed: true` and `consume_request_id: "consume-1"`, then returns `{ consumed: <reason string> }` without calling `next(e)`. Other arriving messages are passed on. Once armed, write:
-
-   ```json
-   {"id":"b-reply-1","step":"send-by-id","to_session_id":"<B_ID>","to_socket":"<B_SOCKET>","text":"Postmaster trial b-reply-1. Reply to the sender named by this message's wrapper with the text consume-1.","count":1}
-   ```
-
-   Read the `b-reply-1` line in `report.jsonl`, then wait at most five minutes for B's reply. Read B's transcript to record whether it replied, stopped at a permission prompt, or did nothing; record that outcome in the reply-route row, together with the destination if it replied. Read A's `received.jsonl` for every field of an arriving `session.receive` event and A's transcript for any new model turn. Record where the reply actually lands, even if it does not reach A. Nobody answers a permission prompt by typing into a pane.
-
-   Whatever B did, arm a second consumption request:
-
-   ```json
-   {"id":"consume-2","step":"consume","to_session_id":"","to_socket":"","text":"","count":0}
-   ```
-
-   Wait for the `consume-2` report line with `ok: true`, then record whether A's transcript is absent or note its current last line. From its own session, the unit director uses its SendMessage tool to send `Postmaster trial consume-2.` to `uds:<A_SOCKET>`. Read A's `received.jsonl` for the matching event with `consumed: true` and `consume_request_id: "consume-2"`, and confirm A's transcript is still absent, or has no new line. Criterion (d) passes when a message matching an armed id is consumed in A and its transcript is still absent, or has no new line; it does not depend on B completing a reply. A is the throwaway session created for this check, so the director sends nothing to an existing session.
-
-9. **Send to a dead session.** Write:
-
-   ```json
-   {"id":"dead-1","step":"send-dead","to_session_id":"<DEAD_ID>","to_socket":"","text":"Postmaster trial dead-1.","count":1}
-   ```
-
-   Read the `dead-1` report line for whether the call throws or returns and the complete failure answer.
-
-10. **Send to A itself.** Write:
-
-    ```json
-    {"id":"self-1","step":"send-self","to_session_id":"<A_ID>","to_socket":"<A_SOCKET>","text":"Postmaster trial self-1. Record receipt; no reply needed.","count":1}
-    ```
-
-    Read the `self-1` report line, A's `received.jsonl` and A's transcript to record the self-send result.
-
-11. **Measure bursts of 20 and 60 sends to B.** Write the first object and read its result before writing the second:
-
-    ```json
-    {"id":"burst-20-1","step":"burst","to_session_id":"<B_ID>","to_socket":"<B_SOCKET>","text":"Postmaster trial burst-20-1. Record receipt; no reply needed.","count":20}
-    ```
-
-    ```json
-    {"id":"burst-60-1","step":"burst","to_session_id":"<B_ID>","to_socket":"<B_SOCKET>","text":"Postmaster trial burst-60-1. Record receipt; no reply needed.","count":60}
-    ```
-
-    Read the matching lines in `report.jsonl` for each send's timing, returned `isDelivered` answer and refusal reason. The probe sends the same text `count` times, and B drops a text identical to the previous message from that sender: its transcript shows one arriving record per burst. Record that repeat limit alongside the send-side rate limit; transcript records cannot establish how many sends returned a delivered answer.
-
-12. **Exercise file calls and visibility.** Have another shell process observe `STATE/postmaster/probe/file-source.txt` before writing this request:
-
-    ```json
-    {"id":"files-1","step":"files","to_session_id":"","to_socket":"","text":"","count":0}
-    ```
-
-    Read the `files-1` report line for writing, listing, reading and testing the existence of a file through `$.fs`, then writing the same path again and reading the replacement value. Its detail includes `path` identifying `file-source.txt`, `final_content` and per-operation timestamps. From the observing process, check that the file and its replacement contents are visible as soon as each write returns; retain the write-return and external-observation evidence for criterion (b). An outside reader may observe a torn value during the replacement write; record the value and timestamp when seen. Treat an unparsable value in a rewritten JSON file as not yet written. Record that `$.fs` has no rename and no remove. The mod starts no process; the unit director runs the observing shell process outside the mod.
-
-13. **Observe ten idle minutes.** Write:
-
-    ```json
-    {"id":"timer-1","step":"timer","to_session_id":"","to_socket":"","text":"","count":0}
-    ```
-
-    Read the `timer-1` report line for the 0.5 s poll mechanism (`setInterval` in the module or an engine API) and the four baseline values: `poll_count`, `max_gap_ms`, `completed_count` and `max_completed_gap_ms`. Leave A idle for ten minutes, reading the `tick` lines appended every 60 s to `report.jsonl`. `poll_count` counts timer callbacks since the worker started; `completed_count` counts request-file checks that ran to their end since the worker started. `max_gap_ms` is the longest gap between timer callbacks inside the minute the tick closes. `max_completed_gap_ms` is the longest time between finished checks inside that minute, including the time still open when the tick is written. Both gap values start again at each tick.
-
-    Record the elapsed interval and ten consecutive ticks for the same `run`. The gate holds when every tick has `max_gap_ms` and `max_completed_gap_ms` at most 2000, and `poll_count` and `completed_count` both rise from tick to tick. Record a new `run` or a second `start` line if either occurs during the interval.
-
-14. **Record generated types, strict checking and the test kit.** Check whether `mods/postmaster/.claude-plugin/types/claude-code/index.d.ts` exists after A loads the mod. The engine also writes `mods/postmaster/.claude-plugin/types/tsconfig.json`, `claude-code-tools/` and `claude-code-mcp/`. Read the generated declarations and engine configuration to identify the API and compiler libraries actually available; keep generated types uncommitted. The declarations supply their own worker globals, so the mod configuration must omit the `DOM` library. `register` must use the engine's `Register`/`On` types. From the worktree, try this command and record the exact command that passes on natedev, together with its exit status and output:
-
-    ```sh
-    nix shell nixpkgs#typescript --command tsc --noEmit -p mods/postmaster
-    ```
-
-    Record the exit status and output, including the `hooks:` and `calls:` lines, from:
-
-    ```sh
-    command claude plugin validate --strict mods/postmaster
-    command claude plugin test mods/postmaster
-    ```
-
-    Record what a `tests/*.test.ts` file must import from `claude-code/testing`, including the exports for a fake clock, `$.session.send`, an arriving `session.receive` and file calls. A run with no test file does not establish those exports; keep unsupported points unverified. Hook exceptions or the 10 s hook limit must produce recorded failures; the probe must not throw out of a hook, and each handler must have a `.catch`.
-
-15. **Apply the four pass criteria.** Continue the trial only when all four have evidence: (a) a send by session id or `uds:` reaches B in another process; (b) the mod writes, lists, reads and tests the existence of files under its state directory, and another process sees a file as soon as the write returns; (c) ten consecutive minute ticks for the same `run` each show `max_gap_ms` and `max_completed_gap_ms` at most 2000, with `poll_count` and `completed_count` both rising from tick to tick; (d) an arriving message matching an armed consumption id is consumed in A and starts no turn there, with A's transcript still absent or showing no new line, including the director's `consume-2` check regardless of B's reply outcome. Cross-account observations cover both C (`~/.claude3`) and D (`~/.claude1`); they are recorded separately from the four gates. If any fails or cannot be verified, the unit director stops the run and reports to the showrunner. Record every other result in the table: address form, reach across accounts, sender name and wrapper, reply route and receive fields, worker replacement or repeated starts, burst limit, dead-session failure, self-send, identity reads, generated types, the TypeScript command, strict validation output and test-kit exports. Strict validation must exit 0 and TypeScript checking must pass.
-
-16. **Clean up the live check.** After reading the evidence and filling the table, exit A, B, C and D through the supported process/session controls, end only the throwaway tmux session and remove `STATE/postmaster/probe/`. End only processes this check started, confirmed from the retained identities; never type into a pane. Delete saved traces, captures and logs before another run. Keep `/home/natepiano/postmaster` empty and available as the permanent postmaster session directory.
+The probe used `STATE/postmaster/probe/` and was removed after Phase 2. Commit `cd85b091` holds its code; the earlier version of this document holds the full probe procedure. The table below preserves the measured evidence; it is separate from the pending shipped-mod start procedure above.
 
 **Mod API on Claude Code 2.1.296, measured 2026-10-12**
 
@@ -419,14 +340,16 @@ Senders:
 - `scripts/message/sessions.py` — session registry readers, process-start reader
 - `scripts/message/process_table.py` — the shared process table
 - `scripts/message/codex_daemon.py` — daemon reader and `queue`
-- `scripts/message/send.py` — one recipient, any address, either machine, the user
+- `scripts/message/send.py` — one recipient, any address, either machine, the user; tagged outbox text and route log fields
+- `scripts/message/postmaster.py` — outbox client, named attempt/reply/recipient states, cleanup and status
+- `mods/postmaster/hooks/{protocol,outbox,replies,register}.ts` — JSON validators, polling, reply routes and shared hook startup
 - `scripts/production/broadcast.py` — groups on both machines
 - `scripts/message/top_level.py` — top-level Claude sessions here
 - `scripts/notify/user_action.py`, `scripts/notify/pushover.py` — the message-to-user gate
 - `scripts/message/escalate.py`, `scripts/shutdown/settle.py`, `scripts/shutdown/restart.py` — held and shutdown messages
 - `scripts/shutdown/test_support.py` — shutdown send guard
 - `codex/AGENTS-messaging.md`, `scripts/message/install_codex_agents.py`, `commands/message.md`, `commands/announce.md`, `commands/unit/announce.md`, `commands/showrunner/announce.md`, `commands/notify_top_level.md`, `commands/alert_user.md` — instructions
-- Tests: `scripts/message/test_{roster,send,codex_daemon,process_table,sessions,top_level,install_codex_agents}.py`, `scripts/notify/test_pushover.py`, `scripts/production/test_{broadcast,codex_winddown}.py`, `scripts/shutdown/test_*.py` (`test_send_guard.py` proves the guard)
+- Tests: `scripts/message/test_{roster,send,postmaster,codex_daemon,process_table,sessions,top_level,install_codex_agents}.py`, `scripts/notify/test_pushover.py`, `scripts/production/test_{broadcast,codex_winddown}.py`, `scripts/shutdown/test_*.py` (`test_send_guard.py` proves the guard); `mods/postmaster/tests/*.test.ts` exercise fake call sets and kit-loaded hooks
 
 ## Invariants
 
@@ -442,10 +365,13 @@ Senders:
 - `process_table` imports none of `roster`, `broadcast` or `codex_winddown`, so `broadcast.py` imports `roster.py` without a cycle.
 - `running_sessions()` and `live_sessions()` select per record through their own predicate; a change to `running_session` keeps that. `sessions.process_start` is the one process-start reader. A record with a `procStart` is running only while it matches its process, socket or not, so a phantom is never a roster row, a broadcast line, an unreachable line or a cause of name ambiguity.
 - A role-key or signature change in `broadcast.broadcast` carries `codex_winddown.py` and `test_codex_winddown.py`.
+- The mod writes its claim before checking the outbox entry; the client takes the entry out before checking its claim. No confirmed delivery means relay or the existing queue, with a possible second copy on `claimed-no-result`.
+- Postmaster is folder-loaded, with no marketplace installation or settings change. Its file access stays under `STATE/postmaster/`, and it starts no process and makes no network call.
+- Tests never write the real outbox: scratch HOME/state, fake clocks and mod/file/send calls only.
 - Tests are hermetic: temp directories for sessions, the delegate root and the notifier state; fake `tmux`, `ps`, `ssh` and `codex`; a fake daemon socket. They never reach the real daemon, a real session, `send.py`'s relay, `pushover.py` or the other machine.
 - Every `TestCase` in `scripts/shutdown/` derives from `ShutdownTestCase` and calls `super().setUp()` first. A new send leaf, or a new module that imports `run_remote` by name, gets an entry in `_REAL_LEAF_BINDINGS` and a stub in `setUp`.
-- Live checks never message a real session: they use a scratch background Claude session, a scratch mesh thread in a scratch session directory and a scratch daemon thread, all removed afterwards. Listing real sessions is allowed.
-- `commands/message.md` and `codex/AGENTS-messaging.md` say the same thing.
+- Live checks never message a real session: they use a scratch background Claude session, a scratch mesh thread in a scratch session directory and a scratch daemon thread, all removed afterwards. The postmaster check uses throwaway recipients and leaves only the service session running for the trial. Listing real sessions is allowed.
+- `commands/message.md` and `codex/AGENTS-messaging.md` share roster discovery and outcome/recovery rules. Only the Claude receiving rules describe postmaster; Codex recipients bypass it.
 
 ## Calibration / gotchas
 
@@ -466,6 +392,15 @@ Senders:
 - `pushover.py` exit 2 also means usage or missing keys; only the `refused before sending:` stderr marker marks a refusal. A caller with no keys and no action flag gets the action refusal, not `keys missing`.
 - Every roster problem on stderr carries `could not read: `, so a machine not reached reads `could not read: <host>: not reached: <why>` (exit 1). In a sandbox this usually means rerun outside it, or use `--here`.
 - The ssh commands run `$HOME/.claude/scripts/...` on the other machine, its main checkout: a branch's changes reach it only once merged and pulled there. A `BROADCAST_SEND` set here is set there to the same path, and a path missing there fails the send there.
+
+**Postmaster**
+- Strict checks from the repo root: `command claude plugin validate --strict mods/postmaster`, `command claude plugin test mods/postmaster`, and `nix shell nixpkgs#typescript --command tsc --noEmit -p mods/postmaster`. Repeat validation and the kit after a Claude Code update.
+- Engine-generated `mods/postmaster/.claude-plugin/types/` stays ignored; it supplies worker globals, so the mod uses ES2023 without `DOM`.
+- `--plugin-dir` hot-reloads the folder. A pull on main replaces the running mod's worker; the relay covers a stale-heartbeat pause. A stopped postmaster must be started by hand; restart preserving `--plugin-dir` is unverified.
+- `/home/natepiano/postmaster` is outside the repo and trusted per account. A new account or a removed/recreated directory can meet the folder-trust dialog.
+- A refused send whose route withdrawal write also fails leaves `open` on disk. If the worker is replaced before a retry succeeds, it restores that route and a message from that recipient within 30 minutes can forward to the sender. This is accepted for the trial: it requires a failed write and replacement before the next 0.5 s poll retry, and `REPLY_WINDOW_MS` bounds it.
+- `forwarded` lists only confirmed destination ids. An empty list can mean an unroutable sender, a refused forward or a throwing forward. These forwards are neither retried nor written to `errors/`; read the logged body, identify the intended sender and resend by hand.
+- Routes accumulate by recipient socket. A later script message does not remove an earlier sender's route; replies cannot be assigned to a single message while several routes are live.
 
 **Codex daemon**
 - An ephemeral daemon thread refuses `codex queue` (-32600) and cannot be archived; live checks start threads with `ephemeral: false`.

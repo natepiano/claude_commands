@@ -85,7 +85,7 @@ class PostmasterTests(unittest.TestCase):
 
     def heartbeat(self, *, age: float = 0, identity: str = "worker") -> None:
         self.write(self.directory / "heartbeat.json", postmaster.Heartbeat(
-            session_id=identity, at_ms=int((self.clock.time() - age) * 1000), version="0.1.0"))
+            session_id=identity, at_ms=int((self.clock.time() - age) * 1000), version="0.1.0", run="1800000000000-test-worker"))
 
     def result(self, outcome: Literal["delivered", "failed", "expired", "withdrawn", "abandoned"], *, matching: bool = True) -> None:
         self.write(self.path("results"), postmaster.OutboxResult(id=ENTRY_ID, outcome=outcome,
@@ -139,6 +139,25 @@ class PostmasterTests(unittest.TestCase):
                 assert isinstance(answer, postmaster.RelayRequired)
                 self.assertEqual(answer.reason, reason)
                 self.no_id_files()
+
+    def test_heartbeat_without_worker_identity_is_stale_and_status_is_not_running(self) -> None:
+        for run_fields in ({}, {"run": ""}, {"run": 17}):
+            with self.subTest(run_fields=run_fields):
+                self.write(self.directory / "heartbeat.json", {
+                    "session_id": "worker", "at_ms": int(self.clock.time() * 1000),
+                    "version": "0.1.0", **run_fields,
+                })
+                self.assertEqual(self.attempt(), postmaster.RelayRequired("stale", 0.0))
+                self.no_id_files()
+                with patch.object(sessions, "live_sessions", return_value=self.live), redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(postmaster.status(self.state), 1)
+                self.assertIn("postmaster: not running;", output.getvalue())
+
+    def test_status_prints_the_current_worker_identity(self) -> None:
+        self.heartbeat()
+        with patch.object(sessions, "live_sessions", return_value=self.live), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(postmaster.status(self.state), 0)
+        self.assertIn("running, heartbeat 0.0 s old, worker 1800000000000-test-worker;", output.getvalue())
 
     def test_shutdown_sender_reads_and_writes_nothing_even_with_fresh_heartbeat(self) -> None:
         self.heartbeat()
@@ -409,7 +428,7 @@ class PostmasterTests(unittest.TestCase):
         output = io.StringIO()
         with patch.object(sessions, "live_sessions", return_value=self.live), redirect_stdout(output):
             self.assertEqual(postmaster.status(self.state), 0)
-        self.assertIn("postmaster: running, heartbeat 0.0 s old; errors: 0; replies: 1", output.getvalue())
+        self.assertIn("postmaster: running, heartbeat 0.0 s old, worker 1800000000000-test-worker; errors: 0; replies: 1", output.getvalue())
         self.assertEqual(list(self.directory.rglob("old.json")), [])
         self.assertTrue(young.exists())
         for index in range(3):
@@ -439,7 +458,7 @@ class PostmasterTests(unittest.TestCase):
         with patch.object(sessions, "live_sessions", return_value=self.live), redirect_stdout(output):
             self.assertEqual(postmaster.status(self.state), 0)
         self.assertEqual(output.getvalue().splitlines()[0],
-            "postmaster: running, heartbeat 0.7 s old; errors: 0; replies: 0")
+            "postmaster: running, heartbeat 0.7 s old, worker 1800000000000-test-worker; errors: 0; replies: 0")
 
     def test_status_today_counts_use_user_zone_and_ignore_other_dates_and_bad_lines(self) -> None:
         self.heartbeat()

@@ -131,7 +131,7 @@ class SendTests(ShutdownTestCase):
         path = self.root / "postmaster" / "heartbeat.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(json.dumps(postmaster.Heartbeat(session_id=identity,
-            at_ms=int(clock.time() * 1000), version="0.1.0")))
+            at_ms=int(clock.time() * 1000), version="0.1.0", run="1800000000000-test-worker")))
 
     def postmaster_mod(self, clock: FakeClock, texts: list[str], *, matching: bool = True) -> None:
         def poll() -> None:
@@ -306,6 +306,13 @@ class SendTests(ShutdownTestCase):
             self.assertEqual(self.send("--text", "body"), self.outcome)
         self.assertEqual(len(self.relayed), 1)
         self.assertEqual((self.log()[-1]["via"], self.log()[-1]["postmaster"]), ("relay", "unresolved"))
+
+    def test_absent_session_address_queues_and_logs_queue_without_a_relay(self) -> None:
+        with mock.patch.object(postmaster, "attempt", side_effect=AssertionError("no live recipient")):
+            result = send.send(local_options(["--to", "session:gone", "--from", "Sender", "--text", "body"]))
+        self.assertEqual(result.outcome, "queued")
+        self.assertEqual(self.relayed, [])
+        self.assertEqual((self.log()[-1]["via"], self.log()[-1]["postmaster"]), ("queue", "unresolved"))
 
     def test_skipped_message_has_no_claude_route_fields(self) -> None:
         _ = send.acknowledge("route-key")

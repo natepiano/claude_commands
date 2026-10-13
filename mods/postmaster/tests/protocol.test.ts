@@ -19,7 +19,7 @@ const result = {
   claimed_ms: 9000,
   finished_ms: 9100,
 };
-const heartbeat = { session_id: "postmaster-session", at_ms: 9000, version: "0.1.0" };
+const heartbeat = { session_id: "postmaster-session", at_ms: 9000, version: "0.1.0", run: "9000-test-worker" };
 
 describe("postmaster protocol validators", () => {
   test("entry requires a sender name and permits an unresolved reply destination on the wire", () => {
@@ -141,6 +141,12 @@ describe("postmaster protocol validators", () => {
 
   test("heartbeat accepts session identity time and version", () => {
     expect(isHeartbeat(heartbeat)).toBe(true);
+  });
+
+  test("heartbeat requires a nonempty worker identity", () => {
+    const { run: _run, ...withoutWorker } = heartbeat;
+    expect(isHeartbeat(withoutWorker)).toBe(false);
+    expect(isHeartbeat({ ...heartbeat, run: "" })).toBe(false);
   });
 
   test("heartbeat rejects missing fields and wrong field types", () => {
