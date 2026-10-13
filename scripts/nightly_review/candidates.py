@@ -27,10 +27,11 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
-from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
 ROOT = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "nightly-review"
-ZONE = ZoneInfo("America/New_York")
 # A title longer than this is cut, so one long sentence cannot widen the whole table.
 TITLE_WIDTH = 90
 
@@ -154,7 +155,7 @@ def table(candidates: list[Candidate]) -> str:
 
 
 def now() -> datetime:
-    return datetime.now(ZONE)
+    return datetime.now(user_zone())
 
 
 def write_note(body: str) -> None:
@@ -164,7 +165,7 @@ def write_note(body: str) -> None:
     try:
         if not note.parent.is_dir() or not (ROOT / "ledger.md").is_file():
             return
-        moment = now().astimezone(ZONE)
+        moment = now().astimezone(user_zone())
         host = socket.gethostname().split(".", 1)[0]
         read_line = (
             f"Read {moment:%Y-%m-%d %H:%M} {moment:%Z} from the nightly review's ledger on {host}. "

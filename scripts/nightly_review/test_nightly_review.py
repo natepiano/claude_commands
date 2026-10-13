@@ -28,6 +28,11 @@ STARTED = [f"{SESSION}: started"]
 UNIT_LOGIN = "unit@example.com"
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 class FakeNote:
     def __init__(self, stem: str, fields: dict[str, str]) -> None:
         self.path: Path = Path(f"/vault/agents/{stem}.md")

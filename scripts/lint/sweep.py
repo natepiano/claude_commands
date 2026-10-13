@@ -142,7 +142,9 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Literal, TypeGuard, TypedDict, cast
-from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
 GIB = 1 << 30
 MIB = 1 << 20
@@ -192,7 +194,6 @@ ALERT_INTERVAL_SECONDS = 60 * 60
 # loss each; their smallest removal was 35.2 GiB, versus 29.2 GiB at most otherwise.
 UNEXPLAINED_FALL_BYTES = 10 * GIB
 LARGE_REMOVAL_BYTES = 32 * GIB
-PACIFIC = ZoneInfo("America/Los_Angeles")
 # A nightly worktree's target is 5 below its root, a scratch crate's under
 # /tmp/claude-<uid>/<project>/<session>/scratchpad/ up to 7.
 FLOOR_SEARCH_DEPTH = 8
@@ -996,7 +997,7 @@ def read_disk_measurement() -> DiskMeasurement:
 
 
 def pacific_time(timestamp: float | datetime) -> str:
-    value = timestamp.astimezone(PACIFIC) if isinstance(timestamp, datetime) else datetime.fromtimestamp(timestamp, PACIFIC)
+    value = timestamp.astimezone(user_zone()) if isinstance(timestamp, datetime) else datetime.fromtimestamp(timestamp, user_zone())
     return value.strftime("%Y-%m-%d %H:%M %Z")
 
 

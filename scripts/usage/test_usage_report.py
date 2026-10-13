@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import unittest
+from unittest import mock
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,11 @@ REPORT = Path(__file__).with_name("usage_report.py")
 METRICS = ("weighted", "weighted_per_checkpoint", "before_first_edit_share", "cache_read_share",
            "output_share", "compactions_per_thread", "weighted_per_finding_closed",
            "weighted_per_review_round", "account_switches")
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class ReportFunctionCalls(TypedDict):

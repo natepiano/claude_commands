@@ -166,7 +166,7 @@ The builder's output, which the renderer consumes:
 ```json
 {
   "length": "simple",
-  "zone": "America/Los_Angeles",
+  "zone": "America/New_York",
   "next_run": "07:28",
   "units": [
     {
@@ -250,7 +250,7 @@ unless it names another plan's document. User, 2026-10-02.
 
 ### What the renderer writes
 
-- **First line:** the length and the time in `ZONE`: `**Dailies (Simple)**, 19:05 PDT`.
+- **First line:** the length and the time in `ZONE`: `**Dailies (Simple)**, 19:05 EDT`.
 - **Counts:** the production's own counts from `dailies.conf`, on one line just above the chart in every
   length, `gantt` included: `counts: nightly queue 8 · proposals 3`. A count whose file is missing reads
   `not found`. None configured, no line. User, 2026-10-10.
@@ -265,13 +265,13 @@ unless it names another plan's document. User, 2026-10-02.
   reason shows its examples only the first time. The word "held" is kept for
   a build hold, so a checkpoint waiting to merge reads `checkpoint:`.
 - **Waiting and idle:** in `simple` only, each unit with `idle` and no `needed`, no unmerged checkpoint and nothing waiting on you gives up its section for one line under `### Waiting and idle`, after the other units: `- cache-evict until 16:33: a day of sweep readings`. A later day adds its weekday (`Sat 22:44`), and a week or more away its date (`Wed 2026-10-14 07:50`). It keeps its timeline row. `page` and `elaborate` keep its full section. User, 2026-10-07.
-- **eta:** the time, then the percent done: `10:46 PDT, 85% done`.
+- **eta:** the time, then the percent done: `10:46 EDT, 85% done`.
 - **eta note:** against the last report's ETA for the same phase:
   `(unchanged)`, `(changed: +0:27 because <why>)`, or `(unchanged, overdue)`
   once the time has passed. A subject's first ETA or a new phase has no note,
   except `(overdue)` when its time has already passed.
   A new phase has a new title; a renumbered phase with the same title keeps its notes.
-- **first eta:** once the ETA has moved from the phase's first: `05:43 PDT (now
+- **first eta:** once the ETA has moved from the phase's first: `05:43 EDT (now
   +17:12, 8 fix rounds added)`. User, 2026-10-03. A
   range follows the note; an end on another day carries its weekday
   (`range Fri 08:24–Sat 07:37`).
@@ -310,7 +310,7 @@ unless it names another plan's document. User, 2026-10-02.
   no report reads `?  no report yet`. A row from `expand` is
   `<child>/<row>`, with no plan bar. The label column widens to the longest
   name. A showrunner with nothing below it gets none of this.
-- **Agents:** after the chart and any build-hold and Mac-block lines, one line per active account shows its week used, when it runs out at its current pace (each rise weighted by half per 12 hours of age, across refills, `scripts/whoami/run_out.py`), whether it reaches its refill first, and its available resets. With no pace, it says the account does not run out at this pace; when exhausted, it says the account ran out: `- claude 1: 40%; runs out about Tue 07:10 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22` (user, 2026-10-05; wording updated 2026-10-06).
+- **Agents:** after the chart and any build-hold and Mac-block lines, one line per active account shows its week used, when it runs out at its current pace (each rise weighted by half per 12 hours of age, across refills, `scripts/whoami/run_out.py`), whether it reaches its refill first, and its available resets. With no pace, it says the account does not run out at this pace; when exhausted, it says the account ran out: `- claude 1: 40%; runs out about Tue 07:10 EDT, before its Sun 23:00 refill; 1 reset available until Oct 22` (user, 2026-10-05; wording updated 2026-10-06).
 - **Footer:** the reply footer (`/showrunner:produce` → Footer), from
   `next_run`, the build-holder files, the Mac block file, `OUTSTANDING` and whether
   any subject has `needed:`. A due item below this production also keeps it

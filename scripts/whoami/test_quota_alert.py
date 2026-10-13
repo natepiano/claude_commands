@@ -91,6 +91,11 @@ def configured_recipients(config: quota_alert.Config, here: str | None = None) -
     return [name for name in ("natedev", "boss of bosses") if name != here]
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 class QuotaAlertTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)

@@ -124,6 +124,8 @@ class AccountsTests(unittest.TestCase):
             "AGENT_NOTES_DIR": str(notes),
             "HOME": str(self.home),
             "PATH": os.defpath,
+            # The wall times these tests pass are Pacific; the user's zone setting must not change them.
+            "USER_ZONE": "America/Los_Angeles",
         }
         environment_context: object = cast(
             object,

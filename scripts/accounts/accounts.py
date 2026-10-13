@@ -1133,9 +1133,9 @@ def _iso_time(text: str, place: str) -> datetime:
         raise AccountsError(f"accounts: {place} must be an ISO timestamp") from error
     if at.tzinfo is None:
         # Command-line and historical wall times use the user's zone.
-        from zoneinfo import ZoneInfo
+        from scripts.lib.user_zone import user_zone
 
-        at = at.replace(tzinfo=ZoneInfo("America/Los_Angeles"))
+        at = at.replace(tzinfo=user_zone())
     return at.astimezone(timezone.utc)
 
 
