@@ -253,7 +253,7 @@ The user, 2026-10-12: "Let's trial post master to see if it works". Scope is sec
 
 **Ruled out:** comparing the pane's current session name with the recorded one (a rename defeats it); `has-session -t $N` for the session-id route (it cannot tell a new server's reused id).
 
-### Phase 9 — Restart tells a replaced tmux server apart by its pid as well as its start time  · status: todo
+### Phase 9 — Restart tells a replaced tmux server apart by its pid as well as its start time  · status: done
 
 #### Work Order
 

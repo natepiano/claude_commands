@@ -728,12 +728,12 @@ def _pane_is_reusable(
 
 
 def _tmux_server_matches(
-    server: TmuxServer | TmuxServerNotRecorded, started_at_text: str,
+    server: TmuxServer | TmuxServerNotRecorded, started_at_text: str, pid_text: str,
 ) -> bool:
     if server["kind"] == "not recorded":
         return False
     try:
-        return int(started_at_text) == server["started_at"]
+        return int(started_at_text) == server["started_at"] and int(pid_text) == server["pid"]
     except ValueError:
         return False
 
@@ -751,14 +751,14 @@ def _tmux_pane_state(
             "-p",
             "-t",
             pane["pane_id"],
-            "#{session_id}\t#{pane_pid}\t#{pane_dead}\t#{start_time}",
+            "#{session_id}\t#{pane_pid}\t#{pane_dead}\t#{start_time}\t#{pid}",
         ],
         dry_run=dry_run,
     )
     if pane_probe.returncode != 0:
         return TmuxPaneUnavailable()
     fields = pane_probe.stdout.rstrip("\r\n").split("\t")
-    if len(fields) != 4 or not _tmux_server_matches(server, fields[3]):
+    if len(fields) != 5 or not _tmux_server_matches(server, fields[3], fields[4]):
         return TmuxPaneUnavailable()
     if _pane_is_reusable(pane, fields[1], fields[2], dry_run=dry_run):
         return ReusableTmuxPane()
@@ -825,10 +825,15 @@ def _tmux_launch(command: str, session: Session, *, dry_run: bool) -> None:
     session_ref = host["session_ref"]
     if server["kind"] == "server" and session_ref["kind"] == "session id":
         session_probe = _probe(
-            [tmux, "display", "-p", "-t", session_ref["session_id"], "#{start_time}"],
+            [tmux, "display", "-p", "-t", session_ref["session_id"], "#{start_time}\t#{pid}"],
             dry_run=dry_run,
         )
-        if session_probe.returncode == 0 and _tmux_server_matches(server, session_probe.stdout):
+        server_fields = session_probe.stdout.rstrip("\r\n").split("\t")
+        if (
+            session_probe.returncode == 0
+            and len(server_fields) == 2
+            and _tmux_server_matches(server, server_fields[0], server_fields[1])
+        ):
             _ = _run(
                 _new_window_argv(tmux, f"{session_ref['session_id']}:", session["cwd"], command),
                 dry_run=dry_run,
