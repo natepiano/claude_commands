@@ -8,18 +8,25 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 import nightly_review
+import account
 import launch_permission
 import agent_notes
 import note_file
 from scripts.accounts import accounts
+from scripts.production import showrunners
+if TYPE_CHECKING:
+    from scripts.notify import review
+else:
+    import review
 
 REAL_TMUX = nightly_review.tmux
 NIGHT = date(2026, 9, 29)
@@ -155,6 +162,113 @@ class NightlyReviewTests(unittest.TestCase):
             json.dumps(value), encoding="utf-8"
         )
 
+    def test_timer_runs_messages_after_rust(self) -> None:
+        self.assertEqual(nightly_review.MODES, ("config", "rust", "messages"))
+        self.assertEqual(nightly_review.PROMPT, "/nightly_review config rust messages")
+
+    def test_copied_nightly_library_import_needs_no_message_review_or_production_modules(self) -> None:
+        copied = self.root / "copy/scripts/nightly_review/nightly_review.py"
+        copied.parent.mkdir(parents=True)
+        _ = shutil.copyfile(nightly_review.__file__, copied)
+        whoami = copied.parents[1] / "whoami"
+        shutdown = copied.parents[1] / "shutdown"
+        whoami.mkdir()
+        shutdown.mkdir()
+        _ = (whoami / "account.py").write_text("NAMED_ACCOUNT_VARIABLES = []\n")
+        _ = (whoami / "agent_accounts.py").write_text("class ClaudeAccountSelection: pass\n")
+        _ = (whoami / "note_file.py").write_text("")
+        _ = (whoami / "quota_alert.py").write_text("def ahead(*args): return False\ndef remaining(*args): return 100\n")
+        _ = (shutdown / "launch_permission.py").write_text(
+            "class BlockedByShutdown: pass\nclass NewWorkLaunchPurpose: pass\nclass ShutdownStateUnreadable: pass\n"
+            + "def launch_barrier(): pass\ndef launch_permission(*args): pass\n")
+        result = subprocess.run([sys.executable, "-I", "-c",
+                                 "import runpy,sys; runpy.run_path(sys.argv[1], run_name='copied_library')", str(copied)],
+                                cwd=self.root, capture_output=True, text=True, check=False, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_transcripts_use_session_accounts_and_timer_identity_after_rename(self) -> None:
+        sessions = self.root / "sessions"
+        sessions.mkdir()
+        since = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        paths: list[Path] = []
+        for index, name in enumerate(("renamed coordinator", "natedev")):
+            config = self.root / f"account-{index}"
+            path = config / "projects/-work" / f"sid-{index}.jsonl"
+            path.parent.mkdir(parents=True)
+            _ = path.write_text(json.dumps(nightly_review.DatedTranscriptRecord(
+                type="assistant", timestamp=since.isoformat())) + "\n")
+            paths.append(path)
+            record = nightly_review.TranscriptSessionRecord(sessionId=f"sid-{index}", name=name,
+                cwd="/work", config_dir=str(config))
+            if index == 0:
+                record["transcript_path"] = str(path)
+                record["cwd"] = "/old-work"
+            _ = (sessions / f"{index}.json").write_text(json.dumps(record))
+        def production_of(sid: str) -> Path | None:
+            return self.root if sid == "sid-0" else None
+        with (mock.patch.object(nightly_review, "SESSIONS_DIR", sessions),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
+              mock.patch.object(showrunners, "production_of", side_effect=production_of),
+              mock.patch.object(account, "process_config_dir", side_effect=AssertionError("recorded account lost"))):
+            self.assertEqual(nightly_review.showrunner_transcripts(since), sorted(paths))
+
+    def test_transcript_selection_uses_reply_time_instead_of_recent_file_write(self) -> None:
+        sessions = self.root / "sessions"
+        sessions.mkdir()
+        since = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        path = self.root / "old.jsonl"
+        _ = path.write_text(json.dumps(nightly_review.DatedTranscriptRecord(
+            type="assistant", timestamp=(since - timedelta(days=2)).isoformat())) + "\n")
+        _ = (sessions / "1.json").write_text(json.dumps(nightly_review.TranscriptSessionRecord(
+            name="natedev", sessionId="sid", transcriptPath=str(path))))
+        with (mock.patch.object(nightly_review, "SESSIONS_DIR", sessions),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=[])):
+            self.assertEqual(nightly_review.showrunner_transcripts(since), [])
+
+    def test_transcript_lookup_uses_the_sessions_process_account(self) -> None:
+        sessions = self.root / "sessions"
+        sessions.mkdir()
+        since = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        config = self.root / "showrunner-account"
+        path = config / "projects/-work" / "sid.jsonl"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text(json.dumps(nightly_review.DatedTranscriptRecord(
+            type="assistant", timestamp=since.isoformat())) + "\n")
+        _ = (sessions / "1.json").write_text(json.dumps(nightly_review.TranscriptSessionRecord(
+            name="natedev", sessionId="sid", cwd="/work", pid=42)))
+        with (mock.patch.object(nightly_review, "SESSIONS_DIR", sessions),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
+              mock.patch.object(account, "process_config_dir", return_value=config) as directory):
+            self.assertEqual(nightly_review.showrunner_transcripts(since), [path])
+        directory.assert_called_once_with(42)
+
+    def test_live_counts_exclude_dry_runs_and_keep_unreviewed_apart_from_failures(self) -> None:
+        since = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        records = [nightly_review.NightlyVerdictRecord(time=since.isoformat(), verdict=verdict,
+                   failed_rules=["reader-starts-cold"]) for verdict in ("send", "rewrite", "ask", "unreviewed: timeout")]
+        records += [nightly_review.NightlyVerdictRecord(time=since.isoformat(), verdict="rewrite", failed_rules=[], replay=True),
+                    nightly_review.NightlyVerdictRecord(time=since.isoformat(), verdict="rewrite", failed_rules=[], dry=True),
+                    nightly_review.NightlyVerdictRecord(time=since.isoformat(), verdict="rewrite", failed_rules=[], sample=True)]
+        records.append(nightly_review.NightlyVerdictRecord(time=(since - timedelta(seconds=1)).isoformat(),
+            verdict="rewrite", failed_rules=["reader-starts-cold"]))
+        path = self.root / "review.jsonl"
+        _ = path.write_text("\n".join(json.dumps(record) for record in records) + '\n{"time":{},"verdict":"ask"}\n')
+        self.assertEqual(nightly_review.live_message_counts(path, since),
+                         nightly_review.LiveMessageCounts(4, 2, 1, (("reader-starts-cold", 2),)))
+
+    def test_messages_mode_runs_only_the_dry_sample_cli_with_a_derived_wait(self) -> None:
+        since = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        paths = [self.root / "one.jsonl", self.root / "two.jsonl"]
+        with (mock.patch.object(nightly_review, "showrunner_transcripts", return_value=paths),
+              mock.patch.object(nightly_review, "live_message_counts", return_value=nightly_review.LiveMessageCounts(0, 0, 0, ())),
+              mock.patch.object(review, "user_send_seconds", return_value=115),
+              mock.patch.object(subprocess, "run", return_value=done("Sampled: 1; failures: 0; Unreviewed: 0; unregistered questions: 1\n")) as run):
+            lines = nightly_review.messages(since)
+        self.assertIn("unregistered questions: 1", lines[-1])
+        self.assertEqual(run.call_args.args[0], [sys.executable, str(nightly_review.REVIEW_SCRIPT), "sample",
+                         *(str(path) for path in paths), "--limit", "20", "--since", since.isoformat()])
+        self.assertEqual(run.call_args.kwargs["timeout"], 2315)
+
     def down_record(self, login: str = "owner@example.com", label: str = "claude 2") -> dict[str, object]:
         return {
             "login": login,
@@ -183,7 +297,7 @@ class NightlyReviewTests(unittest.TestCase):
         return shlex.join([
             "claude", "--remote-control", SESSION, "-n", SESSION,
             "--add-dir", "/etc/nixos", "--add-dir", str(Path.home() / ".claude"),
-            "--settings", str(nightly_review.SETTINGS), "/nightly_review config rust",
+            "--settings", str(nightly_review.SETTINGS), "/nightly_review config rust messages",
         ])
 
     def launched_environment(self, caller: dict[str, str]) -> tuple[dict[str, str], mock.MagicMock, mock.MagicMock]:
@@ -239,7 +353,7 @@ class NightlyReviewTests(unittest.TestCase):
         self.assertEqual(command[command.index("-s") + 1], SESSION)
         self.assertEqual(command[command.index("-c") + 1], str(Path.home() / "rust"))
         self.assertEqual(command[-1], f"ENABLE_TOOL_SEARCH=true command {self.review_command()}; exec zsh")
-        self.assertTrue(command[-1].endswith("'/nightly_review config rust'; exec zsh"))
+        self.assertTrue(command[-1].endswith("'/nightly_review config rust messages'; exec zsh"))
         self.assertEqual((self.root / NIGHT.isoformat() / "launch.log").read_text(), f"{SESSION}: started\n")
 
     def test_last_night_is_replaced_unless_the_user_is_attached(self) -> None:

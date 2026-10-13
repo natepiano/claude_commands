@@ -8,7 +8,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 
@@ -42,6 +42,11 @@ class OutstandingItem(TypedDict):
     since: str
     text: str
     after: str
+
+
+class QuestionRegistration(TypedDict):
+    time: str
+    text: str
 
 
 class UnitJudgment(NamedTuple):
@@ -347,6 +352,30 @@ def append_log(production: Production, event: str, path: Path | None, before_com
     report("log", "ok", f"event {count}" + (" with STATE" if block else ""))
 
 
+def record_question_history(outstanding: Path, texts: list[str], now: datetime) -> None:
+    """Retain two days of registrations, including questions that have closed."""
+    history = outstanding.with_suffix(".history.jsonl")
+    retained: list[QuestionRegistration] = []
+    cutoff = now - timedelta(hours=48)
+    if history.exists():
+        for line in history.read_text(encoding="utf-8").splitlines():
+            try:
+                value = cast(object, json.loads(line))
+                if not isinstance(value, dict):
+                    continue
+                fields = cast(dict[str, object], value)
+                stamp, text = fields.get("time"), fields.get("text")
+                if not isinstance(stamp, str) or not isinstance(text, str):
+                    continue
+                dated = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                if dated.tzinfo is not None and dated >= cutoff:
+                    retained.append(QuestionRegistration(time=stamp, text=text))
+            except ValueError:
+                continue
+    retained.extend(QuestionRegistration(time=now.isoformat(), text=text) for text in dict.fromkeys(texts))
+    _ = history.write_text("".join(json.dumps(item) + "\n" for item in retained), encoding="utf-8")
+
+
 def footer(production: Production, path: Path | None, nothing_needed: bool) -> None:
     state = judgment_state(path, "footer")
     outstanding = outstanding_path(production)
@@ -363,7 +392,8 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
                         if isinstance(text, str) and isinstance(since, str):
                             previous[text] = OutstandingItem(since=since, text=text,
                                                              after=str(fields.get("after", "")))
-        since = datetime.now(production.zone).strftime("%Y-%m-%dT%H:%M")
+        now = datetime.now(production.zone)
+        since = now.strftime("%Y-%m-%dT%H:%M")
         entries: list[dict[str, str]] = []
         for item in state.outstanding.items:
             entry = {"since": previous[item.text]["since"] if item.text in previous else since,
@@ -372,6 +402,8 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
                 entry["after"] = item.after
             entries.append(entry)
         outstanding.parent.mkdir(parents=True, exist_ok=True)
+        record_question_history(outstanding, [item.text for item in state.outstanding.items
+                                             if item.text not in previous], now)
         _ = outstanding.write_text(json.dumps(entries) + "\n", encoding="utf-8")
     # The switch hides the printed footer only. What waits on the user is stored above either way,
     # so the dailies and the open-questions count still see it.
