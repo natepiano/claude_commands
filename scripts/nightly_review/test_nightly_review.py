@@ -23,6 +23,7 @@ import agent_notes
 import note_file
 from scripts.accounts import accounts
 from scripts.herdr import herdr
+import usage_store
 from scripts.production import showrunners
 if TYPE_CHECKING:
     from scripts.notify import review
@@ -37,8 +38,11 @@ UNIT_LOGIN = "unit@example.com"
 
 
 def setUpModule() -> None:
-    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    """The times these tests expect are Pacific; neither the user's zone setting nor a showrunner
+    registered on the machine running them may change them."""
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+    no_showrunners = unittest.enterModuleContext(tempfile.TemporaryDirectory())
+    _ = unittest.enterModuleContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", Path(no_showrunners)))
 
 
 class FakeNote:
@@ -105,10 +109,32 @@ class NightlyReviewTests(unittest.TestCase):
         del environment_context
         _ = os.environ.pop("CLAUDE_CONFIG_DIR", None)
         _ = self.enterContext(mock.patch.object(herdr, "run_program", return_value=done(code=1)))
+        self.quota_reading("owner@example.com", 80, 7)
         for name, value in (("ROOT", self.root), ("tmux", self.tmux)):
             patcher = mock.patch.object(nightly_review, name, value)
             _ = patcher.start()
             self.addCleanup(patcher.stop)
+
+    def quota_reading(self, login: str, left: float, reset_days: float) -> None:
+        file = Path.home() / ".local/state/agent-notes/usage.json"
+        saved = cast(dict[str, usage_store.StoredUsage], json.loads(file.read_text())) if file.exists() else {}
+        now = datetime.now(timezone.utc)
+        saved[login] = {"weekly": {"left": left, "at": now.isoformat(),
+                                  "resets": (now + timedelta(days=reset_days)).isoformat()}}
+        file.parent.mkdir(parents=True, exist_ok=True)
+        _ = file.write_text(json.dumps(saved))
+
+    def test_picked_nightly_account_with_one_percent_room_launches(self) -> None:
+        self.quota_reading("owner@example.com", 1, 7)
+        self.assertEqual(self.launched(self.account_notes("1", "90")), STARTED)
+        self.assertTrue(self.calls)
+
+    def test_nightly_refuses_when_no_account_has_room(self) -> None:
+        self.quota_reading("owner@example.com", 0, 7)
+        lines = self.launched(self.account_notes("0", "90"))
+        self.assertEqual(len(lines), 1)
+        self.assertIn("no claude account has room", lines[0])
+        self.assertEqual(self.calls, [])
 
     def tmux(self, *args: str) -> subprocess.CompletedProcess[str]:
         verb, name = args[0], args[-1].removeprefix("=").removesuffix(":")
@@ -150,6 +176,7 @@ class NightlyReviewTests(unittest.TestCase):
         _ = (self.notes / f"{label}.md").write_text(
             f"---\nlogin: {UNIT_LOGIN}\nstate: active\n---\n", encoding="utf-8",
         )
+        self.quota_reading(UNIT_LOGIN, 1, 2)
         return directory
 
     def unit_role(self, label: str) -> Path:
@@ -195,46 +222,51 @@ class NightlyReviewTests(unittest.TestCase):
         self.assertIn(f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))}", lines[0])
         self.assertEqual(self.calls, [])
 
-    def test_legacy_launch_refuses_untrusted_inherited_account_before_retiring_or_spawning(self) -> None:
-        directory = self.root / "inherited account"
-        directory.mkdir()
-        _ = (directory / ".claude.json").write_text(json.dumps({"projects": {}}))
-        self.live = {SESSION, *nightly_review.LEGACY_SESSIONS}
-        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(directory)}):
-            self.assertFalse(accounts.claude_account_selection().multiple_accounts)
-            lines = self.launched([])
-        folder = Path.home() / "rust"
-        self.assertEqual(len(lines), 1)
-        self.assertIn(f"{SESSION}: Claude is not trusted in {folder} on {directory}. Run:", lines[0])
-        self.assertIn(f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))}", lines[0])
-        self.assertEqual(self.calls, [])
-        self.assertEqual(self.live, {SESSION, *nightly_review.LEGACY_SESSIONS})
-
-    def test_legacy_launch_checks_and_preserves_the_inherited_account_environment(self) -> None:
+    def test_picked_launch_checks_default_trust_despite_a_trusted_inherited_account(self) -> None:
         directory = self.root / "inherited account"
         directory.mkdir()
         _ = (directory / ".claude.json").write_text(json.dumps({
             "projects": {str(Path.home() / "rust"): {"hasTrustDialogAccepted": True}}}))
-        _ = (Path.home() / ".claude.json").write_text(json.dumps({"projects": {}}))
+        _ = (Path.home() / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "owner@example.com"}, "projects": {}}))
+        self.live = {SESSION, *nightly_review.LEGACY_SESSIONS}
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(directory)}):
+            lines = self.launched([])
+        folder = Path.home() / "rust"
+        self.assertEqual(lines, [
+            f"{SESSION}: Claude is not trusted in {folder} on default account. "
+            + f"Run: cd {shlex.quote(str(folder))} && "
+            + "env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR claude",
+        ])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.live, {SESSION, *nightly_review.LEGACY_SESSIONS})
+
+    def test_picked_launch_ignores_untrusted_inherited_account_and_preserves_checked_environment(self) -> None:
+        directory = self.root / "inherited account"
+        directory.mkdir()
+        _ = (directory / ".claude.json").write_text(json.dumps({"projects": {}}))
         with (
             mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(directory)}),
             mock.patch("note_file.read_notes", return_value=[]),
             mock.patch.object(nightly_review, "launch_permission",
-                              return_value=launch_permission.AllowedByShutdownState()),
+                              return_value=launch_permission.AllowedByShutdownState()) as permission,
             mock.patch("subprocess.run", return_value=done()) as spawn,
         ):
-            inherited = dict(os.environ)
-            self.assertFalse(accounts.claude_account_selection().multiple_accounts)
             self.assertEqual(nightly_review.launch(NIGHT), STARTED)
         spawn.assert_called_once()
-        self.assertEqual(spawn.call_args.kwargs["env"], inherited)
+        environment = cast(dict[str, str], spawn.call_args.kwargs["env"])
+        self.assertEqual(environment, permission.call_args.args[0])
+        self.assertNotIn("CLAUDE_CONFIG_DIR", environment)
         command = cast(list[str], spawn.call_args.args[0])[-1]
-        self.assertEqual(command, f"ENABLE_TOOL_SEARCH=true command {self.review_command()}; exec zsh")
+        self.assertEqual(command, "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; "
+                         + f"ENABLE_TOOL_SEARCH=true command {self.review_command()}; exec zsh")
 
     def test_unreadable_trust_file_refuses_without_contents(self) -> None:
+        selected = accounts.role_account("unit")
         config = Path.home() / ".claude.json"
         _ = config.write_text('{"oauthAccount": "SECRET-EMAIL", ')
-        lines = self.launched([])
+        with mock.patch.object(accounts, "role_account", return_value=selected):
+            lines = self.launched([])
         self.assertEqual(lines, [f"{SESSION}: cannot read {config} to check Claude trust (JSONDecodeError)"])
         self.assertNotIn("SECRET", lines[0])
         self.assertEqual(self.calls, [])
@@ -248,9 +280,7 @@ class NightlyReviewTests(unittest.TestCase):
         whoami.mkdir()
         shutdown.mkdir()
         _ = (whoami / "account.py").write_text("NAMED_ACCOUNT_VARIABLES = []\n")
-        _ = (whoami / "agent_accounts.py").write_text("class ClaudeAccountSelection: pass\n")
-        _ = (whoami / "note_file.py").write_text("")
-        _ = (whoami / "quota_alert.py").write_text("def ahead(*args): return False\ndef remaining(*args): return 100\n")
+        _ = (whoami / "agent_accounts.py").write_text("class ClaudeAccountsInUse: pass\n")
         _ = (shutdown / "launch_permission.py").write_text(
             "class BlockedByShutdown: pass\nclass NewWorkLaunchPurpose: pass\nclass ShutdownStateUnreadable: pass\n"
             + "def launch_barrier(): pass\ndef launch_permission(*args): pass\n")
@@ -425,7 +455,7 @@ class NightlyReviewTests(unittest.TestCase):
         command = self.calls[0]
         self.assertEqual(command[command.index("-s") + 1], SESSION)
         self.assertEqual(command[command.index("-c") + 1], str(Path.home() / "rust"))
-        self.assertEqual(command[-1], f"ENABLE_TOOL_SEARCH=true command {self.review_command()}; exec zsh")
+        self.assertEqual(command[-1], "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; " + f"ENABLE_TOOL_SEARCH=true command {self.review_command()}; exec zsh")
         self.assertTrue(command[-1].endswith("'/nightly_review config rust messages'; exec zsh"))
         self.assertEqual((self.root / NIGHT.isoformat() / "launch.log").read_text(), f"{SESSION}: started\n")
 
@@ -468,36 +498,18 @@ class NightlyReviewTests(unittest.TestCase):
         self.assertEqual(self.live, {"nightly-config", "nightly-rust"})
         self.assertEqual(len(self.calls), 2)
 
-    def test_low_quota_skips_the_night(self) -> None:
-        resets = (datetime.now() + timedelta(days=1)).isoformat(timespec="seconds")
-        low = FakeNote("claude 2", {"login": "owner@example.com", "state": "active", "weekly_remaining_usage": "4", "resets": resets})
-        lines = self.launched([low])
-        self.assertEqual(lines, ["skipped: claude 2 has 4% of its weekly usage left, under the 10% floor"])
-        self.assertEqual(self.calls, [])
+    def test_low_note_reading_does_not_override_picked_room(self) -> None:
+        self.assertEqual(self.launched(self.account_notes("4", "90")), STARTED)
+        self.assertTrue(self.calls)
 
-    def test_quota_permission_names_clear_and_below_floor_states(self) -> None:
-        resets = (datetime.now() + timedelta(days=1)).isoformat(timespec="seconds")
-        low = FakeNote(
-            "claude 2",
-            {
-                "login": "owner@example.com",
-                "state": "active",
-                "weekly_remaining_usage": "4",
-                "resets": resets,
-            },
-        )
-        with mock.patch("note_file.read_notes", return_value=[low]):
-            below = nightly_review.quota_permission()
-        self.assertEqual(
-            below,
-            nightly_review.QuotaBelowFloor(
-                "claude 2 has 4% of its weekly usage left, under the 10% floor"
-            ),
-        )
-
-        with mock.patch("note_file.read_notes", return_value=[]):
-            clear = nightly_review.quota_permission()
-        self.assertIsInstance(clear, nightly_review.QuotaClear)
+    def test_quota_permission_uses_zero_room_instead_of_a_ten_percent_floor(self) -> None:
+        self.quota_reading("owner@example.com", 1, 7)
+        self.assertIsInstance(nightly_review.quota_permission(), nightly_review.QuotaClear)
+        self.quota_reading("owner@example.com", 0, 7)
+        refused = nightly_review.quota_permission()
+        self.assertIsInstance(refused, nightly_review.ReviewAccountUnavailable)
+        assert isinstance(refused, nightly_review.ReviewAccountUnavailable)
+        self.assertIn("no claude account has room", refused.reason)
 
     def account_notes(self, default_left: str, unit_left: str) -> list[FakeNote]:
         resets = (datetime.now() + timedelta(days=1)).isoformat(timespec="seconds")
@@ -508,23 +520,17 @@ class NightlyReviewTests(unittest.TestCase):
                                   "weekly_remaining_usage": default_left, "resets": resets}),
         ]
 
-    def test_quota_floor_reads_the_unit_account_the_review_launches_on(self) -> None:
+    def test_nightly_launch_picks_low_room_account_resetting_before_default(self) -> None:
         _ = self.unit_account("claude 3")
-        self.assertEqual(self.launched(self.account_notes(default_left="80", unit_left="2")), [
-            "skipped: claude 3 has 2% of its weekly usage left, under the 10% floor",
-        ])
-        self.assertEqual(self.calls, [])
-        self.assertEqual(self.launched(self.account_notes(default_left="4", unit_left="80")), STARTED)
+        self.assertEqual(self.launched(self.account_notes("80", "1")), STARTED)
+        self.assertIn(str(accounts.account_dir("claude 3")), self.calls[-1][-1])
 
-    def test_without_a_unit_role_the_quota_floor_reads_the_default_login(self) -> None:
-        (Path.home() / ".claude3").mkdir()
-        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(Path.home() / ".claude3")}):
-            self.assertEqual(self.launched(self.account_notes(default_left="80", unit_left="2")), STARTED)
-        self.calls.clear()
-        self.assertEqual(self.launched(self.account_notes(default_left="4", unit_left="80")), [
-            "skipped: claude 2 has 4% of its weekly usage left, under the 10% floor",
-        ])
-        self.assertEqual(self.calls, [])
+    def test_nightly_ignores_named_callers_low_note_and_uses_picked_default(self) -> None:
+        named = Path.home() / ".claude3"
+        named.mkdir()
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(named)}):
+            self.assertEqual(self.launched(self.account_notes("1", "0")), STARTED)
+        self.assertNotIn(str(named), self.calls[-1][-1])
 
     def test_nightly_gate_uses_the_supplied_identities_for_the_whole_launch(self) -> None:
         """Nightly does not independently resolve a login after the snapshot."""
@@ -538,6 +544,11 @@ class NightlyReviewTests(unittest.TestCase):
         with mock.patch.object(accounts, "claude_account_selection", return_value=selection) as resolve:
             self.assertEqual(self.launched(notes), STARTED)
         resolve.assert_called_once_with()
+
+    def test_nightly_ignores_legacy_unit_assignment_for_an_unread_account(self) -> None:
+        _ = self.unit_role("claude 3")
+        self.assertEqual(self.launched(self.account_notes("80", "0")), STARTED)
+        self.assertNotIn(str(accounts.account_dir("claude 3")), self.calls[-1][-1])
 
     def test_named_caller_and_tmux_server_cannot_select_the_nightly_account(self) -> None:
         """With no unit role, the guard and launched Claude both use the default account."""
@@ -555,7 +566,7 @@ class NightlyReviewTests(unittest.TestCase):
             self.assertNotIn("CLAUDE_CODE_REMOTE_MEMORY_DIR", environment)
             self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
 
-    def test_unit_role_launches_the_review_on_that_account(self) -> None:
+    def test_nightly_picked_named_account_reaches_guard_and_launch_despite_caller(self) -> None:
         """The guard and launched Claude both use the unit role's account, whatever the caller holds."""
         unit = self.unit_account("claude 3")
         launched, permission, spawn = self.launched_environment({
@@ -580,29 +591,23 @@ class NightlyReviewTests(unittest.TestCase):
         self.assertEqual(launched["CLAUDE_CODE_REMOTE_MEMORY_DIR"], str(Path.home() / ".claude"))
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", launched)
 
-    def test_a_unit_account_not_fit_to_launch_skips_the_night(self) -> None:
-        missing = self.unit_role("claude 3")
-        self.assertEqual(self.launched([]), [
-            f"skipped: unit account claude 3: accounts: {missing} is missing",
-        ])
-        self.assertEqual(self.calls, [])
+    def test_nightly_skips_unfit_named_account_and_uses_default_with_room(self) -> None:
+        _ = self.unit_role("claude 3")
+        self.assertEqual(self.launched([]), STARTED)
+        self.assertNotIn(str(accounts.account_dir("claude 3")), self.calls[-1][-1])
 
-    def test_unconfigured_nightly_launch_keeps_its_command_and_environment(self) -> None:
-        """Legacy launches retain the plain command and inherited environment."""
-        inherited = {**os.environ, "CLAUDE_TEST_MARKER": "fixture"}
-        with (
-            mock.patch.dict(os.environ, inherited),
-            mock.patch("note_file.read_notes", return_value=[]),
-            mock.patch.object(nightly_review, "launch_permission",
-                              return_value=launch_permission.AllowedByShutdownState()) as permission,
-            mock.patch("subprocess.run", return_value=done()) as spawn,
-        ):
+    def test_picked_default_nightly_launch_drops_inherited_claude_variables(self) -> None:
+        with (mock.patch.dict(os.environ, {"CLAUDE_TEST_MARKER": "fixture"}),
+              mock.patch.object(nightly_review, "launch_permission", return_value=launch_permission.AllowedByShutdownState()) as permission,
+              mock.patch("subprocess.run", return_value=done()) as spawn):
             self.assertEqual(nightly_review.launch(NIGHT), STARTED)
-            self.assertEqual(permission.call_args.args[0], inherited)
+        guard = cast(dict[str, str], permission.call_args.args[0])
+        self.assertFalse(any(key.startswith("CLAUDE_") for key in guard))
         spawn.assert_called_once()
-        self.assertEqual(spawn.call_args.kwargs["env"], inherited)
+        self.assertEqual(spawn.call_args.kwargs["env"], guard)
         argv = cast(list[str], spawn.call_args.args[0])
-        self.assertEqual(argv[-1], f"ENABLE_TOOL_SEARCH=true command {self.review_command()}; exec zsh")
+        self.assertIn("unset CLAUDE_CONFIG_DIR", argv[-1])
+        self.assertIn(f"ENABLE_TOOL_SEARCH=true command {self.review_command()}; exec zsh", argv[-1])
 
     def skipped_by_shutdown(self) -> list[str]:
         """Launch against the real shutdown check, with a start that must not run when it blocks."""

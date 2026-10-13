@@ -8,7 +8,7 @@ The status line's second row shows this session's account label. To print it:
 ~/.claude/scripts/lib/py ~/.claude/scripts/whoami/account.py
 ```
 
-`/whoami` shows Claude accounts in use with their roles (`showrunners`, `unit directors`), omitting Claude spares. It also shows every Codex home; with multiple homes, the home in use is marked `(seats)`. It does not identify this session's account.
+`/whoami` shows Claude accounts in use used by the default login or local live sessions, omitting unused Claude accounts. It also shows every Codex home; with multiple homes, the home in use is marked `(seats)`. It does not identify this session's account.
 
 ## Every account in one table
 
@@ -22,7 +22,7 @@ The status line's second row shows this session's account label. To print it:
 | --- | --- |
 | Label | The account's label. A named Claude folder keeps its own label; a Codex home shows the label of its login's note. |
 | Login | The login, `not logged in`, or `not set up` for an account that has a note and is in no folder. |
-| Role | `showrunners`, `unit directors`, or `spare`; `seats` for the Codex home in use, `spare` for the other Codex homes. |
+| Role | `next` for the Claude account a new launch would pick; `seats` for the Codex home in use, `spare` for the other Codex homes. |
 | 5-hour left, Weekly left | Percent of each window left, each with its reset time. A dash when the account has no such window. |
 | On credits | Codex only: `yes` when a window is used up and the account's credits now pay for the work. |
 | Credits left | Codex only: the credit balance, or `unlimited`. |
@@ -38,8 +38,8 @@ Run these in a terminal:
 
 | Command | Account |
 | --- | --- |
-| `claude` | Default (`~/.claude`): showrunners and your own work. |
-| `claude-unit` | The current unit account; the default when no unit role is set. |
+| `claude` | Default (`~/.claude`). |
+| `claude-unit` | The account with room whose weekly window resets soonest. |
 | `claude1` | claude 1 |
 | `claude2` | claude 2 |
 | `claude3` | claude 3 |
@@ -53,7 +53,7 @@ These aliases come from natedev's shell configuration after a rebuild; the Mac h
 
 Arguments after the label pass through to `claude`.
 
-New units pick the unit role; resumed units keep their recorded account unless given `--account`. Each unit launch saves its config directory and model on its tmux session for later resumes. If neither tmux nor shutdown has a recorded account, resume refuses and asks for `--account`. A named alias whose login matches the default runs on `~/.claude`, with `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_REMOTE_MEMORY_DIR` removed. Today that is `claude2`; other named aliases use their own `~/.claudeN` directory. `exec default` starts plain `claude`, removing those variables and any inherited OAuth token.
+New units, showrunners and nightly reviews pick an account with room. Resumes keep their recorded account unless given `--account`. Each unit launch saves its config directory and model on its tmux session for later resumes. If neither tmux nor shutdown has a recorded account, resume refuses and asks for `--account`. A named alias whose login matches the default runs on `~/.claude`, with `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_REMOTE_MEMORY_DIR` removed. Today that is `claude2`; other named aliases use their own `~/.claudeN` directory. `exec default` starts plain `claude`, removing those variables and any inherited OAuth token.
 
 A missing directory refuses without starting Claude, for example:
 
@@ -133,7 +133,7 @@ Before changing anything, move refuses when:
 
 Move runs `shutdown.py down '<current note label>' --here --only <id> --restart --to '<target>'`. A tmux session respawns its pane; a unit resumes through `add_unit.py --resume --account '<target>'`; Ghostty, Zed and Terminal reopen a window. Use `--why "<text>"` to explain the move; the default is `<old label> is out of usage`. Every resume says it was an account move, not a stop, and continues where it stopped; a unit director continues its `/unit:direct` run. An unknown host prints exactly one resume command with `run this once <name> has exited` before starting shutdown. Run it after exit; restart reports the same command as `manual restart <name>: <line>`.
 
-The target is checked again at launch. A moved launch uses `accounts.py exec '<target>'`, which drops inherited OAuth tokens. Moving changes no login or credentials and leaves other sessions in place. The unit role selects only new launches.
+The target is checked again at launch. A moved launch uses `accounts.py exec '<target>'`, which drops inherited OAuth tokens. Moving changes no login or credentials and leaves other sessions in place. New launches pick independently of the session kind.
 
 To move every showrunner off an expired account together:
 
@@ -145,73 +145,17 @@ The terminal command is `accounts.py move showrunners --from 'claude 2' --to 'cl
 
 Each returns to its own conversation, cwd, name, model and production resume prompt. Tmux respawns its existing pane and keeps the attached desktop window. For a direct Ghostty showrunner, shutdown closes its window as usual and restart opens a replacement on the recorded desktop. The batch command also accepts `--why "<text>"`; each resume carries the same account-move explanation.
 
-## Swapping the unit account
+## Picking an account
 
-The unit account runs the unit directors and the nightly review. A swap moves both: the next night's review starts on the new account.
+`/showrunner:accounts pick claude --explain` shows each candidate's weekly and 5-hour readings, its reset, and why it was picked or skipped. Use `pick codex` for Codex, repeat `--exclude "<label>"` to omit accounts, or use `--keep "<label>"` to retain a session's account while it has room.
 
-The review cannot edit any account folder: its settings deny edits under `~/.claude1`, `~/.claude2` and `~/.claude3` as well as `~/.claude`. A new account folder needs its own line in `scripts/nightly_review/settings.json`.
+The picker uses readings from the last 10 minutes. Claude needs more than 0% in both windows, or only the weekly window when no 5-hour window exists. Codex can also work on credits. There is no minimum: 1% is room. The soonest weekly reset wins, then the most weekly allowance left, then label order. Duplicate logins count once: default wins, then the lowest numbered directory.
 
-Run the swap from a session on another account, normally plain `claude`, or from a terminal. This example moves units from claude 3 to claude 1:
+A recorded refusal overrides saved percentages until its reset passes or a later successful reading establishes renewed allowance. When fresh readings exist but no account has room, the picker prints `no claude account has room; the earliest reset is <time>` and refuses new work. When no candidate has a fresh reading, it keeps the requested account if eligible, otherwise uses default; unresolved refusals still exclude their accounts. `--explain` names this fallback. The Mac has no usage snapshot timer, so it normally uses this fallback.
 
-```text
-/showrunner:accounts swap unit "claude 1"
-```
+`claude-unit`, `exec unit`, `env unit` and `role unit` resolve the picker without storing a role. A legacy `unit` configuration key is ignored; `set-role unit` and `swap unit` refuse. Move running sessions with `move`, or `move showrunners`; the Codex seats role remains unchanged.
 
-The terminal equivalent is:
-
-```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py swap unit "claude 1"
-```
-
-It shows shutdown's output unchanged, followed by `units come back on claude 1 when claude 3 is down`. Shutdown prints one `<name>: added` line for each unit it will stop, then `shutdown of claude 3 started; /shutdown status to watch, /shutdown cancel to undo`. This confirms acceptance; the stops and restarts are still running. Each unit stops when it reaches a safe point and comes back on claude 1 by itself, without waiting for the others. Watch `/shutdown status "claude 3"`, then check the resumed units' account labels. When every unit is back, a session that ran the swap gets:
-
-```text
-claude 3 is back
-```
-
-The message names the old account, because the request was a shutdown of claude 3; the units are on claude 1. A swap run from a terminal gets no message.
-
-Before changing the role, swap refuses and names the cause. Reported values replace the angle brackets below:
-
-```text
-accounts: current unit account identity is unreadable
-accounts: default account identity is unreadable
-accounts: <label> is the default account; use default
-accounts: <note label> is already the unit account
-accounts: cannot swap <old>: <machine> <kind> <name> would not move
-accounts: cannot swap <old>: <machine> unattributed session <name> (pid <pid>)
-accounts: <name> already has a shutdown in progress
-```
-
-An unfit target reports its first `/showrunner:accounts` problem. Fix account readiness there; for a logged-out account, use its alias and `/login` as that account. Close ordinary sessions on the outgoing unit account before retrying a session refusal. Only units and their director-owned seats on natedev move; any session on the Mac refuses. Swap needs the Mac reachable even if its inventory is empty. A Mac outage refuses with the role unchanged. Swap takes no `--here`.
-
-Swap selects the unit role, then runs `down '<old>' --restart --to '<new>'`; `--dry-run` prints both commands. A unit already in shutdown refuses before changing the role because a repeated request cannot attach a target to its existing record.
-
-`unit account unchanged: still claude 3` means shutdown refused and the old role is back. Fix the printed refusal, then run the same swap again.
-
-If a unit's stop fails, the result is `claude 3: stop partial`, and the alert names the unit. The new role stays selected. Units that stopped are already back on claude 1; the failed one is still on claude 3. Retry its stop, naming the old account and the unit from the alert:
-
-```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now 'claude 3' --only '<unit name>'
-```
-
-It prints `<unit name>: stopping now`. The unit stops without waiting to be idle and comes back on claude 1. Without `--only`, `now` also stops every unit that is still finishing its work. Repeating `down` retries nothing: each unit prints `<name>: already in progress`.
-
-`claude 3 is not fully back` means a unit stopped and did not fully come back. Run the alert's command:
-
-```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart 'claude 3'
-```
-
-Both recovery commands name the **old note label** printed in the alert, even though the role now names the target. Here the old label is claude 3; use your alert's label.
-
-To undo:
-
-```text
-/showrunner:accounts swap unit default
-```
-
-Moving units off the default account, which showrunners share, uses the cutover's selected-unit procedure. Swap refuses showrunners and top-level sessions.
+New units and showrunners save `@claude_config_dir` and `@claude_model` on tmux. A showrunner resume accepts `--account "<label>"`, `--account default` or `--config-dir <dir>` to retain an external directory; otherwise it retains that recorded directory and refuses with a line naming `--account` if none remains. Promoting a unit to showrunner retains its recorded account.
 
 ## Setting up a new directory
 

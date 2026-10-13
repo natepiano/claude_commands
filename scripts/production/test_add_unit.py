@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest.mock import patch
@@ -25,6 +26,7 @@ import launch_permission
 import unit_lookup
 from add_unit import cell_value, live_unit_table, plan_cell_is_retired, retired_units
 from scripts.accounts import accounts
+import usage_store
 from test_support import ShutdownTestCase
 
 
@@ -34,6 +36,7 @@ OLD_HEADER = ["## Units", "| Unit | Plan | Worktree | Branch | Session | Port | 
 STUB = r'''#!/usr/bin/env python3
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
 import sys
@@ -191,6 +194,16 @@ class AddUnitTests(ShutdownTestCase):
                     "CODEX_MODELS_CACHE_FILE": str(codex_cache),
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
         _ = self.env.pop("CLAUDE_CONFIG_DIR", None)
+        self.quota_reading("owner@example.com", 80, 7)
+
+    def quota_reading(self, login: str, left: float, reset_days: float) -> None:
+        file = Path(self.env["HOME"]) / ".local/state/agent-notes/usage.json"
+        saved = cast(dict[str, usage_store.StoredUsage], json.loads(file.read_text())) if file.exists() else {}
+        now = datetime.now(timezone.utc)
+        saved[login] = {"weekly": {"left": left, "at": now.isoformat(),
+                                  "resets": (now + timedelta(days=reset_days)).isoformat()}}
+        file.parent.mkdir(parents=True, exist_ok=True)
+        _ = file.write_text(json.dumps(saved))
 
     def select_unit_account(self, label: str) -> Path:
         with patch.dict(os.environ, self.env):
@@ -238,6 +251,8 @@ class AddUnitTests(ShutdownTestCase):
         self.assert_no_launch_change(document, head)
 
     def test_unreadable_trust_file_names_the_unit_and_refuses_before_any_write(self) -> None:
+        with patch.dict(os.environ, self.env):
+            selected = accounts.role_account("unit")
         config = Path(self.env["HOME"]) / ".claude.json"
         _ = config.write_text('{"oauthAccount": "SECRET-EMAIL", ')
         document = self.doc.read_text()
@@ -245,6 +260,7 @@ class AddUnitTests(ShutdownTestCase):
         output = io.StringIO()
         errors = io.StringIO()
         with (patch.dict(os.environ, self.env), redirect_stdout(output), redirect_stderr(errors),
+              patch.object(accounts, "role_account", return_value=selected),
               patch.object(launch_permission, "launch_permission",
                            return_value=launch_permission.AllowedByShutdownState())):
             code = add_unit.main(["--production", str(self.doc), "alpha", "--brief", "Add a feature"])
@@ -279,6 +295,7 @@ class AddUnitTests(ShutdownTestCase):
             _ = (Path(self.env["AGENT_NOTES_DIR"]) / f"{label}.md").write_text(
                 f"---\nlogin: {login}\nstate: active\n---\n", encoding="utf-8"
             )
+        self.quota_reading(login, 1, 2)
         return directory
 
     def persist_unit_account(self, directory: Path, *, session: str = "recorded-tmux", model: str = "opus") -> None:
@@ -296,8 +313,9 @@ class AddUnitTests(ShutdownTestCase):
         """The assignments a unit on a named account's directory starts with."""
         memory_base = Path(self.env["HOME"]) / ".claude"
         return (
-            f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} "
-            f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(memory_base))} "
+            "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; "
+            + f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} "
+            + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(memory_base))} "
         )
 
     def write_agent_config(self, *, family: str = "claude", director: str = "opus:xhigh",
@@ -1213,7 +1231,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertIn("'/unit:direct docs/plans/given.md'", args[-1])
         self.assertEqual(
             args[-1],
-            "ENABLE_TOOL_SEARCH=true command " + shlex.join([
+            "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; ENABLE_TOOL_SEARCH=true command " + shlex.join([
                 "claude", "--model", "opus", "--effort", "xhigh",
                 "--remote-control", "alpha", "-n", "alpha",
                 "--settings", '{"disableAgentView": true}',
@@ -1341,14 +1359,15 @@ class AddUnitTests(ShutdownTestCase):
             expected, launch_permission.NewWorkLaunchPurpose()
         )
 
-    def test_role_change_after_readiness_keeps_the_checked_launch_account(self) -> None:
+    def test_candidate_change_after_readiness_keeps_the_picked_launch_account(self) -> None:
         """F003: a role change after checking cannot select an unchecked account."""
         directory = self.prepare_unit_account("claude 3")
         ensure_worktree = add_unit.ensure_worktree
 
         def change_role_after_worktree(request: add_unit.UnitLaunch) -> None:
             ensure_worktree(request)
-            _ = self.select_unit_account("claude 1")
+            _ = self.prepare_unit_account("claude 1")
+            self.quota_reading("claude-1@example.invalid", 1, 1)
 
         with (
             patch.dict(os.environ, self.env),
@@ -1362,11 +1381,11 @@ class AddUnitTests(ShutdownTestCase):
 
         self.assertEqual(result, 0)
         selection.assert_called_once_with("unit")
-        readiness.assert_called_once_with("claude 3")
+        self.assertIn("claude 3", [call.args[0] for call in readiness.call_args_list])
         self.assertTrue(self.launch_command().startswith(
             self.named_prefix(directory)
         ))
-        self.assertFalse((directory.parent / ".claude1").exists())
+        self.assertTrue((directory.parent / ".claude1").exists())
         with patch.dict(os.environ, self.env):
             self.assertEqual(
                 accounts.role_account("unit"),
@@ -1414,7 +1433,7 @@ class AddUnitTests(ShutdownTestCase):
             "--resume", "session-123", "--cwd", str(prior),
         )
 
-        self.assertTrue(self.launch_command().startswith("ENABLE_TOOL_SEARCH=true command claude "))
+        self.assertTrue(self.launch_command().startswith("unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; ENABLE_TOOL_SEARCH=true command claude "))
         self.assertNotIn(str(directory), self.launch_command())
         self.assertIn("--resume session-123", self.launch_command())
 
@@ -1511,38 +1530,25 @@ class AddUnitTests(ShutdownTestCase):
         self.assertNotIn(str(old_directory), command)
         self.assertIn("--resume session-123", command)
 
-    def test_unready_unit_account_is_refused_before_launch_permission(self) -> None:
-        directory = self.select_unit_account("claude 3")
+    def test_no_account_with_room_refuses_new_unit_before_launch_permission_or_table_changes(self) -> None:
+        self.quota_reading("owner@example.com", 0, 7)
         document = self.doc.read_text(encoding="utf-8")
         head = self.git("rev-parse", "HEAD")
-
         for mode in ([], ["--check"]):
             with self.subTest(mode=mode):
                 result = self.cli("alpha", "--plan", "docs/plans/given.md", *mode)
-
-                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-                self.assertEqual(
-                    result.stderr,
-                    f"add_unit: unit account claude 3: accounts: {directory} is missing; /showrunner:accounts\n",
-                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(result.stderr.splitlines()), 1)
+                self.assertIn("no claude account has room", result.stderr)
                 self.assert_no_launch_change(document, head)
                 self.assertFalse(Path(self.env["SHUTDOWN_STATE_DIR"]).exists())
 
-    def test_unit_account_refusal_reports_only_the_first_problem(self) -> None:
+    def test_new_unit_ignores_unfit_legacy_assignment_and_launches_on_picked_default(self) -> None:
         directory = self.select_unit_account("claude 3")
         directory.mkdir()
-        document = self.doc.read_text(encoding="utf-8")
-        head = self.git("rev-parse", "HEAD")
-
-        result = self.cli("alpha", "--plan", "docs/plans/given.md")
-
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertEqual(
-            result.stderr,
-            f"add_unit: unit account claude 3: accounts: {directory / 'projects'} is missing; /showrunner:accounts\n",
-        )
-        self.assert_no_launch_change(document, head)
-        self.assertFalse(Path(self.env["SHUTDOWN_STATE_DIR"]).exists())
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertNotIn(str(directory), self.launch_command())
+        self.assertTrue(self.launch_command().startswith("unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; ENABLE_TOOL_SEARCH=true command claude "))
 
     def test_ready_unit_account_passes_check_without_launch_changes(self) -> None:
         _ = self.prepare_unit_account("claude 3")
@@ -1837,8 +1843,8 @@ class AddUnitTests(ShutdownTestCase):
         args = cast(list[str], tmux["args"])
         self.assertEqual(args[args.index("-c") + 1], str(prior))
         command = args[-1]
-        self.assertTrue(command.startswith("ENABLE_TOOL_SEARCH=true command claude "))
-        self.assertNotIn("CLAUDE_CONFIG_DIR", command)
+        self.assertTrue(command.startswith("unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; ENABLE_TOOL_SEARCH=true command claude "))
+        self.assertNotIn("CLAUDE_CONFIG_DIR=", command)
         self.assertIn("claude --model opus --effort xhigh --resume session-123 --remote-control alpha -n alpha", command)
         self.assert_director_flags("opus", "xhigh")
         self.assertIn("You are now alpha-unit in production build-followups", command)
@@ -1961,8 +1967,8 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(set(has_targets), {f"={recorded_tmux}"})
 
         command = tmux[-1]
-        self.assertTrue(command.startswith("ENABLE_TOOL_SEARCH=true command claude "))
-        self.assertNotIn("CLAUDE_CONFIG_DIR", command)
+        self.assertTrue(command.startswith("unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; ENABLE_TOOL_SEARCH=true command claude "))
+        self.assertNotIn("CLAUDE_CONFIG_DIR=", command)
         encoded = command.split(" command ", 1)[1].rsplit("; exec zsh", 1)[0]
         claude = shlex.split(encoded)
         self.assertEqual(claude[claude.index("--remote-control") + 1], recorded_session)

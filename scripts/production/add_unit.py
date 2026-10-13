@@ -29,13 +29,15 @@ if TYPE_CHECKING:
     from scripts.accounts.accounts import ClaudeLaunchAccount
 
 
-class RetainedUnitAccount(NamedTuple):
-    """The existing config directory saved for this unit's previous launch."""
+class RetainedClaudeAccount(NamedTuple):
+    """The existing config directory saved for a previous Claude launch."""
     dir: Path
 
 
+RetainedUnitAccount = RetainedClaudeAccount
+
 if TYPE_CHECKING:
-    UnitLaunchAccount = ClaudeLaunchAccount | RetainedUnitAccount
+    UnitLaunchAccount = ClaudeLaunchAccount | RetainedClaudeAccount
 
 
 class Production(NamedTuple):
@@ -760,7 +762,7 @@ def launch_session(
     if target:
         argv = [sys.executable, str(SCRIPTS / "accounts" / "accounts.py"), "exec", target, *argv[1:]]
         prefix = ""
-    command = prefix + "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
+    command = "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; " + prefix + "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
     environment = launch_environment()
     scope_name = re.sub(r"[^A-Za-z0-9_.-]", "-", tmux_session)
     scope = f"--unit={scope_name}-{int(time.time())}"
@@ -844,7 +846,10 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
     if isinstance(request.session, NewSession):
         if target or config_dir:
             raise Refusal("--account and --config-dir require --resume")
-        return accounts.role_account("unit")
+        try:
+            return accounts.role_account("unit")
+        except accounts.AccountsError as error:
+            raise Refusal(str(error)) from error
     if target:
         if config_dir:
             raise Refusal("give only one of --account and --config-dir")
