@@ -474,6 +474,20 @@ class AccountTests(unittest.TestCase):
 
         self.assertEqual(
             self.render_status_line(document, "claude 2"),
+            ACCOUNT_FIRST_LINE
+            + "\n5-hour 73% left until 03:00 EST | weekly 41% left until Fri 03:00 EST\n",
+        )
+
+    def test_status_line_without_reset_times_names_no_reset(self) -> None:
+        document = self.status_line_input() | {
+            "rate_limits": {
+                "five_hour": {"used_percentage": 26.4},
+                "seven_day": {"used_percentage": 58.2},
+            }
+        }
+
+        self.assertEqual(
+            self.render_status_line(document, "claude 2"),
             ACCOUNT_FIRST_LINE + "\n5-hour 73% left | weekly 41% left\n",
         )
 
