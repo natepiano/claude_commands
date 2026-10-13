@@ -673,6 +673,30 @@ class TargetCommandTests(IsolatedBuildHoldTest):
                 self.assertEqual(calls, [])
                 self.assert_no_natedev_record()
 
+    def test_unknown_target_with_an_unreadable_config_names_the_reason(self) -> None:
+        missing = self.scratch / "missing-targets.conf"
+        incomplete = self.scratch / "incomplete-targets.conf"
+        _ = incomplete.write_text("targets=mac\n", encoding="utf-8")
+        invalid_utf8 = self.scratch / "invalid-utf8-targets.conf"
+        _ = invalid_utf8.write_bytes(b"\xff")
+        for config, reason in (
+            (missing, f"targets: expected distinct target names in {missing}"),
+            (incomplete, "kind.mac: expected local or ssh, got ''"),
+            (invalid_utf8, "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"),
+        ):
+            for arguments in (["hold", "--for", "renderer checks"], ["release"]):
+                with self.subTest(config=config.name, action=arguments[0]), mock.patch.dict(
+                    os.environ, {"BUILD_TARGETS_CONFIG": str(config)},
+                ), mock.patch.object(build_hold, "holder_of") as holder_lookup:
+                    status, output, errors, calls = self.run_with_mac_stand_in(
+                        [*arguments, "--target", "missing", "--holder", "alice"])
+                    self.assertEqual(status, 2)
+                    self.assertEqual(output, f"unknown target missing; the target config cannot be read: {reason}\n")
+                    self.assertEqual(errors, "")
+                    holder_lookup.assert_not_called()
+                    self.assertEqual(calls, [])
+                    self.assert_no_natedev_record()
+
     def test_mac_hold_refuses_release_eta_and_zone_before_calling_block(self) -> None:
         for option, value in (("--release-eta", "23:59"), ("--zone", "UTC")):
             with self.subTest(option=option):

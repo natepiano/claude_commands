@@ -30,7 +30,7 @@ from user_zone import user_zone
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import override_guard
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
-from target_config import read_targets
+from target_config import ConfigError, read_targets
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
@@ -369,7 +369,13 @@ class UnknownHoldTarget:
     configured: tuple[str, ...]
 
 
-HoldTarget = NatedevHoldTarget | MacHoldTarget | UnknownHoldTarget
+@dataclass(frozen=True)
+class UncheckedHoldTarget:
+    name: str
+    reason: str
+
+
+HoldTarget = NatedevHoldTarget | MacHoldTarget | UnknownHoldTarget | UncheckedHoldTarget
 
 
 def parse_hold_target(name: str) -> HoldTarget:
@@ -377,7 +383,11 @@ def parse_hold_target(name: str) -> HoldTarget:
         return NatedevHoldTarget()
     if name == "mac":
         return MacHoldTarget()
-    return UnknownHoldTarget(name, tuple(target.name for target in read_targets()))
+    try:
+        configured = read_targets()
+    except (ConfigError, UnicodeError) as error:
+        return UncheckedHoldTarget(name, str(error))
+    return UnknownHoldTarget(name, tuple(target.name for target in configured))
 
 
 @dataclass(frozen=True)
@@ -1681,6 +1691,9 @@ def main(arguments: list[str]) -> int:
             target = cast(HoldTarget, options.target)
             if isinstance(target, UnknownHoldTarget):
                 print(f"unknown target {target.name}; configured targets: {', '.join(target.configured)}")
+                return 2
+            if isinstance(target, UncheckedHoldTarget):
+                print(f"unknown target {target.name}; the target config cannot be read: {target.reason}")
                 return 2
             if isinstance(target, MacHoldTarget):
                 refused: list[str] = []

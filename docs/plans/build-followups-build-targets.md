@@ -612,7 +612,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **Ruled out:** a function-local import of `targets` in `parse_hold_target` (it hid the cycle and changed `sys.path` on each call).
 
-### Phase 16 — An unknown `--target` says why when the target config cannot be read  · status: todo
+### Phase 16 — An unknown `--target` says why when the target config cannot be read  · status: done
 
 #### Work Order
 
