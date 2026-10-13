@@ -18,9 +18,9 @@ Showrunner's brief and approval, 2026-10-13 10:3x–10:4x EDT (not the user's wo
 
 ## Calls I made
 
-- **Each unit's two workers are one implementer and one reviewer**, resolved at launch from agents.conf: `delegate=codex` today, so `impl=gpt-5.6-sol:xhigh` and `review=gpt-5.6-sol:max`, each an interactive `codex` in its own pane. **The default codex account is the seats role's account** (`accounts.py` role `seats`: codex 1, `~/.codex1`, today), since that is the account seats run on. Risk: if the showrunner meant `~/.codex` (codex 2), it is a one-line change in the launcher.
+- **Each unit's two workers are one implementer and one reviewer**, resolved at launch from agents.conf: `delegate=codex` today, so `impl=gpt-6.1-sol:high` and `review=gpt-6.1-sol:high` (the live `~/.claude/config/agents.conf`; this worktree's copy is older), each an interactive `codex` in its own pane. **The default codex account is the seats role's account** (`accounts.py` role `seats`: codex 1, `~/.codex1`, today), since that is the account seats run on. Risk: if the showrunner meant `~/.codex` (codex 2), it is a one-line change in the launcher.
 - **Account fallback:** a Codex worker whose account reports its limit is recorded as an issue and relaunched on the `[delegate.claude]` row of its role (`impl=opus:high`, `review=opus:xhigh`) on claude 1.
-- **The fake showrunner runs at `opus:xhigh`** (the `[production.claude] director` row; agents.conf has no showrunner row). Risk: none for the trial.
+- **The fake showrunner runs at `opus:high`** (the live `[production.claude] director` row; agents.conf has no showrunner row). Risk: none for the trial.
 - **The scratch root is `/home/natepiano/rust/herdr-trial-scratch/`**, because no session may face a trust prompt and none is answered for the user. `/home/natepiano/rust` has `hasTrustDialogAccepted` in `~/.claude1/.claude.json`, and `/home/natepiano` is `trust_level = "trusted"` in the Codex config (`~/.codex1/config.toml` links to `~/.codex/config.toml`). `~/rust` is not a git repository, and the folder does not exist today. Risk: a scratch folder sits beside the real repos for the length of the trial; Phase 5 removes it by exact path. If Phase 1's live check still shows a trust prompt, the launcher stops and the unit director brings that one folder to the showrunner before Phase 3.
 - **One herdr session named `herdr-trial`** (`herdr --session herdr-trial`), so nothing joins or disturbs a default herdr session. No herdr Claude integration is installed: it writes into `~/.claude/hooks/` and `settings.json`. Consequence, logged as a finding: no resume after a server restart.
 - **Units are launched by this unit's launcher, not by `add_unit.py`**, which starts tmux sessions. The fake showrunner is told so, and each place its commands assume tmux is logged as a finding. That list is the main output of the trial.
@@ -37,7 +37,7 @@ Showrunner's brief and approval, 2026-10-13 10:3x–10:4x EDT (not the user's wo
   - `scripts/production/add_unit.py` — `prompt_for` 665 (the unit director's first prompt, three forms), `launch_session` 701 (argv: `claude --model <m> --effort <e> --remote-control <name> -n <name> --settings '{"disableAgentView": true}' <prompt>`, prefixed by `account_prefix(selected)` and `ENABLE_TOOL_SEARCH=true`; run as `systemd-run --user --scope` around `tmux new-session -d -s <name> -c <cwd> -e SHOWRUNNER_UNIT=<slug> -e SHOWRUNNER_UNIT_ID=<unit> zsh -ic "<command>; exec zsh"`), `launch_environment` 739 (drops `CLAUDE_*`). The herdr launcher mirrors this argv and these marks.
   - `scripts/production/unit_lookup.py` — `PRODUCTION_MARK = "SHOWRUNNER_UNIT"` 27, `UNIT_MARK = "SHOWRUNNER_UNIT_ID"` 28; finds units by asking tmux.
   - `scripts/accounts/accounts.py` — `account_prefix`; `role_account` (role `unit` → claude 1 `~/.claude1`; role `seats`, `CODEX_ROLE` 126 → codex 1 `~/.codex1` today).
-  - `scripts/agents/agents_config.sh` — `agents_resolve_print production.director`, `delegate.impl`, `delegate.review` print `family=… agent=<model> effort=<effort>`; read them at launch, never hard-code.
+  - `scripts/agents/agents_config.sh` — `agents_resolve_print production.director`, `delegate.impl`, `delegate.review` print `family=… agent=<model> effort=<effort>`; read them at launch, never hard-code. Call the live copy, `bash -c 'source ~/.claude/scripts/agents/agents_config.sh; agents_resolve_print <task>'` (bash only: sourced into zsh it returns empty rows); it reads `~/.claude/config/agents.conf`, which is newer than this worktree's `config/agents.conf`.
   - `scripts/delegate/implement.sh` — the codex delegate's model, effort, sandbox and approval settings (around 393–489); the interactive Codex workers take the same.
   - `scripts/production/showrunners.py` — `registered_showrunners` 190, `current_name` 230, `address <slug>`; `scripts/production/production_check.sh` (doc status line `> **Status: PRODUCTION — running.**`).
   - `scripts/message/roster.py` 612–661 — finds units through tmux panes (research §2: inside herdr the pane field is empty).
@@ -56,7 +56,7 @@ Showrunner's brief and approval, 2026-10-13 10:3x–10:4x EDT (not the user's wo
 
 ## Phases
 
-### Phase 1 — herdr server, client window and pane helpers  · status: todo
+### Phase 1 — herdr server, client window and pane helpers  · status: done
 
 #### Work Order
 
