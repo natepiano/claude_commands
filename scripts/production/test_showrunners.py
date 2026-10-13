@@ -24,6 +24,11 @@ FAKE = str(Path(__file__).with_name("fake_tmux.py"))
 LOS_ANGELES = "America/Los_Angeles"
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 class ShowrunnerRegistryTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -107,7 +112,7 @@ raise SystemExit(1)
             fields.append(f"PROMPT_FILE={prompt}")
         if doc is not None:
             fields.append("CHECK=" + shlex.join(["zsh", "/opt/tools/production_check.sh", str(doc)]))
-            # The zone is read from the production doc's own line.
+            # Older docs carry a User zone line. It is no longer read; the zone is the user's setting.
             _ = Path(doc).write_text(f"- **User zone:** {zone}\n", encoding="utf-8")
         _ = (directory / "conf").write_text("\n".join(fields) + "\n")
 
@@ -230,14 +235,28 @@ raise SystemExit(1)
         self.assertIn("cannot tell whether session:live-id is running: sessions: one or more registry files",
                       result.stderr)
 
+    def test_the_zone_is_the_users_setting_whatever_the_doc_says(self) -> None:
+        # A doc's own User zone line is no longer read: a doc without one, or with one that names
+        # another zone or no zone at all, is listed with the setting's zone.
+        no_zone = self.root / "no-zone-production.md"
+        self.instance("showrunner-no-zone", doc=no_zone)
+        _ = no_zone.write_text("# Production\n", encoding="utf-8")
+        other_zone = self.root / "other-zone-production.md"
+        self.instance("showrunner-other-zone", doc=other_zone, zone="Europe/Paris")
+        bad_zone = self.root / "bad-zone-production.md"
+        self.instance("showrunner-bad-zone", doc=bad_zone, zone="Nowhere/Never")
+        _ = self.record("director", "live-id")
+        result = self.cli("list")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(result.stdout.splitlines()), sorted(
+            f"{slug}\tdirector\t{LOS_ANGELES}\t{doc}"
+            for slug, doc in (("no-zone", no_zone), ("other-zone", other_zone), ("bad-zone", bad_zone))))
+        self.assertNotIn("skipping", result.stderr)
+
     def test_a_timer_that_is_not_a_complete_showrunners_is_left_out_with_the_reason(self) -> None:
         self.instance("showrunner-no-target", include_target=False)
         self.instance("showrunner-no-doc")
         self.instance("showrunner-unnamed", target="session:unnamed-id", doc=self.root / "unnamed-production.md")
-        # The zone is the doc's own line: a doc without one, or with one that names no zone, is no showrunner's.
-        self.instance("showrunner-no-zone", doc=self.root / "no-zone-production.md")
-        _ = (self.root / "no-zone-production.md").write_text("# Production\n", encoding="utf-8")
-        self.instance("showrunner-bad-zone", doc=self.root / "bad-zone-production.md", zone="Nowhere/Never")
         self.instance("showrunner-lost-doc", doc=self.root / "lost-production.md")
         (self.root / "lost-production.md").unlink()
         self.instance("showrunner-show", doc=self.doc)
@@ -249,8 +268,6 @@ raise SystemExit(1)
         self.assertEqual(result.stdout.splitlines(), [f"show\tdirector\t{LOS_ANGELES}\t{self.doc}"])
         self.assertIn("skipping showrunner-no-target", result.stderr)
         self.assertIn("skipping showrunner-no-doc: CHECK is missing", result.stderr)
-        self.assertIn("skipping showrunner-no-zone: production doc lacks User zone", result.stderr)
-        self.assertIn("skipping showrunner-bad-zone: production doc has an invalid User zone", result.stderr)
         self.assertIn("skipping showrunner-lost-doc: production doc could not be read", result.stderr)
         self.assertIn("skipping showrunner-unnamed: session unnamed-id has no live named process", result.stderr)
 

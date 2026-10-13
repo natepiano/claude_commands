@@ -331,6 +331,7 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         # path would need a live app-server, which is a different test's subject.
         environment["PLAN_DELEGATE_CODEX_MESH"] = "0"
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         _ = environment.pop("CODEX_THREAD_ID", None)
         _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
         return environment

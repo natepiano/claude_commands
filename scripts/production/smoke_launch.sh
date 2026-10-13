@@ -19,7 +19,11 @@ READY_SECONDS=300
 EXIT_SECONDS=30
 
 : >"$LOG"
-log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG"; }
+# Log stamps are in the user's zone setting; the machine's zone when the setting cannot be read.
+LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
+ZONE="$("$LIB/py" "$LIB/user_zone.py" 2>/dev/null)" || ZONE=
+stamp() { if [[ -n "$ZONE" ]]; then TZ="$ZONE" date '+%H:%M:%S'; else date '+%H:%M:%S'; fi; }
+log() { printf '%s %s\n' "$(stamp)" "$*" | tee -a "$LOG"; }
 fail() { log "SMOKE FAILED: $*"; exit 1; }
 
 [[ "$(uname -s)" == Linux ]] || fail "Linux only; Hana ignores XDG_CONFIG_HOME on $(uname -s)"

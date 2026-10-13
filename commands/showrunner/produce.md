@@ -21,8 +21,10 @@ Read `~/.claude/docs/production_format.md` first. It defines:
 
 State:
 
-- `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG`, `ZONE`, `UNITS` — from the production
-  doc.
+- `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG`, `UNITS` — from the production doc.
+- `ZONE` — the user's zone setting, which
+  `python3 ~/.claude/scripts/lib/user_zone.py` prints. It is one setting for
+  every production; a doc's own **User zone** line is not read.
 - `CHECKOUT` — this session's checkout, which must be on `MERGE_BRANCH`.
 - `SCRATCH` — this session's scratchpad directory.
 - `DAILIES_STATE_DIR` — `<SCRATCH>/dailies_input_state`, the dailies builder's

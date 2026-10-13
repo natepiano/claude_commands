@@ -243,11 +243,11 @@ neither the command's output nor its exit status. Plans without a
 `> **Production:` line skip the subprocess. [Phase tables](phase-tables.md)
 covers the note, the table built from these events and the hook's limits.
 
-`eta` reads its times in the process `TZ` (unset: the user's zone setting), requires an active phase, appends
+`eta` reads its times in the user's zone setting (`scripts/lib/user_zone.py`), requires an active phase, appends
 one `eta_stated` event, and prints `ETA recorded: <HH:MM zone>`. It exits 2 on
 a malformed or past time, a time the local clock skips, a range that does not
 enclose the target, one range end alone, a blank basis, or no active phase.
-`/unit:eta` and `/unit:eta_breakdown` run it under `TZ=<User zone>`.
+`/unit:eta` and `/unit:eta_breakdown` pass no `TZ=`; the process `TZ` is not read.
 
 `implement.sh` and `review.sh` own pass lifecycle: they set
 `PLAN_DELEGATE_PASS_OWNER=launcher` on their own `start-pass` / `finish-pass`
