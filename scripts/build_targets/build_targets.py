@@ -38,6 +38,7 @@ from targets import (
 )
 import offload
 import build_hold
+import mac_test
 import override_guard
 from user_zone import user_zone
 
@@ -116,7 +117,16 @@ def command_status(probe: bool = False) -> int:
             if probe and isinstance(target, SshTarget)
             else target_state(target)
         )
-        print(format_state(target.name, state))
+        line = format_state(target.name, state)
+        if isinstance(target, SshTarget) and isinstance(state, Running):
+            try:
+                paths = mac_test.state_paths()
+                run = mac_test.read_run(paths.run)
+                if isinstance(run, dict) and datetime.fromisoformat(run["since"]) == state.since:
+                    line += mac_test.claim_idle_clause(run)
+            except (OSError, mac_test.StateReadError) as error:
+                line = format_state(target.name, StateUnreadable(str(error)))
+        print(line)
     return 0
 
 
