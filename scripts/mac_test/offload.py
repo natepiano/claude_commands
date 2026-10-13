@@ -23,9 +23,11 @@ from typing import Literal, TextIO, cast, final
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "buildlog"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 import override_guard
 import sweep
+import treekey
 
 
 # Version the mirrored repository's development shell exports on the Mac.
@@ -62,6 +64,36 @@ class UnknownRepository:
 
 RepositoryIdentity = KnownRepository | UnknownRepository
 UNKNOWN_REPOSITORY = UnknownRepository()
+
+
+@dataclass(frozen=True)
+class KnownTreeKey:
+    value: str
+
+
+@dataclass(frozen=True)
+class UnavailableTreeKey:
+    pass
+
+
+TreeKey = KnownTreeKey | UnavailableTreeKey
+UNAVAILABLE_TREE_KEY = UnavailableTreeKey()
+
+
+@dataclass(frozen=True)
+class CopiedTree:
+    tree_key: TreeKey
+
+
+@dataclass(frozen=True)
+class TreeCopyFailed:
+    pass
+
+
+def read_tree_key(directory: Path) -> TreeKey:
+    if key := treekey.tree_key(str(directory)):
+        return KnownTreeKey(key)
+    return UNAVAILABLE_TREE_KEY
 
 
 @dataclass(frozen=True)
@@ -892,6 +924,21 @@ def copy_tree(
         return False
 
 
+def copy_tree_with_key(
+    controller: ProcessController,
+    config: OffloadConfig,
+    request: OffloadRequest,
+    repository: KnownRepository,
+) -> CopiedTree | TreeCopyFailed:
+    before = read_tree_key(request.repo_root)
+    if not copy_tree(controller, config, request, repository):
+        return TreeCopyFailed()
+    after = read_tree_key(request.repo_root)
+    if isinstance(before, KnownTreeKey) and isinstance(after, KnownTreeKey) and before == after:
+        return CopiedTree(before)
+    return CopiedTree(UNAVAILABLE_TREE_KEY)
+
+
 def nextest_words_with_skip(
     words: tuple[str, ...], skip_expression: str
 ) -> tuple[str, ...]:
@@ -914,6 +961,7 @@ def remote_test_command(
     config: OffloadConfig,
     request: OffloadRequest,
     repository: KnownRepository,
+    sent_tree_key: TreeKey = UNAVAILABLE_TREE_KEY,
 ) -> str:
     budget = config.values.get(
         f"mac_budget_gib.{repository.name}", config.default_target_budget_gib
@@ -923,11 +971,16 @@ def remote_test_command(
         config.values.get(f"mac_skip.{repository.name}", ""),
     )
     invocation = shlex.join(["nextest", *words])
+    sent_tree = (
+        f"BUILDLOG_SENT_TREE_KEY={shlex.quote(sent_tree_key.value)} "
+        if isinstance(sent_tree_key, KnownTreeKey) else ""
+    )
     return (
         f"cd {shlex.quote(remote_mirror(repository))} && "
         'PATH="$HOME/.cargo/bin:$PATH" '
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_CALL_ID={shlex.quote(request.call_id)} "
+        f"{sent_tree}"
         "BUILDLOG_SYNC=1 "
         f"LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "
         f"MACOSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET} "
@@ -1058,7 +1111,8 @@ def claimed_run(
             return declined("disk", started)
 
         copy_started = time.monotonic()
-        if not copy_tree(controller, config, request, repository):
+        copied = copy_tree_with_key(controller, config, request, repository)
+        if isinstance(copied, TreeCopyFailed):
             return declined("copy", started)
         copy_seconds = elapsed_seconds(copy_started)
         print(
@@ -1070,7 +1124,7 @@ def claimed_run(
         remote_status = controller.stream_mac_run(
             [
                 *ssh_prefix(config),
-                remote_test_command(config, request, repository),
+                remote_test_command(config, request, repository, copied.tree_key),
             ]
         )
         seconds = elapsed_seconds(started)

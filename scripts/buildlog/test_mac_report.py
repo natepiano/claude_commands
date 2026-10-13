@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 import tempfile
@@ -11,7 +12,7 @@ import unittest
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, TypedDict, Unpack, override
+from typing import Literal, TypedDict, Unpack, cast, override
 from unittest.mock import patch
 
 import index
@@ -193,6 +194,62 @@ class MacReportTests(unittest.TestCase):
             step("local-step", started_at="2026-10-12T14:01:00.000Z", call_id="local-pass", step="nextest", status=0, tree_key="tree-a"),
         )
         self.assertIn("Mac failures with a natedev pass of the same tree: 1 recorded", self.report())
+
+    def record_sent_mac_step(self, call_id: str, sent_key: str) -> None:
+        mirror = self.root.parent / "mac-mirror"
+        mirror.mkdir()
+        self.assertFalse((mirror / ".git").exists())
+        environment = {
+            name: value for name, value in os.environ.items()
+            if not name.startswith("BUILDLOG_") and name != "MANIFEST_PATH"
+        }
+        environment.update({
+            "BUILDLOG_DIR": str(self.root), "BUILDLOG_CALLER": "verify-mac",
+            "BUILDLOG_CALL_ID": call_id, "BUILDLOG_SENT_TREE_KEY": sent_key,
+        })
+        started = datetime(2026, 10, 12, 14, tzinfo=UTC).timestamp()
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("record.py")), "step", "1",
+             str(started), str(started + 1), "0", "", "", "cargo", "nextest", "run"],
+            cwd=mirror, env=environment, capture_output=True, text=True, check=False, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [
+            cast(Record, json.loads(line))
+            for path in self.root.glob("*/*.jsonl")
+            for line in path.read_text().splitlines()
+        ]
+        mac_steps = [row for row in rows if row.get("kind") == "step" and row.get("caller") == "verify-mac"]
+        self.assertEqual(len(mac_steps), 1)
+        self.assertEqual((mac_steps[0]["call_id"], mac_steps[0]["tree_key"]), (call_id, sent_key))
+
+    def test_sent_key_on_recorded_mac_step_counts_a_natedev_pass_of_the_same_selection(self) -> None:
+        sent_key = "a" * 64
+        self.write(
+            self.mac_call("sent-mac-failure", "failed", command="test hana --filter one"),
+            self.mac_call("same-selection-pass", "declined", "local_flag", local_reason="retry",
+                          command="test hana --filter one"),
+            step("same-selection-step", started_at=START, call_id="same-selection-pass",
+                 step="nextest", status=0, tree_key=sent_key),
+        )
+        self.record_sent_mac_step("sent-mac-failure", sent_key)
+        output = self.report()
+        self.assertIn("Mac failures with a natedev pass of the same tree: 1 recorded.", output)
+        self.assertNotIn("without a tree key", output)
+
+    def test_sent_key_on_recorded_mac_step_does_not_count_a_different_natedev_command(self) -> None:
+        sent_key = "a" * 64
+        self.write(
+            self.mac_call("sent-mac-failure", "failed", command="test hana --filter one"),
+            self.mac_call("different-selection-pass", "declined", "local_flag", local_reason="retry",
+                          command="test hana --filter two"),
+            step("different-selection-step", started_at=START, call_id="different-selection-pass",
+                 step="nextest", status=0, tree_key=sent_key),
+        )
+        self.record_sent_mac_step("sent-mac-failure", sent_key)
+        output = self.report()
+        self.assertIn("Mac failures with a natedev pass of the same tree: 0 recorded.", output)
+        self.assertNotIn("without a tree key", output)
 
     def test_mac_failures_require_the_same_test_selection_as_the_natedev_pass(self) -> None:
         self.write(

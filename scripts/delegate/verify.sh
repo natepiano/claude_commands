@@ -2,21 +2,24 @@
 # verify.sh — The only build/test/lint commands a delegate may run.
 #
 # Work Orders list exact invocations of this script; the delegate composes no
-# cargo flags and makes no scope choices. Cargo's default target selection
-# compiles examples, so every dev-loop subcommand pins explicit targets
-# (--lib/--bins/--tests). `test` includes examples with test = true; other
-# examples are left out. Nothing below `final` uses --all-targets (mend
-# excepted, see `lint`); `final` is the plan-final full
-# gate, run by the unit director, never by a phase delegate.
+# cargo flags and makes no scope choices. `check` pins lib and bin targets;
+# `test` selects the package's test targets, including examples with test = true.
+# `lint` runs clippy with --all-targets --all-features to match CI, and mend
+# also uses --all-targets. It checks TOML formatting with taplo at the workspace
+# root. `example` runs clippy on one named example while
+# iterating. `final` is the plan-final full gate, run by the unit director,
+# never by a phase delegate.
 #
-# Package selection is always --workspace, with default features. Cargo
-# resolves features per invocation from the selected packages, so `-p <pkg>`
+# Package selection is always --workspace. Commands use default features unless
+# the Work Order supplies --features; `lint`'s clippy always uses all features.
+# Cargo resolves features per invocation from the selected packages, so `-p <pkg>`
 # gives every member its own feature set for bevy and the rest of the
 # dependency tree, and each set is a separate compile of that tree in the
 # shared target directory: nine to eleven copies of bevy_render across the
 # members, which evict one another under the sweep budget and rebuild in
 # minutes each time a phase moves to a new package. --workspace resolves one
-# set for the whole tree, so every command below reuses one compiled copy.
+# set for the whole tree, so commands with the same feature set reuse one
+# compiled copy. `lint`'s all-features clippy shares its set with the push gate.
 # The package argument still decides what runs and what is reported: nextest
 # filters to it with -E 'package(<pkg>)', and --features qualifies its list
 # with it. `test` builds the named package's test targets, plus workspace libs
@@ -31,7 +34,8 @@
 #
 # The lint stages — mend, fmt, clippy, doc — are gated by config/lint.conf (edit
 # it with /lint_config), so one switch silences a check across /clippy, the fix
-# pipeline, and every delegate phase. A phase runs all four; only the
+# pipeline, and every delegate phase. `lint` also always runs taplo fmt --check
+# at the workspace root, using its taplo.toml. A phase runs all five; only the
 # branch-wide style review is left to the plan-final gate. A gated-off check
 # prints a SKIPPED line and the command still exits 0. Scope is never
 # configurable: the target pinning and the single package selection above are
@@ -88,14 +92,18 @@
 #                                          build nothing
 #   verify.sh lint <package>               mend --fix, nightly fmt of the package
 #                                          and the members that differ from HEAD,
-#                                          workspace clippy (warnings denied), then
+#                                          workspace taplo fmt --check,
+#                                          workspace clippy on all targets with
+#                                          all features (warnings denied), then
 #                                          rustdoc on the members that differ
-#                                          — every stage gated by config/lint.conf
+#                                          — cargo stages gated by config/lint.conf;
+#                                          taplo always checks TOML formatting
 #   … [--features <list>]                  check, test, and lint accept one trailing
 #                                          `--features a,b` when the Work Order names
-#                                          it: code behind a non-default feature has
-#                                          no other route to a gate. Names without a
-#                                          `/` are qualified as <package>/<name>
+#                                          it. For lint, the list reaches mend and
+#                                          rustdoc; clippy always checks all features.
+#                                          Names without a `/` are qualified as
+#                                          <package>/<name>
 #   … --no-cache                           test and lint: run even when this
 #                                          exact call already passed (or lint
 #                                          failed) on this tree, a flake hunt;
@@ -118,7 +126,7 @@
 # release checks) use the lint CLI in that directory instead of this script.
 #
 # Exit codes: 2 = usage error or missing tooling; 3 = sandbox failure, re-run
-# the same command unsandboxed; anything else is the underlying cargo status.
+# the same command unsandboxed; anything else is the underlying tool status.
 
 set -euo pipefail
 BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
@@ -443,6 +451,13 @@ require_member() {
     fi
 }
 
+require_taplo() {
+    if ! command -v taplo >/dev/null 2>&1; then
+        echo "taplo is required" >&2
+        exit 2
+    fi
+}
+
 example_features() {
     cargo metadata --no-deps --format-version 1 \
         | "$PY" -c "$EXAMPLE_FEATURES_PY" "$1" "$2"
@@ -548,9 +563,9 @@ compose_nextest_args() {
     # and the package's own bins and test-enabled targets. --bins
     # --tests linked every member's test executables, 78 in hana, to
     # run one package's; this links 4 (2026-10-04). The integration
-    # tests stay in, matching what the lint half compiles under
-    # clippy: without them a phase could lint an integration test,
-    # pass its gate, and checkpoint without ever running it.
+    # tests stay in so a phase runs the package's integration tests
+    # alongside its unit tests. The lint half's clippy checks all
+    # workspace targets with all features.
     take_test_targets
     NEXTEST_ARGS=(--no-fail-fast --workspace "${TEST_SELECTION[@]}" \
         -E "$TEST_FILTER" "${FEATURE_FLAGS[@]}")
@@ -868,6 +883,7 @@ withdraw_local_demand() {
 # when the holder, reason or escalation message changes during this wait.
 register_routing_demand() {
     local admission=0
+    if build_hold_nothing_held; then return 0; fi
     python3 "$BUILD_TARGETS_SCRIPT" register-local --call-id "$BUILDLOG_CALL_ID" --pid $$ \
         2>"$HOLD_WAIT_DIR/routing-diagnostic" || admission=$?
     if ! cmp -s "$HOLD_WAIT_DIR/routing-diagnostic" "$HOLD_WAIT_DIR/last-routing-diagnostic"; then
@@ -902,7 +918,7 @@ route_test() {
         [[ "$eligibility" == eligible ]] || continue
         if [[ "$settings" == - ]]; then
             admission=0
-            python3 "$BUILD_TARGETS_SCRIPT" check-admission --call-id "$BUILDLOG_CALL_ID" || admission=$?
+            build_hold_check_admission || admission=$?
             case "$admission" in
                 0) return 0 ;;
                 10|12) continue ;;
@@ -1115,12 +1131,14 @@ if [[ "$CMD" == test ]]; then
     compose_nextest_args
     route_test
 fi
-python3 "$BUILD_TARGETS_SCRIPT" wait-local --call-id "$BUILDLOG_CALL_ID" --pid $$ &
-HOLD_WAITER_PID=$!
-HOLD_WAIT_STATUS=0
-wait "$HOLD_WAITER_PID" || HOLD_WAIT_STATUS=$?
-HOLD_WAITER_PID=""
-if [[ "$HOLD_WAIT_STATUS" != 0 ]]; then exit "$HOLD_WAIT_STATUS"; fi
+if ! build_hold_nothing_held; then
+    python3 "$BUILD_TARGETS_SCRIPT" wait-local --call-id "$BUILDLOG_CALL_ID" --pid $$ &
+    HOLD_WAITER_PID=$!
+    HOLD_WAIT_STATUS=0
+    wait "$HOLD_WAITER_PID" || HOLD_WAIT_STATUS=$?
+    HOLD_WAITER_PID=""
+    if [[ "$HOLD_WAIT_STATUS" != 0 ]]; then exit "$HOLD_WAIT_STATUS"; fi
+fi
 trap - INT TERM HUP
 
 # Open a progress window for the duration of this run when a delegate session is
@@ -1342,11 +1360,13 @@ case "$CMD" in
         shift
         take_features "$@"
         require_member "$PKG"
-        # Order: mend rewrites first, fmt formats what mend wrote, then clippy
-        # and rustdoc read the settled tree. Every stage is gated by lint.conf.
-        # mend is the one stage below `final` that passes --all-targets: it
-        # needs the test and example targets to see every import and
-        # visibility site. It covers the workspace like the other stages, so
+        require_taplo
+        # Order: mend rewrites first, fmt formats what mend wrote, then taplo
+        # checks TOML before clippy and rustdoc read the settled tree.
+        # Cargo stages are gated by lint.conf; the Taplo check always runs.
+        # mend passes --all-targets because it needs the test and example
+        # targets to see every import and visibility site. It covers the
+        # workspace like the other stages, so
         # --fix can also rewrite a member the phase did not edit, when this
         # phase's change left an item there unused or over-visible.
         if lint_config_enabled mend; then
@@ -1386,7 +1406,25 @@ case "$CMD" in
             fi
         done <<< "$FMT_MEMBERS"
         fmt_cargo "${FMT_SCOPE[@]}"
-        invoke_clippy --workspace --lib --bins --tests "${FEATURE_FLAGS[@]}"
+        # Cargo's workspace root can differ from the caller's directory.
+        # Run there so Taplo uses the same config and scope as the push gate.
+        TAPLO_WORKSPACE_ROOT="$(cargo metadata --no-deps --format-version 1 \
+            | "$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])')"
+        if (cd "$TAPLO_WORKSPACE_ROOT" && run taplo fmt --check); then
+            :
+        else
+            taplo_status=$?
+            if (( taplo_status == 101 )); then
+                if [[ "$(uname)" == Darwin ]]; then
+                    echo "verify.sh: taplo panicked; the macOS sandbox does this. Re-run the same command with the sandbox disabled." >&2
+                    exit 3
+                fi
+                echo "verify.sh: taplo panicked; this is a tooling failure." >&2
+                exit 2
+            fi
+            exit "$taplo_status"
+        fi
+        invoke_clippy --workspace --all-targets --all-features
         # Found after mend, so a member its --fix rewrote is documented too.
         FEATURE_MEMBER=""
         if [[ ${#FEATURE_FLAGS[@]} -gt 0 ]]; then
@@ -1414,8 +1452,8 @@ case "$CMD" in
         PKG="${1:?verify.sh example <package> <name>}"
         NAME="${2:?verify.sh example <package> <name>}"
         FEATURES="$(example_features "$PKG" "$NAME")"
-        # clippy, not check: `lint` never sees an example, so a check here let
-        # lint errors in a changed example reach the merge branch twice.
+        # Clippy gives focused lint feedback on one changed example while
+        # iterating; the full `lint` command checks every workspace target.
         # Example names are unique across the workspace, so --workspace
         # --example builds this one example under the workspace's feature
         # resolution. A required feature that resolution leaves off still

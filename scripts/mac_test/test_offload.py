@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -25,6 +25,7 @@ from unittest import mock
 
 import offload
 import mac_test
+import treekey
 
 
 SCRIPT = Path(__file__).with_name("offload.py")
@@ -692,6 +693,9 @@ class OffloadCommandTests(unittest.TestCase):
             SCRIPT.parent.parent / "lint", target_is_directory=True
         )
         (scripts_directory / "build_hold").symlink_to(SCRIPT.parent.parent / "build_hold", target_is_directory=True)
+        (scripts_directory / "buildlog").symlink_to(
+            SCRIPT.parent.parent / "buildlog", target_is_directory=True
+        )
         return runner
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -1233,6 +1237,111 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(len(self.events_for("ssh")), 1)
         self.assertEqual(len(self.events_for("rsync")), 1)
         self.assert_claimed_commands()
+
+    def commit_sent_tree(self) -> str:
+        environment = {
+            **self.environment,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_AUTHOR_NAME": "test", "GIT_COMMITTER_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "test@example.com", "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        result = subprocess.run(
+            ["git", "commit", "-q", "--allow-empty", "-m", "sent tree"],
+            cwd=self.repository, env=environment, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        key = treekey.tree_key(str(self.repository))
+        self.assertIsInstance(key, str)
+        assert isinstance(key, str)
+        return key
+
+    def run_with_copy_change(self, change: Callable[[], None]) -> None:
+        self.fixture["hold_copy"] = True
+        self.sync_fixture()
+        process = self.start_command()
+        try:
+            self.wait_for_path(self.stub_directory / "copy-started")
+            change()
+            _ = (self.stub_directory / "continue-copy").write_text("continue\n")
+            output, _ = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 0, output)
+            self.assert_wire("passed", "")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                _ = process.communicate(timeout=5)
+
+    def sent_command_words(self) -> list[str]:
+        self.assertEqual(len(self.events_for("rsync")), 1)
+        remote = self.events_for("ssh")[-1]["args"][-1]
+        self.assertIn("lint nextest", remote)
+        return shlex.split(remote.rpartition("; echo mac_exit=$?")[0])
+
+    def assert_stable_copy_sends_key(self) -> None:
+        # A later stable copy must send its key after the earlier copy omitted it.
+        self.clear_events()
+        self.fixture["hold_copy"] = False
+        self.sync_fixture()
+        key = self.commit_sent_tree()
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"BUILDLOG_SENT_TREE_KEY={key}", self.sent_command_words())
+
+    def test_unchanged_copy_sends_its_known_tree_key_beside_the_call_id(self) -> None:
+        key = self.commit_sent_tree()
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(treekey.tree_key(str(self.repository)), key)
+        words = self.sent_command_words()
+        call_index = words.index("BUILDLOG_CALL_ID=call-17")
+        self.assertEqual(words[call_index + 1], f"BUILDLOG_SENT_TREE_KEY={key}")
+
+    def test_copy_with_different_before_and_after_tree_keys_sends_no_key(self) -> None:
+        before = self.commit_sent_tree()
+
+        def change() -> None:
+            _ = (self.repository / "during-copy.rs").write_text("changed during copy\n")
+
+        self.run_with_copy_change(change)
+        after = treekey.tree_key(str(self.repository))
+        self.assertIsInstance(after, str)
+        self.assertNotEqual(before, after)
+        self.assertFalse(any(word.startswith("BUILDLOG_SENT_TREE_KEY=") for word in self.sent_command_words()))
+        self.assert_stable_copy_sends_key()
+
+    def test_copy_with_unavailable_before_key_and_known_after_key_sends_no_key(self) -> None:
+        self.assertIsNone(treekey.tree_key(str(self.repository)))
+
+        def change() -> None:
+            _ = self.commit_sent_tree()
+
+        self.run_with_copy_change(change)
+        self.assertIsInstance(treekey.tree_key(str(self.repository)), str)
+        self.assertFalse(any(word.startswith("BUILDLOG_SENT_TREE_KEY=") for word in self.sent_command_words()))
+        self.assert_stable_copy_sends_key()
+
+    def test_copy_with_known_before_key_and_unavailable_after_key_sends_no_key(self) -> None:
+        _ = self.commit_sent_tree()
+        head_path = self.repository / ".git" / "HEAD"
+        head = head_path.read_text()
+
+        def change() -> None:
+            (self.repository / ".git" / "HEAD").unlink()
+
+        self.run_with_copy_change(change)
+        self.assertIsNone(treekey.tree_key(str(self.repository)))
+        self.assertFalse(any(word.startswith("BUILDLOG_SENT_TREE_KEY=") for word in self.sent_command_words()))
+        _ = head_path.write_text(head)
+        self.assert_stable_copy_sends_key()
+
+    def test_copy_with_both_tree_keys_unavailable_sends_no_key(self) -> None:
+        self.assertIsNone(treekey.tree_key(str(self.repository)))
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIsNone(treekey.tree_key(str(self.repository)))
+        self.assertFalse(any(word.startswith("BUILDLOG_SENT_TREE_KEY=") for word in self.sent_command_words()))
+        self.assert_stable_copy_sends_key()
 
     def test_remote_test_command_sets_development_deployment_target_before_nextest(self) -> None:
         words = ("--no-fail-fast", "unit_case")

@@ -43,8 +43,24 @@ build_hold_mark() {
     python3 "$BUILD_HOLD_MARK_SCRIPT" "${arguments[@]}" >/dev/null 2>&1 || true
 }
 
+# Status 0 only when the holder directory is a readable directory with no
+# entry at all and this shell expands patterns unfiltered; any doubt starts
+# the Python, which decides as before.
+build_hold_nothing_held() {
+    [[ -n "${BUILD_HOLD_DIR-x}" ]] || return 1
+    [[ "$-" != *f* && -z "${GLOBIGNORE-}" ]] || return 1
+    if shopt -q failglob; then return 1; fi
+    local holder_dir="${BUILD_HOLD_DIR-$HOME/.local/state/build-hold}" entry
+    [[ -d "$holder_dir" && -r "$holder_dir" && -x "$holder_dir" ]] || return 1
+    for entry in "$holder_dir"/* "$holder_dir"/.[!.]* "$holder_dir"/..?*; do
+        if [[ -e "$entry" || -L "$entry" ]]; then return 1; fi
+    done
+    return 0
+}
+
 build_hold_wait_local() {
     [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]] || return 0
+    if build_hold_nothing_held; then return 0; fi
     local waiter_pid status=0
     python3 "$BUILD_TARGETS_SCRIPT" wait-local --call-id "$BUILDLOG_CALL_ID" --pid "${BUILDLOG_HOLD_PID:-$$}" &
     waiter_pid=$!
@@ -54,6 +70,7 @@ build_hold_wait_local() {
 
 build_hold_check_admission() {
     [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]] || return 0
+    if build_hold_nothing_held; then return 0; fi
     python3 "$BUILD_TARGETS_SCRIPT" check-admission --call-id "$BUILDLOG_CALL_ID"
 }
 

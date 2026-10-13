@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -22,6 +23,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 import build_hold
+from sessions import SessionRecord
 from user_zone import user_zone
 
 
@@ -522,6 +524,198 @@ class QuietTests(IsolatedBuildHoldTest):
         self.assertIn("cargo", "; ".join(verdict.reasons))
 
 
+class TargetCommandTests(IsolatedBuildHoldTest):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.enterContext(mock.patch.dict(os.environ, {
+            "BUILD_TARGETS_CONFIG": str(SCRIPT.parent.parent.parent / "config/build_targets.conf"),
+        }))
+
+    def run_with_mac_stand_in(
+        self, arguments: list[str], exit_code: int = 0, *, check_block_holder: bool = False,
+    ) -> tuple[int, str, str, list[list[str]]]:
+        calls: list[list[str]] = []
+        expected_script = SCRIPT.resolve().parent.parent / "mac_test/mac_test.py"
+
+        def command(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(argv[:2], [sys.executable, str(expected_script)])
+            self.assertTrue(options.get("capture_output"))
+            self.assertTrue(options.get("text"))
+            calls.append(argv[2:])
+            if check_block_holder:
+                block = self.scratch / "stand-in-block-holder"
+                holder = argv[argv.index("--holder") + 1]
+                if argv[2] == "block":
+                    _ = block.write_text(holder)
+                elif block.exists():
+                    stored = block.read_text()
+                    if stored != holder:
+                        return subprocess.CompletedProcess(argv, 1, f"blocked by {stored}\n", "")
+                    block.unlink()
+            return subprocess.CompletedProcess(argv, exit_code, "Mac stand-in result\n", "Mac stand-in detail\n")
+
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(subprocess, "run", side_effect=command), redirect_stdout(output), redirect_stderr(errors):
+            try:
+                status = build_hold.main(arguments)
+            except SystemExit as error:
+                status = error.code if isinstance(error.code, int) else 1
+        self.reap_recorders()
+        return status, output.getvalue(), errors.getvalue(), calls
+
+    def assert_no_natedev_record(self) -> None:
+        self.assertFalse((self.scratch / "holders").exists())
+        self.assertFalse((self.scratch / "release" / "current").exists())
+        self.assertEqual(recorded_hold_events(self.scratch / "buildlog", 0), [])
+
+    def test_mac_hold_forwards_block_holder_and_reason_without_a_natedev_record(self) -> None:
+        status, output, errors, calls = self.run_with_mac_stand_in(
+            ["hold", "--target", "mac", "--holder", "alice", "--for", "renderer checks"])
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(calls, [["block", "--holder", "alice", "--for", "renderer checks"]])
+        self.assertEqual(output, "Mac stand-in result\n")
+        self.assertEqual(errors, "Mac stand-in detail\n")
+        self.assert_no_natedev_record()
+
+    def test_mac_release_forwards_unblock_holder_and_child_exit_codes(self) -> None:
+        for exit_code in (0, 7):
+            with self.subTest(exit_code=exit_code):
+                status, output, errors, calls = self.run_with_mac_stand_in(
+                    ["release", "--target", "mac", "--holder", "alice"], exit_code=exit_code)
+                self.assertEqual(status, exit_code, errors)
+                self.assertEqual(calls, [["unblock", "--holder", "alice"]])
+                self.assertEqual(output, "Mac stand-in result\n")
+                self.assertEqual(errors, "Mac stand-in detail\n")
+                self.assert_no_natedev_record()
+
+    def test_mac_hold_returns_the_block_child_failure(self) -> None:
+        status, output, errors, calls = self.run_with_mac_stand_in(
+            ["hold", "--target", "mac", "--holder", "alice", "--for", "renderer checks"], exit_code=9)
+        self.assertEqual(status, 9, errors)
+        self.assertEqual(calls, [["block", "--holder", "alice", "--for", "renderer checks"]])
+        self.assertEqual(output, "Mac stand-in result\n")
+        self.assertEqual(errors, "Mac stand-in detail\n")
+        self.assert_no_natedev_record()
+
+    def session(self, name: str, *former: str) -> None:
+        path = self.scratch / "renamed-session.sock"
+        if not path.exists():
+            connection = socket.socket(socket.AF_UNIX)
+            connection.bind(str(path))
+            self.addCleanup(connection.close)
+        directory = self.scratch / "sessions"
+        directory.mkdir(exist_ok=True)
+        record: SessionRecord = {
+            "pid": os.getpid(), "sessionId": "renamed-session", "name": name,
+            "formerNames": list(former), "messagingSocketPath": str(path), "updatedAt": 1,
+            "tmux": "",
+        }
+        _ = (directory / "renamed-session.json").write_text(json.dumps(record))
+
+    def test_mac_release_after_session_rename_releases_own_block_and_keeps_others(self) -> None:
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "renamed-session"}):
+            for given in ([], ["--holder", "first-name"], ["--holder", "current-name"]):
+                with self.subTest(given=given):
+                    self.session("first-name")
+                    status, _, errors, calls = self.run_with_mac_stand_in(
+                        ["hold", "--target", "mac", "--for", "renderer checks"], check_block_holder=True)
+                    self.assertEqual(status, 0, errors)
+                    self.assertEqual(calls, [["block", "--holder", "first-name", "--for", "renderer checks"]])
+                    self.session("current-name", "first-name", "middle-name")
+                    status, output, errors, calls = self.run_with_mac_stand_in(
+                        ["release", "--target", "mac", *given], check_block_holder=True)
+                    self.assertEqual(status, 0, errors)
+                    self.assertEqual(calls, [["unblock", "--holder", "current-name"],
+                                             ["unblock", "--holder", "first-name"]])
+                    self.assertEqual(output, "Mac stand-in result\n")
+                    self.assertEqual(errors, "Mac stand-in detail\n")
+                    self.assertFalse((self.scratch / "stand-in-block-holder").exists())
+                    self.assert_no_natedev_record()
+                    status, _, errors, _ = self.run_with_mac_stand_in(
+                        ["hold", "--target", "mac", "--holder", "someone-else", "--for", "renderer checks"],
+                        check_block_holder=True)
+                    self.assertEqual(status, 0, errors)
+                    status, output, errors, calls = self.run_with_mac_stand_in(
+                        ["release", "--target", "mac", *given], check_block_holder=True)
+                    self.assertEqual(status, 1)
+                    self.assertEqual(calls, [["unblock", "--holder", "current-name"]])
+                    self.assertEqual(output, "blocked by someone-else\n")
+                    self.assertEqual(errors, "")
+                    self.assertEqual((self.scratch / "stand-in-block-holder").read_text(), "someone-else")
+                    self.assert_no_natedev_record()
+
+    def test_default_hold_and_release_record_only_natedev_and_never_call_mac(self) -> None:
+        status, output, errors, calls = self.run_with_mac_stand_in(
+            ["hold", "--holder", "alice", "--for", "renderer checks"])
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(calls, [])
+        self.assertTrue(output.startswith("natedev is held for renderer checks."), output)
+        holder = build_hold.read_holder(self.scratch / "holders" / "alice")
+        self.assertEqual((holder.name, holder.purpose), ("alice", "renderer checks"))
+        (self.scratch / "release" / "current").unlink()
+        status, _, errors, calls = self.run_with_mac_stand_in(["release", "--holder", "alice"])
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(calls, [])
+        self.assertFalse((self.scratch / "holders" / "alice").exists())
+        rows = recorded_hold_events(self.scratch / "buildlog", 2)
+        self.assertEqual([(row["target"], row["event"], row["holder"]) for row in rows],
+                         [("natedev", "began", "alice"), ("natedev", "ended", "alice")])
+
+    def test_unknown_hold_and_release_targets_list_the_configured_names(self) -> None:
+        for arguments in (["hold", "--for", "renderer checks"], ["release"]):
+            with self.subTest(action=arguments[0]):
+                status, output, errors, calls = self.run_with_mac_stand_in(
+                    [*arguments, "--target", "missing", "--holder", "alice"])
+                self.assertEqual(status, 2)
+                self.assertEqual((output + errors).splitlines(),
+                                 ["unknown target missing; configured targets: mac, natedev"])
+                self.assertEqual(calls, [])
+                self.assert_no_natedev_record()
+
+    def test_unknown_target_with_an_unreadable_config_names_the_reason(self) -> None:
+        missing = self.scratch / "missing-targets.conf"
+        incomplete = self.scratch / "incomplete-targets.conf"
+        _ = incomplete.write_text("targets=mac\n", encoding="utf-8")
+        invalid_utf8 = self.scratch / "invalid-utf8-targets.conf"
+        _ = invalid_utf8.write_bytes(b"\xff")
+        for config, reason in (
+            (missing, f"targets: expected distinct target names in {missing}"),
+            (incomplete, "kind.mac: expected local or ssh, got ''"),
+            (invalid_utf8, "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"),
+        ):
+            for arguments in (["hold", "--for", "renderer checks"], ["release"]):
+                with self.subTest(config=config.name, action=arguments[0]), mock.patch.dict(
+                    os.environ, {"BUILD_TARGETS_CONFIG": str(config)},
+                ), mock.patch.object(build_hold, "holder_of") as holder_lookup:
+                    status, output, errors, calls = self.run_with_mac_stand_in(
+                        [*arguments, "--target", "missing", "--holder", "alice"])
+                    self.assertEqual(status, 2)
+                    self.assertEqual(output, f"unknown target missing; the target config cannot be read: {reason}\n")
+                    self.assertEqual(errors, "")
+                    holder_lookup.assert_not_called()
+                    self.assertEqual(calls, [])
+                    self.assert_no_natedev_record()
+
+    def test_mac_hold_refuses_release_eta_and_zone_before_calling_block(self) -> None:
+        for option, value in (("--release-eta", "23:59"), ("--zone", "UTC")):
+            with self.subTest(option=option):
+                status, output, errors, calls = self.run_with_mac_stand_in(
+                    ["hold", "--target", "mac", "--holder", "alice", "--for", "renderer checks", option, value])
+                self.assertEqual(status, 2)
+                self.assertEqual((output + errors).splitlines(), [f"{option} is not supported with --target mac"])
+                self.assertEqual(calls, [])
+                self.assert_no_natedev_record()
+
+    def test_mac_release_refuses_resume_before_calling_unblock(self) -> None:
+        status, output, errors, calls = self.run_with_mac_stand_in(
+            ["release", "--target", "mac", "--holder", "alice", "--resume"])
+        self.assertEqual(status, 2)
+        self.assertEqual((output + errors).splitlines(), ["--resume is not supported with --target mac"])
+        self.assertEqual(calls, [])
+        self.assert_no_natedev_record()
+
+
 class CommandTests(IsolatedBuildHoldTest):
     def run_cli(self, folder: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -587,7 +781,7 @@ class CommandTests(IsolatedBuildHoldTest):
         folder = self.scratch / "holders"
         self.session("id-1", "old-name")
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
-            self.assertIn("/build_hold from old-name:", self.hold(folder, None))
+            self.assertIn("natedev is held for one test.", self.hold(folder, None))
         self.assertEqual([path.name for path in folder.iterdir()], ["id-1"])
         self.session("id-1", "new-name", "old-name")
         holders = build_hold.read_holders(folder)
@@ -669,7 +863,7 @@ class CommandTests(IsolatedBuildHoldTest):
                 self.assertEqual(status.returncode, 0, status.stderr)
                 self.assertIn("release record could not be read:", status.stdout)
                 self.assertIn(error_field, status.stdout)
-                self.assertIn("/build_hold release sets it aside and ends the hold", status.stdout)
+                self.assertIn("/build:hold release sets it aside and ends the hold", status.stdout)
                 self.assertEqual(path.read_bytes(), content)
                 result = self.run_cli(scratch / "holders", "release", "--holder", "first")
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -800,7 +994,7 @@ class CommandTests(IsolatedBuildHoldTest):
                 result = self.run_cli(scratch / "holders", "status")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("release record could not be read:", result.stdout)
-                self.assertIn("/build_hold release sets it aside and ends the hold", result.stdout)
+                self.assertIn("/build:hold release sets it aside and ends the hold", result.stdout)
                 self.assertEqual(path.read_bytes(), content)
                 self.assertTrue((scratch / "release" / "current").exists())
                 self.assertEqual(list(path.parent.glob(path.name + ".damaged-*")), [])
@@ -852,11 +1046,14 @@ class CommandTests(IsolatedBuildHoldTest):
             self.assertIn("the focused test", status.stdout)
             self.assertIn("unknown", status.stdout)
 
-    def test_hold_message_tells_recipient_to_register_at_once(self) -> None:
+    def test_hold_message_tells_recipient_verify_waits_without_registering(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             result = self.run_cli(Path(scratch), "hold", "--holder", "slot", "--for", "the focused test")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("build_hold.py wait", result.stdout)
+            self.assertIn("verify.sh waits by itself", result.stdout)
+            self.assertNotIn("build_hold.py wait", result.stdout)
+            self.assertEqual(len(result.stdout.splitlines()), 1)
+            self.assertEqual(len(recorded_hold_events(self.scratch / "buildlog", 1)), 1)
 
     def test_recipient_wait_command_registers_its_session_id(self) -> None:
         folder = self.scratch / "holders"
@@ -1270,7 +1467,7 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         self.assertEqual(errors.getvalue(), "")
         self.assertIn("holder since", output.getvalue())
         self.assertIn("release record could not be read: invalid released_at for first", output.getvalue())
-        self.assertIn("/build_hold release sets it aside and ends the hold", output.getvalue())
+        self.assertIn("/build:hold release sets it aside and ends the hold", output.getvalue())
         self.assertEqual(path.read_bytes(), before)
 
     def test_new_hold_replaces_damaged_cycle_when_no_holder_remains(self) -> None:
@@ -1284,7 +1481,7 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         (self.scratch / "holders" / "holder").unlink()
         notice = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("new-holder", "new-holder"), "new test",
                                        build_hold.NoReleaseEta(), datetime.now().astimezone())
-        self.assertIn("new-holder", notice)
+        self.assertTrue(notice.startswith("natedev is held for new test."), notice)
         current = build_hold.read_cycle()
         assert current is not None
         self.assertNotEqual(current["id"], old_id)
@@ -1302,7 +1499,7 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         with redirect_stdout(output):
             notice = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("new-holder", "new-holder"), "new test",
                                            build_hold.NoReleaseEta(), datetime.now().astimezone())
-        self.assertIn("new-holder", notice)
+        self.assertTrue(notice.startswith("natedev is held for new test."), notice)
         self.assertIn("this hold now releases every session at once", output.getvalue() + notice)
         self.assertIsNone(build_hold.read_cycle())
         self.assertTrue((self.scratch / "holders" / "holder").exists())
@@ -1448,7 +1645,9 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         self.assertIn("--to", calls[1])
         self.assertEqual(calls[1][calls[1].index("--to") + 1], "uds:/tmp/registered.sock")
         self.assertNotIn("shared name", calls[1])
-        self.assertIn("build_hold.py nothing-to-build", calls[1][calls[1].index("--text") + 1])
+        notice = calls[1][calls[1].index("--text") + 1]
+        self.assertTrue(notice.startswith("/build:hold: your hold has been released."), notice)
+        self.assertIn("build_hold.py nothing-to-build", notice)
 
     def test_send_exit_codes_have_named_delivery_results(self) -> None:
         entry = build_hold.new_entry("session-a", "shared name")
@@ -3615,9 +3814,9 @@ class CallAdmissionTests(IsolatedBuildHoldTest):
         self.assertIsInstance(build_hold.read_admission("owner", "started"), build_hold.AdmittedTurn)
         self.assertIsInstance(build_hold.read_admission("owner", "pending"), build_hold.AwaitingTurn)
 
-    def test_hold_notice_preserves_the_existing_session_instructions(self) -> None:
+    def test_hold_notice_says_verify_waits_and_launch_retries_without_appending_wait(self) -> None:
         notice = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second", "second"), "another test", build_hold.NoReleaseEta(), self.now)
-        self.assertEqual(notice, "/build_hold from second: stop any cargo or verify.sh you are running and start none until I release. No release after 2 h: ask me. For: another test Run python3 ~/.claude/scripts/build_hold/build_hold.py wait now in this session.")
+        self.assertEqual(notice, "natedev is held for another test. verify.sh waits by itself; an app launch is refused until the release, so launch again after it. Tests that can run on the Mac keep running there. Stop only cargo you started outside verify.sh. No release after 2 h: ask me.")
 
 
     def test_queued_notification_authorizes_the_active_call(self) -> None:
@@ -3676,7 +3875,7 @@ class HoldRecordingTests(IsolatedBuildHoldTest):
                     ["python3", str(SCRIPT), "hold", "--holder", "alice", "--for", "render checks"],
                     env=dict(os.environ), capture_output=True, text=True, timeout=1.5, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("/build_hold from alice:", result.stdout)
+                self.assertIn("natedev is held for render checks.", result.stdout)
                 self.assertTrue((self.scratch / "holders" / "alice").is_file())
                 with (self.scratch / "release" / "release.lock").open("a+") as coordination:
                     fcntl.flock(coordination, fcntl.LOCK_EX | fcntl.LOCK_NB)

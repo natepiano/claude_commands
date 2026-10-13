@@ -11,7 +11,7 @@ Two additions to the build log. The first is a "Tests per edit" section in the d
 - `scripts/buildlog/report.py`: `tests_per_edit_section()`, its data pass `tests_per_edit_data()`, `call_trees()`, `failure_bin()`, `target_status()`, `TESTS_PER_EDIT_TARGET`, `EDIT_BINS`; `report()` adds the section and `rust_release.report_line()`.
 - `scripts/buildlog/rust_release.py`: the whole release check: `check_release()`, `trial_release()`, the state types and file, the text, `report_line()`.
 - `scripts/buildlog/cli.py`: `hourly()` runs the check after sync and CI.
-- `commands/build_hold.md`: `/build_hold` writes one holder file per holder under `~/.local/state/build-hold/`; the check counts any regular file there as a hold. Hold and release are described in `docs/as-built/build-memory-admission.md`.
+- `commands/build/hold.md`: `/build:hold` writes one holder file per holder under `~/.local/state/build-hold/`; the check counts any regular file there as a hold. Hold and release are described in `docs/as-built/build-memory-admission.md`.
 - `scripts/buildlog/test_report.py`, `scripts/buildlog/test_rust_release.py`: behavior tests on a temporary log, with fakes for every outside effect.
 - `/etc/nixos` `modules/linux/buildlog.nix`, `nate.jobs.buildlog`: the hourly timer (3600 s, natedev only, the user's `PATH`) that runs `~/.claude/scripts/buildlog/buildlog hourly`. Not in this repo.
 
@@ -129,7 +129,7 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 - hana had no `rust-toolchain.toml` on `origin/init/catalyst` on 2026-10-04, so the check stays silent until one lands.
 - The pin is whatever `origin/init/catalyst` was at hana's last fetch. The check never fetches hana.
 - The trial runs inside the hourly job, so sync, CI polling and the index update wait while it runs, at night only.
-- The hold is checked between steps, not during one. A hold that arrives during clippy waits for clippy to end, up to 2 h. `/build_hold` already waits for `pgrep` to print nothing before its test starts.
+- The hold is checked between steps, not during one. A hold that arrives during clippy waits for clippy to end, up to 2 h. `/build:hold` already waits for `pgrep` to print nothing before its test starts.
 - hana's `.#ci` shell carries no Rust toolchain. The job `PATH`'s `cargo` is the rustup proxy, which is why `cargo +<ver>` selects the trial toolchain inside `nix develop`.
 - The clone has no `origin/init/catalyst` ref. The sha is resolved in hana and checked out by sha in the clone; that works because `--local` hard-links hana's whole object store.
 - The trial toolchain stays installed for the bump. Nothing removes old trial toolchains.
