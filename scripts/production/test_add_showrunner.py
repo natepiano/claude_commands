@@ -92,9 +92,17 @@ class AddShowrunnerTests(unittest.TestCase):
                     "SHOWRUNNERS_SEND": str(self.root / "send.py"), "TEST_SENT": str(self.root / "sent.jsonl"),
                     # The parent runs the command, so its own session and account are in the caller's environment.
                     "CLAUDE_CODE_SESSION_ID": PARENT_SESSION, "CLAUDE_CONFIG_DIR": str(self.root / "unit-account"),
-                    "ADD_SHOWRUNNER_WAIT_S": "0"}
+                    "ADD_SHOWRUNNER_WAIT_S": "0", "ADD_SHOWRUNNER_CLAUDE_JSON": str(self.root / "claude.json")}
+        # The folders these tests start sessions in are trusted; the trust tests change that.
+        self.trust(self.root, self.root / "kid-checkout", self.root / "elsewhere")
         self.timer("top", PARENT_SESSION)
         self.live(PARENT_SESSION)
+
+    def trust(self, *folders: Path, extra: dict[str, object] | None = None) -> None:
+        """The showrunner account's config, trusting exactly `folders`, with `extra` fields beside them."""
+        projects = {str(folder.resolve()): {"hasTrustDialogAccepted": True, "allowedTools": ["SECRET-TOOL"]}
+                    for folder in folders}
+        _ = (self.root / "claude.json").write_text(json.dumps({**(extra or {}), "projects": projects}), encoding="utf-8")
 
     def doc(self, slug: str) -> Path:
         path = self.root / f"{slug}-production.md"
@@ -246,6 +254,37 @@ class AddShowrunnerTests(unittest.TestCase):
         self.timer("kid", "some-session")
         self.refused(self.run_command("kid"), "cannot tell whether session:some-session is running: registry gone")
 
+    def flaky_registry(self, failures: int) -> None:
+        """Once the started session registers its timer, the registry cannot be read for `failures` looks."""
+        count = self.root / "registry-failures"
+        _ = (self.root / "flaky_sessions.py").write_text(
+            "import os, pathlib, runpy, sys\n"
+            + f"count, conf = pathlib.Path({str(count)!r}), pathlib.Path({str(self.timer_conf('kid'))!r})\n"
+            + "seen = int(count.read_text()) if count.exists() else 0\n"
+            + f"if conf.exists() and seen < {failures}:\n"
+            + "    count.write_text(str(seen + 1))\n"
+            + "    print('one or more registry files could not be read', file=sys.stderr)\n"
+            + "    raise SystemExit(3)\n"
+            + f"runpy.run_path({str(self.root / 'sessions.py')!r}, run_name='__main__')\n", encoding="utf-8")
+        self.env["SHOWRUNNERS_SESSIONS"] = str(self.root / "flaky_sessions.py")
+
+    def test_a_registry_unreadable_for_a_moment_during_the_wait_is_tried_again(self) -> None:
+        self.flaky_registry(1)
+        self.env["ADD_SHOWRUNNER_WAIT_S"] = "30"
+        self.starts("kid-session", registers="kid")
+        result = self.run_command("kid")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.parent_of("kid"), "top")
+
+    def test_a_registry_still_unreadable_at_the_deadline_leaves_the_child_unattached(self) -> None:
+        self.flaky_registry(1000)
+        self.starts("kid-session", registers="kid")
+        result = self.run_command("kid")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("kid is not attached: cannot tell whether session:kid-session is running: "
+                      + "one or more registry files could not be read", result.stdout)
+        self.assertEqual(self.parent_of("kid"), "")
+
     def test_check_runs_the_refusals_and_starts_nothing(self) -> None:
         result = self.run_command("kid", "--check")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -277,6 +316,41 @@ class AddShowrunnerTests(unittest.TestCase):
             edge.parent.mkdir(parents=True)
             _ = edge.write_text(parent + "\n", encoding="utf-8")
         self.refused(self.run_command("grand"), "top already reports to grand, directly or through others")
+
+    def test_an_untrusted_start_folder_is_refused_naming_it_and_nothing_from_the_config(self) -> None:
+        checkout = self.root / "kid-checkout"
+        _ = self.doc("kid")
+        self.trust(self.root, extra={"oauthAccount": {"emailAddress": "SECRET-EMAIL"}, "userID": "SECRET-ID"})
+        result = self.run_command("kid", "--check")
+        self.refused(result, f"Claude is not trusted in {checkout.resolve()} on the showrunner account. The user "
+                     + "trusts it first, by running `claude` there once and accepting")
+        self.assertNotIn("SECRET", result.stdout + result.stderr)
+
+    def test_trust_comes_from_the_repository_root_or_a_worktrees_main_checkout(self) -> None:
+        main = self.root / "main"
+        main.mkdir()
+        for command in (["init", "-q", "-b", "main"], ["-c", "user.name=t", "-c", "user.email=t@x.invalid",
+                                                       "commit", "-q", "--allow-empty", "-m", "seed"],
+                        ["worktree", "add", "-q", "-b", "side", str(self.root / "side")]):
+            _ = subprocess.run(["git", "-C", str(main), *command], check=True, capture_output=True)
+        (main / "sub").mkdir()
+        self.trust(main)
+        for folder in (main / "sub", self.root / "side"):
+            with self.subTest(folder=folder.name):
+                result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(folder), "--check")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_a_trusted_parent_folder_does_not_cover_a_repository_below_it(self) -> None:
+        _ = self.doc("kid")
+        _ = subprocess.run(["git", "init", "-q", str(self.root / "kid-checkout")], check=True, capture_output=True)
+        self.trust(self.root)
+        self.refused(self.run_command("kid", "--check"), "Claude is not trusted in")
+
+    def test_an_unreadable_config_refuses_without_its_contents(self) -> None:
+        _ = (self.root / "claude.json").write_text('{"oauthAccount": "SECRET-EMAIL", ', encoding="utf-8")
+        result = self.run_command("kid", "--check")
+        self.refused(result, f"cannot read {self.root / 'claude.json'} to see whether")
+        self.assertNotIn("SECRET", result.stderr)
 
     def test_a_session_that_runs_no_production_is_refused(self) -> None:
         self.env["CLAUDE_CODE_SESSION_ID"] = "no-such-session"

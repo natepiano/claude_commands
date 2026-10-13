@@ -86,6 +86,7 @@ class CargoPackageMetadata(TypedDict):
 
 
 class CargoMetadata(TypedDict):
+    workspace_root: str
     workspace_members: list[str]
     packages: list[CargoPackageMetadata]
 
@@ -349,6 +350,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.write_executable(self.bin_directory / "cargo", CARGO_STUB)
         self.write_executable(self.bin_directory / "git", GIT_STUB)
         self.write_executable(self.bin_directory / "rustc", RUSTC_STUB)
+        self.write_executable(self.bin_directory / "taplo", "raise SystemExit(0)\n")
         self.write_executable(self.runner, RUNNER_STUB)
         blocker = "#!/bin/sh\nexit 99\n"
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
@@ -385,6 +387,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         _ = config.write_text("targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\n"
                               + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
         metadata: CargoMetadata = {
+            "workspace_root": str(self.root),
             "workspace_members": ["sample-id"],
             "packages": [
                 {

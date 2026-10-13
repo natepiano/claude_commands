@@ -112,6 +112,7 @@ buildlog_step_compiles() {
     for arg in "$@"; do
         [[ "$arg" == */sweep.py ]] && return 1
     done
+    [[ "${1:-}" == taplo ]] && return 1
     [[ "${1:-}" == cargo ]] || return 0
     shift
     if [[ "${1:-}" == +* ]]; then
@@ -323,9 +324,10 @@ require_nextest() {
     fi
 }
 
-# Phase 3 changes this line to the trial verdict. The trial block length must
-# stay in sync with BLOCK_S in scripts/buildlog/width_trial.py.
-LINT_TEST_WIDTH=trial
+# The nextest width mode: trial alternates physical and logical by block, and
+# physical or logical fixes the width. The trial block length must stay in sync
+# with BLOCK_S in scripts/buildlog/width_trial.py.
+LINT_TEST_WIDTH=logical
 
 nextest_physical_cores() {
     [[ "${LINT_PHYSICAL_CORES+x}" == x ]] && return 0

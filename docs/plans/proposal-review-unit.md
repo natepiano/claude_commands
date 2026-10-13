@@ -1,6 +1,20 @@
 # Proposal: a review unit with long-lived reviewer pools
 
-> **Status: PROPOSAL — for the user's decision.** A production starts one review
+> **Status: BUILT.** The user approved a trial on 2026-10-12 and it shipped;
+> `docs/as-built/review-pool.md` is the current design and wins wherever this
+> proposal differs. Known differences: the production doc line is
+> `**Review pool:**`; a lease ends with the mesh verb `reset`; `follow` takes
+> `--read-only`, with no `--sandbox` or `--output-schema` and no JSON findings;
+> `allocate` takes `--pass` and `--lens`, not `--kind`; the slot is
+> `pool_<reviewer>`; turn records live under the history root's
+> `review_turns/`; the report is `review_pool_report.py`, not
+> `seat_usage.py --reviews`; the review unit has a worktree; `agent_exec.sh`
+> and `sweep` did not change; the UI reviewer's standing prompt holds its
+> whole judging procedure, every rule's full text and the production
+> repository's design decisions, so a pooled design check reads no rule or
+> command file; merge holds count as escapes by unit, phase and plan. Sections 6 to 8 (risks, the trial verdict rule
+> and the directors' input) are stated nowhere else. The proposal as written:
+> A production starts one review
 > unit. Its reviewers are long-lived Codex threads in two pools, code and UI.
 > Unit directors send every review to it through one script call. That call gives
 > the review to an idle reviewer of the right type, or creates a new reviewer at
@@ -99,9 +113,9 @@ Build it, in four phases, behind a measured trial. The key calls, all mine:
   rollouts). One complete review rollout (2026-10-07) made 15 requests:
   - 48k uncached input, 686k cached input and 8k output;
   - 180k weighted in total.
-- **Long-lived seats** (`build-followups-long-lived-seats.md`): Phase 1 keeps
+- **Long-lived seats** (`docs/as-built/long-lived-seats.md`): Phase 1 keeps
   `impl` and `test` open across phases and compacts them above
-  `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (100000). Phase 3 (in progress) adds
+  `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (100000). Phase 3 (since shipped) adds
   `review.sh --to <seat>`, so a unit's own seats take its reviews. A writer then
   reviews its own code as an adversary.
 - **The app-server already supports what the pool needs** (codex 0.162 schema,
@@ -112,7 +126,7 @@ Build it, in four phases, behind a measured trial. The key calls, all mine:
   - `thread/fork` takes `lastTurnId`;
   - `thread/revert` takes `beforeTurnId`.
 
-  No script calls any of these yet.
+  On 2026-10-10 no script called any of these; `codex_mesh.py` now does.
 - **Guide sizes:**
 
   | Text | Size |

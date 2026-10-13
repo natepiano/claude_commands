@@ -530,7 +530,7 @@ def _stop_owner(
 
     current = match["session"]
     if not force_now and (
-        prior["kind"] not in {"ready", "stopping", "stop failed"}
+        prior["kind"] not in {"ready", "held by usage limit", "stopping", "stop failed"}
         or current["status"] != "idle"
         or any(seat["status"] != "idle" for seat in match["seats"])
         or settle.blocker(current)["kind"] != "clear"
@@ -538,7 +538,8 @@ def _stop_owner(
         issue = NotReadyToStop(
             kind="not ready to stop", at=_timestamp(clock),
             status=current["status"],
-            progress="ready" if prior["kind"] == "ready" else "waiting",
+            progress=("held by usage limit" if prior["kind"] == "held by usage limit"
+                      else "ready" if prior["kind"] == "ready" else "waiting"),
         )
         _ = _set_stop_outcome(
             claim, "stop failed", clock, [issue],
@@ -699,7 +700,7 @@ def stop_session(
             if age < CLAIM_STALE_SECONDS:
                 return
         elif progress["kind"] not in {
-            "waiting", "ready", "stop failed", "stopped", "already gone", "process identity lost", "restart failed",
+            "waiting", "ready", "held by usage limit", "stop failed", "stopped", "already gone", "process identity lost", "restart failed",
         }:
             return
         prior = copy.deepcopy(progress)

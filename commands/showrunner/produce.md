@@ -21,8 +21,10 @@ Read `~/.claude/docs/production_format.md` first. It defines:
 
 State:
 
-- `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG`, `ZONE`, `UNITS` — from the production
-  doc.
+- `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG`, `UNITS` — from the production doc.
+- `ZONE` — the user's zone setting, which
+  `python3 ~/.claude/scripts/lib/user_zone.py` prints. It is one setting for
+  every production; a doc's own **User zone** line is not read.
 - `CHECKOUT` — this session's checkout, which must be on `MERGE_BRANCH`.
 - `SCRATCH` — this session's scratchpad directory.
 - `DAILIES_STATE_DIR` — `<SCRATCH>/dailies_input_state`, the dailies builder's
@@ -126,6 +128,19 @@ State:
     the root is not running, keep it there and say so at your next footer.
   - **A question between productions** (a Mac window, the order of two
     promotions) goes to your parent, not to the root.
+  - **Who decides a shared resource:**
+    - a contested Mac window or build hold: the lowest showrunner whose
+      subtree holds every production that wants it. Two of your own units
+      are yours to settle; your unit and a sibling production's go to your
+      parent;
+    - the order of promotions to a shared destination: the parent of the
+      productions promoting;
+    - disk room and quota: the root, always.
+  - **Your wrap holds while a lower showrunner still runs** and reports to
+    you: its showrunner wraps first, or you detach it
+    (`showrunners.py detach <child>`). Once it runs, wrap removes your link
+    to your parent and every link to you, and tells your parent and each
+    production below you, which is a root from then on.
   - **As a root or a parent**, show the user each item a child sends in the
     child's words, and relay the answer back to that child.
   - **As a root**, never copy a lower showrunner's item into your own
@@ -144,6 +159,11 @@ State:
     many open questions it holds. Gather nothing for it. `/showrunner:dailies
     expand <child|all>` adds its own rows. A row that reads `no report yet`
     fills in at that showrunner's next dailies.
+  - **Turn a unit into a lower showrunner only with
+    `/showrunner:promote_showrunner <unit> <production doc>`**, once the unit
+    has committed the new production's doc. The unit keeps its conversation,
+    restarts on the showrunner account and reports to you, and its Units row
+    retires.
   - **Start a lower showrunner only with `/showrunner:add_showrunner
     <production doc>`**, never in your own pane and never as a unit. It gets
     its own tmux session on the showrunner account and is attached to you
@@ -587,12 +607,10 @@ message.
    When the production doc has a **Review pool** line, send `review-unit`
    one line per merged code checkpoint:
    `review merge: unit <unit>; phase <phase>; session dir <path>; design check: <verdict>`.
-   Find the unit's newest run in the local history root (`PLAN_DELEGATE_HISTORY_DIR`
-   or `~/.local/state/plan-delegate`), else the Mac's over ssh at
-   `collect.MAC_HOST` from `scripts/usage/collect.py`: read `runs/<run id>.jsonl`
-   whose `run_started` event's `working_dir` matches the unit's Worktree cell,
-   choose the greatest `run_started_at`, and use `<run id>` as the session
-   dir's name in the merge line. Take the verdict from step 3;
+   Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/unit_run.py
+   --production PRODUCTION_DOC <unit>`: its first field is the session
+   directory's name for the merge line; on exit 1, send the merge line with
+   `session dir unavailable` and tell `review-unit` why. Take the verdict from step 3;
    use `not applicable` when nothing users see changed. Append the same line
    to `LOG`. A shrink sends no memory line.
 </MergeCheckpoint>
@@ -1086,8 +1104,10 @@ that condition.
    --production PRODUCTION_DOC --ci-green <sha> --smoke-passed <sha>
    --close-out-done "<item>"` (repeat the last flag for every item), or pass
    `--no-ci` when CI does not apply. The command holds on an unfinished close-out item,
-   a dirty worktree, or an unmerged branch. It promotes main, retires the unit
-   worktrees and branches, removes the update instance, archives the production's
+   a dirty worktree, an unmerged branch, or a lower showrunner that still runs
+   and reports to this one (**Nested showrunners** above). It promotes main, retires the unit
+   worktrees and branches, removes the update instance, removes the
+   production's links in the showrunner tree, archives the production's
    phase notes in the vault, wraps and pushes the doc, and prints the final report.
    Leave tmux sessions for the user to close.
 </Wrap>

@@ -262,6 +262,8 @@ mkdir -p "${CODEBASE}/.claude/bevy_migration"
 ~/.claude/scripts/bevy_migration_plan/bevy_migration_dependency_check.py --bevy-version "${VERSION}" --codebase "${CODEBASE}" --output "/tmp/bevy_migration_deps_$(basename ${CODEBASE}).md"
 ```
 
+**Run it in the background and wait for it to finish.** The script sends crates.io at most one request a second, one for each direct dependency, then up to 21 more for each one that depends on Bevy. A workspace with 45 dependencies to look up took a little over two minutes.
+
 **The script will:**
 - Run `cargo tree` to discover direct Bevy-dependent crates, including crates that depend only on Bevy's own crates, such as `bevy_app` or `bevy_ecs`
 - Query crates.io for each dependency to find compatible versions

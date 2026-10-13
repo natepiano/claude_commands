@@ -12,6 +12,8 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request
 
+import crates_io_pacer
+
 Fetch = Callable[[str], bytes]
 LookupResult = TypeVar("LookupResult")
 
@@ -96,6 +98,8 @@ def http_fetch(url: str) -> bytes:
     host = urlsplit(url).hostname or url
     try:
         request = Request(url, headers={"User-Agent": "bevy-upgrade (natepiano)"})
+        if host == "crates.io":
+            crates_io_pacer.CRATES_IO_PACER.wait()
         with cast(HTTPResponse, urllib.request.urlopen(request, timeout=30)) as response:
             return response.read()
     except HTTPError as error:

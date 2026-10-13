@@ -1,6 +1,6 @@
 # Nested showrunners: a showrunner runs other showrunners, to any depth
 
-> **Status: IMPLEMENTATION PLAN — Phase 1 (the tree) is built, its live attach of tool-based-ui under build-followups waiting on the showrunner's go; Phases 2–6 are todo.**
+> **Status: IMPLEMENTATION PLAN — all six phases are built; the live checks of launch, promote, wrap and restart are the showrunner's, run together after Phase 6 merges.**
 
 > **As-built disposition: amend** — `docs/as-built/showrunner-automation.md`
 
@@ -223,7 +223,7 @@ Built as specified; the code-level account is `docs/as-built/showrunner-automati
 
 **Gotchas:** the tmux session's name is the production's slug, so a unit whose session has that same name blocks the start (`a tmux session named <slug> is already live`). The launcher needs the parent's own `CLAUDE_CODE_SESSION_ID` to know which production it runs: run from a plain shell it refuses with "this session runs no production".
 
-### Phase 5 — Promote a unit to a showrunner  · status: todo · live check gated by G2
+### Phase 5 — Promote a unit to a showrunner  · status: done · live check is the showrunner's under G2, on a unit whose run is done
 
 #### Work Order
 
@@ -246,7 +246,7 @@ Built as specified; the code-level account is `docs/as-built/showrunner-automati
 
 **Acceptance gate:** the gate. Tests cover each refusal, the stop before the restart, both account cases, the retired row and the failed restart. Live under G2: the unit the showrunner picks is promoted; it answers a question about its earlier conversation; `tree` shows it under build-followups; its old Units row reads retired; the parent's units table no longer lists it.
 
-### Phase 6 — Wrap, arbitration, restart, and the as-built  · status: todo
+### Phase 6 — Wrap, arbitration, restart, and the as-built  · status: done · restart needed no change; the live check is the showrunner's with G1 and G2
 
 #### Work Order
 

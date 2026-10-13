@@ -1587,10 +1587,18 @@ class AddUnitTests(ShutdownTestCase):
 
     def test_refuses_missing_production_field(self) -> None:
         original = self.doc.read_text()
-        _ = self.doc.write_text(original.replace("- **User zone:** America/Los_Angeles — reports use PDT\n", ""))
+        _ = self.doc.write_text(original.replace("- **Log:** `docs/plans/build-followups-log.md` — git-excluded\n", ""))
         result = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertNotIn("| alpha-unit |", self.doc.read_text())
+
+    def test_a_doc_without_a_user_zone_line_still_adds_a_unit(self) -> None:
+        # The zone is the user's setting; a production doc no longer has to name one.
+        original = self.doc.read_text()
+        _ = self.doc.write_text(original.replace("- **User zone:** America/Los_Angeles — reports use PDT\n", ""))
+        result = self.cli("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertIn("| alpha-unit |", self.doc.read_text())
 
     def test_refuses_checkout_off_merge_branch(self) -> None:
         _ = self.git("checkout", "-b", "wrong-branch")

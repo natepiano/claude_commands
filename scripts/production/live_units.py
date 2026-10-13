@@ -28,14 +28,35 @@ def production_units(doc: Path) -> list[LiveUnit]:
 
     Raises OSError when the doc cannot be read or tmux cannot say which sessions exist.
     """
+    slug, units = _listed(doc)
+    return _joined(slug, units, unit_lookup.every_marked_unit())
+
+
+def units_in(doc: Path, every: unit_lookup.MarkedProductions) -> list[LiveUnit]:
+    """The doc's units, as `production_units` finds them, from one read of every production's marks.
+
+    Raises OSError when the doc cannot be read or its production's marks are at fault.
+    """
+    slug, units = _listed(doc)
+    return _joined(slug, units, every)
+
+
+def _listed(doc: Path) -> tuple[str, list[str]]:
+    """The doc's production slug and the units its Units table lists and has not retired."""
     slug = showrunners.production_slug(str(doc))
     try:
         rows = live_unit_table(doc.read_text(encoding="utf-8").splitlines(), slug)
     except (UnicodeError, Refusal) as error:
         raise OSError(f"{doc}: {error}") from error
-    marked = unit_lookup.marked_units(slug)
     units = [cell_value(cells.get("Unit", "")) for cells in rows]
-    return [LiveUnit(unit, marked.get(unit)) for unit in units if unit]
+    return slug, [unit for unit in units if unit]
+
+
+def _joined(slug: str, units: list[str], every: unit_lookup.MarkedProductions) -> list[LiveUnit]:
+    if slug in every.faults:
+        raise OSError(every.faults[slug])
+    marked = every.units.get(slug, {})
+    return [LiveUnit(unit, marked.get(unit)) for unit in units]
 
 
 def units_of(runner: showrunners.Showrunner) -> list[LiveUnit]:

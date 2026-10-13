@@ -60,7 +60,7 @@ A scheduled tick's prompt saves `<SCRATCH>/unit_status.txt`, then runs
 Read the current state, not memory, and check what you state the way
 `/showrunner:produce` checks a unit director's claims.
 
-1. **Time.** `TZ=<ZONE> date '+%H:%M %Z'`. `ZONE` only, never UTC (user, 2026-10-02).
+1. **Time.** `TZ="$(python3 ~/.claude/scripts/lib/user_zone.py)" date '+%H:%M %Z'`. `ZONE` only, never UTC (user, 2026-10-02).
 2. **Log.** The latest `### STATE` block in `LOG` and every event after it.
 3. **Each unit.** Use the saved status output for its latest activity. For a
    numbered open plan phase, the input builder takes its start and ETA from

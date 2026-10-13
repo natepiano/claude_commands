@@ -4,7 +4,7 @@
 
 `/showrunner:bevy_upgrade` keeps one record per production of every crate that ties the project to its Bevy version: the project's pin, what crates.io and GitHub offer for the target version, and the user's answer on a git pin, stored in the user's own words. A job in [the notifier](session-notifier.md) runs a check every four hours, which keeps the record current and writes to the showrunner only what changed since the showrunner last saw it. [The dailies builder](showrunner-automation.md) adds one `Bevy upgrade` topic read from the same record, so every statement about the upgrade in a report has one source. The user asked for it so that a report "doesn't have bad information", and so that what is known about each dependency is saved "so we can limit the work we do" (user, 2026-10-12).
 
-The same work made `/bevy_migration_plan`'s dependency check see a crate that depends on Bevy only through Bevy's own sub-crates, such as `bevy_app` or `bevy_ecs`. The watch lives in `scripts/bevy_upgrade/`, behind `commands/showrunner/bevy_upgrade.md`; the dependency check is `scripts/bevy_migration_plan/bevy_migration_dependency_check.py`.
+`/bevy_migration_plan`'s dependency check belongs to the same feature. It lists the direct dependencies of every workspace member, sees a crate that depends on Bevy only through Bevy's own sub-crates, such as `bevy_app` or `bevy_ecs`, and looks each crate up on crates.io once, under its whole version. The watch and the check send crates.io at most one request a second, through one shared pacer. The watch lives in `scripts/bevy_upgrade/`, behind `commands/showrunner/bevy_upgrade.md`; the dependency check is `scripts/bevy_migration_plan/bevy_migration_dependency_check.py`.
 
 ## How it works
 
@@ -15,17 +15,19 @@ The same work made `/bevy_migration_plan`'s dependency check see a crate that de
 | `scripts/bevy_upgrade/pins.py` | Reads `Cargo.lock` and the root `Cargo.toml` of the production checkout: the Bevy versions, Bevy's own crate names and every dependent with its pin. Runs no cargo command. |
 | `scripts/bevy_upgrade/upgrade_record.py` | The record's types, lock, validation, load and save, `start`, the pins merge, answers and notes, `on_target` and `target_fit`. |
 | `scripts/bevy_upgrade/upstream.py` | `Fetch`, the two fetchers, the crates.io and GitHub lookups and the types they return. |
+| `scripts/bevy_upgrade/crates_io_pacer.py` | The one-second interval, `RequestPacer` and the shared `CRATES_IO_PACER`, used by the watch and by the migration plan's dependency check. |
 | `scripts/bevy_upgrade/upgrade_check.py` | `run_check`: one check with its order, skip rule, time budget and per-entry failure rule. |
 | `scripts/bevy_upgrade/upgrade_report.py` | The derived state, the table, the change lines and the `line` sentence. |
 | `scripts/bevy_upgrade/upgrade_schedule.py` | The notifier job, the message to the showrunner and the retire call. |
 | `scripts/bevy_upgrade/bevy_upgrade.py` | The CLI: the verbs, the one lock block and its save, the baseline, job upkeep, closing and exit codes. |
-| `scripts/bevy_upgrade/test_*.py` | One test file per module, and `test_cli.py`, which runs the CLI as a subprocess. |
+| `scripts/bevy_upgrade/test_*.py` | One test file per module, `test_crates_io_pacer.py` among them, and `test_cli.py`, which runs the CLI as a subprocess. |
 | `commands/showrunner/bevy_upgrade.md` | The command: runs the CLI and gives the showrunner its rules. |
 | `scripts/production/dailies_input.py` | `bevy_upgrade_watch` and `bounded_bevy_update`: the `Bevy upgrade` dailies topic. |
 | `commands/showrunner/dailies.md` | Gather item 7 and the meaning of `bevy upgrade: unavailable`. |
 | `scripts/bevy_migration_plan/bevy_migration_dependency_check.py` | The dependency check behind `/bevy_migration_plan`. |
-| `commands/bevy_migration_plan.md` | The two bullets under "The script will" that describe that check. |
-| `pyrightconfig.json` | One `executionEnvironments` entry: root `scripts/bevy_upgrade`, extraPaths `scripts/bevy_upgrade` and `scripts/production`. |
+| `scripts/bevy_migration_plan/test_bevy_migration_dependency_check.py` | That check's tests. |
+| `commands/bevy_migration_plan.md` | The command that runs that check: the time note beside it and the two bullets under "The script will" that describe it. |
+| `pyrightconfig.json` | Two `executionEnvironments` entries: root `scripts/bevy_upgrade` with extraPaths `scripts/bevy_upgrade` and `scripts/production`, and root `scripts/bevy_migration_plan` with extraPaths `scripts/bevy_migration_plan` and `scripts/bevy_upgrade`. Both stand before the closing `{"root": "."}` entry. |
 
 ```text
 bevy_upgrade.py [--production <doc>] [status]
@@ -116,7 +118,7 @@ Announced(state: str, repository: str, items: dict[str, str])
 
 ### Upstream lookups
 
-`upstream.py` holds every request the feature makes. Each lookup takes a `Fetch` as its first argument and raises only `FetchFailure`.
+`upstream.py` holds every request the watch makes. Each lookup takes a `Fetch` as its first argument and raises only `FetchFailure`.
 
 ```python
 Fetch = Callable[[str], bytes]
@@ -143,12 +145,12 @@ port_items(fetch: Fetch, repository: str, target: str, since: str) -> list[Item]
 pull_state(fetch: Fetch, repository: str, number: int) -> tuple[Literal["open", "closed", "merged"], str]
 ```
 
-- **`Fetch`.** GETs one URL and raises only `FetchFailure`, whose text is `<host>: <reason>` (`crates.io: HTTP 503`). `http_fetch` uses urllib with the User-Agent `bevy-upgrade (natepiano)`, a 30 s timeout and no token. It raises `NotFound` for HTTP 404 and turns `HTTPError`, `http.client.HTTPException`, `OSError` and `ValueError` into `FetchFailure`; nothing else leaves it.
-- **Fixtures.** `fixture_fetch` serves each URL from a JSON object of URL to body. A string is served as it is (a manifest), any other value as JSON, and `null` raises `NotFound`. A URL the file lacks raises `FetchFailure("<host>: no fixture")`, and an unreadable file fails every request with `<host>: fixture <path>: <reason>`.
+- **`Fetch`.** GETs one URL and raises only `FetchFailure`, whose text is `<host>: <reason>` (`crates.io: HTTP 503`). `http_fetch` uses urllib with the User-Agent `bevy-upgrade (natepiano)`, a 30 s timeout and no token. It raises `NotFound` for HTTP 404 and turns `HTTPError`, `http.client.HTTPException`, `OSError` and `ValueError` into `FetchFailure`; nothing else leaves it. When the URL's host is `crates.io` it calls `crates_io_pacer.CRATES_IO_PACER.wait()` immediately before `urllib.request.urlopen`; a request to any other host, `api.github.com` and `raw.githubusercontent.com` included, never waits.
+- **Fixtures.** `fixture_fetch` serves each URL from a JSON object of URL to body. A string is served as it is (a manifest), any other value as JSON, and `null` raises `NotFound`. A URL the file lacks raises `FetchFailure("<host>: no fixture")`, and an unreadable file fails every request with `<host>: fixture <path>: <reason>`. It never reaches `http_fetch`, so a run from a fixtures file never waits on the pacer.
 - **Malformed bodies.** A body that is not the expected JSON, or a manifest that is not valid TOML, is a `FetchFailure` (`<host>: invalid response: <reason>`), because `run_check` catches nothing else.
 - **`crate_info`.** Reads `https://crates.io/api/v1/crates/<crate>`. `versions` holds the versions not yanked, in the API's order (newest first). `repository` is `github_repository` of the crate's repository URL.
 - **`github_repository`.** `owner/name` for a github.com URL, with a `.git` suffix and any trailing path removed; `""` for any other URL or none.
-- **`release_requirement`.** Reads `https://crates.io/api/v1/crates/<crate>/<version>/dependencies`. Among the dependencies whose kind is not `dev` it returns the `req` of the one named `bevy`, whether or not `bevy_names` holds it (a lockfile with only Bevy sub-crates has no `bevy` package); else the `req` of the first by sorted name whose `crate_id` is in `bevy_names`; else `""`. A name outside `bevy_names` is never read as Bevy: `bevy_egui` is a third-party crate.
+- **`release_requirement`.** Reads `https://crates.io/api/v1/crates/<crate>/<version>/dependencies`, with the crate and the version each percent-encoded by `quote(…, safe='')`, so a version with build metadata is asked for whole (`1.1.6+spec-1.1.0` as `1.1.6%2Bspec-1.1.0`). Among the dependencies whose kind is not `dev` it returns the `req` of the one named `bevy`, whether or not `bevy_names` holds it (a lockfile with only Bevy sub-crates has no `bevy` package); else the `req` of the first by sorted name whose `crate_id` is in `bevy_names`; else `""`. A name outside `bevy_names` is never read as Bevy: `bevy_egui` is a third-party crate.
 - **`target_release`.** Reads `https://crates.io/api/v1/crates/bevy/versions` and looks at each `num` that starts with `<target>.`. No such version is `unpublished`; only pre-releases is `pre-release`; otherwise `released`, with the highest stable version and the date of its `created_at`. `since` is the earliest `created_at` date among them.
 - **`default_branch` and `branch_head`.** `https://api.github.com/repos/<repository>` and `…/commits/<branch>`; `committed` is the committer date.
 - **`manifest_requirement`.** Reads `https://raw.githubusercontent.com/<repository>/<rev>/Cargo.toml`. It looks at the keys of `[dependencies]` and `[workspace.dependencies]` that are `bevy` or in `bevy_names`. An entry is a version string or a table with `version`, and a `workspace = true` table is resolved through `[workspace.dependencies]`. Of the keys that give a requirement it returns `bevy`'s, else the first by sorted key, else `""`. A root manifest that answers `NotFound` gives `""`.
@@ -156,6 +158,23 @@ pull_state(fetch: Fetch, repository: str, number: int) -> tuple[Literal["open", 
 - **`port_items`.** Reads one page: `https://api.github.com/repos/<repository>/issues?state=all&since=<since>T00:00:00Z&sort=updated&direction=desc&per_page=100`. It keeps the issues and pull requests, open or closed, whose title contains `<target>` as a substring and whose `created_at` date is not before `since`. `updated` is the API's `updated_at`. It returns `head` `""` and never the state `merged`; the check fills both for a pull request.
 - **`pull_state`.** Reads `…/pulls/<number>`: `merged` when the API says so, else the API's state, and the head as `<head.ref> @ <first 7 of head.sha>`.
 - **`NotFound` as an answer.** In three places only: `crate_info` during a check (the entry becomes `unlisted`), a manifest (`""` for the root, a skipped member), and `branch_head` under a stored branch name (the default branch is read again). From any other request, a release's dependencies included, it fails the entry.
+
+### The crates.io pacer
+
+`crates_io_pacer.py` keeps the starts of one process's crates.io requests at least one second apart. The watch and the migration plan's dependency check both import it.
+
+```python
+CRATES_IO_MIN_INTERVAL_SECONDS: float = 1.0
+RequestPacer(min_interval: float, clock: Callable[[], float] = time.monotonic,
+             sleep: Callable[[float], None] = time.sleep)
+RequestPacer.wait() -> None
+CRATES_IO_PACER = RequestPacer(CRATES_IO_MIN_INTERVAL_SECONDS)
+```
+
+- **One home.** The three names are defined in this module only. `upstream.py` and `bevy_migration_dependency_check.py` import the module and define, copy or re-export none of them.
+- **`wait`.** It returns at once on its first call. A later call sleeps for what is left of `min_interval` since the previous request started, and not at all once the interval has passed. After a sleep it reads the clock again and records that reading as the request's start.
+- **Callers.** Three functions reach crates.io, and each calls `crates_io_pacer.CRATES_IO_PACER.wait()` immediately before it opens the request: `http_fetch` in the watch, and `query_crates_io` and `get_bevy_dependency_requirement` in the migration check.
+- **Replaced in one place.** Every caller reads the module attribute at call time, so a test replaces the pacer once, with `mock.patch.object(crates_io_pacer, "CRATES_IO_PACER", …)`, never on `upstream` or on the check.
 
 ### The check
 
@@ -173,7 +192,7 @@ _github_facts(fetch: Fetch, name: str, entry: Entry, record: Record,
 ```
 
 - **Result.** `asked` counts the entries that made at least one request, `failed` those whose lookup failed. `run_check` never raises for a failed lookup or a spent budget, so the caller always saves what the check learned.
-- **Budget.** The run's `now` is `clock()` at its start, and the clock is read before every request. Once 180 s have passed, no further request is made, the entry being read stays exactly as stored (its `error` too) and the run returns. `CheckBudgetSpent` never leaves `run_check`.
+- **Budget.** The run's `now` is `clock()` at its start, and the clock is read before every request. Once 180 s have passed, no further request is made, the entry being read stays exactly as stored (its `error` too) and the run returns. A pacer sleep happens inside the fetch, after the clock is read for it, so the sleep counts against the budget. `CheckBudgetSpent` never leaves `run_check`.
 - **Target first.** While `target_bevy["status"]` is not `released`, `target_release` runs once per check; its result is stored and `target_error` set to `""`. A `FetchFailure` there leaves `target_bevy` as it was and sets `target_error` to the failure's text; the entries still run. Once the status is `released`, the lookup never runs again.
 - **Order.** Entries never read first, then the oldest `crates_io["checked"]` first, then by name, so the next check continues one the budget cut short.
 - **Skip rule.** No request of any kind for an entry that is `done`, is a patched Bevy crate, has a path pin, or already has a `ready` release. Such an entry keeps its stored `crates_io`, `branch` and `items`.
@@ -304,7 +323,7 @@ bounded_bevy_update(text: str) -> str
 
 ### The migration plan's dependency check
 
-`bevy_migration_dependency_check.py` lists and classifies a crate that depends on Bevy only through one of Bevy's own crates, such as `bevy_app` or `bevy_ecs`, as it does one that depends on `bevy`. A crates.io lookup that gets no answer keeps the crate in the report for manual verification.
+`bevy_migration_dependency_check.py` reads the direct dependencies of every workspace member and asks crates.io about each one once, under its whole version, never faster than one request a second. It lists and classifies a crate that depends on Bevy only through one of Bevy's own crates, such as `bevy_app` or `bevy_ecs`, as it does one that depends on `bevy`. A crates.io lookup that gets no answer keeps the crate in the report for manual verification.
 
 ```python
 # every class is a frozen dataclass
@@ -322,6 +341,8 @@ BevyCheckout = BevyCheckoutRead | BevyCheckoutMissing
 
 get_bevy_internal_crates(bevy_version: str) -> BevyCheckout
 bevy_requirement_names(bevy_checkout: BevyCheckout) -> frozenset[str]
+run_cargo_tree(codebase: Path) -> str | None
+query_crates_io(crate_name: str) -> QueryResult | None
 get_bevy_dependency_requirement(crate_name: str, version: str, bevy_names: frozenset[str]) -> RequirementLookup
 get_all_direct_dependencies(codebase: Path, bevy_checkout: BevyCheckout) -> list[tuple[str, str]]
 get_bevy_dependencies(codebase: Path, bevy_checkout: BevyCheckout) -> list[DiscoveredDependency]
@@ -331,12 +352,16 @@ find_bevy_compatible_version(crate_name: str, all_versions: list[str], target_be
 ```
 
 - **Bevy's own crate names.** `get_bevy_internal_crates` runs once, in `main`, and its result is passed down. A read checkout holds the package name of every `Cargo.toml` under `~/rust/bevy-<version>/crates`, plus `bevy` and `bevy_internal`: a requirement may come from any of them, and `get_all_direct_dependencies` leaves them out of its list. A missing checkout allows only `bevy` and leaves nothing out.
-- **Direct dependencies.** `cargo tree --depth=1 --format {p}`, with `--all-features` first and the default features when that fails, minus Bevy's own crates, the workspace's members and a fixed list of utility crates.
+- **Direct dependencies.** `run_cargo_tree` runs `cargo tree --workspace --no-dedupe --depth=1 --format {p}`, first with `--all-features` and then, when that fails, with the default features; both attempts carry `--workspace` and `--no-dedupe`. `--workspace` covers a root manifest that is also a package, which cargo otherwise lists alone. `--no-dedupe` prints every member's dependencies in full: without it cargo prints a package it has already printed as `name vX (*)` with no children, so a member that an earlier member depends on hides its own direct dependencies. `get_all_direct_dependencies` drops Bevy's own crates, the workspace's members and a fixed list of utility crates.
+- **Whole versions, each crate once.** `get_all_direct_dependencies` reads each line with `([a-zA-Z0-9_-]+)\s+v(\d\S*)`. The version is the whole token after `v`, so `1.1.6+spec-1.1.0`, `0.20.0-rc.1` and `0.5.0-dev` are kept whole and a trailing ` (proc-macro)` or path is left out. It collects `(name, version)` pairs in a set and returns them sorted, so a crate that several members list at one version is looked up once.
+- **Lookup address.** `get_bevy_dependency_requirement` reads `https://crates.io/api/v1/crates/<name>/<version>/dependencies` with the version percent-encoded by `parse.quote(version, safe='')`: `1.1.6+spec-1.1.0` is requested as `1.1.6%2Bspec-1.1.0`. The crate name is not encoded. The whole version also reaches `classify_dependency`'s equality comparison and the report row, so a crate already on the compatible version, suffix included, is `OK`.
+- **Pacing.** `query_crates_io` and `get_bevy_dependency_requirement` are the only two functions that reach crates.io, and each waits for the shared pacer immediately before `request.urlopen`. The check defines no pacing name: after its standard-library imports it puts `scripts/bevy_upgrade` first on `sys.path` and imports `crates_io_pacer`.
+- **Request count.** One request for each direct dependency that `get_all_direct_dependencies` returns. Then, for each one that depends on Bevy or whose lookup failed, one for its crates.io entry and up to 20 for its recent releases: the walk stops at the first release that fits, so a blocker spends them all. A run of N requests takes at least N − 1 seconds.
 - **The requirement rule.** Among a release's dependencies whose kind is not `dev`: the `req` of the one named `bevy`, else of the first by sorted name whose `crate_id` is in `bevy_names`. A crates.io request that fails, or answers in another form, is `RequirementLookupFailed`, never `NoBevyDependency`, and `get_bevy_dependencies` leaves a crate out only for `NoBevyDependency`.
 - **Compatible version.** The newest of the 20 most recent versions whose requirement fits the target. `CompatibilityUnknown`, with the first failure's reason, when none fits and at least one lookup failed; else `NoCompatibleVersion`.
 - **Report.** A release that fits decides the classification, `OK` or `UPDATE_REQUIRED`, whatever else failed. `CompatibilityUnknown` gives `CHECK_NEEDED` with `Could not read every release's dependencies from crates.io (<reason>) - manual verification needed`. No fitting release after a failed discovery lookup gives `CHECK_NEEDED` with `Could not read release <version>'s dependencies from crates.io (<reason>) - manual verification needed`. No fitting release for a crate known to depend on Bevy is a `BLOCKER`. A crate whose own crates.io entry cannot be read gives `CHECK_NEEDED` with `Could not query crates.io - manual verification needed`. `CHECK_NEEDED` entries stand under "Verification Needed".
 - **Missing checkout.** `Warning: <path> not found; crates that depend only on a Bevy sub-crate are not detected` is printed once on stderr and stands under the report's title, on an empty report too.
-- **Command file.** The two bullets under "The script will" in `commands/bevy_migration_plan.md` say the check reads direct dependencies, including crates that depend only on Bevy's own crates, and that `CHECK_NEEDED` means compatibility is unclear or crates.io did not answer a lookup.
+- **Command file.** `commands/bevy_migration_plan.md` tells the runner to run the check in the background and wait for it to finish, and gives the reason beside the command: at most one request a second, one for each direct dependency, then up to 21 more for each one that depends on Bevy. Its two bullets under "The script will" say the check reads direct dependencies, including crates that depend only on Bevy's own crates, and that `CHECK_NEEDED` means compatibility is unclear or crates.io did not answer a lookup.
 
 ### Roots and overrides
 
@@ -371,18 +396,24 @@ find_bevy_compatible_version(crate_name: str, all_versions: list[str], target_be
 - The job is created and removed, and the queued message retired, inside the record lock, after the one save.
 - `line` takes no lock, saves nothing, never changes `announced` and sends nothing. A scheduled check prints nothing on stdout and never calls `retire_message`.
 - The dailies builder reads the watch through the command, never from the record file. A failed lookup reads `unavailable`, never `failed`, because `dailies.md` treats a `<step>: failed` line as a failed report. The dailies length limit has one copy, `dailies_render.LENGTHS`.
-- In the migration plan's dependency check, a failed crates.io request is never read as "no Bevy dependency", and the Bevy checkout is read once per run.
+- In the migration plan's dependency check, a failed crates.io request is never read as "no Bevy dependency", and the Bevy checkout is read once per run. A crate is looked up under its whole version, and once however many workspace members list it.
+- Within one process, crates.io requests start at least one second apart: every function that reaches crates.io, in the watch and in the migration check, waits for `crates_io_pacer.CRATES_IO_PACER` immediately before it opens the request. A GitHub request never waits on it.
+- One pacer: `CRATES_IO_MIN_INTERVAL_SECONDS`, `RequestPacer` and `CRATES_IO_PACER` are defined in `crates_io_pacer.py` only, and nothing copies or re-exports them.
+- Tests never wait on the real clock and never run cargo. Every test class that can reach a crates.io request replaces the shared pacer in `setUp` with one on a stand-in clock and a stand-in sleep, and the migration check's `setUp` fails any `subprocess.run` call.
 
 ## Calibration and gotchas
 
-- **Schedule.** The job runs every 240 minutes with a 300 s limit. `CHECK_BUDGET` is 180 s and one request's timeout is 30 s, so a run ends inside the job's limit. The stale limit is eight hours, twice the interval. The scheduled job reads the exit code of `check --scheduled`, and that job is what keeps `Record.checked` inside eight hours.
+- **Schedule.** The job runs every 240 minutes with a 300 s limit. `CHECK_BUDGET` is 180 s. The budget is read before a fetch, and the fetch can then add one pacer sleep of at most 1 s and one request's 30 s timeout: 180 s + 1 s + 30 s, so a run ends inside the job's limit. The stale limit is eight hours, twice the interval. The scheduled job reads the exit code of `check --scheduled`, and that job is what keeps `Record.checked` inside eight hours.
 - **Member search.** An entry whose requirement stays empty is read again on every check: up to seven requests (root, tree, five members).
 - **GitHub's limit.** GitHub allows 60 API requests an hour without a token, and `port_items` reads one page of 100 per check, newest update first. A repository's first read makes 4 requests plus one per pull request. A following check makes 2, plus one for each kept open pull request and for each returned pull request whose `updated` moved, plus the manifest reads when the head moved or the requirement is still empty. One check of hana's ten dependencies makes 16 GitHub requests on a first read and 8 afterwards, counted without a member search or a kept pull request.
-- **crates.io.** There is no pause between crates.io requests; about 40 in a row were all answered.
+- **crates.io.** Requests start at least one second apart, which the pacer module's docstring gives as crates.io's published crawler limit. Measured at 22:01 EDT on 2026-10-12 through the real `http_fetch`: three crates.io lookups in a row answered at 0.22, 1.18 and 2.17 s, and a GitHub lookup after them took 0.27 s with no wait.
+- **The limit is per process.** `CRATES_IO_PACER` is one object in each Python process. A watch check and a migration check running at the same moment each keep to one request a second and are not paced against each other.
+- **A paced check and the record lock.** A check that makes N crates.io requests takes at least N − 1 seconds and holds the record lock that long, about 40 s for hana_catalyst's first read. A verb that takes the lock waits behind it. `line` takes no lock, so the dailies topic never waits.
+- **The pacer's clock reading.** The pacer records the reading taken after its sleep, never the planned wake time. With the planned time, one sleep that runs 0.6 s long gives request starts at 0.0, 1.6 and 2.0 s, a gap of 0.4 s. A stand-in sleep that advances the clock by exactly the amount asked for cannot show this; the regression test's stand-in runs long.
 - **Dailies cut.** 240 characters today. A change that lengthens the `line` sentence shows in the dailies cut at that limit.
 - **Fetcher exceptions.** `http.client.IncompleteRead` and `BadStatusLine` are `http.client.HTTPException`, which is neither `OSError` nor `ValueError`. A fetcher that catches only those two lets a truncated or malformed response escape as a traceback.
 - **`newest`.** It is crates.io's first version not yanked, which is publication order. A yanked version of the target Bevy still reads as `released`.
-- **Spent budget.** Its only outward sign is that `Record.checked` does not advance.
+- **Spent budget.** About 180 crates.io requests is the most one check makes before `CHECK_BUDGET` cuts it short. The next check continues from there, and the only outward sign is that `Record.checked` does not advance.
 - **Title filter.** `<target>` is matched as a substring of the title, so `0.20` matches `v0.20.0` and also any other title that holds those characters. An item created before `since` is dropped, so a port pull request opened before the target's first pre-release is not listed.
 - **Workspace inheritance.** A member entry with `workspace = true` under a root entry that has no version gives an empty requirement.
 - **Member failures.** A member that answers `NotFound` is skipped and counts as one of the five reads. Every other member failure is a `FetchFailure`, so the entry keeps its stored facts; this includes a wrongly typed table in a member that is not the crate's.
@@ -394,14 +425,18 @@ find_bevy_compatible_version(crate_name: str, all_versions: list[str], target_be
 - **`next_check`.** It raises `ValueError` for a `next_due=` line it cannot parse, or for a status answer without one, and nothing catches it.
 - **Lock order.** The notifier takes its own lock only around its state edits and releases it before running a stored command, so a notifier call made under the record lock cannot deadlock with a firing job.
 - **`line` and the job.** `line` calls `ensure_job` outside the lock. A job it re-creates for a watch closed in that instant removes itself at its next run.
-- **Module names.** A module here needs a name no other directory under `scripts/` uses: `record.py` exists in `scripts/shutdown` and `scripts/buildlog`, `report.py` in `scripts/buildlog` and `scripts/model_study`, and `add_unit.py` puts `scripts/shutdown` first on `sys.path`. `bevy_upgrade.py` imports the production helpers first, then its own modules.
-- **basedpyright.** It exits 3 in this repo because `pyrightconfig.json` names a `.venv` no checkout has. Its result is the `0 errors, 0 warnings, 0 notes` line.
+- **Module names.** A module here needs a name no other directory under `scripts/` uses: `record.py` exists in `scripts/shutdown` and `scripts/buildlog`, `report.py` in `scripts/buildlog` and `scripts/model_study`, and `add_unit.py` puts `scripts/shutdown` first on `sys.path`. `bevy_upgrade.py` imports the production helpers first, then its own modules. Importing the migration check puts `scripts/bevy_upgrade` first on `sys.path`, so in that process a module here is found before a same-named module later on the path.
+- **basedpyright.** It prints `venv .venv subdirectory not found` and exits 3 in this repo because `pyrightconfig.json` names a `.venv` no checkout has. Its result is the `0 errors, 0 warnings, 0 notes` line.
+- **Execution environments.** An `executionEnvironments` entry rooted at a script directory makes basedpyright resolve that directory's imports from the directory itself. Under the `scripts/bevy_migration_plan` entry the check's test module imports `bevy_migration_dependency_check` as a sibling; the `scripts.bevy_migration_plan` package path is an unresolved import there.
 - **Module tests.** They use a fetcher over a dict of URL to body that records each URL asked for and raises `FetchFailure` for an unknown one, and `test_upgrade_check.py` uses a clock that advances by a set step on each call. They need no network and, for `run_check`, no file. `test_upgrade_schedule.py` points `BEVY_UPGRADE_NOTIFIER` and `BEVY_UPGRADE_SEND` at stub scripts that record their arguments.
-- **`test_cli.py`.** It runs the CLI as a subprocess with `--production`, `BEVY_UPGRADE_STATE_DIR` and a fixtures file named by `BEVY_UPGRADE_FIXTURES`, and its subprocess rejects real network access with `a test attempted network access`. The notifier and sender stand-ins record every call with its arguments, whether the record lock was held and the saved `announced` and `closed`: `tool_calls(kind)`, `tool_args(kind)` (sends only for `send`), `retire_calls()`, `retire_arguments()`, `clear_calls()`. It counts saves by wrapping the real `save`. `write_fixtures` holds the GitHub answers for `example/adapter`, which a CLI test needs when it runs `check` on an entry with no `ready` release. Every fixture with a read branch needs `repository`, `name`, `rev`, `committed` and `requirement`.
+- **Pacer in the tests.** `UpstreamTests.setUp` installs a pacer on a stand-in clock and sleep, and a `urllib.request.urlopen` stand-in that fails any test reaching the network; an `http_fetch` test replaces `urlopen` for itself. Its four pacing tests cover one wait before a crates.io request, no wait for either GitHub host, one one-second sleep between two crates.io requests, and no pacing through `fixture_fetch`. The five `RequestPacer` tests sit in `test_crates_io_pacer.py` on their own stand-in clock: no sleep on the first call, the remaining 0.75 s after 0.25 s, no sleep after the interval, two one-second sleeps for three calls in a row, and a sleep that runs long. The stand-in clock class has one copy in each of the three test modules that pace, because a test module here imports no other test module; a change to it is made in all three.
+- **`test_cli.py`.** It runs the CLI as a subprocess with `--production`, `BEVY_UPGRADE_STATE_DIR` and a fixtures file named by `BEVY_UPGRADE_FIXTURES`, and its subprocess rejects real network access with `a test attempted network access`. Every CLI run names a fixtures file, so no CLI test reaches `http_fetch` or waits on the real pacer. The notifier and sender stand-ins record every call with its arguments, whether the record lock was held and the saved `announced` and `closed`: `tool_calls(kind)`, `tool_args(kind)` (sends only for `send`), `retire_calls()`, `retire_arguments()`, `clear_calls()`. It counts saves by wrapping the real `save`. `write_fixtures` holds the GitHub answers for `example/adapter`, which a CLI test needs when it runs `check` on an entry with no `ready` release. Every fixture with a read branch needs `repository`, `name`, `rev`, `committed` and `requirement`.
 - **Dailies tests.** Every test in `test_dailies_input.py` runs behind a `DAILIES_BEVY_UPGRADE` stand-in set in the shared `setUp`, so none reaches the real upgrade command, which for an open watch calls the notifier. The timeout test replaces `subprocess.run` in-process and waits for nothing.
-- **Migration check, live.** The script runs `cargo tree` on the codebase, so a live run counts as a build on that project. `/bevy_migration_plan` clones `~/rust/bevy-<version>` itself; a machine that has only `~/rust/bevy` reports the missing checkout. A direct dependency that is not on crates.io fails its lookup and is listed under "Verification Needed". The script reads the codebase's direct dependencies only.
-- **Migration check, tests.** `test_bevy_migration_dependency_check.py` uses canned crates.io bodies behind a replaced `urlopen` and a temporary home directory, and any `subprocess.run` call fails the test, so no cargo runs.
-- **Two copies of the requirement rule.** `upstream.release_requirement` and `get_bevy_dependency_requirement` hold the same rule. A change to one needs the same change in the other.
+- **Migration check, live.** The script runs `cargo tree` on the codebase, so a live run counts as a build on that project. `/bevy_migration_plan` clones `~/rust/bevy-<version>` itself; a machine that has only `~/rust/bevy` reports the missing checkout. A direct dependency that is not on crates.io fails its lookup and is listed under "Verification Needed". The script reads the direct dependencies of every workspace member and nothing deeper. Its run time follows the request count, not the dependency count. Measured on 2026-10-12 against hana_catalyst for Bevy 0.20.0: exit 0 in 129 s, 45 crates asked about and every request answered; `bevy_tween` 0.13.0 and `bevy_lookup_curve` 0.12.0 are listed, both as blockers, `moonshine-save` is listed and `toml` is not.
+- **Shared crates under `--no-dedupe`.** The flag repeats a shared crate under every member that uses it. Only the set in `get_all_direct_dependencies` keeps that to one lookup.
+- **Build metadata.** crates.io answers 404 for `/api/v1/crates/toml/1.1.6/dependencies` and 200 for `/api/v1/crates/toml/1.1.6%2Bspec-1.1.0/dependencies` (measured 2026-10-12). A version cut off at its suffix reads as a failed lookup and a `CHECK_NEEDED` row.
+- **Migration check, tests.** `test_bevy_migration_dependency_check.py` uses canned crates.io bodies behind a replaced `urlopen` and a temporary home directory, and any `subprocess.run` call fails the test, so no cargo runs. Its `setUp` replaces the shared pacer at `crates_io_pacer.CRATES_IO_PACER` with one on a stand-in clock and sleep, and one test checks that the three pacing names are absent from the check. The module imports the check as a sibling (`import bevy_migration_dependency_check as checker`), so it runs only under `python3 -m unittest discover -s scripts/bevy_migration_plan -p 'test_*.py'`, which puts its directory on `sys.path`. Named by package path from the repository root it raises `ModuleNotFoundError`.
+- **Two copies of the requirement rule.** `upstream.release_requirement` and `get_bevy_dependency_requirement` hold the same rule, and both percent-encode the version in the lookup address. A change to one needs the same change in the other.
 
 ## Why
 
@@ -410,7 +445,14 @@ find_bevy_compatible_version(crate_name: str, all_versions: list[str], target_be
 - **Stored facts, derived words.** The record holds what a script cannot look up again for free (user, 2026-10-08). A state word computed from the facts at print time cannot disagree with them.
 - **`announced` holds state words, not a digest.** An opaque per-crate digest would show that something changed, but the change lines need the previous state word.
 - **An answer per crate, verbatim.** A git pin is the user's call ("if we do a git dependency which i would approve", user, 2026-10-12), so the record keeps the words and the date, no default approves, and one crate's answer never covers another.
-- **No pause between crates.io requests.** It is not needed at this volume.
+- **One request a second to crates.io.** It is crates.io's published crawler limit, and a check sends many requests in a row: about 40 on hana_catalyst's first read by the watch, and more from a migration check of a workspace.
+- **One pacer module, imported by both scripts.** A second copy in the watch, or a re-export from the migration check, would be a second definition to keep equal to the first.
+- **GitHub hosts are not paced.** GitHub has its own limit, and the watch already keeps to it (**GitHub's limit** under Calibration and gotchas).
+- **The pacer sleeps inside the fetch.** `run_check` reads the clock before each fetch, so `CHECK_BUDGET` already brackets the sleep and neither it nor `run_check` needs a rule for pacing.
+- **The clock is read again after a sleep.** Recording the planned wake time lets a sleep that runs long shorten the next gap below the interval.
+- **The command file tells the runner to wait.** A paced migration check runs longer than a default 120 s command limit.
+- **The check's tests import their module as a sibling.** The check's directory has its own execution environment so that basedpyright resolves `crates_io_pacer`, and under that entry the `scripts.bevy_migration_plan` package path does not resolve.
+- **No test asserts that the check's pacer is the shared object.** Reaching it through a private module import draws a basedpyright warning, and the two caller-order tests already prove the check uses the replaced pacer.
 - **The issues list with a substring filter, not GitHub's search.** The search does not match `0.20` inside `v0.20.0` (Multirious/bevy_tween pull request 97, "Migrate to Bevy v0.20.0", checked 2026-10-12).
 - **No token.** The `gh` token sits behind gpg-agent, which is cold after every reboot, and a check failing then would leave the record stale.
 - **`load` fills `branch` and `items`; `apply_pins` does not.** Every record reaches `apply_pins` through `load`, so a stored entry already has both there.
@@ -420,13 +462,9 @@ find_bevy_compatible_version(crate_name: str, all_versions: list[str], target_be
 - **A scheduled close waits for its message.** The watch stays open, and its job keeps running, until the showrunner has been sent the closing sentence.
 - **The builder takes the length limit from the renderer.** A second copy of the 240 limit in the builder could differ from the renderer's.
 - **The `line` sentence stays whole.** The dailies cut happens in the builder; the showrunner's own report and the scheduled message get the full sentence.
-- **The migration check keeps its own requirement rule.** It runs alone and prints its own warnings, so it does not import `scripts/bevy_upgrade/upstream.release_requirement`.
+- **The migration check keeps its own requirement rule.** It prints its own warnings, so it does not import `scripts/bevy_upgrade/upstream.release_requirement`. The pacer is the one module it takes from the watch's directory.
 - **The tree lookup, not `[workspace] members` globs.** The tree lists the manifests that exist and needs no glob rules.
 - **A truncated tree is not followed.** The search is bounded and answers unknown instead of making further requests.
-
-## Not verified yet
-
-- The migration plan's dependency check has not been run live against a real project (hana_catalyst). That run waits on a build hold, because the script runs `cargo tree`, which counts as a build.
 
 ## Steps still to run
 

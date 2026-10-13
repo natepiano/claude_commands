@@ -37,7 +37,8 @@
         "scripts/hooks",
         "scripts/message",
         "scripts/notify",
-        "scripts/production"
+        "scripts/production",
+        "scripts/lib"
       ]
     },
     {
@@ -74,7 +75,8 @@
         "scripts/production",
         "scripts/delegate",
         "scripts/notify",
-        "scripts/shutdown"
+        "scripts/shutdown",
+        "scripts/lib"
       ]
     },
     {
@@ -173,6 +175,13 @@
       "extraPaths": [
         "scripts/bevy_upgrade",
         "scripts/production"
+      ]
+    },
+    {
+      "root": "scripts/bevy_migration_plan",
+      "extraPaths": [
+        "scripts/bevy_migration_plan",
+        "scripts/bevy_upgrade"
       ]
     },
     {

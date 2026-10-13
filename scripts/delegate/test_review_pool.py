@@ -1017,5 +1017,17 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertIsNone(self.reviewer("code1")["lease"])
 
 
+class UIStandingPromptTests(unittest.TestCase):
+    def test_ui_standing_prompt_defines_report_and_measurement_without_rule_reads(self) -> None:
+        prompt = (SCRIPT.parents[2] / "config" / "review_pool" / "ui.md").read_text(encoding="utf-8")
+        self.assertRegex(prompt, r"Verdict:\s*pass\b")
+        self.assertRegex(prompt, r"Verdict:\s*(?:pass\s*\|\s*)?defects\b")
+        self.assertIn("| Shot | Rule | Defect | Fix |", prompt)
+        self.assertIn("measure_text.py", prompt)
+        instructions = " ".join(prompt.split())
+        self.assertNotIn("Follow `~/.claude/commands/ux_eval.md`", instructions)
+        self.assertNotIn("Read a rule's full text", instructions)
+
+
 if __name__ == "__main__":
     _ = unittest.main()

@@ -10,9 +10,9 @@ Answer in this turn from what is already recorded; start no runs and do not paus
 2. **Durations.** Time each step from the recorder's durations for the same step, earlier in this run or project (`~/.claude/scripts/delegate/progress_history.py` `timeline`, `aggregate`). A step no record covers is marked `(estimate)`.
 3. **End times.** Chain them from now. The last end time is the phase ETA. When it differs from the ETA last stated, the ETA moves to match the bullets; say so and send the showrunner the new ETA as `/unit:eta` words it (`commands/unit/eta.md`).
    When it moves, before sending, expand that last end time to its date in the
-   production doc's **User zone** and run
-   `TZ=<User zone> python3 ~/.claude/scripts/delegate/progress_history.py eta --session-dir "${SESSION_DIR}" --time "<YYYY-MM-DDTHH:MM>" --basis "<durations behind the bullets>"`.
-   The recorder reads the time in the zone it runs under; the `ETA recorded:`
+   user's zone and run
+   `python3 ~/.claude/scripts/delegate/progress_history.py eta --session-dir "${SESSION_DIR}" --time "<YYYY-MM-DDTHH:MM>" --basis "<durations behind the bullets>"`.
+   The recorder reads the time in the user's zone setting; the `ETA recorded:`
    line it prints names that zone.
 4. **Read every bullet twice before sending.** The user has not seen the plan, the board, the reviews or this session. Each bullet must tell them, in a few plain words, what is being built or checked and why that step exists, so they can judge whether the time is right. Rewrite any bullet that leans on context only this session holds, names a stage without saying what it does to this phase's work ("review" alone, "repair round 2"), or uses tooling words. Then cut every word that adds nothing. `~/.claude/docs/user_facing_explanation.md` holds the full method.
 
@@ -26,4 +26,4 @@ Print it as plain Markdown, a first line and bullets, never inside a code block:
 - …
 ```
 
-Every time is in the production doc's **User zone**. No ids, seat names or batch letters.
+Every time is in the user's zone, the one the recorder prints. No ids, seat names or batch letters.
