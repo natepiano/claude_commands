@@ -69,6 +69,8 @@ One Codex pane stalled with `Working` and a frozen timer on a one-line task. `tr
 
 ## How `scripts/herdr/` works
 
+The trial driver was removed when `herdr.py` replaced it; see [the adoption plan](../plans/build-followups-herdr-adoption.md).
+
 | File | Role |
 | --- | --- |
 | `trial.py` | The driver: herdr wrapper, systemd units, client window, launch, `work`/`wait`, teardown, `leftovers` |
