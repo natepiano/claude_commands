@@ -104,7 +104,7 @@ Showrunner's brief and approval, 2026-10-13 10:3x–10:4x EDT (not the user's wo
 
 **Ruled out:** a shared `work.json` with a lock — concurrent `work` calls from three directors lost an assignment, and one file per worker needs no lock.
 
-### Phase 3 — Launch the 10 sessions  · status: todo
+### Phase 3 — Launch the 10 sessions  · status: done
 
 #### Work Order
 
