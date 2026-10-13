@@ -208,41 +208,26 @@ The user, 2026-10-12: "Let's trial post master to see if it works". Scope is sec
 
 ### Phase 7 — The receiving rule, the as-built, and a worker id the live check can read  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** the documents say what shipped and how to start, check and stop the postmaster; the heartbeat names the worker that wrote it, so the live check in Phase 9 can tell a replaced worker from one that kept running; the log never names a relay that did not run.
-
-**Spec:**
-
-Worktree `/home/natepiano/worktrees/claude-build-followups-shutdown`, branch `build-followups-shutdown`.
-
-- `commands/message.md`, loaded after `/succinct_style`. "Receiving" gains one rule: a message from `postmaster` names its real sender in its first line: `Message from <name> via postmaster: <summary> [<tag>]` for an outbox delivery, or `Message from <name> (their answer to …, passed on by postmaster) [<at_ms>-<n>]:` for a forwarded reply; answer that name, never `postmaster`. "Sending" says `send.py` delivers through the postmaster session when one runs and relays otherwise. `codex/AGENTS-messaging.md` is not changed: a Codex recipient is never reached through the postmaster, and the shared "Finding sessions" words do not change.
-- `docs/as-built/session-roster.md`, the amend:
-  - `### send.py: one recipient`: the delivery paragraph names the postmaster attempt, the 3 s wait, each miss reason and the relay fallback; the outcome table's `SENT` row notes `postmaster; …`.
-  - `### Postmaster mod (trial)`: what the mod is and where it lives; the state directory and its JSON formats (entry, claim, result, heartbeat, route file, reply log, error); the claim file and why a message is delivered once; the `claimed-no-result` path and the choice made there; reply handling; the measured API table from Phase 2; the start, check and stop procedure below; the log fields.
-  - Key files, Invariants (the outbox rule; no settings change; the mod touches only `STATE/postmaster/`; tests never write the real outbox) and gotchas (the `tsc` command; the generated types folder; `--plugin-dir` hot-reloads the folder, so a pull on main reloads the running mod and the relay covers the pause; after a Claude Code update run `claude plugin validate --strict` and `claude plugin test`; a stopped postmaster session is started again by hand, and until then every message relays; `/home/natepiano/postmaster` is outside the repo and trusted per account, so a new account or a removed directory meets the folder-trust dialog; a refused send whose withdrawal write also fails leaves an `open` route on disk, and a worker replaced before the retry lands (a pull on main reloads the mod) restores it, so a message from that recipient inside 30 minutes is forwarded to that sender: accepted for the trial, since it needs a failed write and a reload within one 0.5 s poll, and `REPLY_WINDOW_MS` bounds it; `forwarded` holds only confirmed destination ids, so an empty list means an unroutable sender, a refused forward or a throwing forward, none of which is retried or written to `errors/`: read the logged body, find the intended sender and resend by hand).
-  - Not verified, and written as such: whether `/shutdown restart` brings the postmaster session back with its `--plugin-dir` flag.
-- The as-built writes the live procedure in full, as Phase 9 states it, with its Results marked pending until Phase 9 runs it.
-- Review repairs (Phase 7 review, 2026-10-13):
-  - The heartbeat names its worker: `heartbeat.json` = `{session_id, at_ms, version, run}`, where `run` is the worker's `<at_ms>-<uuid>`, the same value its claims carry. `postmaster.py` requires the field and `status` prints it: `running, heartbeat <age> s old, worker <run>`. Without it a reload that never replaced the worker passes the reload check.
-  - A `session:` address with no live session is queued without any send, and its log line says `via: queue`, `postmaster: unresolved`. `ClaudeRoute.via` is `postmaster | relay | queue`; `via: relay` means a relay ran. The step 2 relay count reads `via: relay` only.
-  - `commands/message.md`'s earlier "answer its wrapper's `from`" names the postmaster exception, so both rules pick the real sender.
-- Log fields step 2 reads, all in `STATE/log.jsonl`: `time`, `outcome`, `detail`, `via`, `postmaster`, `seconds`, `from`, `to`. From them: the share delivered by the mod, relays a day against the baseline of about 600, delivery time against the relay's 4.5 s median, `queued` and `failed` counts, and the count of `claimed-no-result`. The `replies/` directory gives replies consumed, and its `forwarded` lists give replies passed on. The as-built lists the one-line command for each number; nothing in this plan computes them.
+- `commands/message.md`: "Receiving" says a message from `postmaster` names its real sender in its first line, `Message from <name> via postmaster: <summary> [<tag>]` for an outbox delivery or `Message from <name> (their answer to …, passed on by postmaster) [<at_ms>-<n>]:` for a forwarded reply, and is answered to that name, never `postmaster`; the earlier "answer its wrapper's `from`" names `postmaster` as the exception. "Sending" says `send.py` tries the running postmaster session first for Claude recipients and relays otherwise. `codex/AGENTS-messaging.md` is unchanged: a Codex recipient is never reached through the postmaster.
+- `docs/as-built/session-roster.md`: `### send.py: one recipient` names the postmaster attempt, the 3 s wait, each miss reason and the relay fallback, and the `SENT` row notes `postmaster; …`. `### Postmaster mod (trial)` holds the mod, its state directory and JSON formats, the claim file and single delivery, the `claimed-no-result` choice, reply handling, the measured API table, the log fields with a one-line command per trial number, Key files, Invariants and gotchas, and the live start-up procedure in full with its Results pending. Whether `/shutdown restart` restores the postmaster with its `--plugin-dir` flag is written as not verified.
+- `heartbeat.json` is `{session_id, at_ms, version, run}`: `run` is the worker's `<at_ms>-<uuid>`, the same value its claims carry. `postmaster.py`'s `is_heartbeat` requires a non-empty `run`, and `status` prints `running, heartbeat <age> s old, worker <run>`.
+- `ClaudeRoute.via` is `postmaster | relay | queue`. A `session:` address with no live session is queued with no send and logs `via: queue`, `postmaster: unresolved`; `via: relay` always means a relay ran.
 
 **Files:**
-- `commands/message.md` — the receiving rule and the sending line.
-- `docs/as-built/session-roster.md` — the amend and the mod's section, with the live procedure and its Results pending.
-- Review repairs: `mods/postmaster/hooks/protocol.ts`, `mods/postmaster/hooks/outbox.ts`, `mods/postmaster/tests/*.test.ts`, `scripts/message/postmaster.py`, `scripts/message/send.py`, `scripts/message/test_postmaster.py`, `scripts/message/test_send.py`.
+- `commands/message.md` — the receiving rule, the wrapper-`from` exception, the sending line.
+- `docs/as-built/session-roster.md` — the `send.py` delivery paragraph and the Postmaster mod section, with the live procedure and Results pending.
+- `mods/postmaster/hooks/protocol.ts`, `outbox.ts` — `Heartbeat.run`, written with each heartbeat.
+- `scripts/message/postmaster.py` — `is_heartbeat` requires `run`; `status` prints `worker`.
+- `scripts/message/send.py` — `via: queue` for an unresolved address.
+- `mods/postmaster/tests/protocol.test.ts`, `register.test.ts`, `scripts/message/test_postmaster.py`, `test_send.py` — the heartbeat `run`, the `worker` line, `via: queue`.
 
-**Seats:** 2 writers — one document each; the review repairs go to `impl` with their tests.
-- `impl` — `commands/message.md`, then the review repairs' code and tests.
-- `test` — opens as impl: `docs/as-built/session-roster.md`.
+**Binds later work:** the live start-up reads `worker` from `postmaster.py status` before and after the reload and passes only on a new worker; its procedure is the as-built's. The relay count reads `via: relay` only.
 
-**Constraints from prior phases:** Phase 1 wrote `### Postmaster mod (trial)` with the probe procedure; Phase 2 filled its measured table and recorded the `tsc` command; Phase 3 removed the probe and marked the procedure as the record of how the table was measured. Phases 3 and 5 built the mod: outbox, claim, result, heartbeat, reply handling, under `mods/postmaster/hooks/`. Phase 5 shipped the reply log as `replies/<at_ms>-<n>.json` = `{at_ms, socket, name, session_id, senders, body, forwarded}`: `senders` is a non-empty list of distinct, non-empty names in first-route order (not a `sender` string), and `forwarded` lists only the session ids a forward was confirmed to. Route files are `delivered/<at_ms>-<n>.json` = `{route: "open" | "withdrawn", socket, sender, reply_to_session_id, session_id, at_ms}`; the mod restores `open` routes younger than `REPLY_WINDOW_MS` (30 minutes) when a worker starts. A forwarded reply's first line is `Message from <name> (their answer to <sender | one of a, b>, passed on by postmaster) [<at_ms>-<n>]:`. Phase 6 built `scripts/message/postmaster.py` (`new_entry_id`, `attempt`, the miss reasons, `status` with its `errors:` and `replies:` counts), the `SENT: postmaster; …` line, `delivered_text` with its tag, the three log fields and `RELAY_ONLY_SENDERS`, and gives the relay after a miss `--timeout` less the attempt's `seconds` (at least 1 s), so a send keeps its caller's time limit; the as-built names the set, the reason, and that step 2's share is counted without those messages. Phase 2 measured that the recipient sees the postmaster session's name, so the receiving rule is added. Spell the CLI `command claude` in every command a seat or a script runs.
+**Gotchas:** a heartbeat without `run` reads as stale, so a mod older than this phase reads as not running. The live procedure ends the `postmaster` tmux session after stopping its `claude` process, or the restart step cannot create it again. A reply is forwarded to every route on its socket within 30 minutes, so the script-only reply check needs its own recipient (`pm-check2`).
 
-**Acceptance gate:** `commands/message.md` names the rule; the as-built's `send.py` section, invariants and gotchas describe what shipped, and it carries Phase 9's procedure with Results pending; the message suite green; `claude plugin validate --strict mods/postmaster`, `claude plugin test mods/postmaster` and the `tsc` check green.
-
-**Verification:** `cd scripts/message && HOME=<scratch home> python3 -m unittest test_postmaster test_send test_sessions test_roster` · `command claude plugin validate --strict mods/postmaster` · `command claude plugin test mods/postmaster` · `nix shell nixpkgs#typescript --command tsc --noEmit -p mods/postmaster`.
+**Ruled out:** running the live start-up in this phase (the session loads the mod from `~/.claude/mods/postmaster` on main, so it waits for this checkpoint there).
 
 ### Phase 8 — Restart finds a session's tmux pane and tmux session after a rename  · status: todo
 
