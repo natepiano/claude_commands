@@ -883,6 +883,7 @@ withdraw_local_demand() {
 # when the holder, reason or escalation message changes during this wait.
 register_routing_demand() {
     local admission=0
+    if build_hold_nothing_held; then return 0; fi
     python3 "$BUILD_TARGETS_SCRIPT" register-local --call-id "$BUILDLOG_CALL_ID" --pid $$ \
         2>"$HOLD_WAIT_DIR/routing-diagnostic" || admission=$?
     if ! cmp -s "$HOLD_WAIT_DIR/routing-diagnostic" "$HOLD_WAIT_DIR/last-routing-diagnostic"; then
@@ -917,7 +918,7 @@ route_test() {
         [[ "$eligibility" == eligible ]] || continue
         if [[ "$settings" == - ]]; then
             admission=0
-            python3 "$BUILD_TARGETS_SCRIPT" check-admission --call-id "$BUILDLOG_CALL_ID" || admission=$?
+            build_hold_check_admission || admission=$?
             case "$admission" in
                 0) return 0 ;;
                 10|12) continue ;;
@@ -1130,12 +1131,14 @@ if [[ "$CMD" == test ]]; then
     compose_nextest_args
     route_test
 fi
-python3 "$BUILD_TARGETS_SCRIPT" wait-local --call-id "$BUILDLOG_CALL_ID" --pid $$ &
-HOLD_WAITER_PID=$!
-HOLD_WAIT_STATUS=0
-wait "$HOLD_WAITER_PID" || HOLD_WAIT_STATUS=$?
-HOLD_WAITER_PID=""
-if [[ "$HOLD_WAIT_STATUS" != 0 ]]; then exit "$HOLD_WAIT_STATUS"; fi
+if ! build_hold_nothing_held; then
+    python3 "$BUILD_TARGETS_SCRIPT" wait-local --call-id "$BUILDLOG_CALL_ID" --pid $$ &
+    HOLD_WAITER_PID=$!
+    HOLD_WAIT_STATUS=0
+    wait "$HOLD_WAITER_PID" || HOLD_WAIT_STATUS=$?
+    HOLD_WAITER_PID=""
+    if [[ "$HOLD_WAIT_STATUS" != 0 ]]; then exit "$HOLD_WAIT_STATUS"; fi
+fi
 trap - INT TERM HUP
 
 # Open a progress window for the duration of this run when a delegate session is

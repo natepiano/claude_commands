@@ -262,6 +262,24 @@ class MacRunTests(unittest.TestCase):
         self.assert_no_build_started()
         self.assert_claim_released()
 
+    def test_both_builds_set_the_development_deployment_target(self) -> None:
+        self.environment.update({
+            "BUILD_HOLD_DIR": str(self.root / "holders"),
+            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+            "BUILDLOG_DIR": str(self.root / "buildlog"),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+        })
+        result = self.mac_run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        builds = [event["args"][-1] for event in self.events()
+                  if event["command"] == "ssh" and "cargo build" in event["args"][-1]]
+        self.assertGreaterEqual(len(builds), 2)
+        self.assertTrue(any("cargo build -q -p hana" in command for command in builds))
+        self.assertTrue(any("--example" in command for command in builds))
+        for command in builds:
+            self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0 ~/.cargo/bin/cargo build", command)
+
     def test_busy_mac_exits_nine_without_starting_build(self) -> None:
         claimed = self.state_command(
             "claim",
