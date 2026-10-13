@@ -2,9 +2,11 @@
 description: Reach the user when work has stopped on something only they can do, or a decision only they can make is overdue. Any session, natedev or Mac.
 ---
 
+Load `/message_style` before the first message to the user in a session.
+
 Send one alert:
 
-`python3 ~/.claude/scripts/message/send.py --to user --need decision|blocked --action "<what the user does>" --summary "<session name>: <topic>" --text "<the one action or decision, under 200 characters>"`
+`python3 ~/.claude/scripts/message/send.py --to user --need decision|blocked --action "<what the user does>" --summary "<what is at stake, under 45 characters>" --text "<the one action or decision, under 500 characters>"`
 
 On the Mac, add `--machine natedev`; the keys exist only on natedev. Never read `~/.config/pushover/env`.
 

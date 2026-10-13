@@ -927,14 +927,16 @@ it needs. Every other wait is yours to clear, and fast.
 </Dependencies>
 
 <Notify>
+Load `/message_style` before the first message to the user in a session.
+
 Phone alerts use the one message path, which reaches the phone through
 Pushover (user's pick, 2026-10-03), because the user often ignores ordinary
 push notifications:
 
-`python3 ~/.claude/scripts/message/send.py --to user --need note|decision|blocked (--action "<what the user does>" | --no-action) --summary "Hana: <unit or topic>" --text "<message>"`
+`python3 ~/.claude/scripts/message/send.py --to user --need note|decision|blocked (--action "<what the user does>" | --no-action) --summary "<what is at stake, under 45 characters>" --text "<message>"`
 
 On the Mac, add `--machine natedev`; the keys exist only on natedev. The
-message is the one action or fact, under 200 characters. Every message says
+message is the one action or fact, under 500 characters, per the message guide. Every message says
 what the user does with `--action`, or says nothing is needed with
 `--no-action`. Emergency (`--need blocked`) is only for an action the user must
 take now. Exit 0 means sent. On `FAILED` (exit 3), fall back to PushNotification
