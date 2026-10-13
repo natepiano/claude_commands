@@ -104,31 +104,19 @@ Source: steps recorded on the Mac; failed follows the build log's failure rule, 
 
 ### Phase 1 — `/build:report` counts natedev alone, and the Mac gets its own section  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/build:report`'s step tables, Rebuilds, Memory pressure and Summary count natedev rows only, and a new `### Mac` section shows every step recorded on a Mac host with its caller, runs, failures and times.
-
-**Spec:**
-- `natedev_step_predicate(step="steps")` returns `{step}.host = 'natedev'`. Every step-based section in `report.py` goes through it: `kinds`, `rebuilds_section`, `kind_section`, `memory_pressure_section` (both of its step queries), `summary`, `lead_block`'s failed-step count, and `report`'s host count. Read each query for a step filter that bypasses the predicate.
-- `mac_section(connection, day) -> list[str]` builds the `### Mac` table and its two lines from the Design, and `report` places it after `tests_by_target_lines`.
-- `test_report.py`:
-  - a day with natedev rows, `verify-mac` rows, and a Mac row with caller `unknown`: no Mac row reaches any natedev table or summary, and each appears in the Mac section with its caller, counts and times;
-  - a `verify-mac` nextest with status 4 is not counted as failed;
-  - a day with no Mac rows prints `No steps recorded on the Mac.`;
-  - an existing caller label loses `(natedev)`.
-  Update existing expectations that relied on the old filter.
-- `commands/build/report.md`: one sentence saying the step tables are natedev's and the Mac section holds the Mac's steps.
+- `natedev_step_predicate(step="steps")` in `scripts/buildlog/mac_outcome.py` returns `{step}.host = 'natedev'`. Every step reader in `report.py` takes it: the kind tables, Rebuilds, lead counts, waits, test routing, caller-host counts, the Summary, and Memory pressure's waits, longest wait, stalls with their concurrent counts, and the unsliced-step, sccache-service and memory-kill lines (through `memory.instrument_lines`, in its unqualified form).
+- `mac_section(connection, day)` follows Tests by target as `### Mac`: Caller | Kind | Runs | Failed | Avg | p95 | Range | Build | Tests | Tests failed, one row per caller and kind over every non-natedev host, busiest first. `verify-mac` shows as "verify.sh offload"; other callers use `caller_label`. Failed uses `index.COUNTED_FAILURE`, so a Mac nextest that matched no tests is not a failure. Build is the mean `finished_s`; missing test facts show as `—`. A `Mac total: <steps> steps, <time>; <n> failed.` line and a Source line close it. A day with no Mac steps prints "No steps recorded on the Mac."
+- `commands/build/report.md` says the step tables, Rebuilds, Memory pressure and Summary count natedev's steps and the Mac section holds the Mac's.
 
 **Files:**
-- `scripts/buildlog/report.py`
-- `scripts/buildlog/mac_outcome.py`
-- `scripts/buildlog/test_report.py`
-- `scripts/buildlog/test_mac_outcome.py`
-- `commands/build/report.md`
+- `scripts/buildlog/mac_outcome.py` — `natedev_step_predicate`, the host rule for local step readers
+- `scripts/buildlog/report.py` — natedev filters on every step reader; `mac_section`
+- `scripts/buildlog/test_report.py`, `scripts/buildlog/test_mac_outcome.py` — mixed-host fixtures for both
+- `commands/build/report.md` — which host each set of tables covers
 
-**Seats:** 1 writer + 1 tester.
-
-**Acceptance gate:** today's `buildlog report` on natedev shows no `Nates-MacBook-Pro-2023` row outside the Mac section, and the Mac section's nextest runs equal `SELECT count(*) FROM steps WHERE host <> 'natedev' AND step = 'nextest'` for the day.
+**Gotchas:** the log carries two Mac host names (`Mac` and `Nates-MacBook-Pro-2023`), so Mac selection is `host <> 'natedev'`, never one Mac name. The `scripts/buildlog/buildlog` wrapper runs the installed copy; worktree code is checked with `~/.claude/scripts/lib/py scripts/buildlog/cli.py` and `BUILDLOG_DIR` on a scratch copy of the log.
 
 ### Phase 2 — A Mac claim with no Mac process for 15 minutes is released, and its holder is told  · status: todo
 
@@ -159,6 +147,7 @@ Source: steps recorded on the Mac; failed follows the build log's failure rule, 
   - `test_offload.py`: the remote activity text runs under `sh` and `zsh -f` with stand-in `pgrep`, `lsof` and `ps`, and prints `active=0` and a counted case. The leftover text's existing cases still pass.
   - `test_build_targets.py`: the `idle since` clause.
 - `commands/build/mac.md`: after the claim instruction, one sentence saying a claim with nothing running on the Mac for 15 minutes is released and the holder is told, so claim right before the remote work and claim again after a release.
+- Constraints from prior phases: a wrapper under `scripts/<tool>/` execs the installed `~/.claude/scripts` copy, so the live check runs this worktree's file directly (`~/.claude/scripts/lib/py <worktree>/scripts/mac_test/mac_test.py`), with `MAC_TEST_STATE_DIR` and `MAC_TEST_CONFIG` pointing at scratch copies; `override_guard` refuses those overrides on the installed copy. `start_claim_watcher` runs `Path(__file__)` and forwards the `MAC_TEST_*` environment, as `start_watcher` does, so the watcher it starts is the same file with the same scratch state.
 
 **Files:**
 - `config/mac_test.conf`
